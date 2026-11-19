@@ -59,7 +59,10 @@ def install_loaded_features(
     are installed on the owner-only window (``_install_owner_window``: no
     replication, every expert on its owner), at tp 4 or tp 8; with
     ``half_window_experts`` (tp 4) the NVFP4 layers also stack the ring predecessor's
-    upper half, which the prologue's routed kernel places onto (``half=True``).
+    upper half, which the prologue's routed kernel places onto (``half=True``); with
+    ``batch_half_window_experts`` its flow also places the 33..64-row decode calls
+    (``half_max_rows``), whose 96-expert tactic is pinned at 40..64 rows
+    (``decode_expert_tactics.pin_half_batch_steps``).
 
     Then ``hot_replicas`` (``hot_replicas.install``: hooks only, at tp 4; the copies are
     gathered on the first forward of a deployment that serves 33..512-row decode steps),
@@ -237,6 +240,12 @@ def _install_owner_window(text_model, mapping, plan: "_dispatch.Plan") -> None:
         extra["bf16_unpacked"] = True
     if plan.enabled("half_window_experts"):
         extra["half"] = True
+        if plan.enabled("batch_half_window_experts"):
+            from .ops.moe import decode_expert_tactics as _decode_tactics
+
+            # batch_half_window_experts: the half flow places the 33..64-row calls too.
+            extra["half_max_rows"] = _ring_buddy.HALF_BATCH_MAX_ROWS
+            _decode_tactics.pin_half_batch_steps()
     _ring_buddy.install(text_model, mapping, balance=False, windows=1, **extra)
 
 

@@ -616,6 +616,10 @@ class _SwaEndpointRetirer(ConversationManager):
     never retired by the conversation, so later siblings leaving the tree at
     the same point still reuse up to it. ``all_reusable`` already commits that
     window, so unlike Mamba no chunk boundary is needed there.
+
+    Requests without a conversation id are left alone: they register no state,
+    record no fork point and save no plan, so their pages keep the priorities
+    they get with the retire off.
     """
 
     # Bounds for ids that never return (finished and recycled conversations);
@@ -645,9 +649,15 @@ class _SwaEndpointRetirer(ConversationManager):
         self._next_log = time.monotonic() + self._LOG_INTERVAL_S
 
     def is_new_conversation(self, request: LlmRequest) -> bool:
-        """False only for a turn whose conversation already committed an endpoint."""
+        """Whether *request* may record a fork point as a new conversation.
+
+        False for a turn whose conversation already committed an endpoint, and for a
+        request without a conversation id.
+        """
         conversation_id = _request_conversation_id(request)
-        state = self._conversation_states.get(conversation_id) if conversation_id else None
+        if conversation_id is None:
+            return False
+        state = self._conversation_states.get(conversation_id)
         return state is None or not state.committed
 
     def record_branch_point(self, request_id: int, point: int) -> None:
@@ -1775,6 +1785,8 @@ class KVCacheManagerV2(BaseResourceManager):
     _allocation_stream = None
     _on_allocation_stream: "set[int] | frozenset[int]" = frozenset()
     _allocation_ready: "dict[int, torch.cuda.Event]" = {}
+    # Stream for resumes made ahead of the step that reads them; see side_stream().
+    _side_stream = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -2597,6 +2609,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"endpoint's window+rewind, windows {retirer._windows}, "
                     f"rewind {self._swa_endpoint_rewind}, branch snapshot priority "
                     f"{'on' if self._swa_endpoint_rewind > 0 else 'off: rewind 0'}, "
+                    "requests without a conversation id are left alone, "
                     f"is_draft={self.is_draft}"
                 )
 
@@ -4803,14 +4816,16 @@ class KVCacheManagerV2(BaseResourceManager):
             index = self.index_mapper.get_index(request_id)
             self.sparse_metadata_batch.add(kv_cache, index)
 
-    def _resume_and_restore(self, req_id: int, kv_cache) -> bool:
+    def _resume_and_restore(self, req_id: int, kv_cache, cuda_stream: int | None = None) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
 
-        Returns True if the cache is (or becomes) active, False on failure.
+        The cache is resumed onto *cuda_stream*, or onto the request's own stream
+        (``_cache_stream``) when none is given. Returns True if the cache is (or
+        becomes) active, False on failure.
         """
         if kv_cache.is_active:
             return True
-        if not kv_cache.resume(self._cache_stream(req_id)):
+        if not kv_cache.resume(self._cache_stream(req_id) if cuda_stream is None else cuda_stream):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
@@ -4852,6 +4867,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if num_lookup_tokens is None or req.is_dummy_request:
             counters["branch_skip_no_fresh_match"] += 1
             return
+        if _request_conversation_id(req) is None:
+            counters["branch_skip_no_conversation_id"] += 1
+            # Traffic without conversation ids saves no plan; log the counters from here too.
+            retirer._maybe_log()
+            return
         if not retirer.is_new_conversation(req):
             counters["branch_skip_continuing_turn"] += 1
             return
@@ -4892,10 +4912,21 @@ class KVCacheManagerV2(BaseResourceManager):
             self._context_reuse_tokens(req),
         )
 
-    def prepare_context_cache(self, req: LlmRequest, reuse_limit: int | None = None) -> int | None:
+    def prepare_context_cache(
+        self,
+        req: LlmRequest,
+        reuse_limit: int | None = None,
+        claim_only: bool = False,
+        resume_stream: int | None = None,
+    ) -> int | None:
         """Create/resume a context cache without touching request cursors. ``reuse_limit``
         caps the claimed depth while retaining its lookahead evidence; the returned
         match lets the scheduler check both pools agree.
+
+        ``claim_only`` stops a first chunk after the claim, leaving the cache
+        suspended; a later call finds it and only resumes it. ``resume_stream``
+        resumes a first chunk onto that stream instead of the execution stream;
+        see ``rejoin_execution_stream``.
         """
         if req.is_first_context_chunk:
             if self.conversation_manager is not None:
@@ -4958,7 +4989,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Connector loads need persistent destination pages; scratch
                 # slots are reserved for local prefill.
                 kv_cache.enable_swa_scratch_reuse = False
-            if not self._resume_and_restore(req.py_request_id, kv_cache):
+            if claim_only:
+                return kv_cache.num_committed_tokens
+            if not self._resume_and_restore(req.py_request_id, kv_cache, resume_stream):
                 return None
             return kv_cache.num_committed_tokens
 
@@ -4972,28 +5005,79 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return kv_cache.num_committed_tokens
 
-    def prepare_context(self, req: LlmRequest) -> bool:
-        """Create/resume the cache and expose local or reserved reuse before budgeting."""
+    def _context_claim_limit(self, req: LlmRequest) -> int | None:
+        """The reuse claim cap ``prepare_context`` applies to *req*, or None for none.
+
+        Hidden-state drafters need a recomputed prompt tail: cap the reuse
+        CLAIM rather than rewinding the cursor afterwards. A capped claim is
+        just a shorter match, so the core materializes every page the
+        recompute needs (for SWA life cycles only sink and live-window pages
+        at the matched endpoint are onboarded; a cursor rewound below that
+        endpoint would read and write spans with no pages behind them). The
+        tail check runs first: partially constructed managers carry only the
+        class-level zero tail.
+        """
+        if not self._spec_recompute_tail:
+            return None
+        return _spec_recompute_claim_limit(
+            req,
+            tail=self._spec_recompute_tail,
+            tokens_per_block=self.tokens_per_block,
+            is_draft=self.is_draft,
+        )
+
+    def claim_context(self, req: LlmRequest) -> bool:
+        """Create a first context chunk's cache and claim its reusable prefix, without resuming it.
+
+        The claim is the radix match ``prepare_context`` makes, with the same
+        cap. The cache stays suspended, so no GPU page is taken; the next
+        ``prepare_context`` finds it and only resumes it (eviction, onboarding,
+        page locks) and settles the cursor. This lets a caller spread the two
+        halves of a long prompt's admission over separate iterations. Returns
+        False when no cache could be created; nothing is left behind then.
+        """
+        assert req.is_first_context_chunk and not req.is_disagg_generation_init_state, (
+            f"req {req.py_request_id}: claim_context takes a first context chunk"
+        )
+        return (
+            self.prepare_context_cache(req, self._context_claim_limit(req), claim_only=True)
+            is not None
+        )
+
+    def side_stream(self) -> int:
+        """Handle of a stream for resumes whose pages only a later step reads.
+
+        A resume makes its cache's stream wait for the page copies it starts
+        (eviction, then onboarding). Resumed here rather than on the execution
+        stream, a cache leaves the steps queued meanwhile free of that wait
+        until ``rejoin_execution_stream`` hands it back.
+        """
+        if self._side_stream is None:
+            self._side_stream = torch.cuda.Stream(device=self._stream.device)
+        return self._side_stream.cuda_stream
+
+    def rejoin_execution_stream(self, req: LlmRequest) -> None:
+        """Move *req*'s cache back onto the execution stream.
+
+        Switching an active cache's stream makes the new stream wait for the
+        old one, so work queued on the execution stream from here on waits for
+        the copies of a resume made on ``side_stream``.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is not None and kv_cache.cuda_stream != self._stream.cuda_stream:
+            kv_cache.cuda_stream = self._stream.cuda_stream
+
+    def prepare_context(self, req: LlmRequest, resume_stream: int | None = None) -> bool:
+        """Create/resume the cache and expose local or reserved reuse before budgeting.
+
+        ``resume_stream``: see ``prepare_context_cache``.
+        """
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
-        # Hidden-state drafters need a recomputed prompt tail: cap the reuse
-        # CLAIM rather than rewinding the cursor afterwards. A capped claim is
-        # just a shorter match, so the core materializes every page the
-        # recompute needs (for SWA life cycles only sink and live-window pages
-        # at the matched endpoint are onboarded; a cursor rewound below that
-        # endpoint would read and write spans with no pages behind them). The
-        # tail check runs first: partially constructed managers carry only the
-        # class-level zero tail.
-        limit = None
-        if self._spec_recompute_tail:
-            limit = _spec_recompute_claim_limit(
-                req,
-                tail=self._spec_recompute_tail,
-                tokens_per_block=self.tokens_per_block,
-                is_draft=self.is_draft,
-            )
-        reused = self.prepare_context_cache(req, limit)
+        reused = self.prepare_context_cache(
+            req, self._context_claim_limit(req), resume_stream=resume_stream
+        )
         if reused is None:
             return False
         # First chunk only: num_committed_tokens holds at the initial prefix

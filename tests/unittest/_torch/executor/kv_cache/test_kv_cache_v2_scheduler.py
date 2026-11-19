@@ -18,6 +18,7 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+import itertools
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -5855,7 +5856,11 @@ class TestKVRetryGate:
             for _ in range(9):
                 out = sched.schedule_request([gen, *pending], set())
                 seq.append(
-                    (ids(out.generation_requests), ids(out.context_requests), sched._ctx_page_backoff.remaining)
+                    (
+                        ids(out.generation_requests),
+                        ids(out.context_requests),
+                        sched._ctx_page_backoff.remaining,
+                    )
                 )
             outputs[mode] = (seq, len(_resize_attempts(mgr)))
         assert outputs["on"][0] == outputs["off"][0]
@@ -5893,3 +5898,354 @@ class TestKVRetryGate:
         sched._stalled_schedules = sched._DEADLOCK_STALL_ITERS // 2
         sched.schedule_request([ctx], set())
         assert _resize_attempts(mgr) == [1, 1]
+
+
+# ===========================================================================
+# Opt-in context admission lookahead
+# ===========================================================================
+
+
+_LOOKAHEAD_ENV = "TRTLLM_SCHED_LOOKAHEAD_ADMIT_PASSES"
+_LOOKAHEAD_BLOCKS_ENV = "TRTLLM_SCHED_LOOKAHEAD_ADMIT_BLOCKS"
+_LOOKAHEAD_SIDE_STREAM_ENV = "TRTLLM_SCHED_LOOKAHEAD_ADMIT_SIDE_STREAM"
+_SIDE_STREAM = 0x5EED
+
+
+@pytest.fixture
+def lookahead_env(kvrg_env):
+    for name in (_LOOKAHEAD_ENV, _LOOKAHEAD_BLOCKS_ENV):
+        kvrg_env.delenv(name, raising=False)
+    # Resumes on the execution stream: the side-stream tests set or clear this themselves.
+    kvrg_env.setenv(_LOOKAHEAD_SIDE_STREAM_ENV, "0")
+    kvrg_env.setenv(_INTERVAL_ENV, "4")
+    kvrg_env.setenv(_SPF_ENV, "1")
+    return kvrg_env
+
+
+def _lookahead_manager(reuse_by_id, free_slots=100, **kwargs):
+    """Manager whose claim makes a suspended cache that the next prepare resumes."""
+    mgr = _reuse_settling_manager(reuse_by_id, enable_block_reuse=True, **kwargs)
+    settle = mgr.prepare_context.side_effect
+    mgr.calls = []
+
+    def claim_context(req):
+        mgr.calls.append(("claim", req.py_request_id))
+        cache = Mock(is_active=False)
+        cache.num_committed_tokens = reuse_by_id.get(req.py_request_id, 0)
+        mgr.kv_cache_map[req.py_request_id] = cache
+        return True
+
+    def prepare_context(req, reuse_limit=None, resume_stream=None):
+        side = resume_stream is not None
+        mgr.calls.append(("prepare_on_side_stream" if side else "prepare", req.py_request_id))
+        cache = mgr.kv_cache_map[req.py_request_id]
+        if not cache.is_active:
+            cache.cuda_stream = resume_stream if side else "execution"
+        cache.is_active = True
+        return settle(req, reuse_limit)
+
+    def rejoin_execution_stream(req):
+        mgr.calls.append(("rejoin", req.py_request_id))
+        mgr.kv_cache_map[req.py_request_id].cuda_stream = "execution"
+
+    def free_resources(req):
+        mgr.calls.append(("free", req.py_request_id))
+        mgr.kv_cache_map.pop(req.py_request_id, None)
+
+    mgr.claim_context.side_effect = claim_context
+    mgr.prepare_context.side_effect = prepare_context
+    mgr.free_resources.side_effect = free_resources
+    mgr.rejoin_execution_stream.side_effect = rejoin_execution_stream
+    mgr.side_stream.return_value = _SIDE_STREAM
+    mgr.index_mapper.num_free_slots.return_value = free_slots
+    mgr._resume_gate_refuses.return_value = False
+    return mgr
+
+
+def _steps_to_pass(sched, mgr, active):
+    """Run the generation steps of one interval with lookahead; return what each did.
+
+    Ends with the next ``schedule_request`` being the context pass.
+    """
+    steps = []
+    while True:
+        out = sched.schedule_request(active, set())
+        assert ids(out.context_requests) == []
+        first = len(mgr.calls)
+        sched.lookahead_admit_context(active, set(), out.generation_requests)
+        steps.append(mgr.calls[first:])
+        if sched._prefill_decode_interval.remaining == 0:
+            return steps
+
+
+class TestContextAdmissionLookahead:
+    def _scheduler(self, mgr, max_num_tokens=1024):
+        sched = make_scheduler(mgr, max_num_tokens=max_num_tokens, ctx_chunk_config=(None, 64))
+        gen = make_gen_request(0)
+        # Admitting a context starts the interval: four generation passes follow.
+        assert ids(sched.schedule_request([gen, make_ctx_request(1, 100)], set()).context_requests)
+        return sched, gen
+
+    def test_off_by_default(self, lookahead_env):
+        sched = make_scheduler(_lookahead_manager({}), ctx_chunk_config=(None, 64))
+        assert not sched.admission_lookahead_enabled
+
+    @pytest.mark.parametrize(
+        "missing", ["interval", "chunked_prefill", "block_reuse", "cache_tier_below_gpu"]
+    )
+    def test_stays_off_where_it_cannot_run(self, lookahead_env, missing):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        if missing == "interval":
+            lookahead_env.delenv(_INTERVAL_ENV)
+        mgr = _lookahead_manager({}, has_cache_tier_below_gpu=missing != "cache_tier_below_gpu")
+        mgr.enable_block_reuse = missing != "block_reuse"
+        chunking = None if missing == "chunked_prefill" else (None, 64)
+        assert not make_scheduler(mgr, ctx_chunk_config=chunking).admission_lookahead_enabled
+
+    def test_stays_off_with_the_out_of_pages_retry_gate(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        lookahead_env.setenv(_KVRG_ENV, "1")
+        mgr = _lookahead_manager({})
+        assert not make_scheduler(mgr, ctx_chunk_config=(None, 64)).admission_lookahead_enabled
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "many"])
+    def test_refuses_a_block_budget_below_one(self, lookahead_env, raw):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        lookahead_env.setenv(_LOOKAHEAD_BLOCKS_ENV, raw)
+        with pytest.raises(
+            ValueError, match=f"{_LOOKAHEAD_BLOCKS_ENV} must be a positive integer, got '{raw}'"
+        ):
+            make_scheduler(_lookahead_manager({}), ctx_chunk_config=(None, 64))
+        lookahead_env.delenv(_LOOKAHEAD_BLOCKS_ENV)
+        sched = make_scheduler(_lookahead_manager({}), ctx_chunk_config=(None, 64))
+        assert sched._admission_lookahead.block_budget == 8192
+
+    def test_predicts_the_pass_order_and_probes_each_prompt_once(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "1")
+        mgr = _lookahead_manager({2: 0, 3: 960})
+        # One chunk of room at the pass: the shortest uncached prompt takes it.
+        sched, gen = self._scheduler(mgr, max_num_tokens=1 + 64)
+        cold, warm = make_ctx_request(2, 1000), make_ctx_request(3, 1000)
+        steps = _steps_to_pass(sched, mgr, [gen, cold, warm])
+        assert steps[-1] == [("claim", 3), ("prepare", 3)]
+        out = sched.schedule_request([gen, cold, warm], set())
+        assert ids(out.context_requests) == [3]
+        # The pass ranks by the estimates lookahead probed.
+        probed = [c.args[0].py_request_id for c in mgr.probe_context_reuse.call_args_list]
+        assert sorted(probed) == [2, 3]
+
+    def test_arrival_order_without_aging_needs_no_probe(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "1")
+        lookahead_env.setenv(_AGING_ENV, "0")
+        mgr = _lookahead_manager({2: 0, 3: 960})
+        sched, gen = self._scheduler(mgr, max_num_tokens=1 + 64)
+        first, second = make_ctx_request(2, 1000), make_ctx_request(3, 1000)
+        steps = _steps_to_pass(sched, mgr, [gen, first, second])
+        assert steps[-1] == [("claim", 2), ("prepare", 2)]
+        assert ids(sched.schedule_request([gen, first, second], set()).context_requests) == [2]
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_prepares_in_the_steps_before_the_pass_and_the_pass_admits(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        mgr = _lookahead_manager({2: 960})
+        sched, gen = self._scheduler(mgr)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        steps = _steps_to_pass(sched, mgr, [gen, ctx])
+        # Only the two steps before the pass act; claim and resume fit one step.
+        assert steps == [[], [], [("claim", 2), ("prepare", 2)], []]
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.context_requests) == [2]
+        assert ctx.context_remaining_length == 40
+        assert mgr.calls.count(("claim", 2)) == 1
+        assert not sched._admission_lookahead.held
+        assert sched._admission_lookahead.stats["admitted_prepared"] == 1
+
+    def test_over_budget_claim_and_resume_split_across_steps(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "3")
+        # Claim 16 prompt blocks, resume 2 x 15 reused blocks: 46 > 20.
+        lookahead_env.setenv(_LOOKAHEAD_BLOCKS_ENV, "20")
+        mgr = _lookahead_manager({2: 960})
+        sched, gen = self._scheduler(mgr)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        steps = _steps_to_pass(sched, mgr, [gen, ctx])
+        assert steps == [[], [], [("claim", 2)], [("prepare", 2)]]
+        assert sched._admission_lookahead.stats["split"] == 1
+
+    def test_waits_for_the_input_copy_before_the_first_change_only(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "4")
+        mgr = _lookahead_manager({2: 960})
+        sched, gen = self._scheduler(mgr)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        waits = []
+        for _ in range(4):
+            out = sched.schedule_request([gen, ctx], set())
+            sched.lookahead_admit_context(
+                [gen, ctx], set(), out.generation_requests, lambda: waits.append(len(mgr.calls))
+            )
+        # Once, right before the claim; the later steps change nothing.
+        assert len(waits) == 1 and mgr.calls[waits[0]] == ("claim", 2)
+
+    def test_request_the_pass_does_not_admit_is_released(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        mgr = _lookahead_manager({2: 0, 3: 0})
+        sched, gen = self._scheduler(mgr, max_num_tokens=256)
+        first, second = make_ctx_request(2, 64), make_ctx_request(3, 64)
+        _steps_to_pass(sched, mgr, [gen, first, second])
+        assert sorted(sched._admission_lookahead.held) == [2, 3]
+        sched.max_num_tokens = 1 + 64  # the pass turns out to fit only one
+        out = sched.schedule_request([gen, first, second], set())
+        assert ids(out.context_requests) == [2]
+        assert ("free", 3) in mgr.calls and 3 not in mgr.kv_cache_map
+        assert second.context_current_position == 0
+        assert not sched._admission_lookahead.held
+
+    def test_generation_short_of_pages_takes_them_back_before_evicting(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "4")
+        mgr = _lookahead_manager({2: 960}, can_evict=True)
+        sched, gen = self._scheduler(mgr)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        out = sched.schedule_request([gen, ctx], set())
+        sched.lookahead_admit_context([gen, ctx], set(), out.generation_requests)
+        assert sched._admission_lookahead.held[2].resumed
+        # The decoding request now needs the pages the prepared request holds.
+        mgr.try_allocate_generation.side_effect = lambda req: 2 not in mgr.kv_cache_map
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.generation_requests) == [0]
+        assert out.paused_requests == []
+        assert ("free", 2) in mgr.calls
+        assert sched._admission_lookahead.stats["released_for_pages"] == 1
+
+    def test_context_refused_for_pages_retries_after_unreached_lookahead_gives_way(
+        self, lookahead_env
+    ):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        mgr = _lookahead_manager({2: 960, 3: 0})
+        sched, gen = self._scheduler(mgr)
+        prepared = make_ctx_request(2, context_remaining_length=1000)
+        _steps_to_pass(sched, mgr, [gen, prepared])
+        # A short request arriving just before the pass is tried first and
+        # fits only once the prepared request's pages are back.
+        late = make_ctx_request(3, context_remaining_length=30)
+        mgr.resize_context.side_effect = lambda req, n: not (
+            req.py_request_id == 3 and mgr.kv_cache_map.get(2, Mock(is_active=False)).is_active
+        )
+        out = sched.schedule_request([gen, prepared, late], set())
+        assert sorted(ids(out.context_requests)) == [2, 3]
+        assert sched._admission_lookahead.stats["released_for_pages"] == 1
+
+    def test_nothing_prepared_above_the_resume_gate_or_short_of_index_slots(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "4")
+        for mgr in (_lookahead_manager({}), _lookahead_manager({}, free_slots=1)):
+            if mgr.index_mapper.num_free_slots() > 1:
+                mgr._resume_gate_refuses.return_value = True
+            sched, gen = self._scheduler(mgr)
+            active = [gen, make_ctx_request(2, 64), make_ctx_request(3, 64)]
+            for _ in range(4):
+                out = sched.schedule_request(active, set())
+                sched.lookahead_admit_context(active, set(), out.generation_requests)
+            assert not any(call[0] == "claim" for call in mgr.calls)
+
+    def test_ranks_with_the_same_requests_make_the_same_calls(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "3")
+        lookahead_env.setenv(_LOOKAHEAD_BLOCKS_ENV, "24")
+
+        def run(clock):
+            mgr = _lookahead_manager({2: 960, 3: 320, 4: 0})
+            sched, gen = self._scheduler(mgr)
+            active = [gen] + [make_ctx_request(r, 1000) for r in (2, 3, 4)]
+            with patch(
+                "tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.time.perf_counter", clock
+            ):
+                for _ in range(12):
+                    out = sched.schedule_request(active, set())
+                    sched.lookahead_admit_context(active, set(), out.generation_requests)
+                    for req in out.context_requests:
+                        active.remove(req)
+            return mgr.calls
+
+        fast, slow = itertools.count(0, 1e-6), itertools.count(0, 1.0)
+        assert run(lambda: next(fast)) == run(lambda: next(slow))
+
+    def test_generation_give_back_holds_lookahead_until_the_pass(self, lookahead_env):
+        lookahead_env.setenv(_INTERVAL_ENV, "10")
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "4")
+        mgr = _lookahead_manager({2: 960}, can_evict=True)
+        sched, gen = self._scheduler(mgr)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        # Decoding stays short of pages while request 2 holds a cache.
+        mgr.try_allocate_generation.side_effect = lambda req: 2 not in mgr.kv_cache_map
+        while True:
+            out = sched.schedule_request([gen, ctx], set())
+            if ids(out.context_requests):
+                break
+            assert out.paused_requests == []
+            sched.lookahead_admit_context([gen, ctx], set(), out.generation_requests)
+        # One claim and one give-back in the whole window, then the pass admits it.
+        assert ids(out.context_requests) == [2]
+        assert mgr.calls.count(("claim", 2)) == 1
+        stats = sched._admission_lookahead.stats
+        assert stats["released_for_pages"] == 1 and stats["claims"] == 1
+        assert not sched._admission_lookahead.refused
+
+    def test_successful_retry_is_not_a_page_refusal(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        lookahead_env.setenv(_DIAG_ENV, "1")
+        mgr = _lookahead_manager({2: 960, 3: 0})
+        sched, gen = self._scheduler(mgr)
+        prepared = make_ctx_request(2, context_remaining_length=1000)
+        _steps_to_pass(sched, mgr, [gen, prepared])
+        late = make_ctx_request(3, context_remaining_length=30)
+        mgr.resize_context.side_effect = lambda req, n: not (
+            req.py_request_id == 3 and mgr.kv_cache_map.get(2, Mock(is_active=False)).is_active
+        )
+        out = sched.schedule_request([gen, prepared, late], set())
+        assert sorted(ids(out.context_requests)) == [2, 3]
+        assert sched._admission_lookahead.stats["released_for_pages"] == 1
+        # As without lookahead: nothing was refused, so nothing backs off.
+        assert sched._ctx_page_backoff.remaining == 0
+        assert sched._admission_diag._window["page_refused"] == 0
+
+    def test_side_stream_resume_rejoins_before_the_pass_uses_the_cache(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        lookahead_env.setenv(_LOOKAHEAD_SIDE_STREAM_ENV, "1")
+        mgr = _lookahead_manager({2: 960})
+        sched, gen = self._scheduler(mgr)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        steps = _steps_to_pass(sched, mgr, [gen, ctx])
+        assert steps == [[], [], [("claim", 2), ("prepare_on_side_stream", 2)], []]
+        assert mgr.kv_cache_map[2].cuda_stream == _SIDE_STREAM
+        first = len(mgr.calls)
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.context_requests) == [2]
+        # Back on the execution stream before the pass prepares or resizes it.
+        assert mgr.calls[first:][:2] == [("rejoin", 2), ("prepare", 2)]
+        assert mgr.kv_cache_map[2].cuda_stream == "execution"
+        assert sched._admission_lookahead.stats["rejoined"] == 1
+
+    def test_side_stream_on_by_default(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        lookahead_env.delenv(_LOOKAHEAD_SIDE_STREAM_ENV)
+        mgr = _lookahead_manager({2: 960})
+        sched, gen = self._scheduler(mgr)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        steps = _steps_to_pass(sched, mgr, [gen, ctx])
+        assert sched._admission_lookahead.side_stream
+        assert steps == [[], [], [("claim", 2), ("prepare_on_side_stream", 2)], []]
+        first = len(mgr.calls)
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.context_requests) == [2]
+        assert mgr.calls[first:][:2] == [("rejoin", 2), ("prepare", 2)]
+        assert mgr.kv_cache_map[2].cuda_stream == "execution"
+
+    def test_side_stream_off_with_zero(self, lookahead_env):
+        lookahead_env.setenv(_LOOKAHEAD_ENV, "2")
+        lookahead_env.setenv(_LOOKAHEAD_SIDE_STREAM_ENV, "0")
+        mgr = _lookahead_manager({2: 960})
+        sched, gen = self._scheduler(mgr)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        steps = _steps_to_pass(sched, mgr, [gen, ctx])
+        assert steps == [[], [], [("claim", 2), ("prepare", 2)], []]
+        sched.schedule_request([gen, ctx], set())
+        assert not sched._admission_lookahead.side_stream
+        assert ("rejoin", 2) not in mgr.calls
+        mgr.side_stream.assert_not_called()

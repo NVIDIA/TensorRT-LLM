@@ -211,6 +211,19 @@ def _read_non_negative_int_env(name: str, default: int) -> int:
     return value
 
 
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as err:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from err
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return value
+
+
 class PrefillDecodeInterval:
     """Cadence that keeps context work off most decode steps.
 
@@ -483,6 +496,8 @@ class ShortestPrefillFirstOrder:
         self._work = 0
         self._arrival_work: dict[int, int] = {}
         self._key: dict[int, int] = {}
+        # Uncached prefill work of each first chunk whose prefix was probed.
+        self._uncached: dict[int, int] = {}
         # Requests prioritize() moved ahead: their work counts as zero.
         self._prioritized: set[int] = set()
         self._store_probe_counts = [0, 0, 0]  # probes, hits, store-only tokens
@@ -525,9 +540,19 @@ class ShortestPrefillFirstOrder:
         if key is None:
             key = self._arrival_work[request_id]
             if self._aging_factor and request_id not in self._prioritized:
-                key += self._aging_factor * self._uncached_tokens(req, kv_cache_manager)
+                key += self._aging_factor * self.uncached_tokens(req, kv_cache_manager)
             self._key[request_id] = key
         return key
+
+    def uncached_tokens(self, req: LlmRequest, kv_cache_manager) -> int:
+        """The prefill work *req* is ranked by, its prefix probed at most once."""
+        if not req.is_first_context_chunk:
+            return req.context_remaining_length
+        request_id = req.py_request_id
+        work = self._uncached.get(request_id)
+        if work is None:
+            work = self._uncached[request_id] = self._uncached_tokens(req, kv_cache_manager)
+        return work
 
     def _store_prefix_end(
         self, req: LlmRequest, local_reusable: Optional[int], kv_cache_manager
@@ -591,6 +616,7 @@ class ShortestPrefillFirstOrder:
         for request_id in self._arrival_work.keys() - waiting_ids:
             del self._arrival_work[request_id]
             self._key.pop(request_id, None)
+            self._uncached.pop(request_id, None)
             self._prioritized.discard(request_id)
         for request_id in waiting_ids - self._arrival_work.keys():
             self._arrival_work[request_id] = self._work
@@ -616,6 +642,119 @@ class ShortestPrefillFirstOrder:
         self._prioritized.add(request_id)
         self._key.pop(request_id, None)
 
+    def is_estimated(self, req: LlmRequest) -> bool:
+        """Whether ranking *req* needs no prefix probe (none, or one already made)."""
+        return (
+            not self._aging_factor
+            or not req.is_first_context_chunk
+            or req.py_request_id in self._uncached
+        )
+
+    def peek_order(self, context_reqs: RequestList, kv_cache_manager) -> RequestList:
+        """The order the next reordering ``order`` call will give *context_reqs*.
+
+        Advances no clock. A key depends on the clock only through the reading a
+        request arrived at, which ``order`` takes the first pass it sees the
+        request; one not seen yet takes the current reading here, as the next
+        ``order`` call would. Its prefix is probed and memoized as ``order``
+        would, so the pass reuses the estimate.
+        """
+        for req in context_reqs:
+            self._arrival_work.setdefault(req.py_request_id, self._work)
+        if len(context_reqs) < 2:
+            return list(context_reqs)
+        return sorted(context_reqs, key=lambda req: self._key_of(req, kv_cache_manager))
+
+
+class _LookaheadEntry:
+    """A first context chunk whose admission lookahead has started."""
+
+    __slots__ = ("req", "resumed", "on_side_stream")
+
+    def __init__(self, req: LlmRequest):
+        self.req = req
+        # False while only the reuse claim is made (cache suspended).
+        self.resumed = False
+        # Resumed on the KV cache manager's side stream, not yet rejoined.
+        self.on_side_stream = False
+
+
+class ContextAdmissionLookahead:
+    """Prepare a context pass's first chunks during the generation steps before it.
+
+    Admitting a first context chunk is mostly host work that does not depend
+    on the step it lands in: ``prepare_context`` matches the prompt against
+    the radix tree and claims the reusable prefix, then resumes the claim onto
+    the GPU (eviction, onboarding copies, a lock on every page). Its cost grows
+    with the reused prefix rather than with the chunk. Under
+    ``PrefillDecodeInterval`` it all falls on the one pass that admits context,
+    while the generation steps before that pass leave the host waiting on the
+    device.
+
+    With ``passes`` N, in each of the N generation steps before a context pass
+    the executor calls ``KVCacheV2Scheduler.lookahead_admit_context`` once the
+    step's forward is queued. It predicts which first chunks the pass will
+    admit (the pass's own order and token budget) and runs their
+    ``prepare_context`` now, spending at most ``block_budget`` units per step:
+    a claim costs the request's prompt blocks, a resume twice its claimed
+    blocks, and a prefix probe the order needs its prompt blocks. A request
+    whose claim and resume do not both fit is claimed in one step and resumed
+    in a later one; the first piece of work in a step always runs, so a prompt
+    larger than the budget still advances one half per step. At the pass,
+    ``prepare_context`` finds the cache active and only settles the cursor.
+
+    Lookahead decides nothing about admission. The pass admits by its own
+    rules, and every prepared request it does not admit is released at the
+    end of that pass, as a failed admission would be. Prepared requests also
+    give way at once: a generation request short of pages, or a context
+    request the pass refuses for pages, releases the prepared requests the
+    pass has not reached yet and retries. No step prepares while the GPU pool
+    is above ``max_util_for_resume``.
+
+    A resume makes its cache's stream wait for the page copies it starts. On
+    the execution stream that wait falls on the next generation step. With
+    ``side_stream`` the resume runs on the KV cache manager's side stream
+    instead, and the cache rejoins the execution stream when its context pass
+    reaches it, so only that pass's forward waits for the copies.
+
+    Every input is a pure function of the scheduling decisions, the request
+    set and the KV cache manager's state, so ranks that schedule the same
+    requests stay in lockstep. Wall time is read for the summary log only.
+    """
+
+    # Work units per resumed block: the resume walks the claimed blocks
+    # several times (activate, migrate, lock), about twice the claim's walk.
+    RESUME_COST_PER_BLOCK = 2
+
+    def __init__(self, passes: int, block_budget: int, side_stream: bool = False):
+        if passes <= 0:
+            raise ValueError(f"passes must be positive, got {passes}")
+        if block_budget <= 0:
+            raise ValueError(f"block_budget must be positive, got {block_budget}")
+        self.passes = passes
+        self.block_budget = block_budget
+        self.side_stream = side_stream
+        # Request id -> entry, in the order lookahead started them.
+        self.held: dict[int, _LookaheadEntry] = {}
+        # Set when the KV pool refused a claim or resume ahead of the pass:
+        # retrying every step would repeat the refused work, so lookahead
+        # waits for the pass, which tries again by its own rules.
+        self.refused = False
+        self.stats: Counter = Counter()
+        self.engaged_logged = False
+
+    def in_window(self, remaining: int) -> bool:
+        """Whether a step leaving *remaining* interval passes is among the ``passes`` before one."""
+        return remaining < self.passes
+
+    def prune(self, active_ids: set[int], kv_cache_map) -> None:
+        """Forget requests that left, or whose cache something else released."""
+        for request_id in [
+            rid for rid in self.held if rid not in active_ids or rid not in kv_cache_map
+        ]:
+            del self.held[request_id]
+            self.stats["dropped"] += 1
+
 
 class KVCacheV2Scheduler(RequestScheduler):
     """Interleaved scheduler for KV Cache Manager V2.
@@ -634,6 +773,10 @@ class KVCacheV2Scheduler(RequestScheduler):
     _ctx_request_chunk_cap: Optional[int] = None
     _ctx_chunk_cap_eligible_share = False
     _ctx_chunk_cap_this_pass: Optional[int] = None
+
+    # Context admission lookahead (TRTLLM_SCHED_LOOKAHEAD_ADMIT_PASSES); see __init__.
+    _admission_lookahead: Optional["ContextAdmissionLookahead"] = None
+    _lookahead_reached: "set[int] | frozenset[int]" = frozenset()
 
     # Scheduling passes between two summaries of the prefill-decode interval.
     _CONTEXT_ADMISSION_LOG_PASSES = 4096
@@ -870,6 +1013,35 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self._kvrg_mode != "off":
             self._kvrg_init()
 
+        # Opt-in (default off): prepare a context pass's first chunks during
+        # the generation steps before it; see ContextAdmissionLookahead.
+        self._admission_lookahead: Optional[ContextAdmissionLookahead] = None
+        # Ids of the requests the current pass's phase 2 has tried so far.
+        self._lookahead_reached: set[int] = set()
+        lookahead_passes = _read_non_negative_int_env("TRTLLM_SCHED_LOOKAHEAD_ADMIT_PASSES", 0)
+        if lookahead_passes > 0:
+            unsupported = self._admission_lookahead_unsupported()
+            if unsupported is not None:
+                logger.warning(
+                    f"KVCacheV2Scheduler context admission lookahead stays off: {unsupported}"
+                )
+            else:
+                block_budget = _read_positive_int_env("TRTLLM_SCHED_LOOKAHEAD_ADMIT_BLOCKS", 8192)
+                # The resumes run on the KV cache manager's side stream unless
+                # TRTLLM_SCHED_LOOKAHEAD_ADMIT_SIDE_STREAM=0.
+                self._admission_lookahead = ContextAdmissionLookahead(
+                    min(lookahead_passes, self._prefill_decode_interval.interval),
+                    block_budget,
+                    side_stream=os.environ.get("TRTLLM_SCHED_LOOKAHEAD_ADMIT_SIDE_STREAM", "1")
+                    != "0",
+                )
+                logger.info(
+                    "KVCacheV2Scheduler context admission lookahead: "
+                    f"passes={self._admission_lookahead.passes}, "
+                    f"block_budget={block_budget}, "
+                    f"side_stream={self._admission_lookahead.side_stream}"
+                )
+
     def _resolve_ctx_request_chunk_cap(self, raw: str) -> Optional[int]:
         try:
             cap = int(raw) if raw.strip() else 0
@@ -899,6 +1071,45 @@ class KVCacheV2Scheduler(RequestScheduler):
         unit = max(self.chunk_unit_size, 1)
         share = remaining_budget // num_eligible // unit * unit
         return max(self._ctx_request_chunk_cap, share)
+
+    def _admission_lookahead_unsupported(self) -> Optional[str]:
+        """Why context admission lookahead cannot run here, or None when it can."""
+        mgr = self.kv_cache_manager
+        if self._prefill_decode_interval is None:
+            return "it needs TRTLLM_SCHED_PREFILL_DECODE_INTERVAL to place the context pass"
+        if not self.chunking_enabled:
+            return "it needs chunked prefill"
+        if not mgr.enable_block_reuse:
+            return "block reuse is off, so there is no claim to prepare"
+        if not mgr.has_cache_tier_below_gpu:
+            return (
+                "without a cache tier below GPU, a pass short of pages preempts a started "
+                "request before lookahead could give its pages back"
+            )
+        if self._joint_draft_manager is not None:
+            return "joint target/draft KV reuse claims both pools at once"
+        if self.cross_kv_cache_manager is not None:
+            return "encoder-decoder cross KV is not supported"
+        if getattr(mgr, "kv_connector_manager", None) is not None:
+            return "a KV connector is attached"
+        if self.has_cp_helix:
+            return "helix context parallelism is not supported"
+        if self._kvrg_mode != "off":
+            return "the out-of-pages context retry gate (TRTLLM_M31_KVRG) replays refusals"
+        if getattr(type(mgr), "prepare_expect_snapshot_points", None) is not None:
+            return "recurrent-state snapshot points are not supported"
+        return None
+
+    @property
+    def admission_lookahead_enabled(self) -> bool:
+        """Whether the executor should call ``lookahead_admit_context``."""
+        return self._admission_lookahead is not None
+
+    def disable_admission_lookahead(self, reason: str) -> None:
+        """Turn lookahead off before any scheduling, for an executor that cannot drive it."""
+        if self._admission_lookahead is not None:
+            logger.warning(f"KVCacheV2Scheduler context admission lookahead stays off: {reason}")
+            self._admission_lookahead = None
 
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
@@ -985,6 +1196,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it_end = len(requests_list)
         recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
+        if self._admission_lookahead is not None:
+            self._lookahead_reached.clear()
 
         # Context requests are always deferred to a second phase so that
         # generation requests are fully accounted for in the budget before
@@ -1337,6 +1550,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._ctx_chunk_cap_this_pass = None
         if backoff is not None:
             backoff.record_pass(has_generation, self._ctx_page_refused)
+        if self._admission_lookahead is not None:
+            # Before the interval records this pass: it tells whether this
+            # pass was the one lookahead prepared for.
+            self._lookahead_after_pass(scheduled_ctx, has_generation)
         if diag is not None:
             diag.end_pass(len(ctx_candidates), len(scheduled_ctx))
         if self._prefix_skip_pending or self._prefix_skip_key_cache:
@@ -1438,6 +1655,275 @@ class KVCacheV2Scheduler(RequestScheduler):
             for r in requests
             if r.state_value == self._context_init_state_value and not r.is_first_context_chunk
         }
+
+    # ---- Context admission lookahead ----
+
+    def _prompt_blocks(self, req: LlmRequest) -> int:
+        return -(-req.prompt_len // self.tokens_per_block)
+
+    def lookahead_admit_context(
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+        generation_requests: RequestList,
+        before_first_change: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Prepare the next context pass's first chunks ahead of it; see ContextAdmissionLookahead.
+
+        Called once per step after the step's forward is queued, with that
+        step's scheduled *generation_requests*. *before_first_change* runs once,
+        before the first call that changes KV cache state: admission rewrites
+        host page-index rows that a queued step's input copy may still read.
+        """
+        lookahead = self._admission_lookahead
+        if lookahead is None:
+            return
+        mgr = self.kv_cache_manager
+        pending = [
+            r
+            for r in active_requests
+            if r.state_value == self._context_init_state_value
+            and r.request_id not in inflight_request_ids
+        ]
+        lookahead.prune({r.py_request_id for r in pending}, mgr.kv_cache_map)
+        remaining = self._prefill_decode_interval.remaining
+        if not generation_requests or not lookahead.in_window(remaining) or lookahead.refused:
+            return
+        backoff = self._ctx_page_backoff
+        if backoff is not None and backoff.remaining > remaining:
+            # The backoff will still hold first chunks back at the pass.
+            return
+        predicted, spent = self._lookahead_predict_pass(pending, generation_requests)
+        held = lookahead.held
+        todo = [
+            r for r in predicted if r.py_request_id not in held or not held[r.py_request_id].resumed
+        ]
+        if not todo:
+            return
+
+        stats = lookahead.stats
+        start = time.perf_counter()
+        # A claim must leave a slot for every pending first chunk still
+        # without a cache, so the pass never runs short of slots for a request
+        # lookahead did not predict.
+        uncached = sum(
+            1
+            for r in pending
+            if r.is_first_context_chunk and r.py_request_id not in mgr.kv_cache_map
+        )
+        changed = False
+        for req in todo:
+            request_id = req.py_request_id
+            entry = held.get(request_id)
+            if entry is None:
+                if request_id in mgr.kv_cache_map:
+                    # A cache lookahead did not make (an admission the executor withheld).
+                    continue
+                cost = self._prompt_blocks(req)
+                if spent and spent + cost > lookahead.block_budget:
+                    break
+                if mgr.index_mapper.num_free_slots() < uncached:
+                    stats["slot_limited"] += 1
+                    break
+                if mgr._resume_gate_refuses():
+                    stats["gated"] += 1
+                    break
+                if not changed:
+                    changed = True
+                    if before_first_change is not None:
+                        before_first_change()
+                spent += cost
+                if not mgr.claim_context(req):
+                    lookahead.refused = True
+                    stats["claim_refused"] += 1
+                    break
+                uncached -= 1
+                entry = held[request_id] = _LookaheadEntry(req)
+                stats["claims"] += 1
+                stats["claimed_blocks"] += cost
+            committed = mgr.kv_cache_map[request_id].num_committed_tokens
+            cost = ContextAdmissionLookahead.RESUME_COST_PER_BLOCK * (
+                -(-committed // self.tokens_per_block)
+            )
+            if spent and spent + cost > lookahead.block_budget:
+                stats["split"] += 1
+                break
+            if mgr._resume_gate_refuses():
+                stats["gated"] += 1
+                break
+            if not changed:
+                changed = True
+                if before_first_change is not None:
+                    before_first_change()
+            spent += cost
+            if not self._lookahead_resume(req):
+                del held[request_id]
+                # The class's own method: an instance attribute may be the
+                # admission diagnostics' timed wrapper, which counts pass work.
+                type(self).release_context_admission(self, req)
+                lookahead.refused = True
+                stats["resume_refused"] += 1
+                break
+            entry.resumed = True
+            entry.on_side_stream = lookahead.side_stream
+            stats["prepared"] += 1
+            stats["prepared_tokens"] += committed
+            if not lookahead.engaged_logged:
+                lookahead.engaged_logged = True
+                logger.info(
+                    f"[V2Scheduler] context admission lookahead engaged: request {request_id} "
+                    f"prepared with {committed} cached tokens {remaining + 1} step(s) before "
+                    "its context pass"
+                )
+        if changed:
+            elapsed_ms = (time.perf_counter() - start) * 1e3
+            stats["steps"] += 1
+            stats["host_ms"] += elapsed_ms
+            stats["max_step_ms"] = max(stats["max_step_ms"], elapsed_ms)
+
+    def _lookahead_resume(self, req: LlmRequest) -> bool:
+        """Resume a claimed first chunk ahead of its pass, as the pass would."""
+        if not self._admission_lookahead.side_stream:
+            # The class's own method: an instance attribute may be the
+            # admission diagnostics' timed wrapper, which counts pass work.
+            return type(self)._prepare_context_pair(self, req)
+        # Joint draft reuse is unsupported with lookahead, so this is what
+        # _prepare_context_pair does: the target pool, then any unpaired mirror.
+        mgr = self.kv_cache_manager
+        if not mgr.prepare_context(req, resume_stream=mgr.side_stream()):
+            return False
+        return type(self)._admit_unpaired_draft(self, req)
+
+    def _lookahead_rejoin(self, request_id: int) -> None:
+        """Hand a cache resumed on the side stream back to the execution stream."""
+        entry = self._admission_lookahead.held.get(request_id)
+        if entry is not None and entry.on_side_stream:
+            entry.on_side_stream = False
+            self.kv_cache_manager.rejoin_execution_stream(entry.req)
+            self._admission_lookahead.stats["rejoined"] += 1
+
+    def _lookahead_predict_pass(
+        self, pending: RequestList, generation_requests: RequestList
+    ) -> tuple[RequestList, int]:
+        """The first chunks the coming context pass is expected to admit, in its order.
+
+        Replays the pass's order (shortest prefill first when enabled) and its
+        token and request budgets, with the generation requests of the current
+        step standing in for the pass's. Also returns the prompt blocks of the
+        prefix probes the order needed. Only the probes touch the KV cache
+        manager, and they are memoized for the pass as ``order`` would.
+        """
+        mgr = self.kv_cache_manager
+        spf = self._shortest_prefill_first
+        probe_blocks = 0
+        if spf is not None:
+            probe_blocks = sum(self._prompt_blocks(r) for r in pending if not spf.is_estimated(r))
+            ordered = spf.peek_order(pending, mgr)
+        else:
+            ordered = pending
+        tokens_left = self.max_num_tokens
+        if tokens_left is not None:
+            tokens_left -= sum(1 + get_draft_token_length(r) for r in generation_requests)
+        slots_left = self.max_num_requests - len(generation_requests)
+        force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+        predicted: RequestList = []
+        for req in ordered:
+            if slots_left <= 0:
+                break
+            if tokens_left is not None and not (
+                tokens_left > 0 and (force_chunk or tokens_left >= self.chunk_unit_size)
+            ):
+                break
+            if spf is not None and spf.aging_factor:
+                need = spf.uncached_tokens(req, mgr)
+            else:
+                need = req.context_remaining_length
+            if tokens_left is not None:
+                take = min(need, tokens_left)
+                if take < need:
+                    take = (take // self.chunk_unit_size) * self.chunk_unit_size
+                tokens_left -= take
+            slots_left -= 1
+            if req.is_first_context_chunk:
+                predicted.append(req)
+        return predicted, probe_blocks
+
+    def _release_lookahead_admissions(self, keep: set[int]) -> bool:
+        """Release the resumed lookahead admissions outside *keep*.
+
+        Each is released as a failed admission is, leaving it as it would be
+        without lookahead. Claims that were not resumed hold no GPU pages and
+        stay. Once pages were given back, lookahead waits for the context pass:
+        preparing again would only take them back. Returns whether any GPU
+        pages were given back.
+        """
+        lookahead = self._admission_lookahead
+        if lookahead is None or not lookahead.held:
+            return False
+        released = False
+        for request_id, entry in list(lookahead.held.items()):
+            if request_id in keep or not entry.resumed:
+                continue
+            del lookahead.held[request_id]
+            if request_id in self.kv_cache_manager.kv_cache_map:
+                self.release_context_admission(entry.req)
+                lookahead.stats["released_for_pages"] += 1
+                released = True
+        if released:
+            lookahead.refused = True
+        return released
+
+    def _lookahead_after_pass(self, scheduled_ctx: RequestList, has_generation: bool) -> None:
+        """Settle lookahead admissions once their context pass has run.
+
+        A prepared request the pass admitted is done. One it did not admit is
+        released, as the pass releases a failed admission, so the next
+        lookahead starts it over against that pass's order.
+        """
+        lookahead = self._admission_lookahead
+        stats = lookahead.stats
+        stats["passes"] += 1
+        context_pass = not self._prefill_decode_interval.defers_context(has_generation)
+        if context_pass:
+            lookahead.refused = False
+        if context_pass and lookahead.held:
+            stats["context_passes"] += 1
+            scheduled_ids = {r.py_request_id for r in scheduled_ctx}
+            for request_id, entry in list(lookahead.held.items()):
+                if request_id in scheduled_ids:
+                    # Rejoined when the pass reached it; kept as a safeguard.
+                    self._lookahead_rejoin(request_id)
+                    stats["admitted_prepared" if entry.resumed else "admitted_claimed"] += 1
+                    del lookahead.held[request_id]
+                    continue
+                del lookahead.held[request_id]
+                if request_id in self.kv_cache_manager.kv_cache_map:
+                    self.release_context_admission(entry.req)
+                    stats["released_unadmitted"] += 1
+                else:
+                    stats["gone_at_pass"] += 1
+        if stats["passes"] >= self._CONTEXT_ADMISSION_LOG_PASSES:
+            steps = stats["steps"]
+            logger.info(
+                f"[V2Scheduler] context admission lookahead over {stats['passes']} passes "
+                f"({stats['context_passes']} with lookahead admissions): "
+                f"{stats['claims']} claims ({stats['claimed_blocks']} prompt blocks), "
+                f"{stats['prepared']} prepared ({stats['prepared_tokens']} cached tokens), "
+                f"{stats['split']} resumes deferred to a later step, "
+                f"{stats['rejoined']} rejoined from the side stream, "
+                f"admitted at their pass {stats['admitted_prepared']} prepared and "
+                f"{stats['admitted_claimed']} claimed only, "
+                f"released {stats['released_unadmitted']} unadmitted and "
+                f"{stats['released_for_pages']} for pages, "
+                f"{stats['gone_at_pass']} gone by the pass (refused there or finished), "
+                f"refused ahead {stats['claim_refused']} claims and "
+                f"{stats['resume_refused']} resumes, held back by the resume gate "
+                f"{stats['gated']} and by index slots {stats['slot_limited']}, dropped "
+                f"{stats['dropped']}; host {stats['host_ms']:.0f} ms in {steps} steps "
+                f"(mean {stats['host_ms'] / max(steps, 1):.1f} ms, "
+                f"max {stats['max_step_ms']:.1f} ms)"
+            )
+            stats.clear()
 
     # ---- Prefix-aware skip ----
 
@@ -1661,10 +2147,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             if gated is not None:
                 return gated, 0, False
             self._kvrg_fail_kind = None
-        if self.chunking_enabled:
-            result = self._try_schedule_context_chunked(req, budget, preempt_for_pages)
+        if self._admission_lookahead is None:
+            result = self._try_schedule_context_once(req, budget, preempt_for_pages)
         else:
-            result = self._try_schedule_context_full(req, budget, preempt_for_pages)
+            result = self._try_schedule_context_after_lookahead(req, budget, preempt_for_pages)
 
         if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
             # Failed admission must not retain prefix-reuse holds. Suspension
@@ -1673,6 +2159,50 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if gate:
             self._kvrg_record(req, first_chunk, result[0])
+        return result
+
+    def _try_schedule_context_once(
+        self,
+        req: LlmRequest,
+        budget: BudgetTracker,
+        preempt_for_pages: Callable[[LlmRequest], bool],
+    ) -> tuple[ScheduleAction, int, bool]:
+        if self.chunking_enabled:
+            return self._try_schedule_context_chunked(req, budget, preempt_for_pages)
+        return self._try_schedule_context_full(req, budget, preempt_for_pages)
+
+    def _try_schedule_context_after_lookahead(
+        self,
+        req: LlmRequest,
+        budget: BudgetTracker,
+        preempt_for_pages: Callable[[LlmRequest], bool],
+    ) -> tuple[ScheduleAction, int, bool]:
+        """``_try_schedule_context_once``, with the pages lookahead took early given back.
+
+        Lookahead resumed some first chunks before this pass. If *req* is
+        refused for pages while any of them that this pass has not reached yet
+        still hold pages, those are released -- the state the pass would be in
+        without lookahead -- and *req* is tried once more.
+        """
+        self._lookahead_reached.add(req.py_request_id)
+        # From here on the pass treats a prepared cache as its own, on its stream.
+        self._lookahead_rejoin(req.py_request_id)
+        refused_before, self._ctx_page_refused = self._ctx_page_refused, False
+        result = self._try_schedule_context_once(req, budget, preempt_for_pages)
+        if (
+            result[0] is not ScheduleAction.SCHEDULED
+            and self._ctx_page_refused
+            and self._release_lookahead_admissions(keep=self._lookahead_reached)
+        ):
+            if req.is_first_context_chunk:
+                self.release_context_admission(req)
+            # The retry alone decides whether this request was refused for
+            # pages, for the backoff and the diagnostics alike.
+            self._ctx_page_refused = False
+            if self._admission_diag is not None:
+                self._admission_diag.count("page_refused", -1)
+            result = self._try_schedule_context_once(req, budget, preempt_for_pages)
+        self._ctx_page_refused = self._ctx_page_refused or refused_before
         return result
 
     def release_context_admission(self, req: LlmRequest) -> None:
@@ -2377,6 +2907,15 @@ class KVCacheV2Scheduler(RequestScheduler):
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
         success = self._try_allocate_generation(req)
+
+        # First chunks resumed ahead of their context pass give their pages
+        # back before any started request is evicted for them.
+        if (
+            not success
+            and self._admission_lookahead is not None
+            and self._release_lookahead_admissions(keep=self._lookahead_reached)
+        ):
+            success = self._try_allocate_generation(req)
 
         if not success:
             if self.has_cp_helix:

@@ -75,6 +75,7 @@ except ImportError:  # the pre-3.2 layout
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 
+from ..gemm.dense_gemm import _bulk_prefetch_l2
 from .paged_decode_attention import (
     BLOCK_N,
     MAX_ROWS,
@@ -1961,6 +1962,9 @@ def _swa_split_kernel(
     part_ml_ptr,
     sm_scale_log2,
     num_splits,
+    pf_base,
+    pf_bytes,
+    pf_chunk,
     M: tl.constexpr,
     HQ: tl.constexpr,
     HKV: tl.constexpr,
@@ -1976,6 +1980,8 @@ def _swa_split_kernel(
     LAUNCH_WITH_PDL: tl.constexpr,
     REQS: tl.constexpr = 1,
     STEP_PROGRAM: tl.constexpr = False,
+    PREFETCH: tl.constexpr = False,
+    PF_LANES: tl.constexpr = 128,
 ):
     G: tl.constexpr = HQ // HKV
     PAGE: tl.constexpr = HKV * P * D
@@ -1986,6 +1992,8 @@ def _swa_split_kernel(
     row_group = tl.program_id(2)
     # Partials per row: one per key tile, and with STEP_PROGRAM the step program's.
     num_parts = num_splits + (1 if STEP_PROGRAM else 0)
+    # This program's index in the launch, for its slice of the L2 prefetch (PREFETCH).
+    pf_program = split + num_parts * (h + HKV * row_group)
     if REQS > 1:
         # Several sequences of M rows each, request-major in the operand: program
         # (split, h, req * RG + row_group) is the one-sequence program of request
@@ -2086,6 +2094,17 @@ def _swa_split_kernel(
         # kernel may launch now and waits for this grid.
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
+    if PREFETCH:
+        # One bulk L2 prefetch of this program's slice of ``pf_bytes`` (lane 0 issues it;
+        # ``PF_LANES`` is the program's thread count, so no element is held twice): the
+        # o_proj weight the multi-request decode prep would have asked for. The asm yields
+        # 0, so the store never happens; it keeps the request live.
+        lane = tl.arange(0, PF_LANES)
+        pf_start = pf_program.to(tl.int64) * pf_chunk
+        pf_size = tl.minimum(pf_bytes - pf_start, pf_chunk)
+        pf_size = tl.where((lane == 0) & (pf_size > 0), pf_size, 0).to(tl.int32)
+        issued = _bulk_prefetch_l2(tl.full([PF_LANES], 0, tl.int64) + pf_base + pf_start, pf_size)
+        tl.store(part_ml_ptr + lane, issued.to(tl.float32), mask=issued != 0)
 
     if not STEP_PROGRAM:
         if writer:
@@ -3431,6 +3450,9 @@ class SwaBlockAttention(OpWrapper):
                 part_ml,
                 math.log2(math.e) / math.sqrt(HEAD_DIM),
                 num_splits,
+                0,
+                0,
+                16,
                 M=rows,
                 HQ=num_q_heads,
                 HKV=num_kv_heads,
@@ -3596,6 +3618,10 @@ swa_block_attention = SwaBlockAttention()
 
 #: Sequences one multi-request call takes: a TP4 decode step of up to four requests.
 MULTI_MAX_REQUESTS = 4
+#: Sequences a multi-request call takes at 4 KV heads on a decode step of five or more
+#: requests (``batch_swa_block``): the same split programs, ``2 * sequences`` row groups per
+#: split. Above it the trtllm-gen FMHA is faster (latency x waves of the split grid).
+BATCH_MAX_REQUESTS = 8
 
 
 class SwaBlockMultiAttention(OpWrapper):
@@ -3613,6 +3639,14 @@ class SwaBlockMultiAttention(OpWrapper):
 
     Fusion boundary, PDL and pre-wait loads: as ``swa_block_attention``; ``blocks_per_program``,
     ``split_max_registers`` and ``split_keys`` as there.
+
+    At 4 KV heads up to ``MULTI_MAX_REQUESTS`` sequences on the ``wide_swa_block`` path, and
+    up to ``BATCH_MAX_REQUESTS`` on ``batch_swa_block``'s steps of five or more requests, which
+    take the split kernels (the one-cluster and ONE2 builds keep their 2..4-sequence range).
+    ``prefetch`` (optional) is a tensor whose bytes the split grid asks the L2 to fetch: each
+    program issues one ``cp.async.bulk.prefetch.L2`` of an equal slice after its wait, as the
+    multi-request decode prep does for the o_proj weight it no longer preps on those steps
+    (the multi-block programs issue none). It changes no value.
     """
 
     ARCHS = frozenset({Arch.SM_107})
@@ -3631,11 +3665,13 @@ class SwaBlockMultiAttention(OpWrapper):
     replays at changing contexts.
 
     Loud preconditions (ValueError): those of swa_block_attention per sequence;
-    2..4 sequences, rows a multiple of their number, at most 8 rows each; an
-    int32 [B, 2, pages] block table whose sequence stride is two rows;
-    contiguous seq_lens and positions.
+    2..8 sequences at 4 KV heads, rows a multiple of their number, at most 8 rows
+    each; an int32 [B, 2, pages] block table whose sequence stride is two rows;
+    contiguous seq_lens and positions; a contiguous, 16-byte aligned prefetch
+    tensor of a multiple of 16 bytes.
 
-    Not certified: sequences of different row counts, more than 4 sequences.
+    Not certified: sequences of different row counts, more than 8 sequences at
+    4 KV heads.
     """
 
     def __call__(
@@ -3662,6 +3698,7 @@ class SwaBlockMultiAttention(OpWrapper):
         blocks_per_program: int = 1,
         split_max_registers: Optional[int] = None,
         split_keys: int = BLOCK_N,
+        prefetch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         check_blocks_per_program(blocks_per_program, split_max_registers)
         _check_split_keys(split_keys, blocks_per_program)
@@ -3675,8 +3712,8 @@ class SwaBlockMultiAttention(OpWrapper):
         if (
             # ONE2 lifts the cap to 8 at TEP8 (2 KV heads), and CL8's TEP8 build to its
             # _CL8_TEP8_MAX_REQUESTS, as kernels/swa_block/attention.py's caller does; 4 KV heads
-            # keep 2..4.
-            not 2 <= reqs <= (cl8_tep8_requests() if num_kv_heads == 2 else MULTI_MAX_REQUESTS)
+            # take 2..4, and 5..BATCH_MAX_REQUESTS under batch_swa_block.
+            not 2 <= reqs <= (cl8_tep8_requests() if num_kv_heads == 2 else BATCH_MAX_REQUESTS)
             or rows * reqs != total
             or not 1 <= rows <= MAX_ROWS
             or qkv.dtype != torch.bfloat16
@@ -3701,7 +3738,7 @@ class SwaBlockMultiAttention(OpWrapper):
             or num_splits < max_blocks(window, rows, split_keys)
         ):
             raise ValueError(
-                f"swa_block_multi takes 2..{MULTI_MAX_REQUESTS} sequences of 1..{MAX_ROWS} rows "
+                f"swa_block_multi takes 2..{BATCH_MAX_REQUESTS} sequences of 1..{MAX_ROWS} rows "
                 "each, request-major BF16 qkv [B * M, "
                 + ("2 (H + G) * 64" if fused_prep else "(H + 2G) * 64")
                 + "] with H = 8 G, an FP8 E4M3 pool [pages, G, P, 64] (P a power of two), an int32 "
@@ -3742,19 +3779,23 @@ class SwaBlockMultiAttention(OpWrapper):
                 f"swa_block_multi's gate must be BF16 [rows, H * {HEAD_DIM}] or "
                 f"[rows, H, {HEAD_DIM}] with unit last stride, got {gate.dtype} {tuple(gate.shape)}"
             )
-        if _SWA_CL8 in ("1", "all") and _cl8_eligible(
-            qkv,
-            kv_pool,
-            num_q_heads,
-            num_kv_heads,
-            window,
-            rows,
-            q_fp8,
-            fused_prep,
-            gate,
-            cos_sin,
-            position_ids,
-            4,
+        if (
+            _SWA_CL8 in ("1", "all")
+            and reqs <= MULTI_MAX_REQUESTS
+            and _cl8_eligible(
+                qkv,
+                kv_pool,
+                num_q_heads,
+                num_kv_heads,
+                window,
+                rows,
+                q_fp8,
+                fused_prep,
+                gate,
+                cos_sin,
+                position_ids,
+                4,
+            )
         ):
             fn = _cl8_function(qkv.device, rope and positions.dtype == torch.int64, 4)
             if fn is not None:
@@ -3865,10 +3906,28 @@ class SwaBlockMultiAttention(OpWrapper):
                 f"swa_block_multi: a step of {reqs} sequences reached the block without the TEP8 "
                 "CL8 build (it takes 9+ sequences only through CL8)"
             )
+        pf_base, pf_bytes, pf_chunk = 0, 0, 16
+        if prefetch is not None:
+            pf_bytes = prefetch.numel() * prefetch.element_size()
+            if not (
+                prefetch.is_cuda
+                and prefetch.is_contiguous()
+                and prefetch.data_ptr() % 16 == 0
+                and pf_bytes % 16 == 0
+            ):
+                raise ValueError(
+                    "swa_block_multi prefetches a contiguous, 16-byte aligned CUDA tensor of a "
+                    f"multiple of 16 bytes, got {tuple(prefetch.shape)} {prefetch.dtype} at "
+                    f"{prefetch.data_ptr():#x}"
+                )
         out = torch.empty((total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
         group_rows = rows * Q_PER_KV
         long = split_keys != BLOCK_N
         num_parts = num_splits + 1 if long else num_splits
+        if prefetch is not None:
+            programs = num_parts * num_kv_heads * reqs * triton.cdiv(group_rows, ROWS_PER_PROGRAM)
+            pf_base = prefetch.data_ptr()
+            pf_chunk = ((pf_bytes + programs - 1) // programs + 15) // 16 * 16
         sms = None
         if _SWA_PREP_SPLIT or _SWA_ONE2:
             index = (
@@ -3981,6 +4040,7 @@ class SwaBlockMultiAttention(OpWrapper):
                 gate_eps=gate_eps,
                 enable_pdl=enable_pdl,
                 split_keys=split_keys,
+                prefetch=prefetch,
             )
         part_o = torch.empty(
             (reqs * num_parts * num_kv_heads * group_rows, HEAD_DIM),
@@ -4020,6 +4080,9 @@ class SwaBlockMultiAttention(OpWrapper):
                 part_ml,
                 math.log2(math.e) / math.sqrt(HEAD_DIM),
                 num_splits,
+                pf_base,
+                pf_bytes,
+                pf_chunk,
                 M=rows,
                 HQ=num_q_heads,
                 HKV=num_kv_heads,
@@ -4035,6 +4098,8 @@ class SwaBlockMultiAttention(OpWrapper):
                 LAUNCH_WITH_PDL=enable_pdl,
                 REQS=reqs,
                 STEP_PROGRAM=long,
+                PREFETCH=prefetch is not None,
+                PF_LANES=NUM_WARPS * 32,
                 num_warps=NUM_WARPS,
                 num_stages=NUM_STAGES,
                 launch_pdl=enable_pdl,
@@ -4086,6 +4151,7 @@ class SwaBlockMultiAttention(OpWrapper):
         blocks_per_program: int = 1,
         split_max_registers: Optional[int] = None,
         split_keys: int = BLOCK_N,
+        prefetch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``swa_block_attention.reference`` of each sequence alone, rows concatenated."""
         reqs = seq_lens.numel()
@@ -4142,6 +4208,7 @@ class SwaBlockMultiAttention(OpWrapper):
         blocks_per_program: int = 1,
         split_max_registers: Optional[int] = None,
         split_keys: int = BLOCK_N,
+        prefetch: Optional[torch.Tensor] = None,
     ) -> None:
         """``swa_block_attention.is_valid`` of each sequence, and no page written by two of them."""
         reqs = seq_lens.numel()

@@ -321,6 +321,9 @@ SERVED_AT = {
     "draft_head_tail": ({(107, 8)}, "lossless-bitwise", "LL"),
     "step_loop_inline_commits": ({(107, 8)}, "lossless-bitwise", "LL"),
     "rejection_sampler": ({(107, 8)}, "composition", "LL"),
+    "swa_block_long_splits": ({(107, 4), (107, 8)}, "lossless-numeric", "LL"),
+    "batch_swa_block": ({(107, 4)}, "lossless-numeric", "midc"),
+    "batch_half_window_experts": ({(107, 4)}, "lossless-numeric", "midc"),
 }
 
 
@@ -4517,6 +4520,207 @@ def test_on_outside_a_numeric_gate_warns():
     lever_table = table((107, 4), 8, "agg", "windowed", knobs(wide_router_per_row="on"))
     assert lever_table.on("wide_router_per_row")
     assert any("outside its accuracy gates" in warning for warning in lever_table.warnings)
+
+
+@pytest.mark.parametrize("key, mbs, role", [((107, 8), 1, "agg"), ((107, 4), 4, "gen")])
+def test_the_long_swa_splits_are_on_only_by_their_knob(key, mbs, role):
+    arena = "dense" if key == (107, 8) else "windowed"
+    # The one-cluster block takes the same steps and is exclusive with the long splits.
+    cl8_off = {"swa_one_cluster_block": "off"}
+    auto = table(key, mbs, role, arena, knobs(**cl8_off))
+    assert not auto.on("swa_block_long_splits")
+    assert auto.decisions["swa_block_long_splits"].source == "default"
+    assert auto.decisions["swa_block_long_splits"].why == "opt-in: on only by its knob"
+    on = table(key, mbs, role, arena, knobs(swa_block_long_splits="on", **cl8_off))
+    assert on.on("swa_block_long_splits")
+    assert on.param("swa_block_long_splits", "KEYS") == 128
+    assert on.param("swa_block_long_splits", "MIN_ROWS") == 8
+    assert any("outside its accuracy gates" in warning for warning in on.warnings)
+    assert on.paths() == auto.paths() | {"swa_block_long_splits"}
+    moved = table(
+        key,
+        mbs,
+        role,
+        arena,
+        knobs(
+            swa_block_long_splits="on",
+            swa_block_long_splits__KEYS=64,
+            swa_block_long_splits__MIN_ROWS=16,
+            **cl8_off,
+        ),
+    )
+    assert moved.param("swa_block_long_splits", "KEYS") == 64
+    assert moved.param("swa_block_long_splits", "MIN_ROWS") == 16
+
+
+def test_the_long_swa_splits_take_only_the_key_tiles_of_their_kernel():
+    def keys_knobs(keys):
+        return knobs(
+            swa_block_long_splits="on",
+            swa_block_long_splits__KEYS=keys,
+            swa_one_cluster_block="off",
+        )
+
+    for keys in (64, 128, 256):
+        lever_table = table((107, 4), 4, "gen", "windowed", keys_knobs(keys))
+        assert lever_table.param("swa_block_long_splits", "KEYS") == keys
+    # Refused when the table resolves, not first at install.
+    for keys in (32, 100, 512, "x"):
+        with pytest.raises(ValueError, match=re.escape("expected one of [64, 128, 256]")):
+            table((107, 4), 4, "gen", "windowed", keys_knobs(keys))
+
+
+def test_the_long_swa_splits_build_on_swa_block():
+    lever_table = table(
+        (107, 8), 1, "agg", "dense", knobs(swa_block="off", swa_block_long_splits="auto")
+    )
+    assert lever_table.decisions["swa_block_long_splits"].source == "dependency"
+    with pytest.raises(ValueError, match="SWA_BLOCK_LONG_SPLITS=on, but it builds on swa_block"):
+        table((107, 8), 1, "agg", "dense", knobs(swa_block="off", swa_block_long_splits="on"))
+
+
+@pytest.mark.parametrize(
+    "key, mbs, role, other",
+    [
+        ((107, 4), 4, "gen", "swa_one_cluster_block"),
+        ((107, 8), 1, "gen", "swa_one_cluster_block"),
+        ((107, 4), 4, "agg", "swa_blocks_per_program"),
+    ],
+)
+def test_the_long_swa_splits_and_the_other_32_key_builds_are_exclusive(key, mbs, role, other):
+    arena = "dense" if key == (107, 8) else "windowed"
+    with pytest.raises(
+        ValueError, match=f"swa_block_long_splits .* and {other} .* cannot both be on"
+    ):
+        table(key, mbs, role, arena, knobs(swa_block_long_splits="on", **{other: "on"}))
+    lever_table = table(key, mbs, role, arena, knobs(swa_block_long_splits="on", **{other: "off"}))
+    assert lever_table.on("swa_block_long_splits") and not lever_table.on(other)
+    # Without its knob the other build steps aside for the long splits' knob.
+    lever_table = table(key, mbs, role, arena, knobs(swa_block_long_splits="on"))
+    assert lever_table.on("swa_block_long_splits") and not lever_table.on(other)
+    assert lever_table.decisions[other].source == "default"
+    assert "steps aside for swa_block_long_splits" in lever_table.decisions[other].why
+
+
+@pytest.mark.parametrize("role", ["agg", "gen"])
+def test_the_batch_swa_block_is_on_only_by_its_knob(role):
+    auto = table((107, 4), 8, role, "windowed")
+    assert auto.on("wide_swa_block")
+    assert not auto.on("batch_swa_block")
+    assert auto.decisions["batch_swa_block"].source == "default"
+    assert auto.decisions["batch_swa_block"].why == "opt-in: on only by its knob"
+    on = table((107, 4), 8, role, "windowed", knobs(batch_swa_block="on"))
+    assert on.on("batch_swa_block")
+    assert on.param("batch_swa_block", "MAX_REQUESTS") == 8
+    assert on.param("batch_swa_block", "O_PROJ_PREFETCH") == 1
+    assert any("outside its accuracy gates" in warning for warning in on.warnings)
+    assert on.paths() == auto.paths() | {"batch_swa_block"}
+    moved = table(
+        (107, 4),
+        8,
+        role,
+        "windowed",
+        knobs(
+            batch_swa_block="on",
+            batch_swa_block__MAX_REQUESTS=7,
+            batch_swa_block__O_PROJ_PREFETCH=0,
+        ),
+    )
+    assert moved.param("batch_swa_block", "MAX_REQUESTS") == 7
+    assert moved.param("batch_swa_block", "O_PROJ_PREFETCH") == 0
+
+
+@pytest.mark.parametrize("value", [4, 9, 48])
+def test_the_batch_swa_block_takes_five_to_eight_requests(value):
+    with pytest.raises(ValueError, match="BATCH_SWA_BLOCK__MAX_REQUESTS"):
+        table(
+            (107, 4),
+            8,
+            "agg",
+            "windowed",
+            knobs(batch_swa_block="on", batch_swa_block__MAX_REQUESTS=value),
+        )
+
+
+def test_the_batch_swa_block_builds_on_wide_swa_block():
+    lever_table = table(
+        (107, 4), 8, "agg", "windowed", knobs(wide_swa_block="off", batch_swa_block="auto")
+    )
+    assert lever_table.decisions["batch_swa_block"].source == "dependency"
+    with pytest.raises(ValueError, match="BATCH_SWA_BLOCK=on, but it builds on wide_swa_block"):
+        table((107, 4), 8, "agg", "windowed", knobs(wide_swa_block="off", batch_swa_block="on"))
+
+
+def test_the_batch_swa_block_is_a_tep4_lever():
+    # TP8 layers take 5..8 requests through swa_eight_requests' one-launch block instead.
+    with pytest.raises(ValueError, match="sm107 tep8 does not serve batch_swa_block"):
+        table((107, 8), 8, "gen", "windowed", knobs(batch_swa_block="on"))
+    lever_table = table((107, 8), 8, "gen", "windowed", knobs(batch_swa_block="off"))
+    assert not lever_table.on("batch_swa_block")
+    assert any("has no effect" in warning for warning in lever_table.warnings)
+
+
+@pytest.mark.parametrize("role", ["agg", "gen"])
+def test_the_batch_half_window_placement_is_on_only_by_its_knob(role):
+    auto = table((107, 4), 8, role, "windowed")
+    assert auto.on("half_window_experts")
+    assert not auto.on("batch_half_window_experts")
+    assert auto.decisions["batch_half_window_experts"].source == "default"
+    assert auto.decisions["batch_half_window_experts"].why == "opt-in: on only by its knob"
+    on = table((107, 4), 8, role, "windowed", knobs(batch_half_window_experts="on"))
+    assert on.on("batch_half_window_experts")
+    assert any("outside its accuracy gates" in warning for warning in on.warnings)
+    assert on.paths() == auto.paths() | {"batch_half_window_experts"}
+
+
+def test_the_batch_half_window_placement_builds_on_the_half_window():
+    # Above the half window's MAX_BATCH hot_replicas places the 33..512-row steps instead.
+    lever_table = table((107, 4), 16, "agg", "windowed", knobs(batch_half_window_experts="auto"))
+    assert not lever_table.on("half_window_experts")
+    assert lever_table.decisions["batch_half_window_experts"].source == "dependency"
+    # Its knob brings the half window up with it, and hot_replicas yields to that.
+    lever_table = table((107, 4), 16, "agg", "windowed", knobs(batch_half_window_experts="on"))
+    assert lever_table.on("batch_half_window_experts") and lever_table.on("half_window_experts")
+    assert lever_table.decisions["half_window_experts"].source == "knob"
+    assert not lever_table.on("hot_replicas")
+    with pytest.raises(
+        ValueError, match="BATCH_HALF_WINDOW_EXPERTS=on, but it builds on half_window_experts"
+    ):
+        table(
+            (107, 4),
+            16,
+            "agg",
+            "windowed",
+            knobs(half_window_experts="off", batch_half_window_experts="on"),
+        )
+
+
+def test_the_two_five_to_eight_request_levers_stack():
+    three = dict(swa_block_long_splits="on", batch_swa_block="on", batch_half_window_experts="on")
+    # A TP4 agg server at max_batch_size 8 runs the multi-block split programs by default, which
+    # the long splits exclude: they step aside for the long splits' knob.
+    lever_table = table((107, 4), 8, "agg", "windowed", knobs(**three))
+    for name in three:
+        assert lever_table.on(name), name
+    assert not lever_table.on("swa_blocks_per_program")
+    assert lever_table.decisions["swa_blocks_per_program"].source == "default"
+    lever_table = table(
+        (107, 4), 8, "agg", "windowed", knobs(swa_blocks_per_program="off", **three)
+    )
+    for name in three:
+        assert lever_table.on(name), name
+    assert not lever_table.on("swa_blocks_per_program")
+    with pytest.raises(ValueError, match="cannot both be on"):
+        table((107, 4), 8, "agg", "windowed", knobs(swa_blocks_per_program="on", **three))
+    # Without the long splits the multi-block programs stay, on the 2..4-request steps.
+    lever_table = table(
+        (107, 4),
+        8,
+        "agg",
+        "windowed",
+        knobs(batch_swa_block="on", batch_half_window_experts="on"),
+    )
+    assert lever_table.on("swa_blocks_per_program") and lever_table.on("batch_swa_block")
 
 
 def test_a_knob_of_an_unserved_lever_set_off_or_auto_only_warns():

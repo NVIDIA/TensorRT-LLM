@@ -2206,10 +2206,26 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         "swa_block_long_splits": Lever(
             Kind.NUMERIC,
             NEVER,
-            params=(Param("KEYS", 128, 64, 256), Param("MIN_ROWS", 8, 1, 32)),
+            # KEYS: the key tiles the split kernel is built for (swa_block.LONG_SPLIT_KEYS).
+            params=(
+                Param("KEYS", 128, 64, 256, values=(64, 128, 256)),
+                Param("MIN_ROWS", 8, 1, 32),
+            ),
             # The 32-key builds of the same steps: the one-cluster block and the multi-block
             # programs take a step before the split path, and run no long split.
             conflicts=("swa_one_cluster_block", "swa_blocks_per_program"),
+        ),
+        # The half window's placement on the NVFP4 decode calls of 33..64 rows (five to eight
+        # requests). On only by its knob.
+        "batch_half_window_experts": Lever(Kind.NUMERIC, NEVER),
+        # The sliding-window decode block on TP4 decode steps of five to MAX_REQUESTS requests.
+        # On only by its knob.
+        "batch_swa_block": Lever(
+            Kind.NUMERIC,
+            NEVER,
+            # MAX_REQUESTS stops at 8: above it the split grid's waves make the block slower
+            # than the trtllm-gen FMHA path the prep append feeds.
+            params=(Param("MAX_REQUESTS", 8, 5, 8), Param("O_PROJ_PREFETCH", 1, 0, 1)),
         ),
         "step_window_compact": Lever(
             Kind.BITWISE,

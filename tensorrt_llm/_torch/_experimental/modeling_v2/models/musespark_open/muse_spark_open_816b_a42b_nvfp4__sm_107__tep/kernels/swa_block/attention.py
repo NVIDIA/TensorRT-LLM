@@ -30,6 +30,13 @@ with the same arithmetic and fewer edges:
   keys (``split_keys`` of ``ops/attention/swa_block``). The cache bytes are the
   same; the attention is merged at other points, so its output may differ in the
   last BF16 place.
+* Batch steps (``install_multi``'s ``max_requests``, the ``batch_swa_block`` lever):
+  TP4 decode steps of 5..``max_requests`` requests take the multi-request block too,
+  which the multi-request decode prep then leaves to it on the sliding-window layers;
+  its split grid issues the L2 prefetch of the o_proj weight that prep issued
+  (``batch_dense_gemms.prep_prefetch``). Each sequence gets the one-sequence block's
+  values, as at two to four requests; the trtllm-gen FMHA those steps ran before
+  merges the window at other points.
 
 * Key blocks per split program (the ``swa_blocks_per_program`` lever, installed by
   ``install_multi``): off, every step runs the one-block split grid; on (``AUTO``),
@@ -90,6 +97,7 @@ from ...ops.attention.paged_decode_attention import window_splits
 from ...ops.attention.preattn_prep import HEAD_DIM, preattn_prep
 from ...ops.attention.swa_block import (
     _ONE2_MAX_REQUESTS,
+    BATCH_MAX_REQUESTS,
     BLOCK_N,
     MAX_BLOCKS_PER_PROGRAM,
     MAX_ROWS,
@@ -193,12 +201,15 @@ class _SwaBlock:
     The per-call attributes are set by ``forward`` and cleared when it returns.
 
     With ``_swa_multi`` (set by the ``wide_swa_block`` fast path) a decode step of
-    2..``MULTI_MAX_REQUESTS`` generation sequences of equal row count runs the block too,
+    2..``_swa_multi_max`` generation sequences of equal row count runs the block too,
     through ``swa_block_multi_attention``: each sequence's rows, cache bytes and output are
-    the one-sequence block's.
+    the one-sequence block's. ``_swa_multi_max`` is ``MULTI_MAX_REQUESTS``, or on a 4-KV-head
+    layer under ``batch_swa_block`` its ``MAX_REQUESTS`` (at most ``BATCH_MAX_REQUESTS``).
     """
 
     _swa_multi: bool = False
+    _swa_multi_max: int = MULTI_MAX_REQUESTS
+    _swa_batch_prefetch: bool = False
     _swa_blocks_per_program: Union[int, str] = 1
     _swa_block: Optional[SwaBlockPlan]
     _swa_raw: bool
@@ -407,7 +418,7 @@ class _SwaBlock:
 
     def _step_requests(self, md) -> int:
         """The sequences of this step the block takes in one call: 1, or under ``_swa_multi`` the
-        2..``MULTI_MAX_REQUESTS`` generation sequences of a step whose host ``seq_lens`` are all
+        2..``_swa_multi_max`` generation sequences of a step whose host ``seq_lens`` are all
         ``rows / sequences`` (at most ``MAX_ROWS``). Host-side reads only."""
         if not self._swa_multi:
             return 1
@@ -424,7 +435,7 @@ class _SwaBlock:
         cap = (
             _ONE2_MAX_REQUESTS
             if _swa_ops._SWA_ONE2 and self.num_key_value_heads == 2
-            else MULTI_MAX_REQUESTS
+            else self._swa_multi_max
         )
         if self.num_key_value_heads == 2 and n > cap:
             wide = _swa_ops.cl8_tep8_requests()
@@ -477,6 +488,20 @@ class _SwaBlock:
         multi = requests > 1
         op = swa_block_multi_attention if multi else swa_block_attention
         keys = self._swa_block.split_keys(rows)
+        extra = {}
+        if multi and requests > MULTI_MAX_REQUESTS and self.num_key_value_heads == 4:
+            # batch_swa_block: the o_proj weight the multi-request decode prep would have
+            # asked the L2 for on this step, now asked by the split grid.
+            batch = getattr(self, "_batch_dense_gemms", None) if self._swa_batch_prefetch else None
+            prefetch = batch.prep_prefetch(self, rows) if batch is not None else None
+            if prefetch is not None:
+                extra["prefetch"] = prefetch
+            logger.info_once(
+                f"[musespark_open] batch_swa_block: {requests}-request decode steps run the "
+                f"sliding-window block in one call (o_proj L2 prefetch "
+                f"{'on' if prefetch is not None else 'off'})",
+                key=f"musespark_open.swa_block.batch_{requests}",
+            )
         num_splits = window_splits(window)
         if keys != BLOCK_N:
             num_splits = long_splits(window, keys)
@@ -508,6 +533,7 @@ class _SwaBlock:
             blocks_per_program=bpp,
             split_max_registers=max_registers,
             split_keys=keys,
+            **extra,
         )
 
     def apply_output_gate(self, attention_output, gate):
@@ -592,21 +618,37 @@ def log_installed(layers, plan: SwaBlockPlan) -> None:
     )
 
 
-def install_multi(model, blocks_per_program: Union[int, str] = 1) -> int:
+def install_multi(
+    model,
+    blocks_per_program: Union[int, str] = 1,
+    max_requests: int = MULTI_MAX_REQUESTS,
+    o_proj_prefetch: bool = False,
+) -> int:
     """``wide_swa_block``: let every sliding-window layer's ``swa_block`` take 2..4-request steps.
 
     Called after the attention re-class. Sets ``_swa_multi`` on each sliding-window layer
     whose attention carries ``swa_block``, and its key blocks per split program to
     ``blocks_per_program`` (``AUTO`` under the ``swa_blocks_per_program`` lever, else the
-    one-block grid); returns how many.
+    one-block grid); returns how many. ``max_requests`` above ``MULTI_MAX_REQUESTS``
+    (``batch_swa_block``, at most ``BATCH_MAX_REQUESTS``) lets the 4-KV-head (TP4) layers take
+    steps of up to that many requests too, which ``multi_request_prep_append`` (installed
+    before this) then leaves to them; ``o_proj_prefetch`` has the split grid of those steps
+    issue the L2 prefetch of the o_proj weight (``batch_dense_gemms.prep_prefetch``).
 
     Raises:
-        ValueError: if a sliding-window layer does not carry ``swa_block``, or for a
-            ``blocks_per_program`` ``check_setting`` refuses.
+        ValueError: if a sliding-window layer does not carry ``swa_block``, for a
+            ``blocks_per_program`` ``check_setting`` refuses, or for a ``max_requests``
+            outside ``MULTI_MAX_REQUESTS..BATCH_MAX_REQUESTS``.
     """
     setting = check_setting(blocks_per_program)
+    if not MULTI_MAX_REQUESTS <= max_requests <= BATCH_MAX_REQUESTS:
+        raise ValueError(
+            f"[musespark_open] swa_block takes steps of up to {MULTI_MAX_REQUESTS}.."
+            f"{BATCH_MAX_REQUESTS} requests, not {max_requests}"
+        )
     count = 0
     one2 = 0
+    batch = 0
     for layer in model.layers:
         attention = layer.self_attn
         if not attention.is_sliding:
@@ -631,6 +673,15 @@ def install_multi(model, blocks_per_program: Union[int, str] = 1) -> int:
                 max(_ONE2_MAX_REQUESTS, _swa_ops.cl8_tep8_requests()) + 1,
             )
             one2 += 1
+        if max_requests > MULTI_MAX_REQUESTS and attention.num_key_value_heads == 4:
+            # batch_swa_block: swa_block does its own prep and K/V append on the steps of
+            # 5..max_requests sequences of these layers, so multi_request_prep_append folds only
+            # larger steps here.
+            attention._swa_multi_max = max_requests
+            attention._swa_batch_prefetch = bool(o_proj_prefetch)
+            if hasattr(attention, "_mr_append_min_seqs"):
+                attention._mr_append_min_seqs = max(attention._mr_append_min_seqs, max_requests + 1)
+            batch += 1
         count += 1
     logger.info(
         f"[musespark_open] wide_swa_block: swa_block on decode steps of 2..{MULTI_MAX_REQUESTS} "
@@ -643,6 +694,13 @@ def install_multi(model, blocks_per_program: Union[int, str] = 1) -> int:
             else ""
         )
     )
+    if batch:
+        logger.info(
+            f"[musespark_open] batch_swa_block: decode steps of {MULTI_MAX_REQUESTS + 1}.."
+            f"{max_requests} requests run swa_block on {batch} sliding-window layers (o_proj L2 "
+            f"prefetch {'on' if o_proj_prefetch else 'off'}); multi_request_prep_append stands "
+            "down for them"
+        )
     return count
 
 

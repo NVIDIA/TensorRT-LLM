@@ -1476,9 +1476,21 @@ def adopt_model(
         swa_attention_block.log_installed(model.layers, swa_block)
         if plan.enabled("wide_swa_block"):
             # swa_blocks_per_program: the split geometry of 2..4-sequence steps by their count.
+            # batch_swa_block: TP4 decode steps of five to MAX_REQUESTS requests too, which the
+            # prep append then leaves to swa_block; with O_PROJ_PREFETCH the split grid asks
+            # the L2 for the o_proj weight.
+            batch = (
+                {
+                    "max_requests": int(plan.param("batch_swa_block", "MAX_REQUESTS")),
+                    "o_proj_prefetch": bool(plan.param("batch_swa_block", "O_PROJ_PREFETCH")),
+                }
+                if plan.enabled("batch_swa_block")
+                else {}
+            )
             swa_attention_block.install_multi(
                 model,
                 swa_attention_block.AUTO if plan.enabled("swa_blocks_per_program") else 1,
+                **batch,
             )
     if plan.enabled("mixed_step_gen_rows"):
         # After every other attention re-class and after select_decode_fmha: the mixin goes

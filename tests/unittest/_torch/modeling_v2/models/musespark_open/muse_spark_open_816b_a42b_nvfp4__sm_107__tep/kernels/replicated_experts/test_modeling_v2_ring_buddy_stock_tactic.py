@@ -13,6 +13,10 @@ backend are stubbed per test. The tests pin ``_stock_tactic`` on the 64-expert t
   stacked window) is treated as a miss, the default config at tile 8, logged once per
   (window, cached tile), instead of sending the call back to the stock call;
 * while tuning there is no tactic (the stock call runs and tunes).
+
+And the install's refusals of ``batch_half_window_experts`` (``half_max_rows``): the half flow
+places up to ``HALF_BATCH_MAX_ROWS`` rows only on the half window, within one
+``ring_buddy_assign`` program, and a refresh keeps a layer's row limit.
 """
 
 from __future__ import annotations
@@ -393,3 +397,53 @@ def test_the_prerouted_call_runs_where_the_cache_holds_another_tile(env):
     (args,) = env.ext.moe_calls
     # ..., window, tile_n, config, act_type, False
     assert args[-5:] == (_WINDOW, 8, _DEFAULT_CONFIG, _ACT_TYPE, False)
+
+
+def _assign_max_slots() -> int:
+    """``ring_buddy_assign.MAX_SLOTS``, read from its file (it imports triton)."""
+    tree = ast.parse((_TARGET / "ops/moe/ring_buddy_assign.py").read_text())
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "MAX_SLOTS"
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError("ring_buddy_assign.py has no MAX_SLOTS")
+
+
+def _refusal(ring_buddy, layers=(), half=True, half_max_rows=None):
+    extra = {} if half_max_rows is None else {"half_max_rows": half_max_rows}
+    return ring_buddy._install_refusal(
+        types.SimpleNamespace(layers=list(layers)), 1, True, False, False, 4, None, half, **extra
+    )
+
+
+def test_the_batch_half_window_rows_fit_one_assign_program(ring_buddy):
+    assert ring_buddy.HALF_MAX_ROWS == 32
+    assert ring_buddy.HALF_BATCH_MAX_ROWS == 64
+    assert ring_buddy.HALF_BATCH_MAX_ROWS * ring_buddy.TOP_K <= _assign_max_slots()
+
+
+def test_the_batch_half_window_install_needs_the_half_window(ring_buddy):
+    assert _refusal(ring_buddy) is None
+    assert _refusal(ring_buddy, half_max_rows=ring_buddy.HALF_BATCH_MAX_ROWS) is None
+    refusal = _refusal(ring_buddy, half=False, half_max_rows=ring_buddy.HALF_BATCH_MAX_ROWS)
+    assert refusal is not None and "it needs half=True" in refusal
+    for rows in (16, 48, 128):
+        refusal = _refusal(ring_buddy, half_max_rows=rows)
+        assert refusal is not None and f"half_max_rows={rows}" in refusal
+
+
+def test_a_refresh_keeps_the_half_window_row_limit(ring_buddy):
+    def layer(max_rows):
+        state = types.SimpleNamespace(half=True, kind="nvfp4", max_rows=max_rows, windows=1)
+        return types.SimpleNamespace(feed_forward=types.SimpleNamespace(_replicated_experts=state))
+
+    refusal = _refusal(
+        ring_buddy, [layer(ring_buddy.HALF_MAX_ROWS)], half_max_rows=ring_buddy.HALF_BATCH_MAX_ROWS
+    )
+    assert refusal is not None and "a refresh cannot" in refusal
+    refusal = _refusal(ring_buddy, [layer(ring_buddy.HALF_BATCH_MAX_ROWS)])
+    assert refusal is not None and "a refresh cannot" in refusal

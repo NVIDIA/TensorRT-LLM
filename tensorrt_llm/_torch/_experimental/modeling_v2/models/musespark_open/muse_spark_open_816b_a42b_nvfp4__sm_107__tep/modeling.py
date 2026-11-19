@@ -1508,7 +1508,8 @@ _SM107_TEP8_SINGLE_REQUEST_LEVERS = _dispatch.SM107_TEP8_ONLY
 #: written into the owner ranks' pages and verified owner-sliced, the NVFP4 MoE layers of the
 #: 584..768-row decode steps as a row-owner island on a wide generation server, and the staged
 #: pool-group block-offset copy filling only the tail columns a row may not already hold as the
-#: bad-page word.
+#: bad-page word; and, each on only by its knob, on steps of five to eight requests the
+#: sliding-window decode block and the half window's own expert placement.
 _SM107_TEP4_LEVERS = frozenset(
     {
         "packed_prep_append",
@@ -1547,6 +1548,8 @@ _SM107_TEP4_LEVERS = frozenset(
         "lm_head_row_owner",
         "row_owner_moe",
         "pool_group_tail_marks",
+        "batch_swa_block",
+        "batch_half_window_experts",
     }
 )
 

@@ -450,6 +450,7 @@ class PendingEncoderStep:
 # _mcb_pre_park / _mcb_post_park. Read once at import, like the scheduler's switch.
 _MCB_DIAG = os.environ.get("TRTLLM_MCB_DIAG", "0") == "1"
 
+
 class PyExecutor:
     # Commit finished disaggregated-generation receives for reuse after the
     # step's forward is launched (RuntimeHooks.defer_gen_reuse_commit, or
@@ -873,7 +874,8 @@ class PyExecutor:
             # (adp_groups.GROUP_SAFE_ROUTERS) index their tables by group.
             why = adp_groups.router_mismatch(type(self.adp_router).__name__)
             if why is not None:
-                raise ValueError(f"{adp_groups.ENV}={self._adp_group_tp}: {why}")
+                raise ValueError(
+                    f"{adp_groups.ENV}={self._adp_group_tp}: {why}")
 
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
@@ -1176,6 +1178,19 @@ class PyExecutor:
             self.event_loop = self._executor_loop_pp
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
+        # Opt-in through the V2 scheduler (TRTLLM_SCHED_LOOKAHEAD_ADMIT_PASSES).
+        # Only the overlap loop has host time between a step's launch and the
+        # wait on the previous one.
+        self._context_admission_lookahead = bool(
+            getattr(self.scheduler, "admission_lookahead_enabled", False))
+        if self._context_admission_lookahead and (
+                self.dist.pp_size > 1 or self.disable_overlap_scheduler
+                or self.enable_attention_dp
+                or self.kv_cache_transceiver is not None):
+            self.scheduler.disable_admission_lookahead(
+                "it runs only in the overlap executor loop of an aggregated "
+                "server without attention DP")
+            self._context_admission_lookahead = False
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
@@ -1526,8 +1541,9 @@ class PyExecutor:
         self._event_loop_completed = False
         if os.environ.get(EXECUTOR_PIN_ENV, "0") == "1":
             # Opt-in (default off): dedicated cores for this thread; see executor_affinity.
-            maybe_pin_executor_thread(getattr(getattr(self, "dist", None), "rank", -1),
-                                      getattr(self, "device_id", None))
+            maybe_pin_executor_thread(
+                getattr(getattr(self, "dist", None), "rank", -1),
+                getattr(self, "device_id", None))
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
@@ -4367,7 +4383,10 @@ class PyExecutor:
             from .scheduler import scheduler_v2 as _mcb_sv2
             now, pre_list = pre
             log = self.dist.tp_rank == 0
-            kept = {req.py_request_id for req in scheduled_batch.context_requests}
+            kept = {
+                req.py_request_id
+                for req in scheduled_batch.context_requests
+            }
             parked_n = parked_tok = fwd_n = fwd_tok = 0
             for req, chunk in pre_list:
                 d = req.py_mcb
@@ -4408,7 +4427,8 @@ class PyExecutor:
             logger.info(
                 f"[MCB] pass it={self.iter_counter} t={now:.3f} act={len(self.active_requests)} ctx_init={ctx_init} "
                 f"loading={loading} other={other} sched={len(pre_list)} parked={parked_n} parked_tok={parked_tok} "
-                f"fwd={fwd_n} fwd_tok={fwd_tok} gen={len(scheduled_batch.generation_requests)} {extra}")
+                f"fwd={fwd_n} fwd_tok={fwd_tok} gen={len(scheduled_batch.generation_requests)} {extra}"
+            )
         except Exception as e:  # noqa: BLE001 - diagnostics must never break the executor loop
             logger.warning(f"[MCB] diag error {type(e).__name__}: {e}")
 
@@ -4651,20 +4671,25 @@ class PyExecutor:
         and propagates its sticky error through the existing fleet error vote.
         """
         for request_id in failed_ids:
-            req = self.kv_connector_manager.finished_async_loading_requests.pop(request_id, None)
+            req = self.kv_connector_manager.finished_async_loading_requests.pop(
+                request_id, None)
             if req is None:
                 # Cancellation can have consumed the finished transfer first.
                 continue
             if self.kv_connector_manager.has_pending_load(req):
-                raise RuntimeError("Failed asynchronous load still owns destination pages")
+                raise RuntimeError(
+                    "Failed asynchronous load still owns destination pages")
             self.kv_connector_manager.worker.drop_bound_saves({request_id})
             self.kv_cache_manager.free_resources(req)
             if isinstance(self.draft_kv_cache_manager, KVCacheManagerV2):
                 self.draft_kv_cache_manager.free_resources(req)
-            rewind_context_after_cache_drop(req, self.kv_cache_manager.tokens_per_block)
+            rewind_context_after_cache_drop(
+                req, self.kv_cache_manager.tokens_per_block)
             req.py_connector_load_failed = True
             req.state = LlmRequestState.CONTEXT_INIT
-            logger.warning(f"M0340_ASYNC_RESTART request={request_id} reason=source_absent_before_get")
+            logger.warning(
+                f"M0340_ASYNC_RESTART request={request_id} reason=source_absent_before_get"
+            )
 
     def _kv_connector_drain_shutdown(self) -> None:
         """Drain ADP transfers at the rank-aligned executor-loop exit."""
@@ -5941,6 +5966,23 @@ class PyExecutor:
         if wait_for_input_copy is not None:
             wait_for_input_copy()
 
+    @nvtx_range("_lookahead_admit_context")
+    def _lookahead_admit_context(self,
+                                 scheduled_batch: ScheduledRequests) -> None:
+        """Let the V2 scheduler prepare the next context pass's admissions now.
+
+        Runs once this step's forward is queued and before the wait on the
+        previous step, on host time that wait would otherwise leave idle; see
+        ``ContextAdmissionLookahead``. Like scheduling, admission rewrites host
+        page-index rows, so before its first change it waits for the queued
+        step's input copy.
+        """
+        self.scheduler.lookahead_admit_context(
+            self.active_requests,
+            self.inflight_req_ids,
+            scheduled_batch.generation_requests,
+            before_first_change=self._wait_for_model_engine_input_copy)
+
     def _step_loop_stream(self):
         """The stream the overlap loop's thread makes current.
 
@@ -6198,6 +6240,9 @@ class PyExecutor:
                     # previous iteration here, after this iteration's forward
                     # step is queued and before waiting for the previous one.
                     self.kv_cache_manager.flush_deferred_closes()
+
+                if can_queue and self._context_admission_lookahead:
+                    self._lookahead_admit_context(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -7002,7 +7047,7 @@ class PyExecutor:
                     route_states, new_requests,
                     self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[
-                self._adp_dp_rank if self._adp_group_tp > 1 else self.dist.tp_rank]
+                self._adp_dp_rank if self._adp_group_tp > 1 else self.dist.tp_rank]  # yapf: disable
 
             all_new_flat = [
                 req for reqs in all_ranks_new_requests.values() for req in reqs

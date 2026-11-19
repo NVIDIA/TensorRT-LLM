@@ -66,8 +66,11 @@ routed kernel places (at most 8 rows) it places with the half-window flow
 other decode calls of those layers, up to ``HALF_MAX_ROWS`` rows (the 16..32-row steps
 of two to four requests), take the same flow from ``ring_buddy_assign(half=True)`` and
 run the whole stack too: the persistent kernel up to its row limit, TRTLLM-gen's
-pre-routed call over the 96 local experts above it. Every call of the other layers
-keeps the owner-only window over the own block.
+pre-routed call over the 96 local experts above it. With ``half_max_rows``
+(``batch_half_window_experts``: ``HALF_BATCH_MAX_ROWS``) the same flow also places the
+NVFP4 decode calls of 33..64 rows (five to eight requests), one ``ring_buddy_assign``
+program of up to 512 slots, onto TRTLLM-gen's 96-expert call. Every call of the other
+layers keeps the owner-only window over the own block.
 
 Ring sizes (``ring_size``): tep8 (8 ranks, 32-expert blocks, the description
 above) and tep4 (4 ranks on one tray, 64-expert blocks, ``ring_buddy_assign``
@@ -117,6 +120,10 @@ MAX_ROWS = 16
 #: Decode rows the stacked path serves on a half-window layer (``half_window_experts``):
 #: up to four requests' verify steps, the slots of one ``ring_buddy_assign`` program.
 HALF_MAX_ROWS = 32
+
+#: Decode rows the NVFP4 half-window layers serve with ``batch_half_window_experts``: up to
+#: eight requests' verify steps, one ``ring_buddy_assign`` program of up to 512 slots.
+HALF_BATCH_MAX_ROWS = 64
 
 #: The static placement: local experts from this index up run on the successor at
 #: every step (4 of 32 per block, about the share the balanced placement
@@ -1293,6 +1300,7 @@ def install(
     persistent_rows: int = 8,
     windows: int = 2,
     half: bool = False,
+    half_max_rows: int = HALF_MAX_ROWS,
 ) -> List[int]:
     """Replicate and patch every eligible MoE layer of ``text_model``; returns their indices.
 
@@ -1324,7 +1332,9 @@ def install(
     ``half=True`` (``half_window_experts``; needs ``windows=1``, ``persistent`` and the
     owner-only placement, tep4 only) stacks the predecessor's upper half on every NVFP4
     layer the persistent kernel serves (see the module docstring); the other layers
-    keep the owner-only window.
+    keep the owner-only window. ``half_max_rows`` (``batch_half_window_experts``:
+    ``HALF_BATCH_MAX_ROWS``; needs ``half``) is the most decode rows the half flow places on
+    the NVFP4 half-window layers (``HALF_MAX_ROWS`` by default; the BF16 ones keep it).
 
     A layer installed by an earlier call is refreshed in place (``_refresh``):
     its stacks follow the newly loaded parameters, its hooks are not wrapped
@@ -1345,7 +1355,15 @@ def install(
     """
     ranks = ring_size(mapping)
     refusal = _install_refusal(
-        text_model, windows, persistent, balance, bf16_unpacked, ranks, static_from, half
+        text_model,
+        windows,
+        persistent,
+        balance,
+        bf16_unpacked,
+        ranks,
+        static_from,
+        half,
+        half_max_rows,
     )
     refusal = _tp_agreement.agreed_refusal(mapping, refusal)
     if refusal is not None:
@@ -1393,6 +1411,8 @@ def install(
         state = _State(
             kind, stacks, mapping.tp_rank, balance, static_from, layer_windows, ranks, layer_half
         )
+        if layer_half and kind == "nvfp4":
+            state.max_rows = half_max_rows
         moe._replicated_experts = state
         if failed is None:
             _patch_routing(moe, state)
@@ -1428,6 +1448,11 @@ def install(
             f"owner-only {block}-expert window with the predecessor's upper half on "
             f"{len(halved)} layers (half_window_experts)"
         )
+        if half_max_rows != HALF_MAX_ROWS:
+            what += (
+                f", the half flow on NVFP4 decode calls of up to {half_max_rows} rows "
+                "(batch_half_window_experts)"
+            )
     elif windows == 1:
         what = f"owner-only {block}-expert window (no replication)"
     else:
@@ -1491,6 +1516,7 @@ def _install_refusal(
     ranks: Optional[int] = RANKS,
     static_from: Optional[int] = None,
     half: bool = False,
+    half_max_rows: int = HALF_MAX_ROWS,
 ) -> Optional[str]:
     """``install``'s refusals known before its first all-gather, or None."""
     if windows not in (1, 2, 3):
@@ -1522,11 +1548,25 @@ def _install_refusal(
             f"(persistent_experts) and a tp4/ep4 mapping; got windows={windows}, "
             f"persistent={persistent}, ring {ranks}"
         )
+    if half_max_rows not in (HALF_MAX_ROWS, HALF_BATCH_MAX_ROWS) or (
+        half_max_rows != HALF_MAX_ROWS and not half
+    ):
+        return (
+            "batch_half_window_experts places the half window's decode calls of up to "
+            f"{HALF_BATCH_MAX_ROWS} rows: it needs half=True and half_max_rows in "
+            f"({HALF_MAX_ROWS}, {HALF_BATCH_MAX_ROWS}); got half={half}, "
+            f"half_max_rows={half_max_rows}"
+        )
     for index, layer in enumerate(text_model.layers):
         moe = layer.feed_forward
         state = getattr(moe, "_replicated_experts", None)
         if state is None:
             continue
+        if state.half and state.kind == "nvfp4" and state.max_rows != half_max_rows:
+            return (
+                f"batch_half_window_experts: layer {index} places half-window calls of up to "
+                f"{state.max_rows} rows and this install {half_max_rows}; a refresh cannot"
+            )
         if state.half != _layer_half(moe, state.kind, half, persistent):
             return (
                 f"half_window_experts: layer {index} {'holds' if state.half else 'lacks'} the half "

@@ -38,6 +38,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _get_kv_alloc_extra_tokens,
     _KVCacheManagerInitStatus,
     _swa_endpoint_priority,
+    _SwaBranchCell,
+    _SwaEndpointRetirer,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
 )
@@ -125,6 +127,48 @@ def test_swa_endpoint_priority_fork_point(fork: int, ordinal: int, expected: int
     priority = _swa_endpoint_priority(40000, 32, 1024, [fork])
     assert priority(ordinal, AttnLifeCycle(2048, 0)) == expected
     assert priority(ordinal, AttnLifeCycle(None, 0)) == 35
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("conversation_id", ["conv-1", None])
+def test_swa_branch_snapshot_needs_a_conversation_id(conversation_id: str | None) -> None:
+    """Under the SWA endpoint retire, only a new conversation records its fork point."""
+    retirer = _SwaEndpointRetirer(1, [2048], 32, 1024)
+    manager = object.__new__(KVCacheManagerV2)
+    manager._swa_retirer = retirer
+    manager.tokens_per_block = 32
+    branch = _SwaBranchCell()
+    manager._swa_pending_branch = (7, branch)
+    request = SimpleNamespace(
+        py_request_id=7,
+        is_dummy_request=False,
+        prompt_len=8192,
+        py_conversation_params=(
+            ConversationParams(conversation_id=conversation_id) if conversation_id else None
+        ),
+    )
+    # The prompt left the reuse tree at 4100 tokens; reuse reached only 1024.
+    kv_cache = Mock(num_committed_tokens=1024)
+    kv_cache._get_num_reusable_tokens_before_pruning.return_value = 4100
+
+    manager._record_branch_snapshot_point(request, kv_cache, 8191)
+
+    assert manager._swa_pending_branch is None
+    if conversation_id is None:
+        assert not retirer.is_new_conversation(request)
+        assert branch.point is None
+        assert retirer._branch_points == {}
+        assert retirer.counters["branch_skip_no_conversation_id"] == 1
+        # Base priorities: the window ending at the fork stays at 0.
+        priority = _swa_endpoint_priority(8192, 32, 1024, branch=branch)
+        assert priority(127, AttnLifeCycle(2048, 0)) == 0
+    else:
+        assert retirer.is_new_conversation(request)
+        assert branch.point == 4096
+        assert retirer._branch_points == {7: 4096}
+        assert retirer.counters["branch_snapshots_taken"] == 1
+        priority = _swa_endpoint_priority(8192, 32, 1024, branch=branch)
+        assert priority(127, AttnLifeCycle(2048, 0)) == 70
 
 
 @pytest.mark.cpu_only

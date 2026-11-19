@@ -805,6 +805,20 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("swa_block",),
     ),
     FastPath(
+        "batch_half_window_experts",
+        "the half window's placement on NVFP4 decode calls of 33..64 rows too (one "
+        "ring_buddy_assign program of up to 512 slots, TRTLLM-gen's 96-expert call)",
+        "load",
+        ("half_window_experts",),
+    ),
+    FastPath(
+        "batch_swa_block",
+        "the sliding-window decode block on TP4 decode steps of 5..MAX_REQUESTS requests, which "
+        "the multi-request decode prep then leaves to it",
+        "construct",
+        ("wide_swa_block",),
+    ),
+    FastPath(
         "step_window_compact",
         "windowed drafter arena compaction in place on the steps the context-K/V fork leaves",
         "draft",
@@ -1181,6 +1195,8 @@ LEVER_NAMES: FrozenSet[str] = frozenset(
         "lm_head_row_owner",
         "pool_group_tail_marks",
         "swa_block_long_splits",
+        "batch_swa_block",
+        "batch_half_window_experts",
     }
     | SM107_TEP8_ONLY
 )

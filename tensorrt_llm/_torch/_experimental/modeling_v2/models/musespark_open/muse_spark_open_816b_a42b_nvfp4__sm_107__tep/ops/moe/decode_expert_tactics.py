@@ -11,13 +11,23 @@ This table pins the tactic of the stacked expert call (``ring_buddy._nvfp4_call`
 ``(expert window, rows)`` for listed decode row counts of tep4 (8 rows per request at the
 DFlash K = 7 verify width), one table per GPU:
 
-* sm107: the 32-token tile the autotuner serves at 128 to 255 rows, for 256 to 384 rows.
-  It computes every expert row bitwise as the autotuned tactics whose FC2 has the same
-  MMA K; tactics whose FC2 MMA K differs can round a rare row differently in its last
-  place (the autotuner picks from both).
+* sm107: the 32-token tile, for 256 to 384 rows, and from ``TILE32_MIN_ROWS`` rows
+  (``MUSESPARK_OPEN_DECODE_TILE32_MIN_ROWS``, a multiple of 8 from 128 to 256; unset: 256).
+  The autotuner's 128-row profile, which serves 128 to 255 rows, is a timing pick on a
+  random routing and can settle on the 64-token tile, whose FC1 runs slow on served
+  routings. The pinned tile computes every expert row bitwise as the autotuned tactics
+  whose FC2 has the same MMA K; tactics whose FC2 MMA K differs can round a rare row
+  differently in its last place (the autotuner picks from both).
+
+With ``batch_half_window_experts`` (``pin_half_batch_steps``) sm107 also pins the 96-expert
+half window's 40..64-row decode steps (five to eight requests) to the same tile: the
+autotuner profiles that window per rank, and a rank that settles on another tile there runs
+every layer's experts slower than the others, which the finalize then waits for.
 
 Row counts and windows not listed, and tuning passes, keep the autotuner. A GPU without a
-table is not supported.
+table is not supported. With the switch below 256, the first call that reaches a listed row
+count logs, once per process and call shape, at how many of the window's listed row counts
+the pinned tactic is a valid config (``fixed_tactic`` leaves the others to the autotuner).
 
 The lever ``l061_tile32_pin``: the owner-only 64-expert window of the NVFP4 layers
 ``hot_replicas`` leaves on the built-in path (0 and 61, experts quantized at load) at 256 to
@@ -37,25 +47,74 @@ returns None otherwise.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
-#: The 32-token tile the autotuner serves at 128..255 rows (FC1
-#: ``t128x32x512u2_s5 … m256x32x128``, FC2 ``t128x32x512_s5 … m256x32x128``), pinned for the
-#: 256..384-row decode steps (32 to 48 requests) of the 68-expert ``hot_replicas`` window.
+#: The 32-token tile (FC1 ``t128x32x512u2_s5 … m256x32x128``, FC2
+#: ``t128x32x512_s5 … m256x32x128``), pinned for the decode steps of ``TILE32_MIN_ROWS`` to
+#: 384 rows (32 to 48 requests by default) of the 68-expert ``hot_replicas`` window.
 #: Its FC2's MMA K is 128, as is that of the tile-64 tactics the autotuner picks there
 #: most, so every expert row is bitwise theirs.
 _TILE32_DECODE = (32, 236)
 
+#: The first decode row count the sm107 pin covers when the switch is unset.
+_TILE32_DEFAULT_MIN_ROWS = 256
+#: The switch: the first decode row count the sm107 pin covers, a multiple of 8 from 128
+#: (16 requests at K = 7) to 256.
+TILE32_MIN_ROWS_ENV = "MUSESPARK_OPEN_DECODE_TILE32_MIN_ROWS"
+
+
+def _tile32_min_rows() -> int:
+    value = os.environ.get(TILE32_MIN_ROWS_ENV, "").strip()
+    if not value:
+        return _TILE32_DEFAULT_MIN_ROWS
+    rows = int(value) if value.isdigit() else -1
+    if rows % 8 or not 128 <= rows <= _TILE32_DEFAULT_MIN_ROWS:
+        raise ValueError(
+            f"{TILE32_MIN_ROWS_ENV}={value!r}: expected a multiple of 8 from 128 to "
+            f"{_TILE32_DEFAULT_MIN_ROWS}"
+        )
+    return rows
+
+
+TILE32_MIN_ROWS = _tile32_min_rows()
+
 #: ``(local_num_experts, rows) -> (tile_n, config)`` on sm107. Window 68 = the 64 own
 #: experts plus 4 hot copies (``hot_replicas``, 33..512 rows).
 SM107_TACTICS: Dict[Tuple[int, int], Tuple[int, int]] = {
-    (68, rows): _TILE32_DECODE for rows in range(256, 385, 8)
+    (68, rows): _TILE32_DECODE for rows in range(TILE32_MIN_ROWS, 385, 8)
 }
 
 _TABLES = {(10, 7): SM107_TACTICS}
+
+#: ``(local_num_experts, rows) -> (tile_n, config)`` on sm107 for the 40..64-row decode steps
+#: of the 96-expert half window (``batch_half_window_experts``): the tile of
+#: ``SM107_TACTICS``. ``fixed_tactic`` keeps the autotuner where it is not a valid config.
+SM107_HALF_BATCH_TACTICS: Dict[Tuple[int, int], Tuple[int, int]] = {
+    (96, rows): _TILE32_DECODE for rows in range(40, 65, 8)
+}
+#: The half-window batch-step tables ``pin_half_batch_steps`` serves, per device capability.
+_HALF_BATCH_TABLES = {(10, 7): SM107_HALF_BATCH_TACTICS}
+#: The capabilities whose half-window batch-step table is served; empty by default.
+_PINNED_HALF_BATCH: Set[Tuple[int, int]] = set()
+
+
+def pin_half_batch_steps() -> None:
+    """Serve the half-window batch-step tables too (``batch_half_window_experts``)."""
+    if not _PINNED_HALF_BATCH:
+        from tensorrt_llm.logger import logger
+
+        logger.info(
+            "[musespark_open] decode expert tactics: the 96-expert half window's "
+            f"{min(r for _, r in SM107_HALF_BATCH_TACTICS)}.."
+            f"{max(r for _, r in SM107_HALF_BATCH_TACTICS)}-row decode steps run tactic "
+            f"{list(_TILE32_DECODE)} on sm107"
+        )
+    _PINNED_HALF_BATCH.update(_HALF_BATCH_TABLES)
+
 
 #: The owner window the pin serves and the decode rows it pins (32 to 48 requests at K = 7).
 L061_WINDOW = 64
@@ -109,6 +168,43 @@ def _valid(act_type: int, top_k: int, hidden: int, intermediate: int, window: in
     return frozenset(tuple(int(v) for v in c) for c in configs)
 
 
+_PINNED_ROWS_REPORTED: Set[Tuple[int, int, int, int, int]] = set()
+
+
+def _report_pinned_rows(
+    table: Dict[Tuple[int, int], Tuple[int, int]],
+    act_type: int,
+    top_k: int,
+    hidden: int,
+    intermediate: int,
+    window: int,
+) -> None:
+    """Log once per process and call shape at how many of ``window``'s listed row counts the
+    pinned tactic is a valid config; the others keep the autotuner (``fixed_tactic``)."""
+    key = (act_type, top_k, hidden, intermediate, window)
+    if key in _PINNED_ROWS_REPORTED:
+        return
+    _PINNED_ROWS_REPORTED.add(key)
+    from tensorrt_llm.logger import logger
+
+    listed = sorted(rows for (w, rows) in table if w == window)
+    invalid = [
+        rows
+        for rows in listed
+        if table[(window, rows)] not in _valid(act_type, top_k, hidden, intermediate, window, rows)
+    ]
+    message = (
+        f"[musespark_open] decode expert tactics: {TILE32_MIN_ROWS_ENV}={TILE32_MIN_ROWS} pins "
+        f"{list(table[(window, listed[0])])} for the {window}-expert window's "
+        f"{listed[0]}..{listed[-1]}-row calls: a valid config at {len(listed) - len(invalid)} "
+        f"of {len(listed)} row counts"
+    )
+    if invalid:
+        logger.warning(f"{message}; the autotuner keeps {invalid}")
+    else:
+        logger.info(message)
+
+
 def fixed_tactic(
     device: torch.device,
     act_type: int,
@@ -126,7 +222,14 @@ def fixed_tactic(
     """
     if act_type != 0:
         return None
-    tactic = table_for(torch.cuda.get_device_capability(device)).get((window, rows))
+    capability = tuple(torch.cuda.get_device_capability(device))
+    table = table_for(capability)
+    tactic = table.get((window, rows))
+    if tactic is not None:
+        if TILE32_MIN_ROWS < _TILE32_DEFAULT_MIN_ROWS and table is SM107_TACTICS:
+            _report_pinned_rows(table, act_type, top_k, hidden, intermediate, window)
+    elif capability in _PINNED_HALF_BATCH:
+        tactic = _HALF_BATCH_TABLES[capability].get((window, rows))
     if tactic is None:
         return None
     if tactic not in _valid(act_type, top_k, hidden, intermediate, window, rows):
