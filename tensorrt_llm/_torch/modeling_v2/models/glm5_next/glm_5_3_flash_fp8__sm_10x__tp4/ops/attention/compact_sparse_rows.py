@@ -57,7 +57,7 @@ class CompactSparseRows(OpWrapper):
     False. Negative ids are the only invalid ones: an id past the latent cache is kept.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # GLM-5.3-Flash selects index_topk = 2048 positions as 512 pools of 4 plus a tail of up to
     # 3, so the expanded rows are kernel_output_width = cdiv(2051, 64) * 64 = 2112 wide.
     # `kv` is the visible length of the cell's last row; the test builds each row's expansion

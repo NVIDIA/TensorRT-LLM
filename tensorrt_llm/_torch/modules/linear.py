@@ -263,6 +263,29 @@ def _set_weight_scale_block128(module: Linear,
                                persistent=False)
 
 
+# Prefill-sized MXFP8 GEMMs of opted-in modules run on the SM107 CuTe DSL GEMM, which is faster
+# there than the CUTLASS MXFP8 kernels.
+_MXFP8_PREFILL_MIN_ROWS_SM107 = 1024
+
+
+def _mxfp8_prefill_gemm_sm107(
+        module: Linear, act: torch.Tensor, act_scale: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor) -> Optional[torch.Tensor]:
+    """``act @ weight.T`` of a prefill-sized MXFP8 GEMM on SM107's CuTe DSL GEMM when the model
+    opted ``module`` in (``use_sm107_mxfp8_prefill_gemm``), else None."""
+    if (not getattr(module, "use_sm107_mxfp8_prefill_gemm", False)
+            or not IS_CUTLASS_DSL_RUBIN_AVAILABLE or get_sm_version() != 107
+            or is_torch_compiling()
+            or act.shape[0] < _MXFP8_PREFILL_MIN_ROWS_SM107
+            or module.dtype != torch.bfloat16):
+        return None
+    from ..custom_ops.cute_dsl_custom_ops import \
+        cute_dsl_mxfp8_prefill_gemm_rubin
+    return cute_dsl_mxfp8_prefill_gemm_rubin(act, weight, act_scale,
+                                             weight_scale, module._mxfp8_alpha)
+
+
 def _uses_marlin_nvfp4_backend(module) -> bool:
     """Whether a regular NVFP4 linear explicitly selects Marlin."""
     allowed_backends = getattr(module, "nvfp4_allowed_backends", ())
@@ -3831,7 +3854,10 @@ class MXFP8LinearMethod(LinearMethodBase):
         dtype and run F.linear. Slow but correct -- used to seed M1 tests and
         as a portable fallback.
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
-        MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
+        MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM. On SM107, a
+        module the model opts in (``use_sm107_mxfp8_prefill_gemm``) runs GEMMs
+        from _MXFP8_PREFILL_MIN_ROWS_SM107 rows on the CuTe DSL GEMM instead,
+        whichever native backend is selected.
       - Automatic: reuse the CUTLASS-layout activations, weights, and scales
         with FlashInfer or Swap-AB. MiniMax-M3 enables this path automatically
         during MXFP8 warmup and decode CUDA graph capture; eager execution
@@ -4041,17 +4067,21 @@ class MXFP8LinearMethod(LinearMethodBase):
                         module.dtype,
                     )
                 else:
-                    gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
-                            if self.needs_native_autotune else
-                            torch.ops.trtllm.mxfp8_mxfp8_gemm)
-                    output = gemm(
-                        act_e4m3,
-                        act_sf,
-                        module.weight,
-                        module.weight_scale,
-                        module._mxfp8_alpha,
-                        module.dtype,
-                    )
+                    output = _mxfp8_prefill_gemm_sm107(module, act_e4m3, act_sf,
+                                                       module.weight,
+                                                       module.weight_scale)
+                    if output is None:
+                        gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+                                if self.needs_native_autotune else
+                                torch.ops.trtllm.mxfp8_mxfp8_gemm)
+                        output = gemm(
+                            act_e4m3,
+                            act_sf,
+                            module.weight,
+                            module.weight_scale,
+                            module._mxfp8_alpha,
+                            module.dtype,
+                        )
             if bias is not None:
                 output = output + bias
         else:

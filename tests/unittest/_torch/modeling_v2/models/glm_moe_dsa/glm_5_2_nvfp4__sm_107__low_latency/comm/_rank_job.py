@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run one of this target's collective entries' rank jobs from pytest, and report what it did.
 
-The matrix of an entry, ``_<entry>_op_matrix.py`` beside this file, is its own launcher: one rank
+The matrix of an entry, ``_<entry>_op_matrix.py``, is its own launcher: one rank
 per device, its own process group, and a deadline it enforces by killing that group, which keeps a
 wedged Lamport exchange from taking the calling run down with it. This only selects the devices,
 starts the launcher in a fresh interpreter (it must carry no CUDA or torch.distributed state of
@@ -49,9 +49,10 @@ def _load_launcher_constants(launcher: Path):
     return module
 
 
-def run(entry: str) -> None:
+def run(entry: str, directory: Path | None = None) -> None:
     """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices."""
-    launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
+    base = Path(__file__).resolve().parent if directory is None else Path(directory).resolve()
+    launcher = base / f"_{entry}_op_matrix.py"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
     package = importlib.util.find_spec("tensorrt_llm")
     assert package is not None and package.origin is not None, "tensorrt_llm is not importable"

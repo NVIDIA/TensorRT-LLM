@@ -22,7 +22,8 @@ from _glm53_mhc_inputs import generator, mixer, streams  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() != 100, reason="the glm5_next fp8 tp4 entries are certified on sm_100"
+    get_sm_version() not in (100, 103),
+    reason="the glm5_next fp8 tp4 entries are certified on sm_100 and sm_103",
 )
 
 #: The band, as a fraction of the summed magnitudes; see `_compare`.

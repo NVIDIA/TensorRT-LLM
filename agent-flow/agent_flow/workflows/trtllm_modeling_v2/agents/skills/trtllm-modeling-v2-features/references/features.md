@@ -1,20 +1,12 @@
 # ModelingV2 runtime features: reference
 
-Repository paths are relative to the TensorRT-LLM checkout and are where things
-were when this was written; `_torch/` means `tensorrt_llm/_torch/`. The code
-moves, and what it defines moves with it: each section's **Grep** line lists
-the symbols that find it. When a path below is missing, `git grep -n` its
-symbol, or a test's function name (`git grep -n "def test_<name>"`), and use
-where it is now. `tree_map.md` in the run's workspace says where the backends,
-the accuracy and perf tests, their reference scores and the CI test lists are
-in the checkout under test. Flow paths (`checks/`, `spec/INTAKE.md`,
-`task.example.yaml`) are relative to
-`agent-flow/agent_flow/workflows/trtllm_modeling_v2/` and move with the flow.
+How to read this, and what to do when a path below has moved, is in `SKILL.md`.
+`_torch/` means `tensorrt_llm/_torch/`. Flow paths (`checks/`, `spec/INTAKE.md`,
+`task.example.yaml`) are relative to `agent-flow/agent_flow/workflows/trtllm_modeling_v2/`.
 Integration node ids are relative to the integration tests' `defs/` directory
 and need the checkpoints its conftest's `llm_models_root` resolves. Every flag named here
 exists in `examples/llm-api/quickstart_advanced.py`, `trtllm-serve`,
-`trtllm-eval` or `trtllm-modeling-v2 gate`; another tool may spell it
-differently or lack it.
+`trtllm-eval` or `trtllm-modeling-v2 gate`.
 
 ## 0. Common machinery
 
@@ -27,16 +19,16 @@ differently or lack it.
   --task task.yaml --unit <unit or variant> --member <m>`; `--mode off` (boot
   only) runs the stock path; `--tree <dir>` measures a worktree as it is;
   `--json` prints the verdict.
-- **Engine read-back.** The rank hook (`checks/harness/rankhook/sitecustomize.py`)
-  wraps `BaseWorker.setup_engine` and every rank prints `MV2FLOW_RANK_ENGINE`
-  (`checks/harness/engine_facts.py`). The fields held to the declaration are
-  `ATTESTED_FIELDS` in `checks/runtime_evidence.py`; which observation proves
-  which feature is `checks/feature_evidence.py`. A declared field the engine
-  ran differently fails the gate; a check about a feature also fails when the
-  feature's field is UNKNOWN or was read only from the request.
-- **Step contract.** A target that implements `step_args` checks the metadata
-  it consumes on its first forward when `TRTLLM_MODELING_V2_VALIDATE=1` reaches
-  the ranks (pass it through `env_overrides`); see `_router_index.py`.
+- **What a gate knows of the configuration.** A gate sends the unit's options
+  to the engine and does not read back what the engine resolved.
+  `modeling_v2="require"` makes the engine raise rather than fall back to its
+  own implementation. Block reuse, chunked prefill and speculation each have
+  an observation of their own (sections 1, 2 and 7). Whether a cache dtype, a
+  CUDA-graph list or a width took effect is in the engine's own log and in
+  the benchmark score, nowhere else.
+- **Step contract.** A target that implements the `step_args` method checks the
+  metadata it consumes on its first forward when `TRTLLM_MODELING_V2_VALIDATE=1`
+  reaches the ranks (pass it through `env_overrides`); see `_router_index.py`.
 - **What combines with what** in the engine:
   `docs/source/features/feature-combination-matrix.md`.
 
@@ -76,13 +68,13 @@ and logs "Disabling KV cache block reuse for the hybrid Mamba model".
 - Nothing may hinge on "first time this request is seen": a resumed request
   never computes its cached prefix.
 
-**Code.** `_torch/pyexecutor/kv_cache/`, `_torch/pyexecutor/resource_manager.py`,
+**Where.** `_torch/pyexecutor/kv_cache/`, `_torch/pyexecutor/resource_manager.py`,
 `_torch/pyexecutor/kv_cache_stats.py`, `_torch/attention/backends/fmha/fallback.py`
-(the paged-context kernel gate).
-**Grep.** `enable_block_reuse`, `enable_partial_reuse`, `copy_on_partial_reuse`,
-`use_kv_cache_manager_v2`, `BlockReusePolicy`, `_extra_buffers_per_layer`,
-`MambaStateConfig`, `periodic_snapshot_interval`, `use_paged_context_fmha`,
-`num_cached_tokens_per_seq`, `cached_tokens`, `cache_salt`, `iterReusedBlocks`.
+(the paged-context kernel gate); `enable_block_reuse`, `enable_partial_reuse`,
+`copy_on_partial_reuse`, `use_kv_cache_manager_v2`, `BlockReusePolicy`,
+`_extra_buffers_per_layer`, `MambaStateConfig`, `periodic_snapshot_interval`,
+`use_paged_context_fmha`, `num_cached_tokens_per_seq`, `cached_tokens`, `cache_salt`,
+`iterReusedBlocks`.
 
 **Tests to imitate.**
 - An op over a cached prefix: the cells with a non-zero `cached` length and
@@ -97,29 +89,24 @@ and logs "Disabling KV cache block reuse for the hybrid Mamba model".
   `tests/unittest/_torch/pyexecutor/test_overlap_scheduler.py::test_overlap_scheduler_block_reuse_cache_hit`.
 - With disaggregation: `accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype`
   (block-reuse parameter), `::TestQwen3_5_4B::test_mismatched_block_reuse`.
+- By hand: quickstart with and without `--disable_kv_cache_reuse`, one prompt
+  sent twice. While debugging a V2 pool, `TRTLLM_KV_FRESH_PAGE_FILL=nan` and
+  `TRTLLM_KV_GUARD_PAGE=nan` (diagnostic only) make a read of a page the
+  request does not own visible instead of returning another request's KV.
 
-**Fast check.** Send one prompt twice to one engine and compare the second
-greedy continuation, by token ids, with a run that has reuse off
-(quickstart `--disable_kv_cache_reuse`) in the same session. While debugging a
-V2 pool, `TRTLLM_KV_FRESH_PAGE_FILL=nan` and `TRTLLM_KV_GUARD_PAGE=nan`
-(diagnostic only) make a read of a page the request does not own visible
-instead of returning another request's KV.
+**Flow proof.** A boot and an acceptance load run the reuse probe
+(`checks/harness/reuse_probe.py`: one prompt sent twice on the same cache,
+pinned to attention-DP rank 0). With reuse on, the gate fails when the second
+response reports zero `cached_tokens`; boot, accuracy and acceptance fail when
+the engine logs that it turned reuse off. A probe that cannot run fails
+nothing. A `reuse` variant with `gates: [accuracy]` runs no probe: report it
+as configured, not verified.
 
-**Flow proof.** Every boot runs the reuse probe (`checks/harness/reuse_probe.py`):
-one prompt (the smallest snapshot boundary, else one block, plus two blocks)
-sent twice after completion under a fresh `cache_salt`, pinned to attention-DP
-rank 0, `max_tokens` 1. With reuse declared, the gate fails if the second
-response reports zero `cached_tokens`, or if the engine logged that it turned
-reuse off. A probe that could not run records UNKNOWN, never a failure; a check
-about reuse then rests on every rank's manager reporting reuse enabled.
-
-**Blind spots.** The probe proves the manager matched blocks, not that the
-forward over the cached prefix is right: its one token is compared with
-nothing, and when it cannot run the managers' enabled flag is all that is left.
-Cache hits do not attest recurrent-snapshot restoration. Only attention-DP
-rank 0 is probed. Correctness under reuse rests on the accuracy run, whose
-few-shot prompts share a long prefix. Side state outside the pools stays
-invisible until a second request reuses a prefix and diverges.
+**Blind spots.** The probe shows that blocks matched, not that the forward
+over the cached prefix is right; that rests on the benchmark, whose few-shot
+prompts share a long prefix. Recurrent-snapshot restoration and attention-DP
+ranks past 0 are not probed. Side state outside the pools stays invisible
+until a second request reuses a prefix and diverges.
 
 ## 2. Chunked prefill
 
@@ -142,12 +129,11 @@ path differs from its fresh-context path needs both certified; the catalog's
 MLA entries `mla_rope_append_paged_kv_assign_q` and
 `load_paged_kv_cache_for_mla` are that second path for MLA.
 
-**Code.** `_torch/pyexecutor/scheduler/`,
+**Where.** `_torch/pyexecutor/scheduler/`,
 `_torch/pyexecutor/engine/runners/decoder/` (its input preparation),
-`_torch/attention/backends/`.
-**Grep.** `enable_chunked_prefill`, `max_num_tokens`, `ContextChunkingPolicy`,
-`context_chunking_policy`, `FORCE_CHUNK`, `context_current_position`,
-`is_last_context_chunk`, `num_cached_tokens_per_seq`.
+`_torch/attention/backends/`; `enable_chunked_prefill`, `max_num_tokens`,
+`ContextChunkingPolicy`, `context_chunking_policy`, `FORCE_CHUNK`,
+`context_current_position`, `is_last_context_chunk`, `num_cached_tokens_per_seq`.
 
 **Tests to imitate.**
 - `tests/unittest/_torch/pyexecutor/test_overlap_scheduler.py` (chunked prefill
@@ -157,23 +143,21 @@ MLA entries `mla_rope_append_paged_kv_assign_q` and
   the pattern -- a `max_num_tokens` below the few-shot prompt length, so every
   benchmark prompt splits.
 - `accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill`.
+- By hand: quickstart `--enable_chunked_prefill --max_num_tokens <n>` with a
+  prompt longer than 2n tokens, against a run whose `--max_num_tokens` exceeds
+  the prompt.
 
-**Fast check.** quickstart `--enable_chunked_prefill --max_num_tokens <n>` with
-a prompt longer than 2n tokens; compare greedy token ids with a run whose
-`--max_num_tokens` exceeds the prompt.
+**Flow proof.** One `chunked` variant (`gates: [accuracy]`) whose
+`max_num_tokens` is below the benchmark's prompts (`spec/INTAKE.md`), so the
+engine must split every prompt, and the result is scored. A variant whose
+gates include `boot` also sends, in that boot, a prompt of about twice
+`max_num_tokens`, and fails unless some request computed more than
+`max_num_tokens` tokens past what the cache resumed (`chunk_shortfall`,
+`checks/boot.py`).
 
-**Flow proof.** `runtime.chunked_prefill: true` in every gate plus one `chunked`
-variant (`gates: [accuracy]`) whose `max_num_tokens` is below the benchmark's
-prompts (`spec/INTAKE.md`: e.g. 512 for 8-shot GSM8K). A boot of a check about
-chunking appends a probe of about twice `max_num_tokens` and fails unless some
-request computed more than `max_num_tokens` tokens past what the cache resumed
-(`chunk_shortfall`, `checks/boot.py`). The variant's accuracy check fails
-unless every rank reports its chunking setting.
-
-**Blind spots.** The boot evidence is inferred from lengths, not a chunk count,
-and the probe's single token is compared with nothing. A wrong later-chunk path
-is caught only by the variant's accuracy. A budget above every benchmark prompt leaves chunking
-configured and never triggered.
+**Blind spots.** The boot's evidence is inferred from lengths, not a chunk
+count; a wrong later-chunk path shows only in the variant's score. A budget
+above every benchmark prompt leaves chunking configured and never triggered.
 
 ## 3. Disaggregated serving
 
@@ -213,12 +197,12 @@ generation step whose cached length is the prompt length
 (`tests/unittest/_torch/pyexecutor/test_gen_only_cached_tokens.py`); it must need
 nothing the context forward computed without storing.
 
-**Code.** `_torch/disaggregation/` (`base/`, `native/`, `nixl/`, `resource/`,
+**Where.** `_torch/disaggregation/` (`base/`, `native/`, `nixl/`, `resource/`,
 `orchestration/`), `_torch/pyexecutor/kv_cache/` (the role hooks),
-`tensorrt_llm/commands/serve.py` (the `disaggregated` subcommand).
-**Grep.** `KvCacheTransceiverV2`, `create_kv_cache_transceiver`,
-`CacheTransceiverConfig`, `transceiver_runtime`, `get_disagg_role_mapper_kinds`,
-`get_disagg_role_layouts`, `MapperKind`, `AuxBufferMeta`, `CtxTransferStatus`.
+`tensorrt_llm/commands/serve.py` (the `disaggregated` subcommand);
+`KvCacheTransceiverV2`, `create_kv_cache_transceiver`, `CacheTransceiverConfig`,
+`transceiver_runtime`, `get_disagg_role_mapper_kinds`, `get_disagg_role_layouts`,
+`MapperKind`, `AuxBufferMeta`, `CtxTransferStatus`.
 
 **Tests to imitate.**
 - Transfer correctness without serving: `tests/unittest/disaggregated/test_cache_transceiver_single_process.py`
@@ -240,17 +224,8 @@ engine's transceiver moves the state, and its disaggregated serving
 (`trtllm-serve` workers behind `trtllm-serve disaggregated`;
 `launch_disaggregated_llm` in `accuracy/test_disaggregated_serving.py`,
 two nodes in `accuracy/test_disaggregated_multinode.py`) runs it. A target's
-disaggregation work is the state the transceiver moves.
-
-**One-node launch** (`examples/disaggregated/README.md`). Two worker YAMLs with
-identical `cache_transceiver_config` (`backend: NIXL`, or `DEFAULT`); the
-example's context YAML also sets `disable_overlap_scheduler: True`; add
-`modeling_v2: require` to both for a target. Start each worker on its own GPUs:
-`CUDA_VISIBLE_DEVICES=<ids> trtllm-serve <ckpt> --host localhost --port <p>
---config <ctx|gen>.yaml` (`--tp_size`, `--ep_size` for width; the in-tree
-launcher also passes `--server_role`). Then `trtllm-serve disaggregated -c
-disagg_config.yaml`, which lists the `context_servers` and
-`generation_servers` URLs.
+disaggregation work is the state the transceiver moves. To start one by hand
+while debugging, `examples/disaggregated/README.md`.
 
 **Flow proof.** The `disagg` unit owes only its disaggregated-serving test
 (`checks/disagg.py`; `gate disagg --unit disagg --member <m>`): a test the run
@@ -262,15 +237,13 @@ node: `launch_disaggregated_llm` starts every worker on one host. It gets two
 engines' devices at the member's width, at most a node's (`dep4` on a 4-GPU
 node: write the test for two engines of two; `accuracy.disagg.devices`
 overrides, never past a node), and passes only when every test the node id
-selects passed: a skip (too few devices, no `LLM_MODELS_ROOT`) fails it. The
-intake lint's `disagg-placement` says whether two engines of the checkpoint fit
-the node.
+selects passed: a skip (too few devices, no `LLM_MODELS_ROOT`) fails it.
 
 **Blind spots.** Boot and accuracy never cross the hop; only the test does, and
 it judges a benchmark score, not token identity with an aggregated engine. A
 hop that loses part of the state can still score within the floor on short
 answers. The transceiver backend and runtime the workers actually ran are not
-read back per rank.
+read back.
 
 ## 4. KV-cache dtype (fp8, nvfp4) and scales
 
@@ -299,12 +272,11 @@ manager choice in `get_kv_cache_manager_cls` (V2 and the TRTLLM backend only).
 - Every op that writes the cache (append and RoPE-append ops) writes the pool's
   format.
 
-**Code.** `tensorrt_llm/llmapi/llm_args.py` (`KvCacheConfig`),
+**Where.** `tensorrt_llm/llmapi/llm_args.py` (`KvCacheConfig`),
 `_torch/pyexecutor/model_loader.py`, `tensorrt_llm/quantization/mode.py`,
 `_torch/attention/attention.py`, `_torch/attention/backends/` (`trtllm.py`,
 `fp4_mla/`), `_torch/pyexecutor/kv_cache/` (mixed-precision staging where the
-tree has it).
-**Grep.** `kv_cache_quant_algo`, `has_fp8_kv_cache`, `has_fp4_kv_cache`,
+tree has it); `kv_cache_quant_algo`, `has_fp8_kv_cache`, `has_fp4_kv_cache`,
 `kv_scale_orig_quant`, `kv_scale_quant_orig`, `kv_cache_scaling_factor`,
 `_load_kv_cache_scales`, `Fp4MlaKVCacheManagerV2`.
 
@@ -317,11 +289,9 @@ tree has it).
   `accuracy/references/gsm8k.yaml` and the tests in
   `accuracy/test_llm_api_pytorch.py` that set a KV-cache dtype; across the hop,
   `accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nvfp4_kv_cache_nixl`.
-
-**Fast check.** quickstart `--kv_cache_dtype fp8` (also `trtllm-serve
---kv_cache_dtype`); read the loader's KV-quantization log line, and compare a
-few greedy continuations with `auto` in the same session (expect close, not
-identical, for a lossy format).
+- By hand: quickstart `--kv_cache_dtype fp8` (also `trtllm-serve
+  --kv_cache_dtype`) against `auto` in the same session: close, not identical,
+  for a lossy format.
 
 **Flow proof.** One variant per dtype: `llm_api_options` setting
 `kv_cache_config.dtype`, `gates: [accuracy]` (derive's `kv=bf16/fp8/nvfp4`
@@ -329,19 +299,16 @@ writes them). Naming no anchor row of its own, a variant is judged against its
 unit's own score at the same member on the same target (`anchor: relative`, a
 floor 2 SE of the difference under it); with
 `accuracy.discriminators.kv_cache_quant_algo` it is judged against that dtype's
-own row instead. The accuracy check fails unless every rank's worker resolved the
-declared dtype (an NVFP4 request that resolved FP8 is a mismatch); intake lint
-blocks a dtype the engine does not load. Feature `kv_quant` (native storage
-instead of bf16 containers) is a unit like the others: its boot and accuracy
-run with the native storage on.
+own row instead. Feature `kv_quant` (native storage instead of bf16
+containers) is a unit like the others: its checks run with the native storage on.
 
-**Blind spots.** The attested value is the engine's resolved quant config, not
-what the forward wrote or which scale it used: a missing or unit scale shows
-only as an accuracy shift against `auto`, which a relative floor catches when
-it is larger than the two runs' noise. Whether
-`kv_quant` really stores fewer bytes per token is not checked: the engine's
-pool-allocation log line (`checks/runtime_evidence.py` parses it) is the place
-to read it by hand.
+**Blind spots.** No gate reads the dtype the engine resolved: an NVFP4 request
+that fell back to FP8 passes unless the score shows it. Report the dtype as
+verified only when the loader's KV-quantization log line says so. A missing or
+unit scale shows only as an accuracy shift against `auto`, which a relative
+floor catches when it is larger than the two runs' noise. Whether `kv_quant`
+stores fewer bytes per token is in the engine's pool-allocation log line
+(`Allocated <n> GiB for max tokens in paged KV cache`), which no gate reads.
 
 ## 5. CUDA graphs and the overlap scheduler
 
@@ -374,7 +341,7 @@ in `_torch/pyexecutor/cuda_graph_runner.py`, `DecoderCudaGraphs` in
 - Under overlap, nothing may depend on host-side per-request state that step
   n's processing has not updated yet.
 
-**Grep.** `CUDAGraphRunner`, `CudaGraphPlan`, `CudaGraphConfig`,
+**Where.** `CUDAGraphRunner`, `CudaGraphPlan`, `CudaGraphConfig`,
 `cuda_graph_config`, `enable_padding`, `prefill_capture_num_tokens`,
 `eager_on_graph`, `TLLM_CUDA_GRAPH_STRICT_BUFFERS`, `disable_overlap_scheduler`,
 `_executor_loop_overlap`.
@@ -388,24 +355,18 @@ in `_torch/pyexecutor/cuda_graph_runner.py`, `DecoderCudaGraphs` in
 - `tests/unittest/_torch/pyexecutor/test_overlap_scheduler.py::test_overlap_scheduler_consistency`
   (identical outputs with overlap on and off).
 - `tests/unittest/_torch/compilation/`.
+- By hand: quickstart with and without `--use_cuda_graph`
+  (`--cuda_graph_batch_sizes`, `--cuda_graph_padding_enabled`), and with
+  `--disable_overlap_scheduler`, at a batch size that is captured exactly and
+  at one that is padded.
 
-**Fast check.** quickstart with and without `--use_cuda_graph`
-(`--cuda_graph_batch_sizes`, `--cuda_graph_padding_enabled`), and with
-`--disable_overlap_scheduler`; compare greedy token ids at a batch size that is
-captured exactly and at one that is padded. Add
-`TLLM_CUDA_GRAPH_STRICT_BUFFERS=1` while debugging.
+**Flow proof.** `runtime.cuda_graph: true` in every gate: the benchmark is the
+proof. The overlap scheduler (on in core) has no check of its own.
 
-**Flow proof.** `runtime.cuda_graph: true` in every gate (lint blocks an eager
-accuracy check). Each rank reports its CUDA-graph settings (batch sizes,
-padding), held to the declaration, and must also report the engine's planned
-capture list. `overlap_scheduler` is read back only as an argument.
-
-**Blind spots.** Settings and plan are not captures or replays: the plan's
-contents are not compared, and whether the workload's batches replayed a graph
-or ran eager is not observed. A host value frozen into a graph shows only at batch sizes the
-accuracy run replays; the boot's batch is small. The overlap scheduler
-has no check of its own; an extra host sync under overlap serializes steps and
-costs throughput only, which no gate sees.
+**Blind spots.** Whether the engine captured the declared batches, and whether
+the workload's batches replayed a graph or ran eager, is not observed. A host
+value frozen into a graph shows only at batch sizes the benchmark replays. An
+extra host sync under overlap costs throughput only, which no gate sees.
 
 ## 6. Multimodal inputs
 
@@ -428,12 +389,11 @@ step: under chunking or reuse part of an image is already cached
 `_torch/models/modeling_multimodal_utils.py`). A `scope: text_only` target
 builds the language model alone and must load and route with the tower absent.
 
-**Code.** `_torch/models/modeling_multimodal_mixin.py`,
+**Where.** `_torch/models/modeling_multimodal_mixin.py`,
 `_torch/models/modeling_multimodal_utils.py`, `tensorrt_llm/inputs/`,
-`_torch/pyexecutor/engine/multimodal.py`.
-**Grep.** `MultimodalParams`, `MultimodalRuntimeData`, `past_seen_token_num`,
-`find_input_mm_embeds`, `fuse_input_embeds`, `register_input_processor`,
-`multi_modal_uuids`.
+`_torch/pyexecutor/engine/multimodal.py`; `MultimodalParams`,
+`MultimodalRuntimeData`, `past_seen_token_num`, `find_input_mm_embeds`,
+`fuse_input_embeds`, `register_input_processor`, `multi_modal_uuids`.
 
 **Tests to imitate.**
 - `tests/unittest/_torch/multimodal/` (`test_multimodal_runtime.py`,
@@ -443,20 +403,19 @@ builds the language model alone and must load and route with the tower absent.
 - Accuracy: `accuracy/test_llm_api_pytorch_multimodal.py`; encoder as its own
   server: `accuracy/test_epd_disagg_multimodal.py`; anchors in
   `accuracy/references/mmmu.yaml`.
+- By hand, from `examples/llm-api/` (the script imports its sibling
+  `quickstart_advanced.py`): `quickstart_multimodal.py --model_dir <ckpt>
+  --modality image --media <image>`; `tests/integration/test_input_files/merlion.png`
+  (git-lfs) is a known image.
 
-**Fast check.** From `examples/llm-api/` (the script imports its sibling
-`quickstart_advanced.py`): `quickstart_multimodal.py --model_dir <ckpt>
---modality image --media <image>`. `tests/integration/test_input_files/merlion.png`
-(git-lfs) is a known image.
+**Flow proof.** No engine field. A `multimodal` unit's boot sends an image
+(default the merlion photograph) and the serve gate sends an image chat: both
+show that a request with an image is answered. That the image was seen is
+shown only by an image benchmark (`mmmu`, `mmstar`, `chartqa`, ...).
 
-**Flow proof.** No engine field. A `multimodal` unit is judged by its boot
-sending an image (default the merlion photograph, with keywords such as
-"merlion", "statue", "fountain"), or by an image benchmark
-(`mmmu`, `mmstar`, `chartqa`, ...). The serve gate also sends an image chat.
-
-**Blind spots.** One keyword in one description is weak evidence, and a text
-benchmark says nothing about the vision path. Nothing exercises image tokens
-split across a chunk, or image-prefix reuse, unless a prompt is built for it.
+**Blind spots.** A target that ignores the image passes boot and serve, and a
+text benchmark says nothing of the vision path. Image tokens split across a
+chunk, and image-prefix reuse, are exercised only by a prompt built for them.
 For `text_only`, absent by design and absent by accident look alike.
 
 ## 7. Speculative decoding
@@ -484,7 +443,7 @@ statistics (`numAcceptedTokens`).
   (`AuxiliarySpeculativeStateHandler` in `_torch/speculative/interface.py`).
 - `route` admits a `speculative_config` only where acceptance was measured.
 
-**Grep.** `SpecMetadata`, `SpeculativeDecodingMode`, `max_draft_len`,
+**Where.** `SpecMetadata`, `SpeculativeDecodingMode`, `max_draft_len`,
 `is_layer_capture`, `maybe_capture_hidden_states`,
 `AuxiliarySpeculativeStateHandler`, `numAcceptedTokens`.
 
@@ -497,29 +456,26 @@ statistics (`numAcceptedTokens`).
   populated from the stock leg with `TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1`.
   `::test_gsm8k_identity_vs_mtp3` pairs accuracy with and without drafts in
   one session.
-
-**Fast check.** quickstart `--spec_decode_algo <algo>
---spec_decode_max_draft_len <n>` (`--draft_model_dir` for a separate drafter);
-greedy output with drafting off should agree up to near-ties; read acceptance
-from the iteration statistics.
+- By hand: quickstart `--spec_decode_algo <algo> --spec_decode_max_draft_len <n>`
+  (`--draft_model_dir` for a separate drafter); greedy output with drafting off
+  should agree up to near-ties, and acceptance is in the iteration statistics.
 
 **Flow proof.** Features `mtp`, `eagle3`, `dflash` and `dspark` owe the
 acceptance gate (`checks/acceptance.py`; `gate acceptance --unit <feature>
---member <m>`): accepted tokens per iteration, iteration-weighted per prompt
-(32 prompts and 32 draft iterations by default), held against
-`TRTLLM_MODELING_V2=off` on the same prompts (fails under a 0.95 ratio when a
-paired test finds the drop significant), against the previous tree, and above
-1.0. Without a stock path the unit declares `measured_reference` or
-`min_absolute` with its `floor_source`. Each rank also reports the algorithm and
-draft depth it runs.
+--member <m>`): accepted tokens per iteration, iteration-weighted over the
+workload (32 prompts and 32 draft iterations by default), in one load. It
+fails at or below 1.0 and under the floor of the unit's `accuracy.acceptance`
+entry (`min_absolute`, or `measured_reference`, with its `floor_source`). A
+unit with no entry of its own takes that of the speculator it builds on, then
+`default`; with none of them it is held to 1.0 alone.
 
 **Blind spots.** Boot and accuracy: rejection sampling preserves the output
-distribution, so a wrong draft path yields correct text, slower. For a new architecture the floor is a number the
-run declares.
+distribution, so a wrong draft path yields correct text, slower. The floor is
+a number the run declares: without one, a drafter that accepts little passes.
 
 ## 8. Attention DP, TP and EP where they meet these features
 
-- **Code.** `tensorrt_llm/mapping.py` (`Mapping`), `_torch/distributed/`,
+- **Where.** `tensorrt_llm/mapping.py` (`Mapping`), `_torch/distributed/`,
   `_torch/pyexecutor/scheduler/adp_router.py` (`DefaultADPRouter`,
   `KVCacheAwareADPRouter`), `enable_attention_dp` and `AttentionDpConfig` in
   `llm_args.py`. Members are `tp<N>`, `tep<N>`, `dep<N>` (attention DP + EP).
@@ -540,8 +496,8 @@ run declares.
 - **Tests.** `tests/unittest/_torch/multi_gpu/`, `tests/unittest/_torch/modeling_v2/comm/`,
   `tests/unittest/_torch/pyexecutor/test_adp_router.py`,
   `tests/unittest/disaggregated/test_cache_transceiver_single_process.py`.
-- **Flow proof.** Every rank's worker reports `tp`, `ep`, `attention_dp` and
-  `pp`; a width the engine ran other than declared fails the gate.
+- **Flow proof.** Each member's benchmark, or its boot where no benchmark runs
+  at it; no gate reads back the widths the engine ran.
 - **Blind spots.** The reuse probe covers attention-DP rank 0 only. With
   `benchmark_members: <member>` the benchmark runs at that member alone; the
   other members rest on their boots (`task.example.yaml`).
