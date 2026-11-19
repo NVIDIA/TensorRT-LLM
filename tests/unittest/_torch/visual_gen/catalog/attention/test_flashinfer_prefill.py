@@ -39,7 +39,7 @@ def test_prefill_matches_reference(cell):
     options = dict(device="cuda", dtype=spec["dtype"], generator=generator)
     q = torch.randn((batch, spec["q"], heads, dim), **options) * 0.2
     k = torch.randn((batch, spec["kv"], kv_heads, dim), **options) * 0.2
-    v = torch.randn(k.shape, **options) * 0.2
+    v = torch.randn(k.shape, **options)
     mask = None
     if spec.get("padding"):
         mask = torch.ones(batch, spec["kv"], device="cuda", dtype=torch.bool)

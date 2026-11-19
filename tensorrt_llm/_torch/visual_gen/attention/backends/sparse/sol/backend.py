@@ -162,12 +162,9 @@ class SOLCuTeDSLAttention(AttentionBackend):
                 key="sol_attn_dense_backend_unavailable",
             )
 
-    # CUDA Graph capture uses the host-resolved phase to avoid reading a device timestep.
     @torch.compiler.disable
     def _dense_by_step(self, timestep: Any) -> bool:
-        # Under CUDA-graph capture the runner has already resolved the phase
-        # host-side (it is part of the graph key); reading the tensor here
-        # would `.item()` inside capture, which CUDA forbids.
+        # Capture supplies the host-resolved phase so the device timestep is read only in eager mode.
         phase = resolved_extra_key("sparse_attn_phase")
         if phase is None:
             phase = graph_phase_for_timestep(
