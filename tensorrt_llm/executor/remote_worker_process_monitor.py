@@ -10,6 +10,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 
 # Only serializes reports; IpcQueue authenticates frames before deserialization.
@@ -27,7 +28,12 @@ from functools import wraps
 from pathlib import Path
 
 _HEARTBEAT_INTERVAL = 0.5
-_HEARTBEAT_TIMEOUT = 5.0
+# Default lease. TCP retransmission backoff (0.2, 0.4, 0.8, 1.6, 3.2 s, ...)
+# leaves gaps, so a lease of N seconds tolerates network outages of only about
+# N - 4 seconds. Worker process death is detected in about one interval
+# regardless, because the helper notices its worker's exit directly. A helper
+# that dies itself sends no report, so only the lease detects it.
+_HEARTBEAT_TIMEOUT = 15.0
 _RECEIVE_WAIT = 0.1
 # A worker call that returns or raises reports its outcome through MPI, which
 # arrives after the helper's final report. Defer to that outcome briefly.
@@ -46,6 +52,25 @@ WORKER_WATCH_HINT = (
     "supervision."
 )
 logger = logging.getLogger(__name__)
+
+
+def _heartbeat_timeout_from_env(config_error: type) -> float:
+    """Read TRTLLM_WORKER_WATCH_TIMEOUT, the lease in seconds, at construction."""
+    value = os.environ.get("TRTLLM_WORKER_WATCH_TIMEOUT")
+    if not value:
+        return _HEARTBEAT_TIMEOUT
+    minimum = 2 * _HEARTBEAT_INTERVAL
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise config_error(
+            f"TRTLLM_WORKER_WATCH_TIMEOUT must be a number of seconds greater than {minimum:g}"
+        ) from error
+    if not math.isfinite(timeout) or timeout <= minimum:
+        raise config_error(
+            f"TRTLLM_WORKER_WATCH_TIMEOUT must be a number of seconds greater than {minimum:g}"
+        )
+    return timeout
 
 
 def _wait_readable(stream, timeout: float) -> bool:
@@ -93,6 +118,7 @@ class RemoteWorkerProcessMonitor:
         self._returned: dict[int, tuple[dict, float]] = {}
         self._first_report_at: float | None = None
         self._failure: dict | None = None
+        self._heartbeat_timeout = _heartbeat_timeout_from_env(ConfigInputError)
         host = os.environ.get("TRTLLM_WORKER_WATCH_HOST") or get_local_ip()
         try:
             family, _, _, _, address = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)[0]
@@ -244,7 +270,7 @@ class RemoteWorkerProcessMonitor:
                         r for r, seen in self._returned.values() if now - seen > _RETURN_GRACE
                     ]
                     expired = [
-                        r for r, seen in self._seen.values() if now - seen > _HEARTBEAT_TIMEOUT
+                        r for r, seen in self._seen.values() if now - seen > self._heartbeat_timeout
                     ]
                     first = self._first_report_at
                     unregistered = (

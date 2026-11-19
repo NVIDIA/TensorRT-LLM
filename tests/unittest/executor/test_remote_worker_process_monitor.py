@@ -52,7 +52,7 @@ def test_remote_rank_loss_wakes_existing_monitor_without_mpi(monkeypatch, lost_p
         monkeypatch.setattr(remote.socket, "gethostbyname", lambda _host: "127.0.2.1")
     else:
         monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
-    monkeypatch.setattr(remote, "_HEARTBEAT_TIMEOUT", 1.5)
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_TIMEOUT", "1.5")
     wake = threading.Event()
     monitor = WorkerProcessMonitor()
     endpoint = monitor.start_remote(1, wake)
@@ -269,6 +269,32 @@ def test_watch_starts_when_worker_descriptors_exceed_fd_setsize(monkeypatch):
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
+def test_heartbeat_lease_defaults_to_tolerate_brief_network_outages(monkeypatch):
+    # Regression: a fixed 5 s lease failed the engine terminally on a network
+    # blip that TCP retransmission alone takes several seconds to recover from.
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.delenv("TRTLLM_WORKER_WATCH_TIMEOUT", raising=False)
+    monitor = remote.RemoteWorkerProcessMonitor(1)
+    try:
+        assert monitor._heartbeat_timeout >= 15.0
+    finally:
+        monitor.close()
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_TIMEOUT", "45")
+    monitor = remote.RemoteWorkerProcessMonitor(1)
+    try:
+        assert monitor._heartbeat_timeout == 45.0
+    finally:
+        monitor.close()
+
+
+@pytest.mark.parametrize("value", ["soon", "nan", "inf", "0", "1", "-3"])
+def test_invalid_heartbeat_lease_is_a_configuration_error(monkeypatch, value):
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_TIMEOUT", value)
+    with pytest.raises(ConfigInputError, match="TRTLLM_WORKER_WATCH_TIMEOUT"):
+        remote.RemoteWorkerProcessMonitor(1)
+
+
 def test_unreachable_watch_helper_reports_rank_endpoint_and_configuration_hint(monkeypatch):
     monkeypatch.setattr(remote, "_START_TIMEOUT", 0.1)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
@@ -321,6 +347,7 @@ def test_queued_heartbeats_prevent_false_death_after_receiver_pause(monkeypatch)
     monitor._lock = threading.Lock()
     monitor._stopped = threading.Event()
     monitor._failure = None
+    monitor._heartbeat_timeout = 5.0
     reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
     monitor._seen = {r["rank"]: (r, 0.0) for r in reports}
     monitor._returned = {}
@@ -356,6 +383,7 @@ def test_continuous_traffic_cannot_hide_an_expired_rank(monkeypatch, invalid_sig
     monitor._lock = threading.Lock()
     monitor._stopped = threading.Event()
     monitor._failure = None
+    monitor._heartbeat_timeout = 5.0
     reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
     monitor._seen = {0: (reports[0], 100.0), 1: (reports[1], 0.0)}
     monitor._returned = {}
@@ -404,6 +432,7 @@ def _paused_receiver(monkeypatch, buffered_until_first_wait):
     monitor._lock = threading.Lock()
     monitor._stopped = threading.Event()
     monitor._failure = None
+    monitor._heartbeat_timeout = 5.0
     reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
     monitor._seen = {r["rank"]: (r, clock[0]) for r in reports}
     monitor._returned = {}
