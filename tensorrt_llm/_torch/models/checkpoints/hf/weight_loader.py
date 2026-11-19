@@ -90,6 +90,20 @@ _LAYER_IN_NAME = re.compile(r"^(?:(?:language_)?model\.){0,2}layers\.(\d+)\.")
 _EXPERT_IN_NAME = re.compile(r"\.experts\.(\d+)\.")
 
 
+@contextmanager
+def _gc_paused():
+    """Pause the cyclic GC while ~1M header entries are created: the
+    collections their allocations trigger rescan the whole process heap
+    (9 s -> 3 s per rank for Kimi K3's 96 shards)."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def _rank_read_set(mapping: Mapping, model) -> tuple | None:
     """The PP layers and EP slice this rank loads; None if it loads all."""
     config = getattr(model, "model_config", None)
@@ -116,12 +130,19 @@ def _node_read_extents(stats, read_sets) -> list[tuple[str, int, int]]:
                      for match in (_LAYER_IN_NAME.search(name),
                                    _EXPERT_IN_NAME.search(name)))
 
-    catalog = build_safetensors_checkpoint_catalog([path for path, _ in stats])
-    paths = {os.path.basename(path): path for path, _ in stats}
-    tensors = [(*indices(tensor.name), tensor.extents[0])
-               for tensor in catalog.tensors]
+    # Parse the headers directly: a validated checkpoint catalog of ~1M
+    # tensors (Kimi K3) takes ~13 s per rank, the headers ~2 s.
+    tensors = []  # (path, start, end, layer, expert)
+    for path, _ in stats:
+        _, header_bytes, header = _read_safetensors_header(path)
+        for name, info in header.items():
+            if name != "__metadata__":
+                begin, end = info["data_offsets"]
+                tensors.append((path, 8 + header_bytes + begin,
+                                8 + header_bytes + end, *indices(name)))
+    tensors.sort(key=lambda tensor: tensor[:2])
     num_experts = 1 + max(
-        (expert for _, expert, _ in tensors if expert is not None), default=-1)
+        (tensor[4] for tensor in tensors if tensor[4] is not None), default=-1)
 
     def is_read(layer, expert, read_set) -> bool:
         layers, num_layers, is_last_stage, ep_size, ep_rank = read_set
@@ -136,15 +157,14 @@ def _node_read_extents(stats, read_sets) -> list[tuple[str, int, int]]:
             return start <= expert < end
         return True
 
-    extents = []  # [path, start, end], coalesced; tensors are in file order
-    for layer, expert, extent in tensors:
+    extents = []  # [path, start, end], coalesced in file order
+    for path, start, end, layer, expert in tensors:
         if not any(is_read(layer, expert, s) for s in read_sets):
             continue
-        path, start = paths[extent.object_id], extent.offset_bytes
         if extents and extents[-1][0] == path and extents[-1][2] >= start:
-            extents[-1][2] = extent.end_offset_bytes
+            extents[-1][2] = end
         else:
-            extents.append([path, start, extent.end_offset_bytes])
+            extents.append([path, start, end])
     return [(path, start, end - start) for path, start, end in extents]
 
 
@@ -541,20 +561,12 @@ class HfWeightLoader(BaseWeightLoader):
             weight_files = filtered_weight_files
         weights: dict[str, Any] = {}
         handles = []
-        # Pause the cyclic GC while the headers' ~1M entries are created: the
-        # collections their allocations trigger rescan the whole process heap
-        # (measured 9 s -> 3 s for Kimi K3's 96 shards).
-        gc_was_enabled = gc.isenabled()
-        gc.disable()
-        try:
+        with _gc_paused():
             for file_name in weight_files:
                 handle = SafetensorsPreader(file_name)
                 handles.append(handle)
                 for name in handle.keys():
                     weights[name] = handle.get_slice(name)
-        finally:
-            if gc_was_enabled:
-                gc.enable()
         logger.info(f"Lazily opened {len(weight_files)} safetensors files "
                     f"({len(weights)} tensors) from {checkpoint_dir}")
         # The slices need their file handles, but the checkpoint loader
@@ -1001,7 +1013,8 @@ class HfWeightLoader(BaseWeightLoader):
             fits, _ = memory_admission(sum(s.st_size for _, s in stats),
                                        available_memory)
             if eligibility_reason is None and None not in read_sets and not fits:
-                extents = _node_read_extents(stats, read_sets)
+                with _gc_paused():
+                    extents = _node_read_extents(stats, read_sets)
         except Exception as error:
             node_error = error
 
