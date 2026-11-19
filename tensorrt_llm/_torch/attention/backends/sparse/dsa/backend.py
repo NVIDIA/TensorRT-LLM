@@ -185,7 +185,17 @@ class DSATrtllmAttention(TrtllmAttention):
                 is_generation=is_generation,
             )
             preserve_mtp_topk = metadata.in_mtp_draft_loop and self.indexer.mtp_index_share
-            if shared_topk_indices is not None and not preserve_mtp_topk:
+            if (
+                shared_topk_indices is not None
+                and not preserve_mtp_topk
+                and not (
+                    _GROUP_REMAP
+                    and is_generation
+                    and metadata.can_skip_shared_topk_copy(
+                        self.get_local_layer_idx(metadata), topk_indices.shape
+                    )
+                )
+            ):
                 shared_topk_indices[
                     phase_start : phase_start + topk_indices.shape[0],
                     : topk_indices.shape[1],
