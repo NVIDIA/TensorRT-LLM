@@ -13755,11 +13755,16 @@ class PyExecutor:
 
     def invalidate_multimodal_encoder_cache(self) -> None:
         """Clear weight-derived MM outputs after request lifetimes quiesce."""
+        # A request that holds its whole encoder output (multimodal_embedding)
+        # reuses it in later chunks and in a recompute replay, and its raw
+        # media may be gone (release_encoded_media), so refuse it as well.
         live_request_ids = [
             request.py_request_id for request in self.active_requests
-            if request.py_mm_encoder_state is not None and any(
+            if (request.py_mm_encoder_state is not None and any(
                 cache_key is not None
-                for cache_key in request.py_mm_encoder_state.item_cache_keys)
+                for cache_key in request.py_mm_encoder_state.item_cache_keys))
+            or (request.py_multimodal_data and request.py_multimodal_data.get(
+                "multimodal_embedding") is not None)
         ]
         if live_request_ids:
             raise RuntimeError(

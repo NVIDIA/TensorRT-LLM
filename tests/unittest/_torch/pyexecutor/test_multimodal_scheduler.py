@@ -16,6 +16,7 @@ from _torch.pyexecutor.multimodal_utils import (
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
+    release_encoded_media,
 )
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -1199,6 +1200,29 @@ def test_weight_invalidation_rejects_live_references():
     request = make_mm_request(1, [4])
     request.py_mm_encoder_state.set_item_cache_key(0, ("cache", 0), ready=False)
     executor.active_requests = [request]
+    with pytest.raises(RuntimeError, match="live multimodal cache references"):
+        executor.invalidate_multimodal_encoder_cache()
+    assert invalidations == [True]
+
+
+def test_weight_invalidation_rejects_held_embeddings():
+    """A request that holds its whole encoder output reuses it in later chunks and in a
+    recompute replay, also after its raw media is dropped, so a weight update must wait."""
+    invalidations = []
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        invalidate_multimodal_encoder_cache=lambda: invalidations.append(True)
+    )
+    # Not encoded yet: a replay encodes it with the new weights.
+    request = make_llm_request(1, {"image": {"pixel_values": torch.ones(4, 2)}})
+    executor.active_requests = [request]
+    executor.invalidate_multimodal_encoder_cache()
+    assert invalidations == [True]
+
+    # After its first prefill chunk: the whole output is held and the host media is gone.
+    request.py_multimodal_data["multimodal_embedding"] = torch.zeros(4, 2)
+    release_encoded_media(request)
+    assert "image" not in request.py_multimodal_data
     with pytest.raises(RuntimeError, match="live multimodal cache references"):
         executor.invalidate_multimodal_encoder_cache()
     assert invalidations == [True]
