@@ -164,7 +164,7 @@ class _FamilyScope:
         self.unit_root = root / "tests" / self.unit
         self.catalog = root / _CATALOG
         self.package = f"tensorrt_llm._torch.visual_gen.models.{self.family}"
-        tree = _parse(family / "routing.py")
+        tree = _parse(family / "pipeline_registry.py")
         self.targets = routed_targets(tree, function_name="route") if tree else None
 
     @cached_property
@@ -188,7 +188,7 @@ class _FamilyScope:
             rel = PurePosixPath(path.removeprefix(f"{_MODELS}{self.family}/"))
             if self.targets and rel.parts[0] in self.targets:
                 return self._target_tests(rel.parts[0])
-            if rel.name == "routing.py" or rel.suffix != ".py" or not self.targets:
+            if rel.name == "pipeline_registry.py" or rel.suffix != ".py" or not self.targets:
                 return whole
             module = _module_name(rel, self.package)
             prefixes = set()
@@ -220,7 +220,7 @@ class VisualGenRule(Rule):
         self.families = (
             {
                 f"{_MODELS}{routing.parent.name}/": _FamilyScope(repo_root, routing.parent)
-                for routing in (repo_root / _MODELS).glob("*/routing.py")
+                for routing in (repo_root / _MODELS).glob("*/pipeline_registry.py")
             }
             if repo_root is not None
             else {}

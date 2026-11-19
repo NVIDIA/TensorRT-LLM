@@ -16,6 +16,7 @@ from cbts.blocks import Block, Stage, YAMLIndex
 from cbts.command.main import Selector, _load_pr_inputs, main
 from cbts.rules.base import PRInputs
 from cbts.rules.python_formatting import PythonFormattingRule, is_formatting_only_change
+from cbts.rules.tests_def import TestsDefRule as CbtsTestsDefRule
 from cbts.rules.visual_gen import VisualGenRule, _is_vg_claim
 
 pytestmark = pytest.mark.cpu_only
@@ -313,35 +314,44 @@ def test_public_api_post_merge_can_use_post_merge_validation() -> None:
 @pytest.mark.parametrize(
     ("changed", "expected"),
     [
-        ("tensorrt_llm/_torch/modeling_v2/catalog/_op.py", {"default", "fasth3", "ops"}),
+        ("tensorrt_llm/_torch/modeling_v2/catalog/_op.py", {"default_pipeline", "fasth3", "ops"}),
         ("tensorrt_llm/_torch/modeling_v2/catalog/attention/core.py", {"fasth3", "ops"}),
-        ("tensorrt_llm/_torch/visual_gen/models/minimax_h3/ops/vsa.py", {"fasth3", "ops"}),
-        ("tensorrt_llm/_torch/visual_gen/models/minimax_h3/default/pipeline.py", {"default"}),
+        ("tensorrt_llm/_torch/modeling_v2/catalog/comm/ulysses.py", {"default_pipeline", "fasth3"}),
+        ("tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/ops/vsa.py", {"fasth3", "ops"}),
         (
-            "tensorrt_llm/_torch/visual_gen/models/minimax_h3/routing.py",
-            {"default", "fasth3", "ops"},
+            "tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/default_pipeline/pipeline.py",
+            {"default_pipeline"},
+        ),
+        (
+            "tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/pipeline_registry.py",
+            {"default_pipeline", "fasth3", "ops"},
         ),
     ],
 )
 def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
-    family = "minimax_h3"
+    family = "minimax_h3_v2"
     unit = f"unittest/_torch/visual_gen/models/{family}"
     quality = f"visual_gen/{family}"
     files = {
-        f"tensorrt_llm/_torch/visual_gen/models/{family}/routing.py": (
-            "from .default.pipeline import Default\nfrom .fasth3.pipeline import Fast\n"
+        f"tensorrt_llm/_torch/visual_gen/models/{family}/pipeline_registry.py": (
+            "from .default_pipeline.pipeline import Default\nfrom .fasth3.pipeline import Fast\n"
             "def route(config):\n    if config.fast:\n        return Fast\n    return Default\n"
         ),
-        f"tensorrt_llm/_torch/visual_gen/models/{family}/default/pipeline.py": "class Default: pass",
+        f"tensorrt_llm/_torch/visual_gen/models/{family}/default_pipeline/pipeline.py": (
+            "from ..parallel.ulysses import shard\nclass Default: pass"
+        ),
         f"tensorrt_llm/_torch/visual_gen/models/{family}/fasth3/pipeline.py": (
-            "from ..ops.vsa import sparse\nclass Fast: pass\n"
+            "from ..ops.vsa import sparse\nfrom ..parallel.ulysses import shard\nclass Fast: pass\n"
+        ),
+        f"tensorrt_llm/_torch/visual_gen/models/{family}/parallel/ulysses.py": (
+            "from tensorrt_llm._torch.modeling_v2.catalog.comm.ulysses import shard"
         ),
         f"tensorrt_llm/_torch/visual_gen/models/{family}/ops/vsa.py": (
             "from tensorrt_llm._torch.modeling_v2.catalog.attention.adapter import sparse"
         ),
         "tensorrt_llm/_torch/modeling_v2/catalog/attention/adapter.py": "from .core import sparse",
         f"tests/{unit}/ops/test_vsa.py": (
-            "from tensorrt_llm._torch.visual_gen.models.minimax_h3.ops.vsa import sparse"
+            "from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.ops.vsa import sparse"
         ),
     }
     for name, source in files.items():
@@ -349,13 +359,25 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source)
     entries = {
-        "default": {f"{unit}/default/test_model.py", f"{quality}/default/test_quality.py"},
+        "default_pipeline": {
+            f"{unit}/default_pipeline/test_model.py",
+            f"{quality}/default_pipeline/test_quality.py",
+        },
         "fasth3": {f"{unit}/fasth3/test_pipeline.py", f"{quality}/fasth3/test_quality.py"},
         "ops": {f"{unit}/ops/test_vsa.py"},
     }
     index = YAMLIndex()
     index.blocks = [
-        Block("l0_b200", 0, {}, [*set.union(*entries.values()), "visual_gen/test_unrelated.py"])
+        Block(
+            "l0_b200",
+            0,
+            {},
+            [
+                *set.union(*entries.values()),
+                "visual_gen/test_unrelated.py",
+                "examples/visual_gen/test_minimax_h3_e2e.py",
+            ],
+        )
     ]
     rule = VisualGenRule(index, {}, tmp_path)
     result = rule.apply(PRInputs([changed], {}))
@@ -364,3 +386,20 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
         e for block in result.block_filters.values() for tests in block.values() for e in tests
     }
     assert selected == set.union(*(entries[key] for key in expected))
+
+
+def test_h3_shared_quality_changes_select_v1_and_v2_entrypoints():
+    index = YAMLIndex.load(REPO_ROOT / "tests/integration/test_lists/test-db")
+    rule = CbtsTestsDefRule(index, {}, REPO_ROOT)
+    result = rule.apply(
+        PRInputs(["tests/integration/defs/visual_gen/minimax_h3_quality_cases.py"], {})
+    )
+    assert result is not None and result.scope == "testdefonly"
+    selected = {path for filters in result.block_filters.values() for path in filters}
+    assert {
+        "examples/visual_gen/test_minimax_h3_e2e.py",
+        "examples/visual_gen/test_visual_gen_multi_gpu.py",
+        "visual_gen/minimax_h3_v2/default_pipeline/test_loading.py",
+        "visual_gen/minimax_h3_v2/default_pipeline/test_parallel_quality.py",
+        "visual_gen/minimax_h3_v2/default_pipeline/test_quality.py",
+    } <= selected

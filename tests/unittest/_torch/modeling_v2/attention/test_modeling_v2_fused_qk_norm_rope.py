@@ -171,7 +171,7 @@ _QWEN_TP4_MTP = dict(_QWEN_MAIN, num_heads_q=6, num_heads_k=1, num_heads_v=1)
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "minimax_h3/default": (
+    "visual_gen/minimax_h3_v2/default_pipeline": (
         Cell(
             why="H3 TP2 text encoder, plain QK norm and interleaved text positions",
             spec=dict(

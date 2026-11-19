@@ -172,7 +172,7 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 
 ## MiniMax-H3 Notes
 
-Base MiniMax-H3 defaults to `num_inference_steps=50`. The video and audio schedulers each use 50 sigma points including the terminal zero, so generation runs 49 joint denoising updates. To reproduce the 27-update schedule, pass `num_inference_steps=28`.
+MiniMax-H3 uses Modeling V1 by default. Set `TLLM_VISUALGEN_MODELING2_H3=1` before starting VisualGen to opt into Modeling V2 for base H3 and FastH3. Base H3 defaults to 50 sigma points in both implementations, giving 49 joint denoising updates. FastH3 8-Step V2 uses its checkpoint's eight-update schedule in both implementations. [H3 Modeling V2 guide](../../../tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/README.md)
 
 MiniMax-H3 parallel VAE uses independent spatial tiles via
 `parallel_config.parallel_vae_size`, with size from 1 through the world size (`tp_size * ulysses_size`).
@@ -197,7 +197,7 @@ are not supported. See the
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 
-- FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
+- FastH3 uses the MiniMax-H3 transformer architecture with a
   distilled 8-step V2 checkpoint. Model-specific VSA is the supported inference path
   for this checkpoint and is selected by default with the TRTLLM backend and the
   checkpoint's sparsity (80% for V2). Explicit incompatible backends

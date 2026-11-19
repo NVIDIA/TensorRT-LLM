@@ -212,7 +212,14 @@ class AutoPipeline:
             )
         entry = PIPELINE_REGISTRY[class_name]
         AutoPipeline._validate_vae_quantization(config, class_name, entry)
-        return entry.pipeline_cls.resolve_variant(config, checkpoint_dir)
+        if (
+            class_name == "MiniMaxH3ModularPipeline"
+            and os.environ.get("TLLM_VISUALGEN_MODELING2_H3") == "1"
+        ):
+            from .models.minimax_h3_v2.pipeline_registry import route
+
+            return route(config, checkpoint_dir)
+        return entry.pipeline_cls.resolve_variant(config)
 
     @staticmethod
     def _validate_vae_quantization(

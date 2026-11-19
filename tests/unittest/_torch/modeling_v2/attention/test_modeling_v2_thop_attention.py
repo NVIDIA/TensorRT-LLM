@@ -7533,7 +7533,7 @@ def _qwen4_prefill_chunk(base: dict) -> dict:
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "visual_gen/minimax_h3/default": (
+    "visual_gen/minimax_h3_v2/default_pipeline": (
         Cell(
             why="H3 full attention: 56 heads with separate packed audio/video sequences per batch row",
             spec=dict(

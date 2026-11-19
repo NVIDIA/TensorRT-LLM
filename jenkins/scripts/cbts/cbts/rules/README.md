@@ -290,7 +290,7 @@ used as test fixtures (e.g. `examples/visual_gen/cat_piano.png` and
 loaded by `tests/unittest/_torch/visual_gen/`), so edits to them must
 still force VG stages.
 
-A model family with a `routing.py` selects its routed target suites and mirrored family unit tests. A family router or native family change runs the family. Changes under the Modeling V2 catalog also select the VisualGen targets that transitively import the entry. The shared `OpWrapper` selects all migrated VisualGen families.
+A VisualGen model family with a `pipeline_registry.py` selects its routed target suites and mirrored family unit tests. A family router or native family change runs the family. Changes under the Modeling V2 catalog also select the VisualGen targets that transitively import the entry. The shared `OpWrapper` selects all migrated VisualGen families.
 
 VisualGen has no `condition.terms.backend` of its own; VG entries
 live in `backend: pytorch` and `backend: tensorrt` blocks. A block

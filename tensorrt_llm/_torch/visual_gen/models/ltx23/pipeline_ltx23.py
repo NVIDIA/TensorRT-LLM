@@ -191,7 +191,7 @@ class LTX23Pipeline(BasePipeline):
         super().__init__(pipeline_config)
 
     @classmethod
-    def resolve_variant(cls, config, checkpoint_dir=None):
+    def resolve_variant(cls, config):
         workflow = config.extra_attrs.get("workflow", "generation")
         if workflow == "retake":
             from .pipeline_ltx23_retake import LTX23RetakePipeline
