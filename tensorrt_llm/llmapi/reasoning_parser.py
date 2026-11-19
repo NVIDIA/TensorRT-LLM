@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from collections.abc import KeysView
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Optional, Type
+from typing import Any, ClassVar, NamedTuple, Optional, Type
 
 from tensorrt_llm import logger
 
@@ -1411,18 +1411,35 @@ class KimiK3ReasoningParser(_BufferedReasoningParser):
         return ReasoningParserResult()
 
 
-_BEAM_START, _BEAM_END, _BEAM_MESSAGE, _BEAM_CHANNEL = ("<|start|>", "<|end|>",
-                                                        "<|message|>",
-                                                        "<|channel|>")
-_BEAM_CONSTRAIN, _BEAM_RETURN, _BEAM_CALL = ("<|constrain|>", "<|return|>",
-                                             "<|call|>")
+_BEAM_START = "<|start|>"
+_BEAM_END = "<|end|>"
+_BEAM_MESSAGE = "<|message|>"
+_BEAM_CHANNEL = "<|channel|>"
+_BEAM_CONSTRAIN = "<|constrain|>"
+_BEAM_RETURN = "<|return|>"
+_BEAM_CALL = "<|call|>"
 _BEAM_TAGS = (_BEAM_START, _BEAM_END, _BEAM_MESSAGE, _BEAM_CHANNEL,
               _BEAM_CONSTRAIN, _BEAM_RETURN, _BEAM_CALL)
 _BEAM_BODY_TERMINATORS = (_BEAM_END, _BEAM_RETURN, _BEAM_CALL)
 _BEAM_TAG_PATTERN = re.compile("|".join(map(re.escape, _BEAM_TAGS)))
 _BEAM_BODY_PATTERN = re.compile("|".join(map(re.escape,
                                              _BEAM_BODY_TERMINATORS)))
-_BEAM_ANALYSIS, _BEAM_FINAL = "analysis", "final"
+_BEAM_ANALYSIS = "analysis"
+_BEAM_FINAL = "final"
+
+_BEAM_HEADER = "header"
+_BEAM_BODY = "body"
+_BEAM_BETWEEN_MESSAGES = "between"
+_BEAM_DONE = "done"
+
+
+class _BeamOutput(NamedTuple):
+    content: list[str]
+    reasoning: list[str]
+
+    def result(self) -> ReasoningParserResult:
+        return ReasoningParserResult(content="".join(self.content),
+                                     reasoning_content="".join(self.reasoning))
 
 
 @register_reasoning_parser("beam_harmony_text")
@@ -1461,31 +1478,28 @@ class BeamHarmonyTextParser(_BufferedReasoningParser):
         self._reset()
 
     def _reset(self) -> None:
-        # "header": before a channel's <|message|>; "body": inside a message;
-        # "between": after <|end|> until the next header; "done": after
-        # <|return|> or <|call|>.
-        self._state = "header"
+        self._state = _BEAM_HEADER
         self._channel: Optional[str] = None
         self._header: list[str] = []
         self._buffer = ""
         self._saw_header = False
 
-    def _emit(self, text: str, out: tuple) -> None:
+    def _emit(self, text: str, out: _BeamOutput) -> None:
         if not text:
             return
         if self._channel == _BEAM_ANALYSIS:
-            out[1].append(text)
+            out.reasoning.append(text)
         elif self._channel == _BEAM_FINAL or (self._channel is None
                                               and not self._saw_header):
-            out[0].append(text)
+            out.content.append(text)
 
     def _feed(self, text: str) -> ReasoningParserResult:
-        out = ([], [])
+        out = _BeamOutput(content=[], reasoning=[])
         data = self._buffer + text
         self._buffer = ""
         cursor = 0
-        while cursor < len(data) and self._state != "done":
-            in_body = self._state == "body"
+        while cursor < len(data) and self._state != _BEAM_DONE:
+            in_body = self._state == _BEAM_BODY
             markers = _BEAM_BODY_TERMINATORS if in_body else _BEAM_TAGS
             pattern = _BEAM_BODY_PATTERN if in_body else _BEAM_TAG_PATTERN
             # Search forward without rescanning or copying the unconsumed suffix.
@@ -1500,9 +1514,9 @@ class BeamHarmonyTextParser(_BufferedReasoningParser):
                 chunk = data[cursor:match.start()]
                 cursor = match.end()
                 tag = match.group()
-            if self._state == "body":
+            if in_body:
                 self._emit(chunk, out)
-            elif self._state == "header":
+            elif self._state == _BEAM_HEADER:
                 if self._header or self._saw_header:
                     if chunk:
                         self._header.append(chunk)
@@ -1513,32 +1527,30 @@ class BeamHarmonyTextParser(_BufferedReasoningParser):
             if tag is None:
                 break
             if tag == _BEAM_CHANNEL:
-                self._state, self._header, self._saw_header = "header", [], True
+                self._state, self._header, self._saw_header = _BEAM_HEADER, [], True
             elif tag == _BEAM_MESSAGE:
-                if self._state == "header":
+                if self._state == _BEAM_HEADER:
                     self._channel = "".join(self._header).split(
                         _BEAM_CONSTRAIN)[0].strip().split(" ")[0] or None
                     self._header = []
-                self._state = "body"
+                self._state = _BEAM_BODY
             elif tag == _BEAM_CONSTRAIN:
                 self._header.append(_BEAM_CONSTRAIN)
             elif tag in (_BEAM_END, _BEAM_START):
-                self._state, self._channel, self._header = "between", None, []
+                self._state, self._channel, self._header = _BEAM_BETWEEN_MESSAGES, None, []
             elif tag in (_BEAM_RETURN, _BEAM_CALL):
-                self._state, self._channel = "done", None
-        return ReasoningParserResult(content="".join(out[0]),
-                                     reasoning_content="".join(out[1]))
+                self._state, self._channel = _BEAM_DONE, None
+        return out.result()
 
     def finish(self) -> ReasoningParserResult:
         held, self._buffer = self._buffer, ""
-        out = ([], [])
-        if self._state == "body" and held:
+        out = _BeamOutput(content=[], reasoning=[])
+        if self._state == _BEAM_BODY and held:
             self._emit(held, out)
-        elif (self._state == "header" and not self._saw_header
+        elif (self._state == _BEAM_HEADER and not self._saw_header
               and not self._header and held):
             self._emit(held, out)
-        return ReasoningParserResult(content="".join(out[0]),
-                                     reasoning_content="".join(out[1]))
+        return out.result()
 
 
 # Model-specific parsers live in tensorrt_llm.llmapi.reasoning; importing a
