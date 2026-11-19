@@ -3487,6 +3487,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     architecture is registered by that wrapper, not here."""
 
     mamba_metadata_cls = KimiK3MambaMetadata
+    rehearses_on_dummy_weights = True
     # Set from the environment in __init__; loaders that build the model without
     # it (modeling_v2 targets, checkpoint tests) inherit the defaults.
     _mxfp8_shared_expert: bool = False

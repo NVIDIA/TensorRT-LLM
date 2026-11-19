@@ -3038,6 +3038,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
     # Preserve M3's hand-fused eager decode and above-ceiling prefill paths,
     # including MXFP8 decode-graph backend tuning, instead of the FX fallback.
     use_fx_for_pcg_fallback = False
+    rehearses_on_dummy_weights = True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
