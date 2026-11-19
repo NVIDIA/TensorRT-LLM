@@ -78,8 +78,8 @@ _SIDE_STREAM_DELAY_CYCLES = 2_000_000_000
 _ORDER_NOT_EXERCISED = "the delayed stream finished before the other stream read"
 
 
-def _input_preparer(*, spec_config: DecodingBaseConfig | None = None) -> DecoderInputPreparer:
-    return input_preparer(decoder_config(is_spec_decode=False, spec_config=spec_config), model=None)
+def _input_preparer(**config_changes: Any) -> DecoderInputPreparer:
+    return input_preparer(decoder_config(is_spec_decode=False, **config_changes), model=None)
 
 
 @pytest.mark.cpu_only
@@ -316,10 +316,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         for backend in PrefillCudaGraphBackend:
             for maybe_graph in (False, True):
                 with self.subTest(backend=backend, maybe_graph=maybe_graph):
-                    inputs = input_preparer(
-                        decoder_config(is_spec_decode=False, prefill_cuda_graph_backend=backend),
-                        model=None,
-                    )
+                    inputs = _input_preparer(prefill_cuda_graph_backend=backend)
                     inputs.guided_decoder = Mock()
                     inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
                     fast_inputs = PreparedInputs({"prepared": True})
