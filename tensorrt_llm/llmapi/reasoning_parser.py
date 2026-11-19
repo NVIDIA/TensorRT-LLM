@@ -1229,8 +1229,32 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
             "Unreachable code reached in `KimiK2ReasoningParser.parse_delta`")
 
 
+class _BufferedReasoningParser(BaseReasoningParser):
+    """Parse a whole response by resetting, consuming it and flushing the buffered tail."""
+
+    @abstractmethod
+    def _reset(self) -> None:
+        pass
+
+    @abstractmethod
+    def _feed(self, text: str) -> ReasoningParserResult:
+        pass
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        self._reset()
+        result = self._feed(text)
+        tail = self.finish()
+        return ReasoningParserResult(
+            content=result.content + tail.content,
+            reasoning_content=result.reasoning_content + tail.reasoning_content,
+        )
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return self._feed(delta_text)
+
+
 @register_reasoning_parser("kimi_k3")
-class KimiK3ReasoningParser(BaseReasoningParser):
+class KimiK3ReasoningParser(_BufferedReasoningParser):
     """Reasoning parser for Kimi-K3 XTML output.
 
     K3 renders assistant messages as an XTML tag stream built from the
@@ -1373,18 +1397,6 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         return ReasoningParserResult(content="".join(content),
                                      reasoning_content="".join(reasoning))
 
-    def parse(self, text: str) -> ReasoningParserResult:
-        self._reset()
-        result = self._feed(text)
-        tail = self.finish()
-        return ReasoningParserResult(
-            content=result.content + tail.content,
-            reasoning_content=result.reasoning_content + tail.reasoning_content,
-        )
-
-    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        return self._feed(delta_text)
-
     def finish(self) -> ReasoningParserResult:
         remaining = self._buffer
         self._buffer = ""
@@ -1414,7 +1426,7 @@ _BEAM_ANALYSIS, _BEAM_FINAL = "analysis", "final"
 
 
 @register_reasoning_parser("beam_harmony_text")
-class BeamHarmonyTextParser(BaseReasoningParser):
+class BeamHarmonyTextParser(_BufferedReasoningParser):
     """Split a Beam channel reply into ``reasoning_content`` and ``content``.
 
     The Beam checkpoints write their reply as channel messages after the chat
@@ -1516,18 +1528,6 @@ class BeamHarmonyTextParser(BaseReasoningParser):
                 self._state, self._channel = "done", None
         return ReasoningParserResult(content="".join(out[0]),
                                      reasoning_content="".join(out[1]))
-
-    def parse(self, text: str) -> ReasoningParserResult:
-        self._reset()
-        result = self._feed(text)
-        tail = self.finish()
-        return ReasoningParserResult(
-            content=result.content + tail.content,
-            reasoning_content=result.reasoning_content + tail.reasoning_content,
-        )
-
-    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        return self._feed(delta_text)
 
     def finish(self) -> ReasoningParserResult:
         held, self._buffer = self._buffer, ""
