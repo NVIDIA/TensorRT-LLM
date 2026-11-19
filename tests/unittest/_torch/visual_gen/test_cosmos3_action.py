@@ -8,6 +8,8 @@ Run:
 """
 
 import dataclasses
+from collections.abc import Mapping
+from typing import Any, Optional
 
 import numpy as np
 import PIL.Image
@@ -16,6 +18,7 @@ import torch
 from cosmos3_fixtures import bare_resolver
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+    ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_POLICY,
     action_reference_frame_step,
     action_reference_size,
@@ -52,14 +55,17 @@ ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["action"]["common"]
 DROID_POLICY_DEFAULTS = COSMOS3_DEFAULTS["nemotron_dense"]["policy"]["droid_lerobot"]
 
 
-def resolve_action_request(checkpoint_policy=None, **given) -> dict:
+def resolve_action_request(
+    checkpoint_policy: Optional[Mapping[str, Any]] = None, **given: Any
+) -> dict[str, Any]:
     """The action fields a request runs with, as a dict with the warnings and origins:
     against the raw ``checkpoint.json`` policy block when one is given, else the domain
     preset."""
     resolver = bare_resolver("qwen3", policy=checkpoint_policy)
     params, warnings, origins = resolver._resolve(
         RequestParameters(
-            action_mode=ACTION_MODE_POLICY if checkpoint_policy else "action", **given
+            action_mode=ACTION_MODE_POLICY if checkpoint_policy else ACTION_MODE_FORWARD_DYNAMICS,
+            **given,
         )
     )
     return {

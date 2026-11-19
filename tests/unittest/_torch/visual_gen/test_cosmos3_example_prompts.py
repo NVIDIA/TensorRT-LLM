@@ -277,7 +277,7 @@ class TestShippedPromptFiles:
         data = cosmos3.load_prompt_file(f"prompts/{name}.json")
         prompt = json.loads(data["prompt"])
         config = bare_resolver("qwen3").request(
-            RequestParameters(action_mode="action", domain_name=domain_name)
+            RequestParameters(action_mode="forward_dynamics", domain_name=domain_name)
         )
 
         assert list(prompt) == [

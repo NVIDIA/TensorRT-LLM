@@ -9,6 +9,7 @@ import dataclasses
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -76,7 +77,7 @@ def _write_scheduler_config(checkpoint_dir: Path, config: dict) -> None:
     write_checkpoint_files(checkpoint_dir, {SCHEDULER_FILE: config}, vae=True)
 
 
-def _write_trained_config(checkpoint_dir: Path, use_system_prompt) -> None:
+def _write_trained_config(checkpoint_dir: Path, use_system_prompt: Optional[bool]) -> None:
     """The training config's prompt flag; ``None`` writes a config without it."""
     vlm_config = {} if use_system_prompt is None else {"use_system_prompt": use_system_prompt}
     write_checkpoint_files(

@@ -40,7 +40,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, NamedTuple, Optional
+from typing import Any, Literal, NamedTuple, Optional, TypeVar
 
 from tensorrt_llm.logger import logger
 
@@ -57,19 +57,24 @@ from .defaults import (
 from .overrides import COSMOS3_OVERRIDES, ParameterOverride
 from .sampling import DISTILLED_GUIDANCE_SCALE
 
-REQUEST = "request"
-OVERRIDE = "override"
+Origin = Literal["request", "override", "checkpoint", "default", "unset"]
+OutputMode = Literal["video", "image"]
+ActionMode = Literal["policy", "forward_dynamics", "inverse_dynamics"]
+PretrainedConfigT = TypeVar("PretrainedConfigT")
+
+REQUEST: Origin = "request"
+OVERRIDE: Origin = "override"
 """Origin of a field taken from ``COSMOS3_OVERRIDES`` in place of the checkpoint's value."""
-CHECKPOINT = "checkpoint"
-DEFAULT = "default"
-UNSET = "unset"
+CHECKPOINT: Origin = "checkpoint"
+DEFAULT: Origin = "default"
+UNSET: Origin = "unset"
 """Origin of a field that none of the three provides and that may stay ``None``."""
 
 
 @dataclass(frozen=True)
 class Resolved:
     value: Any
-    origin: str
+    origin: Origin
     """``REQUEST``, ``OVERRIDE``, ``CHECKPOINT`` or ``DEFAULT``."""
     where: str = ""
     """For checkpoint settings, the file and key that held the value; for overrides,
@@ -400,7 +405,7 @@ def resolve_checkpoint(
     )
 
 
-def fill_pretrained_config(pretrained_config: Any) -> Any:
+def fill_pretrained_config(pretrained_config: PretrainedConfigT) -> PretrainedConfigT:
     """Set the transformer-construction attributes of ``pretrained_config`` that the
     export omits (:data:`ARCHITECTURE_KEYS`). Idempotent; returns the config.
 
@@ -426,9 +431,10 @@ class RequestParameters:
     filled. Fields another mode owns (the action fields outside action mode, the
     canvas inside it) stay ``None``."""
 
-    mode: str = "video"
+    mode: OutputMode = "video"
     """``"video"`` or ``"image"``; the action table is used instead when ``action_mode`` is set."""
-    action_mode: Optional[str] = None
+    action_mode: Optional[ActionMode] = None
+    """The action task; ``None`` outside action mode."""
     is_v2v: bool = False
     is_transfer: bool = False
     domain_name: Optional[str] = None
@@ -524,7 +530,15 @@ def policy_domain(
 
 class ParameterResolver:
     """The settings of one Cosmos3 checkpoint, and the per-request resolution against
-    them. Build it with :meth:`from_checkpoint`, or from a :class:`Cosmos3Config`."""
+    them. Build it with :meth:`from_checkpoint`, or from a :class:`Cosmos3Config`.
+
+    Args:
+        family: The transformer family, a key of ``COSMOS3_DEFAULTS``; it selects the
+            defaults and overrides tables.
+        config: The checkpoint's settings, as :func:`resolve_checkpoint` returns them.
+        log: Whether to log the overrides that replace a checkpoint value and the
+            warnings and origins of each resolved request.
+    """
 
     def __init__(self, family: str, config: Cosmos3Config, *, log: bool = True) -> None:
         self.family = family

@@ -19,6 +19,7 @@ checkpoints, and the per-request settings."""
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from cosmos3_fixtures import VAE_CONFIG, bare_config, bare_resolver, write_checkpoint_files
@@ -38,6 +39,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     VAE_FILE,
     CheckpointFiles,
     Conflict,
+    Cosmos3Config,
     ParameterResolver,
     RequestParameters,
     fill_pretrained_config,
@@ -56,7 +58,7 @@ def _files_on_disk(tmp_path: Path, files: dict) -> CheckpointFiles:
     return CheckpointFiles(str(tmp_path), files.get(TRANSFORMER_FILE, {}))
 
 
-def _resolve(tmp_path: Path, files: dict):
+def _resolve(tmp_path: Path, files: dict) -> Cosmos3Config:
     write_checkpoint_files(tmp_path, files)
     return resolve_checkpoint(str(tmp_path), files.get(TRANSFORMER_FILE, {}))
 
@@ -110,7 +112,7 @@ class TestCheckpointFiles:
         assert ignored.value == 1 and ignored.disagreeing == ("model_index.json:a=2",)
 
 
-def _files():
+def _files() -> dict[str, dict]:
     """A distilled checkpoint whose training config and diffusers index disagree on
     the system prompt."""
     return {
@@ -237,7 +239,7 @@ def test_fixture_covers_every_expected_checkpoint():
     assert set(json.loads(FIXTURE.read_text())) == set(EXPECTED)
 
 
-def _resolver(**facts) -> ParameterResolver:
+def _resolver(**facts: Any) -> ParameterResolver:
     return bare_resolver(facts.pop("family", "qwen3"), **facts)
 
 
@@ -307,7 +309,9 @@ class TestRequest:
 
     def test_caller_value_wins_and_the_recommendation_is_reported(self):
         params, warnings, origins = _resolver()._resolve(
-            RequestParameters(action_mode="action", domain_name="av", action_chunk_size=16)
+            RequestParameters(
+                action_mode="forward_dynamics", domain_name="av", action_chunk_size=16
+            )
         )
         assert params.action_chunk_size == 16
         assert origins["action_chunk_size"] == REQUEST
