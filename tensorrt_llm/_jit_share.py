@@ -46,7 +46,9 @@ without sharing. Two kinds of kernels are shared:
   dict a :class:`SharedKernelCache`: while :class:`sharing_kernels` is active
   (the autotuner turns it on while it tunes), a lookup that misses loads the
   kernel another process exported as ``<dir>/cute/<name>.o``, and a kernel
-  stored in it is exported there.
+  stored in it is exported there. A runner class whose kernels another library
+  caches (FlashInfer's) has that cache shared the same way by its
+  ``share_kernel_caches()``.
 
 Either way, a process that finds a kernel claimed by another waits for it (at
 most ``TLLM_JIT_SHARE_WAIT_S`` seconds, default 60, and not past the deadline
@@ -347,15 +349,32 @@ class SharedKernelCache(dict):
     :class:`KernelBusy`), and otherwise claims it, so that the store that
     follows exports it. A claimed kernel whose compile raises is marked failed
     at the thread's next lookup or store, which the waiting processes see.
+
+    A subclass adapts a cache whose keys or values hold more than the kernel
+    (:meth:`_shared_text`, :meth:`_export`, :meth:`_load`).
     """
 
     def __init__(self, owner: str, entries=()):
         super().__init__(entries)
         self.owner = owner
 
-    def _paths(self, key):
+    def _shared_text(self, key) -> str | None:
+        """What names ``key``'s kernel in the directory besides the owner, or None to keep it in
+        this process: the key's ``repr``, unless it holds an object address."""
         text = repr(key)
-        if " at 0x" in text:
+        return None if " at 0x" in text else text
+
+    def _export(self, value, obj: str, name: str, meta: str) -> None:
+        """Export the kernel of a stored ``value`` (:func:`_export_kernel`); here the value is the kernel."""
+        _export_kernel(value, obj, name, meta)
+
+    def _load(self, obj: str, name: str, meta: str):
+        """The value to keep for the kernel another process exported (:meth:`_export`)."""
+        return _load_kernel(obj, name, meta)
+
+    def _paths(self, key):
+        text = self._shared_text(key)
+        if text is None:
             return None
         name = (
             "k"
@@ -394,10 +413,10 @@ class SharedKernelCache(dict):
                 return False
             action = "cute-waited"
         try:
-            kernel = _load_kernel(obj, name, meta)
+            value = self._load(obj, name, meta)
         except Exception:  # noqa: BLE001 - a kernel that does not load is compiled here instead
             return False
-        dict.__setitem__(self, key, kernel)
+        dict.__setitem__(self, key, value)
         _log(os.environ.get(SHARE_DIR_ENV, ""), start, action, name)
         return True
 
@@ -417,7 +436,7 @@ class SharedKernelCache(dict):
             return
         start = time.time()
         try:
-            _export_kernel(kernel, obj, name, meta)
+            self._export(kernel, obj, name, meta)
         except Exception as e:  # noqa: BLE001 - the kernel works here; the others compile it
             _mark_failed(failed, f"{type(e).__name__}: {e}")
             return
@@ -425,8 +444,13 @@ class SharedKernelCache(dict):
 
 
 def share_kernel_caches(runners) -> None:
-    """Make the ``kernel_cache`` dict of each runner's class a :class:`SharedKernelCache`."""
+    """Make the ``kernel_cache`` dict of each runner's class a :class:`SharedKernelCache`, and
+    have a runner class whose kernels another library caches share that cache (the class's
+    ``share_kernel_caches()``)."""
     for runner in runners:
+        share = getattr(type(runner), "share_kernel_caches", None)
+        if callable(share):
+            share()
         for cls in type(runner).__mro__:
             cache = cls.__dict__.get("kernel_cache")
             if cache is None:
@@ -458,8 +482,9 @@ def _cute_identity() -> str:
     return _cute_salt
 
 
-def _export_kernel(kernel, obj: str, name: str, meta: str) -> None:
-    """Write a compiled CuTe DSL kernel to ``obj`` as an object file with entry symbol ``name``."""
+def _export_kernel(kernel, obj: str, name: str, meta: str, extra=None) -> None:
+    """Write a compiled CuTe DSL kernel to ``obj`` as an object file with entry symbol ``name``,
+    and ``extra``, a JSON value, beside it (:func:`_exported_extra`)."""
     import json
 
     tvm_ffi = any(c.__name__.startswith("TVMFFI") for c in type(kernel).__mro__)
@@ -471,10 +496,18 @@ def _export_kernel(kernel, obj: str, name: str, meta: str) -> None:
         with open(part, "wb") as f:
             f.write(kernel.dump_to_object(name))
     with open(f"{meta}.{os.getpid()}.part", "w") as f:
-        json.dump({"tvm_ffi": tvm_ffi}, f)
+        json.dump({"tvm_ffi": tvm_ffi, "extra": extra}, f)
     os.replace(f"{meta}.{os.getpid()}.part", meta)
     _fsync(part)
     os.replace(part, obj)
+
+
+def _exported_extra(meta: str):
+    """The ``extra`` value :func:`_export_kernel` wrote beside a kernel."""
+    import json
+
+    with open(meta) as f:
+        return json.load(f).get("extra")
 
 
 def _load_kernel(obj: str, name: str, meta: str):

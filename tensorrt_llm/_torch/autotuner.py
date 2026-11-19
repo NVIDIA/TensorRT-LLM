@@ -171,16 +171,19 @@ class TuningConfig:
         build_strategy (BuildStrategy): How the processes of a launch split the op's kernel
             builds. INDEPENDENT: each builds every kernel it needs. PARALLEL, for runners whose
             kernels are DeepGEMM builds or CuTe DSL kernels kept in their class's
-            ``kernel_cache``: when the processes share their JIT builds (TLLM_JIT_SHARE_DIR, or
-            by default the launch's directory on each node; see tensorrt_llm._jit_share), each
-            kernel is built by one process and loaded by the others. They split the profiles
-            not yet tuned through claims in that directory: for a single tactic, each rank
-            runs the profiles it claims first, setting aside one whose kernel another rank is
-            building, then the profiles other ranks claimed once those have run; for several
-            tactics under INDEPENDENT tuning, a build pass first runs each (profile, runner,
-            tactic) once on the rank that claims it, and the profiling that follows finds the
-            kernels built. The claims then take the place of the ``parallel_jit_warmup``
-            thread pool, which does not run.
+            ``kernel_cache`` (or in another library's cache that the class shares, its
+            ``share_kernel_caches()``): when the processes share their JIT builds
+            (TLLM_JIT_SHARE_DIR, or by default the launch's directory on each node; see
+            tensorrt_llm._jit_share), each kernel is built by one process and loaded by the
+            others. They split the profiles not yet tuned through claims in that directory: for
+            a single tactic, each rank runs the profiles it claims first, setting aside one
+            whose kernel another rank is building, then the profiles other ranks claimed once
+            those have run; for several tactics under INDEPENDENT tuning, a build pass first
+            runs each (profile, runner, tactic) once on the rank that claims it, and the
+            profiling that follows finds the kernels built. The claims then take the place of
+            the ``parallel_jit_warmup`` thread pool, which does not run. Under PARALLEL tuning
+            a rank builds the kernels of the pairs dealt to it, and loads those it runs later
+            (another profile's deal, the winners it primes) where another rank built them.
         cold_l2_flush_bytes (int): When > 0, every timed repeat first reads a buffer of this many
             bytes (evicting the operands, weights included, from L2) and each repeat is timed alone
             with %globaltimer stamps inside one CUDA graph; the median repeat is the tactic's time.
@@ -1574,13 +1577,20 @@ class AutoTuner:
                 )[0]
 
             # Every rank profiles under MERGE / PARALLEL, so they agree on the profiles to tune.
+            # PARALLEL deals the tactics of a profile only when every rank of the group profiles
+            # it: ranks build profiles from their own input shapes (attention DP).
             agreed_hits = None
+            undealt = set()
             if (self._needs_rank_agreement(strategy)
                     and strategy != DistributedTuningStrategy.BROADCAST):
-                agreed_hits = dict(
-                    zip([p.get_opt_shapes() for p in profiles],
-                        self._profile_hits_on_all_ranks(
-                            profiles, [is_cached(p) for p in profiles])))
+                keys = [p.get_opt_shapes() for p in profiles]
+                hits, everywhere = self._profile_hits_on_all_ranks(
+                    profiles, [is_cached(p) for p in profiles])
+                agreed_hits = dict(zip(keys, hits))
+                undealt = {
+                    key
+                    for key, shared in zip(keys, everywhere) if not shared
+                }
 
             def is_pending(p: OptimizationProfile) -> bool:
                 if agreed_hits is not None:
@@ -1594,7 +1604,12 @@ class AutoTuner:
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
                         *_, has_tuning_failure_occurred = self._profile_runners(
-                            custom_op, runners, tensors, p, tuning_config,
+                            custom_op,
+                            runners,
+                            tensors,
+                            p,
+                            tuning_config,
+                            deal=p.get_opt_shapes() not in undealt,
                             **kwargs)
                     new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
@@ -2056,8 +2071,12 @@ class AutoTuner:
         input_tensors: List[torch.Tensor],
         profile: OptimizationProfile,
         tuning_config: TuningConfig,
+        *,
+        deal: bool = True,
         **kwargs,
     ) -> float:
+        """``deal``: under PARALLEL, time this rank's share of the (runner, tactic) pairs; False
+        when another rank of the group does not profile ``profile``, to time them all."""
         # PARALLEL ranks profile different tactics, so window requests here would diverge the
         # per-rank pools and let a later request register a window collectively on some ranks only.
         window_guard = (nccl_window_allocation_suppressed()
@@ -2071,9 +2090,13 @@ class AutoTuner:
                 input_tensors = tuning_config.inputs_pre_hook(input_tensors)
             self._profiling_depth += 1
             try:
-                return self._profile_runners_impl(custom_op, runners,
-                                                  input_tensors, profile,
-                                                  tuning_config, **kwargs)
+                return self._profile_runners_impl(custom_op,
+                                                  runners,
+                                                  input_tensors,
+                                                  profile,
+                                                  tuning_config,
+                                                  deal=deal,
+                                                  **kwargs)
             finally:
                 self._profiling_depth -= 1
 
@@ -2084,6 +2107,8 @@ class AutoTuner:
         input_tensors: List[torch.Tensor],
         profile: OptimizationProfile,
         tuning_config: TuningConfig,
+        *,
+        deal: bool = True,
         **kwargs,
     ) -> float:
         """Profile runners and select the best tactic.
@@ -2185,10 +2210,10 @@ class AutoTuner:
             pair_offset = self._parallel_deal_start(
                 custom_op, profile, tuning_config.distributed_tuning_strategy)
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
-                valid_tactics = self._maybe_parallelize_tactics(
+                valid_tactics = (self._maybe_parallelize_tactics(
                     all_valid_tactics,
                     tuning_config.distributed_tuning_strategy,
-                    offset=pair_offset)
+                    offset=pair_offset) if deal else all_valid_tactics)
                 pair_offset += len(all_valid_tactics)
                 local_pairs += len(valid_tactics)
                 if "do_preparation" in runner_arg_names and len(
@@ -3108,19 +3133,24 @@ class AutoTuner:
         """Whether ``is_cache_hit`` holds on every rank (host all-gather)."""
         return all(self._dist.tp_cp_allgather(obj=bool(is_cache_hit)))
 
-    def _profile_hits_on_all_ranks(self, profiles: List[OptimizationProfile],
-                                   hits: List[bool]) -> List[bool]:
-        """Per profile, whether every rank that builds it has it cached (one host all-gather).
+    def _profile_hits_on_all_ranks(
+            self, profiles: List[OptimizationProfile],
+            hits: List[bool]) -> Tuple[List[bool], List[bool]]:
+        """Per profile, whether every rank that builds it has it cached, and whether every rank
+        builds it (one host all-gather).
 
         Ranks build their profiles from their own input shapes (attention DP), so the lists may differ.
         """
         keys = [p.get_opt_shapes() for p in profiles]
         missed = set()
+        everywhere = set(keys)
         for rank_keys, rank_hits in self._dist.tp_cp_allgather(
                 obj=(keys, [bool(hit) for hit in hits])):
             missed.update(key for key, hit in zip(rank_keys, rank_hits)
                           if not hit)
-        return [key not in missed for key in keys]
+            everywhere.intersection_update(rank_keys)
+        return ([key not in missed
+                 for key in keys], [key in everywhere for key in keys])
 
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
                              strategy: DistributedTuningStrategy) -> int:
