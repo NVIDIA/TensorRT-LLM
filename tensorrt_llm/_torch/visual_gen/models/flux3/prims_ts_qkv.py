@@ -34,6 +34,7 @@ from tensorrt_llm._torch.visual_gen import prims_ts
 from tensorrt_llm._torch.visual_gen.models.flux3.fused_gemm_common import (
     HEAD_DIM,
     fused_input_ok,
+    local_projection,
     nvfp4_projection_eligible,
     pack_nvfp4_qkv,
     qk_norm_epilogue_eligible,
@@ -196,10 +197,12 @@ def prepare_prims_ts_qkv(attn: nn.Module, enabled: bool) -> Optional[PrimsTsQKV]
     Returns the projection, or None when ``attn`` keeps the TRT-LLM path.
     """
     attn.prims_ts_qkv = None
-    if not enabled or getattr(attn, "tp_size", 1) != 1:
+    if not enabled:
         return None
     projections = tuple(getattr(attn, name, None) for name in ("to_q", "to_k", "to_v"))
-    if any(p is None for p in projections) or not all(map(nvfp4_projection_eligible, projections)):
+    if any(p is None for p in projections) or not all(
+        local_projection(p) and nvfp4_projection_eligible(p) for p in projections
+    ):
         return None
     if not prims_ts.device_supported(projections[0].weight.device):
         return None

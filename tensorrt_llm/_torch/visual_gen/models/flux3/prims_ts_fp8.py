@@ -29,6 +29,7 @@ from tensorrt_llm._torch.visual_gen import prims_ts
 from tensorrt_llm._torch.visual_gen.models.flux3.fused_gemm_common import (
     SWIGLU_PAIR_LAYOUT,
     fused_input_ok,
+    local_projection,
     plain_swiglu,
     qk_norm_epilogue_eligible,
     rope_table,
@@ -105,10 +106,12 @@ def prepare_prims_ts_fp8(block: nn.Module, enabled: bool) -> Optional[PrimsTsFP8
         # Already repacked: GatedMLP cannot run this block any more.
         block.prims_ts_fp8 = PrimsTsFP8Block(block)
         return block.prims_ts_fp8
-    if not enabled or getattr(attn, "tp_size", 1) != 1:
+    if not enabled:
         return None
     fused = (getattr(attn, "qkv_proj", None), ff.gate_up_proj)
-    if any(layer is None for layer in fused) or not all(map(prims_ts.fp8_gemm_eligible, fused)):
+    if any(layer is None for layer in fused) or not all(
+        local_projection(layer) and prims_ts.fp8_gemm_eligible(layer) for layer in fused
+    ):
         return None
     if not qk_norm_epilogue_eligible(attn) or not plain_swiglu(ff):
         return None

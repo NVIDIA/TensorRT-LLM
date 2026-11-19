@@ -223,7 +223,10 @@ are not supported. See the
   Loading by Hugging Face ID downloads both variants. To download one, fetch
   `modular_model_index.json`, `transformer/config.json`, `text_encoder/*`, `vae/*` and
   `variants/<variant>/*`, then pass the local directory.
-- Without tensor parallelism (`tp_size` 1), `nvfp4` and `fp8r` checkpoints run fused GEMM kernels automatically on supported Blackwell GPUs.
+- `nvfp4` and `fp8r` checkpoints run fused GEMM kernels automatically on supported Blackwell GPUs.
+  Under tensor parallelism a block fuses when each rank's weight shards fit the kernels and
+  otherwise keeps TRT-LLM's GEMMs (SM120 fuses at `tp_size` 1 only); at `TLLM_LOG_LEVEL=info`
+  the load log reports how many blocks are fused.
   Set `TRTLLM_FLUX3_PRIMS_TS_AUTOTUNE=1` to autotune the fused `fp8r` GEMMs on SM100/SM103/SM107
   in warmup's autotuning pass (`torch_compile_config.enable_autotune`); rank 0 tunes, every rank
   uses its tactics, and they are cached under `TRTLLM_FLUX3_PRIMS_TS_CACHE_DIR`

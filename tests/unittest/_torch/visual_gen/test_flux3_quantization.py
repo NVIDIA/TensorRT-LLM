@@ -11,6 +11,7 @@ import json
 import math
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -55,7 +56,12 @@ from tensorrt_llm._torch.visual_gen import (
 from tensorrt_llm._torch.visual_gen import pipeline_loader as pipeline_loader_module
 from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
-from tensorrt_llm._torch.visual_gen.models.flux3 import fused_gemm_common
+from tensorrt_llm._torch.visual_gen.models.flux3 import (
+    fused_gemm_common,
+    prims_ts_fp8,
+    prims_ts_qkv,
+    sm120_nvfp4,
+)
 from tensorrt_llm._torch.visual_gen.models.flux3.packed import pack
 from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import (
     Flux3DistilledPipeline,
@@ -971,6 +977,98 @@ def test_fp8r_blocks_share_one_quantize_under_tensor_parallelism(no_cuda, tp_siz
     assert fp8_blocks and len(fp8_blocks) < len(blocks)
     for block in blocks:
         assert block.share_fp8_quant == (block in fp8_blocks)
+
+
+# Whether klein blocks fuse at each tp_size: (Prims-TS FP8 blocks, Prims-TS NVFP4 Q/K/V, SM120
+# NVFP4 blocks, which fuse at tp 1 only). Per rank at tp 2/4/8, FP8 Q/K/V N is 4608/2304/1152
+# and gate/up N 9216/4608/2304, against Prims-TS's N % 512.
+FUSED_AT_TP_SIZE = {
+    1: (True, True, True),
+    2: (True, True, False),
+    4: (False, True, False),
+    8: (False, True, False),
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", list(FUSED_AT_TP_SIZE))
+@pytest.mark.parametrize(
+    "variant, sm100",
+    [
+        pytest.param("fp8r", True, id="fp8r"),
+        pytest.param("nvfp4", True, id="nvfp4"),
+        pytest.param("nvfp4", False, id="nvfp4-sm120"),
+    ],
+)
+def test_fused_gemms_follow_local_shards_under_tensor_parallelism(
+    no_cuda, monkeypatch, variant, sm100, tp_size
+):
+    """Each rank fuses a block whose column shards fit the kernels; the rest keep TRT-LLM's GEMMs.
+
+    So does a block whose Q/K/V forward gathers its output.
+    """
+    # An SM100 or an SM120 GPU with the kernels installed; the adapters only mark their blocks.
+    monkeypatch.setattr(prims_ts, "device_supported", lambda device: sm100)
+    monkeypatch.setattr(prims_ts.fp8, "device_supported", lambda device: sm100)
+    monkeypatch.setattr(sm120_nvfp4, "sm120_device", lambda device: not sm100)
+    for module, name in (
+        (prims_ts, "fp8_gemm_available"),
+        (prims_ts, "nvfp4_qkv_available"),
+        (sm120_nvfp4, "sm120_kernels_available"),
+    ):
+        monkeypatch.setattr(module, name, lambda: True)
+    monkeypatch.setattr(prims_ts_fp8, "PrimsTsFP8Block", lambda block: object())
+    monkeypatch.setattr(sm120_nvfp4, "Sm120NVFP4Block", lambda block: object())
+    monkeypatch.setattr(
+        prims_ts_qkv,
+        "PrimsTsQKV",
+        lambda attn, projections: SimpleNamespace(input_scale=projections[0].input_scale),
+    )
+    quant_config, _, _, dynamic_activations = DiffusionPipelineConfig.load_diffusion_quant_config(
+        variant_quantization_config(
+            variant,
+            bfl_hf_quant_config(KLEIN_CONFIG, variant),
+            bfl_variant_tensor_names(KLEIN_CONFIG, variant),
+        )
+    )
+    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_size - 1)
+    with MetaInitMode():
+        transformer = Flux3Transformer2DModel(
+            model_config(
+                KLEIN_CONFIG,
+                quant_config=quant_config,
+                force_dynamic_quantization=dynamic_activations,
+                skip_create_weights_in_init=True,
+                mapping=mapping,
+            )
+        )
+    blocks = [module for module in transformer.modules() if isinstance(module, _Flux3Block)]
+    gathered, *quantized = _blocks(transformer, QUANTIZED_METHODS[variant])
+    if variant == "nvfp4":
+        # Calibrated static input scales, one for the whole block input.
+        for block in (gathered, *quantized):
+            for layer in (block.attn.to_q, block.attn.to_k, block.attn.to_v, block.ff.gate_up_proj):
+                layer.input_scale = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+    (gathered.attn.qkv_proj if variant == "fp8r" else gathered.attn.to_k).gather_output = True
+    transformer._prepare_fused_gemms()
+
+    fp8, qkv, sm120 = FUSED_AT_TP_SIZE[tp_size]
+    expected = (
+        variant == "fp8r" and sm100 and fp8,
+        variant == "nvfp4" and sm100 and qkv,
+        variant == "nvfp4" and not sm100 and sm120,
+    )
+    for block in blocks:
+        fused = (
+            block.prims_ts_fp8 is not None,
+            block.attn.prims_ts_qkv is not None,
+            block.sm120_nvfp4 is not None,
+        )
+        assert fused == (expected if block in quantized else (False, False, False))
+    # Blocks on TRT-LLM's FP8 GEMMs quantize once; the fused NVFP4 Q/K/V shares with gate/up.
+    for block in quantized:
+        assert block.share_fp8_quant == (variant == "fp8r" and not expected[0])
+        assert block.share_nvfp4_quant == expected[1]
 
 
 @requires_prims_ts

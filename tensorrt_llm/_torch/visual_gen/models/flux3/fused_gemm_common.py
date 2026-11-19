@@ -17,6 +17,10 @@
 Fused kernels are picked from the GPU and the checkpoint, not by a user option. Set
 ``FUSED_GEMMS = False`` before the model loads to keep every projection on TRT-LLM's
 GEMMs (tests and A/B runs).
+
+Under tensor parallelism each rank fuses its own column shards of Q/K/V and gate/up, as the
+Linears they replace compute them, and the block still all-reduces once. Eligibility follows
+the local shapes, so a block whose shards do not fit a kernel keeps TRT-LLM's GEMMs.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from typing import Tuple
 import torch
 from torch import Tensor, nn
 
-from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
+from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod, TensorParallelMode
 from tensorrt_llm._torch.utils import compute_swizzled_sf_shape
 from tensorrt_llm._torch.visual_gen import prims_ts
 
@@ -78,6 +82,21 @@ prims_ts.register_tactics(
 def nvfp4_scale_bytes(rows: int, k: int) -> int:
     """Bytes of the padded 128x4-swizzled E4M3 block scales of a [rows, k] NVFP4 matrix."""
     return math.prod(compute_swizzled_sf_shape(rows, k // 16))
+
+
+def local_projection(layer: nn.Module) -> bool:
+    """A plain Linear whose forward is only its GEMM on this rank's weights.
+
+    A fused kernel runs in place of that forward, so the layer must not be a row shard or a
+    gathered column shard, run LoRA, or be a subclass that wraps the forward (such as a
+    token-sharded TP adapter).
+    """
+    return (
+        type(layer) is Linear
+        and layer.lora is None
+        and layer.tp_mode != TensorParallelMode.ROW
+        and not layer.gather_output
+    )
 
 
 def nvfp4_projection_eligible(layer: nn.Module) -> bool:

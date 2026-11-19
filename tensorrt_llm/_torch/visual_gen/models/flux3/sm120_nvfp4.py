@@ -35,6 +35,7 @@ from tensorrt_llm._torch.visual_gen import prims_ts
 from tensorrt_llm._torch.visual_gen.models.flux3.fused_gemm_common import (
     SWIGLU_PAIR_LAYOUT,
     fused_input_ok,
+    local_projection,
     nvfp4_projection_eligible,
     nvfp4_scale_bytes,
     pack_nvfp4_qkv,
@@ -313,11 +314,14 @@ def prepare_sm120_nvfp4(block: nn.Module, enabled: bool) -> Optional[Sm120NVFP4B
     if nvfp4 and getattr(gate_up, SWIGLU_PAIR_LAYOUT, False):
         # Already repacked: GatedMLP cannot run this block any more.
         return _attach(block)
+    # SM120 has no multi-GPU CI, so its blocks fuse at tp_size 1 only.
     if not enabled or getattr(attn, "tp_size", 1) != 1:
         return None
     projections = tuple(getattr(attn, name, None) for name in ("to_q", "to_k", "to_v"))
     layers = (*projections, gate_up, ff.down_proj)
     if any(layer is None for layer in layers) or not all(map(nvfp4_projection_eligible, layers)):
+        return None
+    if not all(map(local_projection, (*projections, gate_up))):
         return None
     if not sm120_device(gate_up.weight.device) or not qk_norm_epilogue_eligible(attn):
         return None

@@ -1346,7 +1346,8 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         GEMMs, which match or beat the alternatives at FLUX 3 shapes. SM120/SM121: the
         static-NVFP4 Q/K/V and gate/up GEMMs on CuTe DSL kernels, and attention-out and down
         on the same kernel through ``Sm120NVFP4LinearMethod``. Blocks left on TRT-LLM's
-        FP8-rowwise Q/K/V and gate/up GEMMs quantize their shared input once.
+        FP8-rowwise Q/K/V and gate/up GEMMs quantize their shared input once. Under tensor
+        parallelism each rank decides from its own shards' shapes.
         """
         enabled = fused_gemm_common.FUSED_GEMMS
         blocks = [m for m in self.modules() if isinstance(m, _Flux3Block)]
@@ -1367,8 +1368,8 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         elif enabled and _has_quantized_blocks(blocks):
             logger.warning_once(
                 "FLUX 3: no quantized block GEMM runs on a fused kernel. Fused GEMMs need "
-                "tp_size 1, an nvfp4 or fp8r checkpoint (static scales, plain SwiGLU) and "
-                "SM100/SM103/SM107 with flashinfer.prims_ts.gemm, or SM120/SM121 for nvfp4. "
-                "TRT-LLM's GEMMs run instead.",
+                "an nvfp4 or fp8r checkpoint (static scales, plain SwiGLU) whose per-rank "
+                "projection shapes fit the kernels, and SM100/SM103/SM107 with "
+                "flashinfer.prims_ts.gemm, or SM120/SM121 for nvfp4. TRT-LLM's GEMMs run instead.",
                 key="flux3_no_fused_gemm",
             )
