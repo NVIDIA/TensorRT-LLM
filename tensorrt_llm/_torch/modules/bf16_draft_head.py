@@ -89,6 +89,7 @@ class BF16DraftHead:
         weight = lm_head.weight
         self.lm_head = lm_head
         self.hidden_size = weight.shape[1]
+        self.weight_dtype = weight.dtype
         self.max_rows = rows
         tp_size = lm_head.tp_size
         self.rank = lm_head.tp_rank if tp_size > 1 else 0
@@ -111,6 +112,16 @@ class BF16DraftHead:
 
     def supports(self, rows: int) -> bool:
         return 1 <= rows <= self.max_rows
+
+    def serves(self, lm_head) -> bool:
+        """Whether this head still fits ``lm_head`` (e.g. after a weight refit): the same module,
+        whose weight keeps the shape and dtype the head was built for."""
+        weight = lm_head.weight
+        return (
+            lm_head is self.lm_head
+            and weight.shape[1] == self.hidden_size
+            and weight.dtype == self.weight_dtype
+        )
 
     def sample(self, x: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Greedy token ids ``[M]`` int32 (global vocabulary of the head), identical on every TP

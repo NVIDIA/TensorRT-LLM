@@ -684,9 +684,13 @@ def test_fused_draft_head_build(case, monkeypatch):
     )
     worker.guided_decoder = object()
     assert worker._fused_draft_head_for(1, md) is None
-    # A rebuild (weights reloaded) replaces it; the kill switch then drops it.
-    monkeypatch.setenv(FUSED_DRAFT_HEAD_ENV_VAR, "0")
+    # A rebuild for the same LM head (a weight refit) keeps the head and the scratch that captured
+    # CUDA graphs hold; another LM head gets a new one (none under the kill switch).
+    scratch = fused.scratch.data_ptr()
     worker.build_fused_draft_head(SimpleNamespace(lm_head=draft_lm_head))
+    assert worker.fused_draft_head is fused and fused.scratch.data_ptr() == scratch
+    monkeypatch.setenv(FUSED_DRAFT_HEAD_ENV_VAR, "0")
+    worker.build_fused_draft_head(SimpleNamespace(lm_head=_lm_head(hidden=1024)))
     assert worker.fused_draft_head is None
 
 

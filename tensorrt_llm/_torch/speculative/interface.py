@@ -2343,11 +2343,18 @@ class SpecWorkerBase(nn.Module, ABC):
         greedy argmax is enabled and the worker's draft head allows it.
 
         Every TP rank reaches the same decision (configuration and device
-        type); the head reuses the key exchange's peer buffers."""
-        self.fused_draft_head = None
-        if not self._vocab_parallel_argmax or draft_model is None:
+        type); the head reuses the key exchange's peer buffers.
+
+        A head built for the same LM head is kept: it reads the weights at
+        every call, and captured CUDA graphs hold its scratch (whose CTA
+        counter each launch leaves at zero), which must outlive a refit."""
+        lm_head = None
+        if self._vocab_parallel_argmax and draft_model is not None:
+            lm_head = self._fused_draft_lm_head(draft_model)
+        head = self.fused_draft_head
+        if head is not None and lm_head is not None and head.serves(lm_head):
             return
-        lm_head = self._fused_draft_lm_head(draft_model)
+        self.fused_draft_head = None
         if lm_head is not None and is_vocab_sharded_lm_head(lm_head):
             self.fused_draft_head = build_bf16_draft_head(
                 lm_head, self.key_exchange)
