@@ -120,13 +120,16 @@ def _probe_cutedsl_mxfp8_fused_fc12_rubin() -> Tuple[bool, str]:
 
 
 def _probe_cutedsl_mxfp8_fused_fc12_blackwell() -> Tuple[bool, str]:
+    # As for Rubin: the op module clears the flag if the kernel import fails.
+    from ...custom_ops import cute_dsl_custom_ops  # noqa: F401
     from ...cute_dsl_utils import IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE
 
     if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE:
         return True, ""
     return (
         False,
-        "installed CuTe DSL lacks cutlass.memory / cutlass.tensor_utils / Blackwell helpers",
+        "installed CuTe DSL lacks cutlass.memory / cutlass.tensor_utils / Blackwell helpers "
+        "or another module the Blackwell MXFP8 fused FC12 kernel imports",
     )
 
 
