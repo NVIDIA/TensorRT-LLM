@@ -460,6 +460,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_quant_ignore_runtime.py::test_final_linear_layout_and_scales_are_shared_without_requantization
   - visual_gen/test_quant_ignore.py::test_flux2_quant_ignore_compile_cuda_graph TIMEOUT (30)
   - visual_gen/test_quant_ignore.py::test_flux2_quant_ignore[attention_cutedsl_step] TIMEOUT (20)
+  - visual_gen/test_quant_ignore.py::test_ltx2_two_stage_linear_step_ignore_compile_cuda_graph TIMEOUT (40)
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
