@@ -127,14 +127,17 @@ For each file under `tests/` in the diff:
    ambiguous, dynamic, transitive, or non-test importer retains the directory
    fallback.
    ModelingV2 tests also have explicit groups spanning component directories.
-   For the named test and helper inputs, a whole-file fallback selects their
-   group instead of the containing directory; AST function/class anchors remain
-   unchanged. MiniMax-M3 MoE groups pair target tests with their matching family
-   router configuration, while collective-launch helpers select their target
-   scope and that configuration. SM103 communication groups span `comm/` and
+   For the named test and helper inputs, a whole-file fallback adds their
+   group to the ordinary anchors. Function/class anchors retain precise
+   selection where test-db registers files or functions; directory registrations
+   retain their associated directories. MiniMax-M3 MoE groups pair target tests
+   with their matching target router configuration, while collective-launch
+   helpers select their target scope and that configuration. SM103 communication groups span `comm/` and
    `ops/comm/`; the GLM GEMM group spans `gemm/` and its router test in
    `ops/gemm/`. Inputs on both sides of these component boundaries select the
-   same group. YAML block and hardware conditions still determine where each
+   same group. The GLM spec launch helpers retain the target-root MTP CPU guard;
+   guard changes retain the GR100 spec selection without adding other
+   CPU siblings. YAML block and hardware conditions still determine where each
    group runs. The shared FP4 helper selects the ModelingV2 test subtree, and
    the K3 engine helper selects its target subtree.
 3. `lookup_paths_into_block_filters` calls `find_match_for_path`
@@ -631,7 +634,9 @@ ModelingV2 test-side cross-directory associations are declared in the
 `MODELING_V2_TEST_GROUPS` table in `tests_def.py`. They preserve the existing
 component selection scope while related tests occupy both category and
 ops/category directories.
-Whole-file associations add to the ordinary walk-up anchors; function/class
-changes retain precise selection. The shared FP4 MoE helper explicitly selects
-the ModelingV2 unit root, including its model-family consumers and CPU guard.
+Whole-file associations add to the ordinary walk-up anchors. Function/class
+changes preserve associations for directory registrations while retaining
+precise file/function selection in other blocks. The shared FP4 MoE helper
+explicitly selects the ModelingV2 unit root, including its model-family
+consumers and CPU guard.
 The tables are checked against real repository paths and test-db registration.

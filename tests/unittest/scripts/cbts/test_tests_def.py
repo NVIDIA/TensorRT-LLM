@@ -982,6 +982,16 @@ def test_modeling_v2_cohort_sm107_comm_keeps_target_and_own_router(
 
 
 @pytest.mark.parametrize(
+    ("test_path", "sibling"),
+    [
+        (_COHORT_GLM_ROUTER, f"{_COHORT_GLM}/gemm/test_dense_gemm.py"),
+        (
+            f"{_COHORT_GLM}/test_modeling_v2_mtp_draft_moe.py",
+            f"{_COHORT_GLM}/spec/test_modeling_v2_draft_token_table.py",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
     ("change", "scoped"),
     [
         ("no-hunk", False),
@@ -993,7 +1003,7 @@ def test_modeling_v2_cohort_sm107_comm_keeps_target_and_own_router(
     ],
 )
 def test_modeling_v2_cohort_preserves_function_diff_narrowing(
-    tmp_path: Path, change: str, scoped: bool
+    tmp_path: Path, change: str, scoped: bool, test_path: str, sibling: str
 ) -> None:
     source = "VALUE = 1\n\ndef test_selected() -> None:\n    assert True\n"
     before = source
@@ -1009,23 +1019,20 @@ def test_modeling_v2_cohort_preserves_function_diff_narrowing(
     elif change == "body-delete":
         before = source + "    assert 1 == 1\n"
     diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), n=3))
-    git_path = f"tests/{_COHORT_GLM_ROUTER}"
+    git_path = f"tests/{test_path}"
     test_file = tmp_path / git_path
     test_file.parent.mkdir(parents=True)
     if change != "file-delete":
         test_file.write_text(after, encoding="utf-8")
-    selected = f"{_COHORT_GLM_ROUTER}::test_selected"
-    untouched = f"{_COHORT_GLM_ROUTER}::test_untouched"
-    sibling = f"{_COHORT_GLM}/gemm/test_dense_gemm.py"
+    selected = f"{test_path}::test_selected"
+    untouched = f"{test_path}::test_untouched"
     unrelated = f"{_COHORT_GLM}/ops/moe/test_experts.py"
     rule = _make_cohort_rule(
         tmp_path,
         {"l0_gr100": {selected, untouched, sibling, unrelated}},
         frozenset({"l0_gr100"}),
     )
-    assert rule._compute_anchors(git_path, _COHORT_GLM_ROUTER, diff) == [
-        selected if scoped else _COHORT_GLM_ROUTER
-    ]
+    assert rule._compute_anchors(git_path, test_path, diff) == [selected if scoped else test_path]
     result = rule.apply(PRInputs(changed_files=[git_path], diffs={git_path: diff}))
     assert result is not None
     expected = {selected} if scoped else {selected, untouched, sibling}
@@ -1062,6 +1069,114 @@ def test_modeling_v2_cohort_real_glm_gemm_excludes_rubin_moe(
     assert {f"{_COHORT_GLM}/gemm", f"{_COHORT_GLM}/ops/gemm"} <= entries["l0_gr100"]
     assert not any(path.startswith(f"{_COHORT_GLM}/ops/moe") for path in entries["l0_gr100"])
     assert "GR100-PyTorch-Post-Merge-1" in result.affected_stages
+
+
+@pytest.mark.parametrize(
+    ("relative", "expected_gr100"),
+    [
+        (
+            "ops/gemm/test_modeling_v2_router_gemm.py",
+            {f"{_COHORT_GLM}/gemm", f"{_COHORT_GLM}/ops/gemm"},
+        ),
+        ("test_modeling_v2_mtp_draft_moe.py", {f"{_COHORT_GLM}/spec"}),
+    ],
+)
+def test_modeling_v2_cohort_scoped_changes_keep_registered_directories(
+    modeling_v2_cohort_real_rule: CbtsTestsDefRule, relative: str, expected_gr100: set[str]
+) -> None:
+    repo = Path(__file__).resolve().parents[4]
+    git_path = f"tests/{_COHORT_GLM}/{relative}"
+    source = (repo / git_path).read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    )
+    before = source.splitlines(True)
+    before.insert(function.body[0].lineno - 1, "    assert True\n")
+    diff = "".join(difflib.unified_diff(before, source.splitlines(True)))
+    result = modeling_v2_cohort_real_rule.apply(
+        PRInputs(changed_files=[git_path], diffs={git_path: diff}, raw_diffs={git_path: diff})
+    )
+    assert result is not None
+    entries = _entries_by_stem(result)
+    assert entries["l0_gr100"] == expected_gr100
+    if relative == "test_modeling_v2_mtp_draft_moe.py":
+        assert entries["l0_cpu"] == {f"{_COHORT_GLM}/{relative}"}
+
+
+def test_modeling_v2_cohort_expansion_keeps_other_blocks_precise(tmp_path: Path) -> None:
+    git_path = f"tests/{_COHORT_GLM_ROUTER}"
+    source = "def test_selected():\n    assert True\n    assert 1 == 1\n"
+    path = tmp_path / git_path
+    path.parent.mkdir(parents=True)
+    path.write_text(source, encoding="utf-8")
+    diff = "@@ -1,2 +1,3 @@\n def test_selected():\n     assert True\n+    assert 1 == 1\n"
+    selected = f"{_COHORT_GLM_ROUTER}::test_selected"
+    rule = _make_cohort_rule(
+        tmp_path,
+        {
+            "l0_cpu": {selected, f"{_COHORT_GLM_ROUTER}::test_untouched"},
+            "l0_gr100": {
+                f"{_COHORT_GLM}/gemm",
+                f"{_COHORT_GLM}/ops/gemm",
+                f"{_COHORT_GLM}/ops/moe",
+            },
+        },
+    )
+    result = rule.apply(PRInputs(changed_files=[git_path], diffs={git_path: diff}))
+    assert result is not None
+    assert _selected_entries(result) == {
+        ("l0_cpu", 0): {selected},
+        ("l0_gr100", 0): {f"{_COHORT_GLM}/gemm", f"{_COHORT_GLM}/ops/gemm"},
+    }
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "test_modeling_v2_mtp_draft_moe.py",
+        "spec/_draft_step_rank_job.py",
+        "spec/_draft_step_op_matrix.py",
+    ],
+)
+def test_modeling_v2_cohort_real_glm_spec_keeps_cpu_guard(
+    modeling_v2_cohort_real_rule: CbtsTestsDefRule, relative: str
+) -> None:
+    result = modeling_v2_cohort_real_rule.apply(
+        PRInputs(changed_files=[f"tests/{_COHORT_GLM}/{relative}"], diffs={})
+    )
+    assert result is not None
+    entries = _entries_by_stem(result)
+    expected_cpu = {f"{_COHORT_GLM}/test_modeling_v2_mtp_draft_moe.py"}
+    if relative.startswith("spec/"):
+        expected_cpu |= {
+            f"{_COHORT_GLM}/spec/test_modeling_v2_draft_exchange.py",
+            f"{_COHORT_GLM}/spec/test_modeling_v2_small_batch_mtp.py",
+        }
+    assert entries["l0_cpu"] == expected_cpu
+    assert entries["l0_gr100"] == {f"{_COHORT_GLM}/spec"}
+    assert "GR100-PyTorch-Post-Merge-1" in result.affected_stages
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "test_modeling_v2_draft_token_table.py",
+        "test_modeling_v2_draft_exchange.py",
+        "test_modeling_v2_small_batch_mtp.py",
+    ],
+)
+def test_modeling_v2_cohort_real_glm_spec_tests_do_not_expand_cpu_selection(
+    modeling_v2_cohort_real_rule: CbtsTestsDefRule, name: str
+) -> None:
+    path = f"{_COHORT_GLM}/spec/{name}"
+    result = modeling_v2_cohort_real_rule.apply(PRInputs(changed_files=[f"tests/{path}"], diffs={}))
+    assert result is not None
+    entries = _entries_by_stem(result)
+    expected_cpu = set() if name == "test_modeling_v2_draft_token_table.py" else {path}
+    assert entries.get("l0_cpu", set()) == expected_cpu
+    assert entries["l0_gr100"] == {f"{_COHORT_GLM}/spec"}
 
 
 def test_modeling_v2_cohort_real_k3_helper_keeps_root_checks(

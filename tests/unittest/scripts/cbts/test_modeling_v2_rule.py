@@ -567,7 +567,9 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
     assert seen == expected
 
 
-def test_stage_coverage_requires_an_affected_stage(repository_rule) -> None:
+def test_stage_coverage_requires_an_affected_stage(
+    repository_rule: tuple[ModelingV2Rule, YAMLIndex, dict[str, Stage]],
+) -> None:
     rule, index, stages = repository_rule
     source = f"{_PY}/models/minimax_m3/ops/comm/m3_allreduce.py"
     result = _apply(rule, source)

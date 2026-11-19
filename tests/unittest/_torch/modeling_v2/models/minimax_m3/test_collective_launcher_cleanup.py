@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import pytest
 
@@ -128,7 +128,7 @@ def test_rank_runner_resolves_launcher_without_entry_name_table(
     class LauncherLocated(Exception):
         pass
 
-    def load_constants(path):
+    def load_constants(path: Path) -> NoReturn:
         selected.append(path)
         raise LauncherLocated
 

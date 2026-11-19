@@ -106,6 +106,16 @@ MODELING_V2_TEST_GROUPS: dict[str, tuple[str, ...]] = {
         "unittest/_torch/modeling_v2",
     ),
     f"tests/{_K3_TP16_EP1_UNIT_DIR}/ops/moe/_k3_moe_engines.py": (_K3_TP16_EP1_UNIT_DIR,),
+    # This GPU-only anchor selects spec without its separately registered CPU siblings.
+    f"tests/{_GLM_SM107_UNIT_DIR}/test_modeling_v2_mtp_draft_moe.py": (
+        f"{_GLM_SM107_UNIT_DIR}/spec/test_modeling_v2_draft_token_table.py",
+    ),
+    **{
+        f"tests/{_GLM_SM107_UNIT_DIR}/spec/{name}": (
+            f"{_GLM_SM107_UNIT_DIR}/test_modeling_v2_mtp_draft_moe.py",
+        )
+        for name in ("_draft_step_op_matrix.py", "_draft_step_rank_job.py")
+    },
     **{
         f"tests/{_GLM_SM107_UNIT_DIR}/{relative}": (
             f"{_GLM_SM107_UNIT_DIR}/gemm",
@@ -172,6 +182,13 @@ _CLASS_RE = re.compile(r"class\s+(\w+)")
 # `acceptance_length.yaml` keys tests directly (`TestC::test_m`) instead of
 # by HF model name, unlike every other reference YAML.
 _TEST_ID_KEY_RE = re.compile(r"^(Test\w+)::(\w+)$")
+
+
+def _has_directory_entry(prefix_to_entries: dict[str, set[str]]) -> bool:
+    paths = (
+        entry.split(maxsplit=1)[0] for entries in prefix_to_entries.values() for entry in entries
+    )
+    return any("::" not in path and not path.endswith(".py") for path in paths)
 
 
 def _direct_test_importers(
@@ -735,22 +752,25 @@ class TestsDefRule(Rule):
                     if yaml_path is not None
                     else []
                 )
-                if anchors == [yaml_path]:
-                    group = MODELING_V2_TEST_GROUPS.get(git_path)
-                    if group is not None:
-                        # Package-file anchors keep directory scopes at their own level.
-                        anchors = list(
-                            dict.fromkeys(
-                                [
-                                    *anchors,
-                                    *(
-                                        path if path.endswith(".py") else f"{path}/__init__.py"
-                                        for path in group
-                                    ),
-                                ]
-                            )
-                        )
+                whole_file = anchors == [yaml_path]
+                # Package-file anchors keep directory scopes at their own level.
+                group_anchors = [
+                    path if path.endswith(".py") else f"{path}/__init__.py"
+                    for path in MODELING_V2_TEST_GROUPS.get(git_path, ())
+                ]
+                if whole_file:
+                    anchors = list(dict.fromkeys([*anchors, *group_anchors]))
                 file_bf, _ = lookup_paths_into_block_filters(self.yaml_index, anchors)
+                if group_anchors and not whole_file:
+                    group_bf, _ = lookup_paths_into_block_filters(self.yaml_index, group_anchors)
+                    for key, prefixes in group_bf.items():
+                        # A scoped anchor still runs a whole registered directory. Keep
+                        # its associations without widening blocks with precise entries.
+                        if not _has_directory_entry(file_bf.get(key, prefixes)):
+                            continue
+                        dst = file_bf.setdefault(key, {})
+                        for prefix, ids in prefixes.items():
+                            dst.setdefault(prefix, set()).update(ids)
             if qa_perf:
                 for key, prefix_to_ids in qa_blocks.items():
                     dst = file_bf.setdefault(key, {})
