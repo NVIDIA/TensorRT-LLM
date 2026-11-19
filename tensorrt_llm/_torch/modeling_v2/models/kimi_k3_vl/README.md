@@ -47,9 +47,9 @@ The recipe:
   OpWrappers are in the family directories, named `*_ull.py` where a family file of the same name
   differs; its runtime pieces are `ops/common/k3_ull_runtime.py` (the step shell),
   `ops/cache/k3_ull_cache_manager.py` and `ops/cache/k3_ull_kda_checkpoints.py` (its KV cache
-  manager and KDA checkpoints) and `ops/attention/k3_ull_helix_tail_workspace.py`; its copy of
-  vLLM MR8's decode kernels is `kernels/vendor/vllm_mr8/`, layout unchanged (provenance in
-  `kernels/SOURCE.json`). `FLAT_*_SOURCE.json` map its functions to the served tree.
+  manager and KDA checkpoints) and `ops/attention/k3_ull_helix_tail_workspace.py`; its specialized
+  decode kernels live under `kernels/k3r_*/ull/` and `kernels/k3r_comm/`, with
+  source and local changes recorded in `kernels/SOURCE.json`. `FLAT_*_SOURCE.json` map its functions to the served tree.
 - The targets share code only through the family directories:
   - `kernels/<kind>/`: the kernels. The SM107 ones are `k3r_*`; `k3_*` are the sm_100 targets'.
   - `ops/<kind>/`: their OpWrappers and the runtime pieces several targets and the drafter use

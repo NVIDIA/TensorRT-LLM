@@ -64,7 +64,7 @@ Merged into this module, in this order (``MOVE.json`` in the family directory):
 * ``_chain_nv.py``: The NVFP4 routed experts of the chain's MoE layers
   (``moe.prepared.PreparedMoE``).
 * ``chain.py``: The KDA + MoE kernel chain of one rank (vLLM MR8's TP16 decode kernels,
-  ``kernels/mr8``).
+  ``kernels/k3r_*/ull/``).
 * ``dflash.py``: The target head and the DSpark worker of the Kimi K3 SM107 Helix16 ULL target.
 * ``drafter.py``: The DSpark drafter of the Kimi K3 SM107 Helix16 ULL target
   (Inferact/Kimi-K3-DSpark, 5 MLA layers) and its installation on the target.
