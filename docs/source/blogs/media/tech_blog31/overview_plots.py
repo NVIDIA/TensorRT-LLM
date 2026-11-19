@@ -3,6 +3,7 @@
 """Render decoder structure and measured WinoVAE workload profiles."""
 
 import json
+import re
 from pathlib import Path
 
 import matplotlib
@@ -24,6 +25,36 @@ WORKLOADS = [
 ]
 
 
+# Intrinsic widths in CSS pixels. The SVG viewBox sets the aspect ratio.
+DISPLAY_WIDTHS = {
+    "decoder_graph": 480,
+    "fusion": 480,
+    "upsample_fold": 505,
+    "causal_first_frame": 450,
+    "transform_stages": 425,
+    "channel_flow": 480,
+    "spatial_tiles": 465,
+    "coordinate_gemm": 820,
+    "cost_flops": 520,
+    "cost_workspace": 520,
+    "cudnn_sweep": 545,
+    "latency": 465,
+    "halo_latency": 505,
+    "nvfp4_error": 490,
+}
+
+
+def article_svg(svg: str, name: str) -> str:
+    if name in DISPLAY_WIDTHS:
+        svg = re.sub(
+            r'(<svg\b[^>]*?) width="[^"]+" height="[^"]+"',
+            rf'\g<1> width="{DISPLAY_WIDTHS[name]}"',
+            svg,
+            count=1,
+        )
+    return "\n".join(line.rstrip() for line in svg.splitlines()) + "\n"
+
+
 def save(fig: plt.Figure, name: str) -> None:
     rights = "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved."
     fig.savefig(
@@ -38,7 +69,7 @@ def save(fig: plt.Figure, name: str) -> None:
     fig.savefig(
         target, bbox_inches="tight", pad_inches=0.16, facecolor="white", metadata={"Rights": rights}
     )
-    target.write_text("\n".join(line.rstrip() for line in target.read_text().splitlines()) + "\n")
+    target.write_text(article_svg(target.read_text(), name))
     plt.close(fig)
 
 

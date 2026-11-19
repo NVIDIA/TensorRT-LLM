@@ -12,31 +12,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import overview_plots
 from matplotlib.patches import Rectangle
+from overview_plots import save
 
 ROOT = Path(__file__).resolve().parent
 BLUE, GREEN, ORANGE, DARK = "#2563A6", "#507C0C", "#BD5B16", "#203044"
 PALE_BLUE, PALE_GREEN, PALE_ORANGE = "#DCE9F7", "#E3EFD3", "#FBE5D3"
 GREY, PALE_GREY = "#697586", "#F1F3F5"
-
-
-def save(fig: plt.Figure, name: str) -> None:
-    copyright_text = "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved."
-    fig.savefig(
-        ROOT / f"{name}.png",
-        dpi=200,
-        facecolor="white",
-        bbox_inches="tight",
-        pad_inches=0.16,
-        metadata={"Copyright": copyright_text},
-    )
-    fig.savefig(
-        ROOT / f"{name}.svg",
-        facecolor="white",
-        bbox_inches="tight",
-        pad_inches=0.16,
-        metadata={"Rights": copyright_text},
-    )
-    plt.close(fig)
 
 
 def canvas(height: float) -> tuple[plt.Figure, plt.Axes]:
