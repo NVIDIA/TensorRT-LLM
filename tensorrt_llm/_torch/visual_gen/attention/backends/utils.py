@@ -38,7 +38,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name and sparse algorithm.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4", "SAGEATTN")
         sparse_algorithm: ``algorithm`` of the sparse attention config, if any. VSA
             ("vsa") and SOL ("sol_attn") have their own TRTLLM and CUTEDSL classes;
             other algorithms, such as skip-softmax, run in the dense class.
@@ -54,6 +54,8 @@ def get_visual_gen_attention_backend(
                         and architecture-specific NVFP4 attention recipes.
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
+        - "SAGEATTN": SageAttention (INT8 QK / FP8 PV) from thu-ml/SageAttention;
+                      SM120 only, optional ``sageattention`` package.
         - "CUTEDSL": CuTe DSL kernels: dense/SkipSoftmax FMHA, VSA or SOL depending on
                      ``sparse_algorithm``.
         - "CUDNN": cuDNN fused SDPA. Unquantized by default; quant_attention_config
@@ -94,6 +96,10 @@ def get_visual_gen_attention_backend(
         from .flash_attn4 import FlashAttn4Attention
 
         return FlashAttn4Attention
+    elif backend_name == "SAGEATTN":
+        from .sageattention import SageAttention
+
+        return SageAttention
     elif backend_name == "CUTEDSL":
         from .cute_dsl import CuTeDSLAttention
 
@@ -130,7 +136,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4", "SAGEATTN")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head

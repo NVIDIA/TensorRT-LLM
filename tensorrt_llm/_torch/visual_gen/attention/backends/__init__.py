@@ -26,6 +26,7 @@ from .flash_attn4 import FlashAttn4Attention
 from .flashinfer import FlashInferAttention
 from .interface import AttentionBackend, AttentionTensorLayout
 from .parallel import Attention2DAttention, RingAttention, UlyssesAttention, wrap_parallel_attention
+from .sageattention import SageAttention
 from .trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from .utils import create_attention, get_visual_gen_attention_backend
 from .vanilla import VanillaAttention
@@ -39,6 +40,7 @@ __all__ = [
     "FlashAttn4Attention",
     "FlashInferAttention",
     "RingAttention",
+    "SageAttention",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
     "UlyssesAttention",
