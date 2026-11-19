@@ -23,7 +23,6 @@ Tests that merely *use* an implementation, such as weight loading, staged hooks,
 or numerical parity across backends, belong in ``test_moe_backend.py``.
 """
 
-import contextlib
 import dataclasses
 import importlib
 from types import SimpleNamespace
@@ -467,10 +466,6 @@ def test_per_layer_dynamic_eplb_filters_backends_by_declared_capability():
     assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
 
 
-
-
-
-
 def test_pinned_megamoe_cutedsl_identity_fails_hard_on_another_format():
     """A pin that cannot run must fail, not widen to the sibling that can.
 
@@ -601,10 +596,6 @@ def test_per_layer_dynamic_eplb_refuses_the_mxfp4_mtp_layer(backend: str) -> Non
     assert report.winner is None
     with pytest.raises(UnsupportedError, match="no MoE implementation can serve this layer"):
         impl_class_for(report)
-
-
-
-
 
 
 # =====================================================================
