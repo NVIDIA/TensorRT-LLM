@@ -135,6 +135,11 @@ def _run_warmup_tracked(
         patch.object(model_engine, "_general_warmup", side_effect=tracker("general_warmup")),
         patch.object(model_engine, "_run_autotuner_warmup", side_effect=tracker("autotuner")),
         patch.object(
+            model_engine,
+            "_prewarm_lowm_mma_row_buckets",
+            side_effect=tracker("lowm_mma_row_buckets"),
+        ),
+        patch.object(
             model_engine._graphs,
             "_capture_generation_cuda_graphs",
             side_effect=tracker("generation_cuda_graph"),
@@ -1096,6 +1101,17 @@ def test_lowm_row_bucket_prewarm_always_meets_its_peers(
 
 
 class TestWarmupCleanup(unittest.TestCase):
+    def test_lowm_row_bucket_prewarm_runs_between_the_autotuner_and_capture(self) -> None:
+        """The low-M MMA row-bucket prewarm runs once the eager warmup forwards (the autotuner's
+        last) have run, and before the CUDA graphs are captured."""
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
+        calls, _ = _run_warmup_tracked(model_engine, resource_manager)
+
+        self.assertIn("lowm_mma_row_buckets", calls)
+        prewarm = calls.index("lowm_mma_row_buckets")
+        self.assertLess(calls.index("autotuner"), prewarm, calls)
+        self.assertLess(prewarm, calls.index("generation_cuda_graph"), calls)
+
     def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after
         _run_autotuner_warmup."""

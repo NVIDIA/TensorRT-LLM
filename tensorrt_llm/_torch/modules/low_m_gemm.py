@@ -1218,10 +1218,18 @@ def _a_operand(x: torch.Tensor, rows: int) -> Tuple[torch.Tensor, Any]:
     rows, else ``x`` copied into the first rows of a ``rows``-row buffer of the current stream."""
     if x.shape[0] >= rows:
         return x, graph_safe_from_dlpack(x)
+    shape = (rows,) + tuple(x.shape[1:])
+    if torch.cuda.is_current_stream_capturing():
+        # Under capture the buffer comes from the graph's private pool: keep it to this capture.
+        buf = x.new_zeros(shape)
+        buf[: x.shape[0]].copy_(x)
+        return buf, graph_safe_from_dlpack(buf)
     key = (torch.cuda.current_stream(x.device).cuda_stream, x.device, x.dtype, rows, x.shape[1:])
     buf = _A_STAGING.get(key)
     if buf is None:
-        buf = _A_STAGING[key] = x.new_zeros((rows,) + tuple(x.shape[1:]))
+        # A normal tensor even under inference mode, so calls in and out of it can both write it.
+        with torch.inference_mode(False):
+            buf = _A_STAGING[key] = x.new_zeros(shape)
     buf[: x.shape[0]].copy_(x)
     return buf, _cute_view(buf)
 
@@ -1232,16 +1240,26 @@ def prewarm_mma_row_buckets() -> Tuple[int, int]:
 
     Run after the eager warmup forwards and before CUDA graph capture, it compiles the buckets they
     did not reach before a capture or a request can need them. A GEMM that no call outside a decode
-    CUDA graph has run yet is not covered.
+    CUDA graph has run yet is not covered. A bucket that fails to compile is reported and left to
+    its first call; the other buckets still compile.
     """
     compiled = 0
     signatures = list(_MMA_SIGNATURES)
     for args, kwargs in signatures:
         for rows in _MMA_ROW_BUCKETS:
-            if (rows, (args, kwargs)) not in _MMA_BUILT:
+            if (rows, (args, kwargs)) in _MMA_BUILT:
+                continue
+            try:
                 _compiled_mma(rows, *args, **dict(kwargs))
-                _MMA_BUILT.add((rows, (args, kwargs)))
-                compiled += 1
+            except Exception as e:
+                # A prewarm miss only defers this compile to the first call that needs it.
+                logger.warning(
+                    f"Low-M MMA GEMM row bucket {rows} of {args} {dict(kwargs)} not prewarmed. "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+            _MMA_BUILT.add((rows, (args, kwargs)))
+            compiled += 1
         logger.debug(f"Low-M MMA GEMM row buckets compiled for {args} {dict(kwargs)}")
     return compiled, len(signatures)
 

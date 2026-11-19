@@ -11,7 +11,7 @@ import gc
 import sys
 import time
 from typing import Any, Callable
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -853,6 +853,10 @@ def test_eager_rows_run_the_row_bucket_kernel_bitwise(
     results = [r if isinstance(r, tuple) else (r,) for r in (eager, captured, exact, reused)]
     if variant == "split_n":
         assert [t.shape for t in results[0]] == [(m, 128), (m, 384)]
+    if variant == "index_query":
+        data, scales = results[0]
+        assert data.shape == (m, 4, 64) and data.dtype == torch.int8
+        assert scales.shape == (m, 4, 4) and scales.dtype == torch.uint8
     assert len({len(r) for r in results}) == 1
     for outputs in zip(*results):
         for t in outputs:
@@ -891,6 +895,49 @@ def test_prewarm_compiles_every_row_bucket_of_eager_calls_only(
     assert compiled_mma.cache_info().misses == 13
     bf16_lowm_linear(rows(13), graph_w)
     assert compiled_mma.cache_info().misses == 14
+
+
+@_skip_no_lowm_fp8
+def test_padded_calls_run_in_and_out_of_inference_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A padded call's staging buffer is a normal tensor: calls in and out of inference mode both
+    write it, and both match the exact-row kernel."""
+    for name, fresh in (("_A_STAGING", {}), ("_MMA_SIGNATURES", {}), ("_MMA_BUILT", set())):
+        monkeypatch.setattr(_mod, name, fresh)
+    monkeypatch.setattr(_mod, "_MMA_ROUTES", {})
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    x = torch.randn(13, 512, device="cuda").to(torch.bfloat16)
+    with torch.inference_mode():
+        inside = bf16_lowm_linear(x, w)
+    outside = bf16_lowm_linear(x, w)
+    with flashinfer_mxfp8_decode_graph_capture():
+        exact = bf16_lowm_linear(x, w)
+    assert torch.equal(inside, exact) and torch.equal(outside, exact)
+
+
+@_skip_no_lowm_fp8
+def test_prewarm_keeps_going_past_a_failed_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bucket that fails to compile is reported and left to its first call; the other buckets of
+    its GEMM and the other GEMMs still compile."""
+    compiled_mma = _mod._compiled_mma
+
+    def flaky(rows: int, *args: Any, **kwargs: Any) -> Any:
+        if rows == 16 and args[0] == 64:
+            raise RuntimeError("no compiler")
+        return compiled_mma(rows, *args, **kwargs)
+
+    monkeypatch.setattr(_mod, "_compiled_mma", flaky)
+    for name, fresh in (("_MMA_SIGNATURES", {}), ("_MMA_BUILT", set()), ("_MMA_ROUTES", {})):
+        monkeypatch.setattr(_mod, name, fresh)
+    x = torch.zeros(3, 512, device="cuda", dtype=torch.bfloat16)
+    for n in (64, 72):
+        bf16_lowm_linear(x, torch.randn(n, 512, device="cuda").to(torch.bfloat16))
+    with patch.object(_mod.logger, "warning") as warning:
+        assert _mod.prewarm_mma_row_buckets() == (2 * 11 - 1, 2)
+    warning.assert_called_once()
+    for signature in _mod._MMA_SIGNATURES:
+        for rows in _mod._MMA_ROW_BUCKETS:
+            failed = rows == 16 and signature[0][0] == 64
+            assert ((rows, signature) in _mod._MMA_BUILT) is not failed
 
 
 @_skip_no_lowm_fp8
