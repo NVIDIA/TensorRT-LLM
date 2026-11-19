@@ -56,7 +56,7 @@ def _run(
     # Do not use manage._run_git here: its synthetic identity is for
     # patch generation. Real promotion commits must use the maintainer's identity.
     env = os.environ.copy()
-    for key in vendor._GIT_LOCAL_ENVIRONMENT_VARIABLES:
+    for key in vendor._GIT_LOCAL_ENVIRONMENT_VARIABLES | vendor._GIT_PATHSPEC_ENVIRONMENT_VARIABLES:
         env.pop(key, None)
     env.setdefault("GH_CONFIG_DIR", str(Path.home() / ".config/gh"))
     env.update(GIT_TERMINAL_PROMPT="0", GH_PROMPT_DISABLED="1", GIT_NO_REPLACE_OBJECTS="1")

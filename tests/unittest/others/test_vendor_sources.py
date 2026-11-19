@@ -667,6 +667,7 @@ def test_git_subprocesses_ignore_ambient_repository_environment(tmp_path: Path) 
             "GIT_WORK_TREE": str(upstream),
             "GIT_INDEX_FILE": str(upstream / ".git" / "index"),
             "GIT_OBJECT_DIRECTORY": str(upstream / ".git" / "objects"),
+            "GIT_GLOB_PATHSPECS": "1",
         },
     )
 

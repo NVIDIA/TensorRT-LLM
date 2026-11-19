@@ -1531,6 +1531,7 @@ def test_command_preserves_identity_and_config(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/test-gh-config")
     monkeypatch.setenv("GIT_AUTHOR_NAME", "Real Maintainer")
     monkeypatch.setenv("GIT_DIR", "/unrelated/git")
+    monkeypatch.setenv("GIT_LITERAL_PATHSPECS", "1")
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
         env = kwargs["env"]
@@ -1538,6 +1539,7 @@ def test_command_preserves_identity_and_config(monkeypatch: pytest.MonkeyPatch) 
         assert env["GIT_AUTHOR_NAME"] == "Real Maintainer"
         assert env["GIT_LFS_SKIP_SMUDGE"] == "1"
         assert "GIT_DIR" not in env
+        assert "GIT_LITERAL_PATHSPECS" not in env
         assert "shell" not in kwargs
         return subprocess.CompletedProcess(command, 0, "ok\n", "")
 

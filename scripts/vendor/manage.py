@@ -68,6 +68,14 @@ _GIT_LOCAL_ENVIRONMENT_VARIABLES = {
     "GIT_SHALLOW_FILE",
     "GIT_WORK_TREE",
 }
+# The tools choose their own pathspec semantics: GIT_LITERAL_PATHSPECS here, and explicit magic
+# such as :(top,literal) in promotion. An inherited global mode would change or reject them.
+_GIT_PATHSPEC_ENVIRONMENT_VARIABLES = {
+    "GIT_GLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+}
 _VENDOR_FIELDS = {
     "url",
     "branch",
@@ -883,7 +891,7 @@ def _git_environment(
     *, isolated: bool, repository_ceiling: Path | None = None, index_file: str | None = None
 ) -> dict[str, str]:
     environment = os.environ.copy()
-    for variable in _GIT_LOCAL_ENVIRONMENT_VARIABLES:
+    for variable in _GIT_LOCAL_ENVIRONMENT_VARIABLES | _GIT_PATHSPEC_ENVIRONMENT_VARIABLES:
         environment.pop(variable, None)
     if index_file is not None:
         environment["GIT_INDEX_FILE"] = index_file
