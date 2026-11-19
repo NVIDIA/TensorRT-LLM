@@ -872,6 +872,7 @@ def test_idle_fetch_publishes_rank_observations_before_wait(clock, poll_seconds)
         stats_lock=threading.Lock(),
         max_stats_len=2,
         _last_rank_observations={},
+        _pending_rank_observations={},
         _disagg_coordinator=SimpleNamespace(transfer_outcomes=(0, 1, 0)),
         _idle_kv_transfer_poll_timeout=lambda: poll,
         _conversation_manager=manager,
@@ -887,31 +888,33 @@ def test_idle_fetch_publishes_rank_observations_before_wait(clock, poll_seconds)
 
     def fetch(timeout, **options):
         assert (timeout, options) == (poll, kwargs)
-        assert stub.stats == [("per_rank_dict", row)]
+        assert PyExecutor.get_latest_iteration_stats(stub) == [("per_rank_dict", row)]
         return []
 
     stub.executor_request_queue.get_from_request_queue.side_effect = fetch
     PyExecutor._fetch_and_enqueue_requests(stub, _WaitingQueue(), 0)
     stub._publish_rank_observations()
-    assert stub.stats == [("per_rank_dict", row)]
+    assert not stub._pending_rank_observations
     if manager is not None:
         manager.snapshot_activity.assert_called_once_with(clock.value)
     stub.enable_iter_perf_stats = False
     stub._disagg_coordinator.transfer_outcomes = (0, 2, 0)
     stub._publish_rank_observations()
-    assert stub.stats == [("per_rank_dict", row)]
+    assert not stub._pending_rank_observations
 
 
 @pytest.mark.parametrize("payload_kind", ["idle", "queued", "synthetic"])
 def test_adp_exchange_publishes_current_peer_observations(clock, payload_kind):
     from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
     from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
     from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
 
     rank0, rank1 = (_attention_dp_rank(rank, clock) for rank in (0, 1))
     rank0._last_rank_observations = {}
-    rank0.max_stats_len = 1
-    rank0.stats.append("older sample")
+    rank0._pending_rank_observations = {}
+    rank0.max_stats_len = 0
+    rank0.stats.append("iteration sample")
     activity = ConversationActivityStats(1, 1, 0, 0, 2, 0, 0, 0)
     outcomes = Mock(return_value=(0, 0, 0))
     rank1._adp_iter_stats = ADPIterStatsBuffer(
@@ -934,19 +937,19 @@ def test_adp_exchange_publishes_current_peer_observations(clock, payload_kind):
     for count in (1, 2):
         outcomes.return_value = (0, count, 0)
         exchange()
-        assert rank0.stats == [
-            (
-                "per_rank_dict",
-                {
-                    "attentionDpRank": 1,
-                    "kvTransferOutcomes": {"success": 0, "error": count, "timeout": 0},
-                    "conversationActivity": activity.to_dict(),
-                },
-            )
-        ]
-        rank0.stats.clear()
-        exchange()
-        assert rank0.stats == []
+    assert PyExecutor.get_latest_iteration_stats(rank0) == [
+        "iteration sample",
+        (
+            "per_rank_dict",
+            {
+                "attentionDpRank": 1,
+                "kvTransferOutcomes": {"success": 0, "error": 2, "timeout": 0},
+                "conversationActivity": activity.to_dict(),
+            },
+        ),
+    ]
+    exchange()
+    assert not PyExecutor.get_latest_iteration_stats(rank0)
 
 
 @pytest.mark.parametrize(

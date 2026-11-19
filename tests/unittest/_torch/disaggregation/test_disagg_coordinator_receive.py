@@ -150,7 +150,7 @@ def test_async_receive_starts_every_request_then_polls_status_once(clock, timeou
     assert h.effects.failed == []
 
 
-@pytest.mark.parametrize("outcome", ["complete", "error"])
+@pytest.mark.parametrize("outcome", ["complete", "error", "native_complete_after_cancel"])
 def test_async_receive_that_settles_immediately_is_reaped_in_the_same_call(outcome) -> None:
     """The trailing status poll picks up a receive that settled as soon as it
     started, so its completion or failure is applied without waiting for the
@@ -161,18 +161,24 @@ def test_async_receive_that_settles_immediately_is_reaped_in_the_same_call(outco
 
     def start_and_settle(request):
         start(request)
-        h.transceiver.finish_recv(request, outcome)
+        if outcome == "native_complete_after_cancel":
+            request.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            h.registry.canceled = [request.py_request_id]
+        else:
+            h.transceiver.finish_recv(request, outcome)
 
     h.transceiver.request_and_receive_async = start_and_settle
-
     h.coordinator.receive_gen_init([req])
 
-    if outcome == "complete":
-        assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-        assert h.effects.failed == []
-    else:
+    if outcome == "error":
         assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
         assert h.effects.failed == [(_GEN_ERROR_MSG, [req], False)]
+        assert h.coordinator.transfer_outcomes == (0, 1, 0)
+    else:
+        assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        assert h.effects.failed == []
+        h.coordinator.reap_gen_receives()
+        assert h.coordinator.transfer_outcomes == (1, 0, 0)
 
 
 def test_sync_receive_drains_every_request_before_the_rank_local_error_check(sync_mode) -> None:

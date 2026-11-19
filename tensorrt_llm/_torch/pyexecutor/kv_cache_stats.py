@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, cast
 
 
 class ConversationActivityStats(NamedTuple):
@@ -142,20 +142,6 @@ class KVCacheV2SsmLifeCycleIterationStats:
 
 
 @dataclass(slots=True)
-class KVCacheV2StorageIterationStats:
-    cache_level: int
-    pool_group_id: int
-    slot_size: tuple[int, ...]
-    total_blocks: int
-    free_blocks: int
-    evictable_blocks: int
-    restored_blocks: int | None = None
-    evicted_blocks: int | None = None
-    capacity_dropped_blocks: int | None = None
-    priority_dropped_blocks: int | None = None
-
-
-@dataclass(slots=True)
 class KVCacheV2IterationStatsReport:
     by_window_size: dict[int, Any]
     by_pool_group: dict[int, KVCacheV2PoolGroupIterationStats]
@@ -182,7 +168,7 @@ class KVCacheV2IterationStatsReport:
     # this iteration. They sit on no cache level, so cached_tokens_by_level does not count them.
     # None when no connector can serve tokens.
     connector_cached_tokens: int | None = None
-    storage_stats: list[KVCacheV2StorageIterationStats] = field(default_factory=list)
+    storage_stats: list[dict[str, int | tuple[int, ...]]] = field(default_factory=list)
     num_conversations: int | None = None
 
 
@@ -282,25 +268,8 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
         stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)
     if kv_iter_stats.storage_stats:
         stats_dict["kvCacheStorageStats"] = [
-            {
-                "cacheLevel": snapshot.cache_level,
-                "poolGroupId": snapshot.pool_group_id,
-                "slotSize": list(snapshot.slot_size),
-                "totalNumBlocks": snapshot.total_blocks,
-                "freeNumBlocks": snapshot.free_blocks,
-                "evictableNumBlocks": snapshot.evictable_blocks,
-                **{
-                    key: value
-                    for key, value in (
-                        ("restoredBlocks", snapshot.restored_blocks),
-                        ("evictedBlocks", snapshot.evicted_blocks),
-                        ("capacityDroppedBlocks", snapshot.capacity_dropped_blocks),
-                        ("priorityDroppedBlocks", snapshot.priority_dropped_blocks),
-                    )
-                    if value is not None
-                },
-            }
-            for snapshot in kv_iter_stats.storage_stats
+            {**row, "slotSize": list(cast(tuple[int, ...], row["slotSize"]))}
+            for row in kv_iter_stats.storage_stats
         ]
     if kv_iter_stats.num_conversations is not None:
         stats_dict["kvCacheNumConversations"] = kv_iter_stats.num_conversations

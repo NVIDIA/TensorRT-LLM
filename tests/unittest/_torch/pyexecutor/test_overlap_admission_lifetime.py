@@ -35,12 +35,21 @@ def _admission_executor(
         cp_config={},
         has_cp_helix=False,
     )
+    observed = []
     executor = SimpleNamespace(
         dist=dist,
         adp_router=DefaultADPRouter(dist=dist, has_seq_slot_headroom=headroom),
         enable_attention_dp=True,
         max_num_active_requests=batch_size,
-        enable_iter_perf_stats=False,
+        enable_iter_perf_stats=True,
+        _adp_iter_stats=SimpleNamespace(next_payload=lambda: None),
+        _with_pending_work_flag=lambda payload: payload,
+        _publish_adp_iter_stats=lambda *args, **kwargs: None,
+        _update_new_active_requests_queue_latency=lambda requests: None,
+        _conversation_manager=SimpleNamespace(
+            observe_admission=lambda request, now: observed.append(request)
+        ),
+        observed_conversation_admissions=observed,
         num_fetch_requests=0,
         num_fetch_requests_cur_rank=0,
         is_benchmark_disagg=False,
@@ -58,8 +67,8 @@ def _admission_executor(
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
     )
-    executor._fetch_and_enqueue_requests = (
-        lambda queue, live, **_: executor.observed_live_counts.append(live)
+    executor._fetch_and_enqueue_requests = lambda queue, live, **_: (
+        executor.observed_live_counts.append(live)
     )
     for name in (
         "_get_request_admission_capacity",
@@ -132,7 +141,8 @@ def test_adp_replacements_acquire_slots_before_retiring_requests_release_them(
     cohort_size = rank_count * batch_size
     _enqueue_cohort(queues, 1, cohort_size)
     resident = _fetch_all_ranks(executors, queues, [[] for _ in executors])
-    for manager, requests in zip(managers, resident, strict=True):
+    for executor, manager, requests in zip(executors, managers, resident, strict=True):
+        assert executor.observed_conversation_admissions == requests
         assert len(requests) == batch_size
         _seat(manager, requests)
 

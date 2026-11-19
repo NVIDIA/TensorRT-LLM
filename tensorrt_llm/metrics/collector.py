@@ -809,10 +809,11 @@ class PrometheusExposure:
                 self._log_gauge(gauge, value, labels=labels)
         fetched = values.get("numFetchedRequestsTotal")
         if isinstance(fetched, int) and fetched >= 0:
-            previous = self._prev_loop_fetched.get(str(global_rank), 0)
-            delta = fetched - previous if fetched >= previous else fetched
+            delta = self._snapshot_delta(self._prev_loop_fetched,
+                                         labels["global_rank"],
+                                         fetched,
+                                         reset_to_zero=True)
             self._log_counter(self.loop_requests_fetched, labels, delta)
-            self._prev_loop_fetched[str(global_rank)] = fetched
 
     def log_config_from_args(self, args: "BaseLlmArgs", model: str) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
@@ -954,6 +955,18 @@ class PrometheusExposure:
                           labelnames=info_labels.keys())
             gauge.labels(**info_labels).set(1)
 
+    @staticmethod
+    def _snapshot_delta(previous: dict,
+                        key,
+                        value: int,
+                        *,
+                        reset_to_zero: bool = False) -> int:
+        before = previous.get(key, 0)
+        previous[key] = value
+        if value >= before:
+            return value - before
+        return value if reset_to_zero else 0
+
     def _log_storage_stats(self, iteration_stats: dict, rank: str) -> None:
         """Export measured level/pool snapshots and deltas of cumulative movement counts."""
         tiers = iteration_stats.get("kvCacheLevelTiers", [])
@@ -1002,16 +1015,14 @@ class PrometheusExposure:
                 if not isinstance(value, int) or isinstance(value,
                                                             bool) or value < 0:
                     continue
-                key = (rank, level, pool_group, operation)
-                previous = self._prev_tier_movement.get(key)
-                if previous is None or value > previous:
-                    movement_labels = {**labels, "operation": operation}
-                    self._log_counter(self.kv_cache_tier_moved_blocks,
-                                      movement_labels, value - (previous or 0))
-                    self._log_counter(self.kv_cache_tier_moved_bytes,
-                                      movement_labels,
-                                      (value - (previous or 0)) * slot_bytes)
-                self._prev_tier_movement[key] = value
+                delta = self._snapshot_delta(
+                    self._prev_tier_movement,
+                    (rank, level, pool_group, operation), value)
+                movement_labels = {**labels, "operation": operation}
+                self._log_counter(self.kv_cache_tier_moved_blocks,
+                                  movement_labels, delta)
+                self._log_counter(self.kv_cache_tier_moved_bytes,
+                                  movement_labels, delta * slot_bytes)
 
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
         if labels is None or len(labels) == 0:
@@ -1507,13 +1518,13 @@ class PrometheusExposure:
                 if not isinstance(value, int) or isinstance(value,
                                                             bool) or value < 0:
                     continue
-                key = (rank, window, reason)
-                previous = self._prev_conversation_overflow.get(key, 0)
-                self._log_counter(
-                    self.conversation_tracking_overflow, {
-                        **labels, "reason": reason
-                    }, value - previous if value >= previous else value)
-                self._prev_conversation_overflow[key] = value
+                delta = self._snapshot_delta(self._prev_conversation_overflow,
+                                             (rank, window, reason),
+                                             value,
+                                             reset_to_zero=True)
+                self._log_counter(self.conversation_tracking_overflow, {
+                    **labels, "reason": reason
+                }, delta)
 
         conversations = iteration_stats.get("kvCacheNumConversations")
         if (isinstance(conversations, int)
@@ -1527,13 +1538,11 @@ class PrometheusExposure:
             if not isinstance(value, int) or isinstance(value,
                                                         bool) or value < 0:
                 continue
-            key = (rank, outcome)
-            previous = self._prev_transfer_outcomes.get(key, 0)
-            if value >= previous:
-                self._log_counter(self.kv_cache_transfer_requests, {
-                    **rank_labels, "outcome": outcome
-                }, value - previous)
-            self._prev_transfer_outcomes[key] = value
+            delta = self._snapshot_delta(self._prev_transfer_outcomes,
+                                         (rank, outcome), value)
+            self._log_counter(self.kv_cache_transfer_requests, {
+                **rank_labels, "outcome": outcome
+            }, delta)
 
         for field, counter in self._kv_request_counters.items():
             value = iteration_stats.get(field, 0)
