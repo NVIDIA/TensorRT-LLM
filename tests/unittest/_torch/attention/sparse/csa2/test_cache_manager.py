@@ -91,16 +91,18 @@ def test_encoder_replay_passes_cold_storage_to_base(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("entrypoint", ["initialize", "size"])
 @pytest.mark.parametrize(
-    "replay_window,tokens_per_block,encoder_replay,rejected",
+    "replay_window,tokens_per_block,encoder_replay,block_reuse,rejected",
     [
-        (140, 128, None, False),
-        (140, 128, True, False),
-        (255, 256, True, True),
-        (256, 256, True, False),
-        (257, 256, True, False),
-        (140, 256, True, True),
-        (140, 256, None, True),
-        (140, 256, False, False),
+        (140, 128, None, True, False),
+        (140, 128, True, True, False),
+        (255, 256, True, True, True),
+        (256, 256, True, True, False),
+        (257, 256, True, True, False),
+        (140, 256, True, True, True),
+        (140, 256, None, True, True),
+        (140, 256, False, True, False),
+        (140, 256, True, False, False),
+        (140, 256, None, False, False),
     ],
 )
 def test_encoder_replay_window_covers_block(
@@ -109,12 +111,13 @@ def test_encoder_replay_window_covers_block(
     replay_window: int,
     tokens_per_block: int,
     encoder_replay: bool | None,
+    block_reuse: bool,
     rejected: bool,
 ) -> None:
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
     monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", str(replay_window))
-    config = KvCacheConfig(enable_block_reuse=True)
+    config = KvCacheConfig(enable_block_reuse=block_reuse)
     layout = CSA2Layout((0, 1, 1), (1,), (1,))
 
     class BackendReached(Exception):
@@ -177,6 +180,48 @@ def test_disabled_layer_mask_rejected_before_allocation():
             layout=CSA2Layout((0, 0), (), ()),
             layer_mask=[True, False],
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("resumed", [False, True])
+def test_disagg_encoder_receive_stops_publication_before_transfer(monkeypatch, resumed):
+    manager = object.__new__(CSA2CacheManager)
+    manager._encoder_replay_enabled = True
+    manager._encoder_optional_groups = (0, 1)
+    events = []
+    cache = SimpleNamespace(
+        num_committed_tokens=0,
+        reuse_status=[SimpleNamespace(complete=False), SimpleNamespace(complete=False)],
+        stop_committing=lambda: events.append("stop"),
+    )
+
+    def resume(self, request_id, current, groups):
+        assert request_id == 7 and current is cache and groups == []
+        events.append("resume")
+        return resumed
+
+    monkeypatch.setattr(CSA2CacheManager, "_resume_and_restore", resume)
+    req = SimpleNamespace(py_request_id=7, is_disagg_generation_init_state=True)
+    assert manager._resume_context_cache(req, cache) == resumed
+    assert events == (["resume", "stop"] if resumed else ["resume"])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("encoder_replay,received", [(True, True), (True, False), (False, True)])
+def test_disagg_encoder_receive_never_republishes_during_decode(
+    monkeypatch, encoder_replay, received
+):
+    manager = object.__new__(CSA2CacheManager)
+    manager._encoder_replay_enabled = encoder_replay
+    req = SimpleNamespace(is_generation_only_request=received)
+    published = []
+    base = CSA2CacheManager.__bases__[0]
+    monkeypatch.setattr(base, "try_commit_blocks", lambda self, request: published.append(request))
+    monkeypatch.setattr(base, "_can_commit_generation_blocks", lambda self, request: True)
+    manager.try_commit_blocks(req)
+    expected = not (encoder_replay and received)
+    assert manager._can_commit_generation_blocks(req) == expected
+    assert published == ([req] if expected else [])
 
 
 @pytest.fixture

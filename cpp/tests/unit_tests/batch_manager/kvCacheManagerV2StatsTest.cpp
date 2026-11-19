@@ -1223,6 +1223,64 @@ TEST_F(ReplayCacheTest, OptionalAndPrivateHaveIndependentGroups)
     manager->shutdown();
 }
 
+TEST_F(ReplayCacheTest, EndpointCollectionSkipsNonOptionalAttention)
+{
+    for (auto policy : {ReusePolicy::REQUIRED, ReusePolicy::SINK_REQUIRED_ONLY, ReusePolicy::OPTIONAL})
+    {
+        auto config = makeConfig();
+        addWindow(config, 1, 8, policy, policy == ReusePolicy::SINK_REQUIRED_ONLY ? 4 : 0);
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const tokens = makeTokens(8);
+        TokenSpan const prefix{tokens.data(), 8};
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(8));
+        source->commit(prefix, true);
+        auto const match = manager->radixTree().match({}, prefix, true, true, 0, true);
+        EXPECT_EQ(match.numTokens, 8);
+        EXPECT_EQ(match.optionalEndpointRanges.empty(), policy != ReusePolicy::OPTIONAL);
+        source->close();
+        manager->shutdown();
+    }
+}
+
+TEST_F(ReplayCacheTest, SingleTokenOptionalWindowsNeedOnlyTheirSinks)
+{
+    for (int sinks : {0, 2})
+    {
+        auto config = makeConfig();
+        config.tokensPerBlock = 1;
+        addWindow(config, 1, 1, ReusePolicy::OPTIONAL, sinks);
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const optional = manager->getLayerGroupId(LayerId{1});
+        auto const tokens = makeTokens(3);
+        TokenSpan const prefix{tokens.data(), 3};
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(3));
+        source->commit(prefix, true);
+        for (int i = sinks; i < 3; ++i)
+        {
+            auto const& block = source->blocks()[BlockOrdinal{i}].treeBlock;
+            if (auto* page = block->getPage(optional))
+            {
+                auto holder = page->hold();
+                block->unlinkPage(optional);
+            }
+        }
+        for (int endpoint : {1, 2, 3})
+        {
+            auto reader = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, {}, false, std::nullopt, 3);
+            ASSERT_EQ(reader->numCommittedTokens(), 3);
+            ASSERT_TRUE(reader->reuseStatus()[optional.value()].complete);
+            ASSERT_TRUE(reader->resume(mStream, std::nullopt, std::map<LifeCycleId, int>{{optional, endpoint}}));
+            reader->close();
+        }
+        source->close();
+        manager->shutdown();
+    }
+}
+
 TEST_F(ReplayCacheTest, OptionalPartialCopyPreservesSharedRetentionAcrossAdmissionRetry)
 {
     using RetentionConfig = tensorrt_llm::executor::KvCacheRetentionConfig;
@@ -1230,54 +1288,62 @@ TEST_F(ReplayCacheTest, OptionalPartialCopyPreservesSharedRetentionAcrossAdmissi
     {
         for (bool overridePriority : {false, true})
         {
-            SCOPED_TRACE(::testing::Message() << "endpoint=" << endpoint << " override=" << overridePriority);
-            auto config = makeConfig();
-            addWindow(config, 1, 8, ReusePolicy::OPTIONAL);
-            auto manager = std::make_shared<KvCacheManager>(config);
-            auto const encoder = manager->getLayerGroupId(LayerId{1});
-            auto const tokens = makeTokens(8);
-            TokenSpan const prefix{tokens.data(), static_cast<int>(tokens.size())};
-            auto source = manager->createKvCache({}, {}, 1);
-            ASSERT_TRUE(source->resume(mStream));
-            ASSERT_TRUE(source->resize(8));
-            source->commit(prefix, /*isEnd=*/true);
-            BlockOrdinal const tail{(endpoint - 1) / 4};
-            auto page = blockPageGetPage(source->blocks()[tail].pages[kDefaultBeamIndex][encoder]);
-            constexpr Priority kSourcePriority = 80;
-            constexpr Priority kReaderPriority = 10;
-            page->claimRetention(kSourcePriority, std::chrono::milliseconds{0});
-            std::optional<RetentionConfig> retention;
-            if (overridePriority)
+            for (bool sharedSource : {false, true})
             {
-                retention.emplace(std::vector{RetentionConfig::TokenRangeRetentionConfig{0, {}, kReaderPriority}});
-            }
-            auto reader = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, retention, false, std::nullopt, 8);
-            std::map<LifeCycleId, int> const endpoints{{encoder, endpoint}};
-            auto& storage = manager->storage();
-            auto const pool = storage.getPoolGroupIndex(kHotLevel, encoder);
-            auto reservations
-                = storage.newSlotsForPoolGroup(kHotLevel, pool, storage.getStatistics(kHotLevel, pool).free);
-            bool const partialCopy = endpoint % 4 != 0;
-            Priority const expected = partialCopy || !overridePriority ? kSourcePriority : kReaderPriority;
-            for (int attempt = 0; attempt < 2; ++attempt)
-            {
-                EXPECT_FALSE(reader->resume(mStream, std::nullopt, endpoints));
+                SCOPED_TRACE(::testing::Message()
+                    << "endpoint=" << endpoint << " override=" << overridePriority << " shared=" << sharedSource);
+                auto config = makeConfig();
+                addWindow(config, 1, 8, ReusePolicy::OPTIONAL);
+                auto manager = std::make_shared<KvCacheManager>(config);
+                auto const encoder = manager->getLayerGroupId(LayerId{1});
+                auto const tokens = makeTokens(8);
+                TokenSpan const prefix{tokens.data(), static_cast<int>(tokens.size())};
+                auto source = manager->createKvCache({}, {}, 1);
+                ASSERT_TRUE(source->resume(mStream));
+                ASSERT_TRUE(source->resize(8));
+                source->commit(prefix, /*isEnd=*/true);
+                BlockOrdinal const tail{(endpoint - 1) / 4};
+                auto page = blockPageGetPage(source->blocks()[tail].pages[kDefaultBeamIndex][encoder]);
+                constexpr Priority kSourcePriority = 80;
+                constexpr Priority kReaderPriority = 10;
+                page->claimRetention(kSourcePriority, std::chrono::milliseconds{0});
+                std::optional<RetentionConfig> retention;
+                if (overridePriority)
+                {
+                    retention.emplace(std::vector{RetentionConfig::TokenRangeRetentionConfig{0, {}, kReaderPriority}});
+                }
+                auto reader
+                    = manager->createKvCache({}, prefix, 2, {}, {}, {}, false, retention, false, std::nullopt, 8);
+                if (!sharedSource)
+                    source->close();
+                std::map<LifeCycleId, int> const endpoints{{encoder, endpoint}};
+                auto& storage = manager->storage();
+                auto const pool = storage.getPoolGroupIndex(kHotLevel, encoder);
+                auto reservations
+                    = storage.newSlotsForPoolGroup(kHotLevel, pool, storage.getStatistics(kHotLevel, pool).free);
+                bool const partialCopy = endpoint % 4 != 0;
+                Priority const expected
+                    = (partialCopy && sharedSource) || !overridePriority ? kSourcePriority : kReaderPriority;
+                for (int attempt = 0; attempt < 2; ++attempt)
+                {
+                    EXPECT_FALSE(reader->resume(mStream, std::nullopt, endpoints));
+                    EXPECT_EQ(page->priority(), expected);
+                }
+                source->close();
+                for (auto& slot : reservations)
+                {
+                    storage.releaseSlot(encoder, kHotLevel, std::move(slot));
+                }
+                ASSERT_TRUE(reader->resume(mStream, std::nullopt, endpoints));
                 EXPECT_EQ(page->priority(), expected);
+                EXPECT_EQ(reader->getPagePriorities(encoder)[tail.value()], expected);
+                reader->close();
+                manager->refreshRetention();
+                // The partial reader preserves the source's expiry; a full-block claim clears it.
+                EXPECT_EQ(page->priority(), partialCopy && sharedSource ? kPriorityDefault : expected);
+                page.reset();
+                manager->shutdown();
             }
-            source->close();
-            for (auto& slot : reservations)
-            {
-                storage.releaseSlot(encoder, kHotLevel, std::move(slot));
-            }
-            ASSERT_TRUE(reader->resume(mStream, std::nullopt, endpoints));
-            EXPECT_EQ(page->priority(), expected);
-            EXPECT_EQ(reader->getPagePriorities(encoder)[tail.value()], expected);
-            reader->close();
-            manager->refreshRetention();
-            // The partial reader preserves the source's expiry; a full-block claim clears it.
-            EXPECT_EQ(page->priority(), partialCopy ? kPriorityDefault : expected);
-            page.reset();
-            manager->shutdown();
         }
     }
 }

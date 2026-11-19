@@ -315,7 +315,7 @@ decoder queries. The query pass preserves those cache entries and still
 executes its attention and FFN. Replay is enabled by default with a shared
 Encoder/Decoder range of 140 tokens (`DEFAULT_BOUNDED_REPLAY_TOKENS`), or one
 token more than the required SWA window (including the embedded DSpark capture
-window) when that window is wider. Encoder replay requires the range to be at
+window) when that window is wider. With prefix block reuse enabled, Encoder replay requires the range to be at
 least `tokens_per_block`; cache initialization and sizing reject smaller ranges
 so cold recovery stays within the configured replay budget.
 `TRTLLM_V41_BOUNDED_REPLAY_TOKENS` overrides the range; a value that
@@ -483,6 +483,10 @@ generation CUDA graphs do not disable final-window replay.
 Disaggregated execution uses the same CED lifecycle. Ordinary context workers
 complete the final Decoder window before handoff; generation workers resume available Encoder groups
 independently and receive missing state without scheduling local Encoder replay.
+When Encoder replay is enabled, generation-side requests do not publish received
+KV or subsequent decode KV for reuse: transferred Encoder pages can contain rows
+before the sender's cold-recovery start. Transfer byte coverage does not establish
+that those rows were computed. Local prefill publication is unchanged.
 The V2 transfer adapter reports each native lifecycle group's admitted reuse
 endpoint. It skips only restored pages: a Global hit does not skip missing
 OPTIONAL Encoder pages or PRIVATE Decoder pages. Generation admission does not

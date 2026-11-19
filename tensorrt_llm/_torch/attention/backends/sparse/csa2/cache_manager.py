@@ -283,7 +283,7 @@ class _CSA2LayerKind(Enum):
 
 
 class CSA2CacheManager(KVCacheManagerV2):
-    """Private SWA, owner-only GLOBAL main/index buffers, and ratio-two compressor state.
+    """Windowed SWA, owner-only GLOBAL main/index buffers, and ratio-two compressor state.
 
     The GLOBAL layer group carries two buffers with identical page indices: a
     288-byte main record and a 68-byte index record per compressed position.
@@ -401,7 +401,9 @@ class CSA2CacheManager(KVCacheManagerV2):
             )
         )
         _validate_encoder_replay_window(
-            self._encoder_replay_enabled, self._decoder_replay_window, tokens_per_block
+            self._encoder_replay_enabled and kv_cache_config.enable_block_reuse,
+            self._decoder_replay_window,
+            tokens_per_block,
         )
         self._encoder_reuse_policy = (
             ReusePolicy.OPTIONAL if self._encoder_replay_enabled else ReusePolicy.REQUIRED
@@ -497,6 +499,20 @@ class CSA2CacheManager(KVCacheManagerV2):
     def _resume_context_cache(self, req: LlmRequest, cache) -> bool:
         """Select Encoder reuse before the normal context-cache activation."""
         from .....pyexecutor.ced_replay import EncoderCheckpoint, EncoderReplay
+
+        if self._encoder_replay_enabled and req.is_disagg_generation_init_state:
+            groups = [
+                group
+                for group in self._encoder_optional_groups
+                if cache.reuse_status[group].complete
+                and cache.reuse_status[group].endpoint == cache.num_committed_tokens
+            ]
+            resumed = self._resume_and_restore(req.py_request_id, cache, groups)
+            if resumed:
+                # A received page can contain rows before the sender's cold-replay start.
+                # Stop before transfer so even close() cannot publish those rows.
+                cache.stop_committing()
+            return resumed
 
         if (
             not self._decoder_replay_window
@@ -624,6 +640,16 @@ class CSA2CacheManager(KVCacheManagerV2):
         if isinstance(plan, EncoderCheckpoint):
             return 0
         return plan.num_tokens if isinstance(plan, EncoderReplay) else None
+
+    def try_commit_blocks(self, request: LlmRequest) -> None:
+        if self._encoder_replay_enabled and request.is_generation_only_request:
+            return
+        super().try_commit_blocks(request)
+
+    def _can_commit_generation_blocks(self, request: LlmRequest) -> bool:
+        return not (
+            self._encoder_replay_enabled and request.is_generation_only_request
+        ) and super()._can_commit_generation_blocks(request)
 
     def _swa_retention(self, layer: int) -> int:
         window = _swa_cache_window(
@@ -1751,7 +1777,11 @@ class CSA2CacheManager(KVCacheManagerV2):
                 replay_window=max(layout.window_size, replay_window),
             )
         )
-        _validate_encoder_replay_window(encoder_replay, replay_window, tokens_per_block)
+        _validate_encoder_replay_window(
+            encoder_replay and kv_cache_config is not None and kv_cache_config.enable_block_reuse,
+            replay_window,
+            tokens_per_block,
+        )
         sizes, windows, scratch_groups = _cache_size_layer_components(
             layout,
             range(num_layers),

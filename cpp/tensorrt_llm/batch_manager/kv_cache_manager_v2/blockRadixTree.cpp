@@ -839,12 +839,13 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(ReuseSco
     std::vector<OptionalMatchState> optionalStates;
     if (optionalEndpointRanges)
     {
-        optionalEndpointRanges->resize(mLifeCycles.size());
         for (auto const& [group, attention] : mLifeCycles.attentionLifeCycles())
         {
-            if (allowsCheckpoint(*attention) && attention->windowSize)
+            if (attention->reusePolicy == ReusePolicy::OPTIONAL && attention->windowSize)
                 optionalStates.push_back({group, attention});
         }
+        if (!optionalStates.empty())
+            optionalEndpointRanges->resize(mLifeCycles.size());
     }
     auto appendRange = [](std::vector<HalfOpenRange<int>>& ranges, int beg, int end)
     {

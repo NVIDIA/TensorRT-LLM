@@ -274,7 +274,11 @@ void KvCache::_collectReuseCandidates(
                 auto const stale = getStaleRange(lifeCycles[lc], first, mTokensPerBlock);
                 if (ranges.empty())
                     ranges.push_back({BlockOrdinal{0}, stale.beg});
-                ranges.front().end = std::max(ranges.front().end, stale.beg);
+                ranges.front().end
+                    = std::max(ranges.front().end, getStaleRange(lifeCycles[lc], end - 1, mTokensPerBlock).beg);
+                // Single-token windows on single-token blocks have no historical tail.
+                if (mTokensPerBlock == 1 && attention->windowSize == 1)
+                    continue;
                 HalfOpenRange<BlockOrdinal> const window{stale.end, BlockOrdinal{divUp(end - 1, mTokensPerBlock)}};
                 if (window.beg <= ranges.back().end)
                     ranges.back().end = std::max(ranges.back().end, window.end);
@@ -432,14 +436,15 @@ void KvCache::_selectOptionalGroups(std::map<LifeCycleId, int> const& endpoints)
             {
                 bool const partialCopy
                     = !isSsm && endpoint % mTokensPerBlock != 0 && ordinal == BlockOrdinal{endpoint / mTokensPerBlock};
+                if (partialCopy)
+                {
+                    // Exclude this candidate's own holder when checking for other consumers.
+                    mOptionalPartialCopyRetentionHolds.emplace(lc, holder->page->borrowRetentionForCopy());
+                }
                 if (!partialCopy || !holder->page->hasRetentionConsumers())
                 {
                     auto const retention = getRetention(ordinal);
                     holder->page->claimRetention(retention.retentionPriority, retention.durationMs);
-                }
-                if (partialCopy)
-                {
-                    mOptionalPartialCopyRetentionHolds.emplace(lc, holder->page->borrowRetentionForCopy());
                 }
             }
             auto& target = isSsm ? mSsmBlocks[kDefaultBeamIndex][lc] : mBlocks[ordinal].pages[kDefaultBeamIndex][lc];
