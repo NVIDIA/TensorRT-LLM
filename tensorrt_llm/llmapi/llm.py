@@ -54,8 +54,8 @@ from ..executor.postprocessor_hook import (PostProcessorHook,
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
-from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
-                      create_input_processor_with_hash,
+from ..inputs import (GenerationInputs, PromptInputs, TokensPrompt,
+                      create_input_processor, create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..inputs.prompt_embeds import (PromptEmbeds, build_prompt_embeds,
                                     multimodal_item_spans, remap_prompt_embeds)
@@ -716,7 +716,7 @@ class BaseLLM:
 
     def generate(
         self,
-        inputs: Union[PromptInputs, Sequence[PromptInputs]],
+        inputs: Union[GenerationInputs, Sequence[GenerationInputs]],
         sampling_params: Optional[Union[SamplingParams,
                                         List[SamplingParams]]] = None,
         use_tqdm: bool = True,
@@ -741,7 +741,7 @@ class BaseLLM:
         Synchronous generation accepts either single prompt or batched prompts.
 
         Args:
-            inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text, token ids, or prompt embeddings.
+            inputs (tensorrt_llm.inputs.data.GenerationInputs, Sequence[tensorrt_llm.inputs.data.GenerationInputs]): The prompt text, token ids, or prompt embeddings.
                 It can be single prompt or batched prompts.
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, List[tensorrt_llm.sampling_params.SamplingParams], optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
@@ -830,7 +830,7 @@ class BaseLLM:
     @nvtx_range_debug("LLM.generate_async", color="green", category="LLM")
     def generate_async(
         self,
-        inputs: Union[PromptInputs, PreprocessedInputs],
+        inputs: Union[GenerationInputs, PreprocessedInputs],
         sampling_params: Optional[SamplingParams] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
@@ -849,7 +849,7 @@ class BaseLLM:
         Asynchronous generation accepts single prompt only.
 
         Args:
-            inputs (Union[tensorrt_llm.inputs.data.PromptInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text, token ids or prompt embeddings, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.
+            inputs (Union[tensorrt_llm.inputs.data.GenerationInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text, token ids or prompt embeddings, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.

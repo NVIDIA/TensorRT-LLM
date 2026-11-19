@@ -123,11 +123,15 @@ class EmbedsPrompt(TypedDict):
     """``[L, hidden_size]``, one row per position; see ``TokensPrompt.prompt_embeds``."""
 
 
-PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt, EmbedsPrompt]
+PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]
+
+# Inputs ``LLM.generate`` and ``generate_async`` accept.
+GenerationInputs = Union[PromptInputs, EmbedsPrompt]
 
 
 def prompt_inputs(
-        inputs: PromptInputs) -> Union[TextPrompt, TokensPrompt, EmbedsPrompt]:
+        inputs: GenerationInputs
+) -> Union[TextPrompt, TokensPrompt, EmbedsPrompt]:
     if isinstance(inputs, str):
         prompt_inputs = TextPrompt(prompt=inputs)
     elif isinstance(inputs, list):
