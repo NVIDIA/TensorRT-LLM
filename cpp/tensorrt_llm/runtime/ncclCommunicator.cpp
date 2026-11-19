@@ -96,7 +96,8 @@ void initNcclCommProbeWithTimeout(ncclUniqueId const& id, int worldSize, int ran
             TLLM_THROW(
                 "NCCL communicator probe initialization timed out after %d seconds on rank %d of %d in "
                 "NcclCommunicator::createComm. TensorRT-LLM will not retry "
-                "in-process. Set %s to adjust the timeout.",
+                "in-process. Other ranks may remain blocked; restart the entire distributed job before retrying. "
+                "Set %s to adjust the timeout.",
                 timeoutSec, rank, worldSize, kNcclCommInitTimeoutEnv);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{kNcclCommInitPollIntervalMs});
