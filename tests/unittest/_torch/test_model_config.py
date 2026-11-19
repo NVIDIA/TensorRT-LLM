@@ -432,87 +432,57 @@ def _mtp_one_model_spec_config(num_nextn_predict_layers: int) -> types.SimpleNam
     )
 
 
-@pytest.mark.parametrize("num_nextn_predict_layers", [1, 3])
-def test_deepseek_v4_mtp_layers_take_the_routed_moe_layout_of_the_mtp_block(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, num_nextn_predict_layers: int
+_NVFP4_LAYOUT, _MXFP4_LAYOUT = (QuantAlgo.NVFP4, 16), (QuantAlgo.W4A8_MXFP4_MXFP8, 32)
+
+
+@pytest.mark.parametrize(
+    "num_hidden_layers, mtp_blocks, num_nextn_predict_layers, expected_mtp",
+    [
+        # An NVFP4 checkpoint whose MTP block stores MXFP4 experts: the MTP layers (as many as
+        # the speculative config runs) take the block's format, the others NVFP4.
+        (3, {"mtp.0": "I8"}, 1, [_MXFP4_LAYOUT]),
+        (3, {"mtp.0": "I8"}, 3, [_MXFP4_LAYOUT] * 3),
+        # Two blocks of different formats: MTP layer j is configured from block mtp.{j}.
+        (3, {"mtp.0": "I8", "mtp.1": "U8"}, 2, [_MXFP4_LAYOUT, _NVFP4_LAYOUT]),
+        # No MTP block in the checkpoint: the MTP layer takes the layers.0 format.
+        (2, {}, 1, [_NVFP4_LAYOUT]),
+    ],
+    ids=["one_mxfp4_block", "one_block_three_layers", "two_blocks", "no_block"],
+)
+def test_deepseek_v4_mtp_layers_take_the_routed_moe_layout_of_their_mtp_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    num_hidden_layers: int,
+    mtp_blocks: dict[str, str],
+    num_nextn_predict_layers: int,
+    expected_mtp: list[tuple[QuantAlgo, int]],
 ) -> None:
-    """An NVFP4 checkpoint whose MTP block stores MXFP4 experts configures each MoE
-    layer from the block it loads, so the MTP layers get MXFP4 and the others NVFP4."""
+    """Each MoE layer is configured from the checkpoint block it loads."""
     from tensorrt_llm._torch import model_config as model_config_module
 
     monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
     monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
-    num_hidden_layers = 3
     _write_routed_expert_blocks(
-        tmp_path, {**{f"layers.{i}": "U8" for i in range(num_hidden_layers)}, "mtp.0": "I8"}
+        tmp_path, {**{f"layers.{i}": "U8" for i in range(num_hidden_layers)}, **mtp_blocks}
     )
 
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        types.SimpleNamespace(num_hidden_layers=num_hidden_layers, num_nextn_predict_layers=1),
+        types.SimpleNamespace(
+            num_hidden_layers=num_hidden_layers, num_nextn_predict_layers=max(len(mtp_blocks), 1)
+        ),
         str(tmp_path),
-        "MEGAMOE_CUTEDSL",
+        MoESelection(backend="MEGAMOE_CUTEDSL").request(),
         None,
         _mtp_one_model_spec_config(num_nextn_predict_layers),
     )
 
-    assert len(layer_quant_config) == num_hidden_layers + num_nextn_predict_layers
-    for layer_idx in range(num_hidden_layers):
+    expected = [_NVFP4_LAYOUT] * num_hidden_layers + expected_mtp
+    assert sorted(layer_quant_config) == sorted(
+        f"model.layers.{i}.mlp.experts" for i in range(len(expected))
+    )
+    for layer_idx, layout in enumerate(expected):
         experts = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
-        assert experts.quant_algo == QuantAlgo.NVFP4
-        assert experts.group_size == 16
-    for layer_idx in range(num_hidden_layers, num_hidden_layers + num_nextn_predict_layers):
-        experts = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
-        assert experts.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
-        assert experts.group_size == 32
-
-
-def test_deepseek_v4_mtp_blocks_take_their_own_routed_moe_layout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With two checkpoint MTP blocks of different formats, MTP layer j is
-    configured from block mtp.{j}."""
-    from tensorrt_llm._torch import model_config as model_config_module
-
-    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
-    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
-    num_hidden_layers = 3
-    _write_routed_expert_blocks(
-        tmp_path,
-        {**{f"layers.{i}": "U8" for i in range(num_hidden_layers)}, "mtp.0": "I8", "mtp.1": "U8"},
-    )
-
-    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        types.SimpleNamespace(num_hidden_layers=num_hidden_layers, num_nextn_predict_layers=2),
-        str(tmp_path),
-        "MEGAMOE_CUTEDSL",
-        None,
-        _mtp_one_model_spec_config(2),
-    )
-
-    mtp0 = layer_quant_config[f"model.layers.{num_hidden_layers}.mlp.experts"]
-    mtp1 = layer_quant_config[f"model.layers.{num_hidden_layers + 1}.mlp.experts"]
-    assert (mtp0.quant_algo, mtp0.group_size) == (QuantAlgo.W4A8_MXFP4_MXFP8, 32)
-    assert (mtp1.quant_algo, mtp1.group_size) == (QuantAlgo.NVFP4, 16)
-
-
-def test_deepseek_v4_mtp_layer_without_its_own_block_keeps_the_layers0_layout(
-    tmp_path: Path,
-) -> None:
-    """A checkpoint that ships no MTP block configures the MTP layer as layers.0."""
-    _write_routed_expert_blocks(tmp_path, {"layers.0": "U8", "layers.1": "U8"})
-
-    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        types.SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=1),
-        str(tmp_path),
-        "MEGAMOE_CUTEDSL",
-        None,
-        _mtp_one_model_spec_config(1),
-    )
-
-    assert sorted(layer_quant_config) == [f"model.layers.{i}.mlp.experts" for i in range(3)]
-    for experts in layer_quant_config.values():
-        assert experts.quant_algo == QuantAlgo.NVFP4
-        assert experts.group_size == 16
+        assert (experts.quant_algo, experts.group_size) == layout, layer_idx
 
 
 def test_safetensors_headers_are_read_once_per_shard(
@@ -566,7 +536,7 @@ def test_deepseek_v4_routed_moe_probe_reads_only_the_layers0_and_mtp_shards(
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
         types.SimpleNamespace(num_hidden_layers=8, num_nextn_predict_layers=1),
         str(tmp_path),
-        "MEGAMOE_CUTEDSL",
+        MoESelection(backend="MEGAMOE_CUTEDSL").request(),
         None,
         _mtp_one_model_spec_config(1),
     )
@@ -592,7 +562,7 @@ def test_deepseek_v4_mtp_block_in_another_dtype_is_named(
     call = lambda: ModelConfig._set_deepseek_v4_routed_moe_quant_config(  # noqa: E731
         types.SimpleNamespace(num_hidden_layers=1, num_nextn_predict_layers=1),
         str(tmp_path),
-        "MEGAMOE_CUTEDSL",
+        MoESelection(backend="MEGAMOE_CUTEDSL").request(),
         None,
         _mtp_one_model_spec_config(1),
         require_layout=require_layout,
