@@ -11252,15 +11252,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # SM100 port of the Rubin kernel below; same op contract and inputs.
     # ----------------------------------------------------------------
     if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE:
-        from ..kernels.blackwell.utils import \
-            TRTLLM_ENABLE_PDL as _BW_TRTLLM_ENABLE_PDL
-        from ..kernels.blackwell.utils import make_ptr as _bw_make_ptr
-        from ..moe.kernels.blackwell.blackwell_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
-            Sm100BlockScaledContiguousGroupedGemmFusedFc12Kernel
-        from ..moe.kernels.blackwell.blackwell_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
-            validate_l2_atomic_descriptor_bounds as \
-            _bw_validate_l2_atomic_descriptor_bounds
+        # As for the Rubin kernel below: a build that passes the cute_dsl_utils
+        # probe but lacks something else the vendored kernel imports disables
+        # this op instead of breaking the import of every CuTe DSL op.
+        try:
+            from ..kernels.blackwell.utils import \
+                TRTLLM_ENABLE_PDL as _BW_TRTLLM_ENABLE_PDL
+            from ..kernels.blackwell.utils import make_ptr as _bw_make_ptr
+            from ..moe.kernels.blackwell.blackwell_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
+                Sm100BlockScaledContiguousGroupedGemmFusedFc12Kernel
+            from ..moe.kernels.blackwell.blackwell_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
+                validate_l2_atomic_descriptor_bounds as \
+                _bw_validate_l2_atomic_descriptor_bounds
+        except (ImportError, AttributeError) as e:
+            logger.warning(
+                "The installed CuTe DSL cannot build the Blackwell MXFP8 fused "
+                f"FC12 MoE kernel ({e!r}); MXFP8 CuTe DSL MoE on SM100/SM103 is "
+                "disabled")
+            IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE = False
+            from .. import cute_dsl_utils
+            cute_dsl_utils.IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE = False
 
+    if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE:
         # MXFP8: E4M3 operands with UE8M0 scales over 32 elements.
         MXFP8_FUSED_FC12_BW_SF_VEC_SIZE = 32
 
