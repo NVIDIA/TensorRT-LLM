@@ -17,6 +17,7 @@ from tensorrt_llm._torch.models.checkpoints.beam.checkpoint_loader import (
 from tensorrt_llm._torch.models.checkpoints.hf.config_loader import HfConfigLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -84,3 +85,23 @@ def test_worker_pickle_preserves_options_but_not_preloaded_state(custom):
         assert restored.config_loader.test_setting == "custom-config-setting"
     else:
         assert restored.weight_mapper is None
+
+
+@pytest.mark.parametrize("mode", ["off", "auto", "require"])
+@pytest.mark.parametrize("custom_loader", [False, True])
+def test_beam_checkpoint_settings_require_modeling_v2(mode, custom_loader):
+    args = TorchLlmArgs.model_construct(
+        modeling_v2=mode,
+        checkpoint_format=None if custom_loader else BEAM_NVFP4_CHECKPOINT_FORMAT,
+        checkpoint_loader=BeamNvfp4CheckpointLoader() if custom_loader else None,
+    )
+    if mode == "require":
+        assert args.validate_checkpoint_format() is args
+    else:
+        with pytest.raises(ValueError, match="requires modeling_v2='require'"):
+            args.validate_checkpoint_format()
+
+
+def test_hf_checkpoint_loading_does_not_require_modeling_v2():
+    args = TorchLlmArgs.model_construct(modeling_v2="off")
+    assert args.validate_checkpoint_format() is args

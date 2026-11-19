@@ -10039,6 +10039,15 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = CheckpointFormat.HF
 
+        beam_loader = self.checkpoint_format == "beam_nvfp4"
+        if self.checkpoint_loader is not None:
+            from tensorrt_llm._torch.models.checkpoints.beam.checkpoint_loader import \
+                BeamNvfp4CheckpointLoader
+            beam_loader = isinstance(self.checkpoint_loader,
+                                     BeamNvfp4CheckpointLoader)
+        if beam_loader and self.modeling_v2 != "require":
+            raise ValueError(
+                "Beam NVFP4 checkpoint loading requires modeling_v2='require'")
         return self
 
     @model_validator(mode="after")

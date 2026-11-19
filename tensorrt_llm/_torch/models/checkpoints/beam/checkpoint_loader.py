@@ -61,7 +61,7 @@ class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
         load_checkpoint = getattr(kwargs.get("model"), "load_checkpoint", None)
         if not callable(load_checkpoint):
             raise TypeError(
-                "BeamNvfp4CheckpointLoader requires the selected model to provide "
+                "BeamNvfp4CheckpointLoader requires modeling_v2='require' and a selected model with "
                 "a callable load_checkpoint(checkpoint_dir)"
             )
         load_checkpoint(checkpoint_dir)
