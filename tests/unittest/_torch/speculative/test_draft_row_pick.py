@@ -197,13 +197,14 @@ class _Eagle3Model(_DraftAttnLayer):
 
 class _FakeFusedHead:
     """``BF16DraftHead``'s interface over the toy LM heads: greedy tokens of ``x @ heads[i]`` on
-    its ``i``-th call (cycling); records every call's input rows."""
+    its ``i``-th call (cycling); records every call's input rows and whether it was given ``out``.
+    ``max_rows=0``: an MXFP8 draft head that declines every row count."""
 
-    max_rows = 8
-
-    def __init__(self, heads):
+    def __init__(self, heads, max_rows=8):
         self.heads = heads
+        self.max_rows = max_rows
         self.calls = []
+        self.outs = []
 
     def supports(self, rows):
         return 1 <= rows <= self.max_rows
@@ -211,6 +212,7 @@ class _FakeFusedHead:
     def sample(self, x, out=None):
         head = self.heads[len(self.calls) % len(self.heads)]
         self.calls.append(x.clone())
+        self.outs.append(out is not None)
         tokens = (x @ head).argmax(-1).to(torch.int32)
         if out is None:
             return tokens
@@ -265,6 +267,7 @@ def _run_loop(
     all_rank=None,
     subseq=None,
     fused_head=None,
+    draft_head=None,
 ):
     g = torch.Generator().manual_seed(seed)
     ctx_lens = torch.randint(2, 9, (num_contexts,), generator=g).tolist()
@@ -305,6 +308,7 @@ def _run_loop(
         )
     worker = _worker(is_mtp_eagle, fast_paths)
     worker.fused_draft_head = fused_head
+    worker.draft_head = draft_head
     tokens, _ = worker._forward_linear_draft_loop(
         inputs,
         md,
@@ -341,18 +345,45 @@ def _compare(ref_layer, ref, layer, out, b, n_rows):
     return picked
 
 
-# Mixed contexts and generations; contexts only with a single draft step.
-@pytest.mark.parametrize("num_contexts,num_gens,k", [(2, 3, 3), (3, 0, 1)])
-def test_mtp_eagle_step0_pick_matches_full(num_contexts, num_gens, k):
+def _check_mtp_eagle_fused(fused_head, mxfp8_head, layer, b, k, with_out):
+    """The fused draft head took every step's request rows (the MTP layer's next hidden input),
+    into the token buffer rows when ``with_out``; the declining MXFP8 head sampled nothing."""
+    assert not mxfp8_head.calls
+    assert [x.shape[0] for x in fused_head.calls] == [b] * k
+    assert fused_head.outs == [with_out] * k
+    for got, carried in zip(fused_head.calls, layer.inputs[1:]):
+        assert torch.equal(got, carried)
+
+
+# Mixed contexts and generations; contexts only with a single draft step. ``fused``: the picked
+# run takes its draft tokens from the fused draft head, the MXFP8 draft head declining the rows.
+@pytest.mark.parametrize(
+    "num_contexts,num_gens,k,fused", [(2, 3, 3, False), (3, 0, 1, False), (2, 3, 3, True)]
+)
+def test_mtp_eagle_step0_pick_matches_full(num_contexts, num_gens, k, fused):
     b = num_contexts + num_gens
     ref_layer = _PlainMtpLayer(seed=7)
     ref = _run_loop(ref_layer, True, False, num_contexts, num_gens, k, 3)
     layer = _PickingMtpLayer(seed=7)
-    out = _run_loop(layer, True, False, num_contexts, num_gens, k, 3)
+    fused_head = _FakeFusedHead([layer.head]) if fused else None
+    mxfp8_head = _FakeFusedHead([layer.head], max_rows=0) if fused else None
+    out = _run_loop(
+        layer,
+        True,
+        False,
+        num_contexts,
+        num_gens,
+        k,
+        3,
+        fused_head=fused_head,
+        draft_head=mxfp8_head,
+    )
     n_rows = ref_layer.kv_writes[0].shape[0]
     assert _compare(ref_layer, ref, layer, out, b, n_rows)
     # The post-attention part ran on one row per request on every step.
     assert layer.post_rows == [b] * k
+    if fused:
+        _check_mtp_eagle_fused(fused_head, mxfp8_head, layer, b, k, with_out=False)
 
 
 @pytest.mark.parametrize("fused", [False, True])
@@ -389,17 +420,41 @@ def test_eagle3_step0_pick_matches_full(fused):
 
 
 # On the spec-decode fast paths (with the step-0 epilogue) even a supporting
-# layer does not pick.
-@pytest.mark.parametrize("layer_cls", [_PlainMtpLayer, _OverridingMtpLayer, _PickingMtpLayer])
-def test_unpicked_step0_is_unaffected(layer_cls):
+# layer does not pick. ``fused``: draft tokens from the fused draft head, written into the step's
+# token buffer row.
+@pytest.mark.parametrize(
+    "layer_cls,fused",
+    [
+        (_PlainMtpLayer, False),
+        (_OverridingMtpLayer, False),
+        (_PickingMtpLayer, False),
+        (_PlainMtpLayer, True),
+    ],
+)
+def test_unpicked_step0_is_unaffected(layer_cls, fused):
     num_contexts, num_gens, k = 2, 3, 3
+    b = num_contexts + num_gens
     ref_layer = _PlainMtpLayer(seed=7)
     ref = _run_loop(ref_layer, True, True, num_contexts, num_gens, k, 3)
     layer = layer_cls(seed=7)
-    out = _run_loop(layer, True, True, num_contexts, num_gens, k, 3)
+    fused_head = _FakeFusedHead([layer.head]) if fused else None
+    mxfp8_head = _FakeFusedHead([layer.head], max_rows=0) if fused else None
+    out = _run_loop(
+        layer,
+        True,
+        True,
+        num_contexts,
+        num_gens,
+        k,
+        3,
+        fused_head=fused_head,
+        draft_head=mxfp8_head,
+    )
     n_rows = ref_layer.kv_writes[0].shape[0]
-    assert not _compare(ref_layer, ref, layer, out, num_contexts + num_gens, n_rows)
+    assert not _compare(ref_layer, ref, layer, out, b, n_rows)
     assert layer.post_rows == ref_layer.post_rows
+    if fused:
+        _check_mtp_eagle_fused(fused_head, mxfp8_head, layer, b, k, with_out=True)
 
 
 def _mtp_worker(mapping=None):
