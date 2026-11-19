@@ -1040,7 +1040,6 @@ class TestEdgeDefaults:
 
     def test_sampling_overrides_beat_tables(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
-        pipeline.sampling = Cosmos3SamplingPolicy(fixed_sigmas=(1.0, 0.5))
         pipeline.resolver = bare_resolver(NEMOTRON_DENSE_RECIPE.name, fixed_sigmas=(1.0, 0.5))
         resolved = pipeline.resolver.request(RequestParameters(mode="video"))
         assert resolved.num_inference_steps == 2

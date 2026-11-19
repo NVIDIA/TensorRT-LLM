@@ -52,7 +52,7 @@ ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["action"]["common"]
 DROID_POLICY_DEFAULTS = COSMOS3_DEFAULTS["nemotron_dense"]["policy"]["droid_lerobot"]
 
 
-def resolve_domain_action_config(checkpoint_policy=None, **given) -> dict:
+def resolve_action_request(checkpoint_policy=None, **given) -> dict:
     """The action fields a request runs with, as a dict with the warnings and origins:
     against the raw ``checkpoint.json`` policy block when one is given, else the domain
     preset."""
@@ -127,7 +127,7 @@ class TestActionResolutionExtraParam:
 
 class TestDomainActionPresets:
     def test_bridge_preset_fills_missing_fields(self):
-        cfg = resolve_domain_action_config(domain_name="bridge_orig_lerobot")
+        cfg = resolve_action_request(domain_name="bridge_orig_lerobot")
         assert cfg["raw_action_dim"] == 10
         assert cfg["action_chunk_size"] == 16
         assert cfg["num_frames"] == 17
@@ -136,13 +136,13 @@ class TestDomainActionPresets:
         assert cfg["warnings"] == []
 
     def test_av_preset_uses_longer_chunk(self):
-        cfg = resolve_domain_action_config(domain_name="av")
+        cfg = resolve_action_request(domain_name="av")
         assert cfg["action_chunk_size"] == 60
         assert cfg["num_frames"] == 61
         assert cfg["raw_action_dim"] == 9
 
     def test_mismatch_emits_warning(self):
-        cfg = resolve_domain_action_config(
+        cfg = resolve_action_request(
             domain_name="bridge_orig_lerobot",
             raw_action_dim=9,
         )
@@ -151,12 +151,12 @@ class TestDomainActionPresets:
         assert "raw_action_dim=9" in cfg["warnings"][0]
 
     def test_action_fps_defaults_to_frame_rate(self):
-        cfg = resolve_domain_action_config(domain_name="av")
+        cfg = resolve_action_request(domain_name="av")
         assert cfg["frame_rate"] == 10.0
         assert cfg["action_fps"] == 10.0
 
     def test_explicit_action_fps_overrides_default(self):
-        cfg = resolve_domain_action_config(domain_name="av", action_fps=5.0, frame_rate=24.0)
+        cfg = resolve_action_request(domain_name="av", action_fps=5.0, frame_rate=24.0)
         assert cfg["frame_rate"] == 24.0
         assert cfg["action_fps"] == 5.0
 
@@ -192,7 +192,7 @@ class TestDomainActionPresets:
     )
     def test_canonical_action_width_per_embodiment(self, domain_name, expected):
         assert resolve_raw_action_dim(domain_name=domain_name) == expected
-        assert resolve_domain_action_config(domain_name=domain_name)["raw_action_dim"] == expected
+        assert resolve_action_request(domain_name=domain_name)["raw_action_dim"] == expected
 
     def test_aliased_domains_keep_their_own_width(self):
         """Sharing a sampling preset must not import that preset's action width."""
@@ -207,13 +207,13 @@ class TestDomainActionPresets:
     def test_libero_has_no_canonical_width(self):
         """LIBERO's width depends on the dataset's rotation space (7/10/13)."""
         assert "libero" not in EMBODIMENT_TO_RAW_ACTION_DIM
-        cfg = resolve_domain_action_config(domain_name="libero")
+        cfg = resolve_action_request(domain_name="libero")
         assert cfg["raw_action_dim"] is None
         assert cfg["action_resolution"] == 256  # sampling preset still applies
         assert any("canonical action width" in w for w in cfg["warnings"])
 
     def test_explicit_raw_action_dim_overrides_with_warning(self):
-        cfg = resolve_domain_action_config(domain_name="libero", raw_action_dim=7)
+        cfg = resolve_action_request(domain_name="libero", raw_action_dim=7)
         assert cfg["raw_action_dim"] == 7
         assert cfg["warnings"] == []
 
@@ -228,7 +228,7 @@ class TestDomainActionPresets:
         assert set(EMBODIMENT_TO_RAW_ACTION_DIM) <= set(EMBODIMENT_TO_DOMAIN_ID)
 
     def test_unknown_domain_warns_and_uses_generic_defaults(self):
-        cfg = resolve_domain_action_config(domain_name="typo_domain")
+        cfg = resolve_action_request(domain_name="typo_domain")
         assert cfg["action_chunk_size"] == 16
         assert cfg["action_resolution"] == 480
         assert cfg["warnings"]
@@ -236,7 +236,7 @@ class TestDomainActionPresets:
 
     def test_non_positive_action_timing_raises(self):
         with pytest.raises(ValueError, match="action_fps must be positive"):
-            resolve_domain_action_config(domain_name="av", action_fps=0.0)
+            resolve_action_request(domain_name="av", action_fps=0.0)
 
     def test_unknown_resolution_raises(self):
         with pytest.raises(ValueError, match="Unknown Cosmos3 action_resolution"):
@@ -263,7 +263,7 @@ class TestCheckpointPolicyDefaults:
             "action_fps": 15.0,
         }
 
-        cfg = resolve_domain_action_config(checkpoint_policy=self.METADATA)
+        cfg = resolve_action_request(checkpoint_policy=self.METADATA)
         assert cfg["domain_name"] == "droid_lerobot"
         assert cfg["raw_action_dim"] == 8
         assert cfg["action_chunk_size"] == 32
@@ -275,7 +275,7 @@ class TestCheckpointPolicyDefaults:
         assert cfg["warnings"] == []
 
     def test_explicit_non_policy_domain_does_not_inherit_droid_width(self):
-        cfg = resolve_domain_action_config(
+        cfg = resolve_action_request(
             domain_name="bridge_orig_lerobot",
             checkpoint_policy=self.METADATA,
         )

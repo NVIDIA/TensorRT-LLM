@@ -352,7 +352,7 @@ class TestRequest:
         assert resolver.request(RequestParameters(is_v2v=True)).flow_shift == 5.0
         assert resolver.request(RequestParameters(is_transfer=True)).flow_shift == 5.0
         assert resolver.request(RequestParameters(flow_shift=3.0)).flow_shift == 3.0
-        assert _resolver().request(RequestParameters()).flow_shift is None  # distilled
+        assert _resolver().request(RequestParameters()).flow_shift is None  # no checkpoint shift
 
     def test_flow_shift_overrides_replace_the_unread_scheduler_shift(self):
         """The scheduler configs that ship a Karras or native grid carry flow_shift

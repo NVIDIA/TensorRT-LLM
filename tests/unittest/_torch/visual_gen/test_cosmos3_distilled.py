@@ -105,8 +105,8 @@ def _base_policy() -> Cosmos3SamplingPolicy:
 
 def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
     """A pipeline instance without heavyweight ``__init__``. ``default_use_system_prompt``
-    and ``checkpoint_policy`` (the raw ``checkpoint.json`` block) go into the resolver, as
-    the checkpoint would put them; the resolver sees the distilled schedule of ``sampling``."""
+    goes into the resolver, as the checkpoint would put it; the resolver sees the distilled
+    schedule of ``sampling``."""
     pipeline = object.__new__(Cosmos3OmniMoTPipeline)
     defaults = dict(
         _device=torch.device("cpu"),
@@ -121,14 +121,12 @@ def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
     defaults.setdefault("_scheduler_cache", {})
     defaults.setdefault("_base_scheduler", defaults.get("scheduler"))
     use_system_prompt = defaults.pop("default_use_system_prompt", False)
-    policy = defaults.pop("checkpoint_policy", None)
     sigmas = getattr(defaults["sampling"], "fixed_sigmas", None)
     defaults.setdefault(
         "resolver",
         bare_resolver(
             defaults["family"],
             fixed_sigmas=sigmas,
-            policy=policy,
             use_system_prompt=use_system_prompt,
         ),
     )

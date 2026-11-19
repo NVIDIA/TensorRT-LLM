@@ -1663,7 +1663,6 @@ class TestCosmos3TextGuardrailBlocked:
         pipeline.audio_gen = False
         pipeline.audio_scheduler = None
         pipeline.family = QWEN3_RECIPE.name
-        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         # All-None policy is the documented pre-load placeholder.
         pipeline.sampling = Cosmos3SamplingPolicy()
         pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
