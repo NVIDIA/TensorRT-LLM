@@ -431,23 +431,33 @@ def test_disaggregated_handoff() -> None:
         assert tokens == _run(ctx, [other])[0] and cached <= mask.index(True)
 
 
-def test_generation_only_passes_deployment_checks() -> None:
-    # Generation workers reject what context workers reject.
+@pytest.mark.parametrize("request_type", ["context_only", "generation_only"])
+@pytest.mark.parametrize("v2", [True, False], ids=["v2", "v1"])
+def test_disaggregated_deployment_checks(request_type: str, v2: bool) -> None:
+    # Both roles pass the full checks; the V1 transceiver cannot key blocks by rows.
     _, pe = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
     request = GenerationRequest(
         [1, 2, 3],
         SamplingParams(max_tokens=1),
         prompt_embeds=pe,
-        disaggregated_params=DisaggregatedParams(request_type="generation_only"),
+        disaggregated_params=DisaggregatedParams(request_type=request_type),
+    )
+    model = SimpleNamespace(
+        prompt_embeds_unsupported_reason=lambda: None, config=SimpleNamespace(hidden_size=4)
     )
     worker = SimpleNamespace(
         llm_args=SimpleNamespace(
-            speculative_config=object(),
+            speculative_config=None,
             parallel_config=SimpleNamespace(enable_attention_dp=False, cp_size=1),
-        )
+        ),
+        engine=SimpleNamespace(model_engine=SimpleNamespace(model=model)),
+        _uses_kv_cache_manager_v2=lambda: v2,
     )
-    with pytest.raises(RequestError, match="speculative decoding"):
+    if v2:
         BaseWorker._check_prompt_embeds(worker, request)
+    else:
+        with pytest.raises(RequestError, match="use_kv_cache_manager_v2"):
+            BaseWorker._check_prompt_embeds(worker, request)
 
 
 def test_cancel_releases_rows(llm: LLM, table: torch.Tensor) -> None:
