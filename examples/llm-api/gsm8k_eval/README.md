@@ -56,7 +56,7 @@ Arguments:
 | Argument | Meaning |
 |---|---|
 | `--endpoint URL` / `--model DIR` | Exactly one: an existing server's base URL, or a model for a managed launch. |
-| `--served-model-name NAME` | Model id to request; by default the only id listed by `/v1/models`. Required for endpoints without `/v1/models`, such as the `trtllm-serve disaggregated` router. |
+| `--served-model-name NAME` | Model id to request; by default the only id listed by `/v1/models`. Required only when the endpoint returns HTTP 404 for `/v1/models`. |
 | `--config YAML` | Managed mode: the `trtllm-serve --config` file (required). |
 | `--chat-template FILE` | Managed mode: passed as `trtllm-serve --chat_template`. |
 | `--server-env NAME=VALUE` | Managed mode: extra server environment variable (repeatable). |
@@ -71,6 +71,12 @@ Arguments:
 Invalid arguments, including a question count outside 1..1319, are rejected before any server is
 started or any request is sent. The full 1,319-question evaluation is a manual run; no CI
 configuration selects it.
+
+The `trtllm-serve disaggregated` router provides `/v1/models`, but may return HTTP 503
+until a context worker registers. Both endpoint and managed modes retry that response
+within the startup budget (at most one hour, also bounded by the remaining run budget).
+Managed mode also waits for `/health`. Other model-discovery HTTP errors, malformed
+replies and model-name mismatches fail immediately.
 
 Exit status: 0 when every selected question completed without an error, timeout or truncation
 (and, with `--min-correct`, enough answers are correct); 1 when the run finished but did not
@@ -150,8 +156,9 @@ with this version; the renamed protocol preserves the same prompts, requests and
 The replies of one run all come from one served model. Before its first request, each attempt
 records the model it asks: the `--served-model-name`, or else the only model that `/v1/models`
 lists. If the recorded replies were asked of a different model, the attempt is refused before
-any question is asked. The refusal is recorded in `run_manifest.json`, `results.jsonl` is left
-unchanged, and a managed server is stopped. A results directory whose replies come from more
+any question is asked. The refusal is recorded in `run_manifest.json`, and a managed
+server is stopped. Completed records are preserved; loading the ledger can quarantine
+and truncate an incomplete trailing line before this refusal is decided. A results directory whose replies come from more
 than one model is never resumed. A run whose selected questions all have completed replies asks
 nothing and contacts no server; its summary names the model those replies came from. The
 evaluator identifies a model only by its served name, so it cannot detect different weights

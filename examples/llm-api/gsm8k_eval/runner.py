@@ -60,6 +60,10 @@ class ServerError(RuntimeError):
     """The server did not come up or stopped serving."""
 
 
+class _ModelListNotReady(ServerError):
+    """The endpoint is waiting for a model-serving worker to register."""
+
+
 @dataclasses.dataclass(frozen=True)
 class ManagedServer:
     """A ``trtllm-serve`` launch this run owns.
@@ -140,12 +144,14 @@ def _read_json(path: Path) -> Optional[dict[str, Any]]:
 def served_model_ids(base: str, deps: RunDeps) -> Optional[list[str]]:
     """The model ids an OpenAI-compatible endpoint lists at ``/v1/models``.
 
-    ``None`` when the endpoint has no such route (HTTP 404), like the router of
-    ``trtllm-serve disaggregated``.
+    ``None`` when the endpoint has no such route (HTTP 404). HTTP 503 means the
+    endpoint is not ready to list models yet.
     """
     reply = deps.get(f"{base}/v1/models", timeout=CONNECT_TIMEOUT_S)
     if reply.status_code == 404:
         return None
+    if reply.status_code == 503:
+        raise _ModelListNotReady("/v1/models answered HTTP 503")
     if reply.status_code != 200:
         raise ServerError(f"/v1/models answered HTTP {reply.status_code}")
     try:
@@ -178,9 +184,15 @@ def resolve_model(base: str, requested: Optional[str], deps: RunDeps) -> tuple[s
 
 
 def _wait_ready(
-    base: str, process: Any, limit: float, requested: Optional[str], deps: RunDeps
+    base: str,
+    process: Any,
+    limit: float,
+    requested: Optional[str],
+    deps: RunDeps,
+    *,
+    check_health: bool = True,
 ) -> tuple[str, bool]:
-    """Poll ``/health`` of a managed server until it answers; return ``resolve_model``'s answer."""
+    """Wait for model discovery, also polling health for a managed server."""
     while True:
         code = process.poll()
         if code is not None:
@@ -188,11 +200,14 @@ def _wait_ready(
         if deps.monotonic() >= limit:
             raise ServerError("trtllm-serve was not ready within its startup budget")
         try:
-            if deps.get(f"{base}/health", timeout=CONNECT_TIMEOUT_S).status_code == 200:
+            if (
+                not check_health
+                or deps.get(f"{base}/health", timeout=CONNECT_TIMEOUT_S).status_code == 200
+            ):
                 return resolve_model(base, requested, deps)
-        except requests.exceptions.RequestException:
+        except (_ModelListNotReady, requests.exceptions.RequestException):
             pass
-        deps.sleep(POLL_S)
+        deps.sleep(min(POLL_S, max(0.0, limit - deps.monotonic())))
 
 
 @dataclasses.dataclass
@@ -552,7 +567,14 @@ def run(
             else:
                 base = endpoint.rstrip("/")
                 try:
-                    model, listed = resolve_model(base, served_model, deps)
+                    model, listed = _wait_ready(
+                        base,
+                        _ExternalEndpoint(),
+                        min(deadline, deps.monotonic() + STARTUP_LIMIT_S),
+                        served_model,
+                        deps,
+                        check_health=False,
+                    )
                 except (ServerError, requests.exceptions.RequestException) as error:
                     timing["startup_error"] = f"{type(error).__name__}: {error}"
                 else:

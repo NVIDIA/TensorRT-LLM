@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--served-model-name",
         help="model id to request (default: the only one listed; required for endpoints "
-        "without /v1/models, such as the trtllm-serve disaggregated router)",
+        "returning HTTP 404 for /v1/models)",
     )
     parser.add_argument("--config", help="managed mode: the trtllm-serve --config YAML")
     parser.add_argument(
