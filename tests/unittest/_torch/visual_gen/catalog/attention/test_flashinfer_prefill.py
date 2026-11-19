@@ -14,7 +14,7 @@ from tensorrt_llm._torch.visual_gen.catalog.attention.flashinfer_prefill import 
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 TARGET_CELLS = {
-    "minimax_h3_v2": (
+    "visual_gen/minimax_h3_v2/default_pipeline": (
         Cell(
             "short H3 text-refiner prefix",
             dict(dtype=torch.bfloat16, batch=1, q=12, kv=12, heads=56, dim=128, padding=True),
@@ -24,7 +24,9 @@ TARGET_CELLS = {
 
 
 @pytest.mark.parametrize(
-    "cell", [*flashinfer_prefill.CELLS, *TARGET_CELLS["minimax_h3_v2"]], ids=lambda c: c.why
+    "cell",
+    [*flashinfer_prefill.CELLS, *TARGET_CELLS["visual_gen/minimax_h3_v2/default_pipeline"]],
+    ids=lambda c: c.why,
 )
 def test_prefill_matches_reference(cell):
     spec = cell.spec

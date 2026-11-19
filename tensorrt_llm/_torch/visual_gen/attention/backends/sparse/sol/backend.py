@@ -162,10 +162,7 @@ class SOLCuTeDSLAttention(AttentionBackend):
                 key="sol_attn_dense_backend_unavailable",
             )
 
-    # The `.item()` in here would graph-break the enclosing block once per
-    # attention layer, so keep it in eager (as cute_dsl/fmha.py and VSA's
-    # `_get_vsa_inputs` do). Returns a host-side bool, so the dense and sparse
-    # phases still compile as separate graphs -- they run different kernels.
+    # CUDA Graph capture uses the host-resolved phase to avoid reading a device timestep.
     @torch.compiler.disable
     def _dense_by_step(self, timestep: Any) -> bool:
         # Under CUDA-graph capture the runner has already resolved the phase
