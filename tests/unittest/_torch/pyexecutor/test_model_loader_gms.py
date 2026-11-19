@@ -881,3 +881,63 @@ def test_release_localized_moe_weights_visits_every_module():
     model = nn.Sequential(first, nn.Linear(2, 2), nn.Sequential(second))
     model_loader_mod.release_localized_moe_weights(model)
     assert released == [first, second]
+
+
+class _LocalizedSpy(nn.Module):
+    """Stands in for a MegaMoE backend whose expert bank was moved into driver mappings."""
+
+    def __init__(self, released, error=None):
+        super().__init__()
+        self._released = released
+        self._error = error
+
+    def release_ugpu_localized_weights(self):
+        self._released.append(self)
+        if self._error is not None:
+            raise self._error
+
+
+def test_release_localized_moe_weights_continues_after_a_failure():
+    released = []
+    failing = _LocalizedSpy(released, RuntimeError("unmap failed"))
+    later = _LocalizedSpy(released)
+    with pytest.raises(RuntimeError, match="unmap failed"):
+        model_loader_mod.release_localized_moe_weights(nn.Sequential(failing, later))
+    assert released == [failing, later]
+
+
+def test_load_releases_localized_weights_when_a_step_after_construction_fails(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    released = []
+    localized = _LocalizedSpy(released)
+    model = nn.Sequential(localized)
+
+    def timed_load(checkpoint_dir, checkpoint_loader):
+        loader._model_in_load = model
+        return model, None
+
+    def interrupted(_dirs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(loader, "_timed_load", timed_load)
+    monkeypatch.setattr(model_loader_mod, "_release_checkpoint_page_cache", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        loader.load("/ckpt", MagicMock(name="checkpoint_loader"))
+    assert released == [localized]
+    assert loader._model_in_load is None
+
+
+def test_load_keeps_the_load_error_when_the_release_also_fails(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    released = []
+    localized = _LocalizedSpy(released, RuntimeError("unmap failed"))
+
+    def timed_load(checkpoint_dir, checkpoint_loader):
+        loader._model_in_load = nn.Sequential(localized)
+        raise ValueError("manifest step failed")
+
+    monkeypatch.setattr(loader, "_timed_load", timed_load)
+    with pytest.raises(ValueError, match="manifest step failed"):
+        loader.load("/ckpt", MagicMock(name="checkpoint_loader"))
+    assert released == [localized]
+    assert loader._model_in_load is None
