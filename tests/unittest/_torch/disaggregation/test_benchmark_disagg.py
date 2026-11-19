@@ -210,6 +210,7 @@ class MockBenchmarkExecutor:
     _allgather_model_parallel_status = PyExecutor._allgather_model_parallel_status
     _get_request_admission_capacity = PyExecutor._get_request_admission_capacity
     _benchmark_stage_fetched = PyExecutor._benchmark_stage_fetched
+    _check_benchmark_schedule_request = PyExecutor._check_benchmark_schedule_request
     _maybe_advance_benchmark_stage = PyExecutor._maybe_advance_benchmark_stage
     _log_benchmark_stage = PyExecutor._log_benchmark_stage
     _configure_benchmark_req_queues_size = PyExecutor._configure_benchmark_req_queues_size
@@ -1933,11 +1934,17 @@ class TestBenchmarkRequestStages:
         ex._benchmark_fill_phase_active = False
         ex._benchmark_stage_base_fetch = 100
         ex.num_fetch_requests = 115
-        queue = Mock(**{"peek_request.return_value.child_req_ids": None})
-        ex._pop_from_waiting_queue(queue, 0)
+        ex._pop_from_waiting_queue(Mock(), 0)
         assert TestBenchmarkFillAdmissionFlowControl._admitted_cap(ex) == 1
         ex.num_fetch_requests = 116
-        ex._pop_from_waiting_queue(queue, 0)
+        ex._pop_from_waiting_queue(Mock(), 0)
         assert TestBenchmarkFillAdmissionFlowControl._admitted_cap(ex) == 0
+
+    def test_schedule_rejects_child_requests(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ex = self._executor(monkeypatch, "8,4")
+        request = Mock(
+            **{"sampling_config.beam_width": 1, "sampling_config.num_return_sequences": 2}
+        )
         with pytest.raises(ValueError, match="n=1"):
-            ex._pop_from_waiting_queue(Mock(), 0)
+            MockBenchmarkExecutor.PyExecutor.enqueue_request(ex, request)
+        ex.executor_request_queue.enqueue_request.assert_not_called()

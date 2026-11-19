@@ -135,7 +135,7 @@ from .request_delivery import ResponseChannel
 from .request_utils import (RequestBroadcaster,
                             derive_attention_dp_per_rank_request_cap,
                             drain_queued_items, get_from_waiting_queue,
-                            merge_requests)
+                            get_num_child_requests, merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, is_context_only_kv_cache,
                                request_context)
@@ -2516,6 +2516,8 @@ class PyExecutor:
         """
         Enqueue new requests
         """
+        for request in requests:
+            self._check_benchmark_schedule_request(request)
         req_ids = self.executor_request_queue.enqueue_requests(requests)
         if result_wait_queue is not None:
             self._response_channel.register(req_ids, result_wait_queue)
@@ -3110,6 +3112,7 @@ class PyExecutor:
         """
         Enqueue a new request.
         """
+        self._check_benchmark_schedule_request(request)
         req_id = self.executor_request_queue.enqueue_request(request)
         if result_wait_queue is not None:
             self._response_channel.register([req_id], result_wait_queue)
@@ -9573,6 +9576,14 @@ class PyExecutor:
                     f"exceeds the executor request admission capacity {admission_capacity}; "
                     f"using effective fill target {effective.fill_target}.")
 
+    def _check_benchmark_schedule_request(self,
+                                          request: ExecutorRequest) -> None:
+        """Reject n > 1 requests, which a request-counting schedule can't fit."""
+        if self._benchmark_sweep and get_num_child_requests(request) > 0:
+            raise ValueError(
+                f"{BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} schedules count "
+                "requests and require n=1")
+
     def _benchmark_stage_fetched(self) -> int:
         """Count admitted requests relative to the current measurement."""
         return self.num_fetch_requests - self._benchmark_stage_base_fetch
@@ -9779,10 +9790,6 @@ class PyExecutor:
                 self._benchmark_stages[self._benchmark_stage_index].num_requests
                 - self._benchmark_stage_fetched())
             max_new_requests = min(max_new_requests, remaining)
-            if waiting_queue and waiting_queue.peek_request().child_req_ids:
-                raise ValueError(
-                    f"{BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} schedules count "
-                    "requests and require n=1")
 
         if self.enable_attention_dp:
             # FIFO in warmup and the benchmark fill phase, where every request
