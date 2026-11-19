@@ -48,7 +48,7 @@ Changing the fused RoPE tile size belongs in `kernels/`. Changing the rotation f
 
 ### Choose the sharing scope
 
-**Only fully model-independent operations belong in a catalog.** Add an entry when independent callers use the same implementation unchanged. Express the computation in terms of tensors, layouts and explicit operation parameters. Model wrappers belong in their family or target, even when several models call the same native kernel. They own checkpoint interpretation, model-specific packing, masks, gates and collective scheduling.
+**Only fully model-independent operations belong in a catalog.** A new entry needs independent callers that use the same implementation unchanged. Express the computation in terms of tensors, layouts and explicit operation parameters. Model wrappers belong in their family or target, even when several models call the same native kernel. They own checkpoint interpretation, model-specific packing, masks, gates and collective scheduling.
 
 | Scope of the change | Place it here | H3 example |
 | --- | --- | --- |
@@ -66,7 +66,7 @@ Both the H3 Ulysses wrappers and the block-sparse attention op use the [Modeling
 
 ### Reuse an existing backend implementation
 
-- **Kernel or library operation.** Call an existing tensor operation such as PyTorch SDPA directly when its inputs, outputs and layout match. A fixed hardware or dtype requirement can be part of the contract. To share a kernel through a catalog, make scales, valid lengths and other inputs explicit and test the same computation for its independent callers.
+- **Kernel or library operation.** Prefer a supported entry point when its tensor and layout contract fits. For example, H3 and the VisualGen SOL backend both call the [SOL predictor](../../attention/backends/sparse/sol/predictor.py) with Q/K/V and explicit thresholds. H3 decides which layers and denoising steps use its result. For a catalog operation, specify scales, valid lengths and other inputs explicitly. Extend its reference tests when a caller needs a new layout, dtype or execution mode.
 - **Runner.** Use the backend's supported execution method when a kernel needs a plan or workspace. For example, [`CuDNNSdpaRunner.run_dense`](../../attention/backends/cudnn.py) owns cuDNN execution. The H3 component controls the runner's lifetime and passes it to [`DenseAttentionOp`](ops/attention.py). The runner manages its plans, workspace and device-specific dispatch. Put new per-instance orchestration with the component.
 - **Model or backend wrapper.** Keep packed-row mask construction, checkpoint recipes, learned gates and per-layer or per-step choices in the owning family or target, including fallback and weight-loading paths. Apply the [Modeling V1 dependency boundary](../../../modeling_v2/README.md#modeling-v1-code) to model classes, layers and complete attention backends. Reuse the underlying computation through a supported kernel or runner interface. The H3 pilot still calls private FlashInfer `_run_*` methods and CuTe quantization helpers in [its attention adapter](ops/attention.py). Treat these as backend internals. When a new caller needs one, expose the required tensor operation or execution method at its owner.
 
