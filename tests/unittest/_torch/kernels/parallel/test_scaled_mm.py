@@ -172,13 +172,14 @@ def test_fp8_scaled_mm_epilogue(m, n, k, gelu, out_fp8):
     assert out.shape == (m, n) and out.dtype == (E4M3
                                                  if out_fp8 else torch.bfloat16)
     if out_fp8:
-        # The e4m3 codes match the quantized reference up to accumulation-order rounding; a
-        # dropped, doubled or misplaced bias changes far more of them.
+        # The e4m3 codes match the quantized reference up to one e4m3 step, plus the FP8 fast
+        # accumulation error near zero (about 1e-3 of the output range); a dropped, doubled or
+        # misplaced bias moves values by ~2 here and changes far more codes.
         ref_codes = (ref * d_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3)
         torch.testing.assert_close(out.float(),
                                    ref_codes.float(),
                                    rtol=0.125,
-                                   atol=2**-6)
+                                   atol=1e-3 * E4M3_MAX)
         same = (out.view(torch.uint8) == ref_codes.view(torch.uint8)).float()
         assert same.mean().item(
         ) > 0.98, f"{same.mean().item():.4f} codes equal"
