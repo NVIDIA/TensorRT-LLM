@@ -101,29 +101,87 @@ LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG = (
 )
 LOGIT_EDITS_MODE_MSG = (
     "embedding_bias (logit_bias) and bad_words are not supported with this speculative "
-    "decoding mode (vanilla MTP or SA). Drop them from the request, or disable "
+    "decoding mode (SA). Drop them from the request, or disable speculative decoding."
+)
+# The occurrence penalties are applied by the same pass, so the same deploys cannot serve them.
+PENALTY_TREE_MSG = (
+    "repetition_penalty / presence_penalty / frequency_penalty are not "
+    "supported with tree speculative decoding (dynamic tree) yet. Drop "
+    "the penalties, use a linear speculation mode, or disable "
     "speculative decoding."
 )
+PENALTY_RELAXED_ACCEPTANCE_MSG = (
+    "repetition_penalty / presence_penalty / frequency_penalty are not supported with "
+    "relaxed acceptance for thinking. Drop the penalties, disable "
+    "use_relaxed_acceptance_for_thinking, or disable speculative decoding."
+)
+PENALTY_MODE_MSG = (
+    "repetition_penalty / presence_penalty / frequency_penalty are not supported with this "
+    "speculative decoding mode (SA). Drop the penalties, or disable speculative decoding."
+)
+
+# What keeps a deploy's worker from verifying through the logits-edit pass, mapped to the
+# (embedding_bias and bad_words, occurrence penalties) rejection messages.
+_EDIT_PASS_LIMIT_MSGS = {
+    "tree": (LOGIT_EDITS_TREE_MSG, PENALTY_TREE_MSG),
+    "relaxed_acceptance": (LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG, PENALTY_RELAXED_ACCEPTANCE_MSG),
+    "mode": (LOGIT_EDITS_MODE_MSG, PENALTY_MODE_MSG),
+}
+
+
+def _edit_pass_limit(spec_config) -> Optional[str]:
+    """What keeps this one-model deploy's worker from verifying through the logits-edit
+    pass (``SpecWorkerBase._edit_target_logits``): a key of ``_EDIT_PASS_LIMIT_MSGS``, or
+    None when it does.
+
+    The pass maps one logits row to each verified position of a linear draft, and strict
+    or rejection acceptance reads its output. Tree rows, relaxed acceptance and SA, which
+    verifies outside it, are not covered. This follows ``get_spec_worker``: Eagle3 serves
+    a tree of top-K 1 with its linear worker, while MTP picks its tree worker on the flag
+    alone. Only fields the user sets are read, so the LLM API and the executor reach the
+    same answer before and after the checkpoint resolves an MTP config's mode.
+    """
+    spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
+    if getattr(spec_config, "use_dynamic_tree", False):
+        linear_eagle3 = (
+            spec_dec_mode is not None
+            and spec_dec_mode.is_eagle3_one_model()
+            and (getattr(spec_config, "dynamic_tree_max_topK", None) or 0) <= 1
+        )
+        if not linear_eagle3:
+            return "tree"
+    if getattr(spec_config, "use_relaxed_acceptance_for_thinking", False):
+        return "relaxed_acceptance"
+    if spec_dec_mode is not None and spec_dec_mode.is_sa():
+        return "mode"
+    return None
+
+
+def verifies_through_edit_pass(spec_config) -> bool:
+    """Whether this one-model deploy's worker verifies against the logits the edit pass
+    returns, on every step. The occurrence penalties, embedding_bias and bad_words are
+    served only where it does."""
+    return _edit_pass_limit(spec_config) is None
 
 
 def logit_edits_unsupported_reason(spec_config) -> Optional[str]:
     """Why this one-model deploy cannot serve embedding_bias and bad_words, or None.
 
     Both are applied to the target logits a worker verifies against, in the pass
-    ``enable_penalty`` turns on. That pass maps one logits row to each verified position of
-    a linear draft, and strict or rejection acceptance reads its output; tree rows, relaxed
-    acceptance and the workers that verify outside it (vanilla MTP, SA) are not covered.
+    ``enable_penalty`` turns on, so the deploy must enable it and verify through it
+    (``verifies_through_edit_pass``).
     """
     if not getattr(spec_config, "enable_penalty", False):
         return LOGIT_EDITS_DISABLED_MSG
-    if getattr(spec_config, "use_dynamic_tree", False):
-        return LOGIT_EDITS_TREE_MSG
-    if getattr(spec_config, "use_relaxed_acceptance_for_thinking", False):
-        return LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG
-    spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
-    if spec_dec_mode is not None and (spec_dec_mode.is_mtp_vanilla() or spec_dec_mode.is_sa()):
-        return LOGIT_EDITS_MODE_MSG
-    return None
+    limit = _edit_pass_limit(spec_config)
+    return None if limit is None else _EDIT_PASS_LIMIT_MSGS[limit][0]
+
+
+def penalty_unsupported_reason(spec_config) -> Optional[str]:
+    """Why this one-model deploy cannot serve the occurrence penalties even with
+    ``enable_penalty`` on, or None when it can."""
+    limit = _edit_pass_limit(spec_config)
+    return None if limit is None else _EDIT_PASS_LIMIT_MSGS[limit][1]
 
 
 def one_model_sampling_rejection_reason(
@@ -299,14 +357,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # Tree speculation lays each request's logits out as tree nodes, where a
         # row's history is its root path rather than the rows before it. Applying
         # the linear mapping there would let sibling branches penalize each other,
-        # so reject until tree-aware prefixes are implemented.
-        if not self._penalty_supported:
-            raise ValueError(
-                "repetition_penalty / presence_penalty / frequency_penalty are not "
-                "supported with tree speculative decoding (dynamic tree) yet. Drop "
-                "the penalties, use a linear speculation mode, or disable "
-                "speculative decoding."
-            )
+        # so reject until tree-aware prefixes are implemented. Relaxed acceptance
+        # and SA verify outside the pass that applies the penalties.
+        if self._penalty_unsupported_reason is not None:
+            raise ValueError(self._penalty_unsupported_reason)
 
     @staticmethod
     def _validate_unsupported_logits_processors(
@@ -420,7 +474,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         args: TorchSampler.Args,
         *,
         enable_penalty: bool = False,
-        penalty_supported: bool = True,
+        penalty_unsupported_reason: Optional[str] = None,
         fused_sampling: bool = False,
         watermark_unsupported_reason: Optional[str] = None,
         logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
@@ -433,8 +487,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             enable_penalty: whether the deploy enabled the occurrence penalties.
                 Only used to decide whether a request asking for them is admitted;
                 the penalties themselves are applied inside the worker.
-            penalty_supported: whether this speculation mode's row layout is one
-                the penalties can map (linear modes yes, tree modes not yet).
+            penalty_unsupported_reason: why this deploy cannot serve the occurrence
+                penalties even when it enabled them (None when it can).
             fused_sampling: whether the configured sampler supports min_p.
             watermark_unsupported_reason: why this speculation mode cannot serve watermarked
                 requests (None when it can). Such requests are rejected at admission.
@@ -443,7 +497,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 the edits themselves are applied inside the worker.
         """
         self._enable_penalty = enable_penalty
-        self._penalty_supported = penalty_supported
+        self._penalty_unsupported_reason = penalty_unsupported_reason
         self._watermark_config = args.watermark_config
         self._watermark_unsupported_reason = watermark_unsupported_reason
         self._fused_sampling = fused_sampling

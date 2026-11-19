@@ -946,8 +946,9 @@ class MTPWorker(SpecWorkerBase):
                 draft_tokens = spec_metadata.draft_tokens.reshape(
                     num_gens, runtime_draft_len)
 
-                # Use base implementation for strict acceptance
-                accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+                # Strict acceptance against the edited target logits, like the
+                # rejection branch above
+                accepted_tokens, num_accepted_tokens = self._accept_draft_tokens(
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
 

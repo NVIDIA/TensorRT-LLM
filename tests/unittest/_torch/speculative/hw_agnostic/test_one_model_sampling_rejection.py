@@ -30,6 +30,9 @@ from tensorrt_llm._torch.speculative.spec_sampler_base import (
     LOGIT_EDITS_MODE_MSG,
     LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG,
     LOGIT_EDITS_TREE_MSG,
+    PENALTY_MODE_MSG,
+    PENALTY_RELAXED_ACCEPTANCE_MSG,
+    PENALTY_TREE_MSG,
     UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG,
     UNSUPPORTED_MIN_LENGTH_MSG,
     UNSUPPORTED_MIN_P_MSG,
@@ -38,10 +41,12 @@ from tensorrt_llm._torch.speculative.spec_sampler_base import (
     SpecSampler,
     logit_edits_unsupported_reason,
     one_model_sampling_rejection_reason,
+    penalty_unsupported_reason,
+    verifies_through_edit_pass,
 )
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi import LLM
-from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, SADecodingConfig
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, SADecodingConfig
 
 # (id, SamplingParams kwargs, expected message). Every entry is a value the
 # OpenAI frontend can send today.
@@ -253,16 +258,18 @@ def _executor_request(**sampling_config_overrides) -> types.SimpleNamespace:
     )
 
 
-def _validate_on_executor(request) -> None:
+def _validate_on_executor(request, **sampler_overrides) -> None:
     """Run the real ``validate_request`` against a minimal sampler stand-in."""
     sampler = types.SimpleNamespace(
         _validate_unsupported_logits_processors=(
             SpecSampler._validate_unsupported_logits_processors
         ),
         _enable_penalty=False,
-        _penalty_supported=True,
+        _penalty_unsupported_reason=None,
         _fused_sampling=False,
     )
+    for name, value in sampler_overrides.items():
+        setattr(sampler, name, value)
     SpecSampler.validate_request(sampler, request)
 
 
@@ -308,14 +315,19 @@ def test_executor_side_check_rejects_a_post_processor_on_the_full_path():
     assert str(excinfo.value) == UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG
 
 
+def _mode(*, eagle3: bool = False, sa: bool = False) -> types.SimpleNamespace:
+    return types.SimpleNamespace(is_eagle3_one_model=lambda: eagle3, is_sa=lambda: sa)
+
+
 def _spec_config(**overrides) -> types.SimpleNamespace:
     """The fields ``logit_edits_unsupported_reason`` reads, for a linear Eagle3 deploy
     that enabled the logits edits."""
     config = dict(
         enable_penalty=True,
         use_dynamic_tree=False,
+        dynamic_tree_max_topK=None,
         use_relaxed_acceptance_for_thinking=False,
-        spec_dec_mode=types.SimpleNamespace(is_mtp_vanilla=lambda: False, is_sa=lambda: False),
+        spec_dec_mode=_mode(eagle3=True),
     )
     config.update(overrides)
     return types.SimpleNamespace(**config)
@@ -331,29 +343,106 @@ def test_logit_edits_are_supported_on_an_enabled_linear_deploy():
     "overrides,expected",
     [
         (dict(enable_penalty=False), LOGIT_EDITS_DISABLED_MSG),
-        (dict(use_dynamic_tree=True), LOGIT_EDITS_TREE_MSG),
+        (dict(use_dynamic_tree=True, dynamic_tree_max_topK=4), LOGIT_EDITS_TREE_MSG),
+        # MTP picks its tree worker on the flag alone, whatever the top-K.
+        (
+            dict(use_dynamic_tree=True, dynamic_tree_max_topK=1, spec_dec_mode=_mode()),
+            LOGIT_EDITS_TREE_MSG,
+        ),
         (dict(use_relaxed_acceptance_for_thinking=True), LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG),
-        (
-            dict(
-                spec_dec_mode=types.SimpleNamespace(
-                    is_mtp_vanilla=lambda: True, is_sa=lambda: False
-                )
-            ),
-            LOGIT_EDITS_MODE_MSG,
-        ),
-        (
-            dict(
-                spec_dec_mode=types.SimpleNamespace(
-                    is_mtp_vanilla=lambda: False, is_sa=lambda: True
-                )
-            ),
-            LOGIT_EDITS_MODE_MSG,
-        ),
+        (dict(spec_dec_mode=_mode(sa=True)), LOGIT_EDITS_MODE_MSG),
     ],
-    ids=["disabled", "dynamic_tree", "relaxed_acceptance", "vanilla_mtp", "sa"],
+    ids=["disabled", "dynamic_tree", "mtp_top1_tree", "relaxed_acceptance", "sa"],
 )
 def test_logit_edits_unsupported_reason_names_the_deploy_limit(overrides, expected):
     assert logit_edits_unsupported_reason(_spec_config(**overrides)) == expected
+
+
+@pytest.mark.cpu_only
+def test_eagle3_top1_tree_serves_logit_edits_and_penalties():
+    """Eagle3 hands a tree of top-K 1 to its linear worker, which verifies through the
+    logits-edit pass."""
+    spec_config = _spec_config(use_dynamic_tree=True, dynamic_tree_max_topK=1)
+    assert verifies_through_edit_pass(spec_config)
+    assert logit_edits_unsupported_reason(spec_config) is None
+    assert penalty_unsupported_reason(spec_config) is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides,edits_expected,penalty_expected",
+    [
+        (dict(), None, None),
+        (
+            dict(use_dynamic_tree=True, dynamic_tree_max_topK=4),
+            LOGIT_EDITS_TREE_MSG,
+            PENALTY_TREE_MSG,
+        ),
+        (
+            dict(use_relaxed_acceptance_for_thinking=True),
+            LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG,
+            PENALTY_RELAXED_ACCEPTANCE_MSG,
+        ),
+        (dict(spec_dec_mode=_mode(sa=True)), LOGIT_EDITS_MODE_MSG, PENALTY_MODE_MSG),
+    ],
+    ids=["linear", "dynamic_tree", "relaxed_acceptance", "sa"],
+)
+def test_penalties_and_logit_edits_share_the_deploy_limits(
+    overrides, edits_expected, penalty_expected
+):
+    """One predicate decides both: a deploy whose worker verifies outside the logits-edit
+    pass serves neither, and the pass stays off there."""
+    spec_config = _spec_config(**overrides)
+    assert logit_edits_unsupported_reason(spec_config) == edits_expected
+    assert penalty_unsupported_reason(spec_config) == penalty_expected
+    assert verifies_through_edit_pass(spec_config) is (penalty_expected is None)
+
+
+@pytest.mark.cpu_only
+def test_executor_side_check_rejects_penalties_the_deploy_cannot_serve():
+    request = _executor_request(repetition_penalty=1.2)
+    _validate_on_executor(request, _enable_penalty=True)
+    with pytest.raises(ValueError) as excinfo:
+        _validate_on_executor(
+            request,
+            _enable_penalty=True,
+            _penalty_unsupported_reason=PENALTY_RELAXED_ACCEPTANCE_MSG,
+        )
+    assert str(excinfo.value) == PENALTY_RELAXED_ACCEPTANCE_MSG
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        (dict(), None),
+        (dict(use_relaxed_acceptance_for_thinking=True), LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG),
+    ],
+    ids=["strict", "relaxed_acceptance"],
+)
+def test_multi_layer_mtp_checkpoint_is_decided_alike_on_both_sides(flags, expected):
+    """The LLM API holds the MTP config before the checkpoint fills in its layer count and
+    reads it as MTP-Eagle, while the executor resolves a 3-layer checkpoint to vanilla
+    MTP. Both must decide a request alike, or the executor rejects it after the stream
+    has opened."""
+    frontend_config = MTPDecodingConfig(max_draft_len=3, enable_penalty=True, **flags)
+    executor_config = MTPDecodingConfig(max_draft_len=3, enable_penalty=True, **flags)
+    executor_config.num_nextn_predict_layers = 3
+    assert frontend_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert executor_config.spec_dec_mode.is_mtp_vanilla()
+
+    assert logit_edits_unsupported_reason(frontend_config) == expected
+    assert logit_edits_unsupported_reason(executor_config) == expected
+
+    bias = torch.zeros(16)
+    bias[3] = -5.0
+    params = SamplingParams(embedding_bias=bias, bad_token_ids=[7])
+    if expected is None:
+        _check_arguments(frontend_config, params)
+    else:
+        with pytest.raises(RequestError) as excinfo:
+            _check_arguments(frontend_config, params)
+        assert str(excinfo.value) == expected
 
 
 @pytest.mark.cpu_only
@@ -370,12 +459,9 @@ def test_enabled_deploy_admits_embedding_bias_and_bad_words():
     params = SamplingParams(embedding_bias=bias, bad_token_ids=[7])
     assert one_model_sampling_rejection_reason(params, logit_edits_unsupported=None) is None
 
-    request = types.SimpleNamespace(
-        py_min_length=None,
-        py_bad_words=[[7], [1, 2, 3]],
-        py_no_repeat_ngram_size=None,
-        py_embedding_bias=bias,
-    )
+    request = _executor_request()
+    request.py_bad_words = [[7], [1, 2, 3]]
+    request.py_embedding_bias = bias
     SpecSampler._validate_unsupported_logits_processors(request, logit_edits_unsupported=None)
 
 
