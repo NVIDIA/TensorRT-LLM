@@ -168,9 +168,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--turboquant-bits",
         type=float,
-        choices=(2.0, 2.5, 3.0, 3.5, 4.0),
+        choices=(2.0, 3.0, 4.0),
         default=4.0,
-        help="TurboQuant average bits per value.",
+        help="TurboQuant bits per value.",
     )
     parser.add_argument(
         "--turboquant-seed",

@@ -27,7 +27,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, Buffe
 
 pytestmark = pytest.mark.cpu_only
 
-_SUPPORTED_BITS = (2, 2.5, 3, 3.5, 4)
+_SUPPORTED_BITS = (2, 3, 4)
 
 
 @pytest.fixture(autouse=True)
@@ -118,7 +118,7 @@ kv_cache_compression_config:
   turboquant_seed: 7
 """)
     section = yaml_options["kv_cache_compression_config"]
-    # YAML reads 3 as an int and 2.5 as a float; both forms must be accepted.
+    # YAML reads 3 as an int; ints and floats must both be accepted.
     assert type(section["turboquant_bits"]) is type(bits)
     serve_args = update_llm_args_with_extra_dict({"model": "/tmp/dummy_model"}, yaml_options)
     configs = (
@@ -145,7 +145,7 @@ def test_model_defaults_revalidate_the_dump_of_either_format() -> None:
 
     for config in (
         ColdPageQuantizationCompressionConfig(),
-        _turboquant(turboquant_bits=3.5, turboquant_seed=5),
+        _turboquant(turboquant_bits=3, turboquant_seed=5),
     ):
         args = TorchLlmArgs(model="/tmp/dummy_model", kv_cache_compression_config=config)
         apply_model_defaults_to_llm_args(args, {"max_batch_size": 8})
@@ -158,7 +158,7 @@ def test_model_defaults_revalidate_the_dump_of_either_format() -> None:
     [
         *(
             ({"quant": "turboquant", "turboquant_bits": bits}, "turboquant_bits must be one of")
-            for bits in (1, 5, 2.25, "x", True)
+            for bits in (1, 5, 2.25, 2.5, 3.5, "x", True)
         ),
         # TurboQuant-prod is not offered: re-encoding on every offload compounds its QJL error.
         ({"quant": "turboquant", "turboquant_mode": "prod"}, "turboquant_mode"),
@@ -187,8 +187,7 @@ def test_unsupported_settings_are_rejected_at_construction(options, match) -> No
 @pytest.mark.parametrize(
     ("bits", "width", "error", "match"),
     [
-        (4, 24, ValueError, "divisible by 16"),  # alignment of integer widths
-        (2.5, 48, ValueError, "divisible by 32"),  # alignment of fractional widths
+        (4, 24, ValueError, "divisible by 16"),  # alignment of the rotation pieces
         (4, 560, NotImplementedError, "power-of-two rest"),  # 2 x 256 + 48
         (4, 1024, NotImplementedError, "fewer than 1024"),  # instance size
         (4, 496, NotImplementedError, "at most 4 power-of-two pieces"),  # 256+128+64+32+16
