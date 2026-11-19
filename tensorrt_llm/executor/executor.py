@@ -42,7 +42,7 @@ from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
-from .utils import ProcessPoolExecutorSession, RequestError
+from .utils import ProcessPoolExecutorSession, RequestError, sync_submission
 
 if TYPE_CHECKING:
     from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
@@ -198,33 +198,35 @@ class GenerationExecutor(ABC):
             prompt_token_ids = [prompt_token_ids]
 
         futures = []
-        for i, p in enumerate(prompt_token_ids):
-            if isinstance(sampling_params, list):
-                sp = sampling_params[i]
-            else:
-                sp = sampling_params
-            if isinstance(lora_request, list):
-                lora_req = lora_request[i]
-            else:
-                lora_req = lora_request
-            if isinstance(prompt_adapter_request, list):
-                pa_req = prompt_adapter_request[i]
-            else:
-                pa_req = prompt_adapter_request
-            cs = cache_salt[i] if isinstance(cache_salt, list) else cache_salt
-            future = self.generate_async(
-                p,
-                sampling_params=sp,
-                lora_request=lora_req,
-                prompt_adapter_request=pa_req,
-                streaming=False,
-                disaggregated_params=disaggregated_params,
-                conversation_params=conversation_params,
-                cache_salt=cs)
-            futures.append(future)
+        with sync_submission(futures):
+            for i, p in enumerate(prompt_token_ids):
+                if isinstance(sampling_params, list):
+                    sp = sampling_params[i]
+                else:
+                    sp = sampling_params
+                if isinstance(lora_request, list):
+                    lora_req = lora_request[i]
+                else:
+                    lora_req = lora_request
+                if isinstance(prompt_adapter_request, list):
+                    pa_req = prompt_adapter_request[i]
+                else:
+                    pa_req = prompt_adapter_request
+                cs = cache_salt[i] if isinstance(cache_salt,
+                                                 list) else cache_salt
+                future = self.generate_async(
+                    p,
+                    sampling_params=sp,
+                    lora_request=lora_req,
+                    prompt_adapter_request=pa_req,
+                    streaming=False,
+                    disaggregated_params=disaggregated_params,
+                    conversation_params=conversation_params,
+                    cache_salt=cs)
+                futures.append(future)
 
-        for future in futures:
-            future.result()
+            for future in futures:
+                future.result()
 
         if unbatched:
             futures = futures[0]

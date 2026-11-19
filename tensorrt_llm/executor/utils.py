@@ -15,6 +15,8 @@
 
 import asyncio
 import concurrent.futures
+import contextlib
+import contextvars
 import ctypes
 import os
 import re
@@ -129,6 +131,48 @@ def has_event_loop() -> bool:
     except RuntimeError:
         return False
     return True
+
+
+# Set while a blocking generate() call submits its batch.
+_sync_submission: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "trtllm_sync_submission", default=False)
+
+
+@contextlib.contextmanager
+def sync_submission(futures: list):
+    """Submit and wait for a batch on behalf of a blocking generate() call.
+
+    Inside the block, generation requests wait for command-queue capacity
+    instead of failing fast, even when the calling thread also runs an event
+    loop, as in Jupyter, so a large batch is not rejected partway through
+    when the queue fills.
+
+    If the block raises, including KeyboardInterrupt, the requests already in
+    ``futures`` are aborted: the caller never receives their results, so they
+    must not keep generating.
+    """
+    token = _sync_submission.set(True)
+    try:
+        yield
+    except BaseException:
+        for future in futures:
+            try:
+                future.abort()
+            except Exception:  # noqa: BLE001 - abort is best-effort cleanup
+                pass
+        raise
+    finally:
+        _sync_submission.reset(token)
+
+
+def submission_waits_for_capacity() -> bool:
+    """Whether a submitted generation request may block for queue capacity.
+
+    Blocking callers wait. An event-loop caller fails fast with
+    EngineUnavailableError rather than stall the loop, unless the request
+    comes from a blocking generate() call (see sync_submission).
+    """
+    return _sync_submission.get() or not has_event_loop()
 
 
 class RequestError(RuntimeError):

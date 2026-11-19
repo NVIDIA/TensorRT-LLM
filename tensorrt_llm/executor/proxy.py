@@ -58,10 +58,10 @@ from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (EngineDeadError, EngineUnavailableError, ErrorResponse,
                     RequestError, WorkerCommIpcAddrs, create_mpi_comm_session,
-                    get_spawn_proxy_process_env, has_event_loop,
-                    is_llm_response, multi_frontend_request_addr,
-                    multi_frontend_result_addr, namespace_client_id,
-                    print_alive_threads)
+                    get_spawn_proxy_process_env, is_llm_response,
+                    multi_frontend_request_addr, multi_frontend_result_addr,
+                    namespace_client_id, print_alive_threads,
+                    submission_waits_for_capacity)
 from .worker import GenerationExecutorWorker, worker_main
 from .worker_process_monitor import WorkerProcessIdentity, WorkerProcessMonitor
 
@@ -1232,7 +1232,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._request_sender.send(
             pickle.dumps(request),
             wait_for_capacity=isinstance(request, GenerationRequest)
-            and not has_event_loop(),
+            and submission_waits_for_capacity(),
             cancellation_id=request.id
             if isinstance(request, CancellingRequest) else None,
             control=isinstance(

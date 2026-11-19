@@ -54,7 +54,7 @@ from ..executor.postprocessor_hook import (PostProcessorHook,
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (EngineDeadError, EngineUnavailableError,
                               RequestError, create_mpi_comm_session,
-                              get_spawn_proxy_process_env)
+                              get_spawn_proxy_process_env, sync_submission)
 from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
                       create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
@@ -797,29 +797,31 @@ class BaseLLM:
                     f"priority must be a float in [0.0, 1.0], got {priority}")
 
         futures = []
-        for i, request_input in enumerate(request_inputs_list):
-            future = self.generate_async(
-                request_input,
-                sampling_params=self._item_at(sampling_params, i),
-                lora_request=self._item_at(lora_request, i),
-                prompt_adapter_request=self._item_at(prompt_adapter_request, i),
-                kv_cache_retention_config=self._item_at(
-                    kv_cache_retention_config, i),
-                disaggregated_params=self._item_at(disaggregated_params, i),
-                scheduling_params=self._item_at(scheduling_params, i),
-                conversation_params=self._item_at(conversation_params, i),
-                cache_salt=self._item_at(cache_salt, i),
-                priority=self._item_at(priority, i),
-                kv_hints=self._item_at(kv_hints, i),
-                streaming=False,
-            )
-            futures.append(future)
+        with sync_submission(futures):
+            for i, request_input in enumerate(request_inputs_list):
+                future = self.generate_async(
+                    request_input,
+                    sampling_params=self._item_at(sampling_params, i),
+                    lora_request=self._item_at(lora_request, i),
+                    prompt_adapter_request=self._item_at(
+                        prompt_adapter_request, i),
+                    kv_cache_retention_config=self._item_at(
+                        kv_cache_retention_config, i),
+                    disaggregated_params=self._item_at(disaggregated_params, i),
+                    scheduling_params=self._item_at(scheduling_params, i),
+                    conversation_params=self._item_at(conversation_params, i),
+                    cache_salt=self._item_at(cache_salt, i),
+                    priority=self._item_at(priority, i),
+                    kv_hints=self._item_at(kv_hints, i),
+                    streaming=False,
+                )
+                futures.append(future)
 
-        for future in tqdm(futures,
-                           desc="Processed requests",
-                           dynamic_ncols=True,
-                           disable=not use_tqdm):
-            future.result()
+            for future in tqdm(futures,
+                               desc="Processed requests",
+                               dynamic_ncols=True,
+                               disable=not use_tqdm):
+                future.result()
 
         if unbatched:
             futures = futures[0]

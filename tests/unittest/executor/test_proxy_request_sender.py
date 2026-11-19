@@ -105,6 +105,103 @@ def _pre_shutdown(proxy):
     return shutdown
 
 
+def _capturing_proxy():
+    proxy = _bare_proxy()
+    sent = []
+    proxy._request_sender = SimpleNamespace(
+        send=lambda payload, **kwargs: sent.append(kwargs["wait_for_capacity"])
+    )
+    return proxy, sent
+
+
+def test_generation_admission_waits_only_for_blocking_callers():
+    from tensorrt_llm.executor.request import GenerationRequest
+    from tensorrt_llm.executor.utils import sync_submission
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    proxy, sent = _capturing_proxy()
+    request = GenerationRequest([1], SamplingParams())
+
+    async def on_event_loop():
+        proxy._send_request(request)  # an async server handler fails fast
+        # Regression: a blocking generate() from a thread that also runs an
+        # event loop (Jupyter) failed fast too, so a large batch was rejected
+        # partway through once the command queue filled.
+        with sync_submission([]):
+            proxy._send_request(request)
+
+    proxy._send_request(request)  # a plain blocking caller waits
+    asyncio.run(on_event_loop())
+    assert sent == [True, False, True]
+
+
+class _Future:
+    def __init__(self):
+        self.aborted = False
+
+    def abort(self):
+        self.aborted = True
+
+    def result(self):
+        return self
+
+
+@pytest.mark.parametrize("failure", [EngineUnavailableError, KeyboardInterrupt])
+def test_failed_blocking_generate_aborts_the_requests_it_submitted(failure):
+    from tensorrt_llm.executor.utils import submission_waits_for_capacity
+    from tensorrt_llm.llmapi.llm import BaseLLM
+
+    submitted, waits = [], []
+
+    class Llm(BaseLLM):
+        def generate_async(self, inputs, **kwargs):
+            waits.append(submission_waits_for_capacity())
+            if len(submitted) == 2:
+                raise failure("command queue is full")
+            submitted.append(_Future())
+            return submitted[-1]
+
+        def shutdown(self):
+            pass
+
+    llm = Llm.__new__(Llm)
+
+    async def in_notebook():
+        # A Jupyter cell calls the blocking API on the loop's thread.
+        llm.generate([[1], [2], [3]], use_tqdm=False)
+
+    with pytest.raises(failure):
+        asyncio.run(in_notebook())
+    assert waits == [True, True, True]
+    assert [future.aborted for future in submitted] == [True, True]
+
+
+def test_multimodal_encoder_generate_uses_blocking_submission():
+    from tensorrt_llm.executor.utils import submission_waits_for_capacity
+    from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
+
+    submitted, waits = [], []
+
+    def generate_async(inputs):
+        waits.append(submission_waits_for_capacity())
+        if len(submitted) == 1:
+            raise EngineUnavailableError("command queue is full")
+        submitted.append(_Future())
+        return submitted[-1]
+
+    encoder = MultimodalEncoder.__new__(MultimodalEncoder)
+    encoder.generate_async = generate_async
+    encoder.shutdown = lambda: None
+
+    async def in_notebook():
+        encoder.generate([{"prompt": "a"}, {"prompt": "b"}], use_tqdm=False)
+
+    with pytest.raises(EngineUnavailableError):
+        asyncio.run(in_notebook())
+    assert waits == [True, True]
+    assert submitted[0].aborted
+
+
 @pytest.mark.parametrize("setting", [None, "0", "1"])
 def test_batching_is_opt_in(monkeypatch, setting):
     if setting is None:
