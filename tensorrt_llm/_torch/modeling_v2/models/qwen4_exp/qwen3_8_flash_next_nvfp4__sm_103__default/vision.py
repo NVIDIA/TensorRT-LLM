@@ -21,6 +21,7 @@ import math
 from typing import NamedTuple
 
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
@@ -37,6 +38,8 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
     triton_pos_embed_interpolate,
 )
 from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
+
+from . import weights as _weights
 
 #: Tower rope base (`vision_config` has no rope field); unrelated to the text 1e7.
 VISION_ROPE_THETA = 10000.0
@@ -292,7 +295,7 @@ def _rope_tables(
     return angles.cos().contiguous(), angles.sin().contiguous()
 
 
-class VisionTower:
+class VisionTower(nn.Module):
     """One request's images or videos through the 27-block ViT and its patch merger.
 
     Not a target: runs only for a context request carrying media, from the shell, before
@@ -306,11 +309,15 @@ class VisionTower:
     frames: attention is per frame, the position embedding and rope are per grid row and
     repeat per frame, the norms and MLPs are row-wise, and a frame's `h * w` is a multiple
     of `merge**2`, so a cut keeps every merger block whole. One frame past the bound cannot
-    be served; `validate_request` refuses it at admission."""
+    be served; `validate_request` refuses it at admission.
 
-    def __init__(self, w: dict, vision_config) -> None:
-        """`w` is the core's weight table after load; `vision_config` the composite
-        config's vision half, which `check_deployment` matched against this checkpoint's."""
+    The tower declares and loads its own weights (`weights.VISION_WEIGHTS`), so a model
+    built without it (`disable_mm_encoder`) allocates no vision weight."""
+
+    def __init__(self, vision_config, dtype: torch.dtype) -> None:
+        """`vision_config` is the composite config's vision half, which `check_deployment`
+        matched against this checkpoint's; `dtype` the activation dtype the tower runs at."""
+        super().__init__()
         vcfg = vision_config
         self.depth = vcfg.depth
         self.hidden = vcfg.hidden_size
@@ -324,11 +331,27 @@ class VisionTower:
         self.merge_dim = self.hidden * self.merge * self.merge
         # The position table is a square grid of this side.
         self.grid_side = math.isqrt(vcfg.num_position_embeddings)
-        self.dtype = w["embed"].dtype
-        self._w = _vision_views(w, self.depth)
+        self.dtype = dtype
+        # Every weight, declared here (meta-init intercepts `torch.empty`) and filled by
+        # `load_weights`; the views the ops read are built after load.
+        self.dims = _weights.vision_dims(vcfg, dtype)
+        self.w = _weights.VISION_WEIGHTS.declare(self.dims)
+        self._w: _VisionWeights | None = None
         # Persistent scratch: `thop_attention` grows `workspace` in place; never the
         # engine's own workspace.
         self._ws: torch.Tensor | None = None
+
+    def load_weights(self, weights) -> None:
+        """Fill the tower's weights from the checkpoint's `model.visual.` keys."""
+        _weights.VISION_WEIGHTS.load(self, weights)
+
+    def post_load_weights(self) -> None:
+        """Build the views the ops read, then warm the kernels up; once, though the
+        engine's post-load walk may reach this module more than once."""
+        if self._w is not None:
+            return
+        self._w = _vision_views(self.w, self.depth)
+        self.warm_up()
 
     def warm_up(self) -> None:
         """Run the tower once per `WARM_UP_GRIDS` grid on zero pixels, so every JIT kernel it
@@ -340,7 +363,7 @@ class VisionTower:
             rows = sum(t * h * w for t, h, w in grid)
             self._run(torch.zeros(rows, self.pixel_width, dtype=self.dtype, device=device), grid)
 
-    def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """`pixel_values` is `[sum(t*h*w), in_channels*kt*kh*kw]`, one flat patch per row,
         channel-slowest. `grid_thw` is one `(frames, height, width)` row per image or video
         and stays on the host (no synchronization). Returns
@@ -498,7 +521,9 @@ def multimodal_embeds(tower: VisionTower | None, kwargs: dict):
         if runtime is not None and int(runtime.num_mm_tokens_in_chunk) == 0:
             # Every placeholder row of this request lies in another chunk.
             continue
-        assert tower is not None, "post_load_weights builds the vision tower before any step"
+        assert tower is not None, (
+            "no vision tower (disable_mm_encoder), so admission refuses media requests"
+        )
         towers = {}
         if image is not None:
             towers["image"] = run_tower(tower, image, *MEDIA_KEYS["image"])
