@@ -85,7 +85,7 @@ def serialize_item(obj: object) -> bytes:
 def _numpy_has_dtype(dtype: torch.dtype) -> bool:
     """Whether ``Tensor.numpy()`` supports ``dtype`` (bfloat16 and float8 do not)."""
     try:
-        torch.empty(0, dtype=dtype).numpy()
+        torch.empty(0, dtype=dtype, device="cpu").numpy()
     except TypeError:
         return False
     return True

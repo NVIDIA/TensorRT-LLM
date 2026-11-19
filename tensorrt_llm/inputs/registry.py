@@ -367,8 +367,6 @@ class BaseMultimodalInputProcessor(ABC):
         of its embedding rows, as `apply_mm_hashes` keys media items, so KV-cache
         reuse matches only identical embeddings.
         """
-        # Detokenizing rebuilds the prompt without the caller's UUIDs.
-        multimodal_uuids = inputs.get("multi_modal_uuids")
         if (inputs.get("prompt_token_ids") is not None
                 and inputs.get("prompt") is None
                 and not self.supports_token_id_mm_expansion):
@@ -382,7 +380,7 @@ class BaseMultimodalInputProcessor(ABC):
                 self._key_attached_embeddings(
                     prompt_token_ids,
                     extra_processed_inputs["multimodal_data"],
-                    multimodal_uuids,
+                    inputs.get("multi_modal_uuids"),
                 ))
         return prompt_token_ids, extra_processed_inputs
 
@@ -396,6 +394,9 @@ class BaseMultimodalInputProcessor(ABC):
 
         The rows of each item fill that item's embedding slots in prompt order,
         so positions and runs come from the embedding mask that fusion uses.
+        Attached items are keyed on their embedding slots only: unlike media
+        items, `multimodal_lengths` holds each item's row count, and positions
+        and runs leave out framing tokens such as Llama 4's tile separators.
         The mask's prefix sum is also cached in `multimodal_data`.
 
         Args:
@@ -487,6 +488,9 @@ class BaseMultimodalInputProcessor(ABC):
         Also flips `sampling_params.add_special_tokens` to False so the
         subclass's re-tokenization doesn't double-add BOS/EOS on top of the
         ones already encoded in `prompt_token_ids`.
+
+        The rebuilt prompt keeps the multimodal data, UUIDs and processor
+        kwargs of `inputs`.
         """
         prompt = self.tokenizer.decode(inputs["prompt_token_ids"])
         if sampling_params is not None and sampling_params.add_special_tokens:
@@ -494,11 +498,14 @@ class BaseMultimodalInputProcessor(ABC):
                 "Setting add_special_tokens to False because prompt_token_ids "
                 "were provided to generate. VLMs will re-encode the prompt.")
             sampling_params.add_special_tokens = False
-        return TextPrompt(
+        text_prompt = TextPrompt(
             prompt=prompt,
             multi_modal_data=inputs.get("multi_modal_data"),
             mm_processor_kwargs=inputs.get("mm_processor_kwargs") or {},
         )
+        if "multi_modal_uuids" in inputs:
+            text_prompt["multi_modal_uuids"] = inputs["multi_modal_uuids"]
+        return text_prompt
 
     @property
     @abstractmethod

@@ -197,6 +197,10 @@ def test_qwen3_vl_attached_embedding_uuid_joins_its_hash() -> None:
             "image": ["user-b"]
         }
     }, [embedding])[1]["multimodal_input"]
+    other_rows = _attach(processor, {
+        "prompt": "Describe.",
+        "multi_modal_uuids": uuids
+    }, [embedding + 1])[1]["multimodal_input"]
     # Token IDs are decoded back to text before the hook runs.
     from_token_ids = _attach(
         processor, {
@@ -208,6 +212,8 @@ def test_qwen3_vl_attached_embedding_uuid_joins_its_hash() -> None:
     assert with_uuid.multimodal_uuids == ["user-a"]
     assert with_uuid.multimodal_hashes != plain.multimodal_hashes
     assert other_uuid.multimodal_hashes != with_uuid.multimodal_hashes
+    # The UUID joins the content; it does not replace it.
+    assert other_rows.multimodal_hashes != with_uuid.multimodal_hashes
     assert from_token_ids.multimodal_uuids == ["user-a"]
     assert from_token_ids.multimodal_hashes == with_uuid.multimodal_hashes
 
