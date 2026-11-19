@@ -74,15 +74,29 @@ def test_scans_both_trees_and_all_jenkins_extensions(scan: tuple[Path, Path, dic
 
 @pytest.mark.parametrize(
     "mutation",
-    ["missing", "missing_copyright", "spdx_only", "wrong_body", "too_long", "line_comment"],
+    [
+        "missing",
+        "missing_copyright",
+        "bare_spdx_copyright",
+        "bare_copyright",
+        "incidental_copyright",
+        "spdx_only",
+        "wrong_body",
+        "too_long",
+        "line_comment",
+    ],
 )
 def test_rejects_missing_or_damaged_license(scan: tuple[Path, Path, dict], mutation: str) -> None:
     root, _, _ = scan
+    copyright_line = next(line for line in HEADER.splitlines() if "Copyright" in line)
     content = {
         "missing": "int value;\n",
         "missing_copyright": "\n".join(
             line for line in HEADER.split("\n") if "Copyright" not in line
         ),
+        "bare_spdx_copyright": HEADER.replace(copyright_line, " * SPDX-FileCopyrightText:   "),
+        "bare_copyright": HEADER.replace(copyright_line, " * Copyright (c)"),
+        "incidental_copyright": HEADER.replace(copyright_line, " * No copyright notice."),
         "spdx_only": "/* SPDX-License-Identifier: Apache-2.0 */\n",
         "wrong_body": HEADER.replace("WITHOUT WARRANTIES", "WITH WARRANTIES"),
         "too_long": "/*" + "x" * 4096 + "*/\n" + HEADER,
@@ -92,6 +106,13 @@ def test_rejects_missing_or_damaged_license(scan: tuple[Path, Path, dict], mutat
     counts, output = run_scan(scan)
     assert counts == (1, 0, 1)
     assert "error include/bad.h:" in output
+    if mutation in (
+        "missing_copyright",
+        "bare_spdx_copyright",
+        "bare_copyright",
+        "incidental_copyright",
+    ):
+        assert "license copyright notice is missing" in output
 
 
 def test_preserves_policy_skip_without_hiding_other_failures(scan: tuple[Path, Path, dict]) -> None:
@@ -117,6 +138,11 @@ def test_ignores_line_wrapping_but_preserves_license_paragraphs(
         HEADER.replace("Apache License", "Apache\t  License"),
         HEADER.replace(copyright_line, " * Copyright (c) 2020-2026, Example Authors."),
         HEADER.replace(copyright_line, " * SPDX-FileCopyrightText: 2020-2026 Example Authors."),
+        HEADER.replace(copyright_line, " * SPDX-FileCopyrightText: Example Authors."),
+        HEADER.replace(
+            copyright_line, " * Adapted from an upstream implementation.\n" + copyright_line
+        ),
+        HEADER.replace(copyright_line, " * Copyright (c)\n * 2020-2026 Example Authors."),
     ):
         path.write_text(content)
         assert run_scan(scan)[0] == (1, 0, 0)
@@ -216,9 +242,34 @@ def test_scan_directory_forms_select_the_same_files(
     (root / "include/nested").mkdir()
     path = root / "include/nested/bad.h"
     path.write_text("int value;\n")
+    sibling = root / "include/sibling.h"
+    sibling.write_text(HEADER)
+    expected_count = 1 if directory == "include/nested" else 2
     assert checker.check_licenses(
-        root, config, [directory], files=[path] if selected_files else None
-    ) == (1, 0, 1)
+        root, config, [directory], files=[path, sibling] if selected_files else None
+    ) == (expected_count, 0, 1)
+
+
+@pytest.mark.parametrize("linked", [False, True])
+def test_selected_path_checks_parents_before_normalization(
+    scan: tuple[Path, Path, dict], linked: bool
+) -> None:
+    root, _, _ = scan
+    deeper = root / "include/nested/deeper"
+    deeper.mkdir(parents=True)
+    sibling = root / "include/example.h"
+    sibling.write_text(HEADER)
+    (root / "include/nested/example.h").write_text("int value;\n")
+    parent = deeper
+    if linked:
+        parent = root / "include/alias"
+        parent.symlink_to(deeper, target_is_directory=True)
+    files = [sibling, parent / "../example.h"]
+    if linked:
+        with pytest.raises(ValueError, match="scan directory is a symlink: .*include/alias"):
+            run_scan(scan, files=files)
+    else:
+        assert run_scan(scan, files=files)[0] == (2, 0, 1)
 
 
 def test_missing_or_empty_scan_fails(scan: tuple[Path, Path, dict]) -> None:

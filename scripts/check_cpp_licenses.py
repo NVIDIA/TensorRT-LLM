@@ -86,7 +86,13 @@ def _check_header(path: Path) -> None:
         raise ValueError("license header is missing")
     segments = _segments(header)
     body = _segments(_APACHE_BODY)
-    if not re.search(r"\bcopyright\b|\bSPDX-FileCopyrightText:", segments[0], re.IGNORECASE):
+    copyright_paragraph = header.split("\n\n", 1)[0]
+    copyright_prefix = re.search(
+        r"^(?:Copyright\b(?:[ \t]*(?:\(c\)|©))?(?:[ \t]+|$)|SPDX-FileCopyrightText:[ \t]*)",
+        copyright_paragraph,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if copyright_prefix is None or not copyright_paragraph[copyright_prefix.end() :].strip():
         raise ValueError("license copyright notice is missing")
     # The copyright paragraph varies; permit one trailing attribution paragraph.
     if len(segments) not in (len(body) + 1, len(body) + 2) or segments[1 : 1 + len(body)] != body:
@@ -113,15 +119,18 @@ def _scan_directory(root: Path, directory: str) -> Path:
 def _source_paths(root: Path, directories: list[str], files: list[Path] | None) -> Iterator[Path]:
     scan_roots = [_scan_directory(root, directory) for directory in directories]
     if files is not None:
-        for path in sorted({Path(os.path.abspath(filename)) for filename in files}):
-            if not any(path.is_relative_to(scan_root) for scan_root in scan_roots):
-                continue
+        paths: set[Path] = set()
+        for filename in files:
+            path = filename.absolute()
             for parent in path.parents:
                 if parent.is_symlink():
                     raise ValueError(f"scan directory is a symlink: {parent}")
                 if parent == root:
                     break
-            yield path
+            path = Path(os.path.abspath(path))
+            if any(path.is_relative_to(scan_root) for scan_root in scan_roots):
+                paths.add(path)
+        yield from sorted(paths)
         return
 
     for scan_root in scan_roots:
