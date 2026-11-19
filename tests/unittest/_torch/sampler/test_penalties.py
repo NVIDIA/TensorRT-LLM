@@ -19,7 +19,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions
-from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyHandler
+from tensorrt_llm._torch.pyexecutor.sampler.penalties import (
+    PenaltyHandler,
+    PenaltyState,
+    _unpack_prompt_mask,
+    seed_prompt,
+)
 
 apply_batched_occurrence_penalties = Fusions.apply_batched_occurrence_penalties
 update_occurrence_workspace = Fusions.update_occurrence_workspace
@@ -789,3 +794,114 @@ def test_single_beam_slot_sharing_a_beam_engine_is_routed_correctly() -> None:
         other = 1 + ((beam + 1) % 4)  # a token belonging to a different beam
         if other != token:
             torch.testing.assert_close(logits[beam, other], original[beam, other], rtol=0, atol=0)
+
+
+def _seed_metadata(vocab_size: int, slot_capacity: int = 3) -> SimpleNamespace:
+    return SimpleNamespace(
+        enable_penalty=True,
+        vocab_size=vocab_size,
+        penalty_state=PenaltyState.create(slot_capacity=slot_capacity, vocab_size=vocab_size),
+    )
+
+
+def _seed_reference(
+    prompt: list[int], ignore_length: int, vocab_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expected ``(counts row, unpacked prompt-mask row)`` after seeding one prompt."""
+    ignore = max(0, min(ignore_length, len(prompt)))
+    counts = torch.zeros(vocab_size, dtype=torch.int32)
+    seen = torch.zeros(vocab_size, dtype=torch.bool)
+    for position, token in enumerate(prompt):
+        if not 0 <= token < vocab_size:
+            continue
+        if position < ignore:
+            seen[token] = True
+        else:
+            counts[token] += 1
+    return counts, seen
+
+
+def _seed_prompt_tokens(vocab_size: int, dtype: torch.dtype = torch.int64) -> torch.Tensor:
+    """Duplicates, both ends of a bitmask word (bits 0 and 31), and dropped ids."""
+    ids = [0, 31, 31, 1, vocab_size - 1, 2, 2, 2, 31, 0, vocab_size - 1]
+    ids += [-1, vocab_size, vocab_size + 40, 2**40]
+    ids += [i % vocab_size for i in range(7, 7 + 3 * vocab_size, 3)]
+    if dtype == torch.int32:
+        ids = [i if i < 2**31 else -5 for i in ids]
+    return torch.tensor(ids, dtype=dtype, pin_memory=True)
+
+
+@pytest.mark.parametrize("vocab_size", [1, 33, 64, 997])
+@pytest.mark.parametrize("ignore_length", [-1, 0, 1, 7, 11, 10_000])
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32], ids=["int64", "int32"])
+def test_seed_prompt_matches_reference(
+    vocab_size: int, ignore_length: int, dtype: torch.dtype
+) -> None:
+    meta = _seed_metadata(vocab_size)
+    state = meta.penalty_state
+    slot = 1
+    prompt = _seed_prompt_tokens(vocab_size, dtype)
+    # Seed twice into one slot: counts accumulate and mask bits OR into existing ones.
+    seed_prompt(meta, slot, prompt, ignore_length)
+    seed_prompt(meta, slot, prompt, ignore_length)
+    # Invalid slots (padding row, negative) and an empty prompt are no-ops.
+    seed_prompt(meta, state.dummy_row, prompt, ignore_length)
+    seed_prompt(meta, -1, prompt, ignore_length)
+    seed_prompt(meta, 0, torch.empty(0, dtype=dtype), ignore_length)
+
+    counts, seen = _seed_reference(prompt.tolist(), ignore_length, vocab_size)
+    rows = torch.tensor([slot], device="cuda")
+    torch.testing.assert_close(state.counts[slot].cpu(), 2 * counts, rtol=0, atol=0)
+    torch.testing.assert_close(
+        _unpack_prompt_mask(state.prompt_mask, rows, vocab_size)[0].cpu(), seen, rtol=0, atol=0
+    )
+    # Padding bits past vocab_size stay clear, and every other row is untouched.
+    unpacked = (
+        (state.prompt_mask[slot].unsqueeze(-1) >> torch.arange(32, device="cuda")) & 1
+    ).flatten()
+    assert not unpacked[vocab_size:].any()
+    others = [r for r in range(state.counts.size(0)) if r != slot]
+    assert not state.counts[others].any()
+    assert not state.prompt_mask[others].any()
+
+
+@pytest.mark.parametrize("ignore_length", [0, 64])
+def test_seed_prompt_does_not_synchronize(ignore_length: int) -> None:
+    vocab_size = 4096
+    meta = _seed_metadata(vocab_size)
+    prompt = _seed_prompt_tokens(vocab_size)
+    seed_prompt(meta, 0, prompt, ignore_length)  # warm up allocations outside the check
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        seed_prompt(meta, 1, prompt, ignore_length)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+
+
+def test_seed_prompt_reads_prompt_freed_while_copy_is_queued() -> None:
+    vocab_size = 4096
+    ignore_length = 100
+    meta = _seed_metadata(vocab_size)
+    state = meta.penalty_state
+    prompt = _seed_prompt_tokens(vocab_size)
+    expected_counts, expected_seen = _seed_reference(prompt.tolist(), ignore_length, vocab_size)
+    # Hold the stream so the copy is still queued when the host releases the prompt
+    # and refills a pinned buffer of the same size.
+    torch.cuda._sleep(200_000_000)
+    seed_prompt(meta, 0, prompt, ignore_length)
+    num_tokens = prompt.numel()
+    del prompt
+    scribble = torch.empty(num_tokens, dtype=torch.int64, pin_memory=True)
+    scribble.fill_(vocab_size - 1)
+    torch.cuda.synchronize()
+
+    rows = torch.tensor([0], device="cuda")
+    torch.testing.assert_close(state.counts[0].cpu(), expected_counts, rtol=0, atol=0)
+    torch.testing.assert_close(
+        _unpack_prompt_mask(state.prompt_mask, rows, vocab_size)[0].cpu(),
+        expected_seen,
+        rtol=0,
+        atol=0,
+    )
