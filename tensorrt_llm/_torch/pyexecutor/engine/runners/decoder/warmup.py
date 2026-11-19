@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, Trtll
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
+from tensorrt_llm._torch.kernel_builder import KernelBuilder
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
@@ -335,8 +336,13 @@ class DecoderWarmup:
         )
         # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
         warmup_named_allreduce_topologies(self.model)
-        # Retain a partial summary when a phase raises.
-        with self._warmup_timer:
+        # Retain a partial summary when a phase raises. The memory-profiling warmup is
+        # KernelBuilder's build mode: as calls reach new shapes, ops build their kernels on
+        # worker processes before they go on, and the workers stop when the pass ends.
+        with (
+            self._warmup_timer,
+            KernelBuilder.get().warmup_pass(self._warmup_timer.purpose),
+        ):
             return self._warmup_scheduled(resource_manager, kv_cache_manager)
 
     def _get_max_shape_warmup_requests(
