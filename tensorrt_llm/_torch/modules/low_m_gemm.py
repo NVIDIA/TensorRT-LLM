@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
 
@@ -1038,6 +1038,19 @@ def lowm_fp8_mma_fits(m: int, n: int, k: int) -> bool:
 
 
 @functools.lru_cache(maxsize=None)
+def lowm_mma_options() -> Tuple[bool, bool]:
+    """``(bf16_dequant, swap_ab)`` of the MMA kernel; both give the plain kernel's bits."""
+    return is_blackwell_datacenter(), is_blackwell_datacenter()
+
+
+def lowm_tiles(n: int, rows: int, group_n: int = 0) -> int:
+    """8-column tiles per CTA that let the MMA kernel swap its operands at <= 8 rows, else 1."""
+    if 0 < rows <= 8 and lowm_mma_options()[1] and n % 16 == 0 and group_n % 16 == 0:
+        return 2
+    return 1
+
+
+@functools.lru_cache(maxsize=None)
 def _compiled_mma(
     m: int,
     n: int,
@@ -1055,6 +1068,11 @@ def _compiled_mma(
     a_rope_head_dim: int = 0,
     a_rms_eps: Optional[float] = None,
     n_tiles: int = 1,
+    bf16_dequant: bool = False,
+    swap_ab: bool = False,
+    index_pack: bool = False,
+    out_swiglu_limit: float = 0.0,
+    release_after_wait: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
@@ -1076,6 +1094,11 @@ def _compiled_mma(
         a_rms_norm=a_rms_eps is not None,
         a_rms_eps=a_rms_eps or 0.0,
         n_tiles=n_tiles,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        index_pack=index_pack,
+        out_swiglu_limit=out_swiglu_limit,
+        release_after_wait=release_after_wait,
     )
     dev = torch.device("cuda")
     groups = n // group_n if group_n else 1
@@ -1089,9 +1112,14 @@ def _compiled_mma(
         s = torch.empty((pad_up(n, 128) * pad_up(k // 32, 4),), dtype=torch.uint8, device=dev)
     else:
         s = torch.empty((n, k // 32), dtype=torch.uint8, device=dev)
-    if split_n:
+    if index_pack:
+        c = torch.empty((m, n // 2), dtype=torch.uint8, device=dev)
+        c2 = torch.empty((m, n // 32), dtype=torch.uint8, device=dev)
+    elif split_n:
         c = torch.empty((m, split_n), dtype=out_dtype, device=dev)
         c2 = torch.empty((m, n - split_n), dtype=out_dtype, device=dev)
+    elif out_swiglu_limit > 0.0:
+        c = c2 = torch.empty((m, n // 2), dtype=out_dtype, device=dev)
     else:
         c = c2 = torch.empty((m, n), dtype=out_dtype, device=dev)
     pos = torch.empty((m,), dtype=torch.int32, device=dev)
@@ -1143,6 +1171,8 @@ def mxfp8_lowm_linear(
     scale_swizzled: bool = False,
     rms_norm: Optional[Tuple[torch.Tensor, float]] = None,
     n_tiles: int = 1,
+    swiglu_out_limit: Optional[float] = None,
+    release_after_wait: bool = False,
 ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
     """y = x @ dequant(weight).T for small M, in BF16.
 
@@ -1155,6 +1185,9 @@ def mxfp8_lowm_linear(
     ``rms_norm``: (gamma [K] bf16, eps) projects the RMS-normalized rows of x,
     ``rms_norm(x) * gamma``, instead of x. ``n_tiles`` (N a multiple of ``8 * n_tiles``): 8-column
     tiles per CTA, the same result with fewer CTAs.
+    ``swiglu_out_limit`` = L (``swiglu_out_supported``): ``weight`` is a ``[2I, K]`` gate | up
+    weight and the result ``swiglu(x @ dequant(weight).T, swiglu_limit=L)`` ``[M, I]``, bit for
+    bit. ``release_after_wait``: dependents are released after this launch's dependency wait.
     """
     import cuda.bindings.driver as cuda
 
@@ -1162,7 +1195,17 @@ def mxfp8_lowm_linear(
     n = weight.shape[0]
     if n % (8 * n_tiles):
         raise ValueError(f"N={n} is not a multiple of {8 * n_tiles}")
-    if split_n:
+    out_swiglu_limit = 0.0
+    if swiglu_out_limit is not None:
+        if not swiglu_out_supported(m, k, weight, swiglu_out_limit):
+            raise ValueError(f"no SwiGLU output (limit {swiglu_out_limit}) for {m} x {k} x {n}")
+        if split_n or rope is not None or rms_norm is not None or scale_swizzled or n_tiles != 1:
+            raise ValueError("swiglu_out_limit takes a plain launch")
+        out_swiglu_limit = float(swiglu_out_limit)
+    bf16_dequant, swap_ab = lowm_mma_options()
+    if out_swiglu_limit:
+        out = out2 = torch.empty((m, n // 2), dtype=torch.bfloat16, device=x.device)
+    elif split_n:
         out = torch.empty((m, split_n), dtype=torch.bfloat16, device=x.device)
         out2 = torch.empty((m, n - split_n), dtype=torch.bfloat16, device=x.device)
     else:
@@ -1185,6 +1228,10 @@ def mxfp8_lowm_linear(
         scale_swizzled=scale_swizzled,
         a_rms_eps=None if rms_norm is None else float(rms_norm[1]),
         n_tiles=n_tiles,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        out_swiglu_limit=out_swiglu_limit,
+        release_after_wait=release_after_wait,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
@@ -1199,6 +1246,79 @@ def mxfp8_lowm_linear(
         stream,
     )
     return (out, out2) if split_n else out
+
+
+def _is_bf16_value(value: float) -> bool:
+    """Whether ``value`` (rounded to FP32) is exactly a BF16 value."""
+    import struct
+
+    return not struct.unpack("<I", struct.pack("<f", value))[0] & 0xFFFF
+
+
+def swiglu_out_supported(m: int, k: int, weight: torch.Tensor, limit: Optional[float]) -> bool:
+    """Whether ``mxfp8_lowm_linear(x [m, k], weight, ..., swiglu_out_limit=limit)`` runs: a positive
+    BF16-valued limit, an E4M3 ``[2I, k]`` weight with I a multiple of 4, m <= 64, k % 64 == 0."""
+    return (
+        limit is not None
+        and limit > 0.0
+        and _is_bf16_value(limit)
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.dim() == 2
+        and weight.shape[1] == k
+        and 0 < m <= 64
+        and weight.shape[0] % 8 == 0
+        and k > 0
+        and k % 64 == 0
+    )
+
+
+def mxfp8_lowm_index_query(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale_swizzled: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RoPE'd index queries ``x @ dequant(weight).T`` as ``(data int8 [M, H, 64], scales uint8
+    [M, H, 4])``, bit for bit ``pack_index_queries_split`` of the plain ``mxfp8_lowm_linear``."""
+    import cuda.bindings.driver as cuda
+
+    m, k = x.shape
+    n = weight.shape[0]
+    if n % 128:
+        raise ValueError(f"N={n} is not a whole number of 128-wide heads")
+    heads = n // 128
+    bf16_dequant, swap_ab = lowm_mma_options()
+    data = torch.empty((m, heads, 64), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((m, heads, 4), dtype=torch.uint8, device=x.device)
+    fn = _compiled_mma(
+        m,
+        n,
+        k,
+        get_env_enable_pdl(),
+        0,
+        0,
+        128,
+        cos_sin.shape[0],
+        scale_swizzled=True,
+        n_tiles=4,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        index_pack=True,
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(
+        graph_safe_from_dlpack(x),
+        graph_safe_from_dlpack(weight.view(torch.uint8)),
+        graph_safe_from_dlpack(scale_swizzled),
+        graph_safe_from_dlpack(data.view(m, heads * 64)),
+        graph_safe_from_dlpack(scales.view(m, heads * 4)),
+        graph_safe_from_dlpack(positions.reshape(-1).to(torch.int32)),
+        graph_safe_from_dlpack(cos_sin),
+        graph_safe_from_dlpack(_no_gamma(x.device)),
+        stream,
+    )
+    return data.view(torch.int8), scales
 
 
 def bf16_lowm_linear(
@@ -1271,6 +1391,8 @@ def fp8_grouped_lowm(
     scale: torch.Tensor,
     group_n: int,
     inverse_rope: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
+    n_tiles: int = 1,
+    release_after_wait: bool = False,
 ) -> torch.Tensor:
     """Grouped small-M GEMM over FP8 weights.
 
@@ -1280,12 +1402,17 @@ def fp8_grouped_lowm(
     ``out[:, g*group_n:(g+1)*group_n] = x[:, g*K:(g+1)*K] @ dequant(weight[g]).T``.
     ``inverse_rope``: (positions [M] int32, cos/sin [P, 2, 32] fp32, head_dim) rotates the last
     64 columns of every head of x back as they load, as ``mla_rope_inplace(inverse=True)``.
+    ``n_tiles``: 8-column tiles per CTA (``group_n`` a multiple of ``8 * n_tiles``), same result.
+    ``release_after_wait``: dependents are released after this launch's dependency wait.
     """
     import cuda.bindings.driver as cuda
 
     m = x.shape[0]
     n, k = weight.shape
+    if (group_n or n) % (8 * n_tiles):
+        raise ValueError(f"N={group_n or n} is not a multiple of {8 * n_tiles}")
     block128 = scale.dtype == torch.float32
+    bf16_dequant, swap_ab = lowm_mma_options()
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     if inverse_rope is None:
         pos, cos_sin = _rope_placeholders(m, x.device)
@@ -1302,6 +1429,10 @@ def fp8_grouped_lowm(
         scale_block128=block128,
         rope_positions=cos_sin.shape[0] if inverse_rope is not None else 0,
         a_rope_head_dim=head_dim,
+        n_tiles=n_tiles,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        release_after_wait=release_after_wait,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
@@ -1327,7 +1458,10 @@ __all__ = [
     "fp8_grouped_lowm",
     "low_m_gemm_dispatcher",
     "lowm_fp8_supported",
+    "lowm_mma_options",
+    "lowm_tiles",
     "mxfp8_linear_scale",
+    "mxfp8_lowm_index_query",
     "mxfp8_lowm_linear",
     "prepare_low_m_gemm",
 ]

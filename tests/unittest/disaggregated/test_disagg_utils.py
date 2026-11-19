@@ -4,6 +4,7 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 import pytest
 import yaml
@@ -572,8 +573,10 @@ def test_shared_draft_kv_under_helix_needs_the_cutedsl_dspark_drafter(
 
 @pytest.mark.parametrize(
     "backend, tokens_per_block, blocked",
+    # Equal TRTLLM pages reach the worker gates: a manager hosting draft layers
+    # reads 128-token pages, other managers keep a separate draft KV cache.
     [("CUTEDSL", 128, False), ("CUTEDSL", 64, False), ("CUTEDSL", 96, True),
-     ("TRTLLM", 128, True), ("TRTLLM", 64, False)],
+     ("TRTLLM", 128, False), ("TRTLLM", 64, False)],
 )
 def test_shared_draft_kv_page_size_follows_the_dspark_drafter_backend(
         backend, tokens_per_block, blocked):
@@ -596,6 +599,40 @@ def test_shared_draft_kv_page_size_follows_the_dspark_drafter_backend(
     ]
     blocker = _shared_draft_kv_blocker(configs)
     assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "context_backend, generation_backend, blocked",
+    [("CUTEDSL", "TRTLLM", True), ("TRTLLM", "AUTO", True),
+     (None, "AUTO", False), ("TRTLLM", "TRTLLM", False)],
+)
+def test_shared_draft_kv_needs_one_drafter_backend_in_both_sections(
+        context_backend: Optional[str], generation_backend: Optional[str],
+        blocked: bool) -> None:
+    """Sections whose drafters name different backends would decide differently."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    configs = [
+        SimpleNamespace(
+            type=role,
+            other_args={
+                "speculative_config": {
+                    "decoding_type": "DSpark",
+                    "attention_backend": backend
+                },
+                "kv_cache_config": {
+                    "tokens_per_block": 64
+                },
+            },
+        ) for role, backend in (("ctx", context_backend), ("gen",
+                                                           generation_backend))
+    ]
+    blocker = _shared_draft_kv_blocker(configs)
+    assert (blocker is not None) == blocked
+    if blocked:
+        assert "attention_backend in both sections" in blocker
 
 
 @pytest.mark.parametrize(
