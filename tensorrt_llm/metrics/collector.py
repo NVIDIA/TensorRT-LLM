@@ -70,7 +70,7 @@ class PrometheusExposure:
         distinguishing between multiple series of the same metric name. Example:
         {"model_name": "nemotron-nano-3", "engine_type": "trtllm"}
 
-    See the Prometheus performance metrics guide for the metric reference.
+    See Shared performance metrics collection in the serving documentation.
     """
     labelname_finish_reason = FINISH_REASON_LABEL
     labelname_cache_level = "cache_level"
