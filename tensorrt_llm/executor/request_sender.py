@@ -29,7 +29,7 @@ from queue import Queue
 import zmq
 from zmq.utils.monitor import recv_monitor_message
 
-from .ipc import IpcQueue
+from .ipc import CLOSE_LINGER_MS, IpcQueue
 from .request import _COMMAND_QUEUE_HWM, CancellingRequest
 from .utils import EngineDeadError, EngineUnavailableError
 
@@ -402,6 +402,22 @@ class _RequestSender:
                 with self._cond:
                     self._cond.wait(timeout=min(self.SEND_TIMEOUT, remaining))
 
+    def _put_sentinel_after_failure(self) -> None:
+        """Queue the stop sentinel after a failure, while rank 0 may still read.
+
+        _put_until cannot be used: it raises once a terminal error is set. The
+        send pipe can be full while rank 0 drains large commands, so retry for
+        as long as close would linger, unless the connection is lost.
+        """
+        deadline = time.monotonic() + CLOSE_LINGER_MS / 1000
+        while True:
+            try:
+                self._request_queue.put(None, timeout=self.SEND_TIMEOUT)
+                return
+            except zmq.Again:
+                if self._connection_lost is not None or time.monotonic() >= deadline:
+                    raise TimeoutError("Executor stop sentinel could not be queued")
+
     def _take_batch(self) -> list[tuple[bytes, bool, int | None]] | None:
         with self._cond:
             while not self._pending and not self._closed and self._terminal_error is None:
@@ -487,12 +503,14 @@ class _RequestSender:
                         self._put_until([pickle.dumps(CancellingRequest(i)) for i in ids])
                 except (zmq.ZMQError, TimeoutError, EngineDeadError) as error:
                     self._record_failure(error)
+            sentinel_queued = False
             if send_sentinel:
                 try:
                     if self._terminal_error is None:
                         self._put_until(None, time.monotonic() + 1.0)
                     else:
-                        self._request_queue.put(None, timeout=self.SEND_TIMEOUT)
+                        self._put_sentinel_after_failure()
+                    sentinel_queued = True
                 except (zmq.ZMQError, TimeoutError, EngineDeadError) as error:
                     self._record_failure(error)
             try:
@@ -502,6 +520,13 @@ class _RequestSender:
                     finally:
                         self._monitor.close(linger=0)
             finally:
-                linger = 0 if self._terminal_error is not None else 1000
+                # LINGER=0 discards everything still queued in the socket,
+                # including a stop sentinel behind large commands. Discard only
+                # when the command peer itself is gone, or when a failed
+                # sender queued nothing that must still arrive.
+                keep_queued = self._terminal_error is None or (
+                    sentinel_queued and self._connection_lost is None
+                )
+                linger = CLOSE_LINGER_MS if keep_queued else 0
                 self._request_queue.socket.setsockopt(zmq.LINGER, linger)
                 self._request_queue.close()

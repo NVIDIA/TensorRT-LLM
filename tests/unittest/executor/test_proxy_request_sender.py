@@ -409,6 +409,59 @@ def test_established_disconnect_fails_while_idle_without_replay(tmp_path, transp
             replacement.close()
 
 
+@pytest.mark.timeout(60, method="thread")
+@pytest.mark.parametrize("transport", ["tcp", "ipc"])
+def test_stop_sentinel_after_engine_failure_survives_commands_in_flight(tmp_path, transport):
+    # Regression: after a terminal failure the sender queued the stop sentinel
+    # and then closed with LINGER=0, which discarded it whenever a large
+    # command was still in flight. A live rank 0 then never stopped, leaving
+    # its workers and GPU memory behind.
+    for attempt in range(3):
+        address = (f"ipc://{tmp_path}/commands{attempt}", b"k" * 32) if transport == "ipc" else None
+        peer = IpcQueue(address, is_server=True, socket_type=zmq.PULL)
+        commands = IpcQueue(
+            peer.address,
+            is_server=False,
+            socket_type=zmq.PUSH,
+            send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES,
+        )
+        received, stop = [], threading.Event()
+
+        def rank0_loop():
+            while not stop.is_set():
+                if peer.poll(0.05):
+                    received.append(peer.get())
+
+        reader = threading.Thread(target=rank0_loop, daemon=True)
+        reader.start()
+        sender = _RequestSender(
+            commands,
+            queue.Queue(),
+            batching=False,
+            stop_workers_on_failure=True,
+            direct_send=True,
+        )
+        try:
+            sender.send(pickle.dumps("connected"))
+            deadline = time.monotonic() + 5
+            while not received and time.monotonic() < deadline:
+                time.sleep(0.005)
+            # For example, a multimodal request still in flight.
+            sender.send(pickle.dumps(b"x" * (4 << 20)))
+            # What _mark_engine_dead does, then pre_shutdown's later close.
+            sender.fail(RuntimeError("the engine was declared dead"))
+            sender._thread.join(timeout=5)
+            sender.close(timeout=7.0, send_sentinel=True)
+            deadline = time.monotonic() + 3
+            while None not in received and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert None in received, f"attempt {attempt}: stop sentinel never reached rank 0"
+        finally:
+            stop.set()
+            reader.join(timeout=2)
+            peer.close()
+
+
 @pytest.mark.timeout(12, method="thread")
 def test_control_capacity_is_reserved_when_admission_is_full():
     q = _RecordingQueue(block_first_put=True)
