@@ -289,7 +289,9 @@ class TestStorageNbytes:
         # 10 fp32 occupies more than 10 bf16
         assert _storage_nbytes(t_f32) > _storage_nbytes(t_bf16)
 
-    def test_shape_independent_for_views(self, monkeypatch):
+
+class TestMoveUntrackedParams:
+    def test_shared_storage_views_preserved(self, monkeypatch):
         # Real CPU storage exercises the migration bookkeeping without a GPU or daemon.
         class CudaParameter(torch.nn.Parameter):
             @property
@@ -305,7 +307,9 @@ class TestStorageNbytes:
         model.bytes_view = CudaParameter(source.view(torch.uint8)[7:13], requires_grad=False)
         model.tied = model.first
         model.cpu_parameter = torch.nn.Parameter(torch.ones(2), requires_grad=False)
-        model.register_buffer("buffer", source)
+        buffer = source.as_subclass(CudaParameter)
+        model.register_buffer("buffer", buffer)
+        buffer_storage_ptr = buffer.untyped_storage().data_ptr()
         expected = {
             name: (parameter.clone(), parameter.stride(), parameter.storage_offset())
             for name, parameter in model.named_parameters()
@@ -356,13 +360,18 @@ class TestStorageNbytes:
         for name, parameter in model.named_parameters():
             value, stride, offset = expected[name]
             assert torch.equal(parameter, value), name
+            assert parameter.dtype == value.dtype, name
             assert parameter.stride() == stride, name
             assert parameter.storage_offset() == offset, name
             if parameter.is_cuda:
                 assert parameter.untyped_storage().data_ptr() == mapped.data_ptr()
                 assert _storage_nbytes(parameter) == mapped.numel()
         assert model.first is model.tied
-        assert model.buffer is source
+        # This sweep only migrates parameters. The buffer retains the original
+        # allocation and no longer aliases the migrated parameter storage.
+        assert model.buffer is buffer
+        assert model.buffer.untyped_storage().data_ptr() == buffer_storage_ptr
+        assert buffer_storage_ptr != mapped.data_ptr()
         model.first[2] = 123
         assert model.overlap[0].item() == 123
         backend.move_untracked_params(model)
@@ -374,7 +383,25 @@ class TestStorageNbytes:
         ):
             backend.move_untracked_params(model)
         assert client.create_mapping.call_count == 1
-        backend._client = None
+        del model.empty_weight
+
+        for view in (source._neg_view(), source.to(torch.complex64).conj()):
+            model.unsupported_view = CudaParameter(view, requires_grad=False)
+            with pytest.raises(ValueError, match="'unsupported_view'.*lazy conjugate/negative"):
+                backend.move_untracked_params(model)
+            assert client.create_mapping.call_count == 1
+        del model.unsupported_view
+
+        # Separate wrappers can expose different extents of the same address.
+        aliases = torch.nn.Module()
+        aliases.small = CudaParameter(
+            torch.frombuffer(source.numpy(), dtype=source.dtype, count=4), requires_grad=False
+        )
+        aliases.large = CudaParameter(source, requires_grad=False)
+        assert aliases.small.untyped_storage().data_ptr() == buffer_storage_ptr
+        with pytest.raises(ValueError, match="'large'.*storage size 400.*mapping size 16"):
+            backend.move_untracked_params(aliases)
+        assert aliases.large.untyped_storage().data_ptr() == buffer_storage_ptr
 
 
 # ---------------------------------------------------------------------------

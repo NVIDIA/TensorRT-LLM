@@ -359,7 +359,8 @@ class GMSBackend:
 
         Raises:
             RuntimeError: If `connect()` has not been called yet.
-            ValueError: If an untracked CUDA parameter has zero-byte storage.
+            ValueError: If an untracked CUDA parameter has zero-byte storage,
+                lazy conjugate/negative state, or exceeds a reused mapping.
         """
         # TODO(GMS-API): Clean up once the stable GMS API becomes available.
         if self._client is None:
@@ -383,6 +384,11 @@ class GMSBackend:
             if _ptr_in_gms(gms_client, int(storage_base_ptr)):
                 continue
 
+            if tensor.is_conj() or tensor.is_neg():
+                raise ValueError(
+                    f"GMS cannot register CUDA parameter {name!r} with lazy conjugate/negative state"
+                )
+
             mapped_storage = storage_to_gms.get(storage_base_ptr)
             if mapped_storage is None:
                 nbytes = _storage_nbytes(tensor)
@@ -396,6 +402,11 @@ class GMSBackend:
                 ).untyped_storage()
                 mapped_storage.copy_(storage)
                 storage_to_gms[storage_base_ptr] = mapped_storage
+            elif storage.nbytes() > mapped_storage.nbytes():
+                raise ValueError(
+                    f"GMS cannot migrate CUDA parameter {name!r}: storage size "
+                    f"{storage.nbytes()} exceeds the shared mapping size {mapped_storage.nbytes()}"
+                )
 
             # set_ interprets the offset and strides in the parameter's dtype,
             # while keeping the whole shared storage available for other views.
