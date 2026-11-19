@@ -12,16 +12,6 @@ class DeepSeekV41Parser(DeepSeekV32Parser):
     of the model's token contract, not cosmetic formatting.
     """
 
-    _INVOKE_HEADER_PREFIX = '<｜DSML｜ invoke name="'  # nosec B105
-    _INVOKE_BEGIN_TEMPLATE = '<｜DSML｜ invoke name="{name}">'  # nosec B105
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.bot_token = "<｜DSML｜ calls>"  # nosec B105
-        self.eot_token = "</｜DSML｜ calls>"  # nosec B105
-        self.invoke_begin_regex = r'<｜DSML｜ invoke\s+name="([^"]+)"\s*>'
-        self.invoke_end_token = "</｜DSML｜ invoke>"  # nosec B105
-        self.parameter_regex = (
-            r'<｜DSML｜ parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>'
-            r"(.*?)</｜DSML｜ parameter>"
-        )
+    _CALLS_TAG = " calls"
+    _INVOKE_TAG = " invoke"
+    _PARAMETER_TAG = " parameter"
