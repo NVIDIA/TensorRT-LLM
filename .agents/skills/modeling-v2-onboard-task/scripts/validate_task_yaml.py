@@ -23,8 +23,9 @@ installed everywhere. task_schema.py itself needs only PyYAML.
 Usage:
     python3 validate_task_yaml.py /path/to/task.yaml [--agent-flow DIR]
 
-Without --agent-flow, the schema is looked up under the task's
-trtllm_repo_path, then under this checkout.
+Without --agent-flow, the schema comes from the agent-flow that this
+Python would import, then from this checkout. Never from a path the task
+names: the schema file is executed, so it must not be chosen by the YAML.
 """
 
 import argparse
@@ -32,23 +33,18 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import yaml
-
 SCHEMA_RELPATH = Path("agent_flow/workflows/modeling_bringup/task_schema.py")
 THIS_CHECKOUT = Path(__file__).resolve().parents[4]
 
 
-def _candidate_agent_flow_dirs(task_path: Path, explicit: Path | None) -> list[Path]:
+def _candidate_agent_flow_dirs(explicit: Path | None) -> list[Path]:
     if explicit is not None:
         return [explicit]
     candidates = []
-    try:
-        data = yaml.safe_load(task_path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
-        data = {}
-    repo = data.get("trtllm_repo_path") if isinstance(data, dict) else None
-    if isinstance(repo, str) and repo.strip():
-        candidates.append(Path(repo) / "agent-flow")
+    # find_spec locates a top-level package without executing it.
+    installed = importlib.util.find_spec("agent_flow")
+    if installed is not None and installed.origin:
+        candidates.append(Path(installed.origin).resolve().parents[1])
     candidates.append(THIS_CHECKOUT / "agent-flow")
     return candidates
 
@@ -67,7 +63,7 @@ def main() -> int:
     parser.add_argument("--agent-flow", type=Path, help="agent-flow directory holding the schema")
     args = parser.parse_args()
 
-    candidates = _candidate_agent_flow_dirs(args.task, args.agent_flow)
+    candidates = _candidate_agent_flow_dirs(args.agent_flow)
     agent_flow_dir = next((d for d in candidates if (d / SCHEMA_RELPATH).is_file()), None)
     if agent_flow_dir is None:
         tried = ", ".join(str(d / SCHEMA_RELPATH) for d in candidates)
