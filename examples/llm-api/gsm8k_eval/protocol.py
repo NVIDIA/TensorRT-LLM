@@ -371,7 +371,9 @@ def load_manifest(path: str | os.PathLike = MANIFEST_PATH) -> dict[str, Any]:
         raise ValueError(f"{path}: the manifest's protocol differs from protocol_definition()")
     questions = manifest.get("questions", [])
     if [q.get("index") for q in questions] != list(range(MANIFEST_QUESTIONS)):
-        raise ValueError(f"{path}: questions must be test rows 0..{MANIFEST_QUESTIONS - 1} in order")
+        raise ValueError(
+            f"{path}: questions must be test rows 0..{MANIFEST_QUESTIONS - 1} in order"
+        )
     if [q.get("id") for q in questions] != [question_id(i) for i in range(MANIFEST_QUESTIONS)]:
         raise ValueError(f"{path}: question ids do not follow the row indices")
     shots = [item.get("index") for item in manifest.get("exemplars", {}).get("items", [])]
@@ -394,15 +396,18 @@ def _inventory_with_prompts(
 ) -> Iterator[tuple[dict[str, Any], str]]:
     for index, (question, answer) in enumerate(test):
         prompt = build_prompt(exemplars, question)
-        yield {
-            "index": index,
-            "id": question_id(index),
-            "question_sha256": sha256_text(question),
-            "answer_sha256": sha256_text(answer),
-            "prompt_sha256": sha256_text(prompt),
-            "prompt_chars": len(prompt),
-            "gold": extract_gold(answer),
-        }, prompt
+        yield (
+            {
+                "index": index,
+                "id": question_id(index),
+                "question_sha256": sha256_text(question),
+                "answer_sha256": sha256_text(answer),
+                "prompt_sha256": sha256_text(prompt),
+                "prompt_chars": len(prompt),
+                "gold": extract_gold(answer),
+            },
+            prompt,
+        )
 
 
 def inventory_rows(
