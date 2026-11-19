@@ -49,7 +49,7 @@ SM_EE = 68096  # its off-diagonal (127 floats)
 SM_E2 = 68608  # the squares of the off-diagonal, floored (128 floats)
 SM_LAM = 69120  # the 32 eigenvalues
 SM_ZC = 69248  # the MGS column in flight: two buffers of 128 floats, used in turn
-SM_RED = 70272  # per-warp parts of the sums and bounds taken over the CTA; the join flag of basis_cta at 224
+SM_RED = 70272  # per-warp parts of the sums and bounds taken over the CTA
 SM_SCL = 70976  # 32 inverse-iteration scales
 SM_IDX2 = 71168  # up to 512 sampled token indices (Gram)
 SM_VSTG = (
@@ -895,7 +895,6 @@ def basis_cta(
     NQK: Int32,
     BH: Int32,
     nspare: Int32,
-    eigwait: Int32,
     FUSED: cutlass.Constexpr,
     vscan_gs,
     vscan,
@@ -928,23 +927,14 @@ def basis_cta(
             if tid == 0:
                 cute.arch.fence_acq_rel_gpu()
                 cute.arch.atomic_add(gptr(Uint32, done_p), Uint32(1), sem="release", scope="gpu")
-        # The scan CTAs wait for each other, then take V tiles; an eigensolver CTA joins them when it is done: it waits
-        # for the scan when eigwait is set (the host sets it when the grid has at most as many CTAs as the device has
-        # SMs), otherwise it joins only if the scan has already finished. Nothing ever waits on an eigensolver CTA.
-        flag = sb + SM_RED + 224
+        # The scan CTAs wait for each other, then take V tiles; an eigensolver CTA joins them when it is done and the
+        # scan has finished (the host takes this form only for a grid of at most as many CTAs as the device has SMs).
+        # Nothing ever waits on an eigensolver CTA.
         if tid == 0:
-            jn = Uint32(1)
-            if pid < BH:
-                jn = Uint32(eigwait != 0) | Uint32(ld_global_acquire_b32(done_p) >= Uint32(nspare))
-            cute.arch.store(sptr(Uint32, flag), jn)
-        cute.arch.sync_threads()
-        join = Int32(cute.arch.load(sptr(Uint32, flag), Uint32))
-        if join != 0:
-            if tid == 0:
+            seen = ld_global_acquire_b32(done_p)
+            while seen < Uint32(nspare):
+                nanosleep(Int32(200))
                 seen = ld_global_acquire_b32(done_p)
-                while seen < Uint32(nspare):
-                    nanosleep(Int32(200))
-                    seen = ld_global_acquire_b32(done_p)
-                cute.arch.fence_acq_rel_gpu()
-            cute.arch.sync_threads()
-            vpass(ntiles, pid, tid, sb)
+            cute.arch.fence_acq_rel_gpu()
+        cute.arch.sync_threads()
+        vpass(ntiles, pid, tid, sb)

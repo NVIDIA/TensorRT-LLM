@@ -296,29 +296,26 @@ def first_stages_full(st, rot, nT):
 @cute.jit
 def first_stages_part(st, t0, nK):
     """The first loads of a key-range piece (tiles t0 .. t0 + nK - 1, nK >= 2), issued by warp 4. Stage j (phases
-    0 .. 2): K' of tile t0 + j and V of tile t0 + j - 1."""
+    0 .. 2): K' of tile t0 + j (stage 2: when the piece has a third tile) and V of tile t0 + j - 1."""
     for tl in cutlass.range_constexpr(STAGES):
-        hk = Int32(0)
-        if tl < nK:
-            hk = Int32(1)
-        hv = Int32(0)
-        if cutlass.const_expr(tl >= 1):
-            if tl - 1 < nK:
-                hv = Int32(1)
-        if (hk | hv) != 0:
-            # phase 2 takes the v_mean rows of the step pair (0, 1) (pieces have nK >= 2 tiles)
-            issue_tile(
-                st,
-                tl,
-                t0 + tl,
-                t0 + max(tl - 1, 0),
-                hk,
-                hv,
-                t0,
-                t0 + 1,
-                Int32(2 if tl == 2 else 0),
-                Int32(0),
-            )
+        hk = Int32(1)
+        if cutlass.const_expr(tl == 2):
+            hk = Int32(0)
+            if tl < nK:
+                hk = Int32(1)
+        # phase 2 takes the v_mean rows of the step pair (0, 1) (pieces have nK >= 2 tiles)
+        issue_tile(
+            st,
+            tl,
+            t0 + tl,
+            t0 + max(tl - 1, 0),
+            hk,
+            Int32(1 if tl >= 1 else 0),
+            t0,
+            t0 + 1,
+            Int32(2 if tl == 2 else 0),
+            Int32(0),
+        )
 
 
 @cute.jit

@@ -35,7 +35,6 @@ def encode_kernel(
     qsf_p: Int64,
     ksf_p: Int64,
     score_scale_p: Int64,
-    done_p: Int64,
     B: Int32,
     H: Int32,
     T: Int32,
@@ -89,10 +88,6 @@ def encode_kernel(
     if cta == 0 and tid == 0:
         score_scale = prod * Float32(1.0 / 128.0)
         cute.arch.store(gptr(Float32, score_scale_p), score_scale)
-        cute.arch.store(
-            gptr(Uint32, done_p), Uint32(0)
-        )  # reset the scan barrier and the V tile counter of the basis launch
-        cute.arch.store(gptr(Uint32, done_p + 4), Uint32(0))
     iq0 = cute.math.rcp(gq0)
     iq1 = cute.math.rcp(gq1)
     iq2 = cute.math.rcp(gq2)

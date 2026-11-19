@@ -288,7 +288,6 @@ def _vpass(
         tt = tile - bh * T
         k0 = tt * 128 + 16 * grp
         cnt = cutlass.max(cutlass.min(S - k0, 16), 0)
-        cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
         wv = cute.make_rmem_tensor((32,), Uint32)
@@ -346,8 +345,6 @@ def _vpass(
         cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
         tix = nix
         nix = Int32(cute.arch.load(sptr(Uint32, slot), Uint32))
-    cute.arch.cp_async_commit_group()
-    cute.arch.cp_async_wait_group(0)
 
 
 @cute.kernel
@@ -371,7 +368,6 @@ def basis_kernel(
     NQK: Int32,
     BH: Int32,
     nspare: Int32,
-    eigwait: Int32,
     FUSED: cutlass.Constexpr,
 ):
     """The basis launch of the NVFP4-PV kernel: basis_cta with the scan and the pass of V'."""
@@ -388,7 +384,6 @@ def basis_kernel(
         NQK,
         BH,
         nspare,
-        eigwait,
         FUSED,
         lambda cta, tid, sb: _vscan_gs(v_p, vmax_p, B, S, H, cta, nspare, tid, sb),
         lambda lo, hi, sp, tid, sb: _vscan(v_p, vmax_p, S, H, T, lo, hi, sp, tid, sb),
