@@ -17,7 +17,8 @@
 FlashInfer Prims-TS and TRT-LLM's fused NVFP4 SwiGLU GEMM run only on datacenter
 Blackwell. On SM120/SM121 these kernels fuse what TRT-LLM runs as separate kernels: Q/K/V
 in one GEMM with per-plane scales, QK-norm and RoPE; and gate/up with SwiGLU and NVFP4
-requantization for the down projection.
+requantization for the down projection. Attention-out and down run on the same kernel's
+plain BF16 epilogue through ``Sm120NVFP4LinearMethod``, so they stay on ``Linear.forward``.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
+from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, unswizzle_sf
 from tensorrt_llm._torch.visual_gen import prims_ts
 from tensorrt_llm._torch.visual_gen.models.flux3.fused_gemm_common import (
@@ -135,6 +136,75 @@ def _swiglu_fp4_fake(data, scales, weight, weight_scale, alpha, output_inverse_s
     )
 
 
+@torch.library.custom_op("trtllm::flux3_sm120_nvfp4_linear", mutates_args=(), device_types="cuda")
+def _linear(
+    data: Tensor, scales: Tensor, weight: Tensor, weight_scale: Tensor, alpha: Tensor
+) -> Tensor:
+    """Plain NVFP4 GEMM scaled by the FP32 [1] ``alpha``: BF16 [M, N]."""
+    return _run("linear", data, weight, scales, weight_scale, alpha)
+
+
+@_linear.register_fake
+def _linear_fake(data, scales, weight, weight_scale, alpha):
+    return data.new_empty((data.shape[0], weight.shape[0]), dtype=torch.bfloat16)
+
+
+class Sm120NVFP4LinearMethod(NVFP4LinearMethod):
+    """NVFP4 Linear method that runs its GEMM on the SM120 kernel, else on TRT-LLM's.
+
+    Takes BF16 rows, quantized as ``NVFP4LinearMethod`` quantizes them, or an
+    ``Fp4QuantizedTensor`` with padded 128x4-swizzled scales.
+    """
+
+    def apply(self, module: Linear, input, bias: Optional[Tensor]):
+        if not self._can_run(module, input, bias):
+            return super().apply(module, input, bias)
+        if isinstance(input, Fp4QuantizedTensor):
+            leading = input.fp4_tensor.shape[:-1]
+        else:
+            leading = input.shape[:-1]
+            input = input.reshape(-1, input.shape[-1])
+        data, scales, alpha = self._input_prepare(module, input)
+        output = torch.ops.trtllm.flux3_sm120_nvfp4_linear(
+            data, scales.reshape(-1), module.weight, module.weight_scale, alpha
+        )
+        return output.view(*leading, output.shape[-1])
+
+    def _can_run(self, module: Linear, input, bias: Optional[Tensor]) -> bool:
+        if bias is not None or torch.is_grad_enabled():
+            return False
+        if (
+            self.supports_nccl_symmetric_memory_window_output
+            and module.all_reduce is not None
+            and module.all_reduce.uses_nccl_symmetric_memory_window()
+        ):
+            # The reduction expects TRT-LLM's GEMM to write into its NCCL window.
+            return False
+        columns, packed_k = module.weight.shape
+        if (
+            columns % 128
+            or packed_k * 2 % 128
+            or columns != module.out_features
+            or module.dtype not in (None, torch.bfloat16)
+        ):
+            return False
+        if isinstance(input, Fp4QuantizedTensor):
+            data, width = input.fp4_tensor, packed_k
+            if (
+                not input.is_sf_swizzled
+                or input.reciprocal_scale is not None
+                or data.dim() != 2
+                or not data.is_contiguous()
+                or input.scaling_factor.numel() != nvfp4_scale_bytes(data.shape[0], packed_k * 2)
+            ):
+                return False
+        elif isinstance(input, Tensor) and input.dtype == torch.bfloat16:
+            data, width = input, packed_k * 2
+        else:
+            return False
+        return data.numel() > 0 and data.shape[-1] == width and sm120_device(data.device)
+
+
 def repack_swiglu_rows(gate_up: nn.Module) -> None:
     """Repack a static NVFP4 [gate; up] Linear in place to [up, gate] row pairs. Idempotent."""
     if getattr(gate_up, SWIGLU_PAIR_LAYOUT, False):
@@ -222,16 +292,27 @@ class Sm120NVFP4Block(nn.Module):
         return output + down.view_as(output)
 
 
+def _attach(block: nn.Module) -> Sm120NVFP4Block:
+    for layer in (block.attn.to_out[0], block.ff.down_proj):
+        if nvfp4_projection_eligible(layer):
+            layer.quant_method = Sm120NVFP4LinearMethod()
+    block.sm120_nvfp4 = Sm120NVFP4Block(block)
+    return block.sm120_nvfp4
+
+
 def prepare_sm120_nvfp4(block: nn.Module, enabled: bool) -> Optional[Sm120NVFP4Block]:
-    """Attach the fused SM120 NVFP4 QKV and gate/up GEMMs to ``block`` when they qualify."""
+    """Put ``block``'s static NVFP4 GEMMs on the SM120 kernels when the block qualifies.
+
+    Q/K/V and gate/up run fused from the block; attention-out and down switch to
+    ``Sm120NVFP4LinearMethod``.
+    """
     block.sm120_nvfp4 = None
     attn, ff = block.attn, block.ff
     gate_up = ff.gate_up_proj
     nvfp4 = type(getattr(gate_up, "quant_method", None)) is NVFP4LinearMethod
     if nvfp4 and getattr(gate_up, SWIGLU_PAIR_LAYOUT, False):
         # Already repacked: GatedMLP cannot run this block any more.
-        block.sm120_nvfp4 = Sm120NVFP4Block(block)
-        return block.sm120_nvfp4
+        return _attach(block)
     if not enabled or getattr(attn, "tp_size", 1) != 1:
         return None
     projections = tuple(getattr(attn, name, None) for name in ("to_q", "to_k", "to_v"))
@@ -247,5 +328,4 @@ def prepare_sm120_nvfp4(block: nn.Module, enabled: bool) -> Optional[Sm120NVFP4B
         return None
     if not plain_swiglu(ff) or not sm120_kernels_available():
         return None
-    block.sm120_nvfp4 = Sm120NVFP4Block(block)
-    return block.sm120_nvfp4
+    return _attach(block)

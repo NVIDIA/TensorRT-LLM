@@ -16,8 +16,9 @@
 """L1 parity for the SM120/SM121 FLUX 3 NVFP4 GEMM fused epilogues.
 
 The boundary is the GEMM output (or packed output and scales). The reference
-is eager FP32 math on the same decoded NVFP4 operands. The BF16 qkv mode is T1;
-the requantized packed mode is T2.
+is eager FP32 math on the same decoded NVFP4 operands. The BF16 linear and qkv
+modes are T1; the requantized packed mode is T2. CPU cases check which GEMM
+``Sm120NVFP4LinearMethod`` dispatches to.
 """
 
 import pytest
@@ -25,8 +26,13 @@ import torch
 import torch.nn.functional as F
 from flux3_test_utils import assert_cuda_graph_replays, assert_parity
 
-from tensorrt_llm._torch.utils import unswizzle_sf
+from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, unswizzle_sf
+from tensorrt_llm._torch.visual_gen.models.flux3 import sm120_nvfp4
+from tensorrt_llm._torch.visual_gen.models.flux3.fused_gemm_common import nvfp4_scale_bytes
 from tensorrt_llm.math_utils import pad_up
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 requires_sm120 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((12, 0), (12, 1)),
@@ -59,7 +65,13 @@ def _packed_reference(values, inverse_scale):
 @requires_sm120
 @pytest.mark.parametrize(
     "mode,shape",
-    [("qkv", (256, 768, 512)), ("qkv", (200, 768, 512)), ("packed", (256, 512, 3072))],
+    [
+        ("linear", (256, 256, 256)),
+        ("linear", (200, 256, 256)),
+        ("qkv", (256, 768, 512)),
+        ("qkv", (200, 768, 512)),
+        ("packed", (256, 512, 3072)),
+    ],
 )
 def test_flux3_sm120_nvfp4_epilogue(mode, shape):
     from flashinfer import SfLayout, nvfp4_quantize
@@ -108,7 +120,9 @@ def test_flux3_sm120_nvfp4_epilogue(mode, shape):
 
     actual = assert_cuda_graph_replays(run)
 
-    if mode == "qkv":
+    if mode == "linear":
+        expected = (raw * 0.125).bfloat16()
+    elif mode == "qkv":
         heads = columns // 384
         expected = (
             (raw.reshape(rows, 3, heads, 128) * qkv_scale[None, :, None, None]).bfloat16().float()
@@ -136,3 +150,60 @@ def test_flux3_sm120_nvfp4_epilogue(mode, shape):
         )
 
     assert_parity(actual, expected, relative_l2=1e-2, cosine=0.9999)
+
+
+def _sm120_linear(out_features=128, in_features=256, bias=False):
+    layer = Linear(
+        in_features,
+        out_features,
+        bias=bias,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+    )
+    layer.quant_method = sm120_nvfp4.Sm120NVFP4LinearMethod()
+    return layer
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "case", ["off_sm120", "bias", "autograd", "fp16_input", "unaligned_n", "unswizzled_fp4"]
+)
+def test_sm120_linear_method_falls_back_to_trtllm(monkeypatch, case):
+    """What the SM120 kernel cannot take runs NVFP4LinearMethod.apply through Linear.forward."""
+    calls = []
+    monkeypatch.setattr(
+        NVFP4LinearMethod, "apply", lambda self, module, x, bias: calls.append(x) or "trtllm"
+    )
+    if case != "off_sm120":
+        # Only the case under test keeps the layer off the kernel.
+        monkeypatch.setattr(sm120_nvfp4, "sm120_device", lambda device: True)
+    layer = _sm120_linear(out_features=96 if case == "unaligned_n" else 128, bias=case == "bias")
+    x = torch.zeros(2, 4, 256, dtype=torch.float16 if case == "fp16_input" else torch.bfloat16)
+    if case == "unswizzled_fp4":
+        scales = torch.zeros(nvfp4_scale_bytes(4, 256), dtype=torch.uint8)
+        x = Fp4QuantizedTensor(torch.zeros(4, 128, dtype=torch.uint8), scales, False)
+    with torch.set_grad_enabled(case == "autograd"):
+        assert layer(x) == "trtllm"
+    assert len(calls) == 1 and calls[0] is x
+
+
+@pytest.mark.cpu_only
+def test_sm120_linear_method_feeds_the_kernel_the_layer_operands(monkeypatch):
+    """A packed SwiGLU output reaches the SM120 op with the layer's weights and device alpha."""
+    calls = []
+
+    def kernel(data, scales, weight, weight_scale, alpha):
+        calls.append((data, scales, weight, weight_scale, alpha))
+        return torch.zeros(data.shape[0], weight.shape[0], dtype=torch.bfloat16)
+
+    monkeypatch.setattr(sm120_nvfp4, "sm120_device", lambda device: True)
+    monkeypatch.setattr(torch.ops.trtllm, "flux3_sm120_nvfp4_linear", kernel)
+    layer = _sm120_linear()
+    data = torch.zeros(4, 128, dtype=torch.uint8)
+    scales = torch.zeros(nvfp4_scale_bytes(4, 256), dtype=torch.uint8)
+    with torch.inference_mode():
+        output = layer(Fp4QuantizedTensor(data, scales, is_sf_swizzled=True))
+    assert output.shape == (4, 128) and output.dtype == torch.bfloat16
+    ((got_data, got_scales, weight, weight_scale, alpha),) = calls
+    assert got_data is data and torch.equal(got_scales, scales)
+    assert weight is layer.weight and weight_scale is layer.weight_scale and alpha is layer.alpha

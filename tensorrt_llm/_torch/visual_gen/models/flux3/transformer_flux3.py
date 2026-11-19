@@ -10,7 +10,19 @@ import dataclasses
 import itertools
 import math
 import re
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import torch
 import torch.nn.functional as F
@@ -26,7 +38,8 @@ from tensorrt_llm._torch.modules.linear import (
     TensorParallelMode,
     WeightMode,
 )
-from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor
+from tensorrt_llm._torch.visual_gen import prims_ts
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -580,20 +593,26 @@ class Flux3Attention(Attention):
         image_rotary_emb: Tuple[Tensor, Tensor],
         sample_bounds: Optional[Bounds] = None,
         timestep: Optional[Tensor] = None,
-        quantized: Optional[Fp4QuantizedTensor] = None,
+        quantized: Optional[Union[Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor]] = None,
     ) -> Tensor:
         """Attention before the output projection: [B, S, hidden] to [B, S, local heads * head_dim].
 
         ``image_rotary_emb`` (cos, sin) are [B, S, 1, head_dim]; ``sample_bounds`` limits attention.
-        ``quantized`` is ``hidden_states`` already quantized for the fused NVFP4 Q/K/V GEMM.
+        ``quantized`` is ``hidden_states`` already quantized as [B * S, hidden], NVFP4 for the
+        fused Q/K/V GEMM or FP8 per-token for FP8-rowwise Q/K/V projections.
         """
         b = hidden_states.shape[0]
         cos, sin = image_rotary_emb
         if self.prims_ts_qkv is not None and self.prims_ts_qkv.can_run(hidden_states, cos):
             q, k, v = self.prims_ts_qkv(hidden_states, cos, sin, quantized)
             return self.attend_projected(q, k, v, sample_bounds, timestep)
+        # Projections of the FP8 quantization are [B * S, ...]; the views below restore [B, S].
+        projection_input = (
+            quantized if isinstance(quantized, Fp8PerTokenQuantizedTensor) else hidden_states
+        )
         if self.fuse_qk_norm_rope:
-            qkv = self.qkv_proj(hidden_states)
+            qkv = self.qkv_proj(projection_input)
+            qkv = qkv.view(*hidden_states.shape[:-1], qkv.shape[-1])
             self.apply_packed_qk_norm_rope(
                 qkv,
                 cos.reshape(-1, self.head_dim).contiguous(),
@@ -602,7 +621,7 @@ class Flux3Attention(Attention):
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
             return self.attend_projected(q, k, v, sample_bounds, timestep)
 
-        q, k, v = self.get_qkv(hidden_states)
+        q, k, v = self.get_qkv(projection_input)
         q = q.view(b, -1, self.local_num_attention_heads, self.head_dim)
         k = k.view(b, -1, self.local_num_key_value_heads, self.head_dim)
         v = v.view(b, -1, self.local_num_key_value_heads, self.head_dim)
@@ -719,6 +738,9 @@ class _Flux3Block(nn.Module):
         # Set by post_load_weights when the fused NVFP4 Q/K/V GEMM and gate/up take the same
         # quantized input, so the block quantizes it once.
         self.share_nvfp4_quant = False
+        # Set by post_load_weights when TRT-LLM's FP8-rowwise Q/K/V and gate/up GEMMs take the
+        # same input, so the block quantizes it once per token.
+        self.share_fp8_quant = False
 
     def _update(
         self,
@@ -759,6 +781,13 @@ class _Flux3Block(nn.Module):
             ):
                 # One NVFP4 quantize feeds the fused Q/K/V GEMM and the gate/up GEMM.
                 quantized = self.attn.prims_ts_qkv.quantize(norm_hidden_states)
+            elif self.share_fp8_quant:
+                # FP8RowwiseLinearMethod's own per-token quantize, once for Q/K/V and gate/up;
+                # GatedMLP hands it to gate_up_proj unchanged.
+                data, scales = prims_ts.quantize_per_token(
+                    norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
+                )
+                quantized = Fp8PerTokenQuantizedTensor(data, scales.view(-1, 1))
             attn = self.attn.attend(
                 norm_hidden_states,
                 image_rotary_emb,
@@ -861,6 +890,36 @@ def _shares_nvfp4_quant(block: "_Flux3Block") -> bool:
         and block.sm120_nvfp4 is None
         and fused_gemm_common.nvfp4_projection_eligible(gate_up)
         and bool(torch.equal(qkv.input_scale, gate_up.input_scale))
+    )
+
+
+def _takes_fp8_per_token_input(layer: nn.Module) -> bool:
+    """Plain FP8-rowwise Linear over the whole, replicated block input.
+
+    It names its output dtype, which an ``Fp8PerTokenQuantizedTensor`` input does not carry.
+    """
+    return (
+        isinstance(layer, Linear)
+        and type(layer.quant_method) is FP8RowwiseLinearMethod
+        and layer.bias is None
+        and layer.lora is None
+        and getattr(layer, "pre_quant_scale", None) is None
+        and layer.dtype is not None
+        and layer.tp_mode != TensorParallelMode.ROW
+    )
+
+
+def _shares_fp8_quant(block: "_Flux3Block") -> bool:
+    """Whether TRT-LLM's FP8-rowwise Q/K/V and gate/up GEMMs can read one quantized input."""
+    attn, ff = block.attn, block.ff
+    return (
+        block.prims_ts_fp8 is None
+        and block.sm120_nvfp4 is None
+        and attn.prims_ts_qkv is None
+        and attn.qkv_mode == QKVMode.FUSE_QKV
+        and not ff.split_gate_up
+        and _takes_fp8_per_token_input(attn.qkv_proj)
+        and _takes_fp8_per_token_input(ff.gate_up_proj)
     )
 
 
@@ -1283,9 +1342,11 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         """Move block GEMMs onto fused kernels where they beat TRT-LLM's at FLUX 3 shapes.
 
         Prims-TS (SM100/103/107): the FP8-rowwise QKV + QK-norm + RoPE and gate/up + SwiGLU,
-        and the static-NVFP4 Q/K/V + QK-norm + RoPE. SM120/SM121: the static-NVFP4 Q/K/V and
-        gate/up GEMMs on CuTe DSL kernels. Plain GEMMs (attention-out, down) keep TRT-LLM's,
-        which match or beat the alternatives at FLUX 3 shapes.
+        and the static-NVFP4 Q/K/V + QK-norm + RoPE; attention-out and down keep TRT-LLM's
+        GEMMs, which match or beat the alternatives at FLUX 3 shapes. SM120/SM121: the
+        static-NVFP4 Q/K/V and gate/up GEMMs on CuTe DSL kernels, and attention-out and down
+        on the same kernel through ``Sm120NVFP4LinearMethod``. Blocks left on TRT-LLM's
+        FP8-rowwise Q/K/V and gate/up GEMMs quantize their shared input once.
         """
         enabled = fused_gemm_common.FUSED_GEMMS
         blocks = [m for m in self.modules() if isinstance(m, _Flux3Block)]
@@ -1295,6 +1356,7 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         qkv = sum(prepare_prims_ts_qkv(attn, enabled) is not None for attn in attentions)
         for block in blocks:
             block.share_nvfp4_quant = _shares_nvfp4_quant(block)
+            block.share_fp8_quant = _shares_fp8_quant(block)
         shared = sum(block.share_nvfp4_quant for block in blocks)
         if fp8 or sm120 or qkv:
             logger.info(

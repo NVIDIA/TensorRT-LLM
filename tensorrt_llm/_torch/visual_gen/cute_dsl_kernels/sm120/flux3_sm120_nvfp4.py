@@ -40,7 +40,7 @@ import torch
 import torch.nn.functional as F
 from cutlass.cute.runtime import make_ptr
 
-from .flux3_sm120_nvfp4_kernel import PACKED_SWIGLU, QKV, Flux3Sm120Nvfp4Kernel
+from .flux3_sm120_nvfp4_kernel import LINEAR, PACKED_SWIGLU, QKV, Flux3Sm120Nvfp4Kernel
 
 _COMPILED = {}
 
@@ -130,7 +130,7 @@ def _launch(
 
 
 def run(
-    mode: Literal["qkv", "packed"],
+    mode: Literal["linear", "qkv", "packed"],
     activation: torch.Tensor,
     weight: torch.Tensor,
     activation_scale: torch.Tensor,
@@ -147,11 +147,12 @@ def run(
     """NVFP4 ``activation`` [M, K/2] x ``weight`` [N, K/2] with 128x4-swizzled block scales.
 
     ``alpha`` is the FP32 [1] dequantization factor (TRT-LLM ``Linear.alpha``). Modes:
-    ``qkv`` applies per-plane ``qkv_scale``, per-head RMSNorm and interleaved RoPE
-    (``cos_sin`` [P, 128], ``positions`` [M]) and returns BF16; ``packed`` returns SwiGLU
-    requantized to NVFP4 with ``output_inverse_scale`` (the next layer's quantize
-    multiplier) plus its scales. Scales are device tensors, so nothing is baked into the
-    compiled kernel or a captured CUDA graph by value.
+    ``linear`` returns the BF16 product scaled by ``alpha``; ``qkv`` applies per-plane
+    ``qkv_scale``, per-head RMSNorm and interleaved RoPE (``cos_sin`` [P, 128],
+    ``positions`` [M]) and returns BF16; ``packed`` returns SwiGLU requantized to NVFP4
+    with ``output_inverse_scale`` (the next layer's quantize multiplier) plus its scales.
+    Scales are device tensors, so nothing is baked into the compiled kernel or a captured
+    CUDA graph by value.
     """
     capability = torch.cuda.get_device_capability(activation.device) if activation.is_cuda else None
     if capability not in ((12, 0), (12, 1)):
@@ -191,10 +192,10 @@ def run(
         global_scale = qkv_scale
         if positions.numel() < padded_rows:
             positions = F.pad(positions, (0, padded_rows - positions.numel()))
-    elif mode == "packed":
+    elif mode in ("linear", "packed"):
         if alpha is None:
-            raise ValueError("packed mode needs alpha")
-        if output_inverse_scale is None:
+            raise ValueError(f"{mode} mode needs alpha")
+        if mode == "packed" and output_inverse_scale is None:
             raise ValueError("packed mode needs output_inverse_scale")
         global_scale = alpha
     else:
@@ -205,8 +206,8 @@ def run(
     cos_sin = cos_sin if cos_sin is not None else placeholder
     positions = positions if positions is not None else placeholder
     qkv_scale = qkv_scale if qkv_scale is not None else placeholder
-    if mode == "qkv":
-        epilogue = QKV
+    if mode != "packed":
+        epilogue = QKV if mode == "qkv" else LINEAR
         output = torch.empty((padded_rows, columns), device=device, dtype=torch.bfloat16)
         output_dtype = cutlass.BFloat16
     else:

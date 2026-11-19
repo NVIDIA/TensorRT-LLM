@@ -44,7 +44,7 @@ from tensorrt_llm._torch.modules.linear import (
     NVFP4LinearMethod,
     UnquantizedLinearMethod,
 )
-from tensorrt_llm._torch.utils import unswizzle_sf
+from tensorrt_llm._torch.utils import Fp8PerTokenQuantizedTensor, unswizzle_sf
 
 # Importing the models package registers every pipeline.
 from tensorrt_llm._torch.visual_gen import (
@@ -60,7 +60,10 @@ from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import (
     Flux3DistilledPipeline,
     Flux3Pipeline,
 )
-from tensorrt_llm._torch.visual_gen.models.flux3.sm120_nvfp4 import repack_swiglu_rows
+from tensorrt_llm._torch.visual_gen.models.flux3.sm120_nvfp4 import (
+    Sm120NVFP4LinearMethod,
+    repack_swiglu_rows,
+)
 from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
     Flux3Attention,
     Flux3Transformer2DModel,
@@ -916,6 +919,59 @@ def test_fp8r_blocks_run_on_prims_ts_and_track_trtllm(tmp_path, monkeypatch):
     assert_parity(image, trtllm_image, relative_l2=0.05, cosine=0.998)
 
 
+@requires_cuda
+@pytest.mark.parametrize("fuse_qk_norm_rope", [True, False], ids=["fused_rope", "eager_rope"])
+def test_fp8r_trtllm_blocks_quantize_once_for_qkv_and_gate_up(
+    tmp_path, monkeypatch, fuse_qk_norm_rope
+):
+    """On TRT-LLM's GEMMs, Q/K/V and gate/up share one per-token FP8 quantize, bit for bit."""
+    _, kwargs = _write_variant_checkpoint(tmp_path, "fp8r")
+    transformer = _trtllm_transformer(tmp_path, monkeypatch, "fp8r")
+    blocks = _blocks(transformer, FP8RowwiseLinearMethod)
+    assert blocks and all(block.share_fp8_quant for block in blocks)
+    assert not any(block.share_fp8_quant for block in transformer.txt_mode_blocks)
+    inputs = []
+    for block in blocks:
+        block.attn.fuse_qk_norm_rope = fuse_qk_norm_rope
+        for layer in (block.attn.qkv_proj, block.ff.gate_up_proj):
+            layer.register_forward_pre_hook(lambda _, args: inputs.append(args[0]))
+
+    hidden, rope = _block_inputs(blocks[0].attn)
+    mod = tuple(torch.randn_like(hidden) * 0.1 for _ in range(3))
+
+    def run():
+        return blocks[0](hidden, rope, mod), transformer(**kwargs)["x_image"]
+
+    with torch.inference_mode():
+        shared = run()
+        shared_inputs = inputs.copy()
+        inputs.clear()
+        for block in blocks:
+            block.share_fp8_quant = False
+        unshared = run()
+    # Each block call hands Q/K/V and then gate/up one quantization; unshared, the BF16 input.
+    assert len(shared_inputs) == 2 * (1 + len(blocks))
+    for qkv_input, gate_up_input in zip(shared_inputs[::2], shared_inputs[1::2]):
+        assert isinstance(qkv_input, Fp8PerTokenQuantizedTensor) and gate_up_input is qkv_input
+    assert all(isinstance(x, torch.Tensor) for x in inputs)
+    for actual, expected in zip(shared, unshared):
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_fp8r_blocks_share_one_quantize_under_tensor_parallelism(no_cuda, tp_size):
+    """Column-parallel Q/K/V and gate/up both read the replicated block input."""
+    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_size - 1)
+    transformer = load_time_transformer(KLEIN_CONFIG, "FP8_PER_CHANNEL_PER_TOKEN", mapping=mapping)
+    transformer._prepare_fused_gemms()
+    blocks = [module for module in transformer.modules() if isinstance(module, _Flux3Block)]
+    fp8_blocks = _blocks(transformer, FP8RowwiseLinearMethod)
+    assert fp8_blocks and len(fp8_blocks) < len(blocks)
+    for block in blocks:
+        assert block.share_fp8_quant == (block in fp8_blocks)
+
+
 @requires_prims_ts
 @pytest.mark.parametrize("variant", ["nvfp4", "fp8r"])
 def test_fused_blocks_compile_once(tmp_path, monkeypatch, variant):
@@ -979,6 +1035,17 @@ def test_nvfp4_blocks_run_on_sm120_and_track_trtllm(tmp_path, monkeypatch):
     trtllm = _trtllm_transformer(tmp_path, monkeypatch, "nvfp4")
     trtllm_blocks = _blocks(trtllm, NVFP4LinearMethod)
     assert trtllm_blocks and all(block.sm120_nvfp4 is None for block in trtllm_blocks)
+    # Attention-out and down stay on Linear.forward, with the SM120 GEMM as their method.
+    assert all(
+        type(layer.quant_method) is Sm120NVFP4LinearMethod
+        for block in blocks
+        for layer in (block.attn.to_out[0], block.ff.down_proj)
+    )
+    assert all(
+        type(layer.quant_method) is NVFP4LinearMethod
+        for block in trtllm_blocks
+        for layer in (block.attn.to_out[0], block.ff.down_proj)
+    )
 
     block, trtllm_block = blocks[0], trtllm_blocks[0]
     hidden, rope = _block_inputs(block.attn)
