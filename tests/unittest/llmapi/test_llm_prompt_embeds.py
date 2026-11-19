@@ -19,11 +19,13 @@ import torch
 from safetensors import safe_open
 
 from tensorrt_llm import LLM
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds, prompt_embeds_cache_salt
 from tensorrt_llm.llmapi import (
+    CacheTransceiverConfig,
     CapacitySchedulerPolicy,
     CudaGraphConfig,
     KvCacheConfig,
@@ -83,10 +85,6 @@ def _token_ids(llm: LLM, prompts: List[str]) -> List[List[int]]:
     return [llm.tokenizer.encode(p) for p in prompts]
 
 
-def _generated(outputs) -> List[List[int]]:
-    return [list(o.outputs[0].token_ids) for o in outputs]
-
-
 def _placeholder_request(prompt_ids: List[int], mask: List[bool], table: torch.Tensor) -> dict:
     """Schedule id 0 at masked positions; only the supplied rows carry the prompt there."""
     return {
@@ -128,12 +126,20 @@ def table(model_dir: str) -> torch.Tensor:
     return _embedding_table(model_dir)
 
 
-@pytest.mark.parametrize("keys_rows", [True, False], ids=["v2", "v1"])
-def test_worker_cache_salt(keys_rows: bool) -> None:
-    # Managers that key blocks by ids alone scope the whole prompt by salt.
+@pytest.mark.parametrize(
+    "v2, connector, keys_rows",
+    [(True, None, True), (False, None, False), (True, object(), False)],
+    ids=["v2", "v1", "v2_connector"],
+)
+def test_worker_cache_salt(v2: bool, connector: Optional[object], keys_rows: bool) -> None:
+    # Where blocks are keyed by ids alone (V1, external KV stores) the salt scopes the prompt.
     _, pe = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
     params = SamplingParams(max_tokens=1)
-    worker = SimpleNamespace(_kv_cache_keys_prompt_embeds=lambda: keys_rows)
+    worker = SimpleNamespace(
+        llm_args=SimpleNamespace(kv_connector_config=connector),
+        _uses_kv_cache_manager_v2=lambda: v2,
+    )
+    worker._kv_cache_keys_prompt_embeds = lambda: BaseWorker._kv_cache_keys_prompt_embeds(worker)
     plain = GenerationRequest([1, 2, 3], params, cache_salt="s")
     embeds = GenerationRequest([1, 2, 3], params, cache_salt="s", prompt_embeds=pe)
     assert embeds.cache_salt == "s"
@@ -145,48 +151,26 @@ def test_worker_cache_salt(keys_rows: bool) -> None:
     assert restored.prompt_embeds.row_digests == pe.row_digests
 
 
-def test_whole_prompt_matches_tokens(llm: LLM, table: torch.Tensor) -> None:
+MASKS = {
+    "prefix": lambda p, n: p < n // 2,
+    "suffix": lambda p, n: p >= n // 2,
+    "interleaved": lambda p, n: p % 3 != 0,
+}
+
+
+@pytest.mark.parametrize("pattern", ["whole", *MASKS])
+def test_matches_tokens(llm: LLM, table: torch.Tensor, pattern: str) -> None:
+    # The last prompt stays plain, so every batch mixes embedding and token prompts.
     ids = _token_ids(llm, PROMPTS)
     expected = _run(llm, ids)
-    embeds = [{"prompt_embeds": table[torch.tensor(i)]} for i in ids]
-    assert _run(llm, embeds) == expected
-
-
-@pytest.mark.parametrize("pattern", ["prefix", "suffix", "interleaved"])
-def test_partial_mask_matches_tokens(llm: LLM, table: torch.Tensor, pattern: str) -> None:
-    ids = _token_ids(llm, PROMPTS)
-    expected = _run(llm, ids)
-    requests = []
-    for prompt_ids in ids:
-        n = len(prompt_ids)
-        if pattern == "prefix":
-            mask = [p < n // 2 for p in range(n)]
-        elif pattern == "suffix":
-            mask = [p >= n // 2 for p in range(n)]
-        else:
-            mask = [p % 3 != 0 for p in range(n)]
-        positions = [p for p in range(n) if mask[p]]
-        # Placeholders at embedding positions must not matter.
-        placeholder_ids = [0 if m else t for t, m in zip(prompt_ids, mask)]
-        requests.append(
-            {
-                "prompt_token_ids": placeholder_ids,
-                "prompt_embeds": table[torch.tensor([prompt_ids[p] for p in positions])],
-                "prompt_embeds_mask": mask,
-            }
-        )
-    assert _run(llm, requests) == expected
-
-
-def test_mixed_batch_matches_tokens(llm: LLM, table: torch.Tensor) -> None:
-    ids = _token_ids(llm, PROMPTS)
-    expected = _run(llm, ids)
-    mixed = [
-        ids[0],
-        {"prompt_embeds": table[torch.tensor(ids[1])]},
-        {"prompt_token_ids": ids[2]},
-    ]
-    assert _run(llm, mixed) == expected
+    if pattern == "whole":
+        requests = [{"prompt_embeds": table[torch.tensor(i)]} for i in ids[:-1]]
+    else:
+        requests = [
+            _placeholder_request(i, [MASKS[pattern](p, len(i)) for p in range(len(i))], table)
+            for i in ids[:-1]
+        ]
+    assert _run(llm, requests + [ids[-1]]) == expected
 
 
 def test_reuse_scoped_to_embeddings(llm: LLM, table: torch.Tensor) -> None:
@@ -236,11 +220,7 @@ def test_reuse_shares_plain_prefix(llm: LLM, table: torch.Tensor) -> None:
     expected = _run(llm, [ids], salt)[0]
     first_embed = len(ids) // 2
     mask = [p >= first_embed for p in range(len(ids))]
-    request = {
-        "prompt_token_ids": [0 if m else t for t, m in zip(ids, mask)],
-        "prompt_embeds": table[torch.tensor(ids[first_embed:])],
-        "prompt_embeds_mask": mask,
-    }
+    request = _placeholder_request(ids, mask, table)
     shared = llm.generate([request], _greedy(), cache_salt=salt)[0]
     assert list(shared.outputs[0].token_ids) == expected
     assert 0 < shared.cached_tokens <= first_embed
@@ -358,27 +338,11 @@ def test_multi_gpu(model_dir: str, table: torch.Tensor, tp_size: int, pp_size: i
         n = len(ids[0])
         mask = [p % 2 == 1 for p in range(n)]
         requests = [
-            {
-                "prompt_token_ids": ids[0],
-                "prompt_embeds": table[torch.tensor([t for t, m in zip(ids[0], mask) if m])],
-                "prompt_embeds_mask": mask,
-            },
+            _placeholder_request(ids[0], mask, table),
             {"prompt_embeds": table[torch.tensor(ids[1])]},
             ids[2],
         ]
         assert _run(parallel, requests) == expected
-
-
-def test_connector_keeps_salt_scoping() -> None:
-    # External KV stores key blocks by ids and salt, even with the V2 manager.
-    def worker(connector: object) -> SimpleNamespace:
-        return SimpleNamespace(
-            llm_args=SimpleNamespace(kv_connector_config=connector),
-            _uses_kv_cache_manager_v2=lambda: True,
-        )
-
-    assert not BaseWorker._kv_cache_keys_prompt_embeds(worker(object()))
-    assert BaseWorker._kv_cache_keys_prompt_embeds(worker(None))
 
 
 def test_preemption_with_graphs_and_compile(model_dir: str, table: torch.Tensor) -> None:
@@ -410,10 +374,57 @@ def test_preemption_with_graphs_and_compile(model_dir: str, table: torch.Tensor)
         assert got == expected
 
 
+def test_disaggregated_handoff() -> None:
+    # Context and generation engines share one GPU; both key the transferred
+    # blocks by the embedding identity.
+    model = get_model_path(QWEN3)
+    if not os.path.isdir(model):
+        pytest.skip(f"{model} not found")
+    table = _embedding_table(model)
+
+    def engine() -> LLM:
+        return LLM(
+            model=model,
+            kv_cache_config=KvCacheConfig(
+                max_tokens=4096, enable_block_reuse=True, use_kv_cache_manager_v2=True
+            ),
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"
+            ),
+            disable_overlap_scheduler=True,
+            max_batch_size=4,
+        )
+
+    with engine() as ctx, engine() as gen:
+        ids = _token_ids(ctx, [LONG_PROMPT])[0]
+        mask = [p % 3 == 1 for p in range(len(ids))]
+        request = _placeholder_request(ids, mask, table)
+        other = {**request, "prompt_embeds": request["prompt_embeds"] * 1.5}
+        salt = uuid.uuid4().hex
+
+        def handoff(req: dict) -> tuple[List[int], int]:
+            first = ctx.generate_async(
+                req,
+                sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+                disaggregated_params=DisaggregatedParams(request_type="context_only"),
+                cache_salt=salt,
+            ).result()
+            params = first.disaggregated_params
+            params.request_type = "generation_only"
+            out = gen.generate_async(
+                req, sampling_params=_greedy(), disaggregated_params=params, cache_salt=salt
+            ).result()
+            return list(out.outputs[0].token_ids), out.cached_tokens
+
+        assert handoff(request) == (_run(ctx, [ids])[0], 0)
+        tokens, cached = handoff(request)
+        assert tokens == _run(ctx, [ids])[0] and cached > mask.index(True)
+        tokens, cached = handoff(other)
+        assert tokens == _run(ctx, [other])[0] and cached <= mask.index(True)
+
+
 def test_generation_only_passes_deployment_checks() -> None:
     # Generation workers reject what context workers reject, from the identity alone.
-    from tensorrt_llm.disaggregated_params import DisaggregatedParams
-
     _, pe = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
     request = GenerationRequest(
         [1, 2, 3],

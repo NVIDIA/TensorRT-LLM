@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""prompt_embeds on Qwen-VL models, alone and batched with image requests."""
+"""prompt_embeds on Qwen-VL models, batched with and inside multimodal requests."""
 
 import json
 import os
@@ -83,29 +83,22 @@ def _image_request(llm: LLM, model_dir: str) -> dict:
     return request
 
 
-def test_text_prompt_embeds_match_tokens(llm: LLM, model_dir: str) -> None:
+def test_text_prompt_embeds_batched_with_image(llm: LLM, model_dir: str) -> None:
     table = _text_embedding_table(model_dir)
+    image = _image_request(llm, model_dir)
     ids = [llm.tokenizer.encode(p) for p in PROMPTS]
-    expected = _run(llm, ids)
-    n = len(ids[1])
-    mask = [p % 2 == 0 for p in range(n)]
+    expected = _run(llm, [image, *ids])
+    mask = [p % 2 == 0 for p in range(len(ids[1]))]
     requests = [
+        image,
         {"prompt_embeds": table[torch.tensor(ids[0])]},
         {
-            "prompt_token_ids": ids[1],
+            "prompt_token_ids": [0 if m else t for t, m in zip(ids[1], mask)],
             "prompt_embeds": table[torch.tensor([t for t, m in zip(ids[1], mask) if m])],
             "prompt_embeds_mask": mask,
         },
     ]
     assert _run(llm, requests) == expected
-
-
-def test_batched_with_image_request(llm: LLM, model_dir: str) -> None:
-    table = _text_embedding_table(model_dir)
-    image = _image_request(llm, model_dir)
-    ids = llm.tokenizer.encode(PROMPTS[0])
-    expected = _run(llm, [image, ids])
-    assert _run(llm, [image, {"prompt_embeds": table[torch.tensor(ids)]}]) == expected
 
 
 def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str) -> None:

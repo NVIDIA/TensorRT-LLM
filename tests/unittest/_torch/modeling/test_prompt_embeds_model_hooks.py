@@ -38,23 +38,22 @@ def test_plain_default() -> None:
     assert DecoderModelForCausalLM.prompt_embeds_model_inputs(plain, IDS, ROWS) == {}
 
 
-def test_gemma4_ple_uses_pad_at_embedding_rows() -> None:
-    model = _gemma4(32, 7)
-    assert Gemma4ForCausalLM.prompt_embeds_unsupported_reason(model) is None
+@pytest.mark.parametrize(
+    "ple_dim, pad_token_id, ple_ids",
+    [(32, 7, [11, 7, 7, 14, 7]), (0, None, None), (32, None, "refused")],
+    ids=["ple_pads_embedding_rows", "no_ple", "ple_without_pad"],
+)
+def test_gemma4(ple_dim: int, pad_token_id, ple_ids) -> None:
+    model = _gemma4(ple_dim, pad_token_id)
+    reason = Gemma4ForCausalLM.prompt_embeds_unsupported_reason(model)
+    if ple_ids == "refused":
+        assert reason
+        return
+    assert reason is None
     extra = Gemma4ForCausalLM.prompt_embeds_model_inputs(model, IDS, ROWS)
+    assert (extra["ple_input_ids"].tolist() if extra else None) == ple_ids
     # Plain rows keep their ids, so plain requests batched alongside are unaffected.
-    assert extra["ple_input_ids"].tolist() == [11, 7, 7, 14, 7]
     assert IDS.tolist() == [11, 0, 0, 14, 0]
-
-
-def test_gemma4_without_ple_is_plain() -> None:
-    model = _gemma4(0, None)
-    assert Gemma4ForCausalLM.prompt_embeds_unsupported_reason(model) is None
-    assert Gemma4ForCausalLM.prompt_embeds_model_inputs(model, IDS, ROWS) == {}
-
-
-def test_gemma4_ple_without_pad_refuses() -> None:
-    assert Gemma4ForCausalLM.prompt_embeds_unsupported_reason(_gemma4(32, None))
 
 
 @pytest.mark.parametrize("cls", [DeepseekV4ForCausalLM, Qwen4ExpForCausalLM])
