@@ -238,6 +238,7 @@ def packed_plan_geometry(
         (reduce.packed_plan_length(num_requests, task_capacity),),
         dtype=torch.int32,
         device=device,
+        shared=False,
     )
     kv_lens = metadata.fp4_mla_state.generation_kv_lens
     lpt_m_tiles = m_tiles
@@ -338,6 +339,7 @@ def backend_plan_geometry(
         (packed_plan_length(num_requests, task_capacity),),
         dtype=torch.int32,
         device=device,
+        shared=False,
         capacity_numel=packed_plan_length(max_requests, task_bound),
     )
     kv_lens = metadata.fp4_mla_state.generation_kv_lens
@@ -590,6 +592,7 @@ def _run_packed_decode(
         (task_capacity, physical_m, 512),
         dtype=torch.float32,
         device=device,
+        shared=False,
     )[:tasks]
     maxima = _ensure_workspace_tensor(
         metadata,
@@ -597,6 +600,7 @@ def _run_packed_decode(
         (task_capacity, physical_m),
         dtype=torch.float32,
         device=device,
+        shared=False,
     )[:tasks]
     sums = _ensure_workspace_tensor(
         metadata,
@@ -604,6 +608,7 @@ def _run_packed_decode(
         (task_capacity, physical_m),
         dtype=torch.float32,
         device=device,
+        shared=False,
     )[:tasks]
     module.run_trtllm_fp4_mla_decode_packed(
         q_fp4,

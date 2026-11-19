@@ -39,6 +39,8 @@ import requests
 import yaml
 from datasets import load_dataset
 from defs.common import wait_for_reported_addr
+from test_common.moe_tactics import (cutedsl_grouped_gemm_moe_tactic,
+                                     sm100f_moe_tactic_or_cutlass)
 
 from tensorrt_llm.evaluate import LongBenchV2 as LongBenchV2Evaluator
 from tensorrt_llm.executor.result import GenerationResultBase
@@ -2375,7 +2377,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
                 "free_gpu_memory_fraction": 0.5,
             },
             "moe_config": {
-                "backend": "CUTLASS"
+                "tactic": "cutlass"
             }
         }
 
@@ -2396,7 +2398,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
                 "free_gpu_memory_fraction": 0.5,
             },
             "moe_config": {
-                "backend": "CUTLASS"
+                "tactic": "cutlass"
             }
         }
 
@@ -2495,7 +2497,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                 "free_gpu_memory_fraction": 0.5,
             },
             "moe_config": {
-                "backend": "CUTLASS"
+                "tactic": "cutlass"
             }
         }
 
@@ -2516,7 +2518,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                 "free_gpu_memory_fraction": 0.5,
             },
             "moe_config": {
-                "backend": "CUTLASS"
+                "tactic": "cutlass"
             }
         }
 
@@ -2614,6 +2616,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             "moe_expert_parallel_size": 2,
             "max_batch_size": 16,
             "cache_transceiver_config": cache_transceiver_config,
+            # The SM103 modeling_v2 context target accepts the backend literal
+            # but honors no tactic.
             "moe_config": {
                 "backend": "TRTLLM"
             },
@@ -2682,7 +2686,9 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
         }
-        moe_config = {"backend": "CUTEDSL"}
+        moe_config = {
+            "tactic": sm100f_moe_tactic_or_cutlass("cutedsl.grouped_gemm")
+        }
         speculative_config = {
             "decoding_type": "MTP",
             "max_draft_len": 1,
@@ -2761,7 +2767,10 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
         }
-        moe_config = {"backend": "CUTEDSL"}
+        # _test_sparse_offload_long_context disables finalize fusion.
+        moe_config = {
+            "tactic": cutedsl_grouped_gemm_moe_tactic(fused_finalize=False)
+        }
         ctx_server_config = {
             "tensor_parallel_size": 2,
             "pipeline_parallel_size": 1,
@@ -2818,7 +2827,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self):
         # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
         # NVFP4 weights ~71 GB/rank at TP=2, leaving ~107 GB for KV on B200.
-        # TRTLLM backend required: it is the backend supporting V4-Flash MXFP4.
+        # MoE: TRTLLM-Gen on the SM100 family, CUTLASS on other GPUs.
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
         cache_transceiver_config = {
             "backend": "NIXL",
@@ -2843,7 +2852,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_seq_len": 4096,
             "moe_config": {
-                "backend": "TRTLLM",
+                "tactic": sm100f_moe_tactic_or_cutlass("trtllm_gen"),
             },
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
@@ -2895,7 +2904,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_seq_len": 4096,
             "moe_config": {
-                "backend": "TRTLLM",
+                "tactic": sm100f_moe_tactic_or_cutlass("trtllm_gen"),
             },
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
@@ -2961,7 +2970,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "moe_expert_parallel_size": 2,
             "disable_overlap_scheduler": True,
             "moe_config": {
-                "backend": "TRTLLM",
+                "tactic": sm100f_moe_tactic_or_cutlass("trtllm_gen"),
             },
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
@@ -3027,6 +3036,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         # needs a whole-sequence prefill, hence no overlap scheduler and no
         # chunked prefill on either worker -- the same pairing the aggregate
         # TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm uses.
+        moe_tactic = "cutedsl.mega_moe"
         common_server_config = {
             "attn_backend": "TRTLLM",
             "tensor_parallel_size": 4,
@@ -3034,7 +3044,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
             "enable_attention_dp": True,
             # MegaMoE CuTe DSL is the backend that serves the NVFP4 export.
             "moe_config": {
-                "backend": "MEGAMOE_CUTEDSL"
+                "tactic": moe_tactic
             },
             "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_seq_len": 4096,
@@ -3057,6 +3067,9 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
                 "decoding_type": "DSpark",
                 "max_draft_len": 5,
                 "speculative_model": model_path,
+                # A target tactic does not reach the drafter; pin it to the
+                # same implementation.
+                "moe_tactic": moe_tactic,
             },
             # Acceptance length is read back off this worker's /metrics.
             # Without return_perf_metrics the server never builds its tee
@@ -3152,7 +3165,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
         # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
         # FP8 weights ~71 GB/rank at TP=4 → ~142 GB/rank at TP=2; requires
         # ≥140 GB per GPU (fits on B300 288 GB, tight on B200 178 GB).
-        # TRTLLM backend: the CUTLASS FP8 block-scale path is Hopper-only.
+        # TRTLLM-Gen MoE: the CUTLASS FP8 block-scale path is Hopper-only.
         # Compact batching keeps KV cache ~1 GB/rank (default ~100 GB requires fully-clean GPU memory).
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
         cache_transceiver_config = {
@@ -3180,7 +3193,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
             "max_num_tokens": 4096,
             "max_seq_len": 4096,
             "moe_config": {
-                "backend": "TRTLLM",
+                "tactic": "trtllm_gen",
             },
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
@@ -3220,7 +3233,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
         """Test with KV cache manager v2, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         max_num_tokens = 8192
-        moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
+        moe_config = {"tactic": "trtllm_gen", "max_num_tokens": max_num_tokens}
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "kv_cache_config": {
@@ -3308,6 +3321,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 },
                 "kv_transfer_timeout_ms": 600000,
             },
+            # Stays on a backend literal: on SM103 and SM107 the MiniMax-M3
+            # modeling_v2 targets serve these deployments and honor no
+            # tactic, so a tactic would build the built-in model.
             "moe_config": {
                 "backend": "CUTLASS"
             },

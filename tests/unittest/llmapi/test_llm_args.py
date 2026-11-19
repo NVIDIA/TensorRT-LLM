@@ -965,6 +965,23 @@ kv_cache_config:
 
         assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 64
 
+    def test_from_yaml_enable_locality_domains(self, tmp_path):
+        assert TorchLlmArgs(
+            model=llama_model_path).enable_locality_domains is False
+
+        yaml_path = tmp_path / "locality_domains.yaml"
+        yaml_path.write_text(
+            yaml.safe_dump({
+                "model": str(llama_model_path),
+                "enable_locality_domains": True,
+            }),
+            encoding="utf-8",
+        )
+
+        llm_args = TorchLlmArgs.from_yaml(yaml_path)
+
+        assert llm_args.enable_locality_domains is True
+
     def test_from_yaml_empty_file_reports_missing_model(self, tmp_path):
         yaml_path = tmp_path / "empty.yaml"
         yaml_path.write_text("", encoding="utf-8")
@@ -1326,6 +1343,22 @@ def test_dspark_requires_positive_max_draft_len(tmp_path):
     spec_cfg = DSparkDecodingConfig(speculative_model=str(tmp_path))
 
     with pytest.raises(ValueError, match="max_draft_len must be > 0"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+@pytest.mark.cpu_only
+def test_dspark_ancestral_draft_sampling_rejects_embedded_drafter(tmp_path):
+    (tmp_path / "config.json").write_text('{"model_type": "deepseek_v4"}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    use_rejection_sampling=True,
+                                    use_ancestral_draft_sampling=True)
+
+    with pytest.raises(ValueError, match="drafter embedded in the target"):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             skip_tokenizer_init=True,

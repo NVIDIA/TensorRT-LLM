@@ -4,6 +4,10 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 
 def _load_eval_module():
     repo_root = Path(__file__).resolve().parents[4]

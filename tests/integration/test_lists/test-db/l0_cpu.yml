@@ -154,6 +154,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_route_b_moe.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_weight_table.py
@@ -263,6 +264,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_cosmos3_edge_fp8_manifest.py
   - unittest/_torch/visual_gen/test_cosmos3_sigma_grid.py
   - unittest/_torch/visual_gen/test_quant_static_guard.py
+  - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_seacache.py
   - unittest/_torch/visual_gen/test_sleep.py
   - unittest/_torch/visual_gen/test_teacache.py
