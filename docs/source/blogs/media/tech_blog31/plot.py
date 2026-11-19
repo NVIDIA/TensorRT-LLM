@@ -408,7 +408,7 @@ def halo_latency(data: dict) -> None:
 
 
 def motivation(data: dict) -> None:
-    fig, ax = plt.subplots(figsize=(6.4, 5.0))
+    fig, ax = plt.subplots(figsize=(5.45, 4.25))
     fig.subplots_adjust(left=0.08, right=0.92, top=0.98, bottom=0.23)
     values = data["motivation"]["seconds"]
     total = sum(values)
@@ -430,7 +430,7 @@ def motivation(data: dict) -> None:
         loc="upper center",
         bbox_to_anchor=(0.5, 0.02),
         frameon=False,
-        fontsize=15,
+        fontsize=13,
         handlelength=1.2,
     )
     angle = np.deg2rad(90 - 180 * values[0] / total)
@@ -440,7 +440,7 @@ def motivation(data: dict) -> None:
         f"{100 * values[0] / total:.0f}%",
         ha="center",
         va="center",
-        fontsize=15,
+        fontsize=13,
         weight="bold",
         color="white",
     )
@@ -450,7 +450,7 @@ def motivation(data: dict) -> None:
         f"{total:.1f} s",
         ha="center",
         va="center",
-        fontsize=29,
+        fontsize=23,
         weight="bold",
         color="#1F2933",
     )
@@ -460,7 +460,7 @@ def motivation(data: dict) -> None:
         f"per {data['motivation']['frames']}-frame clip",
         ha="center",
         va="center",
-        fontsize=13,
+        fontsize=11,
         color="#5F6B76",
     )
     save(fig, "motivation")

@@ -243,14 +243,16 @@ def decoder_breakdown(data: dict) -> None:
         "Upsample shortcut",
         "Other",
     ]
-    fig, ax = plt.subplots(figsize=(6.4, 3.6), layout="constrained")
+    fig, ax = plt.subplots(figsize=(5.5, 3.1), layout="constrained")
     ax.barh(labels, vals, color=["#76B900"] + ["#B5DC6A"] * 5, height=0.64)
     for i, v in enumerate(vals):
-        ax.text(v + 0.08, i, f"{v:.1f} s ({100 * v / sum(vals):.0f}%)", va="center", fontsize=12)
+        ax.text(v + 0.08, i, f"{v:.1f} s ({100 * v / sum(vals):.0f}%)", va="center", fontsize=11)
     ax.invert_yaxis()
     ax.set(xlim=(0, 6.3), xlabel="Decoder time (seconds)")
     ax.spines[["top", "right", "left"]].set_visible(False)
-    ax.tick_params(axis="y", length=0, labelsize=12)
+    ax.tick_params(axis="y", length=0, labelsize=11)
+    ax.tick_params(axis="x", labelsize=11)
+    ax.xaxis.label.set_size(11)
     save(fig, "decoder_breakdown")
 
 
