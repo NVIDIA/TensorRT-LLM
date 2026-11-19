@@ -80,7 +80,7 @@ def test_handoff_replays_parent_history_and_reinitializes_reused_slots() -> None
     def apply(
         parents: list[list[int]], lengths: list[int], widths: list[int], contexts: int
     ) -> None:
-        sampler._apply_beam_relay(
+        sampler._beam_search.apply_relay(
             requests,
             BeamSearchRelayState(
                 request_ids=[request.py_request_id for request in requests],

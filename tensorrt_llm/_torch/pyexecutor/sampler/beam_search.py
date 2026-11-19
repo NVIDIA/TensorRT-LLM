@@ -244,6 +244,9 @@ class BeamSearchStore:
     cba: Optional[_CBAFields] = None
     """CBA tensors; None until the first beam-search request."""
 
+    def reset_prompt_cache_indirection(self, slots: torch.Tensor, max_prompt_len: int) -> None:
+        self.cache_indirection.narrow(2, 0, max_prompt_len).index_fill_(0, slots, 0)
+
     @classmethod
     def create(
         cls,
@@ -1279,9 +1282,7 @@ def prepare_beam_search(
 
     ``seq_slots_long`` must be int64 (required by ``index_fill_``).
     """
-    beam_search_store.cache_indirection.narrow(2, 0, max_prompt_len).index_fill_(
-        0, seq_slots_long, 0
-    )
+    beam_search_store.reset_prompt_cache_indirection(seq_slots_long, max_prompt_len)
     beam_search_store.cum_log_probs.index_fill_(0, seq_slots_long, 0)
     log_probs_store.sampled_log_probs.index_fill_(0, seq_slots_long, 0)
     log_probs_store.sampled_log_prob_ranks.index_fill_(0, seq_slots_long, 0)
@@ -1620,6 +1621,106 @@ class BeamSearchHandler:
         # Stop-word length check lives with finish-reason handling, which also
         # uses it outside beam search; injected rather than duplicated here.
         self._has_multi_token_stop_words = has_multi_token_stop_words
+
+    def start_relay(
+        self,
+        requests: list[LlmRequest],
+        seq_slots_cuda: torch.Tensor,
+        seq_lens_host: torch.Tensor,
+        num_context_requests: int,
+    ) -> BeamSearchRelayState:
+        """Start the host copies of the step's beam-search state for the other ranks.
+
+        Parent beam indices let each rank update its cache indirection without
+        transferring the full token history. Context-only requests also need
+        the cumulative log-probs of their first tokens. The copies complete
+        with the sampler event.
+
+        Args:
+            requests: The step's requests, after the beam-search step.
+            seq_slots_cuda: The step's existing device sequence-slot indices.
+            seq_lens_host: The token positions used by this sampling step.
+            num_context_requests: Number of leading context requests.
+        """
+        store = self._store
+        assert store is not None
+        beam_widths = [_get_beam_width_out(request) for request in requests]
+        return BeamSearchRelayState(
+            request_ids=[request.py_request_id for request in requests],
+            num_context_requests=num_context_requests,
+            predecessor_beams=self._copy_to_host(
+                store.predecessor_beams[seq_slots_cuda, : max(beam_widths)]
+            ),
+            seq_lens=seq_lens_host.tolist(),
+            beam_widths=beam_widths,
+            cum_log_probs=self._copy_to_host(store.cum_log_probs[seq_slots_cuda]),
+        )
+
+    def apply_relay(
+        self, requests: list[LlmRequest], beam_relay: BeamSearchRelayState
+    ) -> None:
+        """Apply the sampling rank's beam-parent update to this rank's cache indirection.
+
+        Token positions and output widths are captured before later request
+        updates can advance them.
+
+        Args:
+            requests: This rank's requests of the step.
+            beam_relay: The step's relay state from the sampling rank.
+        """
+        store = self._store
+        assert store is not None
+        assert beam_relay.request_ids == [request.py_request_id for request in requests], (
+            "PP beam-search relay request order differs from the scheduled batch"
+        )
+        # Completed requests may have released their slots to a new request.
+        live_rows = [
+            row
+            for row, request in enumerate(requests)
+            if request.state != LlmRequestState.GENERATION_COMPLETE
+        ]
+        if not live_rows:
+            return
+        seq_slots = [request.py_seq_slot for request in requests]
+        seq_slots_cuda, seq_lens_cuda = torch.tensor(
+            [seq_slots, beam_relay.seq_lens], dtype=torch.int64, pin_memory=prefer_pinned()
+        ).to(device="cuda", non_blocking=True)
+        context_rows = [row for row in live_rows if row < beam_relay.num_context_requests]
+        if context_rows:
+            max_prompt_len = max(requests[row].py_prompt_len for row in context_rows)
+            if len(context_rows) == beam_relay.num_context_requests:
+                context_slots = seq_slots_cuda[: beam_relay.num_context_requests]
+            else:
+                context_slots = torch.tensor(
+                    [seq_slots[row] for row in context_rows],
+                    dtype=torch.int64,
+                    pin_memory=prefer_pinned(),
+                ).to(device="cuda", non_blocking=True)
+            store.reset_prompt_cache_indirection(context_slots, max_prompt_len)
+        predecessor_beams_cuda = beam_relay.predecessor_beams.to(device="cuda", non_blocking=True)
+        rows_by_width: dict[int, list[int]] = {}
+        for row in live_rows:
+            beam_width = beam_relay.beam_widths[row]
+            rows_by_width.setdefault(beam_width, []).append(row)
+        num_positions = max(beam_relay.seq_lens) + 1
+        for beam_width, rows in rows_by_width.items():
+            if len(rows) == len(requests):
+                slots, lengths = seq_slots_cuda, seq_lens_cuda
+                predecessors = predecessor_beams_cuda[:, :beam_width]
+            else:
+                rows_cuda = torch.tensor(rows, dtype=torch.int64, pin_memory=prefer_pinned()).to(
+                    device="cuda", non_blocking=True
+                )
+                slots, lengths = seq_slots_cuda[rows_cuda], seq_lens_cuda[rows_cuda]
+                predecessors = predecessor_beams_cuda[rows_cuda, :beam_width]
+            store.cache_indirection[slots, :beam_width, :num_positions] = (
+                _reorder_cache_indirection(
+                    store.cache_indirection[slots, :, :num_positions],
+                    predecessors,
+                    lengths,
+                    store.beam_idx_arange,
+                )
+            )
 
     def build_metadata(
         self,
