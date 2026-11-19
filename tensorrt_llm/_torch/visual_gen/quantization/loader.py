@@ -178,6 +178,10 @@ class DynamicLinearWeightLoader:
         if quant_algo is None or self.dynamic_weight_quant:
             return
 
+        if self.quant_config is not None:
+            if self.quant_config.is_module_excluded_from_quantization(name):
+                return
+
         # Ask the destination buffer, not the module's name. ``quant_algo``
         # above falls back to the *global* recipe for any module that carries
         # no ``quant_config`` of its own, which includes modules that cannot be
@@ -258,6 +262,11 @@ class DynamicLinearWeightLoader:
         if not self.dynamic_weight_quant or quant_algo is None:
             return False
 
+        # Check if module is excluded
+        if self.quant_config is not None:
+            if self.quant_config.is_module_excluded_from_quantization(name):
+                return False
+
         weight = weight_dict.get("weight")
         if weight is None:
             return False
@@ -280,10 +289,10 @@ class DynamicLinearWeightLoader:
 
         return False
 
-    def validate_step_quant_weights(
+    def _validate_linear_step_ignore_weight_loading(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: QuantAlgo, name: str
     ) -> None:
-        """Require original weights and an implemented load-time quantizer."""
+        """Validate source weights and load-time quantization support for Linear step ignore."""
         weight = weight_dict.get("weight")
         if (
             not self.dynamic_weight_quant
@@ -416,11 +425,6 @@ class DynamicLinearWeightLoader:
             quant_algo = module_quant_config.quant_algo
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
-            if (
-                self.quant_config is not None
-                and self.quant_config.is_module_excluded_from_quantization(name)
-            ):
-                quant_algo = None
 
         # Static (pre-quantized) recipes must not be loaded from checkpoints
         # that do not carry the expected scale tensors.
@@ -433,7 +437,7 @@ class DynamicLinearWeightLoader:
             or getattr(self.quant_config, "ignore_steps", [])
         ):
             for weight_dict in weight_dicts:
-                self.validate_step_quant_weights(weight_dict, quant_algo, name)
+                self._validate_linear_step_ignore_weight_loading(weight_dict, quant_algo, name)
 
         # Special handling for fused NVFP4 dynamic quantization
         # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER
