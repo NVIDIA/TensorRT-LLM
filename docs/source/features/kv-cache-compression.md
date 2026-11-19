@@ -339,18 +339,7 @@ reconstruction error. The paper's TurboQuant-prod (Algorithm 2), which spends
 one bit on a Quantized Johnson-Lindenstrauss (QJL) sign of the residual to make
 inner products unbiased, is not offered: KVCacheManagerV2 re-encodes a Page each
 time it offloads the Page again after an onboard, and the QJL error of `prod`
-compounds over these round trips, whereas the error of `mse` stays the same
-(integer bits) or settles after a few round trips (fractional bits).
-
-Fractional widths (2.5 and 3.5 bits) treat outlier channels
-separately, as the paper does. For each group of vectors that share a page,
-layer, buffer, and KV head, the codec computes the energy of every channel in
-that page while encoding, without any calibration. The channels whose energy
-exceeds four times the median channel energy are outliers; they and then the
-lowest-numbered other channels, up to half of the channels, use
-`turboquant_bits + 0.5` bits, and the other half uses `turboquant_bits - 0.5`
-bits, each half with its own rotation, codebook, and scales; a channel mask per
-group records the split.
+compounds over these round trips, whereas the error of `mse` stays the same.
 
 The rotations depend only on `turboquant_seed` and the vector
 width and are generated the same way in every process, so equal configurations
@@ -363,13 +352,13 @@ kv_cache_config:
 kv_cache_compression_config:
   algorithm: quantization_for_cold_page
   quant: turboquant
-  turboquant_bits: 3     # 2, 2.5, 3, 3.5, or 4
+  turboquant_bits: 3     # 2, 3, or 4
 ```
 
 | Field | Values | Default | Meaning |
 | --- | --- | --- | --- |
 | `quant` | `nvfp4`, `turboquant` | `nvfp4` | Cold-page format |
-| `turboquant_bits` | `2`, `2.5`, `3`, `3.5`, `4` | `4` | Average bits per quantized value (codebook indices), not counting per-vector scales |
+| `turboquant_bits` | `2`, `3`, `4` | `4` | Bits per quantized value (codebook indices), not counting per-vector scales |
 | `turboquant_seed` | Integer `>= 0` | `5` | Seed of the random rotations |
 | `skip_rope_quantization` | `true`, `false` | `false` | Same as for NVFP4; see [Skipping RoPE Quantization](#skipping-rope-quantization) |
 
@@ -384,11 +373,7 @@ FP16, BF16, or FP8 active KV cache.
 | `turboquant_bits` | Stored for each vector of `n` quantized values | Bits per value, `n` = 128 |
 | --- | --- | --- |
 | `2`, `3`, `4` | `n * b` codebook bits and one BF16 scale | 2.125, 3.125, 4.125 |
-| `2.5`, `3.5` | `n/2 * (b + 0.5)` plus `n/2 * (b - 0.5)` codebook bits and two BF16 scales, plus one `n`-bit channel mask per group | 2.78, 3.78[^turboquant-mask] |
 | NVFP4, for comparison | `n` FP4 values and one E4M3 scale per 16 values | 4.5 |
-
-[^turboquant-mask]: With `tokens_per_block` of 32, the default; the channel
-    mask is shared by the tokens of a page, so it costs less with larger pages.
 
 A BF16 hot page shrinks by a factor of 16 divided by these numbers and an FP8 hot
 page by 8 divided by them. Each lifecycle's cold page is the sum of its
@@ -396,14 +381,13 @@ buffers, with every region rounded up to 16 bytes:
 
 ```text
 quantized buffer:  H * T * (n * b / 8 + 2 * s)    codebook bits, per-vector BF16 scales
-                 + H * n / 8                       channel masks (fractional bits only)
                  + H * T * (r - n) * e             values kept at the hot-cache precision
 lossless buffer:   its hot size
 
 H: KV heads of the buffer (1 for an MLA latent)    T: tokens_per_block
 n: quantized values per vector                     r: values per vector in the hot cache
 b: turboquant_bits                                 e: bytes per hot value (2 for FP16/BF16, 1 for FP8)
-s: 1 for 2, 3, or 4 bits; 2 for fractional bits; one per instance for n > 512
+s: 1, or one per instance for n > 512
 ```
 
 Vectors with more than 512 quantized values, such as the 576-value MLA latent,
@@ -411,8 +395,6 @@ are stored as several independent TurboQuant instances, each with its own
 rotation, codebook and scale, because decoding accumulates all output values of
 an instance on chip: instances of 256 values plus the rest (576 = 256 + 256 +
 64, three BF16 scales). The per-vector side information stays within 64 bits.
-Fractional bit widths are not split this way: their two halves (288 + 288 values
-of a 576-value vector) already are two instances.
 
 For example, Llama-3.1-8B (32 layers, 8 KV heads, head dimension 128) with
 32-token Pages and a BF16 cache has 4 MiB hot Pages. TurboQuant stores them in
@@ -437,11 +419,10 @@ and Conv state are preserved losslessly. See [Support](#support).
 - TurboQuant kernels are written in Triton and need compute capability 8.0 or
   newer (8.9 with an FP8 KV cache); NVFP4 cold pages need an SM100-family GPU.
 
-Integer bit widths reach the paper's distortion (normalized MSE 0.117, 0.034, and
+TurboQuant reaches the paper's distortion (normalized MSE 0.117, 0.034, and
 0.0094 at 2, 3, and 4 bits for head dimension 128) on every input structure tested, and
 re-encoding a decoded Page settles within a few round trips without changing the error, so Pages
-that migrate repeatedly do not accumulate error. Fractional bit widths settle 10-20% above their
-error after one round trip on 128-value heads, and 50-70% above it on GLM-5.3 MLA latents.
+that migrate repeatedly do not accumulate error.
 Encode and decode are bound by the host link for
 conventional K/V Pages, so they take about the NVFP4 time scaled by the cold-page size. MLA
 latents and DeepSeek-V4 CSA rows need more decode work; with a fast host link (about 200 GB/s)

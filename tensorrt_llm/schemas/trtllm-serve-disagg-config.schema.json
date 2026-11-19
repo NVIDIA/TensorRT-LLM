@@ -878,12 +878,10 @@
         },
         "turboquant_bits": {
           "default": 4.0,
-          "description": "TurboQuant average bits per quantized value (codebook indices), excluding per-vector scales: one of 2, 2.5, 3, 3.5, or 4. TurboQuant minimizes the reconstruction error (the paper's TurboQuant-mse).",
+          "description": "TurboQuant bits per quantized value (codebook indices), excluding per-vector scales: one of 2, 3, or 4. TurboQuant minimizes the reconstruction error (the paper's TurboQuant-mse).",
           "enum": [
             2,
-            2.5,
             3,
-            3.5,
             4
           ],
           "status": "prototype",

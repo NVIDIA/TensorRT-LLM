@@ -18,9 +18,7 @@ import math
 import torch
 
 ROTATION = 0
-"""Purpose of the Haar rotation of a group with a single instance (or of the outlier group)."""
-REGULAR_ROTATION = 1
-"""Purpose of the Haar rotation of the regular-channel group of a fractional-bit setting."""
+"""Purpose of the Haar rotation of a TurboQuant instance."""
 
 _MAX_SUPPORT = 12.0
 _GRID_POINTS = 1 << 18

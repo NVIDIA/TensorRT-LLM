@@ -5477,7 +5477,7 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
-_TURBOQUANT_BITS = (2, 2.5, 3, 3.5, 4)
+_TURBOQUANT_BITS = (2, 3, 4)
 _NVFP4_COLD_PAGE_OPTIONS = frozenset(
     {"nvfp4_residual_dim", "scale_checkpoint_path"})
 _TURBOQUANT_COLD_PAGE_OPTIONS = frozenset(
@@ -5540,9 +5540,8 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         default=4.0,
         status="prototype",
         json_schema_extra={"enum": list(_TURBOQUANT_BITS)},
-        description=
-        "TurboQuant average bits per quantized value (codebook indices), "
-        "excluding per-vector scales: one of 2, 2.5, 3, 3.5, or 4. TurboQuant "
+        description="TurboQuant bits per quantized value (codebook indices), "
+        "excluding per-vector scales: one of 2, 3, or 4. TurboQuant "
         "minimizes the reconstruction error (the paper's TurboQuant-mse).")
     turboquant_seed: NonNegativeInt = Field(
         default=5,
@@ -5568,8 +5567,8 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         # bool is an int subclass: reject it rather than read True as 1 bit.
         if (isinstance(value, bool) or not isinstance(value, numbers.Real)
                 or value not in _TURBOQUANT_BITS):
-            raise ValueError("turboquant_bits must be one of 2, 2.5, 3, 3.5, "
-                             f"or 4, got {value!r}")
+            raise ValueError("turboquant_bits must be one of 2, 3, or 4, "
+                             f"got {value!r}")
         return float(value)
 
     @model_validator(mode="after")

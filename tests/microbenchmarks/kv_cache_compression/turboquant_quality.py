@@ -36,7 +36,7 @@ from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig, 
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
 
 DIM, HEADS, TOKENS, PAGES = 128, 8, 32, 16
-BITS = (2, 2.5, 3, 3.5, 4)
+BITS = (2, 3, 4)
 INPUTS = ("gaussian", "outliers", "sparse", "one_hot", "constant", "mixed_norms")
 TRIPS = (1, 4, 16)
 

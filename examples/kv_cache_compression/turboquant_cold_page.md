@@ -34,24 +34,17 @@ rotated coordinate with the index of the nearest value of a Lloyd-Max codebook,
 and stores one BF16 scale for the vector. The decoder looks up the codebook
 values, applies the scale, and rotates back.
 
-| `turboquant_bits` | Algorithm | Use it for |
-| --- | --- | --- |
-| 2, 3, or 4 | The paper's TurboQuant-mse (Algorithm 1): the smallest reconstruction error for the bit width | The default (4 bits); K and V reconstruction |
-| 2.5 or 3.5 | Two Algorithm 1 instances per vector: in each group of vectors that share a page, layer, buffer, and KV head, half of the channels use one bit more than the other half; channels with more than four times the median channel energy are always in that half | Bit widths between the integer settings, with outlier channels kept more precise |
-
-The fractional settings choose the high-bit half from the channel energies in
-the Page being encoded: the outlier channels, whose energy exceeds four times
-the median channel energy, and then the lowest-numbered other channels until
-half of the channels are chosen. The split adapts to every Page without
-calibration. The rotation matrices are fixed by `turboquant_seed` and generated
-identically in every process.
+These steps are the paper's TurboQuant-mse (Algorithm 1), which gives the
+smallest reconstruction error for the bit width: 2, 3, or 4 bits per value
+(`turboquant_bits`, default 4). The rotation matrices are fixed by
+`turboquant_seed` and generated identically in every process.
 
 The paper's TurboQuant-prod (Algorithm 2), which spends one bit on a QJL sign
 of the residual so that inner products with decoded keys are unbiased, is not
 offered. KVCacheManagerV2 re-encodes a Page each time it offloads the Page
 again after an onboard, and the QJL error of `prod` compounds over these round
-trips, whereas the error of TurboQuant-mse stays the same or settles after a few
-round trips (see [Reconstruction Quality](#reconstruction-quality)).
+trips, whereas the error of TurboQuant-mse stays the same (see
+[Reconstruction Quality](#reconstruction-quality)).
 
 Each cold Page is one compact storage blob. For conventional MHA, MQA, and GQA,
 the K and V buffers are encoded; for key-only MLA, the latent Attention key is
@@ -67,12 +60,10 @@ Disk tiers share one TurboQuant representation.
 
 | `turboquant_bits` | Bits per stored value, head dimension 128[^bits] | BF16 Page compression |
 | --- | --- | --- |
-| `2`, `2.5`, `3`, `3.5`, `4` | 2.125, 2.78, 3.125, 3.78, 4.125 | 7.5x, 5.8x, 5.1x, 4.2x, 3.9x |
+| `2`, `3`, `4` | 2.125, 3.125, 4.125 | 7.5x, 5.1x, 3.9x |
 | NVFP4, for comparison | 4.5 | 3.6x |
 
-[^bits]: Including per-vector scales and, for 2.5 and 3.5
-    bits, the channel masks at the default 32 tokens per Page. The cold-page
-    size formula is in the
+[^bits]: Including per-vector scales. The cold-page size formula is in the
     [feature documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md#turboquant-cold-pages).
 
 This is different from an active quantized KV cache. Do not set
@@ -164,7 +155,7 @@ kv_cache_config:
 kv_cache_compression_config:
   algorithm: quantization_for_cold_page
   quant: turboquant
-  turboquant_bits: 3     # 2, 2.5, 3, 3.5, or 4
+  turboquant_bits: 3     # 2, 3, or 4
 ```
 
 ```bash
@@ -349,9 +340,7 @@ it with NVFP4 cold pages at the same cold-tier quota.
 | Bits | Paper (d = 128) | Gaussian | Outlier channels | Sparse | One-hot | All-equal | Norms 1e-6..1e6 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 2 | 0.117 | 0.115 | 0.110 | 0.116 | 0.115 | 0.127 | 0.115 |
-| 2.5 | between | 0.073 | 0.045 | 0.041 | 0.032 | 0.055 | 0.073 |
 | 3 | 0.034 | 0.034 | 0.032 | 0.034 | 0.034 | 0.035 | 0.033 |
-| 3.5 | between | 0.021 | 0.012 | 0.011 | 0.009 | 0.017 | 0.021 |
 | 4 | 0.0094 | 0.0092 | 0.0086 | 0.0092 | 0.0092 | 0.0094 | 0.0091 |
 | NVFP4 | | 0.0091 | 0.0084 | 0.0014 | 0 | 0 | 0.51 |
 
@@ -364,16 +353,13 @@ Page:
 | Bits | 1 round trip | 4 round trips | 16 round trips |
 | --- | --- | --- | --- |
 | 4 / 3 / 2 | 0.0086 / 0.0314 / 0.1092 | 0.0086 / 0.0314 / 0.1092 | 0.0086 / 0.0314 / 0.1092 |
-| 3.5 / 2.5 | 0.0123 / 0.0448 | 0.0137 / 0.0497 | 0.0137 / 0.0497 |
 | NVFP4 | 0.0084 | 0.0084 | 0.0084 |
 
 The cold bytes settle after a few round trips and then repeat with period 1 or 2: most vectors
 reproduce their codes, and a few alternate between two codes (on GB300 every setting tested
-settled within 17 round trips; the unit tests check 32). At integer bit widths the error stays
-where one round trip leaves it (within 1.5% with an FP8 KV cache, whose decoded values are rounded
-again). Fractional bits also choose the outlier channels from the decoded data again, so channels
-move between the two groups before a Page settles: the error grows by 10-20% on these 128-value
-heads, and by more on MLA latents (below). The paper's TurboQuant-prod is not offered because its
+settled within 17 round trips; the unit tests check 32). The error stays where one round trip
+leaves it (within 1.5% with an FP8 KV cache, whose decoded values are rounded again). The paper's
+TurboQuant-prod is not offered because its
 error compounds instead; a prototype measured 0.55, 16.9, and 2.3e6 after 1, 4, and 16 round trips
 at 2 bits, and 0.051, 0.31, and 7.0 at 4 bits.
 
@@ -384,15 +370,11 @@ of an end-to-end run), the normalized MSE of the whole latent is:
 | Bits | 1 / 4 / 16 round trips | 1 / 4 / 16 round trips with `skip_rope_quantization` |
 | --- | --- | --- |
 | 2 | 0.1148 / 0.1148 / 0.1148 | 0.0213 / 0.0213 / 0.0213 |
-| 2.5 | 0.0427 / 0.0701 / 0.0736 | 0.0136 / 0.0148 / 0.0148 |
 | 3 | 0.0328 / 0.0328 / 0.0328 | 0.0062 / 0.0062 / 0.0062 |
-| 3.5 | 0.0120 / 0.0172 / 0.0178 | 0.0039 / 0.0045 / 0.0045 |
 | 4 | 0.0089 / 0.0089 / 0.0089 | 0.0017 / 0.0017 / 0.0017 |
 
 The 64 RoPE values carry most of a latent's energy (median norm 13.5, against 4.2 for the 512 NoPE
-values), so keeping them lossless lowers the error of the whole latent. On whole latents the
-error of fractional bit widths grows by 50-70% over repeated round trips, so prefer an integer bit
-width when Pages migrate repeatedly.
+values), so keeping them lossless lowers the error of the whole latent.
 
 ### Encode and Decode Time
 
@@ -439,10 +421,10 @@ if the iteration statistics of its question phase show Attention Pages reused fr
 and each Page goes to the cold tier and back once. With TP4/EP4 on four GB300 GPUs, greedy
 decoding, two 6144-token prefixes, and 400 questions:
 
-| Model | none | NVFP4 | TurboQuant 4 | TurboQuant 3.5 | TurboQuant 3 | TurboQuant 2.5 |
-| --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.8-Flash-Next-FP8 | 400/400 | 400/400 | 400/400 | 400/400 | 400/400 | 395/400 |
-| GLM-5.3-Flash | not run | not run | 400/400 | not run | 397/400 | not run |
+| Model | none | NVFP4 | TurboQuant 4 | TurboQuant 3 |
+| --- | --- | --- | --- | --- |
+| Qwen3.8-Flash-Next-FP8 | 400/400 | 400/400 | 400/400 | 400/400 |
+| GLM-5.3-Flash | not run | not run | 400/400 | 397/400 |
 
 ## Enablement Checklist
 
