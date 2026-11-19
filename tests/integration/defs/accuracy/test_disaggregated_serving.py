@@ -1192,10 +1192,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "max_tokens_in_buffer": 8192,
         }
         speculative_config = {"decoding_type": "MTP", "max_draft_len": 3}
+        # Each worker tunes the SM107 dense GEMM of the checkpoint's NVFP4
+        # linear layers at startup. Profile only the kernel configurations
+        # nvMatmulHeuristics ranks highest instead of the full tactic space.
+        autotuner_nvmmh_config = {"max_tactics": 5}
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
+            "autotuner_nvmmh_config": autotuner_nvmmh_config,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
             "speculative_config": {
@@ -1206,6 +1211,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": False,
             "enable_chunked_prefill": False,
+            "autotuner_nvmmh_config": autotuner_nvmmh_config,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
             "speculative_config": speculative_config,
@@ -1227,6 +1233,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 gen_server_config,
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
                 assert_worker_log_contains=context_only_log,
+                assert_worker_log_excludes=(
+                    "nvMatmulHeuristics cannot be imported", ),
         ) as llm:
             # The DuckLLM args do not carry the served quantization, so set
             # the specs the accuracy reference lookup matches on.

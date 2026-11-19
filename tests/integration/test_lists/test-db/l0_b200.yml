@@ -103,6 +103,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[bf16-kv]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[fp8-kv]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark[TRTLLM] # SM100+ only; l0_h100 runs [VANILLA]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[standard-fused_chain]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[block-per_position]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-trtllm_gen]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-trtllm_gen]
@@ -293,6 +295,7 @@ l0_b200:
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   - unittest/_torch/moe/test_megamoe_streaming_load.py
+  - unittest/_torch/moe/test_megamoe_combine_dedup_tactic.py
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
@@ -379,7 +382,6 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
-  - unittest/_torch/modeling/test_modeling_gemma4_unified.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
   - unittest/_torch/modeling/test_gemma4_assistant.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
@@ -451,7 +453,6 @@ l0_b200:
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py
   - unittest/_torch/visual_gen/test_media_decode.py
-  - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
