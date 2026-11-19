@@ -237,6 +237,12 @@ class AttachedFrontendWatchdog:
     An attached frontend owns no workers: its only signals are the launcher
     process exiting and the launcher's ``/health`` failing. ``mark_dead`` is
     called once.
+
+    Only answers that describe the engine count as failures: 503 at any time,
+    and after the launcher's first engine verdict (200 or 503), a lost
+    connection or another 5xx. Other statuses, such as 401/403 from a
+    ``--middleware`` that gates ``/health`` or 429 from a rate limiter, say
+    nothing about the engine and are ignored with a one-time warning.
     """
 
     def __init__(
@@ -255,13 +261,14 @@ class AttachedFrontendWatchdog:
         self._ppid_interval = ppid_interval_s
         self._health_interval = health_interval_s
         self._health_failures = health_failures
+        self._warned_status: Optional[int] = None
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         failures = 0
         # The launcher starts listening after worker admission and attached
-        # frontend readiness. Any HTTP response ends the connection grace;
-        # worker loss may make its very first response unhealthy.
+        # frontend readiness, so a lost connection counts only after its first
+        # engine verdict. Worker loss may make that very first verdict 503.
         launcher_answered = False
         next_health = loop.time() + self._health_interval
         while True:
@@ -277,7 +284,11 @@ class AttachedFrontendWatchdog:
                 launcher_answered = True
                 failures = 0
                 continue
-            if not launcher_answered and status is None:
+            if status is None:
+                if not launcher_answered:
+                    continue
+            elif status != 503 and (not launcher_answered or status < 500):
+                self._warn_ignored(status)
                 continue
             launcher_answered = True
             failures += 1
@@ -287,6 +298,17 @@ class AttachedFrontendWatchdog:
                     f"consecutive times (last status: {status})"
                 )
                 return
+
+    def _warn_ignored(self, status: int) -> None:
+        if self._warned_status is not None:
+            return
+        self._warned_status = status
+        logger.warning(
+            f"Launcher frontend /health answered {status}, which is not an engine "
+            "health verdict; a --middleware may be gating /health. Attached-frontend "
+            "engine-loss detection ignores such answers and relies on 503 and on "
+            "the launcher process exiting."
+        )
 
     def _die(self, why: str) -> None:
         logger.error(f"Attached frontend lost its engine: {why}")

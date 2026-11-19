@@ -36,7 +36,7 @@ from starlette.routing import Match
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
-from tensorrt_llm.serve import _frontend_processes, openai_server
+from tensorrt_llm.serve import _frontend_processes, multi_frontend, openai_server
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
 from tensorrt_llm.serve.multi_frontend import (
     FORWARDED_ROUTES,
@@ -210,6 +210,56 @@ def test_watchdog_counts_health_failures_only_after_the_launcher_answered(
 
     asyncio.run(run())
     assert len(deaths) == 1 and "failed 2 consecutive" in str(deaths[0])
+
+
+def test_watchdog_ignores_health_answers_that_are_not_engine_verdicts(
+    tmp_path, monkeypatch
+) -> None:
+    # Regression: a --middleware that answers the internal /health probe with
+    # 401 made every attached frontend mark its engine dead and exit after
+    # three probes, although the launcher and engine were healthy.
+    warnings = []
+    monkeypatch.setattr(multi_frontend.logger, "warning", warnings.append)
+    path = str(tmp_path / "launcher.sock")
+    deaths = []
+
+    async def run() -> None:
+        launcher = await asyncio.to_thread(_FakeLauncher, path, 401)
+        forwarder = LauncherForwarder(path)
+        watchdog = AttachedFrontendWatchdog(
+            forwarder,
+            os.getppid(),
+            deaths.append,
+            ppid_interval_s=0.01,
+            health_interval_s=0.02,
+            health_failures=2,
+        )
+        task = asyncio.create_task(watchdog.run())
+        try:
+            # Before any engine verdict: 401 and 500 come from middleware.
+            for status in (401, 500):
+                launcher.health_status = status
+                seen = launcher.health_hits
+                await _wait_for(lambda: launcher.health_hits >= seen + 4)
+                assert not deaths and not task.done()
+            # After a verdict, a client-error status still says nothing.
+            for status in (200, 429):
+                launcher.health_status = status
+                seen = launcher.health_hits
+                await _wait_for(lambda: launcher.health_hits >= seen + 4)
+                assert not deaths and not task.done()
+            # A server error after the launcher answered is still a failure.
+            launcher.health_status = 500
+            await asyncio.wait_for(task, timeout=10)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await forwarder.close()
+            await asyncio.to_thread(launcher.close)
+
+    asyncio.run(run())
+    assert len(deaths) == 1 and "last status: 500" in str(deaths[0])
+    assert len(warnings) == 1 and "answered 401" in warnings[0]
 
 
 @pytest.mark.parametrize("failure", ["engine", "batcher"])
