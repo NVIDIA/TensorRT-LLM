@@ -1613,6 +1613,7 @@ class PyExecutor:
 
         self.stats_lock = threading.Lock()
         self.stats = []
+        self._pending_rank_observations: Dict[int, dict] = {}
         self._latest_kv_iter_stats = None
         self._last_kv_iter_stats_fetch_iter = None
         self._kv_iter_stats_interval = getattr(
@@ -3028,15 +3029,17 @@ class PyExecutor:
     def get_latest_iteration_stats(self):
         """
         Returns the per-iterations statistics computed since last call to this method.
-        Contains at most iter_stats_max_iterations iterations.
+        Includes the bounded iteration history and the latest changed snapshot per rank.
         """
         if self.enable_iter_perf_stats == False:
             return []
 
-        latest_stats = (IterationStats(), None)
         with self.stats_lock:
-            latest_stats = self.stats
-            self.stats = []
+            latest_stats, self.stats = self.stats, []
+            latest_stats.extend(
+                ("per_rank_dict", row)
+                for row in self._pending_rank_observations.values())
+            self._pending_rank_observations.clear()
         return latest_stats
 
     def _read_kv_cache_capacity(self) -> dict:
@@ -3942,9 +3945,7 @@ class PyExecutor:
                            req_stats: Optional[List[RequestStats]] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None,
-                           kv_transfer_outcomes: Optional[tuple[int, int,
-                                                                int]] = None):
+                           gpu_forward_time_ms: Optional[float] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         Args:
@@ -3964,15 +3965,11 @@ class PyExecutor:
             gpu_forward_time_ms: Batch-matched GPU forward time captured by
                 the events surrounding this batch's ``_forward_step``.
                 Surfaces as ``gpuForwardTimeMS`` in the /metrics JSON.
-            kv_transfer_outcomes: Rank-local cumulative request success/error/timeout counts.
         """
         # Non-ADP appends immediately, so the latest KV stats and per-loop
         # timings belong to this IterationStats.
         kv_iter_stats = None
         if not self.enable_attention_dp:
-            coordinator = self.__dict__.get("_disagg_coordinator")
-            kv_transfer_outcomes = (coordinator.transfer_outcomes
-                                    if coordinator is not None else None)
             kv_iter_stats = self._latest_kv_iter_stats
             if host_step_time_ms is None:
                 host_step_time_ms = self._latest_host_step_time_ms
@@ -4004,7 +4001,6 @@ class PyExecutor:
             prev_device_step_time_ms=prev_device_step_time_ms,
             scheduler_mode=scheduler_mode,
             gpu_forward_time_ms=gpu_forward_time_ms,
-            kv_transfer_outcomes=kv_transfer_outcomes,
             mm_encoder_stats=mm_encoder_stats,
             executor_loop=loop_metrics)
 
@@ -9101,10 +9097,7 @@ class PyExecutor:
                         zip(("success", "error", "timeout"), outcomes))
                 if activity is not None:
                     row["conversationActivity"] = activity.to_dict()
-                if not _stats_buffer_is_unbounded(self.max_stats_len) and len(
-                        self.stats) >= max(1, self.max_stats_len):
-                    self.stats.pop(0)
-                self.stats.append(("per_rank_dict", row))
+                self._pending_rank_observations[rank] = row
                 self._last_rank_observations[rank] = snapshot
 
     def _idle_kv_transfer_poll_timeout(self) -> Optional[datetime.timedelta]:
@@ -9789,6 +9782,7 @@ class PyExecutor:
                 # Nothing is left to fan out, and finalize() would only
                 # forget what the last fanout was: the idle wait is planned
                 # from it (see _plan_idle_heartbeat_wait).
+                self._publish_rank_observations(all_rank_states)
                 return
 
     @nvtx_range("_fetch_new_requests")

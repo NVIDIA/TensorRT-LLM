@@ -137,7 +137,6 @@ from ..kv_cache_stats import (
     KVCacheV2PoolGroupIterationStats,
     KVCacheV2SsmLifeCycleIterationStats,
     KVCacheV2SsmSnapshotIterationStats,
-    KVCacheV2StorageIterationStats,
 )
 from ..llm_request import (
     LlmRequest,
@@ -9272,18 +9271,24 @@ class KVCacheManagerV2(BaseResourceManager):
                 else None
             ),
             storage_stats=[
-                KVCacheV2StorageIterationStats(
-                    cache_level=level,
-                    pool_group_id=pool_group_id,
-                    slot_size=self._stats_slot_sizes(stats),
-                    total_blocks=int(stats.total),
-                    free_blocks=int(stats.free),
-                    evictable_blocks=int(stats.evictable),
-                    restored_blocks=getattr(stats, "restored_blocks", None),
-                    evicted_blocks=getattr(stats, "evicted_blocks", None),
-                    capacity_dropped_blocks=getattr(stats, "capacity_dropped_blocks", None),
-                    priority_dropped_blocks=getattr(stats, "priority_dropped_blocks", None),
-                )
+                {
+                    "cacheLevel": level,
+                    "poolGroupId": pool_group_id,
+                    "slotSize": self._stats_slot_sizes(stats),
+                    "totalNumBlocks": int(stats.total),
+                    "freeNumBlocks": int(stats.free),
+                    "evictableNumBlocks": int(stats.evictable),
+                    **{
+                        key: value
+                        for key, attr in (
+                            ("restoredBlocks", "restored_blocks"),
+                            ("evictedBlocks", "evicted_blocks"),
+                            ("capacityDroppedBlocks", "capacity_dropped_blocks"),
+                            ("priorityDroppedBlocks", "priority_dropped_blocks"),
+                        )
+                        if (value := getattr(stats, attr, None)) is not None
+                    },
+                }
                 for level, level_stats in enumerate([primary_stats, *secondary_stats_by_level])
                 for pool_group_id, stats in enumerate(level_stats)
             ],

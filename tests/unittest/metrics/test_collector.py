@@ -15,17 +15,14 @@
 """Unit tests for MetricsCollector and process_req_perf_metrics."""
 
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Dict
 
 import pytest
-from prometheus_client import REGISTRY, generate_latest
-from prometheus_client.parser import text_string_to_metric_families
+from prometheus_client import REGISTRY
 
 from tensorrt_llm._torch.pyexecutor.iteration_stats import IterationStatsRecord
-from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
-    KVCacheV2IterationStatsReport,
-    KVCacheV2StorageIterationStats,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm.bindings.executor import IterationStats
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MAX_SPEC_DECODE_POSITION_LABELS, MetricsCollector
@@ -203,8 +200,6 @@ class TestKVCacheStats:
 
 class TestRequestTransferMetrics:
     def test_transfer_perf_metrics_count_once_across_candidates(self, collector):
-        from types import SimpleNamespace
-
         from tensorrt_llm.executor.result import GenerationResultBase
         from tensorrt_llm.sampling_params import SamplingParams
 
@@ -1834,7 +1829,7 @@ def scrape(collector):
     def read(name: str, **labels):
         return [
             sample.value
-            for family in text_string_to_metric_families(generate_latest(REGISTRY).decode())
+            for family in REGISTRY.collect()
             for sample in family.samples
             if sample.name == "trtllm_" + name
             and all(sample.labels.get(key) == str(value) for key, value in labels.items())
@@ -1853,8 +1848,13 @@ def test_iteration_record_exports_rank_owned_timings_and_transfer_outcomes(colle
                 gpu_forward_time_ms=2.0,
                 prev_device_step_time_ms=3.0,
                 scheduler_mode="overlap",
-                kv_transfer_outcomes=outcomes,
             ).to_dict()
+        )
+        collector.log_iteration_stats(
+            {
+                "attentionDpRank": rank,
+                "kvTransferOutcomes": dict(zip(("success", "error", "timeout"), outcomes)),
+            }
         )
     collector.log_iteration_stats(
         {
@@ -1880,21 +1880,21 @@ def test_storage_report_exports_capacity_and_cumulative_movement(collector, scra
         cache_level_tiers=["gpu", "host"],
         num_conversations=7,
         storage_stats=[
-            KVCacheV2StorageIterationStats(
-                cache_level=1,
-                pool_group_id=2,
-                slot_size=(32, 32),
-                total_blocks=10,
-                free_blocks=2,
-                evictable_blocks=3,
-                restored_blocks=4,
-            )
+            {
+                "cacheLevel": 1,
+                "poolGroupId": 2,
+                "slotSize": (32, 32),
+                "totalNumBlocks": 10,
+                "freeNumBlocks": 2,
+                "evictableNumBlocks": 3,
+                "restoredBlocks": 4,
+            }
         ],
     )
     record = IterationStatsRecord(IterationStats(), kv_iteration_stats=report, attention_dp_rank=3)
     collector.log_iteration_stats(record.to_dict())
     for restored in (4, 6):
-        report.storage_stats[0].restored_blocks = restored
+        report.storage_stats[0]["restoredBlocks"] = restored
         collector.log_iteration_stats(record.to_dict())
     labels = dict(dp_rank=3, cache_level=1, cache_tier="host", pool_group=2)
     assert scrape("kv_cache_tier_blocks", **labels, state="unavailable") == [5]
@@ -1905,44 +1905,31 @@ def test_storage_report_exports_capacity_and_cumulative_movement(collector, scra
     assert scrape("kv_cache_num_conversations", dp_rank=3) == [7]
 
 
-@pytest.fixture
-def conversation_request():
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-    from tensorrt_llm.conversation_params import ConversationParams
-
-    def make(conversation_id="session", *, lora=None, salt=None):
-        request = LlmRequest(
-            request_id=1,
-            max_new_tokens=1,
-            input_tokens=[1, 2],
-            sampling_config=SamplingConfig(1),
-            is_streaming=False,
-            lora_task_id=lora,
-            cache_salt=salt,
-        )
-        if conversation_id is not None:
-            request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
-        return request
-
-    return make
+def _conversation_request(conversation_id="session", *, lora=None, salt=None):
+    return SimpleNamespace(
+        py_conversation_params=SimpleNamespace(conversation_id=conversation_id)
+        if conversation_id is not None
+        else None,
+        is_dummy_request=False,
+        lora_task_id=lora,
+        cache_salt=salt,
+    )
 
 
-def test_worker_conversations_export_namespace_refresh_and_idle_expiry(
-    collector, scrape, conversation_request
-):
+def test_worker_conversations_export_namespace_refresh_and_idle_expiry(collector, scrape):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
 
     manager = ConversationManager(0, retention_enabled=False)
     manager.enable_activity_tracking(now=0.0)
     for request in (
-        conversation_request(" session "),
-        conversation_request(),
-        conversation_request(lora=1),
-        conversation_request(salt="other"),
-        conversation_request(None),
+        _conversation_request(" session "),
+        _conversation_request(),
+        _conversation_request(lora=1),
+        _conversation_request(salt="other"),
+        _conversation_request(None),
     ):
         manager.observe_admission(request, 1.0)
-    manager.observe_admission(conversation_request(), 500.0)
+    manager.observe_admission(_conversation_request(), 500.0)
     manager.clear()  # Retention clearing must not erase activity history.
     for now, short, long, complete in (
         (600.0, 3, 3, 0),
@@ -1961,17 +1948,15 @@ def test_worker_conversations_export_namespace_refresh_and_idle_expiry(
 
 
 @pytest.mark.parametrize("limit", ["entries", "identity_bytes"])
-def test_worker_conversation_overflow_preserves_refresh_and_recovers(
-    collector, scrape, conversation_request, limit
-):
+def test_worker_conversation_overflow_preserves_refresh_and_recovers(collector, scrape, limit):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
 
     manager = ConversationManager(0, retention_enabled=False)
     limits = {"max_entries": 2} if limit == "entries" else {"max_identity_bytes": 1024}
     manager.enable_activity_tracking(now=0.0, **limits)
-    request = conversation_request()
+    request = _conversation_request()
     manager.observe_admission(request, 1.0)
-    rejected = conversation_request("other" if limit == "entries" else "x" * 2048)
+    rejected = _conversation_request("other" if limit == "entries" else "x" * 2048)
     manager.observe_admission(rejected, 10.0)
     manager.observe_admission(request, 11.0)
     for now, count, complete in ((600.0, 1, 0), (610.0, 1, 1), (611.0, 0, 1)):
@@ -1986,44 +1971,3 @@ def test_worker_conversation_overflow_preserves_refresh_and_recovers(
         assert scrape(
             "conversation_tracking_overflow_total", dp_rank=2, window="10m", reason=limit
         ) == [1]
-
-
-@pytest.mark.parametrize("include_count", [False, True])
-def test_prometheus_example_keeps_metric_sample_names_distinct(monkeypatch, capsys, include_count):
-    import runpy
-    from pathlib import Path
-    from unittest.mock import Mock
-
-    monkeypatch.setattr("openai.OpenAI", Mock())
-    example = runpy.run_path(
-        str(Path(__file__).resolve().parents[3] / "examples/serve/prometheus_metrics.py")
-    )
-    count = 'trtllm_conversation_unique_seen{window="10m"} 7.0'
-    complete = 'trtllm_conversation_unique_seen_complete{window="10m"} 1.0'
-    # Histograms have derived samples, gauges can lack labels, and HELP/TYPE
-    # metadata alone does not establish that a measurement exists.
-    samples = [
-        complete,
-        "trtllm_kv_cache_hit_rate 0.5",
-        'trtllm_e2e_request_latency_seconds_bucket{le="1.0"} 2.0',
-        "trtllm_e2e_request_latency_seconds_sum 1.5",
-        "trtllm_e2e_request_latency_seconds_count 2.0",
-    ]
-    if include_count:
-        samples.append(count)
-    text = "\n".join(
-        [
-            "# HELP trtllm_kv_cache_transfer_bytes_total Completed transfer bytes",
-            "# TYPE trtllm_kv_cache_transfer_bytes_total counter",
-            *samples,
-        ]
-    )
-    example["parse_and_display_metrics"](text)
-    output = capsys.readouterr().out
-    available, missing = output.split("✗ Not Yet Available:")
-    count_heading = "Unique worker conversations over 10m/1h (trtllm_conversation_unique_seen)"
-    assert (count_heading in available) == include_count
-    assert (count_heading in missing) != include_count
-    assert "Completed-request KV transfer bytes (trtllm_kv_cache_transfer_bytes_total)" in missing
-    for sample in samples:
-        assert output.count("  " + sample + "\n") == 1

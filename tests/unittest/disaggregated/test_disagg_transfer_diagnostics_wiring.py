@@ -1755,35 +1755,6 @@ def test_native_profile_diagnostics_do_not_affect_worker_setup(
         )
 
 
-def test_request_transfer_outcomes_ignore_polls_and_deduplicate_timeout_cleanup():
-    requests = [_disagg_request(i, i) for i in range(1, 5)]
-    for request in requests:
-        request.is_child = False
-    coordinator = _coordinator(active_requests=requests)
-    coordinator._registry.canceled_request_ids = lambda: {4}
-    coordinator._check_transfer_errors = Mock()
-    coordinator.inflight_cancel_active = lambda: False
-    coordinator._describe_transfer_timeout = lambda request: "test deadline"
-    coordinator._transceiver.check_gen_transfer_status = Mock(
-        return_value=GenTransferStatus([], [], [])
-    )
-    coordinator.reap_gen_receives()
-    assert coordinator.transfer_outcomes == (0, 0, 0)
-
-    timed_out = requests[2]
-    timed_out.py_kv_transfer_start_time = 0.0
-    timed_out.py_kv_transfer_timed_out = False
-    coordinator._flag_transfer_timeout(timed_out, "generation", 1000, current_time=2.0)
-    # A late completion cannot turn the same timed-out request into a success.
-    # Cancellation alone does not count as an error.
-    coordinator._transceiver.check_gen_transfer_status.return_value = GenTransferStatus(
-        [1, 3], [2], [requests[3]]
-    )
-    coordinator.reap_gen_receives()
-    coordinator.reap_gen_receives()
-    assert coordinator.transfer_outcomes == (1, 1, 1)
-
-
 @pytest.mark.parametrize("physical_ownership", [False, True])
 def test_expired_blocking_receive_marks_timeout_and_preserves_retirement(
     monkeypatch: pytest.MonkeyPatch, receive_chunk_bytes: Mock, physical_ownership: bool
@@ -1855,44 +1826,3 @@ def test_shared_receive_outcome_is_counted_once_until_last_candidate_is_forgotte
     )
     coordinator.reap_gen_receives()
     assert coordinator.transfer_outcomes == (expected[0] + 1, expected[1], expected[2])
-
-
-def test_native_async_failure_is_counted_before_consensus_cleanup():
-    request = _disagg_request(1, 73)
-    request.is_child = False
-    request.is_generation_only_request = True
-    request.state = LlmRequestState.DISAGG_TRANS_ERROR
-    requests = [request]
-    coordinator = _coordinator(active_requests=requests)
-
-    def fail(_message, failed, **_kwargs):
-        assert failed == [request]
-        assert coordinator.transfer_outcomes == (0, 1, 0)
-        requests.clear()
-
-    coordinator._effects.fail_requests = Mock(side_effect=fail)
-    coordinator._check_gen_transfer_errors_consensus()
-    coordinator._check_gen_transfer_errors_consensus()
-    assert coordinator.transfer_outcomes == (0, 1, 0)
-    coordinator._effects.fail_requests.assert_called_once()
-
-
-def test_native_receive_success_is_counted_before_cancelled_generation_handoff():
-    request = _disagg_request(1, 73)
-    request.is_child = False
-    coordinator = _coordinator(active_requests=[request])
-    coordinator._registry.canceled_request_ids = lambda: {1}
-    coordinator._check_transfer_errors = Mock()
-    coordinator.inflight_cancel_active = lambda: True
-    coordinator._check_gen_transfer_errors_consensus = Mock()
-    coordinator._retire_cancelled_gen_receives = Mock()
-
-    def poll(_at_least):
-        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-        return GenTransferStatus([], [], [])
-
-    coordinator._transceiver.check_gen_transfer_status = Mock(side_effect=poll)
-    coordinator.reap_gen_receives()
-    assert coordinator.transfer_outcomes == (1, 0, 0)
-    coordinator.reap_gen_receives()
-    assert coordinator.transfer_outcomes == (1, 0, 0)

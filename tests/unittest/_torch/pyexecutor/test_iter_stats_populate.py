@@ -1635,7 +1635,6 @@ def test_attention_dp_fanout_rows_match_serializing_each_rank_stats():
     rank0_stats.specdec_stats = specdec_stats
     buffer = _build_adp_stats_buffer(rank0_stats)
     states = [RankState(rank=0, iter_stats=buffer.next_payload())]
-    states[0].iter_stats.kv_transfer_outcomes = (0, 0, 0)
     for rank in range(1, 6):
         payload = RankIterStatsPayload(
             has_iter_stats=1,
@@ -1654,10 +1653,6 @@ def test_attention_dp_fanout_rows_match_serializing_each_rank_stats():
             kv_cache_stats=(
                 None if rank == 3 else _snapshot_kv_cache_stats(_make_kv_cache_snapshot(rank))
             ),
-            cross_kv_cache_stats=(
-                _snapshot_kv_cache_stats(_make_kv_cache_snapshot(100 + rank)) if rank % 2 else None
-            ),
-            kv_transfer_outcomes=(rank, 2 * rank, 3 * rank) if rank != 2 else None,
             specdec_stats=(
                 None
                 if rank == 4
@@ -1685,15 +1680,9 @@ def test_attention_dp_fanout_rows_match_serializing_each_rank_stats():
         for state in states
     ]
 
-    expected = [json.loads(row) for row in expected]
-    for state, row in zip(states, expected):
-        if state.rank != 2:
-            row["kvTransferOutcomes"] = dict(
-                zip(("success", "error", "timeout"), (state.rank, 2 * state.rank, 3 * state.rank))
-            )
     rows = buffer.finalize(states[::-1], is_rank0=True, scheduler_mode="non_overlap")
 
-    assert [json.loads(row) for row in rows] == expected
+    assert [json.loads(row) for row in rows] == [json.loads(row) for row in expected]
     assert [BaseWorker._stats_serializer(row) for row in rows] == rows
     # Every rank's row has its own queued counters, also the ones spliced into the first.
     assert [json.loads(row)["numQueuedRequests"] for row in rows] == [4, 1, 3, 1, 3, 4]

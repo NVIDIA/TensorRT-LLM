@@ -292,6 +292,7 @@ def test_remote_cancellation_of_a_receive_fails_the_request_unless_the_user_canc
 
     h.coordinator.reap_gen_receives(0)
 
+    assert h.coordinator.transfer_outcomes == (0, 1, 0)
     assert remote.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert user.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
     assert h.effects.failed == [
@@ -543,6 +544,9 @@ def test_fail_timed_out_ends_the_receive_state_of_cancelled_requests() -> None:
 
     assert cancelled.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert completed_late.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    h.active.append(completed_late)
+    h.coordinator.reap_gen_receives()
+    assert h.coordinator.transfer_outcomes == (0, 0, 2)
     assert h.effects.failed == [
         ("Request 1 timed out", [cancelled], False),
         ("Request 2 timed out", [completed_late], False),
@@ -676,8 +680,18 @@ def test_generation_error_consensus_fails_only_when_some_rank_needs_it(inflight_
     h.coordinator.poll_gen_transfers()
     assert h.effects.failed == []
 
+    assert h.coordinator.transfer_outcomes == (0, 0, 0)
+    fail = h.effects.fail_requests
+
+    def fail_after_count(*args, **kwargs):
+        assert h.coordinator.transfer_outcomes == (0, 1, 0)
+        h.active.remove(error_req)
+        fail(*args, **kwargs)
+
+    h.effects.fail_requests = fail_after_count
     h.dist.tp_allreduce.return_value = 1
     h.coordinator.poll_gen_transfers()
+    assert h.coordinator.transfer_outcomes == (0, 1, 0)
     assert h.effects.failed == [
         ("Error in kv cache transfer for generation requests", [error_req], False)
     ]

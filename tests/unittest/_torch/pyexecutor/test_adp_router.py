@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
@@ -244,29 +245,27 @@ class TestBuildActiveRequestsForOverlap:
 
 
 class TestRankState:
-    @pytest.mark.parametrize("include_extended", [False, True])
-    def test_transfer_outcomes_roundtrip_with_legacy_and_kv_snapshots(self, include_extended):
-        for snapshot in (None, RankKvCacheStats(20, 12, 8, 16, 10, 4, 6, 2, 0.75)):
-            for include_load in (False, True):
-                for outcomes in (None, (13, 2, 3)):
-                    payload = RankIterStatsPayload(
-                        has_iter_stats=1,
-                        iter_stats_iter=7,
-                        kv_cache_stats=snapshot,
-                        cross_kv_cache_stats=snapshot,
-                        kv_transfer_outcomes=outcomes,
-                        specdec_stats=RankSpecDecodingStats(20, 12, 4)
-                        if include_extended
-                        else None,
-                        scheduling_counters=(
-                            RankSchedulingCounters(num_deferred_gen_receives=3)
-                            if include_extended
-                            else None
-                        ),
-                    )
-                    state = RankState(rank=2, iter_stats=payload, num_connector_transfers=5)
-                    restored = RankState.deserialize(state.serialize(include_load))
-                    assert restored == state
+    @pytest.mark.parametrize("outcomes", [None, (13, 2, 3)])
+    @pytest.mark.parametrize("activity", [None, ConversationActivityStats(3, 1, 0, 2, 9, 0, 1, 4)])
+    def test_rank_observations_roundtrip(self, outcomes, activity):
+        payload = RankIterStatsPayload(
+            kv_cache_stats=RankKvCacheStats(20, 12, 8, 16, 10, 4, 6, 2, 0.75),
+            scheduling_counters=RankSchedulingCounters(num_deferred_gen_receives=3),
+            has_pending_work=True,
+            num_queued_context_requests=2,
+            kv_transfer_outcomes=outcomes,
+            conversation_activity=activity,
+        )
+        state = RankState(rank=2, iter_stats=payload, num_connector_transfers=5)
+        for include_load in (False, True):
+            assert RankState.deserialize(state.serialize(include_load)) == state
+        wire = payload.serialize(include_kv_cache_load=True)
+        with pytest.raises(ValueError):
+            RankIterStatsPayload.deserialize(wire[:-1])
+        if activity is not None:
+            wire[-3] = 2  # The 1h completeness field must be boolean.
+            with pytest.raises(ValueError):
+                RankIterStatsPayload.deserialize(wire)
 
     # RankState is the wire payload shared across attention-DP ranks. Keep its
     # serialization stable because iter-stats now ride on the same allgather.

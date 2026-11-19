@@ -172,7 +172,7 @@ class TestStatsSerializer:
         assert json.loads(BaseWorker._stats_serializer(record)) == expected
         assert json.loads(BaseWorker._stats_serializer(tuple(record))) == expected
 
-    @pytest.mark.parametrize("field_count", range(2, 14))
+    @pytest.mark.parametrize("field_count", range(2, 13))
     def test_legacy_tuple_prefixes_and_future_trailing_fields(self, field_count):
         iter_stats = _make_mock_iteration_stats()
         loop = {"kind": "loop", "per_iter": {"iter": 9}}
@@ -188,7 +188,6 @@ class TestStatsSerializer:
             {"gpuTimesMS": [2.5]},
             loop,
             True,
-            (3, 2, 1),
             "future field",
         )[:field_count]
         expected = {
@@ -203,7 +202,6 @@ class TestStatsSerializer:
             (9, "multimodalEncoderStats", {"gpuTimesMS": [2.5]}),
             (10, "executorLoop", loop),
             (11, "isQueueSnapshot", True),
-            (12, "kvTransferOutcomes", {"success": 3, "error": 2, "timeout": 1}),
         ):
             if field_count >= required_fields:
                 expected[key] = value

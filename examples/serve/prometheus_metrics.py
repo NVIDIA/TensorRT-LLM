@@ -74,49 +74,18 @@ def parse_and_display_metrics(metrics_data: str) -> None:
         f"{METRIC_PREFIX}e2e_request_latency_seconds": "End-to-end request latency",
         f"{METRIC_PREFIX}time_to_first_token_seconds": "Time to first token",
         f"{METRIC_PREFIX}request_queue_time_seconds": "Request queue time",
-        f"{METRIC_PREFIX}host_step_time_seconds": "Latest executor-loop wall time",
-        f"{METRIC_PREFIX}prev_device_step_time_seconds": "Latest lagged device-step time",
-        f"{METRIC_PREFIX}gpu_forward_time_seconds": "Latest batch-matched GPU forward time",
-        f"{METRIC_PREFIX}host_step_duration_seconds": "Executor-loop wall-time distribution",
-        f"{METRIC_PREFIX}gpu_forward_duration_seconds": "GPU forward-time distribution",
         f"{METRIC_PREFIX}kv_cache_hit_rate": "KV cache hit rate",
         f"{METRIC_PREFIX}kv_cache_reused_blocks_total": "KV cache reused blocks (cumulative)",
         f"{METRIC_PREFIX}kv_cache_missed_blocks_total": "KV cache missed blocks (cumulative)",
         f"{METRIC_PREFIX}kv_cache_utilization": "KV cache utilization",
-        f"{METRIC_PREFIX}kv_cache_transfer_duration_seconds": "Completed-request KV transfer latency",
-        f"{METRIC_PREFIX}kv_cache_transfer_bytes_total": "Completed-request KV transfer bytes",
-        f"{METRIC_PREFIX}kv_cache_transfer_requests_total": "KV transfer success/error/timeout outcomes",
-        f"{METRIC_PREFIX}kv_cache_tier_blocks": "Per-tier storage blocks by occupancy state",
-        f"{METRIC_PREFIX}kv_cache_tier_bytes": "Per-tier storage bytes by occupancy state",
-        f"{METRIC_PREFIX}kv_cache_tier_moved_blocks_total": "Per-tier moved/dropped blocks",
-        f"{METRIC_PREFIX}kv_cache_tier_moved_bytes_total": "Per-tier moved/dropped bytes",
-        f"{METRIC_PREFIX}conversation_unique_seen": "Unique worker conversations over 10m/1h",
-        f"{METRIC_PREFIX}conversation_unique_seen_complete": "Whether the full activity window is known",
-        f"{METRIC_PREFIX}conversation_tracking_overflow_total": "Conversation observations skipped at capacity",
-        f"{METRIC_PREFIX}kv_cache_num_conversations": "Tracked KV-cache conversation entries",
     }
-
-    samples_by_name: dict[str, list[str]] = {}
-    for raw_line in metrics_data.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        sample_name = line.split("{", 1)[0].split(maxsplit=1)[0]
-        samples_by_name.setdefault(sample_name, []).append(line)
 
     found_metrics = []
     missing_metrics = []
 
     for metric_name, description in metrics_of_interest.items():
-        sample_names = (
-            metric_name,
-            metric_name + "_bucket",
-            metric_name + "_sum",
-            metric_name + "_count",
-        )
-        lines = [line for name in sample_names for line in samples_by_name.get(name, ())]
-        if lines:
-            found_metrics.append((metric_name, description, lines))
+        if metric_name in metrics_data:
+            found_metrics.append((metric_name, description))
         else:
             missing_metrics.append((metric_name, description))
 
@@ -124,7 +93,13 @@ def parse_and_display_metrics(metrics_data: str) -> None:
     if found_metrics:
         print("\n✓ Available Metrics:")
         print("-" * 80)
-        for metric_name, description, lines in found_metrics:
+        for metric_name, description in found_metrics:
+            # Extract the metric lines from the data
+            lines = [
+                line
+                for line in metrics_data.split("\n")
+                if line.startswith(metric_name) and not line.startswith("#")
+            ]
             print(f"\n{description} ({metric_name}):")
             for line in lines:
                 print(f"  {line}")

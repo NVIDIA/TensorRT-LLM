@@ -35,7 +35,6 @@ class IterationStatsRecord(NamedTuple):
     # The record was taken without a forward pass: it reports the queues, and
     # its duration and per-loop timings are not measurements.
     is_queue_snapshot: bool = False
-    kv_transfer_outcomes: tuple[int, int, int] | None = None
 
     @classmethod
     def from_tuple(cls, stats: tuple) -> IterationStatsRecord:
@@ -90,10 +89,6 @@ class IterationStatsRecord(NamedTuple):
         for name, value in optional_fields:
             if value is not None:
                 stats[name] = value
-        if self.kv_transfer_outcomes is not None:
-            stats["kvTransferOutcomes"] = dict(
-                zip(("success", "error", "timeout"), self.kv_transfer_outcomes)
-            )
         # Measured records do not have the key.
         if self.is_queue_snapshot:
             stats["isQueueSnapshot"] = True
