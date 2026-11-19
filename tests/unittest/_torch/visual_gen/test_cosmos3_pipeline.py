@@ -1337,8 +1337,12 @@ class TestCosmos3T2I:
         )
         assert result.video is None
         _assert_valid_image(result.image, height=T2I_HEIGHT, width=T2I_WIDTH)
-        # Image mode runs at the checkpoint scheduler's shift like every other mode.
-        _assert_default_video_scheduler_config(cosmos3_pipeline)
+        # The image override stands in for the checkpoint scheduler's shift of 1.0.
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=3.0,
+            use_karras_sigmas=_base_use_karras_sigmas(cosmos3_pipeline),
+        )
 
 
 @pytest.mark.integration
