@@ -35,7 +35,7 @@ trtllm-serve nvidia/Cosmos3-Nano --port 8000
 curl -X POST "http://localhost:8000/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Cosmos3-Nano",
+    "model": "nvidia/Cosmos3-Nano",
     "messages": [{"role": "user", "content": "Describe what a robot arm does."}],
     "max_tokens": 60
   }'
