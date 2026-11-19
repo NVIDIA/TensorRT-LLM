@@ -1003,14 +1003,14 @@ def test_read_ahead_reads_only_the_node_ranks_stages_and_experts(
     path = str(checkpoint_dir / "model.safetensors")
     save_file(tensors, path)
     file_size, header_bytes, header = weight_loader_module._read_safetensors_header(path)
-    node_bytes = 8 + header_bytes
+    node_offsets = []  # the bytes of the tensors ranks 0 and 3 load
     for name, info in header.items():
         parts = name.split(".")
         if name != "__metadata__" and (
             "experts" not in parts or (parts[2] < "2") == (parts[5] < "2")
         ):
-            node_bytes += info["data_offsets"][1] - info["data_offsets"][0]
-    assert node_bytes < file_size
+            node_offsets += range(*(8 + header_bytes + offset for offset in info["data_offsets"]))
+    assert len(node_offsets) < file_size
 
     config = SimpleNamespace(num_hidden_layers=4)
     model = SimpleNamespace(
@@ -1033,18 +1033,19 @@ def test_read_ahead_reads_only_the_node_ranks_stages_and_experts(
     monkeypatch.setattr(weight_loader_module, "mpi_disabled", lambda: False)
     monkeypatch.setattr(weight_loader_module, "mpi_comm", lambda: active_communicator)
     # Whole files when the checkpoint fits, else only the node's share.
-    read_bytes = file_size if checkpoint_fits else node_bytes
-    available = read_bytes + read_ahead._HOST_MEMORY_HEADROOM_BYTES
+    read_offsets = range(file_size) if checkpoint_fits else node_offsets
+    available = len(read_offsets) + read_ahead._HOST_MEMORY_HEADROOM_BYTES
     monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: available)
-    session_factory = mock.Mock(wraps=read_ahead.RankStripedReadAheadSession)
-    monkeypatch.setattr(weight_loader_module, "RankStripedReadAheadSession", session_factory)
+    plan_factory = mock.Mock(wraps=read_ahead.build_local_plan)
+    monkeypatch.setattr(weight_loader_module, "build_local_plan", plan_factory)
 
     loader = _rank_striped_loader()
     with loader.open_weight_session(str(checkpoint_dir), mapping=mapping(0), model=model):
         pass
 
     assert loader.last_checkpoint_io_status.activated
-    assert session_factory.call_args.kwargs["checkpoint_bytes"] == read_bytes
+    read = [o for _, start, n in plan_factory.call_args.args[0] for o in range(start, start + n)]
+    assert sorted(read) == sorted(read_offsets)
 
 
 def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:

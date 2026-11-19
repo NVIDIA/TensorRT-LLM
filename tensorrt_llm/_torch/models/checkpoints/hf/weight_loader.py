@@ -83,7 +83,9 @@ _PREFETCH_LOG_INTERVAL_SEC = 60.0
 # the lock makes the check-and-set atomic across concurrent prefetch threads.
 _PREFETCH_FALLBACK_LOGGED = threading.Event()
 _PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
-_LAYER_IN_NAME = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+# Decoder layers only; other stacks (e.g. a vision encoder) are read everywhere.
+_LAYER_IN_NAME = re.compile(
+    r"^(?:model\.|language_model\.model\.)?layers\.(\d+)\.")
 _EXPERT_IN_NAME = re.compile(r"\.experts\.(\d+)\.")
 
 
@@ -113,41 +115,36 @@ def _node_read_extents(stats, read_sets) -> list[tuple[str, int, int]]:
                      for match in (_LAYER_IN_NAME.search(name),
                                    _EXPERT_IN_NAME.search(name)))
 
-    files = []
-    for path, _ in stats:
-        _, header_bytes, header = _read_safetensors_header(path)
-        files.append(
-            (path, 8 + header_bytes, [(*indices(name), *info["data_offsets"])
-                                      for name, info in header.items()
-                                      if name != "__metadata__"]))
+    catalog = build_safetensors_checkpoint_catalog([path for path, _ in stats])
+    paths = {os.path.basename(path): path for path, _ in stats}
+    tensors = [(*indices(tensor.name), tensor.extents[0])
+               for tensor in catalog.tensors]
     num_experts = 1 + max(
-        (expert for *_, tensors in files
-         for _, expert, _, _ in tensors if expert is not None),
-        default=-1)
+        (expert for _, expert, _ in tensors if expert is not None), default=-1)
 
     def is_read(layer, expert, read_set) -> bool:
         layers, num_layers, is_last_stage, ep_size, ep_rank = read_set
-        # Layers past the decoder (e.g. MTP) live on the last stage.
-        if layers is not None and layer is not None and (
-            (layer not in layers) if layer < num_layers else not is_last_stage):
-            return False
+        if layers is not None and layer is not None:
+            if layer < num_layers and layer not in layers:
+                return False
+            # Layers past the decoder (e.g. MTP) live on the last stage.
+            if layer >= num_layers and not is_last_stage:
+                return False
         if ep_size > 1 and expert is not None:
             _, start, end = _compute_ep_partition(num_experts, ep_size, ep_rank)
             return start <= expert < end
         return True
 
-    extents = []
-    for path, data_start, tensors in files:
-        start, end = 0, data_start  # coalesce the header and tensors read
-        for begin, stop in sorted(
-            (begin, stop) for layer, expert, begin, stop in tensors if any(
-                is_read(layer, expert, s) for s in read_sets)):
-            if data_start + begin > end:
-                extents.append((path, start, end - start))
-                start = data_start + begin
-            end = max(end, data_start + stop)
-        extents.append((path, start, end - start))
-    return extents
+    extents = []  # [path, start, end], coalesced; tensors are in file order
+    for layer, expert, extent in tensors:
+        if not any(is_read(layer, expert, s) for s in read_sets):
+            continue
+        path, start = paths[extent.object_id], extent.offset_bytes
+        if extents and extents[-1][0] == path and extents[-1][2] >= start:
+            extents[-1][2] = extent.end_offset_bytes
+        else:
+            extents.append([path, start, extent.end_offset_bytes])
+    return [(path, start, end - start) for path, start, end in extents]
 
 
 class _LazySafetensorsWeights(ConsumableWeightsDict):
@@ -998,7 +995,7 @@ class HfWeightLoader(BaseWeightLoader):
             # when the checkpoint does not fit.
             fits, _ = memory_admission(sum(s.st_size for _, s in stats),
                                        available_memory)
-            if None not in read_sets and not fits:
+            if eligibility_reason is None and None not in read_sets and not fits:
                 extents = _node_read_extents(stats, read_sets)
         except Exception as error:
             node_error = error
