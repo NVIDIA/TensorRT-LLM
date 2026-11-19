@@ -42,7 +42,8 @@ WORKER_WATCH_HINT = (
     "Set TRTLLM_WORKER_WATCH_HOST to this proxy's address reachable from every MPI worker "
     "and allow worker-to-proxy TCP traffic through the firewall. "
     "TRTLLM_WORKER_WATCH_PORT selects a fixed listener port. "
-    "TRTLLM_WORKER_WATCH=0 disables independent remote process supervision."
+    "Unset TRTLLM_WORKER_WATCH (or set it to 0) to disable independent remote process "
+    "supervision."
 )
 logger = logging.getLogger(__name__)
 

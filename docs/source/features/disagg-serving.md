@@ -277,7 +277,7 @@ One limitation applies to `/v1/responses` on every server, disaggregated or not:
 
 Please refer to [Disaggregated Inference Benchmark Scripts](source:examples/disaggregated/slurm).
 
-Disaggregated MPI instances also require worker-to-proxy TCP connectivity for [remote process supervision](../llm-api/index.md#remote-mpi-process-supervision), independently of the KV-transfer backend. Configure `TRTLLM_WORKER_WATCH_HOST` for each instance's proxy when local address discovery selects an unreachable interface. Use `TRTLLM_WORKER_WATCH_PORT` for a firewall-allowlisted port, with distinct ports for co-located proxies. An explicit `TRTLLM_WORKER_WATCH=0` opt-out retains existing MPI/error checks but loses independent abrupt-rank-loss detection; it is logged as reduced coverage.
+Multi-node disaggregated MPI instances should enable [remote process supervision](../llm-api/index.md#remote-mpi-process-supervision) with `TRTLLM_WORKER_WATCH=1`. Without it, the abrupt loss of a remote rank other than rank 0 can leave the instance stuck. Supervision requires worker-to-proxy TCP connectivity, independently of the KV-transfer backend. Configure `TRTLLM_WORKER_WATCH_HOST` for each instance's proxy when local address discovery selects an unreachable interface. Use `TRTLLM_WORKER_WATCH_PORT` for a firewall-allowlisted port, with distinct ports for co-located proxies.
 
 ### Multiple Instances
 

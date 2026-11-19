@@ -107,7 +107,12 @@ class WorkerProcessMonitor:
         self._remote = None
 
     def start_remote(self, world_size: int, wake: threading.Event):
-        """Watch remote ranks, unless TRTLLM_WORKER_WATCH=0 explicitly opts out.
+        """Watch remote ranks when TRTLLM_WORKER_WATCH=1 opts in.
+
+        Supervision needs worker-to-proxy TCP connectivity that MPI alone does
+        not provide, so it is off unless explicitly enabled. Without it, rank 0
+        loss is still detected through the command connection, but abrupt loss
+        of another rank or node may leave MPI stuck.
 
         Args:
             world_size: Number of worker ranks that must report readiness.
@@ -116,11 +121,18 @@ class WorkerProcessMonitor:
         Returns:
             The helper endpoint, or None when independent supervision is disabled.
         """
-        if os.environ.get("TRTLLM_WORKER_WATCH") == "0":
-            logger.warning(
-                "TRTLLM_WORKER_WATCH=0: independent remote worker process supervision is disabled; "
-                "existing MPI future/error checks may not detect an abruptly lost remote rank"
-            )
+        if os.environ.get("TRTLLM_WORKER_WATCH") != "1":
+            configured = [
+                name
+                for name in ("TRTLLM_WORKER_WATCH_HOST", "TRTLLM_WORKER_WATCH_PORT")
+                if os.environ.get(name)
+            ]
+            if configured:
+                logger.warning(
+                    "%s is set but remote worker process supervision is disabled; "
+                    "set TRTLLM_WORKER_WATCH=1 to enable it",
+                    " and ".join(configured),
+                )
             return None
         from .remote_worker_process_monitor import RemoteWorkerProcessMonitor
 

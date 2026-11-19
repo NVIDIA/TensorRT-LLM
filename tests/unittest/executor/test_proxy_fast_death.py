@@ -1084,6 +1084,7 @@ def test_rank_lost_before_its_first_report_fails_init_before_ready(monkeypatch):
     from tensorrt_llm.executor.worker_process_monitor import WorkerProcessMonitor
     from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient
 
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH", "1")
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
     monkeypatch.setattr(remote, "_REGISTRATION_TIMEOUT", 1.0)
     proxy = _proxy_awaiting_worker_init(owns_session=True)

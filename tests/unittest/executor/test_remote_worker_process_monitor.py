@@ -36,6 +36,12 @@ finally:
 """
 
 
+@pytest.fixture(autouse=True)
+def _enable_remote_supervision(monkeypatch):
+    # Remote supervision is opt-in; these tests exercise it when enabled.
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH", "1")
+
+
 @pytest.mark.parametrize("lost_process", ["worker", "watch"])
 def test_remote_rank_loss_wakes_existing_monitor_without_mpi(monkeypatch, lost_process):
     # Regression: a remote rank's SIGKILL leaves MPI futures and its root alive,
@@ -194,9 +200,15 @@ def test_explicit_watch_host_and_fixed_port_reach_standalone_helper(monkeypatch,
         monitor.close()
 
 
-def test_watch_opt_out_preserves_existing_checks_without_opening_a_listener(monkeypatch, caplog):
-    monkeypatch.setenv("TRTLLM_WORKER_WATCH", "0")
-    # Invalid network config would fail if opt-out still constructed a listener.
+@pytest.mark.parametrize("setting", [None, "0", "true"])
+def test_remote_supervision_is_off_unless_explicitly_enabled(monkeypatch, caplog, setting):
+    # Regression: supervision was on by default, so every remote MPI deployment
+    # needed a new worker-to-proxy TCP path and failed startup without one.
+    if setting is None:
+        monkeypatch.delenv("TRTLLM_WORKER_WATCH", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_WORKER_WATCH", setting)
+    # Invalid network config would fail if a disabled monitor still built a listener.
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "missing.invalid")
     monitor = WorkerProcessMonitor()
     try:
@@ -204,8 +216,21 @@ def test_watch_opt_out_preserves_existing_checks_without_opening_a_listener(monk
         assert monitor._remote is None
         assert monitor.wait_remote_ready()
         assert monitor.find_dead_worker() is None
-        assert "supervision is disabled" in caplog.text
-        assert "may not detect" in caplog.text
+        # Network settings without the switch are almost certainly a mistake.
+        assert "TRTLLM_WORKER_WATCH_HOST is set" in caplog.text
+        assert "TRTLLM_WORKER_WATCH=1" in caplog.text
+    finally:
+        monitor.close()
+
+
+def test_disabled_supervision_is_silent_without_network_settings(monkeypatch, caplog):
+    monkeypatch.delenv("TRTLLM_WORKER_WATCH", raising=False)
+    monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
+    monkeypatch.delenv("TRTLLM_WORKER_WATCH_PORT", raising=False)
+    monitor = WorkerProcessMonitor()
+    try:
+        assert monitor.start_remote(1, threading.Event()) is None
+        assert "TRTLLM_WORKER_WATCH" not in caplog.text
     finally:
         monitor.close()
 
