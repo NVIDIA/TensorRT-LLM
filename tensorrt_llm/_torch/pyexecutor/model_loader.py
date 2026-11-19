@@ -395,10 +395,20 @@ def release_localized_moe_weights(model: torch.nn.Module) -> None:
     The banks are driver mappings outside PyTorch's allocator, so dropping the
     model does not free them. Call only once no CUDA graph can replay them.
     """
+    errors = []
     for module in model.modules():
         release = getattr(module, "release_ugpu_localized_weights", None)
         if release is not None:
-            release()
+            # Keep going: a module that fails must not strand the banks after it.
+            try:
+                release()
+            except Exception as error:  # noqa: BLE001 - re-raised below
+                errors.append(error)
+    for error in errors[1:]:
+        logger.error(
+            f"Releasing a localized MoE weight bank also failed: {error!r}")
+    if errors:
+        raise errors[0]
 
 
 def validate_lm_head_output_dtype(model: torch.nn.Module,
@@ -1388,31 +1398,39 @@ class ModelLoader:
         self._metrics = {}
         # Directories _timed_load read checkpoint files from.
         self._checkpoint_dirs_read: list[str] = []
-        with timing_metric(
-                ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
-                self._metrics):
-            self._model_in_load = None
-            try:
+        # Track the model until it is returned: localized MoE banks are driver
+        # mappings that outlive it, so any failure before then must release them.
+        self._model_in_load = None
+        try:
+            with timing_metric(
+                    ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
+                    self._metrics):
                 model, moe_load_balancer = self._timed_load(
                     checkpoint_dir, checkpoint_loader)
-            except BaseException:
-                # Localized MoE banks are driver mappings that outlive the model.
-                if self._model_in_load is not None:
+
+            release_seconds = _release_checkpoint_page_cache(
+                self._checkpoint_dirs_read)
+            if release_seconds is not None:
+                self._metrics[
+                    _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
+
+            metrics = ", ".join(f"{name}={value:.4f}"
+                                for name, value in self._metrics.items())
+            logger.info(
+                f"Model loading metrics for rank {self.mapping.rank}: {metrics}"
+            )
+        except BaseException:
+            if self._model_in_load is not None:
+                # The load error stays the one callers see.
+                try:
                     release_localized_moe_weights(self._model_in_load)
-                raise
-            finally:
-                self._model_in_load = None
-
-        release_seconds = _release_checkpoint_page_cache(
-            self._checkpoint_dirs_read)
-        if release_seconds is not None:
-            self._metrics[
-                _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
-
-        metrics = ", ".join(f"{name}={value:.4f}"
-                            for name, value in self._metrics.items())
-        logger.info(
-            f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+                except Exception as release_error:  # noqa: BLE001 - logged
+                    logger.error(
+                        "Releasing localized MoE weights after a failed "
+                        f"load also failed: {release_error!r}")
+            raise
+        finally:
+            self._model_in_load = None
         return model, moe_load_balancer
 
     def _timed_load(
