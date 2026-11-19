@@ -18,7 +18,6 @@ import re
 from collections.abc import Mapping
 from typing import List, Optional
 
-from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from tensorrt_llm.llmapi.inkling_tokens import (
@@ -73,7 +72,15 @@ class InklingToolParser(BaseToolParser):
         try:
             calls: List[ToolCallItem] = []
             for match in self.tool_call_regex.finditer(text):
-                payload = json.loads(match.group(1).strip())
+                # A malformed invocation is dropped on its own; the calls around it stand.
+                try:
+                    payload = json.loads(match.group(1).strip())
+                except json.JSONDecodeError:
+                    logger.warning(f"Inkling tool call payload is not JSON: {match.group(1)!r}")
+                    continue
+                if not isinstance(payload, Mapping):
+                    logger.warning(f"Invalid Inkling tool call payload: {payload}")
+                    continue
                 _, header_name = self._split_trailing_tool_header(text[: match.start()])
                 call = self._tool_call_item(payload, tools, len(calls), header_name=header_name)
                 if call is not None:
@@ -98,7 +105,36 @@ class InklingToolParser(BaseToolParser):
             return StreamingParseResult(normal_text=self._clean_normal_text(prefix))
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Report every complete invocation the buffer holds, and the text around them."""
         self._buffer += new_text
+        normal_text = ""
+        calls: List[ToolCallItem] = []
+        while True:
+            text, step_calls, consumed = self._parse_step(tools)
+            normal_text += text
+            calls.extend(step_calls)
+            if not consumed:
+                return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Also release a held-back partial control token: the stream ended, so it is text.
+
+        A trailing tool header or an unfinished invocation is not text and is dropped.
+        """
+        result = super().finish(tools)
+        tail, self._buffer = self._buffer, ""
+        if tail and self.bot_token not in tail and self._pending_tool_header_start(tail) is None:
+            return StreamingParseResult(
+                normal_text=result.normal_text + self._clean_normal_text(tail), calls=result.calls
+            )
+        return result
+
+    def _parse_step(self, tools: List[Tool]) -> tuple:
+        """Parse the buffer up to the end of its first invocation.
+
+        Returns the normal text and the call deltas it yields, and whether a complete invocation
+        was consumed (accepted or dropped), in which case the rest of the buffer may hold more.
+        """
         current_text = self._buffer
 
         if self.bot_token not in current_text:
@@ -108,7 +144,7 @@ class InklingToolParser(BaseToolParser):
                 # the making; hold it back rather than emit the name as text.
                 safe_text = current_text[:header_start]
                 self._buffer = current_text[header_start:]
-                return StreamingParseResult(normal_text=self._clean_normal_text(safe_text))
+                return self._clean_normal_text(safe_text), [], False
             # Hold back a partial prefix of ANY token _clean_normal_text strips:
             # emitting a split control token leaks its first half as visible
             # text, where the completed token would have been removed.
@@ -122,7 +158,7 @@ class InklingToolParser(BaseToolParser):
             else:
                 safe_text = current_text
                 self._buffer = ""
-            return StreamingParseResult(normal_text=self._clean_normal_text(safe_text))
+            return self._clean_normal_text(safe_text), [], False
 
         bot_pos = current_text.find(self.bot_token)
         pending_normal = ""
@@ -133,12 +169,9 @@ class InklingToolParser(BaseToolParser):
             self._buffer = current_text[bot_pos:]
             pending_normal = self._clean_normal_text(normal_text)
             current_text = self._buffer
-            # Deliberately NOT returning here, which is what the reference
-            # implementation does. The serving layer calls this once per delta
-            # and never flushes at the end of the stream, so a final delta
-            # carrying both visible text and a complete call would leave the
-            # call sitting in the buffer forever -- silently dropped. Carry the
-            # text along and parse the call in the same pass.
+            # The text before the call and the call itself are reported in the same pass (the
+            # reference implementation returns the text first and leaves the call for the next
+            # delta), so a delta that carries both is reported whole.
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
@@ -147,62 +180,50 @@ class InklingToolParser(BaseToolParser):
         while start_idx < len(current_text) and current_text[start_idx].isspace():
             start_idx += 1
 
-        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
         try:
-            payload, end_idx = partial_json_loads(current_text[start_idx:], flags)
-        except (MalformedJSON, json.JSONDecodeError):
-            return StreamingParseResult(normal_text=pending_normal)
-        if not isinstance(payload, Mapping):
-            return StreamingParseResult(normal_text=pending_normal)
+            # Partial strings are not needed: a call is reported only once its payload is whole.
+            payload, end_idx = partial_json_loads(current_text[start_idx:], Allow.ALL & ~Allow.STR)
+        except (ValueError, AssertionError, IndexError):
+            # partial_json_parser reports malformed input as any of these (its own and the json
+            # module's decode errors are ValueErrors; some shapes fail an internal assertion).
+            # Malformed for good once its end token has arrived: drop just this invocation.
+            end_pos = current_text.find(self.eot_token, start_idx)
+            if end_pos < 0:
+                return pending_normal, [], False
+            payload_text = current_text[start_idx:end_pos]
+            logger.warning(f"Inkling tool call payload is not JSON: {payload_text!r}")
+            self._buffer = current_text[end_pos + len(self.eot_token) :]
+            self._current_header_name = None
+            return pending_normal, [], True
+        if not is_complete_json(current_text[start_idx : start_idx + end_idx]):
+            return pending_normal, [], False
 
-        calls: List[ToolCallItem] = []
-        name = payload.get("name")
-        if (
-            not self.current_tool_name_sent
-            and isinstance(name, str)
-            and (self._current_header_name is None or self._current_header_name == name)
-        ):
-            self._ensure_current_tool()
-            calls.append(ToolCallItem(tool_index=self.current_tool_id, name=name, parameters=""))
-            self.current_tool_name_sent = True
-            self.prev_tool_call_arr[self.current_tool_id] = {
-                "name": name,
-                "arguments": {},
-            }
-
-        json_text = current_text[start_idx : start_idx + end_idx]
-        if not is_complete_json(json_text):
-            return StreamingParseResult(normal_text=pending_normal, calls=calls)
-
-        call = self._tool_call_item(
-            payload, tools, self.current_tool_id, header_name=self._current_header_name
-        )
+        # The payload is whole: report the call, or drop this invocation only. Announcing the name
+        # earlier would leave a call the client already saw when the rest of the payload fails.
+        if isinstance(payload, Mapping):
+            call = self._tool_call_item(
+                payload, tools, self.current_tool_id, header_name=self._current_header_name
+            )
+        else:
+            logger.warning(f"Invalid Inkling tool call payload: {payload}")
+            call = None
+        self._buffer = self._remaining_after_call(current_text, start_idx + end_idx)
+        self._current_header_name = None
         if call is None:
-            self._abandon_current_tool()
-            self._buffer = ""
-            return StreamingParseResult(normal_text=pending_normal, calls=calls)
+            return pending_normal, [], True
 
-        if self.current_tool_id == -1:
-            self._ensure_current_tool()
-
-        args = json.loads(call.parameters)
+        self._ensure_current_tool()
         self.prev_tool_call_arr[self.current_tool_id] = {
             "name": call.name,
-            "arguments": args,
+            "arguments": json.loads(call.parameters),
         }
-        sent = self.streamed_args_for_tool[self.current_tool_id]
-        remaining_args = call.parameters[len(sent) :]
-        if remaining_args:
-            calls.append(
-                ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=remaining_args)
-            )
-            self.streamed_args_for_tool[self.current_tool_id] += remaining_args
-
-        self._buffer = self._remaining_after_call(current_text, start_idx + end_idx)
+        self.streamed_args_for_tool[self.current_tool_id] = call.parameters
+        calls = [
+            ToolCallItem(tool_index=self.current_tool_id, name=call.name, parameters=""),
+            ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=call.parameters),
+        ]
         self.current_tool_id += 1
-        self.current_tool_name_sent = False
-        self._current_header_name = None
-        return StreamingParseResult(normal_text=pending_normal, calls=calls)
+        return pending_normal, calls, True
 
     def structure_info(self) -> _GetInfoFunc:
         def info(name: str) -> StructureInfo:
@@ -254,20 +275,6 @@ class InklingToolParser(BaseToolParser):
             self.prev_tool_call_arr.append({})
         while len(self.streamed_args_for_tool) <= self.current_tool_id:
             self.streamed_args_for_tool.append("")
-
-    def _abandon_current_tool(self) -> None:
-        """Discard the in-flight call after a rejected payload.
-
-        Resetting `current_tool_id` to -1 here would collide the NEXT valid
-        call with tool index 0 (`_ensure_current_tool` maps -1 -> 0) and slice
-        its arguments against index 0's already-streamed args. Keep the counter:
-        an unannounced slot is simply reused, an announced one is abandoned by
-        advancing past it.
-        """
-        if self.current_tool_name_sent:
-            self.current_tool_id += 1
-        self.current_tool_name_sent = False
-        self._current_header_name = None
 
     def _split_trailing_tool_header(self, text: str) -> tuple:
         message_pos = self._pending_tool_header_start(text)
