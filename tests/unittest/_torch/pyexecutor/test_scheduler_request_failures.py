@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
@@ -108,14 +109,14 @@ def test_admission_failure_delivers_one_error_and_cleans_up_once():
     executor.sampler, executor.resource_manager = Mock(), Mock()
     executor.model_engine = executor.draft_model_engine = None
     result_queue = Mock()
-    executor.result_wait_queues = {7: result_queue}
-    executor.response_cv, executor.responses = threading.Condition(), {}
+    executor._response_channel = ResponseChannel()
+    executor._response_channel.register([7], result_queue)
     executor._merged_transfer_flush, executor._stage_responses = None, False
     executor._maybe_record_hang_diagnostic_phase = Mock()
 
     def check_delivery_before_free(request):
         result_queue.put_response.remote.assert_called_once()
-        assert executor.result_wait_queues[7] is result_queue
+        assert executor._response_channel.result_wait_queues[7] is result_queue
 
     executor.resource_manager.free_resources.side_effect = check_delivery_before_free
     batch = ScheduledRequests()
@@ -129,8 +130,8 @@ def test_admission_failure_delivers_one_error_and_cleans_up_once():
     client_id, response = result_queue.put_response.remote.call_args.args
     assert client_id == 17
     assert response.request_id == blocked.py_request_id
-    assert executor.responses[7] == [response]
-    assert 7 not in executor.result_wait_queues
+    assert executor._response_channel.responses[7] == [response]
+    assert 7 not in executor._response_channel.result_wait_queues
     assert response.error_msg == "KV cache admission made no progress within the scheduler limit"
     executor.sampler.release_request.assert_called_once_with(blocked)
     executor.resource_manager.free_resources.assert_called_once_with(blocked)
@@ -266,6 +267,26 @@ def test_mpi_scheduler_failure_consensus_spans_cp_and_pp():
                 with pytest.raises(RuntimeError, match="three failure rounds"):
                     executor._fail_scheduler_requests(batch)
         assert executor._handle_errors.call_count == 2
+        # Reuse these communicators for transport failure/retirement agreement.
+        from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+        node = object.__new__(KvCacheTransceiverV2)
+        for drained in (False, True):
+            result = (
+                [],
+                [],
+                [],
+                [73] if drained or rank != 3 else [],
+                {73} if rank == 3 else set(),
+                drained or rank != 3,
+            )
+            for gather in (cp.allgather, pp.allgather):
+                c, f, d, q, intents, ready = result
+                result = node._consensus_outcome(
+                    [73], c, f, d, gather, True, q, failure_intents=list(intents), agent_ready=ready
+                )
+            assert result[1] == [73] and result[3] == ([73] if drained else [])
+            assert result[-1] is drained
     finally:
         cp.Free()
         pp.Free()

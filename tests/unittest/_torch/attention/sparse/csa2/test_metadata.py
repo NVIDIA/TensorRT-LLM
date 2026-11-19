@@ -31,6 +31,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._utils import is_blackwell_datacenter
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -633,11 +634,12 @@ def test_retained_metadata_buffers_and_workspace_accounting(manager_requests):
     extra = torch.empty(129, device="cuda", dtype=torch.uint8)
     metadata._csa2_buffers["extra", (129,), torch.uint8, False] = extra
     assert metadata.get_workspace_bytes() == before + extra.untyped_storage().nbytes()
-    # Exact sum of the graph descriptor allocations: block table, contexts,
-    # visible lengths, request contexts, page validity, radix scratch and one schedule.
-    # Index rows are read from the owner's cache pages in place, so no page copies are
-    # retained.
-    expected = 4 * (1 * (4 + 1) + 12 + 80 * 32) + (148 + 1) * 8
+    # Exact sum of the graph descriptor allocations: block table (and on SM100/SM103 its
+    # masked-page copy), contexts, visible lengths, request contexts, page validity, radix
+    # scratch and one schedule. Index rows are read from the owner's cache pages in place,
+    # so no page copies are retained.
+    table_bytes = 8 if is_blackwell_datacenter() else 4
+    expected = 4 * (1 * (table_bytes + 1) + 12 + 80 * 32) + (148 + 1) * 8
     assert metadata.workspace_reservation_bytes(2, 4, 64, 32, 148) == expected
 
 

@@ -20,7 +20,6 @@ ladder (``TIER_*``). Only when **every** rung is exhausted is the verdict a
 
 from __future__ import annotations
 
-import ast
 import re
 import zlib
 from dataclasses import dataclass
@@ -36,9 +35,6 @@ CATALOG_TESTS_DIR = "tests/unittest/_torch/modeling_v2"
 #: target, one ``<category>/<name>.py`` each, and their tests mirror that path
 #: under ``CATALOG_TESTS_DIR/models/<family>/<target>/``.
 MODEL_OPS_DIRNAME = "ops"
-
-_CATALOG_IMPORT = re.compile(r"tensorrt_llm\._torch\.modeling_v2\.catalog\.([a-z_]+)\.([a-z0-9_]+)")
-
 
 #: The survey's product, in the run's workspace.
 VOCABULARY_FILENAME = "vocabulary.yaml"
@@ -99,8 +95,7 @@ TIER_DESCRIPTION: dict[int, str] = {
     ),
     TIER_NATIVE_TORCH: (
         "no engine implementation exists, so compose one from torch ops. Correct "
-        "first and slow is acceptable for a functionality onboarding; the tuning "
-        "phase replaces it"
+        "first and slow is acceptable for a functionality onboarding"
     ),
     TIER_TRITON: (
         "native torch cannot express it, or does so at a cost that breaks the "
@@ -611,27 +606,6 @@ def queue_item_from_ref(ref: str, task_id: str, goal: str = "") -> QueueItem | N
     return QueueItem(n=n, mode=mode, target=target, note=goal, site=site or None)
 
 
-def imported_catalog_entries(modeling_py: Path) -> list[tuple[str, str]]:
-    """Return ``(category, name)`` for every catalog entry a target imports."""
-    tree = ast.parse(modeling_py.read_text(encoding="utf-8"))
-    found: list[tuple[str, str]] = []
-    for node in ast.walk(tree):
-        module = None
-        if isinstance(node, ast.ImportFrom) and node.module:
-            module = node.module
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                match = _CATALOG_IMPORT.search(alias.name)
-                if match:
-                    found.append((match.group(1), match.group(2)))
-            continue
-        if module:
-            match = _CATALOG_IMPORT.search(module)
-            if match:
-                found.append((match.group(1), match.group(2)))
-    return sorted(set(found))
-
-
 def model_ops_tests_dir(target_rel: str) -> str:
     """``.../modeling_v2/models/<family>/<target>`` -> its tests' directory."""
     tail = target_rel.rstrip("/").split(f"{MODELING_V2_PACKAGE}/", 1)[-1]
@@ -680,7 +654,6 @@ def is_entry_file(path: str, target: str) -> bool:
 __all__ = [
     "is_entry_file",
     "entry_module",
-    "imported_catalog_entries",
     "model_ops_tests_dir",
     "MODEL_OPS_DIRNAME",
     "MODELING_V2_PACKAGE",
