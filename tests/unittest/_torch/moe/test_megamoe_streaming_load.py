@@ -59,8 +59,6 @@ class _StreamingMoEModule(nn.Module):
         self.num_experts = NUM_EXPERTS
         self.layer_idx = 0
         self.hidden_size = HIDDEN_SIZE
-        # The checkpoint-scale check reads the unsharded size and the
-        # activation kind, as a real MoE module carries them.
         self.intermediate_size = INTERMEDIATE_SIZE
         self.is_gated_activation = True
         self.intermediate_size_per_partition = INTERMEDIATE_SIZE
