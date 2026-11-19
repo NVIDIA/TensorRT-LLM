@@ -57,6 +57,42 @@ collection/timing settings. The existing device-step profiler timing policy is
 preserved. CPU and
 end-to-end overhead of this refactor have not been benchmarked.
 
+## Prometheus
+
+Enable production collection using the serving configuration above. Set
+`iter_perf_stats_interval: 1` for unsampled iteration records.
+
+```sh
+trtllm-serve /path/to/model --config metrics.yaml --port 8000
+curl --fail http://localhost:8000/prometheus/metrics
+```
+
+Scrape each worker separately. OpenEngine uses a
+[separate metrics listener](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/grpc/openengine/README.md#prometheus-metrics).
+Set request histogram buckets in seconds through `prometheus_metrics_config`.
+
+- **Transfer outcomes.** `trtllm_kv_cache_transfer_requests_total` counts success,
+  error, and timeout once per transfer on each reporting rank. CTX sends and GEN
+  receives count their own endpoints. User cancellation alone is excluded.
+  `trtllm_kv_cache_transfer_duration_seconds` and `trtllm_kv_cache_transfer_bytes_total`
+  use completed-request observations.
+- **Tier capacity and movement.** `trtllm_kv_cache_tier_{blocks,bytes}` reports
+  free, evictable, and unavailable capacity per level and pool group. The exported
+  unavailable remainder includes retained cold copies that can be reclaimed.
+  `trtllm_kv_cache_tier_moved_{blocks,bytes}_total` counts accepted restores,
+  evictions, and drops. Its byte totals use logical slot sizes. Detailed tier
+  snapshots report rank 0 under attention DP.
+- **Conversation activity.** `trtllm_kv_cache_num_conversations` counts retention
+  entries, including saved plans. `trtllm_conversation_unique_seen` counts distinct
+  conversation identities admitted by a worker in rolling `10m` and `1h` windows.
+  Workers can see the same identity, so summing their counts can double-count it. Use
+  `trtllm_conversation_unique_seen_complete` to identify full windows. The fixed
+  limits are 100,000 window entries and 16 MiB of accounted identity storage.
+  Capacity skips increment `trtllm_conversation_tracking_overflow_total`.
+- **Executor timing.** Host and GPU forward histograms observe measured rank-0
+  iterations. The previous device-step gauge lags by one loop. Per-loop work
+  metrics use the producing `global_rank`.
+
 ## Transport cost and KV utilization semantics
 
 Worker serialization parses native JSON into a dictionary, partitions it into
@@ -118,7 +154,3 @@ reclaimable prefixes. These panels cannot identify which prefix was evicted.
 Select one application scrape job path to avoid duplicate engine observations.
 Existing `irate` charts use the last two samples in `counter_lookback`. Tier
 turnover charts average the window. Dashboard creation does not enable instrumentation.
-
-The template includes optional KV-cache tier and transfer panels whose added
-instrumentation is provided separately by [PR #22083](https://github.com/NVIDIA/TensorRT-LLM/pull/22083).
-This metrics refactor does not introduce those metric families.
