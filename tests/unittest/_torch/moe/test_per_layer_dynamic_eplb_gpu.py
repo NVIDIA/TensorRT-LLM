@@ -21,7 +21,9 @@ Three quarters of the tokens pick the experts of one rank, so the plan must
 use helper slots.  Three forwards cover a fresh plan, the same plan again with
 its helpers already resident, and a different plan.  A second case removes the
 pair team objects, so an owner outside a rank pair writes its share of the
-copy with unicast stores, as at EP16.  After each forward every rank checks
+copy with unicast stores, as at EP16. A third case captures the full MoE,
+replays changing routes on MAIN, and clears and recaptures the parent graph.
+After each forward every rank checks
 
 - the output against the NVFP4 reference MoE;
 - every route: a home slot must be the expert's own, and a helper slot must
@@ -35,6 +37,7 @@ run it; the planner alone is tested on one GPU by moeRebalanceHaloQTest.
 import os
 import pickle
 import sys
+from contextlib import nullcontext
 
 import cloudpickle
 import pytest
@@ -54,8 +57,12 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     maybe_create_moe_load_balancer,
 )
 from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
-from tensorrt_llm._utils import is_sm_100f, mpi_comm, mpi_rank
-from tensorrt_llm.llmapi.llm_args import MoePerLayerDynamicLoadBalancerConfig
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_comm, mpi_rank
+from tensorrt_llm.llmapi.llm_args import (
+    _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS,
+    MoePerLayerDynamicLoadBalancerConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -137,14 +144,15 @@ def _init_process_group(rank, world_size):
     dist.init_process_group(backend="nccl", store=store, rank=rank, world_size=world_size)
 
 
-def _record_routes(layer):
+def _record_routes(layer, *, capture_only=False):
     """Record the logical experts and physical slots of each route the layer plans."""
     records = []
     route = layer.route
 
     def recording_route(token_selected_experts, *args, **kwargs):
         physical = route(token_selected_experts, *args, **kwargs)
-        records.append((token_selected_experts, physical))
+        if not capture_only or torch.cuda.is_current_stream_capturing():
+            records.append((token_selected_experts, physical))
         return physical
 
     layer.route = recording_route
@@ -173,8 +181,6 @@ def _check_routes(layer, records, world_size):
         logical, physical = (t.flatten().to(torch.int64) for t in records[-1])
     else:
         logical = physical = torch.empty(0, dtype=torch.int64, device="cuda")
-    records.clear()
-
     arena = layer.live_weight_arena
     home, slots = arena.home_experts, arena.slot_count
     in_range = (physical >= 0) & (physical < world_size * slots)
@@ -199,8 +205,12 @@ def _check_routes(layer, records, world_size):
     return errors
 
 
-def _run_rank(world_size: int, team_objects: bool) -> tuple[int, list[str], bool]:
+def _run_rank(
+    world_size: int, team_objects: bool, parent_graph: bool
+) -> tuple[int, list[str], bool]:
     """Run the forwards on this rank and return its errors and shutdown result."""
+    if parent_graph:
+        os.environ["MEGAMOE_TACTIC_AUTOTUNE"] = "0"
     if not team_objects:
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler import geometry
 
@@ -209,22 +219,24 @@ def _run_rank(world_size: int, team_objects: bool) -> tuple[int, list[str], bool
     _init_process_group(rank, world_size)
     # The test utilities create weights and scales on the default device.
     with torch.device(f"cuda:{rank}"):
-        errors, shut_down = _run_forwards(rank, world_size)
+        # The planner, BCG capture, and replay must all bind to the same MAIN.
+        stream_scope = torch.cuda.stream(torch.cuda.Stream()) if parent_graph else nullcontext()
+        with stream_scope:
+            errors, shut_down = _run_forwards(rank, world_size, parent_graph)
     return rank, errors, shut_down
 
 
-def _run_forwards(rank, world_size):
+def _run_forwards(rank, world_size, parent_graph):
     dtype = torch.bfloat16
     num_experts = MODEL.num_experts
     home = num_experts // world_size
+    tokens = _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS if parent_graph else TOKENS_PER_RANK
 
     # All ranks draw the same tensors, so they build identical weights with one
     # activation scale; each rank then takes its own tokens.
     torch.manual_seed(0)
-    all_x = torch.randn(
-        (world_size, TOKENS_PER_RANK, MODEL.hidden_size), dtype=dtype, device="cuda"
-    )
-    all_logits = torch.randn((world_size, TOKENS_PER_RANK, num_experts), dtype=dtype, device="cuda")
+    all_x = torch.randn((world_size, tokens, MODEL.hidden_size), dtype=dtype, device="cuda")
+    all_logits = torch.randn((world_size, tokens, num_experts), dtype=dtype, device="cuda")
     x = all_x[rank]
 
     routing_method = RenormalizeMoeRoutingMethod(top_k=MODEL.top_k, force_enable_pytorch_op=True)
@@ -265,7 +277,7 @@ def _run_forwards(rank, world_size):
         moe_load_balancer=MoePerLayerDynamicLoadBalancerConfig(
             num_slots=num_experts + world_size * HELPER_SLOTS_PER_RANK
         ),
-        max_num_tokens=256,
+        max_num_tokens=max(256, tokens),
     )
 
     errors = []
@@ -281,44 +293,101 @@ def _run_forwards(rank, world_size):
         moe.load_weights([weights])
         moe.post_load_weights()
         (layer,) = balancer.single_layer_load_balancers
-        records = _record_routes(layer)
+        records = _record_routes(layer, capture_only=parent_graph)
         ref_moe = quantize_util.create_ref_module(routing_method, ref_cls=ref_cls)
         ref_moe.load_weights([weights])
         ref_moe.cuda(f"cuda:{rank}")
 
-        for step, hot_rank in enumerate(HOT_RANKS):
-            logits = all_logits[rank].clone()
-            logits[: TOKENS_PER_RANK * 3 // 4, hot_rank * home : (hot_rank + 1) * home] += 8
-            with torch.inference_mode():
-                with MoeLoadBalancerIterContext(balancer):
-                    output = moe.forward(
-                        x, logits, all_rank_num_tokens=[TOKENS_PER_RANK] * world_size
-                    )
-                ref_output = ref_moe.forward(x, logits)
-            # Peers write this rank's helper slots, so wait for every rank.
-            torch.cuda.synchronize()
-            dist.barrier()
-            try:
-                ref_moe.check_accuracy(output, ref_output)
-            except AssertionError as error:
-                errors.append(f"forward {step}: output: {error}")
-            errors += [
-                f"forward {step}: {error}" for error in _check_routes(layer, records, world_size)
-            ]
+        runner = (
+            BreakableCUDAGraphRunner(moe, capture_on_current_stream=True) if parent_graph else None
+        )
+        group = layer._scheduler_group
+        logits = torch.empty_like(all_logits[rank])
+
+        def forward():
+            with MoeLoadBalancerIterContext(balancer):
+                return moe.forward(x, logits, all_rank_num_tokens=[tokens] * world_size)
+
+        def warmup_or_capture():
+            assert runner is not None
+            if runner.is_capturing:
+                with runner.capture_context(), layer.use_parent_moe_graph():
+                    return runner.capture_output(forward())
+            with layer.use_parent_moe_graph():
+                return forward()
+
+        try:
+            for step, hot_rank in enumerate((0, 1, 0, 1) if parent_graph else HOT_RANKS):
+                logits.copy_(all_logits[rank])
+                logits[: tokens * 3 // 4, hot_rank * home : (hot_rank + 1) * home] += 8
+                with torch.inference_mode():
+                    if runner is None:
+                        records.clear()
+                        output = forward()
+                    else:
+                        if step in (0, 2):
+                            runner.clear()
+                            records.clear()
+                            runner.capture(tokens, warmup_or_capture, scope_inputs=x)
+                            graph = runner._graphs[tokens]
+                            if graph.num_segments != 1 or not graph._segment_replays:
+                                errors.append("expected one parent segment containing the MoE")
+                        expected_generation = group._generation + 1
+                        with MoeLoadBalancerIterContext(balancer):
+                            output = runner.replay(tokens)
+                        ready = layer.live_weight_arena.terminal_flags_tensor().view(torch.int64)
+                        if (
+                            group._finished_generation != expected_generation
+                            or ready.tolist() != [expected_generation] * world_size
+                        ):
+                            errors.append(
+                                f"forward {step}: the parent replay did not advance READY"
+                            )
+                        expected_routes, _ = routing_method.apply(logits)
+                        if len(records) != 1 or not torch.equal(records[0][0], expected_routes):
+                            errors.append(
+                                f"forward {step}: the graph did not use the current logical routes"
+                            )
+                    ref_output = ref_moe.forward(x, logits)
+                # Peers write this rank's helper slots, so wait for every rank.
+                torch.cuda.synchronize()
+                dist.barrier()
+                try:
+                    ref_moe.check_accuracy(output, ref_output)
+                except AssertionError as error:
+                    errors.append(f"forward {step}: output: {error}")
+                errors += [
+                    f"forward {step}: {error}"
+                    for error in _check_routes(layer, records, world_size)
+                ]
+        finally:
+            if runner is not None:
+                torch.cuda.synchronize()
+                runner.clear()
         shut_down = balancer.shutdown()
     return errors, shut_down
 
 
 @pytest.mark.threadleak(enabled=False)  # the MPIPoolExecutor manager thread outlives the test
-@pytest.mark.parametrize("team_objects", [True, False], ids=["pair_teams", "pair_unicast"])
-def test_per_layer_dynamic_eplb_megamoe_cutedsl(team_objects: bool) -> None:
+@pytest.mark.parametrize(
+    ("team_objects", "parent_graph"),
+    [(True, False), (False, False), (True, True)],
+    ids=["pair_teams", "pair_unicast", "parent_graph"],
+)
+def test_per_layer_dynamic_eplb_megamoe_cutedsl(team_objects: bool, parent_graph: bool) -> None:
     reason = _skip_reason()
     if reason:
         pytest.skip(reason)
+    if parent_graph and get_sm_version() not in (100, 103):
+        pytest.skip("Parent MoE graph capture is supported on SM100 and SM103")
     with MPIPoolExecutor(
         initializer=_init_worker, initargs=(sys.path,), max_workers=EP_SIZE
     ) as executor:
-        results = list(executor.map(_run_rank, [EP_SIZE] * EP_SIZE, [team_objects] * EP_SIZE))
+        results = list(
+            executor.map(
+                _run_rank, [EP_SIZE] * EP_SIZE, [team_objects] * EP_SIZE, [parent_graph] * EP_SIZE
+            )
+        )
     for rank, errors, shut_down in sorted(results):
         assert not errors, f"rank {rank}: " + "; ".join(errors)
         assert shut_down, f"rank {rank}: per-layer dynamic EPLB did not shut down"

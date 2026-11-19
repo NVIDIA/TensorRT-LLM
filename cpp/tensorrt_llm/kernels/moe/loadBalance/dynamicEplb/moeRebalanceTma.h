@@ -218,9 +218,15 @@ extern "C"
  * route_target is its value after this launch. A cuStreamWaitValue64 (GEQ
  * route_target) on another stream orders that stream after the routes. READY is
  * published as by the copy alone.
+ * During graph capture replay_generation points to a persistent device scalar.
+ * The kernel then reads the generation at replay and computes its route target.
  */
 int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
     tensorrt_llm::kernels::MoeRebalanceHaloQParams const& scheduler, uint64_t* route_epoch, uint64_t route_target,
-    uint64_t flag_mc, uint64_t generation, void* cuda_stream);
+    uint64_t flag_mc, uint64_t generation, void* cuda_stream, uint64_t const* replay_generation = nullptr);
+
+//! Capture a consumer-stream wait for route sorting, while copy work can finish in parallel.
+int megamoe_tma_copy_wait_replay_routes(uint64_t const* route_epoch, uint64_t const* replay_generation, unsigned ctas,
+    uint64_t spin_cycles, void* cuda_stream);
 #endif
 #endif

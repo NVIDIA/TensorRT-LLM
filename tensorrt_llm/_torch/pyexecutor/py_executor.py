@@ -101,6 +101,8 @@ from ..speculative.utils import get_static_draft_len, update_draft_len
 from .adp_iter_stats import ADPIterStatsBuffer
 from .benchmark_request_stages import (BenchmarkRequestStage,
                                        parse_benchmark_request_stages)
+from .breakable_cuda_graph.breakable_cuda_graph import \
+    DynamicMoeGraphReplayError
 from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
@@ -12412,6 +12414,9 @@ class PyExecutor:
                                                      scheduled_requests)
 
             return outputs
+        except DynamicMoeGraphReplayError:
+            # The rank-crash watchdog releases peers waiting for this rank's generation.
+            raise
         except Exception as e:
             self._maybe_record_hang_diagnostic_phase("forward_error",
                                                      scheduled_requests)

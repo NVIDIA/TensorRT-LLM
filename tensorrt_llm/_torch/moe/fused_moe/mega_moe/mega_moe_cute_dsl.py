@@ -2002,6 +2002,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         topk_idx and topk_weights are this bucket's launch buffers, whose cute
         views the op may then reuse.
         """
+        generation_tensor = (
+            replica_plan.ready_generation_tensor if replica_plan is not None else None
+        )
+        if generation_tensor is not None:
+            self._wait_rebalance_routes(replica_plan)
+
         # Hand the symmetric profiling scratch (or a deferred factory) to the
         # op for tuning-mode profiling launches; cleared in the ``finally`` so
         # a later same-process call for a different shape never sees a stale
@@ -2155,6 +2161,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 hot_expert_weight_ready_flags=helper_ready_flags,
                 hot_expert_weight_ready_generation=int(helper_ready_generation),
                 ugpu_weight_layout=self._ugpu_weight_layout,
+                hot_expert_weight_ready_generation_tensor=generation_tensor,
             )
         finally:
             # Always clear: a raising op call must not leave the factory
