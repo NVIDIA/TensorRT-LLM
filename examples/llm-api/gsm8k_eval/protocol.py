@@ -53,7 +53,7 @@ SPLIT_FILES = {
     "test": "main/test-00000-of-00001.parquet",
 }
 
-#: The first-100 selection frozen by ``manifest.json`` (the CI configuration).
+#: The first-100 selection frozen by ``manifest.json``.
 NUM_QUESTIONS = 100
 #: Rows of the pinned test split; the largest selectable question count.
 TEST_SPLIT_ROWS = 1319
