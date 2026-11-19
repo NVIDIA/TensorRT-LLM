@@ -125,8 +125,8 @@ l0_cpu:
   - unittest/_torch/memory
   - unittest/_torch/modeling
   - unittest/_torch/models/checkpoints/beam/test_checkpoint_loader.py
-  # ModelingV2 routing, sharding and Beam component, diagnostic and checkpoint-layout
-  # checks run on CPU. Mixed CPU/GPU modules select only cpu_only-marked cases here.
+  # ModelingV2 and Beam CPU checks cover routing, components, checkpoints and serving.
+  # Mixed CPU/GPU modules select only cpu_only-marked cases here.
   - unittest/_torch/modeling_v2/models/beam/test_component_contracts.py
   - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout.py
   - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout_nvfp4.py
@@ -429,6 +429,7 @@ l0_cpu:
   - unittest/llmapi/test_mpi_stop.py
   - unittest/llmapi/test_mpi_stop_launcher.py
   - unittest/llmapi/test_reasoning_parser.py
+  - unittest/llmapi/test_beam_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py
   - unittest/llmapi/test_rlhf_utils.py

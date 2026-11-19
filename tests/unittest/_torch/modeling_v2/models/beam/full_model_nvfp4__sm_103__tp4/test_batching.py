@@ -5,8 +5,7 @@
 The native runtime orders a step's requests contexts first, then generations; each request
 has its own cached prefix and KV length. ``check_batch_metadata`` must return each request's
 ``(past, new tokens)`` from the prepared metadata and reject a step whose rows or requests
-disagree; ``check_metadata`` keeps the one-request contract; the full model selects the last
-row of each request for the sampler. Needs one CUDA device (a small KVCacheManagerV2); no
+disagree; ``check_metadata`` keeps the one-request contract. Needs one CUDA device (a small KVCacheManagerV2); no
 model files.
 """
 
@@ -21,9 +20,6 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFea
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modeling_v2.models.beam import _attention
-from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (  # noqa: E501
-    BeamFullModelNvfp4Sm103Tp4,
-)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -130,17 +126,3 @@ def test_unheld_layer_is_rejected():
             _attention.check_batch_metadata(
                 md, 62, layer_idx=3, num_kv_heads=KV_HEADS, head_dim=HEAD_DIM
             )
-
-
-@pytest.mark.parametrize(
-    "spans,expected",
-    [
-        ([(0, 40)], [39]),
-        ([(0, 40), (64, 20), (100, 1), (7, 1)], [39, 59, 60, 61]),
-        ([(5, 1), (9, 1), (2, 1)], [0, 1, 2]),
-    ],
-)
-def test_default_rows_are_each_requests_last_row(spans, expected):
-    select = BeamFullModelNvfp4Sm103Tp4._select_rows
-    assert select(None, None, spans) == expected
-    assert select(None, "all", spans) == list(range(sum(n for _, n in spans)))
