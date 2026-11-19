@@ -113,7 +113,7 @@ def test_random_operands(m, misaligned):
         shifted = torch.empty(m * k + 1, dtype=torch.bfloat16, device="cuda")[1:].view(m, k)
         shifted.copy_(x)
         assert shifted.is_contiguous() and shifted.data_ptr() % 16
-        head = SimpleNamespace(weight=w, tp_size=1, tp_rank=0, out_features=n)
+        head = SimpleNamespace(weight=w, tp_size=1, tp_rank=0, out_features=n, output_dtype=None)
         tokens = BF16DraftHead(head, None, _capacity(k)).sample(shifted).long()
     else:
         tokens = _run(x, w).long()

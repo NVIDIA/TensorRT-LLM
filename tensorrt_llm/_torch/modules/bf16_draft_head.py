@@ -94,7 +94,7 @@ class BF16DraftHead:
         self.vocab_offset = self.rank * lm_head.out_features
         # Compare what the GEMM path would store: logits in the weight dtype unless the head
         # writes fp32.
-        self.round_logits = getattr(lm_head, "output_dtype", None) in (None, weight.dtype)
+        self.round_logits = lm_head.output_dtype in (None, weight.dtype)
         self.scratch = torch.zeros(SCRATCH_WORDS, dtype=torch.int64, device=weight.device)
         self.exchange_epoch: Optional[torch.Tensor] = None
         self.peer_buffers: List[int] = []
@@ -156,16 +156,16 @@ def build_bf16_draft_head(lm_head, key_exchange) -> Optional[BF16DraftHead]:
     """
     if not fused_draft_head_enabled():
         return None
-    weight = getattr(lm_head, "weight", None)
+    weight = lm_head.weight
     reason = None
-    if weight is None or weight.dim() != 2 or not weight.is_cuda:
+    if weight.dim() != 2 or not weight.is_cuda:
         reason = "the LM head has no 2D CUDA weight"
-    elif getattr(lm_head, "has_any_quant", False) or weight.dtype not in (
+    elif lm_head.has_any_quant or weight.dtype not in (
         torch.bfloat16,
         torch.float16,
     ):
         reason = "the LM head is not BF16 or FP16"
-    elif getattr(lm_head, "bias", None) is not None or weight.stride(-1) != 1:
+    elif lm_head.bias is not None or weight.stride(-1) != 1:
         reason = "the LM head has a bias or a strided weight"
     elif lm_head.tp_size > 1 and (key_exchange is None or key_exchange.nranks != lm_head.tp_size):
         reason = "no TP key exchange for the LM head's group"
