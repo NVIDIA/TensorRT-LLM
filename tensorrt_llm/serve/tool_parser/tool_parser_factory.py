@@ -14,6 +14,7 @@ from .deepseekv41_parser import DeepSeekV41Parser
 from .gemma4_parser import Gemma4ToolParser
 from .glm4_parser import Glm4ToolParser
 from .glm47_parser import Glm47ToolParser
+from .inkling_tool_parser import InklingToolParser
 from .kimi_k2_tool_parser import KimiK2ToolParser
 from .kimi_k3_tool_parser import KimiK3ToolParser
 from .minimax_m2_parser import MiniMaxM2ToolParser
@@ -44,6 +45,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "glm_moe_dsa": "glm47",
     "gemma4": "gemma4",
     "gemma4_text": "gemma4",
+    "inkling2": "inkling",
     "laguna": "poolside_v1",
     "minimax_m3_vl": "minimax_m3",
     "muse_spark": "musespark",
@@ -79,6 +81,7 @@ class ToolParserFactory:
         "deepseek_v4": DeepSeekV4Parser,
         "deepseek_v41": DeepSeekV41Parser,
         "gemma4": Gemma4ToolParser,
+        "inkling": InklingToolParser,
         "glm4": Glm4ToolParser,
         "glm47": Glm47ToolParser,
         "minimax_m2": MiniMaxM2ToolParser,
