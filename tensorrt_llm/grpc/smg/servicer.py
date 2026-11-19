@@ -23,7 +23,7 @@ import asyncio
 import io
 import time
 from collections.abc import AsyncGenerator
-from typing import List, Union
+from typing import Any, List, Union
 
 import grpc
 
@@ -31,13 +31,23 @@ from tensorrt_llm.executor.result import Logprob, TokenLogprobs
 from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
-from .bindings import trtllm_service_pb2, trtllm_service_pb2_grpc
+from .bindings import common_pb2, trtllm_service_pb2, trtllm_service_pb2_grpc
+from .load_feed import NO_KV_EVENTS, LoadRecordStream, get_loads_response, wants_loads_only
 from .request_manager import (
     GrpcRequestManager,
     create_disaggregated_params_from_proto,
     create_lora_request_from_proto,
     create_sampling_params_from_proto,
 )
+
+
+def _engine_version() -> str:
+    try:
+        import tensorrt_llm
+
+        return getattr(tensorrt_llm, "__version__", "unknown")
+    except Exception:
+        return "unknown"
 
 
 class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
@@ -50,6 +60,8 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
     - Abort: Cancel a request
     - GetModelInfo: Model metadata
     - GetServerInfo: Server state
+    - SubscribeKvEvents: The engine's load records (loads_only; no KV events are relayed)
+    - GetLoads: The engine's load, when the installed proto declares the RPC
     """
 
     def __init__(self, request_manager: GrpcRequestManager, model_path: str = ""):
@@ -286,12 +298,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
         Returns:
             GetServerInfoResponse protobuf
         """
-        try:
-            import tensorrt_llm
-
-            version = getattr(tensorrt_llm, "__version__", "unknown")
-        except Exception:
-            version = "unknown"
+        version = _engine_version()
 
         # Try to get parallelism info from LLM args
         tp_size = 1
@@ -318,6 +325,54 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             context_parallel_size=1,  # Context parallelism is separate from TP/PP
             world_size=world_size,
         )
+
+    async def SubscribeKvEvents(
+        self,
+        request: common_pb2.SubscribeKvEventsRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncGenerator[common_pb2.KvEventBatch, None]:
+        """Stream the engine's load records to a ``loads_only`` subscriber.
+
+        This servicer relays no KV cache events, so a subscription for them is refused with
+        UNIMPLEMENTED and the reason; a ``loads_only`` one gets a ``load_only`` batch (sequence
+        0, rank 0) whenever the record changed or its heartbeat is due, until the client goes.
+
+        Args:
+            request: The SubscribeKvEventsRequest protobuf
+            context: gRPC context
+
+        Yields:
+            KvEventBatch protobuf messages carrying the load record
+        """
+        if not wants_loads_only(request):
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, NO_KV_EVENTS)
+            return
+        logger.info("Load record subscription opened")
+        stream = LoadRecordStream(self.request_manager.load_record)
+        try:
+            async for batch in stream.batches(cancelled=context.cancelled):
+                yield batch
+        finally:
+            logger.info("Load record subscription closed")
+
+    async def GetLoads(
+        self,
+        request: Any,
+        context: grpc.aio.ServicerContext,
+    ) -> Any:
+        """Answer a load poll with the engine's current record as rank 0.
+
+        Registered by the generated server only when the installed ``smg-grpc-proto`` declares
+        the RPC; a router polls it when the pushed records stop.
+
+        Args:
+            request: The GetLoadsRequest protobuf
+            context: gRPC context
+
+        Returns:
+            GetLoadsResponse protobuf
+        """
+        return get_loads_response([self.request_manager.load_record()], version=_engine_version())
 
     # ========== Helper methods ==========
 
