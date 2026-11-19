@@ -22,10 +22,15 @@ import pytest
 
 import tensorrt_llm._torch.model_config as model_config_mod
 import tensorrt_llm._torch.models as models_mod
+import tensorrt_llm.inputs.registry as registry_mod
 from tensorrt_llm.inputs.registry import (
     INPUT_PROCESSOR_REGISTRY,
     DefaultInputProcessor,
+    InputProcessorRegistry,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderRegistry,
     create_input_processor,
+    register_input_processor,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -105,6 +110,32 @@ def _resolve_to_model_without_processor(monkeypatch: pytest.MonkeyPatch) -> None
         "get_model_architecture",
         lambda config: (_FakeTextOnlyModel, config.architectures[0]),
     )
+
+
+def test_registry_returns_the_input_processor_registered_for_a_model_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`get_input_processor_cls` returns what `register_input_processor` stored, else None."""
+    monkeypatch.setattr(registry_mod, "INPUT_PROCESSOR_REGISTRY", InputProcessorRegistry())
+    monkeypatch.setattr(
+        registry_mod, "MULTIMODAL_PLACEHOLDER_REGISTRY", MultimodalPlaceholderRegistry()
+    )
+
+    class _Model:
+        pass
+
+    class _Processor:
+        pass
+
+    register_input_processor(
+        _Processor,
+        model_type="fake_vision_language",
+        placeholder_metadata=MultimodalPlaceholderMetadata(placeholder_map={"image": "<image>"}),
+    )(_Model)
+
+    registry = registry_mod.INPUT_PROCESSOR_REGISTRY
+    assert registry.get_input_processor_cls(_Model) is _Processor
+    assert registry.get_input_processor_cls(_FakeTextOnlyModel) is None
 
 
 @pytest.mark.parametrize("checkpoint_format", ["HF", "MX"])

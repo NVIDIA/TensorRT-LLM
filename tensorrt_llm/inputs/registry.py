@@ -1140,6 +1140,11 @@ class InputProcessorRegistry:
         self._input_processors_cls_by_model_type: Dict[
             Type[nn.Module], Type[InputProcessor]] = {}
 
+    def get_input_processor_cls(
+            self, model_cls: Type[nn.Module]) -> Optional[Type[InputProcessor]]:
+        """Return the input processor class registered for ``model_cls``, or None."""
+        return self._input_processors_cls_by_model_type.get(model_cls)
+
 
 INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
 
@@ -1294,8 +1299,8 @@ def create_input_processor(
     if config is not None:
         try:
             model_cls, _ = get_model_architecture(config)
-            input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
-                .get(model_cls)
+            input_processor_cls = INPUT_PROCESSOR_REGISTRY.get_input_processor_cls(
+                model_cls)
         except (RuntimeError, ConfigInputError,
                 UnsupportedError):  # unregistered model
             logger.info("Unregistered model, using DefaultInputProcessor")

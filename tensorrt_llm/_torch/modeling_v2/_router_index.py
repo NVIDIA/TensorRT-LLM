@@ -306,6 +306,71 @@ def _refuse_unhonored_moe_tactic(
     )
 
 
+def _architecture_takes_media(architecture: str) -> bool:
+    """Whether requests for ``architecture`` can carry media: the input processor registered
+    for its built-in class, which the LLM API serves every deployment of it with, is a
+    multimodal one."""
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm.inputs.registry import INPUT_PROCESSOR_REGISTRY, BaseMultimodalInputProcessor
+
+    model_cls = get_registered_model_class(architecture)
+    processor_cls = INPUT_PROCESSOR_REGISTRY.get_input_processor_cls(model_cls)
+    return processor_cls is not None and issubclass(processor_cls, BaseMultimodalInputProcessor)
+
+
+def _check_multimodal_contract(target: type, architecture: str) -> None:
+    """Raise ``ValueError`` when a target of an architecture whose requests can carry media
+    neither runs media through the multimodal runtime nor refuses it at admission.
+
+    The first is a ``ModelingV2ForConditionalGeneration`` (``multimodal.py``), or any other
+    ``MultimodalModelMixin`` model or class that sets the ``supports_multimodal`` marker; the
+    second defines ``validate_multimodal_request_data`` and raises there on media. A target that
+    encodes media in its own forward refuses what its tower cannot take in a ``validate_request``
+    of its own class; an inherited one, such as a token range check, does not count. A target
+    that does none of these would run placeholder tokens as text or fail a whole batch
+    in ``forward``: a bug in the target, so this raises in every mode (a plain ``ValueError``,
+    not a ``NoTarget``).
+    """
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+
+    if (
+        issubclass(target, MultimodalModelMixin)
+        or getattr(target, "supports_multimodal", False) is True
+        or callable(getattr(target, "validate_multimodal_request_data", None))
+        or callable(vars(target).get("validate_request"))
+    ):
+        return
+    if _architecture_takes_media(architecture):
+        raise ValueError(
+            f"{target.__qualname__} is the target for {architecture!r}, whose requests can "
+            "carry images, videos or audio. Make it a ModelingV2ForConditionalGeneration "
+            "subclass to serve media, or define validate_multimodal_request_data to refuse "
+            "media at admission and serve text only."
+        )
+
+
+def _refuse_encoder_side_stream(config: "ModelConfig", target: type) -> None:
+    """Raise ``NoTarget`` when a ``ModelingV2ForConditionalGeneration`` target would build its
+    tower and the engine runs the encoder on a side stream: the base runs its encoder inside
+    the step only. ``auto`` then uses the built-in implementation. An encoder-only deployment
+    (``mm_encoder_only``) builds the architecture's encoder model, not this one."""
+    from .multimodal import ModelingV2ForConditionalGeneration
+
+    if (
+        not issubclass(target, ModelingV2ForConditionalGeneration)
+        or config.disable_mm_encoder
+        or config.mm_encoder_only
+    ):
+        return
+    mm_config = config.multimodal_config
+    if mm_config is not None and mm_config.encoder_side_stream_max_ahead > 0:
+        raise NoTarget(
+            "multimodal_config.encoder_side_stream_max_ahead="
+            f"{mm_config.encoder_side_stream_max_ahead}; {target.__name__} does not run its "
+            "encoder on a side stream"
+        )
+
+
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
@@ -314,7 +379,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     for the architecture, or when that ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
     It also returns None for a ``@disable_v2_by_default`` target when
-    ``modeling_v2`` was left at its default.
+    ``modeling_v2`` was left at its default. A target that breaks the multimodal
+    contract (:func:`_check_multimodal_contract`) raises in every mode.
 
     """
     mode = ModelingV2Mode.of(llm_args)
@@ -334,6 +400,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         target = route(config, llm_args, _device_compute_capability())
         if target is not None:
             _refuse_unhonored_moe_tactics(config, target, arch)
+            _check_multimodal_contract(target, arch)
+            _refuse_encoder_side_stream(config, target)
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None

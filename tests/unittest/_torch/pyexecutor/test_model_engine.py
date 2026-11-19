@@ -692,6 +692,29 @@ def test_model_engine_resolves_multimodal_prefill_graphs_before_validation(
         assert engine.llm_args.torch_compile_config is None
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("takes_rows", [False, True], ids=["fused", "language_model_takes_rows"])
+def test_breakable_gate_for_a_composite_model_with_its_own_tower(takes_rows: bool) -> None:
+    """A composite model whose language model is a decoder, with a local tower. When the
+    language model takes `input_ids` and places the rows itself (`language_model_takes_rows`),
+    as it does when routed alone, the breakable prefill graph is allowed; with the rows fused
+    into `inputs_embeds` it is refused at startup. The message is not matched."""
+    engine = object.__new__(ModelEngine)
+    engine.model = DummyLegacyMultimodalIndexModel()
+    engine.model.llm = Mock(spec=DecoderModelForCausalLM)
+    engine.model.mm_encoder = torch.nn.Module()
+    engine.model.language_model_takes_rows = takes_rows
+    engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+    engine.llm_args = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE, disable_mm_encoder=False
+    )
+    if takes_rows:
+        engine._validate_breakable_cuda_graph_compatibility()
+    else:
+        with pytest.raises(ValueError):
+            engine._validate_breakable_cuda_graph_compatibility()
+
+
 class ModelEngineTestCase(unittest.TestCase):
     def test_breakable_allows_text_decoder_with_multimodal_processor(self) -> None:
         engine = object.__new__(ModelEngine)

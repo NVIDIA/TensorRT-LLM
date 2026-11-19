@@ -905,10 +905,13 @@ class ModelEngine:
         if isinstance(self.model, DecoderModelForCausalLM):
             return
         decoder_model = getattr(self.model, "llm", None)
-        if (
-            self.llm_args.disable_mm_encoder
-            and isinstance(decoder_model, DecoderModelForCausalLM)
-            and getattr(self.model, "mm_encoder", None) is None
+        if isinstance(decoder_model, DecoderModelForCausalLM) and (
+            # The language model takes `input_ids` and places the rows itself, so its graph
+            # runs as for the decoder alone.
+            getattr(self.model, "language_model_takes_rows", False)
+            or (
+                self.llm_args.disable_mm_encoder and getattr(self.model, "mm_encoder", None) is None
+            )
         ):
             return
         if isinstance(self.model, MultimodalModelMixin) or isinstance(
