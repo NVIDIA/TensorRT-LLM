@@ -14,8 +14,6 @@ metadata:
   author: NVIDIA Corporation
 ---
 
-<!-- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
-
 # TensorRT-LLM MoE Checklist
 
 `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` and the code hold the
@@ -23,10 +21,10 @@ answers; this skill holds only the questions, because reading the guide does
 not by itself bring all of them up. Read the guide first. For a design or a
 review, answer each question that applies with file:line evidence from the
 code; a question the code cannot answer is a finding. The section named after a
-question is where the guide answers it. For runtime behavior, where the guide
-and code disagree, the code wins: fix the guide or report it. For test
-organization, follow the guide's rules. In a review, weigh owner boundaries
-and testability above local style.
+question is where the guide answers it. Where the guide and the code disagree
+on runtime behavior, the code wins: fix the guide in the same change or report
+it. For test organization, follow the guide's rules. In a review,
+weigh owner boundaries and testability above local style.
 
 ## Implementations and selection
 

@@ -415,53 +415,27 @@ including fused steps, helpers and CI selection. Source paths are relative to
 `tensorrt_llm/_torch/modeling_v2/`; test paths below are relative to
 `tests/unittest/_torch/modeling_v2/`.
 
-- **ST-MOE-01 — Identify the tested behavior.** Trace the actual MoE call path
-  and identify the implementation, model usage or shared-op contract being
-  tested. Filenames and `torch.ops.trtllm.*` registration alone do not establish
-  ownership. Shared-op coverage does not replace target-specific usage coverage.
-- **ST-MOE-02 — Mirror the source layout.** Model-owned tests belong under
-  `models/<family>/` or `models/<family>/<target>/`, following the relevant
-  source component, without requiring an extra `moe/` directory. A fused step
-  is tested where that step lives. Target-specific shape, weight or execution
-  matrices stay with the target even when they call family-shared code; promote
-  them only when they verify a shared family contract. Router/finalize tests
-  can follow the MoE component even when they import `modeling.py`.
-- **ST-MOE-03 — Reuse shared-op coverage.** Put contracts of MoE ops/wrappers
-  shared across ModelV2 families in `moe/ops/`. Extend existing files and
-  parameter matrices instead of copying them into models. Test a wrapper's
-  additional behavior at its own shared, family or target scope.
-- **ST-MOE-04 — Keep helpers and mixed tests with their owners.** Shared MoE
-  references and input generators belong in `moe/`; family/target setup stays
-  local. Determine helper ownership from its consumers. Classify mixed files
-  by case: independent communication or other component tests keep their own
-  home, while model-specific MoE combinations follow the model.
-- **ST-MOE-05 — Preserve coverage.** A move preserves parameters, assertions,
-  references, tolerances, fixtures, markers and skip conditions. Deletion or
-  merging needs equivalent replacement coverage; explain behavior changes
-  separately. New tests should assert the changed contract with a justified
-  reference/tolerance and evidence that the intended path executes, including
-  state or replay behavior where supported. Whole-model accuracy is not a
-  substitute for MoE-specific tests.
-- **ST-MOE-06 — Preserve CI execution.** Update affected imports, launchers,
-  test IDs, test lists, waives, path triggers and documentation. Preserve
-  effective selection on each affected platform, including directory selection
-  and precise file/function selectors. Retain hardware, device count,
-  CPU/GPU and serial/parallel classification, timeouts and isolation; avoid
-  missing or duplicate runs. Directory moves do not justify changing CI
-  frequency or cost.
-- **ST-MOE-07 — Validate the move.** Map old cases to new ones and compare
-  default, `cpu_only` and `not cpu_only` collection. Run affected tests with
-  their required hardware and launch method; record commands, build/revision,
-  hardware and results. Distinguish passes from skips, collection-only checks
-  and untested scope. Use a matched baseline to identify existing failures.
-- **ST-MOE-08 — Keep common extraction separate.** Record candidates for
-  sharing with non-Staircase `tests/unittest/_torch/moe/`; cross-path extraction
-  is a separate task. Existing duplication across those paths does not require
-  immediate migration; shared tests within Staircase still follow rules 03–04.
-- **ST-MOE-09 — Review against these rules.** Review the full PR diff and
-  existing coverage. Report violations with the file/case, rule and suggested
-  correction, and identify missing validation. Adding a new test file is not
-  required when existing tests already cover the changed behavior.
+Determine behavior and ownership from the call path and assertions, not
+filenames, imports or op registration alone.
+
+- **ST-MOE-01 — Mirror the source layout.** Model-owned tests belong under
+  `models/<family>/` or `models/<family>/<target>/`, mirroring the tested
+  component without requiring an extra `moe/`. Keep target-specific matrices
+  with the target, even when calling family-shared code.
+- **ST-MOE-02 — Reuse shared-op coverage.** Keep cross-family MoE op/wrapper
+  contracts in `moe/ops/`. Extend existing tests and parameters; test additional
+  wrapper behavior at its owning scope. Shared-op tests do not replace
+  model-specific usage tests.
+- **ST-MOE-03 — Place helpers and mixed tests by ownership.** Keep cross-family
+  MoE helpers in `moe/` and family/target setup local; determine ownership from
+  consumers. Classify mixed files by case; independent components retain their
+  own test directories.
+- **ST-MOE-04 — Cover changed behavior.** MoE behavior changes need direct test
+  coverage. Existing tests may provide this coverage. Whole-model accuracy
+  alone is insufficient.
+- **ST-MOE-05 — Ensure CI execution.** Ensure CI selects the intended tests and
+  runs them with the required hardware, device count and execution mode. Avoid
+  missed or duplicate runs.
 
 ## Implementation Families
 
