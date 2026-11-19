@@ -101,9 +101,37 @@ def test_text_prompt_embeds_batched_with_image(llm: LLM, model_dir: str) -> None
     assert _run(llm, requests) == expected
 
 
-def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str) -> None:
+@pytest.mark.parametrize("chunked", [False, True], ids=["one_chunk", "chunked"])
+def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str, chunked: bool) -> None:
     # The mask indexes the ids before the image placeholder expands. Swap two
     # words around the image through embeddings only; the reference swaps the ids.
+    # Chunked: the image splits the two rows into different 32-token chunks.
+    if chunked:
+        with LLM(
+            model=model_dir,
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=0.3, enable_block_reuse=True, tokens_per_block=32
+            ),
+            enable_chunked_prefill=True,
+            max_num_tokens=32,
+            max_batch_size=1,
+        ) as chunked_llm:
+            _check_image_swap(chunked_llm, model_dir, reuse=True)
+        return
+    _check_image_swap(llm, model_dir, reuse=False)
+    table = _text_embedding_table(model_dir)
+    image = _image_request(llm, model_dir)
+    ids = llm.tokenizer.encode(image["prompt"], add_special_tokens=False)
+    plain = {"prompt_token_ids": ids, "multi_modal_data": image["multi_modal_data"]}
+    image_pos = ids.index(llm.tokenizer.convert_tokens_to_ids("<|image_pad|>"))
+    on_image = [p == image_pos for p in range(len(ids))]
+    with pytest.raises(ValueError, match="multimodal placeholder"):
+        llm.generate(
+            {**plain, "prompt_embeds": table[:1], "prompt_embeds_mask": on_image}, _greedy()
+        )
+
+
+def _check_image_swap(llm: LLM, model_dir: str, reuse: bool) -> None:
     table = _text_embedding_table(model_dir)
     image = _image_request(llm, model_dir)
     ids = llm.tokenizer.encode(image["prompt"], add_special_tokens=False)
@@ -119,14 +147,12 @@ def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str) -> No
         "prompt_embeds": table[torch.tensor([ids[after], ids[before]])],
         "prompt_embeds_mask": [p in (before, after) for p in range(len(ids))],
     }
-    assert _run(llm, [request]) == _run(llm, [{**plain, "prompt_token_ids": swapped_ids}])
-
-    image_pos = ids.index(llm.tokenizer.convert_tokens_to_ids("<|image_pad|>"))
-    on_image = [p == image_pos for p in range(len(ids))]
-    with pytest.raises(ValueError, match="multimodal placeholder"):
-        llm.generate(
-            {**plain, "prompt_embeds": table[:1], "prompt_embeds_mask": on_image}, _greedy()
-        )
+    expected = _run(llm, [{**plain, "prompt_token_ids": swapped_ids}])
+    salt = uuid.uuid4().hex
+    for repeat in (False, True) if reuse else (False,):
+        out = llm.generate([request], _greedy(), cache_salt=salt)[0]
+        assert [list(out.outputs[0].token_ids)] == expected
+        assert (out.cached_tokens > 0) == repeat
 
 
 def _video_request(llm: LLM) -> dict:
