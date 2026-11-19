@@ -18,8 +18,6 @@ import re
 from collections.abc import Mapping
 from typing import List, Optional
 
-from partial_json_parser.core.options import Allow
-
 from tensorrt_llm.llmapi.inkling_tokens import (
     INKLING_CONTROL_TOKENS,
     INKLING_END_MESSAGE,
@@ -31,7 +29,6 @@ from tensorrt_llm.logger import logger
 from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .base_tool_parser import BaseToolParser
 from .core_types import StreamingParseResult, StructureInfo, ToolCallItem, _GetInfoFunc
-from .utils import is_complete_json, partial_json_loads
 
 
 class InklingToolParser(BaseToolParser):
@@ -173,42 +170,24 @@ class InklingToolParser(BaseToolParser):
             # reference implementation returns the text first and leaves the call for the next
             # delta), so a delta that carries both is reported whole.
 
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
-        start_idx = len(self.bot_token)
-        while start_idx < len(current_text) and current_text[start_idx].isspace():
-            start_idx += 1
-
-        try:
-            # Partial strings are not needed: a call is reported only once its payload is whole.
-            payload, end_idx = partial_json_loads(current_text[start_idx:], Allow.ALL & ~Allow.STR)
-        except (ValueError, AssertionError, IndexError):
-            # partial_json_parser reports malformed input as any of these (its own and the json
-            # module's decode errors are ValueErrors; some shapes fail an internal assertion).
-            # Malformed for good once its end token has arrived: drop just this invocation.
-            end_pos = current_text.find(self.eot_token, start_idx)
-            if end_pos < 0:
-                return pending_normal, [], False
-            payload_text = current_text[start_idx:end_pos]
-            logger.warning(f"Inkling tool call payload is not JSON: {payload_text!r}")
-            self._buffer = current_text[end_pos + len(self.eot_token) :]
-            self._current_header_name = None
-            return pending_normal, [], True
-        if not is_complete_json(current_text[start_idx : start_idx + end_idx]):
+        end_pos = current_text.find(self.eot_token, len(self.bot_token))
+        if end_pos < 0:
+            # A call is judged whole, as the one-shot parse judges it: the payload is everything
+            # between the marker and its end token, so a call waits for that token.
             return pending_normal, [], False
-
-        # The payload is whole: report the call, or drop this invocation only. Announcing the name
-        # earlier would leave a call the client already saw when the rest of the payload fails.
-        if isinstance(payload, Mapping):
-            call = self._tool_call_item(
-                payload, tools, self.current_tool_id, header_name=self._current_header_name
-            )
-        else:
+        payload_text = current_text[len(self.bot_token) : end_pos].strip()
+        self._buffer = current_text[end_pos + len(self.eot_token) :]
+        header_name, self._current_header_name = self._current_header_name, None
+        # Report the call, or drop this invocation only and parse on after it.
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            logger.warning(f"Inkling tool call payload is not JSON: {payload_text!r}")
+            return pending_normal, [], True
+        if not isinstance(payload, Mapping):
             logger.warning(f"Invalid Inkling tool call payload: {payload}")
-            call = None
-        self._buffer = self._remaining_after_call(current_text, start_idx + end_idx)
-        self._current_header_name = None
+            return pending_normal, [], True
+        call = self._tool_call_item(payload, tools, self.current_tool_id, header_name=header_name)
         if call is None:
             return pending_normal, [], True
 
@@ -304,14 +283,6 @@ class InklingToolParser(BaseToolParser):
             if text.endswith(token[:length]):
                 return length
         return 0
-
-    def _remaining_after_call(self, text: str, end_idx: int) -> str:
-        remaining = text[end_idx:]
-        if remaining.startswith(self.eot_token):
-            return remaining[len(self.eot_token) :]
-        if self.eot_token in remaining:
-            return remaining.split(self.eot_token, 1)[1]
-        return remaining
 
     def _clean_normal_text(self, text: str) -> str:
         for token in INKLING_CONTROL_TOKENS:

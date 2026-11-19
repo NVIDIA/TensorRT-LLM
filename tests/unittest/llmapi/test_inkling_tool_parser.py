@@ -257,7 +257,7 @@ def test_streaming_malformed_payload_keeps_the_next_call():
 
 
 def test_final_increment_with_two_calls_drains_exactly_once():
-    """Both calls of a last delta are reported once; finish() adds nothing."""
+    """The last delta reports both of its calls itself; finish() has nothing left to add."""
     tools = _tools("a", "b")
     parser = _parser()
     first = parser.parse_streaming_increment(f"{CT}checking{EM}", tools)
@@ -265,10 +265,11 @@ def test_final_increment_with_two_calls_drains_exactly_once():
         _call("a", {"x": 1}) + _call("b", {"y": 2}) + f"{CT}ok", tools
     )
     tail = parser.finish(tools)
-    calls = first.calls + last.calls + tail.calls
-    assert [(c.tool_index, c.name) for c in calls if c.name] == [(0, "a"), (1, "b")]
-    assert _assembled(calls) == [("a", json.dumps({"x": 1})), ("b", json.dumps({"y": 2}))]
-    assert first.normal_text + last.normal_text + tail.normal_text == "checkingok"
+    assert not first.calls and first.normal_text == "checking"
+    assert [(c.tool_index, c.name) for c in last.calls if c.name] == [(0, "a"), (1, "b")]
+    assert _assembled(last.calls) == [("a", json.dumps({"x": 1})), ("b", json.dumps({"y": 2}))]
+    assert last.normal_text == "ok"
+    assert not tail.calls and tail.normal_text == ""
 
 
 @pytest.mark.parametrize(
@@ -285,12 +286,37 @@ def test_finish_releases_held_text_but_not_a_tool_header(held, expected):
     assert not streamed.calls and not tail.calls
 
 
-def test_finish_drops_an_unfinished_invocation():
+@pytest.mark.parametrize(
+    "unfinished",
+    [f'{MM}f{IT}{{"name":"f","ar', f'{MM}f{IT}{{"name":"f","args":{{}}}}'],
+    ids=["partial_payload", "payload_without_end_token"],
+)
+def test_finish_drops_an_unfinished_invocation(unfinished):
+    """Without its end token an invocation is not a call, as in the one-shot parse."""
     parser = _parser()
-    streamed = parser.parse_streaming_increment(f'{MM}f{IT}{{"name":"f","ar', _tools("f"))
+    streamed = parser.parse_streaming_increment(unfinished, _tools("f"))
     tail = parser.finish(_tools("f"))
+    assert not streamed.calls and not tail.calls
     assert streamed.normal_text + tail.normal_text == ""
+    assert not _parser().detect_and_parse(unfinished, _tools("f")).calls
+
+
+def test_streaming_judges_the_whole_framed_payload():
+    """Streaming judges a call by its whole framed payload, as the one-shot parse does.
+
+    A complete object followed by other text before the end token is malformed; a call whose end
+    token comes in a later delta is reported then.
+    """
+    tools = _tools("f", "g")
+    head = f'{MM}f{IT}{{"name":"f","args":{{}}}}'
+    parser = _parser()
+    deltas = [head, f"not-json{EM}", _call("g", {"y": 2})[: -len(EM)], EM]
+    results = [parser.parse_streaming_increment(d, tools) for d in deltas]
+    tail = parser.finish(tools)
+    assert [bool(r.calls) for r in results] == [False, False, False, True]
+    assert _assembled(results[-1].calls) == [("g", json.dumps({"y": 2}))]
     assert not tail.calls
+    assert [c.name for c in _parser().detect_and_parse("".join(deltas), tools).calls] == ["g"]
 
 
 def test_structure_info_round_trip():
