@@ -173,9 +173,12 @@ class ADPIterStatsBuffer:
     """
 
     def __init__(
-        self, activity_snapshot: Callable[[], ConversationActivityStats | None] | None = None
+        self,
+        activity_snapshot: Callable[[], ConversationActivityStats | None] | None = None,
+        transfer_outcomes_snapshot: Callable[[], tuple[int, int, int] | None] | None = None,
     ) -> None:
         self._activity_snapshot = activity_snapshot
+        self._transfer_outcomes_snapshot = transfer_outcomes_snapshot
         # All ranks: local per-iteration payloads waiting to piggyback on the
         # next ADP rank-state allgather.
         self._payloads: Dict[int, RankIterStatsPayload] = {}
@@ -256,12 +259,18 @@ class ADPIterStatsBuffer:
     def next_payload(self) -> Optional[RankIterStatsPayload]:
         """Return the oldest pending stats payload to piggyback."""
         payload = self._payloads[self._oldest_iter] if self._oldest_iter is not None else None
-        if self._activity_snapshot is None:
-            return payload
-        activity = self._activity_snapshot()
-        if activity is None:
-            return payload
-        return replace(payload or RankIterStatsPayload(), conversation_activity=activity)
+        updates = {}
+        if self._activity_snapshot is not None:
+            activity = self._activity_snapshot()
+            if activity is not None:
+                updates["conversation_activity"] = activity
+        if self._transfer_outcomes_snapshot is not None:
+            outcomes = self._transfer_outcomes_snapshot()
+            if outcomes is not None:
+                updates["kv_transfer_outcomes"] = outcomes
+        # Outcome counters describe the current endpoint, including work that
+        # settled after the last measured batch or a queued/synthetic payload.
+        return replace(payload or RankIterStatsPayload(), **updates) if updates else payload
 
     @staticmethod
     def rank0_sent_payload(all_rank_states: List[RankState]) -> bool:

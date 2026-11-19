@@ -1350,6 +1350,8 @@ class PyExecutor:
         self._pending_iter_stats_dict: Optional[Dict] = None
         self._last_published_transfer_outcomes: Optional[tuple[int, int,
                                                                int]] = None
+        self._last_published_adp_transfer_outcomes: Dict[int, tuple[int, int,
+                                                                    int]] = {}
         # Legacy ADP dummy role for overlap and PP fallback paths. The generic
         # non-overlap path derives its role from fresh per-iteration intent.
         self._adp_dummy_is_gen: bool = True
@@ -1705,8 +1707,9 @@ class PyExecutor:
         self._last_published_conversation_activity: Dict[
             int, ConversationActivityStats] = {}
         self._adp_iter_stats = ADPIterStatsBuffer(
-            activity_snapshot=self._snapshot_conversation_activity if self.
-            _conversation_manager is not None else None)
+            activity_snapshot=self._snapshot_conversation_activity
+            if self._conversation_manager is not None else None,
+            transfer_outcomes_snapshot=self._snapshot_transfer_outcomes)
         # Per-loop CPU wall and GPU forward time captured by the profile_step
         # closure (see _profiler). Populated whenever enable_iter_perf_stats or
         # print_iter_log is on so the /metrics serializer can read them
@@ -9029,9 +9032,42 @@ class PyExecutor:
                 }))
                 self._last_published_conversation_activity[rank] = snapshot
 
-    def _publish_transfer_outcomes(self) -> None:
-        """Publish changed terminal counts before an idle request wait."""
-        if not self.enable_iter_perf_stats or self.enable_attention_dp:
+    def _snapshot_transfer_outcomes(self) -> Optional[tuple[int, int, int]]:
+        if not self.enable_iter_perf_stats:
+            return None
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        return coordinator.transfer_outcomes if coordinator is not None else None
+
+    def _publish_transfer_outcomes(self,
+                                   rank_states: Optional[List[RankState]] = None
+                                   ) -> None:
+        """Publish changed endpoint counters, including outcome-only idle exchanges."""
+        if not self.enable_iter_perf_stats:
+            return
+        if self.enable_attention_dp:
+            if rank_states is None or self.dist.rank != 0:
+                return
+            snapshots: Dict[int, tuple[int, int, int]] = {}
+            for state in rank_states:
+                outcomes = state.iter_stats.kv_transfer_outcomes
+                if outcomes is not None and self._last_published_adp_transfer_outcomes.get(
+                        state.rank) != outcomes:
+                    snapshots[state.rank] = outcomes
+            if not snapshots:
+                return
+            with self.stats_lock:
+                for rank, outcomes in snapshots.items():
+                    if not _stats_buffer_is_unbounded(
+                            self.max_stats_len) and len(self.stats) >= max(
+                                1, self.max_stats_len):
+                        self.stats.pop(0)
+                    self.stats.append(("per_rank_dict", {
+                        "attentionDpRank":
+                        rank,
+                        "kvTransferOutcomes":
+                        dict(zip(("success", "error", "timeout"), outcomes)),
+                    }))
+                    self._last_published_adp_transfer_outcomes[rank] = outcomes
             return
         coordinator = self.__dict__.get("_disagg_coordinator")
         if coordinator is None:
@@ -9477,6 +9513,7 @@ class PyExecutor:
             idle_wait_follows: Whether the fleet has no live or waiting request.
         """
         while True:
+            self._publish_transfer_outcomes(all_rank_states)
             if getattr(self, "_conversation_manager", None) is not None:
                 self._publish_conversation_activity(all_rank_states)
             rows = self._adp_iter_stats.finalize(
@@ -12416,7 +12453,8 @@ class PyExecutor:
                         source_kv_request_owned=False,
                     )
         self._prefetched_request_ids.discard(request.py_request_id)
-        self.disagg.forget_request(request.py_request_id)
+        self.disagg.forget_request(request.py_request_id,
+                                   transfer_id=get_unique_rid(request))
         for engine in (self.model_engine, self.draft_model_engine):
             release = getattr(getattr(engine, "model", None),
                               "release_request_state", None)

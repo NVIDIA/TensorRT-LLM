@@ -933,7 +933,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
-        self.py_kv_transfer_outcome: str | None = None
         # Set once a received generation request's first token is found not
         # to end it, so the executor does not recheck it while it waits.
         self.py_first_token_checked = False

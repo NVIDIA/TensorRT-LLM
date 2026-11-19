@@ -103,7 +103,16 @@ def test_noop_coordinator_accepts_every_loop_call() -> None:
         _public_methods(DisaggTransferCoordinator) - {"admit"} - _LOOP_ENTRY_POINTS_EXCLUDED
     ):
         params = inspect.signature(getattr(noop, name)).parameters
-        getattr(noop, name)(*[Mock() for _ in params])
+        args = [
+            Mock()
+            for p in params.values()
+            if p.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        kwargs = {
+            key: Mock() for key, p in params.items() if p.kind == inspect.Parameter.KEYWORD_ONLY
+        }
+        getattr(noop, name)(*args, **kwargs)
 
 
 def test_noop_coordinator_refuses_release_transfer() -> None:

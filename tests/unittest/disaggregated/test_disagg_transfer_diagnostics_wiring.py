@@ -60,6 +60,7 @@ def _disagg_request(
     return SimpleNamespace(
         py_request_id=local_id,
         request_id=local_id,
+        state=None,
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=canonical_id),
         prompt_len=prompt_len,
     )
@@ -117,7 +118,9 @@ def _coordinator(
             world_size=1,
         ),
         effects=SimpleNamespace(revert_ctx_alloc=Mock()),
-        registry=SimpleNamespace(active_requests=lambda: list(active_requests)),
+        registry=SimpleNamespace(
+            active_requests=lambda: list(active_requests), canceled_request_ids=lambda: ()
+        ),
         enable_attention_dp=False,
         admission_controller=controller,
         is_kv_manager_v2=True,
@@ -1491,7 +1494,9 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
     assert request.py_request_id not in executor._prefetched_request_ids
-    executor._disagg_coordinator.forget_request.assert_called_once_with(request.py_request_id)
+    executor._disagg_coordinator.forget_request.assert_called_once_with(
+        request.py_request_id, transfer_id=5051
+    )
     for engine in (executor.model_engine, executor.draft_model_engine):
         engine.model.release_request_state.assert_called_once_with(request.py_request_id)
 
@@ -1952,3 +1957,151 @@ def test_transfer_failure_is_exported_before_idle_wait_without_another_batch(mon
     executor._last_published_conversation_activity.clear()
     executor._publish_conversation_activity(states)
     assert len(executor.stats) == 2
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "timeout"])
+def test_shared_receive_outcome_is_counted_once_until_last_candidate_is_forgotten(outcome):
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
+
+    requests = [_disagg_request(i, 73) for i in (1, 2, 3)]
+    for request in requests:
+        request.is_child, request.parent_request_id = True, 10
+    coordinator = _coordinator(active_requests=requests)
+    coordinator._check_transfer_errors = Mock()
+    coordinator.inflight_cancel_active = lambda: False
+    coordinator._transceiver.check_gen_transfer_status = Mock(
+        return_value=GenTransferStatus(
+            [73] if outcome == "success" else [], [73] if outcome != "success" else [], []
+        )
+    )
+    if outcome == "timeout":
+        for request in requests:
+            request.py_kv_transfer_timed_out = True
+    coordinator.reap_gen_receives()
+    expected = tuple(int(name == outcome) for name in ("success", "error", "timeout"))
+    assert coordinator.transfer_outcomes == expected
+    while requests:
+        request = requests.pop(0)
+        coordinator.forget_request(request.py_request_id, transfer_id=73)
+        coordinator.reap_gen_receives()
+        assert coordinator.transfer_outcomes == expected
+    assert not coordinator._settled_transfer_ids
+    coordinator._record_transfer_outcome(_disagg_request(4, 73), "success")
+    assert coordinator.transfer_outcomes == (expected[0] + 1, expected[1], expected[2])
+
+
+def test_native_async_failure_is_counted_before_consensus_cleanup():
+    request = _disagg_request(1, 73)
+    request.is_child = False
+    request.is_generation_only_request = True
+    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+    requests = [request]
+    coordinator = _coordinator(active_requests=requests)
+
+    def fail(_message, failed, **_kwargs):
+        assert failed == [request]
+        assert coordinator.transfer_outcomes == (0, 1, 0)
+        requests.clear()
+
+    coordinator._effects.fail_requests = Mock(side_effect=fail)
+    coordinator._check_gen_transfer_errors_consensus()
+    coordinator._check_gen_transfer_errors_consensus()
+    assert coordinator.transfer_outcomes == (0, 1, 0)
+    coordinator._effects.fail_requests.assert_called_once()
+
+
+def test_native_receive_success_is_counted_before_cancelled_generation_handoff():
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
+
+    request = _disagg_request(1, 73)
+    request.is_child = False
+    coordinator = _coordinator(active_requests=[request])
+    coordinator._registry.canceled_request_ids = lambda: {1}
+    coordinator._check_transfer_errors = Mock()
+    coordinator.inflight_cancel_active = lambda: True
+    coordinator._check_gen_transfer_errors_consensus = Mock()
+    coordinator._retire_cancelled_gen_receives = Mock()
+
+    def poll(_at_least):
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        return GenTransferStatus([], [], [])
+
+    coordinator._transceiver.check_gen_transfer_status = Mock(side_effect=poll)
+    coordinator.reap_gen_receives()
+    assert coordinator.transfer_outcomes == (1, 0, 0)
+    coordinator.reap_gen_receives()
+    assert coordinator.transfer_outcomes == (1, 0, 0)
+
+
+@pytest.mark.parametrize("payload_kind", ["idle", "queued", "synthetic"])
+def test_adp_idle_exchange_exports_current_source_rank_transfer_outcomes(payload_kind):
+    from prometheus_client import CollectorRegistry
+
+    from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
+    from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
+    from tensorrt_llm.executor.base_worker import BaseWorker
+    from tensorrt_llm.metrics.collector import MetricsCollector
+
+    executors = []
+    for rank in range(2):
+        executor = object.__new__(PyExecutor)
+        executor.enable_iter_perf_stats = executor.enable_attention_dp = True
+        executor.dist = SimpleNamespace(rank=rank)
+        executor.stats_lock, executor.stats = threading.Lock(), []
+        executor.max_stats_len = 2
+        executor._last_published_adp_transfer_outcomes = {}
+        executor._stats_scheduler_mode = lambda: "non_overlap"
+        executor._disagg_coordinator = SimpleNamespace(transfer_outcomes=(0, 0, 0))
+        executor._adp_iter_stats = ADPIterStatsBuffer(
+            transfer_outcomes_snapshot=executor._snapshot_transfer_outcomes
+        )
+        executors.append(executor)
+    rank0, rank1 = executors
+    if payload_kind == "queued":
+        stats = IterationStats()
+        stats.iter, stats.inflight_batching_stats = 9, InflightBatchingStats()
+        rank1._adp_iter_stats.queue(stats, is_rank0=False, kv_transfer_outcomes=(0, 0, 0))
+    elif payload_kind == "synthetic":
+        rank1._adp_iter_stats._ensure_zero_payload(9)
+    collector = MetricsCollector({"model_name": "test"}, registry=CollectorRegistry())
+
+    def exchange():
+        states = [
+            RankState.deserialize(
+                RankState(
+                    rank=ex.dist.rank, iter_stats=ex._adp_iter_stats.next_payload()
+                ).serialize()
+            )
+            for ex in executors
+        ]
+        for ex in executors:
+            ex._publish_adp_iter_stats(states, idle_wait_follows=False)
+        assert rank1.stats == []
+
+    for count in (1, 2):
+        rank1._disagg_coordinator.transfer_outcomes = (0, count, 0)
+        exchange()
+        assert len(rank0.stats) == (2 if count == 1 else 1)
+        for entry in rank0.stats:
+            row = json.loads(BaseWorker._stats_serializer(entry))
+            assert set(row) == {"attentionDpRank", "kvTransferOutcomes"}
+            collector.log_iteration_stats(row)
+        rank0.stats.clear()
+        assert (
+            collector._registry.get_sample_value(
+                "trtllm_kv_cache_transfer_requests_total",
+                {**collector.labels, "dp_rank": "1", "outcome": "error"},
+            )
+            == count
+        )
+        assert (
+            collector._registry.get_sample_value(
+                "trtllm_kv_cache_transfer_requests_total",
+                {**collector.labels, "dp_rank": "0", "outcome": "error"},
+            )
+            == 0
+        )
+        exchange()
+        assert rank0.stats == []
+    assert not rank0._adp_iter_stats._payloads
