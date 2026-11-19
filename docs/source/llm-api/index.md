@@ -242,7 +242,7 @@ configured environment variable takes precedence.
 | `TORCHINDUCTOR_CACHE_DIR` | `/tmp/torchinductor_$USER` | `inductor` |
 | `TRITON_CACHE_DIR` | `$HOME/.triton/cache` | `triton` |
 | `TORCH_EXTENSIONS_DIR` | `$HOME/.cache/torch_extensions` | `torch_extensions` |
-| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/flashinfer` | `flashinfer` |
+| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/tensorrt_llm/flashinfer/rank-N` in MPI workers (see below), `$HOME/.cache/flashinfer` otherwise | `flashinfer/rank-N` in MPI workers, `flashinfer` otherwise |
 | `CUTE_DSL_CACHE_DIR` | `/tmp/$USER/cutlass_python_cache` | `cute_dsl` |
 | `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
 | `TLLM_JIT_SHARE_DIR` | Disabled | Not set (one directory per launch, see below) |
@@ -399,6 +399,14 @@ concurrent MPI processes never write to each other's compiler inputs while JIT
 artifacts stay warm across launches. Set
 `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking the launcher or
 creating the LLM instance to disable this behavior.
+
+Workspaces outside these slots, such as FlashInfer's default
+`~/.cache/flashinfer`, are not reused. The first launch, and each additional
+slot that concurrent jobs claim, downloads and compiles FlashInfer artifacts
+again. On a host without network access, pre-populate an explicit
+`FLASHINFER_CUBIN_DIR` and set `FLASHINFER_NO_DOWNLOAD=1` as described below,
+or set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to keep using the shared
+workspace.
 
 Downloaded TRTLLM-Gen FMHA kernel cubins are the exception: FlashInfer only
 loads them and never compiles them, so ranks with persistent slots share them

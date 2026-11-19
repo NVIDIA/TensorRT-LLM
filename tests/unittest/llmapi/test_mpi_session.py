@@ -302,7 +302,9 @@ def flashinfer_environment_probe():
 
 @pytest.mark.cpu_only
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
-def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
+@pytest.mark.parametrize("pool_sizes", [(2, ), (1, 1)])
+def test_mpi_pool_session_flashinfer_workspace_isolation(
+        monkeypatch: pytest.MonkeyPatch, pool_sizes: tuple[int, ...]) -> None:
     # A singleton spawn reuses OpenMPI's already-running DVM once one exists in
     # this process, so a spawned worker's HOME can't be relied on to follow a
     # monkeypatched HOME set here; compare against the real home directory
@@ -310,9 +312,20 @@ def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
     monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)
     monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
     monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", raising=False)
+    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_MANAGED", raising=False)
+    monkeypatch.delenv("TRTLLM_CACHE_DIR", raising=False)
 
-    with _pool_session(n_workers=2, wait_shutdown=True) as session:
-        worker_envs = _submit_sync(session, flashinfer_environment_probe)
+    # Pools are held open together, so their workers claim slots concurrently.
+    with contextlib.ExitStack() as stack:
+        sessions = [
+            stack.enter_context(
+                _pool_session(n_workers=pool_size, wait_shutdown=True))
+            for pool_size in pool_sizes
+        ]
+        worker_envs = [
+            worker_env for session in sessions for worker_env in _submit_sync(
+                session, flashinfer_environment_probe)
+        ]
 
     workspaces = {workspace for workspace, _ in worker_envs}
     cubin_dirs = {cubin_dir for _, cubin_dir in worker_envs}
@@ -692,6 +705,7 @@ _LAUNCHER_ENV_SCRUB = (
     "FLASHINFER_CUBIN_DIR",
     "TRTLLM_FLASHINFER_WORKSPACE_MANAGED",
     "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
+    "TRTLLM_CACHE_DIR",
 )
 
 
@@ -750,13 +764,13 @@ def _run_launcher_env(env: dict) -> subprocess.CompletedProcess:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("pmi_rank", ["0", None])
+@pytest.mark.parametrize("with_pmi_rank", [True, False])
 def test_llmapi_launch_isolates_single_rank(tmp_path: Path,
-                                            pmi_rank: str | None) -> None:
+                                            with_pmi_rank: bool) -> None:
     home = tmp_path / "home"
     home.mkdir()
     env = _launcher_env(tmp_path, str(home))
-    if pmi_rank is None:
+    if not with_pmi_rank:
         env.pop("PMI_RANK")
 
     result = _run_launcher_env(env)
@@ -767,6 +781,34 @@ def test_llmapi_launch_isolates_single_rank(tmp_path: Path,
     # The artifact cache must follow the per-rank workspace, so the launcher
     # must not pin FLASHINFER_CUBIN_DIR to a shared directory.
     assert "FLASHINFER_CUBIN_DIR=" not in result.stdout
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("unified_cache", [False, True])
+def test_llmapi_launch_single_rank_opt_out(tmp_path: Path,
+                                           unified_cache: bool) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    env = _launcher_env(tmp_path, str(home))
+    env.pop("PMI_RANK")
+    env["TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS"] = "0"
+    expected_workspaces = []
+    if unified_cache:
+        env["TRTLLM_CACHE_DIR"] = "~/unified"
+        expected_workspaces = [
+            f"FLASHINFER_WORKSPACE_BASE={home / 'unified' / 'flashinfer'}"
+        ]
+
+    result = _run_launcher_env(env)
+
+    stdout_lines = result.stdout.splitlines()
+    assert [
+        line for line in stdout_lines
+        if line.startswith("FLASHINFER_WORKSPACE_BASE=")
+    ] == expected_workspaces
+    assert not any(
+        line.startswith("TRTLLM_FLASHINFER_WORKSPACE_MANAGED=")
+        for line in stdout_lines)
 
 
 @pytest.mark.cpu_only
