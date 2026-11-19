@@ -295,6 +295,11 @@ def test_rejects_bad_requests(llm: LLM, table: torch.Tensor) -> None:
         )
     with pytest.raises(ValueError, match="cannot be combined"):
         llm.generate({"prompt": PROMPTS[0], "prompt_embeds": rows}, _greedy())
+    encoder = SimpleNamespace(max_seq_len=4096, max_num_tokens=4096, max_batch_size=8)
+    encoder.batch_forward = lambda *args, **kwargs: pytest.fail("encode() ran the model")
+    encode_only = SimpleNamespace(_encode_only=True, _encoder_executor=encoder)
+    with pytest.raises(ValueError, match="not supported by encode"):
+        LLM.encode(encode_only, {"prompt_token_ids": ids, "prompt_embeds": rows})
     # The engine keeps serving after rejected requests.
     assert llm.generate(ids, _greedy()).outputs[0].token_ids
 

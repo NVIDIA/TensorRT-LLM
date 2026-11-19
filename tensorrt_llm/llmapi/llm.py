@@ -1365,6 +1365,8 @@ class BaseLLM:
         batch_multi_item_part_lens = []
         for inp in inputs:
             inp = prompt_inputs(inp)
+            if "prompt_embeds" in inp or "prompt_embeds_mask" in inp:
+                raise ValueError("prompt_embeds is not supported by encode().")
             if "prompt_token_ids" in inp:
                 inp_tok = cast(TokensPrompt, inp)
                 multi_item_part_lens = inp_tok.get("multi_item_part_lens")
