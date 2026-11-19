@@ -904,6 +904,7 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         runner.config = SimpleNamespace(
             enable_in_graph_sampling=False,
             enable_attention_dp=True,
+            skip_adp_count_gather=False,
             mapping=SimpleNamespace(tp_size=2),
             dist=SimpleNamespace(tp_allgather_int64=allgather),
         )
@@ -1122,6 +1123,7 @@ class PackedSplitGraphKeyTestCase(unittest.TestCase):
         runner.config = SimpleNamespace(
             enable_in_graph_sampling=False,
             enable_attention_dp=True,
+            skip_adp_count_gather=False,
             mapping=SimpleNamespace(tp_size=2),
             dist=SimpleNamespace(tp_allgather_int64=allgather),
         )
