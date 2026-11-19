@@ -60,7 +60,12 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
-from .multimodal import MultimodalFeature, SupportsMultimodal, get_multimodal_data_device_paths
+from .multimodal import (
+    MultimodalFeature,
+    SupportsMultimodal,
+    _MultimodalOptOuts,
+    get_multimodal_data_device_paths,
+)
 
 
 class MultimodalEncoderContractError(ValueError):
@@ -432,7 +437,7 @@ class MultimodalModelMixin:
     supports_multimodal: ClassVar[Literal[True]] = True
     """Opt in to the shared model contract without requiring mixin inheritance."""
 
-    multimodal_opt_outs: ClassVar[Mapping[MultimodalFeature, str]] = {}
+    multimodal_opt_outs: ClassVar[_MultimodalOptOuts] = {}
     """Features excluded for every deployment, each with a reason and tracking ID."""
 
     supports_encoder_cache: ClassVar[bool] = False

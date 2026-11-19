@@ -388,6 +388,33 @@ extra host sync under overlap costs throughput only, which no gate sees.
 
 ## 6. Multimodal inputs
 
+Once the shared V2 composite lands, implement a media-serving target as `ModelingV2<Target>ForConditionalGeneration` on that base. A text-only target must reject both raw media and attached encoder rows at admission in `validate_multimodal_request_data`.
+
+V2 uses the same tiers, based on performance gain and implementation effort. P0 is required for every new model. Skipping a P0 feature needs an owner-approved entry in `APPROVED_EXCEPTIONS`. P1 is the next follow-up. Record a reason and tracking ID in `multimodal_opt_outs` for each P1 feature the model skips. P2 is optional. See the [multimodal onboarding tiers](../../../../../../../../.claude/skills/trtllm-model-onboard-multimodal/SKILL.md#multimodal-feature-tiers).
+
+<!-- BEGIN multimodal-feature-tiers -->
+| Feature | Tier | What the model must provide |
+| --- | --- | --- |
+| `contract` | P0 | Expose the language model and tower. Supply item order, row counts and input partitions. |
+| `text_only` | P0 | With `disable_mm_encoder`, omit the tower and refuse raw media and attached rows at admission. |
+| `uint8_media` | P0 | Accept the loader's default uint8 arrays or PIL images and honor processor normalization. |
+| `encoder_cache` | P0 | Return whole-item encoder rows with exact row counts and stable media hashes. |
+| `chunked_prefill_media` | P0 | Fuse only the media rows in the current prefill chunk. |
+| `kv_reuse_media` | P0 | Supply stable media hashes and token counts for prefix reuse. |
+| `llm_breakable_cuda_graph` | P0 | Keep encoder attention out of the decoder layer registry and prepare extra graph inputs. The check is structural until #21333 lands. |
+| `llm_piecewise_cuda_graph` | P0 | Scope piecewise prefill compilation to the decoder. The check is structural until #21333 lands. |
+| `encoder_dp` | P0 | Build the tower from the encoder config so replicas can encode whole items. The check is structural until #17330 lands. |
+| `item_scheduling` | P1 | Supply exact item costs, profiling inputs and encoder budgets. Moves to P0 when the runtime derives costs from item metadata. |
+| `supports_vision_gpu_normalize` | P1 | Provide processor statistics and a compatible tensor dtype and layout for normalization. |
+| `encoder_attention_backend` | P1 | Declare each tower's backends in the model class body. Let the engine size its attention metadata. |
+| `disagg_p_to_d` | P1 | Preserve media identity and export and restore mRoPE state across workers when used. |
+| `mm_encoder_groups` | P2 | Batch compatible items across requests. Moves to P1 when #21052 supplies the default builder. |
+| `encoder_cuda_graph` | P2 | Provide a graph capture adapter for the tower blocks. Moves to P1 when the default block adapter lands. |
+| `encoder_tp` | P2 | Shard tower weights under the encoder mapping. |
+| `disagg_e_to_p` | P2 | Accept attached rows with a complete item layout. |
+| `image_routing` | P2 | Qualify image KV events and routing before opting in. |
+<!-- END multimodal-feature-tiers -->
+
 **What.** An input processor prepares media, an encoder embeds it, and the
 embeddings replace placeholder tokens in the decoder's input
 (`docs/source/features/multi-modality.md`; onboarding hooks in

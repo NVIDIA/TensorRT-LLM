@@ -139,10 +139,12 @@ method signatures and does not turn on any feature.
 
 - Declare encoder caching and item scheduling separately. Item scheduling also
   needs the processor's item metadata and a runtime configuration that allows it.
-- List skipped `MultimodalFeature` values in `multimodal_opt_outs`, or in
-  `multimodal_feature_limits` when the skip depends on the deployment. The
-  [conformance suite](source:tests/unittest/_torch/multimodal/conformance) checks
-  them against the required features in the multimodal onboarding skill.
+- Record P1 skips with a reason and tracking ID in `multimodal_opt_outs`. Use
+  the `MultimodalFeature` value, or the guide's `supports_vision_gpu_normalize`
+  and `encoder_attention_backend` keys for those two requirements. Report
+  deployment-specific limits on runtime features in `multimodal_feature_limits`.
+  The [conformance suite](source:tests/unittest/_torch/multimodal/conformance)
+  checks skips against the multimodal onboarding tiers.
 - Declare attention backends in the `supported_encoder_attention_backends`
   class attribute. Its empty default declares none.
 - Keep the existing `MultimodalParams` inputs and tensor outputs. Selected items

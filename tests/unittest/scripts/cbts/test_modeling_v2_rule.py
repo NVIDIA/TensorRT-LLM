@@ -610,3 +610,21 @@ def test_stage_coverage_requires_an_affected_stage(
     assert _test_stages(result, index, stages, path)
     result.affected_stages.clear()
     assert not _test_stages(result, index, stages, path)
+
+
+def test_multimodal_contract_users_run_the_conformance_suite(rule):
+    """Routes, shared files and contract importers also run the multimodal conformance suite."""
+    cpu = next(block for block in rule.yaml_index.blocks if block.yaml_stem == "l0_cpu")
+    cpu.tests.append("unittest/_torch/multimodal")
+    target = rule._src_root / "models/kimi_k3_vl/target"
+    (target / "modeling.py").write_text(
+        "from tensorrt_llm._torch.models.multimodal import SupportsMultimodal\n"
+    )
+    (target / "vision.py").write_text("X = 1\n")
+    for path, runs in (
+        (f"{_PY}/models/kimi_k3_vl/target/vision.py", True),
+        (f"{_PY}/models/gpt_oss/{_GPT_OSS_TARGET}/modeling.py", False),
+        (f"{_PY}/models/gpt_oss/routing.py", True),
+        (f"{_PY}/multimodal.py", True),
+    ):
+        assert ("unittest/_torch/multimodal" in _selected(_apply(rule, path))) is runs, path

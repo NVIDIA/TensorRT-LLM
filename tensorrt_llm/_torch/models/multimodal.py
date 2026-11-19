@@ -48,6 +48,11 @@ class MultimodalFeature(StrEnum):
     UINT8_MEDIA = "uint8_media"
 
 
+_MultimodalOptOuts = Mapping[
+    MultimodalFeature | Literal["supports_vision_gpu_normalize", "encoder_attention_backend"], str
+]
+
+
 class SupportsMultimodal(Protocol):
     """The model-facing multimodal contract, independent of mixin inheritance.
 
@@ -67,7 +72,7 @@ class SupportsMultimodal(Protocol):
     """
 
     supports_multimodal: ClassVar[Literal[True]]
-    multimodal_opt_outs: ClassVar[Mapping[MultimodalFeature, str]]
+    multimodal_opt_outs: ClassVar[_MultimodalOptOuts]
     supports_encoder_cache: ClassVar[bool]
     supports_mm_encoder_item_scheduling: ClassVar[bool]
     supported_encoder_attention_backends: ClassVar[dict[str, frozenset[str]]]
