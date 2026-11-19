@@ -18,13 +18,15 @@
 
 import java.lang.InterruptedException
 
-DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
+TRTLLM_IMAGE_ARCH = params.ARCH == "aarch64" ? "sbsa" : "x86_64"
+DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-26.09-py3-${TRTLLM_IMAGE_ARCH}-ubuntu24.04-skip-tritondevel-202611160721-22039"
 ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
-def createKubernetesPodConfig(image, arch = "amd64")
+def createKubernetesPodConfig(image)
 {
-    def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def kubernetesArch = params.ARCH == "aarch64" ? "arm64" : "amd64"
+    def jnlpArchSuffix = params.ARCH == "aarch64" ? "arm" : "amd"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${jnlpArchSuffix}_linux:jdk17"
 
     def podConfig = [
         cloud: "kubernetes-cpu",
@@ -37,6 +39,7 @@ def createKubernetesPodConfig(image, arch = "amd64")
                 nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
+                  kubernetes.io/arch: ${kubernetesArch}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
@@ -100,6 +103,7 @@ pipeline {
     parameters {
         choice(name: "OPERATION", choices: ["Stats", "NormalClean", "NuclearClean", "Reset", "Config"], description: "Cache operation.")
         choice(name: "BASE", choices: ["NFS", "PVC"], description: "Base directory.")
+        choice(name: "ARCH", choices: ["x86_64", "aarch64"], description: "Cache architecture.")
     }
     stages {
         stage("Check or reset CCACHE") {
@@ -121,7 +125,8 @@ pipeline {
                             break
                         }
 
-                        withEnv(["CCACHE_DIR=${BASE_DIR}/scratch.trt_ccache/llm_ccache"]) {
+                        def cacheName = params.ARCH == "aarch64" ? "llm_ccache_aarch64" : "llm_ccache"
+                        withEnv(["CCACHE_DIR=${BASE_DIR}/scratch.trt_ccache/${cacheName}"]) {
                             sh "nproc && free -g && hostname"
                             sh "env | sort"
                             sh "pwd && ls -alh"
@@ -142,6 +147,7 @@ pipeline {
                                 sh "printf 'max_size=500G\ntemporary_dir=/tmp/ccache\ncompression=true\nbase_dir=/home/jenkins/agent/workspace/LLM\nsloppiness=file_macro,time_macros,pch_defines\n' > ${CCACHE_DIR}/ccache.conf"
                                 break
                               case "Config":
+                                sh "mkdir -p ${CCACHE_DIR}"
                                 sh "printf 'max_size=500G\ntemporary_dir=/tmp/ccache\ncompression=true\nbase_dir=/home/jenkins/agent/workspace/LLM\nsloppiness=file_macro,time_macros,pch_defines\n' > ${CCACHE_DIR}/ccache.conf"
                                 break
                               case "Stats":
@@ -149,7 +155,7 @@ pipeline {
                                 sh "cat ${CCACHE_DIR}/ccache.conf"
                                 sh "ls -alh ${BASE_DIR}"
                                 sh "ls -alh ${BASE_DIR}/scratch.trt_ccache"
-                                sh "ls -alh ${BASE_DIR}/scratch.trt_ccache/llm_ccache"
+                                sh "ls -alh ${CCACHE_DIR}"
                                 break
                               default:
                                 assert false, "Unknown operation"

@@ -218,15 +218,6 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false, stageNa
                   persistentVolumeClaim:
                     claimName: sw-tensorrt-pvc
     """
-    if (arch == "arm64") {
-        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
-        pvcVolume = """
-                - name: sw-tensorrt-pvc
-                  nfs:
-                    server: 10.117.145.13
-                    path: /vol/scratch1/scratch.svc_tensorrt_blossom
-        """
-    }
     def nodeLabelPrefix = "cpu"
     def jobName = "llm-build-images"
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix, jobName)

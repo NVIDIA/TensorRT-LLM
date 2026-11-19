@@ -247,7 +247,9 @@ TESTER_MEMORY = "96Gi"
 TESTER_CPU_ONLY_CORES = "2"
 TESTER_CPU_ONLY_MEMORY = "12Gi"
 
-CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
+CCACHE_DIR = env.targetArch == AARCH64_TRIPLE ?
+    "/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache_aarch64" :
+    "/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
 KITMAKER_CREDENTIALS_ID = env.kitmakerCredentialsId ? env.kitmakerCredentialsId : "svc_tensorrt_kitmaker_api_token"
@@ -5024,15 +5026,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                   persistentVolumeClaim:
                     claimName: sw-tensorrt-pvc
     """
-    if (arch == "arm64") {
-        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
-        pvcVolume = """
-                - name: sw-tensorrt-pvc
-                  nfs:
-                    server: 10.117.145.13
-                    path: /vol/scratch1/scratch.svc_tensorrt_blossom
-        """
-    }
     // Any kubernetes-cpu stage mounting this NFS must be covered by cpu-model-scratch-nfs in
     // trtllm-jenkins-shared-lib/resources/trtllm/ci/excluded_nodes.yaml.
     def llmModelVolume = """
