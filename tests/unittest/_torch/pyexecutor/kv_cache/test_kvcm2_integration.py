@@ -98,6 +98,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BufferId,
     CacheLevel,
     CacheTier,
+    CorruptedError,
     CudaStream,
     DataRole,
     DiskCacheTierConfig,
@@ -8084,6 +8085,33 @@ def test_free_resources_flushes_deferred_generation_commit_before_close(
         assert manager.flush_deferred_closes()
     # close() turns the committed tail into the partial block a later request can reuse.
     assert kv_cache.calls == [("commit", [4, 5]), ("close", [])]
+
+
+@pytest.mark.parametrize("defer_close", [False, True], ids=["close", "deferred_close"])
+def test_free_resources_disposes_cache_when_poisoned_runtime_rejects_flush(
+    defer_close: bool,
+) -> None:
+    """A poisoned runtime rejects the flush's commit(); the cache must still unmap and close."""
+    request = _generation_request(
+        max_beam_num_tokens=7, is_generation_only_request=defer_close, is_dummy=False
+    )
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_freeing_manager(request, kv_cache)
+    manager._defer_close_enabled = defer_close
+    manager.try_commit_generation_blocks(request)
+    kv_cache.commit = Mock(side_effect=CorruptedError("the KV cache runtime is poisoned"))
+
+    manager.free_resources(request)
+    if defer_close:
+        manager.release_index_slot.assert_called_once_with(request.py_request_id)
+        assert manager.flush_deferred_closes()
+    else:
+        manager.index_mapper.remove_sequence.assert_called_once_with(request.py_request_id)
+
+    kv_cache.commit.assert_called_once()
+    assert kv_cache.calls == [("close", [])]
+    assert request.py_request_id not in manager.kv_cache_map
+    assert not manager._deferred_generation_commits
 
 
 def test_flush_deferred_generation_commit_skips_inactive_cache() -> None:

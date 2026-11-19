@@ -91,6 +91,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     CacheLevel,
     CacheTier,
     CacheTierConfig,
+    CorruptedError,
     DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
@@ -9565,7 +9566,15 @@ class KVCacheManagerV2(BaseResourceManager):
         request, end = entry
         start = kv_cache.num_committed_tokens
         if end > start:
-            self._commit_generation_tokens(request, kv_cache, start, end, is_end=False)
+            try:
+                self._commit_generation_tokens(request, kv_cache, start, end, is_end=False)
+            except CorruptedError as error:
+                # Removal must still unmap and close(), which disposes on a poisoned runtime;
+                # suspend() and stop_committing() raise this again themselves.
+                logger.warning(
+                    f"KVCacheManagerV2: dropping the deferred generation commit of request "
+                    f"{request_id} on a poisoned runtime: {error!r}"
+                )
 
     def _stop_committing(self, request_id: int, kv_cache: _KVCache) -> None:
         """stop_committing() after flushing a deferred generation commit, which it would reject."""
