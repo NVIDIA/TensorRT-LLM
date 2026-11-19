@@ -337,13 +337,14 @@ class DecoderWarmup:
         )
         # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
         warmup_named_allreduce_topologies(self.model)
-        # Retain a partial summary when a phase raises.
-        with self._warmup_timer:
-            reclaimer = self._warmup_scheduled(resource_manager, kv_cache_manager)
-        # Serving runs on the executor's worker thread, whose padded low-M GEMM launches stage their
-        # rows in buffers of its own: free the ones the warmup forwards left on this thread.
-        release_mma_staging_buffers()
-        return reclaimer
+        try:
+            # Retain a partial summary when a phase raises.
+            with self._warmup_timer:
+                return self._warmup_scheduled(resource_manager, kv_cache_manager)
+        finally:
+            # Serving runs on the executor's worker thread, whose padded low-M GEMM launches stage
+            # their rows in buffers of its own: free the ones the warmup forwards left on this thread.
+            release_mma_staging_buffers()
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager

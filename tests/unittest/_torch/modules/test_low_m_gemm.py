@@ -11,6 +11,7 @@ import gc
 import sys
 import threading
 import time
+import weakref
 from typing import Any, Callable
 from unittest.mock import MagicMock, patch
 
@@ -996,18 +997,25 @@ def test_prewarm_keeps_going_past_a_failed_bucket(monkeypatch: pytest.MonkeyPatc
 @_skip_no_lowm_fp8
 def test_cute_views_are_reused_per_tensor_storage(monkeypatch: pytest.MonkeyPatch) -> None:
     """A base tensor's CuTe view is exported once per host thread and reused by that thread; another
-    thread, new storage, a view, or a dead tensor does not reuse it."""
+    thread, new storage, a view, or a dead tensor does not reuse it. A thread's cache goes with the
+    thread while the tensor lives on."""
     monkeypatch.setattr(_mod, "_CUTE_VIEWS", threading.local())
     t = torch.zeros(8, 64, device="cuda", dtype=torch.bfloat16)
     first = _mod._cute_view(t)
     assert _mod._cute_view(t) is first
     other = []
-    worker = threading.Thread(
-        target=lambda u: other.extend((_mod._cute_view(u), _mod._cute_view(u))), args=(t,)
-    )
+
+    def use_in_worker(u: torch.Tensor) -> None:
+        other.extend((_mod._cute_view(u), _mod._cute_view(u), weakref.ref(_mod._views())))
+
+    worker = threading.Thread(target=use_in_worker, args=(t,))
     worker.start()
     worker.join()
     assert other[0] is other[1] and other[0] is not first
+    worker_cache = other[2]
+    other.clear()
+    gc.collect()
+    assert worker_cache() is None
     t.data = torch.zeros(8, 64, device="cuda", dtype=torch.bfloat16)
     assert _mod._cute_view(t) is not first
     assert _mod._cute_view(t[:4]) is not _mod._cute_view(t[:4])

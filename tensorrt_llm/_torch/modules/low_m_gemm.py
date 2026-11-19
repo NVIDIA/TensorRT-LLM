@@ -1294,6 +1294,12 @@ def _no_gamma(device) -> torch.Tensor:
     return torch.zeros((1, 8), dtype=torch.bfloat16, device=device)
 
 
+class _ThreadViews(dict):
+    """A host thread's cached CuTe views: tensor ``id`` -> (weak reference to the tensor, layout key,
+    view). The cache owns the weak references, and their callbacks hold it weakly, so a thread's
+    cache and views go with the thread even while the tensors live on."""
+
+
 # Per host thread: CuTe views of the base tensors that launches pass call after call (weights, their
 # scales, the placeholder arguments), one DLPack export per tensor and layout, dropped with the
 # tensor. A launch keeps its argument descriptors on the views it is given, so threads never share
@@ -1301,12 +1307,19 @@ def _no_gamma(device) -> torch.Tensor:
 _CUTE_VIEWS = threading.local()
 
 
-def _views() -> Dict[int, Tuple[tuple, Any]]:
-    """The calling thread's cached CuTe views, by tensor ``id``."""
+def _views() -> _ThreadViews:
+    """The calling thread's cached CuTe views."""
     views = getattr(_CUTE_VIEWS, "views", None)
     if views is None:
-        views = _CUTE_VIEWS.views = {}
+        views = _CUTE_VIEWS.views = _ThreadViews()
     return views
+
+
+def _drop_view(cache: "weakref.ReferenceType[_ThreadViews]", tensor_id: int, ref: Any) -> None:
+    """Weak-reference callback of a cached tensor: drop its view if its thread's cache remains."""
+    views = cache()
+    if views is not None and views.get(tensor_id, (None,))[0] is ref:
+        del views[tensor_id]
 
 
 def _cute_view(t: torch.Tensor, dtype: Optional[torch.dtype] = None) -> Any:
@@ -1317,12 +1330,14 @@ def _cute_view(t: torch.Tensor, dtype: Optional[torch.dtype] = None) -> Any:
     views = _views()
     key = (t.data_ptr(), dtype, t.shape, t.stride())
     entry = views.get(id(t))
-    if entry is None:
-        weakref.finalize(t, views.pop, id(t), None)
-    elif entry[0] == key:
-        return entry[1]
+    if entry is not None and entry[0]() is t:
+        if entry[1] == key:
+            return entry[2]
+        ref = entry[0]
+    else:
+        ref = weakref.ref(t, functools.partial(_drop_view, weakref.ref(views), id(t)))
     view = graph_safe_from_dlpack(t if dtype is None else t.view(dtype))
-    views[id(t)] = (key, view)
+    views[id(t)] = (ref, key, view)
     return view
 
 
