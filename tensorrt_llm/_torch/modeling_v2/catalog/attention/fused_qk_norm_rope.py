@@ -65,6 +65,8 @@ class FusedQkNormRope(OpWrapper):
     gpt-oss uses RoPE with YaRN. qwen4_exp uses Gemma QK normalization.
     The H3 TP text encoder uses plain-weight QK normalization and interleaved
     mRoPE with identical text positions on all three axes.
+    Uncertified combinations include `is_neox=False`, YaRN with QK normalization,
+    and YaRN with mRoPE. Add a target cell before using one of these paths.
 
     mRoPE preconditions. `position_ids` is a contiguous int32 `[3, T]`; the op
     rejects a strided view loudly, so an engine's `[3, 1, max_num_tokens]`

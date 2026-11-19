@@ -44,6 +44,10 @@ def test_minimax_h3_public_visual_gen_api_smoke() -> None:
 def test_minimax_h3_diffusers_lpips_and_audio_reference(
     task: str, quant_algo: str | None, tmp_path: Path, _full_cuda_memory_budget: None
 ) -> None:
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+        MiniMaxH3Pipeline,
+    )
+
     release.check_diffusers_lpips_and_audio_reference(
-        task, quant_algo, tmp_path, _full_cuda_memory_budget
+        task, quant_algo, tmp_path, _full_cuda_memory_budget, expected_pipeline=MiniMaxH3Pipeline
     )

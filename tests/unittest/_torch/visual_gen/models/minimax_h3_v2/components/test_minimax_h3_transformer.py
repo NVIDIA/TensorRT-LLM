@@ -268,6 +268,88 @@ def test_transformer_accepts_dynamic_nvfp4_configuration() -> None:
     assert model.model_config.dynamic_weight_quant
 
 
+@pytest.mark.parametrize("algo", [QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4])
+def test_vsa_gate_loads_bf16_weights_with_dynamic_quantization(algo: QuantAlgo) -> None:
+    config = _make_model_config(
+        quant_config=QuantConfig(quant_algo=algo),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=True,
+    )
+    config.skip_create_weights_in_init = True
+    config.attention = AttentionConfig(backend="TRTLLM")
+    config.attention_metadata_state = create_attention_metadata_state()
+    attention = attention_module.MiniMaxH3VSAAttention(
+        model_config=config,
+        hidden_size=128,
+        num_attention_heads=1,
+        attention_head_dim=128,
+        qk_norm_eps=1e-5,
+        layer_idx=0,
+        module_name="transformer_blocks.0.attn",
+    )
+    gate = attention.to_gate_compress
+    gate.create_weights()
+    name = "transformer_blocks.0.attn.to_gate_compress"
+    weight = torch.linspace(-0.25, 0.25, 128 * 128, dtype=torch.bfloat16).reshape(128, 128)
+    assert gate.load_checkpoint(name, {f"{name}.weight": weight}, config) == []
+    torch.testing.assert_close(gate.weight, weight, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "algo,alignment", [(QuantAlgo.FP8_BLOCK_SCALES, 128), (QuantAlgo.NVFP4, 32)]
+)
+def test_quantized_mlp_shards_paired_intermediate_channels(
+    algo: QuantAlgo, alignment: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TLLM_DISABLE_MPI", raising=False)
+    config = _make_model_config(
+        quant_config=QuantConfig(quant_algo=algo), dynamic_weight_quant=True
+    )
+    channels = torch.arange(3 * alignment)
+    for rank, shard in enumerate((channels[: 2 * alignment], channels[2 * alignment :])):
+        config.mapping = Mapping(world_size=2, tp_size=2, rank=rank)
+        mlp = gated_mlp_module.GatedMLP(
+            hidden_size=128,
+            intermediate_size=len(channels),
+            bias=False,
+            dtype=torch.bfloat16,
+            config=config,
+            reduce_output=False,
+        )
+        assert mlp.gate_up_proj.out_features == 2 * mlp.down_proj.in_features == 2 * len(shard)
+        for name in ("gate", "up"):
+            torch.testing.assert_close(mlp.gate_up_proj.load_shard(channels, name=name), shard)
+        torch.testing.assert_close(mlp.down_proj.load_shard(channels[None, :]), shard[None, :])
+
+
+def test_deferred_mlp_preserves_shards_for_excluded_projections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TLLM_DISABLE_MPI", raising=False)
+    quant = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, exclude_modules=["*ff.down_proj"])
+    config = _make_model_config(quant_config=quant, dynamic_weight_quant=True)
+    config.skip_create_weights_in_init = True
+    config.mapping = Mapping(world_size=2, tp_size=2, rank=1)
+    mlp = gated_mlp_module.GatedMLP(
+        hidden_size=128,
+        intermediate_size=192,
+        bias=False,
+        dtype=torch.bfloat16,
+        config=config,
+        reduce_output=False,
+    )
+    assert mlp.gate_up_proj.out_features == 192
+    name = "transformer_blocks.0.ff.down_proj"
+    down = mlp.down_proj
+    with pytest.raises(ValueError, match="splits a quantization block"):
+        down.load_shard(torch.ones(1, 2), span=128)
+    down.disable_quantization()
+    down.create_weights()
+    weight = torch.arange(128 * 192, dtype=torch.bfloat16).reshape(128, 192)
+    assert down.load_checkpoint(name, {f"{name}.weight": weight}, config) == []
+    torch.testing.assert_close(down.weight, weight[:, 96:], rtol=0, atol=0)
+
+
 def test_post_load_quantizes_nvfp4_projections_like_fp8() -> None:
     """NVFP4 gets the same FP32-projection treatment as FP8: they are quantized."""
     model = h3.MiniMaxH3Transformer3DModel(_make_dynamic_nvfp4_model_config())

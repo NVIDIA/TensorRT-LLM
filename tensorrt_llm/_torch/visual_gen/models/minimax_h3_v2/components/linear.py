@@ -16,9 +16,9 @@ from tensorrt_llm._torch.kernels.fused_ops.fp8_static_quant import fp8_static_qu
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
 from tensorrt_llm._torch.modules.low_m_gemm import (
-    _should_apply_low_m_gemm,
     apply_low_m_gemm,
     low_m_gemm_dispatcher,
+    low_m_gemm_takes_rows,
 )
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_disabled
@@ -35,7 +35,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 )
 
 from ..ops.quantized_gemm import fp8_block_gemm, fp8_scaled_gemm, tunable_fp4_quantize
-from ..parallel.tp import shard_bounds
+from ..parallel.tp import projection_shard_bounds
 from .projection_weights import load_projection
 
 
@@ -76,19 +76,9 @@ class Linear(nn.Module):
             raise ValueError(f"Invalid H3 projection TP mode {self.tp_mode}")
         if self.tp_sharding is None and self.tp_mode and self.tp_size > 1:
             width = in_features if self.tp_mode == "row" else out_features
-            alignment = 128 if self.has_fp8_block_scales else 32 if self.has_nvfp4 else 1
-            if skip_create_weights_in_init:
-                if width % self.tp_size:
-                    raise ValueError(
-                        f"Deferred H3 projection width {width} must divide across {self.tp_size} ranks"
-                    )
-                alignment = 1
-            if width % alignment:
-                raise ValueError(
-                    f"TP projection width {width} must be divisible by quantization alignment {alignment}"
-                )
-            start, end = shard_bounds(width // alignment, self.tp_size, self.tp_rank)
-            self.tp_sharding = start * alignment, end * alignment
+            self.tp_sharding = projection_shard_bounds(
+                width, self.tp_size, self.tp_rank, self.quant_algo, skip_create_weights_in_init
+            )
         self.in_features = in_features
         self.out_features = out_features
         if self.tp_sharding is not None:
@@ -263,13 +253,21 @@ class Linear(nn.Module):
             return int(BufferKind.NCCL_WINDOW), self.mapping.tp_group
         return int(BufferKind.DEFAULT), None
 
+    def _uses_low_m_gemm(self, x: torch.Tensor) -> bool:
+        return (
+            not torch.compiler.is_compiling()
+            and x.ndim > 0
+            and x.shape[-1] > 0
+            and low_m_gemm_takes_rows(self, x.numel() // x.shape[-1])
+        )
+
     def _fp8(self, x, bias):
         orig = x.shape
         if (
             self.input_scale is not None
             and not self.force_dynamic_quantization
             and bias is None
-            and _should_apply_low_m_gemm(x, self)
+            and self._uses_low_m_gemm(x)
         ):
             dispatcher = low_m_gemm_dispatcher(self)
             result = (
@@ -379,7 +377,7 @@ class Linear(nn.Module):
                 y = y + bias
         else:
             y = None
-            if not self.use_custom_cublas_mm and _should_apply_low_m_gemm(x, self):
+            if not self.use_custom_cublas_mm and self._uses_low_m_gemm(x):
                 y = apply_low_m_gemm(self, x, self.weight, bias)
             if y is None and self.use_cute_dsl_bf16_gemm and self.weight.dtype == torch.bfloat16:
                 out = x.new_empty((x.numel() // x.shape[-1], self.out_features))

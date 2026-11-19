@@ -15,14 +15,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import torch
 import torch.distributed as dist
+from PIL import Image
 
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
+from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.logger import logger
 
+from ..components.transformer import MiniMaxH3Transformer3DModel, trunk_attention_for
 from ..packing import resolve_canvas_size
 from ..pipeline import H3PipelineBase
 from .ref2va import load_references, prepare_references, validate_reference_order
@@ -31,6 +38,49 @@ from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder, _MiniMaxH3TextE
 
 class MiniMaxH3Pipeline(H3PipelineBase):
     """MiniMax H3 functional pipeline for text and reference conditioning."""
+
+    def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
+        self.text_encoder_tp_size = int(
+            getattr(getattr(pipeline_config, "parallel", None), "text_encoder_tp_size", 1)
+        )
+        vgm = getattr(pipeline_config, "visual_gen_mapping", None)
+        world_size = vgm.world_size if vgm is not None else pipeline_config.mapping.world_size
+        if self.text_encoder_tp_size > world_size:
+            raise ValueError(
+                f"text_encoder_tp_size ({self.text_encoder_tp_size}) exceeds "
+                f"world_size ({world_size})."
+            )
+        if world_size != 1:
+            supports_topology = (
+                vgm is not None
+                and vgm.cfg_size == 1
+                and vgm.cp_size == 1
+                and vgm.ring_size == 1
+                and vgm.attn2d_row_size == 1
+                and vgm.attn2d_col_size == 1
+                and vgm.ulysses_size * pipeline_config.mapping.tp_size == world_size
+            )
+            if not supports_topology:
+                raise NotImplementedError(
+                    "MiniMax-H3 supports tensor parallelism and Ulysses: "
+                    "cfg_size=1, ring_size=1, attn2d_size=(1, 1), and "
+                    "tp_size * ulysses_size=world_size."
+                )
+            if vgm.ulysses_size > 1 and pipeline_config.attention.backend not in (
+                "VANILLA",
+                "FA4",
+                "TRTLLM",
+                "FLASHINFER",
+            ):
+                raise NotImplementedError(
+                    "MiniMax-H3 Ulysses requires VANILLA, FA4, TRTLLM, or FLASHINFER attention. "
+                    "Other attention backends do not support the required "
+                    "packed-row padding mask."
+                )
+        self._setup_text_encoder_group(pipeline_config, world_size)
+
+        self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
+        super().__init__(pipeline_config)
 
     @property
     def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
@@ -56,6 +106,12 @@ class MiniMaxH3Pipeline(H3PipelineBase):
                 "defaults to images, videos, then audio, preserving each slot's order.",
             )
         }
+
+    def _init_transformer(self) -> None:
+        config = self.pipeline_config.primary_model_config
+        self.transformer = MiniMaxH3Transformer3DModel(
+            config, attention_cls=trunk_attention_for(config)
+        )
 
     def load_transformer_weights(self, checkpoint_dir: str) -> dict:
         if self.workflow == "ref2va":
@@ -118,6 +174,89 @@ class MiniMaxH3Pipeline(H3PipelineBase):
         text_encoder.load_weights(weights)
         return text_encoder.eval()
 
+    def _encode_prompt(
+        self,
+        prompt: str,
+        keyframes: list[Image.Image],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._uses_tensor_parallel_text_encoder and keyframes:
+            raise NotImplementedError(
+                "MiniMax-H3 tensor-parallel text encoder currently supports "
+                "text-only prompts; set text_encoder_tp_size=1 for keyframe requests."
+            )
+        if self.world_size == 1:
+            return self._encode_prompt_local(prompt, keyframes)
+
+        prompt_embeds: torch.Tensor | None = None
+        text_token_tags: torch.Tensor | None = None
+        with self._coordinate_text_encoder_errors():
+            if self._loads_text_encoder_on_this_rank:
+                prompt_embeds, text_token_tags = self._encode_prompt_local(prompt, keyframes)
+
+        prompt_embeds = self._broadcast_tensor_from_rank0(prompt_embeds, dtype=self.dtype)
+        text_token_tags = self._broadcast_tensor_from_rank0(text_token_tags, dtype=torch.long)
+        return prompt_embeds, text_token_tags.cpu()
+
+    @property
+    def _uses_tensor_parallel_text_encoder(self) -> bool:
+        return self.text_encoder_tp_size > 1
+
+    @property
+    def _loads_text_encoder_on_this_rank(self) -> bool:
+        return self.rank < self.text_encoder_tp_size
+
+    @contextmanager
+    def _coordinate_text_encoder_errors(self) -> Iterator[None]:
+        """Propagate caught encoding failures before peers enter payload broadcasts."""
+        if self.world_size == 1 or not dist.is_initialized():
+            yield
+            return
+
+        # Allocate before encoding so an encoder OOM does not prevent reporting it.
+        failed_rank = torch.zeros(1, dtype=torch.int32, device=self.device)
+        local_error: Exception | None = None
+        try:
+            yield
+        except Exception as error:
+            local_error = error
+            failed_rank.fill_(self.rank + 1)
+
+        # This coordinates Python failures only; failed TP collectives still
+        # require distributed worker teardown.
+        dist.all_reduce(failed_rank, op=dist.ReduceOp.MAX)
+        failed_rank_id = int(failed_rank.item()) - 1
+        if failed_rank_id >= 0:
+            message = f"MiniMax-H3 text encoding failed on rank {failed_rank_id}"
+            if local_error is not None:
+                message += f": {local_error}"
+            raise RuntimeError(message) from local_error
+
+    def _broadcast_tensor_from_rank0(
+        self,
+        tensor: torch.Tensor | None,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not dist.is_initialized():
+            if tensor is None:
+                raise ValueError("rank 0 tensor is required when distributed is not initialized.")
+            return tensor.to(device=self.device, dtype=dtype)
+
+        shape = torch.zeros(8, dtype=torch.long, device=self.device)
+        if self.rank == 0:
+            if tensor is None:
+                raise ValueError("rank 0 tensor is required for MiniMax-H3 broadcast.")
+            tensor = tensor.to(device=self.device, dtype=dtype).contiguous()
+            shape[0] = tensor.ndim
+            shape[1 : tensor.ndim + 1] = torch.tensor(tensor.shape, device=self.device)
+        dist.broadcast(shape, src=0)
+        ndim = int(shape[0].item())
+        tensor_shape = tuple(int(value) for value in shape[1 : ndim + 1].tolist())
+        if self.rank != 0:
+            tensor = torch.empty(tensor_shape, dtype=dtype, device=self.device)
+        dist.broadcast(tensor, src=0)
+        return tensor
+
     def _encode_text_tokens(
         self, token_ids: list[int], vision_inputs: dict[str, torch.Tensor]
     ) -> torch.Tensor:
@@ -155,9 +294,16 @@ class MiniMaxH3Pipeline(H3PipelineBase):
         return self._broadcast_tensor_from_rank0(prompt_embeds, dtype=self.dtype)
 
     def _load_text_encoder(self, checkpoint_dir, device, offloaded):
+        if not self._loads_text_encoder_on_this_rank:
+            logger.info("MiniMax-H3 rank %d receives prompt embeddings from rank 0", self.rank)
+            return None
         if self._uses_tensor_parallel_text_encoder:
             return self._load_tensor_parallel_text_encoder(checkpoint_dir, device)
         return super()._load_text_encoder(checkpoint_dir, device, offloaded)
+
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        if self.workflow != "ref2va":
+            super()._run_warmup(height, width, num_frames, steps)
 
     def _configure_scheduler_shifts(self):
         if self.scheduler is not None:
@@ -189,6 +335,10 @@ class MiniMaxH3Pipeline(H3PipelineBase):
         self, references, prompt, height, width, num_frames, keyframes, generator
     ):
         if self.workflow != "ref2va":
+            if references:
+                raise ValueError(
+                    "Reference conditioning requires pipeline_config workflow='ref2va'."
+                )
             return None
         if keyframes:
             raise ValueError("Ref2VA accepts references, not first/last keyframes.")

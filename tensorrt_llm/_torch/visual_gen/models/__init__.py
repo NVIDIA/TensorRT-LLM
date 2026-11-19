@@ -32,7 +32,7 @@ Example structure:
 """
 
 from ..pipeline import BasePipeline
-from ..pipeline_registry import AutoPipeline, register_pipeline
+from ..pipeline_registry import AutoPipeline, register_pipeline, register_pipeline_opt_in
 from .cosmos3 import Cosmos3OmniMoTPipeline
 from .flux import Flux2Pipeline, FluxPipeline
 from .glm_image import GlmImagePipeline
@@ -43,6 +43,14 @@ from .minimax_h3 import MiniMaxH3Pipeline
 from .qwen_image import QwenImageEditPlusPipeline, QwenImagePipeline
 from .qwen_image_layered import QwenImageLayeredPipeline
 from .wan import WanDMDPipeline, WanImageToVideoPipeline, WanPipeline
+
+
+@register_pipeline_opt_in("MiniMaxH3ModularPipeline", "TLLM_VISUALGEN_MODELING2_H3")
+def _route_minimax_h3_v2(config, checkpoint_dir):
+    from .minimax_h3_v2.pipeline_registry import route
+
+    return route(config, checkpoint_dir)
+
 
 __all__ = [
     "AutoPipeline",

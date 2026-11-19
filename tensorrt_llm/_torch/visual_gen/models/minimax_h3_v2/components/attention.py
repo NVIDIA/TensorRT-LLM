@@ -21,14 +21,14 @@ from typing import Optional
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.layout import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
-from ..ops.attention import create_h3_attention
 from ..ops.rope import apply_minimax_h3_qk_norm_rope_bf16, apply_minimax_h3_rotary_emb
 from ..ops.vsa import H3VSAMetadata, h3_vsa_attention
 from ..parallel.tp import head_bounds
 from ..parallel.ulysses import wrap_parallel_attention
+from .dense_attention import create_h3_attention
 from .linear import Linear
 from .norm import PerHeadRMSNorm
 

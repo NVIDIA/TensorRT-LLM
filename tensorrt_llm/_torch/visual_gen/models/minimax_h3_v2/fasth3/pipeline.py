@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
+
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
     create_attention_metadata_state,
@@ -30,7 +32,11 @@ from ..pipeline import H3PipelineBase
 from .schedule import set_dmd_timesteps
 
 
-def configure_attention(config: DiffusionPipelineConfig, manifest: dict) -> None:
+def configure_checkpoint(config: DiffusionPipelineConfig, manifest: dict) -> None:
+    if config.mapping.world_size != 1:
+        raise ValueError("FastH3 VSA requires a single GPU.")
+    if config.extra_attrs.get("workflow") == "ref2va":
+        raise ValueError("FastH3 VSA supports text-to-video only.")
     attention = config.attention
     backend = attention.backend
     if backend == "VANILLA" and "backend" not in attention.model_fields_set:
@@ -42,6 +48,17 @@ def configure_attention(config: DiffusionPipelineConfig, manifest: dict) -> None
         sparse = VideoSparseAttentionConfig(vsa_sparsity=manifest.get("vsa_sparsity", 0.8))
     elif sparse.algorithm != "vsa":
         raise ValueError("FastH3 requires the vsa sparse attention algorithm.")
+    if torch.device(config.device).type == "cuda" and torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability(config.device)
+        if backend == "TRTLLM" and capability not in ((10, 0), (10, 3)):
+            raise NotImplementedError("FastH3 TRTLLM attention requires SM100 or SM103.")
+        if backend == "CUTEDSL":
+            from ....cute_dsl_kernels.blackwell.video_sparse_attention import CUTE_AVAILABLE
+
+            if not CUTE_AVAILABLE or capability[0] < 10:
+                raise NotImplementedError(
+                    "FastH3 CUTEDSL attention requires CuTe DSL and SM100 or newer."
+                )
     config.attention = AttentionConfig.model_validate(
         {**attention.model_dump(), "backend": backend, "sparse_attention_config": sparse}
     )
@@ -52,10 +69,15 @@ def configure_attention(config: DiffusionPipelineConfig, manifest: dict) -> None
         model_config.attention = config.attention.model_copy(deep=True)
         if backend == "TRTLLM" and model_config.attention_metadata_state is None:
             model_config.attention_metadata_state = create_attention_metadata_state()
+    config.primary_pretrained_config._fasth3_manifest = manifest
 
 
 class FastH3Pipeline(H3PipelineBase):
     """FastH3 single-GPU VSA pipeline with checkpoint-trained denoising schedules."""
+
+    @property
+    def ref_slot_specs(self):
+        return {}
 
     def _init_transformer(self) -> None:
         self.transformer = MiniMaxH3Transformer3DModel(

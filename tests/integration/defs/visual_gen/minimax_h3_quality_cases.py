@@ -453,7 +453,12 @@ def check_public_visual_gen_api_smoke() -> None:
 
 
 def check_diffusers_lpips_and_audio_reference(
-    task: str, quant_algo: str | None, tmp_path: Path, _full_cuda_memory_budget: None
+    task: str,
+    quant_algo: str | None,
+    tmp_path: Path,
+    _full_cuda_memory_budget: None,
+    *,
+    expected_pipeline: type,
 ) -> None:
     """Gate both supported tasks against a fresh Diffusers reference."""
     checkpoint_path = _minimax_h3_checkpoint_path()
@@ -489,6 +494,7 @@ def check_diffusers_lpips_and_audio_reference(
         )
     ).load(skip_warmup=True)
     try:
+        assert type(pipeline) is expected_pipeline
         output = pipeline.forward(
             prompt=MINIMAX_H3_PROMPT,
             keyframes=keyframes,

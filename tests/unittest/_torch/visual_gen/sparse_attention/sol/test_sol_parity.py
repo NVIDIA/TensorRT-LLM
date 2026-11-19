@@ -434,7 +434,7 @@ def test_cutedsl_sol_kernel_matches_dense_on_a_single_block() -> None:
     ).transpose(1, 2)
 
     before = sol_attn_backend._SOL_STATS["kernel_calls"]
-    out = sol_attn_backend._run_sol_attn_bthd(q, k, v, tau=2.0, thresh_type="diag", kv_splits=1)
+    out = sol_attn_backend.run_sol_attn_bthd(q, k, v, tau=2.0, thresh_type="diag", kv_splits=1)
     torch.cuda.synchronize()
     assert sol_attn_backend._SOL_STATS["kernel_calls"] == before + 1, (
         "the kernel did not run; this comparison would be dense against dense"
@@ -478,7 +478,7 @@ def test_cutedsl_sol_kernel_matches_reference_with_approximated_blocks() -> None
     assert (ref - dense).abs().max() > 1e-1, "approximation is not measurably different from dense"
 
     before = sol_attn_backend._SOL_STATS["kernel_calls"]
-    out = sol_attn_backend._run_sol_attn_bthd(q, k, v, tau=tau, thresh_type="diag", kv_splits=1)
+    out = sol_attn_backend.run_sol_attn_bthd(q, k, v, tau=tau, thresh_type="diag", kv_splits=1)
     torch.cuda.synchronize()
     assert sol_attn_backend._SOL_STATS["kernel_calls"] == before + 1, "kernel did not run"
 

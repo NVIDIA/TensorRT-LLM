@@ -24,6 +24,7 @@ from utils.util import getSMVersion
 
 from tensorrt_llm._torch.attention.backends import prims_ts
 from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
+from tensorrt_llm._torch.attention.backends.fmha import block_sparse_plan
 from tensorrt_llm._torch.attention.backends.fmha import prims_ts_block_sparse as block_sparse_fmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
@@ -398,7 +399,7 @@ def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypat
     _attention, fmha, q, k, v, metadata, args = _contiguous_case()
     wrapper = Mock()
     factory = Mock(return_value=wrapper)
-    monkeypatch.setattr(block_sparse_fmha, "_BlockSparseTSWrapper", factory)
+    monkeypatch.setattr(block_sparse_plan, "BlockSparseTSWrapper", factory)
 
     bsr_inputs = [
         _bsr_inputs(),
@@ -466,7 +467,7 @@ def test_block_sparse_plan_cache_lives_on_the_metadata(monkeypatch) -> None:
     """Layers that run with one metadata object share its planned wrappers."""
     wrapper = Mock()
     factory = Mock(return_value=wrapper)
-    monkeypatch.setattr(block_sparse_fmha, "_BlockSparseTSWrapper", factory)
+    monkeypatch.setattr(block_sparse_plan, "BlockSparseTSWrapper", factory)
     _attention, first, q, k, v, metadata, args = _contiguous_case()
     second_attention = _Attention()
     second = block_sparse_fmha.PrimsTSBlockSparseFmha(second_attention)
@@ -603,7 +604,7 @@ def test_dense_sage_with_v_smoothing_runs_on_a_dense_plan() -> None:
 def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch) -> None:
     attention, fmha, q, metadata, args = _paged_case()
     wrapper = Mock()
-    monkeypatch.setattr(block_sparse_fmha, "_BlockSparsePagedTSWrapper", Mock(return_value=wrapper))
+    monkeypatch.setattr(block_sparse_plan, "BlockSparsePagedTSWrapper", Mock(return_value=wrapper))
     monkeypatch.setattr(block_sparse_fmha, "get_kv_page_offset", Mock(return_value=8))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", Mock(return_value=False))
     q_processed = torch.zeros((2, 2, 128), dtype=torch.bfloat16)
@@ -680,7 +681,7 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
 def test_paged_block_tables_remain_live_across_graph_replay(monkeypatch) -> None:
     attention, fmha, q, metadata, args = _paged_case()
     wrapper = Mock()
-    monkeypatch.setattr(block_sparse_fmha, "_BlockSparsePagedTSWrapper", Mock(return_value=wrapper))
+    monkeypatch.setattr(block_sparse_plan, "BlockSparsePagedTSWrapper", Mock(return_value=wrapper))
     monkeypatch.setattr(block_sparse_fmha, "get_kv_page_offset", Mock(return_value=8))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", Mock(return_value=True))
     q_processed = torch.zeros((2, 2, 128), dtype=torch.bfloat16)

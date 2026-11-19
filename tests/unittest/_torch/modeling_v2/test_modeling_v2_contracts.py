@@ -23,12 +23,19 @@ _UNIT_ROOT = Path(__file__).resolve().parent
 
 
 def _entry_files() -> list[Path]:
-    """Entry modules in the two catalogs and Modeling V2 families and targets."""
+    """Entry modules in the shared catalogs, model families and targets."""
     shared = (_ROOT / "catalog").glob("*/*.py")
-    visual_gen = (_ROOT.parent / "visual_gen/catalog").glob("*/*.py")
+    vg = _ROOT.parent / "visual_gen"
+    vg_catalog = (vg / "catalog").glob("*/*.py")
+    vg_family = (vg / "models").glob("*/ops/**/*.py")
+    vg_target = (vg / "models").glob("*/*/ops/**/*.py")
     family = (_ROOT / "models").glob("*/ops/*/*.py")
     owned = (_ROOT / "models").glob("*/*/ops/*/*.py")
-    return sorted(p for p in (*shared, *visual_gen, *family, *owned) if p.name != "__init__.py")
+    return sorted(
+        p
+        for p in (*shared, *vg_catalog, *vg_family, *vg_target, *family, *owned)
+        if p.name != "__init__.py"
+    )
 
 
 def test_entry_discovery_covers_both_catalogs_and_owned_ops(tmp_path, monkeypatch):
@@ -38,6 +45,8 @@ def test_entry_discovery_covers_both_catalogs_and_owned_ops(tmp_path, monkeypatc
         root / "models/family/ops/attention/family.py",
         root / "models/family/target/ops/attention/target.py",
         tmp_path / "visual_gen/catalog/attention/shared.py",
+        tmp_path / "visual_gen/models/family/ops/family.py",
+        tmp_path / "visual_gen/models/family/target/ops/target.py",
     }
     for path in entries:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -138,19 +147,20 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
     `.CELLS`, or assigns `CELLS = certified_cells(op, TARGET_CELLS)`,
     which drives the entry's cells and its targets'. This reads the source, so it
     shows that some test refers to the cells, not that they ran.
-    VisualGen catalog tests live under the matching category in `visual_gen/catalog/`.
+    VisualGen tests live under their catalog category, family or target.
     """
     llm_sources = [t.read_text() for t in _UNIT_ROOT.rglob("*.py")]
-    vg_catalog = _ROOT.parent / "visual_gen/catalog"
+    vg = _ROOT.parent / "visual_gen"
     undriven = []
     for entry in _entry_files():
         if "Cell(" not in entry.read_text():
             continue
         sources = llm_sources
-        if entry.is_relative_to(vg_catalog):
-            test_dir = (
-                _UNIT_ROOT.parent / "visual_gen/catalog" / entry.parent.relative_to(vg_catalog)
-            )
+        if entry.is_relative_to(vg):
+            owner = entry.parent.relative_to(vg)
+            if owner.parts[0] == "models":
+                owner = Path(*owner.parts[: owner.parts.index("ops")])
+            test_dir = _UNIT_ROOT.parent / "visual_gen" / owner
             sources = [t.read_text() for t in test_dir.rglob("test_*.py")]
         if not any(
             entry.stem in src and (".CELLS" in src or _DRIVES_TARGET_CELLS.search(src))
@@ -204,10 +214,10 @@ def test_target_cells_feed_entries_the_target_calls(test, monkeypatch):
         if target.startswith("visual_gen/"):
             repo = _ROOT.parents[2]
             monkeypatch.syspath_prepend(str(repo / "jenkins/scripts/cbts"))
-            from cbts.rules.visual_gen import _FamilyScope
+            from cbts.rules.visual_gen import VisualGenFamilyScope
 
             _, family, target_name = target.split("/")
-            scope = _FamilyScope(repo, _ROOT.parent / "visual_gen/models" / family)
+            scope = VisualGenFamilyScope(repo, _ROOT.parent / "visual_gen/models" / family)
             assert scope.targets and target_name in scope.targets, (
                 f"Unknown VisualGen target {target}"
             )

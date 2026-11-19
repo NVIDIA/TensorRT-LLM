@@ -19,10 +19,11 @@ Defines shared types, enums, and the abstract base class for attention backends.
 """
 
 from abc import ABC, abstractmethod
-from enum import Enum
 from typing import Optional
 
 import torch
+
+from ..layout import AttentionTensorLayout
 
 
 @torch.compiler.disable
@@ -62,18 +63,6 @@ def as_fused_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Ten
     b, s, h_q, d = q.shape
     total = (h_q + 2 * k.shape[2]) * d
     return torch.as_strided(q, (b, s, total), (s * total, total, 1), q.storage_offset())
-
-
-class AttentionTensorLayout(str, Enum):
-    """
-    Tensor layout for attention backend input/output.
-
-    Backends declare their preferred layout so the attention module
-    can reshape tensors optimally before calling the backend.
-    """
-
-    NHD = "NHD"  # [B, S, H, D] - batch, seq, heads, dim
-    HND = "HND"  # [B, H, S, D] - batch, heads, seq, dim
 
 
 class AttentionBackend(ABC):

@@ -6,10 +6,9 @@ import torch
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention.interface import (
     block_sparse_attn_from_indices_cute,
-    is_cute_supported,
 )
 
-__all__ = ["block_sparse_attention", "is_cute_supported"]
+__all__ = ["block_sparse_attention"]
 
 
 class BlockSparseAttention(OpWrapper):

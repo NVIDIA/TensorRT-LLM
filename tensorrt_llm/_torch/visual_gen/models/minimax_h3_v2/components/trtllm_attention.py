@@ -17,7 +17,7 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
-from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.layout import AttentionTensorLayout
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
 

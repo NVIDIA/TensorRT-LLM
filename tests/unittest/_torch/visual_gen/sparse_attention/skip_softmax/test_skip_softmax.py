@@ -16,10 +16,9 @@ from pydantic import ValidationError
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxParams
 from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
-from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import fmha as cute_dsl_fmha
-from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl.fmha import (
-    CuTeDSLAttention,
-    _resolve_skip_softmax_threshold_scale_factor,
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl.fmha import CuTeDSLAttention
+from tensorrt_llm._torch.visual_gen.attention.skip_softmax_threshold import (
+    resolve_skip_softmax_threshold_scale_factor,
 )
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
@@ -455,7 +454,7 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
             disabled_until_timestep=0.6,
         ).to_sparse_params()
 
-        threshold = _resolve_skip_softmax_threshold_scale_factor(
+        threshold = resolve_skip_softmax_threshold_scale_factor(
             None,
             sparse_params,
             timestep,
@@ -490,21 +489,8 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
         assert phase_fn(timestep=0.6) == 0
         assert phase_fn(timestep=0.59) == 1
 
-    @pytest.mark.skipif(
-        cute_dsl_fmha._cute_dsl_import_error is not None,
-        reason="CuTe DSL runtime unavailable",
-    )
-    def test_forward_threads_timestep_and_sparse_params_to_kernel_call(self, monkeypatch):
-        """The timestep-gating feature hinges on `_fwd`'s `kwargs.get("timestep")`
-        reaching `cute_dsl_fmha_fwd` unchanged; nothing else in this chain would
-        raise if that silently dropped to `None` (the scheduler would just apply
-        the full threshold during early, high-noise steps -- a quality
-        regression, not an error). This exercises `CuTeDSLAttention.forward`
-        (the boundary `_attn_impl`/`Attention.forward` call into, and the one
-        `Attention._attn_impl` also threads `timestep` through unchanged to)
-        directly, monkeypatching the actual kernel launcher so no CUDA/cutlass
-        runtime is required.
-        """
+    @pytest.mark.parametrize(("timestep", "expected"), [(0.6, None), (0.59, 5000.0)])
+    def test_forward_passes_active_threshold(self, monkeypatch, timestep, expected):
         sparse_params = SkipSoftmaxAttentionConfig(
             threshold_scale_factor=5000.0,
             disabled_until_timestep=0.6,
@@ -512,13 +498,13 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
 
         captured_kwargs = {}
 
-        def _fake_cute_dsl_fmha_fwd(q, k, v, o, **kwargs):
+        def capture_fmha(q, k, v, **kwargs):
             captured_kwargs.update(kwargs)
-            o.zero_()
+            return q, None
 
         monkeypatch.setattr(
-            "tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl.fmha.cute_dsl_fmha_fwd",
-            _fake_cute_dsl_fmha_fwd,
+            "tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl.fmha.cute_fmha",
+            capture_fmha,
         )
 
         attn = CuTeDSLAttention(
@@ -533,10 +519,9 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
         k = torch.zeros(batch, seq_len, num_heads, head_dim, dtype=torch.bfloat16)
         v = torch.zeros(batch, seq_len, num_heads, head_dim, dtype=torch.bfloat16)
 
-        attn.forward(q, k, v, timestep=0.59)
+        attn.forward(q, k, v, timestep=timestep)
 
-        assert captured_kwargs.get("timestep") == 0.59
-        assert captured_kwargs.get("sparse_params") is sparse_params
+        assert captured_kwargs["skip_softmax_threshold_scale_factor"] == expected
 
 
 class TestVisualGenSkipSoftmaxPipelineConfig:

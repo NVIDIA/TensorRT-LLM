@@ -55,6 +55,12 @@ def _operand(rows, k, seed):
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "visual_gen/minimax_h3_v2/default_pipeline": (
+        Cell(
+            why="H3 text conditioning projection with fused bias",
+            spec=dict(m=2, k=5120, n=5376, bias=True, backend="cutlass,cublaslt,cutedsl,cuda_core"),
+        ),
+    ),
     "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
         Cell(
             why="deepseek default at attention TP8, shared expert gate+up: 2 x 2048/8 rows",
@@ -76,6 +82,10 @@ def test_certified_cells(cell) -> None:
     seed = zlib.crc32(cell.why.encode()) % 2**31
     act, act_sf, act_gs = _operand(spec["m"], spec["k"], seed)
     weight, weight_sf, weight_gs = _operand(spec["n"], spec["k"], seed + 1)
+    bias = None
+    if spec["bias"]:
+        generator = torch.Generator(device="cuda").manual_seed(seed + 2)
+        bias = torch.randn(spec["n"], dtype=torch.bfloat16, device="cuda", generator=generator)
     # alpha folds both global scales back out of the product.
     alpha = (1.0 / (act_gs * weight_gs)).float().reshape(1)
 
@@ -88,9 +98,10 @@ def test_certified_cells(cell) -> None:
             alpha,
             torch.bfloat16,
             allowed_backends=spec.get("backend", "cutlass,cublaslt,cuda_core"),
+            bias=bias,
         )
     assert out.shape == (spec["m"], spec["n"])
-    _compare(out, op.reference(act, weight, act_sf, weight_sf, alpha, torch.bfloat16))
+    _compare(out, op.reference(act, weight, act_sf, weight_sf, alpha, torch.bfloat16, bias=bias))
 
 
 def _ok():

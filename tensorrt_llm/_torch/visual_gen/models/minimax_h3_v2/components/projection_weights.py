@@ -101,16 +101,15 @@ def load_projection(
     if missing:
         return missing
 
-    if model_config is not None and model_config.dynamic_weight_quant:
-        config = module.quant_config or model_config.get_quant_config(name)
+    if module.has_any_quant and model_config is not None and model_config.dynamic_weight_quant:
         excluded = (
             model_config.quant_config
             and model_config.quant_config.is_module_excluded_from_quantization(name)
         )
-        if config is not None and not excluded:
+        if not excluded:
             _quantize(
                 parts,
-                config.quant_algo,
+                module.quant_algo,
                 model_config.quant_config.group_size if model_config.quant_config else 128,
             )
 

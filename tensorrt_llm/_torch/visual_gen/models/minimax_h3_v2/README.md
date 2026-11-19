@@ -40,7 +40,7 @@ Place a change according to the decision it makes. Then choose its [sharing scop
 | --- | --- | --- |
 | Pipeline | How a request moves through conditioning, denoising and decoding, including which components run at each step. | The [family pipeline](pipeline.py) advances the joint audio/video denoising loop. The [FastH3 target](fasth3/pipeline.py) supplies its trained schedule. |
 | Component | How a model block computes its output. It composes operations and holds the parameters or other instance state that block needs. | [H3 attention](components/attention.py) owns its projections and normalization weights and chooses when to apply fused Q/K norm and RoPE. |
-| Parallel | How tensors and weights are partitioned across ranks, which process group participates, and when collectives run relative to model computation. | [H3 Ulysses](parallel/ulysses.py) schedules V, Q, K on the asynchronous path and waits for the transfers before attention. |
+| Parallel | Define rank-local shard ranges and schedule collectives on the participating process group. Components use those ranges to construct paired projections and load weights. | [H3 Ulysses](parallel/ulysses.py) schedules V, Q, K on the asynchronous path and waits for the transfers before attention. |
 | Operation | What one tensor computation or collective returns for explicit inputs, layouts and parameters. The call is stateless. It can select a compatible kernel or compose several calls that satisfy the same contract. | The [Q/K norm and RoPE op](ops/rope.py) takes packed QKV, norm weights and rotation tables. Its PyTorch reference defines the expected Q and K. |
 | Kernel | How the device executes the operation, including fusion, tiling, memory access and launch configuration. | The [fused Triton kernel](kernels/fused_rope.py) loads the Q/K head data, computes RMS normalization and rotates the leading channels in one launch. |
 
@@ -54,11 +54,11 @@ Changing the fused RoPE tile size belongs in `kernels/`. Changing the rotation f
 | --- | --- | --- |
 | One target | The target directory, including its local operations or kernels | Base Ref2VA conditioning and its TP text encoder, or FastH3's trained schedule |
 | Sibling H3 targets | The H3 family | Packed rows, transformer blocks, attention modules and H3 Ulysses Q/K/V exchange and receive layouts |
-| A model-independent operation used unchanged by independent VisualGen callers | The [VisualGen catalog](../../catalog/) | H3 V2 and the VisualGen VSA backend share fine block-sparse attention over explicit KV tile indices. |
+| A model-independent operation used unchanged by independent VisualGen callers | The [VisualGen catalog](../../catalog/) | H3 and other VisualGen callers share FA4 attention, FlashInfer prefill, CuTe FMHA and fine block-sparse attention over explicit KV tile indices. |
 | An existing model-independent operation used by VisualGen and LLM callers | Its entry in the [Modeling V2 catalog](../../../modeling_v2/catalog/) | Import `thop_attention` and `cublas_mm` directly. |
 | Runtime services | The existing VisualGen runtime | Checkpoint discovery, process groups, executor and lifecycle interfaces |
 
-**Attention.** The [block-sparse attention op](../../catalog/attention/block_sparse_attention.py) takes head-major Q/K/V, selected KV tile indices, route counts, valid KV tile lengths and an optional scale. It returns attention output and logsumexp. [H3](ops/vsa.py) builds mixed-modality routes and applies its learned gate. The [VisualGen VSA backend](../../attention/backends/sparse/vsa/backend.py) supplies its predictor's routes and chooses its fallback. Both call the same operation unchanged. Each family owns its attention module and projections.
+**Attention.** The [block-sparse attention op](../../catalog/attention/block_sparse_attention.py) takes head-major Q/K/V, selected KV tile indices, route counts, valid KV tile lengths and an optional scale. It returns attention output and logsumexp. [H3](ops/vsa.py) builds mixed-modality routes and applies its learned gate. The [VisualGen VSA backend](../../attention/backends/sparse/vsa/backend.py) supplies its predictor's routes and chooses its fallback. Both call the same operation unchanged. Keep the gated attention component in the family so the base target can also load a checkpoint with gate weights and explicit VSA configuration. Each family owns its attention module and projections.
 
 **Communication.** The base and FastH3 targets share the [H3 Ulysses wrappers](ops/ulysses.py). They encode how H3 exchanges sequence shards for head shards and converts asynchronous receive buffers to the layout its attention expects. The [H3 parallel module](parallel/ulysses.py) owns the V, Q, K projection order, streams and barriers. Other families can call the same native kernels from their own wrappers.
 
@@ -66,9 +66,11 @@ Both the H3 Ulysses wrappers and the block-sparse attention op use the [Modeling
 
 ### Reuse an existing backend implementation
 
-- **Kernel or library operation.** Prefer a supported entry point when its tensor and layout contract fits. For example, H3 and the VisualGen SOL backend both call the [SOL predictor](../../attention/backends/sparse/sol/predictor.py) with Q/K/V and explicit thresholds. H3 decides which layers and denoising steps use its result. For a catalog operation, specify scales, valid lengths and other inputs explicitly. Extend its reference tests when a caller needs a new layout, dtype or execution mode.
-- **Runner.** Use the backend's supported execution method when a kernel needs a plan or workspace. For example, [`CuDNNSdpaRunner.run_dense`](../../attention/backends/cudnn.py) owns cuDNN execution. The H3 component controls the runner's lifetime and passes it to [`DenseAttentionOp`](ops/attention.py). The runner manages its plans, workspace and device-specific dispatch. Put new per-instance orchestration with the component.
-- **Model or backend wrapper.** Keep packed-row mask construction, checkpoint recipes, learned gates and per-layer or per-step choices in the owning family or target, including fallback and weight-loading paths. Apply the [Modeling V1 dependency boundary](../../../modeling_v2/README.md#modeling-v1-code) to model classes, layers and complete attention backends. Reuse the underlying computation through a supported kernel or runner interface. The H3 pilot still calls private FlashInfer `_run_*` methods and CuTe quantization helpers in [its attention adapter](ops/attention.py). Treat these as backend internals. When a new caller needs one, expose the required tensor operation or execution method at its owner.
+Place the V2 operation contract in the [narrowest scope that uses it](../../../modeling_v2/README.md#writing-operations). One target or family owns its local operations. A fully model-independent computation used unchanged across families belongs in the catalog. A kernel library or backend supplies the implementation underneath that contract.
+
+- **Kernel invocation.** [FA4](../../catalog/attention/flash_attention_4.py) accepts Q/K/V, scale, a causal flag and valid KV lengths, and returns output and logsumexp. H3 converts its trailing-padding mask to lengths. [CuTe FMHA](../../catalog/attention/cute_fmha.py) owns quantization and the kernel launch. The caller resolves any step-dependent skip-softmax threshold. Test each shared op against its reference for the layouts, dtypes and execution modes its callers use.
+- **Stateful execution.** The H3 [dense attention component](components/dense_attention.py) holds its runner and passes execution state explicitly to [FlashInfer prefill](../../catalog/attention/flashinfer_prefill.py). The op selects a compatible implementation and the runner manages its plans and workspace. Keep persistent per-instance state with the component. Use an existing supported kernel or runner method directly when it already provides the execution interface, as with cuDNN's [`run_dense`](../../attention/backends/cudnn.py).
+- **Model policy.** Keep checkpoint interpretation, masks, gates and per-step choices in the family or target, including fallbacks and weight loading. For example, H3 chooses which denoising steps call the [SOL predictor](../../attention/backends/sparse/sol/predictor.py). Prefer a supported execution interface when reusing an existing kernel or runner. Apply the [V1 dependency rule](../../../modeling_v2/README.md#modeling-v1-code) to model classes, layers and complete attention backends.
 
 ## File map
 
@@ -90,6 +92,9 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 
 | Components and parallelism | Responsibility |
 | --- | --- |
+| [components/dense_attention.py](components/dense_attention.py) | Select the H3 dense attention path, own its runner and adapt H3 masks and per-step choices to the operation. |
+| [components/trtllm_attention.py](components/trtllm_attention.py) | Pack H3 Q/K/V and run TRTLLM attention with the model's masks and sparse routes. |
+| [components/trtllm_attention_prims.py](components/trtllm_attention_prims.py) | Maintain contiguous attention plans and quantization state for an H3 instance. |
 | [components/transformer.py](components/transformer.py) | Assemble the token refiner, DiT blocks and joint audio/video outputs. |
 | [components/attention.py](components/attention.py) | Build H3 projections, per-head normalization, three-axis RoPE and dense or gated attention. |
 | [components/linear.py](components/linear.py) | Own rank-local projection parameters and dispatch their GEMM. |
@@ -108,11 +113,8 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 | [ops/ulysses.py](ops/ulysses.py) | Exchange Q/K/V for synchronous H3 attention and convert asynchronous receive buffers into its attention layout. |
 | [ops/activation.py](ops/activation.py) | Define the H3 SwiGLU operation. |
 | [ops/adaln.py](ops/adaln.py) | Define adaptive normalization/modulation and its gated residual variant. |
-| [ops/attention.py](ops/attention.py) | Select the H3 attention implementation and adapt dense attention inputs to its kernel runner. |
 | [ops/quantized_gemm.py](ops/quantized_gemm.py) | Define FP8 scaled and block GEMMs and FP4 activation quantization. |
 | [ops/rope.py](ops/rope.py) | Apply partial rotary embedding and expose fused Q/K norm and RoPE. |
-| [ops/trtllm_attention.py](ops/trtllm_attention.py) | Pack Q/K/V and issue TRTLLM attention with H3 masks and sparse routes. |
-| [ops/trtllm_attention_prims.py](ops/trtllm_attention_prims.py) | Maintain contiguous attention plans and quantization state for an H3 instance. |
 | [ops/vsa.py](ops/vsa.py) | Build H3 tile routes, run fine attention and combine it with coarse attention through the learned gate. |
 | [kernels/fused_adaln.py](kernels/fused_adaln.py) | Implement and register H3's fused AdaLN Triton kernels. |
 | [kernels/fused_rope.py](kernels/fused_rope.py) | Implement and register fused BF16 Q/K normalization and RoPE. |

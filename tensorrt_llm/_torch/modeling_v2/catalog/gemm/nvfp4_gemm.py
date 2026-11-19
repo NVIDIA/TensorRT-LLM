@@ -76,12 +76,9 @@ class Nvfp4Gemm(OpWrapper):
     )
 
     note = """
-    `bias`, `group` and `output_buffer_kind` exist on the op and no shipped
-    target passes them, so none is a cell axis.
-
-    `allowed_backends` selects among cutlass, cublaslt and cuda_core. The cells
-    drive the default string, so which backend answers is the op's choice on the
-    day -- that is deliberate, since a target gets the same choice.
+    The H3 text conditioning projection passes a bias and enables cutlass,
+    cublaslt, cutedsl and cuda_core. The other cells use the default backend list.
+    Non-default output buffers and process groups remain uncertified here.
     """
 
     def __call__(

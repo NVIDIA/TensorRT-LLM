@@ -75,6 +75,9 @@ def test_fasth3_generation_steps_follow_inference_contract(
         (tmp_path / "fastvideo_inference.json").write_text(json.dumps(manifest))
     config = SimpleNamespace(
         attention=AttentionConfig(),
+        mapping=SimpleNamespace(world_size=1),
+        extra_attrs={},
+        device="cpu",
         model_configs={},
         attention_metadata_state=None,
         primary_pretrained_config=SimpleNamespace(),
@@ -194,6 +197,7 @@ def test_fasth3_manifest_metadata_controls_pipeline_defaults(
     )
 
     config = DiffusionPipelineConfig.from_pretrained(str(tmp_path))
+    config.device = "cpu"
     config.attention = AttentionConfig(**attention_kwargs)
     assert route(config, str(tmp_path)) is FastH3Pipeline
     assert config.attention.backend == expected_backend

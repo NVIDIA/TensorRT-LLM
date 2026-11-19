@@ -58,6 +58,9 @@ if TYPE_CHECKING:
     from .pipeline import BasePipeline
 
 
+_PipelineResolver = Callable[["DiffusionPipelineConfig", str], Type["BasePipeline"]]
+
+
 class PipelineComponent(str, Enum):
     """Identifiers for Diffusers-pipeline components.
 
@@ -93,6 +96,7 @@ class _PipelineEntry:
     download_patterns: List[str] = field(default_factory=list)
     doc: str = ""
     supports_nvfp4_vae: bool = False
+    opt_in: Optional[tuple[str, _PipelineResolver]] = None
 
 
 # Keyed by Diffusers ``_class_name`` (from either manifest format). ~3-5 entries
@@ -146,6 +150,21 @@ def register_pipeline(
         )
         logger.debug(f"Registered pipeline: {name} -> {cls.__name__}")
         return cls
+
+    return decorator
+
+
+def register_pipeline_opt_in(
+    name: str, env_var: str
+) -> Callable[[_PipelineResolver], _PipelineResolver]:
+    """Attach an opt-in resolver to an existing checkpoint family."""
+
+    def decorator(resolver: _PipelineResolver) -> _PipelineResolver:
+        entry = PIPELINE_REGISTRY[name]
+        if entry.opt_in is not None:
+            raise ValueError(f"Pipeline opt-in already registered: {name}")
+        entry.opt_in = (env_var, resolver)
+        return resolver
 
     return decorator
 
@@ -212,13 +231,10 @@ class AutoPipeline:
             )
         entry = PIPELINE_REGISTRY[class_name]
         AutoPipeline._validate_vae_quantization(config, class_name, entry)
-        if (
-            class_name == "MiniMaxH3ModularPipeline"
-            and os.environ.get("TLLM_VISUALGEN_MODELING2_H3") == "1"
-        ):
-            from .models.minimax_h3_v2.pipeline_registry import route
-
-            return route(config, checkpoint_dir)
+        if entry.opt_in is not None:
+            env_var, resolver = entry.opt_in
+            if os.environ.get(env_var) == "1":
+                return resolver(config, checkpoint_dir)
         return entry.pipeline_cls.resolve_variant(config)
 
     @staticmethod

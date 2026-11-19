@@ -279,6 +279,15 @@ class MiniMaxH3TokenRefiner(nn.Module):
         return self.sharder.gather(hidden_states, dim=1, unpad_to=seq_len)
 
 
+def trunk_attention_for(model_config: DiffusionModelConfig) -> type[MiniMaxH3Attention]:
+    sparse = model_config.attention.sparse_attention_config
+    return (
+        MiniMaxH3VSAAttention
+        if sparse is not None and sparse.algorithm == "vsa"
+        else MiniMaxH3Attention
+    )
+
+
 class MiniMaxH3TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -300,12 +309,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
         )
         if attention_cls is None:
-            sparse = model_config.attention.sparse_attention_config
-            attention_cls = (
-                MiniMaxH3VSAAttention
-                if sparse is not None and sparse.algorithm == "vsa"
-                else MiniMaxH3Attention
-            )
+            attention_cls = trunk_attention_for(model_config)
         self.attn = attention_cls(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,

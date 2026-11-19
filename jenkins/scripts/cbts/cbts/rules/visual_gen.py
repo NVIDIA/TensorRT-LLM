@@ -157,7 +157,9 @@ _VG_UNIT = "unittest/_torch/visual_gen/models"
 _VG_QUALITY = "visual_gen"
 
 
-class _FamilyScope:
+class VisualGenFamilyScope:
+    """Source dependencies and mirrored test paths for a routed VisualGen family."""
+
     def __init__(self, root: Path, family: Path):
         self.source = family
         self.family = family.name
@@ -221,7 +223,7 @@ class VisualGenRule(Rule):
     ) -> None:
         self.families = (
             {
-                f"{_MODELS}{routing.parent.name}/": _FamilyScope(repo_root, routing.parent)
+                f"{_MODELS}{routing.parent.name}/": VisualGenFamilyScope(repo_root, routing.parent)
                 for routing in (repo_root / _MODELS).glob("*/pipeline_registry.py")
             }
             if repo_root is not None
@@ -257,7 +259,10 @@ class VisualGenRule(Rule):
         required_checks = {}
         if _VG_SCHEMA_PATH in claimed:
             required_checks[_SCHEMA_TEST_TARGET] = "schema"
-        if any(path.startswith(_VG_CATALOG) for path in claimed):
+        if any(
+            path.startswith(_VG_CATALOG) or (path.startswith(_MODELS) and "/ops/" in path)
+            for path in claimed
+        ):
             required_checks[_CATALOG_CONTRACT_TEST] = "catalog contract"
         check_filters_by_target: dict[str, dict[tuple[str, int], dict[str, set[str]]]] = {
             check: {} for check in required_checks

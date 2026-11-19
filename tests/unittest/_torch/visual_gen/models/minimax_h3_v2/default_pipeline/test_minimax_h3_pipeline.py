@@ -720,12 +720,12 @@ def test_subset_text_encoder_tp_rejects_mpi_before_group_creation(
     monkeypatch: pytest.MonkeyPatch, rank: int
 ) -> None:
     monkeypatch.setattr(default_pipeline, "mpi_disabled", lambda: False)
-    monkeypatch.setattr(h3_pipeline.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
 
     def unexpected_group_creation(*args, **kwargs):
         pytest.fail("Unsupported MPI subset must fail before creating a process group")
 
-    monkeypatch.setattr(h3_pipeline.dist, "new_group", unexpected_group_creation)
+    monkeypatch.setattr(dist, "new_group", unexpected_group_creation)
     config = SimpleNamespace(
         mapping=SimpleNamespace(world_size=4, tp_size=1, rank=rank),
         visual_gen_mapping=_ulysses_mapping(4),

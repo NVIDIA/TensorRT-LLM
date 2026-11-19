@@ -65,7 +65,7 @@ from .predictor import BLOCK_SIZE
 _sol_attn_import_error = None
 try:
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.sol_attn_backend import (
-        _run_sol_attn_bthd as _sol_attn_run,
+        run_sol_attn_bthd as _sol_attn_run,
     )
 except (ImportError, OSError) as e:
     _sol_attn_run = None
@@ -73,28 +73,16 @@ except (ImportError, OSError) as e:
 
 
 def _cute_dense_available() -> bool:
-    """Whether `cute_dsl_fmha_fwd` can run on the current device.
+    from tensorrt_llm._torch.visual_gen.catalog.attention.cute_fmha import is_cute_fmha_supported
 
-    Checked once at construction. SOL and the dense CuTe DSL kernel now
-    cover the same set (sm_100a/sm_103a), so in practice this is always true
-    wherever SOL runs; the negative branch exists so an unsupported device
-    degrades to SDPA instead of raising.
-    """
-    try:
-        from ...cute_dsl.fmha import _check_cute_runtime_available, _get_gpu_arch
-
-        _check_cute_runtime_available()
-        _get_gpu_arch()
-    except Exception:
-        return False
-    return True
+    return is_cute_fmha_supported()
 
 
 class SOLCuTeDSLAttention(AttentionBackend):
     """Fused SOL sparse attention (CuTeDSL, sm100/sm103).
 
     Inputs the kernel cannot serve (shape, dtype, architecture) are delegated to
-    dense attention up front by ``_run_sol_attn_bthd``; a kernel error is not
+    dense attention up front by ``run_sol_attn_bthd``; a kernel error is not
     recovered from and propagates. This class adds the ``dense_layers`` guard
     (resolved for this layer at construction) and forwards the routing knobs
     from config.

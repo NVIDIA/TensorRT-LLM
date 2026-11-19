@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from itertools import product
+
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.ops.trtllm_attention import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.components.trtllm_attention import (
     H3TrtllmAttention,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.ops.vsa import (
@@ -25,9 +27,16 @@ def test_h3_vsa_geometry():
     assert metadata.sizes[:2].tolist() == [7, 5]
 
 
-@pytest.mark.parametrize("sparsity", [0.0, 0.5, 0.9])
-@pytest.mark.parametrize("batch", [1, 2])
-@pytest.mark.parametrize("segments", [(7, 5, (5, 5, 7)), (7, (4, 4, 12))])
+def _vsa_cases():
+    cells = (
+        (cell.spec["segments"], cell.spec["batch"], cell.spec["sparsity"])
+        for cell in h3_vsa_attention.CELLS
+    )
+    layout_cases = product(((7, 5, (5, 5, 7)), (7, (4, 4, 12))), (1, 2), (0.0, 0.5, 0.9))
+    return list(dict.fromkeys((*cells, *layout_cases)))
+
+
+@pytest.mark.parametrize(("segments", "batch", "sparsity"), _vsa_cases())
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_h3_vsa_backends_masked_reference(sparsity, batch, segments):
     if torch.cuda.get_device_capability()[0] != 10:

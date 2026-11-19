@@ -37,17 +37,12 @@ than overwrite:
   a ``backend: CUTEDSL`` A/B isolate sparsity rather than also swapping the
   dense kernel.
 * ``@torch.compiler.disable`` guards the launch boundary; see the comment on
-  ``_run_sol_attn_bthd`` for why, and for the ``torch.library.custom_op``
+  ``run_sol_attn_bthd`` for why, and for the ``torch.library.custom_op``
   alternative upstream uses.
 
 The kernel-facing API accepts contiguous BF16
 ``[batch, tokens, heads, 128]`` Q/K/V, ``tau``, ``thresh_type``,
 ``kv_splits``, and an optional exact KV sink range.
-
-TRT-LLM's dispatch path (``attention/backends/sparse/sol/backend.py``,
-``SOLCuTeDSLAttention``) consumes exactly two names from this module:
-``_run_sol_attn_bthd`` and ``sol_attn_supported``. The dense-prefix decision
-lives there too, keyed off the normalized timestep forward kwarg.
 
 CuTe DSL imports and compilation are deferred to first use. Calls the kernel
 is known not to serve -- wrong shape, dtype, or an architecture with no kernel
@@ -167,7 +162,7 @@ def _dense_bthd(q, k, v):
 # CuTe DSL entry point in this repository already follows, and is what the
 # reported measurements were taken with.
 @torch.compiler.disable
-def _run_sol_attn_bthd(
+def run_sol_attn_bthd(
     q,
     k,
     v,

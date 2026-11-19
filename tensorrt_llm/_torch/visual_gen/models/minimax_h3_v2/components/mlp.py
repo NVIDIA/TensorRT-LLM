@@ -12,7 +12,7 @@ from tensorrt_llm._torch.modules.gate_up_swiglu_quack import (
 from tensorrt_llm._utils import get_sm_version
 
 from ..ops.activation import swiglu
-from ..parallel.tp import shard_bounds
+from ..parallel.tp import projection_shard_bounds
 from .linear import Linear
 
 
@@ -31,13 +31,20 @@ class GatedMLP(nn.Module):
     ):
         super().__init__()
         mapping = config.mapping
-        lo, hi = shard_bounds(intermediate_size, mapping.tp_size, mapping.tp_rank)
+        quant = config.get_quant_config()
+        lo, hi = projection_shard_bounds(
+            intermediate_size,
+            mapping.tp_size,
+            mapping.tp_rank,
+            quant.quant_algo if quant is not None else None,
+            config.skip_create_weights_in_init,
+        )
         size = hi - lo
         kwargs = dict(
             bias=bias,
             dtype=dtype,
             mapping=mapping,
-            quant_config=config.get_quant_config(),
+            quant_config=quant,
             force_dynamic_quantization=config.force_dynamic_quantization,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             use_cute_dsl_bf16_gemm=getattr(config, "use_cute_dsl_bf16_gemm", False),
@@ -58,6 +65,7 @@ class GatedMLP(nn.Module):
             **kwargs,
             tensor_parallel_mode="row",
             reduce_output=reduce_output,
+            override_tp_sharding=(lo, hi),
         )
         self.fuse_bf16_gate_up_swiglu = (
             fuse_bf16_gate_up_swiglu and gate_up_swiglu_quack_available()

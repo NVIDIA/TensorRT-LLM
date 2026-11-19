@@ -6,7 +6,7 @@ import torch
 from torch.nn import functional as F
 
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.ops.trtllm_attention import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.components.trtllm_attention import (
     H3TrtllmAttention,
 )
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig

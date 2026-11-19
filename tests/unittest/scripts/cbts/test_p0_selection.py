@@ -323,7 +323,10 @@ def test_public_api_post_merge_can_use_post_merge_validation() -> None:
             "tensorrt_llm/_torch/modeling_v2/catalog/gemm/cublas_mm.py",
             {"default_pipeline", "fasth3"},
         ),
-        ("tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/ops/vsa.py", {"fasth3", "ops"}),
+        (
+            "tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/ops/vsa.py",
+            {"fasth3", "ops", "contracts"},
+        ),
         (
             "tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/default_pipeline/pipeline.py",
             {"default_pipeline"},
@@ -372,6 +375,7 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
         "fasth3": {f"{unit}/fasth3/test_pipeline.py", f"{quality}/fasth3/test_quality.py"},
         "ops": {f"{unit}/ops/test_vsa.py"},
         "legacy": {"visual_gen/test_unrelated.py", "examples/visual_gen/test_minimax_h3_e2e.py"},
+        "contracts": {"unittest/_torch/modeling_v2/test_modeling_v2_contracts.py"},
     }
     index = YAMLIndex()
     index.blocks = [
@@ -379,10 +383,12 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
             "l0_b200",
             0,
             {},
-            sorted(set.union(*entries.values())),
-        )
+            sorted(set.union(*(paths for key, paths in entries.items() if key != "contracts"))),
+        ),
+        Block("l0_cpu", 0, {}, sorted(entries["contracts"])),
     ]
-    rule = VisualGenRule(index, {}, tmp_path)
+    stages = {"CPU-Generic-x86-1": Stage("CPU-Generic-x86-1", "l0_cpu", "x86_64", 1, 1)}
+    rule = VisualGenRule(index, stages, tmp_path)
     result = rule.apply(PRInputs([changed], {}))
     assert result is not None
     selected = {
@@ -423,7 +429,7 @@ def test_visualgen_catalog_selects_block_sparse_attention_and_its_consumers():
     )
     assert {
         "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
-        "unittest/_torch/visual_gen/catalog/attention/test_block_sparse_attention.py",
+        "unittest/_torch/visual_gen/catalog/attention",
         "unittest/_torch/visual_gen/models/minimax_h3_v2/ops/test_minimax_h3_vsa.py",
         "unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py",
         "unittest/_torch/visual_gen/test_wan_vsa_pipeline.py",
@@ -439,5 +445,7 @@ def test_h3_ulysses_ops_select_the_family():
         f"{unit}/ops/test_ulysses.py",
         f"{unit}/default_pipeline/test_minimax_h3_pipeline.py",
         f"{unit}/fasth3/test_fasth3_pipeline.py",
+        "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
     } <= selected
-    assert all(path.startswith((unit + "/", "visual_gen/minimax_h3_v2/")) for path in selected)
+    h3_tests = selected - {"unittest/_torch/modeling_v2/test_modeling_v2_contracts.py"}
+    assert all(path.startswith((unit + "/", "visual_gen/minimax_h3_v2/")) for path in h3_tests)
