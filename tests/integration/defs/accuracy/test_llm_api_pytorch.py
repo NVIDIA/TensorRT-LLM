@@ -6113,7 +6113,8 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
             "\n".join(f"{letter}) {choice}"
                       for letter, choice in zip("ABCD", ordered_choices)))
 
-    @pytest.mark.timeout(43200)
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_device_not_contain(["B200", "B300", "GB200", "GB300"])
     @pytest.mark.parametrize("mode", ["baseline", "mtp3", "dflash7"])
     def test_reasoning_replay(
         self,

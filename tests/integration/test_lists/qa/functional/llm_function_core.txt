@@ -601,6 +601,9 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[trtllm_gen]
 accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4_dflash[TRTLLM]
 accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4_dflash[VANILLA]
 accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4_w4a16
+accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_reasoning_replay[baseline] TIMEOUT (60)
+accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_reasoning_replay[dflash7] TIMEOUT (60)
+accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_reasoning_replay[mtp3] TIMEOUT (60)
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[multi_gpus_no_cache]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dflash
