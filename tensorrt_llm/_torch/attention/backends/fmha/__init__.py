@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Import the built-in modules that are only needed for name registration.
+from . import beam_shared_prefix, prims_ts_block_sparse, prims_ts_dsa_sparse_mla  # noqa: F401
 from .combined import CombinedFmha
 from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
+from .flash_attn4_generation import FlashAttn4GenerationFmha  # noqa: F401
 from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
@@ -26,7 +29,8 @@ from .msa_prefill import MsaPrefillFmha
 from .phased import FmhaParams, PhasedFmha
 from .prims_ts import PrimsTSFmha
 from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
-from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
+from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, fmha_lib, get_enabled_fmha_lib_classes
+from .sampling_shared_prefix import SamplingSharedPrefixFmha  # noqa: F401
 from .triton_custom_mask import TritonCustomMaskFmha
 
 __all__ = [
@@ -49,5 +53,6 @@ __all__ = [
     "PrimsTSFmha",
     "PrimsTSSparseMlaFmha",
     "TritonCustomMaskFmha",
+    "fmha_lib",
     "get_enabled_fmha_lib_classes",
 ]

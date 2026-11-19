@@ -61,6 +61,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 from .fallback import FallbackFmha
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -814,6 +815,7 @@ def _lse_rows_log2(lse: torch.Tensor, rows: int, lse_scale: float) -> torch.Tens
     return lse[:, :rows].t().contiguous() * lse_scale
 
 
+@fmha_lib(LIB_NAME)
 class BeamSharedPrefixFmha(PhasedFmha):
     """Generation-phase library for wide-beam decoding; see the module docstring."""
 

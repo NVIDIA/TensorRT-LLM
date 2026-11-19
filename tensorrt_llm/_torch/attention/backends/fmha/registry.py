@@ -13,167 +13,145 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import functools
 import os
-from typing import TypeAlias
+from collections.abc import Callable, Sequence
+from typing import TypeAlias, TypeVar
 
-from .beam_shared_prefix import BeamSharedPrefixFmha
-from .cute_dsl_mla import CuteDslMlaFmha
-from .fallback import FallbackFmha
-from .flash_attn4_generation import FlashAttn4GenerationFmha
-from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
-from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
-from .prims_ts import PrimsTSFmha
-from .sampling_shared_prefix import SamplingSharedPrefixFmha
-from .triton_custom_mask import TritonCustomMaskFmha
 
 FmhaCls: TypeAlias = type[Fmha]
+_FmhaT = TypeVar("_FmhaT", bound=Fmha)
 
-
-def init_fmha_libs() -> dict[str, "FmhaCls"]:
-    """Build the ordered FMHA library registry.
-
-    Backend classes are imported inside this factory rather than at module
-    scope, so backends can import trtllm attention classes at module scope
-    without an import cycle.
-    """
-    from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
-    from .gqa_decode import (
-        GqaDecodeFmha,
-        GqaKvReplicaFmha,
-        GqaKvReplicaFusedFmha,
-        GqaSegmentedFmha,
-        GqaSplitKvFmha,
-    )
-    from .msa_decode import MsaDecodeFmha
-    from .msa_prefill import MsaPrefillFmha
-    from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
-    from .prims_ts_dsa_sparse_mla import PrimsTSDsaSparseMlaFmha
-    from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
-
-    return {
-        "fp4_mla": Fp4MlaFmha,
-        "triton_custom_mask": TritonCustomMaskFmha,
-        "prims_ts": PrimsTSFmha,
-        "cute_dsl_mla": CuteDslMlaFmha,
-        # A pair, not a priority: msa_decode serves a MiniMax-M3 MSA layer's
-        # generation phase and msa_prefill its context phase, and neither will
-        # take the other's.
-        "msa_decode": MsaDecodeFmha,
-        "msa_prefill": MsaPrefillFmha,
-        "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
-        "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
-        # DeepSeek-V4 generation on the vendored PrimTS native sparse MLA
-        # kernel. Enabled by default: it only reports itself available for
-        # DeepSeek-V4 on SM100, so every other model and architecture never
-        # sees it; everything else keeps the TRTLLM-Gen libraries below.
-        "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
-        # DSA generation on the PrimTS D576 sparse MLA kernel over NVFP4 KV records. It only
-        # reports itself available for DSA layers whose cache uses the ``fp8rope`` NVFP4 layout,
-        # and DSATrtllmAttention then hands it the records instead of gathered FP8 rows.
-        "prims_ts_dsa_sparse_mla": PrimsTSDsaSparseMlaFmha,
-        # Opt-in shared-prefix generation path (TLLM_FMHA_LIBS=+sampling_shared_prefix).
-        # It must precede flashinfer_trtllm_gen, which takes every generation
-        # batch it supports. It declines eager batches without a shared prefix
-        # but serves every batch it plans when a CUDA graph is captured for it,
-        # n = 1 requests included (each attended on its own).
-        "sampling_shared_prefix": SamplingSharedPrefixFmha,
-        # Opt-in FlashAttention-4 generation path on SM90 (TLLM_FMHA_LIBS=+flash_attn4_generation):
-        # decode and linear speculative verification. After sampling_shared_prefix, which takes the
-        # n-sample batches it plans.
-        "flash_attn4_generation": FlashAttn4GenerationFmha,
-        # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
-        # trtllm-gen with the module's KV append / deferred prologue.
-        "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
-        "gqa_kv_replica": GqaKvReplicaFmha,
-        "gqa_split_kv": GqaSplitKvFmha,
-        "gqa_segmented": GqaSegmentedFmha,
-        "gqa_decode": GqaDecodeFmha,
-        "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
-        # Opt-in wide-beam generation path (TLLM_FMHA_LIBS=+beam_shared_prefix);
-        # takes generation-only beam-search batches ahead of the fallback.
-        "beam_shared_prefix": BeamSharedPrefixFmha,
-        "fallback": FallbackFmha,
-    }
-
-
-FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
-# Libraries left out of the default set and enabled explicitly through
-# TLLM_FMHA_LIBS: beam_shared_prefix and sampling_shared_prefix are narrow-scope
-# beam-search / n-sample paths; flash_attn4_generation is an SM90 generation path
-# under evaluation.
-_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset(
-    {"beam_shared_prefix", "sampling_shared_prefix", "flash_attn4_generation"}
-)
-DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
-    name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
+FMHA_LIBS: dict[str, FmhaCls] = {}
+DEFAULT_FMHA_LIBS = (
+    "fp4_mla",
+    "triton_custom_mask",
+    "prims_ts",
+    "cute_dsl_mla",
+    "msa_decode",
+    "msa_prefill",
+    "flashinfer_sparse_mla",
+    "prims_ts_block_sparse",
+    "prims_ts_sparse_mla",
+    "prims_ts_dsa_sparse_mla",
+    # GQA generation kernels in precedence order, then general GQA decode.
+    "gqa_kv_replica_fused",
+    "gqa_kv_replica",
+    "gqa_split_kv",
+    "gqa_segmented",
+    "gqa_decode",
+    "flashinfer_trtllm_gen",
+    "fallback",
 )
 
 
-def _parse_fmha_libs_env() -> tuple[str, ...]:
-    return _parse_fmha_libs_value(os.environ.get("TLLM_FMHA_LIBS"))
+def fmha_lib(name: str) -> Callable[[type[_FmhaT]], type[_FmhaT]]:
+    """Register an FMHA class for name lookup without changing the default order."""
+    if not name or name != name.strip() or name[0] in "+-" or "," in name:
+        raise ValueError(f"Invalid FMHA library name {name!r}.")
+
+    def register(cls: type[_FmhaT]) -> type[_FmhaT]:
+        if FMHA_LIBS.setdefault(name, cls) is not cls:
+            raise ValueError(f"FMHA library {name!r} is already registered.")
+        return cls
+
+    return register
+
+
+def _get_fmha_lib_class(name: str) -> FmhaCls:
+    try:
+        return FMHA_LIBS[name]
+    except KeyError:
+        raise ValueError(f"Unknown FMHA library {name!r}.") from None
+
+
+def _parse_fmha_libs_env() -> tuple[tuple[str, str], ...]:
+    return _parse_fmha_libs_value(os.environ.get("TLLM_FMHA_LIBS", ""))
 
 
 @functools.lru_cache(maxsize=8)
-def _parse_fmha_libs_value(value: str | None) -> tuple[str, ...]:
-    """Parse a ``TLLM_FMHA_LIBS`` value; cached because per-step host code queries it."""
-    if value is None or not value.strip():
-        return DEFAULT_FMHA_LIBS
-
+def _parse_fmha_libs_value(value: str) -> tuple[tuple[str, str], ...]:
+    """Cache the syntax of environment overrides independently of registration."""
     tokens = [token.strip() for token in value.split(",") if token.strip()]
-    if not tokens:
-        return DEFAULT_FMHA_LIBS
-
-    has_delta_token = any(token[0] in "+-" for token in tokens)
-    if has_delta_token and not all(token[0] in "+-" for token in tokens):
+    has_delta = any(token[0] in "+-" for token in tokens)
+    if has_delta and not all(token[0] in "+-" for token in tokens):
         raise ValueError(
             "TLLM_FMHA_LIBS must use either an exact comma-separated list "
             "or only +/- delta entries."
         )
 
-    if has_delta_token:
-        enabled_names = set(DEFAULT_FMHA_LIBS)
-        for token in tokens:
-            sign = token[0]
-            name = token[1:].strip()
-            if not name:
-                raise ValueError(f"Invalid empty FMHA library entry in {value!r}.")
-            if name not in FMHA_LIBS:
-                raise ValueError(f"Unknown FMHA library {name!r} in TLLM_FMHA_LIBS.")
-            if sign == "+":
-                enabled_names.add(name)
-            else:
-                enabled_names.discard(name)
-        names = [name for name in FMHA_LIBS if name in enabled_names]
-    else:
-        names = []
-        for name in tokens:
-            if name not in FMHA_LIBS:
-                raise ValueError(f"Unknown FMHA library {name!r} in TLLM_FMHA_LIBS.")
-            if name not in names:
-                names.append(name)
-
-    return tuple(names)
+    entries = []
+    for token in tokens:
+        sign = token[0] if has_delta else ""
+        name = token[1:].strip() if has_delta else token
+        if not name:
+            raise ValueError(f"Invalid empty FMHA library entry in {value!r}.")
+        entries.append((sign, name))
+    return tuple(entries)
 
 
-def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
-    return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
+def get_enabled_fmha_lib_classes(
+    fmha_libs: Sequence[str | FmhaCls] | None = None,
+    use_fmha_libs_env: bool = True,
+) -> list[FmhaCls]:
+    """Resolve ordered candidates and apply environment overrides.
+
+    Args:
+        fmha_libs: Registered names and classes. None selects the default list.
+        use_fmha_libs_env: Apply deltas or an exact list from TLLM_FMHA_LIBS.
+    """
+    entries = _parse_fmha_libs_env() if use_fmha_libs_env else ()
+    return _resolve_fmha_lib_classes(fmha_libs, entries)
+
+
+def _resolve_fmha_lib_classes(
+    fmha_libs: Sequence[str | FmhaCls] | None,
+    env_entries: tuple[tuple[str, str], ...],
+) -> list[FmhaCls]:
+    entries = []
+    for sign, name in env_entries:
+        if name not in FMHA_LIBS:
+            raise ValueError(f"Unknown FMHA library {name!r} in TLLM_FMHA_LIBS.")
+        entries.append((sign, FMHA_LIBS[name]))
+    if entries and not entries[0][0]:
+        return list(dict.fromkeys(cls for _, cls in entries))
+
+    candidates = DEFAULT_FMHA_LIBS if fmha_libs is None else fmha_libs
+    classes = [_get_fmha_lib_class(lib) if isinstance(lib, str) else lib for lib in candidates]
+    prepended: dict[FmhaCls, None] = {}
+    excluded: set[FmhaCls] = set()
+    for sign, cls in entries:
+        if sign == "+":
+            excluded.discard(cls)
+            prepended[cls] = None
+        else:
+            prepended.pop(cls, None)
+            excluded.add(cls)
+
+    return [cls for cls in dict.fromkeys((*prepended, *classes)) if cls not in excluded]
+
+
+@functools.lru_cache(maxsize=8)
+def _global_fmha_lib_classes(entries: tuple[tuple[str, str], ...]) -> tuple[FmhaCls, ...]:
+    return tuple(_resolve_fmha_lib_classes(None, entries))
 
 
 def is_fmha_lib_enabled(name: str) -> bool:
     """Whether ``TLLM_FMHA_LIBS`` enables the library registered as ``name``."""
-    return name in _parse_fmha_libs_env()
+    return FMHA_LIBS.get(name) in _global_fmha_lib_classes(_parse_fmha_libs_env())
 
 
 @functools.lru_cache(maxsize=8)
-def _step_planning_classes(names: tuple[str, ...]) -> tuple[FmhaCls, ...]:
-    return tuple(FMHA_LIBS[name] for name in names if FMHA_LIBS[name].plans_steps())
+def _step_planning_classes(entries: tuple[tuple[str, str], ...]) -> tuple[FmhaCls, ...]:
+    return tuple(cls for cls in _global_fmha_lib_classes(entries) if cls.plans_steps())
 
 
 @functools.lru_cache(maxsize=8)
-def _step_stats_classes(names: tuple[str, ...]) -> tuple[FmhaCls, ...]:
-    return tuple(FMHA_LIBS[name] for name in names if FMHA_LIBS[name].step_stats_field is not None)
+def _step_stats_classes(entries: tuple[tuple[str, str], ...]) -> tuple[FmhaCls, ...]:
+    return tuple(cls for cls in _global_fmha_lib_classes(entries) if cls.step_stats_field is not None)
 
 
 def step_planning_fmha_lib_classes() -> tuple[FmhaCls, ...]:
@@ -207,9 +185,9 @@ __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
     "FmhaCls",
+    "fmha_lib",
     "fmha_step_stats",
     "get_enabled_fmha_lib_classes",
-    "init_fmha_libs",
     "is_fmha_lib_enabled",
     "reset_fmha_step_stats",
     "step_planning_fmha_lib_classes",
