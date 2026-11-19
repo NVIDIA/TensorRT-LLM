@@ -69,31 +69,24 @@ def clean(ax: plt.Axes, direction: str = "x") -> None:
 
 
 def flow() -> None:
-    fig, ax = canvas(5.5)
-    text(ax, 3.2, 5.25, "Two windows become two GEMM rows", weight="bold")
-    for k in range(6):
-        color = PALE_GREEN if k < 2 else PALE_ORANGE if k > 3 else "#E9E4CF"
-        box(ax, 0.5 + k * 0.9, 4.55, 0.9, 0.45, rf"$x_{{{k},c}}$", color)
-    ax.plot([0.5, 4.1], [4.4, 4.4], color=GREEN, lw=3)
-    ax.plot([2.3, 5.9], [4.05, 4.05], color=ORANGE, lw=3)
-    for x, y, label, color in [(1.3, 4.17, "tile A", GREEN), (4.9, 3.82, "tile B", ORANGE)]:
-        ax.text(x, y, label, ha="center", va="center", color=color, fontsize=16)
-    text(ax, 3.2, 3.46, "Coordinate 0: first sample − third sample")
-    for x, label in [(2.0, "channel 0"), (3.75, "channel 1"), (5.5, "…")]:
-        text(ax, x, 2.99, label)
-    for y, first, label, color in [
-        (2.22, 0, "tile A", PALE_GREEN),
-        (1.63, 2, "tile B", PALE_ORANGE),
+    fig, ax = canvas(1.68)
+    left, step = 0.84, 0.54
+    for j in range(6):
+        text(ax, left + (j + 0.5) * step, 1.43, rf"$\mathbf{{x}}_{j}$")
+    text(ax, 5.40, 1.43, r"$V_0$")
+
+    for tile, first, y, fill, ink in [
+        ("A", 0, 0.75, PALE_GREEN, GREEN),
+        ("B", 2, 0.17, PALE_ORANGE, ORANGE),
     ]:
-        text(ax, 0.55, y + 0.28, label)
-        for x, channel in [(1.17, 0), (2.92, 1)]:
-            value = rf"$x_{{{first},{channel}}}-x_{{{first + 2},{channel}}}$"
-            box(ax, x, y, 1.67, 0.56, value, color)
-        box(ax, 4.67, y, 1.67, 0.56, "…", color)
-    text(ax, 3.75, 1.31, "V₀: one row per tile, one column per channel")
-    text(ax, 3.2, 0.85, r"$M_0 = V_0U_0$")
-    text(ax, 3.2, 0.45, "U₀ holds g₀ for every input/output channel pair.")
-    text(ax, 3.2, 0.08, "Repeat for the other three coordinates.")
+        center = y + 0.24
+        ax.text(0.70, center, f"Tile {tile}", ha="right", va="center", color=ink, fontsize=14)
+        for offset, weight in enumerate(("+1", "0", "−1", "0")):
+            x = left + (first + offset) * step
+            box(ax, x, y, step, 0.48, weight, fill)
+        arrow(ax, (4.16, center), (4.50, center))
+        row = rf"$\mathbf{{x}}_{first} - \mathbf{{x}}_{first + 2}$"
+        box(ax, 4.63, y, 1.54, 0.48, row, fill)
     save(fig, "channel_flow")
 
 

@@ -267,17 +267,17 @@ U_i &: C_{\mathrm{in}}\times C_{\mathrm{out}}.
 \qquad (10)
 $$
 
-Figure 7 follows coordinate zero from <a href="#eq-winograd-f23">Eq. 9</a> into the GEMM layout of <a href="#eq-coordinate-gemm">Eq. 10</a>. Window A reads positions 0 through 3, and window B reads positions 2 through 5. Subtracting the third sample from the first in each window produces two rows of $V_0$. Multiplication by $U_0$ sums over channels for every output filter. Repeating this for the four coordinates supplies everything needed to reconstruct both output pairs.
+The subscript 0 in $V_0$ selects the input combination for $m_0$ in <a href="#eq-winograd-f23">Eq. 9</a>. Its coefficients are $(1,0,-1,0)$ over a four-sample window. Figure 7 applies those coefficients at two window positions. Both resulting rows multiply the same filter matrix $U_0$, whose entries are the $g_0$ weights for each input/output-channel pair. Each of the other three products uses its own input combination and filter matrix. Together the four GEMMs supply the terms for reconstructing both output pairs.
 
 <a id="figure-7"></a>
 
 <div align="center">
 
-![Coordinate-zero input combinations from two overlapping windows become two rows of a GEMM](../media/tech_blog31/channel_flow.svg)
+![Tile A places weights +1 and −1 at positions 0 and 2. Tile B shifts the same weights to positions 2 and 4. The two differences form rows of V₀.](../media/tech_blog31/channel_flow.svg)
 
 </div>
 
-*Figure 7. Building the GEMM input for F(2,3) from input stream x. The first subscript identifies the sample position and the second identifies the input channel. Each window contributes one row, and all windows share the transformed filters.*
+*Figure 7.* Each $\mathbf{x}_j$ is the row vector of input channels at spatial position $j$. Shading marks the four samples in each tile. The shared sample $\mathbf{x}_2$ contributes with opposite signs in the two tiles. Each entry in the resulting $V_0$ row is the difference for one input channel.
 
 The important reuse is across outputs within a tile. Overlapping tiles still read shared input samples, but their reconstructed outputs are disjoint. Applying the one-dimensional construction along both rows and columns gives a two-dimensional Winograd convolution, denoted $F(h\times w, h_f\times w_f)$. Here, $h$ and $w$ are the **output tile height and width**, and $h_f$ and $w_f$ are the **filter height and width**. For stride 1 and no dilation, the required input tile has dimensions $(h+h_f-1)\times(w+w_f-1)$, as shown in Figure 8.
 
