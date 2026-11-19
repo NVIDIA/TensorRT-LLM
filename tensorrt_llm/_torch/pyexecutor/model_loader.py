@@ -798,6 +798,14 @@ def _reject_dense_dwdp_update(model: torch.nn.Module, action: str) -> None:
             "dwdp_config.enable_dense to update weights.")
 
 
+def _holds_its_bytes(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor``'s storage still holds its elements: post-load processing
+    can release a parameter's memory in place (``untyped_storage().resize_(0)``)."""
+    return (tensor.untyped_storage().nbytes()
+            >= (tensor.storage_offset() + tensor.numel()) *
+            tensor.element_size())
+
+
 class _ModuleTree:
     """Each module's submodules, attributes and parameters, to put the module tree
     back as it was.
@@ -819,6 +827,13 @@ class _ModuleTree:
                             for module in model.modules()
                             for name, param in module._parameters.items()
                             if param is not None]
+        # Each parameter's tensor as created, which keeps its memory allocated
+        # while post-load processing replaces the parameter (restore_parameters).
+        self._tensors = {
+            id(param): param.detach()
+            for module in model.modules()
+            for param in module._parameters.values() if param is not None
+        }
 
     def restore(self) -> None:
         """Put back the submodules, and the attributes as they were.
@@ -841,23 +856,31 @@ class _ModuleTree:
         """Give each parameter slot its layout back, for the checkpoint to load into.
 
         A parameter that post-load processing released or replaced with another
-        layout is created again, empty. Slots that shared a parameter share one
+        layout gets its tensor as created back: the checkpoint loads into the
+        memory it was created in, as a load without the rehearsal does, so that
+        post-load processing frees the same memory and leaves the allocator's
+        cache as fragmented as it does then. One whose memory was released in
+        place is created again, empty. Slots that shared a parameter share one
         again.
         """
         kept: dict[int, torch.nn.Parameter] = {}
         for module, name, key, shape, dtype, device, _ in self._parameters:
             param = module._parameters.get(name)
             if (param is not None and param.shape == shape
-                    and param.dtype == dtype and param.device == device):
+                    and param.dtype == dtype and param.device == device
+                    and _holds_its_bytes(param)):
                 kept.setdefault(key, param)
         for module, name, key, shape, dtype, device, requires_grad in self._parameters:
             if key not in kept:
-                kept[key] = torch.nn.Parameter(torch.empty(shape,
-                                                           dtype=dtype,
-                                                           device=device),
+                tensor = self._tensors.get(key)
+                if tensor is None or not _holds_its_bytes(tensor):
+                    tensor = torch.empty(shape, dtype=dtype, device=device)
+                kept[key] = torch.nn.Parameter(tensor,
                                                requires_grad=requires_grad)
             module.__dict__.pop(name, None)
             module._parameters[name] = kept[key]
+        # The parameters hold the tensors they need now.
+        self._tensors.clear()
 
 
 @dataclass

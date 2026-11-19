@@ -146,17 +146,26 @@ def test_the_module_tree_goes_back_as_created():
 def test_parameters_go_back_to_their_layouts_as_created():
     root = torch.nn.Module()
     root.a, root.b, root.c = torch.nn.Linear(4, 2), torch.nn.Linear(4, 2), torch.nn.Linear(4, 2)
+    root.d = torch.nn.Linear(4, 2)
     root.b.weight = root.a.weight  # one parameter in two slots
     kept = root.c.weight
+    created = {name: getattr(root, name).weight.data_ptr() for name in "ad"}
+    created_bias = root.c.bias.data_ptr()
     tree = _ModuleTree(root)
-    # Post-load processing releases one parameter and replaces another with a new layout.
+    # Post-load processing releases one parameter, replaces another with a new layout, and
+    # frees the memory of a third in place.
     root.a.weight.data = root.a.weight.data.new_empty(0)
     root.c.bias = torch.nn.Parameter(torch.zeros(2, dtype=torch.float16))
+    root.d.weight.untyped_storage().resize_(0)
     tree.restore()
     tree.restore_parameters()
     assert root.a.weight.shape == (2, 4) and root.b.weight is root.a.weight
     assert root.c.bias.shape == (2,) and root.c.bias.dtype == torch.float32
     assert root.c.weight is kept
+    # The checkpoint loads into the memory the parameters were created in, unless that memory
+    # was released.
+    assert root.a.weight.data_ptr() == created["a"] and root.c.bias.data_ptr() == created_bias
+    assert root.d.weight.shape == (2, 4) and root.d.weight.untyped_storage().nbytes() == 32
 
 
 @cuda
