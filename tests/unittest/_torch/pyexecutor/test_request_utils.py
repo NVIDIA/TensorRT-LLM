@@ -2281,6 +2281,35 @@ def test_prepared_response_keeps_outputs_and_metadata_stable(
     assert response.result.ctx_usage == {"prompt_tokens": 3}
 
 
+def test_prepared_response_preserves_excluded_generation_logits() -> None:
+    from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
+
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        return_generation_logits=True,
+        return_logits_device_memory=False,
+        exclude_last_generation_logits=True,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    chunk_a = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+    chunk_b = torch.full((1, 1, 4), 10.0)
+    chunk_c = torch.full((1, 1, 4), 20.0)
+    request.py_result.append_generation_logits(chunk_a)
+    request.py_result.append_generation_logits(chunk_b)
+    response = prepare_response(request)
+    assert response is not None
+
+    request.py_result.append_generation_logits(chunk_c)
+    request.py_result.set_exclude_last_generation_logits(False)
+    torch.testing.assert_close(request.py_result.generation_logits, chunk_c.transpose(0, 1))
+    torch.testing.assert_close(response.result.generation_logits, chunk_a.transpose(0, 1))
+
+
 @pytest.mark.parametrize("output_kind", ["context", "generation"])
 @pytest.mark.parametrize("serializer", [pickle, cloudpickle])
 def test_response_bounds_additional_outputs(output_kind: str, serializer: ModuleType) -> None:
