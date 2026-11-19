@@ -49,6 +49,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.sampler import (
     SampleStateTensorsHostTorch,
     SampleStateTorch,
@@ -155,9 +156,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.executor_request_queue = ExecutorRequestQueue(
         dist=engine.dist, max_batch_size=8, enable_iter_perf_stats=False, batch_wait_timeout_ms=0.0
     )
-    engine.response_cv = threading.Condition()
-    engine.responses = {}
-    engine.result_wait_queues = {}
+    engine._response_channel = ResponseChannel()
     engine._disagg_pp_termination_handler = None
     engine._prefetched_request_ids = set()
     engine.resource_manager = Mock(spec=["free_resources"])
@@ -227,12 +226,12 @@ def _assert_released_once(executor: PyExecutor, request: LlmRequest) -> None:
     assert request.is_finished_due_to_cancellation
     assert request not in executor.active_requests
     executor._flush_pending_transfer_responses()
-    (response,) = executor.responses[request.py_request_id]
+    (response,) = executor._response_channel.responses[request.py_request_id]
     assert response.error_msg is None
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[request.py_request_id]) == 1
+    assert len(executor._response_channel.responses[request.py_request_id]) == 1
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
 
@@ -467,7 +466,7 @@ def test_preserved_failure_is_flushed_before_idle_fetch(
     for target in ("torch.cuda.set_device", "cudart.cudaSetDevice", "CUASSERT"):
         monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{target}", Mock())
 
-    def stop_before_blocking(timeout: timedelta | None, *, wait_for_batch: bool = True) -> None:
+    def stop_before_blocking(timeout: timedelta | None, *, wait_for_batch: bool) -> None:
         """Check publication and cleanup before the real fetch would wait forever."""
         events.append("fetch")
         assert timeout is None
@@ -484,11 +483,11 @@ def test_preserved_failure_is_flushed_before_idle_fetch(
             assert executor._pending_transfer_responses == []
             assert executor._pending_response_terminations == []
         if not should_flush:
-            assert executor.responses == {}
+            assert executor._response_channel.responses == {}
             executor.dist.tp_gather.assert_not_called()
             executor.dist.allgather.assert_not_called()
         else:
-            (response,) = executor.responses[1]
+            (response,) = executor._response_channel.responses[1]
             assert response.error_msg == "Disagg KV cache transfer error"
             response_gather.assert_called_once()
         if failure_rank == 0 and should_flush:
@@ -635,7 +634,9 @@ def test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary
     else:
         batch.generation_requests = [request]
     executor.previous_batch = BatchState(
-        scheduled_requests=batch, sample_state=SampleStateTorch(requests=[])
+        scheduled_requests=batch,
+        sample_state=SampleStateTorch(requests=[]),
+        guided_failures=[],
     )
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
@@ -674,12 +675,12 @@ def test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary
     assert request.is_finished_due_to_cancellation is not completed
     assert executor.active_requests == []
     assert executor.canceled_req_ids == []
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(request)
     executor.sampler.release_request.assert_called_once_with(request)
     executor._cancel_waiting_disagg_requests([])
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(request)
 
 
@@ -704,7 +705,9 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
             single_step_greedy=True,
         ),
     )
-    executor.previous_batch = BatchState(scheduled_requests=batch, sample_state=state)
+    executor.previous_batch = BatchState(
+        scheduled_requests=batch, sample_state=state, guided_failures=[]
+    )
     sampler = object.__new__(TorchSampler)
     sampler.max_seq_len = 1024
     sampler._track_pending_steps = False
@@ -726,6 +729,7 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
     executor.perf_manager = Mock()
     executor.iter_counter = 0
     executor.stream_interval = 1
+    executor.max_draft_len = 0
 
 
 def test_deferred_lora_generation_resumes_from_harvested_host_token(executor: PyExecutor) -> None:
@@ -741,6 +745,8 @@ def test_deferred_lora_generation_resumes_from_harvested_host_token(executor: Py
     executor.scheduler.schedule_request.side_effect = lambda requests, _: SchedulerOutput(
         [], [], list(requests), [], [], len(requests)
     )
+    # As the base scheduler: no request lost its KV pages to a failed remote cache level.
+    executor.scheduler.take_lost_kv_requests.return_value = []
     _abort(executor, held)
 
     current_batch, _, _ = executor._schedule()
@@ -812,7 +818,7 @@ def test_overlap_marker_changes_only_after_previous_sample_is_harvested(
     executor._release_unused_connector_reservations = Mock()
     executor._terminate_recompute_paused_requests = Mock()
     executor._pause_recompute_paused_requests = Mock()
-    executor._revert_gen_alloc = Mock()
+    executor._revert_unexecuted_alloc = Mock()
     executor._finalize_adp_dummy_allocation = Mock()
     executor._send_kv_async = Mock()
     executor._commit_kv_cache_stats = Mock()
@@ -823,6 +829,7 @@ def test_overlap_marker_changes_only_after_previous_sample_is_harvested(
     executor.device_id = 0
     executor._profiler = lambda: nullcontext(lambda: None)
     executor.hang_detector = MagicMock()
+    executor._intake_window = threading.Event()
     executor._execution_stream_loop_armed = False
     executor._resource_governor_enabled = False
     executor.is_benchmark_disagg = False
@@ -1111,7 +1118,7 @@ def test_parked_executor_failure_precedes_generation_cancellation(
     executor._handle_errors(message, requests=[request], charge_budget=False)
     assert executor._held_transfer_failures() == {id(request): (request, message)}
     assert not request.is_finished
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     executor.resource_manager.free_resources.assert_not_called()
 
     def settle() -> None:
@@ -1133,13 +1140,13 @@ def test_parked_executor_failure_precedes_generation_cancellation(
     assert executor.active_requests == [request]
     assert set(executor.canceled_req_ids) == {1}
     assert not request.is_finished_due_to_cancellation
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     assert executor.disagg._retiring_gen_receives == {}
     executor.resource_manager.free_resources.assert_not_called()
     if not settled_before_cancel:
         executor._sweep_transfer_held_failures()
         assert executor._held_transfer_failures() == {id(request): (request, message)}
-        assert executor.responses == {}
+        assert executor._response_channel.responses == {}
         aux.free_slot.assert_not_called()
         executor.resource_manager.free_resources.assert_not_called()
         settle()
@@ -1150,7 +1157,7 @@ def test_parked_executor_failure_precedes_generation_cancellation(
 
     assert executor.active_requests == []
     assert executor._held_transfer_failures() == {}
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg == message
     assert not request.is_finished_due_to_cancellation
     executor.resource_manager.free_resources.assert_called_once_with(request)
@@ -1159,7 +1166,7 @@ def test_parked_executor_failure_precedes_generation_cancellation(
     executor.disagg.reap_gen_receives(0)
     executor._sweep_transfer_held_failures()
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(request)
     aux.free_slot.assert_called_once_with(0)
 
@@ -1195,7 +1202,7 @@ def test_parked_native_failure_waits_for_physical_cancel_completion(
     assert executor.canceled_req_ids == [1]
     assert executor.active_requests == [request]
     assert executor._held_transfer_failures() == {id(request): (request, message)}
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     executor.resource_manager.free_resources.assert_not_called()
 
 
@@ -1252,7 +1259,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
     assert transceiver.has_inflight_transfer(request)
     assert executor.active_requests == [request]
     assert not request.is_finished_due_to_cancellation
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     executor.resource_manager.free_resources.assert_not_called()
 
     clock[0] = 0.75
@@ -1263,7 +1270,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
     assert len(watchdog._owners) == 1
     assert watchdog.fatal is None
     assert executor._held_transfer_failures() == {id(request): (request, message)}
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     transceiver.request_and_receive_async.assert_not_called()
     executor.resource_manager.free_resources.assert_not_called()
 
@@ -1282,7 +1289,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
         assert executor.active_requests == [request]
         assert executor._held_transfer_failures() == {id(request): (request, message)}
         assert transceiver._recv_reqs == {1: request}
-        assert executor.responses == {}
+        assert executor._response_channel.responses == {}
         executor.resource_manager.free_resources.assert_not_called()
     else:
         containment.assert_not_called()
@@ -1290,7 +1297,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
         assert executor._held_transfer_failures() == {}
         assert transceiver._recv_reqs == {}
         assert not transceiver._cancelled_receive_fences
-        (response,) = executor.responses[1]
+        (response,) = executor._response_channel.responses[1]
         assert response.error_msg == message
         executor.resource_manager.free_resources.assert_called_once_with(request)
         watchdog.require_retired()
@@ -1299,7 +1306,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
         executor.disagg.poll_gen_transfers()
         executor._sweep_transfer_held_failures()
         executor._flush_pending_transfer_responses()
-        assert len(executor.responses[1]) == 1
+        assert len(executor._response_channel.responses[1]) == 1
         executor.resource_manager.free_resources.assert_called_once_with(request)
     assert not request.is_finished_due_to_cancellation
     assert executor.disagg._retiring_gen_receives == {}
@@ -1354,14 +1361,14 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     if failure_first:
         assert executor.active_requests == [request]
         assert not request.is_finished
-        assert executor.responses == {}
+        assert executor._response_channel.responses == {}
     else:
         if boundary == "post_batch":
             executor._handle_responses()
         executor._flush_pending_transfer_responses()
         assert executor.active_requests == []
         assert request.is_finished_due_to_cancellation
-        (response,) = executor.responses[request.py_request_id]
+        (response,) = executor._response_channel.responses[request.py_request_id]
         assert response.error_msg is None
         assert executor.disagg._retiring_gen_receives == {1: request}
     aux.free_slot.assert_not_called()
@@ -1386,7 +1393,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     executor._flush_pending_transfer_responses()
 
     assert executor.active_requests == []
-    (response,) = executor.responses[request.py_request_id]
+    (response,) = executor._response_channel.responses[request.py_request_id]
     assert (response.error_msg is not None) is failure_first
     assert request.is_finished_due_to_cancellation is not failure_first
     executor.resource_manager.free_resources.assert_called_once_with(request)
@@ -1395,7 +1402,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     cancel()
     executor.disagg.reap_gen_receives(0)
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[request.py_request_id]) == 1
+    assert len(executor._response_channel.responses[request.py_request_id]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(request)
     aux.free_slot.assert_called_once_with(0)
     watchdog.require_retired()
@@ -1434,7 +1441,7 @@ def test_worker_cancel_retains_published_kv_and_aux_until_both_settle(
         assert request.py_kv_transfer_start_time == 12.0
         assert session.status is SessionStatus.CANCELLED
         assert isinstance(handle.poll(), Cancelled)
-        (response,) = executor.responses[request.py_request_id]
+        (response,) = executor._response_channel.responses[request.py_request_id]
         assert response.error_msg is None
         assert request.is_finished_due_to_cancellation
         executor.sampler.release_request.assert_not_called()
@@ -1470,11 +1477,11 @@ def test_settled_receive_waits_for_terminal_response_before_request_release(
 
     executor.disagg.poll_gen_transfers()
 
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     assert executor.disagg._retiring_gen_receives == {1: request}
     executor.resource_manager.free_resources.assert_not_called()
     executor._flush_pending_transfer_responses()
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg is None
     executor.resource_manager.free_resources.assert_not_called()
     executor.disagg.poll_gen_transfers()
@@ -1605,21 +1612,21 @@ def test_peer_notification_error_does_not_delay_logical_cancellation(executor: P
     assert request.is_finished_due_to_cancellation
     assert executor.active_requests == []
     assert executor.disagg._retiring_gen_receives == {1: request}
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg is None
     notify.assert_called_once_with(1, {"ctx"})
     executor.resource_manager.free_resources.assert_not_called()
     aux.free_slot.assert_not_called()
 
     executor.disagg.poll_gen_transfers()
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_not_called()
     notify.reset_mock()
     notify.side_effect = lambda _rid, endpoints: set(endpoints)
     executor.disagg.poll_gen_transfers()
     executor.disagg.poll_gen_transfers()
     assert [call.args for call in notify.call_args_list if call.args[1]] == [(1, {"ctx"})]
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_not_called()
     session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
     session.process_aux_agent_result(0, AgentResult.SUCCESS)
@@ -1663,7 +1670,7 @@ def test_cancelled_unpublished_receive_retains_local_fence_with_fixed_grace(
     assert transceiver.has_inflight_transfer(request)
     assert not transceiver.check_gen_transfer_complete()
     assert transceiver._recv_reqs == {1: request}
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg is None
     executor.resource_manager.free_resources.assert_not_called()
 
@@ -1673,7 +1680,7 @@ def test_cancelled_unpublished_receive_retains_local_fence_with_fixed_grace(
     executor.disagg.poll_gen_transfers()
     assert len(watchdog._owners) == 1
     assert watchdog.fatal is None
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     transceiver.request_and_receive_async.assert_not_called()
     executor.resource_manager.free_resources.assert_not_called()
 
@@ -1730,7 +1737,7 @@ def test_cancelled_receive_shutdown_preserves_roots_until_fence_settles(
     executor._flush_pending_transfer_responses()
 
     assert request.is_finished_due_to_cancellation
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg is None
     expected = "CUDA completion query failed" if query_raises else "still owns destination memory"
     with pytest.raises(RuntimeError, match=expected):
@@ -1772,6 +1779,7 @@ def test_pending_receive_retirement_keeps_idle_fetch_and_shutdown_live(
     """
     request = _request(1)
     executor.active_requests = [request]
+    session = ready = None
     if published:
         session, _ = _published_receive(executor, request)
     else:
@@ -1975,3 +1983,509 @@ def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
     assert executor.active_requests == [healthy]
     assert not healthy.is_finished
     _assert_released_once(executor, cancelled)
+
+
+@pytest.mark.parametrize(
+    ("multimodal_params", "mm_item_scheduling", "encoder_decoder"),
+    [
+        (object(), False, False),
+        (None, True, True),
+    ],
+)
+def test_legacy_tp_cancel_reaches_multimodal_model_generation_work(
+    executor: PyExecutor,
+    multimodal_params: object | None,
+    mm_item_scheduling: bool,
+    encoder_decoder: bool,
+) -> None:
+    """Consensus cancellation reaches multimodal generation work between batches.
+
+    The scheduler-exclusion gate used to drop any request with multimodal
+    parameters or encoder-decoder models outright. With the replicated-GEN
+    consensus active, such a request is admitted to model-work cancellation, the
+    previous batch protects it for one iteration, and the settled vote retires
+    it together with exactly one resource release per rank.
+    """
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    engines = []
+    requests = []
+    for rank in range(2):
+        engine = object.__new__(PyExecutor)
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        engine.is_encoder_decoder = encoder_decoder
+        engine._mm_encoder_item_scheduling_enabled = mm_item_scheduling
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        transceiver._recv_reqs = {}
+        transceiver._recv_sessions = {}
+        transceiver._send_reqs = {}
+        transceiver._send_sessions = {}
+        transceiver._gen_need_sync = False
+        transceiver._gen_allgather = Mock(side_effect=AssertionError("unexpected collective"))
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        request = _request(1)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        request.py_multimodal_params = multimodal_params
+        engine.active_requests = [request]
+        engine.canceled_req_ids = [1]
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine.previous_batch = None
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        engine.disagg.request_cancellation = Mock(return_value=True)
+        engines.append(engine)
+        requests.append(request)
+
+    # Pre-fix, encoder-decoder models and multimodal parameters excluded the
+    # request from model-work cancellation entirely. The consensus branch now
+    # admits it on every rank.
+    for engine in engines:
+        assert engine._cancelled_disagg_model_request_ids() == {1}
+
+    # The previous model batch still owns the request: the vote must hold it.
+    for rank, engine in enumerate(engines):
+        scheduled = ScheduledRequests()
+        scheduled.generation_requests = [requests[rank]]
+        engine.previous_batch = SimpleNamespace(scheduled_requests=scheduled)
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(not request.is_finished for request in requests)
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+
+    for engine in engines:
+        engine.previous_batch = None
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(request.is_finished_due_to_cancellation for request in requests)
+    assert all(engine.canceled_req_ids == [] for engine in engines)
+    assert all(engine.active_requests == [] for engine in engines)
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize(
+    ("state", "encoder_decoder"),
+    [
+        (LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS, False),
+        (LlmRequestState.GENERATION_IN_PROGRESS, False),
+        (LlmRequestState.GENERATION_IN_PROGRESS, True),
+    ],
+)
+def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
+    executor: PyExecutor,
+    tp_size: int,
+    state: LlmRequestState,
+    encoder_decoder: bool,
+) -> None:
+    """One drained receive cannot remove a replicated request ahead of its peers."""
+    group = FakeDistGroup(world_size=tp_size, tp_size=tp_size)
+    ready = [True] * tp_size
+    ready[-1] = False
+    engines = []
+    requests = []
+    for rank in range(tp_size):
+        engine = object.__new__(PyExecutor)
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        request = _request(1)
+        request.state = state
+        engine.is_encoder_decoder = encoder_decoder
+        engine.active_requests = [request]
+        engine.canceled_req_ids = [1]
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        engine.disagg.request_cancellation = Mock(side_effect=lambda req, r=rank: ready[r])
+        engine._try_cancel_request = Mock(side_effect=lambda req, r=rank: ready[r])
+        engines.append(engine)
+        requests.append(request)
+
+    # A receive still referenced by a prior model batch cannot be closed by
+    # the loop-head retry, even when local transport retirement reports ready.
+    for rank, engine in enumerate(engines):
+        scheduled = ScheduledRequests()
+        scheduled.generation_requests = [requests[rank]]
+        engine.previous_batch = SimpleNamespace(scheduled_requests=scheduled)
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(not request.is_finished for request in requests)
+    for engine in engines:
+        engine.disagg.request_cancellation.assert_not_called()
+        engine.previous_batch = None
+
+    group.run(lambda rank: engines[rank]._handle_canceled_requests())
+
+    assert all(not request.is_finished for request in requests)
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+    assert all(engine.active_requests == [requests[rank]] for rank, engine in enumerate(engines))
+
+    # No model batch follows. The loop-head path must keep retrying without
+    # releasing the rank whose physical receive already drained.
+    remaining = group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert remaining == [[] for _ in engines]
+    assert all(not request.is_finished for request in requests)
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+    assert all(engine._pending_response_terminations == [] for engine in engines)
+
+    ready[-1] = True
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+
+    assert all(request.is_finished_due_to_cancellation for request in requests)
+    assert all(engine.active_requests == [] for engine in engines)
+    assert all(engine.canceled_req_ids == [] for engine in engines)
+    assert all(
+        engine._pending_response_terminations == [requests[rank]]
+        for rank, engine in enumerate(engines)
+    )
+    assert all(
+        [name for name, _ in engine.dist.calls] == ["tp_allgather"] * 3 for engine in engines
+    )
+
+
+@pytest.mark.parametrize("peer_owns_receive", [False, True])
+@pytest.mark.parametrize("cancel_rank", [0, 1])
+def test_legacy_tp_cancel_with_request_missing_on_peer(
+    executor: PyExecutor, peer_owns_receive: bool, cancel_rank: int
+) -> None:
+    """A peer with no active copy must still participate in cancellation."""
+    group = FakeDistGroup(world_size=2, tp_size=2, timeout_s=1)
+    engines = []
+    request = _request(1)
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    for rank in range(2):
+        engine = object.__new__(PyExecutor)
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        engine.active_requests = [request] if rank == 0 else []
+        engine.canceled_req_ids = [1] if rank == cancel_rank else []
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        engine.previous_batch = None
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        if rank == 1 and peer_owns_receive:
+            transceiver._recv_reqs = {1: _request(1)}
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        engine.disagg.request_cancellation = Mock(return_value=True)
+        engine._try_cancel_request = Mock(return_value=True)
+        engines.append(engine)
+
+    group.run(lambda rank: engines[rank]._handle_canceled_requests())
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    if peer_owns_receive:
+        assert not request.is_finished
+        engines[1].kv_cache_transceiver._recv_reqs.clear()
+    if not request.is_finished:
+        group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert request.is_finished_due_to_cancellation
+    assert all(not engine.canceled_req_ids for engine in engines)
+
+
+def test_legacy_tp_cancel_propagates_to_peer_with_active_request(executor: PyExecutor) -> None:
+    """A peer missing the cancel ID must drain its own transfer before retirement."""
+    group = FakeDistGroup(world_size=2, tp_size=2, timeout_s=1)
+    engines = []
+    requests = []
+    for rank in range(2):
+        engine = object.__new__(PyExecutor)
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        request = _request(1)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        engine.active_requests = [request]
+        engine.canceled_req_ids = [1] if rank == 0 else []
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        engine.previous_batch = None
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        engine.disagg.request_cancellation = Mock(return_value=True)
+        engines.append(engine)
+        requests.append(request)
+
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(not request.is_finished for request in requests)
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+    engines[1].disagg.request_cancellation.assert_not_called()
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(request.is_finished_due_to_cancellation for request in requests)
+    assert all(not engine.canceled_req_ids for engine in engines)
+
+
+@pytest.mark.parametrize("missing_replica", [None, 0, 3])
+def test_legacy_tp_cp_cancel_vote_covers_cp_ranks_with_missing_replica(
+    executor: PyExecutor, missing_replica: int | None
+) -> None:
+    """The cancellation vote rides the TP+CP collective with asymmetric readiness.
+
+    With tp_size=2 and cp_size=2 the vote must gather over ``tp_cp_allgather``,
+    not the TP-only collective. A cancellation originating on one rank propagates its
+    ID to peers (including one with no active replica), retirement is held while a
+    peer's receive is not drained, and once every rank settles the batch retires
+    together with the ID cleared everywhere.
+    """
+    ranks = 4
+    group = FakeDistGroup(world_size=ranks, tp_size=2, cp_size=2)
+    engines = []
+    requests = []
+    ready = [True] * ranks
+    ready[1] = False  # peer whose receive is not drained
+    for rank in range(ranks):
+        engine = object.__new__(PyExecutor)
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        transceiver._recv_reqs = {}
+        transceiver._recv_sessions = {}
+        transceiver._send_reqs = {}
+        transceiver._send_sessions = {}
+        transceiver._gen_need_sync = False
+        transceiver._gen_allgather = Mock(side_effect=AssertionError("unexpected collective"))
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        request = _request(1)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        if rank == missing_replica:
+            engine.active_requests = []
+        else:
+            engine.active_requests = [request]
+        # The cancel ID starts only on rank 0; propagation must fan it out.
+        engine.canceled_req_ids = [1] if rank == 0 else []
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine.previous_batch = None
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        engine.disagg.request_cancellation = Mock(side_effect=lambda req, r=rank: ready[r])
+        engines.append(engine)
+        requests.append(request)
+
+    # Vote one: the not-ready rank holds the batch everywhere and the cancel ID
+    # propagates to every rank, including the one with no active replica.
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+    assert all(
+        not request.is_finished for rank, request in enumerate(requests) if rank != missing_replica
+    )
+    for engine in engines:
+        assert "tp_cp_allgather" in [name for name, _ in engine.dist.calls]
+
+    # Vote two, still not ready: the propagated owner attempts cancellation but stays
+    # unretired, so retirement cannot slip past an unready CP owner.
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    if missing_replica != 1:
+        assert engines[1].disagg.request_cancellation.call_count >= 1
+    assert all(
+        not request.is_finished for rank, request in enumerate(requests) if rank != missing_replica
+    )
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+
+    # Every rank's drain settles: the batch retires together and the ID clears.
+    ready[1] = True
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    for rank, (engine, request) in enumerate(zip(engines, requests)):
+        if rank != missing_replica:
+            assert request.is_finished_due_to_cancellation
+        assert engine.canceled_req_ids == []
+    for engine in engines:
+        assert "tp_cp_allgather" in [name for name, _ in engine.dist.calls]
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+def test_legacy_tp_cancel_with_capacity_connector_completes_consensus(
+    executor: PyExecutor, tp_size: int
+) -> None:
+    """A capacity-only connector must not drop a consensus cancellation.
+
+    A generation server can attach a capacity-only KV connector (external storage
+    that moves no KV, e.g. for shared capacity) alongside the legacy
+    asynchronous transceiver that requires cross-rank retirement consensus.
+    Such a connector only gates cancellation through its per-request release
+    hooks; the loop-head vote must still run on every rank, a not-ready
+    rank must hold its peers' retirement, and settled drains must retire the
+    batch together.
+    """
+    group = FakeDistGroup(world_size=tp_size, tp_size=tp_size)
+    engines = []
+    requests = []
+    ready = [True] * tp_size
+    ready[-1] = False
+    for rank in range(tp_size):
+        engine = object.__new__(PyExecutor)
+        engine.__dict__.update(executor.__dict__)
+        engine.dist = group.rank(rank)
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._fp4_mla_bridge_enabled = False
+        transceiver._dist = engine.dist
+        transceiver._recv_reqs = {}
+        transceiver._recv_sessions = {}
+        transceiver._send_reqs = {}
+        transceiver._send_sessions = {}
+        transceiver._gen_need_sync = False
+        transceiver._gen_allgather = Mock(side_effect=AssertionError("unexpected collective"))
+        engine.kv_cache_transceiver = transceiver
+        engine._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=engine.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=engine.dist,
+            effects=PyExecutorEffects(engine),
+            registry=PyExecutorRequestRegistry(engine),
+            enable_attention_dp=False,
+        )
+        engine.kv_cache_manager = Mock(spec=["is_preemption_pending"])
+        engine.kv_cache_manager.is_preemption_pending.return_value = False
+        engine.kv_connector_manager = Mock(
+            spec=[
+                "capacity_only",
+                "release_unstarted_prefix_loads",
+                "defer_load_termination",
+                "has_pending_load",
+            ]
+        )
+        engine.kv_connector_manager.capacity_only = True
+        engine.kv_connector_manager.defer_load_termination.return_value = False
+        request = _request(1)
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        engine.active_requests = [request]
+        engine.canceled_req_ids = [1]
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine.previous_batch = None
+        engine._pending_transfer_responses = []
+        engine._pending_response_terminations = []
+        engine.disagg.request_cancellation = Mock(side_effect=lambda req, r=rank: ready[r])
+        engines.append(engine)
+        requests.append(request)
+
+    # The vote runs with the connector attached. The not-ready rank's physical
+    # drain holds every rank's cancellation, so no request retires early.
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(not request.is_finished for request in requests)
+    assert all(engine.canceled_req_ids == [1] for engine in engines)
+    assert all(engine.active_requests == [requests[rank]] for rank, engine in enumerate(engines))
+    for engine in engines:
+        engine.kv_connector_manager.release_unstarted_prefix_loads.assert_called_once()
+        # The gate consults physical retirement through the connector-aware
+        # _try_cancel_request tail, then the logical-cancel fallback consults it
+        # again; both polls run before the vote.
+        engine.disagg.request_cancellation.assert_called()
+
+    # Every drain settles. The batch retires together and each cancel ID leaves
+    # canceled_req_ids on every rank.
+    ready[-1] = True
+    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+    assert all(request.is_finished_due_to_cancellation for request in requests)
+    assert all(engine.active_requests == [] for engine in engines)
+    assert all(engine.canceled_req_ids == [] for engine in engines)
+
+
+@pytest.mark.parametrize("overlap_disabled", [False, True])
+def test_pending_cancel_idle_hold_needs_the_consensus_vote(
+    executor: PyExecutor, monkeypatch: pytest.MonkeyPatch, overlap_disabled: bool
+) -> None:
+    """A pending cancel ID holds idle only when the loop-head vote can clear it.
+
+    With the consensus disabled (e.g. TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1),
+    no loop-head path clears a late cancel ID without a batch, so a non-idle
+    hold would busy-poll the queue until the next request arrives; the fetch
+    keeps its normal idle behavior instead. With the consensus enabled, the
+    pending ID keeps the rank awake for the loop-head vote.
+    """
+    if overlap_disabled:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+
+    executor.canceled_req_ids = [9]
+    executor.control_requests = []
+    executor.enable_iter_perf_stats = False
+    executor._disable_mpi = False
+    executor.request_accumulated = []
+    executor.hang_detector = MagicMock()
+    broadcast = Mock(return_value=[])
+    executor.request_broadcaster = SimpleNamespace(broadcast=broadcast)
+
+    def fetch_probe(timeout, *, wait_for_batch=True):
+        # A busy-poll regression shows up as an endless timeout=0 wait; the idle
+        # path parks with no timeout at all. Record the first queue read the
+        # fetch makes instead of parking this test on the real wait.
+        if fetch_probe.last_timeout == "unset":
+            fetch_probe.last_timeout = timeout
+        return []
+
+    fetch_probe.last_timeout = "unset"
+    monkeypatch.setattr(executor.executor_request_queue, "get_from_request_queue", fetch_probe)
+    executor.disagg.request_cancellation = Mock(return_value=True)
+
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, 0)
+
+    consensus = (
+        executor.kv_cache_transceiver.consumes_transfer_buffer is False
+        and executor.disagg.requires_gen_cancellation_consensus
+    )
+    if not consensus:
+        # The vote cannot clear this ID without a batch; the fetch stays idle so
+        # the worker parks rather than burning a zero-timeout poll loop.
+        broadcast.assert_called_once_with([], prefer_cpu=True)
+        assert fetch_probe.last_timeout is None
+    else:
+        broadcast.assert_called_once_with([], prefer_cpu=False)
+        assert fetch_probe.last_timeout == timedelta(0)

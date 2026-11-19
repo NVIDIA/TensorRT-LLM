@@ -21,13 +21,14 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputs
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, remove_weights, skip_forward
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     BaseMoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_bf16 import TrtllmTrtllmGenBf16Impl
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor._util import _mamba_conv_layout_kwargs, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -41,6 +42,9 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_qwen3_hybrid,
     load_pretrained_config,
     unwrap_kimi_text_config,
+)
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import (
+    resolve_mamba_metadata_cls,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.model_loader import (
@@ -506,6 +510,10 @@ class Runner:
                     )
                 else:
                     hidden_states = layer(position_ids, hidden_states, attn_metadata, **kwargs)
+            # As the model's own forward: its hook after the last decoder layer (e.g. joining a side stream).
+            after_decoder_layers = getattr(model.model, "after_decoder_layers", None)
+            if after_decoder_layers is not None:
+                after_decoder_layers()
             return hidden_states, residual
 
         def forward_block_residual(
@@ -697,6 +705,8 @@ class Runner:
             if sparse_attention_config is not None
             else None
         )
+        # Resolved as the engine does: the model's class, then the cache manager's.
+        mamba_metadata_cls = resolve_mamba_metadata_cls(self.model, kv_cache_manager)
         attn_metadata = metadata_cls(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
@@ -721,6 +731,7 @@ class Runner:
             workspace=attn_workspace,
             mapping=self.model_config.mapping,
             sparse_metadata_params=sparse_metadata_params,
+            mamba_metadata_cls=mamba_metadata_cls,
         )
         # One entry per attention-DP rank, not per world rank: the non-DP MoE path
         # asserts len(all_rank_num_tokens) == 1.
@@ -817,7 +828,7 @@ class Runner:
             )
 
         if is_nemotron_hybrid(pretrained_config) or is_qwen3_hybrid(pretrained_config):
-            mamba_metadata = Mamba2Metadata(
+            mamba_metadata = mamba_metadata_cls(
                 attn_metadata.max_num_requests,
                 chunk_size=128
                 if is_qwen3_hybrid(pretrained_config)
@@ -928,12 +939,30 @@ class Runner:
             else:
                 run_moe_orig = None
 
+            # The TRTLLM-Gen BF16 leaf routes inside its op from the router logits and never calls
+            # `routing_method.apply`: route on the host while the replacement is in place (the leaf
+            # asks `_requires_separated_routing` per forward).
+            backend = getattr(moe_module, "backend", None)
+            host_routed_backend = backend if isinstance(backend, TrtllmTrtllmGenBf16Impl) else None
+            if host_routed_backend is not None:
+                host_routed_backend._requires_separated_routing = lambda: True
+
+            # A fused route+quant backend would bypass the replaced `routing_method.apply`.
+            if isinstance(moe_module, ConfigurableMoE):
+                moe_module.backend.fused_route_quant_enabled = False
+
             # Replace `forward_impl` to ensure that routing results are replaced
             forward_impl_orig = moe_module.forward_impl
             moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
 
             original_methods.append(
-                (apply_method_orig, apply_with_sort_orig, run_moe_orig, forward_impl_orig)
+                (
+                    apply_method_orig,
+                    apply_with_sort_orig,
+                    run_moe_orig,
+                    forward_impl_orig,
+                    host_routed_backend,
+                )
             )
         try:
             yield
@@ -943,12 +972,17 @@ class Runner:
                 apply_with_sort_orig,
                 run_moe_orig,
                 forward_impl_orig,
+                host_routed_backend,
             ) in zip(moe_modules, original_methods):
                 moe_module.routing_method.apply = apply_method_orig
                 moe_module.routing_method.apply_with_sort = apply_with_sort_orig
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
+                if isinstance(moe_module, ConfigurableMoE):
+                    del moe_module.backend.fused_route_quant_enabled
                 moe_module.forward_impl = forward_impl_orig
+                if host_routed_backend is not None:
+                    del host_routed_backend._requires_separated_routing
 
     @staticmethod
     def create_kv_cache_manager(

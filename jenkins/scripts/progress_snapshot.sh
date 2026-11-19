@@ -26,8 +26,10 @@
 # Optional:
 #   POST_TAG            the attempt's suffix; renames results*.xml inside the tar, not on disk
 #   FINAL_SNAPSHOT      non-empty for the snapshot taken when the tests end
-#   TIMEOUT_XML_SCRIPT  path to generate_timeout_xml.py; with FINAL_SNAPSHOT, regenerates
-#                       results-timeout.xml from unfinished_test.txt
+#   TIMEOUT_XML_SCRIPT  path to generate_timeout_xml.py; regenerates results-timeout.xml
+#                       from unfinished_test.txt when the input belongs to a finished run
+#   TIMEOUT_INPUT_FINAL 1 during reruns: the stage-level unfinished_test.txt is already final
+#   TIMEOUT_EVIDENCE_FILE  pytest timeout and attempt records for the report, outside the stage
 #   PROGRESS_HASH_FILE  path that holds the content hash every upload target last received
 #                       (default: ${WORKSPACE}/${PROGRESS_TAR}.last_hash).
 #                       Set to empty string to disable dedup.
@@ -49,14 +51,24 @@ for _var in WORKSPACE STAGE_NAME PROGRESS_TAR LABEL; do
     fi
 done
 
-# --- Generate timeout XML from unfinished_test.txt (final snapshot only) ---
-# Skipped during periodic snapshots so incomplete unfinished_test.txt does not produce premature timeout reports.
-if [ -n "$FINAL_SNAPSHOT" ] && \
-        [ -n "$TIMEOUT_XML_SCRIPT" ] && [ -f "${WORKSPACE}/${STAGE_NAME}/unfinished_test.txt" ]; then
+# The stage-level unfinished list is final once the run ends, including throughout its reruns.
+# Ordinary running checkpoints must not report their still-running tests as failures.
+timeout_xml="${WORKSPACE}/${STAGE_NAME}/results-timeout.xml"
+include_timeout_xml=0
+if { [ -n "$FINAL_SNAPSHOT" ] || [ "$TIMEOUT_INPUT_FINAL" = 1 ]; } && [ -n "$TIMEOUT_XML_SCRIPT" ]; then
     ( cd "$WORKSPACE" && python3 "$TIMEOUT_XML_SCRIPT" \
         --stage-name "$STAGE_NAME" \
         --test-file-path "unfinished_test.txt" \
-        --output-file "${WORKSPACE}/${STAGE_NAME}/results-timeout.xml" ) 2>/dev/null || true
+        --timeout-evidence-file "$TIMEOUT_EVIDENCE_FILE" \
+        --output-file "$timeout_xml" ) && include_timeout_xml=1
+fi
+
+# Running checkpoints must not publish a previous invocation's synthetic failures.
+exclude=()
+hash_exclude=()
+if [ "$include_timeout_xml" = 0 ]; then
+    exclude=(--exclude="${STAGE_NAME}/results-timeout.xml")
+    hash_exclude=(! -path "$timeout_xml")
 fi
 
 # --- Fix testsuite name in XML files (pytest default -> stage name) ---
@@ -66,7 +78,7 @@ find "${WORKSPACE}/${STAGE_NAME}" -name "*.xml" -exec \
 # --- Content-based dedup: no snapshot when every upload target already has this content ---
 HASH_FILE="${PROGRESS_HASH_FILE-${WORKSPACE}/${PROGRESS_TAR}.last_hash}"
 if [ -n "$HASH_FILE" ]; then
-    current_hash=$(find "${WORKSPACE}/${STAGE_NAME}" -type f | sort \
+    current_hash=$(find "${WORKSPACE}/${STAGE_NAME}" -type f "${hash_exclude[@]}" | sort \
                    | xargs sha256sum 2>/dev/null | sha256sum | awk '{print $1}')
     last_hash=$(cat "$HASH_FILE" 2>/dev/null || echo "")
     if [ -n "$current_hash" ] && [ "$current_hash" = "$last_hash" ]; then
@@ -81,7 +93,7 @@ transform=()
 if [ -n "$POST_TAG" ]; then
     transform=(--transform "s|^\(${STAGE_NAME}/results[^/]*\)\.xml$|\1${POST_TAG}.xml|")
 fi
-if ! ( cd "$WORKSPACE" && tar -czf "$PROGRESS_TAR" "${transform[@]}" "${STAGE_NAME}/" ); then
+if ! ( cd "$WORKSPACE" && tar -czf "$PROGRESS_TAR" "${exclude[@]}" "${transform[@]}" "${STAGE_NAME}/" ); then
     echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: ${LABEL} tar failed"
     exit 1
 fi

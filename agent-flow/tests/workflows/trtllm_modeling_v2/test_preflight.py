@@ -185,8 +185,8 @@ def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environme
         substrate_reuse,
     )
 
-    def inputs(perf=None, **environment):
-        task = _task(tmp_path, environment=environment, perf=perf or {})
+    def inputs(**environment):
+        task = _task(tmp_path, environment=environment)
         return substrate_inputs(task, resolve_environment(task, world_size=4))
 
     gates = {"name": "gates", "spool": "/s/gates", "env": {"A": "1"}, "setup": ["source /e.sh"]}
@@ -199,18 +199,18 @@ def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environme
         "sessions": [gates],
     }
     record = {"at": 0.0, "inputs": inputs(**block)}
-    perf = [
-        {**gates, "name": f"perf{n}", "spool": f"/s/perf{n}", "time_limit": "4h"} for n in (1, 2)
+    more = [
+        {**gates, "name": f"work{n}", "spool": f"/s/work{n}", "time_limit": "4h"} for n in (1, 2)
     ]
     resized = {**gates, "role": "gates", "nodes": 2, "gpus_per_node": 8, "handover_lead": "30m"}
-    grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *perf]}
-    assert substrate_reuse(record, inputs({"dev_spools": ["/s/perf2"]}, **grown), now=60.0)[0]
+    grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *more]}
+    assert substrate_reuse(record, inputs(**grown), now=60.0)[0]
     for changed in (
         {"container_image": "/images/other.sqsh"},
         {"mounts": ["/data:/data", "/models:/models"]},
         {"env": {"TMPDIR": _SCRATCH, "NCCL_DEBUG": "INFO"}},
         {"python": "/other/bin/python"},
-        {"sessions": [gates, {**gates, "name": "perf1", "setup": ["source /other.sh"]}]},
+        {"sessions": [gates, {**gates, "name": "work1", "setup": ["source /other.sh"]}]},
         # A field no list names counts too.
         {"gpu_memory_gib": 80},
     ):
@@ -272,7 +272,7 @@ def _entry_source(impl, archs):
     arch_set = ", ".join(f"Arch.{a}" for a in archs)
     cell_list = "".join(f"Cell(why='c{i}', spec={{}}), " for i in range(2))
     return (
-        "from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper\n\n\n"
+        "from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper\n\n\n"
         "class Entry(OpWrapper):\n"
         '    """Mentions torch.ops.trtllm.neighbour in prose, which is not the op."""\n\n'
         f"    ARCHS = frozenset({{{arch_set}}})\n"
@@ -291,7 +291,7 @@ def _fake_repo(tmp_path, entries, model_ops=()):
     ``catalog/``; ``model_ops`` are ``(family/target, category/name.py, impl,
     archs)`` kept in a target's ``ops/``.
     """
-    catalog = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
+    catalog = tmp_path / "tensorrt_llm/_torch/modeling_v2/catalog"
     catalog.mkdir(parents=True)
     (catalog / "_op.py").write_text("class OpWrapper:\n    pass\n", encoding="utf-8")
     for path, impl, archs in entries:
@@ -299,7 +299,7 @@ def _fake_repo(tmp_path, entries, model_ops=()):
         py.parent.mkdir(parents=True, exist_ok=True)
         (py.parent / "__init__.py").write_text("", encoding="utf-8")
         py.write_text(_entry_source(impl, archs), encoding="utf-8")
-    models = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+    models = tmp_path / "tensorrt_llm/_torch/modeling_v2/models"
     for scope, path, impl, archs in model_ops:
         py = models / scope / "ops" / path
         py.parent.mkdir(parents=True, exist_ok=True)

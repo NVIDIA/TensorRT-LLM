@@ -69,7 +69,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestTyp
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvPoolRebalanceConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvPoolRebalanceConfig, RemoteCacheConfig
 from tensorrt_llm.logger import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
@@ -91,8 +91,13 @@ class KvCacheConfigV2:
     sink_token_length: Optional[int] = None
     free_gpu_memory_fraction: Optional[float] = None
     host_cache_size: Optional[int] = None
+    host_cache_bind_to_gpu_numa_node: bool = False
     disk_cache_size: Optional[int] = None
     disk_cache_path: Optional[str] = None
+    disk_io_threads: int = 0
+    disk_keep_copy_after_restore: bool = False
+    disk_write_through: bool = False
+    disk_protected_copy_fraction: float = 1.0
     cross_kv_cache_fraction: Optional[float] = None
     cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
@@ -113,6 +118,8 @@ class KvCacheConfigV2:
     # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
+    # Mirrors KvCacheConfig.remote_cache_config; read by KVCacheManagerV2.__init__.
+    remote_cache_config: Optional[RemoteCacheConfig] = None
     enable_kv_pool_rebalance: bool = False
 
 

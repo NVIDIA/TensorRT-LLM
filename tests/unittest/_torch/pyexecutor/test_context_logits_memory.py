@@ -239,7 +239,6 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
             logits,
             1,
             [0, 1 if handled else end - start],
-            True,
             context_logits_handled=handled,
         )
     assert projected_rows == ([32, 22, 1] if legacy_first else [32, 5, 1])
@@ -334,9 +333,9 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         return replay() if graph_key is not None else run_model(inputs)
 
     graphs = SimpleNamespace(
-        attention_dp_execution_batch=lambda value: value,
+        attention_dp_execution_batch=lambda value, *args: value,
         promote_final_contexts=lambda *args, **kwargs: (graph_batch, promoted_ids),
-        pad_batch=lambda *args: nullcontext(graph_batch),
+        pad_batch=lambda *args, **kwargs: nullcontext(graph_batch),
         select=Mock(
             return_value=SimpleNamespace(
                 key=key, use_lora_graph=False, attn_metadata=metadata, spec_metadata=None

@@ -204,7 +204,7 @@ class ServeTestEnv:
                 str(self.tmp_dir / "perf") if config.perf_metrics_output_dir else None
             ),
             sleep_config=SimpleNamespace() if config.runtime_control else None,
-            encode_only=config.role is ServerRole.EMBEDDING,
+            encode_only=config.role in (ServerRole.EMBEDDING, ServerRole.RERANK),
             reasoning_parser=config.reasoning_parser,
             num_postprocess_workers=config.num_postprocess_workers,
         )
@@ -217,7 +217,7 @@ class ServeTestEnv:
             generator = FakeVisualGen(model=config.model_name)
         elif config.role is ServerRole.MM_ENCODER:
             generator = FakeMultimodalEncoder(args=args, executor=executor)
-        elif config.role is ServerRole.EMBEDDING:
+        elif config.role in (ServerRole.EMBEDDING, ServerRole.RERANK):
             generator = FakeEncodeOnlyLLM(args=args)
         elif config.rl_control:
             generator = FakeAsyncLLM(args=args, executor=executor)
@@ -306,7 +306,7 @@ class ServeTestEnv:
             ):
                 pool = getattr(server, pool_name, None)
                 if pool is not None:
-                    pool.shutdown(wait=False, cancel_futures=True)
+                    pool.shutdown(wait=True, cancel_futures=True)
         self._servers.clear()
 
 

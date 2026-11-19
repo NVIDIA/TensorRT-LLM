@@ -8,7 +8,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.indexer_k_cache_gather_op import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.indexer_k_cache_gather_op import (  # noqa: E501
     indexer_k_cache_gather_op as op,
 )
 
