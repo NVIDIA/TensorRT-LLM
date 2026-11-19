@@ -647,15 +647,11 @@ class Mamba2Mixer(nn.Module):
                 assert layer_cache is not None, \
                     "Speculative decoding requires Python MambaCacheManager"
                 intermediate_conv_states = layer_cache.intermediate_conv_window
-                use_replay = getattr(attn_metadata.kv_cache_manager,
-                                     'use_replay_state_update', False)
+                replay_metadata = (attn_metadata.kv_cache_manager.
+                                   get_replay_state_update_metadata())
+                use_replay = replay_metadata is not None
                 draft_token_num = spec_metadata.runtime_draft_len + 1
                 if use_replay:
-                    replay_metadata = (attn_metadata.kv_cache_manager.
-                                       get_replay_state_update_metadata())
-                    assert replay_metadata is not None, (
-                        "Mamba replay state update is enabled but replay "
-                        "metadata was not allocated.")
                     replay_step_width = replay_metadata.replay_step_width
                     assert draft_token_num == replay_step_width, (
                         "Mamba replay state update does not support dynamic "
@@ -806,8 +802,10 @@ class Mamba2Mixer(nn.Module):
 
                 if use_replay:
                     # replay_work_items is write-first for persistent_main and
-                    # carries decode-batch position, cache slot, PNAT, and
-                    # active cache buffer index for replay kernels.
+                    # carries decode-batch position, state slot, PNAT, active
+                    # cache buffer index and replay slot for replay kernels.
+                    replay_batch_indices = mamba_metadata.replay_state_indices[
+                        num_prefills:num_prefills + num_decodes]
                     replay_selective_state_update(
                         ssm_states,
                         layer_cache.old_x,
@@ -825,6 +823,7 @@ class Mamba2Mixer(nn.Module):
                         dt_bias=dt_bias,
                         dt_softplus=self.delta_softplus,
                         state_batch_indices=state_batch_indices,
+                        replay_batch_indices=replay_batch_indices,
                         out=out_4d,
                         n_writes=mamba_metadata.replay_n_writes,
                         replay_work_items=(

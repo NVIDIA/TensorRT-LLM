@@ -32,14 +32,15 @@ from typing import Callable
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+from ._worker_pool import run_distributed
 
 ATTENTION_META_DICT = threading.local()
 ATTENTION_META_DICT.metadata = create_attention_metadata_state()
@@ -49,6 +50,16 @@ def _cuda_cc():
     if torch.cuda.is_available():
         return torch.cuda.get_device_capability()
     return -1, -1
+
+
+def _skip_unsupported_int8(sage_attn_qk_int8: bool) -> None:
+    """Restrict INT8 SageAttention to the shipped SM100 cubins.
+
+    FP8 cases exercise kernels directly, independently of AttentionConfig's
+    public recipe allowlist, including the FP8 kernels shipped for SM107.
+    """
+    if sage_attn_qk_int8 and get_sm_version() != 100:
+        pytest.skip("INT8 SageAttention kernels are only available on SM100.")
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -63,32 +74,6 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
-def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port):
-    """Worker function that runs in each spawned process.  Module-level for pickling."""
-    try:
-        init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed with error: {e}")
-        raise
-    finally:
-        cleanup_distributed()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for SageAttention")
@@ -96,23 +81,11 @@ def run_test_in_distributed(world_size: int, test_fn: Callable):
         pytest.skip("SageAttention requires CUDA compute capability major version 10")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    from ._visual_gen_dist_utils import spawn_with_retry
-
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, "nccl", test_fn, port),
-            nprocs=world_size,
-            join=True,
-        )
-    )
+    run_distributed(world_size, test_fn, dist_backend="nccl", preload=("tensorrt_llm",))
 
 
 # =============================================================================
-# Test logic functions (module-level so mp.spawn can pickle them)
+# Test logic functions (module-level so the pool can pickle them by reference)
 # =============================================================================
 
 
@@ -241,8 +214,7 @@ class TestSageUlyssesAttention:
     @pytest.mark.parametrize("sage_attn_qk_int8", [True, False])
     def test_sage_ulysses_forward(self, sage_attn_qk_int8: bool):
         """Forward pass runs without error and produces finite output."""
-        if sage_attn_qk_int8 and _cuda_cc()[1] == 3:
-            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+        _skip_unsupported_int8(sage_attn_qk_int8)
         run_test_in_distributed(
             world_size=2,
             test_fn=functools.partial(
@@ -262,8 +234,7 @@ class TestSageUlyssesAttention:
         self, sage_attn_qk_int8: bool, sage_attn_num_elts_per_blk_k: int
     ):
         """Ulysses+SageAttention output matches full-sequence SDPA within approximation tolerance."""
-        if sage_attn_qk_int8 and _cuda_cc()[1] == 3:
-            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+        _skip_unsupported_int8(sage_attn_qk_int8)
         run_test_in_distributed(
             world_size=2,
             test_fn=functools.partial(

@@ -33,7 +33,13 @@ from .open_search_db_utils import add_id, get_history_data, post_new_perf_data
 POST_MERGE_THRESHOLD = 0.05
 PRE_MERGE_THRESHOLD = 0.1
 
-_URM_BASE = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main"
+# Where people open a run's outputs, by the location that the pipeline publishes test results to
+# (globalVars["llm_artifacts_primary"], aws when unset). artifactory.nvidia.com is opened in its
+# native browser, which signs people in; urm serves direct links.
+_ARTIFACT_BASES = {
+    "aws": "https://artifactory.nvidia.com/ui/native/sw-tensorrt-llm-generic-local/llm-artifacts/LLM/main",
+    "urm": "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main",
+}
 
 
 def get_job_info():
@@ -65,6 +71,15 @@ def get_job_info():
     raw_branch = global_vars.get("build_branch")
     branch = raw_branch if isinstance(raw_branch, str) else ""
     commit = os.getenv("gitlabCommit", "")
+    primary = global_vars.get("llm_artifacts_primary") or "aws"
+    artifact_base = _ARTIFACT_BASES.get(primary, _ARTIFACT_BASES["aws"])
+    # Original OCI/base reference, not the derived Enroot artifact or dispatcher.
+    runtime_image = os.getenv("TRTLLM_CI_RUNTIME_IMAGE", "").strip()
+    digest_match = re.fullmatch(r"[^@\s]+@(sha256:[0-9a-f]{64})", runtime_image)
+    runtime_image_digest = digest_match.group(1) if digest_match else "unknown"
+    runtime_image_identity_strength = (
+        "digest_pinned" if digest_match else "reference_only" if runtime_image else "unknown"
+    )
 
     # Initialize PR-specific fields
     trigger_mr_user = ""
@@ -95,9 +110,11 @@ def get_job_info():
 
         # Set trigger_mr_commit to commit
         trigger_mr_commit = commit
-        artifact_url = f"{_URM_BASE}/L0_MergeRequest_PR/{job_id}" if job_id else ""
+        artifact_url = (
+            f"{artifact_base}/L0_MergeRequest_PR/{job_id}/test-results/" if job_id else ""
+        )
     else:
-        artifact_url = f"{_URM_BASE}/L0_PostMerge/{job_id}" if job_id else ""
+        artifact_url = f"{artifact_base}/L0_PostMerge/{job_id}/test-results/" if job_id else ""
 
     return {
         "b_is_baseline": False,
@@ -113,6 +130,10 @@ def get_job_info():
         "s_job_url": job_url,
         "s_branch": branch,
         "s_commit": commit,
+        "s_runtime_image": runtime_image or "unknown",
+        "s_runtime_image_source": "TRTLLM_CI_RUNTIME_IMAGE" if runtime_image else "unknown",
+        "s_runtime_image_digest": runtime_image_digest,
+        "s_runtime_image_identity_strength": runtime_image_identity_strength,
         "b_is_post_merge": is_post_merge,
         "b_is_pr_job": is_pr_job,
         "s_trigger_mr_user": trigger_mr_user,
@@ -185,8 +206,39 @@ def _percentile(values, p):
     return s[lo] + frac * (s[hi] - s[lo])
 
 
-def _daily_aggregate_values(data_list, metric):
+def _created_ms(data):
+    """``ts_created`` of a history record in epoch milliseconds, or None.
+
+    OpenSearch returns ``ts_created`` as epoch milliseconds; an epoch in seconds
+    is accepted as well. Anything else (absent, ISO string, malformed) is None.
+    """
+    ts = data.get("ts_created")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return ts if ts > 1e12 else ts * 1000
+
+
+def _stored_baseline_predates_floor(baseline_threshold, metric, metric_history_floors_ms):
+    """Whether a stored d_baseline_* for *metric* may predate the metric's history floor.
+
+    The stored fields come from one history record (see get_history_data), whose
+    ts_created says when they were set. A metric with no floor is never affected;
+    under a floor, a record of unknown age counts as older than the floor.
+    """
+    floor_ms = (metric_history_floors_ms or {}).get(metric)
+    if floor_ms is None:
+        return False
+    stored_ms = _created_ms(baseline_threshold or {})
+    return stored_ms is None or stored_ms < floor_ms
+
+
+def _daily_aggregate_values(data_list, metric, min_created_ms=None):
     """Aggregate multiple data points on the same day to a single mean value.
+
+    When min_created_ms is given, records created before it are skipped, and so
+    are records whose creation time is unknown (see _created_ms). The record
+    being checked never reaches here with a ts_created, so it is unaffected by
+    construction.
 
     Returns a list of daily-aggregated metric values sorted by date.
     """
@@ -197,6 +249,10 @@ def _daily_aggregate_values(data_list, metric):
         val = data.get(metric)
         if val is None:
             continue
+        if min_created_ms is not None:
+            created_ms = _created_ms(data)
+            if created_ms is None or created_ms < min_created_ms:
+                continue
         ts = data.get("ts_created") or data.get("@timestamp")
         if ts is None:
             continue
@@ -216,14 +272,28 @@ def _daily_aggregate_values(data_list, metric):
     return result
 
 
-def calculate_baseline_metrics(history_data_list, new_data, maximize_metrics, minimize_metrics):
+def calculate_baseline_metrics(
+    history_data_list,
+    new_data,
+    maximize_metrics,
+    minimize_metrics,
+    metric_history_floors_ms=None,
+):
     """Calculate baseline metrics using rolling smooth + percentile algorithm.
 
     For each metric, aggregates data to daily values, applies a trailing
     rolling mean (window=3), then takes:
       - P95 for maximize_metrics (larger is better, e.g. throughput)
       - P5  for minimize_metrics (smaller is better, e.g. latency)
+
+    metric_history_floors_ms optionally maps a metric to an epoch-millisecond
+    ts_created floor: that metric's baseline is computed only from history
+    records created at or after the floor, so values recorded under an older
+    definition of the metric cannot set it. A metric with no history left
+    above its floor gets no baseline, which the caller treats as "nothing to
+    compare against yet".
     """
+    floors = metric_history_floors_ms or {}
     all_data = []
     if history_data_list:
         all_data.extend(history_data_list)
@@ -237,7 +307,7 @@ def calculate_baseline_metrics(history_data_list, new_data, maximize_metrics, mi
 
     baseline_metrics = {}
     for metric in maximize_metrics + minimize_metrics:
-        daily_vals = _daily_aggregate_values(all_data, metric)
+        daily_vals = _daily_aggregate_values(all_data, metric, floors.get(metric))
         if not daily_vals:
             continue
         smoothed = _rolling_smooth(daily_vals, window=3)
@@ -284,11 +354,16 @@ def prepare_regressive_test_cases(
     maximize_metrics,
     minimize_metrics,
     regression_metrics,
+    metric_history_floors_ms=None,
 ):
     """Update regression info for all data in new_data_dict.
 
     Uses baseline/threshold fields from latest_baseline_threshold_dict when
     available, otherwise falls back to calculating baseline from history data.
+    For a metric listed in metric_history_floors_ms, a stored baseline is used only
+    when the record it came from (its ts_created) is at or after the metric's floor;
+    otherwise the floor-filtered calculation is used (see calculate_baseline_metrics).
+    Its threshold is read from latest_baseline_threshold_dict either way.
 
     Returns the set of pre-merge cmd_idx whose regression must not fail the
     stage because the latest post-merge record for the same case is itself
@@ -342,11 +417,23 @@ def prepare_regressive_test_cases(
             # then fall back to calculating from history data
             baseline_key = f"d_baseline_{metric_suffix}"
             baseline_value = baseline_threshold.get(baseline_key) if baseline_threshold else None
+            # A stored baseline recorded before a metric's floor predates the
+            # metric's current definition, so the floored metric recomputes its
+            # baseline from the floor-filtered history instead. One recorded at or
+            # after the floor (or with no floor) is honoured as before.
+            if baseline_value is not None and _stored_baseline_predates_floor(
+                baseline_threshold, metric, metric_history_floors_ms
+            ):
+                baseline_value = None
             if baseline_value is None or baseline_value <= 0:
                 if fallback_baseline is None:
                     history_list = history_data_dict.get(cmd_idx, [])
                     fallback_baseline = calculate_baseline_metrics(
-                        history_list, new_data, maximize_metrics, minimize_metrics
+                        history_list,
+                        new_data,
+                        maximize_metrics,
+                        minimize_metrics,
+                        metric_history_floors_ms=metric_history_floors_ms,
                     )
                 baseline_value = fallback_baseline.get(metric)
                 if baseline_value is None or baseline_value <= 0:
@@ -428,7 +515,11 @@ def _safe_float(value, default):
 
 
 def add_baseline_fields_to_post_merge_data(
-    latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
+    latest_baseline_threshold_dict,
+    new_data_dict,
+    maximize_metrics,
+    minimize_metrics,
+    metric_history_floors_ms=None,
 ):
     """Embed baseline fields directly into each post-merge data entry.
 
@@ -436,6 +527,10 @@ def add_baseline_fields_to_post_merge_data(
       - d_baseline_{metric_suffix}
       - d_threshold_post_merge_{metric_suffix}
       - d_threshold_pre_merge_{metric_suffix}
+
+    A d_baseline_* that predates the metric's floor in metric_history_floors_ms is
+    not carried forward: the gate no longer uses it, and copying it onto a new
+    record would give it a current ts_created.
     """
     if latest_baseline_threshold_dict is None:
         return
@@ -463,7 +558,13 @@ def add_baseline_fields_to_post_merge_data(
                 new_data[pre_merge_key] = pre_merge_val
 
             baseline_val = _safe_float(baseline_threshold.get(baseline_key), None)
-            if baseline_val is not None and baseline_val > 0:
+            if (
+                baseline_val is not None
+                and baseline_val > 0
+                and not _stored_baseline_predates_floor(
+                    baseline_threshold, metric, metric_history_floors_ms
+                )
+            ):
                 new_data[baseline_key] = baseline_val
 
 
@@ -526,6 +627,7 @@ def process_and_upload_test_results(
     extra_fields: Optional[dict] = None,
     upload_to_db: bool = True,
     fail_on_regression: Optional[bool] = None,
+    metric_history_floors_ms: Optional[Dict[str, int]] = None,
 ):
     """Generic regression pipeline: enrich data, query history, detect regression, upload.
 
@@ -540,6 +642,9 @@ def process_and_upload_test_results(
         upload_to_db: Whether to post results to the database.
         fail_on_regression: Whether to raise on pre-merge regression.
             None = auto (fail for pre-merge only).
+        metric_history_floors_ms: Optional metric -> epoch-ms ts_created floor.
+            History created before a metric's floor is ignored when computing
+            that metric's baseline (see calculate_baseline_metrics).
     """
     if not new_data_dict:
         print_info("No data to upload to database.")
@@ -593,12 +698,17 @@ def process_and_upload_test_results(
         maximize_metrics,
         minimize_metrics,
         regression_metrics,
+        metric_history_floors_ms=metric_history_floors_ms,
     )
 
     # Step 7: For post-merge, embed baseline fields
     if is_post_merge:
         add_baseline_fields_to_post_merge_data(
-            latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
+            latest_baseline_threshold_dict,
+            new_data_dict,
+            maximize_metrics,
+            minimize_metrics,
+            metric_history_floors_ms=metric_history_floors_ms,
         )
 
     # Step 8: Upload to DB

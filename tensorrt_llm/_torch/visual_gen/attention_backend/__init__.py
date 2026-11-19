@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,23 +12,42 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Visual Generation Attention Backend
+"""Compatibility shim for ``tensorrt_llm._torch.visual_gen.attention_backend``.
 
-This module provides attention backend infrastructure for visual generation (diffusion) models.
-It reuses existing TRT-LLM attention backends (TrtllmAttention, VanillaAttention) with
-simplified metadata that doesn't require KV caching.
+Will be removed once all usages are migrated to
+``tensorrt_llm._torch.visual_gen.attention.backends``.
+
+DO NOT ADD ANYTHING TO THIS FILE.
 """
 
-from .cudnn import CuDNNAttention
-from .cute_dsl import CuTeDSLAttention
-from .flash_attn4 import FlashAttn4Attention
-from .flashinfer import FlashInferAttention
-from .interface import AttentionBackend, AttentionTensorLayout
-from .parallel import Attention2DAttention, RingAttention, UlyssesAttention, wrap_parallel_attention
-from .trtllm import TrtllmAttention, TrtllmAttentionMetadata
-from .utils import create_attention, get_visual_gen_attention_backend
-from .vanilla import VanillaAttention
+import warnings
+
+from tensorrt_llm._torch.visual_gen.attention.backends import (  # noqa: F401
+    Attention2DAttention,
+    AttentionBackend,
+    AttentionTensorLayout,
+    CuDNNAttention,
+    CuTeDSLAttention,
+    FlashAttn4Attention,
+    FlashInferAttention,
+    RingAttention,
+    TrtllmAttention,
+    TrtllmAttentionMetadata,
+    UlyssesAttention,
+    VanillaAttention,
+    create_attention,
+    get_visual_gen_attention_backend,
+    wrap_parallel_attention,
+)
+
+warnings.warn(
+    "tensorrt_llm._torch.visual_gen.attention_backend has moved to "
+    "tensorrt_llm._torch.visual_gen.attention.backends. Only the package-root "
+    "exports are still available from the old path, and it will be removed in a "
+    "future release; submodule imports must use the new path.",
+    FutureWarning,
+    stacklevel=2,
+)
 
 __all__ = [
     "Attention2DAttention",

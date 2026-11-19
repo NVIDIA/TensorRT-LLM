@@ -25,8 +25,8 @@
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -49,7 +49,8 @@ constexpr int kHistCopies = 16;
 //! How many survivors the shared gather buffer holds (8 KB). Past this the descent falls
 //! back to re-reading the row, so the cap is a performance knob, never a correctness one.
 constexpr int kCandCap = 2048;
-//! Guards 1/T for a zero temperature. Matches decodingCommon.cu's EPSILON for float.
+//! Stands in for a zero temperature in 1/T. A positive temperature is used as given, however
+//! small, so that it scales the logits exactly as dividing by it would.
 constexpr float kTempEpsilon = 1e-6f;
 //! Rejection rounds a tokens-only row may spend before it settles for the argmax. Each
 //! round drops the rejected candidate and everything at or below its weight, so the
@@ -58,6 +59,8 @@ constexpr float kTempEpsilon = 1e-6f;
 //! build, so exhausting the budget still answers with a token inside the support -- it
 //! perturbs the distribution rather than leaving it.
 constexpr int kMaxRejectRounds = 32;
+//! Walkers the parallel walk serves; more (a rounding pathology) take the per-thread walk.
+constexpr int kMaxWalkers = 4;
 
 __device__ inline float toFloat(float v)
 {
@@ -116,6 +119,41 @@ __device__ inline void forEachLogit(T const* row, int vocabSize, Fn fn)
     }
 }
 
+//! forEachLogit with the next vector's load issued before the current one is processed: the same
+//! elements in the same per-thread order.
+template <typename T, typename Fn>
+__device__ inline void forEachLogitPipelined(T const* row, int vocabSize, Fn fn)
+{
+    constexpr int kWidth = kVecBytes / sizeof(T);
+    if ((reinterpret_cast<uintptr_t>(row) % kVecBytes) != 0)
+    {
+        forEachLogit(row, vocabSize, fn);
+        return;
+    }
+    int const vecCount = vocabSize / kWidth;
+    int4 const* vec = reinterpret_cast<int4 const*>(row);
+    int v = threadIdx.x;
+    int4 next = v < vecCount ? vec[v] : int4{};
+    for (; v < vecCount; v += blockDim.x)
+    {
+        int4 const packed = next;
+        if (v + static_cast<int>(blockDim.x) < vecCount)
+        {
+            next = vec[v + blockDim.x];
+        }
+        T const* elems = reinterpret_cast<T const*>(&packed);
+#pragma unroll
+        for (int j = 0; j < kWidth; ++j)
+        {
+            fn(v * kWidth + j, toFloat(elems[j]));
+        }
+    }
+    for (int i = vecCount * kWidth + threadIdx.x; i < vocabSize; i += blockDim.x)
+    {
+        fn(i, toFloat(row[i]));
+    }
+}
+
 //! Row-local view of one request's sampling parameters, resolved once per block.
 struct RowParams
 {
@@ -128,11 +166,28 @@ struct RowParams
     bool needMinP;
 };
 
+//! Seeds one row's Philox stream (see FusedSamplingParams::perRowRng).
+__device__ inline void initRowRng(FusedSamplingParams const& p, int row, curandStatePhilox4_32_10_t* state)
+{
+    int const rngIdx = p.perRowRng ? row : 0;
+    uint64_t const seed = p.seed != nullptr ? p.seed[rngIdx] : 0ull;
+    uint64_t const offset = p.offset != nullptr ? p.offset[rngIdx] : 0ull;
+    if (p.perRowRng)
+    {
+        curand_init(seed, kPerRowSubsequenceBase | offset, 0ull, state);
+    }
+    else
+    {
+        curand_init(seed, static_cast<uint64_t>(row), offset, state);
+    }
+}
+
 __device__ inline RowParams loadRowParams(FusedSamplingParams const& p, int row)
 {
     RowParams r;
     float const temperature = p.temperatures != nullptr ? p.temperatures[row] : 1.0f;
-    r.tempInv = 1.0f / (temperature + kTempEpsilon);
+    // In-tree callers pass T > 0: a zero temperature is sampled greedily before it gets here.
+    r.tempInv = temperature > 0.0f ? 1.0f / temperature : 1.0f / kTempEpsilon;
 
     // min_p is a fraction of the row maximum, so a value above 1 keeps nothing: keptMass
     // would be 0 and the renormalized row would come back all-inf instead of raising.
@@ -547,7 +602,161 @@ struct FusedSamplingShared
     float massTarget;
     int candIdx;
     curandStatePhilox4_32_10_t rejectRng;
+    int walkers;
+    int walkerTid[kMaxWalkers];
+    float walkerBase[kMaxWalkers];
 };
+
+//! Inverse-CDF walk of the rejection path: the thread whose scan interval holds ``target`` re-adds
+//! its strided weights in order until the running mass passes it. Warp 0 stages them in shared
+//! memory in parallel and one lane sums them in that order, bit-identical to the per-thread walk.
+template <typename T, int BLOCK>
+__device__ void walkSupport(T const* rowLogits, int vocabSize, float tempInv, float maxScaled, float supportFloor,
+    float pivot, float target, float base, bool walks, FusedSamplingShared<BLOCK>& shared)
+{
+    constexpr int kWidth = kVecBytes / sizeof(T);
+    constexpr int kChunk = 32;
+    static_assert(kChunk * kWidth <= kCandCap);
+    int const tid = threadIdx.x;
+    if (tid == 0)
+    {
+        shared.walkers = 0;
+    }
+    __syncthreads();
+    if (walks)
+    {
+        int const k = atomicAdd(&shared.walkers, 1);
+        if (k < kMaxWalkers)
+        {
+            shared.walkerTid[k] = tid;
+            shared.walkerBase[k] = base;
+        }
+    }
+    __syncthreads();
+    int const walkers = shared.walkers;
+    if (tid == 0 && walkers > 1 && walkers <= kMaxWalkers)
+    {
+        // Ascending thread order: a later walker that also crosses (a rounding-only overlap) wins.
+        for (int k = 1; k < walkers; ++k)
+        {
+            for (int q = k; q > 0 && shared.walkerTid[q - 1] > shared.walkerTid[q]; --q)
+            {
+                int const t = shared.walkerTid[q];
+                float const b = shared.walkerBase[q];
+                shared.walkerTid[q] = shared.walkerTid[q - 1];
+                shared.walkerBase[q] = shared.walkerBase[q - 1];
+                shared.walkerTid[q - 1] = t;
+                shared.walkerBase[q - 1] = b;
+            }
+        }
+    }
+    __syncthreads();
+    bool const aligned = (reinterpret_cast<uintptr_t>(rowLogits) % kVecBytes) == 0;
+    if (walkers > kMaxWalkers || !aligned)
+    {
+        if (walks)
+        {
+            float running = base;
+            bool found = false;
+            forEachLogit(rowLogits, vocabSize,
+                [&](int i, float logit)
+                {
+                    if (found)
+                    {
+                        return;
+                    }
+                    float const w = __expf(__fmul_rn(logit, tempInv) - maxScaled);
+                    if (!(w >= supportFloor && w > pivot))
+                    {
+                        return;
+                    }
+                    running += w;
+                    if (running > target)
+                    {
+                        shared.candIdx = i;
+                        shared.candWeight = w;
+                        found = true;
+                    }
+                });
+        }
+        return;
+    }
+    if (tid >= 32)
+    {
+        return;
+    }
+    int const lane = tid;
+    int const vecCount = vocabSize / kWidth;
+    float* const weights = shared.cand;
+    for (int w = 0; w < walkers; ++w)
+    {
+        int const walker = shared.walkerTid[w];
+        float running = shared.walkerBase[w];
+        int const count = walker < vecCount ? (vecCount - 1 - walker) / BLOCK + 1 : 0;
+        int found = -1;
+        float foundWeight = 0.0f;
+        for (int c0 = 0; c0 < count && found < 0; c0 += kChunk)
+        {
+            int const m = c0 + lane;
+            if (m < count)
+            {
+                int4 const packed = reinterpret_cast<int4 const*>(rowLogits)[walker + m * BLOCK];
+                T const* elems = reinterpret_cast<T const*>(&packed);
+#pragma unroll
+                for (int j = 0; j < kWidth; ++j)
+                {
+                    weights[lane * kWidth + j] = __expf(__fmul_rn(toFloat(elems[j]), tempInv) - maxScaled);
+                }
+            }
+            __syncwarp();
+            if (lane == 0)
+            {
+                int const n = min(kChunk, count - c0);
+                for (int mm = 0; mm < n && found < 0; ++mm)
+                {
+#pragma unroll
+                    for (int j = 0; j < kWidth; ++j)
+                    {
+                        float const wj = weights[mm * kWidth + j];
+                        if (wj >= supportFloor && wj > pivot)
+                        {
+                            running += wj;
+                            if (found < 0 && running > target)
+                            {
+                                found = (walker + (c0 + mm) * BLOCK) * kWidth + j;
+                                foundWeight = wj;
+                            }
+                        }
+                    }
+                }
+            }
+            found = __shfl_sync(0xffffffffu, found, 0);
+            __syncwarp();
+        }
+        if (lane == 0)
+        {
+            for (int i = vecCount * kWidth + walker; found < 0 && i < vocabSize; i += BLOCK)
+            {
+                float const wi = __expf(__fmul_rn(toFloat(rowLogits[i]), tempInv) - maxScaled);
+                if (wi >= supportFloor && wi > pivot)
+                {
+                    running += wi;
+                    if (running > target)
+                    {
+                        found = i;
+                        foundWeight = wi;
+                    }
+                }
+            }
+            if (found >= 0)
+            {
+                shared.candIdx = found;
+                shared.candWeight = foundWeight;
+            }
+        }
+        __syncwarp();
+    }
+}
 
 //! \brief The kernel body, shared by both entry points below.
 //!
@@ -631,7 +840,7 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
         {
             if (reuseThreadMass)
             {
-                forEachLogit(rowLogits, vocabSize,
+                forEachLogitPipelined(rowLogits, vocabSize,
                     [&](int i, float logit) {
                         cachedThreadStats = combineOnlineSoftmax(
                             cachedThreadStats, OnlineSoftmax{__fmul_rn(logit, rp.tempInv), 1.0f, i});
@@ -772,10 +981,7 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
 
             if (tid == 0)
             {
-                int const rngIdx = params.perRowRng ? row : 0;
-                uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
-                uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
-                curand_init(seed, static_cast<uint64_t>(row), offset, &sRejectRng);
+                initRowRng(params, row, &sRejectRng);
                 // -1 admits every weight: w is an exp, so it is never negative.
                 sPivot = -1.0f;
                 sToken = -1;
@@ -822,33 +1028,8 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
                 __syncthreads();
 
                 float const target = sTarget;
-                if (target >= base && target < base + localMass)
-                {
-                    // Same traversal as the accumulation above, so the two float sums
-                    // agree term for term and the crossing lands on the same element.
-                    float running = base;
-                    bool found = false;
-                    forEachLogit(rowLogits, vocabSize,
-                        [&](int i, float logit)
-                        {
-                            if (found)
-                            {
-                                return;
-                            }
-                            float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
-                            if (!(w >= supportFloor && w > pivot))
-                            {
-                                return;
-                            }
-                            running += w;
-                            if (running > target)
-                            {
-                                sCandIdx = i;
-                                sCandWeight = w;
-                                found = true;
-                            }
-                        });
-                }
+                walkSupport<T, BLOCK>(rowLogits, vocabSize, rp.tempInv, maxScaled, supportFloor, pivot, target, base,
+                    target >= base && target < base + localMass, shared);
                 __syncthreads();
 
                 if (sCandIdx < 0)
@@ -1092,13 +1273,8 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
     {
         if (tid == 0)
         {
-            int const rngIdx = params.perRowRng ? row : 0;
-            uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
-            uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
             curandStatePhilox4_32_10_t state;
-            // The row index is the subsequence, so rows draw independent streams from a
-            // shared seed -- and a seeded request stays reproducible via its own offset.
-            curand_init(seed, static_cast<uint64_t>(row), offset, &state);
+            initRowRng(params, row, &state);
             sTarget = curand_uniform(&state) * keptMass;
             sToken = -1;
         }
@@ -1166,4 +1342,5 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
 
 } // namespace fusedSampling
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

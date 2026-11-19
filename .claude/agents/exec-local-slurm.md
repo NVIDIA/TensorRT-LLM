@@ -7,7 +7,6 @@ description: >
   scripts identically. The orchestrator (typically trtllm-case-executor) writes
   a job spec to <work_dir>/job_spec.json and invokes this agent to run it.
 tools: ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
-model: sonnet
 license: Apache-2.0
 ---
 

@@ -203,8 +203,107 @@ Cold-page NVFP4 is different from an active NVFP4 KV cache. The former stores
 NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets `KvCacheConfig(dtype="nvfp4")` and keeps active GPU KV in
 NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
+
 For complete single-GPU and disaggregated-serving configurations, see the
 [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
+
+#### Skipping RoPE Quantization
+
+In some models, part of each K vector carries positional information (RoPE).
+When NVFP4 cold-page compression is enabled, `skip_rope_quantization` controls
+how that part is stored:
+
+- `false` (default): quantize RoPE as well. DeepSeek-V4 compressed rows use single
+  NVFP4 for NoPE and two FP4 components (2FP4) for RoPE by default; other models
+  use single NVFP4.
+- `true`: copy the supported target RoPE part unchanged at the hot-cache
+  precision, such as FP8 or BF16. The remaining values use NVFP4.
+
+For DeepSeek-V4, `nvfp4_residual_dim` defaults to `64`, using 2FP4 for its
+64 RoPE values. Set it to `0` with `skip_rope_quantization: false`
+for single NVFP4 throughout the row. Only `0` and `64` are supported. Setting
+`skip_rope_quantization` to `true` preserves RoPE regardless of the residual
+option. See the [DeepSeek-V4 example](source:examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4)
+for the three formats.
+
+Preserving RoPE increases cold-cache storage relative to single NVFP4. These
+formats are exploratory; validate accuracy on your model and workload. Skipping
+RoPE is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5 series;
+2FP4 is available only for DeepSeek-V4. To add model support, follow the layout
+requirements in the
+[development guide](../developer-guide/kv-cache-compression-development.md#which-numbers-of-a-k-or-v-vector-become-nvfp4).
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  skip_rope_quantization: true
+```
+
+#### Keeping the First and Last Tokens Unquantized
+
+Cold-page quantization stores every page that leaves the GPU in the compact
+format selected by `quant`. The first tokens of a sequence, which attention
+uses as anchors, and its most recent tokens are the ones generation is most
+sensitive to. `mixed_precision_first_n` and `mixed_precision_last_n` take them
+out of the quantization: the leading N and the most recent N tokens of every
+sequence are stored in the cold tiers at the runtime KV type, and only the
+tokens in between are stored in the compact format. This first/last-N mixed
+precision applies per attention layer: full-attention layers take it;
+sliding-window layers do not take part, as with the mixed-precision KV cache,
+and their pages are stored as ordinary cold pages. The high copies are kept
+with a retention of `mixed_precision_last_n + 1` tokens plus
+`mixed_precision_first_n` sink tokens. A sliding-window layer whose window and
+sink pages match that retention would share the high copies' page group,
+which the codec cannot split, so the manager rejects that first/last-N
+combination (`mixed_precision_first_n: 0` with `mixed_precision_last_n: 127`
+for a 128-token window) and asks for another `mixed_precision_last_n`.
+
+This is the same split as the
+[mixed-precision KV cache](kvcache.md#mixed-precision-kv-cache-prototype),
+which keeps the first/last tokens at the runtime KV type while the rest of the
+GPU KV cache is NVFP4. The difference is where the compact format lives. With
+`dtype: mixed_nvfp4_*` the GPU history itself is compact. With the cold-page
+option the GPU keeps the whole history at the runtime KV type, and only pages in
+the Host or Disk tier are compact. Both keep the first/last tokens in whole
+cache pages, and the two options cannot be combined.
+
+The runtime KV type is the one `kv_cache_config.dtype` resolves to: FP8 in the
+example below, or the checkpoint's KV type under the default `auto`.
+
+```yaml
+kv_cache_config:
+  dtype: fp8
+  host_cache_size: 8589934592
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  mixed_precision_first_n: 256
+  mixed_precision_last_n: 256
+```
+
+The cost in steady decode is one extra GPU copy of the first/last tokens per
+attention layer, `mixed_precision_first_n + mixed_precision_last_n` tokens
+rounded up to whole pages, plus the full-size storage of those tokens in the
+cold tiers. The two fields describe the retained history, not the peak GPU
+memory: during prefill the copy also has to hold every token of the chunk being
+processed, so its peak per layer is that window plus one prefill chunk (bounded
+by `max_num_tokens`), and the pages beyond the window are released once the
+chunk is history, as for a native sliding-window layer. Attention kernels are
+unchanged: the page tables point the first/last tokens at that copy, and each
+step's new tokens are copied into the history pages as well.
+
+`mixed_precision_reuse` sets how a prefix whose GPU copy of the last N tokens was
+evicted is reused, as described for the [mixed-precision KV cache](kvcache.md).
+
+The option is a prototype and has the limits of the mixed-precision KV cache:
+the TRTLLM attention backend, the standard KV cache manager, the hybrid Mamba
+manager and the DSA and DeepSeek-V4 sparse backends, single-beam decoding,
+speculative decoding except dynamic-tree drafting, no KV connector, not the
+`fp8_ds_mla` cache layout, and not sparse KV cache offload
+(`enable_kv_cache_offload`). Drafter layers appended to the target cache (MTP,
+Eagle3) keep their first/last tokens like the target layers; a separate drafter
+with its own architecture keeps a plain cache.
 
 ### TriAttention
 
@@ -213,7 +312,12 @@ generation KV tokens, retains the most useful tokens, and physically compacts
 the cache. The prompt remains preserved, and the model's standard Attention
 implementation runs over the compacted cache.
 
-TriAttention requires an offline calibration file. A minimal configuration is:
+TriAttention requires an offline calibration file. The Blackwell TopK selector
+supports `budget` values from 1 through 16384; larger values are rejected when
+the compression manager is constructed, before calibration loading or workspace
+initialization.
+
+A minimal configuration is:
 
 ```python
 from tensorrt_llm import LLM
@@ -251,7 +355,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the NoPE part of the compressed KV is encoded as NVFP4, the RoPE part and the indexer cache are preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; NoPE uses NVFP4 and RoPE defaults to 2FP4, or keeps its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly | Not supported |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,

@@ -54,6 +54,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
 from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -204,6 +205,7 @@ def _build_multi_seq_metadata(
         request_ids=request_ids,
         runtime_features=SimpleNamespace(has_speculative_draft_tokens=False),
         is_cuda_graph=False,
+        forward_scratch_buffers=None,
         fp4_mla_state=Fp4MlaState(
             batch_indices=batch_indices,
             positions=positions,
@@ -214,10 +216,10 @@ def _build_multi_seq_metadata(
             device_page_table=True,
             device_page_table_valid=True,
             page_table_stride=max_blocks_per_seq,
+            generation_max_pages=max_blocks_per_seq,
             num_context_blocks=num_seqs * max_blocks_per_seq,
             num_generation_blocks=0,
             num_sequences=num_seqs,
-            num_blocks=None,
             hp_pool=hp_pool,
             v_scale_pool=kv_cache_manager.get_mla_v_scale_pool(),
             q_global_scale=q_global_scale,
@@ -943,7 +945,6 @@ def run_one_trtllm_rubin(
     )
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
     from tensorrt_llm._torch.metadata import KVCacheParams
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
     from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
     from tensorrt_llm.functional import PositionEmbeddingType
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -974,7 +975,7 @@ def run_one_trtllm_rubin(
     max_tokens = batch * ((seq + page_size - 1) // page_size) * page_size
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
 
-    kv_cache_manager = KVCacheManager(
+    kv_cache_manager = KVCacheManagerV2(
         KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=1,
@@ -1823,7 +1824,9 @@ def main() -> None:
             if not is_rubin:
                 p.error("--backend cutedsl requires a Rubin SM107 GPU.")
             if not _cutedsl_backend_available():
-                p.error("--backend cutedsl requires the CTM and CuTeDSL runtime packages.")
+                p.error(
+                    "--backend cutedsl requires a CuTe DSL build that supports the FP4 MLA kernels."
+                )
         if args.backend == "trtllm_fp8_rubin" and not is_rubin:
             p.error("--backend trtllm_fp8_rubin requires a Rubin SM107 GPU.")
         backends = [args.backend]

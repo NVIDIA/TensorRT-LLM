@@ -21,6 +21,7 @@
 #include <fmha/paged_kv_cache.h>
 #include <fstream>
 #include <fused_multihead_attention_api.h>
+#include <fused_multihead_attention_sage_utils.h>
 #include <iostream>
 #include <math.h>
 #include <numeric>
@@ -77,15 +78,6 @@ void run_conversion_fp32_to_bf16(void* dst, void const* src, int s, int b, int h
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void run_conversion_fp32_to_e4m3(void* dst, void const* src, int s, int b, int h, int d, float scale_o);
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void run_sage_quant(unsigned int batch_size, unsigned int head_num, unsigned int head_size, unsigned int max_seq_len,
-    // device var
-    void const* q, void const* k, void const* v, int stride_q, int stride_k, int stride_v, int const* cu_seqlens_q,
-    int const* cu_seqlens_kv, int block_size_q, int block_size_k, int block_size_v,
-    // output
-    void* quant_q, void* quant_k, void* quant_v, float* scales_q, float* scales_k, float* scales_v);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1818,63 +1810,163 @@ int main(int argc, char** argv)
 
     if (sage_block_size_q > 0 || sage_block_size_k > 0 || sage_block_size_v > 0)
     {
-        assert(input_layout == Attention_input_layout::PACKED_QKV && "for now this test only supports PACKED_QKV");
+        // SageAttention targets separate Q/K/V, where the q and kv sequence lengths may differ.
+        // Packed QKV is still supported; it forces s_q == s_kv because Q, K and V share a token.
+        bool const separate_qkv = input_layout == Attention_input_layout::SEPARATE_Q_K_V;
+        assert((separate_qkv || input_layout == Attention_input_layout::PACKED_QKV)
+            && "SageAttention supports the separate Q/K/V and packed QKV layouts");
+        assert((separate_qkv || s_q == s) && "packed QKV shares one token between Q and KV, so it needs s_q == s");
         assert(d == dv && "for now SageAttention doesn't support different QKV dims");
-        assert(((sm == 90 && !force_non_warp_specialization) || (sm == 89))
-            && "only hopper and ada kernels support SageAttention");
-        fmha::e4m3_t* quant_qkv;
-        FMHA_CHECK_CUDA(cudaMalloc((void**) &quant_qkv, qkv_packed_size));
-        params_v2.sage.q.block_size = sage_block_size_q;
-        params_v2.sage.q.max_nblock = (s + sage_block_size_q - 1) / sage_block_size_q;
-        FMHA_CHECK_CUDA(
-            cudaMalloc((void**) &params_v2.sage.q.scales, params_v2.sage.q.max_nblock * h * b * sizeof(float)));
-        params_v2.sage.k.block_size = sage_block_size_k;
-        params_v2.sage.k.max_nblock = (s + sage_block_size_k - 1) / sage_block_size_k;
-        FMHA_CHECK_CUDA(
-            cudaMalloc((void**) &params_v2.sage.k.scales, params_v2.sage.k.max_nblock * h * b * sizeof(float)));
-        params_v2.sage.v.block_size = sage_block_size_v;
-        params_v2.sage.v.max_nblock = (s + sage_block_size_v - 1) / sage_block_size_v;
-        FMHA_CHECK_CUDA(
-            cudaMalloc((void**) &params_v2.sage.v.scales, params_v2.sage.v.max_nblock * h * b * sizeof(float)));
-#if 1
+        assert(sm == 90 && !force_non_warp_specialization
+            && "only the hopper warp-specialized kernels support SageAttention");
+        assert(attention_mask_type == Attention_mask_type::PADDING
+            && "SageAttention supports the padding mask only (non-causal)");
+
+        sage_quant::Geometry const sage_geo(sage_block_size_k);
+        assert(sage_block_size_q == sage_geo.q_tokens_per_scale
+            && "-sage-block-q must be 2: Q is quantized per thread (2 rows)");
+        assert(sage_block_size_k == sage_geo.k_tokens_per_scale
+            && "-sage-block-k must be 16: K is quantized per thread sub-fragment (16 keys)");
+        assert((sage_block_size_v == 0 || sage_block_size_v == 1)
+            && "V is quantized along the channel axis; -sage-block-v must be 1 or 0");
+
+        sage_quant::Input sage_in;
+        sage_in.b = b;
+        sage_in.h = h;
+        sage_in.h_kv = h_kv;
+        sage_in.d = d;
+        sage_in.dv = dv;
+        sage_in.cu_q_seqlens = cu_q_seqlens.data();
+        sage_in.cu_kv_seqlens = cu_seqlens.data();
+        sage_in.block_size_q = sage_block_size_q;
+        sage_in.block_size_k = sage_block_size_k;
+        sage_in.block_size_v = sage_block_size_v;
+
+        // Quantized bytes. Separate Q/K/V gets three buffers matching the layout the kernel reads
+        // (q [token][h][d], k [token][h_kv][d], v [token][h_kv][dv]); packed QKV gets one, with the
+        // three tensors aliasing it at different head offsets.
+        size_t const total_q = cu_q_seqlens.back(), total_kv = cu_seqlens.back();
+        std::vector<float> q_f, k_f, v_f;
+        std::vector<uint8_t> q_b, k_b, v_b, packed_b;
+
+        if (separate_qkv)
         {
-            // simple test, all scales are the same
-            constexpr float const_scale = 0.618f;
-            fmha::e4m3_t* quant_qkv_h = (fmha::e4m3_t*) malloc(qkv_packed_size);
-            for (size_t i = 0; i < qkv_packed_size; i++)
+            // Split the packed fp32 source the same way store_q_and_contiguous_kv_cache splits it
+            // for the non-sage layouts, including Q being right-aligned in the kv sequence when
+            // s_q < s_kv, so that both paths see identical values.
+            size_t const packed_hs = 2 * d + dv, packed_ts = h * packed_hs;
+            size_t const h_q_per_kv = h / h_kv;
+            q_f.assign(total_q * h * d, 0.f);
+            k_f.assign(total_kv * h_kv * d, 0.f);
+            v_f.assign(total_kv * h_kv * dv, 0.f);
+            for (size_t bi = 0; bi < b; bi++)
             {
-                quant_qkv_h[i] = fmha::e4m3_t(qkv_packed_h[i] / const_scale);
+                int const q_len = cu_q_seqlens[bi + 1] - cu_q_seqlens[bi];
+                int const kv_len = cu_seqlens[bi + 1] - cu_seqlens[bi];
+                for (int si = 0; si < q_len; si++)
+                {
+                    size_t const src_t = cu_seqlens[bi] + kv_len - q_len + si;
+                    size_t const dst_t = cu_q_seqlens[bi] + si;
+                    for (size_t hi = 0; hi < h; hi++)
+                    {
+                        for (size_t di = 0; di < d; di++)
+                        {
+                            q_f[dst_t * h * d + hi * d + di] = qkv_packed_h[src_t * packed_ts + hi * packed_hs + di];
+                        }
+                    }
+                }
+                for (int si = 0; si < kv_len; si++)
+                {
+                    size_t const ti = cu_seqlens[bi] + si;
+                    for (size_t hi = 0; hi < h_kv; hi++)
+                    {
+                        size_t const src = ti * packed_ts + hi * h_q_per_kv * packed_hs;
+                        for (size_t di = 0; di < d; di++)
+                        {
+                            k_f[ti * h_kv * d + hi * d + di] = qkv_packed_h[src + d + di];
+                        }
+                        for (size_t di = 0; di < dv; di++)
+                        {
+                            v_f[ti * h_kv * dv + hi * dv + di] = qkv_packed_h[src + 2 * d + di];
+                        }
+                    }
+                }
             }
-            FMHA_CHECK_CUDA(cudaMemcpy(quant_qkv, quant_qkv_h, qkv_packed_size, cudaMemcpyHostToDevice));
-            free(quant_qkv_h);
-            auto init_scales = [&](bert::Fused_multihead_attention_params_v2::SageAttention::Scales& x)
-            {
-                std::vector<float> scales(x.max_nblock * h * b, const_scale);
-                FMHA_CHECK_CUDA(
-                    cudaMemcpy(x.scales, scales.data(), sizeof(float) * scales.size(), cudaMemcpyHostToDevice));
-            };
-            init_scales(params_v2.sage.q);
-            init_scales(params_v2.sage.k);
-            init_scales(params_v2.sage.v);
+            q_b.assign(q_f.size(), 0);
+            k_b.assign(k_f.size(), 0);
+            v_b.assign(v_f.size(), 0);
+            sage_in.q = {q_f.data(), q_b.data(), h * d, d};
+            sage_in.k = {k_f.data(), k_b.data(), h_kv * d, d};
+            sage_in.v = {v_f.data(), v_b.data(), h_kv * dv, dv};
         }
-#else
+        else
         {
-            // use external quant kernel
-            run_sage_quant(b, h, d, s, params_v2.qkv_ptr,
-                (char*) params_v2.qkv_ptr + get_size_in_bytes(h * d, data_type),
-                (char*) params_v2.qkv_ptr + get_size_in_bytes(2 * h * d, data_type,
-                params_v2.q_stride_in_bytes,
-                params_v2.k_stride_in_bytes,
-                params_v2.v_stride_in_bytes,
-                params_v2.cu_q_seqlens, params_v2.cu_kv_seqlens, sage_block_size_q, sage_block_size_k,
-                sage_block_size_v, quant_qkv, quant_qkv + h * d, quant_qkv + 2 * h * d, params_v2.sage.q.scales,
-                params_v2.sage.k.scales, params_v2.sage.v.scales);
+            // MQA/GQA and MHA pack QKV differently, so alias whichever buffer the kernel reads.
+            std::vector<float> const& src = multi_query_attention ? mqa_qkv_packed_h : qkv_packed_h;
+            packed_b.assign(multi_query_attention ? mqa_qkv_packed_size : qkv_packed_size, 0);
+            if (multi_query_attention)
+            {
+                // [token][h + 2 * h_kv][d], all q heads first, then k heads, then v heads.
+                size_t const ts = (h + 2 * h_kv) * d;
+                sage_in.q = {src.data(), packed_b.data(), ts, d};
+                sage_in.k = {src.data() + h * d, packed_b.data() + h * d, ts, d};
+                sage_in.v = {src.data() + (h + h_kv) * d, packed_b.data() + (h + h_kv) * d, ts, d};
+            }
+            else
+            {
+                // [token][h][2 * d + dv], q at 0, k at d, v at 2 * d within each head.
+                size_t const hs = 2 * d + dv, ts = h * hs;
+                sage_in.q = {src.data(), packed_b.data(), ts, hs};
+                sage_in.k = {src.data() + d, packed_b.data() + d, ts, hs};
+                sage_in.v = {src.data() + 2 * d, packed_b.data() + 2 * d, ts, hs};
+            }
         }
-#endif
-        // no need to free old params_v2.qkv_ptr, it will be released in the end
-        params_v2.qkv_ptr = quant_qkv;
-        params_v2.q_stride_in_bytes = params_v2.k_stride_in_bytes = params_v2.v_stride_in_bytes
-            = get_size_in_bytes((h + 2 * h_kv) * d, DATA_TYPE_E4M3);
+
+        sage_quant::Output const sage_out = sage_quant::quantize(sage_in);
+
+        params_v2.sage.q.block_size = sage_block_size_q;
+        params_v2.sage.q.max_nblock = sage_out.q_stride;
+        params_v2.sage.k.block_size = sage_block_size_k;
+        params_v2.sage.k.max_nblock = sage_out.k_stride;
+        params_v2.sage.v.block_size = sage_block_size_v;
+
+        auto upload_bytes = [](void* dst, std::vector<uint8_t> const& src)
+        { FMHA_CHECK_CUDA(cudaMemcpy(dst, src.data(), src.size(), cudaMemcpyHostToDevice)); };
+        if (separate_qkv)
+        {
+            upload_bytes(q_d, q_b);
+            upload_bytes(k_d, k_b);
+            upload_bytes(v_d, v_b);
+            params_v2.q_ptr = q_d;
+            params_v2.k_ptr = k_d;
+            params_v2.v_ptr = v_d;
+            params_v2.q_stride_in_bytes = get_size_in_bytes(h * d, DATA_TYPE_E4M3);
+            params_v2.k_stride_in_bytes = get_size_in_bytes(h_kv * d, DATA_TYPE_E4M3);
+            params_v2.v_stride_in_bytes = get_size_in_bytes(h_kv * dv, DATA_TYPE_E4M3);
+        }
+        else
+        {
+            void* quant_qkv;
+            FMHA_CHECK_CUDA(cudaMalloc(&quant_qkv, packed_b.size()));
+            upload_bytes(quant_qkv, packed_b);
+            // no need to free old params_v2.qkv_ptr, it will be released in the end
+            params_v2.qkv_ptr = quant_qkv;
+            params_v2.q_stride_in_bytes = params_v2.k_stride_in_bytes = params_v2.v_stride_in_bytes
+                = get_size_in_bytes(sage_in.q.token_stride, DATA_TYPE_E4M3);
+        }
+
+        auto upload = [](float** dst, std::vector<float> const& src)
+        {
+            if (src.empty())
+            {
+                return;
+            }
+            FMHA_CHECK_CUDA(cudaMalloc((void**) dst, sizeof(float) * src.size()));
+            FMHA_CHECK_CUDA(cudaMemcpy(*dst, src.data(), sizeof(float) * src.size(), cudaMemcpyHostToDevice));
+        };
+        upload(&params_v2.sage.q.scales, sage_out.scales_q);
+        upload(&params_v2.sage.k.scales, sage_out.scales_k);
+        upload(&params_v2.sage.v.scales, sage_out.scales_v);
     }
 
 #if defined(DEBUG_HAS_PRINT_BUFFER)

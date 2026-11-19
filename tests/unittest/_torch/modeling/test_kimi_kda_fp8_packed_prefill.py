@@ -31,12 +31,16 @@ class _Cfg:
 
 
 def _has_supported_gpu() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    }
 
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
-    reason="Kimi K3 FP8 projection is supported only on SM100/SM103",
+    reason="Kimi K3 FP8 projection is supported only on SM100/SM103/SM107",
 )
 
 

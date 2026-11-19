@@ -19,11 +19,13 @@ from .fallback import FallbackFmha
 from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
+from .gqa_decode import GqaDecodeFmha
 from .interface import Fmha, FmhaPhase
 from .msa_decode import MsaDecodeFmha
 from .msa_prefill import MsaPrefillFmha
 from .phased import FmhaParams, PhasedFmha
 from .prims_ts import PrimsTSFmha
+from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
 from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
 from .triton_custom_mask import TritonCustomMaskFmha
 
@@ -40,10 +42,12 @@ __all__ = [
     "FmhaCls",
     "FmhaParams",
     "FmhaPhase",
+    "GqaDecodeFmha",
     "MsaDecodeFmha",
     "MsaPrefillFmha",
     "PhasedFmha",
     "PrimsTSFmha",
+    "PrimsTSSparseMlaFmha",
     "TritonCustomMaskFmha",
     "get_enabled_fmha_lib_classes",
 ]

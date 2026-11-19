@@ -15,19 +15,18 @@
 
 import json
 import os
-import subprocess
 import tempfile
 
 import pytest
 import yaml
 
 from ..test_llm import get_model_path
-from .openai_server import RemoteOpenAIServer
+from .openai_server import RemoteOpenAIServer, run_command_with_output
 
 
-@pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
+@pytest.fixture(scope="module", ids=["Qwen3-0.6B"])
 def model_name():
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module")
@@ -72,17 +71,12 @@ def example_root():
 def test_trtllm_serve_examples(exe: str, script: str, model_name: str,
                                server: RemoteOpenAIServer, example_root: str):
     client_script = os.path.join(example_root, script)
-    # CalledProcessError will be raised if any errors occur
     custom_env = os.environ.copy()
     if script.startswith("aiperf"):
         custom_env[""] = get_model_path(model_name)
-    result = subprocess.run([exe, client_script],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            check=True,
-                            env=custom_env,
-                            timeout=600)
+    result = run_command_with_output([exe, client_script],
+                                     env=custom_env,
+                                     timeout=600)
     if script.startswith("curl"):
         # For curl scripts, we expect a JSON response
         result_stdout = result.stdout.strip()

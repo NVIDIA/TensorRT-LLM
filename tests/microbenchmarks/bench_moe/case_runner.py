@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -721,6 +722,18 @@ def _run_one_candidate(
                 device=device,
             )
         except Exception as exc:
+            # The framework checks the actual backend/comm capabilities after
+            # AUTO selection. Only its unfinalized-output refusals are skips.
+            if (
+                model.post_expert_norm_eps is not None
+                and isinstance(exc, ValueError)
+                and (
+                    str(exc).startswith("unfinalized_combine_fn is registered but ")
+                    or str(exc) == "unfinalized_combine_fn requires ConfigurableMoE."
+                )
+            ):
+                _maybe_print_rank0(f"[bench_moe] skipped: {exc}")
+                return _short_circuit(result, "skipped", str(exc))
             reason = f"build error: {type(exc).__name__}: {exc}"
             _maybe_print_rank0(f"[bench_moe] build failed: {reason}\n{traceback.format_exc()}")
             return _short_circuit(result, "failed", reason)
@@ -885,6 +898,13 @@ def _run_one_candidate(
                 moe.destroy()
             except Exception:
                 pass
+            # When a sweep runs many configs, OOM can occasionally occur because
+            # the MoE module (a reference cycle with its scheduler) is only freed
+            # when the cyclic GC happens to run.
+            # Collect explicitly so the weights are released
+            # before the next candidate builds its own module.
+            moe = None
+            gc.collect()
         if prev_force_comm is None:
             os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
         else:

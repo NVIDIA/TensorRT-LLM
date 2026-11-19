@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from utils.llm_data import get_checkpoint
 
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import _cute_dsl_import_error
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
@@ -120,7 +120,7 @@ def _count_cute_fine_stage_launches() -> Iterator[SimpleNamespace]:
     """
     from unittest.mock import patch
 
-    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.backend import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa.backend import (
         VSACuTeDSLAttention,
     )
 
@@ -147,7 +147,7 @@ def _assert_vsa_matches_dense(
     """Compare CuTe-DSL VSA against SDPA-fallback VSA (same gated formulation, different fine kernel)."""
     from unittest.mock import patch
 
-    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import backend as _vsa_module
+    from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import backend as _vsa_module
 
     common_kwargs = dict(
         prompt=PROMPT,

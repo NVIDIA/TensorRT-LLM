@@ -35,29 +35,23 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
-using MemoryOwner = std::variant<HostMem, CudaUniqPtr>;
-
-CudaUniqPtr allocateDeviceMemory(size_t size)
-{
-    CUdeviceptr ptr = 0;
-    cuCheck(cuMemAlloc(&ptr, size));
-    return CudaUniqPtr{reinterpret_cast<std::byte*>(ptr)};
-}
+using MemoryOwner = std::variant<StaticHostMem, CudaUniqPtr<std::byte>>;
 
 MemoryOwner makeMemoryOwner(size_t size, StagingBufferMemory memory)
 {
     TLLM_CHECK_WITH_INFO(size > 0, "Staging buffer size must be non-zero");
     switch (memory)
     {
-    case StagingBufferMemory::kPinnedHost: return MemoryOwner{std::in_place_type<HostMem>, size};
-    case StagingBufferMemory::kDevice: return MemoryOwner{std::in_place_type<CudaUniqPtr>, allocateDeviceMemory(size)};
+    case StagingBufferMemory::kPinnedHost: return MemoryOwner{std::in_place_type<StaticHostMem>, size};
+    case StagingBufferMemory::kDevice:
+        return MemoryOwner{std::in_place_type<CudaUniqPtr<std::byte>>, allocateDeviceMemory<std::byte>(size)};
     default: throw std::invalid_argument("StagingBufferManager received an invalid memory kind");
     }
 }
 
 } // namespace
 
-void DeviceDeleter::operator()(std::byte* ptr) const noexcept
+void DeviceDeleter::operator()(void* ptr) const noexcept
 {
     if (ptr != nullptr)
     {
@@ -170,17 +164,17 @@ StagingBufferManager::~StagingBufferManager() noexcept
 
 MemAddress StagingBufferManager::baseAddress() const noexcept
 {
-    if (auto const* host = std::get_if<HostMem>(&mMemoryOwner))
+    if (auto const* host = std::get_if<StaticHostMem>(&mMemoryOwner))
     {
         return host->address();
     }
-    return reinterpret_cast<MemAddress>(std::get<CudaUniqPtr>(mMemoryOwner).get());
+    return reinterpret_cast<MemAddress>(std::get<CudaUniqPtr<std::byte>>(mMemoryOwner).get());
 }
 
 StagingBufferMemory StagingBufferManager::memory() const noexcept
 {
-    return std::holds_alternative<HostMem>(mMemoryOwner) ? StagingBufferMemory::kPinnedHost
-                                                         : StagingBufferMemory::kDevice;
+    return std::holds_alternative<StaticHostMem>(mMemoryOwner) ? StagingBufferMemory::kPinnedHost
+                                                               : StagingBufferMemory::kDevice;
 }
 
 StagingBuffer StagingBufferManager::acquire(

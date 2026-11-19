@@ -7,7 +7,7 @@
 #   - Linear projections  → tensorrt_llm._torch.modules.linear.Linear
 #   - RMSNorm (QK norm)   → tensorrt_llm._torch.modules.rms_norm.RMSNorm
 #   - FeedForward (MLP)    → tensorrt_llm._torch.modules.mlp.MLP
-#   - Attention backend    → tensorrt_llm._torch.visual_gen.attention_backend
+#   - Attention backend    → tensorrt_llm._torch.visual_gen.attention.backends
 #
 # Architecture-specific components (RoPE, AdaLN, timestep/text embeddings,
 # modality dataclass, transformer args) are ported from LTX-2 and live
@@ -32,13 +32,13 @@ from tqdm import tqdm
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
-from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     UlyssesAttention,
     wrap_parallel_attention,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -1522,6 +1522,9 @@ class LTXModel(BaseDiffusionModel):
     follows the Lightricks reference implementation.
     """
 
+    _transformer_block_class = BasicAVTransformerBlock
+    _cache_text_kv = True
+
     def __init__(
         self,
         *,
@@ -1915,7 +1918,7 @@ class LTXModel(BaseDiffusionModel):
             else None
         )
         blocks: list[nn.Module] = [
-            BasicAVTransformerBlock(
+            self._transformer_block_class(
                 idx=idx,
                 video=video_config,
                 audio=audio_config,
@@ -2179,13 +2182,15 @@ class LTXModel(BaseDiffusionModel):
             v_ctx, v_mask, v_pe, v_cross_pe = self.video_args_preprocessor.prepare_text_cache(
                 video_context, video_context_mask, video_positions, dtype
             )
-            v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
+            if self._cache_text_kv:
+                v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
 
         if audio_context is not None:
             a_ctx, a_mask, a_pe, a_cross_pe = self.audio_args_preprocessor.prepare_text_cache(
                 audio_context, audio_context_mask, audio_positions, dtype
             )
-            a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
+            if self._cache_text_kv:
+                a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
             # cos/sin are token-major: token axis is dim 1 for both SPLIT and
             # INTERLEAVED rope, matching `_make_pe_local`'s `cos[:, s:e]` shard.
             if self._audio_pad > 0:

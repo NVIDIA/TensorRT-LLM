@@ -185,7 +185,7 @@ For optimization patterns by type, see [references/optimization-patterns.md](ref
 **Finding related tests:**
 ```bash
 # Search by modified file name
-grep -rl "model_engine\|PyTorchModelEngine" tests/unittest/_torch/executor/
+grep -rl "model_engine\|PyTorchModelEngine" tests/unittest/_torch/pyexecutor/
 
 # Search by modified function name
 grep -rl "_prepare_tp_inputs\|prepare_inputs" tests/
@@ -194,10 +194,10 @@ grep -rl "_prepare_tp_inputs\|prepare_inputs" tests/
 **Running tests:**
 ```bash
 # Run specific test file with stop-on-first-failure
-pytest tests/unittest/_torch/executor/test_pytorch_model_engine.py -v -x --timeout=120
+pytest tests/unittest/_torch/pyexecutor/test_model_engine.py -v -x --timeout=120
 
 # Run specific test method
-pytest tests/unittest/_torch/executor/test_pytorch_model_engine.py::PyTorchModelEngineTestCase::test_position_id_preparation -v -x
+pytest tests/unittest/_torch/pyexecutor/test_model_engine.py::ModelEngineTestCase::test_position_id_preparation -v -x
 ```
 
 For the full UT-to-file mapping, see [references/hot-path-files.md](references/hot-path-files.md).

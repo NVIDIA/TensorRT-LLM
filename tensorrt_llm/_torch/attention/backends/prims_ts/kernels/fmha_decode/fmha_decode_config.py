@@ -22,28 +22,44 @@ that should be set before kernel compilation.
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, fields, replace
+from functools import wraps
+import math
 
 import cutlass.utils as utils
-from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
+from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN, Int8
 
+from ...sage.config import SAGE_K_BLOCK_SIZES, is_power_of_two
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
+    _block_sparse_proxy_summary_geometry,
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
+from ...sage.layout import (
+    _SAGE_ATOM_MIN_WORDS,
+    _SAGE_ATOM_TOKENS,
+    _SageKSection,
+    _SageQSection,
+    _SageScaleLayout,
+    _SageVSection,
+)
+from ...sage.modes import SageScoreScaling
 from ...split_kv_mode_policy import select_split_kv_modes
+from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
+    E4M3_MAX,
+    SOFTMAX_RESCALE_THRESHOLD_LOG2,
     AUTO_LAUNCH_TILE_SIZE_KV,
+    KV_TILE_256_MAX_EX2_EMULATED_PAIRS,
     BITS_PER_BYTE,
     BYTES_PER_KIB,
     FALLBACK_SM_COUNT_B200,
     FP32_BYTES,
     FP8_OUTPUT_ELEMENTS_PER_REG_GROUP,
     FP8_P_PACKED_REGS_PER_Q_REPEAT,
-    FP8_VALUES_PER_REG,
     FP16_OUTPUT_ELEMENTS_PER_REG_GROUP,
     FP16_P_PACKED_REGS_PER_Q_REPEAT,
-    FP16_VALUES_PER_REG,
+    KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
     KV_TILE_256_SHARED_FIFO_STAGES,
     MAX_CLUSTER_DIM_X,
@@ -51,23 +67,39 @@ from .fmha_decode_constants import (
     MAX_KV_STAGE_SMEM_KIB,
     MAX_WARP_GROUPS,
     MIN_LOOP_ITERS_PER_SPLIT,
+    MMA_K_STEP_BYTES,
+    PACKED_REGISTER_BYTES,
     PARALLEL_REDUCTION_BYTES_PER_SLICE,
+    PARALLEL_REDUCTION_SLOT_LANES,
     PARALLEL_REDUCTION_THREADS_PER_CTA,
     PARTIAL_O_ELEMENT_BYTES,
     PARTIAL_STATS_VALUES_PER_ROW,
+    Q_TOKEN_KV_BLOCK_SPARSE_HELD_LOCATOR_MAX_TILES,
+    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
     Q_REPETITION_GROUP_HEADS,
     Q_ROW_ALIGNMENT_BYTES,
     REDUCTION_BYTES_PER_SLICE,
     REDUCTION_THREADS_PER_CTA,
     SPLIT_KV_MIN_TOKENS_PER_CTA,
+    SWIZZLE_128B_ROW_BYTES,
     TMEM_COLUMNS_PER_ROW,
+    TMEM_MAX_ALLOCATION_COLUMNS,
     TMEM_ROW_STRIDE,
     TOTAL_SMEM_BUDGET_KIB,
     WARP_THREADS,
 )
 
+LENGTH_DERIVED_FIELDS = (
+    "max_seq_len_q",
+    "total_kv_tiles",
+    "static_seq_len_kv",
+    "max_num_pages_per_seq_kv",
+    "static_num_skipped_kv_tiles",
+    "static_window_start_idx",
+)
+
 ConfigValue = int | float | bool | str | type | None
-_GroupedKeepsProfileKey = tuple[type, type, type, int, int, int, int]
+_GroupedKeepsProfileKey = tuple[type, type, type, type, int, int, int, int]
 
 # Public APIs use the strings ``dense`` and ``causal``.  Keep the value carried
 # through FmhaDecodeConfig as a small integer so mask selection remains a
@@ -84,23 +116,61 @@ _GROUPED_KEEPS_MAIN_PROFILE: _GroupedKeepsProfileKey = (
     Float16,
     Float16,
     Float16,
+    Float16,
     128,
     0,
     2,
     2,
 )
-# Block-sparse feature compatibility is validated by
-# ``validate_block_sparse_profile``. This set only selects the Keeps MMA
-# resource recipes qualified for that already-validated launch domain.
-_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
+# Keeps MMA resource recipes qualified for contiguous K/V, dense or
+# block-sparse. Block-sparse feature compatibility is validated by
+# ``validate_block_sparse_profile``.
+_CONTIGUOUS_GROUPED_KEEPS_PROFILES = {
     _GROUPED_KEEPS_MAIN_PROFILE,
-    (BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
+    (BFloat16, BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
+}
+_D192_GROUPED_KEEPS_PROFILES = {
+    (dtype, dtype, dtype, output, 192, stage, 1, 1)
+    for dtype, output in (
+        (Float16, Float16),
+        (BFloat16, BFloat16),
+        (Float8E4M3FN, Float16),
+        (Float8E4M3FN, BFloat16),
+        (Float8E4M3FN, Float8E4M3FN),
+    )
+    for stage in ((128, 192) if dtype in (Float16, BFloat16) else (128,))
+}
+# Sage recipes: 8-bit Q/K, E4M3 V and a 16-bit output. ``use_sage_attention``
+# selects this table because the same dtypes without scales name the
+# static-only FP8 profile below.
+_SAGE_GROUPED_KEEPS_PROFILES = {
+    (qk_dtype, qk_dtype, Float8E4M3FN, out_dtype, 128, 0, 2, 2)
+    for qk_dtype in (Float8E4M3FN, Int8)
+    for out_dtype in (Float16, BFloat16)
+}
+# (Q, K, output) dtype triples of the Sage recipes; V is E4M3 in every one.
+_SAGE_DTYPE_RECIPES = {
+    (profile[0], profile[1], profile[3]) for profile in _SAGE_GROUPED_KEEPS_PROFILES
 }
 _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
-    (Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
-    (BFloat16, BFloat16, BFloat16, 64, 0, 2, 2),
-    (Float16, Float16, Float16, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, BFloat16, 128, 0, 2, 2),
+    (BFloat16, BFloat16, BFloat16, BFloat16, 64, 0, 2, 2),
+    (Float16, Float16, Float16, Float16, 256, 128, 1, 1),
 }
+# This profile qualifies the Keeps MMA resource recipe for
+# ``supports_grouped_keeps``. Mixed k_dtype != v_dtype itself is validated by
+# ``_validate_mixed_kv_dtype_profile``.
+_GROUPED_KEEPS_MIXED_KV_DTYPE_PROFILE: _GroupedKeepsProfileKey = (
+    BFloat16,
+    BFloat16,
+    Float8E4M3FN,
+    BFloat16,
+    128,
+    0,
+    2,
+    2,
+)
 
 # Per-thread register budgets for the Q64/KV256 warp groups once the launch
 # bound enables ``setmaxnreg``. The MMA, load, and scheduler warps keep 56, so
@@ -112,6 +182,36 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
 KV_TILE_256_SOFTMAX_TASK_REGISTERS = 152
 KV_TILE_256_CORRECTION_TASK_REGISTERS = 152
 
+# Sparse route unions reuse the dense Keeps staging: D64/D128 use two
+# unstaged K/V instances; D256 uses one instance with D128 bands or a full
+# D256 FP8 stage assembled from 128-byte swizzled chunks.
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
+    (
+        dtype,
+        dtype,
+        dtype,
+        output,
+        dim,
+        128 if dim == 256 else 0,
+        1 if dim == 256 else 2,
+        1 if dim == 256 else 2,
+    )
+    for dim in (64, 128, 256)
+    for dtype, output in (
+        (Float16, Float16),
+        (BFloat16, BFloat16),
+        (Float8E4M3FN, Float16),
+        (Float8E4M3FN, BFloat16),
+    )
+}
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES.update(
+    profile for profile in _D192_GROUPED_KEEPS_PROFILES if profile[3] != Float8E4M3FN
+)
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES.update(
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, output, 256, 256, 1, 1)
+    for output in (Float16, BFloat16)
+)
+
 _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
     "tmem_s_cols": 128,
     "tmem_stats_cols": 32,
@@ -122,7 +222,6 @@ _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
     "mma_tile_m_bmm2": 64,
     "mma_tile_n_bmm2": 256,
     "q_stages": 1,
-    "kv_stages": KV_TILE_256_SHARED_FIFO_STAGES,
     "head_dim_per_stage_kv": 0,
     "num_insts_kv": 2,
     "o_stages": 2,
@@ -148,18 +247,63 @@ _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS: Mapping[str, int] = {
     "scheduler_num_warps": 1,
 }
 
-_KV_TILE_256_TUNABLE_FIELDS = frozenset(("kv_stages",))
 
-# Public cost-model collection uses the FP8 proxy for every source dtype.  The
-# original fixed-Q1 ratio-32 requests exercise a partial grouped-Q tile; the
-# shape-aware path also admits complete fixed multi-Q tiles at any legal head
-# ratio. These are profile families rather than shape exceptions: batch size,
-# KV length, tile choice, and legal GMEM split fanout remain unrestricted by
-# this declaration.
+def _dtype_bytes(dtype: type) -> int:
+    """Return the storage bytes of one CUTLASS element; packed NVFP4 counts one."""
+    return max(dtype.width // BITS_PER_BYTE, 1)
+
+
+# ``(Q, K/V, O)`` dtype recipes that qualify the Q64/KV256 profile without Sage
+# attention. KV128 Keeps profiles qualify on the full profile keys above.
+_KV256_DTYPE_RECIPES = {
+    (Float16, Float16, Float16),
+    (BFloat16, BFloat16, BFloat16),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN),
+    (Float8E4M3FN, Float8E4M3FN, Float16),
+    (Float8E4M3FN, Float8E4M3FN, BFloat16),
+}
+
+
+# Public cost-model collection uses the FP8 proxy for every source dtype. The
+# fixed-Q1 path admits every head ratio covered by its Q64/Q128 tile, while the
+# shape-aware path also admits complete fixed multi-Q tiles. These are profile
+# families rather than shape exceptions: batch size, KV length, tile choice,
+# and legal GMEM split fanout remain unrestricted by this declaration.
 _GROUPED_KEEPS_PAGED_FP8_PROFILES = {
-    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 64, 0, 2, 2),
-    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 128, 0, 2, 2),
-    (Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
+    (
+        Float8E4M3FN,
+        Float8E4M3FN,
+        Float8E4M3FN,
+        output_dtype,
+        head_dim,
+        128 if head_dim == 256 else 0,
+        1 if head_dim == 256 else 2,
+        1 if head_dim == 256 else 2,
+    )
+    for head_dim in (64, 128, 256)
+    for output_dtype in (Float16, BFloat16, Float8E4M3FN)
+}
+
+# Automatic selection retains the established cost-model recipes. A working
+# output epilogue alone does not qualify another MMA layout for that model;
+# explicit kernel configurations can use the wider capability matrix above.
+_AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES = {
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 64, 0, 2, 2),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 128, 0, 2, 2),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, BFloat16, 256, 128, 1, 1),
+}
+_AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES.update(
+    profile for profile in _D192_GROUPED_KEEPS_PROFILES if profile[0] == Float8E4M3FN
+)
+
+# FP16/BF16 grouped Keeps Q128 recipes on paged K/V: the contiguous 16-bit Q128
+# resources with the paged FP8 Q128 K/V loads. Paged 16-bit Q64 keeps its own
+# profile below.
+_GROUPED_KEEPS_PAGED_16BIT_Q128_PROFILES = {
+    _GROUPED_KEEPS_MAIN_PROFILE,
+    (BFloat16, BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
 }
 
 
@@ -312,25 +456,26 @@ _GROUPED_Q_MMA_TILES = (
 # The selector reuses the measured relative costs but resolves its own legal
 # profiles, Q geometry, split fanout, and cluster promotion instead of copying
 # a final shape policy.
+# Both tables are keyed by a K/V width (``_grouped_q_cost_kv_width``), then by
+# TileQ. Width 16 scores 16-bit K and V at head dim 128, the one head dim whose
+# TileQ64 candidate is promoted to the Q64/KV256 CTA; every other profile,
+# 16-bit D192 included, takes width 8. The widths share every factor but one:
+# a 16-bit D128 Keeps Q128 CTA runs its MMAs at half the 8-bit rate, so
+# TileQ128 is scored against the Q64/KV256 CTA that the Q64 factor stands for
+# after the KV256 promotion rather than with the shared TileQ128 factor.
 _GROUPED_Q_MAINLOOP_COST = {
-    8: 1.0,
-    16: 1.2,
-    32: 1.48,
-    64: 1.68,
-    128: 2.2,
+    8: {8: 1.0, 16: 1.2, 32: 1.48, 64: 1.68, 128: 2.2},
+    16: {8: 1.0, 16: 1.2, 32: 1.48, 64: 1.68, 128: 3.2},
 }
 _GROUPED_Q_REDUCTION_COST = {
-    8: 1.0,
-    16: 1.03,
-    32: 1.08,
-    64: 1.2,
-    128: 1.32,
+    8: {8: 1.0, 16: 1.03, 32: 1.08, 64: 1.2, 128: 1.32},
+    16: {8: 1.0, 16: 1.03, 32: 1.08, 64: 1.2, 128: 1.32},
 }
 _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
 
 
 def enumerate_grouped_q_mma_candidates(
-    *, heads_q_per_kv: int, seq_len_q: int
+    *, heads_q_per_kv: int, seq_len_q: int, swaps_only: bool = False
 ) -> tuple[GroupedQMmaCandidate, ...]:
     """Return grouped-Q candidates without applying launch policy.
 
@@ -338,7 +483,8 @@ def enumerate_grouped_q_mma_candidates(
     leave structural padding rows and the final CTA may own fewer tokens than
     its capacity; the common Q geometry and row masks already represent both
     cases.  This helper deliberately does not inspect dtypes, reduction modes,
-    scheduler state, or mutate ``FmhaDecodeConfig``.
+    scheduler state, or mutate ``FmhaDecodeConfig``. ``swaps_only`` excludes
+    KeepsMmaAb tiles for profiles such as transformed mixed-precision K/V.
     """
     if heads_q_per_kv <= 0:
         raise ValueError("heads_q_per_kv must be positive")
@@ -347,6 +493,8 @@ def enumerate_grouped_q_mma_candidates(
 
     candidates = []
     for variant, tile_size_q in _GROUPED_Q_MMA_TILES:
+        if swaps_only and variant != "swaps_mma_ab":
+            continue
         if tile_size_q < heads_q_per_kv:
             continue
         q_tokens_per_cta = tile_size_q // heads_q_per_kv
@@ -371,6 +519,7 @@ def make_grouped_q_launch_candidate(
     batch_size: int,
     num_heads_kv: int,
     service_capacity: int,
+    cost_kv_width: int,
 ) -> GroupedQLaunchCandidate:
     """Build one empirical grouped-Q launch-cost record.
 
@@ -379,9 +528,10 @@ def make_grouped_q_launch_candidate(
     ``(mainloop_factor[TileQ] * seq_len_per_cta_kv +``
     `` reduction_factor[TileQ] * 128 * splits_kv) * waves``.
 
-    This is a small deterministic default heuristic. It deliberately uses the
-    same factors for every dtype; the production profile validator still
-    determines which actual-dtype recipes are legal.
+    This is a small deterministic default heuristic. Both factors come from
+    the tables of ``cost_kv_width`` (``_grouped_q_cost_kv_width``); the
+    production profile validator still determines which actual-dtype recipes
+    are legal.
     """
     if splits_kv <= 0:
         raise ValueError("splits_kv must be positive")
@@ -403,8 +553,9 @@ def make_grouped_q_launch_candidate(
     launched_ctas = base_ctas * splits_kv
     waves = (launched_ctas + service_capacity - 1) // service_capacity
     modeled_time = (
-        _GROUPED_Q_MAINLOOP_COST[candidate.tile_size_q] * seq_len_per_cta_kv
-        + _GROUPED_Q_REDUCTION_COST[candidate.tile_size_q]
+        _GROUPED_Q_MAINLOOP_COST[cost_kv_width][candidate.tile_size_q]
+        * seq_len_per_cta_kv
+        + _GROUPED_Q_REDUCTION_COST[cost_kv_width][candidate.tile_size_q]
         * _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR
         * splits_kv
     ) * waves
@@ -482,6 +633,26 @@ def make_q_tile_geometry(
     )
 
 
+def _accept_legacy_dtype_aliases(cls):
+    """Keep legacy constructor keywords outside the canonical dataclass fields."""
+    init = cls.__init__
+
+    @wraps(init)
+    def init_with_dtype_aliases(self, *args, qkv_dtype=None, kv_dtype=None, **kwargs):
+        if qkv_dtype is not None:
+            kwargs.setdefault("q_dtype", qkv_dtype)
+            kwargs.setdefault("k_dtype", kv_dtype or qkv_dtype)
+            kwargs.setdefault("v_dtype", kv_dtype or qkv_dtype)
+        elif kv_dtype is not None:
+            kwargs.setdefault("k_dtype", kv_dtype)
+            kwargs.setdefault("v_dtype", kv_dtype)
+        init(self, *args, **kwargs)
+
+    cls.__init__ = init_with_dtype_aliases
+    return cls
+
+
+@_accept_legacy_dtype_aliases
 @dataclass
 class FmhaDecodeConfig:
     """
@@ -491,11 +662,20 @@ class FmhaDecodeConfig:
     # ------------------------------------------------------------------
     # Problem shape
     # ------------------------------------------------------------------
-    # Per-head embedding dimension D. Supported profiles use 64, 128, or 256.
+    # Per-head embedding dimension D. Generic profiles use 64, 128, 192, or 256;
+    # dense paged FP8-Q/NVFP4-KV additionally supports staged H512.
     headdim: int = 128
     # Number of KV tiles in the launch (= ceil(seq_len_kv / tile_size_kv)).
     # Populated by the launcher once seq_len_kv is known.
     total_kv_tiles: int = 0
+    # Compile for the exact Q/KV lengths recorded in this config. By default the
+    # logical lengths are runtime launch operands and stay out of the compiled
+    # program and its cache identity (see ``compile_signature``).
+    fixed_seqlen: bool = False
+    # Whether a grouped sparse route carries a packed-membership table. Runtime Q
+    # lengths cannot imply it, and a single-token route keeps the lean layout, so
+    # the launch policy records it before the lengths leave the identity.
+    query_memberships: bool | None = None
     # Q rows placed on the small MMA N dimension. Shape-aware selection derives
     # this tile from the Q-heads-per-KV-head ratio and grouping policy.
     tile_size_q: int = 8
@@ -505,6 +685,22 @@ class FmhaDecodeConfig:
     # Select the packed Q/O ABI. Q and O are laid out as
     # [sum_q_tokens, num_heads_q, head_dim] and indexed by cu_seqlens_q.
     use_variable_seqlens_q: bool = False
+    # Derived from the affine metadata view; lengths themselves stay runtime.
+    uniform_query_offsets: bool = False
+    # Select the private sparse-block route. This explicit discriminator keeps
+    # ordinary storage-subpage callers on the generic paged-KV path. Grouped
+    # sparse routes consume query membership from a separate packed-word table;
+    # Q1 uses the same scattered page route without membership masking.
+    use_q_token_kv_block_sparse_route: bool = False
+    # Private prepared-plan layout: eight query words per 32 page-4 IDs.
+    # Legacy public membership tensors keep the default page-byte encoding.
+    query_major_memberships: bool = False
+    # None preserves each sparse family's default in raw/static configs too.
+    share_pattern_across_kv_heads: bool | None = None
+    # Allow the attention grid to acquire a programmatic launch dependency.
+    # Callers must opt in only when a producer was launched immediately before
+    # attention on the same stream and will release that dependency.
+    use_pdl: bool = False
     heads_q_per_kv: int = 0
     groups_tokens_heads_q: bool = False
     # K/V tokens per tile along the K-sequence dimension; also the MMA "M"
@@ -538,18 +734,19 @@ class FmhaDecodeConfig:
     # ------------------------------------------------------------------
     # Data types
     # ------------------------------------------------------------------
-    # Q element type. One of Float16 / BFloat16 / Float8E4M3FN. Must equal
-    # kv_dtype — mixed Q/KV element types are not supported yet; enforced by
-    # the guard in make_decode_config.
+    # Q element type. One of Float16 / BFloat16 / Float8E4M3FN, or Int8 with
+    # Sage attention.
     q_dtype: type = Float16
-    # K and V element type. One of Float16 / BFloat16 / Float8E4M3FN.
-    kv_dtype: type = Float16
+    # K/V element types. K may be Int8 with Sage attention. Raw K/V storage may
+    # also use packed Float4E2M1FN (NVFP4), which the transform task converts
+    # to q_dtype before MMA consumption.
+    k_dtype: type = Float16
+    v_dtype: type = Float16
     # Output O element type. One of Float16 / BFloat16 / Float8E4M3FN.
     out_dtype: type = Float16
     # Accumulator type (BMM accumulators and softmax stats), always Float32
     # in the currently supported recipes.
     acc_dtype: type = Float32
-
     # ------------------------------------------------------------------
     # Software pipeline depths
     # ------------------------------------------------------------------
@@ -559,6 +756,13 @@ class FmhaDecodeConfig:
     # K/V TMA pipeline depth. Deeper KV staging hides the long
     # GMEM→SMEM latency in the BMM1↔BMM2 chain.
     kv_stages: int = 4
+    # Transformed K/V pipeline depth for mixed Q/KV modes. Raw K/V is loaded
+    # into SmemKv, converted to the Q-side MMA input type, then consumed by MMA.
+    # Zero selects the profile-derived stage count.
+    transformed_kv_stages: int = 0
+    # Store the transformed NVFP4 K/V operand ring in TMEM. The supported
+    # FP8-Q Swaps profile defaults to this path; other mixed modes use SMEM.
+    store_transformed_kv_in_tmem: bool = False
 
     # ------------------------------------------------------------------
     # TMEM column counts
@@ -591,7 +795,8 @@ class FmhaDecodeConfig:
     mma_tile_n_bmm2: int = 8
 
     # ------------------------------------------------------------------
-    # Warp specialization layout (4 warp groups × 4 warps = 16 warps total)
+    # Warp specialization layout (normally 4 warp groups / 16 warps; a static
+    # sparse-attention throughput profile may add two producer-only groups)
     # NOTE: please update `_active_warp_roles` after new roles are added.
     # ------------------------------------------------------------------
     # Softmax0Task: WG0 (warps 0–3) handles even K/V instances (K0/V0).
@@ -607,11 +812,11 @@ class FmhaDecodeConfig:
     # MmaTask: a single warp in WG3 issues tcgen05 MMA instructions for BMM1/BMM2.
     mma_warp_idx: int = 12  # WG3: warp 12
     mma_num_warps: int = 1
-    # LoadTask: a single warp in WG3 issues TMA loads for Q/K/V.
+    # LoadTask: one or more independently configured warps issue Q/K/V TMA.
     load_warp_idx: int = 13  # WG3: warp 13
     load_num_warps: int = 1
-    # PageTableTask (paged-KV only): warp 14 prefetches logical→physical
-    # page IDs that LoadTask consumes when issuing the TMA copies.
+    # PageTableTask (paged-KV only): prefetch logical→physical page IDs for
+    # LoadTask. Its warp count is independent of num_insts_kv and TMA issuers.
     page_offsets_warp_idx: int = 14  # WG3: warp 14 for paged-KV page table prefetch
     page_offsets_num_warps: int = 1
     # SMEM pipeline depth for the prefetched page-offset table.
@@ -623,10 +828,14 @@ class FmhaDecodeConfig:
     # ClcLoadTask: under persistent scheduling, warp 15 issues the CLC
     # response loads.
     clc_load_warp_idx: int = 15
+    # TransformKvTask (mixed Q/KV): converts raw K/V into the Q-side MMA input
+    # type. Finalization preserves its configured role order while compacting.
+    transform_kv_warp_idx: int = 14
+    transform_kv_num_warps: int = 2
     # PaddingTask placement is derived after selecting the active task roles.
     # Each active warp group is compacted first, then its unused tail warps are
     # assigned to the corresponding padding task. Persistent layouts retain
-    # all four warp groups even when the last group contains only padding.
+    # all four original warp groups even when the last contains only padding.
     wg0_padding_warp_idx: int = 4
     wg0_padding_num_warps: int = 0
     wg1_padding_warp_idx: int = 8
@@ -635,6 +844,10 @@ class FmhaDecodeConfig:
     wg2_padding_num_warps: int = 0
     wg3_padding_warp_idx: int = 16
     wg3_padding_num_warps: int = 0
+    wg4_padding_warp_idx: int = 20
+    wg4_padding_num_warps: int = 0
+    wg5_padding_warp_idx: int = 24
+    wg5_padding_num_warps: int = 0
 
     # ------------------------------------------------------------------
     # Task-local register allocation
@@ -642,33 +855,250 @@ class FmhaDecodeConfig:
     # The full TileQ128 Keeps graph has the largest live softmax/correction
     # fragments and needs registers moved from its descriptor-only task group.
     # A long KV256 graph instead moves a smaller share from Softmax to its
-    # heavier correction tail. Short KV256 loops avoid the fixed hand-off cost.
+    # heavier correction tail. Mixed Q/KV graphs also reserve registers for
+    # TransformKvTask. Short KV256 loops avoid the fixed hand-off cost.
     @property
-    def uses_task_register_reallocation(self) -> bool:
-        return self.use_keeps_mma_ab and (
-            self.tile_size_q == 128
-            or (
-                self.tile_size_q == 64
-                and self.tile_size_kv == 256
-                and self.total_kv_tiles >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
-            )
+    def effective_storage_tokens_per_page(self) -> int:
+        """Return the physical cache-page extent used by the TensorMap."""
+        return self.storage_tokens_per_page or self.num_tokens_per_page
+
+    @property
+    def has_storage_subpages(self) -> bool:
+        """Whether one physical cache page contains multiple semantic pages."""
+        return self.effective_storage_tokens_per_page != self.num_tokens_per_page
+
+    @property
+    def uses_scattered_page_route(self) -> bool:
+        """Whether a prepared sparse route supplies page-fragment locators."""
+        return self.use_q_token_kv_block_sparse_route
+
+    @property
+    def uses_page_offsets_task(self) -> bool:
+        """Whether a page-table producer task stages page IDs for the load warp.
+
+        Every paged plan that is not block-sparse takes it, the
+        QToken-KvBlock-Sparse paged routes included; a block-sparse paged plan
+        reads each atom's physical page from its prepared route instead.
+        """
+        return self.use_paged_kv and not self.use_block_sparse
+
+    @property
+    def shares_sparse_pattern(self) -> bool:
+        """Q-block routes default to per-head patterns; token routes share."""
+        if self.share_pattern_across_kv_heads is None:
+            return not self.use_block_sparse
+        return self.share_pattern_across_kv_heads
+
+    @property
+    def uses_q_token_kv_block_sparse_page_membership(self) -> bool:
+        """Whether grouped sparse attention uses a packed-membership table."""
+        return self.uses_q_token_kv_block_sparse_page_route and (
+            self.is_multi_token_q
+            if self.query_memberships is None
+            else self.query_memberships
         )
 
     @property
+    def is_multi_token_q(self) -> bool:
+        """Runtime Q domains retain general token indexing and masking."""
+        return not self.fixed_seqlen or self.max_seq_len_q > 1
+
+    @property
+    def grouped_q_rows(self) -> int:
+        """Return logical query/head rows represented by one sparse-route group."""
+        return self.heads_q_per_kv * (
+            self.q_tokens_per_cta if not self.fixed_seqlen else self.max_seq_len_q
+        )
+
+    @property
+    def grouped_q_fits_tile(self) -> bool:
+        """Whether one complete query group fits in the physical Q tile."""
+        return (
+            self.groups_tokens_heads_q
+            and self.grouped_q_rows > 0
+            and self.grouped_q_rows <= self.tile_size_q
+        )
+
+    @property
+    def uses_q_token_kv_block_sparse_page_route(self) -> bool:
+        """Whether this grouped-Q route consumes sparse-block locators."""
+        return (
+            self.use_paged_kv
+            and not self.use_block_sparse
+            and self.uses_scattered_page_route
+            and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
+            and self.groups_tokens_heads_q
+            and self.use_q_token_kv_block_sparse_route
+            and (
+                not self.fixed_seqlen
+                or 0
+                < self.max_seq_len_q
+                <= Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+            )
+            and self.grouped_q_fits_tile
+        )
+
+    @property
+    def supports_query_major_memberships(self) -> bool:
+        """Whether this CTA can read eight-slot/page-4 query masks for G2..G8."""
+        return (
+            self.uses_q_token_kv_block_sparse_page_membership
+            and self.use_keeps_mma_ab
+            and (self.fixed_seqlen and 2 <= self.max_seq_len_q <= 8)
+            and self.has_single_q_cta
+            and self.num_tokens_per_page == 4
+            and self.tile_size_kv == 128
+            and self.tile_size_q in (64, 128)
+        )
+
+    @property
+    def uses_held_encoded_locator_window(self) -> bool:
+        """Whether encoded paging keeps the complete CTA route in SMEM."""
+
+        return (
+            not self.runtime_split_kv
+            and self.use_paged_kv
+            and self.uses_scattered_page_route
+            and self.tile_size_kv == 128
+            and self.fixed_seqlen
+            and not self.use_sliding_window_causal
+            and self.static_local_kv_tiles
+            <= Q_TOKEN_KV_BLOCK_SPARSE_HELD_LOCATOR_MAX_TILES
+        )
+
+    # Select profiles whose task roles hand registers between producer and compute
+    # warps.
+    @property
+    def uses_task_register_reallocation(self) -> bool:
+        if (
+            self.use_transform_kv
+            or (self.use_keeps_mma_ab and self.tile_size_q == 128)
+            # Persistent grouped masks keep additional routing/softmax state
+            # live. Reuse the same CTA-pool budgets to give it register headroom.
+            or (
+                self.use_keeps_mma_ab
+                and self.use_persistent_scheduler
+                and self.uses_q_token_kv_block_sparse_page_membership
+            )
+            or (
+                self.use_keeps_mma_ab
+                and self.tile_size_q == 64
+                and self.tile_size_kv == 256
+                and (
+                    not self.fixed_seqlen
+                    or self.total_kv_tiles
+                    >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
+                )
+            )
+        ):
+            return True
+        else:
+            return False
+
+    @property
     def softmax_task_num_registers(self) -> int | None:
+        """Softmax's preferred grant, capped by the CTA's initial register pool.
+
+        Dense and sparse Keeps kernels share this rule. Full 128-score rows
+        can use 232 registers only when the pool permits; active producer and
+        correction grants are unchanged. KV256 and transformed KV keep their
+        separate budgets.
+        """
         if not self.uses_task_register_reallocation:
             return None
-        return KV_TILE_256_SOFTMAX_TASK_REGISTERS if self.tile_size_kv == 256 else 184
+        if self.use_transform_kv:
+            preferred = 168 if self.headdim == 64 and self.num_insts_kv != 1 else 184
+        else:
+            # Full Q128 rows keep 128 scores live through masking and P
+            # conversion. Give them headroom without taking registers from TMA.
+            preferred = 232 if self.softmax_score_fragment_regs == 128 else 184
+            if self.tile_size_kv == 256:
+                preferred = KV_TILE_256_SOFTMAX_TASK_REGISTERS
+        # setmaxnreg redistributes the CTA's initial register pool, not the
+        # whole SM register file. Complete 8-register/thread quanta leave
+        # unused SM registers when a CTA has more than 16 warps.
+        total_warps = self.threads_per_cta // WARP_THREADS
+        initial_regs = 65536 // (self.threads_per_cta * 8) * 8
+        softmax_warps = self.softmax0_num_warps + (
+            self.softmax1_num_warps if self.num_insts_kv != 1 else 0
+        )
+        other_warps = total_warps - softmax_warps - self.correction_num_warps
+        correction_regs = self.correction_task_num_registers
+        producer_regs = self.mma_load_task_num_registers
+        assert correction_regs is not None and producer_regs is not None
+        available = (
+            total_warps * initial_regs
+            - self.correction_num_warps * correction_regs
+            - other_warps * producer_regs
+        )
+        if self.use_transform_kv:
+            # Transform warps can retain more registers than descriptor-only
+            # producers; reserve their actual budget before growing Softmax.
+            transform_regs = self.transform_kv_task_num_registers
+            assert transform_regs is not None
+            available -= self.transform_kv_num_warps * (transform_regs - producer_regs)
+        # Only whole padding warpgroups may donate independently. Padding
+        # beside active tasks must execute the same setmaxnreg as its peers.
+        for wg_idx in range(MAX_WARP_GROUPS):
+            padding_warps = getattr(self, f"wg{wg_idx}_padding_num_warps")
+            if padding_warps == 4:
+                padding_regs = self.padding_task_num_registers(wg_idx * 4, 4)
+                assert padding_regs is not None
+                available += padding_warps * (producer_regs - padding_regs)
+        return min(preferred, available // (softmax_warps * 8) * 8)
 
     @property
     def correction_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
+        if self.use_transform_kv:
+            return 88
+        # Runtime partition metadata extends the full score tile's live ranges.
+        # Grant one eight-register quantum per Softmax thread from Correction;
+        # the two-instance Q128 graph returns 16 registers per correction lane.
+        if self.runtime_split_kv and self.use_keeps_mma_ab and self.tile_size_q == 128:
+            softmax_warps = self.softmax0_num_warps + (
+                self.softmax1_num_warps if self.num_insts_kv != 1 else 0
+            )
+            quanta = (
+                softmax_warps + self.correction_num_warps - 1
+            ) // self.correction_num_warps
+            return 88 - quanta * 8
         return KV_TILE_256_CORRECTION_TASK_REGISTERS if self.tile_size_kv == 256 else 88
 
     @property
     def mma_load_task_num_registers(self) -> int | None:
-        return 56 if self.uses_task_register_reallocation else None
+        if not self.uses_task_register_reallocation:
+            return None
+        if self.use_transform_kv and self.headdim == 64 and self.num_insts_kv != 1:
+            return 88
+        return 56
+
+    @property
+    def transform_kv_task_num_registers(self) -> int | None:
+        if not self.use_transform_kv:
+            return None
+        if self.num_insts_kv == 1 or self.store_transformed_kv_in_tmem:
+            return 184
+        if self.headdim == 64:
+            return 88
+        return 56
+
+    def padding_task_num_registers(self, warp_idx: int, num_warps: int) -> int | None:
+        """Release unused registers only from complete padding warpgroups."""
+        if not self.uses_task_register_reallocation:
+            return None
+        if (
+            not self.use_transform_kv
+            and self.tile_size_kv != 256
+            and self.softmax_score_fragment_regs == 128
+            and warp_idx % 4 == 0
+            and num_warps == 4
+        ):
+            # setmaxnreg's minimum legal grant; no attention work runs here.
+            # Smaller score fragments and KV transforms keep their budgets.
+            return 24
+        return self.mma_load_task_num_registers
 
     # ------------------------------------------------------------------
     # SMEM allocation alignment
@@ -678,9 +1108,15 @@ class FmhaDecodeConfig:
     stensor_align: int = 1024
 
     @property
+    def smem_q_head_dim(self) -> int:
+        """Q storage rounded to a complete TMA swizzle fragment."""
+        fragment = min(128 // self.q_dtype_bytes, self.headdim)
+        return (self.headdim + fragment - 1) // fragment * fragment
+
+    @property
     def smem_q_tile_bytes(self) -> int:
-        """SMEM bytes for one Q tile (tile_size_q × headdim elements)."""
-        return self.tile_size_q * self.headdim * self.q_dtype_bytes
+        """SMEM bytes for one Q tile, including TMA-filled head padding."""
+        return self.tile_size_q * self.smem_q_head_dim * self.q_dtype_bytes
 
     @property
     def q_tokens_per_cta(self) -> int:
@@ -692,6 +1128,17 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def q_tma_tokens_per_cta(self) -> int:
+        """Q tokens copied by a box, excluding spare sparse-group slots."""
+        if self.use_variable_seqlens_q and self.uses_q_token_kv_block_sparse_page_route:
+            return (
+                self.q_tokens_per_cta
+                if not self.fixed_seqlen
+                else min(self.max_seq_len_q, self.q_tokens_per_cta)
+            )
+        return self.q_tokens_per_cta
+
+    @property
     def num_q_ctas(self) -> int:
         """Return Q-CTA groups per ``(batch, KV head)`` launch tile.
 
@@ -699,6 +1146,10 @@ class FmhaDecodeConfig:
         raw shape-less configs conservative so this scheduling predicate can
         never specialize geometry that has not been resolved yet.
         """
+        if not self.fixed_seqlen:
+            if hasattr(self, "runtime_q_ctas"):
+                return self.runtime_q_ctas
+            raise ValueError("runtime Q CTA count is a launch operand")
         if self.heads_q_per_kv <= 0 or self.max_seq_len_q <= 0:
             return max(self.max_seq_len_q, 1)
         q_geometry = make_q_tile_geometry(
@@ -709,32 +1160,107 @@ class FmhaDecodeConfig:
         return max(q_geometry.num_q_ctas(self.max_seq_len_q), 1)
 
     @property
+    def uses_compact_split_grid(self) -> bool:
+        """Launch actual split work in X and fuse Q/batch in Z."""
+        return (
+            self.runtime_split_kv
+            and self.use_split_kv
+            and not self.use_cluster_smem_reduction
+            and not self.use_persistent_scheduler
+        )
+
+    @property
     def has_single_q_cta(self) -> bool:
         """Whether every physical split maps to one logical Q CTA."""
         return (
-            self.heads_q_per_kv > 0 and self.max_seq_len_q > 0 and self.num_q_ctas == 1
+            self.fixed_seqlen
+            and self.heads_q_per_kv > 0
+            and self.max_seq_len_q > 0
+            and self.num_q_ctas == 1
         )
 
     @property
     def q_tma_rows_per_cta(self) -> int:
         """Q rows represented by the configured tensor-map box."""
-        return _q_tma_rows_per_cta(
-            self.tile_size_q,
-            self.heads_q_per_kv,
-            self.groups_tokens_heads_q,
-        )
+        if self.groups_tokens_heads_q:
+            return self.q_tma_tokens_per_cta * self.heads_q_per_kv
+        return self.tile_size_q
 
     @property
     def q_manual_padding_rows(self) -> int:
-        """Grouped structural Q rows completed without a TMA instruction."""
+        """Grouped Q rows whose transaction bytes are completed without TMA."""
         if self.groups_tokens_heads_q:
             return self.tile_size_q - self.q_tma_rows_per_cta
         return 0
 
     @property
     def smem_kv_tile_bytes(self) -> int:
-        """SMEM bytes for one staged K or V tile."""
-        return self.tile_size_kv * self.head_dim_kv_stage * self.kv_dtype_bytes
+        """TMA bytes for a shared K/V stage; unequal dtypes use separate rings."""
+        return max(self.smem_k_tile_bytes, self.smem_v_tile_bytes)
+
+    @property
+    def smem_k_tile_bytes(self) -> int:
+        """TMA transaction bytes for one raw K tile, before NVFP4 expansion."""
+        bits = 4 if self.k_dtype == Float4E2M1FN else self.k_dtype_bytes * 8
+        return self.tile_size_kv * self.head_dim_kv_stage * bits // 8
+
+    @property
+    def smem_v_tile_bytes(self) -> int:
+        """TMA transaction bytes for one raw V tile, before NVFP4 expansion."""
+        bits = 4 if self.v_dtype == Float4E2M1FN else self.v_dtype_bytes * 8
+        return self.tile_size_kv * self.head_dim_kv_stage * bits // 8
+
+    @property
+    def smem_k_storage_tile_bytes(self) -> int:
+        """SMEM allocation bytes for one raw K tile."""
+        return self.smem_k_tile_elements * self.k_dtype_bytes
+
+    @property
+    def smem_v_storage_tile_bytes(self) -> int:
+        """SMEM allocation bytes for one raw V tile."""
+        return self.smem_v_tile_elements * self.v_dtype_bytes
+
+    @property
+    def smem_kv_storage_tile_bytes(self) -> int:
+        """SMEM bytes for storing one K or V stage."""
+        return self.smem_kv_tile_elements * self.kv_dtype_bytes
+
+    @property
+    def smem_kv_sf_bytes_per_token(self) -> int:
+        """SMEM bytes for one complete K or V scale row of a token."""
+        if self.use_nvfp4_kv:
+            # Packed K/V still uses head_dim_kv_stage-column stages (two for
+            # H256, four for H512). Each stage's SF copy takes the complete
+            # D/16-byte row, because one stage's slice (8 B) is below TMA's
+            # 16-byte minimum box and is not contiguous across tokens. The
+            # transform then selects the 8-byte slice for its stage.
+            return self.headdim // 16
+        return 0
+
+    @property
+    def smem_kv_sf_tile_bytes(self) -> int:
+        """SMEM bytes for one staged K or V NVFP4 scale-factor tile."""
+        return self.tile_size_kv * self.smem_kv_sf_bytes_per_token
+
+    @property
+    def sf_tma_reshape_factor(self) -> int:
+        """Token-fold factor that widens the NVFP4 SF TMA inner box to 128 B."""
+        sf_per_token = self.headdim // 16
+        return min(max(1, 128 // sf_per_token), self.num_tokens_per_page)
+
+    @property
+    def smem_transformed_kv_tile_bytes(self) -> int:
+        """SMEM bytes for one transformed K or V tile consumed by MMA."""
+        return self.tile_size_kv * self.head_dim_kv_stage * self.q_dtype_bytes
+
+    @property
+    def tmem_transformed_kv_stage_cols(self) -> int:
+        """TMEM columns occupied by one transformed K or V stage."""
+        if not self.store_transformed_kv_in_tmem:
+            return 0
+        return (
+            self.tile_size_kv * self.head_dim_kv_stage * self.q_dtype_bytes // (128 * 4)
+        )
 
     @property
     def head_dim_kv_stage(self) -> int:
@@ -749,6 +1275,23 @@ class FmhaDecodeConfig:
     def num_head_dim_stages_kv(self) -> int:
         """Number of K/V head-dim stages needed to cover headdim."""
         return (self.headdim + self.head_dim_kv_stage - 1) // self.head_dim_kv_stage
+
+    @property
+    def uses_2d_flat_kv_tma(self) -> bool:
+        """Whether warp-owned issuing can omit the flat map's singleton axes."""
+        return (
+            self.use_flat_native_kv_tma
+            and (self.tile_size_kv // self.num_tokens_per_page) % self.load_num_warps
+            == 0
+            and (
+                self.k_dtype == self.v_dtype == BFloat16
+                or (
+                    self.use_fp8_qkv
+                    and self.use_persistent_scheduler
+                    and self.head_dim_kv_stage // 128 > 1
+                )
+            )
+        )
 
     @property
     def tmem_o_cols_per_head_dim_stage(self) -> int:
@@ -802,34 +1345,40 @@ class FmhaDecodeConfig:
     @property
     def smem_p_tile_bytes(self) -> int:
         """P stored in SMEM for the SwapsMmaAb BMM2 B operand."""
-        return self.tile_size_kv * self.tile_size_q * self.q_dtype_bytes
+        return self.tile_size_kv * self.tile_size_q * self.pv_dtype_bytes
 
     @property
     def tmem_total_cols(self) -> int:
-        """Sum of TMEM columns used by the kernel: 2× S, 2× softmax stats,
-        and o_stages× O accumulators (the factor 2 is the two softmax
-        instances K0/V0 and K1/V1)."""
+        """Sum of TMEM columns used by the kernel: (S + softmax) * num_insts_kv +
+        o_stages * O accumulators + transformed K/V stages (if any)."""
+        total_cols = 0
         if self.use_keeps_mma_ab:
             if self.num_insts_kv == 1:
-                return (
+                total_cols = (
                     self.tmem_s_cols
                     + self.tmem_stats_cols
                     + self.tmem_p_cols
                     + self.tmem_o_stage_cols * self.o_stages
                 )
-            return (
-                2 * self.tmem_s_cols
-                + (
-                    2 * self.tmem_stats_cols
-                    if self.keeps_separates_tmem_s_and_stats
-                    else 0
+            else:
+                total_cols = (
+                    2 * self.tmem_s_cols
+                    + (
+                        2 * self.tmem_stats_cols
+                        if self.keeps_separates_tmem_s_and_stats
+                        else 0
+                    )
+                    + self.tmem_o_stage_cols * self.o_stages
                 )
+        else:
+            total_cols = (
+                self.num_insts_kv * self.tmem_s_cols
+                + self.num_insts_kv * self.tmem_stats_cols
                 + self.tmem_o_stage_cols * self.o_stages
             )
         return (
-            2 * self.tmem_s_cols
-            + 2 * self.tmem_stats_cols
-            + self.tmem_o_stage_cols * self.o_stages
+            total_cols
+            + self.tmem_transformed_kv_stage_cols * self.transformed_kv_stages
         )
 
     @property
@@ -850,25 +1399,70 @@ class FmhaDecodeConfig:
         )
 
     # ------------------------------------------------------------------
-    # Inferred dtype attributes (derived from q_dtype / kv_dtype / out_dtype)
+    # Inferred dtype attributes (derived from q_dtype / k_dtype / v_dtype / out_dtype)
     # ------------------------------------------------------------------
     @property
     def q_dtype_bytes(self) -> int:
-        """Byte width of one Q element (fp16/bf16=2, e4m3=1).
-
-        Also the byte width used by anything that feeds the MMA on the Q/S/P
-        side (softmax stats, P tile, MMA operand descriptors)."""
-        return 1 if self.q_dtype == Float8E4M3FN else 2
+        """Byte width of one Q element (fp16/bf16=2, e4m3/int8=1)."""
+        return _dtype_bytes(self.q_dtype)
 
     @property
     def kv_dtype_bytes(self) -> int:
-        """Byte width of one K/V element (fp16/bf16=2, e4m3=1)."""
-        return 1 if self.kv_dtype == Float8E4M3FN else 2
+        """Integral byte width used for raw K/V storage bookkeeping."""
+        return max(self.k_dtype_bytes, self.v_dtype_bytes)
+
+    @property
+    def k_dtype_bytes(self) -> int:
+        """Raw K storage unit in bytes (fp16/bf16=2, e4m3/int8=1, packed NVFP4=1)."""
+        return _dtype_bytes(self.k_dtype)
+
+    @property
+    def v_dtype_bytes(self) -> int:
+        """Raw V storage unit in bytes (fp16/bf16=2, e4m3=1, packed NVFP4=1)."""
+        return _dtype_bytes(self.v_dtype)
+
+    @property
+    def qk_dtype(self) -> type:
+        """Effective input precision for the QK MMA."""
+        return self.q_dtype
+
+    @property
+    def pv_dtype(self) -> type:
+        """Effective input precision for P and the transformed/raw V operand."""
+        return self.q_dtype if self.use_transform_kv else self.v_dtype
+
+    @property
+    def qk_dtype_bytes(self) -> int:
+        return self.q_dtype_bytes
+
+    @property
+    def pv_dtype_bytes(self) -> int:
+        return 1 if self.use_fp8_pv else 2
+
+    @property
+    def use_fp8_qk(self) -> bool:
+        return self.qk_dtype == Float8E4M3FN
+
+    @property
+    def use_fp8_pv(self) -> bool:
+        return self.pv_dtype == Float8E4M3FN
+
+    @property
+    def use_bf16_pv(self) -> bool:
+        return self.pv_dtype == BFloat16
+
+    @property
+    def use_bf16_qkv(self) -> bool:
+        return self.q_dtype == self.k_dtype == self.v_dtype == BFloat16
+
+    @property
+    def use_fp8_qkv(self) -> bool:
+        return self.q_dtype == self.k_dtype == self.v_dtype == Float8E4M3FN
 
     @property
     def o_dtype_bytes(self) -> int:
         """Byte width of one O element (fp16/bf16=2, e4m3=1)."""
-        return 1 if self.out_dtype == Float8E4M3FN else 2
+        return _dtype_bytes(self.out_dtype)
 
     @property
     def acc_dtype_bytes(self) -> int:
@@ -876,9 +1470,9 @@ class FmhaDecodeConfig:
         return 4 if self.acc_dtype == Float32 else 2
 
     @property
-    def use_bf16_qkv(self) -> bool:
-        """Whether Q/K/V use BF16 storage and MMA inputs."""
-        return self.kv_dtype == BFloat16
+    def use_bf16_q(self) -> bool:
+        """Whether Q uses BF16 storage and MMA inputs."""
+        return self.q_dtype == BFloat16
 
     @property
     def use_bf16_output(self) -> bool:
@@ -886,9 +1480,14 @@ class FmhaDecodeConfig:
         return self.out_dtype == BFloat16
 
     @property
-    def use_fp8_qkv(self) -> bool:
-        """fp8 (E4M3) Q/K/V path: switches MMA kind and P-quantization."""
-        return self.kv_dtype == Float8E4M3FN
+    def use_fp8_q(self) -> bool:
+        """Whether Q uses FP8 storage and QK MMA inputs."""
+        return self.q_dtype == Float8E4M3FN
+
+    @property
+    def kv_swizzle_row_elems(self) -> int:
+        """Return the K/V elements of one 128-byte swizzle row: 64 or 128."""
+        return SWIZZLE_128B_ROW_BYTES // self.kv_dtype_bytes
 
     @property
     def use_fp8_output(self) -> bool:
@@ -911,15 +1510,39 @@ class FmhaDecodeConfig:
             self.q_dtype in (Float16, BFloat16)
             and self.out_dtype in (Float16, BFloat16)
         ) or (
-            self.q_dtype == Float8E4M3FN and self.out_dtype in (Float16, Float8E4M3FN)
+            self.q_dtype == Float8E4M3FN
+            and self.out_dtype in (Float16, BFloat16, Float8E4M3FN)
         )
+
+    @property
+    def kv_dtype(self) -> type | None:
+        """Legacy shared-K/V alias; independent storage has no common dtype."""
+        return self.k_dtype if self.k_dtype == self.v_dtype else None
+
+    @kv_dtype.setter
+    def kv_dtype(self, dtype: type) -> None:
+        self.k_dtype = self.v_dtype = dtype
+
+    @property
+    def use_transform_kv(self) -> bool:
+        """Whether raw K/V must be transformed before MMA consumes it."""
+        return self.k_dtype == self.v_dtype and self.q_dtype != self.k_dtype
+
+    @property
+    def use_nvfp4_kv(self) -> bool:
+        """Whether the raw KV cache uses packed NVFP4 storage."""
+        return self.k_dtype == self.v_dtype == Float4E2M1FN
+
+    @property
+    def use_fp8_kv(self) -> bool:
+        """Whether the raw KV cache uses FP8 E4M3 storage."""
+        return self.k_dtype == self.v_dtype == Float8E4M3FN
 
     # ------------------------------------------------------------------
     # Feature flags
     # ------------------------------------------------------------------
-    # Enable persistent scheduling: work tiles are fetched from a CLC response
-    # queue at runtime instead of mapping one tile per CTA in the launch grid.
-    # Mutually exclusive with split-KV mode.
+    # Enable persistent scheduling: one physical worker may consume multiple
+    # logical work tiles. Mutually exclusive with split-KV mode.
     use_persistent_scheduler: bool = False
     # Split-KV: split the K-sequence across several CTAs that produce partial
     # O/stats, with a GMEM reduction epilogue.
@@ -927,6 +1550,9 @@ class FmhaDecodeConfig:
     # Split-KV fanout: number of CTAs that cooperate on one (batch, head_kv)
     # when use_split_kv is enabled. The launcher picks this based on SM count.
     splits_kv: int = 1
+    runtime_split_kv: bool = False
+    # Internal launch profile for a bounded CTA-relative page-ID span.
+    runtime_page_window: bool = False
     # Upper bound of splits_kv across all (batch, head_kv) groups,
     # used to size the per-launch partial-O / partial-stats / counter
     # scratch GMEM buffers.
@@ -934,9 +1560,19 @@ class FmhaDecodeConfig:
     # Paged-KV cache layout: K/V live in fixed-size pages and the kernel
     # follows a logical→physical page index table per request.
     use_paged_kv: bool = False
-    # Page size (tokens per page) when use_paged_kv is enabled. Must be one of
-    # 16 / 32 / 64 / 128 and must divide the 128-token KV tile.
+    # Semantic page size (tokens represented by one page-table entry) when
+    # use_paged_kv is enabled. It must divide the 128-token KV tile.
     num_tokens_per_page: int = 32
+    # Physical tokens stored in one cache page. Zero selects the semantic page
+    # size. A larger value enables encoded subpage locators for a native
+    # page-four table:
+    # locator = physical_page * subpages_per_storage_page + subpage.
+    storage_tokens_per_page: int = 0
+    # Prepared compact caches can view physical pages and heads as tensor rows.
+    # The paired metadata plan selects the corresponding locator head span.
+    use_flat_native_kv_tma: bool = False
+    # Prepared locators count the complete physical head span between pages.
+    flat_native_kv_num_heads: int = 1
     # Maximum number of pages per (batch, head_kv) — sizes the page index
     # table stride.
     max_num_pages_per_seq_kv: int = 1
@@ -966,8 +1602,21 @@ class FmhaDecodeConfig:
     # denominator (extra logit that absorbs probability mass). Requires the
     # `attention_sinks` tensor argument at launch.
     use_attention_sinks: bool = False
+    lse_mode: str = "none"
     # Optional profile and reduction knobs selected by launcher policy or tests.
     use_keeps_mma_ab: bool = False
+    # Sage attention: a nonzero ``sage_k_block_size`` enables per-block Q/K
+    # scales and per-channel V scales. ``sage_k_summary_block_size`` is the K
+    # block size of proxy summary scales and equals ``sage_k_block_size``
+    # without proxy routes. ``sage_v_mean`` adds a per-channel V mean back.
+    sage_q_block_size: int = 0
+    sage_k_block_size: int = 0
+    sage_k_summary_block_size: int = 0
+    sage_v_mean: bool = False
+    # Binades a deferred exponent anchor may lag the row maximum, at most
+    # ``SOFTMAX_RESCALE_THRESHOLD_LOG2``; 0 keeps exact anchors and None the
+    # P dtype's default. See ``softmax_anchor_headroom_log2``.
+    softmax_rescale_threshold_log2: float | None = None
     # Nonzero means each K/V stage covers only this many head-dim columns.
     # H256 SwapsMmaAb uses 128-column stages to keep TMA and TMEM layouts valid.
     head_dim_per_stage_kv: int = 0
@@ -979,6 +1628,14 @@ class FmhaDecodeConfig:
     softmax_order_barrier_id: int = 8
     # Both softmax task groups participate: 8 warps * 32 lanes.
     softmax_order_barrier_threads: int = 256
+    # Score pairs per streamed K32 fragment whose exponentials run as FMA
+    # polynomials instead of MUFU. The best value depends on the GPU's MUFU
+    # rate; ``arch_config_args`` supplies it for the launch device, and
+    # ``fragment_ex2_emulated_pairs`` caps it on KV256 tiles.
+    ex2_emulated_pairs: int = 6
+    # Reduce streamed score-fragment maxima inside the TMEM load
+    # (tcgen05.ld.red); ``arch_config_args`` supplies it.
+    uses_ldtm_stat: bool = False
     use_cluster_smem_reduction: bool = False
     use_separate_reduction_kernel: bool = False
     # Compile-time attention-mask selection. Public APIs normalize the string
@@ -1021,11 +1678,12 @@ class FmhaDecodeConfig:
         if (
             not self.use_separate_reduction_kernel
             or self.use_compact_parallel_reduction
+            or self.runtime_split_kv
         ):
             return 1
         return {
             8: 1,
-            16: 2,
+            16: 1,
             32: 4,
             64: 8,
             128: 16,
@@ -1042,11 +1700,22 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def parallel_reduction_slot_lanes(self) -> int:
+        """Share a single-CTA fragment's split slots across adjacent lanes."""
+        if (
+            self.use_compact_parallel_reduction
+            or self.parallel_reduction_cluster_size != 1
+            or self.parallel_reduction_splits_per_cta % PARALLEL_REDUCTION_SLOT_LANES
+        ):
+            return 1
+        return PARALLEL_REDUCTION_SLOT_LANES
+
+    @property
     def parallel_reduction_threads_per_cta(self) -> int:
         """Return the thread count selected by the reducer schedule."""
         if self.use_compact_parallel_reduction:
             return REDUCTION_THREADS_PER_CTA
-        return PARALLEL_REDUCTION_THREADS_PER_CTA
+        return PARALLEL_REDUCTION_THREADS_PER_CTA * self.parallel_reduction_slot_lanes
 
     @property
     def parallel_reduction_bytes_per_slice(self) -> int:
@@ -1057,8 +1726,28 @@ class FmhaDecodeConfig:
 
     @property
     def smem_kv_tile_elements(self) -> int:
-        """Return K or V elements in one staged SMEM tile."""
+        """Return physical K or V elements in one staged SMEM tile.
+
+        When using nvfp4 KV with TmemTransformedKvResource, TMA uses ``B4X16_P64`` format.
+        It adds 4 padding bits to each 4-bit e2m1 value.
+        """
+        if self.store_transformed_kv_in_tmem and self.use_nvfp4_kv:
+            return self.tile_size_kv * self.head_dim_kv_stage
         return self.smem_kv_tile_bytes // self.kv_dtype_bytes
+
+    @property
+    def smem_k_tile_elements(self) -> int:
+        """Return K elements in one staged SMEM tile."""
+        if self.store_transformed_kv_in_tmem and self.k_dtype == Float4E2M1FN:
+            return self.tile_size_kv * self.head_dim_kv_stage
+        return self.smem_k_tile_bytes // self.k_dtype_bytes
+
+    @property
+    def smem_v_tile_elements(self) -> int:
+        """Return V elements in one staged SMEM tile."""
+        if self.store_transformed_kv_in_tmem and self.v_dtype == Float4E2M1FN:
+            return self.tile_size_kv * self.head_dim_kv_stage
+        return self.smem_v_tile_bytes // self.v_dtype_bytes
 
     @property
     def num_softmax_scale_groups(self) -> int:
@@ -1077,23 +1766,71 @@ class FmhaDecodeConfig:
         return self.num_softmax_scale_groups * 4
 
     @property
+    def keeps_score_chunk_regs(self) -> int:
+        """Return the scores of one Keeps K32 chunk, a native 32-register LDTM atom.
+
+        Streamed profiles publish P one chunk at a time
+        (``softmax_score_fragment_regs``). Keeps layout atoms and Sage ``sfK``
+        groups count in chunks whether the softmax streams the row or holds
+        it complete, so both forms read one scale layout.
+        """
+        return 32
+
+    @property
     def softmax_score_fragment_regs(self) -> int:
         """Return the maximum score fragment kept live in registers.
 
         Streamed profiles own 128 score values per lane but process them as
-        four native 32-register LDTM atoms. Other profiles retain their
-        complete score fragment, so this property is intentionally distinct
-        from ``num_s_regs_per_thread`` (the total logical ownership). The
-        selection of streamed profiles lives in ``streams_tmem_p_fragments``.
+        four K32 chunks (``keeps_score_chunk_regs``). Other profiles retain
+        their complete score fragment, so this property is intentionally
+        distinct from ``num_s_regs_per_thread`` (the total logical ownership).
+        The selection of streamed profiles lives in
+        ``streams_tmem_p_fragments``.
         """
         if self.streams_tmem_p_fragments:
-            return 32
+            return self.keeps_score_chunk_regs
         return self.num_s_regs_per_thread
+
+    @property
+    def fragment_ex2_emulated_pairs(self) -> int:
+        """Return a streamed fragment's score pairs exponentiated on the FMA pipe.
+
+        KV128 tiles take ``ex2_emulated_pairs``; KV256 tiles take at most
+        ``KV_TILE_256_MAX_EX2_EMULATED_PAIRS``.
+        """
+        if self.tile_size_kv == 256:
+            return min(self.ex2_emulated_pairs, KV_TILE_256_MAX_EX2_EMULATED_PAIRS)
+        return self.ex2_emulated_pairs
 
     @property
     def num_softmax_score_fragments(self) -> int:
         """Return score fragments used to cover one logical KV tile."""
         return self.num_s_regs_per_thread // self.softmax_score_fragment_regs
+
+    @property
+    def p_values_per_reg(self) -> int:
+        """Return the probabilities packed into one 32-bit P register."""
+        return PACKED_REGISTER_BYTES // self.pv_dtype_bytes
+
+    @property
+    def fragment_p_packed_cols(self) -> int:
+        """Return the packed TMEM P columns published by one score fragment."""
+        return self.softmax_score_fragment_regs // self.p_values_per_reg
+
+    @property
+    def pv_mma_k_step(self) -> int:
+        """Return the K elements one PV MMA instruction consumes."""
+        return MMA_K_STEP_BYTES // self.pv_dtype_bytes
+
+    @property
+    def p_cols_per_mma_k_step(self) -> int:
+        """Return the packed TMEM P columns one PV MMA K step advances."""
+        return MMA_K_STEP_BYTES // PACKED_REGISTER_BYTES
+
+    @property
+    def pv_mma_steps_per_fragment(self) -> int:
+        """Return the PV MMA instructions consumed by one score fragment."""
+        return self.softmax_score_fragment_regs // self.pv_mma_k_step
 
     @property
     def block_sparse_kv_atom_size(self) -> int:
@@ -1120,17 +1857,120 @@ class FmhaDecodeConfig:
         return self.tile_size_kv == 256
 
     @property
+    def keeps_spatial_halves(self) -> int:
+        """Return the Keeps lane halves that own distinct KV tokens of one row.
+
+        KV256's 2x2 datapath splits a row between threads ``[0, 64)`` (K64
+        atoms 0 and 2) and ``[64, 128)`` (atoms 1 and 3); every other Keeps
+        profile has one half.
+        """
+        return 2 if self.uses_ws_2x2_datapath else 1
+
+    def keeps_route_atom_owner(self, atom: int) -> tuple[int, int]:
+        """Return ``(half, position)`` of a route atom.
+
+        Half ``h`` owns atoms ``h``, ``h + halves``, ... in order;
+        ``_keeps_route_atom`` in ``helpers_common`` is the inverse.
+        """
+        halves = self.keeps_spatial_halves
+        return atom % halves, atom // halves
+
+    @property
+    def keeps_fragments_per_atom(self) -> int:
+        """Return the K32 score chunks of one Keeps layout atom.
+
+        Fragment ``f`` of a thread is the low or high half of its spatial
+        half's KV64 atom ``f // 2``. Block-sparse route atoms span the same
+        tokens.
+        """
+        return 2
+
+    @property
+    def keeps_atom_tokens(self) -> int:
+        """Return the K tokens of one Keeps layout atom."""
+        return self.keeps_fragments_per_atom * self.keeps_score_chunk_regs
+
+    @property
+    def proxy_summary_geometry(self) -> tuple[int, int]:
+        """Return ``(summary count, final summary's token mass)`` of proxy routes.
+
+        One summary stands for each KV block; the final block may be ragged.
+        """
+        return _block_sparse_proxy_summary_geometry(
+            self.static_seq_len_kv, self.kv_block_size
+        )
+
+    @property
+    def num_proxy_summaries(self) -> int:
+        """Return the length of the summary sequence proxy routes address."""
+        num_summaries, _ = self.proxy_summary_geometry
+        return num_summaries
+
+    @property
+    def proxy_log2_block_mass(self) -> float:
+        """Return ``log2`` of the tokens one full proxy summary stands for.
+
+        A summary is its block's mean K/V, so it acts as that many identical
+        tokens: the mass enters its log2-domain logit additively.
+        """
+        return math.log2(self.kv_block_size)
+
+    @property
+    def proxy_tail_summary(self) -> tuple[int, float]:
+        """Return the final summary index and its ``log2(mass)`` shortfall.
+
+        The shortfall is non-positive and zero for a sequence that ends on a
+        block boundary.
+        """
+        num_summaries, tail_mass = self.proxy_summary_geometry
+        if not self.fixed_seqlen:
+            import cutlass.cute as cute
+
+            return num_summaries - 1, cute.math.log2(Float32(tail_mass)) - math.log2(
+                self.kv_block_size
+            )
+        return num_summaries - 1, math.log2(tail_mass) - math.log2(self.kv_block_size)
+
+    @property
+    def num_proxy_groups(self) -> int:
+        """Return the fixed summary groups that make up the proxy routes.
+
+        The prepare kernel emits one proxy record per ``tile_size_kv``
+        consecutive summaries, whatever blocks the row selects.
+        """
+        return (self.num_proxy_summaries + self.tile_size_kv - 1) // self.tile_size_kv
+
+    @property
+    def proxy_tail_fragment(self) -> tuple[int, int]:
+        """Return ``(spatial half, fragment)`` holding the ragged final summary.
+
+        Proxy groups cover consecutive summaries, so the final summary sits at
+        position ``tail_summary_idx % tile_size_kv`` of the last group. Only
+        meaningful when ``proxy_tail_summary`` reports a non-zero shortfall.
+        """
+        atom_size = self.block_sparse_kv_atom_size
+        fragment_regs = self.softmax_score_fragment_regs
+        assert atom_size == 2 * fragment_regs, (
+            "the proxy tail location requires the K64 Keeps atom"
+        )
+        tail_summary_idx, _ = self.proxy_tail_summary
+        in_group_idx = tail_summary_idx % self.tile_size_kv
+        half, position = self.keeps_route_atom_owner(in_group_idx // atom_size)
+        fragment_idx = (
+            position * self.softmax_fragments_per_route_atom
+            + (in_group_idx % atom_size) // fragment_regs
+        )
+        return half, fragment_idx
+
+    @property
     def num_packed_p_regs(self) -> int:
         """Return packed P registers stored by each softmax producer lane."""
         if self.use_keeps_mma_ab:
-            values_per_reg = (
-                FP8_VALUES_PER_REG if self.use_fp8_qkv else FP16_VALUES_PER_REG
-            )
-            return max(self.num_s_regs_per_thread // values_per_reg, 1)
+            return max(self.num_s_regs_per_thread // self.p_values_per_reg, 1)
         q_repeats = max(self.tile_size_q // Q_REPETITION_GROUP_HEADS, 1)
         regs_per_repeat = (
             FP8_P_PACKED_REGS_PER_Q_REPEAT
-            if self.use_fp8_qkv
+            if self.use_fp8_pv
             else FP16_P_PACKED_REGS_PER_Q_REPEAT
         )
         return regs_per_repeat * q_repeats
@@ -1139,12 +1979,12 @@ class FmhaDecodeConfig:
     def tmem_p_cols_per_inst(self) -> int:
         """Return the TMEM-P columns owned by one K/V instance.
 
-        Two-instance Keeps publishes one packed row per producer lane, with one
+        Two-instance Keeps stores one packed row per producer lane, with one
         packed 32-bit register slot per TMEM column. Therefore its footprint is
-        ``num_s_regs_per_thread / values_per_reg == num_packed_p_regs``, rather
-        than a function of the complete logical KV tile width. Q128/KV128 and
-        Q64/KV256 both own 128 packed 16-bit P values per lane and need 64
-        columns per instance.
+        ``num_s_regs_per_thread / p_values_per_reg == num_packed_p_regs``,
+        rather than a function of the complete logical KV tile width.
+        Q128/KV128 and Q64/KV256 both own 128 P values per lane: 64 columns
+        per instance for 16-bit P and 32 for FP8 P.
         """
         if self.uses_two_inst_tmem_p:
             return self.num_packed_p_regs
@@ -1154,15 +1994,24 @@ class FmhaDecodeConfig:
     def num_fp8_output_regs(self) -> int:
         """Return packed FP8 output registers owned by each correction lane."""
         return max(
-            (self.tile_size_q * self.headdim) // FP8_OUTPUT_ELEMENTS_PER_REG_GROUP,
+            (self.tile_size_q * self.swaps_output_head_dim)
+            // FP8_OUTPUT_ELEMENTS_PER_REG_GROUP,
             1,
         )
+
+    @property
+    def swaps_output_head_dim(self) -> int:
+        """STSM layout covers complete head bands; GMEM stores remain logical."""
+        if self.use_keeps_mma_ab:
+            return self.headdim
+        return self.num_head_dim_stages_kv * self.head_dim_kv_stage
 
     @property
     def num_fp16_output_regs(self) -> int:
         """Return packed 16-bit output registers owned by each correction lane."""
         return max(
-            (self.tile_size_q * self.headdim) // FP16_OUTPUT_ELEMENTS_PER_REG_GROUP,
+            (self.tile_size_q * self.swaps_output_head_dim)
+            // FP16_OUTPUT_ELEMENTS_PER_REG_GROUP,
             1,
         )
 
@@ -1181,7 +2030,7 @@ class FmhaDecodeConfig:
     @property
     def keeps_p_smem_vector_elements(self) -> int:
         """Return P elements in one aligned 16-byte SMEM store."""
-        return 16 // self.q_dtype_bytes
+        return 16 // self.pv_dtype_bytes
 
     @property
     def static_local_kv_tiles(self) -> int:
@@ -1197,38 +2046,114 @@ class FmhaDecodeConfig:
     @property
     def inferred_kv_stages(self) -> int:
         """Return the deepest K/V ring that fits the shared-memory budget."""
-        q_dtype_bits = 8 if self.q_dtype == Float8E4M3FN else 16
+        q_dtype_bits = self.q_dtype_bytes * BITS_PER_BYTE
         q_row_bytes = (
-            (q_dtype_bits * self.headdim // BITS_PER_BYTE + Q_ROW_ALIGNMENT_BYTES - 1)
+            (
+                q_dtype_bits * self.smem_q_head_dim // BITS_PER_BYTE
+                + Q_ROW_ALIGNMENT_BYTES
+                - 1
+            )
             // Q_ROW_ALIGNMENT_BYTES
         ) * Q_ROW_ALIGNMENT_BYTES
-        q_tile_kib = q_row_bytes * self.tile_size_q // BYTES_PER_KIB
-        kv_budget_kib = min(
-            MAX_KV_STAGE_SMEM_KIB,
-            TOTAL_SMEM_BUDGET_KIB - q_tile_kib * self.q_stages,
+        fixed_bytes = (
+            q_row_bytes * self.tile_size_q * self.q_stages
+            + self.correction_sum_scratch_entries * FP32_BYTES
         )
-        kv_stage_head_dim = self.head_dim_per_stage_kv or self.headdim
-        kv_tile_bits = q_dtype_bits * self.tile_size_kv * kv_stage_head_dim
-        return max(
-            1,
-            kv_budget_kib * BYTES_PER_KIB * BITS_PER_BYTE // kv_tile_bits,
+        if not self.uses_tmem_p:
+            fixed_bytes += self.num_insts_kv * self.smem_p_tile_bytes
+        if not self.use_keeps_mma_ab:
+            fixed_bytes += (
+                self.tile_size_q
+                * self.swaps_output_head_dim
+                * max(self.o_dtype_bytes, 2)
+            )
+        if self.use_paged_kv:
+            page_ids_per_stage = WARP_THREADS
+            if self.uses_held_encoded_locator_window:
+                page_ids_per_stage = max(
+                    page_ids_per_stage,
+                    self.static_local_kv_tiles
+                    * self.tile_size_kv
+                    // self.num_tokens_per_page,
+                )
+            fixed_bytes += self.page_offsets_stages * page_ids_per_stage * 4
+        if self.use_cluster_smem_reduction:
+            fixed_bytes += self.cluster_transaction_bytes
+
+        # Separate K/V rings each contain half of kv_stages slots. Their
+        # average stage width accounts for the BF16-K/FP8-V profile exactly.
+        kv_tile_bits = (self.smem_k_tile_bytes + self.smem_v_tile_bytes) * 4
+        if self.use_transform_kv:
+            # Raw storage and converted operands coexist. When the converted
+            # depth is still implicit, budget both rings per stage; otherwise
+            # reserve the configured converted ring before sizing raw storage.
+            kv_tile_bits = (
+                self.smem_kv_storage_tile_bytes + self.smem_kv_sf_tile_bytes
+            ) * BITS_PER_BYTE
+            if not self.store_transformed_kv_in_tmem:
+                if self.transformed_kv_stages > 0:
+                    fixed_bytes += (
+                        self.transformed_kv_stages * self.smem_transformed_kv_tile_bytes
+                    )
+                else:
+                    kv_tile_bits += self.smem_transformed_kv_tile_bytes * BITS_PER_BYTE
+
+        # Reserve common buffers for every profile, leaving hardware SMEM
+        # above this budget for alignment, barriers, and scheduler state.
+        kv_budget_bytes = min(
+            MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB,
+            TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB - fixed_bytes,
         )
+        inferred_stages = max(1, kv_budget_bytes * BITS_PER_BYTE // kv_tile_bits)
+        return inferred_stages
 
     def validate_dtypes(self) -> None:
-        """Validate decode input, output, and accumulator dtypes."""
+        """Validate homogeneous, transformed K/V, QK-BF16/PV-FP8 and Sage IO.
+
+        Sage attention takes 8-bit Q/K of one dtype, E4M3 V and a 16-bit
+        output; Int8 Q/K exists only in that recipe.
+        """
         for name, dtype, supported in (
-            ("q_dtype", self.q_dtype, SUPPORTED_IO_DTYPES),
-            ("kv_dtype", self.kv_dtype, SUPPORTED_IO_DTYPES),
+            ("q_dtype", self.q_dtype, SUPPORTED_QK_DTYPES),
+            ("k_dtype", self.k_dtype, SUPPORTED_KV_DTYPES | SUPPORTED_QK_DTYPES),
+            ("v_dtype", self.v_dtype, SUPPORTED_KV_DTYPES),
             ("out_dtype", self.out_dtype, SUPPORTED_IO_DTYPES),
             ("acc_dtype", self.acc_dtype, SUPPORTED_ACC_DTYPES),
         ):
             if dtype not in supported:
                 raise ValueError(f"Unsupported {name}: {dtype}")
-        if self.q_dtype != self.kv_dtype:
-            raise ValueError(
-                f"q_dtype ({self.q_dtype}) != kv_dtype ({self.kv_dtype}): "
-                "mixed Q/KV element types are not supported"
-            )
+        if self.use_sage_attention:
+            if (self.q_dtype, self.k_dtype, self.out_dtype) not in _SAGE_DTYPE_RECIPES:
+                raise ValueError(
+                    "Sage attention requires Float8E4M3FN or Int8 Q and K with "
+                    "Float16 or BFloat16 output"
+                )
+            if self.v_dtype != Float8E4M3FN:
+                raise ValueError(
+                    "Sage attention requires Float8E4M3FN V, "
+                    f"got v_dtype {self.v_dtype}"
+                )
+            return
+        if Int8 in (self.q_dtype, self.k_dtype):
+            raise ValueError("Int8 Q/K requires Sage attention")
+        if self.q_dtype == self.k_dtype == self.v_dtype:
+            return
+        if self.k_dtype != self.v_dtype:
+            if (
+                self.q_dtype == self.k_dtype == BFloat16
+                and self.v_dtype == Float8E4M3FN
+            ):
+                return
+            raise ValueError("k_dtype != v_dtype is supported only for QK-BF16/PV-FP8")
+        if (self.q_dtype == BFloat16 and self.k_dtype == Float8E4M3FN) or (
+            self.q_dtype in (BFloat16, Float8E4M3FN) and self.k_dtype == Float4E2M1FN
+        ):
+            return
+        raise ValueError(
+            f"q_dtype ({self.q_dtype}) != kv_dtype ({self.kv_dtype}): "
+            "only BF16 Q with E4M3 K/V or BF16/FP8 Q with NVFP4 K/V "
+            "mixed modes are supported"
+        )
 
     def validate_boolean_fields(self) -> None:
         """Require every boolean config field to carry a real Python bool."""
@@ -1243,8 +2168,16 @@ class FmhaDecodeConfig:
         if not self.use_paged_kv:
             raise ValueError("paged-KV staging requires use_paged_kv=True")
         validate_page_size(self.num_tokens_per_page)
+        validate_storage_page_size(
+            self.num_tokens_per_page,
+            self.effective_storage_tokens_per_page,
+        )
 
         if self.use_block_sparse:
+            if self.uses_scattered_page_route:
+                raise ValueError(
+                    "scattered page routes are supported only by dense paged-KV"
+                )
             if self.tile_size_kv not in (128, 256):
                 raise ValueError(
                     "paged block-sparse supports only KV128 or KV256 routes"
@@ -1273,14 +2206,74 @@ class FmhaDecodeConfig:
             raise ValueError(
                 "paged-KV num_tokens_per_page must divide tile_size_kv exactly"
             )
+        if self.uses_scattered_page_route and self.tile_size_kv != 128:
+            raise ValueError("scattered page routes currently require tile_size_kv=128")
         pages_per_tile = self.tile_size_kv // self.num_tokens_per_page
-        if pages_per_tile not in (1, 2, 4, 8, 16):
+        if pages_per_tile not in (1, 2, 4, 8, 16, 32):
             raise ValueError(
-                "paged-KV staging supports 1, 2, 4, 8, or 16 pages per KV tile"
+                "paged-KV staging supports 1, 2, 4, 8, 16, or 32 pages per KV tile"
             )
-        if self.page_offsets_num_warps != 1:
+        max_page_producers = 2 if self.uses_q_token_kv_block_sparse_page_route else 1
+        if not 1 <= self.page_offsets_num_warps <= max_page_producers:
             raise ValueError(
-                "paged-KV page-offset staging requires exactly one producer warp"
+                "paged-KV page-offset staging requires one producer warp, "
+                "or up to two for QToken-KvBlock-Sparse-Attention"
+            )
+
+    def validate_sage_profile(self) -> None:
+        """Validate the Sage scale block sizes and tile profile.
+
+        ``validate_dtypes`` owns the Sage dtype recipe.
+        """
+        if not self.use_sage_attention:
+            if (
+                self.sage_q_block_size != 0
+                or self.sage_k_summary_block_size != 0
+                or self.sage_v_mean
+            ):
+                raise ValueError(
+                    "sage_q_block_size, sage_k_summary_block_size and sage_v_mean "
+                    "require sage_k_block_size"
+                )
+            return
+        if self.sage_k_block_size not in SAGE_K_BLOCK_SIZES:
+            raise ValueError(
+                f"sage_k_block_size must be one of {SAGE_K_BLOCK_SIZES}, "
+                f"got {self.sage_k_block_size}"
+            )
+        if self.sage_k_summary_block_size not in SAGE_K_BLOCK_SIZES:
+            raise ValueError(
+                f"sage_k_summary_block_size must be one of {SAGE_K_BLOCK_SIZES}, "
+                f"got {self.sage_k_summary_block_size}"
+            )
+        q_block_size = self.sage_q_block_size
+        if not is_power_of_two(q_block_size):
+            raise ValueError(
+                f"sage_q_block_size must be a power of two, got {q_block_size}"
+            )
+        if not (self.streams_tmem_p_fragments or self.stages_q128_p_in_smem):
+            raise ValueError(
+                "Sage attention requires a two-instance Keeps profile: "
+                "Q64/KV256 or Q128/KV128"
+            )
+        if not self.groups_tokens_heads_q:
+            # The prepared ``sfQ`` rows follow the grouped Q tile rows.
+            raise ValueError("Sage attention requires groups_tokens_heads_q=True")
+        if self.use_paged_kv or self.headdim != 128:
+            raise ValueError("Sage attention requires contiguous K/V with headdim=128")
+        # Only the direct output store applies the V channel scales and means;
+        # split-KV partials and reductions do not.
+        if (
+            self.use_variable_seqlens_q
+            or self.use_sliding_window_causal
+            or self.use_attention_sinks
+            or self.use_split_kv
+            or self.use_cluster_smem_reduction
+            or self.use_separate_reduction_kernel
+        ):
+            raise ValueError(
+                "Sage attention supports the direct-output grid only, without "
+                "split-KV, variable-Q, sliding-window, or attention-sink features"
             )
 
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
@@ -1296,12 +2289,16 @@ class FmhaDecodeConfig:
                 )
             return
 
-        if not (self.q_dtype == self.kv_dtype == self.out_dtype):
-            raise ValueError("block-sparse requires q_dtype == kv_dtype == out_dtype")
-        if self.q_dtype not in (Float16, BFloat16):
-            raise ValueError(
-                "block-sparse supports only matching Float16 or BFloat16 IO"
-            )
+        # ``validate_dtypes`` owns the Sage dtype recipe.
+        if not self.use_sage_attention:
+            if not (self.q_dtype == self.k_dtype == self.v_dtype == self.out_dtype):
+                raise ValueError(
+                    "block-sparse requires q_dtype == k_dtype == v_dtype == out_dtype"
+                )
+            if self.q_dtype not in (Float16, BFloat16):
+                raise ValueError(
+                    "block-sparse supports only matching Float16 or BFloat16 IO"
+                )
 
         kv_block_size = _validate_sparse_kv_block_size(self.kv_block_size)
         selected_q_tile = _select_block_sparse_q_tile_size(
@@ -1323,15 +2320,15 @@ class FmhaDecodeConfig:
             and not self.use_parallel_sparse_kv_loads
         ):
             raise ValueError(
-                "block-sparse tile_size_kv=256 requires the Q64 16-bit Keeps "
-                "profile with coarse KV blocks and one load task"
+                "block-sparse tile_size_kv=256 requires the Q64 Keeps profile "
+                "with coarse KV blocks and one load task"
             )
         if self.use_keeps_mma_ab and not self.streams_tmem_p_fragments:
             # The block-sparse Keeps softmax and P passes exist only in their
             # streamed K32-fragment form.
             raise ValueError(
                 "block-sparse KeepsMmaAb requires a streamed TMEM-P profile "
-                "(Q64/KV256 or 16-bit Q128/KV128)"
+                "(Q64/KV256 or Q128/KV128)"
             )
         if self.tile_size_q != selected_q_tile:
             raise ValueError(
@@ -1374,13 +2371,24 @@ class FmhaDecodeConfig:
         The public planner can reuse one compiled topology across batch sizes.
         Keeping the complete static config in the cache key prevents a callable
         compiled for one scheduler, reduction, or tile layout from being reused
-        by another.
+        by another. Unless ``fixed_seqlen`` asks for exact lengths, every
+        length-derived field is dropped from the key: Q lengths come from packed
+        offsets and K/V lengths from metadata at launch.
         """
 
-        return tuple(
-            (config_field.name, getattr(self, config_field.name))
+        items = {
+            config_field.name: getattr(self, config_field.name)
             for config_field in fields(self)
-        )
+        }
+        if not self.fixed_seqlen:
+            policy = replace(self, fixed_seqlen=True)
+            for name in LENGTH_DERIVED_FIELDS:
+                del items[name]
+            items.update(
+                use_variable_seqlens_q=True,
+                query_memberships=policy.uses_q_token_kv_block_sparse_page_membership,
+            )
+        return tuple(items.items())
 
     @property
     def uses_prepared_score_keep_words(self) -> bool:
@@ -1426,7 +2434,7 @@ class FmhaDecodeConfig:
     @property
     def has_odd_kv_tail(self) -> bool:
         """Whether the K/V tile count leaves an unpaired tail instance."""
-        return (self.total_kv_tiles % self.num_insts_kv) != 0
+        return not self.fixed_seqlen or (self.total_kv_tiles % self.num_insts_kv) != 0
 
     @property
     def uses_uniform_causal_mask(self) -> bool:
@@ -1452,13 +2460,83 @@ class FmhaDecodeConfig:
         """Return the dtype, shape, and staging key used by Keeps recipe tables."""
         return (
             self.q_dtype,
-            self.kv_dtype,
+            self.k_dtype,
+            self.v_dtype,
             self.out_dtype,
             self.headdim,
             self.head_dim_per_stage_kv,
             self.num_insts_kv,
             self.o_stages,
         )
+
+    @property
+    def _uses_contiguous_grouped_keeps_recipe(self) -> bool:
+        """Whether the dtype and staging key is a contiguous grouped-Keeps recipe."""
+        profiles = (
+            _SAGE_GROUPED_KEEPS_PROFILES
+            if self.use_sage_attention
+            else _CONTIGUOUS_GROUPED_KEEPS_PROFILES
+        )
+        return self._grouped_keeps_profile_key in profiles
+
+    @property
+    def _in_grouped_q_selection_scope(self) -> bool:
+        """Whether the grouped-Q cost model may select this launch's Q tile.
+
+        It covers fixed multi-token grouped launches over paged K/V with 4- to
+        128-token pages and no attention sinks; the selector also requires the
+        caller to leave the MMA and launch fields unpinned.
+        """
+        return (
+            self.groups_tokens_heads_q
+            and self.use_paged_kv
+            and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
+            and not self.use_variable_seqlens_q
+            and self.max_seq_len_q > 1
+            and not self.use_attention_sinks
+        )
+
+    @property
+    def _kv256_dtypes_qualified(self) -> bool:
+        """Whether the Q64/KV256 profile is qualified for this dtype combination."""
+        if self.use_sage_attention:
+            return self._uses_contiguous_grouped_keeps_recipe
+        return (self.q_dtype, self.k_dtype, self.out_dtype) in _KV256_DTYPE_RECIPES
+
+    @property
+    def supports_auto_grouped_keeps(self) -> bool:
+        """Whether automatic selection may choose this grouped Keeps config.
+
+        ``supports_grouped_keeps`` decides whether the kernel runs a config;
+        automatic selection, with or without a cost comparison, takes a recipe
+        only on the launches it is qualified for. Paged FP8 qualifies the
+        established cost-model recipes. Paged 16-bit Q128 qualifies the fixed
+        multi-token launches that the grouped-Q cost model scores; single-token
+        and variable-length launches keep their previous tiles.
+        """
+        if not self.supports_grouped_keeps:
+            return False
+        profile = self._grouped_keeps_profile_key
+        if (
+            self.use_paged_kv
+            and self.tile_size_q == 128
+            and profile in _GROUPED_KEEPS_PAGED_16BIT_Q128_PROFILES
+        ):
+            return self._in_grouped_q_selection_scope
+        if (
+            self.use_paged_kv
+            and self.tile_size_kv == 128
+            and self.q_dtype == self.k_dtype == self.v_dtype == Float8E4M3FN
+        ):
+            # DSL 4.8 measurements also qualify D128 FP8 -> 16-bit fixed
+            # multi-Q recipes. Let the existing cost model compare them;
+            # retaining only Swaps Q32 leaves a substantial runtime-split gap.
+            return profile in _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES or (
+                self._in_grouped_q_selection_scope
+                and self.headdim == 128
+                and self.out_dtype in (Float16, BFloat16)
+            )
+        return True
 
     @property
     def uses_guarded_fixed_q1_grouped_keeps(self) -> bool:
@@ -1473,7 +2551,9 @@ class FmhaDecodeConfig:
         profile = self._grouped_keeps_profile_key
         return (
             self.use_keeps_mma_ab
+            and self.use_paged_kv
             and self.groups_tokens_heads_q
+            and self.fixed_seqlen
             and self.max_seq_len_q == 1
             and not self.use_variable_seqlens_q
             and self.q_manual_padding_rows == 0
@@ -1499,8 +2579,12 @@ class FmhaDecodeConfig:
         profile = self._grouped_keeps_profile_key
         return (
             self.use_keeps_mma_ab
+            and self.use_paged_kv
             and self.groups_tokens_heads_q
-            and not self.use_variable_seqlens_q
+            and (
+                not self.use_variable_seqlens_q
+                or (self.uniform_query_offsets and not self.use_sage_attention)
+            )
             and profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES
             and self.supports_grouped_keeps
             and not (self.uses_staged_one_inst_tmem_p and self.tile_size_q == 64)
@@ -1510,7 +2594,8 @@ class FmhaDecodeConfig:
     def has_static_dense_full_kv_tiles(self) -> bool:
         """Whether static dense KV avoids masking and runtime tile remapping."""
         return (
-            not self.use_split_kv
+            self.fixed_seqlen
+            and not self.use_split_kv
             and not self.use_block_sparse
             and self.mask_type == DENSE
             and not self.use_sliding_window_causal
@@ -1521,10 +2606,11 @@ class FmhaDecodeConfig:
     @property
     def uses_ordered_softmax_barrier(self) -> bool:
         """Whether this profile selects the ordered P0/P1 softmax barrier."""
-        if self.streams_tmem_p_fragments:
-            # Streamed profiles use independent per-fragment P pipelines.
-            # Ordering the two softmax groups would serialize fragment
-            # production and defeat the intended P/PV overlap.
+        if self.streams_tmem_p_fragments or self.stages_q128_p_in_smem:
+            # Streamed profiles use independent per-fragment P pipelines, and
+            # SMEM-P Q128 tiles overlap each softmax with its own next QK.
+            # Ordering the two softmax groups would make one wait for the other
+            # and defeat that overlap.
             return False
         if self.ordered_softmax_barrier_mode == 2:
             return True
@@ -1569,15 +2655,24 @@ class FmhaDecodeConfig:
 
     @property
     def q_tiles_are_full(self) -> bool:
-        """Whether every launched Q CTA owns all of its MMA rows."""
-        if self.use_variable_seqlens_q:
+        """Whether every active Q CTA owns all of its MMA rows."""
+        # Empty/overlaunched Q tiles are discarded before the task graph.
+        # One-token tiles with complete head bands cannot have partial rows,
+        # even when request lengths are packed or change at runtime.
+        if (
+            self.heads_q_per_kv > 0
+            and self.q_tokens_per_cta == 1
+            and self.heads_q_per_kv % self.tile_size_q == 0
+        ):
+            return True
+        if self.use_variable_seqlens_q or not self.fixed_seqlen:
             return False
         if self.uses_nontrivial_grouped_q_layout:
             return (
                 self.q_manual_padding_rows == 0
                 and self.max_seq_len_q % self.q_tokens_per_cta == 0
             )
-        if self.max_seq_len_q > 1:
+        if self.is_multi_token_q:
             return self.heads_q_per_kv % self.tile_size_q == 0
         return self.heads_q_per_kv == self.tile_size_q
 
@@ -1585,8 +2680,8 @@ class FmhaDecodeConfig:
     def q_tiles_need_row_mask(self) -> bool:
         """Whether softmax must suppress inactive Q rows."""
         if self.use_variable_seqlens_q:
-            return True
-        if self.uses_nontrivial_grouped_q_layout or self.max_seq_len_q > 1:
+            return not self.q_tiles_are_full
+        if self.uses_nontrivial_grouped_q_layout or self.is_multi_token_q:
             return not self.q_tiles_are_full
         return False
 
@@ -1603,7 +2698,7 @@ class FmhaDecodeConfig:
         """Whether the causal/window KV union depends on the logical Q CTA."""
         return (
             self.mask_type == CAUSAL
-            and self.max_seq_len_q > 1
+            and self.is_multi_token_q
             and not self.has_single_q_cta
         )
 
@@ -1611,13 +2706,14 @@ class FmhaDecodeConfig:
     def uses_runtime_q_kv_union(self) -> bool:
         """Whether task/resource KV geometry must retain runtime Q metadata.
 
-        Multiple causal Q CTAs have distinct right bounds. A multi-token
-        sliding-window launch also retains the runtime path even when it fits
-        in one Q CTA, because the existing static window-prefix metadata is
-        specialized only for SQ1.
+        This is a geometry property, not the ``fixed_seqlen`` switch: it holds
+        even when every length is static. Multiple causal Q CTAs have distinct
+        right bounds. A multi-token sliding-window launch also retains the
+        runtime path even when it fits in one Q CTA, because the existing static
+        window-prefix metadata is specialized only for SQ1.
         """
         return self.uses_q_cta_sliding_union or (
-            self.use_sliding_window_causal and self.max_seq_len_q > 1
+            self.use_sliding_window_causal and self.is_multi_token_q
         )
 
     @property
@@ -1627,11 +2723,19 @@ class FmhaDecodeConfig:
 
     @property
     def uses_staged_one_inst_tmem_p(self) -> bool:
-        """Whether P uses the double-buffered D256 TMEM overlay."""
+        """Whether staged wide-head P uses the double-buffered TMEM overlay."""
         return (
             self.use_keeps_mma_ab
-            and self.headdim == 256
-            and self.head_dim_per_stage_kv == 128
+            and self.headdim in (192, 256)
+            and (
+                self.head_dim_per_stage_kv == 128
+                or (self.headdim == 192 and self.head_dim_per_stage_kv == 192)
+                or (
+                    self.head_dim_per_stage_kv == 256
+                    and self.use_fp8_qkv
+                    and self.uses_scattered_page_route
+                )
+            )
             and self.num_insts_kv == 1
             and self.o_stages == 1
         )
@@ -1640,11 +2744,11 @@ class FmhaDecodeConfig:
     def uses_two_inst_tmem_p(self) -> bool:
         """Whether a two-instance Keeps profile uses the TMEM-P overlay.
 
-        FP8 Q128/KV128 and dense 16-bit Q128/KV128 publish a complete
-        packed-P row per pipeline token. Q64/KV256 and block-sparse 16-bit
-        Q128/KV128 use the same S-to-P aliasing contract but stream four
-        independently ready K32 fragments (see ``streams_tmem_p_fragments``).
-        Q64/KV128 keeps the base kernel's faster SMEM-P cadence.
+        Unstreamed profiles publish a complete packed-P row per pipeline
+        token. Streamed profiles use the same S-to-P aliasing contract but
+        stream four independently ready K32 fragments (see
+        ``streams_tmem_p_fragments``). Q64/KV128 and the 8-bit Q128/KV128
+        tiles of ``stages_q128_p_in_smem`` stage P in SMEM instead.
         """
         # Two-instance Keeps keeps stats outside S, so both static and persistent
         # work tiles can overlay P on the consumed S instance. The split K/V
@@ -1660,6 +2764,33 @@ class FmhaDecodeConfig:
             and self.num_insts_kv == 2
             and self.o_stages == 2
             and self.tmem_total_cols <= 512
+            and not self.stages_q128_p_in_smem
+        )
+
+    @property
+    def stages_q128_p_in_smem(self) -> bool:
+        """Whether a two-instance Keeps Q128/KV128 tile stages its P in SMEM.
+
+        P aliasing S in TMEM ties each instance's next QK to its PV: the QK
+        may only overwrite S once PV has read the whole P. With P in SMEM,
+        Softmax holds the complete score row in registers and releases S after
+        the max pass, so the MMA warp issues the next QK before this tile's PV
+        and the exponentials overlap that QK. Dense 8-bit Q/K/V tiles take it,
+        Sage included; an 8-bit P tile fits beside the K/V ring. Sage's max
+        pass dequantizes the row in registers one K32 chunk of ``sfK`` groups
+        at a time, so its P pass reads no scale words. Block-sparse routes
+        keep the streamed TMEM P.
+        """
+        return (
+            self.use_keeps_mma_ab
+            and self.tile_size_q == 128
+            and self.tile_size_kv == 128
+            and self.head_dim_per_stage_kv == 0
+            and self.num_insts_kv == 2
+            and self.o_stages == 2
+            and self.k_dtype.width == 8
+            and self.v_dtype.width == 8
+            and not self.use_block_sparse
         )
 
     @property
@@ -1673,18 +2804,28 @@ class FmhaDecodeConfig:
         the MMA warp start its PV k-slice before the row is complete, at the
         cost of one barrier round per fragment.
 
-        Streaming is limited to the 16-bit two-instance profiles whose route
-        loop waits on the K/V loads, where the earlier PV start hides load
-        latency: Q64/KV256 and block-sparse Q128/KV128. Dense Q128/KV128
-        keeps the complete row because its route loop is not load-bound, so
-        the per-fragment barriers are not compensated. FP8 Q128 keeps the
-        complete row because its P publication packs four values per column
-        into one store.
+        A two-instance TMEM-P profile streams for KV256 tiles and block-sparse
+        routes, whose loops wait on K/V loads that the earlier PV start hides.
+        Dense KV128 tiles stream too when K and V share a width and the
+        softmax stats travel through SMEM (the 16-bit recipes; dense 8-bit
+        tiles, Sage included, stage P in SMEM through
+        ``stages_q128_p_in_smem``): the PV MMA starts on the first fragment
+        instead of the complete row, and the exponentials share the FMA pipe
+        (``fragment_ex2_emulated_pairs``). Q-token page membership keeps the
+        complete row, since a dense fragment's keep word is one visible token
+        range and cannot express per-page membership; so do FP8 D64 (softmax
+        stats in TMEM) and QK-BF16/PV-FP8.
         """
+        if not self.uses_two_inst_tmem_p:
+            return False
         return (
-            self.uses_two_inst_tmem_p
-            and not self.use_fp8_qkv
-            and (self.tile_size_kv == 256 or self.use_block_sparse)
+            self.tile_size_kv == 256
+            or self.use_block_sparse
+            or (
+                self.k_dtype.width == self.v_dtype.width
+                and self.keeps_stats_via_smem
+                and not self.uses_q_token_kv_block_sparse_page_membership
+            )
         )
 
     @property
@@ -1693,18 +2834,160 @@ class FmhaDecodeConfig:
 
         Keeps correction skips the in-place O rescale whenever the anchor is
         unchanged, so keeping the prior anchor within
-        ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` trades a bounded 16-bit P range
-        (2**8) for fewer TMEM rescales. The profiles listed here are the ones
-        where that trade was measured to pay: KV256 tiles and block-sparse
-        routes, whose row maximum moves often but rarely by much.
+        ``softmax_anchor_headroom_log2`` binades trades a bounded P range for
+        fewer TMEM rescales. A row maximum moves often but rarely by much, so
+        every Keeps profile takes the trade. A zero headroom anchors on the
+        exact row maximum.
         """
-        return self.use_keeps_mma_ab and (
-            self.tile_size_kv == 256 or self.use_block_sparse
+        return self.use_keeps_mma_ab and self.softmax_anchor_headroom_log2 > 0
+
+    @property
+    def softmax_anchor_headroom_log2(self) -> float:
+        """Binades a deferred exponent anchor may lag the row maximum.
+
+        A probability is ``2**(s - anchor)`` times its scale with ``s - anchor``
+        at most this headroom. ``softmax_rescale_threshold_log2`` sets it.
+        Otherwise 16-bit P allows ``SOFTMAX_RESCALE_THRESHOLD_LOG2``, far
+        inside its range, and FP8 P keeps exact anchors: FP8 headroom lowers
+        the E4M3 scale by the same number of binades (``fp8_p_quant_scale``).
+        """
+        if self.softmax_rescale_threshold_log2 is not None:
+            return self.softmax_rescale_threshold_log2
+        return 0.0 if self.use_fp8_pv else SOFTMAX_RESCALE_THRESHOLD_LOG2
+
+    @property
+    def fp8_p_quant_scale(self) -> float:
+        """Scale ``c`` of FP8 probabilities, which are quantized to E4M3 as ``c * p``.
+
+        A deferred anchor lets ``p`` reach ``2**softmax_anchor_headroom_log2``,
+        so ``c`` is the E4M3 maximum divided by that bound; an exact anchor
+        keeps ``p <= 1`` and uses the whole range.
+        """
+        if self.defers_softmax_anchor_updates:
+            return E4M3_MAX * 2.0**-self.softmax_anchor_headroom_log2
+        return E4M3_MAX
+
+    @property
+    def fp8_p_quant_log2_scale(self) -> float:
+        """``log2(fp8_p_quant_scale)``, the exponent addend of FP8 probabilities."""
+        return math.log2(self.fp8_p_quant_scale)
+
+    @property
+    def use_sage_attention(self) -> bool:
+        """Whether Q/K scores carry per-block scales and V per-channel scales."""
+        return self.sage_k_block_size > 0
+
+    @property
+    def uses_int32_scores(self) -> bool:
+        """Whether BMM1 accumulates INT8 Q/K into INT32 scores."""
+        return self.qk_dtype == Int8
+
+    def softmax_num_warps(self, inst_id: int) -> int:
+        """Return the warps of one softmax instance."""
+        return self.softmax0_num_warps if inst_id == 0 else self.softmax1_num_warps
+
+    def sage_k_scale_block_size(self, proxy: bool = False) -> int:
+        """Return the K block size of the ``sfK`` words one route kind reads.
+
+        A plan's route kinds read one geometry wherever both read words in
+        the P pass: the finer of the K and summary block sizes, and the
+        prepared scales repeat the coarser kind's (``_SageScaleLayout``). A
+        P loop per kind would cost more than the repeated words: its second
+        copy of the loop spills the softmax warps' registers. One-token
+        summary scales are the exception: the max pass dequantizes a proxy
+        route's scores, so the P pass reads exact words only and each kind
+        keeps its own block size.
+        """
+        if not self.use_block_sparse_proxy_routes:
+            return self.sage_k_block_size
+        if self.sage_k_summary_block_size == 1:
+            return 1 if proxy else self.sage_k_block_size
+        return min(self.sage_k_block_size, self.sage_k_summary_block_size)
+
+    @property
+    def sage_mixed_k_geometry(self) -> bool:
+        """Whether exact and proxy routes read different ``sfK`` geometries."""
+        return self.use_sage_attention and (
+            self.sage_k_scale_block_size(proxy=True) != self.sage_k_scale_block_size()
         )
+
+    def sage_scale_layout(self, seq_len_kv: int) -> _SageScaleLayout:
+        """Return the layout of the Sage scales a plan prepares before attention.
+
+        Its K atoms are the plan's Keeps atoms, 64 K tokens of two K32 score
+        chunks, and its Q tiles the plan's grouped Q CTAs, so the softmax
+        reads a work tile's rows at ``q_group_idx * tile_size_q``. Streamed
+        and complete-row softmax passes read the words per chunk alike
+        (``keeps_score_chunk_regs``).
+        """
+        assert self.use_sage_attention and self.groups_tokens_heads_q
+        assert self.keeps_atom_tokens == _SAGE_ATOM_TOKENS
+        assert self.keeps_fragments_per_atom == _SAGE_ATOM_MIN_WORDS
+        summaries = None
+        if self.use_block_sparse_proxy_routes:
+            num_summaries, _ = _block_sparse_proxy_summary_geometry(
+                seq_len_kv, self.kv_block_size
+            )
+            summaries = _SageKSection(
+                length=num_summaries,
+                block_size=self.sage_k_scale_block_size(proxy=True),
+                source_block_size=self.sage_k_summary_block_size,
+            )
+        layout = _SageScaleLayout(
+            k_tokens=_SageKSection(
+                length=seq_len_kv,
+                block_size=self.sage_k_scale_block_size(),
+                source_block_size=self.sage_k_block_size,
+            ),
+            q_rows=_SageQSection(
+                seq_len_q=self.max_seq_len_q,
+                q_block_size=self.sage_q_block_size,
+                heads_q_per_kv=self.heads_q_per_kv,
+                rows_per_tile=self.tile_size_q,
+                heads_interleaved=True,
+            ),
+            v_rows=_SageVSection(headdim=self.headdim, has_mean=self.sage_v_mean),
+            summaries=summaries,
+        )
+        q_rows = layout.q_rows
+        assert q_rows.tokens_per_tile == self.q_tokens_per_cta
+        if self.fixed_seqlen:
+            assert q_rows.tiles == self.num_q_ctas
+        return layout
+
+    def sage_k_groups_per_fragment(self, proxy: bool = False) -> int:
+        """Return the ``sfK`` groups of one K32 score chunk of a route kind."""
+        if not self.use_sage_attention:
+            return 1
+        return max(
+            1, self.keeps_score_chunk_regs // self.sage_k_scale_block_size(proxy)
+        )
+
+    def sage_score_scaling(self, proxy: bool = False) -> SageScoreScaling | None:
+        """Return how the softmax applies a route kind's ``sfK`` to its scores.
+
+        A complete-row SMEM-P tile (``stages_q128_p_in_smem``) dequantizes its
+        register-resident row in every geometry. A streamed kind is dequantized
+        only with one scale per score (the one-token K block): the max pass
+        writes its scores back multiplied. Either way the P pass reads neither
+        ``sfK`` nor the INT32 bias. Other streamed geometries scale blocks of
+        ``sage_k_scale_block_size`` columns, avoiding a TMEM round trip per
+        tile. Every kind's words come through the ``SageKScalesResource`` ring
+        (``SageKTransport.SMEM``).
+        """
+        if not self.use_sage_attention:
+            return None
+        if (
+            self.stages_q128_p_in_smem
+            or self.sage_k_groups_per_fragment(proxy) == self.keeps_score_chunk_regs
+        ):
+            return SageScoreScaling.DEQUANTIZED
+        return SageScoreScaling.BLOCK
 
     @property
     def matches_kv256_task_topology(self) -> bool:
         """Whether task roles match KV256's validated 16-warp layout."""
+
         return all(
             getattr(self, field) == expected
             for field, expected in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items()
@@ -1715,7 +2998,8 @@ class FmhaDecodeConfig:
         """Whether two-instance Keeps has room for standalone stats tiles."""
         if not (
             self.use_keeps_mma_ab
-            and self.use_fp8_qkv
+            and self.k_dtype.width == 8
+            and self.v_dtype.width == 8
             and self.tile_size_kv == 128
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
@@ -1741,6 +3025,20 @@ class FmhaDecodeConfig:
         the existing softmax-local pipelines already order the handoff.
         """
         return self.use_keeps_mma_ab and not self.keeps_separates_tmem_s_and_stats
+
+    @property
+    def splits_kv_tile_256_tail_columns(self) -> bool:
+        """Whether the KV256 tail splits the output columns between spatial halves.
+
+        Each correction lane then merges and stores its own 64 of the 128
+        output columns, so all four correction warps store. The per-lane
+        exchange needs SMEM that only the byte-wide K/V ring leaves free.
+        """
+        return (
+            self.tile_size_kv == 256
+            and self.k_dtype.width == 8
+            and self.v_dtype.width == 8
+        )
 
     @property
     def keeps_loop_correction_chunk_regs(self) -> int:
@@ -1783,6 +3081,7 @@ class FmhaDecodeConfig:
         ungrouped_q_layout = (
             not self.groups_tokens_heads_q
             and not self.use_variable_seqlens_q
+            and self.fixed_seqlen
             and self.max_seq_len_q == 1
         )
         grouped_q_layout = (
@@ -1875,6 +3174,45 @@ class FmhaDecodeConfig:
         return max((self.tile_size_q + rows_per_slice - 1) // rows_per_slice, 1)
 
     @property
+    def uses_direct_kv_launch(self) -> bool:
+        """Whether the attention CTA publishes final output directly."""
+        return not (self.use_split_kv or self.use_separate_reduction_kernel)
+
+    @property
+    def has_valid_split_kv_fanout(self) -> bool:
+        """Whether the configured split fanout is internally consistent."""
+        return (
+            self.use_split_kv
+            and self.splits_kv > 1
+            and self.max_splits_kv >= self.splits_kv
+        )
+
+    def validate_q_token_kv_block_sparse_grouped_keeps_profile(self) -> None:
+        """Validate the grouped-Keeps profiles for token-query sparse routes."""
+        common_profile = (
+            self.use_keeps_mma_ab
+            and self.groups_tokens_heads_q
+            and self.tile_size_q in (64, 128)
+            and self.uses_q_token_kv_block_sparse_page_route
+            and self.mask_type == CAUSAL
+            and not self.use_cluster_smem_reduction
+            and not self.use_attention_sinks
+        )
+        kv128_profile = (
+            self.tile_size_kv == 128
+            and self._grouped_keeps_profile_key
+            in _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES
+            and not self.use_sliding_window_causal
+            and (self.uses_direct_kv_launch or self.has_valid_split_kv_fanout)
+        )
+        if not (common_profile and kv128_profile):
+            raise ValueError(
+                "QToken-KvBlock-Sparse-Attention grouped KeepsMmaAb requires an encoded sparse Q group "
+                "that fits Q64/Q128, a supported D64/D128/D256 KV128 recipe, "
+                "and a supported causal direct, persistent or split launch"
+            )
+
+    @property
     def supports_grouped_keeps(self) -> bool:
         """Whether a validated config uses a qualified grouped-Keeps recipe."""
         if self.tile_size_kv == 256:
@@ -1887,8 +3225,14 @@ class FmhaDecodeConfig:
                 or not self.groups_tokens_heads_q
                 or self.tile_size_q != 64
                 or self.headdim != 128
-                or self.q_dtype not in (Float16, BFloat16)
-                or not (self.q_dtype == self.kv_dtype == self.out_dtype)
+                or not self._kv256_dtypes_qualified
+                # FP8 Keeps recipes exclude attention sinks, as the paged FP8
+                # Q64/Q128 profiles do.
+                or (
+                    self.k_dtype.width == 8
+                    and self.v_dtype.width == 8
+                    and self.use_attention_sinks
+                )
                 or self.use_cluster_smem_reduction
                 or not self.matches_kv256_task_topology
             ):
@@ -1915,40 +3259,67 @@ class FmhaDecodeConfig:
             return False
 
         profile = self._grouped_keeps_profile_key
-
-        # Keep block-sparse qualification separate from the dense/paged
-        # profile matrix below. Its structural, masking, and reduction
-        # constraints are validated separately; both scheduler modes use the
-        # same qualified recipe keys.
-        if self.use_block_sparse:
-            return profile in _BLOCK_SPARSE_GROUPED_KEEPS_PROFILES
-
         direct = not (self.use_split_kv or self.use_separate_reduction_kernel)
 
-        if profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES:
-            fixed_q1_ratio32 = self.max_seq_len_q == 1 and self.heads_q_per_kv == 32
-            fixed_grouped_q = self.max_seq_len_q > 1
-            return (
-                (fixed_q1_ratio32 or fixed_grouped_q)
-                and not self.use_variable_seqlens_q
-                and self.use_paged_kv
-                and self.num_tokens_per_page == 32
-                and self.mask_type == CAUSAL
-                and not any(
-                    (
-                        self.use_cluster_smem_reduction,
-                        self.use_sliding_window_causal,
-                        self.use_attention_sinks,
-                    )
+        # Contiguous K/V launches share one qualified recipe set, apart from the
+        # dense/paged profile matrix below. Block-sparse constraints are
+        # validated separately; a dense contiguous launch must be direct.
+        if self.use_block_sparse:
+            return self._uses_contiguous_grouped_keeps_recipe
+        if (
+            self._uses_contiguous_grouped_keeps_recipe
+            and direct
+            and not self.use_paged_kv
+            and not any(
+                (
+                    self.use_variable_seqlens_q,
+                    self.use_sliding_window_causal,
+                    self.use_attention_sinks,
                 )
-                and (
+            )
+        ):
+            return True
+        if self.use_sage_attention:
+            return False
+
+        if profile in _D192_GROUPED_KEEPS_PROFILES:
+            # Fixed-Q staged resources support dense/paged K/V, CLC and
+            # non-windowed GMEM splits. Common validators enforce the
+            # remaining reduction geometry and exclude cluster-SMEM Keeps.
+            return (
+                (
                     direct
                     or (
-                        self.use_split_kv
-                        and self.splits_kv > 1
-                        and self.max_splits_kv >= self.splits_kv
+                        self.has_valid_split_kv_fanout
+                        and not self.use_sliding_window_causal
                     )
                 )
+                and not self.uses_q_token_kv_block_sparse_page_route
+                and (not self.use_variable_seqlens_q or not self.fixed_seqlen)
+                and not self.use_attention_sinks
+                and not self.use_cluster_smem_reduction
+            )
+
+        paged_16bit_q128 = (
+            self.tile_size_q == 128
+            and profile in _GROUPED_KEEPS_PAGED_16BIT_Q128_PROFILES
+        )
+        if self.use_paged_kv and (
+            paged_16bit_q128 or profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES
+        ):
+            # Paged grouped Keeps recipes exclude sliding windows and attention
+            # sinks. The 16-bit Q128 recipe, which reuses the contiguous 16-bit
+            # resources, runs fixed or packed Q in direct nonpersistent
+            # launches; the FP8 recipes run fixed Q, direct or split.
+            if self.use_sliding_window_causal or self.use_attention_sinks:
+                return False
+            if paged_16bit_q128:
+                return direct and not self.use_persistent_scheduler
+            return (
+                (self.is_multi_token_q or self.grouped_q_fits_tile)
+                and (not self.use_variable_seqlens_q or not self.fixed_seqlen)
+                and self.mask_type in (DENSE, CAUSAL)
+                and (direct or self.has_valid_split_kv_fanout)
             )
 
         if profile in _GROUPED_KEEPS_STATIC_ONLY_PROFILES:
@@ -1966,7 +3337,10 @@ class FmhaDecodeConfig:
                     )
                 )
             )
-        if profile != _GROUPED_KEEPS_MAIN_PROFILE:
+        if profile not in (
+            _GROUPED_KEEPS_MAIN_PROFILE,
+            _GROUPED_KEEPS_MIXED_KV_DTYPE_PROFILE,
+        ):
             return False
 
         if self.tile_size_q == 128:
@@ -2013,6 +3387,9 @@ class FmhaDecodeConfig:
 
 
 SUPPORTED_IO_DTYPES = {Float16, BFloat16, Float8E4M3FN}
+SUPPORTED_KV_DTYPES = SUPPORTED_IO_DTYPES | {Float4E2M1FN}
+# Q and K also admit Int8, which only the Sage recipe uses.
+SUPPORTED_QK_DTYPES = SUPPORTED_IO_DTYPES | {Int8}
 SUPPORTED_ACC_DTYPES = {Float32}
 
 
@@ -2045,7 +3422,19 @@ def _apply_config_source(cfg: FmhaDecodeConfig, source: object) -> set[str]:
     field_names = FmhaDecodeConfig.__dataclass_fields__
     explicit_fields: set[str] = set()
     for source_item in _iter_config_sources(source):
-        for key, value in _decode_config_items(source_item):
+        source_fields = dict(_decode_config_items(source_item))
+        # Normalize legacy shared dtypes before individual fields so explicit
+        # q_dtype/k_dtype/v_dtype values retain their normal precedence.
+        for alias, names in (
+            ("qkv_dtype", ("q_dtype", "k_dtype", "v_dtype")),
+            ("kv_dtype", ("k_dtype", "v_dtype")),
+        ):
+            value = source_fields.get(alias)
+            if value is not None:
+                for name in names:
+                    setattr(cfg, name, value)
+                    explicit_fields.add(name)
+        for key, value in source_fields.items():
             if key == "use_causal_spec_decoding":
                 raise ValueError(
                     "use_causal_spec_decoding was removed; use "
@@ -2185,6 +3574,9 @@ def _finalize_static_decode_config(
     if not use_keeps_mma_ab and cfg.headdim > 128:
         _set_if_implicit(cfg, "head_dim_per_stage_kv", 128, explicit_fields)
         _set_if_implicit(cfg, "num_insts_kv", 2, explicit_fields)
+    if cfg.use_transform_kv and cfg.use_paged_kv:
+        # Force using 1 instances kv to allow more warps for transform kv tasks.
+        _set_if_implicit(cfg, "num_insts_kv", 1, explicit_fields)
 
     if use_keeps_mma_ab:
         tile_size_q = cfg.tile_size_q if "tile_size_q" in explicit_fields else 64
@@ -2200,6 +3592,15 @@ def _finalize_static_decode_config(
             # effective configuration is supported by the kernel.
             for field_name, value in _KV_TILE_256_PHYSICAL_DEFAULTS.items():
                 _set_if_implicit(cfg, field_name, value, explicit_fields)
+            # The K/V ring depth follows the element width and stays tunable.
+            _set_if_implicit(
+                cfg,
+                "kv_stages",
+                KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
+                if cfg.k_dtype.width == 8 and cfg.v_dtype.width == 8
+                else KV_TILE_256_SHARED_FIFO_STAGES,
+                explicit_fields,
+            )
             for field_name, value in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items():
                 _set_if_implicit(cfg, field_name, value, explicit_fields)
         else:
@@ -2235,8 +3636,54 @@ def _finalize_static_decode_config(
             _set_if_implicit(cfg, "q_stages", 1, explicit_fields)
         _set_if_implicit(cfg, "ordered_softmax_barrier_mode", 1, explicit_fields)
 
-    if cfg.tile_size_kv != 256 and "kv_stages" not in explicit_fields:
-        cfg.kv_stages = cfg.inferred_kv_stages
+    # Derive transform placement after the profile has selected its KV
+    # instance count: one-instance mixed decode reuses Softmax1's warp group.
+    uses_full_wg_transform = cfg.use_transform_kv and cfg.num_insts_kv == 1
+    if uses_full_wg_transform:
+        _set_if_implicit(cfg, "transform_kv_warp_idx", 4, explicit_fields)
+        _set_if_implicit(cfg, "transform_kv_num_warps", 4, explicit_fields)
+
+    # MmaTask publishes one TMEM O stage per K/V instance in each loop group,
+    # and Correction uses those stage slots as the corresponding accumulators.
+    _set_if_implicit(cfg, "o_stages", cfg.num_insts_kv, explicit_fields)
+
+    _set_if_implicit(
+        cfg,
+        "store_transformed_kv_in_tmem",
+        (
+            cfg.use_nvfp4_kv
+            and cfg.use_fp8_q
+            and not cfg.use_keeps_mma_ab
+            and cfg.head_dim_kv_stage == 128
+            and cfg.tile_size_kv == 128
+        ),
+        explicit_fields,
+    )
+    if cfg.store_transformed_kv_in_tmem:
+        # Allocate the remaining TMEM columns to transformed K/V eagerly.
+        if (
+            "transformed_kv_stages" not in explicit_fields
+            or cfg.transformed_kv_stages == 0
+        ):
+            cfg.transformed_kv_stages = (
+                TMEM_MAX_ALLOCATION_COLUMNS
+                - cfg.tmem_total_cols
+                + cfg.tmem_transformed_kv_stage_cols * cfg.transformed_kv_stages
+                # tmem_total_cols already includes the tmem of transform kv task. drop it
+            ) // cfg.tmem_transformed_kv_stage_cols
+
+    if cfg.tile_size_kv != 256:
+        _set_if_implicit(cfg, "kv_stages", cfg.inferred_kv_stages, explicit_fields)
+
+    if (
+        cfg.use_transform_kv
+        and not cfg.store_transformed_kv_in_tmem
+        and cfg.transformed_kv_stages == 0
+    ):
+        # SMEM-backed mixed modes still need a real number of stages.
+        _set_if_implicit(
+            cfg, "transformed_kv_stages", min(cfg.kv_stages, 4), explicit_fields
+        )
 
     # Split-KV mode forbids persistent scheduling. Canonicalize here so
     # downstream consumers can gate on use_persistent_scheduler alone without
@@ -2246,7 +3693,11 @@ def _finalize_static_decode_config(
 
 
 def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
-    """Validate the effective KV256 profile after implicit defaults are filled."""
+    """Validate the effective KV256 profile after implicit defaults are filled.
+
+    The SMEM check covers the Q and K/V pipelines; the schedule builder checks
+    the complete layout against the SM capacity.
+    """
     if cfg.tile_size_kv != 256:
         return
 
@@ -2261,10 +3712,9 @@ def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
 
     for field_name, expected in _KV_TILE_256_PHYSICAL_DEFAULTS.items():
         actual = _require_python_int(field_name)
-        if field_name in _KV_TILE_256_TUNABLE_FIELDS:
-            continue
         if actual != expected:
             raise ValueError(f"KV256 requires {field_name}={expected}, got {actual}")
+    _require_python_int("kv_stages")
     for field_name, expected in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items():
         actual = _require_python_int(field_name)
         if actual != expected:
@@ -2289,8 +3739,7 @@ def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
         )
     if not cfg.supports_grouped_keeps:
         raise ValueError(
-            "KV256 currently supports only the qualified Q64 FP16/BF16/D128 "
-            "grouped Keeps profile"
+            "KV256 supports only the qualified Q64 D128 grouped Keeps profile"
         )
 
 
@@ -2315,24 +3764,45 @@ def _append_padding_warp_roles(cfg: FmhaDecodeConfig, roles: list[_WarpRole]) ->
         preferred_wg = role.preferred_warp_idx // 4
         preferred_wg_end = (role.preferred_warp_idx + role.num_warps - 1) // 4
         if preferred_wg != preferred_wg_end:
-            raise ValueError(
-                f"{role.name} spans warp groups {preferred_wg} and {preferred_wg_end}; "
-                "each task role must fit within one warp group"
+            # A producer-only LoadTask may occupy complete consecutive warp
+            # groups. Keeping each group full preserves warpgroup register
+            # reallocation participation and needs no cross-group padding.
+            spans_complete_wgs = (
+                role.name == "load"
+                and role.preferred_warp_idx % 4 == 0
+                and role.num_warps % 4 == 0
             )
-        if preferred_wg < 0 or preferred_wg >= MAX_WARP_GROUPS:
+            if not spans_complete_wgs:
+                raise ValueError(
+                    f"{role.name} spans warp groups {preferred_wg} and "
+                    f"{preferred_wg_end}; only a complete-group load task may "
+                    "span warp groups"
+                )
+        if preferred_wg < 0 or preferred_wg_end >= MAX_WARP_GROUPS:
             raise ValueError(
-                f"{role.name} is assigned to unsupported warp group {preferred_wg}"
+                f"{role.name} is assigned through unsupported warp group "
+                f"{preferred_wg_end}"
             )
-        num_warps_per_wg[preferred_wg] += role.num_warps
-        total_num_wgs = max(total_num_wgs, preferred_wg + 1)
+        role_warps_remaining = role.num_warps
+        role_wg = preferred_wg
+        while role_warps_remaining > 0:
+            warps_in_group = min(role_warps_remaining, 4)
+            num_warps_per_wg[role_wg] += warps_in_group
+            role_warps_remaining -= warps_in_group
+            role_wg += 1
+        total_num_wgs = max(total_num_wgs, preferred_wg_end + 1)
     for wg_idx, num_warps in enumerate(num_warps_per_wg):
         if num_warps > 4:
             raise ValueError(
                 f"warp group {wg_idx} has {num_warps} active warps; at most 4 are allowed"
             )
 
+    # When using persistent scheduling, force 4 warp groups
     if cfg.use_persistent_scheduler:
-        total_num_wgs = MAX_WARP_GROUPS
+        # Ordinary persistent decode retains its established four-group
+        # contract. A profile that explicitly places a role in WG4 keeps that
+        # fifth group instead of truncating the task from the CTA.
+        total_num_wgs = max(total_num_wgs, 4)
 
     for wg_idx, active_warps in enumerate(num_warps_per_wg):
         padding_index_field = f"wg{wg_idx}_padding_warp_idx"
@@ -2379,6 +3849,15 @@ def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
                 cfg.softmax1_num_warps,
             )
         )
+    if cfg.use_transform_kv:
+        roles.append(
+            _WarpRole(
+                "transform_kv",
+                "transform_kv_warp_idx",
+                cfg.transform_kv_warp_idx,
+                cfg.transform_kv_num_warps,
+            )
+        )
 
     if cfg.use_persistent_scheduler:
         roles.extend(
@@ -2407,7 +3886,7 @@ def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
             )
         )
 
-    if cfg.use_paged_kv and not cfg.use_block_sparse:
+    if cfg.uses_page_offsets_task:
         roles.append(
             _WarpRole(
                 "page_offsets",
@@ -2453,6 +3932,10 @@ def _make_static_decode_config(
     """
     cfg = FmhaDecodeConfig(headdim=headdim)
     explicit_fields = _apply_config_source(cfg, args)
+    # Policy selection uses the planned lengths; only the compiled program
+    # replaces them with runtime operands.
+    fixed_seqlen = cfg.fixed_seqlen
+    cfg.fixed_seqlen = True
     _apply_mask_type_config(
         cfg,
         source=args,
@@ -2461,8 +3944,10 @@ def _make_static_decode_config(
         explicit_fields=explicit_fields,
     )
     _finalize_static_decode_config(cfg, explicit_fields)
+    _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)
     _finalize_warp_roles(cfg)
+    cfg.fixed_seqlen = fixed_seqlen
     return cfg
 
 
@@ -2591,9 +4076,12 @@ def _max_splits_kv_by_work(
     tile_size_kv: int,
     num_insts_kv: int,
     max_splits_kv: int | None = None,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
 ) -> int:
     """Return the fanout cap that retains useful KV work per CTA."""
-    tile_size_per_cta_kv = tile_size_kv * num_insts_kv * MIN_LOOP_ITERS_PER_SPLIT
+    if min_loop_iters_per_split <= 0:
+        raise ValueError("min_loop_iters_per_split must be positive")
+    tile_size_per_cta_kv = tile_size_kv * num_insts_kv * min_loop_iters_per_split
     max_by_seq = max(
         1,
         (seq_len_kv + tile_size_per_cta_kv - 1) // tile_size_per_cta_kv,
@@ -2612,13 +4100,19 @@ def enumerate_auto_splits_kv(
     num_insts_kv: int,
     num_q_tiles: int,
     service_capacity: int,
+    split_kv: bool = True,
+    requested_splits_kv: int = -1,
+    max_splits_kv: int | None = None,
 ) -> tuple[int, ...]:
     """Enumerate direct and useful split fanouts for an under-filled Q grid.
 
     All one-wave fanouts and the first capacity-crossing fanout participate in
     the empirical score. The latter is important when a partially filled wave
     cannot be completed by any uniform integer fanout.
+    A positive requested fanout is pinned, subject to the same KV-work cap.
     """
+    if not split_kv:
+        return (1,)
     if num_q_tiles <= 0:
         raise ValueError("num_q_tiles must be positive")
     if service_capacity <= 0:
@@ -2627,7 +4121,10 @@ def enumerate_auto_splits_kv(
         seq_len_kv=seq_len_kv,
         tile_size_kv=tile_size_kv,
         num_insts_kv=num_insts_kv,
+        max_splits_kv=max_splits_kv,
     )
+    if requested_splits_kv > 0:
+        return (max(1, min(requested_splits_kv, max_by_work)),)
     base_grid = max(1, batch_size * num_heads_kv * num_q_tiles)
     if base_grid >= service_capacity or max_by_work <= 1:
         return (1,)
@@ -2650,15 +4147,21 @@ def select_splits_kv(
     service_capacity: int | None = None,
     requested_splits_kv: int = -1,
     max_splits_kv: int | None = None,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
+    split_kv: bool = True,
 ) -> int:
     """
     Select a Q-grid-aware split-KV fanout.
 
     Every legal TileQ is considered with its actual number of Q CTAs.  The
     automatic fanout fills otherwise idle cluster-size-one service slots while
-    retaining at least ``MIN_LOOP_ITERS_PER_SPLIT`` KV iterations per CTA.
-    Positive caller fanouts remain pinned subject only to the KV-work cap.
+    retaining at least ``min_loop_iters_per_split`` KV iterations per CTA.
+    Positive caller fanouts remain pinned subject only to the KV-work cap. The
+    default preserves the dense-decode policy; specialized bounded-work routes
+    may choose a lower positive iteration floor explicitly.
     """
+    if not split_kv:
+        return 1
     if num_q_tiles <= 0:
         raise ValueError("num_q_tiles must be positive")
     max_by_seq = _max_splits_kv_by_work(
@@ -2666,6 +4169,7 @@ def select_splits_kv(
         tile_size_kv=tile_size_kv,
         num_insts_kv=num_insts_kv,
         max_splits_kv=max_splits_kv,
+        min_loop_iters_per_split=min_loop_iters_per_split,
     )
     if requested_splits_kv > 0:
         return max(1, min(max_by_seq, requested_splits_kv))
@@ -2700,6 +4204,8 @@ def _select_auto_launch_mode(
     tile_size_kv: int = AUTO_LAUNCH_TILE_SIZE_KV,
     persistent_min_waves: int = 1,
     persistent_min_tiles_per_cta: int = 1,
+    split_kv: bool = True,
+    service_capacity: int | None = None,
 ) -> str:
     """Pick the launch mode that best matches the kernel's parallelism budget.
 
@@ -2733,14 +4239,15 @@ def _select_auto_launch_mode(
     """
     if seq_len_kv <= 0 or batch_size <= 0 or num_heads_kv <= 0 or num_q_tiles <= 0:
         return "static"
-    hardware_info = utils.HardwareInfo()
-    sm_count = hardware_info.get_device_multiprocessor_count()
+    sm_count = service_capacity
+    if sm_count is None:
+        sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
     sm_count = FALLBACK_SM_COUNT_B200 if sm_count <= 0 else sm_count
     ctas = batch_size * num_heads_kv * num_q_tiles
     waves = ctas / sm_count
     tiles_per_cta = (seq_len_kv + tile_size_kv - 1) // tile_size_kv
     kv_tokens_per_cta = tiles_per_cta * tile_size_kv
-    if waves < 1 and kv_tokens_per_cta >= SPLIT_KV_MIN_TOKENS_PER_CTA:
+    if split_kv and waves < 1 and kv_tokens_per_cta >= SPLIT_KV_MIN_TOKENS_PER_CTA:
         return "gmem_reduction"
     if (
         ctas > persistent_min_waves * sm_count
@@ -2751,28 +4258,19 @@ def _select_auto_launch_mode(
 
 
 def get_max_active_clusters_for_cluster_size(cluster_size: int) -> int:
-    """Query cluster occupancy after establishing CUDA's primary context.
+    """Query device occupancy, preserving the CPU-only policy fallback."""
+    from ..._hardware import get_max_active_clusters
 
-    ``HardwareInfo`` compiles and retains a tiny occupancy-query module on its
-    first call.  If that first call precedes CUDA context creation, retrying can
-    reuse an invalid module handle.  Establish the context before constructing
-    ``HardwareInfo`` so a fresh Python process is reliable as well.
-    """
-    cuda_context_ready = False
     try:
         import torch
 
         if torch.cuda.is_available():
-            torch.cuda.init()
-            torch.empty(0, device="cuda")
-            cuda_context_ready = True
-    except (ImportError, RuntimeError):
+            return get_max_active_clusters(cluster_size)
+    except ImportError:
         pass
     try:
         return utils.HardwareInfo().get_max_active_clusters(cluster_size)
     except RuntimeError:
-        if cuda_context_ready:
-            raise
         return max(FALLBACK_SM_COUNT_B200 // max(cluster_size, 1), 1)
 
 
@@ -2908,12 +4406,76 @@ _MMA_SELECTION_FIELDS = {
 
 _LAUNCH_SELECTION_FIELDS = {
     "use_split_kv",
-    "splits_kv",
-    "max_splits_kv",
     "use_separate_reduction_kernel",
     "use_cluster_smem_reduction",
     "use_persistent_scheduler",
 }
+
+
+def _try_apply_default_wide_keeps_config(
+    cfg: FmhaDecodeConfig,
+    *,
+    explicit_fields: set[str],
+    seq_len_q: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+) -> bool:
+    """Select Q64/Q128 Keeps for an unpinned head ratio above 32.
+
+    Prefer a grouped tile so a partial GQA group can occupy the next supported
+    MMA width. If that profile family is not qualified, an exact 64- or
+    128-head group may still use the established ungrouped Keeps path. The
+    caller falls back to ungrouped Q16 Swaps head bands for other profiles.
+    """
+
+    heads_q_per_kv = num_heads_q // num_heads_kv
+    if (
+        heads_q_per_kv <= 32
+        or heads_q_per_kv > 128
+        or bool(_MMA_SELECTION_FIELDS & explicit_fields)
+    ):
+        return False
+
+    tile_size_q = 64 if heads_q_per_kv <= 64 else 128
+    grouping_was_explicit = "groups_tokens_heads_q" in explicit_fields
+    grouping_candidates = (cfg.groups_tokens_heads_q,)
+    if (
+        not grouping_was_explicit
+        and cfg.groups_tokens_heads_q
+        and heads_q_per_kv == tile_size_q
+    ):
+        grouping_candidates += (False,)
+
+    for groups_tokens_heads_q in grouping_candidates:
+        probe = deepcopy(cfg)
+        probe.groups_tokens_heads_q = groups_tokens_heads_q
+        probe.use_keeps_mma_ab = True
+        probe.tile_size_q = tile_size_q
+        try:
+            _finalize_static_decode_config(
+                probe,
+                explicit_fields | {"tile_size_q"},
+            )
+            if probe.groups_tokens_heads_q and not probe.supports_auto_grouped_keeps:
+                continue
+            _validate_profile_support(
+                cfg=probe,
+                seq_len_q=seq_len_q,
+                num_heads_q=num_heads_q,
+                num_heads_kv=num_heads_kv,
+                split_kv_mode="disabled",
+            )
+        except ValueError:
+            continue
+
+        cfg.groups_tokens_heads_q = groups_tokens_heads_q
+        cfg.use_keeps_mma_ab = True
+        cfg.tile_size_q = tile_size_q
+        # Keeps finalization otherwise canonicalizes an implicit tile to Q64.
+        explicit_fields.add("tile_size_q")
+        return True
+
+    return False
 
 
 def _try_apply_auto_kv256_profile(
@@ -2953,7 +4515,7 @@ def _try_apply_auto_kv256_profile(
         and cfg.groups_tokens_heads_q
         and cfg.headdim == 128
         and cfg.q_dtype in (Float16, BFloat16)
-        and cfg.q_dtype == cfg.kv_dtype == cfg.out_dtype
+        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype == cfg.out_dtype
         and num_heads_q // num_heads_kv <= 64
     )
     if not profile_is_eligible:
@@ -2978,6 +4540,18 @@ def _apply_grouped_q_mma_candidate(
     cfg.mma_tile_n_bmm2 = candidate.tile_size_q
 
 
+def _grouped_q_cost_kv_width(cfg: FmhaDecodeConfig) -> int:
+    """Return the cost-table width that scores ``cfg``'s grouped-Q candidates.
+
+    Only 16-bit K and V at head dim 128 take width 16, since only that head
+    dim promotes its TileQ64 candidate to KV256. Every other profile takes
+    width 8, under which D192 picks its faster Q128 tile.
+    """
+    if cfg.headdim == 128 and cfg.k_dtype.width == 16 and cfg.v_dtype.width == 16:
+        return 16
+    return 8
+
+
 def _resolve_grouped_q_launch_candidates(
     cfg: FmhaDecodeConfig,
     candidate: GroupedQMmaCandidate,
@@ -2989,6 +4563,9 @@ def _resolve_grouped_q_launch_candidates(
     num_heads_q: int,
     num_heads_kv: int,
     service_capacity: int,
+    splits_kv: int,
+    max_splits_kv: int | None,
+    split_kv: bool = True,
 ) -> tuple[GroupedQLaunchCandidate, ...]:
     """Resolve one TileQ with Q-grid-aware direct and split recipes.
 
@@ -3008,21 +4585,44 @@ def _resolve_grouped_q_launch_candidates(
         and candidate.tile_size_q == 64
         and probe.headdim == 128
         and probe.q_dtype == BFloat16
-        and probe.q_dtype == probe.kv_dtype == probe.out_dtype
+        and probe.q_dtype == probe.k_dtype == probe.v_dtype == probe.out_dtype
     ):
         # TileQ selection uses a common KV128 cost basis and is independent of
         # the later KV-tile decision. BF16 Q64 has no final KV128 profile, but
         # its Q geometry and modeled cost are identical to the qualified FP16
         # logical candidate. The KV selector materializes and validates the
         # actual BF16 profile only after the Q winner is known.
+        if cfg.tile_size_kv != 256 and not _try_apply_auto_kv256_profile(
+            probe,
+            q_candidate=candidate,
+            explicit_fields=explicit_fields,
+            auto_tuner=True,
+            split_kv_mode="disabled",
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
+        ):
+            return ()
+        probe.tile_size_kv = 128
         probe.q_dtype = Float16
-        probe.kv_dtype = Float16
+        probe.k_dtype = Float16
+        probe.v_dtype = Float16
         probe.out_dtype = Float16
     try:
         _finalize_static_decode_config(
             probe,
             explicit_fields | {"tile_size_q"},
         )
+        # Explicit MMA fields constrain candidates instead of disabling the
+        # search over the remaining geometry and launch choices.
+        if any(
+            getattr(probe, field) != getattr(cfg, field)
+            for field in _MMA_SELECTION_FIELDS & explicit_fields
+        ):
+            return ()
+        if probe.use_keeps_mma_ab and not probe.supports_auto_grouped_keeps:
+            return ()
         cost_num_insts_kv = probe.num_insts_kv
         _validate_profile_support(
             cfg=probe,
@@ -3033,15 +4633,23 @@ def _resolve_grouped_q_launch_candidates(
         )
     except ValueError:
         return ()
+    cost_kv_width = _grouped_q_cost_kv_width(probe)
 
-    split_candidates = enumerate_auto_splits_kv(
-        seq_len_kv=seq_len_kv,
-        batch_size=batch_size,
-        num_heads_kv=num_heads_kv,
-        tile_size_kv=cost_tile_size_kv,
-        num_insts_kv=cost_num_insts_kv,
-        num_q_tiles=candidate.q_tiles,
-        service_capacity=service_capacity,
+    split_candidates = (
+        (cfg.splits_kv if cfg.use_split_kv else 1,)
+        if _LAUNCH_SELECTION_FIELDS & explicit_fields
+        else enumerate_auto_splits_kv(
+            seq_len_kv=seq_len_kv,
+            batch_size=batch_size,
+            num_heads_kv=num_heads_kv,
+            tile_size_kv=cost_tile_size_kv,
+            num_insts_kv=cost_num_insts_kv,
+            num_q_tiles=candidate.q_tiles,
+            service_capacity=service_capacity,
+            split_kv=split_kv,
+            requested_splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
+        )
     )
     recipes = []
     for candidate_splits_kv in split_candidates:
@@ -3070,6 +4678,7 @@ def _resolve_grouped_q_launch_candidates(
                 batch_size=batch_size,
                 num_heads_kv=num_heads_kv,
                 service_capacity=service_capacity,
+                cost_kv_width=cost_kv_width,
             )
         )
     return tuple(recipes)
@@ -3088,38 +4697,48 @@ def _apply_auto_grouped_q_mma_config(
     num_heads_kv: int,
     splits_kv: int,
     max_splits_kv: int | None,
+    split_kv: bool = True,
 ) -> GroupedQLaunchCandidate | None:
-    """Select a legal fixed multi-Q MMA and KV-split recipe when unpinned.
+    """Select a legal multi-Q MMA and KV-split recipe within caller constraints.
 
-    SQ1, packed/variable Q, explicit launch modes, ungrouped layouts, and
-    caller-provided MMA fields retain the existing path. Explicit fanout
-    controls bypass this selector together with explicit launch and MMA fields.
+    SQ1, packed sliding windows, explicit launch modes, and ungrouped layouts
+    retain the existing path. Explicit MMA fields filter candidates; explicit launch
+    fields and fanout controls constrain their launch recipes.
+    Mixed-precision candidates use SwapsMmaAb since Keeps is not supported yet.
+
+    Fanout arguments here are caller overrides, before automatic selection.
+    Each Q candidate gets its own automatic split search; final KV/reduction
+    choices are applied after the joint recipe has been selected.
     """
+    # TODO: Refine short-KV setup/epilogue costs. Wider dense Q tiles can
+    # regress even when their current mainloop/reduction proxy scores lower.
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
         or seq_len_q <= 1
-        or cfg.use_variable_seqlens_q
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
-        or cfg.num_tokens_per_page != 32
-        or cfg.mask_type != CAUSAL
-        or cfg.use_sliding_window_causal
-        or cfg.use_attention_sinks
-        or bool(_MMA_SELECTION_FIELDS & explicit_fields)
-        or bool(_LAUNCH_SELECTION_FIELDS & explicit_fields)
-        or splits_kv != -1
-        or max_splits_kv is not None
+        or (cfg.use_variable_seqlens_q and cfg.use_sliding_window_causal)
     ):
         return None
 
     candidates = enumerate_grouped_q_mma_candidates(
         heads_q_per_kv=num_heads_q // num_heads_kv,
         seq_len_q=seq_len_q,
+        swaps_only=cfg.use_transform_kv,
     )
     if not candidates:
         return None
     service_capacity = get_max_active_clusters_for_cluster_size(1)
+    if cfg.use_sliding_window_causal:
+        # Wider Q tiles reuse overlapping windows, but only win when fewer
+        # Q-grid waves repay their per-tile cost. Score the visible union,
+        # not the model's maximum context. Windowed split-KV recipes remain
+        # outside this selector; qualified direct Keeps tiles can reuse a
+        # query group with fewer KV loads than narrower Swaps tiles. Partial
+        # final groups retain their ceil-divided CTA count in the cost model.
+        seq_len_kv = min(seq_len_kv, cfg.attention_window_size + seq_len_q - 1)
+        split_kv = False
     supported = tuple(
         recipe
         for candidate in candidates
@@ -3133,6 +4752,9 @@ def _apply_auto_grouped_q_mma_config(
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
             service_capacity=service_capacity,
+            splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
+            split_kv=split_kv,
         )
     )
     if not supported:
@@ -3150,11 +4772,17 @@ def _apply_auto_grouped_q_mma_config(
         # mainloop-aware score instead of rewarding narrow tiles that reread
         # the complete KV sequence for each additional Q tile.
         direct = tuple(recipe for recipe in supported if recipe.splits_kv == 1)
-        if not direct:
-            return None
-        selected = select_grouped_q_direct_wave_candidate(direct)
+        selected = (
+            select_grouped_q_direct_wave_candidate(direct)
+            if direct
+            else select_grouped_q_launch_candidate(supported)
+        )
     _apply_grouped_q_mma_candidate(cfg, selected.mma)
-    if selected.splits_kv == 1 and selected.base_ctas > service_capacity:
+    if (
+        selected.splits_kv == 1
+        and selected.base_ctas > service_capacity
+        and not (_LAUNCH_SELECTION_FIELDS & explicit_fields)
+    ):
         # CLC persistence pays for work discovery by reusing one resident CTA
         # wave. Select it only when the direct launch has more than one wave;
         # a single-wave grid has no launch work for persistence to eliminate.
@@ -3186,14 +4814,56 @@ def _apply_auto_grouped_q_mma_config(
     return selected
 
 
+def _apply_dtype_config(
+    cfg: FmhaDecodeConfig,
+    *,
+    explicit_fields: set[str],
+    q_dtype: type,
+    k_dtype: type,
+    v_dtype: type,
+    o_dtype: type,
+) -> None:
+    """Apply independent Q/K/V storage dtypes before selecting MMA geometry."""
+    for name, dtype in (
+        ("q_dtype", q_dtype),
+        ("k_dtype", k_dtype),
+        ("v_dtype", v_dtype),
+        ("out_dtype", o_dtype),
+    ):
+        _set_if_implicit(cfg, name, dtype, explicit_fields)
+
+
+def _resolve_decode_dtype_aliases(
+    *,
+    q_dtype: type | None,
+    k_dtype: type | None,
+    v_dtype: type | None,
+    qkv_dtype: type | None,
+    kv_dtype: type | None,
+) -> tuple[type, type, type]:
+    """Resolve legacy defaults while retaining independent canonical dtypes."""
+    if kv_dtype is not None:
+        for name, dtype in (("k_dtype", k_dtype), ("v_dtype", v_dtype)):
+            if dtype is not None and dtype != kv_dtype:
+                raise ValueError(f"{name} conflicts with kv_dtype")
+    default_dtype = qkv_dtype if qkv_dtype is not None else Float16
+    default_kv_dtype = kv_dtype if kv_dtype is not None else default_dtype
+    return (
+        q_dtype if q_dtype is not None else default_dtype,
+        k_dtype if k_dtype is not None else default_kv_dtype,
+        v_dtype if v_dtype is not None else default_kv_dtype,
+    )
+
+
 def _apply_default_q_grouping(
     cfg: FmhaDecodeConfig,
     *,
     explicit_fields: set[str],
+    heads_q_per_kv: int,
 ) -> None:
-    """Enable token/head grouping unless the caller explicitly opts out."""
+    """Group complete head sets when they fit one supported Q tile."""
     if "groups_tokens_heads_q" not in explicit_fields:
-        cfg.groups_tokens_heads_q = True
+        cfg.groups_tokens_heads_q = heads_q_per_kv <= 128
 
 
 def _apply_layout_config(
@@ -3201,14 +4871,19 @@ def _apply_layout_config(
     *,
     qkv_layout: str,
     num_tokens_per_page: int,
+    storage_tokens_per_page: int | None,
     seq_len_kv: int,
 ) -> str:
     """Apply contiguous/paged-KV layout fields and return the canonical layout."""
     qkv_layout = normalize_qkv_layout(qkv_layout)
     if qkv_layout == "pagedKv":
         validate_page_size(num_tokens_per_page)
+        if storage_tokens_per_page is None:
+            storage_tokens_per_page = cfg.storage_tokens_per_page or num_tokens_per_page
+        validate_storage_page_size(num_tokens_per_page, storage_tokens_per_page)
         cfg.use_paged_kv = True
         cfg.num_tokens_per_page = num_tokens_per_page
+        cfg.storage_tokens_per_page = storage_tokens_per_page
         cfg.max_num_pages_per_seq_kv = (
             seq_len_kv + num_tokens_per_page - 1
         ) // num_tokens_per_page
@@ -3227,6 +4902,7 @@ def _apply_feature_config(
     use_attention_sinks: bool,
 ) -> None:
     """Apply feature flags that affect config construction."""
+
     if sliding_window_causal:
         cfg.use_sliding_window_causal = True
         cfg.attention_window_size = attention_window_size
@@ -3283,6 +4959,7 @@ def _apply_auto_launch_mode(
     num_heads_kv: int,
     seq_len_kv: int,
     seq_len_q: int,
+    split_kv: bool = True,
 ) -> str:
     """Apply the static/persistent/split-KV launch heuristic when it is allowed."""
     if not _should_auto_select_launch_mode(
@@ -3299,20 +4976,17 @@ def _apply_auto_launch_mode(
         seq_len_kv=seq_len_kv,
         num_q_tiles=_num_q_tiles_for_launch(cfg),
         tile_size_kv=cfg.tile_size_kv,
+        split_kv=split_kv,
     )
-    if (cfg.use_variable_seqlens_q or cfg.use_sliding_window_causal) and mode == (
-        "gmem_reduction"
-    ):
-        # Runtime Q offsets and sliding-window bounds are compatible with CLC
-        # work discovery, but they deliberately remain nonsplit. Underfilled
-        # grids therefore stay direct while grids above one resident wave use
-        # the same structural persistence rule as fixed-Q decode.
+    if cfg.use_sliding_window_causal and mode == ("gmem_reduction"):
+        # Automatic sliding-window split recipes are not qualified. Query
+        # storage layout alone does not restrict split selection.
         return split_kv_mode
     if mode not in ("gmem_reduction", "persistent"):
         return split_kv_mode
 
-    # An explicitly selected MMA profile can bypass the joint selector while
-    # still leaving launch mode automatic. Probe the complete derived launch
+    # Profiles outside the joint selector can still leave launch mode
+    # automatic. Probe the complete derived launch
     # before committing it, so an unsupported Keeps split/persistent recipe
     # falls back to the caller's valid direct profile.
     probe = deepcopy(cfg)
@@ -3362,6 +5036,7 @@ def _apply_split_kv_config(
     max_splits_kv: int | None,
     sliding_window_causal: bool,
     attention_window_size: int,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
 ) -> None:
     """Resolve split-KV fanout and config flags for the selected reduction mode."""
     if split_kv_mode == "disabled":
@@ -3382,6 +5057,7 @@ def _apply_split_kv_config(
         num_q_tiles=_num_q_tiles_for_launch(cfg),
         requested_splits_kv=splits_kv,
         max_splits_kv=max_splits_kv,
+        min_loop_iters_per_split=min_loop_iters_per_split,
     )
     if selected_splits_kv <= 1:
         return
@@ -3487,6 +5163,43 @@ def _select_auto_split_kv_reduction_mode(
     return _config_with_split_kv_mode(cfg, "gmem_reduction"), "gmem_reduction"
 
 
+def _validate_headdim_512(cfg: FmhaDecodeConfig) -> None:
+    """Reject H512 profiles other than dense paged FP8-Q/NVFP4-KV decode.
+
+    Other H512 combinations can be enabled here as they are qualified.
+    """
+    if cfg.headdim != 512:
+        return
+    if not (
+        cfg.q_dtype == Float8E4M3FN
+        and cfg.use_nvfp4_kv
+        and cfg.use_paged_kv
+        and not cfg.use_block_sparse
+    ):
+        raise ValueError(
+            "PrimTS head_dim=512 is currently supported only for dense paged "
+            "FP8-E4M3 Q with NVFP4 K/V"
+        )
+
+
+def _validate_mixed_kv_dtype_profile(cfg: FmhaDecodeConfig) -> None:
+    """Reject k_dtype != v_dtype profiles outside the supported combinations.
+
+    Sage pairs Int8 K with E4M3 V; 16-bit K with E4M3 V is dense KV128 only.
+    """
+    if cfg.k_dtype == cfg.v_dtype:
+        return
+    if cfg.use_sage_attention and cfg.k_dtype == Int8 and cfg.v_dtype == Float8E4M3FN:
+        return
+    if cfg.use_block_sparse or cfg.tile_size_kv == 256:
+        raise ValueError(
+            "k_dtype != v_dtype requires use_block_sparse=False and "
+            "tile_size_kv=128; got "
+            f"use_block_sparse={cfg.use_block_sparse}, "
+            f"tile_size_kv={cfg.tile_size_kv}"
+        )
+
+
 def _validate_profile_support(
     *,
     cfg: FmhaDecodeConfig,
@@ -3502,10 +5215,15 @@ def _validate_profile_support(
     use_groups_tokens_heads_q = cfg.groups_tokens_heads_q
     tile_size_q = cfg.tile_size_q
     cfg.validate_boolean_fields()
+    cfg.validate_dtypes()
+    _validate_mixed_kv_dtype_profile(cfg)
+    _validate_headdim_512(cfg)
+    if cfg.o_stages != cfg.num_insts_kv:
+        raise ValueError("fmha_decode requires o_stages == num_insts_kv")
     _validate_kv256_static_config(cfg)
     if cfg.mask_type not in (DENSE, CAUSAL):
         raise ValueError("mask_type must be DENSE or CAUSAL")
-    if cfg.use_paged_kv and not cfg.use_block_sparse:
+    if cfg.uses_page_offsets_task:
         cfg.validate_paged_kv_staging_config()
     if num_heads_q % num_heads_kv != 0:
         raise ValueError("fmha_decode requires num_heads_q divisible by num_heads_kv")
@@ -3514,6 +5232,13 @@ def _validate_profile_support(
         raise ValueError(
             "heads_q_per_kv metadata must equal num_heads_q / num_heads_kv"
         )
+    cfg.validate_sage_profile()
+    threshold = cfg.softmax_rescale_threshold_log2
+    if threshold is not None and not 0.0 <= threshold <= SOFTMAX_RESCALE_THRESHOLD_LOG2:
+        raise ValueError(
+            "softmax_rescale_threshold_log2 must lie in "
+            f"[0, {SOFTMAX_RESCALE_THRESHOLD_LOG2:g}], got {threshold}"
+        )
     cfg.validate_block_sparse_profile(heads_q_per_kv=heads_q_per_kv)
     if use_groups_tokens_heads_q:
         make_q_tile_geometry(
@@ -3521,25 +5246,25 @@ def _validate_profile_support(
             heads_q_per_kv=heads_q_per_kv,
             groups_tokens_heads_q=True,
         )
-    # Preserve the legacy fixed FP8 Q8/D128 profile. The D64/D256 extensions
-    # are deliberately limited to grouped page-32 decode; broader dtypes,
-    # head ratios, and variable-Q layouts remain unqualified.
+    # Fixed FP8 Q8 producers and reducers support both 16-bit output types.
+    # D64/D256 retain their grouped paged-KV geometry; head ratios and
+    # variable-Q layouts remain constrained by the same resource profile.
     qualified_fp8_q8_separate_reduction_supported = (
         not use_keeps_mma_ab
         and cfg.use_split_kv
         and cfg.use_separate_reduction_kernel
         and not cfg.use_cluster_smem_reduction
         and cfg.q_dtype == Float8E4M3FN
-        and cfg.kv_dtype == Float8E4M3FN
+        and cfg.k_dtype == Float8E4M3FN
+        and cfg.v_dtype == Float8E4M3FN
         and (
-            (headdim == 128 and cfg.out_dtype == Float8E4M3FN)
+            headdim == 128
             or (
                 use_groups_tokens_heads_q
                 and cfg.use_paged_kv
-                and cfg.num_tokens_per_page == 32
                 and (
-                    (headdim == 64 and cfg.out_dtype == Float8E4M3FN)
-                    or (headdim == 256 and cfg.out_dtype == Float16)
+                    headdim == 64
+                    or (headdim == 256 and cfg.out_dtype in (Float16, BFloat16))
                 )
             )
         )
@@ -3557,7 +5282,7 @@ def _validate_profile_support(
         padded_splits = cfg.parallel_reduction_padded_splits
         default_cluster_size = {
             8: 1,
-            16: 2,
+            16: 1,
             32: 4,
             64: 8,
             128: 16,
@@ -3570,7 +5295,7 @@ def _validate_profile_support(
         clustered_topology_supported = (
             not cfg.use_compact_parallel_reduction
             and default_cluster_size == cluster_size
-            and splits_per_cta in (2, 4, 8)
+            and splits_per_cta in (2, 4, 8, 16)
             and cluster_size * splits_per_cta == padded_splits
         )
         if not (
@@ -3592,26 +5317,51 @@ def _validate_profile_support(
                 "parallel separate reduction cluster size "
                 f"{cluster_size} is not supported on this device"
             )
+    is_q_token_kv_block_sparse_grouped_keeps = (
+        use_keeps_mma_ab
+        and use_groups_tokens_heads_q
+        and cfg.uses_q_token_kv_block_sparse_page_route
+    )
+    if (
+        cfg.use_pdl
+        and cfg.use_split_kv
+        and (
+            not cfg.use_separate_reduction_kernel
+            or cfg.use_cluster_smem_reduction
+            or cfg.use_persistent_scheduler
+        )
+    ):
+        raise ValueError(
+            "split PDL requires nonpersistent attention with a standalone GMEM reducer"
+        )
+    if is_q_token_kv_block_sparse_grouped_keeps:
+        cfg.validate_q_token_kv_block_sparse_grouped_keeps_profile()
     supports_grouped_keeps = cfg.supports_grouped_keeps
     if cfg.tile_size_kv != 128 and not (
         cfg.tile_size_kv == 256 and supports_grouped_keeps
     ):
         raise ValueError(
-            "wide KeepsMmaAb is enabled only for the qualified FP16/BF16/D128 "
-            "KV256 native warp-specialized profile"
+            "wide KeepsMmaAb is enabled only for the qualified D128 KV256 "
+            "native warp-specialized profile"
         )
     if use_keeps_mma_ab and use_groups_tokens_heads_q:
-        if not supports_grouped_keeps:
+        if not (is_q_token_kv_block_sparse_grouped_keeps or supports_grouped_keeps):
             raise ValueError(
                 "grouped KeepsMmaAb currently supports only validated narrow "
                 "profiles; pass groups_tokens_heads_q=False to use a supported "
                 "ungrouped Keeps profile"
             )
     if cfg.use_variable_seqlens_q:
+        if cfg.use_transform_kv:
+            raise ValueError(
+                "packed variable-Q does not support mixed Q/KV dtypes or "
+                "transformed K/V"
+            )
         # Packed Q supports the broad grouped Swaps matrix plus the narrow
         # grouped Keeps direct profile validated above.
         if use_keeps_mma_ab and not (
-            use_groups_tokens_heads_q and supports_grouped_keeps
+            use_groups_tokens_heads_q
+            and (is_q_token_kv_block_sparse_grouped_keeps or supports_grouped_keeps)
         ):
             raise ValueError(
                 "packed variable-Q KeepsMmaAb requires its supported grouped "
@@ -3622,46 +5372,91 @@ def _validate_profile_support(
                 "packed ungrouped SwapsMmaAb does not support cluster SMEM reduction; "
                 "use grouped Q or a GMEM reduction mode"
             )
+    # Page16 currently misaligns D64 NVFP4 staging; other transformed profiles
+    # use the ordinary page-size and staging checks.
+    if (
+        cfg.use_nvfp4_kv
+        and cfg.headdim == 64
+        and cfg.use_paged_kv
+        and cfg.num_tokens_per_page == 16
+    ):
+        raise ValueError("NVFP4 KV with head_dim=64 does not support page_size=16")
+    if cfg.use_transform_kv and not cfg.store_transformed_kv_in_tmem:
+        # The SMEM transform assigns eight elements per thread per iteration.
+        total_elems = cfg.tile_size_kv * cfg.head_dim_kv_stage
+        elems_per_iteration = cfg.transform_kv_num_warps * 32 * 8
+        if elems_per_iteration <= 0 or total_elems % elems_per_iteration != 0:
+            raise ValueError(
+                "SMEM transform-KV requires tile_size_kv * head_dim_kv_stage "
+                f"({total_elems}) to be divisible by a positive "
+                "transform_kv_num_warps * 32 * 8 "
+                f"({elems_per_iteration}); got "
+                f"transform_kv_num_warps={cfg.transform_kv_num_warps}"
+            )
+    if cfg.store_transformed_kv_in_tmem and not (
+        cfg.use_nvfp4_kv
+        and cfg.use_fp8_q
+        and not cfg.use_keeps_mma_ab
+        and cfg.head_dim_kv_stage == 128
+        and cfg.tile_size_kv == 128
+        and cfg.transform_kv_num_warps == 4
+        and cfg.transformed_kv_stages > 0
+        and cfg.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS
+    ):
+        raise ValueError(
+            "store_transformed_kv_in_tmem requires FP8 Q, NVFP4 K/V, "
+            "SwapsMmaAb, 128-wide K/V head-dimension stages and KV tiles, "
+            "and a four-warp TransformKvTask"
+        )
     if use_keeps_mma_ab:
-        if headdim not in (64, 128, 256):
-            raise ValueError("fmha_decode keepsMmaAb supports headdim=64, 128, or 256")
+        if cfg.use_transform_kv:
+            raise ValueError("transform-KV is not supported with KeepsMmaAb for now")
+        if headdim not in (64, 128, 192, 256):
+            raise ValueError(
+                "fmha_decode keepsMmaAb supports headdim=64, 128, 192, or 256"
+            )
         if tile_size_q not in (64, 128):
             raise ValueError("fmha_decode keepsMmaAb supports tile_size_q=64 or 128")
         effective_head_dim_stage = cfg.head_dim_per_stage_kv
         effective_num_insts_kv = cfg.num_insts_kv
         effective_o_stages = cfg.o_stages
+        supported_head_stage = (
+            effective_head_dim_stage == 128
+            or (headdim == 192 and effective_head_dim_stage == 192)
+            or (
+                effective_head_dim_stage == 256
+                and cfg.use_fp8_qkv
+                and cfg.uses_q_token_kv_block_sparse_page_route
+            )
+        )
         if effective_num_insts_kv == 1 and (
-            headdim != 256 or effective_head_dim_stage != 128 or effective_o_stages != 1
+            headdim not in (192, 256)
+            or not supported_head_stage
+            or effective_o_stages != 1
         ):
             raise ValueError(
                 "one-instance KeepsMmaAb is enabled only for the staged "
-                "headDim=256 profile with head_dim_per_stage_kv=128 and "
+                "headDim=192/256 profiles with D128 bands, full 16-bit D192, "
+                "or full sparse FP8 D256, and "
                 "o_stages=1"
             )
-        if headdim == 256 and (
-            effective_head_dim_stage != 128
+        if headdim in (192, 256) and (
+            not supported_head_stage
             or effective_num_insts_kv != 1
             or effective_o_stages != 1
         ):
             raise ValueError(
-                "fmha_decode keepsMmaAb headDim=256 requires "
-                "head_dim_per_stage_kv=128, num_insts_kv=1, and o_stages=1"
+                "fmha_decode keepsMmaAb headDim=192/256 requires supported "
+                "head staging, num_insts_kv=1, and o_stages=1"
             )
-        if headdim != 256 and effective_head_dim_stage != 0:
+        if headdim not in (192, 256) and effective_head_dim_stage != 0:
             raise ValueError(
                 "split head_dim_per_stage_kv keepsMmaAb profiles are enabled "
-                "only for headDim=256"
+                "only for headDim=192 or 256"
             )
         if not use_groups_tokens_heads_q and heads_q_per_kv != tile_size_q:
             raise ValueError(
                 "fmha_decode keepsMmaAb requires numHeadsQPerKv == tile_size_q"
-            )
-        if cfg.q_dtype == Float8E4M3FN and cfg.out_dtype not in (
-            Float16,
-            Float8E4M3FN,
-        ):
-            raise ValueError(
-                "fmha_decode keepsMmaAb fp8 qkv path supports fp16 or fp8 output"
             )
         use_split_kv = split_kv_mode != "disabled" or cfg.use_split_kv
         if use_split_kv:
@@ -3678,16 +5473,26 @@ def _validate_profile_support(
             not use_groups_tokens_heads_q and heads_q_per_kv == tile_size_q
         ) or use_groups_tokens_heads_q
         separate_reduction_unstaged_supported = (
-            headdim == 128
+            (
+                headdim == 128
+                or (headdim == 64 and cfg.uses_q_token_kv_block_sparse_page_route)
+            )
             and tile_size_q in (64, 128)
             and effective_head_dim_stage == 0
             and effective_num_insts_kv == 2
             and effective_o_stages == 2
         )
-        separate_reduction_h256_supported = (
-            headdim == 256
-            and tile_size_q == 128
-            and effective_head_dim_stage == 128
+        separate_reduction_staged_supported = (
+            headdim in (192, 256)
+            and (
+                (tile_size_q == 128 and cfg.tile_size_kv == 128)
+                or (
+                    tile_size_q == 64
+                    and cfg.tile_size_kv == 128
+                    and (headdim == 192 or cfg.uses_q_token_kv_block_sparse_page_route)
+                )
+            )
+            and supported_head_stage
             and effective_num_insts_kv == 1
             and effective_o_stages == 1
         )
@@ -3698,16 +5503,16 @@ def _validate_profile_support(
             and cfg.max_seq_len_q == 1
             and not cfg.use_variable_seqlens_q
             and cfg.use_paged_kv
-            and cfg.num_tokens_per_page == 32
             and cfg.q_dtype == Float8E4M3FN
-            and cfg.kv_dtype == Float8E4M3FN
-            and cfg.out_dtype == (Float16 if headdim == 256 else Float8E4M3FN)
+            and cfg.k_dtype == Float8E4M3FN
+            and cfg.v_dtype == Float8E4M3FN
+            and (headdim == 64 or cfg.out_dtype in (Float16, BFloat16))
             and cfg.splits_kv == cfg.max_splits_kv
             and 2 <= cfg.max_splits_kv <= 128
         )
         separate_reduction_profile_supported = (
             separate_reduction_unstaged_supported
-            or separate_reduction_h256_supported
+            or separate_reduction_staged_supported
             or fixed_fp8_new_keeps_separate_reduction_supported
         )
         if use_separate_reduction_kernel and not (
@@ -3718,8 +5523,10 @@ def _validate_profile_support(
         ):
             raise ValueError(
                 "separate reduction keepsMmaAb profiles require "
-                "the established D128/Q64-Q128 or D256/Q128 profiles, or a "
-                "fixed FP8/page-32 D64/Q64-Q128 or D256/Q64 profile; valid "
+                "the established D128/Q64-Q128 or D192-D256/Q128 profiles, "
+                "D192/Q64-KV128, QToken-KvBlock-Sparse-Attention "
+                "D64/D128/D192/D256 Q64/Q128-KV128 profiles, or a "
+                "fixed FP8/paged D64/Q64-Q128 or D256/Q64 profile; valid "
                 "reduction dtypes, Q layout, and static split-KV are required"
             )
         return
@@ -3728,17 +5535,16 @@ def _validate_profile_support(
     # Keep the ungrouped one-token-per-CTA control available at the same tile Q
     # as grouped profiles so explicit ungrouped launches retain the MMA shape.
     effective_head_dim_stage = cfg.head_dim_per_stage_kv
-    effective_num_insts_kv = cfg.num_insts_kv
-    if headdim == 256:
-        if effective_head_dim_stage != 128 or effective_num_insts_kv != 2:
+    if headdim in (192, 256, 512):
+        if effective_head_dim_stage != 128:
             raise ValueError(
-                "fmha_decode SwapsMmaAb headDim=256 requires "
-                "head_dim_per_stage_kv=128 and num_insts_kv=2"
+                f"fmha_decode SwapsMmaAb headDim={headdim} requires "
+                "head_dim_per_stage_kv=128"
             )
     elif effective_head_dim_stage != 0:
         raise ValueError(
             "split head_dim_per_stage_kv SwapsMmaAb profiles are enabled only "
-            "for headDim=256"
+            "for headDim=192, 256 or 512"
         )
     if cfg.use_cluster_smem_reduction:
         # Single source of truth for structural eligibility plus dtype and
@@ -3749,7 +5555,7 @@ def _validate_profile_support(
                 "{64,128,256}, TileSizeQ in {8,16,32}, "
                 "either ungrouped single-token or complete-token grouped Q, "
                 "at least two split CTAs, "
-                "and fp16/bf16 or fp8 qkv with fp16/fp8 output"
+                "and fp16/bf16 or fp8 qkv with fp16/bf16/fp8 output"
             )
         cluster_reason = cluster_smem_reduction_unsupported_reason(
             max_splits_kv=cfg.max_splits_kv,
@@ -3765,25 +5571,37 @@ def _validate_profile_support(
         use_split_kv
         and cfg.supports_reduction_dtypes
         and (seq_len_q == 1 or cfg.use_variable_seqlens_q or use_groups_tokens_heads_q)
-        and (tile_size_q in (16, 32) or qualified_fp8_q8_separate_reduction_supported)
+        and (
+            tile_size_q in (16, 32)
+            or qualified_fp8_q8_separate_reduction_supported
+            # The sparse publisher and standalone reducer both index
+            # actual logical rows, so a partial TileQ8 is also valid.
+            or (tile_size_q == 8 and cfg.uses_q_token_kv_block_sparse_page_route)
+        )
         and headdim >= 64
     )
     if use_separate_reduction_kernel and not separate_reduction_supported:
         raise ValueError(
             "separate reduction SwapsMmaAb profiles require fixed SQ=1, "
-            "fixed grouped Q, or packed variable Q; tile_size_q in {16,32} "
-            "or a fixed FP8 Q8/HqPerKv8 profile (legacy D128 with FP8 output, "
-            "plus grouped paged-KV/page-32 D64 with FP8 output or D256 with "
-            "FP16 output); valid reduction dtypes and static split-KV are required"
+            "fixed grouped Q, or packed variable Q; tile_size_q in {16,32}, "
+            "QToken-KvBlock-Sparse-Attention TileQ8, or a fixed FP8 Q8/HqPerKv8 profile "
+            "(D128, plus grouped paged-KV D64 or D256 with "
+            "FP16/BF16 output); valid reduction dtypes and static split-KV are required"
         )
     if tile_size_q and tile_size_q not in (8, 16, 32):
         raise ValueError("fmha_decode SwapsMmaAb supports tile_size_q in {8,16,32}")
-    if headdim not in (64, 128, 256):
+    if headdim not in (64, 128, 192, 256, 512):
         raise ValueError(
             "fmha_decode SwapsMmaAb supports headDim in "
-            "{64,128,256}. headDim=256 uses the staged profile with "
-            "head_dim_per_stage_kv=128 and num_insts_kv=2."
+            "{64,128,192,256,512}. headDim=192/256/512 use the staged profile with "
+            "head_dim_per_stage_kv=128."
         )
+    # Validate constraints imposed by mixed precision KV.
+    if cfg.use_nvfp4_kv:
+        if not cfg.use_paged_kv:
+            raise ValueError("NVFP4 KV cache is supported only with pagedKv layout")
+        if cfg.headdim % 16 != 0:
+            raise ValueError("NVFP4 KV cache requires headdim to be a multiple of 16")
 
 
 def normalize_qkv_layout(qkv_layout: str) -> str:
@@ -3798,10 +5616,47 @@ def normalize_qkv_layout(qkv_layout: str) -> str:
 
 def validate_page_size(num_tokens_per_page: int) -> None:
     """Validate a paged-KV page size against supported tile shapes."""
-    if num_tokens_per_page not in (16, 32, 64, 128):
-        raise ValueError("num_tokens_per_page must be one of 16, 32, 64, or 128")
+    if num_tokens_per_page not in (4, 8, 16, 32, 64, 128):
+        raise ValueError("num_tokens_per_page must be one of 4, 8, 16, 32, 64, or 128")
     if 128 % num_tokens_per_page != 0:
         raise ValueError("num_tokens_per_page must divide the 128-token KV tile")
+
+
+def validate_storage_page_size(
+    num_tokens_per_page: int,
+    storage_tokens_per_page: int,
+) -> None:
+    """Validate native page-4 subpage-locator storage geometry."""
+    if isinstance(storage_tokens_per_page, bool) or not isinstance(
+        storage_tokens_per_page, int
+    ):
+        raise TypeError("storage_tokens_per_page must be an integer")
+    if storage_tokens_per_page <= 0:
+        raise ValueError("storage_tokens_per_page must be positive")
+    if storage_tokens_per_page % num_tokens_per_page != 0:
+        raise ValueError(
+            "storage_tokens_per_page must be divisible by num_tokens_per_page"
+        )
+
+
+def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
+    """Return the config fields whose value depends on the GPU architecture.
+
+    SM100 runs three eighths of the streamed exponentials of KV128 tiles (a
+    quarter on KV256 tiles) as FMA polynomials because the MUFU issue rate
+    bounds its P pass while the FMA pipe has room; larger shares grow the
+    fragment body until the softmax warps become instruction-fetch bound.
+    SM103 doubles the MUFU ex2 rate (32 results per
+    SM clock), so the polynomials only add instructions there and every
+    exponential stays on MUFU. GPUs whose TMEM loads return score maxima
+    (LDTM.STAT) take them from the load, which replaces the max pass's
+    register reduction; the context kernel shares that gate.
+    """
+    is_sm103 = tuple(compute_capability) == (10, 3)
+    return {
+        "ex2_emulated_pairs": 0 if is_sm103 else 6,
+        "uses_ldtm_stat": ldtm_stat_supported(compute_capability),
+    }
 
 
 def make_decode_config(
@@ -3813,18 +5668,25 @@ def make_decode_config(
     batch_size: int | None = None,
     num_heads_q: int | None = None,
     num_heads_kv: int | None = None,
-    qkv_dtype: type = Float16,
+    q_dtype: type | None = None,
+    k_dtype: type | None = None,
+    v_dtype: type | None = None,
+    qkv_dtype: type | None = None,
+    kv_dtype: type | None = None,
     o_dtype: type = Float16,
     qkv_layout: str = "contiguousKv",
     num_tokens_per_page: int = 32,
+    storage_tokens_per_page: int | None = None,
     split_kv_mode: str = "disabled",
     splits_kv: int = -1,
     max_splits_kv: int | None = None,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
     sliding_window_causal: bool = False,
     attention_window_size: int = 0,
     mask_type: str | None = None,
     use_attention_sinks: bool = False,
     auto_tuner: bool = True,
+    split_kv: bool = True,
 ) -> FmhaDecodeConfig:
     """Build the static decode kernel config and apply auto-selection policy.
 
@@ -3833,14 +5695,19 @@ def make_decode_config(
     applies static profile defaults. When launch-shape inputs are supplied, it
     additionally runs the decode kernel-selection workflow below.
 
+    ``q_dtype``, ``k_dtype``, and ``v_dtype`` select independent storage types.
+    The legacy ``qkv_dtype`` sets their common default, while ``kv_dtype``
+    sets a common K/V default. Mixed-profile scheduling derives from the
+    effective dtypes before Q-tile or launch-mode selection.
+
     Workflow:
     1. Create a default ``FmhaDecodeConfig`` and apply caller-supplied config
        fields directly onto it, remembering which profile fields were explicit.
     2. Fill profile-derived defaults: dtype fields, paged-KV metadata, the
        dense/causal mask, sliding-window flags, attention-sink flags, default
        grouped-Q metadata for fixed or packed launches, and the SMEM-derived
-       KV stage count. For an unpinned fixed multi-Q paged-causal page-32
-       launch, the Q selector first enumerates Swaps8/16/32 and Keeps64/128
+       KV stage count. For a multi-Q paged launch, the Q selector first
+       enumerates Swaps8/16/32 and Keeps64/128
        tiles and every useful direct/split recipe through the first
        capacity-crossing fanout.
        Production-valid recipes minimize the empirical TileQ
@@ -3850,12 +5717,14 @@ def make_decode_config(
        KV128. The final KV width re-derives launch policy instead of reusing a
        fanout scored for KV128. Explicit policies remain caller-controlled.
        TileQ128 remains automatic over TileQ64 only for staged D256. SQ1 is
-       outside this grouped-Q cost model and therefore remains KV128.
+       outside this cost model and remains KV128, but ratios above 32 select
+       the smallest qualified Q64/Q128 Keeps tile. Other profile families use
+       exact-width ungrouped Keeps or ungrouped Swaps head bands as a fallback.
     3. Shapes outside that qualified Q/launch selector retain the general launch
-       policy: under-filled fixed-Q long-sequence grids use split-KV GMEM
+       policy: under-filled long-sequence grids may use split-KV GMEM
        reduction, direct grids above one resident wave use persistent
-       scheduling, and the rest stay static. Packed-Q and sliding-window grids
-       remain nonsplit but use the same structural persistence boundary. An
+       scheduling, and the rest stay static. Query packing does not disable
+       splits; automatic sliding-window splits remain unqualified. An
        unsupported automatic mode falls back to direct.
     4. If split-KV is selected or requested, compute the split fanout from the
        effective KV length, requested split count, max split cap, SM count, and
@@ -3867,17 +5736,51 @@ def make_decode_config(
        downward for a one-wave cluster split.
     6. Validate the final profile combination before returning the config.
 
-    Attention-sink paths skip automatic launch-mode selection. Explicit launch
-    modes are still validated.
+    Outside joint grouped-Q selection, attention-sink paths retain their
+    existing launch mode. Explicit launch modes are still validated.
+
+    ``split_kv`` is a common planning control for every FMHA kernel family.
+    True permits supported automatic split recipes; False restricts selection
+    to nonsplit recipes without disabling Q-tile or persistence selection.
+    It is independent of fixed/packed Q. Pass False for prefill and True for
+    decode. Explicit split modes/fanouts conflict with False. The resulting
+    ``cfg.use_split_kv`` describes the selected launch, not this permission.
     """
+    if not isinstance(split_kv, bool):
+        raise TypeError("split_kv must be a bool")
+    if not split_kv and (split_kv_mode != "disabled" or splits_kv > 1):
+        raise ValueError("split_kv=False conflicts with an explicit split mode/fanout")
+    dtype_keywords_supplied = any(
+        dtype is not None for dtype in (q_dtype, k_dtype, v_dtype, qkv_dtype, kv_dtype)
+    )
+    q_dtype, k_dtype, v_dtype = _resolve_decode_dtype_aliases(
+        q_dtype=q_dtype,
+        k_dtype=k_dtype,
+        v_dtype=v_dtype,
+        qkv_dtype=qkv_dtype,
+        kv_dtype=kv_dtype,
+    )
     shape_values = (seq_len_kv, batch_size, num_heads_q, num_heads_kv)
     if all(value is None for value in shape_values):
-        return _make_static_decode_config(
+        if dtype_keywords_supplied:
+            args = (
+                {
+                    "q_dtype": q_dtype,
+                    "k_dtype": k_dtype,
+                    "v_dtype": v_dtype,
+                    "out_dtype": o_dtype,
+                },
+                args,
+            )
+        cfg = _make_static_decode_config(
             headdim,
             args,
             mask_type=mask_type,
             sliding_window_causal=sliding_window_causal,
         )
+        if not split_kv and cfg.use_split_kv:
+            raise ValueError("split_kv=False conflicts with use_split_kv=True")
+        return cfg
     if any(value is None for value in shape_values):
         raise ValueError(
             "seq_len_kv, batch_size, num_heads_q, and num_heads_kv are all "
@@ -3887,6 +5790,12 @@ def make_decode_config(
     validate_sliding_window_args(sliding_window_causal, attention_window_size)
     cfg = FmhaDecodeConfig(headdim=headdim)
     explicit_fields = _apply_config_source(cfg, args)
+    # Policy selection uses the planned lengths; only the compiled program
+    # replaces them with runtime operands.
+    fixed_seqlen = cfg.fixed_seqlen
+    cfg.fixed_seqlen = True
+    if not split_kv and (cfg.use_split_kv or cfg.splits_kv > 1):
+        raise ValueError("split_kv=False conflicts with an explicit split config")
     splits_kv, max_splits_kv = _resolve_explicit_split_controls(
         cfg,
         explicit_fields=explicit_fields,
@@ -3913,16 +5822,22 @@ def make_decode_config(
     _apply_default_q_grouping(
         cfg,
         explicit_fields=explicit_fields,
+        heads_q_per_kv=num_heads_q // num_heads_kv,
     )
-    cfg.q_dtype = qkv_dtype
-    cfg.kv_dtype = qkv_dtype
-    cfg.out_dtype = o_dtype
-
     qkv_layout = _apply_layout_config(
         cfg,
         qkv_layout=qkv_layout,
         num_tokens_per_page=num_tokens_per_page,
+        storage_tokens_per_page=storage_tokens_per_page,
         seq_len_kv=seq_len_kv,
+    )
+    _apply_dtype_config(
+        cfg,
+        explicit_fields=explicit_fields,
+        q_dtype=q_dtype,
+        k_dtype=k_dtype,
+        v_dtype=v_dtype,
+        o_dtype=o_dtype,
     )
     _apply_feature_config(
         cfg,
@@ -3939,8 +5854,8 @@ def make_decode_config(
             "fixed-Q max_seq_len_q must equal seq_len_q; use "
             "use_variable_seqlens_q for a runtime-varying Q length"
         )
-    # Resolve Q first. The KV selector consumes the multi-Q cost-model result
-    # instead of forcing a Q64 profile ahead of the established Q policy.
+    # Score Q geometry with candidate KV fanouts on the common KV128 basis.
+    # Finalize the KV tile and reduction mode after selecting that joint recipe.
     auto_selection_explicit_fields = set(explicit_fields)
     selected_grouped_q_recipe = _apply_auto_grouped_q_mma_config(
         cfg,
@@ -3954,14 +5869,32 @@ def make_decode_config(
         num_heads_kv=num_heads_kv,
         splits_kv=splits_kv,
         max_splits_kv=max_splits_kv,
+        split_kv=split_kv,
     )
     if selected_grouped_q_recipe is None:
-        _apply_swaps_tile_config(
+        selected_wide_keeps = _try_apply_default_wide_keeps_config(
             cfg,
             explicit_fields=explicit_fields,
+            seq_len_q=seq_len_q,
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
         )
+        if not selected_wide_keeps:
+            heads_q_per_kv = num_heads_q // num_heads_kv
+            if (
+                heads_q_per_kv > 32
+                and "groups_tokens_heads_q" not in explicit_fields
+                and not (_MMA_SELECTION_FIELDS & auto_selection_explicit_fields)
+            ):
+                # Profiles outside the grouped-Keeps matrix remain valid via
+                # the established ungrouped Swaps head bands.
+                cfg.groups_tokens_heads_q = False
+            _apply_swaps_tile_config(
+                cfg,
+                explicit_fields=explicit_fields,
+                num_heads_q=num_heads_q,
+                num_heads_kv=num_heads_kv,
+            )
     kv_tile_was_promoted = _try_apply_auto_kv256_profile(
         cfg,
         q_candidate=(
@@ -3983,6 +5916,7 @@ def make_decode_config(
         # below from the final KV256 work granularity.
         cfg.use_persistent_scheduler = False
         selected_grouped_q_recipe = None
+
     _finalize_static_decode_config(cfg, explicit_fields)
     if not cfg.use_variable_seqlens_q:
         validate_causal_decode_lengths(
@@ -3992,9 +5926,11 @@ def make_decode_config(
         )
 
     # Auto launch-mode selection. Only kicks in if the caller has not already
-    # opted into a specific mode. Packed-Q and sliding-window shapes may select
-    # CLC persistence, but remain nonsplit.
-    if selected_grouped_q_recipe is not None:
+    # opted into a specific mode. The caller's split permission is independent
+    # of Q storage; unsupported automatic recipes retain their direct fallback.
+    if selected_grouped_q_recipe is not None and not (
+        _LAUNCH_SELECTION_FIELDS & explicit_fields
+    ):
         if selected_grouped_q_recipe.splits_kv > 1:
             split_kv_mode = selected_grouped_q_recipe.split_kv_mode
             splits_kv = selected_grouped_q_recipe.splits_kv
@@ -4012,6 +5948,7 @@ def make_decode_config(
                 num_heads_kv=num_heads_kv,
                 seq_len_kv=seq_len_kv,
                 seq_len_q=seq_len_q,
+                split_kv=split_kv,
             )
 
     reduction_mode_preconfigured = (
@@ -4022,7 +5959,6 @@ def make_decode_config(
         and launch_mode_was_auto
         and split_kv_mode == "gmem_reduction"
         and not reduction_mode_preconfigured
-        and not cfg.use_variable_seqlens_q
         and not cfg.use_sliding_window_causal
         and not cfg.use_attention_sinks
     )
@@ -4038,6 +5974,7 @@ def make_decode_config(
         max_splits_kv=max_splits_kv,
         sliding_window_causal=sliding_window_causal,
         attention_window_size=attention_window_size,
+        min_loop_iters_per_split=min_loop_iters_per_split,
     )
 
     if auto_split_kv_selected and cfg.use_split_kv:
@@ -4052,6 +5989,7 @@ def make_decode_config(
             ),
         )
 
+    _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)
     _finalize_warp_roles(cfg)
 
@@ -4062,4 +6000,5 @@ def make_decode_config(
         num_heads_kv=num_heads_kv,
         split_kv_mode=split_kv_mode,
     )
+    cfg.fixed_seqlen = fixed_seqlen
     return cfg

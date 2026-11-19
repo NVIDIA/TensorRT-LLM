@@ -16,6 +16,7 @@
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 
@@ -32,7 +33,6 @@ def test_deepseek_v32_context_forward():
         DeepseekV32Attention,
     )
     from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
     from tensorrt_llm._utils import torch_dtype_to_binding
     from tensorrt_llm.bindings.internal.batch_manager import CacheType
 
@@ -92,7 +92,7 @@ def test_deepseek_v32_context_forward():
 
         @contextmanager
         def fresh_metadata(length):
-            cache_manager = KVCacheManager(
+            cache_manager = KVCacheManagerV2(
                 KvCacheConfig(max_tokens=64, enable_block_reuse=False),
                 CacheType.SELFKONLY,
                 num_layers=config.num_hidden_layers,

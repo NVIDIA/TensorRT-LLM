@@ -24,11 +24,12 @@ is delegated to the GMS library's stable public Python primitives.
 
 Design notes:
 - We deliberately avoid the upstream `setup_gms()` monkey-patch entry
-  point. TRT-LLM owns the integration policy in `ModelLoader`; this
+  point. TRT-LLM owns the integration policy in
+  `models/checkpoints/gms/model_loading.py`; this
   backend is a thin adapter over the GMS library's primitive API.
 - The protocol has a single point of contact per concern, so when the
   upstream GMS Python API drifts, only the methods on `GMSBackend`
-  need to change — the call sites in `model_loader.py` are stable.
+  need to change — the call sites in `gms/model_loading.py` are stable.
 
 Operating modes:
 - **RW (Read-Write)**: First worker loads weights via the normal
@@ -120,8 +121,9 @@ class GMSBackend:
     This adapter calls the GMS library's stable per-call primitives
     (`GMSClientMemoryManager` + the helpers in
     `gpu_memory_service.client.torch.allocator` and `.module`) and
-    composes them into the methods TRT-LLM's `ModelLoader` invokes for
-    the `LoadFormat.GMS` branch. We intentionally do **not** use the
+    composes them into the methods that TRT-LLM's GMS loading code
+    (`models/checkpoints/gms/model_loading.py`) invokes for
+    `LoadFormat.GMS`. We intentionally do **not** use the
     upstream `setup_gms()` monkey-patch — TRT-LLM owns the integration
     policy and we keep the dependency surface narrow and explicit.
     """
@@ -531,7 +533,7 @@ class GMSBackend:
         in upstream `client.close()` or `evict_gms_client_memory_manager`
         is logged (warning for the outer error, debug for `close()`)
         and swallowed so callers — including `__del__` paths in
-        `ModelLoader` and `PyTorchModelEngine` — never raise from
+        `ModelLoader` and `ModelEngine` — never raise from
         teardown.
 
         After return:

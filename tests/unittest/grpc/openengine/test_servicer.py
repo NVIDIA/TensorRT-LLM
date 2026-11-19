@@ -5,6 +5,11 @@
 
 import asyncio
 import base64
+import gc
+import hashlib
+import hmac
+import json
+import weakref
 from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -12,15 +17,16 @@ from typing import Any
 import pytest
 
 grpc = pytest.importorskip(  # noqa: E402
-    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")'
 )
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.disagg as oe_disagg  # noqa: E402
 import tensorrt_llm.grpc.openengine.formatting as oe_formatting  # noqa: E402
 import tensorrt_llm.grpc.openengine.servicer as openengine_servicer  # noqa: E402
 import tensorrt_llm.grpc.openengine.streaming as oe_streaming  # noqa: E402
-from tensorrt_llm.grpc.openengine.bindings import generation_pb2  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import generation_pb2, openengine_pb2_grpc  # noqa: E402
 from tensorrt_llm.grpc.openengine.request_mapping import sampling_params_from_request  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.sampling_params import SamplingParams  # noqa: E402
@@ -273,6 +279,39 @@ def test_disaggregated_params_context_only_from_extra() -> None:
     params = oe_disagg.disaggregated_params_from_request(request)
     assert params is not None
     assert params.request_type == "context_only"
+
+
+def test_independent_prefill_handoffs_keep_distinct_transfer_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm.llmapi.disagg_utils import MIN_GLOBAL_ID
+
+    nonces = iter((0, (1 << 63) - MIN_GLOBAL_ID - 1))
+
+    def next_nonce(upper: int) -> int:
+        assert upper == (1 << 63) - MIN_GLOBAL_ID
+        return next(nonces)
+
+    monkeypatch.setattr("secrets.randbelow", next_nonce)
+    transfer_ids = []
+    for worker in range(2):
+        request = generation_pb2.GenerateRequest()
+        request.extra.update({"request_type": "context_only"})
+        params = oe_disagg.disaggregated_params_from_request(request)
+        assert params is not None
+        # Independent prefill engines can return the same local context ID.
+        params.ctx_request_id = 274
+        params.ctx_info_endpoint = f"tcp://127.0.0.1:{7001 + worker}"
+        response = oe_disagg.prefill_ready_response("req", params, "NIXL")
+        handoff = generation_pb2.GenerateResponse.FromString(response.SerializeToString())
+        follow_up = generation_pb2.GenerateRequest()
+        follow_up.kv.session.CopyFrom(handoff.prefill_ready.kv_session)
+        decoded = oe_disagg.disaggregated_params_from_request(follow_up)
+        assert decoded is not None
+        assert decoded.ctx_request_id == 274
+        transfer_ids.append(decoded.disagg_request_id)
+
+    assert transfer_ids == [MIN_GLOBAL_ID, (1 << 63) - 1]
 
 
 def test_disaggregated_params_invalid_request_type() -> None:
@@ -651,6 +690,222 @@ def test_generate_aborts_when_response_stream_closes() -> None:
     assert llm.result_handle.aborted
 
 
+def test_generate_releases_result_after_completion() -> None:
+    """A finished stream releases its result while its consumer task is still alive."""
+
+    class _SelfIteratingHandle(_FakeResultHandle):
+        """Iterates the way GenerationResult does: ``__aiter__`` returns the handle."""
+
+        def __aiter__(self) -> "_SelfIteratingHandle":
+            self._iterator = iter(self._results)
+            return self
+
+        async def __anext__(self) -> Any:
+            try:
+                result = next(self._iterator)
+            except StopIteration:
+                raise StopAsyncIteration from None
+            result.finished = all(o.finish_reason for o in result.outputs)
+            self.finished = result.finished
+            self.prompt_token_ids = result.prompt_token_ids
+            self.outputs = result.outputs
+            self.cached_tokens = result.cached_tokens
+            self.error = result.error
+            return result
+
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        prompt_logprobs=[],
+        finish_reason="length",
+        stop_reason=None,
+    )
+    result = SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
+    handle_refs = []
+
+    class _HandOffLlm:
+        """Gives each result handle to the servicer and keeps only a weak reference."""
+
+        args = _fake_llm_args()
+        tokenizer = _FakeTokenizer()
+
+        def generate_async(self, **kwargs: Any) -> _SelfIteratingHandle:
+            kwargs["sampling_params"]._validate()
+            handle = _SelfIteratingHandle([result])
+            handle_refs.append(weakref.ref(handle))
+            return handle
+
+    servicer = OpenEngineInferenceServicer(_HandOffLlm(), model="test-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="request-release",
+        model="test-model",
+        prompt="hello",
+    )
+    context = FakeServicerContext()
+
+    async def consume() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+        assert len(handle_refs) == 1
+        assert handle_refs[0]() is None
+
+    asyncio.run(consume())
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_generate_releases_rpc_contexts_without_gc() -> None:
+    """Completed real gRPC contexts must not accumulate when cyclic GC is disabled."""
+    context_types: dict[int, type] = {}
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        prompt_logprobs=[],
+        finish_reason="length",
+        stop_reason=None,
+    )
+    result = SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
+
+    class _TrackingServicer(OpenEngineInferenceServicer):
+        async def Generate(
+            self, request: generation_pb2.GenerateRequest, context: grpc.aio.ServicerContext
+        ) -> AsyncIterator[generation_pb2.GenerateResponse]:
+            context_types[id(context)] = type(context)
+            async for response in super().Generate(request, context):
+                yield response
+
+    async def exercise_server() -> None:
+        servicer = _TrackingServicer(_FakeLlm([result]), model="test-model")
+        server = grpc.aio.server()
+        openengine_pb2_grpc.add_InferenceServicer_to_server(servicer, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+                stub = openengine_pb2_grpc.InferenceStub(channel)
+                for i in range(100):
+                    request = generation_pb2.GenerateRequest(
+                        request_id=f"release-{i}", model="test-model", prompt="hello"
+                    )
+                    responses = [response async for response in stub.Generate(request, timeout=5)]
+                    assert responses[-1].HasField("finished")
+                assert servicer.active_request_count() == 0
+                # Let gRPC finish its transport cleanup while the server remains
+                # live. No collection is allowed to rescue a context cycle.
+                deadline = asyncio.get_running_loop().time() + 5
+                while True:
+                    await asyncio.sleep(0.01)
+                    retained = sum(
+                        context_types.get(id(obj)) is type(obj) for obj in gc.get_objects()
+                    )
+                    if retained == 0 or asyncio.get_running_loop().time() >= deadline:
+                        break
+                assert retained == 0, f"Retained {retained} completed RPC contexts without GC"
+        finally:
+            await server.stop(0)
+
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        asyncio.run(exercise_server())
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("cancel_point", ["engine", "write"])
+def test_generate_aborts_on_transport_cancellation(cancel_point: str) -> None:
+    """Cancellation aborts work during an engine wait or a suspended response yield."""
+
+    async def exercise_server() -> None:
+        entered = asyncio.Event()
+        aborted = asyncio.Event()
+        streams = []
+
+        class _BlockingHandle(_FakeResultHandle):
+            async def __aiter__(self) -> AsyncIterator[SimpleNamespace]:
+                if cancel_point == "engine":
+                    entered.set()
+                    await asyncio.Event().wait()
+                yield SimpleNamespace(
+                    prompt_token_ids=[1],
+                    outputs=[
+                        SimpleNamespace(
+                            index=0,
+                            token_ids=[10],
+                            text="A",
+                            logprobs=[],
+                            prompt_logprobs=[],
+                            finish_reason=None,
+                            stop_reason=None,
+                        )
+                    ],
+                    cached_tokens=0,
+                    error=None,
+                    finished=False,
+                )
+
+            def abort(self) -> None:
+                super().abort()
+                aborted.set()
+
+        llm = _FakeLlm([])
+        llm.result_handle = _BlockingHandle([])
+        servicer = OpenEngineInferenceServicer(llm, model="test-model")
+
+        async def generate(
+            request: generation_pb2.GenerateRequest, context: grpc.aio.ServicerContext
+        ) -> None:
+            stream = servicer.Generate(request, context)
+            # Keep the generator alive so finalization cannot mask a missing
+            # task callback when cancellation happens outside __anext__.
+            streams.append(stream)
+            async for _ in stream:
+                entered.set()
+                await asyncio.Event().wait()  # A transport write under backpressure.
+
+        server = grpc.aio.server()
+        server.add_generic_rpc_handlers(
+            (
+                grpc.method_handlers_generic_handler(
+                    "test.Inference",
+                    {
+                        "Generate": grpc.unary_stream_rpc_method_handler(
+                            generate, request_deserializer=generation_pb2.GenerateRequest.FromString
+                        )
+                    },
+                ),
+            )
+        )
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+                generate_rpc = channel.unary_stream(
+                    "/test.Inference/Generate",
+                    request_serializer=generation_pb2.GenerateRequest.SerializeToString,
+                )
+                request = generation_pb2.GenerateRequest(
+                    request_id="cancel", model="test-model", prompt="hello"
+                )
+                call = generate_rpc(request, timeout=10)
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                assert call.cancel()
+                await asyncio.wait_for(aborted.wait(), timeout=5)
+                assert llm.result_handle.aborted
+        finally:
+            await server.stop(0)
+            for stream in streams:
+                await stream.aclose()
+        assert servicer.active_request_count() == 0
+
+    asyncio.run(exercise_server())
+
+
 def test_generate_aborts_stalled_response_consumer(monkeypatch: pytest.MonkeyPatch) -> None:
     """A stalled response consumer cannot leave engine output buffering indefinitely."""
     output = SimpleNamespace(
@@ -745,23 +1000,15 @@ def test_generate_does_not_abort_slow_engine(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.parametrize(
-    ("key", "value"),
+    "value",
     [
-        ("openengine-priority", "7"),
-        ("openengine-priority", "not-an-integer"),
-        ("openengine-target-dp-rank", "0"),
-        ("openengine-target-dp-rank", "-1"),
+        "7",
+        "not-an-integer",
     ],
 )
-def test_generate_rejects_unsupported_numeric_metadata(key: str, value: str) -> None:
-    """Unsupported OpenEngine metadata returns UNIMPLEMENTED, whatever the value.
-
-    Control advertises both headers as unsupported and Generate never reads the
-    value, so the status must tell the client to stop sending the header rather
-    than to correct it.
-    """
+def test_generate_rejects_unsupported_priority_metadata(value: str) -> None:
     servicer = OpenEngineInferenceServicer(_FakeLlm([]), model="test-model")
-    context = FakeServicerContext(metadata=((key, value),))
+    context = FakeServicerContext(metadata=(("openengine-priority", value),))
     request = generation_pb2.GenerateRequest(
         request_id="request-6",
         model="test-model",
@@ -776,6 +1023,193 @@ def test_generate_rejects_unsupported_numeric_metadata(key: str, value: str) -> 
         asyncio.run(collect_responses())
 
     assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+
+
+@pytest.mark.parametrize("enable_attention_dp, rank", [(True, 2), (False, 0)])
+def test_generate_maps_target_dp_rank_to_strict_scheduling(
+    enable_attention_dp: bool, rank: int
+) -> None:
+    """A Dynamo route must not be relaxed onto a rank that lacks the selected prefix."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = enable_attention_dp
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", str(rank)),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-dp-rank",
+        model="test-model",
+        prompt="hello",
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(collect_responses())
+
+    scheduling_params = llm.generate_kwargs["scheduling_params"]
+    assert scheduling_params.attention_dp_rank == rank
+    assert scheduling_params.attention_dp_relax is False
+
+
+def test_generate_uses_rank_hint_for_first_conversation_turn() -> None:
+    """A Dynamo KV route seeds the conversation binding on its first turn."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.tensor_parallel_size = 4
+    llm.args.attention_dp_config = SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "2"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-conversation-rank",
+        model="test-model",
+        prompt="hello",
+    )
+    request.extra.update({"conversation_id": "session-a"})
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(collect_responses())
+
+    assert llm.generate_kwargs["scheduling_params"].attention_dp_rank == 2
+    assert llm.generate_kwargs["scheduling_params"].attention_dp_relax is False
+    assert llm.generate_kwargs["conversation_params"].conversation_id == "session-a"
+
+
+def test_generate_rejects_rank_hint_without_conversation_affinity_key() -> None:
+    """Dropping an explicit rank hint must not leave placement unkeyed."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.attention_dp_config = SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "1"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="missing-conversation", model="test-model", prompt="hello"
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(collect_responses())
+    assert error.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize("key", ["openengine-routing-key", "openengine-unknown-route"])
+def test_generate_rejects_ignored_routing_metadata(key: str) -> None:
+    """A caller's routing request must not succeed after being discarded."""
+    llm = _FakeLlm([])
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=((key, "parent-1"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="unsupported-route", model="test-model", prompt="hello"
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(collect_responses())
+    assert error.value.code == grpc.StatusCode.UNIMPLEMENTED
+
+
+def test_generate_preserves_child_identity_and_authenticates_parent_affinity() -> None:
+    """A sidecar parent hint must place the request without replacing its child ID."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.attention_dp_config = SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+    servicer = OpenEngineInferenceServicer(
+        llm, model="test-model", subagent_affinity_auth_key="shared-secret"
+    )
+    request = generation_pb2.GenerateRequest(
+        request_id="child-request", model="test-model", prompt="hello"
+    )
+    request.extra.update({"conversation_id": "child-a", "request_type": "context_only"})
+    payload = {
+        "purpose": "x-trtllm-subagent-affinity-id",
+        "model": "test-model",
+        "request_id": "child-request",
+        "conversation_id": "child-a",
+        "subagent_affinity_id": "parent-1",
+        "request_type": "context_only",
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    signature = "sha256=" + hmac.new(b"shared-secret", encoded, hashlib.sha256).hexdigest()
+
+    async def send(parent: str) -> None:
+        context = FakeServicerContext(
+            metadata=(
+                ("x-trtllm-subagent-affinity-id", parent),
+                ("x-trtllm-subagent-affinity-auth", signature),
+            )
+        )
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(send("parent-1"))
+    assert llm.generate_kwargs["conversation_params"].conversation_id == "child-a"
+    scheduling = llm.generate_kwargs["scheduling_params"]
+    assert scheduling.subagent_affinity_id == "parent-1"
+    assert scheduling.attention_dp_rank is None
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(send("different-parent"))
+    assert error.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_generate_rejects_target_dp_rank_with_multiple_sequences() -> None:
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "2"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-multi-dp-rank",
+        model="test-model",
+        prompt="hello",
+        sampling=generation_pb2.SamplingParams(num_sequences=2),
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError):
+        asyncio.run(collect_responses())
+
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize(
+    "value, enable_attention_dp",
+    [("-1", True), ("4", True), ("not-an-integer", True), ("1", False)],
+)
+def test_generate_rejects_invalid_target_dp_rank(value: str, enable_attention_dp: bool) -> None:
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = enable_attention_dp
+    llm.args.tensor_parallel_size = 4
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", value),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-invalid-dp-rank",
+        model="test-model",
+        prompt="hello",
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError):
+        asyncio.run(collect_responses())
+
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
 
 
 def test_generate_context_only_ends_at_prefill_ready() -> None:
@@ -834,7 +1268,11 @@ def test_generate_context_only_ends_at_prefill_ready() -> None:
             prompt_token_ids=[1, 2], outputs=[final_output], cached_tokens=0, error=None
         ),
     ]
-    servicer = OpenEngineInferenceServicer(_FakeLlm(results), model="test-model")
+    outcomes = []
+    metrics = SimpleNamespace(
+        record_outcome=lambda *args: outcomes.append(args), record_result=lambda _: None
+    )
+    servicer = OpenEngineInferenceServicer(_FakeLlm(results), model="test-model", metrics=metrics)
     request = generation_pb2.GenerateRequest(
         request_id="request-ctx",
         model="test-model",
@@ -844,7 +1282,11 @@ def test_generate_context_only_ends_at_prefill_ready() -> None:
     request.extra.update({"request_type": "context_only"})
 
     async def collect_responses() -> list[generation_pb2.GenerateResponse]:
-        return [response async for response in servicer.Generate(request, FakeServicerContext())]
+        responses = []
+        async for response in servicer.Generate(request, FakeServicerContext()):
+            assert outcomes == []
+            responses.append(response)
+        return responses
 
     responses = asyncio.run(collect_responses())
     events = [response.WhichOneof("event") for response in responses]
@@ -853,6 +1295,7 @@ def test_generate_context_only_ends_at_prefill_ready() -> None:
     assert "finished" not in events
     assert events[-1] == "prefill_ready"
     assert responses[-1].prefill_ready.kv_session.session_id == "99"
+    assert outcomes == [("prefill", "completed")]
 
 
 def _set_priority_metadata(request: generation_pb2.GenerateRequest) -> None:
@@ -1089,7 +1532,8 @@ def test_no_logprobs_token_infos_skip_detokenization() -> None:
     assert all(info.token == "" and not info.candidates for info in infos)
 
 
-def test_oversized_prompt_logprobs_are_refused_not_built() -> None:
+@pytest.mark.parametrize("error_on_final_result", [False, True])
+def test_oversized_prompt_logprobs_are_refused_not_built(error_on_final_result: bool) -> None:
     """A prompt_length * candidates blow-up is rejected, not computed.
 
     PromptOutput is built in one non-preemptible slice on the shared event loop,
@@ -1124,6 +1568,168 @@ def test_oversized_prompt_logprobs_are_refused_not_built() -> None:
     assert responses[0].error.code == openengine_servicer.error_pb2.ERROR_CODE_INVALID_ARGUMENT
     assert "prompt logprobs" in responses[0].error.message
 
+    # Formatting can fail without result.error. Neither immediate completion
+    # nor a later normal engine result may turn that RPC into a success.
+    output.finish_reason = "length" if error_on_final_result else None
+    results = [result]
+    if not error_on_final_result:
+        results.append(
+            SimpleNamespace(
+                prompt_token_ids=[1],
+                outputs=[SimpleNamespace(**{**vars(output), "finish_reason": "length"})],
+                cached_tokens=0,
+                error=None,
+            )
+        )
+    outcomes = []
+    metrics = SimpleNamespace(
+        record_outcome=lambda *args: outcomes.append(args), record_result=lambda _: None
+    )
+    servicer = OpenEngineInferenceServicer(_FakeLlm(results), model="test-model", metrics=metrics)
+    request = generation_pb2.GenerateRequest(
+        request_id="oversized-logprobs",
+        model="test-model",
+        prompt="hello",
+        response=generation_pb2.ResponseOptions(
+            return_prompt_logprobs=True,
+            prompt_candidates=generation_pb2.CandidateTokenSelection(top_n=2),
+        ),
+    )
+
+    async def collect_responses() -> list[generation_pb2.GenerateResponse]:
+        return [response async for response in servicer.Generate(request, FakeServicerContext())]
+
+    responses = asyncio.run(collect_responses())
+    assert responses[0].HasField("error")
+    assert outcomes == [("aggregated", "engine_error")]
+
+
+def test_generate_reserve_failure_is_unavailable() -> None:
+    """A coordination failure before submission is not an engine failure."""
+    from tensorrt_llm.grpc.openengine.coordinator import CoordinationError
+
+    class Frontend:
+        async def reserve(self, request_id):
+            raise CoordinationError("reservation failed")
+
+    outcomes = []
+    metrics = SimpleNamespace(record_outcome=lambda *args: outcomes.append(args))
+    servicer = OpenEngineInferenceServicer(
+        _FakeLlm([]), "test-model", frontend=Frontend(), metrics=metrics
+    )
+    context = FakeServicerContext()
+    request = generation_pb2.GenerateRequest(
+        request_id="reserve-failure", model="test-model", prompt="hello"
+    )
+
+    async def run():
+        with pytest.raises(AbortError) as error:
+            async for _ in servicer.Generate(request, context):
+                pass
+        assert error.value.code == grpc.StatusCode.UNAVAILABLE
+
+    asyncio.run(run())
+    assert outcomes == [("aggregated", "unavailable")]
+
+
+@pytest.mark.parametrize(
+    "failure,expected_status,expected_outcome",
+    [
+        ("cancel_release", grpc.StatusCode.CANCELLED, "cancelled"),
+        ("deadline_release", grpc.StatusCode.DEADLINE_EXCEEDED, "timeout"),
+        ("reject_release", grpc.StatusCode.INVALID_ARGUMENT, "rejected"),
+        ("abort_submission", grpc.StatusCode.CANCELLED, "cancelled"),
+    ],
+)
+def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expected_outcome):
+    """Real transport deadlines, cancellation, and cleanup errors retain their outcomes."""
+    from tensorrt_llm.grpc.openengine.coordinator import CoordinationError
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        outcomes = []
+        recorded = asyncio.Event()
+
+        class Reservation:
+            aborted = failure == "abort_submission"
+
+            def bind(self, handle):
+                pass
+
+            async def release(self):
+                entered.set()
+                if failure in ("cancel_release", "deadline_release"):
+                    await release.wait()
+                elif failure == "reject_release":
+                    raise CoordinationError("release failed")
+
+        class Frontend:
+            async def reserve(self, request_id):
+                return Reservation()
+
+        output = SimpleNamespace(
+            index=0,
+            token_ids=[10],
+            text="A",
+            logprobs=[],
+            prompt_logprobs=[],
+            finish_reason="length",
+            stop_reason=None,
+        )
+        result = SimpleNamespace(
+            prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None, finished=True
+        )
+
+        def record_outcome(*args):
+            outcomes.append(args)
+            recorded.set()
+
+        metrics = SimpleNamespace(record_outcome=record_outcome, record_result=lambda _: None)
+        servicer = OpenEngineInferenceServicer(
+            _FakeLlm([result]), "test-model", frontend=Frontend(), metrics=metrics
+        )
+        server = grpc.aio.server()
+        openengine_pb2_grpc.add_InferenceServicer_to_server(servicer, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+                request = generation_pb2.GenerateRequest(
+                    request_id="cleanup",
+                    model="" if failure == "reject_release" else "model",
+                    prompt="hello",
+                )
+                call = openengine_pb2_grpc.InferenceStub(channel).Generate(
+                    request, timeout=0.5 if failure == "deadline_release" else 5
+                )
+
+                async def drain():
+                    try:
+                        async for _ in call:
+                            pass
+                    except (grpc.aio.AioRpcError, asyncio.CancelledError):
+                        pass
+
+                task = asyncio.create_task(drain())
+                if failure in ("cancel_release", "deadline_release"):
+                    await asyncio.wait_for(entered.wait(), 3)
+                    if failure == "cancel_release":
+                        call.cancel()
+                await task
+                assert await call.code() == expected_status
+                await asyncio.wait_for(recorded.wait(), 3)
+                await asyncio.wait_for(server.stop(0), 3)
+                assert outcomes == [("aggregated", expected_outcome)]
+        finally:
+            release.set()
+            await server.stop(0)
+
+    try:
+        asyncio.run(run())
+    finally:
+        # gRPC transport cycles can retain its global poller after the loop closes.
+        gc.collect()
+
 
 def test_generate_aborts_the_engine_when_the_rpc_is_cancelled() -> None:
     """A cancelled RPC must abort the engine request, not just stop streaming.
@@ -1142,7 +1748,9 @@ def test_generate_aborts_the_engine_when_the_rpc_is_cancelled() -> None:
     )
     result = SimpleNamespace(prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None)
     llm = _FakeLlm([result, result])
-    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    outcomes = []
+    metrics = SimpleNamespace(record_outcome=lambda *args: outcomes.append(args))
+    servicer = OpenEngineInferenceServicer(llm, model="test-model", metrics=metrics)
     context = FakeServicerContext()
     request = generation_pb2.GenerateRequest(
         request_id="cancelled-1", model="test-model", prompt="hello"
@@ -1159,6 +1767,7 @@ def test_generate_aborts_the_engine_when_the_rpc_is_cancelled() -> None:
 
     assert llm.result_handle.aborted
     assert servicer.active_request_count() == 0
+    assert outcomes == [("aggregated", "cancelled")]
 
 
 @pytest.mark.parametrize("detokenize", [None, True, False])

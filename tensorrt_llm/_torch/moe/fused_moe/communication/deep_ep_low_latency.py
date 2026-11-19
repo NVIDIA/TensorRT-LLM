@@ -25,9 +25,9 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_120f
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -127,7 +127,7 @@ class DeepEPLowLatency(Communication):
         if not deep_ep_installed:
             return False
         # SM120/121 (RTX PRO 6000 Blackwell): no NVSwitch -> NVSHMEM-LL deadlocks.
-        if get_sm_version() in (120, 121):
+        if is_sm_120f():
             return False
         # Native NVSHMEM/IBGDA bootstrap aborts instead of raising on split
         # H100/H200 NVL systems. Disabling P2P does not avoid the abort: this
@@ -159,6 +159,16 @@ class DeepEPLowLatency(Communication):
             # fp8/w4afp8 post-quant dispatch views fp8 (1 byte) as bf16 (2 bytes),
             # halving the hidden dimension. The kernel must support the halved size.
             return (self.hidden_size // 2) in self.SUPPORTED_HIDDEN_SIZES
+        return False
+
+    def supports_finalize_before_combine(self) -> bool:
+        """``combine`` here is not an unweighted row sum over a per-token tensor.
+
+        It consumes expert-major rows (``[local_experts, ep_size * max_tokens,
+        hidden]``) and applies the routing weights itself, and the post-dispatch
+        ``token_final_scales`` are unit placeholders. A finalize that already
+        applied the real weights per token cannot feed it.
+        """
         return False
 
     def supports_low_precision_combine(self) -> bool:

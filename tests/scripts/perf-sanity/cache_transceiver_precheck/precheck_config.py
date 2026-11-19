@@ -88,7 +88,7 @@ MAX_STEP_TIMEOUT_S = 1800
 
 # Fallback KV shape for dry-runs and explicitly selected manager versions when
 # the model directory cannot be resolved. Manager-version "auto" resolution
-# fails fast instead of silently pairing this shape with V1.
+# requires a registered checkpoint or declared architecture instead of assuming V1.
 FALLBACK_KV_SHAPE = {
     "num_layers": 32,
     "num_kv_heads": 8,
@@ -96,6 +96,12 @@ FALLBACK_KV_SHAPE = {
     "is_mla": False,
     "source": "fallback",
 }
+
+
+def _dwdp_ctx(cfg):
+    """True when the ctx side is a DWDP group (dwdp_config.dwdp_size > 1)."""
+    ctx = (cfg.get("worker_config", {}) or {}).get("ctx", {}) or {}
+    return int((ctx.get("dwdp_config") or {}).get("dwdp_size", 1) or 1) > 1
 
 
 def _side_cfg(cfg, role):
@@ -274,7 +280,9 @@ def precheck_prefix_lines(
     # A selected pytest case that is SKIP-waived must not run its precheck.
     # This takes precedence over the global force-enable knob because there
     # will be no corresponding test execution to gate.
-    enabled = precheck_enabled(cfg) and not skip_precheck
+    # A DWDP ctx side is one MPI step of single-GPU servers, a topology the
+    # gate's one-srun-per-ctx-server launch does not reproduce, so skip it too.
+    enabled = precheck_enabled(cfg) and not skip_precheck and not _dwdp_ctx(cfg)
     cmd = (
         "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
         f"run_precheck.py --config {config_path_expr} "
@@ -337,6 +345,39 @@ def gate_library_content(draft_launch_sh, llm_src):
         "precheck gate library slurm_ct_precheck_gate.sh not found; looked in: "
         + ", ".join(candidates)
     )
+
+
+def declared_architecture(cfg: Mapping[str, Any]) -> str | None:
+    """Read one architecture hint for prechecks without a local checkpoint.
+
+    Args:
+        cfg: Parsed disaggregated benchmark YAML.
+
+    Returns:
+        The stripped architecture name, or None when the hint is omitted.
+
+    Raises:
+        ValueError: If a supplied declaration is not a nonempty string.
+    """
+    metadata = cfg.get("metadata") or {}
+    if "architecture" not in metadata:
+        return None
+    value = metadata["architecture"]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("metadata.architecture must be a nonempty string")
+    return value.strip()
+
+
+def normalized_kv_dtype(dtype: str) -> str:
+    """Return the storage dtype used by the synthetic KV pool.
+
+    Args:
+        dtype: Per-role KV dtype from the benchmark configuration.
+
+    Returns:
+        Canonical fp8, fp16, or bf16 spelling; unsupported/auto uses bf16.
+    """
+    return {"fp8": "fp8", "fp16": "fp16", "half": "fp16"}.get(dtype.lower(), "bf16")
 
 
 def resolve_plan(cfg, benchmark_mode="e2e"):
@@ -439,6 +480,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         ),
         "rendezvous_timeout_s": rendezvous_timeout_s,
         "verify_data": bool(knobs["verify_data"]),
+        "architecture": declared_architecture(cfg),
     }
     for role, side, xcvr in (("ctx", ctx_side, ctx_xcvr), ("gen", gen_side, gen_xcvr)):
         kv_cfg = side.get("kv_cache_config") or {}
@@ -449,7 +491,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         # True/False from the yaml wins; absent means "auto", which the
         # driver resolves against the model class's manager preference at
         # runtime, exactly like serving (_resolve_kv_cache_manager_v2_auto).
-        plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", "auto")
+        plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", True)
     plan["fingerprint"] = plan_fingerprint(plan)
     return plan
 
@@ -457,6 +499,11 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
 def plan_fingerprint(plan):
     """Stable string both sides must agree on before transferring."""
     keys = (
+        "architecture",
+        "ctx_use_kv_cache_manager_v2",
+        "gen_use_kv_cache_manager_v2",
+        "ctx_kv_dtype",
+        "gen_kv_dtype",
         "num_ctx_servers",
         "num_gen_servers",
         "ctx",
@@ -479,6 +526,7 @@ def side_plan(plan, role):
     """Per-role view: this role's parallelism + transceiver/kv config."""
     return {
         "role": role,
+        "architecture": plan["architecture"],
         "parallel": plan[role],
         "cache_transceiver_config": plan[f"{role}_cache_transceiver_config"],
         "kv_dtype": plan[f"{role}_kv_dtype"],

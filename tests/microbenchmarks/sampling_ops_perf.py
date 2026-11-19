@@ -26,6 +26,9 @@ call shape       op                                                  call sites
 ``tokens_probs`` ``sampling_batch_spec_dec_one_model_for_rejection`` draft sampler + draft probs
 ===============  ==================================================  ==========================
 
+The ``fused:per_row`` impl passes one seed/offset per row instead, as
+TorchSampler and the one-model path do.
+
 Both eager and CUDA-graph-replay latency are reported: these ops run inside a
 captured graph in production, so eager latency alone can mislead.
 
@@ -257,6 +260,24 @@ def available_impls() -> dict[str, Impl]:
         raise ValueError(f"unknown call shape: {shape}")
 
     impls["fused"] = Impl(name="fused", call=call, supports_min_p=True)
+
+    # One seed/offset per row, with non-overlapping offsets.
+    def call_per_row(shape: str, inp: Inputs) -> Callable[[], Any]:
+        args = (inp.logits, inp.temperatures, inp.top_ks, inp.top_ps, inp.min_ps)
+        rows = inp.logits.size(0)
+        seed = inp.seed.expand(rows).contiguous()
+        offset = torch.arange(rows, dtype=torch.int64, device=inp.logits.device) * 32
+        if shape == "tokens":
+            return lambda: fused.fused_sample_from_logits(*args, seed=seed, offset=offset)
+        if shape == "probs":
+            return lambda: fused.fused_compute_probs_from_logits(*args)
+        if shape == "tokens_probs":
+            return lambda: fused.fused_sample_from_logits_with_probs(
+                *args, seed=seed, offset=offset
+            )
+        raise ValueError(f"unknown call shape: {shape}")
+
+    impls["fused:per_row"] = Impl(name="fused:per_row", call=call_per_row, supports_min_p=True)
     return impls
 
 

@@ -1,0 +1,2776 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""CSA2 packed formats, cache kernels, attention kernels and lazy import behavior."""
+
+import math
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import (
+    packed_sparse_attention,
+    quantize_scatter_rows,
+)
+from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+    INDEX_PAGE_BYTES,
+    INDEX_PAGE_ROWS,
+    pack_rows,
+    row_bytes,
+    unpack_rows,
+)
+from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm.math_utils import ceil_div, pad_up
+
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
+
+def _inputs(main_count=73, dtype=torch.int64):
+    torch.manual_seed(7401)
+    q = torch.randn(2, 32, 512, device="cuda", dtype=torch.bfloat16)
+    swa = pack_rows(torch.randn(141, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    owner = torch.empty(103, 356, device="cuda", dtype=torch.uint8)
+    main = owner[:, :288]
+    main.copy_(pack_rows(torch.randn(103, 512, device="cuda", dtype=torch.bfloat16), "main"))
+    si = torch.randint(0, 141, (2, 77), device="cuda", dtype=dtype)
+    mi = torch.randint(0, 103, (2, main_count), device="cuda", dtype=dtype)
+    si[0, 3:] = -1
+    if main_count:
+        mi[0] = -1
+        mi[1, 0] = 103
+        if dtype == torch.int64:
+            mi[1, 1] = 1 << 40
+    sink = torch.randn(32, device="cuda")
+    return q, swa, main, si, mi, sink, 512**-0.5
+
+
+def _reference(q, swa, main, si, mi, sink, scale):
+    parts, masks = [], []
+    for pool, indices, fmt in ((swa, si, "swa"), (main, mi, "main")):
+        valid = (indices >= 0) & (indices < pool.shape[0])
+        values = unpack_rows(pool[indices.clamp(0, pool.shape[0] - 1).long()], 512, fmt)
+        parts.append(torch.where(valid[..., None], values, 0))
+        masks.append(valid)
+    kv = torch.cat(parts, 1).float()
+    logits = torch.einsum("qhd,qkd->qhk", q.float(), kv) * scale
+    logits.masked_fill_(~torch.cat(masks, 1)[:, None, :], float("-inf"))
+    probabilities = torch.softmax(
+        torch.cat((logits, sink[None, :, None].expand(q.shape[0], -1, -1)), -1), -1
+    )[..., :-1]
+    return torch.einsum("qhk,qkd->qhd", probabilities, kv).bfloat16()
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("main_count", [0, 73])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_packed_attention_parity(main_count, dtype):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 packed attention")
+    args = _inputs(main_count, dtype)
+    actual = packed_sparse_attention(*args)
+    torch.testing.assert_close(actual, _reference(*args), atol=0.016, rtol=0.016)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("heads", [16, 32, 64])
+@pytest.mark.parametrize("queries", [1, 8, 129])
+@pytest.mark.parametrize("main_count", [0, 73])
+def test_mixed_cache_head_and_batch_geometries(heads, queries, main_count):
+    """Preserve the merged mixed-cache coverage using CSA2's packed row layouts."""
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 packed attention")
+    _, swa, main, si, mi, _, scale = _inputs(main_count)
+    q = torch.randn(queries, heads, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(heads, device="cuda")
+    si = si[1:2].repeat(queries, 1)
+    mi = mi[1:2].repeat(queries, 1)
+    args = (q, swa, main, si, mi, sink, scale)
+    torch.testing.assert_close(
+        packed_sparse_attention(*args), _reference(*args), atol=0.016, rtol=0.016
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_attention_graph_refresh():
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 packed attention")
+    args = _inputs()
+    output = torch.empty_like(args[0])
+    packed_sparse_attention(*args, output=output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        packed_sparse_attention(*args, output=output)
+    args[3][0].fill_(-1)
+    args[4][0].fill_(-1)
+    args[4][1].fill_(0)
+    graph.replay()
+    torch.testing.assert_close(output, _reference(*args), atol=0.016, rtol=0.016)
+    assert torch.count_nonzero(output[0]) == 0
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_attention_multiple_tiles_per_split():
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 packed attention")
+    q, swa, main, si, mi, sink, scale = _inputs(512)
+    q = q.repeat(8, 2, 1)
+    si = si.repeat(8, 1)
+    mi = mi.repeat(8, 1)
+    sink = sink.repeat(2)
+    args = (q, swa, main, si, mi, sink, scale)
+    torch.testing.assert_close(
+        packed_sparse_attention(*args), _reference(*args), atol=0.016, rtol=0.016
+    )
+
+
+def _rope_inputs(heads):
+    q, swa, main, si, mi, sink, scale = _inputs()
+    if heads == 16:
+        q, sink = q[:, :16].contiguous(), sink[:16].contiguous()
+    else:
+        q, sink = q.repeat(1, 2, 1), sink.repeat(2)
+    angles = torch.randn(37, 32, device="cuda")
+    cos_sin = torch.stack((angles.cos(), angles.sin()), dim=1).contiguous()
+    positions = torch.tensor([3, 19], dtype=torch.int64, device="cuda")
+    return (q, swa, main, si, mi, sink, scale), positions, cos_sin
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("heads", [16, 64])
+def test_packed_inverse_rope_native_parity(heads):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 packed attention")
+    args, positions, cos_sin = _rope_inputs(heads)
+    attention = packed_sparse_attention(*args)
+    expected = attention.clone()
+    torch.ops.trtllm.mla_rope_inplace(
+        expected, positions.int(), cos_sin, heads, 448, 64, True, False
+    )
+    actual = packed_sparse_attention(*args, position_ids=positions, rotary_cos_sin=cos_sin)
+    torch.testing.assert_close(actual[..., :448], attention[..., :448], atol=0, rtol=0)
+    torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.008)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_inverse_rope_graph_positions_and_bounds():
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 packed attention")
+    args, positions, cos_sin = _rope_inputs(16)
+    attention = packed_sparse_attention(*args)
+    output = torch.empty_like(attention)
+    packed_sparse_attention(*args, output=output, position_ids=positions, rotary_cos_sin=cos_sin)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        packed_sparse_attention(
+            *args, output=output, position_ids=positions, rotary_cos_sin=cos_sin
+        )
+    positions.copy_(torch.tensor([17, 2], device="cuda"))
+    graph.replay()
+    expected = attention.clone()
+    torch.ops.trtllm.mla_rope_inplace(expected, positions.int(), cos_sin, 16, 448, 64, True, False)
+    torch.testing.assert_close(output, expected, atol=0.002, rtol=0.008)
+    # Standalone callers receive a nonfinite tail, never an out-of-bounds read.
+    positions.copy_(torch.tensor([-1, cos_sin.shape[0]], device="cuda"))
+    graph.replay()
+    assert torch.isnan(output[..., 448:]).all()
+    torch.testing.assert_close(output[..., :448], attention[..., :448], atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_inverse_rope_rejects_invalid_geometry():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import supports_packed_attention
+
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 packed attention")
+    args, positions, cos_sin = _rope_inputs(16)
+    assert not supports_packed_attention(*args, position_ids=positions)
+    assert not supports_packed_attention(*args, rotary_cos_sin=cos_sin)
+    assert not supports_packed_attention(
+        *args, position_ids=positions, rotary_cos_sin=cos_sin.bfloat16()
+    )
+    assert not supports_packed_attention(
+        *args, position_ids=positions, rotary_cos_sin=cos_sin[:, :, :16]
+    )
+
+
+def _sm100():
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Fused CSA2 store is enabled only after SM100-family validation")
+
+
+def _values(rows, dim, cache_format):
+    storage = torch.randn(rows, dim + 17, dtype=torch.bfloat16, device="cuda")
+    x = storage[:, :dim]
+    pattern = torch.tensor(
+        [6, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5, -0.0, -0.25, -0.75, -1.25, -1.75, -2.5, -3.5, -5],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    x[0].copy_(pattern.repeat((dim + 15) // 16)[:dim])
+    x[2].zero_()
+    x[2, 1::2] = -0.0
+    x[4].copy_(pattern.repeat((dim + 15) // 16)[:dim] * 2.0**-12)
+    x[6].copy_(pattern.repeat((dim + 15) // 16)[:dim] * 2.0**-126)
+    # Include BF16 subnormal input channels and positive/negative zero.
+    x[8].fill_(2.0**-133)
+    x[8, 1::2].neg_()
+    x[10].fill_(6 * 1.0625)
+    x[12].fill_(6 * 1.1875)
+    x[14].fill_(6 * 1.5 * 2.0**-9)
+    x[16].fill_(6 * 464)
+    x[18].fill_(6 * 468)
+    if cache_format == "swa":
+        x[20].fill_(2.0**-30)
+    x[22, 0] = float("nan")
+    x[24, 0] = float("inf")
+    x[26, 0] = -float("inf")
+    x[28, 0] = -float("nan")
+    return x
+
+
+def _storage(rows, dim, cache_format):
+    width = row_bytes(dim, cache_format)
+    stride = 356 if cache_format in ("main", "index") else width + 13
+    offset = 288 if cache_format == "index" else 0
+    storage = torch.full((rows + 8, stride), 77, dtype=torch.uint8, device="cuda")
+    return storage, storage[:, offset : offset + width]
+
+
+def _expected(storage, pool, slots, x, cache_format):
+    expected = storage.clone()
+    offset = pool.storage_offset() - storage.storage_offset()
+    target = expected[:, offset : offset + pool.shape[1]]
+    valid = (slots >= 0) & (slots < pool.shape[0])
+    target.index_copy_(0, slots[valid].long(), pack_rows(x, cache_format)[valid])
+    return expected
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "cache_format,dim",
+    [
+        ("main", 512),
+        ("index", 128),
+        ("swa", 512),
+        ("main", 48),
+        ("index", 96),
+        ("swa", 96),
+    ],
+)
+@torch.inference_mode()
+def test_fused_store_exact_bytes(cache_format, dim):
+    _sm100()
+    torch.manual_seed(781)
+    rows = 33
+    x = _values(rows, dim, cache_format)
+    storage, pool = _storage(rows, dim, cache_format)
+    slot_storage = torch.empty(rows * 2, dtype=torch.int64, device="cuda")
+    slots = slot_storage[::2]
+    slots.copy_((torch.arange(rows, device="cuda") * 7) % pool.shape[0])
+    slots[1], slots[3], slots[5], slots[7] = 2**40, -1, pool.shape[0], -(2**50)
+    expected = _expected(storage, pool, slots, x, cache_format)
+    quantize_scatter_rows(pool, slots, x, cache_format)
+    torch.testing.assert_close(storage, expected, atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_fused_store_jobs_match_separate_launches():
+    """One four-job launch (SWA, main, index footer, index-query split) writes the same bytes."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import (
+        footer_job,
+        quantize_scatter_jobs,
+        row_job,
+        split_job,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import RowTransform
+
+    _sm100()
+    torch.manual_seed(97)
+    swa, main, index, queries = 37, 19, 19, 45
+    values = {
+        "swa": torch.randn(swa, 512, dtype=torch.bfloat16, device="cuda") * 3,
+        "main": torch.randn(main, 512, dtype=torch.bfloat16, device="cuda") * 3,
+        "index": torch.randn(index, 128, dtype=torch.bfloat16, device="cuda") * 3,
+        "query": torch.randn(queries, 128, dtype=torch.bfloat16, device="cuda") * 3,
+    }
+    slots = {
+        "swa": (torch.arange(swa, device="cuda") * 5 % 41).long(),
+        "main": (torch.arange(main, device="cuda") * 3 % 23).long(),
+    }
+    slots["main"][2] = -1
+    table = torch.randn(64, 64, dtype=torch.float32, device="cuda")
+    positions = (torch.arange(swa, device="cuda") % 64).int()
+    transform = RowTransform(
+        norm=(torch.rand(512, dtype=torch.bfloat16, device="cuda") + 0.5, 1e-6),
+        rope=(positions, table, 64),
+    )
+    index_transform = RowTransform(
+        norm=(torch.rand(128, dtype=torch.bfloat16, device="cuda") + 0.5, 1e-6),
+        rope=(positions[:main], table, 64),
+    )
+
+    def run(fused):
+        pools = {
+            "swa": torch.full((41, 528), 7, dtype=torch.uint8, device="cuda"),
+            "main": torch.full((23, 288), 7, dtype=torch.uint8, device="cuda"),
+            "index": torch.zeros(INDEX_PAGE_BYTES, dtype=torch.uint8, device="cuda"),
+            "data": torch.zeros(queries, 64, dtype=torch.uint8, device="cuda"),
+            "scales": torch.zeros(queries, 4, dtype=torch.uint8, device="cuda"),
+        }
+        jobs = [
+            row_job(
+                pools["swa"], slots["swa"], values["swa"], "swa", transform.norm, transform.rope
+            ),
+            row_job(
+                pools["main"], slots["main"], values["main"], "main", None, index_transform.rope
+            ),
+            footer_job(
+                pools["index"],
+                slots["main"],
+                values["index"],
+                INDEX_PAGE_ROWS,
+                index_transform.norm,
+                index_transform.rope,
+            ),
+            split_job(values["query"], pools["data"], pools["scales"]),
+        ]
+        if fused:
+            quantize_scatter_jobs(jobs)
+        else:
+            for job in jobs:
+                quantize_scatter_jobs([job])
+        torch.cuda.synchronize()
+        return pools
+
+    separate, fused = run(False), run(True)
+    for name in separate:
+        torch.testing.assert_close(fused[name], separate[name], atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "cache_format,dim,norm", [("main", 512, False), ("index", 128, True), ("swa", 512, True)]
+)
+@torch.inference_mode()
+def test_fused_store_norm_rope(cache_format, dim, norm):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import RowTransform
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+        apply_row_transform,
+        unpack_rows,
+    )
+
+    _sm100()
+    torch.manual_seed(613)
+    rows, rope_dim = 37, 64
+    # Finite rows only: non-finite handling is covered by the exact-byte tests.
+    x = torch.randn(rows, dim, dtype=torch.bfloat16, device="cuda") * 3
+    weight = (torch.rand(dim, device="cuda") + 0.5).bfloat16()
+    positions = torch.randint(0, 4096, (rows,), dtype=torch.int32, device="cuda")
+    angles = torch.rand(4096, rope_dim // 2, device="cuda") * 6.283
+    cos_sin = torch.cat((angles.cos(), angles.sin()), -1).contiguous()
+    transform = RowTransform(
+        norm=(weight, 1e-6) if norm else None, rope=(positions, cos_sin, rope_dim)
+    )
+    storage, pool = _storage(rows, dim, cache_format)
+    slots = torch.arange(rows, device="cuda", dtype=torch.int64)
+    slots[5] = -1
+    reference = apply_row_transform(x, transform)
+    expected = _expected(storage.clone(), pool, slots, reference, cache_format)
+    quantize_scatter_rows(pool, slots, x, cache_format, norm=transform.norm, rope=transform.rope)
+    # The fused prologue uses the hardware rsqrt and FMA ordering; a bit may
+    # differ at a rounding boundary, so compare dequantized rows and bound the
+    # raw byte mismatch instead of demanding exact bytes.
+    assert (storage != expected).float().mean().item() < 0.01
+    torch.testing.assert_close(
+        unpack_rows(pool[slots[slots >= 0]], dim, cache_format).float(),
+        reference[slots >= 0].float(),
+        atol=0.25 if cache_format == "swa" else 1.5,
+        rtol=0.1,
+    )
+    if not norm:
+        # The fused RoPE rounds exactly as mla_rope_inplace does.
+        rotated = x.clone().unsqueeze(1)
+        torch.ops.trtllm.mla_rope_inplace(
+            rotated,
+            positions,
+            cos_sin.view(-1, 2, rope_dim // 2),
+            1,
+            dim - rope_dim,
+            rope_dim,
+            False,
+            False,
+        )
+        separate, separate_pool = _storage(rows, dim, cache_format)
+        quantize_scatter_rows(separate_pool, slots, rotated.squeeze(1), cache_format)
+        assert torch.equal(separate, storage)
+    if cache_format == "index":
+        pages = torch.zeros(2 * 64 * 68, dtype=torch.uint8, device="cuda")
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import (
+            quantize_scatter_index_pages,
+        )
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import read_index_rows
+
+        quantize_scatter_index_pages(pages, slots, x, 64, norm=transform.norm, rope=transform.rope)
+        torch.testing.assert_close(
+            unpack_rows(read_index_rows(pages, slots[slots >= 0]), dim, "index").float(),
+            reference[slots >= 0].float(),
+            atol=1.5,
+            rtol=0.1,
+        )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("cache_format,dim", [("main", 512), ("index", 128), ("swa", 512)])
+@torch.inference_mode()
+def test_fused_store_graph_changes_padding(cache_format, dim):
+    _sm100()
+    torch.manual_seed(913)
+    x = _values(33, dim, cache_format)
+    storage, pool = _storage(33, dim, cache_format)
+    slots = torch.arange(33, device="cuda", dtype=torch.int64)
+    for _ in range(3):
+        quantize_scatter_rows(pool, slots, x, cache_format)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        quantize_scatter_rows(pool, slots, x, cache_format)
+    for valid_count in (33, 0, 1, 17, 33):
+        slots.copy_(torch.arange(33, device="cuda"))
+        slots[valid_count:] = 2**40
+        x.neg_()
+        storage.fill_(77)
+        expected = _expected(storage, pool, slots, x, cache_format)
+        graph.replay()
+        torch.testing.assert_close(storage, expected, atol=0, rtol=0)
+
+
+def _gather_reference(pool, slots, dim, cache_format):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import unpack_rows
+
+    valid = (slots >= 0) & (slots < pool.shape[0])
+    if pool.shape[0] == 0:
+        return torch.zeros((*slots.shape, dim), dtype=torch.bfloat16, device=pool.device)
+    selected = pool[torch.where(valid, slots, 0).long()]
+    decoded = unpack_rows(selected, dim, cache_format)
+    return torch.where(valid[..., None], decoded, 0)
+
+
+def _assert_bf16_decode(actual, expected):
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+    finite = torch.isfinite(expected)
+    torch.testing.assert_close(
+        actual.view(torch.int16)[finite], expected.view(torch.int16)[finite], atol=0, rtol=0
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "cache_format,dim,slot_dtype,rank",
+    [
+        ("main", 512, torch.int64, 2),
+        ("index", 128, torch.int32, 1),
+        ("swa", 512, torch.int64, 2),
+        ("main", 48, torch.int32, 1),
+        ("index", 96, torch.int64, 2),
+        ("swa", 96, torch.int32, 1),
+    ],
+)
+def test_fused_gather_strided_exact(cache_format, dim, slot_dtype, rank):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import gather_rows
+
+    _sm100()
+    torch.manual_seed(791)
+    storage, pool = _storage(33, dim, cache_format)
+    pool[:33].copy_(pack_rows(_values(33, dim, cache_format), cache_format))
+    # Additional allocated rows are initialized, including padding ownership bytes.
+    before = storage.clone()
+    backing = torch.empty(66, dtype=slot_dtype, device="cuda")
+    flat = backing[::2]
+    flat.copy_(torch.arange(33, device="cuda") % 33)
+    flat[1], flat[3] = -1, pool.shape[0]
+    flat[5] = 2**40 if slot_dtype == torch.int64 else 2**30
+    flat[7] = -(2**50) if slot_dtype == torch.int64 else -100
+    slots = flat.reshape(3, 11) if rank == 2 else flat
+    expected = _gather_reference(pool, slots, dim, cache_format)
+    actual = gather_rows(pool, slots, dim, cache_format)
+    _assert_bf16_decode(actual, expected)
+    torch.testing.assert_close(storage, before, atol=0, rtol=0)
+
+
+def _fp8_python(code):
+    import math
+
+    sign = -1.0 if code & 128 else 1.0
+    exponent, mantissa = (code >> 3) & 15, code & 7
+    if exponent == 15 and mantissa == 7:
+        return math.copysign(float("nan"), sign)
+    if exponent == 0:
+        return sign * mantissa * 2.0**-9
+    return sign * (1.0 + mantissa / 8.0) * 2.0 ** (exponent - 7)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("cache_format,dim", [("main", 512), ("index", 128), ("swa", 512)])
+def test_fused_gather_all_scale_bytes(cache_format, dim):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import gather_rows
+
+    _sm100()
+    _, pool = _storage(256, dim, cache_format)
+    data_bytes = dim if cache_format == "swa" else dim // 2
+    payload = torch.arange(data_bytes, dtype=torch.int64, device="cuda").to(torch.uint8)
+    pool[:256, :data_bytes].copy_(payload)
+    pool[:256, data_bytes:].copy_(torch.arange(256, device="cuda", dtype=torch.uint8)[:, None])
+    slots = torch.arange(256, device="cuda", dtype=torch.int64)
+    actual = gather_rows(pool, slots, dim, cache_format)
+    _assert_bf16_decode(actual, _gather_reference(pool, slots, dim, cache_format))
+    levels = (
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    )
+    expected_rows = []
+    for scale_byte in range(256):
+        scale = _fp8_python(scale_byte) if cache_format == "main" else 2.0 ** (scale_byte - 127)
+        # Mirror the FP32 intermediate range before rounding into BF16.
+        if cache_format != "main" and scale_byte == 255:
+            scale = float("inf")
+        values = []
+        for channel in range(dim):
+            if cache_format == "swa":
+                value = _fp8_python(channel % 256)
+            else:
+                byte = (channel // 2) % 256
+                value = levels[(byte >> (channel % 2 * 4)) & 15]
+            values.append(value * scale)
+        expected_rows.append(values)
+    independent = torch.tensor(expected_rows, dtype=torch.float64).float().bfloat16().cuda()
+    _assert_bf16_decode(actual, independent)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("cache_format,dim", [("main", 512), ("index", 128), ("swa", 512)])
+def test_fused_gather_graph_refresh(cache_format, dim):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import gather_rows
+
+    _sm100()
+    torch.manual_seed(792)
+    _, pool = _storage(33, dim, cache_format)
+    pool[:33].copy_(pack_rows(_values(33, dim, cache_format), cache_format))
+    slots = torch.arange(33, device="cuda", dtype=torch.int64).reshape(3, 11)
+    gather_rows(pool, slots, dim, cache_format)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = gather_rows(pool, slots, dim, cache_format)
+    for active in (0, 17, 33):
+        flat = torch.arange(33, device="cuda", dtype=torch.int64)
+        slots.copy_(torch.where(flat < active, flat, 2**40).reshape_as(slots))
+        pool[:33, 0].bitwise_xor_(8)
+        graph.replay()
+        _assert_bf16_decode(actual, _gather_reference(pool, slots, dim, cache_format))
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_gather_empty_and_fallback(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import quantization
+
+    _sm100()
+    pool = torch.empty((0, 288), dtype=torch.uint8, device="cuda")
+    slots = torch.tensor([[-1, 0, 2**40]], dtype=torch.int64, device="cuda")
+    assert torch.count_nonzero(quantization.gather_rows(pool, slots, 512, "main")) == 0
+    empty = slots[:, :0]
+    assert quantization.gather_rows(pool, empty, 512, "main").shape == (1, 0, 512)
+    _, pool = _storage(33, 512, "main")
+    expected = _gather_reference(pool, slots, 512, "main")
+    monkeypatch.setattr(quantization, "_fused_gather_supported", lambda _: False)
+    _assert_bf16_decode(quantization.gather_rows(pool, slots, 512, "main"), expected)
+
+
+def test_kernel_import_without_optional_cute_or_cuda_context():
+    kernel = (
+        Path(__file__).resolve().parents[6]
+        / "tensorrt_llm/_torch/attention/backends/sparse/csa2/kernel.py"
+    )
+    program = """
+import importlib.abc
+import importlib.util
+import sys
+import torch
+import triton
+
+class RejectOptional(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname.split('.')[0] in {'cutlass', 'cuda'}:
+            raise AssertionError('Unexpected optional import: ' + fullname)
+
+sys.meta_path.insert(0, RejectOptional())
+assert not torch.cuda.is_initialized()
+spec = importlib.util.spec_from_file_location('csa2_import_probe', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert not torch.cuda.is_initialized()
+assert hasattr(torch.ops.trtllm, 'csa2_indexer_q_gemm_rope_fp4')
+"""
+    subprocess.run([sys.executable, "-c", program, str(kernel)], check=True, timeout=60)
+
+
+@pytest.mark.parametrize(
+    "cache_format,dim,expected_bytes", [("main", 512, 288), ("index", 128, 68), ("swa", 512, 528)]
+)
+def test_quantized_row_layout(cache_format, dim, expected_bytes):
+    x = torch.zeros(2, dim, dtype=torch.bfloat16)
+    x[1] = 6
+    rows = pack_rows(x, cache_format)
+    assert rows.shape == (2, expected_bytes)
+    assert row_bytes(dim, cache_format) == expected_bytes
+    torch.testing.assert_close(unpack_rows(rows, dim, cache_format), x, atol=0, rtol=0)
+    assert torch.all(rows[0, dim if cache_format == "swa" else dim // 2 :] != 0)
+
+
+def test_fp4_midpoint_rounding_and_rope_tail():
+    x = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0] * 2)
+    x[8:] = -x[8:]
+    rows = pack_rows(x[None], "main")
+    assert rows[0, -1].item() == 56  # E4M3 1.0
+    codes = torch.stack((rows[0, :-1] & 15, rows[0, :-1] >> 4), dim=-1).flatten()
+    assert codes.tolist() == [0, 2, 2, 4, 4, 6, 6, 7, 8, 10, 10, 12, 12, 14, 14, 15]
+    # No special BF16 tail: every channel, including the final RoPE group,
+    # follows exactly the same packed quantization contract.
+    torch.testing.assert_close(
+        unpack_rows(rows, 16, "main", torch.float32),
+        torch.tensor([[0, 1, 1, 2, 2, 4, 4, 6, 0, -1, -1, -2, -2, -4, -4, -6.0]]),
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_quantization_cuda_graph_changed_values():
+    x = torch.ones(4, 128, dtype=torch.bfloat16, device="cuda")
+    for _ in range(3):
+        pack_rows(x, "main")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        packed = pack_rows(x, "main")
+        restored = unpack_rows(packed, 128, "main")
+    for value in (0.0, 3.0, -6.0):
+        x.fill_(value)
+        graph.replay()
+        torch.testing.assert_close(restored, x, atol=0, rtol=0)
+
+
+def _stage_fixture(queries, swa_width, main_width, *, empty_pool=False, extra_width=None):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+
+    torch.manual_seed(711)
+    q = torch.empty(queries, 1, 512, dtype=torch.bfloat16, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(
+        q, (main_width or 0) if extra_width is None else extra_width
+    )
+    rows = 0 if empty_pool else 23
+    swa = pack_rows(torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    main_storage = torch.empty(rows, 360, dtype=torch.uint8, device="cuda")
+    main = main_storage[:, :288]
+    main.copy_(pack_rows(torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16), "main"))
+    if rows:
+        # Finite edge payloads include negative zero and the smallest SWA scale.
+        swa[0, :512] = 128
+        swa[0, 512:] = 0
+        swa[0, 0], swa[0, 1] = 56, 184  # E4M3 +1/-1 produce nonzero subnormals.
+        main[0, :256] = 136
+        main[0, 256:] = 1
+    dtype = torch.int32 if main_width is None else torch.int64
+
+    def slots(width):
+        backing = torch.zeros(queries, width * 2, dtype=dtype, device="cuda")
+        selected = backing[:, ::2]
+        selected.copy_(torch.arange(width, device="cuda") % max(rows, 1))
+        selected[:, 2::5] = -1
+        selected[:, 3::11] = (1 << 40) if dtype == torch.int64 else 10000
+        if queries > 1:
+            selected[0].fill_(-1)
+        return selected
+
+    si = slots(swa_width)
+    mi = None if main_width is None else slots(main_width)
+    if queries > 1:
+        si[1].fill_(-1)  # Main selections must fill the primary pool first.
+    return metadata, CSA2BackendForwardArgs(
+        swa_pool=swa, swa_indices=si, main_pool=main, topk_indices=mi
+    )
+
+
+def _stage_oracle(metadata, inputs):
+    sources = [(inputs.swa_pool, inputs.swa_indices, "swa")]
+    if inputs.topk_indices is not None:
+        sources.append((inputs.main_pool, inputs.topk_indices, "main"))
+    # Independent BF16 decode reference: never the CuTe dequant under test.
+    rows = torch.cat([_gather_reference(p, s, 512, fmt) for p, s, fmt in sources], 1)
+    valid = torch.cat([(s >= 0) & (s < p.shape[0]) for p, s, _ in sources], 1)
+    positions = torch.arange(rows.shape[1], device=rows.device).expand(valid.shape)
+    order = torch.where(valid, positions, rows.shape[1]).argsort(dim=1, stable=True)
+    packed = rows.gather(1, order[..., None].expand(-1, -1, 512))
+    counts = valid.sum(1, dtype=torch.int32)
+    packed = torch.where((positions < counts[:, None])[..., None], packed, 0)
+    primary, extra = torch.zeros_like(metadata.swa_pool), torch.zeros_like(metadata.extra_pool)
+    primary[:, : min(rows.shape[1], 128)] = packed[:, :128]
+    if rows.shape[1] > 128:
+        extra[:, : rows.shape[1] - 128] = packed[:, 128:]
+    lengths = counts.clamp_min(1)
+    columns = torch.arange(metadata.num_sparse_topk, device=rows.device)[None, :]
+    query = torch.arange(rows.shape[0], device=rows.device)[:, None]
+    indices = torch.where(
+        columns < 128,
+        query * 128 + columns,
+        query * (metadata.num_sparse_topk - 128) + columns - 128,
+    )
+    indices = torch.where(columns < lengths[:, None], indices, -1).int()
+    return primary, extra, lengths, indices
+
+
+def _published_rows(metadata, queries):
+    """Each query's staged rows as its published indices and lengths reach them."""
+    indices = metadata.prepared_indices[:queries].long()
+    columns = torch.arange(indices.shape[1], device="cuda").expand_as(indices)
+    valid = columns < metadata.prepared_lens[:queries, None]
+    width = 512 * metadata.swa_pool.dtype.itemsize
+    rows = torch.zeros(*indices.shape, width, dtype=torch.uint8, device="cuda")
+    primary, extra = valid & (columns < 128), valid & (columns >= 128)
+    rows[primary] = metadata.swa_pool.view(torch.uint8).view(-1, width)[indices[primary]]
+    rows[extra] = metadata.extra_pool.view(torch.uint8).view(-1, width)[indices[extra]]
+    return rows
+
+
+def _check_stage(metadata, expected):
+    for actual, reference in zip(
+        (metadata.swa_pool, metadata.extra_pool, metadata.prepared_lens, metadata.prepared_indices),
+        expected,
+    ):
+        if actual.dtype == torch.bfloat16:
+            actual, reference = actual.view(torch.int16), reference.view(torch.int16)
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+    assert metadata.prepared_counter.item() == 0
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "queries,swa_width,main_width,empty_pool,extra_width",
+    [
+        (1, 128, None, False, None),
+        (8, 17, 17, False, None),
+        (128, 128, 512, False, None),
+        (1, 0, 17, False, None),
+        (1, 17, 17, True, None),
+        (1, 17, 17, False, 4096),
+    ],
+)
+def test_native_staging_exact(queries, swa_width, main_width, empty_pool, extra_width, monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+
+    _sm100()
+    calls = []
+    original = kernel.stage_selected_rows
+
+    def stage(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "stage_selected_rows", stage)
+    metadata, inputs = _stage_fixture(
+        queries, swa_width, main_width, empty_pool=empty_pool, extra_width=extra_width
+    )
+    expected = _stage_oracle(metadata, inputs)
+    metadata.swa_pool.fill_(13)
+    metadata.extra_pool.fill_(17)
+    metadata.prepared_counter.fill_(19)
+    metadata.stage_selected(inputs)
+    _check_stage(metadata, expected)
+    assert bool(calls) == (metadata.num_sparse_topk <= 4096)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_staging_group_reuse_validates_each_layers_own_slots():
+    """A reused compaction still decodes slots the compacting layer never resolved.
+
+    Staging groups key on the KV owner and index source, so they span layers whose
+    SWA pool and SWA slots are private to each layer. A column the group's first
+    layer resolved can therefore be empty in a later one.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import stage_selected_rows
+
+    _sm100()
+    queries, width = 4, 17
+    metadata, inputs = _stage_fixture(queries, width, None)
+    rows, row_bytes = inputs.swa_pool.shape
+    resolved = (
+        torch.arange(width, device="cuda", dtype=torch.int64)
+        .remainder(rows)[None, :]
+        .expand(queries, width)
+        .contiguous()
+    )
+    scratch = {
+        "tags": torch.empty(queries, metadata.num_sparse_topk, dtype=torch.int32, device="cuda"),
+        "counts": torch.empty(queries, dtype=torch.int32, device="cuda"),
+        "row_slots": torch.empty(
+            queries, metadata.num_sparse_topk, dtype=torch.int32, device="cuda"
+        ),
+    }
+    # The first layer of the group resolves every column, so it tags all of them.
+    stage_selected_rows(
+        inputs.swa_pool, resolved, inputs.swa_pool, None, metadata, scratch, compact=True
+    )
+    assert scratch["counts"].tolist() == [width] * queries
+    # The later layer's private pool starts one row into a sentinel buffer, so the
+    # row an unvalidated negative slot reaches decodes to +1.0 instead of zero.
+    sentinel = torch.empty(rows + 1, row_bytes, dtype=torch.uint8, device="cuda")
+    sentinel[:, :512], sentinel[:, 512:] = 56, 127  # E4M3 +1.0 with a 2**0 scale
+    metadata.swa_pool.fill_(13)
+    metadata.extra_pool.fill_(17)
+    stage_selected_rows(
+        sentinel[1:],
+        torch.full((queries, width), -1, device="cuda", dtype=torch.int64),
+        sentinel[1:],
+        None,
+        metadata,
+        scratch,
+        compact=False,
+    )
+    # Every tagged column is empty for this layer, so every staged row stays zero.
+    assert torch.count_nonzero(metadata.swa_pool) == 0
+    assert torch.count_nonzero(metadata.extra_pool) == 0
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_native_staging_graph_refresh():
+    _sm100()
+    metadata, inputs = _stage_fixture(8, 128, 17)
+    metadata.stage_selected(inputs)
+    tensor_names = ("swa_pool", "extra_pool", "prepared_indices", "prepared_lens")
+    pointers = [getattr(metadata, name).data_ptr() for name in tensor_names]
+    retained = metadata.get_workspace_bytes()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        metadata.stage_selected(inputs)
+    for selection, payload in ((0, 56), (-1, 128), (2, 32), (2, 184)):
+        inputs.swa_indices.fill_(selection)
+        inputs.topk_indices.fill_(selection)
+        inputs.swa_pool[2, :512].fill_(payload)
+        inputs.main_pool[2, :256].fill_(payload)
+        expected = _stage_oracle(metadata, inputs)
+        metadata.swa_pool.fill_(13)
+        metadata.extra_pool.fill_(17)
+        metadata.prepared_counter.fill_(19)
+        graph.replay()
+        _check_stage(metadata, expected)
+    assert pointers == [getattr(metadata, name).data_ptr() for name in tensor_names]
+    assert retained == metadata.get_workspace_bytes()
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("repeat", [1, 48])
+def test_native_staging_dedup_matches_independent_rows(repeat):
+    """Verification queries read their request anchor's staged rows through the indices.
+
+    Repeating the requests 48 times stages blocks of four queries per CTA.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+
+    _sm100()
+    torch.manual_seed(951)
+    # The last request straddles the aligned group of eight queries at query 8.
+    lengths, main_width, page_size, positions = [2, 2, 1, 2, 3, 2] * repeat, 32, 16, 256
+    requests, queries = len(lengths), sum(lengths)
+    request_ids = torch.repeat_interleave(torch.arange(requests), torch.tensor(lengths)).cuda()
+    offsets = torch.cat([torch.arange(n) for n in lengths]).cuda()
+    starts = torch.arange(queries).cuda() - offsets
+    anchors = torch.maximum(starts, torch.arange(queries).cuda() // 8 * 8)
+    swa = pack_rows(torch.randn(requests * 136, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    main = pack_rows(
+        torch.randn(requests * positions, 512, device="cuda", dtype=torch.bfloat16), "main"
+    )
+    # Each query's SWA window is its request's window shifted by its offset; its main
+    # selection permutes its request's selection with a few positions replaced.
+    windows = torch.randperm(swa.shape[0], device="cuda").view(requests, 136)
+    swa_slots = torch.stack([windows[r, k : k + 128] for r, k in zip(request_ids, offsets)])
+    # Empty anchor SWA slots move two of its main rows into the primary pool, where its
+    # follower's main rows must not reference them.
+    swa_slots[0, :2] = -1
+    base = torch.stack([torch.randperm(positions - 1, device="cuda")[:main_width] for _ in lengths])
+    logical = torch.stack([base[r][torch.randperm(main_width, device="cuda")] for r in request_ids])
+    logical[offsets > 0, :3] = torch.randint(0, positions - 1, (int((offsets > 0).sum()), 3)).cuda()
+    table = torch.randperm(requests * positions // page_size, device="cuda", dtype=torch.int32)
+    inputs = CSA2BackendForwardArgs(
+        swa_pool=swa,
+        swa_indices=swa_slots,
+        main_pool=main,
+        topk_indices=logical,
+        main_mapping=(
+            table.view(requests, -1),
+            page_size,
+            positions,
+            request_ids,
+            torch.full((queries,), positions - 1, device="cuda", dtype=torch.int64),
+        ),
+    )
+    q = torch.empty(queries, 64, 512, dtype=torch.bfloat16, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, main_width, staging_dtype=torch.float8_e4m3fn)
+
+    def gathered():
+        indices = metadata.prepared_indices[:queries].long()
+        columns = torch.arange(indices.shape[1], device="cuda").expand_as(indices)
+        valid = columns < metadata.prepared_lens[:queries, None]
+        rows = torch.zeros(*indices.shape, 512, dtype=torch.uint8, device="cuda")
+        primary, extra = valid & (columns < 128), valid & (columns >= 128)
+        rows[primary] = metadata.swa_pool.view(torch.uint8).view(-1, 512)[indices[primary]]
+        rows[extra] = metadata.extra_pool.view(torch.uint8).view(-1, 512)[indices[extra]]
+        return rows, indices.clone(), valid
+
+    metadata.stage_selected(inputs)
+    independent, own, valid = gathered()
+    metadata.swa_pool.fill_(13)
+    metadata.extra_pool.fill_(17)
+    metadata.stage_selected(inputs, dedup=True)
+    shared, indices, _ = gathered()
+    assert torch.equal(shared, independent)
+    referenced = (indices != own) & valid
+    followers = anchors != torch.arange(queries).cuda()
+    assert not referenced[~followers].any()
+    if repeat == 1:
+        # Followers reference the shifted SWA rows and all but the replaced or moved main
+        # rows; at scale, the bounded hash probing can leave a few more rows unreferenced.
+        assert referenced[followers, :128].sum(1).ge(120).all()
+        assert referenced[followers, 128:].sum(1).ge(main_width - 5).all()
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("main_magnitude, repeat", [(1, 80), (3000, 1)])
+def test_native_staging_group_reuse_matches_full_staging(main_magnitude, repeat):
+    """Later layers of a staging group keep its main rows unless their KV scale changes.
+
+    Every layer brings its own SWA pool. The second layer's rows decode far above 448,
+    so its FP8 scale differs and it restages every row, as does the third one, back at
+    the unit scale; the fourth restages only its SWA rows. Large main rows set every
+    layer's scale, which later layers derive from the main scale bits the group's first
+    layer recorded. Repeating the requests 80 times stages blocks of four queries per CTA.
+    """
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+
+    _sm100()
+    torch.manual_seed(953)
+    lengths, main_width, page_size, positions = [3, 1, 4] * repeat, 160, 16, 512
+    requests, queries = len(lengths), sum(lengths)
+    request_ids = torch.repeat_interleave(torch.arange(requests), torch.tensor(lengths)).cuda()
+    offsets = torch.cat([torch.arange(n) for n in lengths]).cuda()
+    windows = torch.randperm(requests * 136, device="cuda").view(requests, 136)
+    swa_slots = torch.stack([windows[r, k : k + 128] for r, k in zip(request_ids, offsets)])
+    swa_slots[0, :20] = -1
+    base = torch.stack([torch.randperm(positions - 1, device="cuda")[:main_width] for _ in lengths])
+    logical = base[request_ids].int()
+    logical[offsets > 0, :7] = torch.randint(
+        0, positions - 1, (int((offsets > 0).sum()), 7), dtype=torch.int32, device="cuda"
+    )
+    main = pack_rows(
+        (torch.randn(requests * positions, 512, device="cuda") * main_magnitude).to(torch.bfloat16),
+        "main",
+    )
+    table = torch.randperm(requests * positions // page_size, device="cuda", dtype=torch.int32)
+    inputs = CSA2BackendForwardArgs(
+        swa_indices=swa_slots,
+        main_pool=main,
+        topk_indices=logical,
+        main_logical_indices=logical,
+        main_mapping=(
+            table.view(requests, -1),
+            page_size,
+            positions,
+            request_ids,
+            torch.full((queries,), positions - 1, device="cuda", dtype=torch.int64),
+        ),
+    )
+    q = torch.randn(queries, 64 * 512, device="cuda").to(torch.bfloat16)
+    tiles = [
+        CSA2TrtllmMetadata.for_query_tile(
+            q.view(queries, 64, 512), main_width, staging_dtype=torch.float8_e4m3fn
+        )
+        for _ in range(2)
+    ]
+
+    for magnitude in (1, 3000, 1, 1):
+        swa = pack_rows(
+            (torch.randn(requests * 136, 512, device="cuda") * magnitude).to(torch.bfloat16),
+            "swa",
+        )
+        # The first tile shares one compaction across its layers; the second compacts
+        # and stages every row for each layer.
+        for metadata, group in zip(tiles, ((0, 0, 0), None)):
+            layer = replace(inputs, swa_pool=swa, stage_group=group)
+            quant, dequant = metadata.derive_stage_kv_scales(layer, q=q)
+            assert (quant.item() < 1) == (magnitude > 1 or main_magnitude > 1)
+            metadata.stage_selected(
+                layer,
+                main_logical=logical,
+                dedup=True,
+                kv_scale_orig_quant=quant,
+                kv_scale_quant_orig=dequant,
+                q_scale_quant_orig=quant,
+            )
+        assert torch.equal(_published_rows(tiles[0], queries), _published_rows(tiles[1], queries))
+        assert torch.equal(tiles[0].prepared_lens[:queries], tiles[1].prepared_lens[:queries])
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("scale, repeat", [(4.0, 80), (0.3, 1)])
+def test_native_staging_rescales_fp8_query(scale, repeat):
+    """Staging with ``q_fixup`` writes ``rescale_fp8_query``'s Q bytes and the same staging.
+
+    Two layers of one staging group cover the full and the reused grid; repeating the
+    requests 80 times stages blocks of four queries per CTA.
+    """
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.query_projection import (
+        rescale_fp8_query,
+    )
+
+    _sm100()
+    torch.manual_seed(1201)
+    lengths, main_width, page_size, positions = [3, 1, 4] * repeat, 160, 16, 512
+    requests, queries = len(lengths), sum(lengths)
+    request_ids = torch.repeat_interleave(torch.arange(requests), torch.tensor(lengths)).cuda()
+    offsets = torch.cat([torch.arange(n) for n in lengths]).cuda()
+    windows = torch.randperm(requests * 136, device="cuda").view(requests, 136)
+    swa_slots = torch.stack([windows[r, k : k + 128] for r, k in zip(request_ids, offsets)])
+    logical = torch.stack(
+        [torch.randperm(positions - 1, device="cuda")[:main_width] for _ in range(queries)]
+    ).int()
+    table = torch.randperm(requests * positions // page_size, device="cuda", dtype=torch.int32)
+    inputs = CSA2BackendForwardArgs(
+        swa_indices=swa_slots,
+        main_pool=pack_rows(
+            torch.randn(requests * positions, 512, device="cuda").to(torch.bfloat16), "main"
+        ),
+        topk_indices=logical,
+        main_logical_indices=logical,
+        main_mapping=(
+            table.view(requests, -1),
+            page_size,
+            positions,
+            request_ids,
+            torch.full((queries,), positions - 1, device="cuda", dtype=torch.int64),
+        ),
+        stage_group=(0, 0, 0),
+    )
+    q = torch.randn(queries, 64 * 512, device="cuda").to(torch.bfloat16)
+    # Unit-scale codes from subnormal to saturated.
+    unit_q = (torch.randn(queries, 64 * 512, device="cuda") * 64).to(torch.float8_e4m3fn)
+    unit_q.view(torch.uint8)[:, :4] = torch.tensor([0x7E, 0xFE, 0x01, 0x81], dtype=torch.uint8)
+    live = torch.full((1,), scale, device="cuda")
+    tiles = [
+        CSA2TrtllmMetadata.for_query_tile(
+            q.view(queries, 64, 512), main_width, staging_dtype=torch.float8_e4m3fn
+        )
+        for _ in range(2)
+    ]
+    quant_q = [unit_q.clone() for _ in tiles]
+    for _ in range(2):
+        layer = replace(
+            inputs,
+            swa_pool=pack_rows(
+                torch.randn(requests * 136, 512, device="cuda").to(torch.bfloat16), "swa"
+            ),
+        )
+        for tile, target, folded in zip(tiles, quant_q, (True, False)):
+            quant, dequant = tile.derive_stage_kv_scales(layer, q=q)
+            if not folded:
+                rescale_fp8_query(target, live)
+            tile.stage_selected(
+                layer,
+                kv_scale_orig_quant=quant,
+                kv_scale_quant_orig=dequant,
+                q_scale_quant_orig=quant,
+                main_logical=logical,
+                dedup=True,
+                q_fixup=(target, live) if folded else None,
+            )
+        assert torch.equal(quant_q[0].view(torch.uint8), quant_q[1].view(torch.uint8))
+        assert torch.equal(_published_rows(tiles[0], queries), _published_rows(tiles[1], queries))
+        assert torch.equal(tiles[0].prepared_lens[:queries], tiles[1].prepared_lens[:queries])
+    assert torch.equal(quant_q[0].view(torch.uint8), unit_q.view(torch.uint8)) == (scale == 1.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_native_staging_validation_and_fallback(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+
+    _sm100()
+    metadata, inputs = _stage_fixture(1, 17, None)
+    # An unused malformed main pool is ignored; a supplied empty selection is validated.
+    inputs.main_pool = torch.zeros(1, device="cuda")
+    metadata.stage_selected(inputs)
+    inputs.topk_indices = inputs.swa_indices[:, :0]
+    with pytest.raises(ValueError, match="wrong row shape or dtype"):
+        metadata.stage_selected(inputs)
+    inputs.topk_indices = None
+    original_slots = inputs.swa_indices
+    backing = torch.empty(inputs.swa_pool.shape[0], 1056, dtype=torch.uint8, device="cuda")
+    backing[:, ::2].copy_(inputs.swa_pool)
+    inputs.swa_pool = backing[:, ::2]
+    expected = _stage_oracle(metadata, inputs)
+    monkeypatch.setattr(
+        kernel, "stage_selected_rows", lambda *args: pytest.fail("Expected fallback")
+    )
+    metadata.stage_selected(inputs)
+    _check_stage(metadata, expected)
+    # The unsupported zero-query direct invocation still resets the counter.
+    metadata._num_tokens = 0
+    inputs.swa_indices = original_slots[:0]
+    metadata.prepared_counter.fill_(19)
+    metadata.stage_selected(inputs)
+    assert metadata.prepared_counter.item() == 0
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("cache_format,dim", [("index", 128), ("swa", 512)])
+@torch.inference_mode()
+def test_fused_store_changed_row_counts(cache_format, dim):
+    """One fixed cache/stride signature serves changing launch grids exactly."""
+    _sm100()
+    torch.manual_seed(814)
+    maximum = 8384
+    storage, pool = _storage(maximum, dim, cache_format)
+    values = _values(maximum, dim, cache_format)
+    slot_storage = torch.empty(maximum * 2, dtype=torch.int64, device="cuda")
+    slots = slot_storage[::2]
+    for rows in (0, 1, 4097, 8384):
+        slots.copy_(torch.arange(maximum, device="cuda"))
+        selected = slots[:rows]
+        if cache_format == "swa" and rows > 128:
+            selected[:-128] = -1  # Real context cache writes retain only the final window.
+        selected[1::31] = -1
+        selected[3::37] = 1 << 40
+        storage.fill_(77)
+        expected = _expected(storage, pool, selected, values[:rows], cache_format)
+        quantize_scatter_rows(pool, selected, values[:rows], cache_format)
+        torch.testing.assert_close(storage, expected, atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dequant,q_dequant", [(1.0, 1.0), (3.0, 2.0)])
+@torch.inference_mode()
+def test_native_fp8_staging_exact_bytes(dequant, q_dequant, monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    control, inputs = _stage_fixture(3, 128, 17)
+    # All E4M3 codes, both zero signs, subnormals and NaNs; scale255 also
+    # yields infinities after decode. Other rows retain random finite values.
+    inputs.swa_pool[2, :512] = torch.arange(512, device="cuda").to(torch.uint8)
+    inputs.swa_pool[2, 512:] = torch.tensor(
+        [127, 126, 128, 136, 255, 0, 127, 127] * 2, device="cuda", dtype=torch.uint8
+    )
+    inputs.swa_indices[2, :4] = torch.tensor([2, 2, 0, 1], device="cuda")
+    # Main payload/scales include FP4 midpoint reconstruction and saturated
+    # E4M3 outputs while retaining the padded 360-byte row stride.
+    inputs.main_pool[2, :256] = torch.arange(256, device="cuda").to(torch.uint8)
+    inputs.main_pool[2, 256:] = torch.tensor(
+        [57, 59, 120, 126] * 8, device="cuda", dtype=torch.uint8
+    )
+    inputs.topk_indices[2, :2] = 2
+    expected = _stage_oracle(control, inputs)
+    q = torch.zeros(3, 64, 512, device="cuda", dtype=torch.bfloat16)
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    dq = torch.tensor([dequant], device="cuda", dtype=torch.float32)
+    q_dq = torch.tensor([q_dequant], device="cuda", dtype=torch.float32)
+    multiplier = dq.reciprocal()
+    calls = []
+    original = kernel.stage_selected_rows
+
+    def stage(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "stage_selected_rows", stage)
+    metadata.prepared_counter.fill_(19)
+    metadata.mla_bmm1_scale.fill_(float("nan"))
+    metadata.mla_bmm2_scale.fill_(float("nan"))
+    metadata.stage_selected(
+        inputs,
+        kv_scale_orig_quant=multiplier,
+        kv_scale_quant_orig=dq,
+        q_scale_quant_orig=q_dq,
+        softmax_scale=512**-0.5,
+    )
+    assert calls == [True]
+    for actual, decoded in zip((metadata.swa_pool, metadata.extra_pool), expected[:2]):
+        quantized, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(decoded, dq)
+        torch.testing.assert_close(
+            actual.view(torch.uint8), quantized.view(torch.uint8), atol=0, rtol=0
+        )
+    torch.testing.assert_close(metadata.prepared_lens, expected[2], atol=0, rtol=0)
+    torch.testing.assert_close(metadata.prepared_indices, expected[3], atol=0, rtol=0)
+    assert metadata.prepared_counter.item() == 0
+    # BMM1 folds the two independent dequant scales, not one shared scale.
+    scale = q_dequant * dequant * 512**-0.5
+    torch.testing.assert_close(
+        metadata.mla_bmm1_scale,
+        torch.tensor([scale, scale * 1.4426950408889634], device="cuda"),
+        atol=1e-7,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(metadata.mla_bmm2_scale, dq, atol=0, rtol=0)
+
+
+def _stage_scale_reference(inputs):
+    """Independent ceiling on the magnitudes the selected rows can decode to.
+
+    Both persistent encoders clamp their payload -- ``main`` codes at the E2M1
+    maximum of 6, ``swa`` values at +-448 -- so a row's group scale alone bounds
+    it, whichever way the encoder rounded that scale.
+    """
+    ceiling = 0.0
+    sources = [(inputs.swa_pool, inputs.swa_indices, "swa")]
+    if inputs.topk_indices is not None:
+        sources.append((inputs.main_pool, inputs.topk_indices, "main"))
+    for pool, slots, cache_format in sources:
+        groups = 16 if cache_format == "swa" else 32
+        valid = (slots >= 0) & (slots < pool.shape[0])
+        if not valid.any():
+            continue
+        observed = pool[torch.where(valid, slots, 0).long()][valid][:, -groups:].flatten()
+        if cache_format == "swa":
+            # Byte 255 is the infinite scale, which no finite scale can bound.
+            finite = observed[observed != 255].int()
+            bound = 448.0 * torch.ldexp(torch.ones_like(finite, dtype=torch.float64), finite - 127)
+        else:
+            # 0x7F is E4M3 NaN; every byte above it encodes a negative scale.
+            finite = observed[observed < 127]
+            bound = 6.0 * finite.view(torch.float8_e4m3fn).double()
+        if bound.numel():
+            ceiling = max(ceiling, bound.max().item())
+    return ceiling
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("case", ["random", "edges", "absent", "huge"])
+@pytest.mark.parametrize("minimum", [-126, 0])
+@torch.inference_mode()
+def test_stage_kv_scale_derivation(case, minimum):
+    """The derived staging scale covers every selected row without saturating."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    _, inputs = _stage_fixture(3, 300, 17)
+    if case == "edges":
+        # E4M3 NaN and the infinite SWA scale cannot be bounded and must not
+        # drive the reduction; the largest finite scales must.
+        inputs.swa_pool[2, 512:] = torch.tensor(
+            [127, 126, 128, 136, 255, 0, 127, 127] * 2, device="cuda", dtype=torch.uint8
+        )
+        inputs.main_pool[2, 256:] = torch.tensor(
+            [57, 59, 120, 126] * 8, device="cuda", dtype=torch.uint8
+        )
+        inputs.swa_indices[2, :4] = 2
+        inputs.topk_indices[2, :2] = 2
+    elif case == "absent":
+        inputs.swa_indices.fill_(-1)
+        inputs.topk_indices.fill_(-1)
+    elif case == "huge":
+        inputs.swa_pool[2, 512:].fill_(254)  # 2**127, past every clamp
+        inputs.swa_indices.masked_fill_(inputs.swa_indices == 2, -1)
+        inputs.swa_indices[2, -1] = 2  # only in the last column block
+    q = torch.zeros(3, 64, 512, device="cuda", dtype=torch.bfloat16)
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    quant, dequant = metadata.derive_stage_kv_scales(inputs, minimum=minimum, maximum=126)
+    assert (quant, dequant) == metadata.stage_kv_scales
+    scale = dequant.item()
+    # A power of two costs no relative precision: it only moves the exponent.
+    assert scale > 0.0 and math.log2(scale).is_integer()
+    assert quant.item() == 1.0 / scale
+    ceiling = _stage_scale_reference(inputs)
+    lowest, highest = 2.0**minimum, 2.0**126
+    if ceiling == 0.0:
+        assert scale == 1.0  # Staging nothing keeps the historical unit scale.
+    elif ceiling > 448.0 * highest:
+        assert scale == highest
+    elif ceiling <= 448.0 * lowest:
+        assert scale == lowest
+    else:
+        # The smallest power of two whose E4M3 range covers the whole ceiling.
+        assert 448.0 * scale >= ceiling > 224.0 * scale
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "amax,expected",
+    [
+        (4.0, 64.0),  # 448 / 4 = 112, so six binades of headroom
+        (1.75, 256.0),  # exactly 2**8 of headroom, the boundary mantissa
+        (1.8, 128.0),  # just past it, one binade tighter
+        (500.0, 1.0),  # Q already saturates: leave the historical unit scale
+        (0.0, 2.0**126),  # a zero Q cannot saturate and bounds nothing
+    ],
+)
+@torch.inference_mode()
+def test_stage_kv_scale_respects_q_headroom(amax, expected):
+    """Q's own range caps the staging scale it has to take the reciprocal of.
+
+    Q carries ``1 / scale`` so that BMM1's dequant product stays one, which the
+    closed cubins behind the other two ``MultiCtasKvMode`` values still assume, so
+    its codes land at ``scale * amax(|Q|)``: a scale wide enough to rescue the KV
+    rows must still leave Q inside the E4M3 range.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    _, inputs = _stage_fixture(3, 128, 17)
+    # A group scale of 2**127 outruns every clamp, so only Q can bound this.
+    inputs.swa_pool[2, 512:].fill_(254)
+    inputs.swa_indices[2, 0] = 2
+    q = torch.full((3, 64, 512), amax, device="cuda", dtype=torch.bfloat16)
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    quant, dequant = metadata.derive_stage_kv_scales(inputs, q=q)
+    assert dequant.item() == expected
+    assert quant.item() == 1.0 / expected
+    if 0.0 < amax <= 448.0:  # A Q that saturates on its own bounds nothing useful.
+        assert expected * amax <= 448.0
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("amax", [1.8, float("nan")])
+@pytest.mark.parametrize("empty_pool", [False, True])
+@pytest.mark.parametrize("late_word", [False, True])
+@torch.inference_mode()
+def test_stage_kv_scale_q_word_matches_q(amax, empty_pool, late_word):
+    """A producer's Q amax word stands in for reading Q, and the derivation consumes it.
+
+    With ``late_word`` the producer raises the word on another stream after a delay;
+    the derivation waits for its event before the finalize reads the word.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    scales = []
+    for use_word in (False, True):
+        _, inputs = _stage_fixture(3, 128, 17, empty_pool=empty_pool)
+        if not empty_pool:
+            inputs.swa_pool[2, 512:].fill_(254)
+            inputs.swa_indices[2, 0] = 2
+        q = torch.full((3, 64, 512), amax, device="cuda", dtype=torch.bfloat16)
+        metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+        if use_word:
+            bits = q.float().abs().amax().reshape(1).view(torch.int32)
+            if late_word:
+                word = torch.zeros(1, dtype=torch.int32, device="cuda")
+                producer, ready = torch.cuda.Stream(), torch.cuda.Event()
+                producer.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(producer):
+                    torch.cuda._sleep(2_000_000)
+                    word.copy_(bits)
+                    ready.record()
+                derived = metadata.derive_stage_kv_scales(inputs, q_word=word, q_ready=ready)
+            else:
+                word = bits.clone()
+                derived = metadata.derive_stage_kv_scales(inputs, q_word=word)
+            torch.cuda.synchronize()
+            assert word.item() == 0
+        else:
+            derived = metadata.derive_stage_kv_scales(inputs, q=q)
+        assert not metadata._csa2_stage_scale_bitmap.any()
+        scales.append(torch.cat(derived))
+    assert torch.equal(scales[0], scales[1])
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_stage_kv_scale_large_q_read_after_rows():
+    """A Q larger than half of L2 is read after the rows, and only when they need range.
+
+    Main rows decoding to 2688 ask for three binades and a Q amax of 100 allows two. The
+    staging group's first layer reduces the main rows and a later one reuses their
+    recorded bits; both keep Q's cap exactly as a small Q read in the same launch does.
+    """
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    _, inputs = _stage_fixture(4, 128, 17)
+    rows = inputs.main_pool.shape[0]
+    inputs.main_pool.copy_(
+        pack_rows(torch.full((rows, 512), 3000.0, device="cuda", dtype=torch.bfloat16), "main")
+    )
+    inputs = replace(inputs, stage_group=(0, 0, 0))
+    for queries in (4, 2048):
+        q = torch.full((queries, 64, 512), 100.0, device="cuda", dtype=torch.bfloat16)
+        metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+        for _ in range(2):
+            quant, dequant = metadata.derive_stage_kv_scales(inputs, q=q)
+            assert dequant.item() == 4.0
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_stage_kv_scale_rescues_saturated_rows():
+    """Rows decoding past 448 survive staging instead of clamping at the E4M3 max."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    control, inputs = _stage_fixture(4, 128, 17)
+    torch.manual_seed(357)
+    rows = inputs.swa_pool.shape[0]
+    # Both encodings carry their own block scales, so packing large magnitudes
+    # is lossless in range; only the unit staging scale used to lose them.
+    inputs.swa_pool.copy_(
+        pack_rows(torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16) * 900, "swa")
+    )
+    inputs.main_pool.copy_(
+        pack_rows(torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16) * 900, "main")
+    )
+    expected = _stage_oracle(control, inputs)
+    q = torch.zeros(4, 64, 512, device="cuda", dtype=torch.bfloat16)
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    unit = metadata.native_unit_scale
+    metadata.stage_selected(inputs, kv_scale_orig_quant=unit, kv_scale_quant_orig=unit)
+    clamped = [pool.float().clone() for pool in (metadata.swa_pool, metadata.extra_pool)]
+    quant, dequant = metadata.derive_stage_kv_scales(inputs)
+    assert dequant.item() > 1.0
+    metadata.stage_selected(inputs, kv_scale_orig_quant=quant, kv_scale_quant_orig=dequant)
+    saturated = 0
+    for pool, before, reference in zip((metadata.swa_pool, metadata.extra_pool), clamped, expected):
+        over = reference.float().abs() > 448.0
+        saturated += int(over.sum())
+        # A unit scale clamped these rows at 448, losing every bit of magnitude.
+        assert before[over].abs().eq(448.0).all()
+        staged = pool.float() * dequant
+        # Half an E4M3 step is 2**-4 relative, and the BF16 decode feeding the
+        # conversion is finer still, so the range is all that was ever missing.
+        torch.testing.assert_close(staged[over], reference.float()[over], atol=0, rtol=0.07)
+    assert saturated > 0
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "amax,expected",
+    [
+        (4.0, 4.0),  # floor(log2(4)) = 2, so Q affords two binades
+        (1.0, 1.0),  # already at unit magnitude: nothing left to divide
+        (0.5, 1.0),  # below it; the bound goes negative and the unit scale stands
+        (2.0**40, 2.0**40),  # a wide Q affords every binade the rows ask for
+        (0.0, 2.0**126),  # a zero Q loses nothing and bounds nothing
+    ],
+)
+@torch.inference_mode()
+def test_stage_kv_scale_respects_q_resolution(amax, expected):
+    """A shared dequant tensor caps the scale by Q's resolution, not its headroom.
+
+    When Q cannot take the reciprocal scale it is divided by the staging scale
+    instead, so it can never saturate -- it runs out of resolution underneath. The
+    bound therefore holds Q's own amax at unit magnitude or above, which leaves it
+    the whole E4M3 normal range below one plus the subnormals under that.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    _, inputs = _stage_fixture(3, 128, 17)
+    # A group scale of 2**127 outruns every clamp, so only Q can bound this.
+    inputs.swa_pool[2, 512:].fill_(254)
+    inputs.swa_indices[2, 0] = 2
+    q = torch.full((3, 64, 512), amax, device="cuda", dtype=torch.bfloat16)
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    quant, dequant = metadata.derive_stage_kv_scales(inputs, q=q, q_shared=True)
+    assert dequant.item() == expected
+    assert quant.item() == 1.0 / expected
+    # A zero Q has no magnitude to keep; otherwise Q stays at unit magnitude, or
+    # the historical unit scale was the floor all along.
+    assert amax == 0.0 or expected == 1.0 or amax / expected >= 1.0
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_stage_kv_scale_rescues_context_rows():
+    """Sharing one dequant tensor still de-saturates the main pool in context.
+
+    The saturation that keeps native FP8 staging opt-in was first observed on image
+    tokens at a chunked-prefill boundary, which runs this path. Context cannot give
+    Q the reciprocal scale, so Q is divided by the staging scale instead: that costs
+    Q resolution underneath but cannot saturate it, so the exponent is bounded by
+    Q's amax and by the binades the main pool can need, not pinned at zero.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
+        _CONTEXT_STAGE_SCALE_MAX_EXPONENT,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    control, inputs = _stage_fixture(4, 128, 17)
+    torch.manual_seed(911)
+    rows = inputs.main_pool.shape[0]
+    # The main pool carries its own block scales, so packing these magnitudes is
+    # lossless in range; only the unit staging scale ever lost them. The SWA rows
+    # stay as the fixture packed them, well inside E4M3, so the main pool alone
+    # drives the exponent here.
+    inputs.main_pool.copy_(
+        pack_rows(torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16) * 900, "main")
+    )
+    # Pin the ceiling at the main pool's structural maximum: its E4M3 group scale
+    # saturates at 448 and its E2M1 codes at 6, so row 0 now decodes to exactly
+    # 6 * 448 = 2688 and no row of any main pool can ever ask for more.
+    inputs.main_pool[0, 256:].fill_(126)
+    expected = _stage_oracle(control, inputs)
+    q = torch.full((4, 64, 512), 64.0, device="cuda", dtype=torch.bfloat16)
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    unit = metadata.native_unit_scale
+    metadata.stage_selected(inputs, kv_scale_orig_quant=unit, kv_scale_quant_orig=unit)
+    clamped = [pool.float().clone() for pool in (metadata.swa_pool, metadata.extra_pool)]
+    quant, dequant = metadata.derive_stage_kv_scales(
+        inputs, q=q, q_shared=True, maximum=_CONTEXT_STAGE_SCALE_MAX_EXPONENT
+    )
+    # 2688 mapped onto 448 is three binades, which is exactly the cap: context
+    # never has to clip what the main pool asks for.
+    assert dequant.item() == 8.0 == 2.0**_CONTEXT_STAGE_SCALE_MAX_EXPONENT
+    assert 64.0 / dequant.item() >= 1.0  # Q gave up resolution, not magnitude.
+    metadata.stage_selected(inputs, kv_scale_orig_quant=quant, kv_scale_quant_orig=dequant)
+    saturated = 0
+    for pool, before, reference in zip((metadata.swa_pool, metadata.extra_pool), clamped, expected):
+        over = reference.float().abs() > 448.0
+        saturated += int(over.sum())
+        # A unit scale clamped these rows at 448, losing every bit of magnitude.
+        assert before[over].abs().eq(448.0).all()
+        staged = pool.float() * dequant
+        # Half an E4M3 step is 2**-4 relative, and the BF16 decode feeding the
+        # conversion is finer still, so the range is all that was ever missing.
+        torch.testing.assert_close(staged[over], reference.float()[over], atol=0, rtol=0.07)
+    assert saturated > 0
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_unfused_fp8_staging_matches_fused_bytes(monkeypatch):
+    """The eager staging fallback reproduces the fused route byte for byte."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    calls = []
+    original = kernel.stage_selected_rows
+
+    def stage(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "stage_selected_rows", stage)
+    staged = []
+    for extra_width, fused in ((17, True), (4096, False)):
+        _, inputs = _stage_fixture(2, 128, 17, extra_width=extra_width)
+        # A selected main row at its format's own ceiling, 6 * 448, makes the
+        # derivation widen; a unit scale would not tell the routes apart.
+        inputs.main_pool[1, 256:].fill_(126)
+        calls.clear()
+        q = torch.zeros(2, 64, 512, device="cuda", dtype=torch.bfloat16)
+        metadata = CSA2TrtllmMetadata.for_query_tile(
+            q, extra_width, staging_dtype=torch.float8_e4m3fn
+        )
+        quant, dequant = metadata.derive_stage_kv_scales(inputs)
+        assert dequant.item() == 8.0  # 2688 mapped onto 448.
+        metadata.mla_bmm1_scale.fill_(float("nan"))
+        metadata.mla_bmm2_scale.fill_(float("nan"))
+        metadata.stage_selected(
+            inputs,
+            kv_scale_orig_quant=quant,
+            kv_scale_quant_orig=dequant,
+            q_scale_quant_orig=metadata.native_unit_scale,
+            softmax_scale=512**-0.5,
+        )
+        assert bool(calls) == fused
+        # The unfused route must publish the same folded BMM scales.
+        scale = dequant * 512**-0.5
+        torch.testing.assert_close(
+            metadata.mla_bmm1_scale,
+            torch.cat((scale, scale * 1.4426950408889634)),
+            atol=0,
+            rtol=1e-6,
+        )
+        torch.testing.assert_close(metadata.mla_bmm2_scale, dequant, atol=0, rtol=0)
+        staged.append(
+            (
+                metadata.swa_pool.view(torch.uint8).clone(),
+                metadata.extra_pool[:, :17].view(torch.uint8).clone(),
+                metadata.prepared_lens.clone(),
+            )
+        )
+    for fused_tensor, unfused in zip(*staged):
+        torch.testing.assert_close(unfused, fused_tensor, atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@torch.inference_mode()
+def test_shared_active_rows_preserve_compaction_and_decode_once(dtype):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import stage_shared_rows
+
+    torch.manual_seed(946)
+    swa = pack_rows(torch.randn(64, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    records = torch.empty(32, 360, device="cuda", dtype=torch.uint8)
+    main = records[:, :288]
+    main.copy_(pack_rows(torch.randn(32, 512, device="cuda", dtype=torch.bfloat16), "main"))
+    swa_values = [[20, -1, 22, 23], [21, 22, 23, 24], [-1] * 4, [37, 38, 39, 40], [20] * 4]
+    logical_values = [[0, 0, 2, -1], [1, 3, 4, (1 << 63) - 1], [-1] * 4, [1, 3, 0, -1], [0] * 4]
+    main_values = [[8, 8, 10, -1], [9, 11, 12, 9], [-1] * 4, [17, 19, 1 << 40, -1], [8] * 4]
+
+    def strided(values):
+        storage = torch.full((len(values), 8), -1, device="cuda", dtype=torch.int64)
+        storage[:, ::2].copy_(torch.tensor(values, device="cuda"))
+        return storage[:, ::2]
+
+    swa_slots, main_slots, logical = map(strided, (swa_values, main_values, logical_values))
+    plan = SimpleNamespace(
+        query_requests=torch.tensor([0, 0, 1, 1, -1], device="cuda", dtype=torch.int64),
+        query_positions=torch.tensor([7, 8, 23, 24, 7], device="cuda", dtype=torch.int32),
+        swa_starts=torch.tensor([4, 20], device="cuda", dtype=torch.int64),
+        swa_offsets=torch.tensor([1, 9, 17], device="cuda", dtype=torch.int64),
+        main_offsets=torch.tensor([17, 21, 25], device="cuda", dtype=torch.int64),
+        swa_pages=torch.tensor([[2, 3, -1, -1], [-1, -1, 4, 5]], device="cuda", dtype=torch.int32),
+        main_pages=torch.tensor([[1], [2]], device="cuda", dtype=torch.int32),
+        swa_page_size=8,
+        main_page_size=8,
+        num_requests=2,
+        swa_rows=16,
+        main_rows=8,
+        swa_first=torch.tensor([0, 2], device="cuda", dtype=torch.int64),
+        swa_floors=torch.tensor([4, 20], device="cuda", dtype=torch.int64),
+        window=1 << 40,
+    )
+    bank = torch.full((25, 512), 7, device="cuda", dtype=dtype)
+    metadata = SimpleNamespace(
+        num_tokens=5,
+        num_sparse_topk=128,
+        shared_pool=bank,
+        _csa2_shared_selected=torch.zeros(25, device="cuda", dtype=torch.int32),
+        _csa2_shared_main_scales=torch.zeros(2, device="cuda", dtype=torch.int32),
+        prepared_indices=torch.empty(5, 128, device="cuda", dtype=torch.int32),
+        prepared_lens=torch.empty(5, device="cuda", dtype=torch.int32),
+        prepared_counter=torch.empty(1, device="cuda", dtype=torch.uint32),
+        mla_bmm1_scale=torch.empty(2, device="cuda"),
+        mla_bmm2_scale=torch.empty(1, device="cuda"),
+    )
+    unit = torch.ones(1, device="cuda")
+    stage_shared_rows(
+        swa,
+        swa_slots,
+        main,
+        main_slots,
+        logical,
+        metadata,
+        plan,
+        kv_scale_orig_quant=unit,
+        kv_scale_quant_orig=unit,
+        q_scale_quant_orig=unit,
+    )
+    expected_ids = [[1, 3, 4, 17, 17, 19], [2, 3, 4, 5, 18, 20], [0], [10, 11, 12, 13, 22, 24], [0]]
+    expected_indices = torch.full_like(metadata.prepared_indices, -1)
+    for row, ids in enumerate(expected_ids):
+        expected_indices[row, : len(ids)] = torch.tensor(ids, device="cuda")
+    torch.testing.assert_close(metadata.prepared_indices, expected_indices, atol=0, rtol=0)
+    torch.testing.assert_close(
+        metadata.prepared_lens,
+        torch.tensor([len(ids) for ids in expected_ids], device="cuda", dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+    selected_rows = sorted({index for ids in expected_ids for index in ids if index})
+    indices = metadata.prepared_indices.clone()
+    decoded_swa, decoded_main = unpack_rows(swa, 512, "swa"), unpack_rows(main, 512, "main")
+    # A later layer of the staging group decodes the same rows from its own SWA pool.
+    other_swa = pack_rows(torch.randn(64, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    for layer_swa, compact in ((swa, True), (other_swa, False)):
+        if not compact:
+            # The bank already holds the group's main rows at this scale.
+            held_main = bank[17:].clone()
+            bank[17:].view(torch.uint8).fill_(85)
+            stage_shared_rows(
+                layer_swa,
+                swa_slots,
+                main,
+                main_slots,
+                logical,
+                metadata,
+                plan,
+                kv_scale_orig_quant=unit,
+                kv_scale_quant_orig=unit,
+                q_scale_quant_orig=unit,
+                compact=False,
+                parity=1,
+            )
+            assert (bank[17:].view(torch.uint8) == 85).all()
+            bank[17:].copy_(held_main)
+            torch.testing.assert_close(metadata.prepared_indices, indices, atol=0, rtol=0)
+        expected_bank = torch.full((25, 512), 7, device="cuda", dtype=torch.bfloat16)
+        expected_bank[0].zero_()
+        decoded_layer = unpack_rows(layer_swa, 512, "swa")
+        # Every main row is decoded; attention reads only the selected ones.
+        for row in [*(row for row in selected_rows if row < 17), *range(17, 25)]:
+            if row < 17:
+                request = int(row >= 9)
+                position = [4, 20][request] + row - [1, 9][request]
+                page = [[2, 3, -1, -1], [-1, -1, 4, 5]][request][position // 8]
+                expected_bank[row].copy_(decoded_layer[page * 8 + position % 8])
+            else:
+                request = int(row >= 21)
+                slot = [8, 16][request] + row - [17, 21][request]
+                expected_bank[row].copy_(decoded_main[slot])
+        expected_bank_bf16 = expected_bank
+        if dtype == torch.float8_e4m3fn:
+            expected_bank = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                expected_bank, unit
+            )[0]
+        torch.testing.assert_close(
+            bank.view(torch.uint8), expected_bank.view(torch.uint8), atol=0, rtol=0
+        )
+    if dtype == torch.float8_e4m3fn:
+        # Another scale decodes the main rows again.
+        stage_shared_rows(
+            other_swa,
+            swa_slots,
+            main,
+            main_slots,
+            logical,
+            metadata,
+            plan,
+            kv_scale_orig_quant=2 * unit,
+            kv_scale_quant_orig=unit / 2,
+            q_scale_quant_orig=unit,
+            compact=False,
+        )
+        selected_main = [row for row in selected_rows if row >= 17]
+        expected_main = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            expected_bank_bf16[selected_main], unit / 2
+        )[0]
+        torch.testing.assert_close(
+            bank[selected_main].view(torch.uint8), expected_main.view(torch.uint8), atol=0, rtol=0
+        )
+    # A second, empty publication clears live indices/marks and the dummy row,
+    # without reading or rewriting any unselected SWA row.
+    previous = bank.clone()
+    swa_slots.fill_(-1)
+    main_slots.fill_(-1)
+    stage_shared_rows(
+        swa,
+        swa_slots,
+        main,
+        main_slots,
+        logical,
+        metadata,
+        plan,
+        kv_scale_orig_quant=unit,
+        kv_scale_quant_orig=unit,
+        q_scale_quant_orig=unit,
+    )
+    assert not metadata._csa2_shared_selected[:17].any()
+    assert (metadata.prepared_lens == 1).all()
+    assert (metadata.prepared_indices[:, 0] == 0).all()
+    assert (metadata.prepared_indices[:, 1:] == -1).all()
+    torch.testing.assert_close(
+        bank[:17].view(torch.uint8), previous[:17].view(torch.uint8), atol=0, rtol=0
+    )
+    # Empty request domains and no MAIN pool use the same offset upper bound.
+    plan.swa_offsets = torch.tensor([1, 1, 9], device="cuda", dtype=torch.int64)
+    plan.main_offsets = torch.tensor([9, 9, 9], device="cuda", dtype=torch.int64)
+    plan.swa_rows, plan.main_rows, plan.main_pages = 8, 0, None
+    metadata.shared_pool = torch.full((9, 512), 7, device="cuda", dtype=dtype)
+    metadata._csa2_shared_selected = torch.zeros(9, device="cuda", dtype=torch.int32)
+    swa_slots.copy_(torch.tensor(swa_values, device="cuda"))
+    stage_shared_rows(
+        swa,
+        swa_slots,
+        None,
+        None,
+        None,
+        metadata,
+        plan,
+        kv_scale_orig_quant=unit,
+        kv_scale_quant_orig=unit,
+        q_scale_quant_orig=unit,
+    )
+    expected_indices.fill_(-1)
+    expected_indices[:, 0] = 0
+    expected_indices[3, :4] = torch.tensor([2, 3, 4, 5], device="cuda")
+    torch.testing.assert_close(metadata.prepared_indices, expected_indices, atol=0, rtol=0)
+    assert metadata.prepared_lens.tolist() == [1, 1, 1, 4, 1]
+    expected_bank = torch.full((9, 512), 7, device="cuda", dtype=torch.bfloat16)
+    expected_bank[0].zero_()
+    expected_bank[2:6].copy_(decoded_swa[37:41])
+    if dtype == torch.float8_e4m3fn:
+        expected_bank = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(expected_bank, unit)[
+            0
+        ]
+    torch.testing.assert_close(
+        metadata.shared_pool.view(torch.uint8), expected_bank.view(torch.uint8), atol=0, rtol=0
+    )
+
+
+# ----------------------------------------------------------------------------
+# Decode glue kernels against their PyTorch references in metadata.py/indexer.py
+# ----------------------------------------------------------------------------
+
+
+def _glue():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+
+    if not kernel.dsl_available():
+        pytest.skip("CSA2 decode glue kernels require the CuTe DSL")
+    return kernel
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_owner_refresh_kernel_matches_reference():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    kernel = _glue()
+    torch.manual_seed(1201)
+    request_count = 3
+    lengths = torch.tensor([3, 2, 2], dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor([140, 300, 905], dtype=torch.int32, device="cuda")
+    query_base = torch.tensor([137, 298, 903], dtype=torch.int32, device="cuda")
+    # One launch serves a ratio-2 owner with compression batch descriptors and
+    # a ratio-4 owner without them, each with its own sources and capacity.
+    owners = []
+    for ratio, source_base, source_lengths, capacity, with_batch in (
+        (2, [137, 298, 900], [3, 0, 5], 8, True),
+        (4, [100, 290, 880], [40, 10, 25], 20, False),
+        # No output rows: only the compression batch descriptors are written.
+        (2, [130, 290, 880], [0, 0, 0], 0, True),
+    ):
+        batch = (
+            [torch.empty(request_count, dtype=torch.int32, device="cuda") for _ in range(2)]
+            + [torch.empty(request_count + 1, dtype=torch.int32, device="cuda")]
+            if with_batch
+            else [None] * 3
+        )
+        owners.append(
+            (
+                torch.tensor(source_base, dtype=torch.int32, device="cuda"),
+                torch.tensor(source_lengths, dtype=torch.int32, device="cuda"),
+                torch.randint(-1, 9, (request_count, 8), dtype=torch.int32, device="cuda"),
+                torch.empty(capacity, dtype=torch.int64, device="cuda"),
+                torch.empty(capacity, dtype=torch.int32, device="cuda"),
+                ratio,
+                128 // ratio,
+                *batch,
+            )
+        )
+    descriptors = torch.tensor(
+        [kernel.owner_slot_descriptor(*owner) for owner in owners],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    # The same launch refreshes the query positions.
+    token_requests = torch.tensor([0, 0, 0, 1, 1, 2, 2], device="cuda")
+    query_offsets = torch.tensor([0, 1, 2, 0, 1, 0, 1], dtype=torch.int32, device="cuda")
+    positions = torch.empty(7, dtype=torch.int32, device="cuda")
+    kernel.refresh_owner_slots(
+        kv_lens,
+        lengths,
+        query_base,
+        descriptors,
+        request_count,
+        20,
+        positions=(positions, token_requests, query_offsets),
+    )
+    _, delta, expected_positions = CSA2TrtllmMetadata._refresh_query_positions(
+        kv_lens, lengths, query_base, token_requests, query_offsets
+    )
+    torch.testing.assert_close(positions, expected_positions, atol=0, rtol=0)
+    for source_base, source_lengths, pages, slots, compressed, ratio, page_size, *batch in owners:
+        outputs = [t for t in (slots, compressed, *batch) if t is not None]
+        expected = [torch.empty_like(t) for t in outputs]
+        CSA2TrtllmMetadata._refresh_owner_slots(
+            source_base,
+            source_lengths,
+            delta,
+            ratio,
+            page_size,
+            pages,
+            *expected[:2],
+            *(expected[2:] or [None] * 3),
+        )
+        for actual, reference_value in zip(outputs, expected):
+            torch.testing.assert_close(actual, reference_value, atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("cwidth", [96, 65536])
+@pytest.mark.parametrize("top_k", [512])
+@torch.inference_mode()
+def test_map_selection_matches_reference(top_k, cwidth):
+    kernel = _glue()
+    torch.manual_seed(1202)
+    count = 4
+    # Candidate columns publish increasing positions; a few columns hold -1.
+    steps = torch.randint(1, 8, (count, cwidth), device="cuda")
+    positions = steps.cumsum(1).to(torch.int32)
+    positions[torch.rand(count, cwidth, device="cuda") < 0.05] = -1
+    counts = torch.tensor([cwidth, 7, 0, cwidth // 3], dtype=torch.int32, device="cuda")
+    # The Top-K writes distinct columns in any order, -1 in unfilled slots; some columns
+    # lie beyond the row's count or the width.
+    selected = torch.full((count, top_k), -1, dtype=torch.int32, device="cuda")
+    picks = min(top_k, cwidth + 5) - top_k // 8
+    for q in range(count):
+        selected[q, :picks] = torch.randperm(cwidth + 5, device="cuda")[:picks]
+        selected[q] = selected[q, torch.randperm(top_k, device="cuda")]
+    # Each row lists its kept columns' positions in column order (so ascending), then -1.
+    expected = torch.full_like(selected, -1)
+    for q in range(count):
+        row = selected[q]
+        columns = row[(row >= 0) & (row < counts[q])].sort().values.long()
+        values = positions[q, columns]
+        values = values[values >= 0]
+        expected[q, : values.numel()] = values
+    mapped = kernel.map_selection_(selected.clone(), positions, counts)
+    torch.testing.assert_close(mapped, expected, atol=0, rtol=0)
+    # The order of the Top-K's output does not matter.
+    shuffled = selected[:, torch.randperm(top_k, device="cuda")]
+    again = kernel.map_selection_(shuffled.clone(), positions, counts)
+    torch.testing.assert_close(again, expected, atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@torch.inference_mode()
+def test_shared_active_rows_heterogeneous_request_domains(dtype: torch.dtype) -> None:
+    """Check request ownership across empty domains, page holes and strided tables."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import stage_shared_rows
+
+    torch.manual_seed(947)
+    requests, page_size, page_columns, swa_width = 16, 8, 6, 4
+    swa_counts = [0, 0, 3, 9, 1, 0, 17, 5, 0, 0, 12, 2, 7, 15, 0, 0]
+    main_counts = [0, 4, 0, 11, 1, 0, 0, 19, 8, 0, 2, 13, 0, 5, 0, 0]
+    starts = [(request * 3) % 17 for request in range(requests)]
+    swa_offsets = [1]
+    for count in swa_counts:
+        swa_offsets.append(swa_offsets[-1] + count)
+    main_offsets = [swa_offsets[-1]]
+    for count in main_counts:
+        main_offsets.append(main_offsets[-1] + count)
+    pages = [
+        [
+            ((request * page_columns + column) * 7) % (requests * page_columns)
+            for column in range(page_columns)
+        ]
+        for request in range(requests)
+    ]
+    # Valid selected physical slots may still point into a missing plan page;
+    # those shared rows must decode to zero instead of touching an invalid page.
+    pages[3][1] = pages[6][1] = pages[7][1] = -1
+    pool_rows = requests * page_columns * page_size
+    swa = pack_rows(torch.randn(pool_rows, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    records = torch.empty(pool_rows, 360, device="cuda", dtype=torch.uint8)
+    main = records[:, :288]
+    main.copy_(pack_rows(torch.randn(pool_rows, 512, device="cuda", dtype=torch.bfloat16), "main"))
+    query_requests, positions, swa_slots, main_slots, logical_rows, expected_ids = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+    for request in reversed(range(requests)):
+        for displacement in (0, swa_counts[request] - 1, swa_counts[request] // 2):
+            position = starts[request] + displacement
+            query_requests.append(request)
+            positions.append(position)
+            selected_swa = []
+            ids = []
+            for column in range(swa_width):
+                logical = position - swa_width + 1 + column
+                page = pages[request][logical // page_size] if logical >= 0 else -1
+                slot = page * page_size + logical % page_size if page >= 0 else 0
+                if column == 1 and request % 3 == 0:
+                    slot = 1 << 40
+                selected_swa.append(slot)
+                if (
+                    0 <= slot < pool_rows
+                    and starts[request] <= logical < starts[request] + swa_counts[request]
+                ):
+                    ids.append(swa_offsets[request] + logical - starts[request])
+            logical = [
+                0,
+                0,
+                main_counts[request] - 1,
+                main_counts[request] // 2,
+                -1,
+                main_counts[request],
+                (1 << 63) - 1,
+            ]
+            selected_main = []
+            for column, row in enumerate(logical):
+                page = (
+                    pages[request][row // page_size] if 0 <= row < page_columns * page_size else -1
+                )
+                slot = page * page_size + row % page_size if page >= 0 else 0
+                if column == 3 and request % 4 == 0:
+                    slot = -1
+                selected_main.append(slot)
+                if 0 <= slot < pool_rows and 0 <= row < main_counts[request]:
+                    ids.append(main_offsets[request] + row)
+            swa_slots.append(selected_swa)
+            main_slots.append(selected_main)
+            logical_rows.append(logical)
+            expected_ids.append(ids or [0])
+
+    def strided(values: list[list[int]], dtype: torch.dtype = torch.int64) -> torch.Tensor:
+        storage = torch.full((len(values), len(values[0]) * 2), -1, device="cuda", dtype=dtype)
+        storage[:, ::2].copy_(torch.tensor(values, device="cuda", dtype=dtype))
+        return storage[:, ::2]
+
+    def strided_pages(values: list[list[int]]) -> torch.Tensor:
+        storage = torch.full(
+            (len(values) * 2, len(values[0])), -1, device="cuda", dtype=torch.int32
+        )
+        storage[::2].copy_(torch.tensor(values, device="cuda", dtype=torch.int32))
+        return storage[::2]
+
+    plan = SimpleNamespace(
+        query_requests=torch.tensor(query_requests, device="cuda", dtype=torch.int64),
+        query_positions=torch.tensor(positions, device="cuda", dtype=torch.int32),
+        swa_starts=torch.tensor(starts, device="cuda", dtype=torch.int64),
+        swa_offsets=torch.tensor(swa_offsets, device="cuda", dtype=torch.int64),
+        main_offsets=torch.tensor(main_offsets, device="cuda", dtype=torch.int64),
+        swa_pages=strided_pages(pages),
+        main_pages=strided_pages(pages),
+        swa_page_size=page_size,
+        main_page_size=page_size,
+        num_requests=requests,
+        swa_rows=sum(swa_counts),
+        main_rows=sum(main_counts),
+        swa_first=torch.tensor(
+            [query_requests.index(r) if r in query_requests else 0 for r in range(requests)],
+            device="cuda",
+            dtype=torch.int64,
+        ),
+        swa_floors=torch.tensor(starts, device="cuda", dtype=torch.int64),
+        window=1 << 40,
+    )
+    bank = torch.full((main_offsets[-1], 512), 7, device="cuda", dtype=dtype)
+    metadata = SimpleNamespace(
+        num_tokens=len(query_requests),
+        num_sparse_topk=128,
+        shared_pool=bank,
+        _csa2_shared_selected=torch.zeros(bank.shape[0], device="cuda", dtype=torch.int32),
+        _csa2_shared_main_scales=torch.zeros(2, device="cuda", dtype=torch.int32),
+        prepared_indices=torch.empty(len(query_requests), 128, device="cuda", dtype=torch.int32),
+        prepared_lens=torch.empty(len(query_requests), device="cuda", dtype=torch.int32),
+        prepared_counter=torch.empty(1, device="cuda", dtype=torch.uint32),
+        mla_bmm1_scale=torch.empty(2, device="cuda"),
+        mla_bmm2_scale=torch.empty(1, device="cuda"),
+    )
+    dequant_scale = torch.tensor([0.3], device="cuda", dtype=torch.float32)
+    stage_shared_rows(
+        swa,
+        strided(swa_slots),
+        main,
+        strided(main_slots),
+        strided(logical_rows),
+        metadata,
+        plan,
+        kv_scale_orig_quant=dequant_scale.reciprocal(),
+        kv_scale_quant_orig=dequant_scale,
+        q_scale_quant_orig=dequant_scale,
+    )
+    expected_indices = torch.full_like(metadata.prepared_indices, -1)
+    for query, ids in enumerate(expected_ids):
+        expected_indices[query, : len(ids)] = torch.tensor(ids, device="cuda")
+    torch.testing.assert_close(metadata.prepared_indices, expected_indices, atol=0, rtol=0)
+    assert metadata.prepared_lens.tolist() == [len(ids) for ids in expected_ids]
+    selected_rows = {row for ids in expected_ids for row in ids if row}
+    # Build the numerical oracle request by request, without a flat-row owner lookup.
+    expected_bank = torch.full_like(bank, 7)
+    expected_bank[0].zero_()
+    for packed, offsets, counts, fmt in (
+        (swa, swa_offsets, swa_counts, "swa"),
+        (main, main_offsets, main_counts, "main"),
+    ):
+        decoded = unpack_rows(packed, 512, fmt)
+        for request, count in enumerate(counts):
+            for logical in range(count):
+                bank_row = offsets[request] + logical
+                if fmt == "swa" and bank_row not in selected_rows:
+                    continue
+                position = logical + (starts[request] if fmt == "swa" else 0)
+                page = pages[request][position // page_size]
+                value = (
+                    decoded[page * page_size + position % page_size].clone()
+                    if page >= 0
+                    else torch.zeros(512, device="cuda", dtype=torch.bfloat16)
+                )
+                if dtype == torch.float8_e4m3fn:
+                    value = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                        value.unsqueeze(0), dequant_scale
+                    )[0][0]
+                expected_bank[bank_row].copy_(value)
+    torch.testing.assert_close(
+        bank.view(torch.uint8), expected_bank.view(torch.uint8), atol=0, rtol=0
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@torch.inference_mode()
+def test_shared_active_rows_reuse_request_count_specialization(
+    dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing active request counts preserves results and reuses compiled kernels."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+
+    # Isolate the CuTe compilation cache so this test proves that request
+    # count changes reuse the same compiled staging functions.
+    monkeypatch.setattr(kernel, "_COMPILED", {})
+    compiled_staging = None
+    torch.manual_seed(953)
+    max_requests, domain_rows, page_size, queries = 32, 96, 8, 5
+    page_columns = domain_rows // page_size
+    pool_rows = max_requests * domain_rows
+    swa = pack_rows(torch.randn(pool_rows, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    records = torch.empty(pool_rows, 360, device="cuda", dtype=torch.uint8)
+    main = records[:, :288]
+    main.copy_(pack_rows(torch.randn(pool_rows, 512, device="cuda", dtype=torch.bfloat16), "main"))
+    decoded_swa, decoded_main = unpack_rows(swa, 512, "swa"), unpack_rows(main, 512, "main")
+    pages = torch.arange(max_requests * page_columns, device="cuda", dtype=torch.int32).reshape(
+        max_requests, page_columns
+    )
+    plan = SimpleNamespace(
+        query_requests=torch.empty(queries, device="cuda", dtype=torch.int64),
+        query_positions=torch.empty(queries, device="cuda", dtype=torch.int32),
+        swa_starts=torch.zeros(max_requests, device="cuda", dtype=torch.int64),
+        swa_offsets=torch.empty(max_requests + 1, device="cuda", dtype=torch.int64),
+        main_offsets=torch.empty(max_requests + 1, device="cuda", dtype=torch.int64),
+        swa_pages=pages,
+        main_pages=pages,
+        swa_page_size=page_size,
+        main_page_size=page_size,
+        num_requests=1,
+        swa_rows=domain_rows,
+        main_rows=domain_rows,
+        swa_first=torch.zeros(max_requests, device="cuda", dtype=torch.int64),
+        swa_floors=torch.zeros(max_requests, device="cuda", dtype=torch.int64),
+        window=1 << 40,
+    )
+    bank = torch.empty(1 + 2 * domain_rows, 512, device="cuda", dtype=dtype)
+    metadata = SimpleNamespace(
+        num_tokens=queries,
+        num_sparse_topk=128,
+        shared_pool=bank,
+        _csa2_shared_selected=torch.zeros(bank.shape[0], device="cuda", dtype=torch.int32),
+        _csa2_shared_main_scales=torch.zeros(2, device="cuda", dtype=torch.int32),
+        prepared_indices=torch.empty(queries, 128, device="cuda", dtype=torch.int32),
+        prepared_lens=torch.empty(queries, device="cuda", dtype=torch.int32),
+        prepared_counter=torch.empty(1, device="cuda", dtype=torch.uint32),
+        mla_bmm1_scale=torch.empty(2, device="cuda"),
+        mla_bmm2_scale=torch.empty(1, device="cuda"),
+    )
+    swa_slots = torch.empty(queries, 1, device="cuda", dtype=torch.int64)
+    main_slots = torch.empty(queries, 2, device="cuda", dtype=torch.int64)
+    main_logical = torch.empty_like(main_slots)
+    dequant_scale = torch.tensor([0.3], device="cuda", dtype=torch.float32)
+    quant_scale = dequant_scale.reciprocal()
+    # Fixed pools, table strides, pointers and bank sizes isolate specialization
+    # by count, including singleton and larger active request sets.
+    for request_count in (1, 3, 6, 8, 16, 32):
+        width = domain_rows // request_count
+        owners = [0, request_count - 1, request_count // 2, -1, request_count]
+        positions = [0, width - 1, width // 2, 0, 0]
+        plan.num_requests = request_count
+        plan.query_requests.copy_(torch.tensor(owners, device="cuda"))
+        plan.query_positions.copy_(torch.tensor(positions, device="cuda"))
+        offsets = [min(request, request_count) * width for request in range(max_requests + 1)]
+        plan.swa_offsets.copy_(torch.tensor([1 + offset for offset in offsets], device="cuda"))
+        plan.main_offsets.copy_(
+            torch.tensor([1 + domain_rows + offset for offset in offsets], device="cuda")
+        )
+        swa_slots.zero_()
+        main_slots.zero_()
+        main_logical[:, 0].zero_()
+        main_logical[:, 1].fill_(width - 1)
+        expected_ids = []
+        expected_rows = {}
+        for query, (owner, position) in enumerate(zip(owners, positions)):
+            if 0 <= owner < request_count:
+                swa_slot = owner * domain_rows + position
+                main_first, main_last = owner * domain_rows, owner * domain_rows + width - 1
+                swa_slots[query, 0] = swa_slot
+                main_slots[query, 0], main_slots[query, 1] = main_first, main_last
+                ids = [
+                    1 + owner * width + position,
+                    1 + domain_rows + owner * width,
+                    1 + domain_rows + owner * width + width - 1,
+                ]
+                expected_rows[ids[0]] = decoded_swa[swa_slot]
+                expected_rows[ids[1]] = decoded_main[main_first]
+                expected_rows[ids[2]] = decoded_main[main_last]
+                expected_ids.append(ids)
+            else:
+                expected_ids.append([0])
+        # Every main row is decoded: a domain row from its page, any other row as zeros.
+        for row in range(1 + domain_rows, 1 + 2 * domain_rows):
+            owner, logical = divmod(row - 1 - domain_rows, width)
+            expected_rows[row] = (
+                decoded_main[owner * domain_rows + logical]
+                if owner < request_count
+                else torch.zeros(512, device="cuda", dtype=torch.bfloat16)
+            )
+        bank.fill_(7)
+        kernel.stage_shared_rows(
+            swa,
+            swa_slots,
+            main,
+            main_slots,
+            main_logical,
+            metadata,
+            plan,
+            kv_scale_orig_quant=quant_scale,
+            kv_scale_quant_orig=dequant_scale,
+            q_scale_quant_orig=dequant_scale,
+        )
+        staging = {
+            key: value
+            for key, value in kernel._COMPILED.items()
+            if key[0][0] in ("shared_compact", "shared_decode")
+        }
+        assert sum(key[0][0] == "shared_compact" for key in staging) == 1
+        assert sum(key[0][0] == "shared_decode" for key in staging) == 1  # SWA and MAIN.
+        if compiled_staging is None:
+            compiled_staging = staging
+        else:
+            assert staging.keys() == compiled_staging.keys()
+            assert all(value is compiled_staging[key] for key, value in staging.items())
+        expected_indices = torch.full_like(metadata.prepared_indices, -1)
+        for query, ids in enumerate(expected_ids):
+            expected_indices[query, : len(ids)] = torch.tensor(ids, device="cuda")
+        torch.testing.assert_close(metadata.prepared_indices, expected_indices, atol=0, rtol=0)
+        assert metadata.prepared_lens.tolist() == [len(ids) for ids in expected_ids]
+        selected_rows = sorted(expected_rows)
+        expected_bank = torch.full_like(bank, 7)
+        expected_bank[0].zero_()
+        values = torch.stack([expected_rows[row] for row in selected_rows])
+        if dtype == torch.float8_e4m3fn:
+            values = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(values, dequant_scale)[
+                0
+            ]
+        expected_bank.view(torch.uint8)[selected_rows] = values.view(torch.uint8)
+        torch.testing.assert_close(
+            bank.view(torch.uint8), expected_bank.view(torch.uint8), atol=0, rtol=0
+        )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("top_k", [4, 512])
+@torch.inference_mode()
+def test_selection_glue_kernels_match_reference(top_k):
+    kernel = _glue()
+    torch.manual_seed(1202)
+    count, width, cwidth = 3, 700, 96
+    logits = torch.randn(count, width, device="cuda")
+    # One validity byte per 64-position page; ``valid`` is its per-position expansion.
+    pages = torch.rand(count, width // kernel.INDEX_PAGE_ROWS + 2, device="cuda") > 0.2
+    valid = pages.repeat_interleave(kernel.INDEX_PAGE_ROWS, dim=1)
+    visible = torch.tensor([700, 65, 0], dtype=torch.int32, device="cuda")
+    # Masking unbacked positions in place; columns past a row's visible length are kept.
+    columns = torch.arange(width, device="cuda")
+    expected = logits.masked_fill(
+        ~valid[:, :width] & (columns[None, :] < visible[:, None]), -torch.inf
+    )
+    kernel.mask_logits_(logits, pages, row_lengths=visible)
+    torch.testing.assert_close(logits, expected, atol=0, rtol=0)
+    # Packed prefix logits: row q scores gathered keys starts[q] + column below lengths[q].
+    keys = torch.rand(900, device="cuda") > 0.2
+    starts = torch.tensor([0, 300, 850], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([700, 65, 0], dtype=torch.int32, device="cuda")
+    packed = torch.randn(count, width, device="cuda")
+    columns = torch.arange(width, device="cuda")[None, :]
+    in_row = columns < lengths[:, None]
+    backed = keys[(starts[:, None] + columns).clamp(max=keys.numel() - 1)]
+    expected = torch.where(in_row & ~backed, -torch.inf, packed)
+    kernel.mask_packed_logits_(packed, keys, starts, lengths)
+    torch.testing.assert_close(packed[in_row], expected[in_row], atol=0, rtol=0)
+    # Packed finalize keeps Top-K's distinct offsets whose key is backed, as the
+    # masked logits do; rows wider than its bitmap sort like the other modes.
+    for columns in (width, kernel._FINALIZE_BITMAP_COLUMNS + 3):
+        offsets = torch.stack(
+            [torch.randperm(columns + 5, device="cuda")[:top_k] - 1 for _ in range(count)]
+        )
+        backing = torch.rand(columns + 900, device="cuda") > 0.2
+        bounded = torch.tensor([columns, 65, 0], dtype=torch.int32, device="cuda")
+        selected = offsets.int()
+        kernel.finalize_selection_(
+            selected, columns, valid=backing, row_starts=starts, row_lengths=bounded
+        )
+        ok = (offsets >= 0) & (offsets < bounded[:, None])
+        ok &= backing[(starts[:, None] + offsets).clamp(0, backing.numel() - 1)]
+        expect = torch.where(ok, offsets, torch.iinfo(torch.int64).max).sort(-1).values
+        torch.testing.assert_close(
+            selected, torch.where(expect == torch.iinfo(torch.int64).max, -1, expect).int()
+        )
+    # Candidate-ordered scores: out-of-range, invisible and unbacked candidates are -inf / -1.
+    candidates = torch.randint(-1, width + 3, (count, cwidth), dtype=torch.int64, device="cuda")
+    scores = torch.empty(count, cwidth, device="cuda")
+    positions = torch.empty(count, cwidth, dtype=torch.int32, device="cuda")
+    kernel.gather_candidate_scores(logits, pages, candidates, visible, scores, positions)
+    ok = (candidates >= 0) & (candidates < width) & (candidates < visible[:, None].long())
+    safe = candidates.clamp(0, width - 1)
+    ok &= valid[:, :width].gather(1, safe)
+    torch.testing.assert_close(scores, torch.where(ok, logits.gather(1, safe), -torch.inf))
+    torch.testing.assert_close(positions, torch.where(ok, candidates, -1).int(), atol=0, rtol=0)
+    # Finalize: paged mode validates visible offsets against their page (distinct offsets, as a
+    # Top-K selects them); mapped mode maps offsets through candidate positions and drops -inf
+    # scores. Both sort with -1 last.
+    indices = torch.stack(
+        [torch.randperm(width + 6, device="cuda")[:top_k] - 1 for _ in range(count)]
+    ).int()
+    paged = indices.clone()
+    kernel.finalize_selection_(paged, width, valid=pages, row_lengths=visible)
+    keys = (
+        torch.where(
+            (indices >= 0)
+            & (indices < width)
+            & (indices < visible[:, None])
+            & valid[:, :width].gather(1, indices.clamp(0, width - 1)),
+            indices.long(),
+            torch.iinfo(torch.int64).max,
+        )
+        .sort(-1)
+        .values
+    )
+    torch.testing.assert_close(
+        paged, torch.where(keys == torch.iinfo(torch.int64).max, -1, keys).int(), atol=0, rtol=0
+    )
+    mapped = torch.randint(-1, cwidth + 5, (count, top_k), dtype=torch.int32, device="cuda")
+    original = mapped.clone()
+    kernel.finalize_selection_(mapped, cwidth, scores=scores, positions=positions)
+    safe = original.clamp(0, cwidth - 1)
+    ok = (original >= 0) & (original < cwidth) & (scores.gather(1, safe) > -torch.inf)
+    keys = (
+        torch.where(ok, positions.gather(1, safe).long(), torch.iinfo(torch.int64).max)
+        .sort(-1)
+        .values
+    )
+    torch.testing.assert_close(
+        mapped, torch.where(keys == torch.iinfo(torch.int64).max, -1, keys).int(), atol=0, rtol=0
+    )
+    # Candidate block maxima over the pages, with blocks that tile them and blocks that do not.
+    zeros = torch.zeros(count, dtype=torch.int32, device="cuda")
+    widths = torch.full((count,), width, dtype=torch.int32, device="cuda")
+    hidden = torch.arange(width, device="cuda")[None, :] >= visible[:, None]
+    scored = logits.masked_fill(~valid[:, :width] | hidden, -torch.inf)
+    for block_size in (8, 24):
+        block_count = -(-width // block_size)
+        blocks = torch.empty(count, block_count, device="cuda")
+        counts = torch.empty(count, dtype=torch.int32, device="cuda")
+        kernel.candidate_block_max_(
+            logits,
+            pages,
+            pages.stride(0),
+            visible,
+            0,
+            zeros,
+            visible,
+            widths,
+            blocks,
+            counts,
+            block_size,
+            kernel.INDEX_PAGE_ROWS,
+        )
+        expected = torch.nn.functional.pad(
+            scored, (0, block_count * block_size - width), value=-torch.inf
+        )
+        expected = expected.unflatten(1, (block_count, block_size)).amax(2)
+        latest = (visible.long() - 1).div(block_size, rounding_mode="floor")
+        expected[torch.arange(block_count, device="cuda")[None, :] == latest[:, None]] = torch.inf
+        torch.testing.assert_close(blocks, expected, atol=0, rtol=0)
+        assert (counts == block_count).all()
+
+
+def _candidates(rows, width, counts, generator):
+    """Candidate-expansion style positions: increasing over each row's leading counts[q] columns,
+    -1 past them."""
+    steps = torch.randint(1, 5, (rows, width), device="cuda", generator=generator)
+    positions = steps.cumsum(1).to(torch.int32)
+    columns = torch.arange(width, device="cuda")[None, :]
+    return torch.where(columns < counts[:, None], positions, -1)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("rows", [64, 300])
+@pytest.mark.parametrize("ties", [False, True])
+@torch.inference_mode()
+def test_fused_consumer_topk_matches_radix_then_map(rows, ties):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.decode_select import (
+        fused_consumer_topk_supported,
+        select_mapped_consumer_topk_,
+    )
+
+    top_k, width, dtype = 512, 16384, torch.bfloat16
+    g = torch.Generator(device="cuda").manual_seed(rows * width + int(ties))
+    if ties:
+        # Few distinct values: many columns score each row's k-th value.
+        scores = torch.randint(0, 40, (rows, width), device="cuda", generator=g).to(dtype)
+    else:
+        scores = torch.randn(rows, width, device="cuda", generator=g).to(dtype)
+    # Full rows, partial rows, rows with fewer valid columns than top_k (and none).
+    pattern = [width, width - 77, top_k + 3, top_k, top_k // 3, 0]
+    counts = torch.tensor(
+        [pattern[q % len(pattern)] for q in range(rows)], dtype=torch.int32, device="cuda"
+    )
+    positions = _candidates(rows, width, counts, g)
+    assert fused_consumer_topk_supported(scores, top_k)
+
+    fused = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+    select_mapped_consumer_topk_(scores, counts, positions, fused)
+    # Ties at the k-th score go to the lowest columns, also above one SM wave of rows (300), where
+    # the radix decode Top-K admits them by thread timing.
+    pages = torch.ones(rows, ceil_div(width, INDEX_PAGE_ROWS), dtype=torch.bool, device="cuda")
+    columns = _decode_select_reference(scores.float(), pages, counts, top_k)
+    expected = torch.where(columns >= 0, positions.gather(1, columns.clamp(min=0).long()), -1)
+    torch.testing.assert_close(fused, expected, atol=0, rtol=0)
+    if rows <= torch.cuda.get_device_properties().multi_processor_count:
+        reference = torch.empty(rows, top_k, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores, counts, reference, top_k, 1)
+        kernel.map_selection_(reference, positions, counts)
+        torch.testing.assert_close(fused, reference, atol=0, rtol=0)
+    # Repeated launches and single-row launches give the same rows.
+    again = torch.empty_like(fused)
+    select_mapped_consumer_topk_(scores, counts, positions, again)
+    torch.testing.assert_close(again, fused, atol=0, rtol=0)
+    for q in (0, rows - 1):
+        alone = torch.empty(1, top_k, dtype=torch.int32, device="cuda")
+        select_mapped_consumer_topk_(
+            scores[q : q + 1].clone(), counts[q : q + 1].clone(), positions[q : q + 1], alone
+        )
+        torch.testing.assert_close(alone[0], fused[q], atol=0, rtol=0)
+
+
+def _decode_select_reference(logits, valid, visible, top_k):
+    """Each row's top_k largest logits (FP32 order of the bits) among visible columns on valid
+    pages, ties lowest column first, as increasing columns followed by -1."""
+    rows, width = logits.shape
+    bits = logits.view(torch.int32).long()
+    unsigned = bits & 0xFFFFFFFF
+    key = torch.where(bits < 0, unsigned ^ 0xFFFFFFFF, unsigned ^ 0x80000000)
+    columns = torch.arange(width, device="cuda")
+    kept = (columns[None, :] < visible.long()[:, None]) & valid[:, columns // INDEX_PAGE_ROWS]
+    order = torch.where(kept, key * (1 << 19) + ((1 << 19) - 1 - columns[None, :]), -1)
+    count = min(top_k, width)
+    values, picked = order.topk(count, dim=1)
+    picked = torch.where(values >= 0, picked, 1 << 30).sort(dim=1).values
+    expected = torch.full((rows, top_k), -1, dtype=torch.int32, device="cuda")
+    expected[:, :count] = torch.where(picked == 1 << 30, -1, picked).int()
+    return expected
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("rows", [6])
+@pytest.mark.parametrize("width", [513, 190776, 300000])
+@pytest.mark.parametrize("ties", [False, True])
+@torch.inference_mode()
+def test_fused_decode_select_matches_chain(rows, width, ties):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.decode_select import (
+        fused_decode_select_,
+        fused_decode_select_supported,
+    )
+
+    top_k = 512
+    g = torch.Generator(device="cuda").manual_seed(rows * width + int(ties))
+    # Paged logits are a view of a wider buffer.
+    logits = torch.empty(rows, pad_up(width, 8) + 8, device="cuda")[:, :width]
+    if ties:
+        # Few distinct values: many columns score each row's k-th value.
+        logits.copy_(torch.randint(0, 40, (rows, width), device="cuda", generator=g) * 0.25)
+    else:
+        logits.copy_(torch.randn(rows, width, device="cuda", generator=g))
+    valid = torch.rand(rows, ceil_div(width, INDEX_PAGE_ROWS), device="cuda", generator=g) < 0.8
+    # Full rows, partial rows, rows with fewer columns than top_k (and none).
+    pattern = [width, width - 77, top_k + 3, top_k, top_k // 3, 0]
+    visible = torch.tensor(
+        [pattern[q % len(pattern)] for q in range(rows)], dtype=torch.int32, device="cuda"
+    )
+    assert fused_decode_select_supported(logits, top_k)
+
+    fused = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+    fused_decode_select_(logits, valid, visible, fused, INDEX_PAGE_ROWS)
+    torch.testing.assert_close(
+        fused, _decode_select_reference(logits, valid, visible, top_k), atol=0, rtol=0
+    )
+    # The decode chain's CuTe DSL Top-K serves these widths on SM100-family GPUs only.
+    if not ties and is_sm_100f():
+        chain = torch.empty_like(fused)
+        masked = logits.clone()
+        kernel.mask_logits_(masked, valid, row_lengths=visible)
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(masked, visible, chain, top_k, 1)
+        kernel.finalize_selection_(chain, width, valid=valid, row_lengths=visible)
+        torch.testing.assert_close(fused, chain, atol=0, rtol=0)
+
+
+def _prefix_gather_reference(
+    pages, table, visible, descriptors, page_size, max_positions, keys, rows
+):
+    flat = pages.reshape(-1)
+    capacity = flat.numel() // INDEX_PAGE_BYTES * INDEX_PAGE_ROWS
+    desc = descriptors.cpu().tolist()
+    data = torch.zeros(keys, 64, dtype=torch.uint8)
+    scales = torch.zeros(keys, 4, dtype=torch.uint8)
+    valid = torch.zeros(keys, dtype=torch.bool)
+    host_table = table.cpu()
+    for key in range(keys):
+        piece = max([0] + [p for p in range(len(desc)) if desc[p][2] <= key])
+        request, _, offset, _, _ = desc[piece]
+        position = key - offset
+        column = position // page_size
+        if not (
+            position < max_positions
+            and column < host_table.shape[1]
+            and 0 <= request < host_table.shape[0]
+        ):
+            continue
+        physical = int(host_table[request, column])
+        slot = physical * page_size + position % page_size
+        if physical < 0 or slot >= capacity:
+            continue
+        page, row = slot // INDEX_PAGE_ROWS, slot % INDEX_PAGE_ROWS
+        base = page * INDEX_PAGE_BYTES
+        data[key] = flat[base + row * 64 : base + row * 64 + 64].cpu()
+        scale_at = base + INDEX_PAGE_ROWS * 64 + row * 4
+        scales[key] = flat[scale_at : scale_at + 4].cpu()
+        valid[key] = True
+    bounds = torch.zeros(5, rows, dtype=torch.int32)
+    host_visible = visible.cpu().tolist()
+    for r in range(rows):
+        piece = max([0] + [p for p in range(len(desc)) if desc[p][4] <= r])
+        _, width, offset, first, in_group = desc[piece]
+        end = min(max(host_visible[first + r - in_group], 0), width)
+        bounds[:, r] = torch.tensor([offset, offset + end, end, width, 0])
+    return data, scales.view(torch.int32).reshape(-1), valid, bounds
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("visible_dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_prefix_gather_matches_reference(visible_dtype):
+    """Key-major prefix gather: exact key rows, scales, validity and row bounds over pieces at
+    unaligned key offsets, missing and out-of-pool pages, invalid requests and bounded positions,
+    with misaligned table, descriptor and visible-length views."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import gather_prefix_keys_
+
+    gen = torch.Generator(device="cuda").manual_seed(31)
+    page_size, num_pages = 64, 9
+    pages = torch.randint(
+        0, 256, (num_pages, INDEX_PAGE_ROWS, 1, 68), device="cuda", dtype=torch.uint8, generator=gen
+    )
+    table_storage = torch.randint(0, num_pages + 2, (4 * 6 + 1,), device="cuda", generator=gen)
+    table_storage = table_storage.to(torch.int32)
+    table_storage[3] = -1
+    table = table_storage[1:].view(4, 6)
+    # (request, key width, key offset, first query row, row in group): unaligned offsets, an empty
+    # piece, a request without a table row and a negative request.
+    descriptor_rows = [
+        [0, 37, 0, 0, 0],
+        [2, 101, 37, 10, 5],
+        [1, 0, 138, 20, 9],
+        [5, 30, 138, 0, 12],
+        [-1, 20, 168, 3, 14],
+    ]
+    descriptor_storage = torch.zeros(len(descriptor_rows) * 5 + 3, dtype=torch.int32, device="cuda")
+    descriptors = descriptor_storage[3:].view(-1, 5)
+    descriptors.copy_(torch.tensor(descriptor_rows, dtype=torch.int32))
+    keys, rows = 193, 17
+    visible_storage = torch.randint(
+        -5, 150, (40,), device="cuda", dtype=visible_dtype, generator=gen
+    )
+    visible = visible_storage[1:]
+    for max_positions in (300, 90):
+        data = torch.full((keys, 64), 7, dtype=torch.int8, device="cuda")
+        scales = torch.full((keys,), 7, dtype=torch.int32, device="cuda")
+        valid = torch.ones(keys, dtype=torch.bool, device="cuda")
+        bounds = torch.full((5, rows), 7, dtype=torch.int32, device="cuda")
+        gather_prefix_keys_(
+            pages,
+            table,
+            visible,
+            descriptors,
+            page_size,
+            max_positions,
+            data,
+            scales,
+            valid,
+            bounds,
+        )
+        expected = _prefix_gather_reference(
+            pages, table, visible, descriptors, page_size, max_positions, keys, rows
+        )
+        assert torch.equal(data.view(torch.uint8).cpu(), expected[0])
+        assert torch.equal(scales.cpu(), expected[1])
+        assert torch.equal(valid.cpu(), expected[2])
+        assert torch.equal(bounds.cpu(), expected[3])
+        assert expected[2].any() and not expected[2].all()
+
+
+def _qs_values(rows, width, gen):
+    scale = torch.exp(torch.randn(rows, 1, generator=gen) * 3)
+    values = torch.randn(rows, width, generator=gen) * scale
+    values[3::97] *= 1e-30  # below every group floor
+    values[5::131, 7] = float("nan")
+    values[11::173] = 0.0
+    return values.to(torch.bfloat16).cuda()
+
+
+def _qs_jobs(which, gen):
+    """Quantize jobs of every format with norm/RoPE, invalid slots, NaN rows and partial CTAs; the
+    inputs live only in the jobs. Returns the jobs and their destination tensors."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+
+    angles = torch.arange(1 << 14, dtype=torch.float64)[:, None] / (
+        10000 ** (torch.arange(0, 64, 2, dtype=torch.float64) / 64)
+    )
+    table = torch.cat((angles.cos(), angles.sin()), dim=1).float().cuda()
+    jobs, outputs = [], []
+    for cache_format, rows, capacity in (("swa", 4099, 5000), ("main", 1031, 1200)):
+        if cache_format not in which:
+            continue
+        pool = torch.full(
+            (capacity, row_bytes(512, cache_format)), 0xA5, dtype=torch.uint8, device="cuda"
+        )
+        slots = torch.randperm(capacity, generator=gen)[:rows].cuda()
+        slots[::50] = -1
+        slots[1::77] = capacity + 1000
+        weight = (torch.rand(512, generator=gen) + 0.5).to(torch.bfloat16).cuda()
+        positions = torch.randint(0, 1 << 14, (rows,), generator=gen, dtype=torch.int32).cuda()
+        values = _qs_values(rows, 512, gen)
+        jobs.append(
+            kernel.row_job(
+                pool, slots, values, cache_format, (weight, 1e-6), (positions, table, 64)
+            )
+        )
+        outputs.append(pool)
+    if "index" in which:
+        rows = 1027
+        pages = torch.full((24, INDEX_PAGE_BYTES), 0x11, dtype=torch.uint8, device="cuda")
+        slots = torch.randperm(24 * INDEX_PAGE_ROWS, generator=gen)[:rows].cuda()
+        positions = torch.randint(0, 1 << 14, (rows,), generator=gen, dtype=torch.int32).cuda()
+        jobs.append(
+            kernel.footer_job(
+                pages,
+                slots,
+                _qs_values(rows, 128, gen),
+                INDEX_PAGE_ROWS,
+                None,
+                (positions, table, 64),
+            )
+        )
+        outputs.append(pages)
+    if "split" in which:
+        rows = 64 * 37 + 5
+        data = torch.full((rows, 64), 0x77, dtype=torch.uint8, device="cuda")
+        scales = torch.full((rows, 4), 0x77, dtype=torch.uint8, device="cuda")
+        jobs.append(kernel.split_job(_qs_values(rows, 128, gen), data, scales))
+        outputs += [data, scales]
+    return jobs, outputs
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("which", ["swa+main+index", "main+index+split"])
+@torch.inference_mode()
+def test_vectorized_quantize_scatter_writes_the_same_bytes(monkeypatch, which):
+    """Sixteen channels per thread (large launches of aligned 128/512-channel rows) write the
+    bytes of the four-channel kernel, alone and in multi-job launches."""
+    import dataclasses
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import quantize_scatter_jobs
+
+    monkeypatch.setattr(kernel, "_QUANTIZE_VEC_MIN_ELEMENTS", 0)
+
+    results = []
+    for vec in (False, True):
+        jobs, outputs = _qs_jobs(which.split("+"), torch.Generator().manual_seed(7))
+        assert all(job.vec_ok for job in jobs)
+        # Inputs referenced only by the jobs stay allocated until the launch.
+        garbage = [
+            torch.full((size,), 0x5A, dtype=torch.uint8, device="cuda")
+            for size in (1 << 12, 1 << 16, 1 << 20, 1 << 22)
+        ]
+        quantize_scatter_jobs(
+            jobs if vec else [dataclasses.replace(job, vec_ok=False) for job in jobs]
+        )
+        torch.cuda.synchronize()
+        del garbage
+        results.append([output.clone() for output in outputs])
+    for index, (plain, vectorized) in enumerate(zip(*results)):
+        assert torch.equal(plain, vectorized), f"output {index} differs"

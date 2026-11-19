@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -73,10 +73,10 @@ public:
         mLogitsPtrVec = mBufferManager->gpu(ITensor::makeShape({mBatchSize}), logitsPtrDtype);
         mLogitsPtrVecHost = BufferManager::pinned(ITensor::makeShape({mBatchSize}), logitsPtrDtype);
 
-        auto logitsHost = BufferRange<T>(*mLogitsHost);
-        auto logitsBitmaskHost = BufferRange<BitmaskT>(*mLogitsBitmaskHost);
-        auto logitsPtrVecHost = BufferRange<T*>(*mLogitsPtrVecHost);
-        auto logitsBitmaskPtrVecHost = BufferRange<BitmaskT*>(*mLogitsBitmaskPtrVecHost);
+        auto logitsHost = mLogitsHost->getBufferRange<T>();
+        auto logitsBitmaskHost = mLogitsBitmaskHost->getBufferRange<BitmaskT>();
+        auto logitsPtrVecHost = mLogitsPtrVecHost->getBufferRange<T*>();
+        auto logitsBitmaskPtrVecHost = mLogitsBitmaskPtrVecHost->getBufferRange<BitmaskT*>();
         for (int i = 0; i < mBatchSize; i++)
         {
             for (int j = 0; j < mVocabSizePadded; j++)
@@ -88,8 +88,8 @@ public:
                 logitsBitmaskHost[i * mBitmaskSize + j] = dist(generator);
             }
             // Map to randomly shuffled addresses
-            logitsPtrVecHost[i] = bufferCast<T>(*ITensor::at(mLogits, {index[i]}));
-            logitsBitmaskPtrVecHost[i] = bufferCast<BitmaskT>(*ITensor::at(mLogitsBitmask, {index[i]}));
+            logitsPtrVecHost[i] = ITensor::at(mLogits, {index[i]})->getBufferPtr<T>();
+            logitsBitmaskPtrVecHost[i] = ITensor::at(mLogitsBitmask, {index[i]})->getBufferPtr<BitmaskT>();
         }
 
         mBufferManager->copy(*mLogitsHost, *mLogits);
@@ -100,16 +100,16 @@ public:
 
     void runTest()
     {
-        auto logitsPtrVec = bufferCast<T*>(*mLogitsPtrVec);
-        auto logitsBitmaskPtrVec = bufferCast<BitmaskT const*>(*mLogitsBitmaskPtrVec);
+        auto logitsPtrVec = mLogitsPtrVec->getBufferPtr<T*>();
+        auto logitsBitmaskPtrVec = mLogitsBitmaskPtrVec->getBufferPtr<BitmaskT const*>();
 
         tk::invokeLogitsBitmask<T>(logitsPtrVec, logitsBitmaskPtrVec, mBatchSize, mVocabSizePadded, mStream->get());
 
         mBufferManager->copy(*mLogits, *mLogitsHost);
         mStream->synchronize();
 
-        auto logitsHost = BufferRange<T>(*mLogitsHost);
-        auto logitsBitmaskHost = BufferRange<BitmaskT>(*mLogitsBitmaskHost);
+        auto logitsHost = mLogitsHost->getBufferRange<T>();
+        auto logitsBitmaskHost = mLogitsBitmaskHost->getBufferRange<BitmaskT>();
         for (int i = 0; i < mBatchSize; i++)
         {
             for (int j = 0; j < mBitmaskSize; j++)

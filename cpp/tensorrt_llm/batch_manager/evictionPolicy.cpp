@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/batch_manager/evictionPolicy.h"
 
+#include "tensorrt_llm/batch_manager/common.h"
+
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 
 // This implements priority-based eviction.
@@ -31,7 +33,6 @@ auto const kMaxPriority = executor::KvCacheRetentionConfig::kMaxRetentionPriorit
 auto const kNumPriorities = kMaxPriority - kMinPriority + 1;
 
 auto const kDefaultPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority;
-executor::RetentionPriority const kDefaultSecondaryOffloadMinPriority = 30;
 
 int const kNumCacheLevels = 2;
 int const kPlaceholderLevel = kNumCacheLevels; // placeholder blocks live at level 2
@@ -80,7 +81,7 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
         startIdx += sizes[cacheLevel];
     }
 
-    mSecondaryOffloadMinPriority = secondaryOffloadMinPriority.value_or(kDefaultSecondaryOffloadMinPriority);
+    mSecondaryOffloadMinPriority = secondaryOffloadMinPriority.value_or(kDefaultColdTierOffloadMinPriority);
 }
 
 void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById)

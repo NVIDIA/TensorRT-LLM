@@ -23,7 +23,8 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci
-from defs.conftest import llm_models_root, skip_no_hopper, skip_pre_blackwell
+from defs.conftest import (llm_models_root, skip_no_hopper, skip_no_sm120,
+                           skip_pre_blackwell)
 from defs.trt_test_alternative import popen, print_error, print_info
 from openai import OpenAI
 from requests.exceptions import RequestException
@@ -92,8 +93,7 @@ def wait_for_log(log_queue, expected_log, timeout=10):
     return False
 
 
-def check_openai_chat_completion(http_port,
-                                 model_name="TinyLlama-1.1B-Chat-v1.0"):
+def check_openai_chat_completion(http_port, model_name="Qwen3-0.6B"):
     """
     Test the launched trtllm-serve server using OpenAI client.
 
@@ -321,7 +321,7 @@ def test_env_overrides_pdl(tmp_path):
     environment variables to the server workers. Specifically, it sets `TRTLLM_ENABLE_PDL=1`
     (Programmatic Dependent Launch) via config and verifies it overrides the env var initially set to 0.
 
-    1. This model (TinyLlama-1.1B-Chat-v1.0) architecture uses RMSNorm, which triggers 'flashinfer' kernels that use PDL when `TRTLLM_ENABLE_PDL=1`.
+    1. This model (Qwen3-0.6B) architecture uses RMSNorm, which triggers 'flashinfer' kernels that use PDL when `TRTLLM_ENABLE_PDL=1`.
     2. When `TRTLLM_ENABLE_PDL=1` is actually propagated into worker env, flashinfer custom ops log "PDL enabled" to stdout/stderr.
     """
     pdl_enabled = "1"
@@ -344,8 +344,7 @@ def test_env_overrides_pdl(tmp_path):
     })
 
     cmd = [
-        "trtllm-serve", "serve",
-        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+        "trtllm-serve", "serve", f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
         "--host", "0.0.0.0", "--port",
         str(port), "--backend", "pytorch", "--config",
         str(config_file)
@@ -365,7 +364,7 @@ def test_env_overrides_pdl(tmp_path):
         check_server_ready(http_port=port, timeout_timer=300)
         response = OpenAI(base_url=f"http://localhost:{port}/v1",
                           api_key="tensorrt_llm").chat.completions.create(
-                              model="TinyLlama-1.1B-Chat-v1.0",
+                              model="Qwen3-0.6B",
                               messages=[{
                                   "role": "user",
                                   "content": "Test"
@@ -445,9 +444,12 @@ _NEMOTRON35_LIGHTNING_COMMON_CONFIG = "Nemotron35_Lightning_30B.yml"
 _NEMOTRON35_LIGHTNING_VARIANTS = {
     "nvfp4": {
         "model_dir": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+        # FlashInfer's CuTe DSL b12x MoE (W4A16_NVFP4 experts), SM120/SM121
+        # only.
+        "marks": [skip_no_sm120],
         "config_overrides": {
             "moe_config": {
-                "backend": "CUTEDSL"
+                "tactic": "b12x"
             },
             "nvfp4_gemm_config": {
                 "allowed_backends":
@@ -457,9 +459,10 @@ _NEMOTRON35_LIGHTNING_VARIANTS = {
     },
     "bf16": {
         "model_dir": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+        "marks": [],
         "config_overrides": {
             "moe_config": {
-                "backend": "CUTLASS"
+                "tactic": "cutlass"
             },
         },
     },
@@ -467,7 +470,10 @@ _NEMOTRON35_LIGHTNING_VARIANTS = {
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("precision", list(_NEMOTRON35_LIGHTNING_VARIANTS))
+@pytest.mark.parametrize("precision", [
+    pytest.param(precision, marks=variant["marks"])
+    for precision, variant in _NEMOTRON35_LIGHTNING_VARIANTS.items()
+])
 def test_nemotron35_lightning_30b(serve_test_root, tmp_path, precision):
     """Nemotron 3.5 Lightning 30B-A3B with chunked prefill + MTP=3."""
     variant = _NEMOTRON35_LIGHTNING_VARIANTS[precision]

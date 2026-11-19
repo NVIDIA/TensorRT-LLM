@@ -34,15 +34,27 @@ per combination -- and what lets ``min_p`` be added without doubling the mode sp
 Disable sentinels, matching ``SpecMetadata._scan_one_model_sampling``: ``top_k`` outside
 ``(0, vocab_size)`` (including ``INT32_MAX``), ``top_p >= 1``, ``min_p <= 0``.
 
+Random draws come from Philox ``(seed, offset)`` tensors holding one entry or one per row.
+One entry for several rows is shared by them, and the row index then separates their
+streams; a single-row call counts as per-row.
+Per-row entries give each row the Philox subsequence its offset names, so a row's draws
+are a function of its own ``(seed, offset)`` alone, independent of its position in the
+batch. Rows need only distinct offsets, however many values each one draws.
+
 Unlike the flashinfer ops, none of these carries ``@torch.compiler.disable``, and the
 absence is deliberate rather than an omission: each is a single C++ custom op with a
 registered fake kernel (:mod:`tensorrt_llm._torch.custom_ops.cpp_custom_ops`), so it
 traces cleanly and has no python chain to break the graph on.
 """
 
-from typing import Optional
+from typing import Final, Optional
 
 import torch
+
+# First offset of the rows that carry no user seed. They all share one seed, which a user
+# seed may equal, so they take offsets far beyond any a seeded stream reaches counting up
+# from 0.
+UNSEEDED_OFFSET_BASE: Final = 1 << 62
 
 
 def fused_sample_from_logits(

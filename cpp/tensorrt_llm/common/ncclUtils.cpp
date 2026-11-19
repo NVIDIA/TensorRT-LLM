@@ -21,40 +21,17 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <cstdlib>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
+#include <utility>
+#include <variant>
 
 namespace
 {
-
-// RAII guard for cudaMalloc. Frees the pointer on destruction, logging a warning on failure.
-struct CudaMallocGuard
-{
-    void* ptr{nullptr};
-
-    explicit CudaMallocGuard(void* p) noexcept
-        : ptr(p)
-    {
-    }
-
-    ~CudaMallocGuard()
-    {
-        if (ptr)
-        {
-            TLLM_CUDA_CHECK_WARN(cudaFree(ptr));
-        }
-    }
-
-    void* release() noexcept
-    {
-        void* p = ptr;
-        ptr = nullptr;
-        return p;
-    }
-
-    CudaMallocGuard(CudaMallocGuard const&) = delete;
-    CudaMallocGuard& operator=(CudaMallocGuard const&) = delete;
-};
 
 // RAII guard for ncclMemAlloc. Frees the pointer on destruction, logging a warning on failure.
 struct NcclMemGuard
@@ -87,8 +64,153 @@ struct NcclMemGuard
 
 } // namespace
 
-namespace tensorrt_llm::common::nccl_util
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::nccl_util
 {
+
+void NcclCommResourceManager::registerHostCommunicator(ncclComm_t comm, HostCommunicator hostComm, int size, int rank)
+{
+    TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
+    int ncclSize = 0;
+    int ncclRank = 0;
+    TLLM_NCCL_CHECK(ncclCommCount(comm, &ncclSize));
+    TLLM_NCCL_CHECK(ncclCommUserRank(comm, &ncclRank));
+    TLLM_CHECK_WITH_INFO(size == ncclSize && rank == ncclRank,
+        "Host consensus communicator must match the NCCL communicator's size and rank order");
+    std::lock_guard<std::mutex> lock(mMutex);
+    mHostCommunicators.insert_or_assign(comm, std::move(hostComm));
+}
+
+void registerHostCommunicator(ncclComm_t comm, MPI_Comm hostComm, std::vector<int> const& ranks)
+{
+    TLLM_CHECK_WITH_INFO(hostComm != MPI_COMM_NULL, "Host MPI communicator cannot be null");
+    int rank = 0;
+    MPICHECK(MPI_Comm_rank(hostComm, &rank));
+    auto const it = std::find(ranks.begin(), ranks.end(), rank);
+    TLLM_CHECK_WITH_INFO(it != ranks.end(), "Current rank is not in the host subgroup");
+    NcclCommResourceManager::getInstance().registerHostCommunicator(
+        comm, NcclCommResourceManager::MpiHostGroup{hostComm, ranks}, ranks.size(), std::distance(ranks.begin(), it));
+}
+
+void registerHostCommunicator(
+    ncclComm_t comm, c10::intrusive_ptr<c10d::ProcessGroup> const& hostComm, std::vector<int> ranks)
+{
+    TLLM_CHECK_WITH_INFO(hostComm != nullptr, "Host process group cannot be null");
+    TLLM_CHECK_WITH_INFO(
+        hostComm->getBackend(c10::DeviceType::CPU) != nullptr, "Host consensus requires a CPU process-group backend");
+    if (ranks.empty())
+    {
+        ranks.resize(hostComm->getSize());
+        std::iota(ranks.begin(), ranks.end(), 0);
+    }
+    auto const it = std::find(ranks.begin(), ranks.end(), hostComm->getRank());
+    TLLM_CHECK_WITH_INFO(it != ranks.end(), "Current rank is not in the host subgroup");
+    int const rank = std::distance(ranks.begin(), it);
+    int const size = ranks.size();
+    NcclCommResourceManager::getInstance().registerHostCommunicator(comm,
+        NcclCommResourceManager::PgHostGroup{c10::weak_intrusive_ptr<c10d::ProcessGroup>(hostComm), std::move(ranks)},
+        size, rank);
+}
+
+NcclCommResourceManager::HostCommunicator NcclCommResourceManager::lookupHostCommunicator(ncclComm_t comm) const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto const it = mHostCommunicators.find(comm);
+    TLLM_CHECK_WITH_INFO(it != mHostCommunicators.end(), "Matching host consensus communicator is missing");
+    return it->second;
+}
+
+namespace
+{
+
+bool mpiAllTrue(MPI_Comm comm, std::vector<int> const& ranks, bool localOk)
+{
+    mpi::MpiComm const hostMpi(comm, false);
+    int value = localOk;
+    if (ranks.size() == static_cast<size_t>(hostMpi.getSize()))
+    {
+        int allOk = 0;
+        hostMpi.allreduce(&value, &allOk, 1, mpi::MpiType::kINT32, mpi::MpiOp::MIN);
+        return allOk != 0;
+    }
+    auto const root = ranks.front();
+    auto const tag = mpi::MpiTag::kNcclWindowAllocation;
+    // Only subgroup members participate; no communicator is created during capture.
+    if (hostMpi.getRank() != root)
+    {
+        hostMpi.sendValue(value, root, tag);
+        hostMpi.recvValue(value, root, tag);
+        return value != 0;
+    }
+    for (auto const rank : ranks)
+    {
+        if (rank == root)
+            continue;
+        int peerOk = 0;
+        hostMpi.recvValue(peerOk, rank, tag);
+        value = std::min(value, peerOk);
+    }
+    for (auto const rank : ranks)
+    {
+        if (rank != root)
+            hostMpi.sendValue(value, rank, tag);
+    }
+    return value != 0;
+}
+
+bool pgAllTrue(c10::intrusive_ptr<c10d::ProcessGroup> const& pg, std::vector<int> const& ranks, bool localOk)
+{
+    int value = localOk;
+    pg_utils::PgHelper hostPg(pg);
+    if (ranks.size() == static_cast<size_t>(pg->getSize()))
+    {
+        PGCHECK_THROW(hostPg.allreduce(&value, {c10d::ReduceOp::MIN}));
+        return value != 0;
+    }
+    // Only subgroup members participate; no process group is created during capture.
+    auto const root = ranks.front();
+    int const tag = static_cast<int>(mpi::MpiTag::kNcclWindowAllocation);
+    if (pg->getRank() != root)
+    {
+        PGCHECK_THROW(hostPg.send(&value, root, tag));
+        PGCHECK_THROW(hostPg.recv(&value, root, tag));
+        return value != 0;
+    }
+    for (auto const rank : ranks)
+    {
+        if (rank == root)
+        {
+            continue;
+        }
+        int peerOk = 0;
+        PGCHECK_THROW(hostPg.recv(&peerOk, rank, tag));
+        value = std::min(value, peerOk);
+    }
+    for (auto const rank : ranks)
+    {
+        if (rank != root)
+        {
+            PGCHECK_THROW(hostPg.send(&value, rank, tag));
+        }
+    }
+    return value != 0;
+}
+
+} // namespace
+
+bool hostAllTrue(ncclComm_t comm, bool localOk)
+{
+    auto const host = NcclCommResourceManager::getInstance().lookupHostCommunicator(comm);
+    if (auto const* mpiGroup = std::get_if<NcclCommResourceManager::MpiHostGroup>(&host))
+    {
+        return mpiAllTrue(mpiGroup->comm, mpiGroup->ranks, localOk);
+    }
+    auto const& pgGroup = std::get<NcclCommResourceManager::PgHostGroup>(host);
+    auto const pg = pgGroup.comm.lock();
+    TLLM_CHECK_WITH_INFO(pg != nullptr, "Matching host consensus communicator has expired");
+    return pgAllTrue(pg, pgGroup.ranks, localOk);
+}
 
 namespace
 {
@@ -96,11 +218,11 @@ namespace
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 constexpr int kNcclWindowMinRuntimeVersion = NCCL_VERSION(2, 28, 0);
 constexpr int kNcclGb10WindowFixedVersion = NCCL_VERSION(2, 30, 4);
-constexpr int kGb10RealSmVersion = 121;
+constexpr int kGb10SmVersion = 121;
 
-bool isGb10Platform(int realSmVersion, bool isIntegrated)
+bool isGb10Platform(int smVersion, bool isIntegrated)
 {
-    return realSmVersion == kGb10RealSmVersion && isIntegrated;
+    return smVersion == kGb10SmVersion && isIntegrated;
 }
 #endif
 
@@ -150,27 +272,27 @@ bool queryNcclWindowSupported()
         return false;
     }
 
-    int realSmVersion = -1;
+    int smVersion = -1;
     try
     {
-        realSmVersion = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true);
+        smVersion = tensorrt_llm::common::getSMVersion();
     }
     catch (std::exception const& e)
     {
         TLLM_LOG_WARNING(
-            "[NCCLUtil] Failed to query real CUDA SM version while checking NCCL window support: %s; falling back "
+            "[NCCLUtil] Failed to query CUDA SM version while checking NCCL window support: %s; falling back "
             "to regular tensors.",
             e.what());
         return false;
     }
 
-    bool const supported = !isGb10Platform(realSmVersion, isIntegrated != 0);
+    bool const supported = !isGb10Platform(smVersion, isIntegrated != 0);
     if (!supported)
     {
         TLLM_LOG_WARNING(
             "[NCCLUtil] Disabling NCCL window buffers on integrated SM %d with NCCL runtime version %d.%d.%d; "
             "GB10 requires NCCL 2.30.4 or newer for symmetric window registration.",
-            realSmVersion, version / 10000, (version % 10000) / 100, version % 100);
+            smVersion, version / 10000, (version % 10000) / 100, version % 100);
     }
     return supported;
 #else
@@ -180,7 +302,7 @@ bool queryNcclWindowSupported()
 
 } // namespace
 
-bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int ncclRuntimeVersion)
+bool isNcclWindowSupportedForPlatform(int smVersion, bool isIntegrated, int ncclRuntimeVersion)
 {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
     if (ncclRuntimeVersion < kNcclWindowMinRuntimeVersion)
@@ -188,9 +310,9 @@ bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int 
         return false;
     }
 
-    return !(ncclRuntimeVersion < kNcclGb10WindowFixedVersion && isGb10Platform(realSmVersion, isIntegrated));
+    return !(ncclRuntimeVersion < kNcclGb10WindowFixedVersion && isGb10Platform(smVersion, isIntegrated));
 #else
-    (void) realSmVersion;
+    (void) smVersion;
     (void) isIntegrated;
     (void) ncclRuntimeVersion;
     return false;
@@ -203,6 +325,16 @@ bool isNcclWindowSupported()
     static bool windowBuffersSupported = false;
     std::call_once(supportCheckFlag, []() { windowBuffersSupported = queryNcclWindowSupported(); });
     return windowBuffersSupported;
+}
+
+bool isNcclWindowRegistrationCaptureSupported()
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    int runtimeVersion = 0;
+    return ncclGetVersion(&runtimeVersion) == ncclSuccess && runtimeVersion >= NCCL_VERSION(2, 30, 7);
+#else
+    return false;
+#endif
 }
 
 //==============================================================================
@@ -300,6 +432,8 @@ void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
                 return;
             }
 
+            mHostCommunicators.erase(comm);
+
             auto it = mCommResources.find(comm);
             if (it == mCommResources.end())
             {
@@ -394,10 +528,78 @@ size_t NcclCommResourceManager::getResourceCount(ncclComm_t comm) const noexcept
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
+namespace
+{
+thread_local std::optional<uint64_t> gGraphPoolOwner;
+thread_local bool gWindowAllocationSuppressed = false;
+} // namespace
+
 NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
 {
     static NCCLWindowAllocator instance;
     return instance;
+}
+
+NCCLWindowAllocator::TensorLeaseScopeKey NCCLWindowAllocator::getTensorLeaseScopeKey(int device)
+{
+    return {device, std::this_thread::get_id()};
+}
+
+void NCCLWindowAllocator::setGraphPoolOwner(int64_t owner)
+{
+    TLLM_CHECK_WITH_INFO(owner >= -1, "NCCL window pool owner must be -1 (eager) or non-negative");
+    gGraphPoolOwner = owner < 0 ? std::nullopt : std::optional<uint64_t>{static_cast<uint64_t>(owner)};
+}
+
+bool NCCLWindowAllocator::setWindowAllocationSuppressed(bool suppressed)
+{
+    return std::exchange(gWindowAllocationSuppressed, suppressed);
+}
+
+void NCCLWindowAllocator::releaseGraphPoolOwner(int64_t owner)
+{
+    TLLM_CHECK_WITH_INFO(owner >= 0, "NCCL window graph-pool owner must be non-negative");
+    auto const graphPoolOwner = static_cast<uint64_t>(owner);
+    std::lock_guard<std::mutex> lock(mMutex);
+    for (auto& [comm, buffers] : mBufferPool)
+    {
+        for (auto& entry : buffers)
+        {
+            if (entry.graphPoolOwner != graphPoolOwner)
+            {
+                continue;
+            }
+            if (entry.inUse)
+            {
+                TLLM_LOG_WARNING(
+                    "[NCCLUtil] Deferring release of graph-pool owner %llu for in-use buffer %p on comm %p",
+                    graphPoolOwner, entry.buffer.ptr, static_cast<void*>(comm));
+                assertLifecycleWarning();
+                entry.releaseOwnerWhenUnused = true;
+            }
+            else
+            {
+                entry.graphPoolOwner.reset();
+                entry.releaseOwnerWhenUnused = false;
+            }
+        }
+    }
+}
+
+bool NCCLWindowAllocator::markFallbackWarningLogged(ncclComm_t comm, FallbackWarning warning)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    registerBufferCleanup(comm);
+    return markFallbackWarningLoggedLocked(comm, warning);
+}
+
+bool NCCLWindowAllocator::markFallbackWarningLoggedLocked(ncclComm_t comm, FallbackWarning warning)
+{
+    auto& loggedWarnings = mLoggedFallbackWarnings[comm];
+    auto const warningBit = static_cast<uint8_t>(warning);
+    bool const firstOccurrence = (loggedWarnings & warningBit) == 0U;
+    loggedWarnings |= warningBit;
+    return firstOccurrence;
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size, cudaStream_t stream)
@@ -406,9 +608,60 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     {
         return NCCLWindowBuffer();
     }
+    if (gWindowAllocationSuppressed)
+    {
+        TLLM_LOG_TRACE("[NCCLUtil] NCCL window allocation suppressed on this thread for comm %p (requested: %zu)",
+            static_cast<void*>(comm), size);
+        return NCCLWindowBuffer();
+    }
 
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
+
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    auto const captureError = cudaStreamIsCapturing(stream, &captureStatus);
+    if (clearCudaErrorIfCaptureQueryFailed(captureError))
+    {
+        // Registration is unsafe when capture state is unknown, so preserve the recoverable
+        // unregistered fallback for overlapping captures and other query failures.
+        if (markFallbackWarningLogged(comm, FallbackWarning::kCaptureStateUnknown))
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] Failed to query CUDA graph capture state on comm %p: %s. Falling back to an "
+                "unregistered buffer; use thread-local capture or serialize global captures across threads.",
+                static_cast<void*>(comm), cudaGetErrorString(captureError));
+            assertLifecycleWarning();
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(
+                "[NCCLUtil] Repeated CUDA graph capture-state query failure on comm %p; using an unregistered buffer.",
+                static_cast<void*>(comm));
+        }
+        return NCCLWindowBuffer();
+    }
+    bool const isCapturing = captureStatus != cudaStreamCaptureStatusNone;
+    if (isCapturing && !gGraphPoolOwner.has_value())
+    {
+        if (markFallbackWarningLogged(comm, FallbackWarning::kCaptureWithoutOwner))
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] NCCL symmetric window requested during CUDA graph capture on comm %p without a PyTorch "
+                "graph-pool owner. Refusing unsafe window reuse and falling back to an unregistered buffer; wrap "
+                "this capture with nccl_window_graph_capture or nccl_window_graph_owner.",
+                static_cast<void*>(comm));
+            assertLifecycleWarning();
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(
+                "[NCCLUtil] Repeated CUDA graph capture without a graph-pool owner on comm %p; using an "
+                "unregistered buffer.",
+                static_cast<void*>(comm));
+        }
+        return NCCLWindowBuffer();
+    }
+    uint64_t const graphOwner = gGraphPoolOwner.value_or(0);
 
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -416,24 +669,47 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     // This is cheap even if no buffers exist yet - cleanup will just return early
     registerBufferCleanup(comm);
 
-    // Check if we have an available buffer of at least the requested size for this communicator
-    // Use best-fit: find the smallest buffer that's >= requested size
+    // Check if we have an eligible buffer of at least the requested size for this communicator
+    // Use best-fit: find the smallest eligible buffer that's >= requested size
     auto& commBuffers = mBufferPool[comm];
-    auto bestFit = commBuffers.end();
-    size_t bestFitSize = std::numeric_limits<size_t>::max();
-
-    for (auto it = commBuffers.begin(); it != commBuffers.end(); ++it)
+    auto findBestFit = [&](std::optional<uint64_t> const& graphPoolOwner)
     {
-        if (!it->inUse && it->buffer.size >= size && it->buffer.size < bestFitSize)
+        auto bestFit = commBuffers.end();
+        size_t bestFitSize = std::numeric_limits<size_t>::max();
+        for (auto it = commBuffers.begin(); it != commBuffers.end(); ++it)
         {
-            bestFit = it;
-            bestFitSize = it->buffer.size;
+            bool const streamEligible
+                = it->reusableOnAnyStream || (it->reusableStream.has_value() && *it->reusableStream == stream);
+            if (!it->inUse && streamEligible && it->graphPoolOwner == graphPoolOwner && it->buffer.size >= size
+                && it->buffer.size < bestFitSize)
+            {
+                bestFit = it;
+                bestFitSize = it->buffer.size;
+            }
+        }
+        return bestFit;
+    };
+
+    // A breakable capture keeps its owner installed across eager segments. Only capturing requests
+    // use that owner; eager requests intentionally remain in the unowned pool.
+    // Captures first reuse their pool's buffers, then may claim a free eager buffer.
+    auto bestFit = isCapturing ? findBestFit(graphOwner) : findBestFit(std::nullopt);
+    if (bestFit == commBuffers.end() && isCapturing)
+    {
+        bestFit = findBestFit(std::nullopt);
+        if (bestFit != commBuffers.end())
+        {
+            bestFit->graphPoolOwner = graphOwner;
         }
     }
 
     if (bestFit != commBuffers.end())
     {
         bestFit->inUse = true;
+        bestFit->reusableOnAnyStream = false;
+        bestFit->reusableStream.reset();
+        bestFit->releaseEpoch = 0;
+        bestFit->buffer.leaseId = mNextLeaseId++;
         TLLM_LOG_TRACE(
             "[NCCLUtil] Reusing NCCL window buffer for comm %p: handle=%d, ptr=%p, size=%zu (requested: %zu)",
             static_cast<void*>(comm), bestFit->buffer.handle, bestFit->buffer.ptr, bestFit->buffer.size, size);
@@ -442,7 +718,8 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 
     // If a previous allocateAndRegisterBuffer call collectively failed for this comm at a size
     // no larger than this request, do not retry the known-failing new allocation path. Smaller
-    // requests and already-pooled buffers can still use NCCL windows.
+    // requests and already-pooled buffers can still use NCCL windows. During capture, this
+    // known resource failure also uses plain NCCL without reporting a lifecycle violation.
     auto const failureIt = mMinSymmetricFailureSize.find(comm);
     if (failureIt != mMinSymmetricFailureSize.end() && size >= failureIt->second)
     {
@@ -451,17 +728,29 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         return NCCLWindowBuffer();
     }
 
-    // No available buffer found, avoid registration during CUDA graph capture
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    auto capture_err = cudaStreamIsCapturing(stream, &capture_status);
-    if (capture_err != cudaSuccess)
+    // Older NCCL runtimes require an existing dedicated/eager buffer during capture. Successful production capture
+    // lifecycles, window requests, tensor-scope exits, and explicit graph-owner releases execute in identical SPMD
+    // order. Failure and destructor paths abandon or quarantine their buffers instead of changing eligibility.
+    // Cross-stream reuse is enabled only at an explicit device-synchronization boundary. Together,
+    // these rules keep best-fit selection rank-symmetric: GC timing cannot change pool
+    // history, and an NCCL symmetric collective never mixes window-backed and plain pointers.
+    if (isCapturing && !mCaptureRegistrationSupported)
     {
-        TLLM_LOG_DEBUG("[NCCLUtil] cudaStreamIsCapturing failed: %s", cudaGetErrorString(capture_err));
-    }
-    if (capture_err == cudaSuccess && capture_status != cudaStreamCaptureStatusNone)
-    {
-        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation during capture for comm %p (requested: %zu)",
-            static_cast<void*>(comm), size);
+        if (markFallbackWarningLoggedLocked(comm, FallbackWarning::kNoEligibleCaptureBuffer))
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] No eligible NCCL window buffer for capture owner %llu on comm %p (requested: %zu); "
+                "falling back to an unregistered buffer. Preallocate this window size eagerly before capture.",
+                graphOwner, static_cast<void*>(comm), size);
+            assertLifecycleWarning();
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(
+                "[NCCLUtil] Repeated capture request without an eligible NCCL window buffer for owner %llu on comm "
+                "%p (requested: %zu); using an unregistered buffer.",
+                graphOwner, static_cast<void*>(comm), size);
+        }
         return NCCLWindowBuffer();
     }
 
@@ -475,11 +764,12 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     // permanently "in use" empty entry per request because releaseBuffer is a no-op for nullptr.
     if (buffer.isValid())
     {
-        commBuffers.push_back({buffer, true});
+        buffer.leaseId = mNextLeaseId++;
+        commBuffers.push_back({buffer, true, getDevice(), isCapturing ? std::make_optional(graphOwner) : std::nullopt});
     }
     else
     {
-        // The collective allreduce inside allocateAndRegisterBuffer agreed that this request
+        // The host consensus inside allocateAndRegisterBuffer agreed that this request
         // cannot use symmetric memory on at least one rank. Remember the smallest failing
         // request size so repeated too-large autotuner probes do not keep stressing this path.
         recordSymmetricFailureLocked(comm, size);
@@ -501,10 +791,21 @@ void NCCLWindowAllocator::recordSymmetricFailureLocked(ncclComm_t comm, size_t s
     }
 }
 
-cudaError_t NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(
-    int localAllocOk, CudaGetLastErrorFunc getLastError) noexcept
+bool NCCLWindowAllocator::clearCudaErrorIfCaptureQueryFailed(
+    cudaError_t captureError, CudaGetLastErrorFunc getLastError) noexcept
 {
-    if (localAllocOk == 0)
+    if (captureError == cudaSuccess)
+    {
+        return false;
+    }
+    static_cast<void>(getLastError());
+    return true;
+}
+
+cudaError_t NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(
+    bool localAllocOk, CudaGetLastErrorFunc getLastError) noexcept
+{
+    if (!localAllocOk)
     {
         return getLastError();
     }
@@ -533,8 +834,6 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
     auto commIt = mBufferPool.find(comm);
     if (commIt == mBufferPool.end())
     {
-        TLLM_LOG_WARNING(
-            "[NCCLUtil] Attempted to release buffer %p for unknown comm %p", ptr, static_cast<void*>(comm));
         return;
     }
 
@@ -542,13 +841,374 @@ void NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr)
     {
         if (entry.buffer.ptr == ptr)
         {
+            if (!entry.inUse)
+            {
+                return;
+            }
             entry.inUse = false;
+            entry.reusableOnAnyStream = true;
+            entry.reusableStream.reset();
+            entry.releaseEpoch = 0;
+            if (entry.releaseOwnerWhenUnused)
+            {
+                entry.graphPoolOwner.reset();
+                entry.releaseOwnerWhenUnused = false;
+            }
             TLLM_LOG_TRACE("[NCCLUtil] Released NCCL window buffer for comm %p: ptr=%p", static_cast<void*>(comm), ptr);
             return;
         }
     }
+}
 
-    TLLM_LOG_WARNING("[NCCLUtil] Attempted to release unknown buffer %p for comm %p", ptr, static_cast<void*>(comm));
+bool NCCLWindowAllocator::releaseBuffer(ncclComm_t comm, void* ptr, cudaStream_t stream)
+{
+    if (!comm || !ptr)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto commIt = mBufferPool.find(comm);
+    if (commIt == mBufferPool.end())
+    {
+        return false;
+    }
+
+    for (auto& entry : commIt->second)
+    {
+        if (entry.buffer.ptr != ptr || !entry.inUse)
+        {
+            continue;
+        }
+        entry.inUse = false;
+        entry.reusableOnAnyStream = false;
+        entry.reusableStream = stream;
+        entry.releaseEpoch = mNextReleaseEpoch++;
+        if (entry.releaseOwnerWhenUnused)
+        {
+            entry.graphPoolOwner.reset();
+            entry.releaseOwnerWhenUnused = false;
+        }
+        TLLM_LOG_TRACE("[NCCLUtil] Explicitly released NCCL window buffer for comm %p: ptr=%p, lease=%llu",
+            static_cast<void*>(comm), ptr, static_cast<unsigned long long>(entry.buffer.leaseId));
+        return true;
+    }
+    return false;
+}
+
+uint64_t NCCLWindowAllocator::getBufferReleaseEpoch()
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mNextReleaseEpoch - 1;
+}
+
+void NCCLWindowAllocator::promoteBufferReleases(int device, uint64_t releaseEpoch)
+{
+    // The caller has synchronized work submitted before releaseEpoch. A later concurrent release
+    // must wait for a subsequent synchronization boundary.
+    std::lock_guard<std::mutex> lock(mMutex);
+    for (auto& commBuffers : mBufferPool)
+    {
+        for (auto& entry : commBuffers.second)
+        {
+            if (entry.device == device && !entry.inUse && entry.reusableStream.has_value()
+                && entry.releaseEpoch <= releaseEpoch)
+            {
+                entry.reusableOnAnyStream = true;
+                entry.reusableStream.reset();
+                entry.releaseEpoch = 0;
+            }
+        }
+    }
+}
+
+void NCCLWindowAllocator::registerTensorLease(
+    ncclComm_t comm, c10::StorageImpl const* storage, void* ptr, uint64_t leaseId, int device)
+{
+    if (!comm || !storage || !ptr || leaseId == 0)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto const stackIt = mTensorLeaseScopeStacks.find(getTensorLeaseScopeKey(device));
+    TensorLeaseScope* scope = nullptr;
+    if (stackIt != mTensorLeaseScopeStacks.end() && !stackIt->second.empty())
+    {
+        scope = &stackIt->second.back();
+    }
+    auto const inserted = mTensorLeases.emplace(storage, TensorLease{comm, ptr, leaseId, scope}).second;
+    TLLM_CHECK_WITH_INFO(inserted, "NCCL window storage already has an active lease");
+    if (scope)
+    {
+        scope->storages.insert(storage);
+    }
+}
+
+size_t NCCLWindowAllocator::beginTensorLeaseScope(std::vector<c10::StorageImpl const*> const& inputStorages, int device)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto& scopeStack = mTensorLeaseScopeStacks[getTensorLeaseScopeKey(device)];
+    auto const entryDepth = scopeStack.size();
+    scopeStack.emplace_back();
+    auto* scope = &scopeStack.back();
+
+    for (auto const* storage : inputStorages)
+    {
+        auto leaseIt = mTensorLeases.find(storage);
+        if (leaseIt == mTensorLeases.end())
+        {
+            continue;
+        }
+        if (leaseIt->second.scope)
+        {
+            leaseIt->second.scope->storages.erase(storage);
+        }
+        leaseIt->second.scope = scope;
+        scope->storages.insert(storage);
+    }
+    return entryDepth;
+}
+
+void NCCLWindowAllocator::endTensorLeaseScope(std::vector<c10::StorageImpl const*> const& outputStorages, int device,
+    cudaStream_t stream, bool failed, std::optional<size_t> entryDepth)
+{
+    std::unordered_set<c10::StorageImpl const*> const escapedStorages(outputStorages.begin(), outputStorages.end());
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto stackIt = mTensorLeaseScopeStacks.find(getTensorLeaseScopeKey(device));
+    TLLM_CHECK_WITH_INFO(stackIt != mTensorLeaseScopeStacks.end() && !stackIt->second.empty(),
+        "NCCL window tensor lease scope stack is empty for device %d on the current thread", device);
+    auto& scopeStack = stackIt->second;
+    auto const targetDepth = entryDepth.value_or(scopeStack.size() - 1);
+    TLLM_CHECK_WITH_INFO(targetDepth < scopeStack.size(), "Invalid NCCL window tensor scope entry depth");
+    TLLM_CHECK_WITH_INFO(
+        failed || scopeStack.size() == targetDepth + 1, "Unbalanced NCCL window tensor scopes on successful exit");
+    auto finishLease = [&](TensorLease const& lease)
+    {
+        if (failed)
+        {
+            quarantineTensorLeaseLocked(lease);
+        }
+        else
+        {
+            releaseTensorLeaseLocked(lease, stream);
+        }
+    };
+
+    while (scopeStack.size() > targetDepth)
+    {
+        // Carry explicitly escaped storages through interrupted child scopes to the surviving parent.
+        auto& scope = scopeStack.back();
+        auto* parentScope = scopeStack.size() > 1 ? &scopeStack[scopeStack.size() - 2] : nullptr;
+        for (auto const* storage : scope.storages)
+        {
+            auto leaseIt = mTensorLeases.find(storage);
+            TLLM_CHECK_WITH_INFO(
+                leaseIt != mTensorLeases.end(), "NCCL window tensor scope contains an unknown storage");
+            if (escapedStorages.find(storage) != escapedStorages.end())
+            {
+                leaseIt->second.scope = parentScope;
+                if (parentScope)
+                {
+                    parentScope->storages.insert(storage);
+                }
+                continue;
+            }
+
+            auto const releasedLease = leaseIt->second;
+            mTensorLeases.erase(leaseIt);
+            finishLease(releasedLease);
+        }
+
+        for (auto const& detachedLease : scope.detachedLeases)
+        {
+            finishLease(detachedLease);
+        }
+        scopeStack.pop_back();
+    }
+    if (scopeStack.empty())
+    {
+        mTensorLeaseScopeStacks.erase(stackIt);
+    }
+}
+
+bool NCCLWindowAllocator::releaseTensorBuffer(ncclComm_t comm, c10::StorageImpl const* storage, cudaStream_t stream)
+{
+    if (!comm || !storage)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    return releaseTensorBufferLocked(storage, stream, comm);
+}
+
+bool NCCLWindowAllocator::releaseTensorBuffer(c10::StorageImpl const* storage, cudaStream_t stream)
+{
+    if (!storage)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    return releaseTensorBufferLocked(storage, stream, nullptr);
+}
+
+bool NCCLWindowAllocator::releaseTensorBufferLocked(
+    c10::StorageImpl const* storage, cudaStream_t stream, ncclComm_t expectedComm)
+{
+    auto const leaseIt = mTensorLeases.find(storage);
+    if (leaseIt == mTensorLeases.end() || (expectedComm && leaseIt->second.comm != expectedComm))
+    {
+        return false;
+    }
+
+    auto const lease = leaseIt->second;
+    if (lease.scope)
+    {
+        lease.scope->storages.erase(storage);
+    }
+    mTensorLeases.erase(leaseIt);
+    return releaseTensorLeaseLocked(lease, stream);
+}
+
+bool NCCLWindowAllocator::releaseTensorLeaseLocked(TensorLease const& tensorLease, cudaStream_t stream)
+{
+    auto commIt = mBufferPool.find(tensorLease.comm);
+    if (commIt == mBufferPool.end())
+    {
+        return false;
+    }
+    for (auto& entry : commIt->second)
+    {
+        if (entry.buffer.ptr != tensorLease.ptr || entry.buffer.leaseId != tensorLease.leaseId || !entry.inUse)
+        {
+            continue;
+        }
+        entry.inUse = false;
+        entry.reusableOnAnyStream = false;
+        entry.reusableStream = stream;
+        entry.releaseEpoch = mNextReleaseEpoch++;
+        if (entry.releaseOwnerWhenUnused)
+        {
+            entry.graphPoolOwner.reset();
+            entry.releaseOwnerWhenUnused = false;
+        }
+        TLLM_LOG_TRACE("[NCCLUtil] Explicitly released NCCL window tensor for comm %p: ptr=%p, lease=%llu",
+            static_cast<void*>(tensorLease.comm), tensorLease.ptr,
+            static_cast<unsigned long long>(tensorLease.leaseId));
+        return true;
+    }
+    return false;
+}
+
+void NCCLWindowAllocator::quarantineTensorLeaseLocked(TensorLease const& tensorLease)
+{
+    auto commIt = mBufferPool.find(tensorLease.comm);
+    if (commIt == mBufferPool.end())
+    {
+        return;
+    }
+    for (auto& entry : commIt->second)
+    {
+        if (entry.buffer.ptr != tensorLease.ptr || entry.buffer.leaseId != tensorLease.leaseId || !entry.inUse)
+        {
+            continue;
+        }
+        entry.inUse = false;
+        entry.reusableOnAnyStream = false;
+        entry.reusableStream.reset();
+        entry.releaseEpoch = 0;
+        if (entry.releaseOwnerWhenUnused)
+        {
+            entry.graphPoolOwner.reset();
+            entry.releaseOwnerWhenUnused = false;
+        }
+        TLLM_LOG_DEBUG("[NCCLUtil] Quarantining NCCL window lease %llu on comm %p after a failed tensor lease scope.",
+            static_cast<unsigned long long>(tensorLease.leaseId), static_cast<void*>(tensorLease.comm));
+        return;
+    }
+}
+
+void NCCLWindowAllocator::releaseBufferFromDestructor(ncclComm_t comm, void* ptr, uint64_t leaseId)
+{
+    if (!comm || !ptr || leaseId == 0)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    for (auto it = mTensorLeases.begin(); it != mTensorLeases.end(); ++it)
+    {
+        auto const lease = it->second;
+        if (lease.comm != comm || lease.ptr != ptr || lease.leaseId != leaseId)
+        {
+            continue;
+        }
+
+        if (lease.scope)
+        {
+            // Storage lifetime inside a scope is intentionally irrelevant. The scope retains the
+            // lease generation and releases it at the same logical boundary on every rank.
+            lease.scope->storages.erase(it->first);
+            lease.scope->detachedLeases.push_back(lease);
+            mTensorLeases.erase(it);
+            return;
+        }
+
+        mTensorLeases.erase(it);
+        break;
+    }
+
+    auto commIt = mBufferPool.find(comm);
+    if (commIt == mBufferPool.end())
+    {
+        return;
+    }
+
+    for (auto& entry : commIt->second)
+    {
+        if (entry.buffer.ptr != ptr || entry.buffer.leaseId != leaseId || !entry.inUse)
+        {
+            continue;
+        }
+        entry.inUse = false;
+        entry.reusableOnAnyStream = false;
+        entry.reusableStream.reset();
+        entry.releaseEpoch = 0;
+        if (entry.releaseOwnerWhenUnused)
+        {
+            entry.graphPoolOwner.reset();
+            entry.releaseOwnerWhenUnused = false;
+        }
+        if (markFallbackWarningLoggedLocked(comm, FallbackWarning::kDestructorFallback))
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] NCCL window lease %llu on comm %p was released by its tensor destructor instead of "
+                "an explicit final consumer. Quarantining this buffer until communicator teardown.",
+                static_cast<unsigned long long>(leaseId), static_cast<void*>(comm));
+            assertLifecycleWarning();
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(
+                "[NCCLUtil] Another NCCL window lease was released by its tensor destructor on comm %p; "
+                "quarantining the buffer.",
+                static_cast<void*>(comm));
+        }
+        return;
+    }
+}
+
+void NCCLWindowAllocator::assertLifecycleWarning() const noexcept
+{
+#if TLLM_NCCL_WINDOW_LIFECYCLE_ASSERT
+    if (!mSuppressLifecycleWarningAssertionsForTest.load(std::memory_order_relaxed))
+    {
+        std::abort();
+    }
+#endif
 }
 
 ncclWindow_t NCCLWindowAllocator::getWindow(ncclComm_t comm, void* ptr) const
@@ -607,44 +1267,20 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
-    ncclComm_t comm, size_t size, int handle, cudaStream_t stream)
+    ncclComm_t comm, size_t size, int handle, cudaStream_t /*stream*/)
 {
-    // Step 1: Pre-allocate the rank-sync flag before ncclMemAlloc. ncclMemAlloc can fail
-    // asymmetrically with ncclUnhandledCudaError on configurations where the symmetric/VMM path
-    // is unavailable; that failure may leave a sticky CUDA last-error on the device. If we
-    // deferred this cudaMalloc until after the failure, the sticky error would propagate into
-    // cudaMalloc, TLLM_CUDA_CHECK would throw, and the failing rank would never reach the
-    // collective ncclAllReduce(min) below, hanging every other rank that did succeed.
-    int* rankSyncFlag = nullptr;
-    TLLM_CUDA_CHECK(cudaMalloc(&rankSyncFlag, sizeof(int)));
-    CudaMallocGuard flagGuard{rankSyncFlag}; // frees rankSyncFlag on any early return or exception
-    TLLM_CUDA_CHECK(cudaMemsetAsync(rankSyncFlag, 0, sizeof(int), stream));
-
-    // Step 2: Allocate symmetric memory. This per-rank, non-collective call can fail
-    // asymmetrically. When it fails, NCCL may leave a sticky CUDA error behind; clear it before
-    // the stream-ordered flag copy and collective fallback so the failing rank still reaches
-    // ncclAllReduce with the other ranks.
+    // Allocation may fail on only some ranks and leave a sticky CUDA error. Clear it so every
+    // rank can reach the host vote, including ranks whose symmetric allocation failed.
     void* ncclPtr = nullptr;
-    TLLM_NCCL_CHECK_WARN(ncclMemAlloc(&ncclPtr, size));
-    int const localAllocOk = (ncclPtr != nullptr) ? 1 : 0;
-    NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
+    auto const allocResult = ncclMemAlloc(&ncclPtr, size);
+    TLLM_NCCL_CHECK_WARN(allocResult);
+    bool const localAllocOk = allocResult == ncclSuccess && ncclPtr != nullptr;
+    NcclMemGuard ncclGuard{ncclPtr};
     clearCudaErrorIfSymmetricAllocationFailed(localAllocOk);
 
-    // Step 3: ncclCommWindowRegister is collective. If any rank skips it, all other ranks hang.
-    // Populate flag, reduce with min across ranks (0 if any rank failed), then read back.
-    // The flag is initialized to 0, so H2D failure is non-fatal and conservatively falls back
-    // to regular NCCL while still reaching the collective. allreduce and D2H failures throw.
-    if (localAllocOk != 0)
-    {
-        TLLM_CUDA_CHECK_WARN(
-            cudaMemcpyAsync(rankSyncFlag, &localAllocOk, sizeof(localAllocOk), cudaMemcpyHostToDevice, stream));
-    }
-    TLLM_NCCL_CHECK(ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream));
-    TLLM_CUDA_CHECK_WARN(cudaStreamSynchronize(stream));
-
-    int allAllocOk = 0;
-    TLLM_CUDA_CHECK(cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost));
-    // flagGuard frees rankSyncFlag here at end of its scope
+    // Window registration is collective: all ranks must agree before entering it. This vote
+    // uses host memory and completes immediately, even while a CUDA stream is being captured.
+    bool const allAllocOk = hostAllTrue(comm, localAllocOk);
 
     if (!allAllocOk)
     {
@@ -658,7 +1294,7 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
         return NCCLWindowBuffer{}; // ncclGuard frees ncclPtr
     }
 
-    // Step 4: Register with NCCL as a window. This is collective, so all ranks must reach it.
+    // Register with NCCL as a window. This is collective, so all ranks must reach it.
     // Failure here is non-fatal: warn and fall back to regular allreduce.
     // ncclGuard frees ncclPtr on return.
     ncclWindow_t window = nullptr;
@@ -669,7 +1305,7 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
         return NCCLWindowBuffer{};
     }
 
-    // Step 5: Success. Transfer ownership to the returned buffer.
+    // Success. Transfer ownership to the returned buffer.
     ncclGuard.release();
     NCCLWindowBuffer buffer{ncclPtr, handle, size, window};
     TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",
@@ -730,6 +1366,31 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
     std::lock_guard<std::mutex> lock(mMutex);
 
+    for (auto it = mTensorLeases.begin(); it != mTensorLeases.end();)
+    {
+        if (it->second.comm != comm)
+        {
+            ++it;
+            continue;
+        }
+        if (it->second.scope)
+        {
+            it->second.scope->storages.erase(it->first);
+        }
+        it = mTensorLeases.erase(it);
+    }
+
+    for (auto& stackEntry : mTensorLeaseScopeStacks)
+    {
+        for (auto& scope : stackEntry.second)
+        {
+            auto& detachedLeases = scope.detachedLeases;
+            detachedLeases.erase(std::remove_if(detachedLeases.begin(), detachedLeases.end(),
+                                     [comm](TensorLease const& lease) { return lease.comm == comm; }),
+                detachedLeases.end());
+        }
+    }
+
     // Check if we've already cleaned up this communicator
     if (mRegisteredComms.find(comm) == mRegisteredComms.end())
     {
@@ -743,6 +1404,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
         // No buffers to clean up, but mark as cleaned
         mRegisteredComms.erase(comm);
         mMinSymmetricFailureSize.erase(comm);
+        mLoggedFallbackWarnings.erase(comm);
         return;
     }
 
@@ -819,10 +1481,13 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
     mMinSymmetricFailureSize.erase(comm);
+    mLoggedFallbackWarnings.erase(comm);
 }
 
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
-} // namespace tensorrt_llm::common::nccl_util
+} // namespace common::nccl_util
+
+TRTLLM_NAMESPACE_END
 
 #endif // ENABLE_MULTI_DEVICE

@@ -11,8 +11,8 @@ import torch
 
 cute = pytest.importorskip("cutlass.cute")
 
-from tensorrt_llm._torch.visual_gen.attention_backend import flash_attn4, parallel  # noqa: E402
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.attention.backends import flash_attn4, parallel  # noqa: E402
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (  # noqa: E402
     _install_cutlass_dsl_compatibility,
     _install_flash_attn_tile_scheduler_compatibility,
 )
@@ -85,7 +85,7 @@ def test_fa4_work_tile_info_survives_task_scheduling_imported_first() -> None:
         import cutlass.experimental.task_scheduling  # noqa: F401
         from cutlass.cutlass_dsl import Boolean
 
-        import tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4  # noqa: F401
+        import tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4  # noqa: F401
         from flash_attn.cute.tile_scheduler import WorkTileInfo
 
         tile_idx = (cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3), cutlass.Int32(0))
@@ -120,7 +120,7 @@ def test_fa4_kernel_traces_after_task_scheduling_imported_first() -> None:
         import cutlass.experimental.task_scheduling  # noqa: F401
         import torch
 
-        from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd
+        from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
 
         torch.manual_seed(0)
         # S_kv stays above FA4's short-KV short-circuit so num_splits=8 reaches the

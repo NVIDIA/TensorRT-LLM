@@ -56,8 +56,17 @@ def ASSERT_DRV(err):
 # ref: https://github.com/NVIDIA/cuda-python/blob/main/examples/extra/jit_program_test.py
 def getSMVersion():
     # Init
-    err, = cuda.cuInit(0)
+    try:
+        err, = cuda.cuInit(0)
+    except RuntimeError as exc:
+        # Missing/broken driver (e.g. CPU-only collection hosts). Returning inf
+        # keeps every SM-gated parametrization, so collection sees the superset
+        # of test IDs; no GPU test can run on such a host anyway.
+        print(f"WARNING: CUDA driver init failed in getSMVersion(): {exc}")
+        return math.inf
     if err == cuda.CUresult.CUDA_ERROR_NO_DEVICE:
+        print("WARNING: CUDA reports no device in getSMVersion(). "
+              "Tests that require a GPU will be skipped.")
         return -1
     ASSERT_DRV(err)
 
@@ -98,6 +107,11 @@ def isSM100Family():
     return sm >= 100 and sm < 110
 
 
+def isSM120Family():
+    sm = getSMVersion()
+    return sm >= 120 and sm < 130
+
+
 skip_pre_ada = pytest.mark.skipif(
     getSMVersion() < 89,
     reason="This test is not supported in pre-Ada architecture")
@@ -114,7 +128,10 @@ skip_blackwell = pytest.mark.skipif(
     isSM100Family(),
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
-    getSMVersion() == 120, reason="This test is not supported on SM 120")
+    isSM120Family(), reason="This test is not supported on SM 120 family")
+skip_pre_rubin = pytest.mark.skipif(
+    getSMVersion() < 107,
+    reason="This test is not supported in pre-Rubin architecture")
 skip_rubin = pytest.mark.skipif(
     100 <= getSMVersion() < 110 and getSMVersion() not in (100, 103),
     reason="This test is not supported on non-Blackwell 100f architectures")
@@ -202,21 +219,6 @@ skip_gpu_memory_less_than_80gb = skip_gpu_memory_less_than(80 * 1000 * 1000 *
 
 skip_gpu_memory_less_than_138gb = skip_gpu_memory_less_than(138 * 1000 * 1000 *
                                                             1000)
-
-
-def modelopt_installed():
-    try:
-        # isort: off
-        import modelopt.torch.quantization as atq  # NOQA
-        from modelopt.torch.export import export_tensorrt_llm_checkpoint  # NOQA
-        # isort: on
-        return True
-    except Exception:
-        return False
-
-
-skip_no_modelopt = unittest.skipIf(not modelopt_installed(),
-                                   reason="Modelopt is not installed")
 
 
 def check_nvlink():

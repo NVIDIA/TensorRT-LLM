@@ -36,9 +36,9 @@ from .kernel_inputs import prepare_kernel_inputs
 class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmGenFusedMoEBase):
     """``trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8``.
 
-    Single-provider, so there is no per-quant parent, and it calls its runner
-    op directly instead of going through ``self.op_backend``: the FlashInfer
-    wheel has no equivalent.
+    No other format shares its runner op, so there is no per-quant parent,
+    and it calls that op directly instead of going through
+    ``self.op_backend``.
     """
 
     descriptor = trtllm_gen_descriptor(
@@ -92,6 +92,10 @@ class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmGenFusedMoEBase):
 
     def _get_quant_method(self) -> object:
         return W4A8NVFP4FP8TRTLLMGenFusedMoEMethod()
+
+    def supports_unfinalized_output(self) -> bool:
+        """The W4A8 NVFP4xFP8 runner honors ``do_finalize=False`` and returns the triple."""
+        return True
 
     def quantize_input(
         self, x: torch.Tensor, post_quant_comm: bool = True

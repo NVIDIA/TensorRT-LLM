@@ -3,16 +3,17 @@
 
 import json
 import os
-import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import transformers
+from pydantic import BaseModel
 
+from .._errors import ConfigInputError, ModelLoadError, UnsupportedError
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
-from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
-                                 ContextChunkingPolicy, KvCacheRetentionConfig)
+from ..bindings.executor import (CapacitySchedulerPolicy, ContextChunkingPolicy,
+                                 KvCacheRetentionConfig)
 # yapf: enable
 from ..logger import logger
 from ..models.modeling_utils import QuantAlgo, QuantConfig
@@ -20,6 +21,7 @@ from ..models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
 from ..quantization.modelopt_config import (is_modelopt_quant_config,
                                             read_modelopt_quant_config,
+                                            reject_checkpoint_nvfp4_plus,
                                             warn_if_inline_diverges)
 # yapf: disable
 from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
@@ -44,11 +46,8 @@ class ModelLoader:
     It accepts model name or a local model dir, and will download the model if necessary.
     """
 
-    def __init__(self,
-                 llm_args: LlmArgs,
-                 workspace: Optional[str | tempfile.TemporaryDirectory] = None):
+    def __init__(self, llm_args: LlmArgs):
         self.llm_args = llm_args
-        self._workspace = workspace or tempfile.TemporaryDirectory()
 
         self.model_obj = _ModelWrapper(self.llm_args.model)
         self.speculative_model_obj = _ModelWrapper(
@@ -77,16 +76,20 @@ class ModelLoader:
         quant_config = self.llm_args.quant_config
         hf_quant_algo = hf_quant_config.pop("quant_algo", None)
         if hf_quant_algo is None:
-            raise ValueError("Pre-quantized checkpoint must have quant_algo.")
+            raise ModelLoadError(
+                "Pre-quantized checkpoint must have quant_algo.")
+        reject_checkpoint_nvfp4_plus(hf_quant_algo,
+                                     "The checkpoint quantization config")
         hf_quant_algo = QuantAlgo(hf_quant_algo)
         if quant_config.quant_algo is None:
             logger.info(
                 f"Setting quant_algo={hf_quant_algo} from HF quant config.")
             quant_config.quant_algo = hf_quant_algo
         elif quant_config.quant_algo != hf_quant_algo:
-            raise ValueError(
-                f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
-            )
+            raise ConfigInputError(
+                f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config.",
+                hint="Remove quant_config.quant_algo; the quantization of a "
+                "pre-quantized checkpoint is read from the checkpoint.")
 
         hf_kv_cache_quant_algo = hf_quant_config.pop("kv_cache_quant_algo",
                                                      None)
@@ -104,14 +107,15 @@ class ModelLoader:
                 )
                 quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
             elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                raise ValueError(
-                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-                )
+                raise ConfigInputError(
+                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config.",
+                    hint="Set the KV cache format with kv_cache_config.dtype, "
+                    "which overrides the checkpoint's.")
         else:
             if quant_config.kv_cache_quant_algo not in [
                     None, QuantAlgo.FP8, QuantAlgo.NVFP4
             ]:
-                raise ValueError(
+                raise UnsupportedError(
                     f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                 )
 
@@ -143,6 +147,7 @@ class ModelLoader:
             "fp8": QuantAlgo.FP8,
             "fp8_ds_mla": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
+            "mixed_nvfp4_fp8": QuantAlgo.FP8,
         }.get(kv_cache_dtype)
         requires_global_quant_config_fallback = False
 
@@ -173,7 +178,7 @@ class ModelLoader:
                         "falling back to config.json or model_kwargs for global "
                         "quantization.")
                 else:
-                    raise ValueError(
+                    raise ModelLoadError(
                         "Pre-quantized checkpoint must have quant_algo.")
             else:
                 self._apply_modelopt_quant_config(normalized,
@@ -201,7 +206,7 @@ class ModelLoader:
             )
 
         if requires_global_quant_config_fallback and hf_quant_config is None:
-            raise ValueError(
+            raise ModelLoadError(
                 "hf_quant_config.json does not set a global quant_algo and no "
                 "quantization_config fallback was found.")
 
@@ -225,7 +230,8 @@ class ModelLoader:
             elif hf_quant_config.get("quant_method") == "mxfp4":
                 from .._torch.model_config import ModelConfig
                 quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
-                    self.llm_args.moe_config.backend)
+                    self.llm_args.moe_config.backend,
+                    moe_tactic=self.llm_args.moe_config.tactic)
                 quant_config.group_size = 32
                 quant_config.exclude_modules = [
                     'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
@@ -361,9 +367,11 @@ class CachedModelLoader:
 
     def __init__(self,
                  llm_args: LlmArgs,
-                 mpi_session: Optional[MpiSession] = None):
+                 mpi_session: Optional[MpiSession] = None,
+                 is_attached_frontend: bool = False):
         self.llm_args = llm_args
         self.mpi_session = mpi_session
+        self._is_attached_frontend = is_attached_frontend
         self._hf_model_dir: Optional[Path] = None
 
     def _submit_to_all_workers(
@@ -385,11 +393,16 @@ class CachedModelLoader:
         Also updates the model_obj.model_dir with the local model dir.
         """
         if model_obj.is_hub_model:
-            model_dirs = self._submit_to_all_workers(
-                CachedModelLoader._node_download_hf_model,
-                model=model_obj.model_name,
-                revision=revision)
-            model_dir = next((d for d in model_dirs if d is not None), None)
+            if self._is_attached_frontend:
+                # Attached frontends have no MPI session; resolve the cached
+                # snapshot locally, independent of their CUDA device index.
+                model_dir = download_hf_model(model_obj.model_name, revision)
+            else:
+                model_dirs = self._submit_to_all_workers(
+                    CachedModelLoader._node_download_hf_model,
+                    model=model_obj.model_name,
+                    revision=revision)
+                model_dir = next((d for d in model_dirs if d is not None), None)
             model_obj.model_dir = model_dir
             return model_dir
         return model_obj.model_dir
@@ -409,11 +422,8 @@ class CachedModelLoader:
             # repo id had no readable config.json at validation time; a local
             # path was already resolved back then.
             if was_hub_model:
-                resolve_from_checkpoint = getattr(
-                    self.llm_args.speculative_config, 'resolve_from_checkpoint',
-                    None)
-                if resolve_from_checkpoint is not None:
-                    resolve_from_checkpoint()
+                self.llm_args.speculative_config.resolve_from_checkpoint(
+                    trust_remote_code=self.llm_args.trust_remote_code)
                 # The DFlash buffer-fit check reads the drafter geometry from
                 # the same config.json, so for a hub repo id the validation
                 # pass only covered the token budget. Re-run it now that the
@@ -461,7 +471,6 @@ __all__ = [
     'ModelLoader',
     '_ParallelConfig',
     '_ModelWrapper',
-    'BatchingType',
     'SchedulerConfig',
     'KvCacheRetentionConfig',
     'MTPDecodingConfig',
@@ -526,8 +535,30 @@ def apply_model_defaults_to_llm_args(
             "via get_preferred_transceiver_runtime() instead.")
 
     user_overrides = llm_args.model_dump(exclude_unset=True)
+    fields_set_before = _snapshot_fields_set(llm_args)
+
+    # A user's ``moe_config.tactic`` already names the implementation, so a
+    # model's preferred ``moe_config.backend`` yields to it instead of being
+    # merged into a combination that MoeConfig rejects.
+    user_moe_config = user_overrides.get("moe_config")
+    default_moe_config = model_defaults_dict.get("moe_config")
+    if (isinstance(user_moe_config, dict)
+            and user_moe_config.get("tactic") is not None
+            and isinstance(default_moe_config, dict)
+            and "backend" in default_moe_config):
+        model_defaults_dict = {
+            **model_defaults_dict,
+            "moe_config": {
+                key: value
+                for key, value in default_moe_config.items() if key != "backend"
+            },
+        }
+
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
+    # Model defaults cannot change this config; retain its private launcher state,
+    # which is intentionally excluded from model_dump().
+    merged_state["cache_transceiver_config"] = llm_args.cache_transceiver_config
 
     new_args = llm_args.__class__(**merged_state)
 
@@ -544,7 +575,9 @@ def apply_model_defaults_to_llm_args(
                 if isinstance(user_override, dict):
                     nested_applied = _compute_applied(default_value,
                                                       user_override)
-                    if nested_applied:
+                    # A default for a key the user left unset constructs that
+                    # config even when it sets nothing inside it.
+                    if nested_applied or key not in overrides:
                         applied[key] = nested_applied
                 elif key not in overrides:
                     applied[key] = default_value
@@ -553,7 +586,64 @@ def apply_model_defaults_to_llm_args(
                     applied[key] = default_value
         return applied
 
-    return _compute_applied(model_defaults_dict, user_overrides)
+    applied = _compute_applied(model_defaults_dict, user_overrides)
+    # Rebuilding from a full dump marks every field, nested ones included, as
+    # set. Keep only the fields the user set and the ones the model defaults
+    # applied, at every level, so checks of whether a deployment set a field
+    # (``model_fields_set``) still hold.
+    _restore_fields_set(llm_args, fields_set_before, applied)
+    return applied
+
+
+def _snapshot_fields_set(value: Any) -> Any:
+    """Record which fields are set on each config in ``value``.
+
+    Descends into config fields and into dicts and lists that hold configs.
+    A config maps to ``(fields_set, {field: snapshot})``; a dict or list maps
+    to the same container of snapshots; anything else maps to None.
+    """
+    if isinstance(value, BaseModel):
+        return (frozenset(value.model_fields_set), {
+            name: _snapshot_fields_set(getattr(value, name, None))
+            for name in type(value).model_fields
+        })
+    if isinstance(value, dict):
+        return {key: _snapshot_fields_set(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_fields_set(item) for item in value]
+    return None
+
+
+def _restore_fields_set(value: Any, snapshot: Any, applied: Any) -> None:
+    """Mark the snapshot's fields and the applied names as set.
+
+    Applies to each config in ``value``. ``snapshot`` comes from
+    ``_snapshot_fields_set`` and is None where no config existed before the
+    defaults were applied; ``applied`` is the defaults applied at this level.
+    """
+    if isinstance(applied, BaseModel):
+        applied = applied.model_dump(exclude_unset=True)
+    if isinstance(value, BaseModel):
+        applied = applied if isinstance(applied, dict) else {}
+        fields_set, nested = (snapshot if isinstance(snapshot, tuple) else
+                              (frozenset(), {}))
+        object.__setattr__(value, "__pydantic_fields_set__",
+                           set(fields_set) | applied.keys())
+        for name in type(value).model_fields:
+            _restore_fields_set(getattr(value, name, None), nested.get(name),
+                                applied.get(name))
+    elif isinstance(value, dict):
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        applied = applied if isinstance(applied, dict) else {}
+        for key, item in value.items():
+            _restore_fields_set(item, snapshot.get(key), applied.get(key))
+    elif isinstance(value, (list, tuple)):
+        snapshot = snapshot if isinstance(snapshot, list) else []
+        applied = applied if isinstance(applied, (list, tuple)) else []
+        for index, item in enumerate(value):
+            _restore_fields_set(
+                item, snapshot[index] if index < len(snapshot) else None,
+                applied[index] if index < len(applied) else None)
 
 
 def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
@@ -561,26 +651,36 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
                                       pretrained_config: Any = None) -> bool:
     """Resolve the KV cache manager auto setting from the model preference.
 
-    A model preference for V2 is demoted to V1 for routes V2 cannot serve; an
-    explicit user value otherwise wins. The compatibility arms are:
-
-    - Disaggregated serving: hybrid Mamba V2 requires the Python transceiver
-      with NIXL, so any other route falls back to V1. The transceiver runtime
-      auto setting must be resolved first.
-    - Two-model speculative decoding: the draft model runs in a separate engine
-      with its own KV cache manager. ``build_managers`` hands that manager the
-      target's ``kv_cache_config`` unsplit, and V2 capacity is governed solely
-      by ``max_gpu_total_bytes``, so both managers size their pools from the
-      full budget. The model preference falls back to V1, and an explicit
-      ``True`` is rejected rather than deferred to that allocation.
+    A model preference for V2 is demoted to V1 for routes V2 cannot serve; a
+    boolean value otherwise wins, including the default ``True``.
+    Disaggregated serving with V2 requires the Python transceiver with NIXL,
+    so ``auto`` falls back to V1 for any other route. The transceiver runtime
+    auto setting must be resolved first.
 
     The fallback only reaches models whose manager class is selected by
-    ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally
-    -- sparse attention picks its class from the algorithm alone -- keep a V2
-    manager after the demotion, so the arm does not protect them.
+    ``use_kv_cache_manager_v2``, such as dense models and Skip Softmax. Models
+    whose manager class ignores the setting -- variable per-layer KV geometry
+    and sparse algorithms with a fixed manager -- keep that manager after the
+    demotion, so the arm does not protect them.
+
+    A model whose ``requires_kv_cache_manager_v2`` hook returns True has no
+    supported V1 route: the disaggregated-serving arm raises instead of
+    demoting, and an explicit ``use_kv_cache_manager_v2=False`` is rejected.
     """
+    model_name = getattr(model_cls, "__name__", "the model")
+    requires_v2 = False
+    if model_cls is not None:
+        get_required = getattr(model_cls, 'requires_kv_cache_manager_v2', None)
+        if get_required is not None:
+            requires_v2 = bool(get_required(pretrained_config))
+
     setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
     if setting != "auto":
+        if requires_v2 and setting is False:
+            raise ValueError(
+                f"{model_name} requires KV cache manager v2; "
+                "kv_cache_config.use_kv_cache_manager_v2=False is not supported "
+                "for this model.")
         return setting
 
     preferred_version = None
@@ -594,7 +694,7 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
             f"{model_cls.__name__}.get_preferred_kv_cache_manager_version() "
             f"must return 'V1', 'V2', or None, got {preferred_version!r}.")
 
-    use_v2 = preferred_version == "V2"
+    use_v2 = preferred_version == "V2" or requires_v2
 
     transceiver_config = llm_args.cache_transceiver_config
     if (use_v2 and transceiver_config is not None
@@ -602,6 +702,14 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
         effective_backend, _ = transceiver_config._resolve_default_backend()
         runtime = transceiver_config.transceiver_runtime
         if effective_backend != "NIXL" or runtime != "PYTHON":
+            if requires_v2:
+                raise ValueError(
+                    f"{model_name} requires KV cache manager v2, which "
+                    "disaggregated serving keeps only on backend='NIXL' with "
+                    "transceiver_runtime='PYTHON'; this run uses "
+                    f"transceiver_runtime={runtime!r} with "
+                    f"backend={effective_backend!r}. Configure the cache "
+                    "transceiver for NIXL with the Python runtime.")
             logger.info(
                 "KV cache manager V2 is the model preference, but disaggregated "
                 "serving uses transceiver_runtime=%r with backend=%r; "
@@ -612,6 +720,12 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
             swa_endpoint_rewind_tokens > 0):
         raise ValueError(
             "block_reuse_config.swa_endpoint_rewind_tokens requires KV cache "
+            "manager v2, but use_kv_cache_manager_v2='auto' resolved to V1. "
+            "Set kv_cache_config.use_kv_cache_manager_v2=True explicitly.")
+    if (not use_v2 and
+            llm_args.kv_cache_config.block_reuse_config.enable_branch_snapshot):
+        raise ValueError(
+            "block_reuse_config.enable_branch_snapshot requires KV cache "
             "manager v2, but use_kv_cache_manager_v2='auto' resolved to V1. "
             "Set kv_cache_config.use_kv_cache_manager_v2=True explicitly.")
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2

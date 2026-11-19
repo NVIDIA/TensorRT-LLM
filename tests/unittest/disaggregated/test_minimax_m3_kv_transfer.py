@@ -38,7 +38,12 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KV
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -50,6 +55,9 @@ HEAD_DIM = 128
 INDEX_DIM = 128
 TOKENS_PER_BLOCK = transfer_harness.TOKENS_PER_BLOCK
 SPARSE_LAYERS = [3]
+# A DSpark drafter's 4096-token window, scaled down to the harness's 512-token sequences.
+NUM_DRAFT_LAYERS = 2
+DRAFT_WINDOW = 256
 
 
 class _FakeKVCache:
@@ -70,6 +78,8 @@ class _ShortFakeKVCache:
 
 def test_minimax_cache_indices_support_block_count_limit() -> None:
     manager = object.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.layer_specs = None
+    manager.kv_factor = 2
     manager.kv_cache_map = {7: _FakeKVCache(), 8: _ShortFakeKVCache()}
 
     assert manager._get_batch_cache_indices_by_pool_id([7]) == [[4, 5, 6, -1]]
@@ -79,6 +89,12 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
         [4, 5, 6, -1],
         [7, 8, -1, -1],
     ]
+    assert manager._get_batch_cache_indices_by_pool_id([7], index_scale=3, kv_factor=2) == [
+        [4, 5, 6, -1]
+    ]
+    assert manager.get_batch_cache_indices([7, 8]) == [[4, 5, 6, -1], [7, 8, -1, -1]]
+    assert manager.get_batch_cache_indices([7], num_blocks_per_seq=[2]) == [[4, 5]]
+    assert manager.get_batch_cache_indices([7], raw_indices=True) == [[4, 5, 6, -1]]
     assert manager.get_block_ids_per_seq([7]).tolist() == [[4, 5, 6, 0]]
     assert manager.get_block_ids_per_seq([7, 8]).tolist() == [
         [4, 5, 6, 0],
@@ -95,13 +111,19 @@ def test_v2_disagg_role_mapper_kind_defaults() -> None:
     }
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "implementation,expected_main_mapper",
-    [("triton", MapperKind.NHD), ("msa", MapperKind.HND)],
+    "implementation,cache_dtype,expected_main_mapper",
+    [
+        ("triton", DataType.BF16, MapperKind.HND),
+        ("msa", DataType.BF16, MapperKind.HND),
+        ("triton", DataType.NVFP4, MapperKind.NHD),
+    ],
 )
 def test_minimax_disagg_role_mapper_kinds(
     monkeypatch: pytest.MonkeyPatch,
     implementation: str,
+    cache_dtype: DataType,
     expected_main_mapper: MapperKind,
 ) -> None:
     def fake_base_init(self: KVCacheManagerV2, *args: Any, **kwargs: Any) -> None:
@@ -114,6 +136,7 @@ def test_minimax_disagg_role_mapper_kinds(
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     manager = MiniMaxM3KVCacheManagerV2(
         num_layers=0,
+        dtype=cache_dtype,
         sparse_layer_ids=[],
         disable_index_value_layer_ids=[],
         sparse_attention_config=SimpleNamespace(
@@ -126,6 +149,18 @@ def test_minimax_disagg_role_mapper_kinds(
         Role.ALL: expected_main_mapper,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+    if implementation == "triton":
+        fp8_manager = MiniMaxM3KVCacheManagerV2(
+            num_layers=0,
+            dtype=DataType.FP8,
+            sparse_layer_ids=[],
+            disable_index_value_layer_ids=[],
+            sparse_attention_config=SimpleNamespace(
+                implementation="triton", indexer_kv_dtype="bf16"
+            ),
+        )
+        assert fp8_manager.get_disagg_role_mapper_kinds()[Role.ALL] == MapperKind.NHD
+        assert fp8_manager._dense_native_layer_ids == ()
 
 
 def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:
@@ -181,6 +216,7 @@ def _create_manager(
     dtype: DataType,
     sparse_layers: list[int] | None = None,
     implementation: str = "triton",
+    layer_specs: tuple[KVCacheLayerSpec, ...] | None = None,
 ) -> MiniMaxM3KVCacheManagerV2:
     max_num_tokens = 2048
     kv_cache_dtype = {
@@ -212,6 +248,8 @@ def _create_manager(
             implementation=implementation,
             indexer_kv_dtype="bf16",
         ),
+        layer_specs=layer_specs,
+        is_disagg=layer_specs is not None,
     )
 
 
@@ -236,7 +274,7 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
     try:
         lg = build_page_table_from_manager(manager).layer_groups[0]
         assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.NHD)
+        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
         idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
         assert kv_view.pool_role == frozenset({str(Role.KEY), str(Role.VALUE)})
         assert idx_view.pool_role == frozenset({str(Role.INDEX_KEY)})
@@ -260,7 +298,7 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
     try:
         lg = build_page_table_from_manager(manager).layer_groups[0]
         assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.NHD)
+        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
         idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
         assert kv_view.pool_idx != idx_view.pool_idx
         starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
@@ -449,8 +487,8 @@ def _initialize_cache(
             continue
 
         for layer_idx in manager.pp_layers:
-            kv = manager.get_buffers(layer_idx)
-            if manager.dtype == DataType.NVFP4:
+            kv = manager.get_buffers(layer_idx, kv_layout=manager._main_kv_layout_name())
+            if manager.dtype == DataType.NVFP4 and layer_idx < NUM_LAYERS:
                 sparse = layer_idx in manager.sparse_layer_ids
                 assert kv.dtype == (torch.int8 if sparse else torch.float8_e4m3fn)
                 assert kv.shape[-1] == (HEAD_DIM // 2 if sparse else HEAD_DIM)
@@ -462,7 +500,9 @@ def _initialize_cache(
                 layout=manager._main_kv_mapper_kind,
             )
 
-            index_key = manager.get_index_k_buffer(layer_idx)
+            index_key = manager.get_index_k_buffer(
+                layer_idx, kv_layout=manager._main_kv_layout_name()
+            )
             if index_key is not None:
                 index_tensor = index_key.unsqueeze(1)
                 _fill_position_dependent(
@@ -508,7 +548,9 @@ def _verify_cache(
                 gen_indices = _valid_indices(manager, gen_request_id, layer_idx)
                 assert gen_indices
 
-                gen_kv = manager.get_buffers(layer_idx)[gen_indices]
+                gen_kv = manager.get_buffers(layer_idx, kv_layout=manager._main_kv_layout_name())[
+                    gen_indices
+                ]
                 head_axis = 2 if manager._main_kv_mapper_kind == MapperKind.HND else 3
                 local_heads = gen_kv.shape[head_axis]
                 first_global_head = _first_global_head(manager)
@@ -526,7 +568,16 @@ def _verify_cache(
                         ctx_indices = _valid_indices(
                             ctx_manager, ctx_request_ids[req_idx], layer_idx
                         )
-                        ctx_kv = ctx_manager.get_buffers(layer_idx)
+                        if layer_idx >= NUM_LAYERS:
+                            # A windowed draft lifecycle's receiver holds the trailing blocks
+                            # (at least a window's), which the sender may still keep after more.
+                            window_blocks = DRAFT_WINDOW // TOKENS_PER_BLOCK
+                            assert min(len(ctx_indices), window_blocks) <= len(gen_indices)
+                            assert len(gen_indices) <= len(ctx_indices)
+                            ctx_indices = ctx_indices[len(ctx_indices) - len(gen_indices) :]
+                        ctx_kv = ctx_manager.get_buffers(
+                            layer_idx, kv_layout=ctx_manager._main_kv_layout_name()
+                        )
                         if manager._main_kv_mapper_kind == MapperKind.HND:
                             actual = gen_kv[:, kv_idx, local_head, :, :]
                             expected = ctx_kv[ctx_indices, kv_idx, ctx_local_head, :, :]
@@ -535,7 +586,9 @@ def _verify_cache(
                             expected = ctx_kv[ctx_indices, kv_idx, :, ctx_local_head, :]
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-                index_key = manager.get_index_k_buffer(layer_idx)
+                index_key = manager.get_index_k_buffer(
+                    layer_idx, kv_layout=manager._main_kv_layout_name()
+                )
                 if index_key is not None:
                     ctx_manager, _ = _find_ctx_source(
                         ctx_managers,
@@ -546,7 +599,9 @@ def _verify_cache(
                         global_head=0,
                     )
                     ctx_indices = _valid_indices(ctx_manager, ctx_request_ids[req_idx], layer_idx)
-                    ctx_index_key = ctx_manager.get_index_k_buffer(layer_idx)
+                    ctx_index_key = ctx_manager.get_index_k_buffer(
+                        layer_idx, kv_layout=ctx_manager._main_kv_layout_name()
+                    )
                     assert ctx_index_key is not None
                     torch.testing.assert_close(
                         index_key[gen_indices],
@@ -728,6 +783,92 @@ def test_minimax_m3_multi_sparse_layer_pp_transfer(
         manager_factory=lambda tp, pp, enable_dp: _create_managers(
             tp, pp, enable_dp, DataType.BF16, sparse_layers=MULTI_SPARSE_LAYERS
         ),
+        init_fn=_initialize_cache,
+        verify_fn=_verify_cache,
+    )
+
+
+def _create_unified_draft_managers(
+    tp: int, pp: int, enable_dp: bool
+) -> list[MiniMaxM3KVCacheManagerV2]:
+    """Hybrid NVFP4 MSA managers hosting a windowed BF16 drafter's layers as draft layer specs."""
+    assert pp == 1, "draft layer specs here cover every layer of one PP rank"
+    heads = NUM_KV_HEADS if enable_dp else NUM_KV_HEADS // tp
+    specs = tuple(
+        KVCacheLayerSpec(
+            global_layer_id=layer,
+            owner=KVCacheLayerOwner.TARGET,
+            dtype=DataType.NVFP4,
+            num_kv_heads=heads,
+            head_dim=HEAD_DIM,
+            buffer_roles=(Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE),
+        )
+        for layer in range(NUM_LAYERS)
+    ) + tuple(
+        KVCacheLayerSpec(
+            global_layer_id=NUM_LAYERS + layer,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            num_kv_heads=heads,
+            head_dim=HEAD_DIM,
+            buffer_roles=(Role.KEY, Role.VALUE),
+            sliding_window_size=DRAFT_WINDOW,
+        )
+        for layer in range(NUM_DRAFT_LAYERS)
+    )
+    managers = [
+        _create_manager(
+            Mapping(world_size=tp, rank=rank, tp_size=tp, pp_size=1, enable_attention_dp=enable_dp),
+            DataType.NVFP4,
+            implementation="msa",
+            layer_specs=specs,
+        )
+        for rank in range(tp)
+    ]
+    for manager in managers:
+        assert manager.draft_layer_ids == tuple(range(NUM_LAYERS, NUM_LAYERS + NUM_DRAFT_LAYERS))
+    return managers
+
+
+@pytest.mark.cuda
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_enable_dp,gen_tp,gen_enable_dp",
+    [
+        (1, False, 1, False),
+        (2, False, 2, False),
+        (2, True, 2, True),
+        (1, False, 2, False),
+        (2, False, 2, True),
+    ],
+    ids=["tp1_to_tp1", "tp2_to_tp2", "dep2_to_dep2", "tp1_to_tp2", "tp2_to_dep2"],
+)
+@pytest.mark.parametrize(
+    "update_before_transfer",
+    [True, False],
+    ids=["update_before", "update_after"],
+)
+def test_minimax_m3_unified_draft_layer_transfer(
+    ctx_tp: int,
+    ctx_enable_dp: bool,
+    gen_tp: int,
+    gen_enable_dp: bool,
+    update_before_transfer: bool,
+) -> None:
+    """Windowed BF16 draft layers of the NVFP4 manager reach the same pages as the target's.
+
+    Draft layers reshard across TP and attention DP like the target's, and are verified byte for
+    byte with the target's K/V, block scales and index-K.
+    """
+    transfer_harness.run_kv_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=1,
+        gen_tp=gen_tp,
+        gen_pp=1,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
+        update_before_transfer=update_before_transfer,
+        manager_factory=_create_unified_draft_managers,
         init_fn=_initialize_cache,
         verify_fn=_verify_cache,
     )

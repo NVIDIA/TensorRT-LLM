@@ -23,8 +23,8 @@ This guide focuses on source-level integration where the kernel ships as either:
 | Flavor | Source language | When it is built | Where it lives |
 | :---- | :---- | :---- | :---- |
 | CUDA C++ | `.cu` / `.h` | At wheel build time (CMake → `nvcc`) | [`cpp/tensorrt_llm/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels) |
-| [CuTe DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) (Python) | Python using `cutlass.cute` / `@cute.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/cute_dsl_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels) |
-| [cuTile](https://docs.nvidia.com/cuda/cutile-python/) (Python) | Python using `cuda.tile` / `@ct.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/cuda_tile_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels) |
+| [CuTe DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) (Python) | Python using `cutlass.cute` / `@cute.kernel` | JIT, on first call (cached in-process) | Beside the owning module layer — [`attention/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/attention/kernels), [`moe/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/moe/kernels), [`visual_gen/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/visual_gen/kernels) — or, when no single layer owns them, [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) |
+| [cuTile](https://docs.nvidia.com/cuda/cutile-python/) (Python) | Python using `cuda.tile` / `@ct.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) (`rms_norm.py`, `rms_norm_fuse_residual.py`) |
 
 ---
 
@@ -166,15 +166,15 @@ CuTe DSL and cuTile kernels are written in Python and JIT-compiled at runtime. T
 
 | Flavor | Directory | Availability flag |
 | :---- | :---- | :---- |
-| CuTe DSL | [`tensorrt_llm/_torch/cute_dsl_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels) (Blackwell variants under `blackwell/`) | `IS_CUTLASS_DSL_AVAILABLE` in [`cute_dsl_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_utils.py) |
-| cuTile | [`tensorrt_llm/_torch/cuda_tile_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels) | `IS_CUDA_TILE_AVAILABLE` in [`cuda_tile_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_utils.py) |
+| CuTe DSL | [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) plus the domain-owned [`attention/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/attention/kernels), [`moe/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/moe/kernels) and [`visual_gen/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/visual_gen/kernels) (architecture variants under `blackwell/` and `rubin/`) | `IS_CUTLASS_DSL_AVAILABLE` in [`cute_dsl_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_utils.py) |
+| cuTile | [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) | `IS_CUDA_TILE_AVAILABLE` in [`cuda_tile_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_utils.py) |
 
 ### 4.2 Kernel skeleton
 
-**CuTe DSL.** The kernel is a class (or a free function) decorated with `@cute.jit` for host code and `@cute.kernel` for the device entry point. Compilation is cached by the call site and reused across launches. See [`cute_dsl_kernels/argmax.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/argmax.py) for a self-contained reduction example, and [`cute_dsl_kernels/blackwell/dense_gemm_persistent.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_gemm_persistent.py) for a GEMM with TMA + persistent scheduling.
+**CuTe DSL.** The kernel is a class (or a free function) decorated with `@cute.jit` for host code and `@cute.kernel` for the device entry point. Compilation is cached by the call site and reused across launches. See [`kernels/argmax.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/kernels/argmax.py) for a self-contained reduction example, and [`kernels/blackwell/dense_gemm_persistent.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/kernels/blackwell/dense_gemm_persistent.py) for a GEMM with TMA + persistent scheduling.
 
 ```py
-# tensorrt_llm/_torch/cute_dsl_kernels/my_kernel.py
+# tensorrt_llm/_torch/kernels/my_kernel.py
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -210,10 +210,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return out
 ```
 
-**cuTile.** The kernel is a Python function decorated with `@ct.kernel` that takes tensors plus `ct.Constant[...]` compile-time parameters, and is launched via `ct.launch(stream, grid, kernel, args)`. See [`cuda_tile_kernels/rms_norm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_kernels/rms_norm.py) and the corresponding Torch op wrapper in [`custom_ops/cuda_tile_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cuda_tile_custom_ops.py).
+**cuTile.** The kernel is a Python function decorated with `@ct.kernel` that takes tensors plus `ct.Constant[...]` compile-time parameters, and is launched via `ct.launch(stream, grid, kernel, args)`. See [`kernels/rms_norm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/kernels/rms_norm.py) and the corresponding Torch op wrapper in [`custom_ops/cuda_tile_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cuda_tile_custom_ops.py).
 
 ```py
-# tensorrt_llm/_torch/cuda_tile_kernels/my_kernel.py
+# tensorrt_llm/_torch/kernels/my_kernel.py
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 
 if IS_CUDA_TILE_AVAILABLE:
@@ -236,7 +236,7 @@ from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 
 if IS_CUDA_TILE_AVAILABLE:
     import cuda.tile as ct
-    from ..cuda_tile_kernels import rms_norm_kernel  # the JIT kernel above
+    from ..kernels.rms_norm import rms_norm_kernel  # the JIT kernel above
 
     @torch.library.custom_op("trtllm::cuda_tile_rms_norm", mutates_args=())
     def cuda_tile_rms_norm(x, weight, eps, ...):
@@ -254,33 +254,28 @@ The same pattern (`@torch.library.custom_op("trtllm::...")`, `register_fake`, co
 
 ### 4.4 Runtime caveats
 
-- **Compute capability checks.** Kernels under `cute_dsl_kernels/blackwell/` and the entire `cuda_tile_kernels/` tree assume sm_100+. Always probe with `tensorrt_llm._utils.get_sm_version()` (see `_should_use_torch_fallback` in `argmax.py`) and route to a fallback otherwise.  
+- **Compute capability checks.** CuTe DSL kernels under a `kernels/blackwell/` package assume sm_100+, and those under a `kernels/rubin/` package assume sm_107+. The cuTile kernels under `tensorrt_llm/_torch/kernels/` assume sm_100+ too. Always probe with `tensorrt_llm._utils.get_sm_version()` (see `_should_use_torch_fallback` in `argmax.py`) and route to a fallback otherwise.  
 - **DLPack/CUDA Graphs.** When exporting tensors via DLPack, use the stream override that mimics the `CUDAGraphCompatibleWrapper` in `argmax.py` so the capture replays cleanly.  
 - **JIT compile cache.** Always cache compiled kernels by the keys that affect codegen (dtype, last-dim size, hardware variant). `argmax.py` and the `cute_dsl_custom_ops.py` runners are good references.
 
-### 4.5 Pruning autotuner tactics with nvMatmulHeuristics
+### 4.5 Guiding autotuner tactics with nvMatmulHeuristics
 
-A CuTe DSL runner that exposes many tactics (tile / cluster / swap / prefetch combinations) can be expensive to autotune, because the AutoTuner JIT-compiles and benchmarks every candidate returned by `get_valid_tactics`. A runner can therefore rank and prune its own candidate list with [nvMatmulHeuristics](https://pypi.org/project/nvidia-matmul-heuristics/) *inside* `get_valid_tactics`, before the tactics ever reach the compile+benchmark loop — all shapes and inputs are already visible at that point, so no extra AutoTuner hook is needed. The pruning is a no-op by default and must degrade gracefully to the full list on any failure, so tuning never loses a valid candidate.
+A CuTe DSL GEMM/BMM runner can expose hundreds of tactics (tile / cluster / split-K / rasterization / swap / prefetch combinations), and the AutoTuner JIT-compiles and benchmarks every candidate returned by `get_valid_tactics`. With `autotuner_nvmmh_config` set, nvMMH-aware runners instead build their tactic list from the top kernel configurations that [nvMatmulHeuristics](https://pypi.org/project/nvidia-matmul-heuristics/) (nvMMH) ranks for the problem:
 
-Today this is wired up for the SM100/SM103 (Blackwell B200/B300) NVFP4 dense GEMM: `CuteDSLNVFP4BlackwellRunner.get_valid_tactics` builds the full sweep and then hands it to the private `_rank_prune_tactics` helper. The pruned set is a strict, re-validated subset of the full sweep — it never introduces a tactic the kernel validator rejected — so correctness is unchanged and only autotuner wall-time is affected. On a 4096³ NVFP4 GEMM this cuts a cold autotune from ~120 tactics to ~5 (roughly 7× less wall-time) while keeping the selected kernel within a few percent of the full-sweep best.
-
-The behavior is controlled entirely by environment variables (all read at tune time; the package must be installed, otherwise the path silently falls back to the full sweep):
-
-| Environment variable | Default | Meaning |
-|---|---|---|
-| `TRTLLM_CUTEDSL_NVMMH_ENABLE` | `0` | Master opt-in switch. Set to `1` to enable heuristic tactic pruning. When unset/`0`, or when `nvidia-matmul-heuristics` is not installed, the full tactic sweep runs unchanged. |
-| `TRTLLM_CUTEDSL_NVMMH_FIELDS` | `tile,cluster` | Comma-separated list of the knobs nvMatmulHeuristics drives; any knob not listed is swept by the runner. Recognized tokens: `tile`, `cluster`, `swizzle`, `cta_order`. `tile` and `cluster` are a coupled pair (the 2-SM encoding maps the joint `(cta, cluster)`), so naming either drives both. Accepted aliases: `cta_tile` / `mma_tiler` → `tile`. Unknown tokens are warned once and ignored. **Top-K tile/cluster pruning happens only when `tile`/`cluster` is selected; with scheduler-only fields (`swizzle` and/or `cta_order`) every valid tile/cluster is swept and merely annotated with the model's scheduler knobs.** |
-| `TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS` | `5` | Top-K distinct `(tile, cluster, swap)` keys to keep from the model's ranking (applies only when `tile`/`cluster` is in `FIELDS`). Both `use_prefetch` variants of a kept key are profiled on top (prefetch is not modeled), so the final tactic count can be up to ~2× this. Larger K = closer to the full-sweep best but slower autotune; smaller K = faster autotune with a larger potential perf gap. |
-
-Example (enable pruning, keep the top 8 tile/cluster candidates):
-
-```bash
-export TRTLLM_CUTEDSL_NVMMH_ENABLE=1
-export TRTLLM_CUTEDSL_NVMMH_FIELDS=tile,cluster
-export TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS=8
+```yaml
+# extra_llm_api_options.yaml
+autotuner_nvmmh_config:
+  max_tactics: 5   # nvMMH configurations to profile per GEMM shape
 ```
 
-The adapter and env helpers live in [`tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py); the `get_valid_tactics` / `_rank_prune_tactics` pruning is in [`cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py).
+or `LLM(..., autotuner_nvmmh_config=AutoTunerNvMMHConfig(max_tactics=5))`. The option is off by default; when it is unset, when `nvidia-matmul-heuristics` is not installed, or when a query fails, runners fall back to their full tactic list.
+
+- **nvMMH chooses, the runner realizes.** Every field nvMMH models (CTA tile, cluster shape, split-K, rasterization order, swizzle) is taken as returned. Only knobs nvMMH does not model (prefetch, scheduler mode, the preferred/fallback cluster launch) are swept inside each configuration. If a chosen configuration performs poorly, the fix belongs in nvMMH's model, not in TensorRT-LLM.
+- **Kernels describe their capabilities.** Each runner passes nvMMH a validity check (built on the kernel's `can_implement`) and backend properties (split-K kind, column-major rasterization, fallback clusters), so nvMMH ranks implementable configurations only. Runners that support both A/B orientations query both problems and merge the rankings by nvMMH's ranking score.
+- **Cache keys.** Runners return `("nvmmh", <library version>, max_tactics)` from `TunableRunner.tactic_space_key()`, so profiling-cache entries tuned with and without the guidance are never mixed.
+- **Library versions.** Both the `nvidia-matmul-heuristics` 0.1.0.x wheels and newer libheuristics builds are supported; the adapter in [`cutedsl_matmul_heuristics.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py) hides their API differences.
+
+To guide a new runner, return `_nvmmh_tactic_space_key()` from `tactic_space_key`, and in `get_valid_tactics` (when `AutoTuner.get().nvmmh_config` is set) call `cutedsl_matmul_heuristics.query(...)` with a validity check that maps a configuration onto the kernel, expand each returned configuration into its tactics, and keep the first `max_tactics` configurations with `select_tactics`. The Rubin block-scaled runner (`CuteDSLBlockScaledRubinLinear`) in [`cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py) is a complete example.
 
 ---
 

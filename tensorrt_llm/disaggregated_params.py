@@ -15,11 +15,14 @@
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 
 from tensorrt_llm.bindings import executor as tllme
+
+if TYPE_CHECKING:
+    from tensorrt_llm.inputs.multimodal import MultimodalInputLayout
 
 
 class DisaggScheduleStyle(IntEnum):
@@ -46,8 +49,16 @@ class DisaggregatedParams:
          Each entry is a torch.Tensor of shape [num_tokens, vocab_size] (one per beam/sequence).
         ctx_usage (Dict[str, Any]): The context usage payload to preserve exact
          usage accounting on the generation server.
+        remote_tail_start (int): Prompt-token boundary transferred by a remote-tail
+         context worker. The generation worker replays the suffix starting here.
+        orig_elapsed_s (float): Seconds since the request arrived at the disagg orchestrator,
+         measured when the generation request was dispatched. Used for GEN admission ordering.
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
+        multimodal_positions (List[int]): Prompt-token offset of each multimodal item.
+        multimodal_lengths (List[int]): Prompt-token count of each multimodal item.
+        multimodal_input_layout (MultimodalInputLayout): Exact encoder-side
+         prompt and multimodal layout to preserve during E/P handoff.
     """
 
     request_type: Optional[str] = None
@@ -64,6 +75,10 @@ class DisaggregatedParams:
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     ctx_usage: Optional[Dict[str, Any]] = None
+    remote_tail_start: Optional[int] = None
+    multimodal_positions: Optional[List[int]] = None
+    multimodal_lengths: Optional[List[int]] = None
+    orig_elapsed_s: Optional[float] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (
@@ -74,6 +89,7 @@ class DisaggregatedParams:
     )
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
+    multimodal_input_layout: Optional["MultimodalInputLayout"] = None
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
         # Prefer disagg_request_id over ctx_request_id
@@ -105,6 +121,28 @@ class DisaggregatedParams:
             )
 
     def __post_init__(self):
+        """Restore serialized layout and validate request and multimodal metadata."""
+        if self.multimodal_input_layout is not None:
+            # Defer the import because inputs and executor import these parameters.
+            from tensorrt_llm.inputs.multimodal import MultimodalInputLayout
+
+            if isinstance(self.multimodal_input_layout, dict):
+                self.multimodal_input_layout = MultimodalInputLayout(**self.multimodal_input_layout)
+            elif not isinstance(self.multimodal_input_layout, MultimodalInputLayout):
+                raise TypeError("multimodal_input_layout must be MultimodalInputLayout")
+        if (self.multimodal_positions is None) != (self.multimodal_lengths is None):
+            raise ValueError(
+                "multimodal_positions and multimodal_lengths must be provided together"
+            )
+        if self.multimodal_positions is not None:
+            if len(self.multimodal_positions) != len(self.multimodal_lengths):
+                raise ValueError(
+                    "multimodal_positions and multimodal_lengths must have the same length"
+                )
+            if any(position < 0 for position in self.multimodal_positions):
+                raise ValueError("multimodal_positions must be non-negative")
+            if any(length <= 0 for length in self.multimodal_lengths):
+                raise ValueError("multimodal_lengths must be positive")
         if self.request_type is not None:
             self.request_type = self.request_type.lower()
             if self.request_type not in [

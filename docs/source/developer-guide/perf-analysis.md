@@ -20,8 +20,35 @@ This can reduce memory retained after workload spikes, but demand tracking and
 repeated reclamation/reallocation can affect performance. It does not reduce the
 initial spike's allocation requirement or necessarily reduce allocator-reserved
 memory. Set `TRTLLM_RECLAIM_WORKSPACE=0` before starting the process to disable
-this behavior if it causes performance regression. Currently this setting only
-controls eager attention workspace reclamation, not all GPU memory management.
+this behavior if it causes performance regression. This setting also controls eager CUTLASS MoE runner workspace reclamation.
+CUTLASS uses its native workspace sizing to accumulate the maximum demand across
+all layers and chunks in a model forward. After three successful forwards using at most half the retained capacity, it
+replaces the backing with the larger of that window's maximum demand and the
+capacity established by successful warmup. Like attention, it never shrinks
+below this warmup floor. Runner/stream discovery happens in native inference
+calls; Python only opens and closes a scope at model-forward boundaries.
+Previously observed demand is reserved at the next model-forward entry so model
+intermediates do not consume and fragment the released burst-sized block first.
+This reduces active allocations; allocator-reserved and device memory can remain
+unchanged even when the released capacity is successfully reused.
+Runners/streams first encountered after warmup are not reclaimed. Captured
+workspace, cross-engine sharing, and use outside the tracked forward opt out;
+speculative, CP, encoder-decoder, compiled, breakable-graph and multi-stream
+execution are excluded. CUDA graph allocations remain unchanged. This setting
+does not control all GPU memory management.
+
+#### CUTLASS reclamation validation
+
+`pytest tests/unittest/_torch/moe/test_workspace_cuda.py` checks BF16 output
+parity through growth, reclamation and regrowth, plus CUDA graph replay. It
+requires native libraries built from the same source revision. Run with each
+allocator separately using `PYTORCH_CUDA_ALLOC_CONF=backend:native` or
+`PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync`.
+
+For performance measurements, compare enabled/disabled arms within the same
+allocator. Keep attention reclamation fixed when isolating the MoE change,
+since the shared environment variable controls both. Operator measurements do
+not establish model throughput or lower reserved/device memory peaks.
 
 ### Profiling Features
 
@@ -209,6 +236,41 @@ ENABLE_PERFECT_ROUTER=1 trtllm-serve ...
 |----------|----------------|
 | Similar performance with/without perfect router | Router load balancing is not a bottleneck; focus optimization efforts elsewhere |
 | Significant improvement with perfect router | The learned router is causing load imbalance; consider router optimization or load balancing strategies |
+
+### Replacing Expert IDs Instead of Logits
+
+`ENABLE_PERFECT_ROUTER=expert_ids` keeps the learned router and its routing
+method, then replaces the routed expert IDs with a perfectly balanced
+assignment: every EP rank and every expert receives an equal share of the
+routes (within one) for any token count, and the receiver order is rotated by
+the sender rank. The routing scales are left as computed.
+
+Use it where logits cannot steer the routing, for example the DeepSeek-V4 hash
+layers, which pick experts from the token IDs, or where the token count changes
+every iteration, as in context-only benchmarks: the IDs come from one cached
+table per expert geometry, sized to `max_num_tokens`, so no logits are
+synthesized per token count.
+
+It applies where the MoE scheduler computes the routed expert IDs outside the
+MoE kernel: always with `MEGAMOE_CUTEDSL`, `CUTLASS`, `DEEPGEMM` and `CUTEDSL`,
+and with other backends under attention DP or with DeepSeek-V4 routing. A
+backend that routes inside its kernel, such as `TRTLLM` without attention DP,
+has no routed expert IDs to replace: the mode logs a warning and has no effect
+there, so use `ENABLE_PERFECT_ROUTER=1` instead.
+
+With the load balancer off, the gap to a plain run bounds what any MoE load
+balancer can gain:
+
+```bash
+# Learned routing, load balancer off
+trtllm-bench ...
+# Perfectly balanced routing, load balancer off (upper bound)
+ENABLE_PERFECT_ROUTER=expert_ids trtllm-bench ...
+```
+
+The layer-wise benchmarks (`examples/layer_wise_benchmarks`) accept the same
+environment variable with `--balance-method NotModified` and without
+`--replay-file-path`, whose recorded routing would replace the balanced IDs.
 
 ### Supported Models
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import os
 from itertools import product
 from typing import Any, Final, Generator, cast
@@ -15,8 +17,9 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequestState,
     get_draft_token_length,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import fused_compute_probs_from_logits
+from tensorrt_llm._torch.pyexecutor.sampler.ops.triton import selected_raw_logprobs
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import Logprob, ScheduledRequests, TorchSampler
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import _StrategyImpls
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
@@ -99,7 +102,7 @@ def llm(
         )
 
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
         kv_cache_config=global_kvcache_config,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
         disable_overlap_scheduler=disable_overlap_scheduler,
@@ -112,7 +115,7 @@ def llm(
 @pytest.fixture(scope="module")
 def simple_llm() -> LLM:
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
         max_batch_size=8,
         kv_cache_config=global_kvcache_config_prompt_logprobs,
     )
@@ -131,8 +134,7 @@ def check_generated_output(
 ):
     if gather_context_logits:
         assert output.context_logits is not None
-        # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
-        expected_len = len(prompts[0].split()) + 1
+        expected_len = len(output.prompt_token_ids)
         assert expected_len == output.context_logits.shape[0]
     else:
         assert output.context_logits is None
@@ -284,6 +286,7 @@ def test_sampled_token_always_in_logprobs(logprobs_k: int, logprobs_mode: str, s
                 token_logprobs.items(), key=lambda x: (x[1].logprob, -x[1].rank), reverse=True
             )
 
+            sampled_in_topk = False
             if logprobs_k > 0:
                 sampled_token_rank = token_logprobs[sampled_token_id].rank
                 sampled_in_topk = sampled_token_rank <= logprobs_k
@@ -560,12 +563,12 @@ def test_logprobs_against_logits(
         # The last context logprob dict and the first generation logprob dict should agree on
         # the top-n entries (n = min(prompt_logprobs_k, logprobs_k)) and the sampled token's logprob.
         if prompt_logprobs_k is not None and logprobs_k is not None:
-            last_context_logprob = context_logprobs[-1]
-            first_generation_logprob = generation_logprobs[0]
+            last_context_logprob = output.outputs[0].prompt_logprobs[-1]
+            first_generation_logprob = output.outputs[0].logprobs[0]
             less_prompt_logprobs = prompt_logprobs_k <= logprobs_k
             expected = last_context_logprob if less_prompt_logprobs else first_generation_logprob
             compare = first_generation_logprob if less_prompt_logprobs else last_context_logprob
-            sampled_token_id = generation_tokens[0]
+            sampled_token_id = output.outputs[0].token_ids[0]
             assert sampled_token_id in last_context_logprob, (
                 f"Sampled token {sampled_token_id} is not a valid key in the last entry "
                 f"of the context logprob dict: {list(last_context_logprob.keys())}"
@@ -574,9 +577,12 @@ def test_logprobs_against_logits(
                 f"Sampled token {sampled_token_id} is not a valid key in the first entry "
                 f"of the generation logprob dict: {list(first_generation_logprob.keys())}"
             )
+            # Context and selected generation logprobs use different FP32 reductions.
             torch.testing.assert_close(
                 last_context_logprob[sampled_token_id].logprob,
                 first_generation_logprob[sampled_token_id].logprob,
+                atol=2e-6,
+                rtol=1e-6,
                 msg=(
                     f"logprob {last_context_logprob[sampled_token_id].logprob} in the last "
                     f"entry of the context logprob dict does not match the corresponding "
@@ -593,11 +599,76 @@ def test_logprobs_against_logits(
                 torch.testing.assert_close(
                     expected_logprob,
                     compare_logprob,
+                    atol=2e-6,
+                    rtol=1e-6,
                     msg=(
                         f"logprob {expected_logprob} does not match the corresponding "
                         f"logprob {compare_logprob} in the other dict for token {token_id}"
                     ),
                 )
+
+
+def _assert_raw_logprobs_match_model_logits(completion) -> None:
+    """Check that each raw logprob is the log-softmax of the model's logits for that step."""
+    expected = torch.log_softmax(completion.generation_logits.to(device="cuda"), dim=-1).cpu()
+    assert len(completion.logprobs) == len(completion.token_ids)
+    for step, token_logprobs in enumerate(completion.logprobs):
+        assert completion.token_ids[step] in token_logprobs
+        for token_id, logprob_obj in token_logprobs.items():
+            torch.testing.assert_close(
+                torch.tensor(logprob_obj.logprob, dtype=torch.float32),
+                expected[step, token_id],
+                msg=f"raw logprob {logprob_obj.logprob} of token {token_id} at step {step} "
+                f"does not match the model's {expected[step, token_id].item()}",
+            )
+
+
+@pytest.mark.parametrize(
+    "logit_rewrite",
+    [
+        {"repetition_penalty": 1.3},
+        {"presence_penalty": 1.0, "frequency_penalty": 0.5},
+        {"bad": [" C"]},
+    ],
+    ids=["repetition_penalty", "presence_frequency_penalty", "bad_words"],
+)
+@pytest.mark.threadleak(enabled=False)
+def test_raw_logprobs_ignore_logit_rewrites(logit_rewrite: dict[str, Any], simple_llm: LLM):
+    """Raw logprobs come from the model's logits, before penalties and token bans rewrite them.
+
+    The prompt repeats its tokens, so the penalties and the banned word already change the
+    logits of the first generated token.
+    """
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        logprobs=3,
+        logprobs_mode=LogprobMode.RAW,
+        return_generation_logits=True,
+        **logit_rewrite,
+    )
+    for output in simple_llm.generate(["A B C A B C A B"], sampling_params=sampling_params):
+        _assert_raw_logprobs_match_model_logits(output.outputs[0])
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_raw_logprobs_ignore_logit_rewrites_in_a_mixed_batch(simple_llm: LLM):
+    """In a batch, the logits of each raw-logprob request are kept and put back in its own rows.
+
+    A processed-logprob request with a penalty comes first, so the raw requests' rows do not
+    start at 0, and each request has its own prompt, so a row put back in the wrong place
+    would not match the model's logits.
+    """
+    common = dict(max_tokens=8, logprobs=3, return_generation_logits=True)
+    sampling_params = [
+        SamplingParams(logprobs_mode=LogprobMode.PROCESSED, repetition_penalty=1.3, **common),
+        SamplingParams(logprobs_mode=LogprobMode.RAW, repetition_penalty=1.3, **common),
+        SamplingParams(logprobs_mode=LogprobMode.RAW, **common),
+    ]
+    outputs = simple_llm.generate(
+        ["A B C A B C A B", "1 2 3 1 2 3 1 2", "x y z x y z x y"], sampling_params=sampling_params
+    )
+    for output in outputs[1:]:
+        _assert_raw_logprobs_match_model_logits(output.outputs[0])
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
@@ -791,16 +862,13 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
                 topp = topp if topp is not None else 1.0
                 temperature = temperature if temperature is not None else 1.0
 
-                # perform masking top-k top-p via the flashinfer strategy impl
-                _, probs = _StrategyImpls.StrategyImplWithProbs._sample_with_probs(
+                # perform masking top-k top-p via the sampler's fused kernel
+                probs = fused_compute_probs_from_logits(
                     logits_for_token,
-                    group_logit_indices=None,
-                    top_k=torch.tensor([topk], dtype=torch.int32, device="cuda"),
-                    top_p=torch.tensor([topp], dtype=torch.float32, device="cuda"),
-                    # None disables the min-p stage; no request here sets min_p.
-                    min_p=None,
-                    temperature=torch.tensor([temperature], dtype=torch.float32, device="cuda"),
-                    generator=None,
+                    torch.tensor([temperature], dtype=torch.float32, device="cuda"),
+                    torch.tensor([topk], dtype=torch.int32, device="cuda"),
+                    torch.tensor([topp], dtype=torch.float32, device="cuda"),
+                    torch.zeros(1, dtype=torch.float32, device="cuda"),
                 )
 
             if temperature != 0:
@@ -825,7 +893,7 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
 @force_ampere
 @pytest.mark.gpu2
 def test_logprobs_match_hf_tp2():
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     llm = LLM(
         model=model_path,
         tensor_parallel_size=2,
@@ -881,7 +949,7 @@ def test_logprobs_pp2():
     Without the fix, logprobs length = 2N-1 instead of N due to duplication
     in the PP ring broadcast diff mechanism.
     """
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     max_tokens = 16
     llm = LLM(
         model=model_path,
@@ -916,7 +984,9 @@ class TestLogsprobsInBatchedSampling:
     VOCAB_SIZE = 123
 
     @staticmethod
-    def _build_test_cases(max_draft_len: int) -> list[tuple[list[SamplingParams], str]]:
+    def _build_test_cases(
+        max_draft_len: int, vocab_size: int
+    ) -> list[tuple[list[SamplingParams], str]]:
         """Return test cases for testing logprobs handling in batched sampling.
 
         Each test case consists of a list of sampling parameters and a human-readable
@@ -1106,6 +1176,31 @@ class TestLogsprobsInBatchedSampling:
             assert raw_configs
             test_cases += _combine_up_to_3_configs(raw_configs, allow_single_only=False)
 
+        # Raw logprobs of rows the sampler rewrites before sampling (embedding bias, bad words,
+        # min_length), alone and mixed with requests it leaves alone.
+        logit_rewrites = {
+            "embedding_bias": {"embedding_bias": torch.linspace(-5.0, 5.0, vocab_size)},
+            "bad_words": {"bad_token_ids": list(range(0, vocab_size, 2))},
+            "min_length": {"end_id": 5, "min_tokens": 10},
+        }
+        rewritten_configs = []
+        for rewrite_label, rewrite in logit_rewrites.items():
+            configs = [
+                SamplingParams(temperature=0.7, top_k=2, logprobs=params.logprobs, **rewrite)
+                for label, params in BASE_CASES.items()
+                if label.startswith("single-raw")
+            ]
+            assert configs
+            test_cases.append((configs, f"single_raw_rewritten_{rewrite_label}"))
+            rewritten_configs += configs
+        test_cases += _shuffle_mixed_batches(
+            (
+                rewritten_configs,
+                [params for label, params in BASE_CASES.items() if label.startswith("single")],
+            ),
+            ("raw_rewritten", "single"),
+        )
+
         return test_cases
 
     @pytest.fixture(scope="function")
@@ -1177,6 +1272,8 @@ class TestLogsprobsInBatchedSampling:
         *,
         seq_slots: list[int],
         draft_lens: list[int],
+        max_new_tokens: int | None = None,
+        is_streaming: bool = False,
     ) -> ScheduledRequests:
         """Build a batch of test requests consumable by sample_async."""
         with torch.inference_mode(True):
@@ -1189,11 +1286,11 @@ class TestLogsprobsInBatchedSampling:
             scheduled_requests.generation_requests = [
                 LlmRequest(
                     request_id=seq_slot,
-                    max_new_tokens=draft_len,
+                    max_new_tokens=draft_len if max_new_tokens is None else max_new_tokens,
                     input_tokens=[],  # not used by tested code
                     sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
                     seq_slot=seq_slot,
-                    is_streaming=False,  # not relevant for tested code
+                    is_streaming=is_streaming,
                     draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
                         torch.testing.make_tensor(
                             (draft_len,),
@@ -1206,14 +1303,19 @@ class TestLogsprobsInBatchedSampling:
                     logprobs_mode=sampling_params.logprobs_mode,
                     num_logprobs=sampling_params.logprobs or 0,
                     return_log_probs=sampling_params.logprobs is not None,
+                    embedding_bias=sampling_params.embedding_bias,
+                    end_id=sampling_params.end_id,
                 )
                 for sampling_params, seq_slot, draft_len in zip(
                     sampling_params_list, seq_slots, draft_lens, strict=True
                 )
             ]
             # Patch up request state to correctly infer input beam width (inspects req.is_context_init_state)
-            for req in scheduled_requests.generation_requests:
+            for req, sampling_params in zip(
+                scheduled_requests.generation_requests, sampling_params_list
+            ):
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                req.py_bad_words = sampling_params._get_bad_words() or None
             return scheduled_requests
 
     @pytest.fixture(scope="function")
@@ -1238,7 +1340,6 @@ class TestLogsprobsInBatchedSampling:
         logits_orig = logits.clone()
         try:
             yield {
-                # No 'd2t': Not relevant for tested functionality
                 "logits": logits,
             }
         finally:
@@ -1456,7 +1557,7 @@ class TestLogsprobsInBatchedSampling:
                 [VOCAB_SIZE],
             )
             for (sampling_params_list, params_label) in _build_test_cases(
-                max_draft_len=max_draft_len
+                max_draft_len=max_draft_len, vocab_size=vocab_size
             )
         ],
     )
@@ -1480,8 +1581,28 @@ class TestLogsprobsInBatchedSampling:
             sampler, "_collect_new_requests_for_setup", _eager_collect_new_requests_for_setup
         )
 
+        sample_batched = sampler._sample_batched_by_strategy
+
+        def _check_logprobs_capacity(logits_cuda, requests, **kwargs):
+            result = sample_batched(logits_cuda, requests, **kwargs)
+            if any(req.py_return_log_probs for req in requests):
+                expected_rows = sum(
+                    get_draft_token_length(req) + 1
+                    for req in requests
+                    if req.py_return_log_probs
+                    and req.py_beam_width == 1
+                    and req.py_logprobs_mode == LogprobMode.PROCESSED
+                )
+                assert result.logprobs_cuda.shape == (expected_rows, vocab_size)
+            else:
+                assert result.logprobs_cuda is None
+            return result
+
+        monkeypatch.setattr(sampler, "_sample_batched_by_strategy", _check_logprobs_capacity)
         sampler.setup_sampler_step(mock_requests)
 
+        # The logits as the sampler receives them; sample_async may rewrite its input in place.
+        reference_outputs = {"logits": model_outputs["logits"].clone()}
         sample_state = sampler.sample_async(
             mock_requests,
             model_outputs,
@@ -1492,6 +1613,93 @@ class TestLogsprobsInBatchedSampling:
 
         self._validate_logprobs(
             mock_requests=mock_requests,
-            model_outputs=model_outputs,
+            model_outputs=reference_outputs,
             sampler=sampler,
         )
+
+        requests = mock_requests.all_requests()
+        if len(requests) == 1 and requests[0].py_beam_width > 1 and requests[0].py_return_log_probs:
+            # Keep the request active so logprobs come from the step store rather
+            # than beam-history finalization, which supplies its own token IDs.
+            request = requests[0]
+            active_requests = self._build_mock_requests(
+                sampling_params_list,
+                seq_slots=[request.py_seq_slot],
+                draft_lens=[0],
+                max_new_tokens=2,
+                is_streaming=True,
+            )
+            sampler.store.log_probs_store.sampled_log_prob_indices[request.py_seq_slot].fill_(-1)
+            sampler.setup_sampler_step(active_requests)
+            active_state = sampler.sample_async(
+                active_requests, model_outputs, num_context_logits_prefix_sum=[0]
+            )
+            sampler.update_requests(active_state)
+            assert active_requests.all_requests()[0].state == LlmRequestState.GENERATION_IN_PROGRESS
+            self._validate_logprobs(
+                mock_requests=active_requests, model_outputs=reference_outputs, sampler=sampler
+            )
+
+
+def test_selected_raw_logprobs():
+    generator = torch.Generator(device="cuda").manual_seed(123)
+    for vocab_size in (123, 4099, 131072):
+        logits = torch.randn((4, vocab_size + 7), device="cuda", generator=generator)
+        logits = logits[:, :vocab_size]
+        logits[1].zero_()
+        logits[2, ::2] = -torch.inf
+        logits[3].fill_(-torch.inf)
+        logits[3, 0] = 0
+        rows = torch.tensor([2, 1, 0, 2, 3], device="cuda")
+        tokens = torch.tensor([3, 10, 9, 0, 0], device="cuda")
+        reference = logits[rows].log_softmax(-1)
+        sampled = reference.gather(1, tokens[:, None]).squeeze(1)
+        ranks = (reference > sampled[:, None]).sum(-1, dtype=torch.int32)
+        for num_rows, top_k in ((5, 0), (5, 3), (5, 100), (1, 100)):
+            reference_rows = reference[:num_rows]
+            values, actual_ranks, top_values, top_tokens = selected_raw_logprobs(
+                logits, rows[:num_rows], tokens[:num_rows], top_k
+            )
+            torch.testing.assert_close(values, sampled[:num_rows], atol=2e-6, rtol=1e-6)
+            torch.testing.assert_close(actual_ranks, ranks[:num_rows], atol=0, rtol=0)
+            torch.testing.assert_close(
+                top_values, reference_rows.topk(top_k).values, atol=2e-6, rtol=1e-6
+            )
+            torch.testing.assert_close(
+                top_values, reference_rows.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
+            )
+            sorted_tokens = top_tokens.sort(-1).values
+            assert (sorted_tokens[:, 1:] != sorted_tokens[:, :-1]).all()
+
+        sparse_logits = logits[:1].expand(65, -1)
+        values, _, top_values, top_tokens = selected_raw_logprobs(
+            sparse_logits, rows.new_zeros(1), tokens[:1], 100
+        )
+        sparse_reference = logits[:1].log_softmax(-1)
+        torch.testing.assert_close(values, sparse_reference[:, tokens[0]], atol=2e-6, rtol=1e-6)
+        torch.testing.assert_close(
+            top_values, sparse_reference.topk(100).values, atol=2e-6, rtol=1e-6
+        )
+        torch.testing.assert_close(
+            top_values, sparse_reference.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
+        )
+
+    # Sparse selection above 16 rows exercises the 512-token tile top-k path.
+    sparse_logits = torch.randn((65, 4099), device="cuda", generator=generator)
+    sparse_rows = torch.arange(17, device="cuda") * 3
+    sparse_tokens = torch.arange(17, device="cuda") * 7
+    reference = sparse_logits[sparse_rows].log_softmax(-1)
+    sampled = reference.gather(1, sparse_tokens[:, None]).squeeze(1)
+    values, ranks, top_values, top_tokens = selected_raw_logprobs(
+        sparse_logits, sparse_rows, sparse_tokens, 100
+    )
+    torch.testing.assert_close(values, sampled, atol=2e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        ranks, (reference > sampled[:, None]).sum(-1, dtype=torch.int32), atol=0, rtol=0
+    )
+    torch.testing.assert_close(top_values, reference.topk(100).values, atol=2e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        top_values, reference.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
+    )
+    sorted_tokens = top_tokens.sort(-1).values
+    assert (sorted_tokens[:, 1:] != sorted_tokens[:, :-1]).all()

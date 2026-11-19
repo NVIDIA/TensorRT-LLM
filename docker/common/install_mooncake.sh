@@ -30,7 +30,7 @@ apt-get install -y --no-install-recommends \
 
 mkdir -p /third-party-source
 
-git clone --depth 1 https://github.com/alibaba/yalantinglibs.git
+git clone --depth 1 -b 0.5.5 https://github.com/alibaba/yalantinglibs.git
 tar -czf /third-party-source/yalantinglibs.tar.gz yalantinglibs
 cd yalantinglibs
 mkdir build && cd build
@@ -53,3 +53,7 @@ cd ../..
 rm -rf Mooncake
 
 echo "export LD_LIBRARY_PATH=${MOONCAKE_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
+
+MOONCAKE_CMAKE_PACKAGE="$(python3 -c "import sys; print([s for s in sys.path if 'packages' in s][0])")/mooncake"
+echo "removing CMake-generated mooncake package: ${MOONCAKE_CMAKE_PACKAGE}"
+rm -rf "${MOONCAKE_CMAKE_PACKAGE}"

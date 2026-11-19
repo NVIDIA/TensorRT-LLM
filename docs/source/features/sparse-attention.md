@@ -69,7 +69,7 @@ KV-cache entry and any internal FP8 staging do not indicate raw FP8 model-input
 support.
 
 See
-[`test_sparse_mla_forward.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py)
+[`test_sparse_mla_forward.py`](source:tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py)
 for executable sparse MLA examples.
 
 ### Sparse MQA/GQA
@@ -114,7 +114,7 @@ contract of that dedicated backend. Raw E4M3 fused QKV is not a token-sparse
 MQA/GQA input contract.
 
 Backend developers can use
-[`test_sparse_mqa_gqa.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
+[`test_sparse_mqa_gqa.py`](source:tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
 as an executable integration example.
 
 ### Sparse MHA
@@ -145,7 +145,7 @@ QKV input remains BF16 or FP16; raw E4M3 fused QKV is not supported by the
 page-sparse MHA path.
 
 Backend developers can use
-[`test_sparse_mha.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mha.py)
+[`test_sparse_mha.py`](source:tests/unittest/_torch/attention/sparse/test_sparse_mha.py)
 as an executable integration example.
 
 <a id="block-sparse-mha-mqa-gqa"></a>
@@ -162,6 +162,11 @@ library declares `supports_block_sparse_inputs`, so a request that carries
 routes is never served by a dense kernel. Both the contiguous prefill path,
 used by diffusion models that keep no KV cache, and the paged generation path
 are provided by the vendored PrimTS kernels.
+
+Both `k_summary` and `v_summary` are arithmetic means over the tokens present
+in each KV block. A partial final block excludes padding from its mean. The
+kernel weights each proxy by its represented token count; do not pass V sums
+or pre-weight the summaries.
 
 This is an attention capability, not a standalone public
 `SparseAttentionConfig` algorithm. A user-facing algorithm must also provide
@@ -190,7 +195,7 @@ request needs a page that holds at least one 64-token route fragment, which is
 why page sizes below `64` are rejected.
 
 Backend developers can use
-[`test_prims_ts_block_sparse.py`](../../../tests/unittest/_torch/attention/sparse/test_prims_ts_block_sparse.py)
+[`test_prims_ts_block_sparse.py`](source:tests/unittest/_torch/attention/sparse/test_prims_ts_block_sparse.py)
 as an executable integration example; it covers MHA, GQA, and MQA head
 topologies, both model dtypes, KV block sizes `64` and `128`, page sizes `64`
 and `128`, proxy routes, token-validity masks, and CUDA Graph replay.
@@ -207,22 +212,23 @@ selector, runtime metadata, cache management, and attention implementation.
 | `rocket` | `RocketSparseAttentionConfig` | Prompt KV eviction, then page-level Top-K selection during decode | TRTLLM or Vanilla | Training-free sparsity for MHA/MQA/GQA models |
 | `dsa` | `DeepSeekSparseAttentionConfig` | Learned token-level indexer followed by sparse MLA | TRTLLM | DeepSeek-V3.2 and compatible model-native DSA architectures |
 | `deepseek_v4` | `DeepSeekV4SparseAttentionConfig` | Sliding-window attention plus compressed sparse or compressed dense history | TRTLLM | DeepSeek-V4 hybrid attention |
+| `csa2` | `CSA2SparseAttentionConfig` | Sliding-window attention plus compressed history with shared KV/index sources | TRTLLM, with hardware-selected Flash helpers | DeepSeek-V4.1 |
 | `minimax_m3` | `MiniMaxM3SparseAttentionConfig` | Learned block selection followed by sparse GQA | Dedicated Triton or packaged block-sparse implementation | MiniMax-M3 sparse layers |
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Dynamically skips eligible softmax work inside the FMHA kernel | TRTLLM | Existing full-attention models with calibrated or direct thresholds |
 
-All five configs are supported only by the PyTorch execution backend. The
+These configs are supported only by the PyTorch execution backend. The
 "attention implementation" column refers to the attention kernel/backend used
 inside that execution backend.
 
 ### Capability Comparison
 
-| Capability | RocketKV | DSA | DeepSeek-V4 | MiniMax-M3 | Skip Softmax |
-|---|---:|---:|---:|---:|---:|
-| Sparse prefill computation | No | Yes | Yes | Yes | Yes |
-| Sparse decode computation | Yes | Yes | Yes | Yes | Yes |
-| Reduces retained main KV history | Yes | No | Yes, through model-native compression | No | No |
-| Requires a model-trained selector | No | Yes | Yes | Yes | No |
-| Selection granularity | Token eviction and pages | Tokens | Compressed entries | Blocks | Kernel tiles |
+| Capability | RocketKV | DSA | DeepSeek-V4 | CSA2 | MiniMax-M3 | Skip Softmax |
+|---|---:|---:|---:|---:|---:|---:|
+| Sparse prefill computation | No | Yes | Yes | Yes | Yes | Yes |
+| Sparse decode computation | Yes | Yes | Yes | Yes | Yes | Yes |
+| Reduces retained main KV history | Yes | No | Yes, through model-native compression | Yes, through model-native compression | No | No |
+| Requires a model-trained selector | No | Yes | Yes | Yes | Yes | No |
+| Selection granularity | Token eviction and pages | Tokens | Compressed entries | Compressed entries | Blocks | Kernel tiles |
 
 "No" for RocketKV prefill means that prompt attention is still computed
 densely. RocketKV selects which prompt KV entries to retain, so it reduces cache
@@ -337,6 +343,58 @@ sparse_attention_config:
 See the
 [DeepSeek-V4 example](source:examples/models/core/deepseek_v4/README.md) for
 checkpoint-derived configuration and deployment constraints.
+
+#### DeepSeek-V4.1 CSA2
+
+DeepSeek-V4.1 selects `CSA2SparseAttentionConfig` from its checkpoint. Keep
+checkpoint compression ratios, KV/index source ownership, window and Top-K
+geometry intact; CSA2 is model-native rather than a switch for arbitrary MLA models.
+
+```yaml
+sparse_attention_config:
+  algorithm: csa2
+```
+
+| Constraint | CSA2 support |
+|---|---|
+| Hardware | SM100 family: native trtllm-gen. SM90 (FlashMLA BF16) and SM120/121 (FlashInfer BF16 FA2) only for checkpoints without candidate-consumer layers |
+| Attention shape | One KV head, 512-dimensional queries/values, 448 non-RoPE and 64 RoPE channels; checkpoint-defined Q heads |
+| Compression | Ratios `0` (SWA only), `1`, `2`; checkpoint-defined shared KV/index sources |
+| KV-cache block size | `128` or `256` tokens |
+| Persistent cache | Fixed E4M3 SWA, NVFP4 main/index records; `dtype` selects compute staging |
+| Staging | BF16; FP8 on native trtllm-gen without packed attention via `dtype: fp8` or `fp8_ds_mla` |
+| Parallelism | TP/EP and attention DP; PP/CP and disabled-layer masks unsupported |
+| Runtime | Chunked prefill, prefix reuse, overlap and CUDA graphs; embedded DSpark linear verification; tree verification and `kv_cache_config.enable_kv_pool_rebalance` unsupported |
+
+Candidate-consumer layers (index-source layers after the checkpoint's
+`candidate_source_layer_id`; the released checkpoint has them) score their
+candidates with DeepGEMM sparse MQA logits. A checkpoint with such layers needs
+an SM100-family GPU, a DeepGEMM build with those kernels, 32 index heads of 128
+dimensions and a `candidate_block_size` that is a multiple of 8; otherwise model
+construction fails with an error that names the missing requirement.
+
+Decoder bounded replay is an **approximation enabled by default** for eligible
+CED layouts. It computes a trailing Decoder window while the Encoder produces
+the complete GLOBAL history. Set `TRTLLM_V41_DECODER_BOUNDED_REPLAY=0` before
+starting workers to use full Decoder prefill. The replay window is 140 tokens,
+or one more than the required SWA window (including an embedded DSpark capture
+window) when that is larger; `TRTLLM_V41_BOUNDED_REPLAY_TOKENS` overrides it and
+must exceed the required window. Encoder replay is also enabled by default when
+Decoder bounded replay runs with CED precompute, as on the released checkpoint:
+prefix reuse can then evict OPTIONAL Encoder SWA state and recover it by
+approximate bounded replay over the same window. Set
+`TRTLLM_V41_ENCODER_REPLAY=0` to keep REQUIRED Encoder state instead. Without
+CED precompute, or when `max_num_tokens` does not exceed the replay window,
+Encoder state stays REQUIRED; an explicit `TRTLLM_V41_ENCODER_REPLAY=1` then
+fails model construction in the first case and is ignored with a warning in the
+second. Set these consistently for all workers. Replay eligibility and output
+requirements can retain full prefill, as described in the [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md).
+
+Validate task accuracy against full prefill on the intended checkpoint before
+deploying bounded replay or optional packed/approximate selector paths. Include
+fresh prompts, reused prefixes, chunk boundaries and speculative verification;
+component tests of cache bytes and graph replay do not establish whole-model
+accuracy or end-to-end disaggregated-serving support.
 
 #### MiniMax-M3 Block-Sparse GQA
 

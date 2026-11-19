@@ -72,7 +72,9 @@ enum class ContextAttentionMaskType
     // Bidirectional sliding window attention.
     BIDIRECTIONAL_SLIDING_WINDOW,
     // The custom mask input.
-    CUSTOM_MASK
+    CUSTOM_MASK,
+    // Per-query inclusive left and right KV-token bounds.
+    VARIABLE_WINDOW
 };
 
 enum class AttentionInputLayout
@@ -137,11 +139,11 @@ struct MHARunnerFixedParams
     int tpSize = 1;
     // The tensor parallel rank (alibi).
     int tpRank = 0;
-    // q tensor quant block size in sage attention
+    // q tensor quant block size in sage attention, in tokens per scale. 0 disables sage attention.
     int sageBlockSizeQ = 0;
-    // k tensor quant block size in sage attention
+    // k tensor quant block size in sage attention, in tokens per scale.
     int sageBlockSizeK = 0;
-    // v tensor quant block size in sage attention
+    // v tensor quant block size in sage attention, in channels per scale.
     int sageBlockSizeV = 0;
     // Use sparse MLA ?
     bool useSparseMLA = false;
@@ -173,6 +175,7 @@ struct MHARunnerFixedParams
         case ContextAttentionMaskType::CAUSAL: output += "causal"; break;
         case ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL: output += "sliding_or_chunked_causal"; break;
         case ContextAttentionMaskType::CUSTOM_MASK: output += "custom_mask"; break;
+        case ContextAttentionMaskType::VARIABLE_WINDOW: output += "variable_window"; break;
         default: output += std::to_string(static_cast<int>(attentionMaskType)) + " (unknown)"; break;
         }
 
@@ -285,6 +288,8 @@ struct MHARunnerParams
     void const* kPtr;
     // The V buffer ptr (for separate V input).
     void const* vPtr;
+    // Physical V token stride for separate Q, K, V input; zero derives it from the layout.
+    int64_t vStrideInBytes = 0;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
     // The paged kv cache array for scaling factor.
@@ -320,6 +325,9 @@ struct MHARunnerParams
     void const* cuKvSeqLenPtr;
     // The cumulative packed mask rows.
     void const* cuMaskRowsPtr;
+    // Per-query inclusive left and right KV-token bounds.
+    int32_t const* variableWindowTokenStartsPtr = nullptr;
+    int32_t const* variableWindowTokenEndsPtr = nullptr;
     // The dynamic scheduler tile counter.
     void* tileCounterPtr;
     // Scratch buffer (partialO + partialStats) for MultiCtasKv mode in trtllm-gen generation-style kernels.
@@ -341,7 +349,7 @@ struct MHARunnerParams
     float* qScalePtr;
     float* kScalePtr;
     float* vScalePtr;
-    // q, k, v block size in sageattention
+    // number of scales per head for q, k, v in sageattention
     int qMaxNBlock;
     int kMaxNBlock;
     int vMaxNBlock;
@@ -491,14 +499,29 @@ struct Fused_multihead_attention_params_v2
     // is input/output padded
     bool is_s_padded = false;
 
-    // SageAttention parameters
+    // SageAttention parameters. This is the reference description of the scale layout; the
+    // quantizer that produces these buffers lives in common/sageQuant.cu.
+    //
+    // Q and K are quantized to INT8 along the sequence axis and their scales are amax/127; V is
+    // quantized to e4m3 along the channel axis, one scale per channel, with the amax taken over
+    // every token of every sequence.
+    //
+    // How Q and K tokens are grouped into scales depends on the GPU. SM100 groups a run of
+    // sage_block_size consecutive tokens. SM90 groups the tokens a single thread owns -- 2 query
+    // rows and 16 keys, both strided -- and stores the scales swizzled so that a thread's scales
+    // are contiguous, so a q/k scale buffer is not a plain per-token-block array.
+    //
+    // The q/k buffers have no batch dimension. A sequence's scales start at a base derived from
+    // its cu_seqlens entry, so the buffer can be sized from the batch size and the total token
+    // count alone, without knowing the longest sequence. Each sequence reserves a spare tile,
+    // because a partial final tile is still indexed in full.
     struct SageAttention
     {
         struct Scales
         {
-            // ceil(max_seqlen / block_size)
+            // number of scales per head, i.e. the stride between heads. Unused for v.
             int max_nblock;
-            // The scale of each block, layout: (B, H, max_nblock)
+            // the scales, layout: (H, max_nblock) for q and k, (H_kv, D) for v
             float* scales;
         } q, k, v;
     } sage;

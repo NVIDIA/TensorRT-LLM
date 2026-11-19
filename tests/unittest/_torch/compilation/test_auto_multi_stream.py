@@ -17,7 +17,8 @@ Eagle3 captures decoder hidden states into a preallocated buffer with
 ``inplace_slice_copy``; the drafter reads that buffer outside the compiled
 graph. The multi-stream scheduler must emit every such mutation before ``output``
 (a node emitted after ``output`` is dead code once the module is recompiled)
-and make the exit wait on the mutating stream.
+and make the exit wait on the mutating stream. It must also keep an in-place op
+behind every earlier read of the tensor it overwrites.
 """
 
 from collections.abc import Callable, Iterable
@@ -37,6 +38,7 @@ from tensorrt_llm._torch.compilation.multi_stream.auto_multi_stream import (
 pytestmark = pytest.mark.cpu_only
 
 COPY = torch.ops.trtllm.inplace_slice_copy.default
+FUSED_ADD_NORM = torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default
 T = TypeVar("T")
 
 
@@ -125,3 +127,50 @@ def test_every_capture_precedes_output(
     copy_lines = [i for i, line in enumerate(lines) if "inplace_slice_copy" in line]
     assert len(copy_lines) == len(captures)
     assert all(i < return_index for i in copy_lines), (copy_lines, return_index)
+
+
+@pytest.mark.parametrize("max_num_streams", [2, 3])
+def test_inplace_norm_waits_for_capture_reads(max_num_streams: int) -> None:
+    """Run the next layer's in-place add+norm only after the capture reads its inputs."""
+    graph = Graph()
+    dest = graph.placeholder("dest")
+    x = graph.placeholder("x")
+    residual = graph.placeholder("residual")
+    weight = graph.placeholder("weight")
+    hidden = graph.call_function(torch.ops.aten.mm.default, args=(x, x))
+    # The capture reads the real-token rows of hidden and residual.
+    hidden_rows = graph.call_function(torch.ops.aten.slice.Tensor, args=(hidden, 0, 0, 4))
+    residual_rows = graph.call_function(torch.ops.aten.slice.Tensor, args=(residual, 0, 0, 4))
+    to_save = graph.call_function(torch.ops.aten.add.Tensor, args=(hidden_rows, residual_rows))
+    _capture(graph, dest, to_save, 0)
+    norm = graph.call_function(
+        FUSED_ADD_NORM,
+        kwargs={"input": hidden, "residual": residual, "weight": weight, "eps": 1e-6},
+    )
+    # Downstream GEMMs put the norm on the critical path ahead of the capture.
+    out = hidden
+    for _ in range(3):
+        out = graph.call_function(torch.ops.aten.mm.default, args=(out, out))
+    graph.output((out,))
+    readers = (hidden_rows, residual_rows, to_save)
+
+    dag = MultiStreamDAG(GraphModule({}, graph))
+    norm_vertex = dag.nodes[norm]
+    for reader in readers:
+        assert dag.nodes[reader] in norm_vertex.in_edges.values(), reader
+
+    dag.assign_streams(max_num_streams)
+    scheduled = dag.create_new_graph()
+    scheduled.lint()
+    nodes = list(scheduled.nodes)
+    index_by_name = {node.name: i for i, node in enumerate(nodes)}
+    norm_index = _index_of(nodes, lambda n: n.target is FUSED_ADD_NORM)
+    for reader in readers:
+        reader_index = index_by_name[reader.name]
+        assert reader_index < norm_index, (reader.name, reader_index, norm_index)
+        reader_vertex = dag.nodes[reader]
+        if reader_vertex.stream is not norm_vertex.stream:
+            assert any(
+                node.target is torch.ops.trtllm.wait_event and node.args == (reader_vertex.event,)
+                for node in nodes[reader_index:norm_index]
+            ), reader.name

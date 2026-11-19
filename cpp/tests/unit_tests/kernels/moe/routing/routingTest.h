@@ -636,17 +636,17 @@ protected:
         routingData.mUsePdl = param.usePdl;
 
         // Set output pointers
-        routingData.mPtrExpertCounts = bufferCast<int32_t>(*mPtrExpertCountsDevice);
-        routingData.mPtrPermutedIdxSize = bufferCast<int32_t>(*mPtrPermutedIdxSizeDevice);
-        routingData.mPtrExpandedIdxToPermutedIdx = bufferCast<int32_t>(*mPtrExpandedIdxToPermutedIdxDevice);
-        routingData.mPtrPermutedIdxToTokenIdx = bufferCast<int32_t>(*mPtrPermutedIdxToTokenIdxDevice);
-        routingData.mPtrTopKWeights = bufferCast<T>(*mPtrTopKWeightsDevice);
-        routingData.mPtrTopKPacked = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*mPtrTopKPackedDevice));
+        routingData.mPtrExpertCounts = mPtrExpertCountsDevice->getBufferPtr<int32_t>();
+        routingData.mPtrPermutedIdxSize = mPtrPermutedIdxSizeDevice->getBufferPtr<int32_t>();
+        routingData.mPtrExpandedIdxToPermutedIdx = mPtrExpandedIdxToPermutedIdxDevice->getBufferPtr<int32_t>();
+        routingData.mPtrPermutedIdxToTokenIdx = mPtrPermutedIdxToTokenIdxDevice->getBufferPtr<int32_t>();
+        routingData.mPtrTopKWeights = mPtrTopKWeightsDevice->getBufferPtr<T>();
+        routingData.mPtrTopKPacked = reinterpret_cast<PackedType*>(mPtrTopKPackedDevice->getBufferPtr<int8_t>());
 
         // Set grouped gemm launch config buffers
-        routingData.mPtrCtaIdxXyToBatchIdx = bufferCast<int32_t>(*mPtrCtaIdxXyToBatchIdxDevice);
-        routingData.mPtrCtaIdxXyToMnLimit = bufferCast<int32_t>(*mPtrCtaIdxXyToMnLimitDevice);
-        routingData.mPtrNumNonExitingCtas = bufferCast<int32_t>(*mPtrNumNonExitingCtasDevice);
+        routingData.mPtrCtaIdxXyToBatchIdx = mPtrCtaIdxXyToBatchIdxDevice->getBufferPtr<int32_t>();
+        routingData.mPtrCtaIdxXyToMnLimit = mPtrCtaIdxXyToMnLimitDevice->getBufferPtr<int32_t>();
+        routingData.mPtrNumNonExitingCtas = mPtrNumNonExitingCtasDevice->getBufferPtr<int32_t>();
     }
 
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;

@@ -23,8 +23,12 @@ from pydantic import field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
+# Token orderings a model may apply around its block stack; see
+# tensorrt_llm._torch.visual_gen.token_order.
+TokenOrder = Literal["native", "morton", "hilbert"]
+
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
+    from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.params import SolParams
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
@@ -257,7 +261,7 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
       dense attention and are counted; GQA/MQA raises at construction.
 
     Context parallelism (cp_size > 1) is rejected for both backends in
-    visual_gen/modules/attention.py.
+    visual_gen/attention/attention.py.
     """
 
     algorithm: Literal["sol_attn"] = "sol_attn"
@@ -301,6 +305,21 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
         ),
     )
 
+    token_order: TokenOrder = PydanticField(
+        "native",
+        description=(
+            "Order of the video tokens seen by the routing blocks. 'morton' applies "
+            "a Z-order permutation over the (frames, height, width) latent grid "
+            "around the transformer block stack so that each 64-token block covers "
+            "a compact 3D neighborhood instead of a run along width; 'hilbert' uses "
+            "the Hilbert curve, a continuous path with no octant jumps. Dense attention "
+            "is permutation-equivariant in exact arithmetic; in bf16 the reordered "
+            "sums round differently, so the output is not bit-identical to native "
+            "order. Supported by the Wan pipelines; other pipelines reject a "
+            "non-native order."
+        ),
+    )
+
     @field_validator("dense_layers")
     @classmethod
     def _validate_dense_layers(cls, layers: Optional[list[int]]) -> Optional[list[int]]:
@@ -314,7 +333,7 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
     def to_sparse_params(self, **kwargs: Any) -> "SolParams":
         """Lower the public recipe into the SOL parameters shared by both backends."""
         del kwargs
-        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
+        from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.params import SolParams
 
         return SolParams(
             tau=self.tau,

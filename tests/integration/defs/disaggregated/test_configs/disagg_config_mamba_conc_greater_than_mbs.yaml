@@ -18,13 +18,12 @@ generation_servers:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.5
   cache_transceiver_config:
-    max_tokens_in_buffer: 9216
     backend: NIXL
     transceiver_runtime: PYTHON
   stream_interval: 20
   num_postprocess_workers: 4
   moe_config:
-    backend: CUTLASS
+    tactic: cutlass
 context_servers:
   num_instances: 1
   max_batch_size: 1
@@ -35,8 +34,7 @@ context_servers:
   enable_attention_dp: false
   disable_overlap_scheduler: true
   cache_transceiver_config:
-    max_tokens_in_buffer: 9216
     backend: NIXL
     transceiver_runtime: PYTHON
   moe_config:
-    backend: CUTLASS
+    tactic: cutlass

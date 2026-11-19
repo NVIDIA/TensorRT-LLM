@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from collections.abc import Callable
 from typing import Optional, Union
 
@@ -14,6 +17,9 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
+from .gate_up_swiglu_quack import (gate_up_swiglu_quack_available,
+                                   gate_up_swiglu_quack_bf16,
+                                   gate_up_swiglu_quack_shape_ok)
 from .linear import (Linear, TensorParallelMode, WeightMode,
                      WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 from .swiglu import swiglu, swiglu_2in
@@ -41,6 +47,8 @@ class GatedMLP(nn.Module):
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
         split_gate_up: bool = False,
+        fuse_bf16_gate_up_swiglu: bool = False,
+        enable_locality_domain_bf16_linear: bool = False,
     ):
 
         super().__init__()
@@ -49,6 +57,13 @@ class GatedMLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.activation = activation
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
+        # Opt-in BF16 gate/up GEMM with SwiGLU in its epilogue (SM100/SM103).
+        # Off by default: the fused GEMM is slightly slower than cuBLAS at small
+        # M, so a model opts in where its token count is large. GPU family and
+        # kernel availability are resolved once here so that forward, which may
+        # run under torch.compile, only reads a plain attribute.
+        self.fuse_bf16_gate_up_swiglu = (fuse_bf16_gate_up_swiglu
+                                         and gate_up_swiglu_quack_available())
         # Keeps each projection's own calibrated scale, which fusing would
         # discard. Off by default.
         self.split_gate_up = split_gate_up
@@ -67,6 +82,7 @@ class GatedMLP(nn.Module):
             swiglu_beta) if swiglu_beta is not None else None
 
         config = config or ModelConfig()
+        locality_domain_policy = getattr(config, "locality_domain_policy", None)
         use_cute_dsl_bf16_gemm = getattr(config, "use_cute_dsl_bf16_gemm",
                                          False)
         self.mapping = config.mapping
@@ -134,8 +150,12 @@ class GatedMLP(nn.Module):
             use_cute_dsl_nvfp4_swiglu_blackwell=(
                 use_cute_dsl_blockscaling_mm and activation == F.silu
                 and not bias
-                and (swiglu_limit is None or swiglu_limit == float("inf"))),
+                and (swiglu_limit is None or swiglu_limit == float("inf"))
+                and self._is_plain_swiglu()),
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_locality_domain_bf16_linear=(
+                use_cute_dsl_bf16_gemm and enable_locality_domain_bf16_linear),
+            locality_domain_policy=locality_domain_policy,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
@@ -186,6 +206,9 @@ class GatedMLP(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_locality_domain_bf16_linear=(
+                use_cute_dsl_bf16_gemm and enable_locality_domain_bf16_linear),
+            locality_domain_policy=locality_domain_policy,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
@@ -336,7 +359,7 @@ class GatedMLP(nn.Module):
             return
         self._maybe_share_gate_up_quantize = True
 
-    def _can_fuse_gate_up_swiglu(self):
+    def _can_fuse_gate_up_swiglu(self) -> bool:
         """Check if fused GEMM + SwiGLU path is available.
 
         The projection owns the capability predicate because weight loading
@@ -359,6 +382,49 @@ class GatedMLP(nn.Module):
             return False
         return is_static_nvfp4_input_eligible(self.down_proj)
 
+    def _can_fuse_gate_up_swiglu_bf16(self, x) -> bool:
+        """Whether this call takes the opt-in BF16 gate/up GEMM + SwiGLU epilogue.
+
+        One place decides, for forward and for the tests: the module opted in
+        and the kernel is available (resolved at construction and re-checked
+        here, since a kernel that fails once is disabled for the process); the projection
+        is the fused ``gate_up_proj`` with plain SwiGLU and no limit; ``x`` is
+        a CUDA BF16 tensor of rank >= 2 outside grad mode, since the op has no
+        backward; ``gate_up_proj`` is unquantized BF16 without bias, tensor
+        parallelism or another GEMM provider; K and I are multiples of 8
+        (16-byte TMA rows). Evaluated in forward, after the weights exist.
+        """
+        if not self.fuse_bf16_gate_up_swiglu or not gate_up_swiglu_quack_available(
+        ):
+            return False  # the second check drops out once the kernel has failed in this process
+        if self.split_gate_up:  # no fused projection to fuse into
+            return False
+        if not (self.activation == F.silu and self._is_plain_swiglu()):
+            return False
+        if self.swiglu_limit is not None and self.swiglu_limit != float("inf"):
+            return False
+        if not (isinstance(x, torch.Tensor) and x.is_cuda
+                and x.dtype == torch.bfloat16 and x.dim() >= 2
+                and not torch.is_grad_enabled()):
+            return False
+        proj = self.gate_up_proj
+        if (proj.has_any_quant or proj.tp_size != 1 or proj.bias is not None
+                or proj.weight.dtype != torch.bfloat16):
+            return False
+        # The epilogue replaces Linear.apply for gate_up_proj, so a projection
+        # that selected another GEMM provider keeps that provider.
+        if proj.use_cute_dsl_bf16_gemm or proj.use_custom_cublas_mm:
+            return False
+        return gate_up_swiglu_quack_shape_ok(proj.weight.shape[1],
+                                             proj.weight.shape[0] // 2)
+
+    def _fused_gate_up_swiglu_bf16(self, x: torch.Tensor) -> torch.Tensor:
+        """BF16 gate/up GEMM with SwiGLU in its epilogue on a 2-D view of ``x``."""
+        input_shape = x.shape
+        output = gate_up_swiglu_quack_bf16(x.reshape(-1, input_shape[-1]),
+                                           self.gate_up_proj.weight)
+        return output.reshape(*input_shape[:-1], output.shape[-1])
+
     def _can_fuse_swiglu_fp8_quant(self) -> bool:
         """Check whether down projection can consume fused SwiGLU FP8 output."""
         # silu_and_mul_fp8_quantize_1x128_packed_ue8m0 takes the limit but has
@@ -374,6 +440,11 @@ class GatedMLP(nn.Module):
                          or self.down_proj.disable_deep_gemm))
         return (is_sm_100f() and not self.down_proj.use_cute_dsl_blockscaling_mm
                 and not self.down_proj.disable_deep_gemm)
+
+    def _can_fuse_swiglu_nvfp4_quant(self) -> bool:
+        return (get_sm_version() >= 100 and self.activation == F.silu
+                and self._is_plain_swiglu() and self.swiglu_limit is None
+                and is_static_nvfp4_input_eligible(self.down_proj))
 
     def _fused_gate_up_swiglu(self, x, fp4_out=False):
         """Fused FC1 GEMM + SwiGLU using CuteDSL dense kernel.
@@ -486,15 +557,26 @@ class GatedMLP(nn.Module):
             h2 = self._fused_gate_up_swiglu(x, fp4_out=fp4_out)
         elif self._can_fuse_gate_up_swiglu():
             h2 = self._fused_gate_up_swiglu(x)
+        elif self._can_fuse_gate_up_swiglu_bf16(x):
+            h2 = self._fused_gate_up_swiglu_bf16(x)
         else:
             h1 = self.gate_up_proj(x)
-            if self._can_fuse_swiglu_fp8_quant():
+            if self._can_fuse_swiglu_fp8_quant(
+            ) and not self.down_proj.prefers_bf16_swiglu_input(
+                    h1.reshape(-1, h1.shape[-1]), self.swiglu_limit):
                 if h1.dim() > 2:
                     fused_output_shape = h1.shape[:-1]
                     h1 = h1.reshape(-1, h1.shape[-1])
                 use_r128c4_layout = get_sm_version() == 107
                 h2 = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
                     h1, self.swiglu_limit, use_r128c4_layout)
+            elif self._can_fuse_swiglu_nvfp4_quant():
+                if h1.dim() > 2:
+                    fused_output_shape = h1.shape[:-1]
+                    h1 = h1.reshape(-1, h1.shape[-1])
+                h2_fp4, h2_sf = torch.ops.trtllm.swiglu_nvfp4_quantize(
+                    h1, self.down_proj.input_scale)
+                h2 = Fp4QuantizedTensor(h2_fp4.view(torch.uint8), h2_sf)
             else:
                 h2 = self._apply_activation(h1)
 

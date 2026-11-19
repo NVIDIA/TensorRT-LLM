@@ -18,13 +18,12 @@ context_servers:
     dtype: fp8
   disable_overlap_scheduler: true
   moe_config:
-    backend: TRTLLM
+    tactic: trtllm_gen
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
-    max_tokens_in_buffer: 16384
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 2
@@ -42,7 +41,7 @@ generation_servers:
     dtype: fp8
   disable_overlap_scheduler: true
   moe_config:
-    backend: TRTLLM
+    tactic: trtllm_gen
   cuda_graph_config:
     enable_padding: true
     batch_sizes:
@@ -62,4 +61,3 @@ generation_servers:
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
-    max_tokens_in_buffer: 16384

@@ -98,10 +98,14 @@ This implementation uses much more memory than needed when sequences are shorter
 
 The paged KV cache decomposes the KV cache into blocks that are distributed to
 the different requests by a cache manager during processing. That cache manager
-keeps track of the sequences, allocates new blocks from a pool, and recycles those blocks when required. See the simplified implementation of
-[`tensorrt_llm.runtime.KVCacheManager`](source:tensorrt_llm/runtime/kv_cache_manager.py).
-A more efficient C++ implementation is included in the
+keeps track of the sequences, allocates new blocks from a pool, and recycles those blocks when required.
+The PyTorch executor integrates the cache managers through
+[`KVCacheManager`](source:tensorrt_llm/_torch/pyexecutor/resource_manager.py) and
+[`KVCacheManagerV2`](source:tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py).
+The V1 `KVCacheManager` wraps the C++ block manager under the
 [Batch Manager](source:cpp/include/tensorrt_llm/batch_manager).
+See [Selecting the KV Cache Manager](kvcache.md#selecting-the-kv-cache-manager)
+for configuration and compatibility details.
 
 ## The schedulers
 

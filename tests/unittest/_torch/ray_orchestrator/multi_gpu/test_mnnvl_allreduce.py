@@ -32,7 +32,7 @@ import torch
 try:
     import ray
 except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
+    from tensorrt_llm.executor.ray import stub as ray
 
 from tensorrt_llm._torch.distributed.communicator import TorchDist
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
@@ -60,7 +60,7 @@ class MnnvlAllReduceWorker:
 
         assert len(ray.get_gpu_ids()) == 1
         self.gpu = int(ray.get_gpu_ids()[0])
-        from tensorrt_llm.executor.ray_gpu_worker import RayWorkerWrapper
+        from tensorrt_llm.executor.ray.gpu_worker import RayWorkerWrapper
 
         torch.cuda.set_device(RayWorkerWrapper.physical_to_local_id(self.gpu))
 
@@ -102,7 +102,7 @@ class MnnvlAllReduceWorker:
         Only the hardware capability, not is_mnnvl(): off aarch64 the test bypasses that policy
         gate below, so skipping has to key off what the machine can actually do.
         """
-        from tensorrt_llm._mnnvl_utils import MnnvlMemory
+        from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 
         MnnvlMemory.initialize()
         return MnnvlMemory.supports_mnnvl()

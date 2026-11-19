@@ -98,6 +98,7 @@ def test_on_update_kv_lens_rebuilds_stale_map() -> None:
     # __init__ (bypassed by object.__new__) defaults this to False;
     # on_update_kv_lens() reads it since #16925.
     md.in_mtp_draft_loop = False
+    md._group_remap_batched = {}
     # Stub collaborators unrelated to the map rebuild (test_dsa_indexer.py style).
     md.kv_lens_cuda = torch.tensor([100, 200, 300], dtype=torch.int32, device=device)
     md._compute_kv_lens_row_reorder = Mock()

@@ -190,7 +190,8 @@ protected:
         params.mMaxSeqLenCacheKv = 1;
         params.mMaxSeqLenQ = 1;
         params.mMaxSeqLenKv = 1;
-        params.mAttentionWindowSize = std::numeric_limits<int32_t>::max();
+        params.mLeftSlidingWindow = -1;
+        params.mRightSlidingWindow = -1;
         params.mChunkedAttentionSize = std::numeric_limits<int32_t>::max();
         params.mSumOfSeqLensQ = kNumTokens;
         params.mSumOfSeqLensKv = kNumTokens;

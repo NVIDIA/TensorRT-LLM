@@ -14,7 +14,9 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
+import shlex
 import subprocess
 import sys
 import sysconfig
@@ -76,7 +78,7 @@ def verify_license_files():
         timeout=60)
 
     if result.returncode != 0:
-        print(f"ERROR: License files check failed!")
+        print("ERROR: License files check failed!")
         print(result.stdout)
         print(result.stderr)
         exit(1)
@@ -84,10 +86,9 @@ def verify_license_files():
     # Parse the output to get the list of files
     output_lines = result.stdout.strip().split('\n')
     try:
-        import json
         found_files = json.loads(output_lines[-1])
     except (json.JSONDecodeError, IndexError):
-        print(f"ERROR: Could not parse license files from output!")
+        print("ERROR: Could not parse license files from output!")
         print(result.stdout)
         exit(1)
 
@@ -101,7 +102,7 @@ def verify_license_files():
     # Check that at least one valid attribution file is present
     found_attributions = [f for f in found_files if f in valid_attributions]
     if not found_attributions:
-        print(f"ERROR: No valid attribution file found!")
+        print("ERROR: No valid attribution file found!")
         print(f"Expected one of: {valid_attributions}")
         print(f"Found: {found_files}")
         exit(1)
@@ -143,15 +144,17 @@ def verify_openengine_distribution() -> None:
             raise RuntimeError(
                 f"Wheel extra {extra!r} does not declare {expected}")
 
-    expected_grpc = Requirement("grpcio>=1.67.1,<2")
-    grpc_declared = any(
-        canonicalize_name(requirement.name) == canonicalize_name(
-            expected_grpc.name) and requirement.specifier ==
-        expected_grpc.specifier and requirement.marker is None
-        for requirement in requirements)
-    if not grpc_declared:
-        raise RuntimeError(
-            f"TensorRT-LLM does not declare base requirement {expected_grpc}")
+    for expected_grpc in (Requirement("grpcio>=1.73.1,<2"),
+                          Requirement("grpcio-health-checking>=1.73.1,<1.82")):
+        grpc_declared = any(
+            canonicalize_name(requirement.name) == canonicalize_name(
+                expected_grpc.name) and requirement.specifier ==
+            expected_grpc.specifier and requirement.marker is None
+            for requirement in requirements)
+        if not grpc_declared:
+            raise RuntimeError(
+                f"TensorRT-LLM does not declare base requirement {expected_grpc}"
+            )
 
     proto_names = (
         "error",
@@ -190,9 +193,21 @@ def get_cpython_version():
     return "cp{}{}".format(python_version[0], python_version[1])
 
 
+URL_SCHEMES = ("http://", "https://")
+
+
 def get_wheel_url(wheel_path, version_local, cpython_version):
-    """Get direct wheel URL from wheel_path (directory listing or direct URL)."""
-    if not wheel_path.startswith(("http://", "https://")):
+    """Get the wheel that wheel_path names.
+
+    Returns the absolute path of a local wheel file, or the direct wheel URL
+    for a wheel given by URL (directory listing or direct URL).
+    """
+    if not wheel_path.startswith(URL_SCHEMES):
+        if os.path.isfile(wheel_path):
+            return os.path.abspath(wheel_path)
+        if os.path.isabs(wheel_path):
+            print(f"Fail to find the wheel file {wheel_path}")
+            exit(1)
         wheel_path = "https://" + wheel_path
 
     if wheel_path.endswith(".whl"):
@@ -238,12 +253,29 @@ def get_wheel_url(wheel_path, version_local, cpython_version):
     return f"{wheel_path}/{wheel_name}"
 
 
+def is_local_wheel(wheel):
+    """Whether get_wheel_url returned a local file rather than a URL."""
+    return not wheel.startswith(URL_SCHEMES)
+
+
 def download_wheel(args):
+    """Download a wheel given by URL into the working directory.
+
+    A local wheel file is used where it is: nothing is downloaded, and no
+    wheel is removed from the working directory.
+
+    Returns:
+        The absolute path of the local wheel file, or None when the wheel was
+        downloaded.
+    """
     wheel_url = get_wheel_url(args.wheel_path, args.version_local,
                               args.cpython_version)
+    if is_local_wheel(wheel_url):
+        return wheel_url
     subprocess.check_call("rm *.whl || true", shell=True)
     subprocess.check_call(f"apt-get install -y wget && wget -q {wheel_url}",
                           shell=True)
+    return None
 
 
 def get_torch_constraint_file(constraint_dir="."):
@@ -286,11 +318,17 @@ def get_torch_constraint_file(constraint_dir="."):
     return None
 
 
-def install_tensorrt_llm():
-    """Install the tensorrt_llm wheel with torch version constraint."""
+def install_tensorrt_llm(wheel_file=None):
+    """Install the tensorrt_llm wheel with torch version constraint.
+
+    Args:
+        wheel_file: Absolute path of the wheel to install. When None, the
+            wheel downloaded into the working directory is installed.
+    """
     print("##########  Install tensorrt_llm package  ##########")
 
-    install_command = "pip3 install tensorrt_llm-*.whl"
+    wheel = shlex.quote(wheel_file) if wheel_file else "tensorrt_llm-*.whl"
+    install_command = f"pip3 install {wheel}"
     constraint_file = get_torch_constraint_file()
     if constraint_file:
         install_command += f" -c {constraint_file}"
@@ -305,9 +343,8 @@ def create_link_for_models():
         print(f"ERROR: Models root {models_root} does not exist")
         exit(1)
     src_dst_dict = {
-        # TinyLlama-1.1B-Chat-v1.0
-        f"{models_root}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
-        f"{os.getcwd()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # Qwen3-0.6B
+        f"{models_root}/Qwen3/Qwen3-0.6B": f"{os.getcwd()}/Qwen3/Qwen3-0.6B",
     }
 
     for src, dst in src_dst_dict.items():
@@ -352,8 +389,7 @@ def install_system_libs():
 def test_pip_install(args):
     install_system_libs()
 
-    download_wheel(args)
-    install_tensorrt_llm()
+    install_tensorrt_llm(download_wheel(args))
 
     verify_openengine_distribution()
     run_sanity_check()
@@ -364,7 +400,7 @@ def test_python_builds(args):
 
     This test verifies the TRTLLM_PRECOMPILED_LOCATION workflow:
     1. Install required system libs
-    2. Use precompiled wheel URL to extract C++ bindings
+    2. Use precompiled wheel (URL or local file) to extract C++ bindings
     3. Build Python-only wheel (editable install with torch constraint)
     4. Verify installation works correctly
     5. Run quickstart example
@@ -413,7 +449,8 @@ if __name__ == "__main__":
     parser.add_argument("--wheel_path",
                         type=str,
                         required=True,
-                        help="The wheel path")
+                        help="The wheel to check: a local wheel file, or the "
+                        "URL of a wheel or of a directory listing with it")
     parser.add_argument("--version_local",
                         type=str,
                         required=False,

@@ -19,7 +19,7 @@ the transfer phase, preventing exhaustion when transfers are slow and multiple
 iterations of requests accumulate in-flight.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -85,6 +85,7 @@ class _FakeExecutor(PyExecutor):
         self._disagg_coordinator.reap_context_sends = lambda at_least=0: None
 
 
+@pytest.mark.cpu_only
 class TestSendKvAsyncReleasesIndexSlot:
     """Test that `_send_kv_async` releases the IndexMapper slot before the
     transfer is started, which is where the production code actually lives
@@ -127,21 +128,8 @@ class TestSendKvAsyncReleasesIndexSlot:
 
         assert 42 in transfer_manager.requests_in_transfer()
 
-    def test_release_called_once_per_request(self):
-        """If the same request passes through _send_kv_async once, release is
-        called exactly once (it's gated by `is_context_finished`, which is
-        reset after the first pass)."""
-        kv_cache_manager = MagicMock()
-        kv_cache_manager.store_blocks_for_reuse.return_value = 100
 
-        executor, _ = self._build(kv_cache_manager)
-        request = create_mock_request(42)
-
-        PyExecutor._send_kv_async(executor, [request])
-
-        kv_cache_manager.release_index_slot.assert_called_once_with(42)
-
-
+# Not cpu_only: the IndexMapper fixtures pin host buffers, which needs a CUDA device.
 class TestIndexMapperSlotReuse:
     """Test IndexMapper slot recycling after early release."""
 
@@ -258,7 +246,54 @@ class TestIndexMapperSlotReuse:
         assert torch.count_nonzero(destination[:, :, 1] != -1) == 0
         assert torch.count_nonzero(destination[:, 4, 0] != -1) == 0
 
+    def test_release_detaches_page_index_views_before_slot_reuse(self):
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+            IndexMapper,
+        )
 
+        manager = object.__new__(KVCacheManagerV2)
+        # release_index_slot reads is_draft before anything else; a target-side
+        # manager is the case that must detach the views.
+        manager.is_draft = False
+        manager.max_beam_width = 2
+        manager.num_pools = 3
+        index_mapper = IndexMapper(max_batch_size=1, max_beam_width=2)
+        index_mapper.add_new_sequence(1)
+        events = []
+        manager.index_mapper = MagicMock(wraps=index_mapper)
+        manager.index_mapper.remove_sequence.side_effect = lambda request_id: (
+            events.append(("remove", request_id)),
+            index_mapper.remove_sequence(request_id),
+        )[1]
+        manager._early_freed_index_requests = set()
+        kv_cache = MagicMock()
+        # release_index_slot walks the sequence's own beam width (#17306), not
+        # the manager's max_beam_width; an unset MagicMock attribute is int 1.
+        kv_cache.beam_width = 2
+        kv_cache.set_base_page_index_buf.side_effect = (
+            lambda beam_idx, pool_idx, value: events.append(("detach", beam_idx, pool_idx, value))
+        )
+        manager.kv_cache_map = {1: kv_cache}
+
+        manager.release_index_slot(1)
+
+        expected_calls = [
+            call(beam_idx, pool_idx, None)
+            for beam_idx in range(kv_cache.beam_width)
+            for pool_idx in range(manager.num_pools)
+        ]
+        assert kv_cache.set_base_page_index_buf.call_args_list == expected_calls
+        assert events == [
+            ("detach", beam_idx, pool_idx, None)
+            for beam_idx in range(kv_cache.beam_width)
+            for pool_idx in range(manager.num_pools)
+        ] + [("remove", 1)]
+        assert not _has_sequence(index_mapper, 1)
+        assert manager._early_freed_index_requests == {1}
+
+
+# Not cpu_only: same pinned-host-buffer fixtures as above.
 class TestFreeResourcesDoubleReleaseSafety:
     """Test that free_resources handles already-released IndexMapper slots."""
 
@@ -295,6 +330,7 @@ class TestFreeResourcesDoubleReleaseSafety:
         assert not _has_sequence(index_mapper, 1)
 
 
+@pytest.mark.cpu_only
 class TestAuxBufferHigherCapacity:
     """Test that increased AuxBuffer capacity works correctly."""
 

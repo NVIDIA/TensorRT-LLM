@@ -15,27 +15,25 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
-# ============================================================================
-# Flash Attention 4 availability
-# ============================================================================
-from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
-from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+# Import new integrated versions
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import _cute_dsl_import_error
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
+    _flash_attn_fwd as _fa4_fwd,
+)
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     Attention2DAttention,
     RingAttention,
     UlyssesAttention,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-# Import new integrated versions
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     QuantAttentionConfig,
@@ -185,9 +183,7 @@ def _require_attention_backend(
         except ImportError as e:
             pytest.skip(f"cuDNN detected hardware/library incompatibility: {e}")
     if attn_backend == "CUTEDSL":
-        compute_capability = torch.cuda.get_device_capability()
-        gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
-        if gpu_arch not in ("sm_100a", "sm_103a"):
+        if get_sm_version() not in (100, 103):
             pytest.skip("CUTEDSL attention test requires a supported Blackwell-class GPU")
 
 
@@ -313,43 +309,6 @@ class TestSeparateQkvSequenceParallelGuard:
         assert isinstance(attn.attn, VanillaAttention)
 
 
-def _build_sage_routed_attention(qkv_mode: QKVMode):
-    """Build a TRTLLM-SAGE-configured Attention for backend-routing checks."""
-    quant_cfg = QuantAttentionConfig(
-        qk_dtype="int8", q_block_size=1, k_block_size=16, v_block_size=1
-    )
-    config = create_model_config(
-        hidden_size=512,
-        num_heads=4,
-        head_dim=128,
-        attn_backend="TRTLLM",
-        quant_attention_config=quant_cfg,
-        skip_create_weights_in_init=True,
-    )
-    attn = Attention(
-        hidden_size=512,
-        num_attention_heads=4,
-        head_dim=128,
-        qkv_mode=qkv_mode,
-        config=config,
-    )
-    return attn, quant_cfg
-
-
-class TestSageAttentionBackendRouting:
-    def test_self_attention_uses_trtllm_sage_backend(self):
-        attn, quant_cfg = _build_sage_routed_attention(QKVMode.FUSE_QKV)
-        assert attn.attn_backend == "TRTLLM"
-        assert isinstance(attn.attn, TrtllmAttention)
-        assert attn.attn.quant_attention_config == quant_cfg
-        assert not attn.attn.support_fused_qkv()
-
-    def test_cross_attention_with_sage_config_falls_back_to_vanilla(self):
-        attn, _ = _build_sage_routed_attention(QKVMode.SEPARATE_QKV)
-        assert attn.attn_backend == "VANILLA"
-        assert isinstance(attn.attn, VanillaAttention)
-
-
 # ============================================================================
 # Test functions
 # ============================================================================
@@ -467,10 +426,10 @@ def test_sage_attention_self_attention(qk_dtype: str, batch_size: int, seq_len: 
     3. Outputs are finite (no NaN/Inf)
     4. Approximate agreement with naive (cosine similarity > 0.99)
     """
-    compute_capability = torch.cuda.get_device_capability()
-    gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
-    if qk_dtype == "int8" and gpu_arch not in ["sm_100a"]:
-        pytest.skip("Int8 kernels are only available for SM100 devices.")
+    # This test configures the contiguous-block recipe (q_block_size=1), which requires SM100. The
+    # SM90 recipe is covered by test_attention_trtllm_sage.py::test_attention_trtllm_sage_hopper.
+    if get_sm_version() != 100:
+        pytest.skip("The contiguous-block SageAttention recipe is only available on SM100 devices.")
     print("\n" + "=" * 60)
     print(f"Testing SageAttention (qk_dtype={qk_dtype}, B={batch_size}, S={seq_len})")
     print("=" * 60)
@@ -884,60 +843,3 @@ def test_trtllm_varying_seq_len():
 
     assert all_passed, "Varying seq_len: outputs did not match naive reference"
     return all_passed
-
-
-def run_all_tests():
-    """Run all tests and report results."""
-    print("\n" + "=" * 60)
-    print("WAN Attention Integration Tests")
-    print("=" * 60)
-
-    results = {}
-
-    # Run self-attention tests with different backends
-    fast_backends = ["FA4"] if _flash_attn4_available else []
-    if _cute_dsl_available:
-        fast_backends.append("CUTEDSL")
-    for backend in ["VANILLA", "TRTLLM"] + fast_backends:
-        results[f"self_attention_{backend}"] = test_self_attention_equivalence(backend, "NO_QUANT")
-
-    # Run SageAttention self-attention tests (subset for manual runner)
-    for batch_size in [1, 2]:
-        for seq_len in [4096, 32760]:
-            for qk_dtype in ["fp8", "int8"]:
-                label = f"sage_B{batch_size}_S{seq_len}_QkDtype{qk_dtype}"
-                results[label] = test_sage_attention_self_attention(
-                    qk_dtype=qk_dtype, batch_size=batch_size, seq_len=seq_len
-                )
-
-    # Run cross-attention tests
-    results["cross_attention_VANILLA"] = test_cross_attention_equivalence("VANILLA", "NO_QUANT")
-    if _flash_attn4_available:
-        results["cross_attention_FA4"] = test_cross_attention_equivalence("FA4", "NO_QUANT")
-    if _cute_dsl_available:
-        results["cross_attention_CUTEDSL"] = test_cross_attention_equivalence("CUTEDSL", "NO_QUANT")
-
-    # Run TRTLLM-specific caching tests
-    results["trtllm_cached_prepare"] = test_trtllm_cached_prepare()
-    results["trtllm_varying_seq_len"] = test_trtllm_varying_seq_len()
-
-    print("\n" + "=" * 60)
-    print("Summary")
-    print("=" * 60)
-
-    all_passed = all(results.values())
-    for name, passed in results.items():
-        status = "✅ PASS" if passed else "❌ FAIL"
-        print(f"  {name}: {status}")
-
-    print()
-    if all_passed:
-        print("All tests passed! ✅")
-    else:
-        print("Some tests failed! ❌")
-
-    return all_passed
-
-
-if __name__ == "__main__":
-    run_all_tests()

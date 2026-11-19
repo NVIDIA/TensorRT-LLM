@@ -30,6 +30,6 @@ measured: []
 - **Apply via:** config `torch_compile_piecewise_cuda_graph: true` (requires `torch_compile_enabled`, asserts `torch_compile_fullgraph=True`) + `cuda_graph_batch_sizes`; flags `--use_torch_compile --use_piecewise_cuda_graph`. Delegate to **perf-torch-cuda-graphs** / **perf-torch-cuda-graph-specialist**.
 - **Expected effect:** reduced launch overhead / lower per-step latency by graphing stable regions; attention stays eager; no number — measured Δ to be recorded from run.
 - **Accuracy risk:** lossless — graph replay reproduces the same kernels. Care: a warmup flag `set_enable_piecewise_cuda_graph_capture_flag(False)` disables capture during runs that "would produce wrong results"; token counts not captured fall back to non-graph.
-- **Verify:** confirm pieces captured/replayed (ad-conf-check); nsys graph coverage vs eager attention; outputs vs eager and full-graph.
+- **Verify:** confirm pieces captured/replayed (config/log inspection); nsys graph coverage vs eager attention; outputs vs eager and full-graph.
 - **Rollback:** `torch_compile_piecewise_cuda_graph=false`. Trigger: capture errors, wrong warmup results, or token counts persistently missing from `cuda_graph_batch_sizes`.
 - **Prior art:** PR #3804. Files: `_torch/compilation/piecewise_optimizer.py`, `compilation/backend.py`, `pyexecutor/config.py`. Owning specialist: **perf-torch-cuda-graph-specialist**.

@@ -30,6 +30,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 # Match dotted namespaces exactly so unrelated decoder weights are not ignored.
@@ -125,17 +126,17 @@ def audit_glm5_next_checkpoint(
 
 
 def glm5_next_is_quantized(model_config: ModelConfig[PretrainedConfig]) -> bool:
-    """Read block-FP8 construction from ModelConfig, rejecting other quantization modes.
+    """Read supported checkpoint quantization from ModelConfig.
 
     Unquantized modules are also supported for component construction.
     """
     quant = model_config.quant_config
     if quant is None or quant.quant_algo is None:
         return False
-    if quant.quant_algo != QuantAlgo.FP8_BLOCK_SCALES:
+    if quant.quant_algo not in (QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4):
         raise ValueError(
-            "glm5_next supports only the published FP8_BLOCK_SCALES checkpoint "
-            f"form or unquantized bf16 modules; got quant_algo={quant.quant_algo}"
+            "glm5_next supports FP8_BLOCK_SCALES and NVFP4 checkpoints "
+            f"or unquantized bf16 modules; got quant_algo={quant.quant_algo}"
         )
     return True
 
@@ -155,8 +156,8 @@ def glm5_next_weight_owner(dest: str, num_layers: int) -> Any:
     return None
 
 
-@register_mapper("HF", "Glm5NextForConditionalGeneration")
-@register_mapper("HF", "Glm5NextForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Glm5NextForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Glm5NextForCausalLM")
 class Glm5NextHfWeightMapper(HfWeightMapper):
     """Resolve checkpoint destinations and owners for the model's custom loader.
 

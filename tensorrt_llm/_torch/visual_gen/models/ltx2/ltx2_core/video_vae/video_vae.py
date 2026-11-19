@@ -326,6 +326,8 @@ def _make_decoder_block(
 
 class VideoDecoder(nn.Module):
     _DEFAULT_NORM_NUM_GROUPS = 32
+    _channel_reducing_blocks = ("compress_all",)
+    _make_decoder_block = staticmethod(_make_decoder_block)
 
     def __init__(
         self,
@@ -340,7 +342,7 @@ class VideoDecoder(nn.Module):
         decoder_spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
     ):
         super().__init__()
-        self.video_downscale_factors = SpatioTemporalScaleFactors(time=8, width=32, height=32)
+        self.video_downscale_factors = SpatioTemporalScaleFactors(time=8, height=32, width=32)
         self.patch_size = patch_size
         out_channels = out_channels * patch_size**2
         self.causal = causal
@@ -354,7 +356,7 @@ class VideoDecoder(nn.Module):
             block_config = block_params if isinstance(block_params, dict) else {}
             if block_name == "res_x_y":
                 feature_channels = feature_channels * block_config.get("multiplier", 2)
-            if block_name == "compress_all":
+            if block_name in self._channel_reducing_blocks:
                 feature_channels = feature_channels * block_config.get("multiplier", 1)
         self.conv_in = make_conv_nd(
             dims=convolution_dimensions,
@@ -371,7 +373,7 @@ class VideoDecoder(nn.Module):
             block_config = (
                 {"num_layers": block_params} if isinstance(block_params, int) else block_params
             )
-            block, feature_channels = _make_decoder_block(
+            block, feature_channels = self._make_decoder_block(
                 block_name=block_name,
                 block_config=block_config,
                 in_channels=feature_channels,

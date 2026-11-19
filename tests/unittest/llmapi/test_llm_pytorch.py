@@ -26,15 +26,14 @@ from .lora_test_utils import (create_mock_nemo_lora_checkpoint,
                               compare_cuda_graph_lora_params_filler,
                               CUDAGraphLoRATestParams,
                               test_lora_with_and_without_cuda_graph)
-from .test_llm import (_test_llm_capture_request_error, get_model_path,
-                       global_kvcache_config, global_kvcache_config_no_reuse,
-                       llama_model_path, llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness,
-                       llm_return_logprobs_test_harness, llm_test_harness,
-                       prompts, run_llm_abort_request,
-                       sampling_params_for_aborting_request,
-                       run_llm_with_postprocess_parallel_and_result_handler,
-                       tinyllama_logits_processor_test_harness)
+from .test_llm import (
+    _test_llm_capture_request_error, get_model_path, global_kvcache_config,
+    global_kvcache_config_no_reuse, is_idle_heartbeat, llama_model_path,
+    llm_get_stats_async_test_harness, llm_get_stats_test_harness,
+    llm_return_logprobs_test_harness, llm_test_harness, prompts,
+    run_llm_abort_request, sampling_params_for_aborting_request,
+    run_llm_with_postprocess_parallel_and_result_handler,
+    tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
@@ -59,7 +58,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
 
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from dataclasses import replace
 
 # isort: on
@@ -141,11 +140,16 @@ def test_llm_get_stats_with_interval(use_overlap):
 
         records = []
         while True:
-            batch = llm.get_stats(timeout=2)
+            batch = [
+                json.loads(r) if isinstance(r, str) else r
+                for r in llm.get_stats(timeout=2)
+            ]
+            # The idle engine keeps reporting heartbeats; they are not
+            # sampled iterations.
+            batch = [r for r in batch if not is_idle_heartbeat(r)]
             if not batch:
                 break
-            records.extend(
-                json.loads(r) if isinstance(r, str) else r for r in batch)
+            records.extend(batch)
 
     iter_records = [r for r in records if "iter" in r]
     assert iter_records, "expected sampled iteration stats records"
@@ -283,7 +287,7 @@ def test_llm_perf_metrics():
 @pytest.mark.part3
 @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
 def test_llm_prefix_cache_reuse(attn_backend):
-    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = get_model_path("Qwen3/Qwen3-0.6B")
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0,
                                      max_tokens=5,
@@ -346,12 +350,13 @@ def test_embedding_bias_with_torch_sampler_strategies():
     """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
-    vocab_size_padded = 32000
+    vocab_size_padded = AutoConfig.from_pretrained(llama_model_path).vocab_size
     embedding_bias = torch.zeros(vocab_size_padded)
     embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
 
+    max_tokens = 6
     sampling_kwargs = {
-        "max_tokens": 6,
+        "max_tokens": max_tokens,
         "embedding_bias": embedding_bias,
     }
 
@@ -359,10 +364,15 @@ def test_embedding_bias_with_torch_sampler_strategies():
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
+    # The biased token's decoded text (e.g. with or without a leading space)
+    # is tokenizer-specific, so derive the expected repeated-token output
+    # rather than hardcoding a particular tokenizer's rendering.
+    expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+
     llm_test_harness(
         llama_model_path,
         prompts,
-        ["Z Z Z Z Z Z"],
+        [expected_output],
         sampling_params=sampling_params,
         backend="pytorch",
     )
@@ -1158,7 +1168,7 @@ async def test_llm_rpc_get_stats_async():
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 def test_llm_context_only_timed_out(transceiver_runtime):
     tp_size = 1
     use_overlap = False
@@ -1171,8 +1181,7 @@ def test_llm_context_only_timed_out(transceiver_runtime):
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    backend = "NIXL"
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
@@ -1249,15 +1258,11 @@ def test_llm_context_only_timed_out(transceiver_runtime):
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
-@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("backend", ["NIXL"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
                                                        backend,
                                                        transceiver_runtime):
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    if transceiver_runtime == "PYTHON" and backend == "UCX":
-        pytest.skip("Python transceiver (V2) does not support UCX backend")
-
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1320,8 +1325,14 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
     for output in llm.generate(prompts0, sampling_params=sampling_params):
         print(output)
 
-    # Get number of allocated blocks
-    results = llm.get_stats(2)
+    # Get number of allocated blocks from the request's own iteration. Its
+    # record can trail the response; until then the engine reports idle
+    # heartbeats and zero-duration queue snapshots, which measure nothing.
+    results = []
+    for _ in range(max_retries):
+        results.extend(r for r in llm.get_stats(2) if r["iterLatencyMS"] > 0)
+        if any(r["numCompletedRequests"] for r in results):
+            break
     assert len(results) == 1
     final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
 
@@ -1342,7 +1353,7 @@ _DISAGG_CANCEL_TEST_ITERATIONS = 2
 @pytest.mark.private_mpi_session
 @pytest.mark.timeout(600)
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 async def test_llm_disagg_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
@@ -1355,8 +1366,7 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    backend = "NIXL"
     llm_ctx = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
@@ -1521,8 +1531,73 @@ def test_priority_request_completes_before_low_priority():
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
+@pytest.mark.timeout(120)
+def test_priority_wait_cap_admits_an_aged_request_first():
+    """With waiting_queue_max_wait_s, a request that waited the cap goes ahead of a higher-priority one.
+
+    max_batch_size=1: Request 1 holds the only slot. Request 2 (priority 0.1) waits past the cap before
+    Request 3 (priority 0.9) arrives, so Request 2 is admitted first when the slot frees; without the cap
+    Request 3 would be (test_priority_request_completes_before_low_priority).
+    """
+    max_wait_s = 0.25
+    llm = LLM(
+        model=llama_model_path,
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        scheduler_config=SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.PRIORITY,
+            waiting_queue_max_wait_s=max_wait_s),
+    )
+
+    prompt = "A B C D E F G H I J"
+    completion_order = []
+    slot_busy_at_request3 = []
+
+    async def run():
+        out1 = llm.generate_async(
+            prompt,
+            SamplingParams(max_tokens=1500, temperature=0, ignore_eos=True))
+        out2 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0),
+                                  priority=0.1)
+        await asyncio.sleep(2 * max_wait_s)
+        out3 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0),
+                                  priority=0.9)
+        slot_busy_at_request3.append(not out1.finished)
+
+        async def await_and_record(output, req_id: int):
+            await output.aresult()
+            completion_order.append(req_id)
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                await_and_record(out1, 1),
+                await_and_record(out2, 2),
+                await_and_record(out3, 3),
+            ),
+            timeout=90,
+        )
+
+    try:
+        asyncio.run(run())
+    finally:
+        llm.shutdown()
+
+    assert slot_busy_at_request3 == [
+        True
+    ], ("Request 1 finished before Request 3 arrived; the test needs it to hold the slot"
+        )
+    assert completion_order.index(2) < completion_order.index(3), (
+        f"Request 2 (waited past the cap) should complete before Request 3 (priority=0.9). "
+        f"Completion order: {completion_order}")
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
@@ -1535,8 +1610,7 @@ async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    backend = "NIXL"
     llm_ctx = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,

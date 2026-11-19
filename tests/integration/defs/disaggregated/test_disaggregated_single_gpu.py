@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import os
 import pickle
@@ -14,7 +29,7 @@ from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig, MpiCommSession)
-from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
+from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, SchedulerConfig
 
 # With the Ray orchestrator, workers spawned through MPI hang inside ray.init()
 # on the Open MPI 5 shipped by the DLFW 26.08 base image: the raylet forked from
@@ -98,6 +113,9 @@ MODEL_PATHS = {
     "DeepSeek-V3-Lite-fp8": "DeepSeek-V3-Lite/fp8",
     "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
     "Qwen3-8B-eagle3": "Qwen3/qwen3_8b_eagle3",
+    "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
+    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
+    "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
     "Qwen3-8B-FP8": "Qwen3/Qwen3-8B-FP8",
     "Qwen3-8B": "Qwen3/Qwen3-8B",
 }
@@ -144,6 +162,19 @@ def mpi_send_termination_request(intercomm):
         intercomm.Disconnect()
 
 
+def mpi_wait_for_workers_ready(intercomm: MPI.Comm) -> None:
+    """Drain every startup outcome before allowing requests or collective shutdown."""
+    errors = []
+    for _ in range(intercomm.Get_remote_size()):
+        status = intercomm.recv(tag=MPI_READY)
+        if isinstance(status, dict):
+            errors.append(f"rank {status['rank']}: {status['error']}")
+        else:
+            print("Received ready signal.", flush=True)
+    if errors:
+        raise RuntimeError("Worker initialization failed: " + "; ".join(errors))
+
+
 def model_path(model_name):
     llm_models_root = os.environ["LLM_MODELS_ROOT"]
     for name, path in MODEL_PATHS.items():
@@ -157,7 +188,8 @@ async def run_worker(kv_cache_config,
                      pytorch_config,
                      model_name,
                      rank,
-                     support_cancel=False):
+                     support_cancel=False,
+                     preemption_events=None):
     assert isinstance(pytorch_config, dict)
     print(f"Running worker {rank}")
     try:
@@ -184,8 +216,17 @@ async def run_worker(kv_cache_config,
                   cache_transceiver_config=cache_transceiver_config)
         print(f"LLM created")
     except Exception as e:
-        print(f"Error creating LLM: {e}")
-        raise e
+        print(f"Error creating LLM: {e}", flush=True)
+        intercomm.send({
+            "rank": rank,
+            "error": f"{type(e).__name__}: {e}"
+        },
+                       dest=0,
+                       tag=MPI_READY)
+        # Stay in the shutdown protocol so the parent can disconnect all peers.
+        intercomm.recv(source=0, tag=MPI_REQUEST)
+        intercomm.Disconnect()
+        raise
 
     # Send ready signal
     print(f"Sending ready signal to main process")
@@ -201,6 +242,9 @@ async def run_worker(kv_cache_config,
                 break
 
             # Handle special commands
+            if requests == "GET_PREEMPTION_EVENTS":
+                intercomm.send(preemption_events, dest=0, tag=MPI_RESULT)
+                continue
             if requests == "GET_STATE":
                 state = llm.get_data_transceiver_state()
                 intercomm.send(state, dest=0, tag=MPI_RESULT)
@@ -316,7 +360,40 @@ def worker_entry_point(kv_cache_config,
                        pytorch_config,
                        model_name,
                        rank,
-                       support_cancel=False):
+                       support_cancel=False,
+                       exercise_preemption=False):
+    if exercise_preemption:
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import \
+            GenPreemption
+
+        events = {"paused": 0, "resumed": 0}
+        original_step = GenPreemption.step
+
+        def step(controller, active_requests, *args, **kwargs):
+            count = original_step(controller, active_requests, *args, **kwargs)
+            events["resumed"] += len(controller.resumed_ids)
+            if not events["paused"]:
+                for req in active_requests:
+                    if (req.is_generation_only_request
+                            and not req.is_dummy_request
+                            and req.py_decoding_iter >= 2):
+                        # Force the policy event so this short GPU test verifies actual
+                        # pause/resume scheduling without waiting for TTFT warmup.
+                        controller._pause(req)
+                        events["paused"] += 1
+                        return count - 1
+            return count
+
+        with patch.object(GenPreemption, "step", step):
+            return asyncio.run(
+                run_worker(kv_cache_config,
+                           cache_transceiver_config,
+                           pytorch_config,
+                           model_name,
+                           rank,
+                           preemption_events=events))
     return asyncio.run(
         run_worker(kv_cache_config,
                    cache_transceiver_config,
@@ -326,23 +403,41 @@ def worker_entry_point(kv_cache_config,
                    support_cancel=support_cancel))
 
 
-def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
-                         expected_output, expected_output_ids):
+def verify_disaggregated(model: str,
+                         generation_overlap: bool,
+                         enable_cuda_graph: bool,
+                         prompt: str,
+                         gen_preemption: bool = False) -> None:
     worker_pytorch_configs = []
 
     # Context worker
     worker_pytorch_configs.append(
-        dict(
-            disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
+        dict(disable_overlap_scheduler=True,
+             max_batch_size=1,
+             max_num_tokens=64,
+             max_seq_len=64,
+             cuda_graph_config=CudaGraphConfig(
+                 batch_sizes=[1]) if enable_cuda_graph else None))
 
     # Generation worker
     worker_pytorch_configs.append(
-        dict(
-            disable_overlap_scheduler=not generation_overlap,
-            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
+        dict(disable_overlap_scheduler=not generation_overlap,
+             max_batch_size=1,
+             max_num_tokens=64,
+             max_seq_len=64,
+             cuda_graph_config=CudaGraphConfig(
+                 batch_sizes=[1]) if enable_cuda_graph else None))
 
-    kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
+    if gen_preemption:
+        worker_pytorch_configs[1]["scheduler_config"] = SchedulerConfig(
+            gen_preemption={"tpot_budget": 0.1})
+
+    # Both engines share one GPU and process one short request at a time.
+    # Disable prefix reuse so the reference cannot populate the transfer path.
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=128, enable_block_reuse=False)
+        for _ in range(2)
+    ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
@@ -352,14 +447,23 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
         zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
             model_names, ranks))
 
+    if gen_preemption:
+        worker_args = [(*args, False, rank == 1)
+                       for rank, args in enumerate(worker_args)]
     port_name = mpi_publish_name()
 
     with MPIPoolExecutor(max_workers=2,
                          env={
-                             "UCX_TLS": get_ucx_tls(),
-                             "UCX_MM_ERROR_HANDLING": "y"
+                             "UCX_TLS":
+                             get_ucx_tls(),
+                             "UCX_MM_ERROR_HANDLING":
+                             "y",
+                             **({
+                                 "TLLM_GEN_ADMISSION_TTFT_PERCENTILE": "90"
+                             } if gen_preemption else {})
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -373,15 +477,18 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             print("Launched all the workers.", flush=True)
             intercomm = mpi_initialize_intercomm(port_name)
 
-            for _ in range(2):
-                intercomm.recv(tag=MPI_READY)
-                print("Received ready signal.")
+            mpi_wait_for_workers_ready(intercomm)
             max_tokens = 25
+            sampling_params = SamplingParams(max_tokens=max_tokens,
+                                             ignore_eos=True,
+                                             top_k=1)
+            reference = send_requests_to_worker(
+                [(prompt, sampling_params, None)], 0, intercomm)[0][0]
+            assert len(reference.token_ids) == max_tokens
 
             requests = []
-            requests.append(
-                (prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True),
-                 DisaggregatedParams(request_type="context_only")))
+            requests.append((prompt, sampling_params,
+                             DisaggregatedParams(request_type="context_only")))
 
             responses = send_requests_to_worker(requests, 0, intercomm)
             output = responses[0]
@@ -390,22 +497,24 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             assert output[0].disaggregated_params is not None
             print(f"Output: {output[0].disaggregated_params.request_type}")
             assert output[0].disaggregated_params.request_type == "context_only"
-            assert output[0].token_ids[0] == expected_output_ids[0]
+            assert output[0].token_ids[0] == reference.token_ids[0]
             assert len(output[0].token_ids) == 1
 
             generation_request_disagg_params = output[0].disaggregated_params
             generation_request_disagg_params.request_type = "generation_only"
             requests = []
             requests.append(
-                (prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True),
-                 generation_request_disagg_params))
+                (prompt, sampling_params, generation_request_disagg_params))
 
             responses = send_requests_to_worker(requests, 1, intercomm)
             output = responses[0]
-            assert output[0].text == expected_output
-            assert output[0].token_ids == expected_output_ids
-        except Exception as e:
-            print(f"Exception encountered: {e}", flush=True)
+            assert output[0].text == reference.text
+            assert output[0].token_ids == reference.token_ids
+            if gen_preemption:
+                intercomm.send("GET_PREEMPTION_EVENTS", dest=1, tag=MPI_REQUEST)
+                events = intercomm.recv(source=1, tag=MPI_RESULT)
+                assert events["paused"] == 1
+                assert events["resumed"] == 1
         finally:
             print("Sending termination request", flush=True)
             mpi_send_termination_request(intercomm)
@@ -417,52 +526,34 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@skip_pre_hopper
 @pytest.mark.parametrize("generation_overlap", [False, True])
-@pytest.mark.parametrize("enable_cuda_graph", [False, True])
-def test_disaggregated_simple_llama(model, generation_overlap,
-                                    enable_cuda_graph):
-    verify_disaggregated(
-        model, generation_overlap, enable_cuda_graph,
-        "What is the capital of Germany?",
-        "\n<|assistant|>\nThe capital of Germany is Berlin. \n<|user|>", [
-            2, 29871, 13, 29966, 29989, 465, 22137, 29989, 29958, 13, 1576,
-            7483, 310, 9556, 338, 5115, 29889, 2, 29871, 13, 29966, 29989, 1792,
-            29989, 29958
-        ])
+def test_disaggregated_gen_preemption_greedy_parity(generation_overlap):
+    verify_disaggregated("Qwen3-0.6B",
+                         generation_overlap,
+                         True,
+                         "What is the capital of Germany?",
+                         gen_preemption=True)
 
 
 @skip_no_hopper
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
-def test_disaggregated_simple_deepseek(model, generation_overlap,
-                                       enable_cuda_graph):
-    verify_disaggregated(
-        model, generation_overlap, enable_cuda_graph,
-        "What is the capital of Germany?",
-        " | Berlin \nWhat is the capital of France? | Paris \nWhat is the capital of Italy? | Rome \nWhat is",
-        [
-            369, 17575, 539, 3085, 344, 270, 6102, 294, 8760, 33, 369, 11111,
-            539, 3085, 344, 270, 6102, 294, 14251, 33, 369, 16235, 539, 3085,
-            344
-        ])
+def test_disaggregated_simple_deepseek(model: str, generation_overlap: bool,
+                                       enable_cuda_graph: bool) -> None:
+    verify_disaggregated(model, generation_overlap, enable_cuda_graph,
+                         "What is the capital of Germany?")
 
 
 @skip_no_hopper
 @pytest.mark.parametrize("model", ["Qwen3-8B-FP8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
-def test_disaggregated_simple_qwen3(model, generation_overlap,
-                                    enable_cuda_graph):
-    verify_disaggregated(
-        model, generation_overlap, enable_cuda_graph,
-        " What is the capital of China?",
-        " The capital of China is Beijing. 2. What is the population of China? The population of China is about 1",
-        [
-            576, 6722, 315, 5616, 374, 26549, 13, 220, 17, 13, 3555, 374, 279,
-            7042, 315, 5616, 30, 576, 7042, 315, 5616, 374, 911, 220, 16
-        ])
+def test_disaggregated_simple_qwen3(model: str, generation_overlap: bool,
+                                    enable_cuda_graph: bool) -> None:
+    verify_disaggregated(model, generation_overlap, enable_cuda_graph,
+                         " What is the capital of China?")
 
 
 @skip_pre_hopper
@@ -510,6 +601,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -523,9 +615,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             print("Launched all the workers.")
             intercomm = mpi_initialize_intercomm(port_name)
 
-            for _ in range(2):
-                intercomm.recv(tag=MPI_READY)
-                print("Received ready signal.")
+            mpi_wait_for_workers_ready(intercomm)
             max_tokens = 25
 
             requests = []
@@ -620,6 +710,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
                          },
                          mpi_info=mpi_info) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -633,9 +724,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
             print("Launched all the workers.")
             intercomm = mpi_initialize_intercomm(port_name)
 
-            for _ in range(2):
-                intercomm.recv(tag=MPI_READY)
-                print("Received ready signal.")
+            mpi_wait_for_workers_ready(intercomm)
             max_tokens = 25
 
             requests = []
@@ -677,7 +766,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 def test_disaggregated_logprobs(model, generation_overlap):
     """Verify that logprobs propagate correctly from prefill to decode.
@@ -710,6 +799,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -721,8 +811,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
         intercomm = None
         try:
             intercomm = mpi_initialize_intercomm(port_name)
-            for _ in range(2):
-                intercomm.recv(tag=MPI_READY)
+            mpi_wait_for_workers_ready(intercomm)
 
             # --- Context-only phase (prefill) with logprobs ---
             ctx_requests = [(prompt,
@@ -784,7 +873,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
                 future.result()
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 def test_disaggregated_cancel_gen_requests(model):
     # Test that cancelling generation requests on a saturated generation
     # worker completes without hangs or resource leaks.
@@ -834,13 +923,12 @@ def test_disaggregated_cancel_gen_requests(model):
             raise e
 
         intercomm = None
+        test_error = None
         try:
             print("Launched all workers.", flush=True)
             intercomm = mpi_initialize_intercomm(port_name)
 
-            for _ in range(2):
-                intercomm.recv(tag=MPI_READY)
-                print("Received ready signal.")
+            mpi_wait_for_workers_ready(intercomm)
 
             context_requests = []
             for _ in range(num_requests):
@@ -881,17 +969,25 @@ def test_disaggregated_cancel_gen_requests(model):
 
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
+            test_error = e
         finally:
             print("Sending termination request", flush=True)
             mpi_send_termination_request(intercomm)
 
             print("Waiting for all workers to terminate.", flush=True)
             for future in futures:
-                future.result()
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Worker failed: {e}", flush=True)
+                    if test_error is None:
+                        test_error = e
             print("All workers terminated.")
+        if test_error is not None:
+            raise test_error
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 def test_disaggregated_logits(model, generation_overlap):
     """Verify that generation logits propagate from prefill to decode in disagg."""
@@ -925,6 +1021,7 @@ def test_disaggregated_logits(model, generation_overlap):
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -938,9 +1035,7 @@ def test_disaggregated_logits(model, generation_overlap):
             print("Launched all the workers.", flush=True)
             intercomm = mpi_initialize_intercomm(port_name)
 
-            for _ in range(2):
-                intercomm.recv(tag=MPI_READY)
-                print("Received ready signal.")
+            mpi_wait_for_workers_ready(intercomm)
 
             # --- Run aggregated request for reference ---
             agg_sp = SamplingParams(max_tokens=max_tokens,
@@ -1013,6 +1108,45 @@ def test_disaggregated_logits(model, generation_overlap):
                 ("First streaming chunk should have generation_logits "
                  "(first_gen_logits from prefill), but got None")
 
+            # --- generation_only that its first token ends (max_tokens=1) ---
+            # No decode step runs, so the response carries exactly the
+            # transferred first token and its logits.
+            ctx_responses3 = send_requests_to_worker(ctx_requests, 0, intercomm)
+            dp3 = ctx_responses3[0][0].disaggregated_params
+            dp3.request_type = "generation_only"
+            single_sp = SamplingParams(max_tokens=1,
+                                       ignore_eos=True,
+                                       return_generation_logits=True)
+            single_responses = send_requests_to_worker(
+                [(prompt, single_sp, dp3)], 1, intercomm)
+            single_output = single_responses[0][0]
+            assert list(single_output.token_ids) == list(dp3.first_gen_tokens)
+            assert single_output.finish_reason == "length"
+            assert single_output.generation_logits is not None, \
+                "max_tokens=1 generation_only should return the first token's logits"
+            assert single_output.generation_logits.shape[0] == 1
+
+            # --- generation_only whose first token is a stop token ---
+            # The request stops by STOP_WORDS at that token, as aggregated
+            # serving does: the stop token and its logits are trimmed, and no
+            # decode step adds a token after it. ignore_eos would also drop
+            # the stop words.
+            ctx_responses4 = send_requests_to_worker(ctx_requests, 0, intercomm)
+            dp4 = ctx_responses4[0][0].disaggregated_params
+            dp4.request_type = "generation_only"
+            first_token = dp4.first_gen_tokens[0]
+            stop_sp = SamplingParams(max_tokens=max_tokens,
+                                     ignore_eos=False,
+                                     stop_token_ids=[first_token],
+                                     return_generation_logits=True)
+            stop_responses = send_requests_to_worker([(prompt, stop_sp, dp4)],
+                                                     1, intercomm)
+            stop_output = stop_responses[0][0]
+            assert list(stop_output.token_ids) == []
+            assert stop_output.finish_reason == "stop"
+            assert stop_output.stop_reason == first_token
+            assert stop_output.generation_logits.shape[0] == 0
+
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
             raise e
@@ -1026,7 +1160,7 @@ def test_disaggregated_logits(model, generation_overlap):
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False])
 def test_arbitrary_kv_cache_transfer(model, generation_overlap):
     """Test KV cache transfer from the reuse tree.
@@ -1050,8 +1184,9 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
              cuda_graph_config=CudaGraphConfig()))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
-        for _ in range(2)
+        KvCacheConfig(max_tokens=2048 * 8,
+                      enable_block_reuse=True,
+                      use_kv_cache_manager_v2=False) for _ in range(2)
     ]
     # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [
@@ -1074,6 +1209,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -1087,9 +1223,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
             print("Launched all the workers.", flush=True)
             intercomm = mpi_initialize_intercomm(port_name)
 
-            for _ in range(2):
-                intercomm.recv(tag=MPI_READY)
-                print("Received ready signal.")
+            mpi_wait_for_workers_ready(intercomm)
 
             # Normal generate on worker 0 to fill KV cache reuse tree
             print("Filling KV cache reuse tree on worker 0", flush=True)
@@ -1108,8 +1242,10 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
             print(f"Got data_transceiver_state: {len(state)} bytes", flush=True)
 
             # generation_only on worker 1 using state from worker 0.
-            # max_tokens=1 ensures only one decode step runs, so the test
-            # relies on the KV cache transfer delivering all prompt tokens.
+            # max_tokens=2 makes exactly one decode step run on the transferred
+            # KV, so the test relies on the transfer delivering all prompt
+            # tokens; with max_tokens=1 the first token alone ends the request
+            # and no decode step reads the KV.
             print("Sending generation_only to worker 1", flush=True)
             DISAGG_REQ_ID = 42
             disagg_params = DisaggregatedParams(
@@ -1118,15 +1254,15 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
                 first_gen_tokens=[0],
                 disagg_request_id=DISAGG_REQ_ID,
             )
-            requests = [(prompt, SamplingParams(max_tokens=1, ignore_eos=True),
+            requests = [(prompt, SamplingParams(max_tokens=2, ignore_eos=True),
                          disagg_params)]
             responses = send_requests_to_worker(requests, 1, intercomm)
             assert len(responses) == 1
             output = responses[0][0]
             print(f"Worker 1 output: {output.text}", flush=True)
             print(f"Worker 1 token_ids: {output.token_ids}", flush=True)
-            assert len(output.token_ids) > 0, \
-                "generation_only request should produce output tokens"
+            assert len(output.token_ids) == 2, \
+                "generation_only request should return max_tokens tokens"
 
             # Send a normal (non-disagg) request to worker 1 to verify
             # it still works properly after the KV cache transfer.
@@ -1177,7 +1313,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False])
 def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
     """Test that missing-block transfers fail.
@@ -1210,8 +1346,9 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
              cuda_graph_config=CudaGraphConfig()))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
-        for _ in range(2)
+        KvCacheConfig(max_tokens=2048 * 8,
+                      enable_block_reuse=True,
+                      use_kv_cache_manager_v2=False) for _ in range(2)
     ]
     # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [
@@ -1234,6 +1371,7 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -1247,9 +1385,7 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
             print("Launched all the workers.", flush=True)
             intercomm = mpi_initialize_intercomm(port_name)
 
-            for _ in range(2):
-                intercomm.recv(tag=MPI_READY)
-                print("Received ready signal.")
+            mpi_wait_for_workers_ready(intercomm)
 
             # Get state from worker 0
             print("Getting data_transceiver_state from empty worker 0",

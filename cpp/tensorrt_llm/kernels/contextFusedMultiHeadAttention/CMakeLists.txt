@@ -15,13 +15,7 @@
 # the License.
 #
 
-# Directory holding the generated FMHA sources (fmha_v2_cu/*.cu and
-# cubin/fmha_cubin.{h,cpp}). scripts/build_wheel.py points this at an
-# out-of-tree location when --out-of-tree is set; by default the generated files
-# live in this directory as before.
-set(TRTLLM_FMHA_GEN_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}"
-    CACHE PATH "Directory containing generated FMHA sources")
+# TRTLLM_FMHA_GEN_DIR (generated FMHA sources) is defined in cpp/CMakeLists.txt.
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
@@ -45,7 +39,7 @@ endif()
 # target below, not to the all-arch source list.
 list(FILTER SRC_CU EXCLUDE REGEX "skip_softmax_sm120/.*")
 
-add_library(context_attention_src OBJECT)
+add_library(context_attention_src STATIC)
 
 filter_source_cuda_architectures(
   SOURCE_LIST SRC_CPP
@@ -58,9 +52,7 @@ target_include_directories(context_attention_src
                            PRIVATE "${TRTLLM_FMHA_GEN_DIR}")
 target_compile_definitions(context_attention_src PRIVATE USE_DEMO_BERT_PARAMS=1
                                                          GENERATE_CUBIN=1)
-set_target_properties(
-  context_attention_src PROPERTIES POSITION_INDEPENDENT_CODE ON
-                                   CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_property(TARGET context_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # Embed cubins via INCBIN. Replaces the bin2c-style hex-array .cpp stubs that
 # previously lived under cubin/. Symbol convention is cubin_<stem>_cu_cubin
@@ -129,7 +121,7 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
               ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/generated/)
     set_cuda_architectures(${TARGET_NAME} ${TARGET_ARCH})
     target_sources(context_attention_src
-                   PUBLIC $<TARGET_OBJECTS:${TARGET_NAME}>)
+                   PRIVATE $<TARGET_OBJECTS:${TARGET_NAME}>)
   else()
     # arch is enabled (disabled archs already `continue`d above) but the
     # generation step produced no *_sm${arch}.cu kernels for it. Fail rather

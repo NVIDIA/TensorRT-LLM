@@ -28,6 +28,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float16, Float32, Int32
 
+from .mla_decode.helpers.constants import LOG2_E
+
 
 @cute.jit
 def finalize_log2_sum_exp(frame: Float32, exp_sum: Float32) -> Float32:
@@ -98,3 +100,15 @@ def unpack_normalized_vec8(
     if cutlass.const_expr(use_bf16_partial):
         return regs_vec.bitcast(BFloat16).to(Float32)
     return regs_vec.bitcast(Float16).to(Float32)
+
+
+@cute.jit
+def attention_sink_scale(log2_lse, sink):
+    """Denominator-only sink mass; keep the KV LSE independent of the sink."""
+    scale = Float32(0)
+    if log2_lse != Float32(-Float32.inf) and sink != Float32(Float32.inf):
+        delta = sink * Float32(LOG2_E) - log2_lse
+        z = cute.math.exp2(-cute.math.abs(delta), fastmath=True)
+        inverse = cute.math.rcp(Float32(1) + z, approx=True)
+        scale = z * inverse if delta > Float32(0) else inverse
+    return scale

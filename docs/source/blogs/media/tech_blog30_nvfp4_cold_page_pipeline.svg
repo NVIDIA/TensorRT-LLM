@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 306" width="1000" height="306">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect width="1000" height="306" fill="#f5f5f5"/>
+<rect x="240" y="28" width="740" height="262" rx="8" fill="none" stroke="#4f5d75" stroke-width="1.25"/>
+<text x="252" y="46" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" letter-spacing="1.4" fill="#2d3142" text-anchor="start">KV CACHE MANAGER V2 · owns pages, tiers, and migration</text>
+<rect x="20" y="66" width="190" height="84" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="32" y="84" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">REQUEST</text>
+<text x="32" y="108" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Page goes cold</text>
+<text x="32" y="123" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">request paused or done,</text>
+<text x="32" y="138" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">or memory pressure</text>
+<rect x="20" y="190" width="190" height="84" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="32" y="208" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">REQUEST</text>
+<text x="32" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Page reused</text>
+<text x="32" y="247" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">an active request hits</text>
+<text x="32" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">the same prefix</text>
+<rect x="262" y="66" width="200" height="208" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="274" y="84" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">GPU</text>
+<text x="274" y="108" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">GPU cache</text>
+<text x="274" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">hot page: 16-bit K and V</text>
+<rect x="722" y="66" width="236" height="208" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="734" y="84" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">STORAGE</text>
+<text x="734" y="108" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Host and disk tiers</text>
+<text x="734" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">cold page: one 4.5-bit block</text>
+<rect x="274.0" y="156.0" width="88.0" height="28" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="362.0" y="156.0" width="88.0" height="28" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="318" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#2d3142" text-anchor="middle">K · FP16</text>
+<text x="406" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#2d3142" text-anchor="middle">V · FP16</text>
+<rect x="734.0" y="156.0" width="80.0" height="28" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<rect x="814.0" y="156.0" width="80.0" height="28" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<rect x="894.0" y="156.0" width="10.0" height="28" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
+<rect x="904.0" y="156.0" width="10.0" height="28" fill="#e4e5e7" stroke="#bfc0c0" stroke-width="1"/>
+<text x="774" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#2d3142" text-anchor="middle">K · NVFP4</text>
+<text x="854" y="174.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#2d3142" text-anchor="middle">V · NVFP4</text>
+<text x="914" y="196.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">block scales</text>
+<rect x="492" y="66" width="200" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="504" y="84" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">CODEC · FUSED KERNEL</text>
+<text x="504" y="108" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Fused encode kernel</text>
+<text x="504" y="138" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">quantize + copy, one pass</text>
+<rect x="492" y="190" width="200" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="504" y="208" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">CODEC · FUSED KERNEL</text>
+<text x="504" y="232" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Fused decode kernel</text>
+<text x="504" y="262" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">dequantize + copy, one pass</text>
+<path d="M212,108.0 L260,108.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M464,108.0 L490,108.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M694,108.0 L720,108.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M720,232.0 L694,232.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M490,232.0 L464,232.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M260,232.0 L212,232.0" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+</svg>

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/arrayView.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -35,6 +34,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <type_traits>
 #include <typeinfo>
 #include <vector>
@@ -437,6 +437,42 @@ public:
 
     [[nodiscard]] virtual char const* getMemoryTypeName() const;
 
+    //! \brief Gets a typed pointer to the underlying data, or throws std::bad_cast if the type does not match.
+    template <typename T>
+    [[nodiscard]] T* getBufferPtr()
+    {
+        if (TRTDataType<std::remove_cvref_t<T>>::value != getDataType())
+        {
+            throw std::bad_cast();
+        }
+        return static_cast<T*>(data());
+    }
+
+    //! \brief Gets a typed pointer to constant data, or throws std::bad_cast if the type does not match.
+    template <typename T>
+    [[nodiscard]] T const* getBufferPtr() const
+    {
+        if (TRTDataType<std::remove_cvref_t<T>>::value != getDataType())
+        {
+            throw std::bad_cast();
+        }
+        return static_cast<T const*>(data());
+    }
+
+    //! \brief Gets a typed view of the buffer's elements. The view does not own the underlying data.
+    template <typename T>
+    [[nodiscard]] std::span<T> getBufferRange()
+    {
+        return {getBufferPtr<T>(), getSize()};
+    }
+
+    //! \brief Gets a read-only typed view of the buffer's elements. The view does not own the underlying data.
+    template <typename T>
+    [[nodiscard]] std::span<T const> getBufferRange() const
+    {
+        return {getBufferPtr<T>(), getSize()};
+    }
+
     //!
     //! \brief Resizes the buffer. This is a no-op if the new size is smaller than or equal to the current capacity.
     //!
@@ -567,123 +603,6 @@ protected:
     [[nodiscard]] std::size_t toBytes(std::size_t size) const
     {
         return size * BufferDataType(getDataType()).getSizeInBits() / 8;
-    }
-};
-
-/// @brief Gets a typed pointer to the constant underlying data of the buffer.
-/// @tparam T The type of the underlying data.
-/// @param buffer The buffer to get a pointer to.
-/// @return A pointer to constant @p T.
-template <typename T>
-T const* bufferCast(IBuffer const& buffer)
-{
-    if (TRTDataType<typename std::remove_cv<T>::type>::value != buffer.getDataType())
-    {
-        throw std::bad_cast();
-    }
-    return static_cast<T const*>(buffer.data());
-}
-
-/// @brief Gets a typed pointer to the underlying data of the buffer.
-/// @tparam T The type of the underlying data.
-/// @param buffer The buffer to get a pointer to.
-/// @return A pointer to @p T.
-template <typename T>
-T* bufferCast(IBuffer& buffer)
-{
-    if (TRTDataType<typename std::remove_cv<T>::type>::value != buffer.getDataType())
-    {
-        throw std::bad_cast();
-    }
-    return static_cast<T*>(buffer.data());
-}
-
-/// @brief Retrieves a T typed pointer to the underlying data of the buffer pointed to by the bufferPtr, or nullptr if
-/// the bufferPtr is null.
-/// @tparam T The type of the underlying data.
-/// @param bufferPtr A possibly null shared ptr.
-/// @return A pointer to T, possibly nullptr.
-template <typename T>
-T* bufferCastOrNull(IBuffer::SharedPtr const& bufferPtr)
-{
-    if (bufferPtr)
-    {
-        return bufferCast<T>(*bufferPtr);
-    }
-
-    return static_cast<T*>(nullptr);
-}
-
-/// @brief Retrieves a T const typed pointer to the underlying data of the buffer pointed to by the bufferPtr, or
-/// nullptr if the bufferPtr is null.
-/// @tparam T The type of the underlying data.
-/// @param bufferPtr A possibly null shared ptr.
-/// @return A pointer to const T, possibly nullptr.
-template <typename T>
-T const* bufferCastOrNull(IBuffer::SharedConstPtr const& bufferPtr)
-{
-    if (bufferPtr)
-    {
-        return bufferCast<T>(*bufferPtr);
-    }
-
-    return static_cast<T const*>(nullptr);
-}
-
-/// @brief Retrieves a T typed pointer to the underlying data of the buffer pointed to by the buffer pointer
-/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
-/// @tparam T The type of the underlying data.
-/// @param optionalBufferPtr A possibly empty optional.
-/// @return A pointer to T, possibly nullptr.
-template <typename T>
-T* bufferCastOrNull(std::optional<IBuffer::SharedPtr> const& optionalBufferPtr)
-{
-    if (optionalBufferPtr)
-    {
-        return bufferCast<T>(*optionalBufferPtr.value());
-    }
-
-    return static_cast<T*>(nullptr);
-}
-
-/// @brief Retrieves a T const typed pointer to the underlying data of the buffer pointed to by the buffer pointer
-/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
-/// @tparam T The type of the underlying data.
-/// @param optionalBufferPtr A possibly empty optional.
-/// @return A pointer to const T, possibly nullptr.
-template <typename T>
-T const* bufferCastOrNull(std::optional<IBuffer::SharedConstPtr> const& optionalBufferPtr)
-{
-    if (optionalBufferPtr)
-    {
-        return bufferCast<T>(*optionalBufferPtr.value());
-    }
-
-    return static_cast<T const*>(nullptr);
-}
-
-template <typename T>
-class BufferRange : public tensorrt_llm::common::ArrayView<T>
-{
-public:
-    using Base = tensorrt_llm::common::ArrayView<T>;
-    using typename Base::size_type;
-
-    BufferRange(T* data, size_type size)
-        : Base{data, size}
-    {
-    }
-
-    template <typename U = T, std::enable_if_t<!std::is_const_v<U>, bool> = true>
-    explicit BufferRange(IBuffer& buffer)
-        : BufferRange(bufferCast<U>(buffer), buffer.getSize())
-    {
-    }
-
-    template <typename U = T, std::enable_if_t<std::is_const_v<U>, bool> = true>
-    explicit BufferRange(IBuffer const& buffer)
-        : BufferRange(bufferCast<U>(buffer), buffer.getSize())
-    {
     }
 };
 

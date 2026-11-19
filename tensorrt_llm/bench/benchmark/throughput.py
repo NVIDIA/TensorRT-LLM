@@ -44,12 +44,15 @@ from tensorrt_llm.bench.utils.data import (DatasetFormatError,
                                            create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
+from tensorrt_llm.commands._telemetry import TelemetryCommand
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
 
-@click.command(name="throughput")
+@click.command(name="throughput",
+               cls=TelemetryCommand,
+               telemetry_llm_startup=True)
 @optgroup.group("Engine run configuration.",
                 help="Runtime settings for executing a TensorRT LLM model.")
 @optgroup.option(

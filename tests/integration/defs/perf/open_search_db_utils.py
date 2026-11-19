@@ -91,8 +91,10 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
     def get_latest_baseline_threshold(data_list):
         """Return baseline/threshold fields from the most recent entry that has them.
 
-        Returns a dict of just the d_baseline_* and d_threshold_* fields,
-        or None if no entry has baseline or threshold fields.
+        Returns a dict of just the d_baseline_* and d_threshold_* fields, plus
+        that entry's ts_created (when it has one) so a caller can tell how old
+        the stored values are, or None if no entry has baseline or threshold
+        fields.
         """
         if not data_list:
             return None
@@ -104,11 +106,14 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
             if any(
                     k.startswith("d_baseline_") or k.startswith("d_threshold_")
                     for k in entry):
-                return {
+                fields = {
                     k: v
                     for k, v in entry.items() if k.startswith("d_baseline_")
                     or k.startswith("d_threshold_")
                 }
+                if "ts_created" in entry:
+                    fields["ts_created"] = entry["ts_created"]
+                return fields
         return None
 
     cmd_idxs = new_data_dict.keys()

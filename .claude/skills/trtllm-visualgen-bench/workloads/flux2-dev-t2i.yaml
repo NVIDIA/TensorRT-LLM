@@ -1,0 +1,16 @@
+# black-forest-labs/FLUX.2-dev  ·  Flux2Pipeline  ·  t2i
+#
+# The reference mode is flux2-dev-edit.yaml: ImageGenerationRequest declares no image
+# field and forbids extras, so it cannot be reached from this file (422).
+backend: openai-images
+
+common_params:
+  width: 1024
+  height: 1024
+  num_inference_steps: 50
+  guidance_scale: 3.5
+  max_sequence_length: 512
+  seed: 42
+
+requests:
+  - prompt: A cat holding a sign that says hello world

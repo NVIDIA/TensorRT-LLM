@@ -21,121 +21,16 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
 
-REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
-REPLAY_WORK_CACHE_SLOT = 1
-REPLAY_WORK_PNAT = 2
-REPLAY_WORK_CACHE_BUF_IDX = 3
-REPLAY_WORK_ITEM_WIDTH = 4
-_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 256
 
-
-@triton.jit
-def _prepare_gdn_replay_work_items_kernel(
-    state_indices,
-    prev_num_accepted_tokens,
-    cache_buf_idx,
-    work_items,
-    n_writes_output,
-    num_decodes,
-    replay_step_width: tl.constexpr,
-    replay_history_size: tl.constexpr,
-    work_item_width: tl.constexpr,
-    position_field: tl.constexpr,
-    cache_slot_field: tl.constexpr,
-    pnat_field: tl.constexpr,
-    cache_buf_idx_field: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Build the write-first GDN replay partition in one launch."""
-    offsets = tl.arange(0, BLOCK_SIZE)
-    active = offsets < num_decodes
-    slots = tl.load(state_indices + offsets, mask=active, other=0)
-    pnat = tl.load(prev_num_accepted_tokens + slots, mask=active, other=0)
-    active_buffer = tl.load(cache_buf_idx + slots, mask=active, other=0)
-    writes = active & (pnat + replay_step_width > replay_history_size)
-    writes_i32 = writes.to(tl.int32)
-    inclusive_write_offsets = tl.cumsum(writes_i32, axis=0)
-    write_offsets = inclusive_write_offsets - writes_i32
-    n_writes = tl.sum(writes_i32, axis=0)
-    no_write_offsets = offsets - write_offsets
-    output_offsets = tl.where(writes, write_offsets,
-                              n_writes + no_write_offsets)
-    output_base = work_items + output_offsets * work_item_width
-    tl.store(output_base + position_field, offsets, mask=active)
-    tl.store(output_base + cache_slot_field, slots, mask=active)
-    tl.store(output_base + pnat_field, pnat, mask=active)
-    tl.store(output_base + cache_buf_idx_field, active_buffer, mask=active)
-    tl.store(n_writes_output, n_writes)
-
-
-def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
-                                    cache_buf_idx, work_items, n_writes,
-                                    replay_step_width, replay_history_size):
-    """Single-launch build of the write-first replay partition.
-
-    Interchangeable with :func:`_build_replay_work_items_torch`; the caller
-    picks between them. Kept to one CTA because the write-first offsets come
-    from an in-block ``tl.cumsum``.
-    """
-    num_decodes = state_indices.shape[0]
-    _prepare_gdn_replay_work_items_kernel[(1, )](
-        state_indices,
-        prev_num_accepted_tokens,
-        cache_buf_idx,
-        work_items,
-        n_writes,
-        num_decodes,
-        replay_step_width=replay_step_width,
-        replay_history_size=replay_history_size,
-        work_item_width=REPLAY_WORK_ITEM_WIDTH,
-        position_field=REPLAY_WORK_POSITION_IN_DECODE_BATCH,
-        cache_slot_field=REPLAY_WORK_CACHE_SLOT,
-        pnat_field=REPLAY_WORK_PNAT,
-        cache_buf_idx_field=REPLAY_WORK_CACHE_BUF_IDX,
-        BLOCK_SIZE=triton.next_power_of_2(num_decodes),
-        num_warps=4,
-    )
-
-
-def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
-                                   cache_buf_idx, work_items, n_writes,
-                                   replay_step_width, replay_history_size):
-    """Same partition as :func:`_build_replay_work_items_triton`, in ATen ops."""
-    num_decodes = state_indices.shape[0]
-    position_in_decode_batch = torch.arange(num_decodes,
-                                            dtype=torch.int32,
-                                            device=state_indices.device)
-    cache_slot_idx = state_indices.to(torch.long)
-    pnat = prev_num_accepted_tokens[cache_slot_idx].to(torch.int32)
-    active_cache_buf_idx = cache_buf_idx[cache_slot_idx].to(torch.int32)
-
-    writes = (pnat + replay_step_width > replay_history_size)
-    writes_i32 = writes.to(torch.int32)
-    write_offsets = torch.cumsum(writes_i32, dim=0) - writes_i32
-    batch_n_writes = torch.sum(writes_i32, dim=0, keepdim=True).to(torch.int32)
-    no_write_offsets = position_in_decode_batch - write_offsets
-    output_offsets = torch.where(writes, write_offsets,
-                                 batch_n_writes + no_write_offsets)
-    output_offsets = output_offsets.to(torch.long)
-
-    decode_work_items = work_items[:num_decodes]
-    decode_work_items[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH].scatter_(
-        0, output_offsets, position_in_decode_batch)
-    decode_work_items[:,
-                      REPLAY_WORK_CACHE_SLOT].scatter_(0, output_offsets,
-                                                       state_indices)
-    decode_work_items[:, REPLAY_WORK_PNAT].scatter_(0, output_offsets, pnat)
-    decode_work_items[:, REPLAY_WORK_CACHE_BUF_IDX].scatter_(
-        0, output_offsets, active_cache_buf_idx)
-    n_writes.copy_(batch_n_writes)
-
-
-@triton.jit
+# num_seqs and N follow the batch; specializing them (on == 1 or % 16) would
+# compile kernel variants mid-serving.
+@triton.jit(do_not_specialize=["num_seqs", "N"])
 def _cu_seqlens_triton_kernel(
     cu_seqlens_ptr,  # [num_seqs + 1]
     chunk_indices_ptr,  # [N] output
@@ -316,6 +211,13 @@ def cu_seqlens_to_chunk_indices_offsets(
 
 
 class Mamba2Metadata:
+    """Per-iteration metadata of the recurrent layers: the requests' state
+    slots and the chunked-scan layout of the context requests.
+
+    Model families extend it with metadata of their own state (replay slots,
+    per-layer caches); a model or its cache manager names the class to build
+    (``mamba_metadata_cls``).
+    """
 
     # Warmup-only knob: when set via ``force_initial_states_for_warmup``,
     # ``prepare()`` forces ``has_initial_states_cpu[:num_contexts]`` to True so
@@ -374,78 +276,42 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
+        self._state_indices_buffer = DeviceCopyBuffer(
+            self.state_indices, pin_memory=prefer_pinned())
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
         self._state_indices_aliased_ptr = None
-
-        self.replay_work_items = torch.zeros(max_batch_size,
-                                             REPLAY_WORK_ITEM_WIDTH,
-                                             dtype=torch.int32,
-                                             device="cuda")
-        self.replay_n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
-        self.replay_num_decodes = 0
 
         # Pre-allocated buffers.
         self._arange_buffer = torch.arange(max_batch_size + 1,
                                            dtype=torch.int,
                                            device="cuda")
         self._arange_buffer_long = self._arange_buffer.to(torch.long)
+        # int64 copy of the cu_seqlens prefix (query_start_loc_long).
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
                                             device="cuda")
 
-    def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
-                                   num_contexts: int):
-        self.replay_num_decodes = 0
-        if not getattr(kv_cache_manager, 'use_replay_state_update', False):
-            return
-        num_decodes = batch_size - num_contexts
-        self.replay_num_decodes = num_decodes
-        if num_decodes == 0:
-            return
-        use_gdn_all_layer_commit = getattr(
-            kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False)
-        if use_gdn_all_layer_commit:
-            from tensorrt_llm._torch.modules.fla.cached_replay import \
-                CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+    def arange_long(self, n: int) -> torch.Tensor:
+        """``[0, 1, ..., n]`` as int64 on the device: the cu_seqlens of ``n`` one-token sequences."""
+        return self._arange_buffer_long[:n + 1]
 
-            # The fused small-batch GDN kernel commits its checkpoint in-layer
-            # and indexes cache metadata directly. Work items are only consumed
-            # by the partitioned replay + all-layer commit path.
-            if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
-                return
+    def prepare_steady_gen_step(self, attn_metadata: AttentionMetadata):
+        """``prepare()`` for a decode-only batch whose request layout (ids,
+        order, state slots, padding rows) is unchanged since the last
+        ``prepare()``: the state indices and the dummy-request mask are still
+        in place, so their host walk and H2D copies are skipped; only the
+        per-step bookkeeping is refreshed."""
+        batch_size = attn_metadata.seq_lens.shape[0]
+        kv_cache_manager = attn_metadata.kv_cache_manager
 
-        if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
-            raise RuntimeError(
-                "Replay state update is enabled, but the KV cache manager "
-                "does not expose replay state update metadata.")
+        self.query_start_loc = None
+        self.query_start_loc_long = self._arange_buffer_long[:batch_size + 1]
 
-        replay_metadata = kv_cache_manager.get_replay_state_update_metadata()
-        if replay_metadata is None:
-            raise RuntimeError(
-                "Replay state update is enabled for a decode batch, but the "
-                "KV cache manager returned no replay state update metadata.")
-
-        prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
-        cache_buf_idx = replay_metadata.cache_buf_idx
-        replay_step_width = replay_metadata.replay_step_width
-        replay_history_size = replay_metadata.replay_history_size
-
-        if (use_gdn_all_layer_commit
-                and num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE):
-            build_work_items = _build_replay_work_items_triton
-        else:
-            build_work_items = _build_replay_work_items_torch
-        build_work_items(
-            self.state_indices[num_contexts:batch_size],
-            prev_num_accepted_tokens,
-            cache_buf_idx,
-            self.replay_work_items,
-            self.replay_n_writes,
-            replay_step_width,
-            replay_history_size,
-        )
+        flush = getattr(kv_cache_manager, "flush_state_transfers", None)
+        if flush is not None:
+            flush()
 
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
@@ -490,11 +356,12 @@ class Mamba2Metadata:
                         "are used; got a different address than the first "
                         "call.")
                 self.state_indices = indices
+                self._state_indices_buffer = kv_cache_manager._state_indices_buffer
             elif isinstance(indices, torch.Tensor):
                 # CPU tensor → bulk H2D
                 self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._state_indices_buffer.update(
+                    self.state_indices_cpu[:batch_size])
             else:
                 # indices is a Python sequence (e.g. List[int]); data
                 # already lives on host, CPU staging is fine. One bulk
@@ -505,11 +372,8 @@ class Mamba2Metadata:
                 self.state_indices_cpu[:batch_size].copy_(
                     torch.as_tensor(indices,
                                     dtype=self.state_indices_cpu.dtype))
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
-
-        self._prepare_replay_work_items(kv_cache_manager, batch_size,
-                                        num_contexts)
+                self._state_indices_buffer.update(
+                    self.state_indices_cpu[:batch_size])
 
         if num_contexts > 0:
             torch.cumsum(context_lens,
@@ -584,7 +448,7 @@ class Mamba2Metadata:
         # CppMambaHybridCacheManager.prepare_resources(). prepare_resources
         # only enqueues the async cudaMemcpyAsync calls and sets a pending
         # flag; we sync the onboard stream here, so CPU-side prep
-        # work in _prepare_tp_inputs overlaps with the in-flight transfers.
+        # work in DecoderInputPreparer.prepare_inputs overlaps with the in-flight transfers.
         # Cheap no-op on cache managers without this method or when no
         # transfers were scheduled this iteration.
         flush = getattr(kv_cache_manager, "flush_state_transfers", None)

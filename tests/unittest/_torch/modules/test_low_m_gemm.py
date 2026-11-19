@@ -5,20 +5,28 @@
 # Apply ``_skip_no_cuda`` / ``_skip_non_sm10x`` to tests that actually
 # invoke the kernel hardware rather than the Python dispatch logic.
 
+import dataclasses
 import sys
+import time
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 import tensorrt_llm._torch.modules.low_m_gemm as _mod
+from tensorrt_llm._torch.autotuner import AutoTuner, TunableRunner, autotune
 from tensorrt_llm._torch.modules.low_m_gemm import (
     _BACKEND_ENV,
     LOW_M_GEMM_OPT_IN_ATTR,
     LowMGemmDispatcher,
     _parse_enabled,
+    fp8_grouped_lowm,
+    lowm_fp8_supported,
+    mxfp8_lowm_index_query,
+    mxfp8_lowm_linear,
 )
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
+from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
 
 # ---------------------------------------------------------------------------
 # Skip helpers — apply to tests that need hardware, not to mocked unit tests.
@@ -31,6 +39,10 @@ _skip_no_cuda = pytest.mark.skipif(
 _skip_non_sm10x = pytest.mark.skipif(
     torch.cuda.device_count() == 0 or not is_sm_100f(),
     reason="requires SM10x GPU (SM100/SM103)",
+)
+_skip_no_lowm_fp8 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not lowm_fp8_supported(),
+    reason="needs SM100/SM103",
 )
 
 # ---------------------------------------------------------------------------
@@ -93,6 +105,20 @@ def test_attach_reaches_the_router_gate(monkeypatch) -> None:
     assert root.gate._low_m_gemm_name == "gate"
 
 
+def test_a_later_attach_keeps_the_models_own_dispatcher(monkeypatch) -> None:
+    """The loader's prepare_low_m_gemm after load must not replace a dispatcher the model attached itself
+    (Qwen3.5: limit_rows, whole_bucket_direct_tiles, per_rank_tuning); new modules still get the later one."""
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    root = torch.nn.Module()
+    root.own = torch.nn.Linear(8, 8)
+    model_dispatcher = _mod.prepare_low_m_gemm(root, force=True, whole_bucket_direct_tiles=True)
+    root.later = torch.nn.Linear(8, 8)
+    loader_dispatcher = _mod.prepare_low_m_gemm(root)
+
+    assert root.own._low_m_gemm_dispatcher is model_dispatcher
+    assert root.later._low_m_gemm_dispatcher is loader_dispatcher
+
+
 # ---------------------------------------------------------------------------
 # linear.py fast pre-filter
 # ---------------------------------------------------------------------------
@@ -103,6 +129,52 @@ def test_linear_fast_rejects_m_above_max_m(monkeypatch) -> None:
 
     assert _mod._should_apply_low_m_gemm(torch.empty((32, 128)))
     assert not _mod._should_apply_low_m_gemm(torch.empty((33, 128)))
+
+
+def test_takes_rows_follows_the_module_ceiling(monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", False)
+    dispatcher = LowMGemmDispatcher()
+    plain, limited = torch.nn.Linear(8, 8), torch.nn.Linear(8, 8)
+    for module in (plain, limited):
+        module._low_m_gemm_dispatcher = dispatcher
+    dispatcher.limit_rows(limited, 14)
+
+    assert not _mod.low_m_gemm_takes_rows(torch.nn.Linear(8, 8), 4)
+    assert _mod.low_m_gemm_takes_rows(plain, _mod._MAX_M)
+    assert not _mod.low_m_gemm_takes_rows(plain, _mod._MAX_M + 1)
+    assert _mod.low_m_gemm_takes_rows(limited, 14)
+    assert not _mod.low_m_gemm_takes_rows(limited, 15)
+
+
+def test_static_fp8_input_scale_is_one_decision(monkeypatch) -> None:
+    """Linear.static_fp8_input_scale: the scale where an FP8 QDQ layer takes an E4M3 input at these rows, else
+    None (another quantization, LoRA, bias, a non-scalar scale, or rows on the low-M path)."""
+    from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod, Linear, W8A16FP8LinearMethod
+
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    scale = torch.tensor([0.5], dtype=torch.float32)
+
+    def layer(**overrides):
+        fields = dict(
+            quant_method=FP8QDQLinearMethod(),
+            lora=None,
+            bias=None,
+            input_scale=scale,
+            force_dynamic_quantization=False,
+        )
+        fields.update(overrides)
+        return MagicMock(
+            spec=[*fields, "_low_m_gemm_dispatcher"], _low_m_gemm_dispatcher=None, **fields
+        )
+
+    rows = _mod._MAX_M + 1
+    assert Linear.static_fp8_input_scale(layer(), rows) is scale
+    assert Linear.static_fp8_input_scale(layer(), _mod._MAX_M) is None
+    assert Linear.static_fp8_input_scale(layer(quant_method=W8A16FP8LinearMethod()), rows) is None
+    assert Linear.static_fp8_input_scale(layer(lora=object()), rows) is None
+    assert Linear.static_fp8_input_scale(layer(bias=torch.zeros(4)), rows) is None
+    assert Linear.static_fp8_input_scale(layer(force_dynamic_quantization=True), rows) is None
+    assert Linear.static_fp8_input_scale(layer(input_scale=scale.half()), rows) is None
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +315,73 @@ def test_apply_force_active_bypasses_low_m_gemm_active(monkeypatch) -> None:
 
     assert output is not None, "force_active=True should bypass LOW_M_GEMM_ACTIVE=False"
     assert reached.get("called"), "split-K kernel was not invoked"
+
+
+def test_attach_force_survives_a_lazy_init_by_an_ordinary_apply(monkeypatch) -> None:
+    """attach(force=True), then a first apply() without force_active (a BF16 Linear call): the
+    lazy init keeps the force and builds the runners and the tuning config the race reads."""
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", False)
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "0")
+    monkeypatch.setattr(LowMGemmDispatcher, "_is_candidate_shape", staticmethod(lambda *_: True))
+
+    module = torch.nn.Linear(128, 256, bias=False)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher.attach(module, force=True)
+    assert not dispatcher._prepared
+
+    def fake_runner(inputs, tactic, bias, out):
+        return out.fill_(1.0)
+
+    def choose_one(op, runners, tuning_config, inputs, **kwargs):
+        assert tuning_config is not None
+        assert all(runner is not None for runner in runners)
+        return fake_runner, -1
+
+    mock_at = MagicMock()
+    mock_at.choose_one.side_effect = choose_one
+    monkeypatch.setattr(_mod, "AutoTuner", MagicMock(get=staticmethod(lambda: mock_at)))
+
+    with torch.inference_mode():
+        output = _mod.apply_low_m_gemm(
+            module, torch.empty((4, 128), dtype=torch.bfloat16), module.weight, None
+        )
+
+    assert dispatcher._force and dispatcher._prepared
+    assert output is not None and mock_at.choose_one.call_count == 1
+
+
+@torch.inference_mode()
+def test_single_cta_k_fp8_race(monkeypatch) -> None:
+    """single_cta_k races the warp-MMA tactics without split-K alone (own runner id); an untuned shape takes the
+    heuristic tactic, so the fused user always gets one."""
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    monkeypatch.setattr(_mod.low_m_mma_gemm, "warp_mma_supported", lambda: True)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._init_runners()
+    plain, single = dispatcher._fp8_runners[True][1], dispatcher._fp8_runners_single_cta_k[True][0]
+    assert dispatcher._fp8_runners_single_cta_k[True] == [single]
+    assert single.unique_id() != plain.unique_id()
+
+    tactics = [(16, 2, 1, 0, 1), (8, 4, 2, 0, 1), (8, 2, 4, 1, 1)]
+    monkeypatch.setattr(_mod, "_warp_mma_tactics", lambda *args, **kwargs: tactics)
+    x = torch.empty((7, 4096), dtype=torch.bfloat16)
+    w = torch.empty((1024, 4096), dtype=torch.float8_e4m3fn)
+    scale = torch.ones((1,), dtype=torch.float32)
+    assert single.get_valid_tactics([x, w], None) == [(16, 2, 1, 0, 1)]
+    assert plain.get_valid_tactics([x, w], None) == tactics
+
+    mock_at = MagicMock(is_tuning_mode=False)
+    mock_at.choose_one.return_value = (single, (16, 2, 1, 0, 1))
+    mock_at.profiling_cache.search_cache.return_value = (False, 0, -1, None)
+    monkeypatch.setattr(_mod, "AutoTuner", MagicMock(get=staticmethod(lambda: mock_at)))
+    runner, tactic, _ = dispatcher._fp8_choice(
+        x, w, scale, scale, torch.bfloat16, single_cta_k=True
+    )
+    assert mock_at.choose_one.call_args[0][1] == [single] and runner is single
+    assert dispatcher.warp_mma_tactic(
+        7, w, scale, scale, single_cta_k=True
+    ) == _mod.low_m_mma_gemm.default_tactic(7, 1024, 4096)
+    assert dispatcher.warp_mma_tactic(7, w, scale, scale) is None
 
 
 # ---------------------------------------------------------------------------
@@ -432,3 +571,245 @@ def test_runner_get_valid_tactics_returns_serialisable_tuples(monkeypatch) -> No
     for t in tactics:
         assert isinstance(t, tuple) and len(t) == 4
         assert all(isinstance(v, int) for v in t)
+
+
+# Small-M FP8 warp-MMA GEMM (CuTe DSL) against a dequantized reference. Its split-output, grouped and
+# RoPE variants serve DSpark's TP attention, which test_dspark_cute_dsl_attention.py covers.
+
+
+@_skip_no_lowm_fp8
+@pytest.mark.parametrize("m", [1, 64])
+def test_fp8_lowm_matches_dequant_reference(m):
+    n, k = 1792, 5120
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(115, 128, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    ref = x.float() @ dequant_mxfp8_weight(w, s).t()
+    # BF16 output rounding only: the kernel accumulates the exact dequantized products in FP32.
+    torch.testing.assert_close(
+        mxfp8_lowm_linear(x, w, s).float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+    )
+
+
+@_skip_no_lowm_fp8
+@pytest.mark.parametrize("m", [1, 16])
+def test_fp8_lowm_rms_norm_matches_norm_then_gemm(m):
+    """The A RMS norm projects ``rms_norm(x) * gamma`` with the row scale applied in FP32 after
+    the MMA; a separate BF16 norm and the same kernel differ by BF16 rounding of A only."""
+    n, k, eps = 4096, 1280, 1e-6
+    g = torch.Generator(device="cuda").manual_seed(m)
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(115, 128, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    x = (torch.randn(m, k, device="cuda", generator=g) * 3).to(torch.bfloat16)
+    gamma = (torch.rand(k, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+    normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
+    ref = (normalized * gamma.float()) @ dequant_mxfp8_weight(w, s).t()
+    actual = mxfp8_lowm_linear(x, w, s, rms_norm=(gamma, eps)).float()
+    torch.testing.assert_close(actual, ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
+    separate = mxfp8_lowm_linear((normalized * gamma.float()).to(torch.bfloat16), w, s).float()
+    torch.testing.assert_close(actual, separate, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
+    # Output RoPE rotates each pair with the row scale on both partners.
+    positions = torch.randint(0, 64, (m,), device="cuda", dtype=torch.int32, generator=g)
+    rope = (positions, torch.randn(64, 2, 32, device="cuda", generator=g), 128)
+    roped = mxfp8_lowm_linear(x, w, s, rms_norm=(gamma, eps), rope=rope).float()
+    separate = mxfp8_lowm_linear(
+        (normalized * gamma.float()).to(torch.bfloat16), w, s, rope=rope
+    ).float()
+    torch.testing.assert_close(roped, separate, rtol=1e-2, atol=1e-2 * separate.abs().max().item())
+
+
+@_skip_no_lowm_fp8
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [1, 5, 8])
+def test_fp8_lowm_bf16_dequant_and_swap_ab_bitwise(m, monkeypatch):
+    """The BF16 weight conversion and, at <= 8 rows, two tiles per CTA with swapped MMA operands give
+    the plain kernel's bits (MXFP8 with and without the RMS norm, and the grouped FP8 GEMM)."""
+    g = torch.Generator(device="cuda").manual_seed(m)
+
+    def run(options, fn):
+        monkeypatch.setattr(_mod, "lowm_mma_options", lambda: options)
+        return fn()
+
+    def bits(y):
+        return y.view(torch.int16)
+
+    plain, dequant, both = (False, False), (True, False), (True, True)
+    n, k, edge = 4096, 1280, 64
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+    s = torch.randint(110, 125, (n, k // 32), device="cuda", dtype=torch.uint8, generator=g)
+    # The first output columns take the NaN codes and full-range scale bytes; the rest stay finite.
+    w.view(torch.uint8)[: edge // 2, ::97] = 0x7F
+    w.view(torch.uint8)[: edge // 4, 1::97] = 0xFF
+    s[edge // 2 : edge] = torch.randint(
+        0, 256, (edge // 2, k // 32), device="cuda", dtype=torch.uint8, generator=g
+    )
+    x = torch.randn(m, k, device="cuda", generator=g).to(torch.bfloat16)
+    gamma = (torch.rand(k, device="cuda", generator=g) + 0.5).to(torch.bfloat16)
+    tiles = 2 if m <= 8 else 1
+    for norm in (None, (gamma, 1e-6)):
+        ref = run(plain, lambda: mxfp8_lowm_linear(x, w, s, rms_norm=norm))
+        assert torch.isfinite(ref[:, edge:]).all()
+        assert torch.equal(
+            bits(run(dequant, lambda: mxfp8_lowm_linear(x, w, s, rms_norm=norm))), bits(ref)
+        )
+        swapped = run(both, lambda: mxfp8_lowm_linear(x, w, s, rms_norm=norm, n_tiles=tiles))
+        assert torch.equal(bits(swapped), bits(ref))
+    # Split outputs whose boundary falls inside a CTA's two tiles.
+    split = run(both, lambda: torch.cat(mxfp8_lowm_linear(x, w, s, split_n=1032, n_tiles=tiles), 1))
+    assert torch.equal(bits(split), bits(run(plain, lambda: mxfp8_lowm_linear(x, w, s))))
+
+    groups, rank, head_dim, heads = 2, 1024, 512, 8
+    depth = heads * head_dim
+    wa = (torch.randn(groups * rank, depth, device="cuda", generator=g) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    sa = torch.exp2(
+        torch.randint(-12, -4, (groups * rank // 128, depth // 128), device="cuda", generator=g)
+    ).float()
+    sa[0, :4] = torch.tensor([0.3, 1.0 + 2**-9, 3e-3, 2.0**-130], device="cuda")
+    xa = torch.randn(m, groups * depth, device="cuda", generator=g).to(torch.bfloat16)
+    positions = torch.randint(0, 4096, (m,), device="cuda", dtype=torch.int32, generator=g)
+    cos_sin = torch.randn(4096, 2, 32, device="cuda", generator=g)
+    rope = (positions, cos_sin, head_dim)
+    ref = run(plain, lambda: fp8_grouped_lowm(xa, wa, sa, rank, inverse_rope=rope))
+    swapped = run(
+        both, lambda: fp8_grouped_lowm(xa, wa, sa, rank, inverse_rope=rope, n_tiles=tiles)
+    )
+    assert torch.equal(bits(swapped), bits(ref))
+
+
+@_skip_no_lowm_fp8
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [1, 12])
+def test_fp8_lowm_index_query_matches_packed_rope_projection(m):
+    """The packed index queries are ``pack_index_queries_split`` of the RoPE'd projection, bit for
+    bit, with zero, tiny, huge, NaN and infinite rows."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+        pack_index_queries_split,
+    )
+
+    n, k = 4096, 1280
+    g = torch.Generator(device="cuda").manual_seed(m)
+    w, s = torch.ops.trtllm.mxfp8_quantize(
+        (torch.randn(n, k, device="cuda", generator=g) * 0.05).to(torch.bfloat16), True
+    )
+    x = torch.randn(m, k, device="cuda", generator=g).to(torch.bfloat16)
+    for row, scale in zip(range(1, m), (0.0, 1e-30, 1e30, float("nan"), float("inf"))):
+        x[row] *= scale
+    positions = torch.randint(0, 64, (m,), device="cuda", dtype=torch.int32, generator=g)
+    cos_sin = torch.randn(64, 2, 32, device="cuda", generator=g)
+    query = mxfp8_lowm_linear(x, w, s, rope=(positions, cos_sin, 128), scale_swizzled=True)
+    expected = pack_index_queries_split(query.view(m, n // 128, 128))
+    for got, want in zip(mxfp8_lowm_index_query(x, w, s, positions, cos_sin), expected):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_blackwell_datacenter(),
+    reason="the shared expert stores the SwiGLU on SM100/SM103",
+)
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [6])
+def test_shared_expert_piece_stores_the_swiglu(m, monkeypatch):
+    """The full-TP shared-expert piece's gate_up GEMM stores the clamped SwiGLU: the bits of the
+    GEMM, the separate SwiGLU launch and the down GEMM, eagerly and in graph replays."""
+    from tensorrt_llm._torch.models.modeling_deepseekv4 import full_tp_shared_expert_forward
+    from tensorrt_llm._torch.modules import swiglu as swiglu_module
+
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+    limit, k, inter = 10.0, 5120, 320
+    g = torch.Generator(device="cuda").manual_seed(m * 1000 + inter)
+
+    def weight(n, kk):
+        w = (torch.randn(n, kk, device="cuda", generator=g) * 0.5).to(torch.float8_e4m3fn)
+        s = torch.randint(115, 128, (n, kk // 32), device="cuda", dtype=torch.uint8, generator=g)
+        return w, s
+
+    (w13, s13), (w2, s2) = weight(2 * inter, k), weight(k, inter)
+    x = torch.empty(m, k, device="cuda", dtype=torch.bfloat16)
+
+    def new_input(scale):
+        x.copy_(torch.randn(m, k, device="cuda", generator=g) * scale)
+        x[0] *= 16  # past the clamp limit
+
+    def separate():
+        gate_up = mxfp8_lowm_linear(x, w13, s13)
+        return mxfp8_lowm_linear(swiglu_module.swiglu(gate_up, swiglu_limit=limit), w2, s2)
+
+    def no_swiglu(*args, **kwargs):
+        raise AssertionError("the shared expert launched the separate SwiGLU")
+
+    def folded():
+        with monkeypatch.context() as patch:
+            patch.setattr(swiglu_module, "swiglu", no_swiglu)
+            return full_tp_shared_expert_forward(x, (w13, s13, w2, s2), limit)
+
+    new_input(2)
+    assert torch.equal(folded(), separate())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = folded()
+    for scale in (1, 4, 8):
+        new_input(scale)
+        graph.replay()
+        assert torch.equal(out, separate())
+
+
+# ---------------------------------------------------------------------------
+# Race timing
+# ---------------------------------------------------------------------------
+
+
+class _HostDeviceCostRunner(TunableRunner):
+    """Returns its input after ``host_s`` of host work and a ``cycles`` device sleep."""
+
+    def __init__(self, name: str, host_s: float, cycles: int) -> None:
+        self.name, self.host_s, self.cycles = name, host_s, cycles
+
+    def unique_id(self) -> tuple:
+        return (self.name,)
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        return [0]
+
+    def forward(self, inputs, *, tactic=-1, do_preparation=False, **kwargs):
+        time.sleep(self.host_s)
+        torch.cuda._sleep(self.cycles)
+        return inputs[0]
+
+
+@_skip_no_cuda
+@pytest.mark.parametrize("pdl", ["1", "0"])
+@torch.inference_mode()
+def test_race_times_device_work_not_host_launch(pdl: str, monkeypatch) -> None:
+    """The decode CUDA graphs pay device time only, so the race times inside a CUDA graph, PDL on or off: a
+    runner with a slow host launch and a short kernel beats one with a fast launch and a longer kernel. Eager
+    timing (positive control) picks the other one."""
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", pdl)
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._init_runners()
+    config = dispatcher._tuning_config
+    assert config.use_cuda_graph
+    # ~2 us vs ~40 us of device sleep at ~1-2 GHz; 2 ms of host time per launch.
+    slow_launch = _HostDeviceCostRunner("slow_launch", host_s=2e-3, cycles=2_000)
+    slow_kernel = _HostDeviceCostRunner("slow_kernel", host_s=0.0, cycles=60_000)
+    x = torch.zeros((4, 128), dtype=torch.bfloat16, device="cuda")
+    w_t = torch.zeros((128, 64), dtype=torch.bfloat16, device="cuda")
+    tuner = AutoTuner.get()
+    winners = {}
+    for graph in (True, False):
+        tuner.clear_cache()
+        with autotune(skip_dynamic_tuning_buckets=True):
+            runner, _ = tuner.choose_one(
+                f"test::low_m_race_timing_{graph}",
+                [slow_kernel, slow_launch],
+                dataclasses.replace(config, use_cuda_graph=graph),
+                [x, w_t],
+            )
+        winners[graph] = runner
+    tuner.clear_cache()
+    assert winners[True] is slow_launch
+    assert winners[False] is slow_kernel

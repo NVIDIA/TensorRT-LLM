@@ -12,58 +12,43 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A Mooncake distributed store to back a KV cache connector.
+"""KV cache connector backed by a Mooncake distributed store.
 
-The store is a shared CPU memory pool addressed by content, so a prefix computed
-by one engine can be replayed by another, which regular block reuse cannot do
-because it never leaves the instance that computed it.
+Offloads KV pages to a shared CPU memory pool addressed by content, so a prefix
+computed by one engine can be replayed by another. Distinct from the Mooncake
+transfer engine the C++ cache transceiver uses, which moves KV point to point
+between two known peers; the two compose.
 
-This is a different component from the Mooncake transfer engine that the C++
-cache transceiver uses for disaggregated prefill/decode handoff: that moves KV
-point to point between two known peers, while this one publishes pages into a
-pool addressed by content. The two compose, so a context server can write pages
-here and still hand off over NIXL.
+A pool has one master, run as infrastructure rather than inside any engine::
 
-`master.py` brings a pool up: it resolves or launches the `mooncake_master`
-and renders the client config the workers read. Capacity comes only from
-processes that open a store handle, which in a disaggregated deployment is the
-context servers alone, so `donor.py` lends a node's memory to the pool without
-giving it a connector. `trtllm-serve mooncake_master` and `mooncake_donor`
-expose both. Both need the Mooncake Python bindings, which `tensorrt-llm` pulls
-in as `mooncake-transfer-engine-cuda13`.
+    trtllm-serve mooncake_master --pool_file /shared/pool.json
 
-`keys.py` and `staging.py` hold what the store side shares with the connector
-that moves pages in and out of the pool: how a block of tokens becomes a store
-key, and how pages reach the fabric on hosts without GPUDirect RDMA. The
-connector itself, and the `LlmArgs` surface that selects it, land with the KV
-cache manager V2 support it depends on.
+Each server joins the pool the master's manifest describes::
+
+    kv_connector_config:
+      connector: mooncake-store
+      mooncake_store:
+        pool: file:///shared/pool.json
+        role: both          # or: capacity, on a server that only lends memory
+        segment_size: 160GiB
+
+Every rank that joins contributes `segment_size`, so capacity is the sum over
+participating ranks. `role` governs traffic only; see `config.StoreRole`.
+`ledger.format_pool_report` totals up what each rank recorded.
 """
 
-from .config import MooncakeStoreConnectorConfig, StoreRole, parse_size
-from .donor import DEFAULT_DONOR_LOCAL_BUFFER_SIZE, donate_segment
-from .master import (
-    PoolSpec,
-    local_address,
-    master_timeout,
-    provision_pool,
-    resolve_master_address,
-    running_master,
-    wait_for_master,
-    write_client_config,
-)
+from .ledger import format_pool_report
+from .master import maybe_provision_pool, running_master
+from .scheduler import MooncakeStoreConnectorScheduler
+from .worker import MooncakeStoreConnectorWorker
 
+# What reaches this package from outside it: the two classes `registry.py`
+# resolves by name, and the three entry points `trtllm-serve` calls. Everything
+# else is imported from the submodule that defines it.
 __all__ = [
-    "DEFAULT_DONOR_LOCAL_BUFFER_SIZE",
-    "MooncakeStoreConnectorConfig",
-    "PoolSpec",
-    "StoreRole",
-    "donate_segment",
-    "local_address",
-    "master_timeout",
-    "parse_size",
-    "provision_pool",
-    "resolve_master_address",
+    "MooncakeStoreConnectorScheduler",
+    "MooncakeStoreConnectorWorker",
+    "format_pool_report",
+    "maybe_provision_pool",
     "running_master",
-    "wait_for_master",
-    "write_client_config",
 ]

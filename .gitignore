@@ -81,12 +81,14 @@ ad-test-workspace/
 */tllm_debug/**
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
-!3rdparty/vendor_patches/*.patch
+!3rdparty/patches/*.patch
+!**/3rdparty/vendor_patches/*.patch
 examples/disaggregated/slurm/benchmark/logs/
 scripts/attribution/data/checksum_to_paths.yml
 
 # Generated files
 /ATTRIBUTIONS.md
+/pyrefly_final_report.json
 cpp/include/tensorrt_llm/executor/version.h
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu/
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.h

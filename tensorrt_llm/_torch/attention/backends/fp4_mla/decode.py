@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA decode dispatch and Triton/CuTeDSL launch preparation."""
 
+import os
 from typing import Any
 
 import torch
@@ -10,9 +11,13 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
 
+from . import decode_4x as _decode_4x
+from . import decode_twostream as _decode_twostream
+from . import fp4_mla_dispatch as _dispatch
 from .cache_update import _prepare_fp4_mla_q_buffers
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
+    _FP4_MLA_MAX_REDUCE_GROUPS,
     FP4_BLOCK_SIZE,
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_K_RESIDUAL_DIM,
@@ -27,6 +32,8 @@ from .config import (
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
     _fp4_mla_cutedsl_kernel_module,
+    _fp4_mla_packed_rows_per_seq,
+    fp4_mla_generation_backend_supported,
 )
 from .layout import (
     _ensure_workspace_tensor,
@@ -34,29 +41,38 @@ from .layout import (
     _get_fp4_mla_kv_cache_tensors,
     _get_fp4_mla_q_global_scale,
     _get_fp4_mla_swizzled_scale_size,
+    _max_sequences,
     _validate_fp4_mla_attention_q_shape,
     _validate_fp4_mla_cache_shape,
     _validate_fp4_mla_kv_storage_shape,
+    _workspace_capacity_numel,
     get_fp4_mla_v_scale_pool_view,
 )
 from .metadata import (
     _fp4_mla_generation_page_ids,
     _fp4_mla_uniform_generation_lengths,
     _get_linear_mtp_query_len_per_seq,
-    _infer_assume_full_pages,
     _materialize_fp4_mla_device_page_table_for_forward,
     _max_generation_pages,
+)
+from .packed_plan import (
+    _fp4_mla_packed_plan_geometry,
+    _get_sm_count,
+    _launch_fp4_mla_packed_plan,
+    _PackedPlanGeometry,
 )
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
     _get_fp4_mla_v_scale_pool_base,
-    _get_triton_v_packed_cache,
-    _select_triton_block_v,
-    _triton_can_prepack_v,
-    _triton_prepack_v_enabled,
-    _update_triton_v_packed_cache,
 )
+
+
+def _select_triton_block_v(num_queries: int) -> int:
+    env_block_v = _env_int("TRTLLM_FP4_MLA_BLOCK_V")
+    if env_block_v is not None:
+        return env_block_v
+    return 32 if num_queries <= 32 else 128
 
 
 @triton.jit
@@ -122,24 +138,9 @@ def _cutedsl_pad_q_and_sf_kernel(
     )
 
 
-_SM_COUNT_CACHE: dict[int, int] = {}
-
-
-def _get_sm_count(device: torch.device) -> int:
-    """Return the SM (multiprocessor) count for ``device``, cached per index."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    count = _SM_COUNT_CACHE.get(index)
-    if count is None:
-        count = torch.cuda.get_device_properties(index).multi_processor_count
-        _SM_COUNT_CACHE[index] = count
-    return count
-
-
 def _run_triton_attention_decode(
     *,
     metadata: Any,
-    layer_idx: int,
-    local_layer: int,
     q_fp4: torch.Tensor,
     q_sf: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -177,9 +178,6 @@ def _run_triton_attention_decode(
     from .fp4_mla_triton import _fp4_mla_attention_page_stats_kernel as _attn_page_stats_kernel
     from .fp4_mla_triton import _fp4_mla_attention_prob_scale_kernel as _attn_prob_scale_kernel
     from .fp4_mla_triton import _fp4_mla_attention_pv_kernel as _attn_pv_kernel
-    from .fp4_mla_triton import (
-        _fp4_mla_attention_pv_prepacked_v_kernel as _attn_pv_prepacked_v_kernel,
-    )
     from .fp4_mla_triton import _fp4_mla_attention_pv_reduce_kernel as _attn_pv_reduce_kernel
     from .fp4_mla_triton import _fp4_mla_attention_reduce_stats_kernel as _attn_reduce_stats_kernel
 
@@ -191,9 +189,7 @@ def _run_triton_attention_decode(
     # lands per SM and hides the L1TEX scoreboard stalls. Empirically (sweep):
     #   bs<=32 -> BLOCK_V=32; bs>=64 -> BLOCK_V=128.
     # (BLOCK_V=16 is rejected by the V TMA descriptor min-stride requirement.)
-    # With prepacked V, BLOCK_V=128 avoids reloading the same P tile four times
-    # and matches the cutile prepacked-V tile shape.
-    block_v = _select_triton_block_v(num_queries, prefer_prepacked_v=_triton_prepack_v_enabled())
+    block_v = _select_triton_block_v(num_queries)
     q_storage_head_dim = head_dim + q_residual_dim
     # The virtual GEMM tail evaluates QK + Q_r K + Q K_r in one reduction.
     # Q and Q_r still occupy the 640-channel interleaved physical Q buffer;
@@ -212,25 +208,8 @@ def _run_triton_attention_decode(
 
     assume_full_heads = num_heads % block_h == 0
     assume_full_v = kv_lora_rank % block_v == 0
-    # Match the cutile path: only mark pages "full" when we can prove every
-    # generation sequence has the same number of cached tokens AND
-    # query_len_per_seq == 1 (so the kv_len adjustment is a no-op).
-    assume_full_pages = (
-        _infer_assume_full_pages(metadata, max_pages, metadata.page_size) and query_len_per_seq == 1
-    )
-    # Leave validity checks on. Matches cutile's default and is correctness-
-    # safe. The perfect-shape PV fast path (tl.ext.make_view + load_view_tko)
-    # remains gated off — when measured on the TileIR backend (ENABLE_TILE=1)
-    # it was net-slower on the bench, so the cost of enabling it isn't worth
-    # the win on the FP4 MLA shapes we care about.
-    assume_valid_pages = False
-    num_gen_seqs = num_queries // query_len_per_seq
-    if (
-        not assume_valid_pages
-        and assume_full_pages
-        and src_page_ids.numel() == num_gen_seqs * max_pages
-    ):
-        assume_valid_pages = True
+    # Keep KV-length and page-validity masks enabled: device lengths can change
+    # between metadata preparation and decode launch.
     # cutile checks only `make_tensor_descriptor`; on the nvt backend the
     # presence of TMA descriptors implies `tl.ext.make_view` is available too.
     use_tma_data_load = hasattr(triton.language, "make_tensor_descriptor")
@@ -253,22 +232,10 @@ def _run_triton_attention_decode(
     # the TritonGPUAutomaticWarpSpecialization + NVWSInsertTmemAref pass that
     # ICEs on the page_stats kernel under Triton 3.6.0 / sm_100.
     launch_meta = {"occupancy": 2}
-    # The matmul kernels (page-stats QK and PV) are register-limited: at the
-    # Triton default of num_warps=4 the [BLOCK_H, BLOCK_T] epilogue spills the
-    # register file down to ~2 CTAs/SM (12.5% occupancy), so there are too few
-    # warps to hide the QK/PV load latency (ncu: ~0.3 eligible warps/scheduler).
-    # Spreading the tile epilogue over num_warps=8 halves the per-thread
-    # register need and roughly doubles resident warps. Matches the cutile
-    # ("nvt") backend, which launches page-stats at num_warps=8. Both are
-    # overridable for tuning.
+    # Masked page statistics defaults to four warps; PV defaults to eight.
+    # Their independent environment overrides permit tuning either launch.
     sm_count = _get_sm_count(q_fp4.device)
-    # page-stats num_warps: the full-pages fast path (uniform q_len==1 decode)
-    # benefits from num_warps=8 (more warps hide the QK load latency); the
-    # masked path (q_len>1 / ragged lengths) carries extra per-thread state and
-    # measured markedly faster at num_warps=4 (e.g. bs256 q_len4: 131->95ms).
-    page_stats_num_warps = _env_int("TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS")
-    if page_stats_num_warps is None:
-        page_stats_num_warps = 8 if assume_full_pages else 4
+    page_stats_num_warps = _env_int("TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS") or 4
     page_stats_launch_meta = {"occupancy": 2, "num_warps": page_stats_num_warps}
     # PV benefits from num_warps=8 across shapes measured.
     pv_num_warps = _env_int("TRTLLM_FP4_MLA_PV_NUM_WARPS") or 8
@@ -295,6 +262,7 @@ def _run_triton_attention_decode(
         page_stats_shape,
         dtype=torch.float32,
         device=q_fp4.device,
+        shared=True,
     )
     page_sum = _ensure_workspace_tensor(
         metadata,
@@ -302,6 +270,7 @@ def _run_triton_attention_decode(
         page_stats_shape,
         dtype=torch.float32,
         device=q_fp4.device,
+        shared=True,
     )
 
     pack_prob_in_page_stats = True
@@ -347,7 +316,7 @@ def _run_triton_attention_decode(
         SF_PER_PAGE=sf_per_page,
         P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
         QUERY_LEN_PER_SEQ=query_len_per_seq,
-        MAX_PAGES=max_pages,
+        max_pages=max_pages,
         BLOCK_H=block_h,
         BLOCK_T=block_t,
         BLOCK_K=block_k,
@@ -356,8 +325,8 @@ def _run_triton_attention_decode(
         USE_TMA_DATA_LOAD=use_tma_data_load,
         PACK_PROBS=pack_prob_in_page_stats,
         ASSUME_FULL_HEADS=assume_full_heads,
-        ASSUME_FULL_PAGES=assume_full_pages,
-        ASSUME_VALID_PAGES=assume_valid_pages,
+        ASSUME_FULL_PAGES=False,
+        ASSUME_VALID_PAGES=False,
         **page_stats_launch_meta,
     )
     # Two-level softmax-stats reduction. The single-level reduce launched only
@@ -373,26 +342,22 @@ def _run_triton_attention_decode(
     # parallelism to hide latency, while keeping the group count small enough
     # that the level-2 combine loop stays short.
     target_l1_ctas = 3 * sm_count
-    num_reduce_groups = _ceil_div(target_l1_ctas, max(seqhead_ctas, 1))
-    num_reduce_groups = max(1, min(num_reduce_groups, max_pages, 64))
-    # The grouped (two-level) reduce needs an auxiliary workspace, and
-    # _ensure_workspace_tensor can only (re)allocate it outside CUDA graph
-    # capture. If a warmup forward did not already size that workspace (e.g. the
-    # warmup batch took the single-level path), fall back to the single-level
-    # reduce during capture so we never allocate mid-capture. The single-level
-    # reduce is numerically identical (it just launches fewer CTAs).
+    num_reduce_groups = min(
+        triton.next_power_of_2(_ceil_div(target_l1_ctas, max(seqhead_ctas, 1))),
+        triton.next_power_of_2(max_pages),
+        _FP4_MLA_MAX_REDUCE_GROUPS,
+    )
+    # Group lengths vary with the query count and page capacity. Keep them runtime
+    # values so changing either does not compile another reduction kernel.
+    group_pages = _ceil_div(max_pages, num_reduce_groups)
+    # Use the grouped reduce during capture only when warmup registered enough
+    # scratch. Otherwise the numerically equivalent single-level reduce avoids
+    # growing the shared pool while capturing.
     if num_reduce_groups > 1 and torch.cuda.is_current_stream_capturing():
-        gmax = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_max_buf")
-        gsum = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_sum_buf")
-        groups_ready = (
-            gmax is not None
-            and gsum is not None
-            and gmax.shape[0] >= num_queries
-            and gmax.shape[1] >= num_reduce_groups
-            and gmax.shape[2] >= num_heads
-            and gsum.shape[0] >= num_queries
-            and gsum.shape[1] >= num_reduce_groups
-            and gsum.shape[2] >= num_heads
+        needed = num_queries * num_reduce_groups * num_heads
+        groups_ready = all(
+            _workspace_capacity_numel(metadata, name, torch.float32, q_fp4.device) >= needed
+            for name in ("_fp4_mla_attention_group_max_buf", "_fp4_mla_attention_group_sum_buf")
         )
         if not groups_ready:
             num_reduce_groups = 1
@@ -407,19 +372,22 @@ def _run_triton_attention_decode(
             page_max.stride(0),
             page_max.stride(1),
             NUM_HEADS=num_heads,
-            MAX_PAGES=max_pages,
+            max_pages=max_pages,
             BLOCK_H=block_h,
             **launch_meta,
         )
     else:
-        group_pages = _ceil_div(max_pages, num_reduce_groups)
-        num_reduce_groups = _ceil_div(max_pages, group_pages)
+        stats_capacity = (
+            _max_sequences(metadata) * query_len_per_seq * _FP4_MLA_MAX_REDUCE_GROUPS * num_heads
+        )
         group_max = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_group_max_buf",
             (num_queries, num_reduce_groups, num_heads),
             dtype=torch.float32,
             device=q_fp4.device,
+            shared=True,
+            capacity_numel=stats_capacity,
         )
         group_sum = _ensure_workspace_tensor(
             metadata,
@@ -427,6 +395,8 @@ def _run_triton_attention_decode(
             (num_queries, num_reduce_groups, num_heads),
             dtype=torch.float32,
             device=q_fp4.device,
+            shared=True,
+            capacity_numel=stats_capacity,
         )
         _attn_group_reduce_stats_kernel[(num_queries, num_head_blocks, num_reduce_groups)](
             group_max,
@@ -439,9 +409,9 @@ def _run_triton_attention_decode(
             page_max.stride(0),
             page_max.stride(1),
             NUM_HEADS=num_heads,
-            GROUP_PAGES=group_pages,
+            group_pages=group_pages,
             BLOCK_H=block_h,
-            PIPELINE_STAGES=min(group_pages, 4),
+            PIPELINE_STAGES=4,
             **launch_meta,
         )
         _attn_reduce_stats_kernel[(num_queries, num_head_blocks)](
@@ -454,7 +424,7 @@ def _run_triton_attention_decode(
             group_max.stride(0),
             group_max.stride(1),
             NUM_HEADS=num_heads,
-            MAX_PAGES=num_reduce_groups,
+            max_pages=_FP4_MLA_MAX_REDUCE_GROUPS,
             BLOCK_H=block_h,
             **launch_meta,
         )
@@ -473,43 +443,14 @@ def _run_triton_attention_decode(
         PAGE_SIZE=metadata.page_size,
         SF_PER_PAGE=sf_per_page,
         QUERY_LEN_PER_SEQ=query_len_per_seq,
-        MAX_PAGES=max_pages,
+        max_pages=max_pages,
         BLOCK_H=block_h,
         ASSUME_FULL_HEADS=assume_full_heads,
-        ASSUME_FULL_PAGES=assume_full_pages,
-        ASSUME_VALID_PAGES=assume_valid_pages,
+        ASSUME_FULL_PAGES=False,
+        ASSUME_VALID_PAGES=False,
         **launch_meta,
     )
     num_dim_blocks = triton.cdiv(kv_lora_rank, block_v)
-    v_packed = _get_triton_v_packed_cache(
-        metadata,
-        layer_idx,
-        kv_cache,
-        v_head_dim=kv_lora_rank,
-        page_size=metadata.page_size,
-        block_v=block_v,
-        local_layer=local_layer,
-        v_sf=v_sf,
-        page_ids=src_page_ids,
-    )
-    if (
-        v_packed is None
-        and _triton_can_prepack_v(kv_lora_rank, metadata.page_size, block_v)
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        v_packed = _update_triton_v_packed_cache(
-            metadata,
-            layer_idx,
-            kv_cache,
-            src_page_ids,
-            v_head_dim=kv_lora_rank,
-            page_size=metadata.page_size,
-            block_v=block_v,
-            local_layer=local_layer,
-            v_sf=v_sf,
-        )
-    use_triton_v_packed_cache = v_packed is not None
-
     # PV page split: partition the page range across additional programs and
     # reduce in a follow-up kernel. ncu showed PV at waves/SM=0.49 for bs=32 —
     # PV is L1-bandwidth bound, so raising in-flight CTAs is the lever.
@@ -528,21 +469,18 @@ def _run_triton_attention_decode(
             if max_pages % p == 0 and max_pages // p >= 16 and base_grid * p <= 148 * 4:
                 page_split = p
                 break
-    # The page-split PV path needs a partial-output workspace, which
-    # _ensure_workspace_tensor can only (re)allocate outside CUDA graph capture.
-    # Fall back to the unsplit PV (numerically identical) during capture unless a
-    # warmup forward already sized that workspace, so capture never allocates.
+    # Use split PV during capture only when warmup registered enough partial
+    # output scratch; unsplit PV is numerically equivalent and needs no pool growth.
     if page_split > 1 and torch.cuda.is_current_stream_capturing():
-        pbuf = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_pv_partial_buf")
         partial_ready = (
-            pbuf is not None
-            and pbuf.shape[0] >= num_queries
-            and pbuf.shape[1] >= page_split
-            and pbuf.shape[2] >= num_heads
-            and pbuf.shape[3] >= kv_lora_rank
+            _workspace_capacity_numel(
+                metadata, "_fp4_mla_attention_pv_partial_buf", torch.float32, q_fp4.device
+            )
+            >= num_queries * page_split * num_heads * kv_lora_rank
         )
         if not partial_ready:
             page_split = 1
+    split_kwargs: dict[str, int | torch.Tensor] = {}
     if page_split > 1:
         pages_per_split = max_pages // page_split
         partial_out = _ensure_workspace_tensor(
@@ -551,110 +489,62 @@ def _run_triton_attention_decode(
             (num_queries, page_split, num_heads, kv_lora_rank),
             dtype=torch.float32,
             device=q_fp4.device,
+            shared=True,
         )
-        if use_triton_v_packed_cache:
-            _attn_pv_prepacked_v_kernel[
-                (num_queries, num_head_blocks, num_dim_blocks * page_split)
-            ](
-                output,
-                p_fp4,
-                p_sf,
-                v_packed,
-                v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode,
-                kv_lens,
-                src_page_ids.shape[0],
-                kv_cache.shape[0],
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                output.shape[0] * output.shape[1],
-                p_fp4.stride(0),
-                p_fp4.stride(1),
-                p_fp4.shape[0],
-                v_sf.stride(0),
-                NUM_HEADS=num_heads,
-                V_HEAD_D=kv_lora_rank,
-                PAGE_SIZE=metadata.page_size,
-                FP4_BLOCK=FP4_BLOCK_SIZE,
-                SF_PER_PAGE=sf_per_page,
-                QUERY_LEN_PER_SEQ=query_len_per_seq,
-                MAX_PAGES=max_pages,
-                P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
-                BLOCK_H=block_h,
-                BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
-                USE_TMA_OUT_STORE=use_tma_data_load and assume_full_heads and assume_full_v,
-                PV_LOOP_STAGES=pv_loop_stages,
-                ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
-                ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
-                PAGE_SPLIT=page_split,
-                PAGES_PER_SPLIT=pages_per_split,
-                PARTIAL_OUT=True,
-                partial_out_ptr=partial_out,
-                partial_s0=partial_out.stride(0),
-                partial_s1=partial_out.stride(1),
-                partial_s2=partial_out.stride(2),
-                partial_s3=partial_out.stride(3),
-                **pv_launch_meta,
-            )
-        else:
-            _attn_pv_kernel[(num_queries, num_head_blocks, num_dim_blocks * page_split)](
-                output,
-                p_fp4,
-                p_sf,
-                kv_cache,
-                kv_cache,
-                v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode,
-                kv_lens,
-                src_page_ids.shape[0],
-                kv_cache.shape[0],
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                output.shape[0] * output.shape[1],
-                p_fp4.stride(0),
-                p_fp4.stride(1),
-                p_fp4.shape[0],
-                kv_cache.stride(0),
-                kv_cache.stride(2),
-                kv_cache.stride(4),
-                v_sf.stride(0),
-                NUM_HEADS=num_heads,
-                V_HEAD_D=kv_lora_rank,
-                PAGE_SIZE=metadata.page_size,
-                FP4_BLOCK=FP4_BLOCK_SIZE,
-                SF_PER_PAGE=sf_per_page,
-                QUERY_LEN_PER_SEQ=query_len_per_seq,
-                MAX_PAGES=max_pages,
-                P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
-                BLOCK_H=block_h,
-                BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
-                USE_TMA_V_LOAD=use_tma_data_load and kv_lora_rank % block_v == 0,
-                USE_PREPACKED_V=False,
-                PV_LOOP_STAGES=pv_loop_stages,
-                ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
-                ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
-                PAGE_SPLIT=page_split,
-                PAGES_PER_SPLIT=pages_per_split,
-                PARTIAL_OUT=True,
-                partial_out_ptr=partial_out,
-                partial_s0=partial_out.stride(0),
-                partial_s1=partial_out.stride(1),
-                partial_s2=partial_out.stride(2),
-                partial_s3=partial_out.stride(3),
-                **pv_launch_meta,
-            )
+        split_kwargs = {
+            "PAGE_SPLIT": page_split,
+            "pages_per_split": pages_per_split,
+            "PARTIAL_OUT": True,
+            "partial_out_ptr": partial_out,
+            "partial_s0": partial_out.stride(0),
+            "partial_s1": partial_out.stride(1),
+            "partial_s2": partial_out.stride(2),
+            "partial_s3": partial_out.stride(3),
+        }
+    _attn_pv_kernel[(num_queries, num_head_blocks, num_dim_blocks * page_split)](
+        output,
+        p_fp4,
+        p_sf,
+        kv_cache,
+        v_sf,
+        global_scale,
+        src_page_ids,
+        metadata.fp4_mla_state.paged_kv_indptr_decode,
+        kv_lens,
+        src_page_ids.shape[0],
+        kv_cache.shape[0],
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output.shape[0] * output.shape[1],
+        p_fp4.stride(0),
+        p_fp4.stride(1),
+        p_fp4.shape[0],
+        kv_cache.stride(0),
+        kv_cache.stride(2),
+        kv_cache.stride(4),
+        v_sf.stride(0),
+        NUM_HEADS=num_heads,
+        V_HEAD_D=kv_lora_rank,
+        PAGE_SIZE=metadata.page_size,
+        FP4_BLOCK=FP4_BLOCK_SIZE,
+        SF_PER_PAGE=sf_per_page,
+        QUERY_LEN_PER_SEQ=query_len_per_seq,
+        max_pages=max_pages,
+        P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
+        BLOCK_H=block_h,
+        BLOCK_V=block_v,
+        USE_TMA_P_LOAD=False,
+        USE_TMA_V_LOAD=use_tma_data_load and kv_lora_rank % block_v == 0,
+        PV_LOOP_STAGES=pv_loop_stages,
+        ASSUME_FULL_HEADS=assume_full_heads,
+        ASSUME_FULL_PAGES=False,
+        ASSUME_FULL_V=assume_full_v,
+        ASSUME_VALID_PAGES=False,
+        **split_kwargs,
+        **pv_launch_meta,
+    )
+    if page_split > 1:
         _attn_pv_reduce_kernel[(num_queries, num_head_blocks, num_dim_blocks)](
             output,
             partial_out,
@@ -676,92 +566,168 @@ def _run_triton_attention_decode(
             ASSUME_FULL_V=assume_full_v,
             **launch_meta,
         )
-    else:
-        if use_triton_v_packed_cache:
-            _attn_pv_prepacked_v_kernel[(num_queries, num_head_blocks, num_dim_blocks)](
-                output,
-                p_fp4,
-                p_sf,
-                v_packed,
-                v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode,
-                kv_lens,
-                src_page_ids.shape[0],
-                kv_cache.shape[0],
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                output.shape[0] * output.shape[1],
-                p_fp4.stride(0),
-                p_fp4.stride(1),
-                p_fp4.shape[0],
-                v_sf.stride(0),
-                NUM_HEADS=num_heads,
-                V_HEAD_D=kv_lora_rank,
-                PAGE_SIZE=metadata.page_size,
-                FP4_BLOCK=FP4_BLOCK_SIZE,
-                SF_PER_PAGE=sf_per_page,
-                QUERY_LEN_PER_SEQ=query_len_per_seq,
-                MAX_PAGES=max_pages,
-                P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
-                BLOCK_H=block_h,
-                BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
-                USE_TMA_OUT_STORE=use_tma_data_load and assume_full_heads and assume_full_v,
-                PV_LOOP_STAGES=pv_loop_stages,
-                ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
-                ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
-                **pv_launch_meta,
-            )
-        else:
-            _attn_pv_kernel[(num_queries, num_head_blocks, num_dim_blocks)](
-                output,
-                p_fp4,
-                p_sf,
-                kv_cache,
-                kv_cache,
-                v_sf,
-                global_scale,
-                src_page_ids,
-                metadata.fp4_mla_state.paged_kv_indptr_decode,
-                kv_lens,
-                src_page_ids.shape[0],
-                kv_cache.shape[0],
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                output.shape[0] * output.shape[1],
-                p_fp4.stride(0),
-                p_fp4.stride(1),
-                p_fp4.shape[0],
-                kv_cache.stride(0),
-                kv_cache.stride(2),
-                kv_cache.stride(4),
-                v_sf.stride(0),
-                NUM_HEADS=num_heads,
-                V_HEAD_D=kv_lora_rank,
-                PAGE_SIZE=metadata.page_size,
-                FP4_BLOCK=FP4_BLOCK_SIZE,
-                SF_PER_PAGE=sf_per_page,
-                QUERY_LEN_PER_SEQ=query_len_per_seq,
-                MAX_PAGES=max_pages,
-                P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
-                BLOCK_H=block_h,
-                BLOCK_V=block_v,
-                USE_TMA_P_LOAD=use_tma_data_load and assume_full_heads and assume_valid_pages,
-                USE_TMA_V_LOAD=use_tma_data_load and kv_lora_rank % block_v == 0,
-                USE_PREPACKED_V=False,
-                PV_LOOP_STAGES=pv_loop_stages,
-                ASSUME_FULL_HEADS=assume_full_heads,
-                ASSUME_FULL_PAGES=assume_full_pages,
-                ASSUME_FULL_V=assume_full_v,
-                ASSUME_VALID_PAGES=assume_valid_pages,
-                **pv_launch_meta,
-            )
+
+
+def _run_cutedsl_packed_decode(
+    module: Any,
+    metadata: Any,
+    q_fp4: torch.Tensor,
+    q_sf: torch.Tensor,
+    kv_cache: torch.Tensor,
+    sf_cache: torch.Tensor,
+    v_packed: torch.Tensor,
+    v_sf: torch.Tensor,
+    kv_global_scale: torch.Tensor,
+    q_global_scale: torch.Tensor,
+    src_page_ids: torch.Tensor,
+    page_indptr: torch.Tensor,
+    kv_lens: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    num_heads: int,
+    query_len: int,
+    num_requests: int,
+    rows_per_seq: int,
+    sm_scale: float,
+    v_page_offset: int,
+    helix_kv_bounds: torch.Tensor | None,
+    softmax_stats_tensor: torch.Tensor | None,
+    plan_geometry: _PackedPlanGeometry | None = None,
+) -> None:
+    """Packed CuTe DSL decode: one kernel over (split, request) tasks.
+
+    A single split writes the output (and Helix stats) directly; several
+    splits write FP32 partials that one reduction kernel folds into the
+    output and stats. Nothing pads, replicates, or copies Q or the output.
+    """
+    valid_m, physical_m = module.packed_query_rows(num_heads, query_len)
+    if physical_m != rows_per_seq:
+        raise RuntimeError(
+            f"FP4 MLA packed Q rows {rows_per_seq} do not match the kernel geometry {physical_m}."
+        )
+    if v_packed is None:
+        raise RuntimeError("FP4 MLA packed decode requires the persistent packed-V cache.")
+    if not output.is_contiguous() or output.numel() != num_requests * valid_m * 512:
+        raise RuntimeError(
+            "FP4 MLA packed decode requires a contiguous [tokens, heads, 512] output."
+        )
+    device = output.device
+    if plan_geometry is None:
+        plan_geometry = _fp4_mla_packed_plan_geometry(
+            metadata,
+            num_heads=num_heads,
+            query_len=query_len,
+            num_requests=num_requests,
+            device=device,
+            helix_kv_bounds=helix_kv_bounds,
+        )
+        if plan_geometry is None:
+            raise RuntimeError("FP4 MLA packed decode requires generation cache pages.")
+    splits = plan_geometry.splits
+    output_rows = output.view(num_requests * valid_m, 512)
+    stats_rows = None
+    if softmax_stats_tensor is not None:
+        stats_rows = softmax_stats_tensor.view(num_requests * valid_m, 2)
+    common = dict(
+        max_kv_len=plan_geometry.split_kv_len,
+        sm_scale=sm_scale,
+        num_heads=num_heads,
+        query_len=query_len,
+        num_requests=num_requests,
+        num_splits=splits,
+        q_global_scale=q_global_scale,
+        v_page_offset=v_page_offset,
+        helix_kv_bounds=helix_kv_bounds,
+    )
+    if splits == 1:
+        module.run_trtllm_fp4_mla_decode_packed(
+            q_fp4,
+            q_sf,
+            kv_cache,
+            sf_cache,
+            v_packed,
+            v_sf,
+            kv_global_scale,
+            src_page_ids,
+            page_indptr,
+            kv_lens,
+            output_rows,
+            softmax_stats=stats_rows,
+            **common,
+        )
+        return
+    from .fp4_mla_packed_reduce import reduce_packed_splits
+
+    tasks = splits * num_requests
+    task_capacity = plan_geometry.task_capacity
+    plan = plan_geometry.plan
+    # The first FP4 MLA kernel of the step wrote the plan fused with the
+    # generation lengths; a stale key means this call plans on other bounds.
+    if metadata.fp4_mla_state.packed_plan_key != plan_geometry.key:
+        _launch_fp4_mla_packed_plan(plan_geometry, kv_lens, metadata)
+    # Metadata-owned CuTe DSL partials reserve the largest batch/query width
+    # the plan can use and return contiguous views for the current geometry.
+    slot_rows_bound = max(plan_geometry.slot_rows_bound, task_capacity * physical_m)
+    partial = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_split_partial",
+        (task_capacity, physical_m, 512),
+        dtype=torch.float32,
+        device=device,
+        shared=False,
+        capacity_numel=slot_rows_bound * 512,
+    )[:tasks]
+    maxima = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_split_maxima",
+        (task_capacity, physical_m),
+        dtype=torch.float32,
+        device=device,
+        shared=False,
+        capacity_numel=slot_rows_bound,
+    )[:tasks]
+    sums = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_packed_split_sums",
+        (task_capacity, physical_m),
+        dtype=torch.float32,
+        device=device,
+        shared=False,
+        capacity_numel=slot_rows_bound,
+    )[:tasks]
+    module.run_trtllm_fp4_mla_decode_packed(
+        q_fp4,
+        q_sf,
+        kv_cache,
+        sf_cache,
+        v_packed,
+        v_sf,
+        kv_global_scale,
+        src_page_ids,
+        page_indptr,
+        kv_lens,
+        output_rows,
+        split_kv_buffers=(partial, maxima, sums),
+        plan=plan,
+        **common,
+    )
+    reduce_packed_splits(
+        partial,
+        maxima,
+        sums,
+        output_rows,
+        q_global_scale,
+        kv_global_scale,
+        num_requests=num_requests,
+        num_splits=splits,
+        valid_m=valid_m,
+        physical_m=physical_m,
+        sm_scale=sm_scale,
+        plan=plan,
+        output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
+        stats=stats_rows,
+        sm_count=_get_sm_count(device),
+    )
 
 
 def run_fp4_mla_attention_decode(
@@ -877,30 +843,57 @@ def run_fp4_mla_attention_decode(
         )
 
     capacity = int(q_batch_capacity)
-    expected_q_shape = (capacity * num_heads, FP4_MLA_Q_PACKED_DIM)
-    expected_q_sf_shape = (
-        _get_fp4_mla_swizzled_scale_size(
-            capacity * num_heads,
-            FP4_MLA_Q_LOGICAL_DIM,
-        ),
+    # The fused generation update records the Q layout it produced; metadata
+    # that never went through it (contract tests) carries the legacy layout.
+    recorded_rows_per_seq = getattr(
+        getattr(metadata, "fp4_mla_state", None), "prequantized_q_rows_per_seq", None
     )
-    if (
-        q.dtype != torch.bfloat16
-        or capacity <= 0
-        or num_queries > capacity
-        or tuple(prequantized_q.shape) != expected_q_shape
-        or prequantized_q.dtype != torch.uint8
-        or not prequantized_q.is_contiguous()
-        or tuple(prequantized_q_sf.shape) != expected_q_sf_shape
-        or prequantized_q_sf.dtype != torch.float8_e4m3fn
-        or not prequantized_q_sf.is_contiguous()
+    packed_rows_per_seq = int(recorded_rows_per_seq or 0)
+    if recorded_rows_per_seq is not None and packed_rows_per_seq != _fp4_mla_packed_rows_per_seq(
+        num_heads, query_len_per_seq
     ):
-        raise ValueError("FP4 MLA prequantized Q does not satisfy the fused-Q contract.")
-    active_q_rows = num_queries * num_heads
+        raise RuntimeError(
+            "FP4 MLA prequantized Q layout does not match the packed decode "
+            f"configuration (rows per request {packed_rows_per_seq})."
+        )
+    if packed_rows_per_seq:
+        active_q_rows = num_gen_seqs * packed_rows_per_seq
+    else:
+        active_q_rows = num_queries * num_heads
     active_q_sf_bytes = _get_fp4_mla_swizzled_scale_size(
         active_q_rows,
         FP4_MLA_Q_LOGICAL_DIM,
     )
+    if packed_rows_per_seq:
+        q_contract_ok = (
+            prequantized_q.ndim == 2
+            and prequantized_q.shape[0] >= active_q_rows
+            and prequantized_q.shape[1] == FP4_MLA_Q_PACKED_DIM
+            and prequantized_q_sf.numel() >= active_q_sf_bytes
+        )
+    else:
+        expected_q_shape = (capacity * num_heads, FP4_MLA_Q_PACKED_DIM)
+        expected_q_sf_shape = (
+            _get_fp4_mla_swizzled_scale_size(
+                capacity * num_heads,
+                FP4_MLA_Q_LOGICAL_DIM,
+            ),
+        )
+        q_contract_ok = (
+            tuple(prequantized_q.shape) == expected_q_shape
+            and tuple(prequantized_q_sf.shape) == expected_q_sf_shape
+        )
+    if (
+        q.dtype != torch.bfloat16
+        or capacity <= 0
+        or num_queries > capacity
+        or not q_contract_ok
+        or prequantized_q.dtype != torch.uint8
+        or not prequantized_q.is_contiguous()
+        or prequantized_q_sf.dtype != torch.float8_e4m3fn
+        or not prequantized_q_sf.is_contiguous()
+    ):
+        raise ValueError("FP4 MLA prequantized Q does not satisfy the fused-Q contract.")
     q_fp4 = prequantized_q[:active_q_rows]
     q_sf = prequantized_q_sf[:active_q_sf_bytes]
     q_global_scale = _get_fp4_mla_q_global_scale(metadata, q.device)
@@ -922,22 +915,34 @@ def run_fp4_mla_attention_decode(
     # CUDA graph / one-engine MTP; recover the true total per sequence so the
     # per-query causal masking sees the full 1 + draft_len window (no-op when the
     # alias already matches).
-    kv_lens, _ = _fp4_mla_uniform_generation_lengths(metadata, num_queries, num_gen_seqs)
+    plan_geometry = _fp4_mla_packed_plan_geometry(
+        metadata,
+        num_heads=num_heads,
+        query_len=query_len_per_seq,
+        num_requests=num_gen_seqs,
+        device=q.device,
+        helix_kv_bounds=helix_kv_bounds,
+    )
+    kv_lens, _ = _fp4_mla_uniform_generation_lengths(
+        metadata, num_queries, num_gen_seqs, plan_geometry=plan_geometry
+    )
     _materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens)
     src_page_ids = _fp4_mla_generation_page_ids(metadata, num_gen_seqs)
     max_pages = _max_generation_pages(metadata)
     if max_pages == 0:
         raise RuntimeError("FP4 MLA attention decode requires generation cache pages.")
+    sm_version = get_sm_version()
+    if not fp4_mla_generation_backend_supported(sm_version, backend):
+        raise RuntimeError(
+            f"FP4 MLA generation does not support SM{sm_version} with the {backend} backend."
+        )
     if backend == _FP4_MLA_CUTEDSL_BACKEND:
-        if get_sm_version() != 107:
-            raise RuntimeError(
-                "FP4 MLA cutedsl attention backend requires Rubin SM107; "
-                f"current architecture is SM{get_sm_version()}."
-            )
+        max_pages = int(metadata.fp4_mla_state.page_table_stride)
         if not _cutedsl_backend_available():
             raise RuntimeError(
-                "FP4 MLA cutedsl attention backend requires the Rubin CTM and "
-                "CuTeDSL runtime packages."
+                "FP4 MLA cutedsl attention backend requires a CuTe DSL build "
+                "that provides the tcgen05 descriptor K-segment offset, and "
+                "cuda-python."
             )
         if not 0 < num_heads <= 128 or kv_lora_rank != 512:
             raise ValueError(
@@ -954,10 +959,28 @@ def run_fp4_mla_attention_decode(
             cutedsl_kernel.run_trtllm_fp4_mla_decode_page_native_from_raw
         )
 
+        # Keep general cases on the original path. This specialization uses
+        # the prepacked-V mufu16 core and linear six-query MTP only.
+        fold_queries = (
+            not packed_rows_per_seq
+            and num_heads == 6
+            and query_len_per_seq == 6
+            and num_gen_seqs == 1
+            and helix_kv_bounds is None
+            and softmax_stats_tensor is None
+            and getattr(cutedsl_kernel, "SUPPORTS_FOLDED_QUERIES", False)
+            and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
+            and getattr(metadata, "_fp4_mla_fold_q", True)
+            and os.environ.get("TRTLLM_FP4_MLA_FOLD_Q", "1") != "0"
+        )
+        if fold_queries:
+            from .fp4_mla_splitkv import select_split_count
+
+            fold_queries = select_split_count(max_pages * metadata.page_size) > 1
         physical_heads = 128
         kernel_q = q_fp4
         kernel_q_sf = q_sf
-        if num_heads < physical_heads:
+        if not packed_rows_per_seq and num_heads < physical_heads and not fold_queries:
             kernel_q_storage, kernel_q_sf_storage, q_batch_capacity = _prepare_fp4_mla_q_buffers(
                 metadata,
                 num_queries,
@@ -1063,6 +1086,152 @@ def run_fp4_mla_attention_decode(
                     "full-pool base and page offset."
                 )
 
+        if packed_rows_per_seq and _decode_4x._fp4_mla_cutedsl_4x_enabled():
+            # Path selection (fp4_mla_dispatch): 2x packed by default; the four-CTA-cluster kernel, or the
+            # two-stream split (4x arm + 2x arm), only inside the static envelope and where the measured gain is
+            # certain. The kernels are compiled and planned for the page-table capacity; the choice itself uses the
+            # KV regime ceiling of a regime-keyed CUDA graph (Fp4MlaState.kv_regime_max_kv), an upper bound of the
+            # step's longest live KV; eager steps decide on the capacity.
+            from . import fp4_mla_cutedsl_4x_host as _host_4x
+
+            max_kv_len_4x = max_pages * metadata.page_size
+            strategy = _dispatch.choose_decode_strategy(
+                num_requests=num_gen_seqs,
+                query_len=query_len_per_seq,
+                num_heads=num_heads,
+                rows_per_seq=packed_rows_per_seq,
+                kv_capacity=max_kv_len_4x,
+                sm_count=_get_sm_count(q.device),
+                envelope_reason=_host_4x.envelope_reason_static,
+                live_max_kv=getattr(metadata.fp4_mla_state, "kv_regime_max_kv", None),
+                helix=helix_kv_bounds is not None,
+                softmax_stats=softmax_stats_tensor is not None,
+                v_packed=core_v_packed is not None,
+                four_x_unavailable=_host_4x.device_unsupported_reason(q.device),
+            )
+            _decode_4x._fp4_mla_4x_record(
+                None if strategy.path != _dispatch.PATH_2X else strategy.reason,
+                num_gen_seqs,
+                query_len_per_seq,
+                max_kv_len_4x,
+                tag=strategy.record_tag,
+            )
+            if strategy.path == _dispatch.PATH_TWO_STREAM:
+                _decode_twostream.run_cutedsl_twostream_decode(
+                    cutedsl_kernel,
+                    metadata,
+                    q_fp4,
+                    q_sf,
+                    kv_cache,
+                    sf_cache,
+                    core_v_packed,
+                    core_v_sf,
+                    global_scale,
+                    q_global_scale,
+                    src_page_ids,
+                    metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                    kv_lens,
+                    output,
+                    num_heads=num_heads,
+                    query_len=query_len_per_seq,
+                    num_requests=num_gen_seqs,
+                    num_requests_2x=strategy.num_requests_2x,
+                    rows_per_seq=packed_rows_per_seq,
+                    max_kv_len=max_kv_len_4x,
+                    sm_scale=float(sm_scale),
+                    v_page_offset=v_page_offset,
+                    run_4x=_decode_4x._run_cutedsl_4x_decode,
+                    run_2x=_run_cutedsl_packed_decode,
+                )
+                return
+            if strategy.path == _dispatch.PATH_4X:
+                _decode_4x._run_cutedsl_4x_decode(
+                    q_fp4,
+                    q_sf,
+                    kv_cache,
+                    sf_cache,
+                    core_v_packed,
+                    core_v_sf,
+                    global_scale,
+                    q_global_scale,
+                    src_page_ids,
+                    metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                    kv_lens,
+                    output,
+                    num_heads=num_heads,
+                    query_len=query_len_per_seq,
+                    num_requests=num_gen_seqs,
+                    max_kv_len=max_kv_len_4x,
+                    sm_scale=float(sm_scale),
+                    v_page_offset=v_page_offset,
+                    metadata=metadata,
+                )
+                return
+        if packed_rows_per_seq:
+            _run_cutedsl_packed_decode(
+                cutedsl_kernel,
+                metadata,
+                q_fp4,
+                q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                q_global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                output,
+                num_heads=num_heads,
+                query_len=query_len_per_seq,
+                num_requests=num_gen_seqs,
+                rows_per_seq=packed_rows_per_seq,
+                sm_scale=float(sm_scale),
+                v_page_offset=v_page_offset,
+                helix_kv_bounds=helix_kv_bounds,
+                softmax_stats_tensor=softmax_stats_tensor,
+                plan_geometry=plan_geometry,
+            )
+            return
+
+        from .fp4_mla_splitkv import run_fp4_mla_splitkv, select_split_count
+
+        if fold_queries:
+            from .fp4_mla_foldq import run_fp4_mla_foldq
+
+            run_fp4_mla_foldq(
+                cutedsl_kernel,
+                metadata,
+                q_fp4,
+                q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                output,
+                splits=select_split_count(max_pages * metadata.page_size),
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                q_global_scale=q_global_scale,
+                query_len_per_seq=query_len_per_seq,
+                v_page_offset=v_page_offset,
+            )
+            return
+
+        # Helix also needs per-query bounds and softmax stats from the native path.
+        splits = (
+            select_split_count(max_pages * metadata.page_size)
+            if helix_kv_bounds is None and softmax_stats_tensor is None
+            else 1
+        )
+        direct_split_output = splits > 1 and getattr(
+            metadata, "_fp4_mla_splitkv_direct_output", True
+        )
         kernel_output = output
         kernel_softmax_stats = None
         if softmax_stats_tensor is not None:
@@ -1072,41 +1241,68 @@ def run_fp4_mla_attention_decode(
                 (2, num_queries, physical_heads),
                 dtype=torch.float32,
                 device=output.device,
+                shared=False,
+                capacity_numel=2 * _max_sequences(metadata) * query_len_per_seq * physical_heads,
             )
-        if num_heads < physical_heads:
+        if num_heads < physical_heads and not direct_split_output:
             kernel_output = _ensure_workspace_tensor(
                 metadata,
                 "_fp4_mla_cutedsl_output_buf",
-                (num_queries, physical_heads, kv_lora_rank),
+                (q_batch_capacity, physical_heads, kv_lora_rank),
                 dtype=output.dtype,
                 device=output.device,
-            )
+                shared=False,
+            )[:num_queries]
 
-        run_trtllm_fp4_mla_decode_page_native_from_raw(
-            kernel_q,
-            kernel_q_sf,
-            kv_cache,
-            sf_cache,
-            core_v_packed,
-            core_v_sf,
-            global_scale,
-            src_page_ids,
-            metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
-            kv_lens,
-            kernel_output,
-            max_kv_len=max_pages * metadata.page_size,
-            sm_scale=float(sm_scale),
-            num_heads=physical_heads,
-            q_global_scale=q_global_scale,
-            page_size=metadata.page_size,
-            query_len_per_seq=query_len_per_seq,
-            v_page_offset=v_page_offset,
-            q_batch_capacity=q_batch_capacity,
-            partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
-            softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
-            softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
-            helix_kv_bounds=helix_kv_bounds,
-        )
+        if splits > 1:
+            run_fp4_mla_splitkv(
+                _fp4_mla_cutedsl_kernel_module(),
+                metadata,
+                kernel_q,
+                kernel_q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                kernel_output,
+                splits=splits,
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                q_global_scale=q_global_scale,
+                query_len_per_seq=query_len_per_seq,
+                v_page_offset=v_page_offset,
+                q_batch_capacity=q_batch_capacity,
+            )
+        else:
+            run_trtllm_fp4_mla_decode_page_native_from_raw(
+                kernel_q,
+                kernel_q_sf,
+                kv_cache,
+                sf_cache,
+                core_v_packed,
+                core_v_sf,
+                global_scale,
+                src_page_ids,
+                metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                kv_lens,
+                kernel_output,
+                max_kv_len=max_pages * metadata.page_size,
+                sm_scale=float(sm_scale),
+                num_heads=physical_heads,
+                q_global_scale=q_global_scale,
+                page_size=metadata.page_size,
+                query_len_per_seq=query_len_per_seq,
+                v_page_offset=v_page_offset,
+                q_batch_capacity=q_batch_capacity,
+                partition_runtime_valid_k=bool(getattr(metadata, "is_cuda_graph", False)),
+                softmax_row_max=(None if kernel_softmax_stats is None else kernel_softmax_stats[0]),
+                softmax_row_sum=(None if kernel_softmax_stats is None else kernel_softmax_stats[1]),
+                helix_kv_bounds=helix_kv_bounds,
+            )
         if kernel_output is not output:
             output.copy_(kernel_output[:, :num_heads])
         if kernel_softmax_stats is not None:
@@ -1121,6 +1317,7 @@ def run_fp4_mla_attention_decode(
         (max(total_p_rows, 1), metadata.page_size // 2),
         dtype=torch.uint8,
         device=q.device,
+        shared=True,
     )[:total_p_rows]
     p_sf = _ensure_workspace_tensor(
         metadata,
@@ -1128,6 +1325,7 @@ def run_fp4_mla_attention_decode(
         (max(_get_fp4_mla_swizzled_scale_size(total_p_rows, metadata.page_size), 1),),
         dtype=torch.float8_e4m3fn,
         device=q.device,
+        shared=True,
     )
     stats_shape = (num_queries, num_heads)
     max_scores = _ensure_workspace_tensor(
@@ -1136,6 +1334,7 @@ def run_fp4_mla_attention_decode(
         stats_shape,
         dtype=torch.float32,
         device=q.device,
+        shared=True,
     )
     denom = _ensure_workspace_tensor(
         metadata,
@@ -1143,6 +1342,7 @@ def run_fp4_mla_attention_decode(
         stats_shape,
         dtype=torch.float32,
         device=q.device,
+        shared=True,
     )
 
     if backend != "triton":
@@ -1153,11 +1353,9 @@ def run_fp4_mla_attention_decode(
         )
 
     # Self-contained public-Triton path: TMA-loaded QK + fused page-stats pack,
-    # reduce-stats, prob-scale, and PV with an optional prepacked V cache.
+    # reduce-stats, prob-scale, and PV reading V directly from the paged KV cache.
     _run_triton_attention_decode(
         metadata=metadata,
-        layer_idx=layer_idx,
-        local_layer=local_layer,
         q_fp4=q_fp4,
         q_sf=q_sf.contiguous().view(-1),
         kv_cache=kv_cache,

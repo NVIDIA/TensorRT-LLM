@@ -49,12 +49,17 @@ option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_NCCL_EXTENSIONS "Build the nccl-extensions Python wheel" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
+set(TRTLLM_MODELING_V2_TARGETS
+    "all"
+    CACHE
+      STRING
+      "modeling_v2 native targets to build: all, none, or a list of <family>/<target> globs"
+)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
-option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
 option(TIMING_NVCC "Enable nvcc build timing report" OFF)
 option(ENABLE_MULTI_DEVICE
@@ -137,11 +142,6 @@ if(FAST_BUILD)
   message(WARNING "Skip some kernels to accelerate compilation")
 endif()
 
-if(INDEX_RANGE_CHECK)
-  add_compile_definitions("INDEX_RANGE_CHECK")
-  message(WARNING "Check index range to detect OOB accesses")
-endif()
-
 # Read the project version
 set(TRTLLM_VERSION_DIR ${PROJECT_SOURCE_DIR}/../tensorrt_llm)
 set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS
@@ -174,14 +174,14 @@ if(NOT TRTLLM_VERSION_H_INCLUDE_DIR STREQUAL
   include_directories(BEFORE "${TRTLLM_VERSION_H_INCLUDE_DIR}")
 endif()
 
-# Generated FMHA sources (see contextFusedMultiHeadAttention/CMakeLists.txt for
-# the full definition and default). fmha_cubin.h is included transitively by
-# headers used across several targets, so when generation is redirected out of
-# the source tree the directory must be on every target's include path, not just
-# the FMHA target's.
-if(DEFINED TRTLLM_FMHA_GEN_DIR AND NOT "${TRTLLM_FMHA_GEN_DIR}" STREQUAL "")
-  include_directories("${TRTLLM_FMHA_GEN_DIR}")
-endif()
+# Directory holding the generated FMHA sources (fmha_v2_cu/*.cu and
+# cubin/fmha_cubin.{h,cpp}). fmha_cubin.h is included transitively by headers
+# used across several targets, so the directory must be on every target's
+# include path, not just the FMHA target's.
+set(TRTLLM_FMHA_GEN_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/contextFusedMultiHeadAttention"
+    CACHE PATH "Directory containing generated FMHA sources")
+include_directories("${TRTLLM_FMHA_GEN_DIR}")
 
 setup_cuda_compiler()
 
@@ -443,6 +443,18 @@ if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   add_compile_options(-fno-plt)
   # Linker flags - applies to shared, module, and executable targets
   add_link_options(-Wl,--emit-relocs)
+  # Ubuntu's aarch64 GCC turns on -mfix-cortex-a53-843419 by default, which
+  # makes the linker rewrite some loads as a branch to a veneer that performs
+  # the load and jumps back. BOLT reads that branch as a tail call, so when it
+  # relocates the function it patches the veneer's return site with an x16
+  # trampoline and destroys a live x16. Grace is not a Cortex-A53, so the
+  # workaround only costs us correctness here. Note there is no
+  # -Wl,--no-fix-cortex-a53-843419: GNU ld rejects it, the driver flag is the
+  # only way to stop the option being passed.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND CMAKE_CXX_COMPILER_ID
+                                                        STREQUAL "GNU")
+    add_link_options(-mno-fix-cortex-a53-843419)
+  endif()
   # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
   set(CMAKE_STRIP
       ""
@@ -651,13 +663,38 @@ if(ENABLE_UCX)
     if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
       if(EXISTS "${ucxx_source_dir}/fetch_rapids.cmake")
         file(READ "${ucxx_source_dir}/fetch_rapids.cmake" FILE_CONTENTS)
+        # use GITHUB_MIRROR to download RAPIDS.cmake
         string(
           REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
                   "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
                   FILE_CONTENTS "${FILE_CONTENTS}")
+        # RAPIDS.cmake downloads the rapids-cmake archive from github.com unless
+        # rapids-cmake-url is set.
+        if(NOT FILE_CONTENTS MATCHES "rapids-cmake-url"
+           AND FILE_CONTENTS MATCHES
+               "rapids-cmake/raw/refs/heads/([^/]+)/RAPIDS\\.cmake")
+          string(
+            PREPEND
+            FILE_CONTENTS
+            "set(rapids-cmake-url \"$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/archive/refs/heads/${CMAKE_MATCH_1}.zip\")\n"
+          )
+        endif()
         file(WRITE "${ucxx_source_dir}/fetch_rapids.cmake" "${FILE_CONTENTS}")
         message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
       endif()
+      # rapids-cmake downloads CPM.cmake from github.com unless the file exists.
+      # Version and MD5 follow rapids-cmake's cpm/detail/download.cmake. If an
+      # upgraded rapids-cmake uses another CPM version, it ignores this file and
+      # downloads its own, no side effect.
+      #
+      # Update the version and MD5 when the ucxx git_tag in
+      # 3rdparty/fetch_content.json changes.
+      set(ucxx_cpm_file "${CMAKE_BINARY_DIR}/ucxx/build/cmake/CPM_0.40.0.cmake")
+      file(
+        DOWNLOAD
+        "$ENV{GITHUB_MIRROR}/cpm-cmake/CPM.cmake/releases/download/v0.40.0/CPM.cmake"
+        "${ucxx_cpm_file}"
+        EXPECTED_MD5 6c9866a0aa0f804a36fe8c3866fb8a2c)
     endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
     # error, thus using their installation script to isolate the installation

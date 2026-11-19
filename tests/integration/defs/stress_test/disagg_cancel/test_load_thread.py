@@ -55,8 +55,8 @@ def _write_load_yaml(
         generation_servers: {}
         stress_config:
           duration_min: 1
-          kv_cache_manager: v1
-          transceiver: cpp
+          kv_cache_manager: v2
+          transceiver: python
           base_concurrency: 4
           input_length:
             distribution: uniform

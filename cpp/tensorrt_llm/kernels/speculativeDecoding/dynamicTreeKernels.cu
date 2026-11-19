@@ -28,6 +28,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/common/vec_dtypes.cuh"
+#include "tensorrt_llm/kernels/fusedSampling/fusedSamplingKernels.h"
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
@@ -511,8 +512,10 @@ constexpr int32_t kMaxTriedPerLevel = 32;
 //! \param numSpeculativeTokens second dim of acceptIndex/acceptToken (= max_draft_len + 1).
 //! \param numDraftTokens      total tree nodes per request (including root).
 //! \param vocabSize           vocabulary size.
-//! \param seed                [1] int64 on GPU. Philox RNG seed.
-//! \param offset              [1] int64 on GPU. Philox RNG offset.
+//! \param seed                [batchSize] int64 on GPU. Philox RNG seed per request.
+//! \param offset              [batchSize] int64 on GPU. Philox RNG offset per request. It names the
+//!                            request's own subsequence, so the request's draws depend only on its own
+//!                            seed/offset, not on its row.
 template <int32_t BLOCK_SIZE>
 __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* draftTokens, float const* targetProbs, int32_t const* retrieveNextToken,
@@ -563,7 +566,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
     if (tid == 0)
     {
         curand_init(
-            static_cast<uint64_t>(seed[0]), static_cast<uint64_t>(bx), static_cast<uint64_t>(offset[0]), &state);
+            static_cast<uint64_t>(seed[bx]), kPerRowSubsequenceBase | static_cast<uint64_t>(offset[bx]), 0, &state);
     }
     __syncthreads();
 

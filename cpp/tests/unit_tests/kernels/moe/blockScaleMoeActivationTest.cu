@@ -75,7 +75,6 @@ using tensorrt_llm::runtime::BufferManager;
 using tensorrt_llm::runtime::CudaStream;
 using tensorrt_llm::runtime::ITensor;
 using tensorrt_llm::runtime::MemoryType;
-using tensorrt_llm::runtime::bufferCast;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -289,17 +288,17 @@ protected:
         data.mDtypeElt = tg::Dtype::E4m3;
         data.mUsePdl = usePdl;
         data.mUseDeepSeekFp8 = true;
-        data.inPtr = bufferCast<int8_t>(*mInDevice) + mPointerOffset;
-        data.outPtr = bufferCast<int8_t>(*mOutDevice) + mPointerOffset;
-        data.inDqSfsPtr = bufferCast<float>(*mInSfDevice);
-        data.outDqSfsPtr = bufferCast<float>(*mOutSfDevice);
+        data.inPtr = mInDevice->getBufferPtr<int8_t>() + mPointerOffset;
+        data.outPtr = mOutDevice->getBufferPtr<int8_t>() + mPointerOffset;
+        data.inDqSfsPtr = mInSfDevice->getBufferPtr<float>();
+        data.outDqSfsPtr = mOutSfDevice->getBufferPtr<float>();
         data.innerDim = mInnerDim;
         data.numTokens = mParam.numTokens;
         data.topK = mParam.topK;
-        data.expandedIdxToPermutedIdx = bufferCast<int32_t>(*mExpandedMapDevice);
+        data.expandedIdxToPermutedIdx = mExpandedMapDevice->getBufferPtr<int32_t>();
         data.numExperts = mParam.numExperts;
         data.tileTokensDim = tileTokensDimOverride;
-        data.totalNumPaddedTokens = bufferCast<int32_t>(*mTotalPaddedDevice);
+        data.totalNumPaddedTokens = mTotalPaddedDevice->getBufferPtr<int32_t>();
         data.swigluLimit = mParam.swigluLimit;
         data.hasSwigluLimit = mParam.hasSwigluLimit;
 

@@ -17,6 +17,10 @@
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -57,6 +61,7 @@ def _make_transceiver(**overrides: Any) -> "KvCacheTransceiverV2":
 
     tc = object.__new__(KvCacheTransceiverV2)
     tc._gen_need_sync = overrides.get("gen_need_sync", True)
+    tc._init_gen_idle_poll(False)
     tc._gen_allgather = overrides.get("gen_allgather", lambda x: [x])
     return tc
 

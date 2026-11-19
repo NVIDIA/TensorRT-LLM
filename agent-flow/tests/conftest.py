@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,23 +15,46 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def pytest_addoption(parser):
-    parser.addoption(
-        "--run-live-backends",
-        action="store_true",
-        help="Run integration checks that launch installed agent CLIs and use local account config.",
+def pytest_configure() -> None:
+    """Forget the repository the caller's environment names, before the suite runs git.
+
+    In a linked worktree git exports ``GIT_DIR`` to what it starts (``git rebase --exec``,
+    a commit hook): the fixtures' ``git init`` and ``git config`` would go there.
+    """
+    local = subprocess.run(
+        ["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True
+    )
+    for name in local.stdout.split():
+        os.environ.pop(name, None)
+
+
+def _git(repo: Path, *args: str) -> None:
+    """Run a git command in ``repo``, raising with captured output on failure."""
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
     )
 
 
-def pytest_configure(config):
-    config.addinivalue_line("markers", "live_backend: requires a configured local agent CLI")
+@pytest.fixture
+def tmp_git_repo(tmp_path: Path) -> Path:
+    """Create an initialized git repo with one commit and an explicit identity.
 
-
-def pytest_collection_modifyitems(config, items):
-    if not config.getoption("--run-live-backends"):
-        skip = pytest.mark.skip(
-            reason="requires --run-live-backends and configured local agent CLIs"
-        )
-        for item in items:
-            if "live_backend" in item.keywords:
-                item.add_marker(skip)
+    Shared by the git-worktree provider tests (``tests/test_git_worktree.py``).
+    A clean CI/sandbox environment has no global ``user.name``/``user.email``,
+    so ``git commit`` would abort. This fixture pins a local identity (and
+    disables commit signing defensively) before creating the initial commit, so
+    the repo is self-contained and deterministic.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "commit.gpgsign", "false")
+    (repo / "README.md").write_text("init\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+    return repo

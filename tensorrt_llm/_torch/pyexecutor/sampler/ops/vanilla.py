@@ -15,19 +15,12 @@
 """PyTorch-native sampling kernels.
 
 Pure tensor functions that operate on logits and probabilities with no
-dependency on the sampler_strategy interface or other backend implementation modules.
+dependency on the sampler or other backend implementation modules.
 """
 
-import math
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
-
-
-@dataclass(kw_only=True)
-class StrategyMetadata:
-    """Base class for per-strategy-group metadata passed into sample()."""
 
 
 def min_p_renorm_probs(
@@ -45,92 +38,6 @@ def min_p_renorm_probs(
     probs = probs.masked_fill(probs < thresholds, 0.0)
     probs = probs / probs.sum(dim=-1, keepdim=True)
     return probs
-
-
-def top_k_top_p_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    temperature: float,
-    top_k: Optional[int] = None,
-    top_p: float = 1.0,
-    min_p: float = 0.0,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Temperature + optional min-p / top-k / top-p filtering + multinomial sampling.
-
-    ``top_k=None`` (or ``vocab_size``) disables top-k filtering; ``top_p=1``
-    disables top-p filtering; ``min_p=0`` disables min-p filtering. With all
-    disabled this is plain temperature sampling.
-    """
-    logits_dim = logits.dim()
-    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
-    assert temperature > 0, "non-greedy sampling requires valid temperature"
-    logits = logits / max(temperature, 1e-5)
-    batch_size, vocab_size = logits.size()
-    # 0 / non-positive means "keep all" (the min_p disabled-top_k sentinel),
-    # matching sanitize_top_k on the flashinfer path.
-    if top_k is None or top_k <= 0:
-        top_k = vocab_size
-
-    assert top_k > 1, "non-greedy sampling requires valid top_k"
-    need_top_k = top_k < vocab_size
-    assert top_p > 0, "non-greedy sampling requires valid top_p"
-    need_top_p = top_p < 1
-    assert 0 <= min_p < 1, "non-greedy sampling requires valid min_p"
-    need_min_p = min_p > 0
-
-    if need_min_p:
-        # Thresholding logits at max_logit + log(min_p) keeps the tokens with
-        # prob >= min_p * max_prob; the softmax below renormalizes.
-        min_values = logits.max(dim=-1, keepdim=True).values + math.log(min_p)
-        logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
-
-    if need_top_k:
-        values, _ = torch.topk(logits, top_k, dim=-1)
-        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
-        logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
-
-    if need_top_p:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        probs_sorted = torch.softmax(sorted_logits, dim=-1)
-        # NB: must NOT use out=probs_sorted here — cumulative_probs is reused as
-        # the renormalization denominator below, after probs_sorted is masked.
-        cumulative_probs = torch.cumsum(probs_sorted, dim=-1)
-        mask_to_remove = cumulative_probs >= top_p
-        # NB: fp32 accumulation can leave every cumulative probability below
-        # top_p when top_p is very close to 1, so the search finds no 'True'
-        # and returns vocab_size. Clamping keeps the un-remove below a no-op,
-        # so such a row retains its full distribution (#19485).
-        last_index_to_keep = torch.searchsorted(
-            mask_to_remove.to(torch.int8, non_blocking=True),
-            torch.ones((1,), dtype=torch.int8, device=mask_to_remove.device).expand(
-                (mask_to_remove.size(0), 1)
-            ),
-            right=False,
-            out_int32=True,
-        ).clamp_(max=vocab_size - 1)
-        mask_to_remove.scatter_(
-            1,
-            last_index_to_keep,
-            torch.zeros((1,), dtype=torch.bool, device=mask_to_remove.device).expand_as(
-                last_index_to_keep
-            ),
-        )
-        probs_sorted.masked_fill_(mask_to_remove, 0.0)
-        probs = torch.empty_like(probs_sorted)
-        probs.scatter_(1, sorted_indices, probs_sorted)
-        probs /= cumulative_probs[
-            torch.arange(
-                cumulative_probs.size(0), dtype=torch.int32, device=cumulative_probs.device
-            ),
-            last_index_to_keep.squeeze(-1),
-        ].unsqueeze(-1)
-        del logits
-    else:
-        probs = torch.softmax(logits, dim=-1)
-
-    next_tokens = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
-    return next_tokens, probs
 
 
 def greedy_search_sampling_batch(

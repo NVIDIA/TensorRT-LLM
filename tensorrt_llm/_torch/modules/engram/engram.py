@@ -24,15 +24,49 @@ All operations run on device:
   - GPU main stream forward: SDP gating + short conv
 """
 
+import ctypes
+import hashlib
 import math
+import os
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from functools import lru_cache
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from cuda.bindings import runtime as cudart
 from tokenizers import Regex, normalizers
 from torch import nn
 from transformers import AutoTokenizer
+
+from tensorrt_llm._torch.host_staging import copy_host_to_device
+from tensorrt_llm._torch.kernels.blackwell.engram.decode_hash import (
+    compile_engram_decode_hash,
+    compile_engram_decode_refresh,
+)
+from tensorrt_llm._torch.kernels.blackwell.engram.lookup import (
+    check_lookup_geometry,
+    compile_engram_lookup,
+    packed_row_bytes,
+)
+from tensorrt_llm._utils import CUASSERT, is_blackwell_datacenter, prefer_pinned
+from tensorrt_llm.logger import logger
+
+from ._host_memory import (
+    HostNumaMem,
+    HostNumaOutOfMemoryError,
+    HostRegisteredMem,
+    ImportedHostMem,
+    host_numa_mem,
+    host_numa_node,
+    node_gpu_numa_nodes,
+)
+from ._node_share import NodeShare
+from .functional import engram_history_scatter
+
+# Decode rows up to which one single-CTA launch scatters and hashes every layer (per-layer above).
+_DECODE_REFRESH_MAX_ROWS = 64
 
 # Default Engram embedding vocabulary size per n-gram level.
 # Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
@@ -340,7 +374,7 @@ class NgramHashMapping:
 class EngramHashProvider:
     """Computes and caches n-gram hash indices for all Engram layers.
 
-    All hash computation runs on GPU using PyTorch ops. CPU-side
+    Hash computation runs on GPU using PyTorch and fused decode kernels. CPU-side
     ``NgramHashMapping`` is used only at init to derive constants
     (lookup table, multipliers, moduli) and then discarded.
 
@@ -381,22 +415,60 @@ class EngramHashProvider:
 
         self._multipliers: Dict[int, torch.Tensor] = {}
         self._modules: Dict[int, List[torch.Tensor]] = {}
+        # The same moduli as plain Python ints. They are static, so reading them
+        # out of the device tensors above with `.item()` inside the per-head hash
+        # loop costs one host sync per (layer, n-gram, head) -- 48 per forward on
+        # V4.1-Flash -- for values known at construction time.
+        self._moduli_ints: Dict[int, List[List[int]]] = {}
         for layer_id in config.layer_ids:
             self._multipliers[layer_id] = hash_mapping.layer_multipliers[layer_id].clone()
             self._modules[layer_id] = [
                 torch.tensor(ngram_head_sizes, dtype=torch.long)
                 for ngram_head_sizes in hash_mapping.vocab_size_across_layers[layer_id]
             ]
+            self._moduli_ints[layer_id] = [
+                [int(size) for size in ngram_head_sizes]
+                for ngram_head_sizes in hash_mapping.vocab_size_across_layers[layer_id]
+            ]
+        self._moduli_keys = {
+            layer_id: tuple(tuple(moduli) for moduli in self._moduli_ints[layer_id])
+            for layer_id in config.layer_ids
+        }
 
         self._device: Optional[torch.device] = None
 
-        # Cache for CUDA graph capture - stores last computed hashes.
-        # _cached_hashes points to the most-recently used entry.
-        # _cached_hashes_store keeps ALL per-shape entries alive so that
-        # CUDA graph tensor addresses remain valid after subsequent compute calls
-        # change the active shape (e.g. warmup batch_size=4 → 3 → 2 → 1).
+        # Per-shape output buffers: a CUDA graph reads its captured shape's buffers by address, so
+        # captured shapes keep theirs for good; of the other shapes only the latest is retained, as
+        # eager passes (context steps) come in arbitrary token counts. _cached_hashes selects the
+        # most recently computed shape.
         self._cached_hashes: Optional[Dict[int, torch.Tensor]] = None
         self._cached_hashes_store: Dict[tuple, Dict[int, torch.Tensor]] = {}
+        self._captured_shapes: set = set()
+        # Per shape: ``[layers, rows, heads]`` whose layer views are that shape's cached buffers.
+        self._cached_hash_stacks: Dict[tuple, torch.Tensor] = {}
+        self._multiplier_stack: Optional[torch.Tensor] = None
+        self._moduli_stack = tuple(self._moduli_keys[layer_id] for layer_id in config.layer_ids)
+
+        # Per-request history of compressed token ids, so that an n-gram at a
+        # decode step can reach the tokens that preceded it. Without this the
+        # look-back can only see the tokens inside the current forward, which is
+        # correct for a prefill and wrong for every generation step: a decode
+        # forward carries exactly one token per sequence, so every n-gram would
+        # degenerate to (pad, ..., pad, tok). Mirrors ``NgramHashState.cache`` in
+        # the reference implementation, which keeps the same per-sequence buffer
+        # for the same reason.
+        #
+        # Rows are grown on demand rather than sized from `max_batch_size` up
+        # front: the column count is `max_seq_len`, so a fixed allocation costs
+        # hundreds of MiB on a long-context config that may never use it.
+        self._history: Optional[torch.Tensor] = None
+        self._history_row_of: Dict[int, int] = {}
+        self._history_free_rows: List[int] = []
+        self._pending_history_seeds: dict[
+            int, tuple[int, tuple[int, ...], tuple[bool, ...] | None]
+        ] = {}
+        self._history_host_staging: dict = {}
+        self._decode_row_map: tuple[tuple, torch.Tensor] | None = None
 
     def _ensure_on_device(self, device: torch.device):
         """Move hash tensors to the specified device (lazy, once)."""
@@ -408,12 +480,442 @@ class EngramHashProvider:
             self._modules[layer_id] = [m.to(device) for m in self._modules[layer_id]]
         self._device = device
 
+    # Excluded image tokens and unwritten history stop n-grams across forwards.
+    _DEAD = -1
+
+    def queue_history_seed(
+        self,
+        request_id: int,
+        start_position: int,
+        token_ids: list[int],
+        token_mask: list[bool] | None = None,
+    ) -> None:
+        """Stage a new request's raw-token lookback before its first GEN forward.
+
+        Only the final ``max_ngram_size - 1`` prompt tokens are needed. Delay
+        device writes until the complete forward batch has reserved its rows.
+        False ``token_mask`` entries mark image boundaries.
+        """
+        if start_position < 0 or len(token_ids) >= self.config.max_ngram_size:
+            raise ValueError("Engram history seeds must be a nonnegative, bounded lookback")
+        if token_mask is not None and len(token_mask) != len(token_ids):
+            raise ValueError("Engram history token_mask must have one entry per token")
+        self.release_request_state(request_id)
+        self._pending_history_seeds[request_id] = (
+            start_position,
+            tuple(token_ids),
+            tuple(token_mask) if token_mask is not None else None,
+        )
+
+    def release_request_state(self, request_id: int) -> None:
+        """Discard pending and resident history ownership on completion or cancellation."""
+        self._pending_history_seeds.pop(request_id, None)
+        row = self._history_row_of.pop(request_id, None)
+        if row is not None:
+            self._history_free_rows.append(row)
+
+    def _upload_history_tensor(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        result = torch.empty_like(value, device=self._history.device)
+        copy_host_to_device(self._history_host_staging, (key, result.device), result, value)
+        return result
+
+    def _write_history(
+        self,
+        slots: list[int],
+        positions: list[int],
+        raw: list[int],
+        text_mask: list[bool],
+    ) -> None:
+        if not raw:
+            return
+        # Upload the small lookback batch once. The pinned ring retains each
+        # source until its DMA completes, including when the host runs ahead.
+        fields = [slots, positions, raw]
+        if text_mask:
+            fields.append(text_mask)
+        packed = self._upload_history_tensor(
+            "lookback", torch.tensor(fields, dtype=torch.long, device="cpu")
+        )
+        row_ids, position_ids, raw_ids = packed[:3].unbind(0)
+        compressed = self._lookup_table[raw_ids]
+        if text_mask:
+            compressed = torch.where(packed[3].bool(), compressed, self._DEAD)
+        self._history[row_ids, position_ids] = compressed.to(torch.int32)
+
+    def _consume_history_seeds(self, request_ids: list[int], rows: list[int]) -> None:
+        if not self._pending_history_seeds:
+            return
+        slots, positions, raw, text_mask, consumed = [], [], [], [], []
+        for request_id, row in zip(request_ids, rows, strict=True):
+            seed = self._pending_history_seeds.get(request_id)
+            if seed is None:
+                continue
+            start, token_ids, token_mask = seed
+            end = start + len(token_ids)
+            if end > self._history.shape[1]:
+                raise ValueError("Engram history seed exceeds the configured sequence length")
+            slots.extend([row] * len(token_ids))
+            positions.extend(range(start, end))
+            raw.extend(max(0, min(token, self._lookup_table.shape[0] - 1)) for token in token_ids)
+            text_mask.extend(token_mask if token_mask is not None else [True] * len(token_ids))
+            consumed.append(request_id)
+        self._write_history(slots, positions, raw, text_mask)
+        for request_id in consumed:
+            del self._pending_history_seeds[request_id]
+
+    def _reserve_history_rows(
+        self,
+        request_ids: List[int],
+        min_columns: int,
+        device: torch.device,
+    ) -> List[int]:
+        """Reserve rows without discarding requests absent from this forward.
+
+        Deferred requests retain their history until ``release_request_state``.
+        Recycled rows start with ``_DEAD`` cells so a completed request's tokens
+        cannot enter another request's hash.
+        """
+        history = self._history
+        if history is not None and history.device == device and history.shape[1] >= min_columns:
+            try:
+                return [self._history_row_of[request_id] for request_id in request_ids]
+            except KeyError:
+                pass
+        rows = self._history.shape[0] if self._history is not None else 0
+        columns = self._history.shape[1] if self._history is not None else 0
+        num_required_rows = len(self._history_row_of) + len(
+            set(request_ids).difference(self._history_row_of)
+        )
+        needed_rows = max(rows, 1)
+        while needed_rows < num_required_rows:
+            needed_rows *= 2
+        needed_columns = max(columns, 1)
+        while needed_columns < min_columns:
+            needed_columns *= 2
+
+        if self._history is None or needed_rows > rows or needed_columns > columns:
+            grown = torch.full(
+                (needed_rows, needed_columns),
+                self._DEAD,
+                dtype=torch.int32,
+                device=device,
+            )
+            if self._history is not None and self._history.device == device:
+                grown[:rows, :columns] = self._history
+            else:
+                # A device change invalidates the row map along with the buffer.
+                self._history_row_of = {}
+            self._history = grown
+            self._history_free_rows = [
+                row for row in range(needed_rows) if row not in set(self._history_row_of.values())
+            ]
+
+        assigned: List[int] = []
+        for request_id in request_ids:
+            row = self._history_row_of.get(request_id)
+            if row is None:
+                row = self._history_free_rows.pop()
+                # A recycled row still holds the previous request's tokens, which
+                # would otherwise be hashed into this one's first n-grams.
+                self._history[row].fill_(self._DEAD)
+                self._history_row_of[request_id] = row
+            assigned.append(row)
+        return assigned
+
+    def seed_context_history(
+        self,
+        request_ids: List[int],
+        context_prefixes: Dict[int, Tuple[int, List[int]]],
+        *,
+        max_seq_len: int,
+        device: torch.device,
+        token_masks: dict[int, list[bool]] | None = None,
+    ) -> None:
+        """Restore bounded raw-token lookback before a context chunk is hashed.
+
+        Each entry is ``request_id: (first_query_position, preceding_raw_ids)``.
+        These tokens populate history only and never add attention/query rows.
+        Generation peers retain their owned rows across context-only forwards.
+        Optional per-request text masks preserve image boundaries.
+        """
+        if not context_prefixes:
+            return
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Seed Engram context history before CUDA Graph capture")
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("Engram history requires unique active request IDs")
+        lookback = self.config.max_ngram_size - 1
+        for request_id, (start, tokens) in context_prefixes.items():
+            if request_id not in request_ids or not 0 <= start < max_seq_len:
+                raise ValueError("Engram lookback does not belong to the active context")
+            if len(tokens) != min(start, lookback):
+                raise ValueError("Engram lookback must contain every available preceding token")
+            token_mask = token_masks.get(request_id) if token_masks is not None else None
+            if token_mask is not None and len(token_mask) != len(tokens):
+                raise ValueError("Engram history token_mask must have one entry per token")
+            if any(token < 0 or token >= self._lookup_table.numel() for token in tokens):
+                raise ValueError("Engram lookback token is outside the tokenizer vocabulary")
+        self._ensure_on_device(device)
+        rows = dict(zip(request_ids, self._reserve_history_rows(request_ids, max_seq_len, device)))
+        slots, positions, raw, text_mask = [], [], [], []
+        for request_id, (start, tokens) in context_prefixes.items():
+            slots.extend([rows[request_id]] * len(tokens))
+            positions.extend(range(start - len(tokens), start))
+            raw.extend(tokens)
+            if token_masks is not None:
+                text_mask.extend(token_masks.get(request_id, [True] * len(tokens)))
+        self._write_history(slots, positions, raw, text_mask)
+
+    def _lookback_from_history(
+        self,
+        compressed: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_lens_host: torch.Tensor,
+        request_ids: List[int],
+        max_seq_len: Optional[int],
+    ) -> List[torch.Tensor]:
+        """Return the shifted n-gram inputs, reading across forward boundaries.
+
+        Writes this forward's compressed ids into each request's row at their
+        absolute positions, then gathers the ``max_ngram_size`` look-back slots
+        out of the row. This replaces left-padding the current forward's token
+        window, which silently substitutes ``pad_id`` for real history.
+        """
+        device = compressed.device
+        positions = position_ids.view(-1).long()
+        num_tokens = compressed.shape[0]
+
+        # Sizing from the runtime's sequence-length ceiling keeps this off the
+        # critical path: reading the true maximum off `positions` would mean a
+        # device-to-host sync on every forward, and the ceiling is known up
+        # front. Only a caller that cannot supply it pays for the sync.
+        min_columns = max_seq_len
+        if min_columns is None:
+            min_columns = int(positions.max().item()) + 1 if num_tokens else 1
+        rows = self._reserve_history_rows(request_ids, min_columns, device)
+        self._consume_history_seeds(request_ids, rows)
+        # Expanded on the host and copied once, rather than by a device-side
+        # `repeat_interleave`: the latter has to read the counts back to size its
+        # output, which is a full sync on the critical path.
+        row_of_token = self._upload_history_tensor(
+            "token_rows",
+            torch.repeat_interleave(
+                torch.tensor(rows, dtype=torch.long, device="cpu"),
+                seq_lens_host[: len(rows)].to(torch.long),
+            ),
+        )
+        assert row_of_token.shape[0] == num_tokens, (
+            f"engram history: seq_lens sum to {row_of_token.shape[0]} tokens but the "
+            f"forward carries {num_tokens}"
+        )
+
+        self._history[row_of_token, positions] = compressed.to(torch.int32)
+
+        shifts: List[torch.Tensor] = []
+        # `blocked` accumulates: once a shorter look-back is unusable every longer
+        # one is too, so a single dead cell truncates the n-gram rather than
+        # leaving a hole in the middle of it. This is the reference's rule.
+        blocked = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+        for shift in range(self.config.max_ngram_size):
+            source = self._history[row_of_token, (positions - shift).clamp_min(0)]
+            blocked = blocked | (positions < shift) | (source == self._DEAD)
+            shifts.append(
+                torch.where(
+                    blocked,
+                    torch.full_like(source, self._pad_id),
+                    source,
+                ).to(compressed.dtype)
+            )
+        return shifts
+
+    def _decode_history_rows(
+        self, rows: list[int], lengths: tuple[int, ...], device: torch.device
+    ) -> torch.Tensor:
+        # A stable batch needs no per-step DMA or host-buffer reuse wait. The
+        # immutable map only runs on its allocation stream; a changed key gets
+        # a new allocation, so pending readers cannot observe an overwrite.
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        key = (device, torch._C._cuda_getCurrentRawStream(index), tuple(rows), lengths)
+        if self._decode_row_map is not None and self._decode_row_map[0] == key:
+            return self._decode_row_map[1]
+        row_map = self._upload_history_tensor(
+            "decode_rows",
+            torch.tensor(rows, dtype=torch.long, device="cpu").repeat_interleave(
+                torch.tensor(lengths)
+            ),
+        )
+        self._decode_row_map = (key, row_map)
+        return row_map
+
+    def _compute_decode_hashes(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        request_ids: list[int] | None,
+        seq_lens_host: torch.Tensor | None,
+        max_seq_len: int | None,
+        token_mask: torch.Tensor | None,
+        padded_num_tokens: int | None,
+    ) -> dict[int, torch.Tensor] | None:
+        # Incomplete host metadata keeps the general path. Capture already
+        # returned its warmup buffers. Single-token unique rows fuse the
+        # scatter too. Multi-token requests, whose tokens read each other's
+        # cells, and repeated CUDA graph dummy requests scatter in one launch
+        # before any hash reads.
+        if (
+            not input_ids.is_cuda
+            or input_ids.ndim != 1
+            or not input_ids.is_contiguous()
+            or input_ids.dtype not in (torch.int32, torch.int64)
+            or position_ids is None
+            or position_ids.device != input_ids.device
+            or not position_ids.is_contiguous()
+            or position_ids.numel() != input_ids.numel()
+            or position_ids.dtype not in (torch.int32, torch.int64)
+            or request_ids is None
+            or not request_ids
+            or seq_lens_host is None
+            or seq_lens_host.device.type != "cpu"
+            or seq_lens_host.ndim != 1
+            or seq_lens_host.numel() < len(request_ids)
+            or seq_lens_host.dtype not in (torch.int32, torch.int64)
+            or type(max_seq_len) is not int
+            or max_seq_len <= 0
+            or self.config.max_ngram_size < 2
+            or self.config.n_head_per_ngram < 1
+            or not self.config.layer_ids
+            or self._pad_id is None
+            or (token_mask is not None and not token_mask.is_contiguous())
+        ):
+            return None
+        lengths = tuple(seq_lens_host[: len(request_ids)].tolist())
+        if min(lengths) < 1 or sum(lengths) != input_ids.numel():
+            return None
+
+        # Constants can move independently of retained history and captured
+        # outputs. Keep cross-device calls on the general path instead of
+        # passing another device's storage to a raw CuTe kernel.
+        if self._history is not None and self._history.device != input_ids.device:
+            return None
+        num_tokens = input_ids.numel()
+        num_output_tokens = padded_num_tokens if padded_num_tokens is not None else num_tokens
+        num_heads = (self.config.max_ngram_size - 1) * self.config.n_head_per_ngram
+        shape_key = ((num_output_tokens, num_heads),) * len(self.config.layer_ids)
+        cached = self._cached_hashes_store.get(shape_key)
+        if cached is not None and any(
+            value.device != input_ids.device for value in cached.values()
+        ):
+            return None
+
+        # Repeated IDs (CUDA graph padding) share one row; each distinct ID needs a row of its own.
+        unique_ids = len(set(request_ids))
+        scatter_first = unique_ids != len(request_ids) or len(request_ids) != input_ids.numel()
+        # Off SM100/SM103 repeated IDs keep the Torch scatter.
+        torch_scatter = unique_ids != len(request_ids) and not is_blackwell_datacenter()
+        rows = self._reserve_history_rows(request_ids, max_seq_len, input_ids.device)
+        if len(set(rows)) != unique_ids:
+            return None
+        # Row assignment and seed consumption must happen even on a map hit:
+        # a released request can immediately reuse the same physical row.
+        self._consume_history_seeds(request_ids, rows)
+        row_map = self._decode_history_rows(rows, lengths, input_ids.device)
+        if token_mask is not None:
+            token_mask = token_mask.to(device=input_ids.device)
+        if cached is None:
+            stack = torch.empty(
+                (len(self.config.layer_ids), num_output_tokens, num_heads),
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            cached = {layer_id: stack[i] for i, layer_id in enumerate(self.config.layer_ids)}
+            self._retain_hashes(shape_key, cached)
+            self._cached_hash_stacks[shape_key] = stack
+        stack = self._cached_hash_stacks.get(shape_key)
+        if (
+            is_blackwell_datacenter()
+            and scatter_first
+            and stack is not None
+            and num_output_tokens <= _DECODE_REFRESH_MAX_ROWS
+        ):
+            if self._multiplier_stack is None or self._multiplier_stack.device != input_ids.device:
+                self._multiplier_stack = torch.stack(
+                    [self._multipliers[layer_id] for layer_id in self.config.layer_ids]
+                ).to(input_ids.device)
+            compile_engram_decode_refresh(
+                self._moduli_stack,
+                self._pad_id,
+                self._DEAD,
+                token_mask is not None,
+                input_ids.dtype,
+                position_ids.dtype,
+            )(
+                input_ids.view(-1),
+                position_ids.view(-1),
+                row_map,
+                None if token_mask is None else token_mask.view(-1).view(torch.uint8),
+                self._lookup_table,
+                self._history,
+                self._multiplier_stack,
+                stack,
+                num_tokens,
+            )
+            self._cached_hashes = cached
+            return cached
+        if torch_scatter:
+            ids = input_ids.long().view(-1)
+            compressed = self._lookup_table[ids.clamp(0, self._lookup_table.shape[0] - 1)]
+            if token_mask is not None:
+                compressed = torch.where(token_mask, compressed, self._DEAD)
+            self._history[row_map, position_ids.view(-1).long()] = compressed.to(torch.int32)
+        elif scatter_first:
+            engram_history_scatter(
+                input_ids,
+                position_ids.view(-1),
+                row_map,
+                token_mask,
+                self._lookup_table,
+                self._history,
+                self._DEAD,
+            )
+        mask = (
+            None if scatter_first or token_mask is None else token_mask.view(-1).view(torch.uint8)
+        )
+        for index, layer_id in enumerate(self.config.layer_ids):
+            compile_engram_decode_hash(
+                self._moduli_keys[layer_id],
+                self._pad_id,
+                self._DEAD,
+                index == 0 and not scatter_first,
+                scatter_first,
+                mask is not None,
+                input_ids.dtype,
+                position_ids.dtype,
+            )(
+                input_ids.view(-1),
+                position_ids.view(-1),
+                row_map,
+                mask,
+                self._lookup_table,
+                self._history,
+                self._multipliers[layer_id],
+                cached[layer_id],
+                num_tokens,
+            )
+        self._cached_hashes = cached
+        return cached
+
     def compute_hashes(
         self,
         input_ids: torch.Tensor,
         seq_lens: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        request_ids: Optional[List[int]] = None,
+        seq_lens_host: Optional[torch.Tensor] = None,
+        max_seq_len: Optional[int] = None,
+        token_mask: torch.Tensor | None = None,
+        padded_num_tokens: Optional[int] = None,
     ) -> Dict[int, torch.Tensor]:
-        """Compute hash indices on GPU using PyTorch ops.
+        """Compute hash indices on GPU.
 
         Runs the compressed-tokenizer lookup, n-gram mixing, and modular
         hashing entirely on the device where ``input_ids`` resides.
@@ -428,6 +930,18 @@ class EngramHashProvider:
             seq_lens: Optional 1-D tensor of per-sequence lengths.  When
                 provided, shifted n-gram windows that would cross a
                 sequence boundary are replaced with ``pad_id``.
+            position_ids: Optional absolute position of each token, shape
+                ``[T]``.  Together with ``request_ids`` this enables the
+                per-request history buffer, which is what lets a generation
+                step's n-grams reach the tokens that came before it.  Without
+                both, the look-back is confined to this forward's tokens --
+                correct for a whole-prompt prefill, wrong for decode.
+            request_ids: Optional per-sequence request ids in the same order as
+                ``seq_lens``, used to key the history buffer.
+            token_mask: Optional ``[T]`` bool tensor, true for text. Image
+                positions hash padding and block subsequent n-gram look-back.
+            padded_num_tokens: Optional output row count for graph or collective
+                padding. Only real input tokens update the request history.
 
         Returns:
             Dictionary mapping layer_id to hash indices as torch.Tensor
@@ -435,6 +949,9 @@ class EngramHashProvider:
         """
         if torch.cuda.is_current_stream_capturing():
             if self._cached_hashes is not None:
+                self._captured_shapes.add(
+                    tuple(tuple(v.shape) for v in self._cached_hashes.values())
+                )
                 return self._cached_hashes
             raise RuntimeError(
                 "EngramHashProvider.compute_hashes() called during CUDA "
@@ -445,23 +962,58 @@ class EngramHashProvider:
         device = input_ids.device
         self._ensure_on_device(device)
 
+        T = input_ids.numel()
+        if token_mask is not None and (token_mask.dtype != torch.bool or token_mask.shape != (T,)):
+            raise ValueError("token_mask must be a bool tensor with one entry per token")
+        if padded_num_tokens is not None and (
+            type(padded_num_tokens) is not int or padded_num_tokens < T
+        ):
+            raise ValueError(
+                "Engram padded_num_tokens must be an integer >= the input token count."
+            )
+
+        decoded = self._compute_decode_hashes(
+            input_ids,
+            position_ids,
+            request_ids,
+            seq_lens_host,
+            max_seq_len,
+            token_mask,
+            padded_num_tokens,
+        )
+        if decoded is not None:
+            return decoded
+
         # 1. Compress token ids via lookup table (1-D)
         ids = input_ids.long().view(-1)
         vocab_size = self._lookup_table.shape[0]
         compressed = self._lookup_table[ids.clamp(0, vocab_size - 1)]
+        if token_mask is not None:
+            compressed = torch.where(token_mask.to(device=device), compressed, self._DEAD)
 
-        (T,) = compressed.shape
-
-        # 2. Pre-compute shifted versions (left-padded with pad_id)
-        shifts = [compressed]
-        for k in range(1, self.config.max_ngram_size):
-            padded = torch.nn.functional.pad(compressed, (k, 0), value=self._pad_id)
-            shifts.append(padded[:T])
+        use_history = (
+            position_ids is not None and request_ids is not None and seq_lens_host is not None
+        )
+        if use_history:
+            # 2. Shifted versions read out of the per-request history, which
+            # spans forwards. Absolute positions and per-request rows make the
+            # sequence-boundary masking below unnecessary: each sequence owns a
+            # row and its own position origin, so a look-back cannot reach
+            # another sequence's tokens in the first place.
+            shifts = self._lookback_from_history(
+                compressed, position_ids, seq_lens_host, list(request_ids), max_seq_len
+            )
+        else:
+            # 2. Pre-compute shifted versions (left-padded with pad_id)
+            shifts = [compressed]
+            for k in range(1, self.config.max_ngram_size):
+                padded = torch.nn.functional.pad(compressed, (k, 0), value=self._pad_id)
+                shifts.append(padded[:T])
 
         # 2b. When input_ids is a packed/flattened tensor containing multiple
         # sequences, mask out shifted positions that cross sequence boundaries
         # so n-gram hashes stay within each sequence.
-        if seq_lens is not None and seq_lens.numel() > 1:
+        if not use_history and seq_lens is not None and seq_lens.numel() > 1:
             cum_lens = torch.cumsum(seq_lens, dim=0)
             seq_starts = torch.cat(
                 [
@@ -479,6 +1031,14 @@ class EngramHashProvider:
                 boundary_mask = pos_in_seq < k  # [T]
                 shifts[k][boundary_mask] = self._pad_id
 
+        if not use_history and token_mask is not None:
+            # Apply sequence boundaries first, so an image in the preceding
+            # packed sequence cannot block this sequence's look-back.
+            blocked = torch.zeros(T, dtype=torch.bool, device=device)
+            for k, source in enumerate(shifts):
+                blocked = blocked | (source == self._DEAD)
+                shifts[k] = torch.where(blocked, self._pad_id, source)
+
         # 3. Compute hashes per layer
         result: Dict[int, torch.Tensor] = {}
         for layer_id in self.config.layer_ids:
@@ -491,19 +1051,18 @@ class EngramHashProvider:
                 for k in range(1, n):
                     mix = torch.bitwise_xor(mix, shifts[k] * multipliers[k])
 
-                moduli = self._modules[layer_id][n_gram_index]
+                moduli = self._moduli_ints[layer_id][n_gram_index]
                 for j in range(self.config.n_head_per_ngram):
-                    head_hash = mix % int(moduli[j].item())
+                    head_hash = mix % moduli[j]
                     all_hashes.append(head_hash)
 
             result[layer_id] = torch.stack(all_hashes, dim=1)
+            if padded_num_tokens is not None and padded_num_tokens > T:
+                result[layer_id] = torch.nn.functional.pad(
+                    result[layer_id], (0, 0, 0, padded_num_tokens - T)
+                )
 
-        # Cache for CUDA graph capture.
-        # Use a per-shape store so tensors captured by CUDA graphs are never
-        # garbage-collected when a subsequent call uses a different batch size.
-        # When the same shape is seen again, update the existing tensors
-        # in-place so CUDA graphs can read the freshly computed values from
-        # the same memory addresses used at capture time.
+        # Update retained per-shape buffers in place to preserve captured addresses.
         shape_key = tuple(tuple(v.shape) for v in result.values())
         if shape_key in self._cached_hashes_store:
             cached = self._cached_hashes_store[shape_key]
@@ -511,9 +1070,61 @@ class EngramHashProvider:
                 cached[layer_id].copy_(hashes)
             self._cached_hashes = cached
         else:
-            self._cached_hashes_store[shape_key] = result
+            self._retain_hashes(shape_key, result)
             self._cached_hashes = result
         return self._cached_hashes
+
+    def _retain_hashes(self, shape_key: tuple, buffers: Dict[int, torch.Tensor]) -> None:
+        """Retain a new shape's buffers, dropping the other shapes no captured graph reads."""
+        for key in [k for k in self._cached_hashes_store if k not in self._captured_shapes]:
+            del self._cached_hashes_store[key]
+            self._cached_hash_stacks.pop(key, None)
+        self._cached_hashes_store[shape_key] = buffers
+
+    def refresh_captured_hashes(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        seq_lens: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        request_ids: Optional[List[int]] = None,
+        seq_lens_host: Optional[torch.Tensor] = None,
+        max_seq_len: Optional[int] = None,
+        token_mask: torch.Tensor | None = None,
+        padded_num_tokens: Optional[int] = None,
+    ) -> Dict[int, torch.Tensor]:
+        """Refresh captured hash buffers before replay, after filling static inputs.
+
+        Call outside capture: replay does not run Python or ``compute_hashes``.
+        Reject new shapes, which allocate buffers while the graph reads old addresses.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "EngramHashProvider.refresh_captured_hashes() must not be called while the "
+                "stream is capturing. It is the replay-path counterpart of the capture "
+                "short-circuit in compute_hashes(), not a way around it."
+            )
+
+        known_shapes = set(self._cached_hashes_store)
+        result = self.compute_hashes(
+            input_ids,
+            seq_lens=seq_lens,
+            position_ids=position_ids,
+            request_ids=request_ids,
+            seq_lens_host=seq_lens_host,
+            max_seq_len=max_seq_len,
+            token_mask=token_mask,
+            padded_num_tokens=padded_num_tokens,
+        )
+        shape_key = tuple(tuple(v.shape) for v in result.values())
+        if shape_key not in known_shapes:
+            raise RuntimeError(
+                f"EngramHashProvider.refresh_captured_hashes() computed hashes of shape "
+                f"{shape_key}, for which no captured graph is reading a buffer (known "
+                f"shapes: {sorted(known_shapes)}). The recomputed values went into a fresh "
+                "allocation, so the graph about to replay would still read stale hashes."
+            )
+        return result
 
     @property
     def layer_ids(self) -> List[int]:
@@ -524,6 +1135,182 @@ class EngramHashProvider:
     def vocab_size_across_layers(self) -> Dict[int, List[List[int]]]:
         """Return the vocabulary sizes for each layer and head."""
         return self._vocab_size_across_layers
+
+
+def _bucket_offsets(list_of_N: List[int]) -> torch.Tensor:
+    """Return per-head base rows shared by the dense and FP8 table layouts."""
+    offsets = [0]
+    for n in list_of_N[:-1]:
+        offsets.append(offsets[-1] + n)
+    return torch.tensor(offsets, dtype=torch.long)
+
+
+class _CudaArrayInterfaceView:
+    """Expose a device pointer as bytes; NumPy typestr has no FP8 spelling."""
+
+    def __init__(self, ptr: int, shape: Tuple[int, ...]):
+        self.__cuda_array_interface__ = {
+            "shape": tuple(shape),
+            "typestr": "|u1",
+            "data": (int(ptr), False),
+            "strides": None,
+            "version": 3,
+        }
+
+
+def _uva_device_view(host_tensor: torch.Tensor) -> torch.Tensor:
+    """Return a zero-copy CUDA view with the pinned tensor's shape and dtype.
+
+    CUDA-allocated pinned memory shares its host and device address under UVA.
+    The byte view requires contiguous single-byte storage to preserve strides.
+    """
+    if host_tensor.device.type != "cpu":
+        raise ValueError(
+            f"A UVA device view requires a pinned CPU tensor, got {host_tensor.device}."
+        )
+    if not host_tensor.is_pinned():
+        raise ValueError(
+            "A UVA device view requires page-locked host memory; this tensor is "
+            "ordinary pageable memory, whose host address is not valid on the device."
+        )
+    if not host_tensor.is_contiguous():
+        raise ValueError("A UVA device view requires a contiguous tensor.")
+    if host_tensor.element_size() != 1:
+        raise ValueError(
+            f"A UVA device view is restricted to single-byte dtypes, got "
+            f"{host_tensor.dtype} ({host_tensor.element_size()} bytes)."
+        )
+    view = torch.as_tensor(
+        _CudaArrayInterfaceView(host_tensor.data_ptr(), host_tensor.shape),
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    return view.view(host_tensor.dtype)
+
+
+def _host_numa_table(shape: Tuple[int, ...], dtype: torch.dtype) -> Optional[torch.Tensor]:
+    """Prefer host-NUMA VMM, with a registered host mapping if its node is full; None (the
+    default pinned allocator) if VMM is unavailable or fails otherwise."""
+    device = torch.cuda.current_device()
+    numa_node = host_numa_node(device)
+    if numa_node is None:
+        return None
+    nbytes = math.prod(shape) * dtype.itemsize
+    # The driver API maps memory in the context current on this thread.
+    CUASSERT(cudart.cudaSetDevice(device))
+    try:
+        host = host_numa_mem(nbytes, device, numa_node)
+    except HostNumaOutOfMemoryError as error:
+        if not _can_use_host_pointer(device):
+            logger.warning(f"Engram: {error}; retrying with the default pinned allocator")
+            return None
+        logger.warning(
+            f"Engram: {error}; retrying with CUDA-registered host memory under the process NUMA "
+            "policy. Pages may span NUMA nodes; lookup performance may be lower."
+        )
+        host = HostRegisteredMem(nbytes, device)
+    except RuntimeError as error:
+        logger.warning(f"Engram: {error}; retrying with the default pinned allocator")
+        return None
+    return _host_bytes(host, nbytes).view(dtype).view(shape)
+
+
+def _can_use_host_pointer(device: int) -> bool:
+    """``device`` reads registered host memory at its host address."""
+    (supported,) = CUASSERT(
+        cudart.cudaDeviceGetAttribute(
+            cudart.cudaDeviceAttr.cudaDevAttrCanUseHostPointerForRegisteredMem, device
+        )
+    )
+    return bool(supported)
+
+
+def _host_bytes(host: object, nbytes: int) -> torch.Tensor:
+    """The first ``nbytes`` of a host mapping as a CPU tensor that keeps the mapping alive."""
+    raw = (ctypes.c_uint8 * nbytes).from_address(host.address)
+    # The tensor's storage keeps ``raw``, and so the mapping, alive.
+    raw.host_mem = host
+    return torch.frombuffer(raw, dtype=torch.uint8)
+
+
+# A node's workers reach a table seconds apart; one off the home node waits for home owners this long
+# in all, so a node without one costs the wait once per process.
+_OFF_HOME_CLAIM_WAIT_S = 120  # 2 min
+_off_home_waited_s = 0.0
+
+
+def _join_off_home(share: NodeShare) -> tuple[list[int], dict] | None:
+    """``share.join`` for a worker off the table's home node, out of this process's wait budget."""
+    global _off_home_waited_s
+    start = time.monotonic()
+    try:
+        return share.join(max(0.0, _OFF_HOME_CLAIM_WAIT_S - _off_home_waited_s))
+    finally:
+        _off_home_waited_s += time.monotonic() - start
+
+
+def _shared_table_home_node(own: Optional[int], tp_rank: int, tp_size: int) -> Optional[int]:
+    """Host NUMA node a node-shared table belongs on: the owner's own (``own``) if the split has one
+    shard, which has nothing to spread, or a shard per GPU, else the ``tp_rank``-th GPU host node
+    (modulo), as workers on several may share it."""
+    if own is None or tp_size == 1:
+        return own
+    gpu_nodes = node_gpu_numa_nodes()
+    homes = sorted({node for node in gpu_nodes if node >= 0})
+    if len(homes) < 2 or tp_size >= len(gpu_nodes):
+        return own
+    return homes[tp_rank % len(homes)]
+
+
+def _shareable_host_mem(nbytes: int, device: int) -> Union[HostNumaMem, HostRegisteredMem]:
+    """Host memory other processes can map: VMM on the device's host NUMA node, else a memfd."""
+    numa_node = host_numa_node(device)
+    if numa_node is not None:
+        try:
+            return host_numa_mem(nbytes, device, numa_node, shareable=True)
+        except (HostNumaOutOfMemoryError, RuntimeError) as error:
+            logger.warning(
+                f"Engram: {error}; sharing CUDA-registered host memory under the process NUMA "
+                "policy instead. Pages may span NUMA nodes; lookup performance may be lower."
+            )
+    if not _can_use_host_pointer(device):
+        raise RuntimeError(f"device {device} cannot read registered host memory in place")
+    return HostRegisteredMem(nbytes, device, shareable=True)
+
+
+def _import_host_mem(
+    fds: List[int], meta: Dict, nbytes: int, device: int
+) -> Union[ImportedHostMem, HostRegisteredMem]:
+    """Map the memory a node-share owner published, which must hold ``nbytes``."""
+    try:
+        if len(fds) != 1 or meta["size"] < nbytes:
+            raise RuntimeError(f"its owner published {len(fds)} handles of {meta['size']} bytes")
+        if meta["granularity"] is not None:
+            return ImportedHostMem(fds[0], meta["size"], meta["granularity"], device)
+        if not _can_use_host_pointer(device):
+            raise RuntimeError(f"device {device} cannot read registered host memory in place")
+        return HostRegisteredMem(meta["size"], device, fd=fds[0])
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _pinned_host_table(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Allocate a page-locked host table for random-row UVA gathers.
+
+    With base pages, nearly every row of a multi-GB table misses the GPU's
+    address-translation caches, capping the gather far below the host-link
+    bandwidth, so tables are mapped in large pages with ``HostNumaMem``. If that
+    NUMA node cannot satisfy the allocation, a CUDA-registered anonymous mapping
+    uses the process NUMA policy and requests transparent huge pages. Devices
+    without host-NUMA virtual memory management use the default pinned allocator,
+    as does construction under an init mode that defers host allocations to the
+    meta device; such tables are materialized later through this function.
+    """
+    if not torch.empty(0, dtype=dtype, device="cpu").is_meta:
+        table = _host_numa_table(shape, dtype)
+        if table is not None:
+            return table
+    return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=prefer_pinned())
 
 
 class MultiHeadEmbedding(nn.Module):
@@ -538,11 +1325,7 @@ class MultiHeadEmbedding(nn.Module):
         self.num_heads = len(list_of_N)
         self.embedding_dim = D
 
-        offsets = [0]
-        for n in list_of_N[:-1]:
-            offsets.append(offsets[-1] + n)
-
-        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
+        self.register_buffer("offsets", _bucket_offsets(list_of_N))
 
         total_N = sum(list_of_N)
         self.embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D, dtype=dtype)
@@ -684,6 +1467,38 @@ class Engram(nn.Module):
       - **No conv state for generation**: See ``ShortConv`` docstring.
     """
 
+    def _make_multi_head_embedding(self, list_of_N: List[int], D: int) -> nn.Module:
+        """Build the n-gram table.
+
+        A hook rather than a class attribute because the alternative
+        implementation (:class:`ShardedFp8MultiHeadEmbedding`) takes different
+        constructor arguments, and because the table has to be built *instead of*
+        the dense one, never alongside it: DeepSeek-V4.1's tables are 384 M rows,
+        so materializing an ``nn.Embedding`` for them would try to allocate
+        ~197 GiB before the subclass got a chance to replace it.
+        """
+        return MultiHeadEmbedding(list_of_N=list_of_N, D=D, dtype=self.config.dtype)
+
+    def _make_short_conv(self) -> Optional[nn.Module]:
+        """Build the depthwise convolution, or return None if there isn't one.
+
+        DeepSeek-V4.1's Engram has no convolution at all (its checkpoint ships no
+        conv weights), so its subclass returns None and overrides ``forward``.
+        """
+        config = self.config
+        return ShortConv(
+            hidden_size=config.hidden_size,
+            kernel_size=config.kernel_size,
+            dilation=config.max_ngram_size,
+            hc_mult=config.hc_mult,
+            norm_eps=config.norm_eps,
+            dtype=config.dtype,
+        )
+
+    def _make_kv_projection(self, in_features: int, out_features: int) -> nn.Module:
+        """Construct WKV without first allocating a replaced full-precision weight."""
+        return nn.Linear(in_features, out_features, bias=False, dtype=self.config.dtype)
+
     def __init__(
         self,
         layer_id: int,
@@ -722,20 +1537,16 @@ class Engram(nn.Module):
 
         dtype = config.dtype
 
-        self.multi_head_embedding = MultiHeadEmbedding(
-            list_of_N=vocab_sizes_flat,
-            D=embed_dim_per_head,
-            dtype=dtype,
+        # Kept so subclasses (and weight-loading checks) can see the per-head
+        # bucket sizes without re-deriving them from the table's offsets.
+        self.vocab_sizes_flat = list(vocab_sizes_flat)
+        self.embed_dim_per_head = embed_dim_per_head
+
+        self.multi_head_embedding = self._make_multi_head_embedding(
+            vocab_sizes_flat, embed_dim_per_head
         )
 
-        self.short_conv = ShortConv(
-            hidden_size=config.hidden_size,
-            kernel_size=config.kernel_size,
-            dilation=config.max_ngram_size,
-            hc_mult=config.hc_mult,
-            norm_eps=config.norm_eps,
-            dtype=dtype,
-        )
+        self.short_conv = self._make_short_conv()
 
         engram_hidden_size = (config.max_ngram_size - 1) * config.n_embed_per_ngram
         hc = config.hc_mult
@@ -743,7 +1554,7 @@ class Engram(nn.Module):
 
         # Fused projection: one GEMM produces value (1 head) + all keys (hc_mult heads).
         # Output layout: [value (D) | key_0 (D) | key_1 (D) | ... | key_{hc-1} (D)]
-        self.kv_proj = nn.Linear(engram_hidden_size, (1 + hc) * D, bias=False, dtype=dtype)
+        self.kv_proj = self._make_kv_projection(engram_hidden_size, (1 + hc) * D)
 
         # Per-HC-stream RMSNorm weights for keys and queries, stored as
         # stacked parameters so we can apply a single vectorised norm
@@ -759,33 +1570,37 @@ class Engram(nn.Module):
         self,
         hash_indices: torch.Tensor,
         dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """Pre-compute embeddings from hash indices.
 
-        When a stream was supplied at construction time, the work is
-        dispatched onto that stream (overlapping with the main stream) and
-        ``sync_event`` is recorded so the caller can synchronize before
-        consuming the result.  When no stream is set the computation runs
-        on the current stream synchronously and ``sync_event`` is None.
+        With an auxiliary stream, the caller must wait on ``sync_event`` before
+        consuming the result. Otherwise, lookup runs on the current stream.
 
         Args:
             hash_indices: Hash indices of shape ``[T, num_heads]`` on GPU.
             dtype: Cast embeddings to this dtype after lookup.
                 If None, uses the embedding's native dtype.
+            all_rank_num_tokens: Unused for replicated tables; accepted for subclasses.
 
         Returns:
             Embedding tensor of shape ``[T, num_heads * embed_dim_per_head]``.
         """
         if self.stream is not None:
-            # Fork: let the engram stream wait for any pending main-stream work
-            # (e.g. hash computation) before we start the embedding lookup.
-            self.stream.wait_stream(torch.cuda.current_stream())
+            # Wait for caller-stream hash production before lookup.
+            caller_stream = torch.cuda.current_stream()
+            self.stream.wait_stream(caller_stream)
+            # Ordering does not prevent allocator reuse after the caller drops
+            # its reference; keep the input alive through the side-stream read.
+            hash_indices.record_stream(self.stream)
             with torch.cuda.stream(self.stream):
                 embeddings = self.multi_head_embedding(hash_indices)
                 embeddings = embeddings.flatten(start_dim=-2)
                 if dtype is not None:
                     embeddings = embeddings.to(dtype)
                 self.sync_event.record()
+            # Keep side-stream output alive through the caller's pending reads.
+            embeddings.record_stream(caller_stream)
         else:
             embeddings = self.multi_head_embedding(hash_indices)
             embeddings = embeddings.flatten(start_dim=-2)
@@ -844,3 +1659,432 @@ class Engram(nn.Module):
 
         output = value + self.short_conv(value)
         return output
+
+
+@lru_cache(maxsize=None)
+def _multi_processor_count(device_index: int) -> int:
+    """Cache the fixed per-device SM count to avoid repeated property queries."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+class ShardedFp8MultiHeadEmbedding(nn.Module):
+    """Sharded E4M3 (MXFP8) or, with ``mxfp4``, packed E2M1 (MXFP4) n-gram rows with one E8M0 scale
+    per ``block_size`` lanes; lookups return the same values and packed rows for both formats.
+
+    With TP > 1 and ``num_heads % tp_size == 0``, each rank owns contiguous heads
+    and their buckets. Lookup returns local heads for the caller's all-gather.
+    Otherwise, ranks own contiguous row ranges, return zero for unowned rows,
+    and the caller combines full-width contributions with a sum all-reduce.
+    ``shard_heads`` selects the collective in ``DeepseekV41Engram.precompute``.
+
+    Both shard layouts stay in pinned host memory; lookup reads them through UVA.
+    The default scale block size is 32 lanes. Processes of one node and user that pass
+    the same ``share_key`` map one copy, which ``load_weights`` elects an owner to load;
+    the others' copy is complete after ``post_load_weights``.
+    """
+
+    def __init__(
+        self,
+        list_of_N: List[int],
+        D: int,
+        block_size: int = 32,
+        dtype: Optional[torch.dtype] = None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        share_key: Optional[str] = None,
+        mxfp4: bool = False,
+    ):
+        super().__init__()
+        if D % block_size != 0:
+            raise ValueError(
+                f"Engram embedding dim {D} is not a multiple of the block size "
+                f"{block_size}; the checkpoint stores one exponent per block, so a "
+                "partial trailing block has no scale to dequantize it with."
+            )
+        check_lookup_geometry(D, block_size)
+        self.num_heads = len(list_of_N)
+        self.embedding_dim = D
+        self.block_size = block_size
+        self.mxfp4 = mxfp4
+        self._row_bytes = D // 2 if mxfp4 else D
+        self._weight_dtype = torch.uint8 if mxfp4 else torch.float8_e4m3fn
+        self.dtype = dtype if dtype is not None else torch.bfloat16
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        # Regular checkpoint loading fills pinned allocations in place; other loaders may
+        # replace them.
+        self._requires_regular_checkpoint_loading = True
+        # Rebuild UVA views when host addresses change to avoid stale pointers.
+        self._views: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._views_src: Optional[Tuple[int, int]] = None
+
+        self.num_embeddings = sum(list_of_N)
+        # Head all-gather requires equal widths; use row shards for uneven splits.
+        self.shard_heads = tp_size > 1 and self.num_heads % tp_size == 0
+        offsets = _bucket_offsets(list_of_N)
+
+        if self.shard_heads:
+            heads_per_rank = self.num_heads // tp_size
+            self.head_start = tp_rank * heads_per_rank
+            head_end = self.head_start + heads_per_rank
+            self.num_local_heads = heads_per_rank
+            self.vocab_start_idx = int(offsets[self.head_start])
+            self.vocab_end_idx = self.vocab_start_idx + sum(list_of_N[self.head_start : head_end])
+            self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
+            # Owned heads use local row offsets; both layouts register the same buffer.
+            offsets = offsets[self.head_start : head_end] - self.vocab_start_idx
+        else:
+            self.head_start = 0
+            self.num_local_heads = self.num_heads
+            # Match the reference's ceil-divided row ranges, with a short final shard.
+            self.part_num_embeddings = (self.num_embeddings + tp_size - 1) // tp_size
+            self.vocab_start_idx = tp_rank * self.part_num_embeddings
+            self.vocab_end_idx = min(
+                self.vocab_start_idx + self.part_num_embeddings, self.num_embeddings
+            )
+
+        self.register_buffer("offsets", offsets)
+
+        self._share_name: Optional[str] = None
+        self._share_spec = ""
+        # The owner of a node-shared table serves it while this module lives.
+        self._share: Optional[NodeShare] = None
+        # An importer's checkpoint rows until its owner marks the table ready.
+        self._share_source: Optional[Dict] = None
+        if share_key is not None:
+            self._share_spec = (
+                f"{share_key} heads {self.num_heads} rows {self.num_embeddings} "
+                f"tp {tp_rank}/{tp_size} dim {D} block {block_size} {'e2m1' if mxfp4 else 'e4m3'}"
+            )
+            digest = hashlib.blake2b(f"{os.getuid()} {self._share_spec}".encode(), digest_size=16)
+            self._share_name = f"trtllm-engram-{digest.hexdigest()}"
+
+        # Override the model's CUDA construction context for table storage.
+        if not prefer_pinned():
+            raise RuntimeError("Engram tables require the pinned-memory runtime policy")
+        weight_shape = (self.part_num_embeddings, self._row_bytes)
+        scale_shape = (self.part_num_embeddings, D // block_size)
+        if share_key is None:
+            weight = _pinned_host_table(weight_shape, self._weight_dtype)
+            scale = _pinned_host_table(scale_shape, torch.float8_e8m0fnu)
+        else:
+            # load_weights places a node-shared table once its owner is elected.
+            weight = torch.empty(weight_shape, dtype=self._weight_dtype, device="meta")
+            scale = torch.empty(scale_shape, dtype=torch.float8_e8m0fnu, device="meta")
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.scale = nn.Parameter(scale, requires_grad=False)
+
+    def _materialize_pinned(self) -> None:
+        """Materialize meta shards directly on the host, without an HBM staging copy."""
+        for name in ("weight", "scale"):
+            param = self._parameters[name]
+            if param.device.type == "cpu" and param.is_pinned():
+                continue
+            if param.device.type != "meta":
+                raise RuntimeError(
+                    f"Engram {name} must be meta or pinned CPU memory, got {param.device}"
+                )
+            if not prefer_pinned():
+                raise RuntimeError("Engram tables require the pinned-memory runtime policy")
+            pinned = nn.Parameter(
+                _pinned_host_table(tuple(param.shape), param.dtype), requires_grad=False
+            )
+            if not pinned.is_pinned():
+                raise RuntimeError(f"Engram {name} allocation is not pinned")
+            self.register_parameter(name, pinned)
+
+    def _apply(
+        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
+    ) -> "ShardedFp8MultiHeadEmbedding":
+        """Preserve table dtypes and pinned host addresses across model transforms."""
+        # Materialization and model.to("cuda") must preserve pinned tables while
+        # offsets and other device buffers still follow the model.
+        host_parameters = {name: self._parameters.pop(name) for name in ("weight", "scale")}
+        try:
+            result = super()._apply(fn, recurse=recurse)
+        finally:
+            self._parameters.update(host_parameters)
+        if self._share_name is None:
+            self._materialize_pinned()
+        return result
+
+    def load_weights(self, weights: List[Dict]) -> None:
+        """Load this rank's rows from full-height checkpoint weights and scales.
+
+        Slice safetensors lazily so unowned rows are not read into host memory.
+        """
+        weights = weights[0] if isinstance(weights, list) else weights
+        if self._share_name is not None and self._load_node_shared(weights):
+            return
+        self._materialize_pinned()
+        self._load_rows(weights)
+
+    def _load_node_shared(self, weights: Dict) -> bool:
+        """Map the node's copy of this table, or allocate, serve and fill it if this process is
+        elected its owner; False, after one warning, if this process must load a private copy.
+
+        The owner serves the memory before it fills it, so in ``load_weights`` an importer waits
+        only for an owner to be elected and to allocate, and for the content in
+        ``post_load_weights``: a rank of a multi-rank worker never waits on another worker's
+        weight load while its own peers may still need it in a collective of the weight load.
+        """
+        share = NodeShare(self._share_name)
+        device = torch.cuda.current_device()
+        # The driver API maps memory in the context current on this thread.
+        CUASSERT(cudart.cudaSetDevice(device))
+        try:
+            own = host_numa_node(device)
+            home = _shared_table_home_node(own, self.tp_rank, self.tp_size)
+            # CUDA allocates host-NUMA memory only on the owner's node, so off-home workers let a home one claim.
+            received = _join_off_home(share) if home != own else share.join(0.0)
+            if received is None:
+                host = _shareable_host_mem(self._table_bytes(), device)
+                registered = isinstance(host, HostRegisteredMem)
+                # A memfd has no VMM granularity; importers map it instead.
+                share.publish(
+                    [host.export_fd()],
+                    {"size": host.size, "granularity": None if registered else host.granularity},
+                )
+            else:
+                host = _import_host_mem(*received, self._table_bytes(), device)
+            views = self._table_views(host)
+        except (OSError, RuntimeError, ValueError) as error:
+            share.close()
+            logger.warning(
+                f"Engram: cannot share table ({self._share_spec}): {error}; loading a private copy"
+            )
+            return False
+        self._share = share
+        for name, view in zip(("weight", "scale"), views):
+            self.register_parameter(name, nn.Parameter(view, requires_grad=False))
+        if received is not None:
+            # Checked against this process's checkpoint once the owner marks the table ready.
+            self._share_source = weights
+            return True
+        try:
+            self._load_rows(weights)
+        except BaseException:
+            # Processes waiting for this owner elect another one.
+            share.close()
+            raise
+        share.mark_ready()
+        place = "in registered memory" if registered else f"on NUMA node {host.numa_node}"
+        logger.info(
+            f"Engram: serving node-shared table ({self._share_spec}), "
+            f"{host.size / (1 << 30):.1f} GiB {place}"
+        )
+        return True
+
+    def post_load_weights(self) -> None:
+        self.wait_shared_ready()
+
+    def wait_shared_ready(self) -> None:
+        """Importer of a node-shared table: wait until its owner marks the table ready and check
+        it against this process's checkpoint; elect again if the owner left first, and load a
+        private copy if the rows differ, the owner is too late or this process cannot share."""
+        while self._share_source is not None:
+            weights, self._share_source = self._share_source, None
+            try:
+                ready = self._share.wait_ready()
+            except TimeoutError as error:
+                logger.warning(
+                    f"Engram: cannot share table ({self._share_spec}): {error}; loading a private "
+                    "copy"
+                )
+            else:
+                if ready:
+                    if self._rows_match((self.weight.data, self.scale.data), weights):
+                        logger.info(
+                            f"Engram: mapped node-shared table ({self._share_spec}); "
+                            "checkpoint rows match"
+                        )
+                        return
+                    logger.warning(
+                        f"Engram: cannot share table ({self._share_spec}): its rows differ from "
+                        "this process's checkpoint; loading a private copy"
+                    )
+                else:
+                    logger.info(
+                        f"Engram: the owner of node-shared table ({self._share_spec}) left before "
+                        "filling it; electing again"
+                    )
+                    self._release_shared()
+                    if self._load_node_shared(weights):
+                        continue
+            self._release_shared()
+            self._materialize_pinned()
+            self._load_rows(weights)
+
+    def _release_shared(self) -> None:
+        """Drop this process's mapping of a node-shared table; the table is meta until reloaded."""
+        if self._share is not None:
+            self._share.close()
+            self._share = None
+        for name in ("weight", "scale"):
+            param = self._parameters[name]
+            meta = torch.empty(param.shape, dtype=param.dtype, device="meta")
+            self.register_parameter(name, nn.Parameter(meta, requires_grad=False))
+        self._views = self._views_src = None
+
+    def _table_bytes(self) -> int:
+        return self.part_num_embeddings * (self._row_bytes + self.embedding_dim // self.block_size)
+
+    def _table_views(self, host: object) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Weight rows, then scale rows, of one host mapping."""
+        data = _host_bytes(host, self._table_bytes())
+        split = self.part_num_embeddings * self._row_bytes
+        return (
+            data[:split].view(self._weight_dtype).view(self.part_num_embeddings, -1),
+            data[split:].view(torch.float8_e8m0fnu).view(self.part_num_embeddings, -1),
+        )
+
+    def _rows_match(self, views: Tuple[torch.Tensor, torch.Tensor], weights: Dict) -> bool:
+        """64 spread rows of this shard, read by the GPU as lookups read them, equal the checkpoint."""
+        start = self.vocab_start_idx
+        count = self.vocab_end_idx - start
+        picks = sorted({i * (count - 1) // 63 for i in range(64)})
+        index = torch.tensor(picks, device="cuda")
+        for name, view in zip(("weight", "scale"), views):
+            rows = [torch.as_tensor(weights[name][start + row : start + row + 1]) for row in picks]
+            expected = torch.cat(rows).to(view.dtype).view(torch.uint8)
+            actual = _uva_device_view(view).view(torch.uint8)[index]
+            if not torch.equal(actual, expected.to(actual.device)):
+                return False
+        return True
+
+    def _load_rows(self, weights: Dict) -> None:
+        start, end = self.vocab_start_idx, self.vocab_end_idx
+        for name, param in (("weight", self.weight), ("scale", self.scale)):
+            src = weights[name]
+            shard = src[start:end]
+            if not isinstance(shard, torch.Tensor):
+                shard = torch.as_tensor(shard)
+            rows = shard.shape[0]
+            if rows != param.shape[0]:
+                # Only the final row shard may be short by the ceil-divide remainder.
+                # Other mismatches violate the hash bucket layout.
+                if self.shard_heads or self.tp_rank != self.tp_size - 1 or rows > param.shape[0]:
+                    raise ValueError(
+                        f"Engram {name}: rank {self.tp_rank}/{self.tp_size} expected "
+                        f"{param.shape[0]} rows in [{start}, {end}) of a "
+                        f"{self.num_embeddings}-row table but the checkpoint tensor "
+                        f"yielded {rows}."
+                    )
+                param.data[:rows].copy_(shard.to(param.dtype))
+                # Valid hashes cannot reach padding; zero it defensively.
+                param.data[rows:].zero_()
+            else:
+                param.data.copy_(shard.to(param.dtype))
+
+    def storage(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return cached UVA ``(weight, scale)`` views, refreshed if host addresses change."""
+        self.wait_shared_ready()
+        src = (self.weight.data_ptr(), self.scale.data_ptr())
+        if self._views_src != src:
+            self._views = (
+                _uva_device_view(self.weight.data),
+                _uva_device_view(self.scale.data),
+            )
+            self._views_src = src
+        assert self._views is not None
+        return self._views
+
+    def forward(self, input_ids: torch.Tensor, background: bool = False) -> torch.Tensor:
+        """``[T, num_heads]`` bucket-local indices -> ``[T, num_local_heads, D]``.
+
+        Head shards return only owned heads; row shards return all heads with
+        unowned rows zeroed. The caller orders the matching collective after the
+        lookup stream. Fused dequantization avoids a full FP32 intermediate.
+
+        ``background`` caps side-stream occupancy to leave SMs for the main stream.
+        """
+        num_rows = input_ids.shape[0] * self.num_local_heads
+        out = torch.empty(
+            (input_ids.shape[0], self.num_local_heads, self.embedding_dim),
+            dtype=self.dtype,
+            device=input_ids.device,
+        )
+        if num_rows == 0:
+            return out
+        weight, scale = self.storage()
+        num_sms = _multi_processor_count(input_ids.device.index)
+        compile_engram_lookup(
+            self.head_start,
+            self.num_local_heads,
+            input_ids.shape[1],
+            self.embedding_dim,
+            self.block_size,
+            # Hashes must stay within each head's bucket. With rebased offsets,
+            # head shards own every lookup and need no ownership mask.
+            not self.shard_heads,
+            self.dtype,
+            mxfp4=self.mxfp4,
+        )(
+            weight.view(torch.uint8),
+            scale.view(torch.uint8),
+            input_ids,
+            self.offsets,
+            out.view(num_rows, self.embedding_dim),
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+            max(1, num_sms // 2) if background else num_sms,
+        )
+        return out
+
+    def empty_packed(self, num_tokens: int, device: torch.device) -> torch.Tensor:
+        """Uninitialized ``forward_packed`` rows for ``num_tokens`` tokens."""
+        return torch.empty(
+            (
+                num_tokens,
+                packed_row_bytes(self.num_local_heads, self.embedding_dim, self.block_size),
+            ),
+            dtype=torch.uint8,
+            device=device,
+        )
+
+    def forward_packed(
+        self,
+        input_ids: torch.Tensor,
+        max_ctas: Optional[int],
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """``[T, num_heads]`` indices -> uint8 rows of the owned heads' E4M3 bytes, then their
+        UE8M0 codes, padded to 16 bytes, into ``out`` (from ``empty_packed``); the lookup uses at
+        most half the SMs, or ``max_ctas`` CTAs."""
+        if (
+            out.shape[0] != input_ids.shape[0]
+            or out.dtype != torch.uint8
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "Engram packed rows must be a contiguous uint8 buffer from empty_packed"
+            )
+        if self.block_size != 32:
+            raise ValueError(
+                "Packed Engram rows feed the MXFP8 projection, which reads one scale per 32 lanes"
+            )
+        weight, scale = self.storage()
+        num_ctas = max(1, _multi_processor_count(input_ids.device.index) // 2)
+        if max_ctas is not None:
+            num_ctas = min(num_ctas, max_ctas)
+        compile_engram_lookup(
+            self.head_start,
+            self.num_local_heads,
+            input_ids.shape[1],
+            self.embedding_dim,
+            self.block_size,
+            False,
+            torch.uint8,
+            packed=True,
+            mxfp4=self.mxfp4,
+        )(
+            weight.view(torch.uint8),
+            scale.view(torch.uint8),
+            input_ids,
+            self.offsets,
+            out,
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+            num_ctas,
+        )
+        return out

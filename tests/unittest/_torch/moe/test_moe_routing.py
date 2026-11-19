@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import pickle
 import sys
+from unittest.mock import Mock
 
 import cloudpickle
 import pytest
@@ -18,8 +22,10 @@ from tensorrt_llm._torch.moe.fused_moe import (
     RenormalizeNaiveMoeRoutingMethod, SparseMixerMoeRoutingMethod,
     StaticMoeRoutingMethod, create_load_balanced_logits, create_moe)
 from tensorrt_llm._torch.moe.fused_moe import routing as moe_routing
-from tensorrt_llm._torch.moe.fused_moe.routing import \
-    get_cached_perfect_router_logits
+from tensorrt_llm._torch.moe.fused_moe.routing import (
+    get_cached_perfect_router_expert_ids, get_cached_perfect_router_logits)
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    discard_nccl_window_tensor_outputs
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 
@@ -435,6 +441,80 @@ def _make_v4_routing(top_k, n_group, topk_group, num_experts, is_hashed):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_experts", [256, 384])
+def test_deepseek_v41_image_routing_native_graph(
+        num_experts: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native image routing preserves FP32 weights and replay-time masks."""
+    num_tokens, top_k, route_scale = 17, 6, 2.5
+    logits = torch.randn(num_tokens,
+                         num_experts,
+                         generator=torch.Generator().manual_seed(17))
+    logits[0] += 100
+    logits[1] = -200
+    logits = logits.to(device="cuda", dtype=torch.bfloat16)
+    text_bias = torch.zeros(num_experts, device="cuda")
+    vision_bias = torch.zeros_like(text_bias)
+    selected_bias = torch.arange(5,
+                                 5 + top_k,
+                                 device="cuda",
+                                 dtype=torch.float32)
+    text_bias[[3, 18, 67, 100, 131, 173]] = selected_bias
+    vision_bias[[7, 34, 89, 143, 205, num_experts - 1]] = selected_bias
+    image_mask = torch.arange(num_tokens, device="cuda") % 3 == 1
+    routing = DeepSeekV4MoeRoutingMethod(
+        top_k=top_k,
+        n_group=8,
+        topk_group=4,
+        routed_scaling_factor=route_scale,
+        callable_e_score_correction_bias=lambda: text_bias,
+        callable_tid2eid=lambda: None,
+        is_hashed=False,
+        callable_e_score_correction_bias_vl=lambda: vision_bias,
+    )
+    native_gate = Mock(wraps=torch.ops.trtllm.gate_forward)
+    monkeypatch.setattr(torch.ops.trtllm, "gate_forward", native_gate)
+
+    def check(outputs: tuple[torch.Tensor, torch.Tensor],
+              mask: torch.Tensor) -> None:
+        indices, weights = outputs
+        assert indices.dtype == torch.int32
+        assert weights.dtype == torch.float32
+        assert torch.isfinite(weights).all()
+        scores = F.softplus(logits.float()).sqrt()
+        bias = torch.where(mask[:, None], vision_bias, text_bias)
+        expected_indices = (scores + bias).topk(top_k, dim=-1).indices
+        expected_weights = scores.gather(1, expected_indices)
+        expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
+        expected_weights *= route_scale
+        sorted_indices, order = indices.sort(dim=-1)
+        sorted_expected, expected_order = expected_indices.sort(dim=-1)
+        torch.testing.assert_close(sorted_indices,
+                                   sorted_expected.to(torch.int32),
+                                   rtol=0,
+                                   atol=0)
+        torch.testing.assert_close(weights.gather(1, order),
+                                   expected_weights.gather(1, expected_order),
+                                   rtol=2e-6,
+                                   atol=1e-6)
+
+    check(routing.apply_with_aux(logits, None, image_mask), image_mask)
+    native_gate.assert_called_once()
+    check(routing.apply(logits), torch.zeros_like(image_mask))
+    torch.cuda.synchronize()
+
+    native_gate.reset_mock()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = routing.apply_with_aux(logits, None, image_mask)
+    native_gate.assert_called_once()
+    for next_mask in (~image_mask, torch.zeros_like(image_mask),
+                      torch.ones_like(image_mask)):
+        image_mask.copy_(next_mask)
+        graph.replay()
+        check(graph_outputs, image_mask)
+
+
 # DSv4-Pro production: num_experts_per_tok=6, n_routed_experts=384, n_group=8,
 # topk_group=4 (verified against the deployed checkpoint config). n_group and
 # topk_group are not explicitly in the HF config; they fall back to the DSv3
@@ -554,6 +634,66 @@ def test_perfect_router_get_cached_logits_e2e(routing_name, shape):
                                                 dtype=dtype,
                                                 routing_method=routing)
     assert torch.equal(logits, logits_2)
+
+
+@pytest.mark.parametrize(
+    "num_experts,top_k,moe_ep_size",
+    [
+        pytest.param(64, 6, 4, id="small"),
+        pytest.param(384, 6, 8, id="dsv4_pro_ep8"),
+    ],
+)
+def test_perfect_router_expert_ids_balanced(num_experts, top_k, moe_ep_size):
+    """ENABLE_PERFECT_ROUTER=expert_ids: balanced ids for any token count.
+
+    Checks, on CPU, for every sender rank and a range of token counts:
+      - every EP rank and every expert receives an equal share of the routes,
+        within one;
+      - a token's routes land on distinct EP ranks and distinct experts;
+      - every call returns a view of the same table, sized to the token bound;
+      - a call above the bound raises instead of growing the table.
+    """
+    device = torch.device("cpu")
+    experts_per_rank = num_experts // moe_ep_size
+    max_num_tokens = 8192
+    moe_routing._PERFECT_ROUTER_EXPERT_IDS_CACHE.clear()
+
+    def get_ids(num_tokens, ep_rank):
+        return get_cached_perfect_router_expert_ids(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            experts_per_token=top_k,
+            moe_ep_size=moe_ep_size,
+            ep_rank=ep_rank,
+            max_num_tokens=max_num_tokens,
+            device=device)
+
+    for ep_rank in range(moe_ep_size):
+        table_ptr = None
+        for num_tokens in [1, 3, 7, 100, 1000, max_num_tokens]:
+            ids = get_ids(num_tokens, ep_rank)
+            assert ids.shape == (num_tokens, top_k)
+            assert ids.dtype == torch.int32
+            assert ids.is_contiguous()
+            if table_ptr is None:
+                table_ptr = ids.data_ptr()
+            assert ids.data_ptr() == table_ptr
+
+            rank_counts = torch.bincount(ids.flatten() // experts_per_rank,
+                                         minlength=moe_ep_size)
+            assert rank_counts.max() - rank_counts.min() <= 1
+            expert_counts = torch.bincount(ids.flatten(), minlength=num_experts)
+            assert expert_counts.max() - expert_counts.min() <= 1
+
+            if top_k <= moe_ep_size:
+                ranks = ids // experts_per_rank
+                assert all(len(set(row)) == top_k for row in ranks.tolist())
+            assert all(len(set(row)) == top_k for row in ids.tolist())
+
+        with pytest.raises(ValueError, match="max_num_tokens"):
+            get_ids(max_num_tokens + 1, ep_rank)
+
+    assert len(moe_routing._PERFECT_ROUTER_EXPERT_IDS_CACHE) == moe_ep_size
 
 
 # -----------------------------------------------------------------
@@ -831,7 +971,8 @@ def _perfect_router_worker(parallel_mode, routing_name, num_tokens, dtype,
                                    dtype=dtype,
                                    device=device)
 
-        with torch.inference_mode():
+        with torch.inference_mode(), discard_nccl_window_tensor_outputs(
+            (x, dummy_logits)):
             _ = fused_moe.forward(x,
                                   dummy_logits,
                                   all_rank_num_tokens=all_rank_num_tokens)

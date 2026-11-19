@@ -61,7 +61,7 @@ Attention-visible GPU layout.
 | Key-only MLA Attention KV | Supported; the latent Attention key is encoded as NVFP4 |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
-| DeepSeek-V4 CSA cache | Supported; the NoPE part of the compressed KV is encoded as NVFP4, the RoPE part and the indexer cache are preserved losslessly |
+| DeepSeek-V4 CSA cache | Supported; NoPE uses NVFP4 and RoPE defaults to 2FP4, or is preserved in its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly |
 
 The current implementation requires the PyTorch backend, native C++
@@ -295,14 +295,37 @@ reusable prefixes when measuring cache-capacity and hit-rate benefits.
 DeepSeek-V4 keeps its compressed sparse attention (CSA) cache as one entry per
 four tokens, each entry a 512-element row: 448 elements without positional
 encoding (NoPE) and 64 with it (RoPE), plus an indexer cache. NVFP4 cold-page
-compression encodes the 448 NoPE elements of every row as NVFP4 data with block
-scales and copies the RoPE elements and the indexer cache as they are. The
-sliding-window, HCA, and compressor caches of the model are preserved
+compression is disabled by default. When enabled, NoPE uses NVFP4 and RoPE
+defaults to two FP4 components (2FP4), matching DeepSeek-V4's native KV-cache
+approach. The second component stores the first component's quantization error.
+Their values are added before restoring the active KV dtype.
+
+`skip_rope_quantization` defaults to `false`. Set it to `true` to preserve RoPE
+in its original precision, which retains DeepSeek-V4's previous cold-page
+behavior. Alternatively, set `nvfp4_residual_dim: 0` to use single NVFP4 for
+RoPE. `nvfp4_residual_dim` defaults to `64` for 2FP4. Only `0` and `64` are supported;
+intermediate widths are rejected. Inference without cold-page compression is unchanged.
+
+| `skip_rope_quantization` | `nvfp4_residual_dim` | DeepSeek-V4 target RoPE in cold pages |
+| --- | --- | --- |
+| `false` (default) | `64` (default) | 2FP4 |
+| `false` | `0` | Single NVFP4 |
+| `true` | Either value | Original hot-cache precision |
+
+Compression may affect model accuracy. Choose the trade-off between accuracy
+and compression ratio that fits your workload and requirements.
+MTP draft KV is not excluded from cold-page compression. Its effect on draft
+acceptance rate has not been evaluated; validate this opt-in experimental
+feature on your workload.
+
+The indexer cache is always copied as it
+is, and the sliding-window, HCA, and compressor caches of the model are preserved
 losslessly in their own lifecycles.
 
 The same two configuration blocks as for the other models enable it. The
 settings below were validated with DeepSeek-V4-Flash on one node (TP=4, EP=4,
-Attention DP) and with DeepSeek-V4-Pro in disaggregated serving on GB300:
+Attention DP) and with DeepSeek-V4-Pro in disaggregated serving on GB300.
+The recipe below uses `skip_rope_quantization: true` to match those serving runs.
 
 ```yaml
 kv_cache_config:
@@ -314,6 +337,7 @@ kv_cache_config:
 kv_cache_compression_config:
   algorithm: quantization_for_cold_page
   quant: nvfp4
+  skip_rope_quantization: true
 ```
 
 DeepSeek-V4 specific requirements:
@@ -368,6 +392,26 @@ layout. For the DeepSeek-V4 CSA cache, `scale_checkpoint_path` supplies only
 the per-layer K scale; the V scale is not used, and CSA cold Pages use identity
 scales when no scale metadata is supplied. Key-only MLA and draft-model cold
 Pages currently use identity global scales.
+
+## Skipping RoPE Quantization
+
+In some models only part of each K vector carries the token's position (RoPE):
+the last 64 of the 576 numbers of an MLA vector, the first 64 of the 256 numbers
+of a Qwen3.5 head, the last 64 of the 512 numbers of a DeepSeek-V4 compressed
+entry. By default all values are quantized: DeepSeek-V4 target RoPE uses the
+2FP4 format described above, while the remaining values use single NVFP4. With
+`skip_rope_quantization: true` the RoPE part is copied unchanged and the rest
+becomes NVFP4. Original precision means the hot-cache dtype, such as FP8 or BF16;
+it does not change that dtype. RoPE preservation is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`),
+and the Qwen3.5 series. To add model support, see
+the [development guide](../../docs/source/developer-guide/kv-cache-compression-development.md#which-numbers-of-a-k-or-v-vector-become-nvfp4).
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  skip_rope_quantization: true
+```
 
 ## Enablement Checklist
 

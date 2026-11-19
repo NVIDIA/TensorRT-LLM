@@ -42,9 +42,6 @@ class LlmLauncherEnvs(StrEnum):
     TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR = "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
     TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
 
-    # Whether to use periodical responses handler in await_responses
-    TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
-
 
 _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY: bytes | None = None
 _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -155,6 +152,15 @@ def context_length_exceeded_message(max_context_length: int,
         f"This model's maximum context length is {max_context_length} tokens. "
         f"However, your messages resulted in {num_prompt_tokens} tokens. "
         "Please reduce the length of the messages.")
+
+
+def check_prompt_capacity(num_prompt_tokens: int, max_prompt_len: int) -> None:
+    """Raise ValueError with the context-length message for a prompt longer than max_prompt_len."""
+    if num_prompt_tokens > max_prompt_len:
+        raise ValueError(
+            context_length_exceeded_message(
+                max_context_length=max_prompt_len,
+                num_prompt_tokens=num_prompt_tokens))
 
 
 _CONTEXT_LENGTH_EXCEEDED_RE = re.compile(

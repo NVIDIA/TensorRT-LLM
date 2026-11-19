@@ -22,9 +22,11 @@ ct_xml_escape() {
 }
 
 # First few root-cause-shaped lines of a step log — the tail alone can miss
-# the real error when it happened early and retry spam follows.
+# the real error when it happened early and retry spam follows. grep -a
+# because an aborted MPI job can leave NUL bytes in the log, and grep would
+# then treat it as binary and stop printing matches.
 ct_first_errors() {
-    grep -m 5 -nE "Traceback \(most recent call last\)|MPI_ABORT|MPIR_Err|srun: error|Segmentation fault|CUDA error|RuntimeError|AssertionError|INIT_ERROR|TRANSFER_ERROR|WATCHDOG_KILL|EXTERNAL_TIMEOUT|EXTERNAL_KILL|PROCESS_EXIT" \
+    grep -a -m 5 -nE "Traceback \(most recent call last\)|MPI_ABORT|MPIR_Err|srun: error|Segmentation fault|CUDA error|RuntimeError|AssertionError|INIT_ERROR|TRANSFER_ERROR|UNHANDLED_ERROR|STATUS_WRITE_ERROR|WATCHDOG_KILL|EXTERNAL_TIMEOUT|EXTERNAL_KILL|PROCESS_EXIT" \
         "$1" 2>/dev/null || true
 }
 
@@ -49,16 +51,17 @@ ct_step_excerpt() {
 ct_record_step_exit() {
     local name=$1 rc=$2
     local statusFile="$precheckDir/status/$name.status"
-    # Preserve a driver's specific failure, but never let a stale/premature
-    # PASS mask the non-zero process exit observed by the gate.
-    if [ -f "$statusFile" ] && ! grep -q '^PASS' "$statusFile"; then
+    # Keep the driver's own FAIL verdict. A PASS (stale or premature) or a
+    # RUNNING placeholder (the driver died mid-run) must not hide the
+    # non-zero exit the gate observed.
+    if [ -f "$statusFile" ] && ! grep -qE '^(PASS|RUNNING)' "$statusFile"; then
         return 0
     fi
     if [ "$rc" -eq 124 ]; then
         printf 'EXTERNAL_TIMEOUT %s: step exceeded the %ss total-runtime backstop\n' \
             "$name" "${ctPrecheckTimeout:-900}" > "$statusFile"
     elif [ "$rc" -eq 137 ]; then
-        printf 'EXTERNAL_KILL %s: step received SIGKILL (possibly timeout -k escalation) before the driver wrote a verdict\n' \
+        printf 'EXTERNAL_KILL %s: step exited with code 137 (possibly timeout -k escalation, or an MPI abort after a rank error) before the driver wrote a verdict\n' \
             "$name" > "$statusFile"
     else
         printf 'PROCESS_EXIT %s: srun exited with code %s before the driver wrote a verdict\n' \
@@ -84,7 +87,7 @@ ct_print_failure_summary() {
     done
     echo ""
     echo "UCX red flags (host-staged tcp fallback / UCX errors), if any:"
-    grep -hE "sw-emul|UCX +(ERROR|WARN)" "$precheckDir"/logs/*.log 2>/dev/null | sort -u | head -20 || true
+    grep -ahE "sw-emul|UCX +(ERROR|WARN)" "$precheckDir"/logs/*.log 2>/dev/null | sort -u | head -20 || true
     echo "Full artifacts: $precheckDir (status/*.json, logs/, csv/)"
     echo "===================================================================="
 }

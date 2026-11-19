@@ -34,7 +34,7 @@ from tensorrt_llm.usage import schemas
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen3/Qwen3-0.6B"
 _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
 
@@ -127,7 +127,7 @@ class TestPayloadVerification:
         assert params["cpuArchitecture"] == platform.machine()
         assert params["cpuCount"] == os.cpu_count()
         assert params["cudaVersion"] == torch.version.cuda
-        assert params["architectureClassName"] == "LlamaForCausalLM"
+        assert params["architectureClassName"] == "Qwen3ForCausalLM"
         assert params["backend"] == "pytorch"
 
         # Step 4: String length checks (ShortString<=128, LongString<=256)

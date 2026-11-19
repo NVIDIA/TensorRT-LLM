@@ -234,6 +234,11 @@ struct ReusedBlocksByLevel
 
 using ReusedBlocksByLevelByLifeCycle = std::unordered_map<LifeCycleId, ReusedBlocksByLevel>;
 
+//! The share of each life cycle's reused blocks that a KV connector loaded from an external store
+//! rather than matching in the radix tree. Those blocks are full reused blocks that sit on no cache
+//! level, so per life cycle the by-level full split plus this count is `iterFullReusedBlocks`.
+using ConnectorReusedBlocksByLifeCycle = std::unordered_map<LifeCycleId, int64_t>;
+
 // ---------------------------------------------------------------------------
 // SsmSnapshotIterationStatsDelta — per-lifecycle counters for SSM snapshot
 // reuse in one iteration. Mirrors Python's SsmSnapshotIterationStatsDelta.

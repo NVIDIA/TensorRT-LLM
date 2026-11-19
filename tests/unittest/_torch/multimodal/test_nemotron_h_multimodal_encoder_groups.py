@@ -25,10 +25,13 @@ the class:
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import NemotronHMultimodalModel
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_multimodal_params(
@@ -45,7 +48,7 @@ def _make_multimodal_params(
         data["video"] = video
     if audio is not None:
         data["audio"] = audio
-    return MultimodalParams(multimodal_data=data, mm_item_order=None)
+    return MultimodalParams(multimodal_data=data)
 
 
 def _marker_tensor(marker: int, n: int, dim: int = 4) -> torch.Tensor:

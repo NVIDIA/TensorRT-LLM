@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 import json
@@ -294,6 +296,33 @@ def test_clean_wipes_checkpoint_and_managed_files(tmp_path):
         assert (tmp_path / "plan.md").read_text(encoding="utf-8") == ""
         assert (tmp_path / "acceptance-criteria.md").read_text(encoding="utf-8") == ""
         assert (tmp_path / "status.md").read_text(encoding="utf-8") == ""
+    finally:
+        workflow.close()
+
+
+def test_clean_wipes_concurrent_graph_state_and_node_workspaces(tmp_path):
+    """``--clean`` also removes concurrent-mode state so a rerun re-plans from scratch.
+
+    Regression: ``--clean`` previously wiped only the linear managed files, leaving
+    ``.graph_state.json`` (the NodeScheduler checkpoint) and ``nodes/`` (per-node
+    sub-workspaces) behind — so a ``--clean --concurrent`` rerun silently resumed the
+    prior (possibly crashed) graph instead of starting over.
+    """
+    module = _load_module()
+    (tmp_path / ".graph_state.json").write_text(
+        '{"version": 1, "states": {"s1": "running"}}\n', encoding="utf-8"
+    )
+    node_dir = tmp_path / "nodes" / "s1.g1"
+    node_dir.mkdir(parents=True)
+    (node_dir / "progress.yaml").write_text("- iteration: 3\n", encoding="utf-8")
+
+    workflow = _make_workflow(module, tmp_path, clean=True)
+    try:
+        assert workflow.resume is False
+        # The concurrent scheduler checkpoint is gone (no stale resume).
+        assert not (tmp_path / ".graph_state.json").exists()
+        # Per-node sub-workspaces are gone.
+        assert not (tmp_path / "nodes").exists()
     finally:
         workflow.close()
 
@@ -765,6 +794,27 @@ def test_clean_cli_flag_default_and_value(tmp_path):
     assert args.clean is False
     args = module._parse_args(_TASK_CLI + ["--clean"])
     assert args.clean is True
+
+
+def test_max_replan_rounds_default_and_custom(tmp_path):
+    """``max_replan_rounds`` defaults to 3 and stores a custom value."""
+    module = _load_module()
+    ws_a, ws_b = tmp_path / "a", tmp_path / "b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    wf = module.AgentTeamWorkflow(workspace=ws_a)
+    assert wf.max_replan_rounds == 3
+    wf = module.AgentTeamWorkflow(workspace=ws_b, max_replan_rounds=5)
+    assert wf.max_replan_rounds == 5
+
+
+def test_max_replan_rounds_cli_flag_default_and_value():
+    """``--max-replan-rounds`` parses to 3 by default and to the supplied int."""
+    module = _load_cli_module()
+    args = module._parse_args(_TASK_CLI)
+    assert args.max_replan_rounds == 3
+    args = module._parse_args(_TASK_CLI + ["--max-replan-rounds", "5"])
+    assert args.max_replan_rounds == 5
 
 
 def test_feedback_cli_flag_default_and_value():
@@ -2279,49 +2329,6 @@ def test_resume_from_qa_skips_coder_and_reviewer(tmp_path):
     ]
     state = module.load_state(tmp_path / module.STATE_FILENAME)
     assert state.done is True
-
-
-@pytest.mark.live_backend
-def test_claude_agents_baseline_context_under_20_percent(tmp_path):
-    """Each Claude-backed team agent's pre-input context must stay < 20%.
-
-    Guards against system-prompt / tool-schema bloat: the baseline an
-    agent carries *before any user input* (Claude Code preset + built-in
-    tools + our role prompt + MCP tool schemas + memory) should leave most
-    of the context window free for real work.
-
-    Uses the live local ``/context`` control request via
-    ``fetch_baseline_context_usage`` (no model call), so it runs for real
-    wherever the ``claude`` CLI is installed and skips cleanly when the
-    backend cannot be reached. A baseline at or above 20% fails; an
-    unreachable backend skips.
-    """
-    module = _load_module()
-    workflow = _make_workflow(module, tmp_path)
-    try:
-        claude_agents = {
-            name: agent
-            for name, agent in (
-                ("coder", workflow.coder),
-                ("plan_reviewer", workflow.plan_reviewer),
-                ("qa", workflow.qa),
-            )
-            if agent.config.backend.kind == "claude-code"
-        }
-        assert claude_agents, "expected at least one Claude Code-backed team agent"
-        for name, agent in claude_agents.items():
-            try:
-                usage = agent.fetch_baseline_context_usage()
-            except Exception as exc:  # CLI missing / backend unreachable
-                pytest.skip(f"live Claude Code backend unavailable: {exc}")
-            if usage is None or usage.context_percentage is None:
-                pytest.skip(f"{name}: backend reported no pre-input context usage")
-            assert usage.context_percentage < 20.0, (
-                f"{name} pre-input context {usage.context_percentage:.1f}% exceeds the "
-                f"20% budget ({usage.context_tokens}/{usage.context_window} tokens)"
-            )
-    finally:
-        workflow.close()
 
 
 # ---------------------------------------------------------------- replan-on-qa

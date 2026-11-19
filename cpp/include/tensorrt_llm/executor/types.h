@@ -200,19 +200,6 @@ enum class ModelType
     kENCODER_DECODER = 2,
 };
 
-/// @brief The batching type
-enum class BatchingType
-{
-    /// @brief STATIC refers to the traditional batching scheme with a batch of requests running in lockstep until the
-    /// full generation for all of them is complete. Requests in a batch are all padded up to the maximum input and
-    /// output sequence length of any member of the batch.
-    kSTATIC = 0,
-
-    /// @brief INFLIGHT refers to a scheme where newly arrived requests are dynamically incorporated into the batch
-    /// under execution, and requests are returned as soon as the end condition is met without any padding.
-    kINFLIGHT = 1,
-};
-
 /// @brief The policy used to select the subset of available requests in each iteration of the executor generation loop
 enum class CapacitySchedulerPolicy
 {
@@ -284,6 +271,17 @@ struct KvCacheStats
     SizeType32 missedBlocks;
     /// @brief Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
     float cacheHitRate;
+    /// @brief Host bytes held by the KV cache manager's live page slabs.
+    size_t hostSlabBytes{0};
+    // The page-table counters below cover the iterations since the previous record.
+    /// @brief Sparse-attention page-table conversions skipped because no page moved since the last one.
+    SizeType32 numPageTableReuses{0};
+    /// @brief Page-table conversions that rebuilt only the rows whose pages moved.
+    SizeType32 numPageTableRowUpdates{0};
+    /// @brief Page-table conversions that rebuilt every row.
+    SizeType32 numPageTableFullBuilds{0};
+    /// @brief Host time in full page-table rebuilds, including their host synchronization, in milliseconds.
+    double pageTableFullBuildMs{0.0};
 };
 
 /// @brief Struct that holds the stats of static batching models for a single iteration
@@ -347,6 +345,30 @@ struct InflightBatchingStats
     /// @brief Total KV context length summed across paused (preempted-decode)
     /// requests. Complements @ref numPausedRequests (count).
     SizeType32 numPausedKvTokens;
+    // The counters below cover the iterations since the previous record.
+    /// @brief Context chunks whose KV growth was given back because the iteration's forward pass was
+    /// skipped (with attention DP, when another rank had nothing to run).
+    SizeType32 numSkippedForwardCtxChunks{0};
+    /// @brief Context chunks dropped from a scheduled batch (attention-DP balance, batch waiting, the
+    /// KV-length cap), their KV growth given back.
+    SizeType32 numDroppedCtxChunks{0};
+    /// @brief Context tokens of the chunks counted by @ref numSkippedForwardCtxChunks and
+    /// @ref numDroppedCtxChunks.
+    SizeType32 numRevertedCtxTokens{0};
+    /// @brief Most disaggregated generation receives waiting at once to be posted after the forward
+    /// pass in flight.
+    SizeType32 numDeferredGenReceives{0};
+    /// @brief Host time blocked on KV admission work before posting disaggregated generation receives,
+    /// in milliseconds.
+    double genReceiveReadyWaitMs{0.0};
+    /// @brief Generation-init requests left for a later pass by max_gen_init_admissions_per_pass.
+    SizeType32 numGenInitCapHolds{0};
+    /// @brief Generation-init requests left for a later pass because its KV-transfer budget was used.
+    SizeType32 numGenInitTransferBudgetHolds{0};
+    /// @brief Scheduling passes in which context decoder-tail batching held final windows.
+    SizeType32 numCtxDecoderHoldPasses{0};
+    /// @brief Context requests whose final window decoder-tail batching held for a pass.
+    SizeType32 numCtxDecoderHeldRequests{0};
 };
 
 /// @brief Struct that holds speculative decoding stats
