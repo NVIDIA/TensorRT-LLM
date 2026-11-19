@@ -368,6 +368,13 @@ def resolve_checkpoint(
         )
     spatial = get("vae.spatial_compression")
     flow_shift = get("sampling.flow_shift")
+    if flow_shift is not None and not (
+        math.isfinite(float(flow_shift)) and float(flow_shift) > 0.0
+    ):
+        raise ValueError(
+            f"Cosmos3 config: {SCHEDULER_FILE}:flow_shift must be a positive finite number, "
+            f"got {flow_shift!r}."
+        )
     return Cosmos3Config(
         architecture=Cosmos3ArchitectureSettings(
             position_embedding_type=str(get("architecture.position_embedding_type")),

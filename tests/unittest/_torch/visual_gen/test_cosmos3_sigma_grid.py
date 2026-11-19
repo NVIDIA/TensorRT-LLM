@@ -926,6 +926,16 @@ class TestRequestPath:
         assert {key[2] for key in pipeline._scheduler_cache} == {"video", "audio", "action"}
         assert {key[0] for key in pipeline._scheduler_cache} == {"native"}
 
+    def test_native_checkpoint_without_a_shift_keeps_its_linear_grid(self):
+        policy, base = _policy(native_flow_schedule=True)
+        pipeline = _request_pipeline(policy, base)
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
+        assert pipeline.resolver.flow_shift() is None
+        with pytest.raises(_StopAfterTokenize):
+            _forward(pipeline)
+        assert pipeline.scheduler.config.use_karras_sigmas is False
+        assert float(pipeline.scheduler.config.flow_shift) == policy.checkpoint_flow_shift
+
     def test_v2v_honors_an_explicit_grid(self):
         policy, base = _policy()
         pipeline = _request_pipeline(policy, base)

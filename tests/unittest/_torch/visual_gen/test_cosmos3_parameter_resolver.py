@@ -169,6 +169,13 @@ class TestCheckpoint:
         with pytest.raises(ValueError, match="t_list must decrease"):
             _resolve(tmp_path, files)
 
+    @pytest.mark.parametrize("shift", [0, -1.0, float("inf"), float("nan")])
+    def test_scheduler_shift_must_be_positive_and_finite(self, tmp_path, shift):
+        files = _files()
+        files[SCHEDULER_FILE]["flow_shift"] = shift
+        with pytest.raises(ValueError, match="flow_shift must be a positive finite number"):
+            _resolve(tmp_path, files)
+
     def test_base_checkpoint_has_no_schedule(self, tmp_path):
         files = {k: v for k, v in _files().items() if k != SCHEDULER_FILE}
         assert _resolve(tmp_path, files).sampling.fixed_sigmas is None
