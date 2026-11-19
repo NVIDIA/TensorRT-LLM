@@ -73,8 +73,10 @@ print("RESULT " + json.dumps({"digest": hashlib.sha256(out.cpu().numpy().tobytes
 """
 
 # The same kernel through a KernelCache: it prints whether the kernel was loaded or compiled.
+_COMPILE_LINE = 'compiled = cute.compile(axpy, *fake, stream, options="--enable-tvm-ffi")'
+assert _COMPILE_LINE in _CHILD
 _KERNEL_CACHE_CHILD = _CHILD.replace(
-    'compiled = cute.compile(axpy, *fake, stream, options="--enable-tvm-ffi")',
+    _COMPILE_LINE,
     """from tensorrt_llm._torch.cute_dsl_file_cache import KernelCache
 
 cache = KernelCache("axpy", __file__)
@@ -180,3 +182,13 @@ def test_kernel_cache_loads_stored_kernels(tmp_path):
     assert "LOADED" in warm[2] and warm[0] == [], warm[2][-6000:]
     assert warm[1] == cold[1]
     assert sorted(p.suffix for p in (cache / "kernels").iterdir()) == [".json", ".o"]
+
+    # A broken entry is compiled again and replaced, and the next process loads the new one.
+    (obj,) = (cache / "kernels").glob("*.o")
+    obj.write_bytes(b"broken")
+    (repaired,) = _finish(_start(script, cache))
+    assert "COMPILED" in repaired[2], repaired[2][-6000:]
+    assert f"entry {obj.stem} unusable" in repaired[2], repaired[2][-6000:]
+    (reloaded,) = _finish(_start(script, cache))
+    assert "LOADED" in reloaded[2], reloaded[2][-6000:]
+    assert repaired[1] == reloaded[1] == cold[1]

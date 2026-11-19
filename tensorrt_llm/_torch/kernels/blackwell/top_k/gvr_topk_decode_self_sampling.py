@@ -16213,7 +16213,8 @@ def get_compiled__reg(
         assert static_k is None or static_k == static_env_bf16[2]
         assert static_npad is None or static_npad == static_env_bf16[1]
         key += ("static_env_bf16",) + static_env_bf16
-    compiled = _COMPILE_CACHE__reg.get(key)
+    # A dump needs a compile, so it skips the stored kernels.
+    compiled = dict.get(_COMPILE_CACHE__reg, key) if dump_dir else _COMPILE_CACHE__reg.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
@@ -23919,7 +23920,10 @@ def get_compiled__regclus(
         assert 0 < static_env_bf16[0] <= static_env_bf16[1]
         assert static_env_bf16[2] == tpl[3] == 1024
         key += ("static_env_bf16",) + static_env_bf16
-    compiled = _COMPILE_CACHE__regclus.get(key)
+    # A dump needs a compile, so it skips the stored kernels.
+    compiled = (
+        dict.get(_COMPILE_CACHE__regclus, key) if dump_dir else _COMPILE_CACHE__regclus.get(key)
+    )
     if compiled is None:
         from cutlass.cute import runtime as _crt
 

@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 
-from .._jit_share import _cute_identity, _export_kernel, _load_kernel
+from .._jit_share import _cute_identity, _export_kernel, _load_kernel, _trusted_dir
 from ..logger import logger
 
 _CACHE_DIR_ENV = "TRTLLM_CUTE_DSL_CACHE_DIR"
@@ -42,6 +42,8 @@ _KEY_VERSION = b"tllm-cute-dsl-file-cache-v1"
 _OPTION_PATHS = frozenset({"DumpDir"})
 # The CuTe DSL's own post-compile hook, which attaches the TVM-FFI wrapper.
 _TVM_FFI_HOOK = "CutlassBaseDSL.compile_and_cache.<locals>.post_compile_hook"
+# CuTe DSL settings under which KernelCache neither loads nor stores: compile outputs or no caching.
+_DSL_ENV_NO_REUSE = ("KEEP_", "DUMP_", "NO_CACHE", "DISABLE_FILE_CACHING")
 
 _local = threading.local()
 _file_digests: dict[tuple[str, int, int], str] = {}
@@ -50,6 +52,8 @@ _stats_lock = threading.Lock()
 # Compiles and seconds per outcome (hit, miss, uncached) for the summary at exit.
 _stats: dict[str, tuple[int, float]] = {}
 _installed = False
+# The cache directory once installed, when only this user can write to it (KernelCache).
+_kernel_root: str | None = None
 _source_digests: dict[str, str] = {}
 
 
@@ -232,7 +236,7 @@ def _log_summary() -> None:
 
 def install_cute_dsl_file_cache() -> None:
     """Install the cache when ``TRTLLM_CUTE_DSL_CACHE_DIR`` names a directory."""
-    global _installed
+    global _installed, _kernel_root
     directory = os.environ.get(_CACHE_DIR_ENV, "")
     if not directory or _installed:
         return
@@ -369,7 +373,22 @@ def install_cute_dsl_file_cache() -> None:
     compile_backend.CompilerBackend.compile = compile_cached
     atexit.register(_log_summary)
     _installed = True
+    if _trusted_dir(directory):
+        _kernel_root = directory
+    else:
+        logger.warning(
+            f"[cute_dsl_file_cache] compiled kernels are not kept: {directory} must be a "
+            "directory of this user that other users cannot write to"
+        )
     logger.info(f"[cute_dsl_file_cache] cute.compile results are cached in {directory}")
+
+
+def _dsl_env() -> str | None:
+    """The ``CUTE_DSL_*`` settings, or None when one asks for compile outputs or no caching."""
+    items = sorted((k, v) for k, v in os.environ.items() if k.startswith("CUTE_DSL_"))
+    if any(v not in ("", "0") and any(s in k for s in _DSL_ENV_NO_REUSE) for k, v in items):
+        return None
+    return repr(items)
 
 
 def _source_digest(directory: str) -> str:
@@ -391,8 +410,10 @@ class KernelCache(dict):
     A lookup that misses loads the kernel a process stored for the key, so the caller neither
     traces nor compiles it; storing a kernel exports it. An entry is keyed on ``owner``, the
     ``repr`` of the key (keys whose ``repr`` holds an object address are not kept), the
-    TensorRT-LLM and CuTe DSL versions, the GPU's compute capability and the ``.py`` files beside
-    ``source_file``. A load or export that fails leaves the caller compiling as without the cache.
+    ``CUTE_DSL_*`` settings, the TensorRT-LLM and CuTe DSL versions, the GPU's compute capability
+    and the ``.py`` files beside ``source_file``. It is used only once the cache is installed, in a
+    directory only this user can write to. A load or export that fails leaves the caller compiling
+    as without the cache.
     """
 
     def __init__(self, owner: str, source_file: str):
@@ -402,26 +423,29 @@ class KernelCache(dict):
         self._unusable: set[str] = set()
 
     def _paths(self, key):
-        directory = os.environ.get(_CACHE_DIR_ENV, "")
-        if not directory:
-            return None
+        env = _dsl_env()
         text = repr(key)
-        if " at 0x" in text:
+        if _kernel_root is None or env is None or " at 0x" in text:
             return None
         try:
-            identity = f"{_cute_identity()}|{_source_digest(self.sources)}|{self.owner}|{text}"
+            identity = (
+                f"{_KEY_VERSION.decode()}|{_cute_identity()}|{env}|"
+                f"{_source_digest(self.sources)}|{self.owner}|{text}"
+            )
         except Exception:  # noqa: BLE001 - no key: the caller compiles as without the cache
             return None
         name = "k" + hashlib.sha256(identity.encode()).hexdigest()[:32]
-        base = os.path.join(os.path.abspath(os.path.expanduser(directory)), "kernels", name)
+        base = os.path.join(_kernel_root, "kernels", name)
         return name, base + ".o", base + ".json"
 
     def __missing__(self, key):
         paths = self._paths(key)
-        if paths is None or not os.path.exists(paths[1]):
+        if paths is None or paths[1] in self._unusable or not os.path.exists(paths[1]):
             raise KeyError(key)
         name, obj, meta = paths
         try:
+            if not _trusted_dir(os.path.dirname(obj)):
+                raise PermissionError("other users can write to its directory")
             kernel = _load_kernel(obj, name, meta)
         except Exception as e:  # noqa: BLE001 - an unusable entry must never stop a compile
             self._unusable.add(obj)
