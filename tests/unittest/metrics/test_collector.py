@@ -1856,6 +1856,15 @@ def test_iteration_record_exports_rank_owned_timings_and_transfer_outcomes(colle
                 kv_transfer_outcomes=outcomes,
             ).to_dict()
         )
+    collector.log_iteration_stats(
+        {
+            "isQueueSnapshot": True,
+            "schedulerMode": "overlap",
+            "hostStepTimeMS": 0.0,
+            "prevDeviceStepTimeMS": 0.0,
+            "gpuForwardTimeMS": 0.0,
+        }
+    )
     assert scrape("host_step_time_seconds", scheduler_mode="overlap") == [0.004]
     assert scrape("prev_device_step_time_seconds", scheduler_mode="overlap") == [0.003]
     assert scrape("gpu_forward_duration_seconds_sum", scheduler_mode="overlap") == [0.006]

@@ -531,8 +531,13 @@ def test_attention_dp_idle_wait_parks_once_peer_rows_are_current(executor):
     adp_stats.last_idle_rank_states = [object(), object()]
     assert executor._plan_idle_heartbeat_wait(None) == (None, executor._idle_heartbeat_tick)
 
+    adp_stats.next_payload = lambda: SimpleNamespace(
+        has_iter_stats=0, kv_transfer_outcomes=(1, 0, 0)
+    )
+    assert executor._plan_idle_heartbeat_wait(None) == (None, executor._idle_heartbeat_tick)
+
     # Snapshots still queued behind the fanned-out one drain one per pass.
-    adp_stats.next_payload = lambda: object()
+    adp_stats.next_payload = lambda: SimpleNamespace(has_iter_stats=1)
     assert executor._plan_idle_heartbeat_wait(None) == (datetime.timedelta(0), None)
     # Ranks that are not aligned settle nothing: wait instead of spinning.
     adp_stats.last_finalize_settled = False
@@ -591,7 +596,7 @@ def _attention_dp_rank(rank, clock):
         "_append_queue_snapshot",
         "_export_adp_fanout",
         "_publish_adp_iter_stats",
-        "_publish_transfer_outcomes",
+        "_publish_rank_observations",
         "_idle_heartbeat_tick",
         "_plan_idle_heartbeat_wait",
     )
@@ -751,7 +756,7 @@ def _fetch_stub(**overrides):
     _bind(
         stub,
         "_plan_idle_heartbeat_wait",
-        "_publish_transfer_outcomes",
+        "_publish_rank_observations",
         "_has_pending_context_retirement",
     )
     return stub

@@ -1859,6 +1859,7 @@ def test_transfer_failure_is_exported_before_idle_wait_without_another_batch(mon
     executor._flush_staged_responses = Mock()
     executor.stats_lock = threading.Lock()
     executor.stats = []
+    executor._last_rank_observations = {}
     executor.max_stats_len = 10
     executor.kv_connector_manager = None
     executor.control_requests = []
@@ -1893,11 +1894,11 @@ def test_transfer_failure_is_exported_before_idle_wait_without_another_batch(mon
     executor.executor_request_queue = SimpleNamespace(get_from_request_queue=idle_wait)
     with pytest.raises(IdleWaitReached):
         executor._fetch_and_enqueue_requests([], 0)
-    executor._publish_transfer_outcomes()
+    executor._publish_rank_observations()
     assert len(executor.stats) == 1
     executor.enable_iter_perf_stats = False
     coordinator._record_transfer_outcome(_disagg_request(2, 2), "error")
-    executor._publish_transfer_outcomes()
+    executor._publish_rank_observations()
     assert len(executor.stats) == 1
 
     # Reuse the idle-wait boundary for conversation expiry and source-rank publication.
@@ -1922,7 +1923,6 @@ def test_transfer_failure_is_exported_before_idle_wait_without_another_batch(mon
     executor._conversation_manager = manager
     executor._conversation_activity_capture_time = float("-inf")
     executor._conversation_activity_cached = None
-    executor._last_published_conversation_activity = {}
     monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic", lambda: 601.0)
     for seconds in (1.0, 0.25):
         executor._idle_kv_transfer_poll_timeout = Mock(
@@ -1948,17 +1948,17 @@ def test_transfer_failure_is_exported_before_idle_wait_without_another_batch(mon
     ]
     for capacity, expected in ((0, [1]), (10, [0, 1])):
         executor.stats.clear()
-        executor._last_published_conversation_activity.clear()
+        executor._last_rank_observations.clear()
         executor.max_stats_len = capacity
-        executor._publish_conversation_activity(states)
-        executor._publish_conversation_activity(states)
+        executor._publish_rank_observations(states)
+        executor._publish_rank_observations(states)
         assert [row[1]["attentionDpRank"] for row in executor.stats] == expected
         assert [
             row[1]["conversationActivity"]["10m"]["unique"] for row in executor.stats
         ] == expected
     executor.dist.rank = 1
-    executor._last_published_conversation_activity.clear()
-    executor._publish_conversation_activity(states)
+    executor._last_rank_observations.clear()
+    executor._publish_rank_observations(states)
     assert len(executor.stats) == 2
 
 
@@ -2053,7 +2053,7 @@ def test_adp_idle_exchange_exports_current_source_rank_transfer_outcomes(payload
         executor.dist = SimpleNamespace(rank=rank)
         executor.stats_lock, executor.stats = threading.Lock(), []
         executor.max_stats_len = 2
-        executor._last_published_adp_transfer_outcomes = {}
+        executor._last_rank_observations = {}
         executor._stats_scheduler_mode = lambda: "non_overlap"
         executor._disagg_coordinator = SimpleNamespace(transfer_outcomes=(0, 0, 0))
         executor._adp_iter_stats = ADPIterStatsBuffer(
@@ -2064,7 +2064,7 @@ def test_adp_idle_exchange_exports_current_source_rank_transfer_outcomes(payload
     if payload_kind == "queued":
         stats = IterationStats()
         stats.iter, stats.inflight_batching_stats = 9, InflightBatchingStats()
-        rank1._adp_iter_stats.queue(stats, is_rank0=False, kv_transfer_outcomes=(0, 0, 0))
+        rank1._adp_iter_stats.queue(stats, is_rank0=False)
     elif payload_kind == "synthetic":
         rank1._adp_iter_stats._ensure_zero_payload(9)
     collector = MetricsCollector({"model_name": "test"}, registry=CollectorRegistry())
