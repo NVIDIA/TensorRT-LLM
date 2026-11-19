@@ -120,6 +120,7 @@ class QwenImagePipeline(BasePipeline):
             and config.quant_config.quant_algo is None
             and not config.quant_config_dict
             and not config.dynamic_weight_quant
+            and not self.scheduler.config.get("stochastic_sampling", False)
         )
 
     @property

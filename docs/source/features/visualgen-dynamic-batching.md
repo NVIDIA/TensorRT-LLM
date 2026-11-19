@@ -63,8 +63,8 @@ FLUX requests also run independently when a transformer layer uses NVFP4
 activation quantization (static or dynamic), dynamic per-tensor FP8, cuDNN FP8
 attention, TRTLLM per-tensor FP8 attention, or FlashInfer/CuTe DSL quantized attention, to
 preserve per-request image quality.
-FLUX schedulers with `stochastic_sampling` enabled also run independently because
-their denoising steps draw additional noise from the shared RNG.
+FLUX and Qwen-Image requests run independently when the scheduler enables
+`stochastic_sampling` because their denoising steps draw noise from the shared RNG.
 Each request keeps its seed and its own outputs, although batched computation
 can introduce small floating-point differences.
 

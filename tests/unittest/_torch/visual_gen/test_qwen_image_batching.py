@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn.functional as F
+from diffusers import FlowMatchEulerDiscreteScheduler
 from transformers import BatchEncoding
 
 from tensorrt_llm._torch.visual_gen.batching import BatchInfo
@@ -170,18 +171,22 @@ def test_request_batch_cannot_bypass_graph_key_with_positional_argument():
 
 
 @pytest.mark.parametrize(
-    "world_size,backend,quant,quant_dict,dynamic,expected",
+    "world_size,backend,quant,quant_dict,dynamic,stochastic,expected",
     [
-        (1, "VANILLA", None, {}, False, True),
-        (2, "VANILLA", None, {}, False, False),
-        (1, "FLASH_ATTN", None, {}, False, False),
-        (1, "VANILLA", "FP8", {}, False, False),
-        (1, "VANILLA", None, {"transformer": "FP8"}, False, False),
-        (1, "VANILLA", None, {}, True, False),
+        (1, "VANILLA", None, {}, False, False, True),
+        (1, "VANILLA", None, {}, False, True, False),
+        (2, "VANILLA", None, {}, False, False, False),
+        (1, "FLASH_ATTN", None, {}, False, False, False),
+        (1, "VANILLA", "FP8", {}, False, False, False),
+        (1, "VANILLA", None, {"transformer": "FP8"}, False, False, False),
+        (1, "VANILLA", None, {}, True, False, False),
     ],
 )
-def test_batching_capability_scope(world_size, backend, quant, quant_dict, dynamic, expected):
+def test_batching_capability_scope(
+    world_size, backend, quant, quant_dict, dynamic, stochastic, expected
+):
     pipe = QwenImagePipeline.__new__(QwenImagePipeline)
+    pipe.scheduler = FlowMatchEulerDiscreteScheduler(stochastic_sampling=stochastic)
     pipe.pipeline_config = SimpleNamespace(
         mapping=SimpleNamespace(world_size=world_size),
         attention=SimpleNamespace(backend=backend),
