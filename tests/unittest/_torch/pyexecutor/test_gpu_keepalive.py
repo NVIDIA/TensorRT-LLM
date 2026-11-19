@@ -28,6 +28,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import gpu_keepalive as ka
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 
 pytestmark = pytest.mark.cpu_only
 
@@ -324,8 +325,8 @@ def test_fill_gate_wiring():
             self.events = []
             self._staged_responses = []
             self._intake_window = threading.Event()
-            self.response_cv = threading.Condition(threading.Lock())
-            self.response_cv.notify_all = lambda: self.events.append("notify_all")
+            self._response_channel = ResponseChannel()
+            self._response_channel.response_cv.notify_all = lambda: self.events.append("notify_all")
             self.is_shutdown = False
             self.shutdown_event = threading.Event()
             self.num_micro_batches = 1

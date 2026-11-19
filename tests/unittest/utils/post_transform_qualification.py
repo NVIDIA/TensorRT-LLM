@@ -377,7 +377,8 @@ def assert_post_transform_lifecycle_equivalent(
     if case.prepare_producer is not None:
         case.prepare_producer(producer)
     model_hooks.walk_full_post_load(producer)
-    model_hooks.setup_aliases(receiver)
+    # The preparation MX runs on a qualified receiver before its weights arrive.
+    model_hooks.prepare_post_transform_receiver(receiver)
     case.prepare_receiver(producer, receiver)
 
     # Runtime finalization repeats setup_aliases(), whose contract is

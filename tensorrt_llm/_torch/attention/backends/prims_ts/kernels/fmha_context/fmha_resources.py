@@ -79,6 +79,7 @@ from ..separate_reduction import merge_log2_lse
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int16, Int32, Int64
+from ..task_compat import consumer_work_stage
 from ..tensor_map import transform_ragged_coords
 
 from cutlass.experimental.task_scheduling.enums import WorkAttr
@@ -2012,7 +2013,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
         cfg = self.cfg
         pages_per_tile = cfg.kv_tile_n // cfg.num_tokens_per_page
         window_entries = cfg.page_table_window_entries
-        stage_idx = self.state_src.consumer_work_stage
+        stage_idx = consumer_work_stage(self)
         group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(window_entries - 1)
         offset = stage_idx * Int32(window_entries) + group_page_idx
         if cutlass.const_expr(pages_per_tile <= 8):
@@ -2273,7 +2274,7 @@ class SmemSageKScalesResource(MemoryResource):
     @cute.jit
     def open_stage(self, stage_info: StageInfo) -> Int32:
         """Publish the waited stage's shared-memory offset for the passes that read it."""
-        return Int32(self._alloc.offset) + Int32(self.consumer_work_stage) * Int32(
+        return Int32(self._alloc.offset) + Int32(consumer_work_stage(self)) * Int32(
             self.cfg.sage_k_tile_bytes
         )
 
@@ -6735,6 +6736,12 @@ class TmemOResource(MemoryResource):
         self.tmem_addr_cached = Int32(0)
         self.tmem_ptr_raw_cached = _placeholder_tmem_ptr()
         self.tmem_o_addr_base_cached = Int32(0)
+        if cfg.vc_restores_means:
+            # Typed values for the mean-step state the MMA prologue caches, so
+            # every traced path that later reads it sees a value.
+            self.vc_mean_issue_cached = cutlass.Boolean(True)
+            self.vc_desc_l_cached = (Int64(0), Int64(0))
+            self.vc_idesc_mu_cached = prims.Tcgen05InstrDesc(0)
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Return the TMEM allocations for the double-buffered O accumulators."""
