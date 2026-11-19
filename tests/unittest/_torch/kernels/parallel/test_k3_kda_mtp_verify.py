@@ -150,9 +150,12 @@ def _case(heads, num_spec, batch, seed, pool=None, kvcm_v2=True):
     window = 3 + num_spec
     pool = batch + 19 if pool is None else pool
     # KV cache manager v2 (deployed) keeps each slot's state, conv state and replay buffers in per-slot blocks: slot
-    # strides beyond the dense ones (here: the state padded, the replay buffers twice the dense stride). The Python
-    # manager (MixedMambaHybridCacheManager) allocates dense per-layer tensors.
+    # strides beyond the dense ones (here: the state padded, the replay buffers twice the dense stride). It keeps the
+    # conv windows, replay caches and accepted counts in a replay pool of their own, at the requests' replay slots
+    # (here smaller than the state pool, so that a state slot used as a replay slot is out of range). The Python
+    # manager (MixedMambaHybridCacheManager) allocates dense per-layer tensors that share the state slots.
     spread = 2 if kvcm_v2 else 1
+    replay_pool = batch + 7 if kvcm_v2 else pool
 
     def rn(*shape, scale=1.0, dtype=torch.float32):
         return (torch.randn(*shape, generator=gen, device="cuda") * scale).to(dtype)
@@ -163,13 +166,14 @@ def _case(heads, num_spec, batch, seed, pool=None, kvcm_v2=True):
     bfa = rn(rows, (128 + heads + 7) // 8 * 8, dtype=BF16)
     padded = (heads + 7) // 8 * 8  # the cache manager pads beta-cache rows to 16 bytes
     beta_cache = _in_place(
-        torch.sigmoid(rn(pool, num_spec, heads)).to(BF16), (spread * num_spec * padded, padded, 1)
+        torch.sigmoid(rn(replay_pool, num_spec, heads)).to(BF16),
+        (spread * num_spec * padded, padded, 1),
     )
     slot_stride = heads * (128 * 128 + (3 * 128 * window if kvcm_v2 else 0))
     state = _in_place(
         rn(pool, heads, 128, 128, scale=0.5, dtype=BF16), (slot_stride, 128 * 128, 128, 1)
     )
-    k_cache = rn(pool, num_spec, heads, 128)
+    k_cache = rn(replay_pool, num_spec, heads, 128)
     conv_strides = (spread * window * dim, 1, dim)  # dim-contiguous [pool, dim, window]
     cache_strides = (spread * num_spec * dim, dim, 1)
     return {
@@ -186,24 +190,31 @@ def _case(heads, num_spec, batch, seed, pool=None, kvcm_v2=True):
         "dt_bias": rn(dim, scale=0.5),
         "onorm_weight": torch.linspace(0.75, 1.25, 128, device="cuda"),
         "ssm_state_indices": torch.randperm(pool, generator=gen, device="cuda")[:batch].int(),
+        "replay_state_indices": (
+            torch.randperm(replay_pool, generator=gen, device="cuda")[:batch].int()
+            if kvcm_v2
+            else None
+        ),
         "num_accepted_tokens": _counts(
             torch.randint(
-                0, num_spec + 1, (pool,), generator=gen, device="cuda", dtype=torch.int32
+                0, num_spec + 1, (replay_pool,), generator=gen, device="cuda", dtype=torch.int32
             ),
             num_spec,
             kvcm_v2,
         ),
-        "cs_q": _in_place(rn(pool, window, dim, dtype=BF16).transpose(1, 2), conv_strides),
-        "cs_k": _in_place(rn(pool, window, dim, dtype=BF16).transpose(1, 2), conv_strides),
-        "cs_v": _in_place(rn(pool, window, dim, dtype=BF16).transpose(1, 2), conv_strides),
+        "cs_q": _in_place(rn(replay_pool, window, dim, dtype=BF16).transpose(1, 2), conv_strides),
+        "cs_k": _in_place(rn(replay_pool, window, dim, dtype=BF16).transpose(1, 2), conv_strides),
+        "cs_v": _in_place(rn(replay_pool, window, dim, dtype=BF16).transpose(1, 2), conv_strides),
         "recurrent_state": state,
         "k_cache": _in_place(
-            (k_cache / k_cache.norm(dim=-1, keepdim=True)).reshape(pool, num_spec, dim).to(BF16),
+            (k_cache / k_cache.norm(dim=-1, keepdim=True))
+            .reshape(replay_pool, num_spec, dim)
+            .to(BF16),
             cache_strides,
         ),
-        "g_cache": _in_place(-5.0 * torch.sigmoid(rn(pool, num_spec, dim)), cache_strides),
+        "g_cache": _in_place(-5.0 * torch.sigmoid(rn(replay_pool, num_spec, dim)), cache_strides),
         "v_cache": _in_place(
-            torch.nn.functional.silu(rn(pool, num_spec, dim)).to(BF16), cache_strides
+            torch.nn.functional.silu(rn(replay_pool, num_spec, dim)).to(BF16), cache_strides
         ),
         "beta_cache": beta_cache,
         "num_spec": num_spec,
@@ -224,10 +235,19 @@ def _clone(case):
     return out
 
 
-def _check_untouched(before, after, slots):
+def _slots(case, name):
+    """The requests' slots in the pool of in-place tensor `name`: the state slots for the state, the replay slots for
+    the others (the state slots when the case has no replay pool of its own)."""
+    replay = case.get("replay_state_indices")
+    if name == "recurrent_state" or replay is None:
+        return case["ssm_state_indices"]
+    return replay
+
+
+def _check_untouched(before, after, case):
     """Every byte of the in-place buffers outside the batch slots' elements is unchanged (bitwise; NaN poison)."""
-    index = slots.long()
     for name in MUTATED:
+        index = _slots(case, name).long()
         t = after[name]
         size = t.element_size()
         owned = torch.zeros(t.untyped_storage().nbytes() // size, dtype=torch.bool, device="cuda")
@@ -302,6 +322,7 @@ def _run_cuda(
         case["dt_bias"],
         case["onorm_weight"],
         case["ssm_state_indices"],
+        case.get("replay_state_indices"),
         case["num_accepted_tokens"],
         case["cs_q"],
         case["cs_k"],
@@ -394,11 +415,17 @@ def _rne_stats(r, u):
     return diff, bias
 
 
-def _check_mutated(ref, cu, slots, check_slots=None, strict=True):
-    used = torch.zeros(ref["recurrent_state"].shape[0], dtype=torch.bool, device="cuda")
-    used[slots.long()] = True
-    check = used if check_slots is None else check_slots
+def _check_mutated(ref, cu, case, num_real=None, strict=True):
+    """The in-place tensors match the reference's at the slots of case's requests (only the first `num_real` ones when
+    given: the rest are CUDA-graph padding) and are unchanged elsewhere."""
     for name in MUTATED:
+        slots = _slots(case, name).long()
+        used = torch.zeros(ref[name].shape[0], dtype=torch.bool, device="cuda")
+        used[slots] = True
+        check = used
+        if num_real is not None:
+            check = torch.zeros_like(used)
+            check[slots[:num_real]] = True
         a, b = cu[name], ref[name]
         assert torch.equal(a[~used], b[~used]), f"{name}: slots outside the batch changed"
         a, b = a[check].float(), b[check].float()
@@ -447,8 +474,8 @@ def test_each_call_passes_the_checker(heads, num_spec, batch):
         cu_out = _run_cuda(cu)
         torch.cuda.synchronize()
         _check_out(ref_out, cu_out, rows, heads)
-        _check_mutated(ref, cu, base["ssm_state_indices"])
-        _check_untouched(before, cu, base["ssm_state_indices"])
+        _check_mutated(ref, cu, base)
+        _check_untouched(before, cu, base)
 
 
 @pytest.mark.parametrize(
@@ -479,8 +506,8 @@ def test_wave_edges(heads, num_spec, waves, extra):
     cu_out = _run_cuda(cu)
     torch.cuda.synchronize()
     _check_out(ref_out, cu_out, batch * (num_spec + 1), heads)
-    _check_mutated(ref, cu, base["ssm_state_indices"])
-    _check_untouched(before, cu, base["ssm_state_indices"])
+    _check_mutated(ref, cu, base)
+    _check_untouched(before, cu, base)
 
 
 @pytest.mark.parametrize("heads,num_spec,batch", [(96, 3, 64), (12, 3, 24)])
@@ -493,8 +520,8 @@ def test_dense_cache_layout(heads, num_spec, batch):
     cu_out = _run_cuda(cu)
     torch.cuda.synchronize()
     _check_out(ref_out, cu_out, batch * (num_spec + 1), heads)
-    _check_mutated(ref, cu, base["ssm_state_indices"])
-    _check_untouched(before, cu, base["ssm_state_indices"])
+    _check_mutated(ref, cu, base)
+    _check_untouched(before, cu, base)
 
 
 @pytest.mark.parametrize("heads,num_spec,batch", [(96, 3, 64), (96, 5, 33), (12, 3, 24)])
@@ -510,7 +537,7 @@ def test_chained_rounds_drift_by_rounding_only(heads, num_spec, batch):
         cu_out = _run_cuda(cu)
         torch.cuda.synchronize()
         _check_out(ref_out, cu_out, rows, heads, strict=rnd == 0)
-        _check_mutated(ref, cu, base["ssm_state_indices"], strict=rnd == 0)
+        _check_mutated(ref, cu, base, strict=rnd == 0)
 
 
 @pytest.mark.parametrize("first", ["cuda", "reference"])
@@ -527,24 +554,23 @@ def test_rounds_continue_across_ops(first):
     # After a reference first round both chains start the second from the same state: the per-call checker holds.
     strict = first == "reference"
     _check_out(ref_out, mixed_out, 64, 96, strict=strict)
-    _check_mutated(ref, mixed, base["ssm_state_indices"], strict=strict)
+    _check_mutated(ref, mixed, base, strict=strict)
 
 
 def test_padding_requests_share_a_slot():
     """CUDA-graph padding requests all use one slot; the real requests must not notice."""
     base = _case(96, 3, 24, seed=9, pool=40)
-    slots = base["ssm_state_indices"].clone()
-    # requests 15..23 share request 15's slot: requests 0..14 are the real ones
-    slots[16:] = slots[15]
-    base["ssm_state_indices"] = slots
+    # requests 15..23 share request 15's state and replay slots: requests 0..14 are the real ones
+    for key in ("ssm_state_indices", "replay_state_indices"):
+        slots = base[key].clone()
+        slots[16:] = slots[15]
+        base[key] = slots
     ref, cu = _clone(base), _clone(base)
     ref_out = _reference(ref)
     cu_out = _run_cuda(cu)
     torch.cuda.synchronize()
     _check_out(ref_out, cu_out, 96, 96, rows_used=torch.arange(15 * 4, device="cuda"))
-    real = torch.zeros(40, dtype=torch.bool, device="cuda")
-    real[slots[:15].long()] = True
-    _check_mutated(ref, cu, slots, check_slots=real)
+    _check_mutated(ref, cu, base, num_real=15)
 
 
 def test_deterministic_graph_replay_and_pdl():
@@ -576,6 +602,8 @@ def test_rejects_unsupported_inputs():
     with pytest.raises(RuntimeError, match="packed layout"):
         # 32 rows where 7 requests with 3 drafts need 28
         _run_cuda(dict(base, ssm_state_indices=base["ssm_state_indices"][:7]))
+    with pytest.raises(RuntimeError, match="replay_state_indices"):
+        _run_cuda(dict(base, replay_state_indices=base["replay_state_indices"][:7]))
     with pytest.raises(RuntimeError):
         _run_cuda(dict(base, g_cache=base["g_cache"].to(BF16)))  # g_cache must be FP32
     with pytest.raises(RuntimeError):
@@ -678,6 +706,9 @@ def test_eligibility_policy(monkeypatch):
     strided = torch.zeros(2 * slots.numel(), dtype=torch.int32, device="cuda")[::2]
     strided.copy_(slots)
     assert reason(96, 3, ssm_state_indices=strided) == "layout"
+    assert reason(96, 3, replay_state_indices=strided) == "layout"
+    # Without replay slots, the replay pool (smaller than the state pool here) must cover the state slots.
+    assert reason(96, 3, replay_state_indices=None) == "layout"
 
 
 @pytest.mark.parametrize("heads,num_spec", [(96, 3), (12, 3), (12, 5)])
@@ -729,6 +760,8 @@ def _engine_buffers(layer_cache):
 
 def _engine_setup(heads, num_spec, batch, seed, num_layers=3, max_batch=None):
     """(runtime, manager, slots, hidden rows) for KimiKDALinearAttention.forward_verify as the engine runs it.
+
+    slots holds the requests' state and replay slots as ``ssm_state_indices`` and ``replay_state_indices``.
 
     The mixer keeps A_log / dt_bias as BF16 parameters, projects q | k | v | output gate as sections of one GEMM
     output (the kernel reads strided views at offsets 0, D, 2D, 3D) and beta as a slice of [f_a | b] (row stride
@@ -783,18 +816,29 @@ def _engine_setup(heads, num_spec, batch, seed, num_layers=3, max_batch=None):
     )
     request_ids = list(range(101, 101 + batch))
     manager.add_dummy_requests(request_ids, token_nums=[32] * batch, is_gen=False)
-    slots = torch.tensor(manager.get_state_indices(request_ids), dtype=torch.int32, device="cuda")
+    slots = {
+        "ssm_state_indices": torch.tensor(
+            manager.get_state_indices(request_ids), dtype=torch.int32, device="cuda"
+        ),
+        "replay_state_indices": torch.tensor(
+            manager.get_replay_state_indices(request_ids), dtype=torch.int32, device="cuda"
+        ),
+    }
     for layer in range(num_layers):
         bufs = _engine_buffers(manager.mamba_layer_cache(layer))
         pool = bufs["recurrent_state"].shape[0]
         bufs["recurrent_state"].copy_(rn(pool, heads, 128, 128, scale=0.5))
+        # the replay pool: conv windows and replay caches
+        replay_pool = bufs["k_cache"].shape[0]
         for name in ("cs_q", "cs_k", "cs_v"):
-            bufs[name].copy_(rn(pool, dim, 3 + num_spec, scale=0.5))
-        k = rn(pool, num_spec, heads, 128)
-        bufs["k_cache"].copy_((k / k.norm(dim=-1, keepdim=True)).reshape(pool, num_spec, dim))
-        bufs["g_cache"].copy_(-5.0 * torch.sigmoid(rn(pool, num_spec, dim)))
-        bufs["v_cache"].copy_(torch.nn.functional.silu(rn(pool, num_spec, dim)))
-        bufs["beta_cache"].copy_(torch.sigmoid(rn(pool, num_spec, heads)))
+            bufs[name].copy_(rn(replay_pool, dim, 3 + num_spec, scale=0.5))
+        k = rn(replay_pool, num_spec, heads, 128)
+        bufs["k_cache"].copy_(
+            (k / k.norm(dim=-1, keepdim=True)).reshape(replay_pool, num_spec, dim)
+        )
+        bufs["g_cache"].copy_(-5.0 * torch.sigmoid(rn(replay_pool, num_spec, dim)))
+        bufs["v_cache"].copy_(torch.nn.functional.silu(rn(replay_pool, num_spec, dim)))
+        bufs["beta_cache"].copy_(torch.sigmoid(rn(replay_pool, num_spec, heads)))
     counts = manager.mamba_layer_cache(0).prev_num_accepted_tokens
     counts.copy_(torch.randint(0, num_spec + 1, counts.shape, generator=gen, device="cuda"))
 
@@ -873,8 +917,9 @@ def test_engine_layout_takes_the_cuda_route(heads, num_spec, batch, monkeypatch)
                 cache,
                 cache.conv,
                 cache.temporal,
-                slots,
+                slots["ssm_state_indices"],
                 allow_prequantized_output=True,
+                replay_slot_indices=slots["replay_state_indices"],
             )
 
         dispatch._cuda_verify = False
@@ -891,7 +936,8 @@ def test_engine_layout_takes_the_cuda_route(heads, num_spec, batch, monkeypatch)
         assert len(routed) == 1, "the call stayed on the CuTe DSL kernels"
 
         # The engine's layouts reached both ops: q | k | v | output-gate sections of one projection, beta a slice of
-        # [f_a | b], per-slot state blocks, counts at stride 4; the CuTe DSL op read the BF16 parameters. These pin
+        # [f_a | b], per-slot state blocks, counts at stride 4, the manager's replay slots; the CuTe DSL op read the
+        # BF16 parameters. These pin
         # what a deployed engine passes (the sections come from _project_verify_inputs; the counts are the per-slot
         # view KimiK3HybridCacheManager._get_state_buffer gives DataRole("prev_num_accepted_tokens")): a manager or
         # projection change that moves them fails here, and the eligibility check has to follow it.
@@ -906,6 +952,7 @@ def test_engine_layout_takes_the_cuda_route(heads, num_spec, batch, monkeypatch)
             assert call["beta"].storage_offset() == 128
             assert call["recurrent_state"].stride(0) > heads * 128 * 128
             assert call["num_accepted_tokens"].stride(0) == 4
+            assert torch.equal(call["replay_state_indices"], slots["replay_state_indices"])
             assert call["A_log"].dtype == BF16 and call["dt_bias"].dtype == BF16
         assert routed[0]["A_log"].dtype == torch.float32
         assert torch.equal(routed[0]["A_log"], calls[-1]["A_log"].float())
@@ -913,9 +960,9 @@ def test_engine_layout_takes_the_cuda_route(heads, num_spec, batch, monkeypatch)
 
         _check_out(ref_out, cu_out, rows, heads)
         _check_mutated(ref, cu, slots)
-        unused = torch.ones(bufs["recurrent_state"].shape[0], dtype=torch.bool, device="cuda")
-        unused[slots.long()] = False
         for name in MUTATED:
+            unused = torch.ones(bufs[name].shape[0], dtype=torch.bool, device="cuda")
+            unused[_slots(slots, name).long()] = False
             assert torch.equal(cu[name][unused], before[name][unused]), (
                 f"{name}: other slots changed"
             )

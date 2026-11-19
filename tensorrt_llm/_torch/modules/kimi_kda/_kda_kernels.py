@@ -500,6 +500,8 @@ _CUDA_ROW_ALIGNED = (
     ("w_k", ()),
     ("w_v", ()),
 )
+# The replay pool's tensors, indexed by replay slot (the accepted counts too).
+_CUDA_REPLAY_POOL_INPUTS = ("cs_q", "cs_k", "cs_v", "k_cache", "g_cache", "v_cache", "beta_cache")
 _cuda_logged: set = set()
 
 
@@ -552,14 +554,33 @@ def _cuda_layout_ok(kwargs: dict, num_heads: int, num_spec: int) -> bool:
         return False
     if state.stride()[1:] != (128 * 128, 128, 1):
         return False
-    pool = state.shape[0]
+    # The conv windows, replay caches and accepted counts sit at the requests' replay slots. With
+    # replay_state_indices they form a pool of their own (the KV cache manager's replay region); without, they share
+    # the state slots and must cover the state pool.
+    replay_pool = state.shape[0]
+    replay = kwargs.get("replay_state_indices")
+    if replay is not None:
+        if replay.dim() != 1 or replay.shape != indices.shape:
+            return False
+        if replay.dtype == torch.int32 and not replay.is_contiguous():
+            return False
+        replay_pool = min(kwargs[name].shape[0] for name in _CUDA_REPLAY_POOL_INPUTS)
     # Accepted counts may have any slot stride (KV cache manager v2 keeps a count block per slot).
     accepted = kwargs["num_accepted_tokens"]
-    if accepted.dim() != 1 or accepted.shape[0] < pool:
+    if accepted.dim() != 1 or accepted.shape[0] < replay_pool:
         return False
-    for name in ("cs_q", "cs_k", "cs_v"):  # [>= pool, H * 128, >= 3 + num_spec], dim-contiguous
+    for name in (
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):  # [>= replay pool, H * 128, >= 3 + num_spec], dim-contiguous
         t = kwargs[name]
-        if t.dim() != 3 or t.shape[0] < pool or t.shape[1] != dim or t.shape[2] < 3 + num_spec:
+        if (
+            t.dim() != 3
+            or t.shape[0] < replay_pool
+            or t.shape[1] != dim
+            or t.shape[2] < 3 + num_spec
+        ):
             return False
         if t.stride(1) != 1:
             return False
@@ -572,7 +593,7 @@ def _cuda_layout_ok(kwargs: dict, num_heads: int, num_spec: int) -> bool:
         t = kwargs[name]
         if (
             t.dim() != 3
-            or t.shape[0] < pool
+            or t.shape[0] < replay_pool
             or t.shape[1:] != (num_spec, width)
             or t.stride(2) != 1
         ):
@@ -669,9 +690,13 @@ def _cuda_mtp_verify(
     lower_bound: float = _CUDA_LOWER_BOUND,
     scale: Optional[float] = None,
     onorm_eps: float = _CUDA_ONORM_EPS,
+    replay_state_indices: Optional[torch.Tensor] = None,
     **unused,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run ``trtllm::kda_mtp_decode_fp8`` (packed layout, fused output norm) on the CUDA verify kernel.
+
+    The slots follow that op: ``ssm_state_indices`` address the recurrent state, and ``replay_state_indices`` (the
+    state slots when None) the conv windows, the replay caches and the accepted counts.
 
     Returns the E4M3 output [T, H * 128] and its UE8M0 scale bytes in the R128c4 layout.
     """
@@ -702,6 +727,7 @@ def _cuda_mtp_verify(
         dt_bias,
         onorm_weight,
         ssm_state_indices.to(torch.int32),
+        None if replay_state_indices is None else replay_state_indices.to(torch.int32),
         num_accepted_tokens.to(torch.int32),
         cs_q,
         cs_k,

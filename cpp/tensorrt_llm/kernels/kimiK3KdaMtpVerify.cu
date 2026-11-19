@@ -19,12 +19,13 @@
 // 1x128 MXFP8 quantization of its output (trtllm::kda_mtp_decode_fp8, packed token layout). The torch op
 // trtllm::kimi_k3_kda_mtp_verify (thop/kimiK3KdaMtpVerifyOp.cpp) runs it through invokeKimiK3KdaMtpVerify.
 //
-// Two details serve TRT-LLM's layouts: the kernel reads num_accepted_tokens with a slot stride, and launchNs sizes
-// the grid in whole waves. The file has two parts:
+// Three details serve TRT-LLM's layouts: the kernel reads num_accepted_tokens with a slot stride, addresses the replay
+// data by a replay slot of its own (see "Slots" below), and launchNs sizes the grid in whole waves. The file has two
+// parts:
 // 1. Between the "kernel code" markers: KdaParams, KdaMaps, Cfg and the kernel. They stay apart from the host code, so
-//    that another kernel with the same interface drops in. Apart from an SM10x guard they have one TRT-LLM addition:
-//    the kernel waits on its programmatic-launch predecessor (griddepcontrol.wait) before anything else, so that it
-//    can be launched with PDL.
+//    that another kernel with the same interface drops in. Apart from an SM10x guard and the replay slots they have
+//    one TRT-LLM addition: the kernel waits on its programmatic-launch predecessor (griddepcontrol.wait) before
+//    anything else, so that it can be launched with PDL.
 // 2. After the markers: the host code. It encodes the tensor maps through CUDADriverWrapper (with their checks), sets
 //    the dynamic shared memory limit per launch and launches the kernel through cudaLaunchKernelEx with the PDL
 //    attribute.
@@ -38,9 +39,15 @@
 // accumulator is seeded with S0 by eight identity MMAs; it is rounded to nearest even BF16 in place and TMA-stored.
 // Warps 0-3 (q / k conv, norms, MMA operands) and warps 4-7 (gates, decay, v conv, solve, gated RMSNorm + MXFP8
 // epilogue) split the work; the latter run one item ahead of the commit epilogue. Token rows, conv history, betas and
-// replay caches arrive by TMA (the replay caches of the first item by bulk copies); each CTA holds 256 TMEM columns, so
+// replay caches arrive by TMA (the replay caches of later items by bulk copies); each CTA holds 256 TMEM columns, so
 // two CTAs fill the 512 columns of an SM. The kernel encodes 17 tensor maps per launch on the host (paid at capture
 // under CUDA graphs).
+//
+// Slots: an item's state lives at its request's state slot (ssm_state_indices). Its conv windows, replay caches and
+// accepted count live at its request's replay slot (replay_state_indices), in a replay pool that the cache manager may
+// keep apart from the state pool. The schedule table holds both slots and the request index, from which the head
+// follows (item = request * H + head). The item loop reads the replay slot from the table only where it uses it, so
+// that no register holds it across the item: at NS = 5 the kernel is at the 128-register cap.
 //
 // Programmatic dependent launch: the kernel waits before reading anything and never triggers early (a CTA counts as
 // triggered when it exits), so it is safe after any predecessor and before any dependent.
@@ -74,7 +81,8 @@ struct KdaParams
     __nv_bfloat16 const *xq, *xk, *xv, *g, *beta, *og;
     long long sxq, sxk, sxv, sg, sbeta, sog; // row strides (elements)
     float const *wq, *wk, *wv, *A_log, *dt_bias, *onorm_w;
-    int const *slots, *nacc;
+    // state slots (of POOL), replay slots (of RPOOL; = slots when the pools are one), accepted counts
+    int const *slots, *rslots, *nacc;
     long long snacc; // num_accepted_tokens slot stride (elements; the hybrid cache keeps one count block per slot)
     __nv_bfloat16 *csq, *csk, *csv;
     long long csq_s, csq_p, csk_s, csk_p, csv_s, csv_p; // slot / position strides (elements)
@@ -84,7 +92,7 @@ struct KdaParams
     __nv_bfloat16 const* state;
     long long sstate0; // recurrent_state slot stride (elements; deployed pool: > H*128*128)
     uint8_t *out, *out_scale;
-    int B, H, T, POOL;
+    int B, H, T, POOL, RPOOL;
 };
 
 typedef __nv_bfloat16 bf16;
@@ -96,12 +104,12 @@ struct KdaMaps
     CUtensorMap state;  // 4D {64, H*128, 2, POOL} (slot stride = recurrent_state.stride(0)) box {64, 128, 2, 1}, SW128
     CUtensorMap x[4];   // x_q, x_k, x_v, onorm_g: 2D {D, T}, box {128, NT}
     CUtensorMap g;      // 2D {D, T}, box {128, NT}
-    CUtensorMap csl[3]; // conv caches (load): 3D {D, S, POOL}, box {128, 3, 1}
-    CUtensorMap css[3]; // conv caches (store): 3D {D, S, POOL}, box {128, 3 + NS, 1}
+    CUtensorMap csl[3]; // conv caches (load): 3D {D, S, RPOOL}, box {128, 3, 1}
+    CUtensorMap css[3]; // conv caches (store): 3D {D, S, RPOOL}, box {128, 3 + NS, 1}
     CUtensorMap bnew;   // beta: 2D {H, T} (row stride BS), box {8, NT}
-    CUtensorMap brep;   // beta_cache: 3D {H, NS, POOL}, box {8, NS, 1}
+    CUtensorMap brep;   // beta_cache: 3D {H, NS, RPOOL}, box {8, NS, 1}
     CUtensorMap
-        cf[3]; // k_cache, v_cache (bf16), g_cache (f32): 3D {D, NS, POOL}, box {128, NS, 1} (item 0: all positions)
+        cf[3]; // k_cache, v_cache (bf16), g_cache (f32): 3D {D, NS, RPOOL}, box {128, NS, 1} (item 0: all positions)
 };
 
 template <int NS>
@@ -158,7 +166,7 @@ struct Cfg
     static constexpr int M_KR = M_SOG + NT * 512; // [NS][128] f32 commit-B values of the replay tokens (group V -> QK)
     static constexpr int M_BETA = M_KR + NS * 512;              // [16] f32: beta of new tokens [0,NT), replay [8,8+NS)
     static constexpr int M_RED = M_BETA + 64;                   // 3 scratch areas of [4][16] f32
-    static constexpr int M_SCHED = M_RED + 3 * 256;             // [MAXN] int4 (slot, a, request, head)
+    static constexpr int M_SCHED = M_RED + 3 * 256;             // [MAXN] int4 (state slot, a, replay slot, request)
     static constexpr int M_BAR = M_SCHED + MAXN * 16;           // st0, st1, m1, m2, raw0, raw1
     static constexpr int M_TMEM = M_BAR + 48;
     static constexpr int M_ID = (M_TMEM + 8 + 127) / 128 * 128; // 16x16 BF16 identity (no-swizzle K-major), 512 B
@@ -610,52 +618,64 @@ __device__ __forceinline__ void reduce128(float (&v)[N], float* scratch, int wq,
     }
 }
 
-// issue the raw loads of one item (lanes of one warp): TMA tiles for token rows / conv history, bulk copies for the
-// replay caches; lane 0 arms the barrier first
+// word w of the n-th item's schedule entry, read where it is used (volatile: the compiler may not keep it in a register
+// across the item)
+__device__ __forceinline__ int sched_word(int4 const* sched, int n, int w)
+{
+    return ((int const volatile*) (sched + n))[w];
+}
+
+// head of this CTA's n-th item (item blockIdx.x + n * gridDim.x = request * H + head)
+__device__ __forceinline__ int item_head(int n, int request, int H)
+{
+    return (int) blockIdx.x + n * (int) gridDim.x - request * H;
+}
+
+// issue the raw loads of the n-th item, schedule entry it (lanes of one warp): TMA tiles for token rows / conv history,
+// bulk copies for the replay caches; lane 0 arms the barrier first
 template <int NS>
 __device__ __forceinline__ void issue_raw(
-    KdaParams const& p, KdaMaps const& m, uint32_t rbase, uint32_t bar, int4 it, int lane)
+    KdaParams const& p, KdaMaps const& m, uint32_t rbase, uint32_t bar, int4 it, int n, int lane)
 {
     using C = Cfg<NS>;
-    constexpr int NT = C::NT;
-    int const slot = it.x, a = it.y, h = it.w;
-    int const row0 = it.z * NT;
+    int const a = it.y, rslot = it.z, h = item_head(n, it.w, p.H);
+    int const row0 = it.w * C::NT;
     if (lane == 0)
     {
         mbar_arrive_expect_tx(bar, C::RAW_FIXED + a * 1024);
-        tma_load_3d(rbase + C::R_CQ, &m.csl[0], h * 128, a, slot, bar);
+        tma_load_3d(rbase + C::R_CQ, &m.csl[0], h * 128, a, rslot, bar);
         tma_load_2d(rbase + C::R_XQ, &m.x[0], h * 128, row0, bar);
-        tma_load_3d(rbase + C::R_CK, &m.csl[1], h * 128, a, slot, bar);
+        tma_load_3d(rbase + C::R_CK, &m.csl[1], h * 128, a, rslot, bar);
         tma_load_2d(rbase + C::R_XK, &m.x[1], h * 128, row0, bar);
-        tma_load_3d(rbase + C::R_CV, &m.csl[2], h * 128, a, slot, bar);
+        tma_load_3d(rbase + C::R_CV, &m.csl[2], h * 128, a, rslot, bar);
         tma_load_2d(rbase + C::R_XV, &m.x[2], h * 128, row0, bar);
         tma_load_2d(rbase + C::R_OG, &m.x[3], h * 128, row0, bar);
         tma_load_2d(rbase + C::R_GR, &m.g, h * 128, row0, bar);
         tma_load_2d(rbase + C::R_BN, &m.bnew, h & ~7, row0, bar);
-        tma_load_3d(rbase + C::R_BR, &m.brep, h & ~7, 0, slot, bar);
+        tma_load_3d(rbase + C::R_BR, &m.brep, h & ~7, 0, rslot, bar);
     }
     __syncwarp();
     if (lane < 3 * a)
     {
         int const which = lane / a, pos = lane - which * a;
         if (which == 0)
-            bulk_g2s(rbase + C::R_KC + pos * 256, p.kc + slot * p.kc_s + pos * p.kc_p + h * 128, 256, bar);
+            bulk_g2s(rbase + C::R_KC + pos * 256, p.kc + rslot * p.kc_s + pos * p.kc_p + h * 128, 256, bar);
         else if (which == 1)
-            bulk_g2s(rbase + C::R_VC + pos * 256, p.vc + slot * p.vc_s + pos * p.vc_p + h * 128, 256, bar);
+            bulk_g2s(rbase + C::R_VC + pos * 256, p.vc + rslot * p.vc_s + pos * p.vc_p + h * 128, 256, bar);
         else
-            bulk_g2s(rbase + C::R_GC + pos * 512, p.gc + slot * p.gc_s + pos * p.gc_p + h * 128, 512, bar);
+            bulk_g2s(rbase + C::R_GC + pos * 512, p.gc + rslot * p.gc_s + pos * p.gc_p + h * 128, 512, bar);
     }
 }
 
-// committed conv windows: positions 0..2+NS <- staging rows 1..3+NS (old history a+1, a+2, then the new tokens)
+// committed conv windows of head h at replay slot rslot: positions 0..2+NS <- staging rows 1..3+NS (old history a+1,
+// a+2, then the new tokens)
 template <int NS>
-__device__ __forceinline__ void store_conv_windows(KdaMaps const& m, uint32_t rbase, int4 it)
+__device__ __forceinline__ void store_conv_windows(KdaMaps const& m, uint32_t rbase, int rslot, int h)
 {
     using C = Cfg<NS>;
-    int const slot = it.x, h = it.w;
-    tma_store_3d(&m.css[0], rbase + C::R_CQ + 256, h * 128, 0, slot);
-    tma_store_3d(&m.css[1], rbase + C::R_CK + 256, h * 128, 0, slot);
-    tma_store_3d(&m.css[2], rbase + C::R_CV + 256, h * 128, 0, slot);
+    tma_store_3d(&m.css[0], rbase + C::R_CQ + 256, h * 128, 0, rslot);
+    tma_store_3d(&m.css[1], rbase + C::R_CK + 256, h * 128, 0, rslot);
+    tma_store_3d(&m.css[2], rbase + C::R_CV + 256, h * 128, 0, rslot);
     bulk_commit();
 }
 
@@ -706,7 +726,8 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
         {
             int const item0 = blockIdx.x;
             int const b0 = item0 / H, h0 = item0 - b0 * H;
-            int const s0 = __ldg(p.slots + b0); // longest dependency chain first
+            int const r0 = __ldg(p.rslots + b0); // longest dependency chain first (replay slot -> count -> conv)
+            int const s0 = __ldg(p.slots + b0);
             mbar_init(bar_raw0, 1);
             mbar_init(bar_raw0 + 8, 1);
             mbar_init(bar_st0, 1);
@@ -736,33 +757,34 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
             tma_load_2d(rb0 + C::R_OG, &maps.x[3], h0 * 128, b0 * NT, bar_raw0);
             tma_load_2d(rb0 + C::R_GR, &maps.g, h0 * 128, b0 * NT, bar_raw0);
             tma_load_2d(rb0 + C::R_BN, &maps.bnew, h0 & ~7, b0 * NT, bar_raw0);
-            int const nacc0 = __ldg(p.nacc + (long long) s0 * p.snacc);
+            int const nacc0 = __ldg(p.nacc + (long long) r0 * p.snacc);
             mbar_arrive_expect_tx(bar_st0, 32768);
             tma_load_4d(sb + C::OFF_ST, &maps.state, 0, h0 * 128, 0, s0, bar_st0);
             // replay caches: all NS positions (no wait on the accepted count)
             mbar_expect_tx(bar_raw0, NS * 1024);
-            tma_load_3d(rb0 + C::R_KC, &maps.cf[0], h0 * 128, 0, s0, bar_raw0);
-            tma_load_3d(rb0 + C::R_VC, &maps.cf[1], h0 * 128, 0, s0, bar_raw0);
-            tma_load_3d(rb0 + C::R_GC, &maps.cf[2], h0 * 128, 0, s0, bar_raw0);
+            tma_load_3d(rb0 + C::R_KC, &maps.cf[0], h0 * 128, 0, r0, bar_raw0);
+            tma_load_3d(rb0 + C::R_VC, &maps.cf[1], h0 * 128, 0, r0, bar_raw0);
+            tma_load_3d(rb0 + C::R_GC, &maps.cf[2], h0 * 128, 0, r0, bar_raw0);
             int const a0 = min(max(nacc0, 0), NS);
-            sched[0] = make_int4(s0, a0, b0, h0);
+            sched[0] = make_int4(s0, a0, r0, b0);
             mbar_arrive_expect_tx(bar_raw0, C::RAW_FIXED - C::RAW_TOK);
-            tma_load_3d(rb0 + C::R_CQ, &maps.csl[0], h0 * 128, a0, s0, bar_raw0);
-            tma_load_3d(rb0 + C::R_CK, &maps.csl[1], h0 * 128, a0, s0, bar_raw0);
-            tma_load_3d(rb0 + C::R_CV, &maps.csl[2], h0 * 128, a0, s0, bar_raw0);
-            tma_load_3d(rb0 + C::R_BR, &maps.brep, h0 & ~7, 0, s0, bar_raw0);
+            tma_load_3d(rb0 + C::R_CQ, &maps.csl[0], h0 * 128, a0, r0, bar_raw0);
+            tma_load_3d(rb0 + C::R_CK, &maps.csl[1], h0 * 128, a0, r0, bar_raw0);
+            tma_load_3d(rb0 + C::R_CV, &maps.csl[2], h0 * 128, a0, r0, bar_raw0);
+            tma_load_3d(rb0 + C::R_BR, &maps.brep, h0 & ~7, 0, r0, bar_raw0);
         }
     }
     else if (warp == 2)
     {
-        // schedule of the remaining items: (slot, accepted count, request, head)
+        // schedule of the remaining items: (state slot, accepted count, replay slot, request)
         for (int n = 1 + lane; n < cnt; n += 32)
         {
             int const item = blockIdx.x + n * G;
             int const b = item / H;
             int const s = __ldg(p.slots + b);
-            int const a = min(max(__ldg(p.nacc + (long long) s * p.snacc), 0), NS);
-            sched[n] = make_int4(s, a, b, item - b * H);
+            int const r = __ldg(p.rslots + b);
+            int const a = min(max(__ldg(p.nacc + (long long) r * p.snacc), 0), NS);
+            sched[n] = make_int4(s, a, r, b);
         }
     }
     if (C::ID && tid >= 128)
@@ -785,20 +807,20 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
     if (warp == 2 && cnt > 1)
     {
         if (C::NRAW == 2)
-            issue_raw<NS>(p, maps, sb + C::OFF_RAW + C::RAW_BYTES, bar_raw0 + 8, sched[1], lane);
+            issue_raw<NS>(p, maps, sb + C::OFF_RAW + C::RAW_BYTES, bar_raw0 + 8, sched[1], 1, lane);
         if (lane == 0)
         {
             const int4 i1 = sched[1];
-            prefetch_l2(p.state + (long long) i1.x * p.sstate0 + (long long) i1.w * 16384, 32768);
+            prefetch_l2(p.state + (long long) i1.x * p.sstate0 + (long long) item_head(1, i1.w, H) * 16384, 32768);
         }
     }
 
     // per-thread per-item inputs (conv weights, gate bias / decay, beta), loaded one item ahead
     int const cch = tid & 127;
     bool const isqk = warp < 4;
-    auto load_item = [&](int4 itx, float4& w0, float4& w1, float& dtb, float& eA, float& bet)
+    auto load_item = [&](int hx, float4& w0, float4& w1, float& dtb, float& eA, float& bet)
     {
-        const long long chx = (long long) itx.w * 128 + cch;
+        const long long chx = (long long) hx * 128 + cch;
         if (isqk)
         {
             w0 = __ldg((const float4*) p.wq + chx);
@@ -808,20 +830,20 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
         {
             w0 = __ldg((const float4*) p.wv + chx);
             dtb = __ldg(p.dt_bias + chx);
-            eA = __ldg(p.A_log + itx.w);
+            eA = __ldg(p.A_log + hx);
             bet = 0.f;
         }
     };
     float4 cw0 = make_float4(0.f, 0.f, 0.f, 0.f), cw1 = cw0;
     float cdtb = 0.f, ceA = 0.f, cbet = 0.f;
-    load_item(sched[0], cw0, cw1, cdtb, ceA, cbet);
+    load_item(item_head(0, sched[0].w, H), cw0, cw1, cdtb, ceA, cbet);
     float const ow_reg = __ldg(p.onorm_w + cch);
 
     for (int n = 0; n < cnt; ++n)
     {
         const int4 it = sched[n];
-        int const slot = it.x, a = it.y, h = it.w;
-        int const row0 = it.z * NT;
+        int const slot = it.x, a = it.y, h = item_head(n, it.w, H);
+        int const row0 = it.w * NT; // the request's first token row
         int const stage = n & 1;
         const uint32_t st_off = C::OFF_ST + stage * 32768;
         int const rb = (C::NRAW == 2) ? (n & 1) : 0;
@@ -844,7 +866,8 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
             const float4 w4k = cw1;
             mbar_wait(bar_raw, raw_phase);
             if (tid == C::PROD * 32)
-                store_conv_windows<NS>(maps, rbase, it); // committed windows straight from the raw rows
+                // committed windows straight from the raw rows
+                store_conv_windows<NS>(maps, rbase, sched_word(sched, n, 2), h);
             float rq[3 + NT], rk[3 + NT];
 #pragma unroll
             for (int i = 0; i < 3; ++i)
@@ -1085,7 +1108,7 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
         float4 nw0 = cw0, nw1 = cw1;
         float ndtb = cdtb, neA = ceA, nbet = cbet;
         if (n + 1 < cnt)
-            load_item(sched[n + 1], nw0, nw1, ndtb, neA, nbet);
+            load_item(item_head(n + 1, sched[n + 1].w, H), nw0, nw1, ndtb, neA, nbet);
         __syncthreads(); // S1: X/Ku written, raw values consumed into registers / smem
 
         if (warp == 0)
@@ -1122,7 +1145,7 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
                 bulk_wait_read0();
             __syncwarp();
             if (n + C::NRAW < cnt)
-                issue_raw<NS>(p, maps, rbase, bar_raw, sched[n + C::NRAW], lane);
+                issue_raw<NS>(p, maps, rbase, bar_raw, sched[n + C::NRAW], n + C::NRAW, lane);
         }
         else if (C::PROD == 1 && tid == 96)
         {
@@ -1134,12 +1157,14 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
                 const int4 itn = sched[n + 1];
                 const uint32_t bs = bar_st0 + 8 * (stage ^ 1);
                 mbar_arrive_expect_tx(bs, 32768);
-                tma_load_4d(sb + C::OFF_ST + (stage ^ 1) * 32768, tmap, 0, itn.w * 128, 0, itn.x, bs);
+                tma_load_4d(
+                    sb + C::OFF_ST + (stage ^ 1) * 32768, tmap, 0, item_head(n + 1, itn.w, H) * 128, 0, itn.x, bs);
             }
             if (n + 2 < cnt)
             {
                 const int4 i2 = sched[n + 2];
-                prefetch_l2(p.state + (long long) i2.x * p.sstate0 + (long long) i2.w * 16384, 32768);
+                prefetch_l2(
+                    p.state + (long long) i2.x * p.sstate0 + (long long) item_head(n + 2, i2.w, H) * 16384, 32768);
             }
         }
         else if (C::PROD == 3 && warp == 3)
@@ -1155,24 +1180,27 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
                     const int4 itn = sched[n + 1];
                     const uint32_t bs = bar_st0 + 8 * (stage ^ 1);
                     mbar_arrive_expect_tx(bs, 32768);
-                    tma_load_4d(sb + C::OFF_ST + (stage ^ 1) * 32768, tmap, 0, itn.w * 128, 0, itn.x, bs);
+                    tma_load_4d(
+                        sb + C::OFF_ST + (stage ^ 1) * 32768, tmap, 0, item_head(n + 1, itn.w, H) * 128, 0, itn.x, bs);
                 }
                 if (n + 2 < cnt)
                 {
                     const int4 i2 = sched[n + 2];
-                    prefetch_l2(p.state + (long long) i2.x * p.sstate0 + (long long) i2.w * 16384, 32768);
+                    prefetch_l2(
+                        p.state + (long long) i2.x * p.sstate0 + (long long) item_head(n + 2, i2.w, H) * 16384, 32768);
                 }
             }
             __syncwarp();
             if (n + C::NRAW < cnt)
-                issue_raw<NS>(p, maps, rbase, bar_raw, sched[n + C::NRAW], lane);
+                issue_raw<NS>(p, maps, rbase, bar_raw, sched[n + C::NRAW], n + C::NRAW, lane);
         }
         else if (tid == 128)
         {
             // beta_cache was read with plain loads before S1
+            long long const rslot = sched_word(sched, n, 2);
 #pragma unroll
             for (int pp = 0; pp < NS; ++pp)
-                p.bc[slot * p.bc_s + pp * p.bc_p + h] = __float2bfloat16_rn(sbeta[pp + 1]);
+                p.bc[rslot * p.bc_s + pp * p.bc_p + h] = __float2bfloat16_rn(sbeta[pp + 1]);
         }
 
         float o[NT];
@@ -1181,9 +1209,10 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
             // k cache of the NS later tokens
             int const c = tid;
             long long const ch = (long long) h * 128 + c;
+            long long const rslot = sched_word(sched, n, 2);
 #pragma unroll
             for (int pp = 0; pp < NS; ++pp)
-                p.kc[slot * p.kc_s + pp * p.kc_p + ch] = __float2bfloat16_rn(kn[pp + 1]);
+                p.kc[rslot * p.kc_s + pp * p.kc_p + ch] = __float2bfloat16_rn(kn[pp + 1]);
             // B2 row c (commit MMA B operand, K-major no swizzle): [Kc_hi | Kc_lo | Kc_hi | 0], aliases X: after MMA1
             mbar_wait(bar_m1, n & 1);
             bf16 e[C::K2];
@@ -1220,11 +1249,12 @@ __global__ void __launch_bounds__(256, 2) kda_mtp_kernel(const __grid_constant__
             {
                 // v / g caches of the NS later tokens
                 long long const ch = (long long) h * 128 + v;
+                long long const rslot = sched_word(sched, n, 2);
 #pragma unroll
                 for (int pp = 0; pp < NS; ++pp)
                 {
-                    p.vc[slot * p.vc_s + pp * p.vc_p + ch] = __float2bfloat16_rn(vN[pp + 1]);
-                    p.gc[slot * p.gc_s + pp * p.gc_p + ch] = gn[pp + 1];
+                    p.vc[rslot * p.vc_s + pp * p.vc_p + ch] = __float2bfloat16_rn(vN[pp + 1]);
+                    p.gc[rslot * p.gc_s + pp * p.gc_p + ch] = gn[pp + 1];
                 }
             }
             // ============ solve (thread = value row v)
@@ -1537,7 +1567,7 @@ KdaMaps makeMaps(KdaParams const& p, int numSpec)
     long long const slotStrides[3] = {p.csq_s, p.csk_s, p.csv_s};
     for (int i = 0; i < 3; ++i)
     {
-        cuuint64_t const dims[3] = {dim, window, static_cast<cuuint64_t>(p.POOL)};
+        cuuint64_t const dims[3] = {dim, window, static_cast<cuuint64_t>(p.RPOOL)};
         cuuint64_t const strides[2]
             = {static_cast<cuuint64_t>(posStrides[i]) * 2, static_cast<cuuint64_t>(slotStrides[i]) * 2};
         cuuint32_t const loadBox[3] = {128, 3, 1};
@@ -1546,14 +1576,14 @@ KdaMaps makeMaps(KdaParams const& p, int numSpec)
         encodeMap(&maps.css[i], conv[i], 3, dims, strides, storeBox, CU_TENSOR_MAP_SWIZZLE_NONE);
     }
     {
-        // Replay caches k / v (BF16) and g (FP32): [POOL][NS][H * 128] views, boxes of the NS rows of one slot.
+        // Replay caches k / v (BF16) and g (FP32): [RPOOL][NS][H * 128] views, boxes of the NS rows of one slot.
         void const* const caches[3] = {p.kc, p.vc, p.gc};
         long long const rowStrides[3] = {p.kc_p, p.vc_p, p.gc_p};
         long long const slotStrides[3] = {p.kc_s, p.vc_s, p.gc_s};
         cuuint64_t const elementBytes[3] = {2, 2, 4};
         for (int i = 0; i < 3; ++i)
         {
-            cuuint64_t const dims[3] = {dim, static_cast<cuuint64_t>(numSpec), static_cast<cuuint64_t>(p.POOL)};
+            cuuint64_t const dims[3] = {dim, static_cast<cuuint64_t>(numSpec), static_cast<cuuint64_t>(p.RPOOL)};
             cuuint64_t const strides[2] = {static_cast<cuuint64_t>(rowStrides[i]) * elementBytes[i],
                 static_cast<cuuint64_t>(slotStrides[i]) * elementBytes[i]};
             cuuint32_t const box[3] = {128, static_cast<cuuint32_t>(numSpec), 1};
@@ -1569,9 +1599,9 @@ KdaMaps makeMaps(KdaParams const& p, int numSpec)
         encodeMap(&maps.bnew, p.beta, 2, dims, strides, box, CU_TENSOR_MAP_SWIZZLE_NONE);
     }
     {
-        // beta cache: [POOL][NS][H] view, boxes of 8 heads x the NS rows of one slot.
+        // beta cache: [RPOOL][NS][H] view, boxes of 8 heads x the NS rows of one slot.
         cuuint64_t const dims[3]
-            = {static_cast<cuuint64_t>(p.H), static_cast<cuuint64_t>(numSpec), static_cast<cuuint64_t>(p.POOL)};
+            = {static_cast<cuuint64_t>(p.H), static_cast<cuuint64_t>(numSpec), static_cast<cuuint64_t>(p.RPOOL)};
         cuuint64_t const strides[2] = {static_cast<cuuint64_t>(p.bc_p) * 2, static_cast<cuuint64_t>(p.bc_s) * 2};
         cuuint32_t const box[3] = {8, static_cast<cuuint32_t>(numSpec), 1};
         encodeMap(&maps.brep, p.bc, 3, dims, strides, box, CU_TENSOR_MAP_SWIZZLE_NONE);
@@ -1647,9 +1677,13 @@ bool isKimiK3KdaMtpVerifySupported(KimiK3KdaMtpVerifyParams const& p, char const
     {
         return fail("requires lower bound -5, q scale 128^-0.5 and output-norm eps 1e-5");
     }
-    if (p.numRequests < 1 || p.numHeads < 1 || p.statePoolSize < 1)
+    if (p.numRequests < 1 || p.numHeads < 1 || p.statePoolSize < 1 || p.replayPoolSize < 1)
     {
-        return fail("needs at least one request, one head and one state slot");
+        return fail("needs at least one request, one head, one state slot and one replay slot");
+    }
+    if (p.replayStateIndices == nullptr && p.replayPoolSize < p.statePoolSize)
+    {
+        return fail("without replay slots, the replay pool must cover the state pool");
     }
     if (p.numAcceptedTokensStride < 0)
     {
@@ -1731,6 +1765,7 @@ void invokeKimiK3KdaMtpVerify(KimiK3KdaMtpVerifyParams const& params, bool enabl
     p.dt_bias = params.dtBias;
     p.onorm_w = params.onormWeight;
     p.slots = params.ssmStateIndices;
+    p.rslots = params.replayStateIndices != nullptr ? params.replayStateIndices : params.ssmStateIndices;
     p.nacc = params.numAcceptedTokens;
     p.snacc = params.numAcceptedTokensStride;
     p.csq = static_cast<__nv_bfloat16*>(params.convQ);
@@ -1762,6 +1797,7 @@ void invokeKimiK3KdaMtpVerify(KimiK3KdaMtpVerifyParams const& params, bool enabl
     p.H = params.numHeads;
     p.T = params.numRequests * (params.numSpec + 1);
     p.POOL = params.statePoolSize;
+    p.RPOOL = params.replayPoolSize;
 
     KdaMaps const maps = makeMaps(p, params.numSpec);
     if (params.numSpec == 3)

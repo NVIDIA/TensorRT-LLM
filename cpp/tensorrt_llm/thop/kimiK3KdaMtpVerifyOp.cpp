@@ -22,6 +22,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -97,14 +98,19 @@ void checkConvWindow(at::Tensor const& t, char const* name, int64_t pool, int64_
 // and the MXFP8 output (see isKimiK3KdaMtpVerifySupported). Outputs are caller-allocated; conv windows, state and
 // replay caches are updated in place. Raises a c10::Error (TORCH_CHECK) for an unsupported tensor or parameter. Slot
 // indices are not range-checked (device values), as in the reference ops.
+//
+// ssm_state_indices gives each request's slot in recurrent_state. replay_state_indices, when given, gives its slot in
+// the replay pool: the conv windows, the replay caches and the accepted counts, which then need not cover the state
+// pool (the KV cache manager keeps them in a region of their own). Without it they share the state slots, as in
+// trtllm::kda_mtp_decode_fp8.
 void kimi_k3_kda_mtp_verify(at::Tensor const& x_q, at::Tensor const& x_k, at::Tensor const& x_v, at::Tensor const& g,
     at::Tensor const& beta, at::Tensor const& onorm_g, at::Tensor const& w_q, at::Tensor const& w_k,
     at::Tensor const& w_v, at::Tensor const& A_log, at::Tensor const& dt_bias, at::Tensor const& onorm_weight,
-    at::Tensor const& ssm_state_indices, at::Tensor const& num_accepted_tokens, at::Tensor const& cs_q,
-    at::Tensor const& cs_k, at::Tensor const& cs_v, at::Tensor const& recurrent_state, at::Tensor const& k_cache,
-    at::Tensor const& g_cache, at::Tensor const& v_cache, at::Tensor const& beta_cache, at::Tensor const& out,
-    std::optional<at::Tensor> const& out_scale, int64_t num_spec, double lower_bound, double scale, double onorm_eps,
-    bool enable_pdl)
+    at::Tensor const& ssm_state_indices, std::optional<at::Tensor> const& replay_state_indices,
+    at::Tensor const& num_accepted_tokens, at::Tensor const& cs_q, at::Tensor const& cs_k, at::Tensor const& cs_v,
+    at::Tensor const& recurrent_state, at::Tensor const& k_cache, at::Tensor const& g_cache, at::Tensor const& v_cache,
+    at::Tensor const& beta_cache, at::Tensor const& out, std::optional<at::Tensor> const& out_scale, int64_t num_spec,
+    double lower_bound, double scale, double onorm_eps, bool enable_pdl)
 {
     TORCH_CHECK(x_q.is_cuda(), "kimi_k3_kda_mtp_verify: x_q must be a CUDA tensor");
     at::Device const device = x_q.device();
@@ -131,6 +137,13 @@ void kimi_k3_kda_mtp_verify(at::Tensor const& x_q, at::Tensor const& x_k, at::Te
     int64_t const T = x_q.size(1);
     TORCH_CHECK(B >= 1 && T == B * (num_spec + 1),
         "kimi_k3_kda_mtp_verify: packed layout expects T == B * (num_spec + 1) new-token rows");
+    if (replay_state_indices.has_value())
+    {
+        at::Tensor const& r = *replay_state_indices;
+        checkDevice(r, "replay_state_indices", device);
+        TORCH_CHECK(r.dim() == 1 && r.size(0) == B && r.scalar_type() == at::kInt && r.is_contiguous(),
+            "kimi_k3_kda_mtp_verify: replay_state_indices must be a contiguous int32 [B] tensor");
+    }
 
     tk::KimiK3KdaMtpVerifyParams p;
     p.xQRowStride = headRowsStride(x_q, "x_q", T, H);
@@ -160,17 +173,29 @@ void kimi_k3_kda_mtp_verify(at::Tensor const& x_q, at::Tensor const& x_k, at::Te
         "kimi_k3_kda_mtp_verify: recurrent_state must be contiguous within each slot");
     int64_t const pool = recurrent_state.size(0);
     TORCH_CHECK(pool <= std::numeric_limits<int32_t>::max(), "kimi_k3_kda_mtp_verify: state pool too large");
+    // With replay slots, the replay pool is the smallest slot count of its tensors; without, it is the state pool.
+    int64_t replayPool = pool;
+    if (replay_state_indices.has_value())
+    {
+        replayPool = std::numeric_limits<int64_t>::max();
+        for (at::Tensor const* t : {&cs_q, &cs_k, &cs_v, &k_cache, &g_cache, &v_cache, &beta_cache})
+        {
+            replayPool = std::min(replayPool, t->dim() > 0 ? t->size(0) : 0);
+        }
+        TORCH_CHECK(replayPool >= 1 && replayPool <= std::numeric_limits<int32_t>::max(),
+            "kimi_k3_kda_mtp_verify: the replay pool must have 1 to 2^31 - 1 slots");
+    }
     TORCH_CHECK(num_accepted_tokens.dim() == 1 && num_accepted_tokens.scalar_type() == at::kInt
-            && num_accepted_tokens.size(0) >= pool,
-        "kimi_k3_kda_mtp_verify: num_accepted_tokens must be a slot-indexed int32 tensor covering the state pool");
+            && num_accepted_tokens.size(0) >= replayPool,
+        "kimi_k3_kda_mtp_verify: num_accepted_tokens must be a slot-indexed int32 tensor covering the replay pool");
 
-    checkConvWindow(cs_q, "cs_q", pool, D, num_spec);
-    checkConvWindow(cs_k, "cs_k", pool, D, num_spec);
-    checkConvWindow(cs_v, "cs_v", pool, D, num_spec);
-    checkReplayCache(k_cache, "k_cache", at::kBFloat16, pool, num_spec, D);
-    checkReplayCache(g_cache, "g_cache", at::kFloat, pool, num_spec, D);
-    checkReplayCache(v_cache, "v_cache", at::kBFloat16, pool, num_spec, D);
-    checkReplayCache(beta_cache, "beta_cache", at::kBFloat16, pool, num_spec, H);
+    checkConvWindow(cs_q, "cs_q", replayPool, D, num_spec);
+    checkConvWindow(cs_k, "cs_k", replayPool, D, num_spec);
+    checkConvWindow(cs_v, "cs_v", replayPool, D, num_spec);
+    checkReplayCache(k_cache, "k_cache", at::kBFloat16, replayPool, num_spec, D);
+    checkReplayCache(g_cache, "g_cache", at::kFloat, replayPool, num_spec, D);
+    checkReplayCache(v_cache, "v_cache", at::kBFloat16, replayPool, num_spec, D);
+    checkReplayCache(beta_cache, "beta_cache", at::kBFloat16, replayPool, num_spec, H);
 
     bool const quantize = out_scale.has_value();
     if (quantize)
@@ -203,6 +228,8 @@ void kimi_k3_kda_mtp_verify(at::Tensor const& x_q, at::Tensor const& x_k, at::Te
     p.dtBias = dt_bias.data_ptr<float>();
     p.onormWeight = onorm_weight.data_ptr<float>();
     p.ssmStateIndices = ssm_state_indices.data_ptr<int32_t>();
+    p.replayStateIndices = replay_state_indices.has_value() ? replay_state_indices->data_ptr<int32_t>() : nullptr;
+    p.replayPoolSize = static_cast<int>(replayPool);
     p.numAcceptedTokens = num_accepted_tokens.data_ptr<int32_t>();
     p.numAcceptedTokensStride = num_accepted_tokens.stride(0); // the hybrid cache keeps a count block per slot
     p.convQ = cs_q.data_ptr();
@@ -254,7 +281,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "kimi_k3_kda_mtp_verify(Tensor x_q, Tensor x_k, Tensor x_v, Tensor g, Tensor beta, Tensor onorm_g, "
         "Tensor w_q, Tensor w_k, Tensor w_v, Tensor A_log, Tensor dt_bias, Tensor onorm_weight, "
-        "Tensor ssm_state_indices, Tensor num_accepted_tokens, Tensor(a!) cs_q, Tensor(b!) cs_k, Tensor(c!) cs_v, "
+        "Tensor ssm_state_indices, Tensor? replay_state_indices, Tensor num_accepted_tokens, Tensor(a!) cs_q, "
+        "Tensor(b!) cs_k, Tensor(c!) cs_v, "
         "Tensor(d!) recurrent_state, Tensor(e!) k_cache, Tensor(f!) g_cache, Tensor(g!) v_cache, "
         "Tensor(h!) beta_cache, Tensor(i!) out, Tensor(j!)? out_scale, int num_spec, float lower_bound, "
         "float scale, float onorm_eps, bool enable_pdl) -> ()");

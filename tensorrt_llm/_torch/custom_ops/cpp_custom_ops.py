@@ -444,9 +444,10 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::kimi_k3_kda_mtp_verify")
     def _(x_q, x_k, x_v, g, beta, onorm_g, w_q, w_k, w_v, A_log, dt_bias,
-          onorm_weight, ssm_state_indices, num_accepted_tokens, cs_q, cs_k,
-          cs_v, recurrent_state, k_cache, g_cache, v_cache, beta_cache, out,
-          out_scale, num_spec, lower_bound, scale, onorm_eps, enable_pdl):
+          onorm_weight, ssm_state_indices, replay_state_indices,
+          num_accepted_tokens, cs_q, cs_k, cs_v, recurrent_state, k_cache,
+          g_cache, v_cache, beta_cache, out, out_scale, num_spec, lower_bound,
+          scale, onorm_eps, enable_pdl):
         pass
 
     @torch.library.register_fake("trtllm::inplace_slice_copy")

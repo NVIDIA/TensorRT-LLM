@@ -29,9 +29,10 @@ namespace kernels
 //! Kimi K3 KDA multi-token speculative verify on the packed token layout, fused with the gated output RMSNorm and the
 //! 1x128 MXFP8 quantization of its output: the contract of trtllm::kda_mtp_decode_fp8 with packed_token_layout = True
 //! and fuse_output_norm = True. K = V = 128, conv width 4, numSpec + 1 new-token rows per request (row
-//! b * (numSpec + 1) + j), slot-indexed accepted-draft counts, replay caches of numSpec rows per slot. Not
-//! bit-identical to that op (different summation order, fast-math transcendentals); the state is committed with
-//! round-to-nearest-even.
+//! b * (numSpec + 1) + j), replay caches of numSpec rows per slot. Each request has a state slot in the recurrent-state
+//! pool and a replay slot in the replay pool, which holds the conv windows, the replay caches and the accepted-draft
+//! counts. The two pools may be one (the replay slots are then the state slots). Not bit-identical to that op
+//! (different summation order, fast-math transcendentals); the state is committed with round-to-nearest-even.
 //!
 //! The parameter block describes the op's tensors; any kernel that honors the contract can replace the one behind
 //! invokeKimiK3KdaMtpVerify (see isKimiK3KdaMtpVerifySupported for what the current one accepts). All strides are
@@ -61,10 +62,14 @@ struct KimiK3KdaMtpVerifyParams
     float const* onormWeight = nullptr;         //!< [128]
 
     int32_t const* ssmStateIndices = nullptr;   //!< [B] state-pool slot of each request
-    int32_t const* numAcceptedTokens = nullptr; //!< [>= pool] accepted drafts of the previous round, by slot
+    int32_t const* numAcceptedTokens = nullptr; //!< [>= replay pool] accepted drafts, by replay slot
     int64_t numAcceptedTokensStride = 1;        //!< its slot stride (the hybrid cache keeps a count block per slot)
+    //! [B] replay-pool slot of each request; null: the replay slots are the state slots
+    int32_t const* replayStateIndices = nullptr;
+    //! Replay-pool slots (statePoolSize when the replay slots are the state slots)
+    int replayPoolSize = 0;
 
-    //! Conv windows (bf16) [pool, H * 128, >= 3 + numSpec], channel stride 1. Mutated.
+    //! Conv windows (bf16) [replay pool, H * 128, >= 3 + numSpec], channel stride 1. Mutated.
     void* convQ = nullptr;
     void* convK = nullptr;
     void* convV = nullptr;
@@ -82,8 +87,8 @@ struct KimiK3KdaMtpVerifyParams
     int64_t stateSlotStride = 0;
     int statePoolSize = 0;
 
-    //! Replay caches of the drafts: k (bf16) / g (fp32) / v (bf16) [pool, numSpec, H * 128], beta (bf16)
-    //! [pool, numSpec, H]; (slot, row) strides, last dimension contiguous. Mutated.
+    //! Replay caches of the drafts: k (bf16) / g (fp32) / v (bf16) [replay pool, numSpec, H * 128], beta (bf16)
+    //! [replay pool, numSpec, H]; (slot, row) strides, last dimension contiguous. Mutated.
     void* kCache = nullptr;
     float* gCache = nullptr;
     void* vCache = nullptr;
