@@ -35,12 +35,14 @@ import argparse
 import ctypes
 import hashlib
 import importlib.util
+import io
 import itertools
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -563,20 +565,30 @@ def smem_bytes(cubin: bytes, func_name: str) -> int:
 
 def write_archive(stem: str, cubin: bytes) -> None:
     with tempfile.TemporaryDirectory(dir=CUBIN_DIR.parent) as tmp:
-        (Path(tmp) / f"{stem}.cubin").write_bytes(cubin)
+        tar_path = Path(tmp) / "cubin.tar"
+        with tarfile.open(tar_path, "w", format=tarfile.PAX_FORMAT) as archive:
+            member = tarfile.TarInfo(f"{stem}.cubin")
+            member.size = len(cubin)
+            member.mode = 0o644
+            member.mtime = 0
+            member.uid = 0
+            member.gid = 65534
+            member.uname = "root"
+            member.gname = "nogroup"
+            archive.addfile(member, io.BytesIO(cubin))
+        compression_script = Path(tmp) / "compress.cmake"
+        compression_script.write_text(
+            'file(ARCHIVE_CREATE OUTPUT "${OUTPUT}" PATHS "${INPUT}"\n'
+            "     FORMAT raw COMPRESSION Zstd COMPRESSION_LEVEL 3)\n"
+        )
         subprocess.run(
             [
                 "cmake",
-                "-E",
-                "tar",
-                "cf",
-                str(CUBIN_DIR / f"{stem}.cubin.tar.zst"),
-                "--zstd",
-                "--mtime=1970-01-01UTC",
-                "--",
-                f"{stem}.cubin",
+                f"-DINPUT:FILEPATH={tar_path}",
+                f"-DOUTPUT:FILEPATH={CUBIN_DIR / f'{stem}.cubin.tar.zst'}",
+                "-P",
+                str(compression_script),
             ],
-            cwd=tmp,
             check=True,
         )
 
