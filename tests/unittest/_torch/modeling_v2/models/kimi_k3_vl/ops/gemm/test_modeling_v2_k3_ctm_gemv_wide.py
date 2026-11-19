@@ -1,19 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_ctm_gemv_wide catalog entry."""
+"""GPU test for the k3_ctm_gemv_wide op."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
-    op as ctm_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import op as ctm_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_wide import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_wide import (
     k3_ctm_gemv_wide,
 )
 
@@ -21,7 +19,7 @@ __extra_import_path__ = ["../../../.."]
 from _validating import validating
 
 assert torch.cuda.is_available(), "k3_ctm_gemv_wide requires a CUDA device"
-# The receipts are sm_100 ones; CI's other architectures skip this file.
+# Runs on sm_100 and sm_103 (the architectures the op is certified on); other architectures skip this file.
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="certified on sm_100 and sm_103",
@@ -114,7 +112,7 @@ def test_projection_cells(cell) -> None:
 
 def test_rows_match_long_at_the_same_split() -> None:
     """A token's row is k3_ctm_gemv_long's for it (calls of up to 8 tokens) where the splits agree."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv.k3_ctm_gemv_kernel import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv.k3_ctm_gemv_kernel import (
         wide_tile,
     )
 

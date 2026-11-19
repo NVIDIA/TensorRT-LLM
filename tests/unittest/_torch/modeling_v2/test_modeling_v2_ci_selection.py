@@ -39,7 +39,7 @@ import yaml
 
 pytestmark = pytest.mark.cpu_only
 
-_PY = "tensorrt_llm/_torch/_experimental/modeling_v2"
+_PY = "tensorrt_llm/_torch/modeling_v2"
 _CPP = "cpp/tensorrt_llm/modeling_v2"
 _UNIT = "tests/unittest/_torch/modeling_v2"
 _ACC = "tests/integration/defs/accuracy/modeling_v2"
@@ -341,10 +341,19 @@ _NO_CI_STAGE = {
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/comm": (
         "2 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/ops/comm": (
+        "2 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/comm": (
         "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/ops/comm": (
+        "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/comm": (
+        "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/ops/comm": (
         "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
 }

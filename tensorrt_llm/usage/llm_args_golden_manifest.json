@@ -291,6 +291,16 @@
       "path": "cuda_graph_config.num_tokens"
     },
     {
+      "allowed_values": [
+        "greedy",
+        "advanced",
+        "temperature_only"
+      ],
+      "capture_policy": "list[literal]|none",
+      "kind": "categorical",
+      "path": "cuda_graph_config.sampling_variants"
+    },
+    {
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "cuda_graph_config.seq_lens"
@@ -953,6 +963,16 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.mixed_precision_last_n"
+    },
+    {
+      "allowed_values": [
+        "default",
+        "strict",
+        "recompute"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_config.mixed_precision_reuse"
     },
     {
       "capture_policy": "list[float]|none",
@@ -2224,6 +2244,15 @@
       "path": "speculative_config.num_nextn_predict_layers"
     },
     {
+      "allowed_values": [
+        "standard",
+        "block"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.rejection_sample_method"
+    },
+    {
       "capture_policy": "float",
       "kind": "value",
       "path": "speculative_config.relaxed_delta"
@@ -2257,6 +2286,11 @@
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "speculative_config.target_layer_ids"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.use_ancestral_draft_sampling"
     },
     {
       "capture_policy": "bool|none",

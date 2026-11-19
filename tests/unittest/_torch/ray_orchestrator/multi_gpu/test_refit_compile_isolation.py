@@ -654,7 +654,7 @@ def _run_engine(engine: _Engine) -> None:
             mamba_ssm_cache_dtype="float32",
         ),
         model_kwargs=_model_kwargs(),
-        moe_config=MoeConfig(backend="CUTLASS"),
+        moe_config=MoeConfig(tactic="cutlass"),
         enable_chunked_prefill=True,
         disable_mm_encoder=True,
         **llm_kwargs,

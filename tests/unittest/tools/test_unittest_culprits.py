@@ -24,6 +24,8 @@ from unittest.mock import Mock
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MODULE_PATH = _REPO_ROOT / "tests/integration/defs/test_unittests.py"
 
@@ -61,13 +63,13 @@ def _load_test_unittests_module() -> types.ModuleType:
 
 
 _TEST_UNITTESTS = _load_test_unittests_module()
+_junit_all_tests_skipped = _TEST_UNITTESTS._junit_all_tests_skipped
 _junit_culprits = _TEST_UNITTESTS._junit_culprits
 _fail_unittests = _TEST_UNITTESTS._fail_unittests
 _parallel_config_key = _TEST_UNITTESTS._parallel_config_key
 _unittest_case_filename = _TEST_UNITTESTS._unittest_case_filename
 
 
-@pytest.mark.cpu_only
 def test_long_selectors_preserve_separate_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -124,7 +126,6 @@ def test_long_selectors_preserve_separate_reports(
     assert reports[4].read_text(encoding="utf-8") == "5"
 
 
-@pytest.mark.cpu_only
 def test_long_selector_report_names_are_stable_across_processes(tmp_path: Path) -> None:
     names_by_seed = []
     for seed in ("1", "2"):
@@ -156,6 +157,91 @@ def test_long_selector_report_names_are_stable_across_processes(tmp_path: Path) 
 
     assert len(names_by_seed[0]) == 4
     assert names_by_seed[0] == names_by_seed[1]
+
+
+def test_junit_all_tests_skipped(tmp_path: Path) -> None:
+    report = tmp_path / "results.xml"
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="2" tests="2">
+    <testcase classname="pkg.test_awq" name="test_a"><skipped message="SM100" /></testcase>
+    <testcase classname="pkg.test_awq" name="test_b"><skipped message="SM100" /></testcase>
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_tests_skipped(str(report)) is True
+
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="1" tests="2">
+    <testcase classname="pkg.test_awq" name="test_a"><skipped message="SM100" /></testcase>
+    <testcase classname="pkg.test_awq" name="test_b" />
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_tests_skipped(str(report)) is False
+
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" />
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_tests_skipped(str(report)) is False
+    assert _junit_all_tests_skipped(str(tmp_path / "missing.xml")) is False
+
+    report.write_text("<testsuites>", encoding="utf-8")
+    assert _junit_all_tests_skipped(str(report)) is False
+
+    # PeriodicJUnitXML always writes suite counts. A report without them still
+    # classifies from testcase nodes, which is the only path this helper uses.
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest">
+    <testcase classname="pkg.test_awq" name="test_a"><skipped message="SM100" /></testcase>
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_tests_skipped(str(report)) is True
+
+    # Non-strict xfail is <skipped type="pytest.xfail"> and is included in the
+    # suite skipped count, but the test body ran.
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="2" tests="2">
+    <testcase classname="pkg.test_awq" name="test_a">
+      <skipped type="pytest.xfail" message="known" />
+    </testcase>
+    <testcase classname="pkg.test_awq" name="test_b">
+      <skipped type="pytest.xfail" message="known" />
+    </testcase>
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_tests_skipped(str(report)) is False
+
+    # A retry merge can leave suite skipped="0" while the kept testcase skipped.
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1">
+    <testcase classname="pkg.test_awq" name="test_a">
+      <skipped type="pytest.skip" message="SM100" />
+    </testcase>
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_tests_skipped(str(report)) is True
 
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:

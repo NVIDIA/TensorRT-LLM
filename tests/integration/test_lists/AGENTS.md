@@ -35,3 +35,29 @@ Before editing `waives.txt` or changing a waived test-list entry, read the
 - Use case/function waives for isolated failures or temporary whole-entry waives
   for widespread failures. Track fixes and restore coverage once verified.
 - Update this file and the CI overview together when changing waive processing.
+
+## CPU test registration and batching
+
+- Reuse a file or parent-directory entry when its actual marker/options already
+  select the intended case. Adding a function entry alongside that parent repeats
+  execution. Prefer one file entry for compatible functions from the same file
+  when all of its CPU cases are intended to run.
+- Keep intentional partial selectors and required `ISOLATION` boundaries. Before
+  consolidating entries, compare real pytest collections under the stage's marker,
+  exclusions and waivers: check node IDs, multiplicity and skip/xfail markers, not
+  just total counts. Explain any deliberate case removal separately.
+- Run the proposed batch to check fixture and process-state interactions, including
+  event loops and environment variables. Retain separate processes where the tests
+  require them; a matching collection does not prove execution compatibility.
+- Check CBTS through the generated filtered test-db, including file/function
+  changes and any domain rules that depend on explicit registrations. Confirm the
+  intended stages, retained tests and split counts. Document any coarser selection
+  granularity and its cost; a successful path lookup alone is not sufficient.
+- Renaming entries or regrouping parameters can change report, waiver and duration
+  keys. Recheck references and safe coverage-history fallback. Use measured batch
+  times when evaluating shard balance; summing old per-function startup costs does
+  not estimate the new batch correctly. Preserve the existing waiver rules above.
+
+Follow the [unit-test coverage guidance](../../unittest/AGENTS.md) when adding or
+reducing cases. These rules preserve useful coverage and efficient execution,
+without fixing a maximum test count or preventing justified new regression tests.

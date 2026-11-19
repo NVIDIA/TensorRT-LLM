@@ -23,7 +23,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import yaml
 
@@ -34,6 +34,7 @@ else:
     import manage as vendor
     from diagnostics import Diagnostic, field, yaml_problem
 
+# The repository lock; --lock selects a scoped vendor lock instead.
 _LOCK = "3rdparty/vendor_sources.lock.yaml"
 _BEGIN = "----- BEGIN VENDOR PROMOTION V1 -----"
 _END = "----- END VENDOR PROMOTION V1 -----"
@@ -55,7 +56,7 @@ def _run(
     # Do not use manage._run_git here: its synthetic identity is for
     # patch generation. Real promotion commits must use the maintainer's identity.
     env = os.environ.copy()
-    for key in vendor._GIT_LOCAL_ENVIRONMENT_VARIABLES:
+    for key in vendor._GIT_LOCAL_ENVIRONMENT_VARIABLES | vendor._GIT_PATHSPEC_ENVIRONMENT_VARIABLES:
         env.pop(key, None)
     env.setdefault("GH_CONFIG_DIR", str(Path.home() / ".config/gh"))
     env.update(GIT_TERMINAL_PROMPT="0", GH_PROMPT_DISABLED="1", GIT_NO_REPLACE_OBJECTS="1")
@@ -102,9 +103,12 @@ class GitHub:
         upstream_repo: str = "",
         base_branch: str = "main",
         upstream_branch: str = "main",
+        *,
+        lock: str = _LOCK,
     ) -> None:
         self.consumer_repo = _repo_name(f"https://github.com/{consumer_repo}")
         self.vendor_name = vendor_name
+        self.lock = lock
         self.upstream_repo = upstream_repo
         self.base_branch = base_branch
         self.upstream_branch = upstream_branch
@@ -172,7 +176,7 @@ def _pr_number(value: str, repo: str) -> int:
 
 
 def _lock_document_at(gh: GitHub, repo: str, commit: str) -> dict:
-    response = gh.get(f"repos/{repo}/contents/{_LOCK}?ref={_sha(commit)}")
+    response = gh.get(f"repos/{repo}/contents/{quote(gh.lock)}?ref={_sha(commit)}")
     if response.get("encoding") != "base64":
         raise ValueError("GitHub did not return the complete vendor lock.")
     try:
@@ -183,13 +187,13 @@ def _lock_document_at(gh: GitHub, repo: str, commit: str) -> dict:
         ):
             raise Diagnostic(
                 "Vendor lock YAML aliases and anchors are not allowed.",
-                f"Replace anchors and aliases with explicit values in `{_LOCK}` and push the PR.",
+                f"Replace anchors and aliases with explicit values in `{gh.lock}` and push the PR.",
             )
         data = yaml.load(content, Loader=vendor._UniqueKeyLoader)
     except yaml.YAMLError as error:
         raise Diagnostic(
             f"Invalid vendor lock YAML: {yaml_problem(error)}.",
-            f"Correct the YAML at that location in `{_LOCK}`, keeping keys unique and "
+            f"Correct the YAML at that location in `{gh.lock}`, keeping keys unique and "
             "using spaces for indentation; then push the PR.",
         ) from error
     if (
@@ -201,15 +205,31 @@ def _lock_document_at(gh: GitHub, repo: str, commit: str) -> dict:
     ):
         raise Diagnostic(
             "Unsupported vendor lock schema.",
-            f"In `{_LOCK}`, use only top-level `schema_version: 1` and a `vendors` mapping. "
+            f"In `{gh.lock}`, use only top-level `schema_version: 1` and a `vendors` mapping. "
             "Preserve other vendors' entries and push the corrected file.",
         )
     return data
 
 
+def _lock_vendors_at(gh: GitHub, repo: str, commit: str) -> dict:
+    """Return the vendors in gh.lock at commit; a lock that does not exist has none."""
+    try:
+        return _lock_document_at(gh, repo, commit)["vendors"]
+    except RuntimeError as error:
+        if "HTTP 404" not in str(error):
+            raise
+        return {}
+
+
 def _lock_at(gh: GitHub, repo: str, commit: str) -> vendor.Vendor:
-    data = _lock_document_at(gh, repo, commit)
-    return vendor._validate_vendor(gh.vendor_name, data["vendors"][gh.vendor_name])
+    vendors = _lock_vendors_at(gh, repo, commit)
+    if gh.vendor_name not in vendors:
+        raise ValueError(
+            f"Vendor {gh.vendor_name!r} is not in `{gh.lock}` at {commit}. "
+            "Pass --lock with the lock that defines it; a source update made before the vendor "
+            "moved to another lock cannot be promoted."
+        )
+    return vendor._validate_vendor(gh.vendor_name, vendors[gh.vendor_name])
 
 
 def _main_sha(gh: GitHub) -> str:
@@ -249,7 +269,7 @@ def _is_upstream_main(gh: GitHub, reviewed: vendor.Vendor) -> bool:
     )
 
 
-def _check_selection(previous: vendor.Vendor, reviewed: vendor.Vendor) -> None:
+def _check_selection(previous: vendor.Vendor, reviewed: vendor.Vendor, *, lock: str) -> None:
     if previous.source != reviewed.source or set(previous.include) != set(reviewed.include):
         changed = (["source"] if previous.source != reviewed.source else []) + (
             ["include"] if set(previous.include) != set(reviewed.include) else []
@@ -259,7 +279,7 @@ def _check_selection(previous: vendor.Vendor, reviewed: vendor.Vendor) -> None:
             "Changed fields: " + ", ".join(f"`{name}`" for name in changed) + ".",
             "Separate the selection change into a different PR. In this source-update PR, "
             "restore the canonical `source`/`include` selection in "
-            "`3rdparty/vendor_sources.lock.yaml` and regenerate the vendor snapshot.",
+            f"`{lock}` and regenerate the vendor snapshot.",
         )
 
 
@@ -270,7 +290,7 @@ def _check_source(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) 
         _check_source_repo(gh, repo)
         _check_canonical_tip(gh, previous, reviewed)
         return None
-    _check_selection(previous, reviewed)
+    _check_selection(previous, reviewed, lock=gh.lock)
     tip = _canonical_tip(gh, previous, reviewed)
     contains_tip = (
         gh.compare(_repo_name(previous.url), tip, reviewed.commit)["merge_base_commit"]["sha"]
@@ -464,6 +484,7 @@ class Promotion:
     record: dict
     consumer_repo: str = "NVIDIA/TensorRT-LLM"
     base_branch: str = "main"
+    lock: str = _LOCK
     completed_pr: dict | None = None
 
     @property
@@ -550,6 +571,7 @@ def _plan_identity(args: argparse.Namespace, gh: GitHub) -> Promotion:
         record,
         consumer_repo=gh.consumer_repo,
         base_branch=gh.base_branch,
+        lock=gh.lock,
     )
 
 
@@ -591,7 +613,7 @@ def _make_plan(
         else:
             import metadata
         pr = gh.get(f"repos/{gh.consumer_repo}/pulls/{plan.number}")
-        entry = metadata.parse(pr.get("body") or "", gh.vendor_name, gh.upstream_repo)
+        entry = metadata.parse(pr.get("body") or "", gh.vendor_name, gh.upstream_repo, lock=gh.lock)
         args.upstream_pr = [str(number) for number in entry["upstream_prs"]]
         args.unpaired_reason = entry["unpaired_reason"]
         resolutions = entry["resolutions"]
@@ -766,15 +788,12 @@ def _recover_plan(args: argparse.Namespace, gh: GitHub, plan: Promotion) -> bool
             if _git(args.repo, "merge-base", sha, plan.main_sha) == sha:
                 return False
             parents = _git(args.repo, "show", "-s", "--format=%P", sha).split()
-            if (
-                len(parents) != 1
-                or _git(args.repo, "diff", "--name-only", parents[0], sha) != _LOCK
-            ):
+            if len(parents) != 1 or _diff_paths(args.repo, parents[0], sha) != {plan.lock}:
                 raise ValueError("Local promotion commit must change only the vendor lock.")
             _git(args.repo, "merge-base", "--is-ancestor", parents[0], plan.main_sha)
             _check_document_change(
-                _local_lock_document(args.repo, parents[0]),
-                _local_lock_document(args.repo, sha),
+                _local_lock_document(args.repo, plan.lock, parents[0]),
+                _local_lock_document(args.repo, plan.lock, sha),
                 plan,
             )
             message = _git(args.repo, "show", "-s", "--format=%B", sha)
@@ -893,7 +912,7 @@ def _verify_upstream_snapshot(gh: GitHub, record: dict) -> None:
 
 def _verify_remote_commit(gh: GitHub, plan: Promotion, repo: str, sha: str) -> str:
     commit = gh.get(f"repos/{repo}/commits/{_sha(sha)}")
-    if len(commit["parents"]) != 1 or [item["filename"] for item in commit["files"]] != [_LOCK]:
+    if len(commit["parents"]) != 1 or [item["filename"] for item in commit["files"]] != [gh.lock]:
         raise ValueError("Promotion commit must change only the vendor lock and have one parent.")
     parent = commit["parents"][0]["sha"]
     comparison = gh.compare(gh.consumer_repo, parent, _main_sha(gh))
@@ -933,25 +952,29 @@ def _source_repo(args: argparse.Namespace, plan: Promotion) -> Iterator[Path]:
         yield repo
 
 
-def _local_lock_document(worktree: Path, revision: str | None = None) -> dict:
+def _local_lock_document(worktree: Path, lock: str, revision: str | None = None) -> dict:
     content = (
-        (worktree / _LOCK).read_text()
+        (worktree / lock).read_text()
         if revision is None
-        else _git(worktree, "show", f"{revision}:{_LOCK}")
+        else _git(worktree, "show", f"{revision}:{lock}")
     )
     return yaml.load(content, Loader=vendor._UniqueKeyLoader)
 
 
+def _diff_paths(worktree: Path, *args: str) -> set[str]:
+    # NUL-separated output keeps Git from quoting non-ASCII paths (core.quotePath).
+    paths = _git(worktree, "diff", "--name-only", "--no-renames", "-z", *args, "--")
+    return {path for path in paths.split("\0") if path}
+
+
 def _pending_paths(worktree: Path) -> set[str]:
     # A file restored in the working tree can still have an unrelated staged edit.
-    return set(_git(worktree, "diff", "--name-only", "HEAD").splitlines()) | set(
-        _git(worktree, "diff", "--cached", "--name-only", "HEAD").splitlines()
-    )
+    return _diff_paths(worktree, "HEAD") | _diff_paths(worktree, "--cached", "HEAD")
 
 
 def _check_lock_only(worktree: Path, before: dict, plan: Promotion) -> None:
-    _check_document_change(before, _local_lock_document(worktree), plan)
-    if _pending_paths(worktree) != {_LOCK}:
+    _check_document_change(before, _local_lock_document(worktree, plan.lock), plan)
+    if _pending_paths(worktree) != {plan.lock}:
         raise ValueError("Promotion must change only the vendor lock.")
     if _git(worktree, "ls-files", "--others", "--exclude-standard"):
         raise ValueError("Unexpected untracked files in the promotion worktree.")
@@ -998,9 +1021,9 @@ def _prepare_commit(args: argparse.Namespace, plan: Promotion, source: Path) -> 
             _adopt_record(plan, _git(worktree, "log", "-1", "--format=%B"))
             parent = _git(worktree, "rev-parse", "HEAD^")
             _git(worktree, "merge-base", "--is-ancestor", parent, plan.main_sha)
-            before = _local_lock_document(worktree, "HEAD^")
+            before = _local_lock_document(worktree, plan.lock, "HEAD^")
             _check_committed_lock(worktree, before, plan)
-            lock = vendor._load_lock(worktree / _LOCK)
+            lock = vendor._load_lock(worktree / plan.lock)
             vendor._verify_source(lock, lock.vendors[plan.previous.name], source)
             print(f"Reusing completed promotion commit {head} in {worktree}.", flush=True)
             return worktree, head
@@ -1014,28 +1037,28 @@ def _prepare_commit(args: argparse.Namespace, plan: Promotion, source: Path) -> 
             _git(args.repo, "worktree", "add", *flags, str(worktree), plan.branch)
             return _prepare_commit(args, plan, source)
         _git(args.repo, "worktree", "add", "-b", plan.branch, str(worktree), plan.main_sha)
-    before = _local_lock_document(worktree, "HEAD")
+    before = _local_lock_document(worktree, plan.lock, "HEAD")
     if before["vendors"][plan.previous.name] != plan.reviewed.to_mapping():
         raise ValueError("Worktree base no longer contains the reviewed temporary pin.")
     # Recover only the two states this tool writes. Preserve arbitrary user or
     # hook edits, including staged-only changes, instead of overwriting them.
     for revision in (None, ""):
-        pending = _local_lock_document(worktree, revision)
+        pending = _local_lock_document(worktree, plan.lock, revision)
         if pending != before:
             _check_document_change(before, pending, plan)
-    if _pending_paths(worktree) - {_LOCK}:
+    if _pending_paths(worktree) - {plan.lock}:
         raise ValueError(
             "Incomplete promotion has changes outside the vendor lock; inspect before retrying."
         )
     if _git(worktree, "ls-files", "--others", "--exclude-standard"):
         raise ValueError("Incomplete promotion has untracked files; inspect before retrying.")
-    lock = vendor._load_lock(worktree / _LOCK)
+    lock = vendor._load_lock(worktree / plan.lock)
     print("Verifying source materialization and the lock-only change...", flush=True)
     vendor._verify_source(lock, lock.vendors[plan.previous.name], source)
     result = vendor.main(
         [
             "--lock",
-            str(worktree / _LOCK),
+            str(worktree / plan.lock),
             "pin",
             plan.previous.name,
             "--url",
@@ -1051,7 +1074,7 @@ def _prepare_commit(args: argparse.Namespace, plan: Promotion, source: Path) -> 
     if result:
         raise ValueError("Vendor pin failed; worktree preserved for inspection.")
     _check_lock_only(worktree, before, plan)
-    _git(worktree, "add", "--", _LOCK)
+    _git(worktree, "update-index", "--add", "--", plan.lock)
     print("Creating signed-off promotion commit...", flush=True)
     _git(worktree, "commit", "-s", "-F", "-", text=f"{plan.title}\n\n{_record_text(plan.record)}\n")
     if _git(worktree, "status", "--porcelain"):
@@ -1061,10 +1084,10 @@ def _prepare_commit(args: argparse.Namespace, plan: Promotion, source: Path) -> 
 
 
 def _check_committed_lock(worktree: Path, before: dict, plan: Promotion) -> None:
-    _check_document_change(before, _local_lock_document(worktree), plan)
+    _check_document_change(before, _local_lock_document(worktree, plan.lock), plan)
     if len(_git(worktree, "rev-list", "--parents", "-n", "1", "HEAD").split()) != 2:
         raise ValueError("Promotion commit must have exactly one parent.")
-    if _git(worktree, "diff", "--name-only", "HEAD^", "HEAD") != _LOCK:
+    if _diff_paths(worktree, "HEAD^", "HEAD") != {plan.lock}:
         raise ValueError("Commit hooks added changes outside the vendor lock.")
     message = _git(worktree, "log", "-1", "--format=%B")
     if _record_from_message(message) != plan.record:
@@ -1197,8 +1220,9 @@ def _pr_body(plan: Promotion, message: str) -> str:
     return (
         "@coderabbitai summary\n\n## Description\n\n"
         f"Promote the exact source revision reviewed in {plan.record['consumer_pr']}.\n"
-        "Only the selected vendor lock URL/branch changes. The source SHA, selected vendor files, "
-        "compatibility patch, and digests are unchanged.\n\n"
+        f"Only `vendors.{plan.previous.name}` in `{plan.lock}` changes its URL/branch. "
+        "The source SHA, selected vendor files, compatibility patch, and digests are "
+        "unchanged.\n\n"
         f"{unpaired}"
         "## Test Coverage\n\nSource materialization and lock-only diff verified by the promotion tool. "
         "No new kernel behavior. The tool posts "
@@ -1348,6 +1372,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     promote.add_argument("--source-pr", required=True)
     promote.add_argument("--vendor", required=True, help="Vendor key in the lock file.")
+    promote.add_argument(
+        "--lock",
+        default=_LOCK,
+        help="Vendor lock that defines --vendor, relative to the consumer repository root "
+        f"(default: {_LOCK}).",
+    )
     promote.add_argument("--consumer-repo", default="NVIDIA/TensorRT-LLM")
     promote.add_argument("--base-branch", default="main")
     promote.add_argument("--upstream-repo", required=True, help="Upstream OWNER/REPO.")
@@ -1406,6 +1436,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--auto-merge and --wait require --publish")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    try:
+        args.lock = vendor._lock_location(args.lock, "--lock")
+    except vendor.VendorError as error:
+        parser.error(str(error))
     args.repo = args.repo.resolve()
     try:
         if not vendor._NAME_PATTERN.fullmatch(args.vendor):
@@ -1417,6 +1451,7 @@ def main(argv: list[str] | None = None) -> int:
             args.upstream_repo,
             args.base_branch,
             args.upstream_branch,
+            lock=args.lock,
         )
         if args.map_upstream and (args.auto_match or args.from_pr_description):
             raise ValueError("Explicit --map-upstream cannot accompany automatic matching.")

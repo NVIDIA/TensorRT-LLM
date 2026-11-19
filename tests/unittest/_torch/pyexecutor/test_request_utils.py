@@ -5,7 +5,8 @@
 
 This module tests:
 - Request merging functions (merge_requests, merge_helix_requests)
-- Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request)
+- Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request,
+  drain_queued_items)
 - Rank-0 clock piggyback in RequestBroadcaster
 
 """
@@ -24,13 +25,17 @@ import pytest
 import torch
 from mpi4py import MPI
 
-from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    ExecutorRequestQueue,
+    RequestQueueItem,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest, PythonRequestInputs
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
     can_process_attention_dp_request,
     derive_attention_dp_per_rank_request_cap,
+    drain_queued_items,
     executor_request_to_llm_request,
     get_from_waiting_queue,
     merge_helix_requests,
@@ -1306,6 +1311,40 @@ def test_merge_helix_requests_empty_ranks():
         assert llm_request.seqlen_this_rank_cp == len(expected_tokens[rank])
 
 
+@pytest.mark.parametrize(
+    ("stop_words", "prompt_tail"),
+    [
+        pytest.param([[11, 12, 99], [7]], [11, 12], id="multi_token_stop_word"),
+        pytest.param([[99], [7]], [], id="single_token_stop_words"),
+        pytest.param(None, [], id="no_stop_words"),
+    ],
+)
+def test_merge_helix_requests_keeps_the_prompt_tail_on_every_rank(stop_words, prompt_tail) -> None:
+    """A multi-token stop word that the first generated token completes can
+    span prompt tokens a rank's slice does not hold, so every rank, including
+    an empty one, keeps the tail it can span."""
+    input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    request_item = RequestQueueItem(
+        id=1,
+        request=trtllm.Request(
+            input_token_ids=input_tokens,
+            max_tokens=4,
+            stop_words=stop_words,
+        ),
+    )
+
+    for rank in range(4):
+        (llm_request,) = merge_helix_requests(
+            [request_item],
+            cp_rank=rank,
+            cp_size=4,
+            tokens_per_block=4,
+            exclude_last_generation_logits=False,
+        )
+
+        assert llm_request.py_helix_prompt_tail == prompt_tail
+
+
 def test_merge_helix_requests_empty_ranks_with_padding():
     """Exercise padding-strip-on-last-owner and empty ranks together.
 
@@ -1568,7 +1607,7 @@ def test_get_from_waiting_queue():
     # Add items to waiting queue
     waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    waiting_queue.extend(items)
+    waiting_queue.add_requests(items)
 
     # Get 3 items
     result = get_from_waiting_queue(
@@ -1597,7 +1636,7 @@ def test_get_from_waiting_queue_edge_cases(
     waiting_queue = FCFSWaitingQueue()
     if queue_size > 0:
         items = [RequestQueueItem(i, Mock()) for i in range(queue_size)]
-        waiting_queue.extend(items)
+        waiting_queue.add_requests(items)
 
     result = get_from_waiting_queue(
         waiting_queue, request_count, enable_attention_dp=False, max_num_active_requests=16
@@ -1612,7 +1651,7 @@ def test_get_from_waiting_queue_with_attention_dp(
 ):
     waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    waiting_queue.extend(items)
+    waiting_queue.add_requests(items)
 
     result = get_from_waiting_queue(
         waiting_queue,
@@ -1642,7 +1681,7 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     )  # No scheduling params
 
     waiting_queue = FCFSWaitingQueue()
-    waiting_queue.extend([req1, req2, req3])
+    waiting_queue.add_requests([req1, req2, req3])
 
     # Set rank 0 to full capacity to test filtering
     all_ranks_num_active_requests[0] = 8
@@ -1659,6 +1698,31 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     assert req2 in result
     assert req3 in result
     assert req1 not in result
+
+
+def test_drain_takes_waiting_then_incoming_items_and_skips_shutdown():
+    dist = Mock(rank=0)
+    request_queue = ExecutorRequestQueue(
+        dist, max_batch_size=4, enable_iter_perf_stats=False, batch_wait_timeout_ms=0
+    )
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.add_requests([RequestQueueItem(1), RequestQueueItem(2)])
+    request_queue.request_queue.put(RequestQueueItem(3))
+    request_queue.enqueue_cancel_request(1)
+    request_queue.enqueue_shutdown_request()
+    request_queue.request_queue.put(RequestQueueItem(4))
+
+    drained = list(drain_queued_items(waiting_queue, request_queue))
+
+    assert [(item.id, item.is_canceled_request) for item in drained] == [
+        (1, False),
+        (2, False),
+        (3, False),
+        (1, True),
+        (4, False),
+    ]
+    assert not waiting_queue
+    assert request_queue.get_request_queue().empty()
 
 
 def test_can_process_attention_dp_request(attention_dp_config):

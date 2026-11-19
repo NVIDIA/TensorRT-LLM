@@ -215,6 +215,37 @@ def test_chat_top_logprobs_request_limit():
         )
 
 
+@pytest.mark.parametrize(
+    ("request_fields", "accepted"),
+    [
+        ({"top_logprobs": 0}, True),
+        ({"logprobs": False, "top_logprobs": 0}, True),
+        ({"logprobs": True, "top_logprobs": 0}, True),
+        ({"logprobs": True, "top_logprobs": 2}, True),
+        ({"top_logprobs": 2}, False),
+        ({"logprobs": False, "top_logprobs": 2}, False),
+    ],
+)
+def test_chat_top_logprobs_requires_logprobs_only_when_positive(request_fields, accepted):
+    def build():
+        return ChatCompletionRequest(
+            model="test", messages=[{"role": "user", "content": "hi"}], **request_fields
+        )
+
+    if accepted:
+        build()
+    else:
+        with pytest.raises(ValueError, match="logprobs must be true when using top_logprobs"):
+            build()
+
+
+def test_chat_request_with_default_logprobs_fields_round_trips():
+    request = ChatCompletionRequest(model="test", messages=[{"role": "user", "content": "hi"}])
+
+    # `top_logprobs` defaults to 0 while `logprobs` is False; sending the dump back must validate.
+    assert ChatCompletionRequest.model_validate(request.model_dump()).top_logprobs == 0
+
+
 def test_chat_template_request_override_respects_runtime_policy():
     request = ChatCompletionRequest(
         model="test",
@@ -303,6 +334,32 @@ def test_sampling_params_rejects_out_of_range(field, value):
 )
 def test_sampling_params_accepts_in_range_values(field, value):
     assert getattr(SamplingParams(**{field: value}), field) == value
+
+
+@pytest.mark.parametrize("stop", ["", [""], ["a", ""]])
+def test_sampling_params_rejects_empty_stop_string(stop):
+    with pytest.raises(ValueError, match="stop must not contain an empty string"):
+        SamplingParams(stop=stop)
+
+
+@pytest.mark.parametrize("stop", [None, [], "a", ["a"], ["a", "b"], [" "]])
+def test_sampling_params_accepts_non_empty_stop_strings(stop):
+    assert SamplingParams(stop=stop).stop == stop
+
+
+@pytest.mark.parametrize(
+    "request_cls, base",
+    [
+        (CompletionRequest, {"prompt": "hi"}),
+        (ChatCompletionRequest, {"messages": [{"role": "user", "content": "hi"}]}),
+    ],
+)
+@pytest.mark.parametrize("stop", ["", [""]])
+def test_serve_requests_reject_empty_stop_string(request_cls, base, stop):
+    request = request_cls(model="test", stop=stop, **base)
+
+    with pytest.raises(ValueError, match="stop must not contain an empty string"):
+        request.to_sampling_params(backend="pytorch")
 
 
 @pytest.mark.parametrize(

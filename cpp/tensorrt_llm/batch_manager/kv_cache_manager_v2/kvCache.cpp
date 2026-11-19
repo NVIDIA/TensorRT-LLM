@@ -58,13 +58,14 @@ int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleI
 // KvCache constructor
 // ---------------------------------------------------------------------------
 
-KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
-    std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly, bool enableRequestStats,
+KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<LocalityDomainId> localityDomainId,
+    std::optional<BlockRadixTree::ReuseMatch> reuseMatch, std::optional<RequestIdType> mId, PriorityCb priorityCb,
+    std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats,
     std::optional<executor::KvCacheRetentionConfig> retentionConfig, bool isPrefetch)
     : id(mId)
     , mManager(manager.shared_from_this())
     , mReuseScope(std::move(reuseScope))
+    , mLocalityDomainId(localityDomainId)
     , mPriorityCb(priorityCb ? std::move(priorityCb) : [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; })
     , mRetentionConfig(std::move(retentionConfig))
     , mStatus(Status::SUSPENDED)
@@ -263,8 +264,10 @@ void KvCache::_collectReuseCandidates()
             }
         }
         // OPTIONAL checks coverage at the REQUIRED endpoint without shortening it.
-        // Use the ordinary SWA live ranges, including sinks and multi-page windows.
-        if (attention && allowsCheckpoint(*attention) && end > 0 && end % mTokensPerBlock == 0 && attention->windowSize)
+        // Use the ordinary SWA live ranges, including sinks and multi-page windows. OPTIONAL needs a block-aligned
+        // endpoint; a SINK_REQUIRED_ONLY window may also end in a partial block, as a REQUIRED window does.
+        if (attention && allowsCheckpoint(*attention) && end > 0 && attention->windowSize
+            && (end % mTokensPerBlock == 0 || policy == ReusePolicy::SINK_REQUIRED_ONLY))
         {
             auto const stale = getStaleRange(lifeCycles[lc], end, mTokensPerBlock);
             auto& candidates = mOptionalCandidates[lc];
@@ -292,7 +295,7 @@ void KvCache::_collectReuseCandidates()
                 // SINK_REQUIRED_ONLY claimed its sinks with the prefix match; only its window is a candidate.
                 if (stale.beg > BlockOrdinal{0})
                 {
-                    status.coverage.emplace_back(0, stale.beg.value() * mTokensPerBlock);
+                    status.coverage.emplace_back(0, std::min(end, stale.beg.value() * mTokensPerBlock));
                 }
             }
             else
@@ -302,6 +305,31 @@ void KvCache::_collectReuseCandidates()
             if (status.complete)
             {
                 collectRange(stale.end, BlockOrdinal{end / mTokensPerBlock});
+            }
+            // A window that ends in a partial block also needs that block's tokens up to the endpoint. The first
+            // resume copies the block before the request appends to it.
+            BlockOrdinal const tail{end / mTokensPerBlock};
+            if (status.complete && end % mTokensPerBlock != 0 && tail >= stale.end)
+            {
+                auto const& block = mBlocks[tail].treeBlock;
+                auto* page = block && !block->isOrphan() ? block->getPage(lc) : nullptr;
+                if (page && page->numTokensInBlock >= end - tail.value() * mTokensPerBlock)
+                {
+                    candidates.emplace_back(tail, page->hold());
+                    // One window range up to the endpoint, as REQUIRED reports it.
+                    if (stale.end < tail)
+                    {
+                        status.coverage.back().second = end;
+                    }
+                    else
+                    {
+                        status.coverage.emplace_back(tail.value() * mTokensPerBlock, end);
+                    }
+                }
+                else
+                {
+                    status.complete = false;
+                }
             }
             if (!status.complete)
             {
@@ -678,7 +706,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
             { _recordDroppedPages(pages, cacheLevel); };
             if (anyResident)
             {
-                tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
+                tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder, localityDomainId());
             }
         }
         catch (OutOfPagesError const&)
@@ -978,7 +1006,7 @@ bool KvCache::prefetch(CacheLevel target)
             for (auto const& page : pagesByDestination[destination])
                 allPages.at(page->lifeCycle).at(page->cacheLevel).push_back(page);
 
-            int64_t const diskBlocksMigrated = storageMgr.prefetch(destination, allPages);
+            int64_t const diskBlocksMigrated = storageMgr.prefetch(destination, allPages, localityDomainId());
             if (diskBlocksMigrated > 0 && _shouldRecordManagerStats())
                 mManager->recordDiskPrefetchBlocks(diskBlocksMigrated);
         }
@@ -1029,6 +1057,8 @@ void KvCache::suspend()
         // Free scratch slots inside scope — unlock() needs finishEvent().
         // Mirrors Python: _free_scratch_slots() inside `with self._record_event()`.
         _freeReservedGpuSlots();
+        // A pending SSM snapshot belongs to the step in flight; it cannot be committed later.
+        mPendingSsmSnapshot.reset();
     }
     mStatus = Status::SUSPENDED;
     _onPageStorageChanged();
@@ -1334,6 +1364,7 @@ bool KvCache::_hasReuseSource(BlockPage const& page)
 
 void KvCache::_clearBlocks(bool keepPageIndices)
 {
+    mPendingSsmSnapshot.reset();
     mPartialCopyRetentionHolds.clear();
     // Drop last block first (mirrors Python: while self._blocks: self._blocks.pop()).
     while (!mBlocks.empty())
@@ -1388,7 +1419,7 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         Slot newSlot;
         try
         {
-            auto slots = storageMgr.newSlotsForPoolGroup(lvl, pgIdx, 1);
+            auto slots = storageMgr.newSlotsForPoolGroup(lvl, pgIdx, 1, {}, {}, localityDomainId());
             newSlot = std::move(slots[0]);
         }
         catch (OutOfPagesError const&)
@@ -1450,11 +1481,13 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
 }
 
 // ---------------------------------------------------------------------------
-// _snapshotSsmToTreeBlock: snapshot live SSM state to a radix tree block for the
-// given committed token count. Mirrors Python's _snapshot_ssm_to_tree_block.
+// _snapshotSsmToTreeBlock: snapshot SSM state (live or pending page) to a radix
+// tree block for the given committed token count. Mirrors Python's
+// _snapshot_ssm_to_tree_block.
 // ---------------------------------------------------------------------------
 
-void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens, bool move)
+void KvCache::_snapshotSsmToTreeBlock(
+    SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens, bool move, bool fromPending)
 {
     if (isPrivateLifeCycle(mManager->lifeCycles()[ssmLcId]))
     {
@@ -1465,6 +1498,20 @@ void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCyc
 
     if (treeBlock->pageCoverage(ssmLcId) >= numTokensInBlock)
     {
+        return;
+    }
+
+    if (fromPending)
+    {
+        TLLM_CHECK_WITH_INFO(mPendingSsmSnapshot.has_value(), "No pending SSM snapshot page to commit");
+        TLLM_CHECK_DEBUG(mPendingSsmSnapshot->page()->lifeCycle == ssmLcId);
+        SharedPageLock pending = std::move(*mPendingSsmSnapshot);
+        mPendingSsmSnapshot.reset();
+        auto up = dynamicPointerCast<UncommittedPage>(pending.unlock());
+        TLLM_CHECK_DEBUG(up != nullptr);
+        // convertToCommitted() installs via replacePage(), dropping any shorter snapshot.
+        auto committed = up->convertToCommitted(treeBlock, finishEvent(), numTokensInBlock);
+        mManager->storage().scheduleForEviction(*committed);
         return;
     }
 
@@ -1547,7 +1594,7 @@ void KvCache::_reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& roo
 // tree. Mirrors Python's _snapshot_partial_block_to_tree.
 // ---------------------------------------------------------------------------
 
-void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
+void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm, bool ssmFromPending)
 {
     int const start = ordinal.value() * mTokensPerBlock;
     int const end = std::min(start + mTokensPerBlock, static_cast<int>(mCommittedTokens.size()));
@@ -1584,10 +1631,10 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     std::vector<LifeCycleId> attachedLcs;
     for (auto const& [lcIdx, attn] : mManager->lifeCycles().attentionLifeCycles())
     {
-        // REQUIRED attaches every partial block; SINK_REQUIRED_ONLY only a partial sink block.
-        bool const requiredSink
-            = attn->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY && ordinal < BlockOrdinal{attn->numSinkBlocks};
-        if (!requiresPrefixCoverage(*attn) && !requiredSink)
+        // REQUIRED and SINK_REQUIRED_ONLY attach every partial block. A later request claims a partial
+        // SINK_REQUIRED_ONLY sink block with the prefix, and can select a window that ends in a partial block.
+        bool const sinkRequiredOnly = attn->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY;
+        if (!requiresPrefixCoverage(*attn) && !sinkRequiredOnly)
         {
             continue;
         }
@@ -1604,7 +1651,7 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     if (commitSsm)
     {
         for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
-            _snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens);
+            _snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens, /*move=*/false, ssmFromPending);
     }
     if (treeBlock->eventSink)
     {
@@ -1835,7 +1882,8 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 DropRecorder const dropRecorder
                     = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
                 { _recordDroppedPages(pages, cacheLevel); };
-                newSlots = mManager->storage().newGpuSlots(allocCounts, migrationRecorder, dropRecorder);
+                newSlots
+                    = mManager->storage().newGpuSlots(allocCounts, migrationRecorder, dropRecorder, localityDomainId());
             }
             catch (OutOfPagesError const&)
             {
@@ -2180,7 +2228,7 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
               CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
     DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
     { _recordDroppedPages(pages, cacheLevel); };
-    auto newSlots = storage.newGpuSlots(slotCounts, migrationRecorder, dropRecorder);
+    auto newSlots = storage.newGpuSlots(slotCounts, migrationRecorder, dropRecorder, localityDomainId());
 
     // Page-index rows must exist before locking the copied pages because lock()
     // immediately publishes the page index through updateBasePageIndex().
@@ -2384,7 +2432,7 @@ TypedVec<LifeCycleId, KvCache::TakenPage> KvCache::_takeUncommittedPage(SeqBlock
 // calls _onStopCommitting() — callers do not need post-call cleanup.
 // ---------------------------------------------------------------------------
 
-void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
+void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm, bool ssmFromPending)
 {
     TLLM_CHECK_DEBUG(mCommitState == CommitState::ALLOWED);
     TLLM_CHECK_DEBUG(ord == mNumCommittedBlocks);
@@ -2599,7 +2647,8 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     if (didCommit && commitSsm)
     {
         for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
-            _snapshotSsmToTreeBlock(newBlock, lcId, start + static_cast<int>(tokenBlock.size()), moveSsm);
+            _snapshotSsmToTreeBlock(
+                newBlock, lcId, start + static_cast<int>(tokenBlock.size()), moveSsm, ssmFromPending);
     }
 
     if (sb.isCommitted())
@@ -2642,11 +2691,35 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 // commit
 // ---------------------------------------------------------------------------
 
-void KvCache::commit(TokenSpan tokens, bool isEnd)
+void KvCache::commit(TokenSpan tokens, bool isEnd, bool ssmFromPending)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(isActive());
     auto const apiLock = mManager->lockExclusive();
+    if (!ssmFromPending)
+    {
+        _commit(tokens, isEnd, /*ssmFromPending=*/false);
+        return;
+    }
+    if (isEnd)
+        throw LogicError("ssm_from_pending cannot be combined with is_end");
+    if (!mPendingSsmSnapshot.has_value())
+        throw LogicError("commit(ssm_from_pending=True) without a pending SSM snapshot page");
+    // The pending page is released on every outcome that does not move it into the tree.
+    try
+    {
+        _commit(tokens, isEnd, /*ssmFromPending=*/true);
+    }
+    catch (...)
+    {
+        _dropPendingSsmSnapshot();
+        throw;
+    }
+    _dropPendingSsmSnapshot();
+}
+
+void KvCache::_commit(TokenSpan tokens, bool isEnd, bool ssmFromPending)
+{
     if (tokens.size() == 0)
     {
         if (isEnd)
@@ -2698,7 +2771,7 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
         {
             bool const commitSsm
                 = commitMinSnapshot && mManager->lifeCycles().hasSSM() && ordinal == ssmSnapshotOrdinal;
-            _commitBlock(ordinal, /*isLast=*/false, commitSsm, /*moveSsm=*/isEnd);
+            _commitBlock(ordinal, /*isLast=*/false, commitSsm, /*moveSsm=*/isEnd, ssmFromPending);
             // _commitBlock transitions to USER_STOP on VIRTUAL_STOP internally.
             if (mCommitState != CommitState::ALLOWED)
                 break;
@@ -2713,7 +2786,8 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
             }
             else if (!isEnd)
             {
-                _snapshotPartialBlockToTree(partialOrdinal, /*commitSsm=*/mManager->lifeCycles().hasSSM());
+                _snapshotPartialBlockToTree(
+                    partialOrdinal, /*commitSsm=*/mManager->lifeCycles().hasSSM(), ssmFromPending);
             }
         }
     }
@@ -2735,6 +2809,7 @@ void KvCache::stopCommitting()
     if (mCommitState == CommitState::VIRTUAL_STOP)
     {
         mCommitState = CommitState::USER_STOP;
+        _dropPendingSsmSnapshot();
         return;
     }
 
@@ -2754,6 +2829,90 @@ void KvCache::stopCommitting()
         _onStopCommitting();
     }
     TLLM_CHECK_DEBUG(mCommitState == CommitState::USER_STOP);
+}
+
+// ---------------------------------------------------------------------------
+// Pending SSM snapshot page: a GPU SSM page that the next forward step fills with
+// the recurrent state at a commit point inside the step.
+// ---------------------------------------------------------------------------
+
+std::optional<int> KvCache::acquireSsmSnapshotSlot()
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    if (!isActive())
+        throw LogicError("acquire_ssm_snapshot_slot() requires an active KV cache");
+    if (mPendingSsmSnapshot.has_value())
+        throw LogicError("An SSM snapshot page is already pending");
+    if (mBeamWidth != BeamIndex{1})
+        throw LogicError("Not implemented yet for beam search");
+    // The pending page stands in for the snapshot of one SSM life cycle. With several shared SSM
+    // life cycles, the others would snapshot the live state at the end of the step, a different point.
+    std::optional<LifeCycleId> ssmLcId;
+    for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
+    {
+        if (isPrivateLifeCycle(mManager->lifeCycles()[lcId]))
+            continue;
+        if (ssmLcId.has_value())
+            throw LogicError("acquire_ssm_snapshot_slot() requires exactly one shared SSM life cycle");
+        ssmLcId = lcId;
+    }
+    if (!ssmLcId.has_value())
+        throw LogicError("acquire_ssm_snapshot_slot() requires a shared SSM life cycle");
+    if (mCommitState != CommitState::ALLOWED)
+        return std::nullopt;
+
+    auto& storageMgr = mManager->storage();
+    Slot slot;
+    try
+    {
+        MigrationRecorder const migrationRecorder
+            = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
+                  CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
+        DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
+        { _recordDroppedPages(pages, cacheLevel); };
+        auto slots = storageMgr.newSlotsForPoolGroup(
+            kHotLevel, storageMgr.getPoolGroupIndex(kHotLevel, *ssmLcId), 1, migrationRecorder, dropRecorder);
+        slot = std::move(slots.at(0));
+    }
+    catch (OutOfPagesError const&)
+    {
+        return std::nullopt;
+    }
+    slot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
+    auto page = makeShared<UncommittedPage>(*this, kBadBlockOrdinal, *ssmLcId, kHotLevel, kDefaultBeamIndex);
+    page->setSlot(slot);
+    mPendingSsmSnapshot.emplace(page->lock(*this, kDefaultBeamIndex, kBadBlockOrdinal, *ssmLcId, /*skipWait=*/true));
+    TLLM_CHECK_DEBUG(_checkSanity());
+    return slotIdToPageIndexValue(page->slotId());
+}
+
+std::optional<int> KvCache::pendingSsmSnapshotSlot() const
+{
+    // Per-object state only, so no API lock.
+    if (!mPendingSsmSnapshot.has_value())
+        return std::nullopt;
+    return slotIdToPageIndexValue(mPendingSsmSnapshot->page()->slotId());
+}
+
+void KvCache::releaseSsmSnapshotSlot()
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    _dropPendingSsmSnapshot();
+}
+
+void KvCache::_dropPendingSsmSnapshot()
+{
+    if (!mPendingSsmSnapshot.has_value())
+        return;
+    if (mFinishEvent.has_value())
+    {
+        mPendingSsmSnapshot.reset();
+        return;
+    }
+    auto scope = recordEventScope();
+    mPendingSsmSnapshot.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -2942,6 +3101,7 @@ void KvCache::_onStopCommitting()
             }
         }
     }
+    _dropPendingSsmSnapshot();
     TLLM_CHECK_DEBUG(_checkSanity());
 }
 
@@ -3042,6 +3202,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
 
     BlockOrdinal const numMatchedBlocks = matched.size();
     _resizePageIndexBuffers(numMatchedBlocks);
+    mBlocks.reserve(numMatchedBlocks);
 
     for (BlockOrdinal i{0}; i < numMatchedBlocks; ++i)
     {
@@ -3225,7 +3386,8 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
 std::vector<TokenIdExt> KvCache::_getMatchedTokens(BlockRadixTree::ReuseMatch const& match) const
 {
     std::vector<TokenIdExt> ret;
-    ret.reserve(static_cast<size_t>(match.numTokens));
+    // Room for the rest of the prompt, which commit() appends.
+    ret.reserve(static_cast<size_t>(std::max(match.numTokens, mExpectedPromptLength.value_or(0))));
     int remaining = match.numTokens;
     for (auto const* block : match.blocks)
     {
@@ -3419,6 +3581,23 @@ bool KvCache::_checkSanity() const
                     TLLM_CHECK_DEBUG(dynamicPointerCast<UncommittedPage>(page) != nullptr);
                 }
             }
+        }
+    }
+
+    // Pending SSM snapshot page: a locked uncommitted GPU page of the SSM life cycle,
+    // distinct from the live SSM pages.
+    if (mPendingSsmSnapshot.has_value())
+    {
+        TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE && mCommitState == CommitState::ALLOWED);
+        TLLM_CHECK_DEBUG(mPendingSsmSnapshot->isValid());
+        auto const& pendingPage = mPendingSsmSnapshot->page();
+        TLLM_CHECK_DEBUG(dynamicPointerCast<UncommittedPage>(pendingPage) != nullptr);
+        auto const pendingLc = pendingPage->lifeCycle;
+        TLLM_CHECK_DEBUG(lcs.isSsm(pendingLc) && !isPrivateLifeCycle(lcs[pendingLc]));
+        TLLM_CHECK_DEBUG(pendingPage->cacheLevel == kHotLevel);
+        for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
+        {
+            TLLM_CHECK_DEBUG(blockPageGetPage(mSsmBlocks[bi][pendingLc]).get() != pendingPage.get());
         }
     }
 
