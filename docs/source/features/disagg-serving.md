@@ -157,6 +157,17 @@ cache_transceiver_config:
 
 `kv_transfer_timeout_ms` bounds the KV transfer wait. The default is `60000`. In ownership-enabled configurations, expiry cancels logical work but does not itself authorize releasing memory that a transfer may still access.
 
+Native multimodal encoder outputs can be published and consumed independently of
+serving protocols. The current path is validated for single-rank Qwen3-VL
+image encoding. `tensorrt_llm._torch.disaggregation.encoder_output` defines the
+input context, encoded-media reference, and local output ownership helpers.
+`NixlEncoderCache` in `encoder_nixl` transfers outputs across hosts using NIXL;
+the caller supplies the peer-transfer callback. Consumers validate the original
+input and model identity before preparing native `MultimodalParams`.
+A claimed output is single-use. Unclaimed outputs can be released idempotently;
+uncertain transfers quarantine their buffers until process exit; normal close
+does not reclaim them.
+
 Single-rank context workers keep polling pending native sends during shutdown.
 With the C++ transceiver, setting `kv_transfer_timeout_ms: null` removes the
 transfer deadline; an orphaned send can then keep shutdown waiting indefinitely.
