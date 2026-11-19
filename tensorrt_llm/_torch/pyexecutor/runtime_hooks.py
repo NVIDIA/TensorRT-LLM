@@ -194,7 +194,11 @@ class DecodePrologue(Protocol):
 
 
 class ExecutorEvents(Protocol):
-    """Points in the executor's life a model may act at."""
+    """Points in the executor's life a model may act at.
+
+    Optional, so not a protocol member: ``on_iteration(iteration)``, called by the overlap executor loop at the top
+    of every iteration with its iteration counter (host bookkeeping only; must not raise).
+    """
 
     def after_warmup(self) -> None:
         """After warmup and CUDA graph capture, before the first request is served."""
@@ -230,6 +234,11 @@ class RuntimeHooks:
     # ``op(window, epoch_or_None, max_desc)``. It writes the window's host copies, then its device copies, zeroes the
     # window's header and increments the epoch, which the default prologue does with two scatter launches and a fill.
     pack_prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None
+    # With pack_step_inputs: the model's own step-input pack, built once per engine as ``factory(device)`` in place
+    # of the stock one. It returns a ``step_inputs.StepInputPack`` subclass that implements ``begin`` / ``stage`` /
+    # ``flush`` / ``discard`` itself; the pack_parallel_scatter / pack_in_graph / pack_early_copy / pack_step_epoch /
+    # pack_prologue_op options then do not apply.
+    step_input_pack_factory: Optional[Callable[[torch.device], Any]] = None
     decode_prologue: Optional[DecodePrologue] = None
     executor_events: Optional[ExecutorEvents] = None
     # Skip host-to-device metadata copies whose values the destination already holds.

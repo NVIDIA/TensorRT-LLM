@@ -2521,12 +2521,12 @@ class DecoderInputPreparer:
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0 and not staged:
             input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
-            self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            step_inputs.copy_metadata_(self._buffers.input_ids_cuda[:num_tokens], input_ids)
 
         if num_draft_tokens > 0 and not staged:
             draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
-            self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
-                draft_tokens, non_blocking=True
+            step_inputs.copy_metadata_(
+                self._buffers.draft_tokens_cuda[: len(draft_tokens)], draft_tokens
             )
         step_fold = (
             self.runtime_hooks.spec_step_fold
