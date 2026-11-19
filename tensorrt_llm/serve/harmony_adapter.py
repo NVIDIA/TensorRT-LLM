@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
@@ -99,6 +100,32 @@ class HarmonyStreamState:
     def get_parser(self) -> StreamableParser:
         return self.parser
 
+    def _process_token(self, token: int) -> bool:
+        """Feed one token to the parser and return whether it was accepted.
+
+        A token the parser rejects is skipped instead of raised, so a batch
+        keeps what its other tokens produce and the output does not depend on
+        how tokens are grouped into batches (speculative decoding delivers
+        several tokens per step). Recovery is the parser's own: it discards a
+        header it rejects and resumes at the next ``<|start|>``.
+        """
+        try:
+            self.parser.process(token)
+        except (HarmonyError, UnicodeDecodeError, ValueError) as e:
+            logger.debug(
+                f"Request {self.request_id}: harmony parser rejected token {token}: {e}"
+            )
+            return False
+        return True
+
+    def _report_rejected_tokens(self, num_rejected: int,
+                                num_tokens: int) -> None:
+        """Log at error level how many tokens of a batch the parser rejected."""
+        if num_rejected:
+            logger.error(
+                f"Streaming: harmony parser rejected {num_rejected} of "
+                f"{num_tokens} token(s) in batch for request {self.request_id}")
+
     def process_token_batch(self, tokens: list[int]) -> list[dict[str, Any]]:
         """
         Process a batch of tokens while maintaining parsing state.
@@ -111,14 +138,16 @@ class HarmonyStreamState:
         """
         raw_deltas = []
         self.tokens_processed += len(tokens)
+        num_rejected = 0
 
         for token in tokens:
             # Store previous state for transition detection
             prev_channel = self.parser.current_channel
             prev_recipient = self.parser.current_recipient
 
-            # Process the token
-            self.parser.process(token)
+            if not self._process_token(token):
+                num_rejected += 1
+                continue
 
             # Detect channel/recipient transitions AFTER processing each token
             channel_changed = prev_channel != self.parser.current_channel
@@ -148,6 +177,8 @@ class HarmonyStreamState:
                 delta = self._create_delta_from_parser_state()
                 if delta:
                     raw_deltas.append(delta)
+
+        self._report_rejected_tokens(num_rejected, len(tokens))
 
         return self._merge_consecutive_deltas(raw_deltas)
 
@@ -211,14 +242,16 @@ class HarmonyStreamState:
         Returns OpenAI Messages for Responses API
         """
         self.tokens_processed += len(tokens)
+        num_rejected = 0
 
         for token in tokens:
             # Store previous state for transition detection
             prev_channel = self.parser.current_channel
             prev_recipient = self.parser.current_recipient
 
-            # Process the token
-            self.parser.process(token)
+            if not self._process_token(token):
+                num_rejected += 1
+                continue
 
             # Detect channel/recipient transitions AFTER processing each token
             channel_changed = prev_channel != self.parser.current_channel
@@ -237,6 +270,8 @@ class HarmonyStreamState:
                 # Reset channel state for new channel
                 self.channel_started = False
                 self.current_channel_state = None
+
+        self._report_rejected_tokens(num_rejected, len(tokens))
 
         return self.parser.messages
 
