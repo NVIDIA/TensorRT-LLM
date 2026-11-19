@@ -76,7 +76,7 @@ _LOGIT_BIAS_MAX = 100.0
 EarlyStopping: TypeAlias = Union[bool, Literal["never"]]
 
 
-def _check_stream_best_of(data):
+def _check_stream_best_of(request):
     """Reject a streamed request that asks for more candidates than it returns.
 
     With sampling and ``best_of > n`` the executor ranks the candidates by
@@ -85,18 +85,17 @@ def _check_stream_best_of(data):
     be taken back, so the stream cannot honour the ranking (OpenAI also
     disallows streaming with ``best_of``). Beam search returns its beams in a
     fixed order and is not affected.
+
+    Runs on the parsed request so that coerced values (``best_of=2.0``,
+    ``n=2.0``, ``stream="false"``, ``use_beam_search="false"``) are judged as
+    the engine will see them.
     """
-    if not isinstance(data, dict) or not data.get("stream"):
-        return data
-    best_of = data.get("best_of")
-    n = data.get("n")
-    if (isinstance(best_of, int) and not isinstance(best_of, bool)
-            and best_of > (n if isinstance(n, int) else 1)
-            and not data.get("use_beam_search")):
+    if (request.stream and request.best_of is not None
+            and request.best_of > request.n and not request.use_beam_search):
         raise ValueError(
             "best_of greater than n is not supported with stream=true; "
             "set best_of to n or disable streaming.")
-    return data
+    return request
 
 
 def _early_stopping_to_int(value: Optional[EarlyStopping]) -> Optional[int]:
@@ -858,10 +857,9 @@ class CompletionRequest(OpenAIBaseModel):
             raise ValueError("suffix is not supported")
         return data
 
-    @model_validator(mode="before")
-    @classmethod
-    def check_stream_best_of(cls, data):
-        return _check_stream_best_of(data)
+    @model_validator(mode="after")
+    def check_stream_best_of(self):
+        return _check_stream_best_of(self)
 
 
 class FunctionCall(OpenAIBaseModel):
@@ -1492,10 +1490,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise ValueError("suffix is not supported")
         return data
 
-    @model_validator(mode="before")
-    @classmethod
-    def check_stream_best_of(cls, data):
-        return _check_stream_best_of(data)
+    @model_validator(mode="after")
+    def check_stream_best_of(self):
+        return _check_stream_best_of(self)
 
     @field_validator("cache_salt")
     @classmethod

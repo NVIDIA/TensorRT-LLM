@@ -216,6 +216,11 @@ def _chat(**kwargs):
         {"n": 1, "best_of": 2, "logprobs": 1},
         {"best_of": 2},
         {"n": 2, "best_of": 3},
+        # Values the models coerce: best_of=2.0 is the int 2 once parsed.
+        {"n": 1, "best_of": 2.0, "logprobs": 1},
+        {"n": 1, "best_of": 2.0},
+        {"n": 2.0, "best_of": 3},
+        {"n": 1, "best_of": 2, "use_beam_search": "false"},
     ],
 )
 def test_stream_with_best_of_above_n_is_rejected(make, extra):
@@ -229,16 +234,39 @@ def test_stream_with_best_of_above_n_is_rejected(make, extra):
 
 @pytest.mark.parametrize("make", [_completion, _chat])
 @pytest.mark.parametrize(
-    "kwargs",
+    "kwargs, expected",
     [
-        {"stream": True, "n": 2},
-        {"stream": True, "n": 2, "best_of": 2},
-        {"stream": True, "best_of": 1},
-        {"stream": False, "n": 1, "best_of": 2},
-        {"n": 1, "best_of": 2},
-        {"stream": True, "n": 1, "best_of": 2, "use_beam_search": True},
+        ({"stream": True, "n": 2}, (True, 2, None, False)),
+        ({"stream": True, "n": 2, "best_of": 2}, (True, 2, 2, False)),
+        ({"stream": True, "best_of": 1}, (True, 1, 1, False)),
+        ({"stream": False, "n": 1, "best_of": 2}, (False, 1, 2, False)),
+        ({"n": 1, "best_of": 2}, (False, 1, 2, False)),
+        (
+            {"stream": True, "n": 1, "best_of": 2, "use_beam_search": True},
+            (True, 1, 2, True),
+        ),
+        # Coerced values are judged as parsed, not as sent.
+        ({"stream": "false", "n": 1, "best_of": 2}, (False, 1, 2, False)),
+        ({"stream": True, "n": 2.0, "best_of": 2}, (True, 2, 2, False)),
+        (
+            {"stream": True, "n": 1, "best_of": 2, "use_beam_search": "true"},
+            (True, 1, 2, True),
+        ),
     ],
 )
-def test_best_of_is_still_accepted_when_not_streamed_above_n(make, kwargs):
+def test_best_of_is_still_accepted_when_not_streamed_above_n(make, kwargs, expected):
     request = make(**kwargs)
-    assert request.stream == bool(kwargs.get("stream"))
+    assert (request.stream, request.n, request.best_of, request.use_beam_search) == expected
+
+
+@pytest.mark.parametrize("make", [_completion, _chat])
+def test_best_of_float_in_json_body_is_rejected(make):
+    # The same coercion through the JSON path the server uses.
+    fields = '"stream": true, "n": 1, "best_of": 2.0'
+    if make is _completion:
+        cls, body = CompletionRequest, '{"model": "m", "prompt": "hi", ' + fields + "}"
+    else:
+        cls = ChatCompletionRequest
+        body = '{"model": "m", "messages": [{"role": "user", "content": "hi"}], ' + fields + "}"
+    with pytest.raises(ValueError, match=_BEST_OF_ERROR):
+        cls.model_validate_json(body)
