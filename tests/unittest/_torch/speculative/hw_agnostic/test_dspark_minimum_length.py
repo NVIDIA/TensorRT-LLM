@@ -26,6 +26,13 @@ minimum = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = minimum
 _SPEC.loader.exec_module(minimum)
 
+_BLOCK_PATH = _ROOT / "tensorrt_llm/_torch/speculative/block_verification.py"
+_BLOCK_SPEC = importlib.util.spec_from_file_location("_dspark_minimum_block_test", _BLOCK_PATH)
+assert _BLOCK_SPEC is not None and _BLOCK_SPEC.loader is not None
+block = importlib.util.module_from_spec(_BLOCK_SPEC)
+sys.modules[_BLOCK_SPEC.name] = block
+_BLOCK_SPEC.loader.exec_module(block)
+
 
 @dataclass
 class _Request:
@@ -336,24 +343,25 @@ def test_recovery_then_fully_accepted_prefix_allows_eos_at_the_exact_minimum() -
     assert torch.equal(raw, original)
 
 
-def _real_accept_methods() -> type:
+def _real_accept_methods(
+    additional: tuple[str, ...] = (), dependencies: dict[str, object] | None = None
+) -> type:
     """Use the production transaction with controlled acceptance outputs, without native imports."""
     path = _ROOT / "tensorrt_llm/_torch/speculative/interface.py"
     tree = ast.parse(path.read_text())
     worker = next(
         n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SpecWorkerBase"
     )
+    names = {"_accept_draft_tokens", "_commit_occurrence_counts", *additional}
     methods = [
-        copy.deepcopy(n)
-        for n in worker.body
-        if isinstance(n, ast.FunctionDef)
-        and n.name in {"_accept_draft_tokens", "_commit_occurrence_counts"}
+        copy.deepcopy(n) for n in worker.body if isinstance(n, ast.FunctionDef) and n.name in names
     ]
     namespace = {
         "torch": torch,
         "minimum_length_ops": minimum,
         "VocabShardedLogits": type("VocabShardedLogits", (), {}),
     }
+    namespace.update(dependencies or {})
     module = ast.Module(
         body=[
             ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
@@ -406,6 +414,101 @@ def test_real_accept_transaction_restores_scores_and_commits_only_result(
             is accepted
         )
         assert meta.minimum_length_state.remaining[0].item() == 2
+    assert torch.equal(logits, original)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("banned_draft", [0, 3])
+def test_real_block_verification_masks_causal_prefix_and_restores_scores(
+    banned_draft: int,
+) -> None:
+    Worker = _real_accept_methods(
+        ("_sample_and_accept_draft_tokens_rejection", "_block_verify"),
+        {
+            "_watermark_active": lambda _: False,
+            "block_verify": block.block_verify,
+            "counter_uniforms": block.counter_uniforms,
+        },
+    )
+    worker = Worker()
+    worker._apply_occurrence_penalties = lambda logits, *_: logits
+    worker._can_use_rejection_sampling = lambda _: True
+    worker._rejection_buffers_valid = lambda *args: True
+    worker._zero_padding_rows = lambda logits, *args, **kwargs: logits
+    worker._compute_probs_from_logits = lambda mode, logits, *args: logits.softmax(-1)
+    worker._rng_state_per_request = lambda *args, **kwargs: (torch.tensor([7]), torch.tensor([0]))
+    worker._unfiltered_sampling_params = lambda *args: ()
+    worker._sample_from_logits = lambda mode, logits, *args, **kwargs: logits.argmax(-1)
+    worker._apply_force_accepted_tokens = lambda counts, *args, **kwargs: counts
+    worker.force_num_accepted_tokens = 0.0
+    worker._d2t = None
+    meta = _metadata(batch=1)
+    meta.enable_penalty = False
+    meta.draft_probs_last_dim = meta.draft_probs_vocab_size = 8
+    meta.draft_probs = torch.zeros(5, 2, 8)
+    meta.temperatures = meta.top_ps = torch.ones(3)
+    meta.top_ks = torch.zeros(3, dtype=torch.int32)
+    meta.min_ps = torch.zeros(3)
+    meta.advanced_sampling_mode = "controlled-cpu"
+    meta.rng_accept_slot = 0
+    meta.rejection_sample_method = "block"
+    request = _Request(py_min_length=3, py_stop_words_list=[[3]])
+    _populate(meta, [request])
+    logits = torch.full((3, 8), -20.0)
+    logits[:, 0], logits[:, 1], logits[:, 3] = 10.0, 9.0, 8.0
+    original = logits.clone()
+
+    for proposals, expected, remaining in [
+        ([banned_draft, 1], [1, -1, -1], 2),
+        ([1, 1], [1, 1, 0], 0),
+    ]:
+        _populate(meta, [request])  # The host history still lags the device commit.
+        drafts = torch.tensor([proposals], dtype=torch.int32)
+        meta.draft_probs[0].copy_(torch.nn.functional.one_hot(drafts[0].long(), 8))
+        original_q = meta.draft_probs.clone()
+        accepted, counts = worker._accept_draft_tokens(logits, drafts, 0, 1, meta)
+        assert accepted.tolist() == [expected]
+        assert counts.item() == (1 if expected[1] == -1 else 3)
+        assert meta.minimum_length_state.remaining[0].item() == remaining
+        assert torch.equal(meta.draft_probs, original_q)
+        assert torch.equal(logits, original)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("raises,accepted_count", [(False, 1), (False, 3), (True, 1)])
+def test_real_fused_early_return_restores_scores_and_commits_result(
+    raises: bool, accepted_count: int
+) -> None:
+    Worker = _real_accept_methods(("_sample_and_accept_draft_tokens_base",))
+    worker = Worker()
+    worker._apply_occurrence_penalties = lambda logits, *_: logits
+    worker._can_use_rejection_sampling = lambda _: False
+    worker.fused_sample_accept = True
+    meta = _metadata(batch=1)
+    meta.enable_penalty = False
+    request = _Request(py_min_length=3, py_stop_words_list=[[3]])
+    _populate(meta, [request])
+    logits = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    original = logits.clone()
+    accepted = (torch.tensor([[1, 1, 1]]), torch.tensor([accepted_count]))
+
+    def fused(scores: torch.Tensor, *args: object) -> tuple[torch.Tensor, torch.Tensor]:
+        assert torch.isneginf(scores[:, [0, 3]]).all()
+        if raises:
+            raise ValueError("controlled fused failure")
+        return accepted
+
+    worker._sample_and_accept_in_one_launch = fused
+    if raises:
+        with pytest.raises(ValueError, match="controlled fused"):
+            worker._accept_draft_tokens(logits, torch.ones(1, 2, dtype=torch.int), 0, 1, meta)
+        assert meta.minimum_length_state.remaining[0].item() == 3
+    else:
+        assert (
+            worker._accept_draft_tokens(logits, torch.ones(1, 2, dtype=torch.int), 0, 1, meta)
+            is accepted
+        )
+        assert meta.minimum_length_state.remaining[0].item() == 3 - accepted_count
     assert torch.equal(logits, original)
 
 
