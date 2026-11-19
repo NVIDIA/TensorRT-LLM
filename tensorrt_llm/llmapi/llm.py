@@ -741,7 +741,7 @@ class BaseLLM:
         Synchronous generation accepts either single prompt or batched prompts.
 
         Args:
-            inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.
+            inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text, token ids, or prompt embeddings.
                 It can be single prompt or batched prompts.
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, List[tensorrt_llm.sampling_params.SamplingParams], optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
@@ -849,7 +849,7 @@ class BaseLLM:
         Asynchronous generation accepts single prompt only.
 
         Args:
-            inputs (Union[tensorrt_llm.inputs.data.PromptInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text or token ids, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.
+            inputs (Union[tensorrt_llm.inputs.data.PromptInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text, token ids or prompt embeddings, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
@@ -1065,6 +1065,12 @@ class BaseLLM:
                     "decoder_input_token_ids is not supported. Pass decoder "
                     "token IDs as inputs.")
 
+        if isinstance(inputs, dict) and ("prompt_embeds" in inputs
+                                         or "prompt_embeds_mask" in inputs):
+            raise ValueError(
+                "prompt_embeds is only accepted by generate() and "
+                "generate_async(); it cannot be preprocessed separately.")
+
         if inputs is None or (isinstance(inputs, dict)
                               and "prompt" not in inputs
                               and "prompt_token_ids" not in inputs):
@@ -1073,11 +1079,6 @@ class BaseLLM:
             )
 
         inputs = prompt_inputs(inputs)
-
-        if "prompt_embeds" in inputs or "prompt_embeds_mask" in inputs:
-            raise ValueError(
-                "prompt_embeds is only accepted by generate() and "
-                "generate_async(); it cannot be preprocessed separately.")
 
         if "multi_item_part_lens" in inputs:
             raise ValueError(
