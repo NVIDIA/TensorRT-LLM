@@ -147,6 +147,12 @@ def test_request_sends_exactly_the_protocol_fields(kwargs):
     assert record == {key: value for key, value in body.items() if key != "messages"}
 
 
+def test_leak_check_covers_beam_parser_tags():
+    from tensorrt_llm.llmapi.reasoning_parser import _BEAM_TAGS
+
+    assert set(protocol.CHANNEL_MARKERS) == set(_BEAM_TAGS)
+
+
 def test_protocol_definition_is_frozen():
     digest = protocol.sha256_text(protocol.canonical_json(protocol.protocol_definition()))
     assert digest == PROTOCOL_DEFINITION_SHA256, (

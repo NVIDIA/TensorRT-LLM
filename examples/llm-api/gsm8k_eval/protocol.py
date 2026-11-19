@@ -94,6 +94,7 @@ SCORER_ID = "final-content-last-number-v1"
 GOLD_DELIMITER = "####"
 #: Channel delimiters that must never reach the final content: their presence means the
 #: reasoning parser did not split the reply, so the content would include the analysis.
+# Include these scoring inputs in protocol_definition() at the next protocol version bump.
 CHANNEL_MARKERS = (
     "<|start|>",
     "<|end|>",

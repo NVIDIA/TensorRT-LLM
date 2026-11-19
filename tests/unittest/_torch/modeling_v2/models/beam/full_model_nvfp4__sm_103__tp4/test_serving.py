@@ -10,6 +10,14 @@ import torch
 pytestmark = pytest.mark.cpu_only
 
 
+def test_default_config_matches_supported_layout():
+    from tensorrt_llm._torch.configs.beam import BeamConfig
+    from tensorrt_llm._torch.modeling_v2.models.beam._constants import SUPPORTED_CONFIG
+
+    config = BeamConfig()
+    assert {key: getattr(config, key) for key in SUPPORTED_CONFIG} == SUPPORTED_CONFIG
+
+
 def test_load_pretrained_config_preserves_beam_rope(tmp_path):
     from tensorrt_llm._torch.configs.beam import BeamConfig
     from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
