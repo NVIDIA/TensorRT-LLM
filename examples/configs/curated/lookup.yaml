@@ -155,3 +155,15 @@
   config_path: examples/configs/curated/musespark-open.yaml
   scenario: General deployment
   gpu_compatibility: "GB300"
+
+- model: meta-models/Muse-Spark-Open-816B-A42B-NVFP4
+  arch: MuseSparkForConditionalGeneration
+  config_path: examples/configs/curated/musespark-open-agentic-max-throughput.yaml
+  scenario: Agentic Max Throughput
+  gpu_compatibility: "GB300"
+
+- model: meta-models/Muse-Spark-Open-816B-A42B-NVFP4
+  arch: MuseSparkForConditionalGeneration
+  config_path: examples/configs/curated/musespark-open-agentic-balanced.yaml
+  scenario: Agentic Balanced
+  gpu_compatibility: "GB300"
