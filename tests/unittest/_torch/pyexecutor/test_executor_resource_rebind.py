@@ -362,8 +362,16 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         setattr(ex, name, object())
     ex._disagg_coordinator = object()
     ex.start_worker = Mock()
+    ex._pending_scheduler_failures = {7}
+    ex._scheduler_failure_sync_tick = 63
+    ex._scheduler_progress_since_vote = True
+    ex._scheduler_stall_rounds = 2
     try:
         ex.rebind_resources(resources)
+        assert ex._pending_scheduler_failures == set()
+        assert ex._scheduler_failure_sync_tick == 0
+        assert not ex._scheduler_progress_since_vote
+        assert ex._scheduler_stall_rounds == 0
         assert ex.iter_counter == 0
         assert ex.profile_start_iters == {2}
         assert ex.profile_stop_iters == {4}

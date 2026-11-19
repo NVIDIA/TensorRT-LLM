@@ -737,7 +737,10 @@ It requires bindings that
 expose `TransferStatus.release`; older bindings log
 `NIXL agent recovery requires rebuilt request-release bindings` and retain the
 legacy path. Released terminal peer errors remain request scoped; an unretirable
-native handle fences the local agent and starts recovery.
+native handle fences the local agent and starts recovery. If replaying a peer's
+metadata fails, healthy peers remain available. The sender retains the failed
+descriptor and retries it on a later request, at most once per second per peer,
+without requiring the receiver to send a new registration message.
 
 The fence closes new send and receive admission. Pending GEN admissions remain
 queued and return speculative allocations while the agent recovers. New CTX
@@ -765,3 +768,8 @@ Scheduler admission failure consensus is batched every 64 scheduling passes for
 model-parallel replicas, adding at most 63 passes after local stall detection.
 Rank-local attention-DP requests do not add a TP vote. Requests whose transfers
 still hold memory remain visible to the scheduler's capacity-stall hold probe.
+Each stall window selects one newest eligible KV holder (or one newest pending
+context if none holds KV), including starved contexts. After three agreed
+failure rounds without a successful scheduling pass, the executor escalates
+through its existing event-loop failure containment instead of rejecting new
+requests indefinitely. A successful scheduling pass resets that round count.

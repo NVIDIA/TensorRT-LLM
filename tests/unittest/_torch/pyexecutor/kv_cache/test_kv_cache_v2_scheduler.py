@@ -2787,11 +2787,39 @@ class TestDeadlockDetection:
         sched._DEADLOCK_STALL_ITERS = 2
         blocked = [make_ctx_request(0, 100), make_ctx_request(1, 100)]
         assert sched.schedule_request(blocked, set()).failed_requests == []
-        assert ids(sched.schedule_request(blocked, set()).failed_requests) == [0, 1]
+        assert ids(sched.schedule_request(blocked, set()).failed_requests) == [1]
+        # One victim per window; the older context retains its opportunity.
+        assert sched.schedule_request(blocked[:1], set()).failed_requests == []
+        assert ids(sched.schedule_request(blocked[:1], set()).failed_requests) == [0]
         healthy = make_ctx_request(2, 100)
         out = sched.schedule_request([healthy], set())
         assert ids(out.context_requests) == [2]
         assert out.failed_requests == []
+
+    def test_starved_contexts_remain_candidates_and_only_newest_holder_fails(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False, has_cache_tier_below_gpu=False
+        )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=(None, 16),
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+            context_starvation_iterations=1,
+            enable_recompute_pause=False,
+        )
+        sched._DEADLOCK_STALL_ITERS = 4
+        older = make_ctx_request(0, 100, prompt_len=116, is_first_context_chunk=False)
+        newest = make_ctx_request(1, 100, prompt_len=116, is_first_context_chunk=False)
+        # These are partial prefills with KV already owned. A fresh arrival
+        # must not be sacrificed while these page holders remain stranded.
+        older.context_current_position = newest.context_current_position = 16
+        fresh = make_ctx_request(2, 100)
+        reqs = [older, newest, fresh]
+        for _ in range(3):
+            assert sched.schedule_request(reqs, set()).failed_requests == []
+        assert older.py_ctx_sched_since_iter is not None
+        assert ids(sched.schedule_request(reqs, set()).failed_requests) == [1]
 
     def test_transient_stall_does_not_raise(self):
         """One bad iteration is normal; the counter has to reset."""

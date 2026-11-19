@@ -955,6 +955,7 @@ def test_scheduler_retirement_probe_is_local_and_fresh_under_adp() -> None:
         10,
         state_value=LlmRequestState.CONTEXT_INIT.value,
         is_generation_in_progress_state=False,
+        context_current_position=0,
     )
 
     def detect_stall(rank: int) -> None:

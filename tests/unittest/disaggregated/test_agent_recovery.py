@@ -29,6 +29,7 @@ def make_sender(agent):
     sender._admission_lock = threading.Lock()
     sender._recovery_fatal_callback = Mock(side_effect=AssertionError("unexpected fatal recovery"))
     sender._loaded_remote_agents = set()
+    sender._deferred_remote_agents = {}
     sender._retirement_timeout_s = 10
     sender._enforce_physical_ownership = False
     sender._recover_agent = Mock()
@@ -53,7 +54,10 @@ def make_worker():
         _sender_ep_instance_map={"prefill": object()},
     )
     worker._config = SimpleNamespace(
-        device_id=0, kv_cache_manager=SimpleNamespace(mapping=SimpleNamespace(rank=5, world_size=8))
+        device_id=0,
+        agent_buffer_size_mb=0,
+        agent_bounce_params=None,
+        kv_cache_manager=SimpleNamespace(mapping=SimpleNamespace(rank=5, world_size=8)),
     )
     worker._rank_info = SimpleNamespace(
         instance_name="prefill", instance_rank=5, transfer_engine_info=b"old-descriptor"
@@ -236,13 +240,21 @@ def test_interruptible_wait_polls_until_terminal(terminal):
 
 def test_concurrent_errors_rebuild_one_agent_and_restore_registered_regions():
     worker = make_worker()
+    worker._config.agent_buffer_size_mb = 17
+    worker._config.agent_bounce_params = object()
     replacement = Mock()
     replacement.get_local_agent_desc.return_value = b"new-descriptor"
     old_agent = worker._agent
     with patch.object(transfer, "_create_nixl_agent", return_value=replacement) as create:
         with ThreadPoolExecutor(max_workers=2) as pool:
             assert all(pool.map(worker._recover_transfer_agent, [0, 0]))
-    create.assert_called_once_with("prefill5", rank=5, world_size=8)
+    create.assert_called_once_with(
+        "prefill5",
+        rank=5,
+        world_size=8,
+        agent_buffer_size_mb=17,
+        agent_bounce_params=worker._config.agent_bounce_params,
+    )
     old_agent.shutdown.assert_called_once()
     assert replacement.register_memory.call_count == 2
     replacement.load_remote_agent.assert_called_once_with("decode11", b"receiver-descriptor")
@@ -783,6 +795,7 @@ def test_registering_new_or_unchanged_peer_does_not_drain_active_sends(previous)
 def test_recovery_drops_a_stale_peer_instead_of_poisoning_the_replacement():
     worker = make_worker()
     worker._sender._remote_agent_descriptors["dead0"] = b"stale"
+    worker._sender._loaded_remote_agents.update({"dead0", "decode11"})
     replacement = Mock()
     replacement.get_local_agent_desc.return_value = b"new-descriptor"
 
@@ -795,25 +808,58 @@ def test_recovery_drops_a_stale_peer_instead_of_poisoning_the_replacement():
         assert worker._recover_transfer_agent(0)
     assert not worker._sender._agent_failed
     assert worker._sender._remote_agent_descriptors == {"decode11": b"receiver-descriptor"}
+    assert worker._sender._loaded_remote_agents == {"decode11"}
+    # A healthy peer does not retry unrelated missing metadata or fence sends.
+    replacement.load_remote_agent.reset_mock()
+    worker._sender._retry_deferred_peer("decode11")
+    replacement.load_remote_agent.assert_not_called()
+    # No new REGISTER arrives: a later demand retries the saved descriptor.
+    worker._sender._retry_deferred_peer("dead0")
+    assert "dead0" not in worker._sender._loaded_remote_agents
+    replacement.load_remote_agent.assert_called_once_with("dead0", b"stale")
+    worker._sender._retry_deferred_peer("dead0")
+    assert replacement.load_remote_agent.call_count == 1  # Backoff, no busy retry.
+    replacement.load_remote_agent.side_effect = None
+    with patch.object(transfer.time, "monotonic", return_value=float("inf")):
+        replacement.submit_transfer_requests.return_value.wait.return_value = True
+        replacement.submit_transfer_requests.return_value.release.return_value = True
+        request = make_request()
+        request.remote_name = "dead0"
+        assert worker._sender._submit_transfer(make_task(), 12, request, agent_generation=1) == (
+            True,
+            None,
+        )
+    assert worker._sender._loaded_remote_agents == {"decode11", "dead0"}
+    assert not worker._sender._deferred_remote_agents
+    assert worker._sender._agent_generation == 1
+    assert not worker._sender._agent_failed
 
 
 @pytest.mark.parametrize("failure", ["cuda", "registration"])
 def test_background_recovery_has_a_deadline_for_setup_and_registration_failures(failure):
     worker = make_worker()
     sender = worker._sender
-    sender._retirement_timeout_s = 0
+    sender._retirement_timeout_s = 1
     sender._recovery_fatal_callback.side_effect = None
     replacement = Mock()
-    replacement.register_memory.side_effect = RuntimeError("no registration resources")
+    now = [0.0]
+
+    def fail_stage(*_args):
+        now[0] = 2.0
+        raise RuntimeError(f"{failure} setup failed")
+
+    if failure == "registration":
+        replacement.register_memory.side_effect = fail_stage
     with (
         patch.object(
             transfer.torch.cuda,
             "set_device",
-            side_effect=RuntimeError("CUDA setup") if failure == "cuda" else None,
+            side_effect=fail_stage if failure == "cuda" else None,
         ),
         patch.object(transfer.cudart, "cudaSetDevice", return_value=0),
         patch.object(transfer, "CUASSERT"),
-        patch.object(transfer, "_create_nixl_agent", return_value=replacement),
+        patch.object(transfer, "_create_nixl_agent", return_value=replacement) as factory,
+        patch.object(transfer.time, "monotonic", side_effect=lambda: now[0]),
     ):
         worker._request_agent_recovery(0)
         thread = worker._agent_recovery_thread
@@ -823,6 +869,18 @@ def test_background_recovery_has_a_deadline_for_setup_and_registration_failures(
             sender._recovery_fatal_callback.assert_called_once()
             assert sender._agent_failed
             assert worker._registered_mem
+            if failure == "cuda":
+                factory.assert_not_called()
+                replacement.register_memory.assert_not_called()
+            else:
+                factory.assert_called_once_with(
+                    "prefill5",
+                    rank=5,
+                    world_size=8,
+                    agent_buffer_size_mb=0,
+                    agent_bounce_params=None,
+                )
+                replacement.register_memory.assert_called_once()
         finally:
             worker._agent_recovery_stop.set()
             thread.join(timeout=2)

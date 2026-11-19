@@ -115,6 +115,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
         monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{target}", Mock())
 
     executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
     executor._disagg_coordinator = _recording_coordinator(calls)
     executor._flush_pending_transfer_responses = lambda **kwargs: calls.append(
         ("flush_pending_transfer_responses",)
@@ -332,6 +333,7 @@ def test_kv_pool_rebalance_flushes_deferred_closes_before_adjust(defer: bool) ->
     """adjust() moves pages, so a deferred close must not hold any: the rebalance closes them before it suspends
     the active requests and adjusts."""
     executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
     executor._defer_generation_only_release = defer
     manager = Mock()
     manager.is_request_active.return_value = True

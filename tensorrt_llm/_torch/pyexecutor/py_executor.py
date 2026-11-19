@@ -1004,6 +1004,7 @@ class PyExecutor:
                                      disable_overlap_scheduler)
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
+        self._reset_scheduler_failure_state()
         # profile config
         _env_start_iters, _env_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
@@ -10340,44 +10341,73 @@ class PyExecutor:
         return bool(self._held_transfer_failures()
                     ) or self.disagg.has_local_retiring_gen_receives
 
+    def _reset_scheduler_failure_state(self) -> None:
+        self._pending_scheduler_failures: set[int] = set()
+        self._scheduler_failure_sync_tick = 0
+        self._scheduler_progress_since_vote = False
+        self._scheduler_stall_rounds = 0
+
     def _fail_scheduler_requests(self,
                                  scheduled_batch: ScheduledRequests) -> None:
         """Agree on admission failures before freeing any rank's request state."""
         if not self._is_kv_manager_v2:
             return
-        local_ids = [
-            req.py_request_id for req in scheduled_batch.failed_requests
-        ]
+        local_ids = {
+            req.py_request_id
+            for req in scheduled_batch.failed_requests
+        }
+        scheduled_ids = {
+            req.py_request_id
+            for req in scheduled_batch.all_requests()
+        }
+        self._scheduler_progress_since_vote |= bool(scheduled_ids - local_ids)
         rank_local = self.enable_attention_dp and self.dist.cp_size == 1 and self.dist.pp_size == 1
         if rank_local or (self.dist.tp_size == self.dist.cp_size ==
                           self.dist.pp_size == 1):
-            failed_ids = set(local_ids)
+            failed_ids = local_ids
+            made_progress = self._scheduler_progress_since_vote
         else:
-            pending = self.__dict__.setdefault("_pending_scheduler_failures",
-                                               set())
-            pending.difference_update(req.py_request_id
-                                      for req in scheduled_batch.all_requests())
+            pending = self._pending_scheduler_failures
+            pending.difference_update(scheduled_ids)
             pending.update(local_ids)
-            tick = self.__dict__.get("_scheduler_failure_sync_tick", 0) + 1
-            self._scheduler_failure_sync_tick = tick
+            self._scheduler_failure_sync_tick += 1
             scheduled_batch.failed_requests = []
-            # All participants advance this counter once per scheduling pass.
-            # Batching avoids a world barrier on every PP microbatch.
-            if tick % 64:
+            # Every participant advances once per scheduling pass, including
+            # empty passes. Phase rebinding resets the counter on every rank.
+            if self._scheduler_failure_sync_tick % 64:
                 return
             active_ids = {req.py_request_id for req in self.active_requests}
-            local_ids = list(pending & active_ids)
+            vote = (list(pending & active_ids),
+                    self._scheduler_progress_since_vote)
             if self.enable_attention_dp:
-                votes = (self.dist.pp_allgather(local_ids) if self.dist.pp_size
-                         > 1 else self.dist.cp_allgather(local_ids))
+                # ADP owns distinct requests across TP, but replicas span both
+                # CP and PP. Reduce CP first, then propagate that union over PP.
+                votes = self.dist.cp_allgather(
+                    vote) if self.dist.cp_size > 1 else [vote]
+                vote = ([rid for ids, _ in votes for rid in ids],
+                        any(progress for _, progress in votes))
+                votes = self.dist.pp_allgather(
+                    vote) if self.dist.pp_size > 1 else [vote]
             elif self.dist.pp_size > 1:
-                votes = self.dist.allgather(local_ids)
+                votes = self.dist.allgather(vote)
             elif self.dist.cp_size > 1:
-                votes = self.dist.tp_cp_allgather(local_ids)
+                votes = self.dist.tp_cp_allgather(vote)
             else:
-                votes = self.dist.tp_allgather(local_ids)
+                votes = self.dist.tp_allgather(vote)
             pending.clear()
-            failed_ids = {rid for vote in votes for rid in vote}
+            failed_ids = {rid for ids, _ in votes for rid in ids}
+            made_progress = any(progress for _, progress in votes)
+        self._scheduler_progress_since_vote = False
+        if made_progress:
+            self._scheduler_stall_rounds = 0
+        elif failed_ids:
+            self._scheduler_stall_rounds += 1
+            if self._scheduler_stall_rounds >= 3:
+                # The event-loop rank-crash path contains this systemic stall;
+                # an ADP subgroup must not enter world response collectives.
+                raise RuntimeError(
+                    "KV cache admission made no progress after three failure rounds"
+                )
         scheduled_batch.failed_requests = []
         if not failed_ids:
             return

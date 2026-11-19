@@ -794,6 +794,7 @@ class Sender(SenderBase):
         self._retirement_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
         self._recover_agent: Optional[Callable[[int], None]] = None
         self._remote_agent_descriptors: dict[str, bytes] = {}
+        self._deferred_remote_agents: dict[str, tuple[bytes, float]] = {}
         self._unreleased_statuses: list[tuple[TransferStatus, SendTaskBase, threading.Event]] = []
         self._ownership_poisoned: Optional[Exception] = None
         self._ownership_poison_lock = (
@@ -1102,6 +1103,28 @@ class Sender(SenderBase):
             return self._get_or_connect_dealer(endpoint)
         return self._get_or_connect_thread_dealer(endpoint)
 
+    def _retry_deferred_peer(self, name: str) -> None:
+        """Retry a failed replay on demand, at most once per peer per second."""
+        # Match recovery's descriptor-lock -> operation-gate ordering. This
+        # runs before acquiring a transfer lease and never fences healthy peers.
+        if name not in self._deferred_remote_agents:
+            return
+        with self._loaded_remote_agents_lock:
+            pending = self._deferred_remote_agents.get(name)
+            if pending is None or self._agent_failed or self._shutdown_requested:
+                return
+            descriptor, retry_at = pending
+            if time.monotonic() < retry_at:
+                return
+            try:
+                self._agent.load_remote_agent(name, descriptor)
+            except RuntimeError:
+                self._deferred_remote_agents[name] = (descriptor, time.monotonic() + 1.0)
+                return
+            self._remote_agent_descriptors[name] = descriptor
+            self._loaded_remote_agents.add(name)
+            del self._deferred_remote_agents[name]
+
     def _submit_direct_transfer(
         self,
         task: SendTaskBase,
@@ -1113,6 +1136,8 @@ class Sender(SenderBase):
         recover = self._recover_agent
         assert recover is not None
         retirement_event = None
+        for member in requests:
+            self._retry_deferred_peer(member.remote_name)
         with self._agent_operation_gate.transfer():
             generation = self._agent_generation
             if agent_generation is not None and agent_generation != generation:
@@ -2215,6 +2240,7 @@ class Sender(SenderBase):
         with self._loaded_remote_agents_lock:
             if self._shutdown_requested:
                 return
+            self._deferred_remote_agents.pop(agent_name, None)
             self._registrar.register(ri.instance_name, ri.instance_rank, ri)
             if getattr(self, "_recover_agent", None) is None:
                 self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
@@ -5277,17 +5303,20 @@ class TransferWorker:
         self._kv_extractor = KVRegionExtractorV1(kvm)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
-    def _setup_transfer_engine(self):
-        torch.cuda.set_device(self._config.device_id)
-        CUASSERT(cudart.cudaSetDevice(self._config.device_id))
+    def _new_agent(self):
         mapping = self._config.kv_cache_manager.mapping
-        self._agent = _create_nixl_agent(
+        return _create_nixl_agent(
             self._rank_info.instance_name + str(self._rank_info.instance_rank),
             rank=mapping.rank,
             world_size=mapping.world_size,
             agent_buffer_size_mb=self._config.agent_buffer_size_mb,
             agent_bounce_params=self._config.agent_bounce_params,
         )
+
+    def _setup_transfer_engine(self):
+        torch.cuda.set_device(self._config.device_id)
+        CUASSERT(cudart.cudaSetDevice(self._config.device_id))
+        self._agent = self._new_agent()
         # The pure-Python agent has no bounce_enabled attribute and already warns on its own.
         if (
             self._config.agent_buffer_size_mb > 0
@@ -5479,12 +5508,7 @@ class TransferWorker:
                     if sender._shutdown_requested:
                         self._registered_mem.clear()
                         return True
-                    mapping = self._config.kv_cache_manager.mapping
-                    agent = _create_nixl_agent(
-                        self._rank_info.instance_name + str(self._rank_info.instance_rank),
-                        rank=mapping.rank,
-                        world_size=mapping.world_size,
-                    )
+                    agent = self._new_agent()
                     try:
                         check_deadline()
                         for desc in self._registered_mem:
@@ -5495,6 +5519,7 @@ class TransferWorker:
                                 agent.load_remote_agent(name, descriptor)
                             except RuntimeError as error:
                                 logger.warning(f"Dropping unavailable NIXL peer {name}: {error}")
+                                sender._deferred_remote_agents[name] = (descriptor, 0.0)
                                 del sender._remote_agent_descriptors[name]
                                 sender._loaded_remote_agents.discard(name)
                         descriptor = bytes(agent.get_local_agent_desc())

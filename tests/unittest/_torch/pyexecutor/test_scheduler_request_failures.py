@@ -34,6 +34,7 @@ def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
     executors, batches = [], []
     for rank in range(2):
         executor = object.__new__(PyExecutor)
+        executor._reset_scheduler_failure_state()
         executor._is_kv_manager_v2 = True
         executor.enable_attention_dp = False
         executor._scheduler_failure_sync_tick = 63
@@ -44,9 +45,7 @@ def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
         )
         collective = {"tp": "tp_allgather", "cp": "tp_cp_allgather", "pp": "allgather"}[parallelism]
         setattr(executor.dist, collective, lambda ids, rank=rank: gather(rank, ids))
-        executor.active_requests = (
-            [healthy, *failed] if parallelism == "pp" else [healthy] if rank == 0 else failed.copy()
-        )
+        executor.active_requests = [healthy, *failed]
         executor._handle_errors = Mock()
         batch = ScheduledRequests()
         batch.failed_requests = failed.copy() if rank == 1 else []
@@ -70,7 +69,7 @@ def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
         assert batch.generation_requests == []
         executor._handle_errors.assert_called_once_with(
             "KV cache admission made no progress within the scheduler limit",
-            requests=failed if rank == 1 or parallelism == "pp" else [],
+            requests=failed,
             charge_budget=False,
         )
     assert batches[0].context_requests == [healthy]
@@ -78,6 +77,7 @@ def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
 
 def test_admission_failure_delivers_one_error_and_cleans_up_once():
     executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
     executor._is_kv_manager_v2 = True
     executor.dist = SimpleNamespace(
         rank=0,
@@ -143,11 +143,15 @@ def test_admission_failure_delivers_one_error_and_cleans_up_once():
 
 def test_model_parallel_failure_votes_are_batched_and_adp_is_rank_local():
     executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
     executor._is_kv_manager_v2, executor.enable_attention_dp = True, False
     failed = SimpleNamespace(py_request_id=7)
     executor.active_requests = [failed]
     executor.dist = SimpleNamespace(
-        tp_size=1, cp_size=1, pp_size=3, allgather=Mock(return_value=[[7], [], []])
+        tp_size=1,
+        cp_size=1,
+        pp_size=3,
+        allgather=Mock(return_value=[([7], False), ([], False), ([], False)]),
     )
     executor._handle_errors = Mock()
     batch = ScheduledRequests()
@@ -157,7 +161,7 @@ def test_model_parallel_failure_votes_are_batched_and_adp_is_rank_local():
     executor.dist.allgather.assert_not_called()
     executor._handle_errors.assert_not_called()
     executor._fail_scheduler_requests(batch)
-    executor.dist.allgather.assert_called_once_with([7])
+    executor.dist.allgather.assert_called_once_with(([7], False))
     executor._handle_errors.assert_called_once()
 
     executor.enable_attention_dp = True
@@ -171,8 +175,92 @@ def test_model_parallel_failure_votes_are_batched_and_adp_is_rank_local():
 
 def test_held_transfer_remains_visible_to_the_scheduler_hold_probe():
     executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
     executor._disagg_coordinator = SimpleNamespace(has_local_retiring_gen_receives=False)
     executor._transfer_held_failures = {7: (object(), "parked receive")}
     assert executor._has_scheduler_transfer_holds()
     executor._transfer_held_failures.clear()
     assert not executor._has_scheduler_transfer_holds()
+
+
+@pytest.mark.parametrize("progress", [False, True])
+def test_persistent_admission_failures_escalate_only_without_progress(progress):
+    executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
+    executor._is_kv_manager_v2, executor.enable_attention_dp = True, False
+    executor.dist = SimpleNamespace(
+        tp_size=2, cp_size=1, pp_size=1, tp_allgather=lambda vote: [vote, ([], False)]
+    )
+    failed = SimpleNamespace(py_request_id=7)
+    healthy = SimpleNamespace(py_request_id=8)
+    executor.active_requests = [failed, healthy]
+    executor._handle_errors = Mock()
+    executor._scheduler_stall_rounds = 2 if progress else 0
+    for round_id in range(3):
+        batch = ScheduledRequests()
+        batch.failed_requests = [failed]
+        batch.generation_requests = [healthy] if progress else []
+        executor._scheduler_failure_sync_tick = 63
+        if round_id == 2 and not progress:
+            with pytest.raises(RuntimeError, match="three failure rounds"):
+                executor._fail_scheduler_requests(batch)
+        else:
+            executor._fail_scheduler_requests(batch)
+    assert executor._handle_errors.call_count == (3 if progress else 2)
+    assert executor._scheduler_stall_rounds == (0 if progress else 3)
+
+
+def test_adp_failure_consensus_covers_both_cp_and_pp_without_tp_vote():
+    executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
+    executor._scheduler_failure_sync_tick = 63
+    executor._is_kv_manager_v2, executor.enable_attention_dp = True, True
+    executor.dist = SimpleNamespace(
+        tp_size=2,
+        cp_size=2,
+        pp_size=2,
+        cp_allgather=Mock(return_value=[([], False), ([7], False)]),
+        pp_allgather=Mock(return_value=[([7], False), ([9], False)]),
+    )
+    failed = [SimpleNamespace(py_request_id=rid) for rid in (7, 9)]
+    executor.active_requests = failed
+    executor._handle_errors = Mock()
+    batch = ScheduledRequests()
+    executor._fail_scheduler_requests(batch)
+    executor.dist.cp_allgather.assert_called_once_with(([], False))
+    executor.dist.pp_allgather.assert_called_once_with(([7], False))
+    assert executor._handle_errors.call_args.kwargs["requests"] == failed
+
+
+def test_mpi_scheduler_failure_consensus_spans_cp_and_pp():
+    from mpi4py import MPI
+
+    world = MPI.COMM_WORLD
+    if world.Get_size() != 4:
+        pytest.skip("launch this test with mpirun -np 4")
+    rank = world.Get_rank()
+    cp, pp = world.Split(rank // 2, rank), world.Split(rank % 2, rank)
+    try:
+        executor = object.__new__(PyExecutor)
+        executor._reset_scheduler_failure_state()
+        executor._is_kv_manager_v2 = executor.enable_attention_dp = True
+        executor.dist = SimpleNamespace(
+            tp_size=1, cp_size=2, pp_size=2, cp_allgather=cp.allgather, pp_allgather=pp.allgather
+        )
+        failed = SimpleNamespace(py_request_id=7)
+        executor.active_requests = [failed]
+        executor._handle_errors = Mock()
+        for round_id in range(3):
+            executor._scheduler_failure_sync_tick = 63
+            batch = ScheduledRequests()
+            batch.failed_requests = [failed] if rank == 3 else []
+            if round_id < 2:
+                executor._fail_scheduler_requests(batch)
+                assert executor._handle_errors.call_args.kwargs["requests"] == [failed]
+            else:
+                with pytest.raises(RuntimeError, match="three failure rounds"):
+                    executor._fail_scheduler_requests(batch)
+        assert executor._handle_errors.call_count == 2
+    finally:
+        cp.Free()
+        pp.Free()

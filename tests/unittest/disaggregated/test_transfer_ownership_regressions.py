@@ -1286,6 +1286,7 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._shutdown = sender._shutdown_requested = False
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
+    sender._deferred_remote_agents = {}
     sender._instance_rank = 0
     sender._num_threads = 1
     sender._pending_settlements = [{}]

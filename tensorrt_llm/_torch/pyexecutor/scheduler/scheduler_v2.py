@@ -1221,7 +1221,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._detect_deadlock(
             requests_list,
             inflight_request_ids,
-            pending_ctx,
+            pending_ctx + starved_ctx,
             preempted_ids,
             made_progress=made_progress,
         )
@@ -2882,7 +2882,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"{self._summarize_stall(active_requests, pending_ctx, inflight_request_ids, preempted_ids)} "
             f"{remedy}"
         )
-        self._failed_requests = [
+        candidates = [
             req
             for req in active_requests
             if req.is_generation_in_progress_state
@@ -2890,15 +2890,27 @@ class KVCacheV2Scheduler(RequestScheduler):
             and req.request_id not in inflight_request_ids
             and not self._has_pending_connector_load(req)
         ]
-        failed_ids = {req.py_request_id for req in self._failed_requests}
+        failed_ids = {req.py_request_id for req in candidates}
         for req in pending_ctx:
             if (
                 req.py_request_id not in failed_ids
                 and req.py_request_id not in preempted_ids
                 and req.request_id not in inflight_request_ids
             ):
-                self._failed_requests.append(req)
+                candidates.append(req)
                 failed_ids.add(req.py_request_id)
+        # Match preemption's newest-first ordering. Prefer a page holder so
+        # freeing one request can admit the older work instead of rejecting
+        # every arrival while a starved partial prefill keeps the pool pinned.
+        holders = {
+            req.py_request_id
+            for req in candidates
+            if req.is_generation_in_progress_state or req.context_current_position > 0
+        }
+        ordered = [
+            req for req in reversed(active_requests) if req.py_request_id in (holders or failed_ids)
+        ]
+        self._failed_requests = ordered[:1]
         self._stalled_schedules = 0
 
     def _summarize_stall(
