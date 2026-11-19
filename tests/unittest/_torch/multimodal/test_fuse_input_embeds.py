@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from unittest import mock
 
 import pytest
@@ -10,6 +13,9 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 
+DEVICE_PARAMS = [pytest.param("cpu", marks=pytest.mark.cpu_only)
+                 ] + (["cuda"] if torch.cuda.is_available() else [])
+
 
 def make_embedding(num_embeddings: int = 100,
                    hidden_size: int = 16,
@@ -20,8 +26,7 @@ def make_embedding(num_embeddings: int = 100,
     return emb.to(device)
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_filter_mm_token_from_input_ids_oov(device):
     vocab_size = 10
     # input_ids contains text (< vocab) and OOV mm tokens (>= vocab)
@@ -38,8 +43,7 @@ def test_filter_mm_token_from_input_ids_oov(device):
                                torch.tensor([2, 4, 6], dtype=torch.long))
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_filter_mm_token_from_input_ids_explicit_ids(device):
     vocab_size = 100
     # All ids are < vocab; mm tokens are explicitly specified
@@ -67,8 +71,7 @@ def test_filter_mm_token_from_input_ids_explicit_ids(device):
                                torch.tensor([2, 4, 6], dtype=torch.long))
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_empty_mm_returns_ids(device):
     emb = make_embedding(num_embeddings=20, hidden_size=8, device=device)
     input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long, device=device)
@@ -83,8 +86,7 @@ def test_fuse_input_embeds_empty_mm_returns_ids(device):
     torch.testing.assert_close(out_ids, input_ids)
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_mismatch_raises(device):
     emb = make_embedding(num_embeddings=50, hidden_size=8, device=device)
 
@@ -110,8 +112,7 @@ def test_fuse_input_embeds_mismatch_raises(device):
                           mm_token_indices=mm_idx)
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_mismatch_error_includes_counts(device):
     emb = make_embedding(num_embeddings=50, hidden_size=8, device=device)
     input_ids = torch.tensor([1, 51, 2, 52, 3], dtype=torch.long, device=device)
@@ -134,8 +135,7 @@ def test_fuse_input_embeds_mismatch_error_includes_counts(device):
     assert "received 3 image embeddings" in error_message
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_with_chunked_multimodal_slice(device):
     hidden = 8
     emb = make_embedding(num_embeddings=50, hidden_size=hidden, device=device)
@@ -164,8 +164,7 @@ def test_fuse_input_embeds_with_chunked_multimodal_slice(device):
     )
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_success_oov_path(device):
     hidden = 8
     emb = make_embedding(num_embeddings=40, hidden_size=hidden, device=device)
@@ -221,8 +220,7 @@ def test_fuse_input_embeds_success_oov_path(device):
     torch.testing.assert_close(out_embeds_int32, out_embeds)
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_empty_multimodal_params_falls_through(device):
     """
     An empty multimodal_params list (non-None but len 0) passed through kwargs
@@ -253,8 +251,7 @@ def test_fuse_input_embeds_empty_multimodal_params_falls_through(device):
     assert out_embeds.shape == (input_ids.numel(), hidden)
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_skips_filter_when_indices_provided(device):
     """
     Sync-free contract: when both ``text_token_indices`` and
@@ -290,8 +287,7 @@ def test_fuse_input_embeds_skips_filter_when_indices_provided(device):
     spy.assert_not_called()
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_calls_filter_when_indices_missing(device):
     """
     Negative half of the sync-free contract: when indices are absent the
@@ -324,8 +320,7 @@ def test_fuse_input_embeds_calls_filter_when_indices_missing(device):
     spy.assert_called_once()
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_in_vocab_fast_path_matches_oov(device):
     """
     In-vocab fast path: when ``mm_token_ids`` is provided, fuse_input_embeds
@@ -372,8 +367,7 @@ def test_fuse_input_embeds_in_vocab_fast_path_matches_oov(device):
     torch.testing.assert_close(out_embeds_fast, out_embeds_oov)
 
 
-@pytest.mark.parametrize("device", ["cpu"] +
-                         (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", DEVICE_PARAMS)
 def test_fuse_input_embeds_kwargs_precedence_over_mm_token_ids(device):
     """
     When precomputed indices are provided, they take precedence over

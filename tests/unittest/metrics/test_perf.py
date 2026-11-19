@@ -372,6 +372,11 @@ def test_conversation_activity_wire_roundtrip(include_load, include_snapshots, o
         else None,
         kv_transfer_outcomes=outcomes,
         conversation_activity=activity,
+        num_queued_context_requests=2,
+        num_queued_ctx_tokens=32,
+        num_queued_gen_requests=3,
+        num_queued_gen_kv_tokens=96,
+        has_pending_work=True,
     )
     state = RankState(rank=2, iter_stats=payload, num_connector_transfers=4)
     assert RankState.deserialize(state.serialize(include_load)) == state

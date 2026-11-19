@@ -322,8 +322,10 @@ def route(
     num_sms: int = 148,
     sm_version: int = 100,
     det: bool = False,
+    r_cap: int = 0,
 ) -> dict[str, object]:
-    """Select a kernel and launch resources from the shape and device properties."""
+    """Select a kernel and launch resources from the shape and device properties; ``r_cap`` > 0
+    caps the streaming split's CTAs per row (a split of 2..8 takes the cluster family)."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     if num_sms < 1:
@@ -532,6 +534,8 @@ def route(
             R = 1
     elif b <= wave // 2 and (n >> 2) >= 16384 and k <= 1024:  # shallow R=2 split
         R = 2
+    if r_cap > 0 and R > r_cap:
+        R = r_cap
 
     useclus = False
     if 2 <= R <= 8 and k <= 1024:
@@ -2054,9 +2058,14 @@ def _varlen_cache_for(dtype: torch.dtype) -> dict:
 _WIDE_CTA_ROWS = (149, 296)
 
 
-def _varlen_key_flags(det: bool, wide_cta_rows: bool) -> tuple:
+def _varlen_key_flags(det: bool, wide_cta_rows: bool, pdl: bool = False, r_cap: int = 0) -> tuple:
     """``_VARLEN_CACHE`` key suffix of the opt-in launch flags (empty for the default launch)."""
-    return ((True,) if det else ()) + (("wide_cta_rows",) if wide_cta_rows else ())
+    return (
+        ((True,) if det else ())
+        + (("wide_cta_rows",) if wide_cta_rows else ())
+        + (("pdl",) if pdl else ())
+        + ((("r_cap", r_cap),) if r_cap else ())
+    )
 
 
 # ---- prefill launcher cache ------------------------------------------------
@@ -2523,6 +2532,8 @@ def _varlen_launcher(
     device_index: int | None = None,
     det: bool = False,
     wide_cta_rows: bool = False,
+    pdl: bool = False,
+    r_cap: int = 0,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher for one logits dtype.
 
@@ -2530,6 +2541,7 @@ def _varlen_launcher(
     their own plans, compile options and tuning scalars (many of them per dtype) and a near-K
     ``complement`` launcher. Batches ``_tallws_gate`` admits run the tall-batch engine. Every
     choice is a function of capture-stable quantities only.
+    ``pdl`` (FP32): the main and clus families wait, then release.
     """
     if dtype not in _DTYPE_TAG:
         raise RuntimeError(f"decode launcher requires float32, bfloat16 or float16, got {dtype}")
@@ -2544,7 +2556,7 @@ def _varlen_launcher(
         key = (num_rows, npad, k, n_env, next_n, cr, device_index, profile)
     else:
         key = (num_rows, npad, k, n_env, next_n, cr, profile) + _varlen_key_flags(
-            det, wide_cta_rows
+            det, wide_cta_rows, pdl, r_cap
         )
     cache = _varlen_cache_for(dtype)
     hit = cache.get(key)
@@ -2579,7 +2591,7 @@ def _varlen_launcher(
     if low:
         plan_free = _route_16bit(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
     else:
-        plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det)
+        plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
     if (
         dtype is torch.float16
         and k == 2048
@@ -3368,8 +3380,7 @@ def _varlen_launcher(
             clus_options["fused_merge_bf16"] = True
         if dtype is torch.bfloat16 and k <= 1024:
             clus_options["push_merge_bf16"] = True
-        fn = dev.get_compiled__clus(
-            tuple(plan_free["tpl"]),
+        compile_kwargs = dict(
             scap=rt_f["SCAP"],
             cmp_=rt_f["CMP"],
             varlen=True,
@@ -3379,7 +3390,9 @@ def _varlen_launcher(
             det=det,
             wave_sms=wave,
             **clus_options,
+            pdl=pdl and not det and not low,
         )
+        fn = dev.get_compiled__clus(tuple(plan_free["tpl"]), **compile_kwargs)
         e_smp, e_tgt, e_ss2, e_tgt2 = 0, 0, 0, 0
         if clus_options.get("envf", False):
             e_smp, e_tgt, e_ss2, e_tgt2 = _clus_env_samples(
@@ -3395,6 +3408,7 @@ def _varlen_launcher(
             "clus",
             fn,
             (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], e_smp, e_tgt, 0, e_ss2, e_tgt2),
+            (tuple(plan_free["tpl"]), compile_kwargs),
         )
     else:
         if low:
@@ -3487,6 +3501,7 @@ def _varlen_launcher(
                 staged_k=k
                 if k == 2048 and r_const == 1 and sm_version in _TUNED_SM_VERSIONS
                 else 0,
+                pdl=pdl and not det,
             )
         big = num_rows * r_const <= wave
         if (
@@ -4176,6 +4191,9 @@ def run_varlen(
     deterministic: bool = False,
     sorting: str | None = None,
     wide_cta_rows: bool = False,
+    pdl: bool = False,
+    r_cap: int = 0,
+    finalize: dict | None = None,
 ) -> None:
     """Run hint-free self-sampling Top-K with per-request device KV lengths.
 
@@ -4183,7 +4201,8 @@ def run_varlen(
     smaller index — and a fixed per-route output order); ``sorting="ascending"`` additionally sorts
     every row (requires deterministic). The default path is the original kernel, unchanged.
     ``wide_cta_rows=True`` runs the non-split gvr_main plan of ``_WIDE_CTA_ROWS``-row batches with
-    1,024-thread CTAs.
+    1,024-thread CTAs. FP32 only: ``pdl`` (see ``_varlen_launcher``), ``r_cap`` (see ``route``) and
+    ``finalize`` (CSA2's paged finalize, run by a clus launch that then sets ``finalize["done"]``).
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -4338,8 +4357,12 @@ def run_varlen(
         n_env = 1 << max(n_env - 1, 1).bit_length()
     n_env = min(max(n_env, 1), npad)
     det = _check_det_args(deterministic, sorting)
+    pdl = bool(pdl) and not det
+    r_cap = max(0, int(r_cap))
     profile = _device_profile_key(d)
-    key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(det, wide_cta_rows)
+    key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(
+        det, wide_cta_rows, pdl, r_cap
+    )
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
@@ -4358,6 +4381,8 @@ def run_varlen(
             sm_version,
             det=det,
             wide_cta_rows=wide_cta_rows,
+            pdl=pdl,
+            r_cap=r_cap,
         )
     idx = indices
     if idx.shape[1] != k:
@@ -4376,7 +4401,33 @@ def run_varlen(
     elif lc[0] == "clus":
         # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
         #                SCAP, CMP, dead DYN x5)
-        lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
+        fn = None
+        if finalize is not None and not det and k % 2 == 0 and k <= 1024:
+            # Each row's rank-0 CTA also runs CSA2's paged finalize (not compiled in a capture).
+            tpl, compile_kwargs = lc[3]
+            fn = _device().get_compiled__clus(
+                tpl,
+                **compile_kwargs,
+                fin_k=k,
+                fin_page=int(finalize["page"]),
+                cached_only=_is_capturing(),
+            )
+        if fn is not None:
+            valid = finalize["valid"].view(torch.uint8)
+            fn(
+                lg,
+                pre_arg,
+                kv_lens,
+                idx,
+                *lc[2],
+                valid.reshape(-1),
+                finalize["visible"],
+                int(finalize["width"]),
+                int(valid.stride(0)),
+            )
+            finalize["done"] = True
+        else:
+            lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
     else:
         _, fn, pre, tail = lc
         fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
@@ -4698,14 +4749,16 @@ def varlen_ready(
     max_seq_len: int | None = None,
     deterministic: bool = False,
     wide_cta_rows: bool = False,
+    pdl: bool = False,
+    r_cap: int = 0,
 ) -> bool:
     """True iff ``run_varlen(logits, kv_lens, indices, next_n, compress_ratio,
-    max_seq_len=max_seq_len, deterministic=deterministic, wide_cta_rows=wide_cta_rows)``
-    without a workspace would launch without compiling: the launcher key it looks up (rows, row
-    stride, k, envelope, next_n, compression, device profile, dtype, det, wide_cta_rows) is cached
-    and the device's default workspace exists, so a caller can route around the engine under
-    CUDA graph capture. Host-only. Without ``max_seq_len`` run_varlen reads
-    ``kv_lens.max()`` on the host, so the answer is False."""
+    max_seq_len=max_seq_len, deterministic=deterministic, wide_cta_rows=wide_cta_rows, pdl=pdl,
+    r_cap=r_cap)`` without a workspace would launch without compiling: the launcher key it looks
+    up (rows, row stride, k, envelope, next_n, compression, device profile, dtype, det,
+    wide_cta_rows, pdl, r_cap) is cached and the device's default workspace exists, so a caller
+    can route around the engine under CUDA graph capture. Host-only. Without ``max_seq_len``
+    run_varlen reads ``kv_lens.max()`` on the host, so the answer is False."""
     if logits.dim() != 2 or indices.dim() != 2:
         return False
     num_rows = logits.shape[0]
@@ -4727,7 +4780,7 @@ def varlen_ready(
         key = (num_rows, npad, k, n_env, nn, cr, d, profile)
     else:
         key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(
-            deterministic, wide_cta_rows
+            deterministic, wide_cta_rows, bool(pdl) and not deterministic, max(0, int(r_cap))
         )
     return key in _varlen_cache_for(logits.dtype) and d in _ws_hot
 

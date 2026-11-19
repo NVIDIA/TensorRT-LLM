@@ -835,6 +835,7 @@ def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) 
     c._disable_overlap_scheduler = disable_overlap_scheduler
     c._llm_args = SimpleNamespace(
         kv_cache_config=SimpleNamespace(kv_events_config=None),
+        enable_locality_domains=False,
     )
     # Short-circuit the post-construction max_seq_len fixup.
     c._skip_est = True
@@ -1051,7 +1052,7 @@ def _sampler_with(store):
 def test_penalty_store_is_read_from_the_torch_sampler_only():
     store = _penalty_store(16)
     assert get_penalty_store(_sampler_with(store)) is store
-    # EarlyStopSampler and friends own no penalty handler, and estimation may have no sampler.
+    # Early-stop samplers own no penalty handler, and estimation may have no sampler.
     assert get_penalty_store(SimpleNamespace()) is None
     assert get_penalty_store(None) is None
     # A mocked sampler auto-creates the attributes; that is not a store to size from.

@@ -9,7 +9,6 @@ test_context_cancellation_retirement.py rather than simulated here.
 
 import pickle
 import queue
-import threading
 from contextlib import nullcontext
 from datetime import timedelta
 from types import MethodType, SimpleNamespace
@@ -34,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
@@ -90,8 +90,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     engine.waiting_queue = FCFSWaitingQueue()
     engine._pending_transfer_responses = []
     engine._pending_response_terminations = []
-    engine.response_cv = threading.Condition()
-    engine.result_wait_queues = {}
+    engine._response_channel = ResponseChannel()
     engine.gather_all_responses = False
     engine.enable_attention_dp = False
     engine.kv_connector_manager = None
@@ -269,9 +268,8 @@ def test_staged_context_cancellation_survives_retirement(executor: PyExecutor) -
     request = _request()
     result_queue = Mock()
     executor.active_requests.append(request)
-    executor.result_wait_queues[request.py_request_id] = result_queue
+    executor._response_channel.result_wait_queues[request.py_request_id] = result_queue
     executor.async_transfer_manager.start_transfer(request)
-    executor.responses = {}
     executor._stage_responses = True
     executor._staged_responses = []
     executor.dist.mapping = SimpleNamespace(tp_group=[0])
@@ -283,7 +281,7 @@ def test_staged_context_cancellation_survives_retirement(executor: PyExecutor) -
     _consume_abort(executor, request.py_client_id, request.py_request_id)
 
     assert executor._progress_context_cancellations([request]) == []
-    assert not executor.responses
+    assert not executor._response_channel.responses
     result_queue.put_response.remote.assert_not_called()
     executor._free_request_resources.assert_not_called()
     assert executor.async_transfer_manager.requests_in_transfer() == {11: request}
@@ -294,12 +292,12 @@ def test_staged_context_cancellation_survives_retirement(executor: PyExecutor) -
 
     assert executor.async_transfer_manager.end_transfer(request)
     executor._terminate_request(request)
-    assert not executor.result_wait_queues
+    assert not executor._response_channel.result_wait_queues
     executor._free_request_resources.assert_called_once_with(request)
 
     executor._flush_staged_responses()
     executor._flush_staged_responses()
-    assert executor.responses == {request.py_request_id: [response]}
+    assert executor._response_channel.responses == {request.py_request_id: [response]}
     result_queue.put_response.remote.assert_called_once_with(response.client_id, response)
     assert not executor._staged_responses
 
@@ -460,7 +458,7 @@ def test_fetch_preserves_admission_result_when_completing_queued_context_cancel(
     ]
     executor.waiting_queue.add_requests([cancelled, pending])
     executor.canceled_req_ids = [11]
-    executor.result_wait_queues = {11: object(), 12: object()}
+    executor._response_channel.result_wait_queues = {11: object(), 12: object()}
     executor.max_num_active_requests = 1
     executor.is_benchmark_disagg = False
     executor.enable_iter_perf_stats = False
@@ -487,7 +485,7 @@ def test_fetch_preserves_admission_result_when_completing_queued_context_cancel(
     assert list(executor.waiting_queue) == ([] if available_slots else [pending])
     assert executor.num_fetch_requests == available_slots
     assert not executor.canceled_req_ids
-    assert set(executor.result_wait_queues) == {12}
+    assert set(executor._response_channel.result_wait_queues) == {12}
     executor._enqueue_responses.assert_called_once()
     responses = executor._enqueue_responses.call_args.args[0]
     assert len(responses) == 1 and responses[0][0] == 11

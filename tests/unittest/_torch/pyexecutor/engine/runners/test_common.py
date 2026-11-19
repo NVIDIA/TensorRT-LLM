@@ -11,7 +11,6 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners import (
     DecoderRunner,
     EncoderDecoderRunner,
-    EncoderRunner,
     common,
     resolve_runner_type,
 )
@@ -36,29 +35,20 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(
-    ("encode_only", "mm_encoder_only", "is_generation", "is_encoder_decoder", "runner_type"),
+    ("mm_encoder_only", "is_encoder_decoder", "runner_type"),
     [
-        (True, False, False, False, EncoderRunner),
-        (True, True, False, False, MultimodalEncoderRunner),
-        (False, True, False, False, MultimodalEncoderRunner),
-        (False, False, False, True, EncoderRunner),
-        (False, False, True, True, EncoderDecoderRunner),
-        (False, False, True, False, DecoderRunner),
+        (True, False, MultimodalEncoderRunner),
+        (False, True, EncoderDecoderRunner),
+        (False, False, DecoderRunner),
     ],
 )
 def test_resolve_runner_dispatches_startup_families(
-    encode_only: bool,
     mm_encoder_only: bool,
-    is_generation: bool,
     is_encoder_decoder: bool,
     runner_type: type[ModelRunner],
 ) -> None:
-    args = SimpleNamespace(encode_only=encode_only, mm_encoder_only=mm_encoder_only)
-    model = SimpleNamespace(
-        model_config=SimpleNamespace(
-            is_generation=is_generation, is_encoder_decoder=is_encoder_decoder
-        )
-    )
+    args = SimpleNamespace(mm_encoder_only=mm_encoder_only)
+    model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=is_encoder_decoder))
 
     assert resolve_runner_type(model, args) is runner_type
 

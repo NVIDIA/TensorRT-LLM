@@ -132,16 +132,15 @@ Actual window labels are `10m` and `1h`; worker target labels plus `dp_rank` ide
 the source. Summing workers double-counts shared conversations. Dynamo's optional
 log-based distinct-session panel uses trace coverage and different identity semantics.
 
-Two ordered last-seen maps use monotonic time and share limits read at enablement:
+Two ordered last-seen maps use monotonic time and share fixed limits of
+100,000 window entries and 16 MiB of accounted identity storage. An identity in
+both windows consumes two entries. Byte accounting charges key tuples and
+referenced identity objects per entry, including shared objects; this is not a
+limit on total Python allocator or worker RSS. Entry capacity also bounds
+timestamp/container metadata.
 
-- `TRTLLM_CONVERSATION_ACTIVITY_MAX_ENTRIES`: default 100000; an identity in both
-  windows consumes two entries. This also bounds timestamp/container metadata.
-- `TRTLLM_CONVERSATION_ACTIVITY_MAX_IDENTITY_BYTES`: default 16777216; charges key
-  tuples and referenced identity objects per entry, including shared objects.
-  This bounds accounted identities, not total Python allocator or worker RSS.
-
-Limits are nonnegative; zero retains nothing. At capacity, known entries still
-refresh and new identities are skipped. Oversized identities are not retained.
+At capacity, known entries still refresh and new identities are skipped.
+Oversized identities are not retained.
 A window remains incomplete until a full window after its latest skip; startup
 also needs a full window. Cache clears preserve history; restart resets it.
 
