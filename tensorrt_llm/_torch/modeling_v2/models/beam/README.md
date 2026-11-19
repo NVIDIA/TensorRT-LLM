@@ -12,24 +12,10 @@ back to a built-in model. Ordinary decoding uses the native TorchSampler.
 
 Supply a compatible checkpoint containing its original configuration, tokenizer,
 chat template and indexed safetensors weights. Use a TensorRT-LLM build matching
-this checkout on four GB300 GPUs. Create `beam-baseline.yaml`:
-
-```yaml
-modeling_v2: require
-checkpoint_format: beam_nvfp4
-reasoning_parser: beam_harmony_text
-tensor_parallel_size: 4
-max_batch_size: 1
-max_num_tokens: 8192
-cuda_graph_config: null
-disable_overlap_scheduler: true
-kv_cache_config:
-  dtype: auto
-  tokens_per_block: 32
-```
+this checkout on four GB300 GPUs. From the repository root:
 
 ```bash
-trtllm-serve /path/to/checkpoint --config beam-baseline.yaml
+trtllm-serve /path/to/checkpoint --config examples/configs/curated/beam-nvfp4-bf16kv-baseline.yaml
 ```
 
 `checkpoint_format: beam_nvfp4` constructs `BeamNvfp4CheckpointLoader` through the

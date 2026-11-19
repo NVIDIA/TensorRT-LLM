@@ -9,21 +9,39 @@ Chat Completions and Responses reject nonempty `tools` lists with HTTP 400 befor
 generation, including streaming requests and `tool_choice: none`. Omit `tools`
 or pass an empty list for text-only requests.
 
-Create `beam-baseline.yaml`:
+## Checkpoint and launch
 
-```yaml
-modeling_v2: require
-checkpoint_format: beam_nvfp4
-reasoning_parser: beam_harmony_text
-tensor_parallel_size: 4
-max_batch_size: 1
-max_num_tokens: 8192
-cuda_graph_config: null
-disable_overlap_scheduler: true
-```
+Stage `config.json`, `tokenizer.json`, the checkpoint's chat template,
+`model.safetensors.index.json` and every shard named by the index. The target reads
+the ModelOpt recipe from `hf_quant_config.json` when present, otherwise from
+`quantization_config` in `config.json`. It requires NVFP4 experts with group size 16.
+The `exclude_modules` patterns must cover every non-expert linear layer (attention,
+router, dense feed-forward and output head) and leave every expert projection quantized.
+KV-cache quantization settings must be absent or null. An incompatible recipe,
+including an FP8-KV export, is refused at startup with `modeling_v2: require`.
+
+Launch from the repository root:
 
 ```bash
-trtllm-serve /path/to/checkpoint --config beam-baseline.yaml
+trtllm-serve /path/to/checkpoint --config examples/configs/curated/beam-nvfp4-bf16kv-baseline.yaml
+```
+
+The recipe uses `max_batch_size: 1` for the single-request accuracy baseline.
+The target does not require a batch size of one for checkpoint selection.
+
+For example, request a short final answer with reasoning enabled:
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"<SERVED_MODEL>","messages":[{"role":"user","content":"What is 2 + 2?"}],"max_tokens":256,"chat_template_kwargs":{"reasoning_effort":128}}'
+```
+
+Use the served model ID from `/v1/models`. An illustrative non-streaming
+`choices[0].message` is:
+
+```json
+{"role":"assistant","reasoning_content":"Adding two and two gives four.","content":"4"}
 ```
 
 The same settings can be passed to `LLM()`; use `checkpoint_format="beam_nvfp4"`

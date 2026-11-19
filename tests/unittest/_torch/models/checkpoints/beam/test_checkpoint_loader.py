@@ -4,12 +4,13 @@
 
 import builtins
 import pickle
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import yaml
 
-from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.beam.checkpoint_loader import (
     BEAM_NVFP4_CHECKPOINT_FORMAT,
     BeamNvfp4CheckpointLoader,
@@ -17,13 +18,20 @@ from tensorrt_llm._torch.models.checkpoints.beam.checkpoint_loader import (
 from tensorrt_llm._torch.models.checkpoints.hf.config_loader import HfConfigLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
+from tensorrt_llm._torch.pyexecutor.model_loader import construct_checkpoint_loader
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
 
-def test_registered_loader_delegates_without_importing_a_target(monkeypatch):
+def test_registered_loader_delegates_without_importing_a_target(monkeypatch, tmp_path):
+    recipe = (
+        Path(__file__).resolve().parents[6]
+        / "examples/configs/curated/beam-nvfp4-bf16kv-baseline.yaml"
+    )
+    args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=4, **yaml.safe_load(recipe.read_text()))
+
     original_import = builtins.__import__
 
     def reject_target_import(name, *args, **kwargs):
@@ -31,7 +39,9 @@ def test_registered_loader_delegates_without_importing_a_target(monkeypatch):
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", reject_target_import)
-    loader = BaseCheckpointLoader.get(BEAM_NVFP4_CHECKPOINT_FORMAT)
+    loader = construct_checkpoint_loader(args.checkpoint_loader, args.checkpoint_format)
+    assert type(loader.weight_loader) is HfWeightLoader
+    assert type(loader.config_loader) is HfConfigLoader
     assert isinstance(loader, BeamNvfp4CheckpointLoader)
     assert not loader.is_weights_preloaded()
     model = SimpleNamespace(load_checkpoint=Mock())
