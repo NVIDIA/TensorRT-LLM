@@ -278,13 +278,18 @@ generator checkpoint:
 | T2V — text-to-video | `/v1/videos/sync`, `/v1/videos` | default |
 | I2V / TI2V — image-conditioned video | same | `image_reference` |
 | V2V — video-conditioned video | same | `video_reference` |
-| Transfer — control-video generation | same | one or more of `extra_params.edge`, `blur`, `depth`, `seg`, or `wsm` |
+| Transfer — control-video generation | same | a control hint in `extra_params` |
 | Action — policy / forward / inverse dynamics | same | `extra_params.action_mode`, or a checkpoint-selected Policy mode; returns a tensor payload |
 | T2AV — video with synchronized audio | same | `extra_params: {"enable_audio": true}` |
 | T2I — text-to-image | `/v1/images/generations` | `extra_params: {"output_type": "image"}` |
 
-For offline usage, see
-[`../models/cosmos3/README.md`](../models/cosmos3/README.md).
+See the [Cosmos3 model README](../models/cosmos3/README.md) for
+[checkpoint selection and memory requirements](../models/cosmos3/README.md#checkpoints),
+[deployment configs](../models/cosmos3/README.md#deployment-configs),
+[guardrail setup](../models/cosmos3/README.md#guardrails),
+[static FP8](../models/cosmos3/README.md#static-fp8-checkpoints), and offline usage.
+For supported request keys, inspect
+[`VisualGen.extra_param_specs`](#model-specific-extra_params) on the loaded model.
 
 ### Starting the server
 
@@ -315,19 +320,9 @@ trtllm-serve nvidia/Cosmos3-Edge --enable_visual_gen
 trtllm-serve nvidia/Cosmos3-Edge-Policy-DROID --enable_visual_gen
 ```
 
-The distilled image-to-video checkpoint reads its fixed four-step schedule from
-the checkpoint. Its default 720p x 189-frame workload needs more device memory
-than one H200 provides. Use a higher-memory GPU, such as Blackwell, or the
-single-node 4-GPU Hopper config shown above. The default 4-GPU config targets
-Blackwell (B200 / B300) with CFG plus Ulysses; the Hopper config uses tensor
-parallelism plus Ulysses to reduce per-GPU memory use. Edge and DROID need no YAML
-because their checkpoint defaults already are the deployed shape, but they do need
-`--enable_visual_gen` to select the generator rather than the Reasoner. The
-DROID checkpoint metadata then selects Policy mode and supplies its deployment
-defaults. A local checkpoint directory works in place of any Hub ID.
-
-Guardrails are enabled by default. Install and authenticate per
-[Guardrails](../models/cosmos3/README.md#guardrails) before serving.
+A local checkpoint directory works in place of any Hub ID.
+For a Hub FP8 checkpoint, pass the FP8 YAML described in the model README to
+`--visual_gen_args`.
 
 ### Per-mode requests
 
@@ -350,24 +345,6 @@ curl -X POST "http://localhost:8000/v1/videos/sync" \
   -o cosmos3_t2v.mp4
 ```
 
-To reuse an offline prompt file verbatim:
-
-```bash
-curl -X POST "http://localhost:8000/v1/videos/sync" \
-  -H "Content-Type: application/json" \
-  -d "$(jq '{prompt: .prompt, size: "1280x720", num_frames: 189, fps: 24}' ../models/cosmos3/prompts/t2v.json)" \
-  -o cosmos3_t2v.mp4
-```
-
-The bundled scripts drive this mode as-is (`seconds * fps` derives the frame
-count; 7.875 x 24 = 189):
-
-```bash
-python sync_video_gen.py --mode t2v --model nvidia/Cosmos3-Nano \
-    --prompt "A cute puppy playing with a ball in a park" \
-    --size 1280x720 --duration 7.875 --fps 24
-```
-
 **I2V / TI2V — image-conditioned video**
 
 ```bash
@@ -380,28 +357,23 @@ curl -X POST "http://localhost:8000/v1/videos/sync" \
   -o cosmos3_i2v.mp4
 ```
 
-```bash
-python sync_video_gen.py --mode ti2v --model nvidia/Cosmos3-Nano \
-    --prompt "She turns around and smiles, then slowly walks out of the frame" \
-    --image ./media/woman_skyline_original_720p.jpeg \
-    --size 1280x720 --duration 7.875 --fps 24
-```
-
 **V2V — video-conditioned video**
 
-Upload an MP4/AVI instead of an image; see
-[Video-to-Video](#video-to-video-multipart-with-file-upload-cosmos3) in the curl
-quick reference for the conditioning knobs. Only the first (or last, per
-`condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` reference
-frames condition the output — 5 frames with the defaults. Output size is fixed
-by the request; references are center-cropped, not aspect-matched. Use Nano or
-Super for this mode.
+Upload an MP4 or AVI through `video_reference`:
+
+```bash
+curl -X POST "http://localhost:8000/v1/videos/sync" \
+  -F "prompt=Continue the same scene with smooth natural motion" \
+  -F "video_reference=@/path/to/reference.mp4" \
+  -F "num_frames=189" \
+  -F "fps=24" \
+  -o cosmos3_v2v.mp4
+```
 
 **Transfer — control-video generation**
 
 Transfer preserves structure from a control video while the prompt determines
-appearance. Upload a source video and set `edge` or `blur` to `true` to compute
-that control on the server:
+appearance. This request computes an edge hint from the uploaded video:
 
 ```bash
 curl -X POST "http://localhost:8000/v1/videos/sync" \
@@ -410,12 +382,6 @@ curl -X POST "http://localhost:8000/v1/videos/sync" \
   -F 'extra_params={"edge":true}' \
   -o cosmos3_transfer.mp4
 ```
-
-Set both `edge` and `blur` to `true` for a composed control. `depth`, `seg`, and
-`wsm` require a precomputed MP4/AVI control clip; JSON clients base64-encode the
-clip either directly as the hint value or as its `control` field. Control clips
-must describe the same underlying motion as one another and the prompt. Transfer
-is supported by Cosmos3-Nano and Cosmos3-Super, not Cosmos3-Edge.
 
 **Action — policy / forward dynamics / inverse dynamics**
 
@@ -436,9 +402,8 @@ curl -X POST "http://localhost:8000/v1/videos/sync" \
 ```
 
 Forward dynamics generates a rollout from the first frame and a supplied action
-trajectory. `action_trajectory.json` is a `[T, D]` list of lists. For the `av`
-preset shown here, `D` must be 9; the trajectory is padded or truncated to the
-preset's 60-action horizon:
+trajectory. Supply `action_trajectory.json` as a list of action vectors for the
+selected domain:
 
 ```bash
 ACTION_PARAMS=$(
@@ -468,12 +433,8 @@ curl -X POST "http://localhost:8000/v1/videos/sync" \
 **Cosmos3 Edge Policy DROID**
 
 The dedicated `nvidia/Cosmos3-Edge-Policy-DROID` checkpoint selects Policy mode
-and its DROID defaults automatically. The prompt remains a string: the command
-below serializes the bundled caller-owned structured caption rather than asking
-the server to construct or validate it. The observation image must already use
-the DROID concatenated layout (wrist camera on top, two exterior views below).
-The current state is eight model-space values: seven joint positions followed
-by the gripper value. TensorRT-LLM does not perform robot-protocol conversion.
+and its DROID defaults automatically. Prepare the observation image and
+model-space state as shown in the [model examples](../models/cosmos3/README.md#usage).
 
 ```bash
 prompt=$(jq -c '.prompt' ../models/cosmos3/prompts/action_edge_policy_droid.json)
@@ -485,24 +446,7 @@ curl -X POST "http://localhost:8000/v1/videos/sync" \
   -o droid_policy.safetensors
 ```
 
-Neither `action_mode` nor `format` is required for this checkpoint. Its Policy
-default is applied before output-format selection, so `format=auto` resolves to
-`safetensors`. For one request, the payload contains a 33-frame rollout in
-`video` and 32 predicted 8-D commands in `action` (`action` shape `[32, 8]`).
-An explicit `-F "format=safetensors"` remains valid.
-
-Inspect a response with:
-
-```bash
-python3 -c 'from safetensors.torch import load_file; x=load_file("cosmos3_action_policy.safetensors"); print({k: tuple(v.shape) for k, v in x.items()})'
-```
-
-`domain_name` supplies the trained frame rate, action horizon, resolution bucket,
-and raw action width when that embodiment has canonical values. Pass
-`raw_action_dim` explicitly for domains such as `libero` where it is ambiguous.
-Action and audio generation are mutually exclusive. The generic Cosmos3-Edge
-checkpoint is not an Action deployment; use `nvidia/Cosmos3-Edge-Policy-DROID`
-for the DROID Policy workflow.
+With this checkpoint, omitting `format` returns a `safetensors` payload.
 
 **T2AV — video with synchronized audio**
 
@@ -510,13 +454,6 @@ Cosmos3-Nano and Cosmos3-Super support video generation with synchronized
 audio. Start the generator with the appropriate config from
 [Starting the server](#starting-the-server), then set `enable_audio: true` in
 the request below.
-
-For static FP8, use the single-GPU config that sets `revision: fp8`.
-Substitute `nvidia/Cosmos3-Super` for Super; the request is unchanged:
-
-```bash
-trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-fp8-1gpu.yaml
-```
 
 ```bash
 curl -X POST "http://localhost:8000/v1/videos/sync" \
@@ -535,12 +472,8 @@ Add an `image_reference` for image-conditioned audio-video (TI2AV). In
 multipart form-data, `extra_params` is sent as a JSON-encoded string:
 `-F 'extra_params={"enable_audio": true}'`.
 
-Audio needs an audio-capable checkpoint (Nano / Super; Cosmos3-Edge has no audio
-tower). On a checkpoint without one, `enable_audio` is accepted and video-only
-output is returned. The audio track is muxed into the container only by the
-FFmpeg encoder — the pure-Python AVI fallback drops it. Request
-`"format": "safetensors"` (or `"pt"`) to get the video and audio tensors plus
-`frame_rate` / `audio_sample_rate` in one payload instead.
+See [Media I/O dependencies](../models/cosmos3/README.md#media-io-dependencies)
+for FFmpeg setup. To download tensors, use `format: "safetensors"` or `"pt"`.
 
 **T2I — text-to-image**
 
@@ -673,37 +606,6 @@ Examples:
 - **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
 - **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
 - **Wan 2.1 / Flux**: no model-specific `extra_params` declared
-- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`; Action's `action_mode`, `domain_name`, `domain_id`, `raw_action_dim`, `action_chunk_size`, `action`, `use_state`, `action_resolution`, `action_fps`; and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
-
-##### Cosmos3 transfer hints
-
-`extra_params` is JSON, so a control clip travels as a **base64-encoded** MP4/AVI
-string under `<hint>.control`; the server decodes it at the HTTP boundary. Only
-`edge` and `blur` can be auto-computed — pass `true` and supply a `video`
-reference for them to derive from. `depth`/`seg`/`wsm` have no generator, so
-they always need a control clip.
-
-```json
-{
-  "prompt": "a city street at dusk",
-  "extra_params": {
-    "video": "<base64 MP4/AVI>",
-    "edge": {"preset_edge_threshold": "medium"},
-    "blur": {"preset_blur_strength": "medium"},
-    "depth": {"control": "<base64 MP4/AVI>"},
-    "control_guidance": 1.5
-  }
-}
-```
-
-`preset_edge_threshold` and `preset_blur_strength` accept
-`none`/`very_low`/`low`/`medium`/`high`/`very_high` and default to `medium`; a
-bare `true` (or `"<base64>"`) is shorthand for the object form. Individual
-values are validated before the job is queued, so a bad preset or an
-unsupported frame count fails fast; combinations that only make sense together
-— a transfer option with no hint selected, or `edge`/`blur` asked to
-auto-compute with no `video` — are still reported by the worker, as a client
-error, once the request is running.
 
 > **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
 > `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
@@ -745,40 +647,6 @@ curl -X POST "http://localhost:8000/v1/videos" \
   -F "size=256x256" \
   -F "guidance_scale=5.0"
 ```
-
-### Video-to-Video (Multipart with File Upload, Cosmos3)
-```bash
-# Modality comes from the field name: image_reference -> I2V, video_reference -> V2V.
-# V2V conditioning knobs ride in extra_params (values below are the defaults).
-curl -X POST "http://localhost:8000/v1/videos" \
-  -F "prompt=Continue the same scene with smooth natural motion and consistent subjects." \
-  -F "video_reference=@./media/reference.mp4" \
-  -F "num_frames=189" \
-  -F "fps=24" \
-  -F 'extra_params={"condition_video_latent_indexes": [0, 1], "condition_video_keep": "first"}'
-```
-
-### Cosmos3 Edge Policy DROID (Multipart with File Upload)
-
-The checkpoint selects Policy mode and its DROID defaults. The prompt remains a
-string: this example serializes the caller-owned nested caption instead of
-asking the server to construct or validate it. The current state contains seven
-joint positions followed by the gripper value in the model's convention.
-
-```bash
-prompt=$(jq -c '.prompt' ../models/cosmos3/prompts/action_edge_policy_droid.json)
-curl -X POST "http://localhost:8000/v1/videos/sync" \
-  -F "prompt=${prompt}" \
-  -F "image_reference=@./droid_observation.png" \
-  -F 'extra_params={"action": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}' \
-  -o droid_policy.safetensors
-```
-
-The tensor payload contains both `video` and `action`; `action` has shape
-`[32, 8]` for one request. The checkpoint-selected Policy default is applied
-before format resolution, so omitting both `action_mode` and `format` still
-resolves `format=auto` to `safetensors`. An explicit `-F 'format=safetensors'`
-is optional.
 
 ### Check Video Status
 ```bash
