@@ -306,6 +306,8 @@ class _Task:
     batch: BuildBatch
     index: int
     settled: bool = False
+    # Counted in BuildPool._outstanding until it settles.
+    outstanding: bool = False
 
 
 def _gpu_has_room() -> bool:
@@ -464,6 +466,9 @@ class BuildPool:
         self._counts: collections.Counter = collections.Counter()
         self._build_s = 0.0
         self._workers_started = 0
+        # Builds queued on the workers that have not ended (wait_idle).
+        self._outstanding = 0
+        self._idle = threading.Condition(self._lock)
         self.min_build_s = float(os.environ.get(_MIN_BUILD_ENV, _MIN_BUILD_S))
         # family -> [builds measured, their seconds]
         self._build_times: Dict[str, List[float]] = {}
@@ -637,6 +642,9 @@ class BuildPool:
             if message is None:
                 self._settle(task, BuildResult(REFUSED))
             else:
+                with self._lock:
+                    self._outstanding += 1
+                    task.outstanding = True
                 pool.put(task)
 
     def _message(self, build: Build) -> Optional[bytes]:
@@ -763,6 +771,13 @@ class BuildPool:
             lane = self._lane
         return lane.join() if lane is not None else {}
 
+    def wait_idle(self) -> None:
+        """Wait until every build queued so far on the workers and the threads has ended."""
+        with self._idle:
+            while self._outstanding:
+                self._idle.wait()
+        self.join_threads()
+
     def counts(self) -> Dict[str, int]:
         """How many builds ended each way (:class:`BuildResult`'s statuses)."""
         with self._lock:
@@ -783,6 +798,10 @@ class BuildPool:
             if task.settled:
                 return
             task.settled = True
+            if task.outstanding:
+                self._outstanding -= 1
+                if not self._outstanding:
+                    self._idle.notify_all()
             self._counts[result.status] += 1
             if result.status == BUILT:
                 self._build_s += result.seconds
@@ -1076,7 +1095,8 @@ class _ThreadLane:
                 )
                 self._threads.append(thread)
                 thread.start()
-        self._queue.put(_LaneBuild(function, family, need_bytes))
+            # Queued under the lock, so that a stop() refuses it or a thread serves it.
+            self._queue.put(_LaneBuild(function, family, need_bytes))
         return True
 
     def join(self) -> Dict[str, int]:

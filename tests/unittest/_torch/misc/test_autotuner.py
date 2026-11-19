@@ -3916,6 +3916,69 @@ def test_a_rehearsal_times_an_op_in_a_worker_and_the_warmup_finds_it_cached(
     tuner.clear_cache()
 
 
+def test_rehearsal_tuner_merges_every_op_a_rank_of_the_group_timed(monkeypatch):
+    """Each merge is collective, so every rank merges the ops any rank timed in the rehearsal,
+    in one order."""
+
+    class _Dist:
+
+        def tp_cp_allgather(self, obj):
+            return [obj, [("other_op", DistributedTuningStrategy.PARALLEL)]]
+
+    tuner = autotuner.AutoTuner()
+    tuner.setup_distributed_state(Mapping(world_size=2, rank=0, tp_size=2),
+                                  dist=_Dist())
+    monkeypatch.setattr(autotuner.AutoTuner, "_instance", tuner)
+    synced = []
+    monkeypatch.setattr(tuner, "_maybe_sync_cache_data",
+                        lambda strategy, custom_op: synced.append(custom_op))
+    rehearsal_tuner = autotuner.RehearsalTuner()
+    rehearsal_tuner.submit(
+        autotuner._RehearsalTuningTask(
+            custom_op="own_op",
+            runners=[],
+            tuning_config=TuningConfig(
+                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL),
+            profiles=[],
+            inputs=[],
+            kwargs={}))
+    rehearsal_tuner.join()
+    assert synced == ["other_op", "own_op"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or torch.cuda.get_device_capability()[0] != 10,
+                    reason="DeepGEMM's FP8 block-scale GEMMs run on SM100f")
+def test_deep_gemm_fp8_gemm_returns_zeros_and_builds_on_threads_in_a_rehearsal(
+        monkeypatch):
+    """In the build state DeepGEMM's GEMM launches nothing and returns zeros of its output's
+    shape; in a pass beside the load, its builds, short and thread-safe, run on the pass's
+    threads, and no worker process starts."""
+    from _torch.helpers import per_block_cast_to_fp8_e8m0
+
+    import tensorrt_llm._torch.custom_ops.torch_custom_ops  # noqa: F401
+    from tensorrt_llm._torch.build_pool import BuildPool
+
+    pool = BuildPool(enabled=True)
+    monkeypatch.setattr(BuildPool, "_instance", pool)
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    m, n, k = 64, 1024, 1024
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    weight, weight_scale = per_block_cast_to_fp8_e8m0(
+        torch.randn((n, k), device="cuda", dtype=torch.bfloat16))
+    with pool.pass_scope(overlapped=True):
+        with autotuner.build_kernels():
+            output = torch.ops.trtllm.fp8_swap_ab_gemm(a, weight, weight_scale)
+        assert output.shape == (m, n) and output.dtype == torch.bfloat16
+        assert torch.count_nonzero(output) == 0
+        assert tuner.join_builds() == {}
+        counts = pool.join_threads()
+    assert counts.get("built", 0) > 0
+    assert counts.get("failed", 0) == counts.get("refused", 0) == 0
+    assert pool._workers_started == 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_each_runner_of_an_op_is_measured_on_its_own(tune_mode_workers,
                                                      tmp_path):

@@ -74,6 +74,12 @@ class DistributedTuningStrategy(enum.Enum):
     PARALLEL = "parallel"
 
 
+def _same_bucket(x: int) -> int:
+    """``DynamicTensorSpec``'s default ``map_to_tuning_buckets``: a module-level function, so
+    that a spec pickles (a rehearsal times its op in a worker process)."""
+    return x
+
+
 @dataclass(slots=True, unsafe_hash=True)
 class DynamicTensorSpec:
     """
@@ -90,7 +96,7 @@ class DynamicTensorSpec:
     input_idx: int
     dim_idx: int
     gen_tuning_buckets: Union[Tuple[int], Callable] = ()
-    map_to_tuning_buckets: Callable = lambda x: x
+    map_to_tuning_buckets: Callable = _same_bucket
 
 
 @dataclass(slots=True, unsafe_hash=True)
@@ -656,13 +662,22 @@ class RehearsalTuner:
                 f"waited {waited:.1f}s for them")
         return waited
 
+    def abandon(self) -> None:
+        """Forget the queued calls and the timing's results, unmerged (a rehearsal that
+        failed); called once the rank's BuildPool pass has ended, which ends the timing."""
+        with self._lock:
+            thread = self._thread
+        if thread is not None:
+            thread.join()
+        with self._lock:
+            self._results, self._tasks, self._thread, self._strategies = [], [], None, {}
+
     def _run(self, group: Tuple[int, int]) -> None:
         t0 = time.perf_counter()
-        tuner = AutoTuner.get()
         pool = BuildPool.get()
-        for _, batch, _ in list(tuner._build_batches):
-            batch.wait()
-        pool.join_threads()
+        # Every build the rehearsal queued ends first: the timing finds their kernels built,
+        # and no build runs beside it.
+        pool.wait_idle()
         with self._lock:
             tasks = list(self._tasks)
         for task in tasks:
@@ -2256,10 +2271,14 @@ class AutoTuner:
             timed += 1
         return timed
 
-    def join_builds(self) -> Dict[str, int]:
+    def join_builds(self, wait: bool = True) -> Dict[str, int]:
         """Wait for the builds the build state queued for the worker processes, and return how
-        many ended each way."""
+        many ended each way; with ``wait`` False, forget them (a rehearsal that failed). The
+        next build state queues every call again."""
         batches, self._build_batches = self._build_batches, []
+        self._build_calls.clear()
+        if not wait:
+            return {}
         counts: Counter = Counter()
         for custom_op, batch, size in batches:
             op_counts = Counter(result.status for result in batch.wait())

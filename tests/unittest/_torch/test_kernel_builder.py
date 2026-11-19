@@ -284,6 +284,21 @@ def test_in_a_rehearsal_short_builds_run_on_the_threads_when_the_op_allows_it(bu
     assert (builder.stats("safe").threads, builder.stats("unsafe").built) == (1, 1)
 
 
+def test_a_rehearsal_that_fails_ends_its_builds_and_forgets_them(builder, tmp_path):
+    from tensorrt_llm._torch.pyexecutor.rehearsal import Rehearsal
+
+    # The build runs until it times out: nothing creates its release file.
+    hold = BuildTask(_HOLD, (str(tmp_path / "started"), str(tmp_path / "release"), 3.0))
+    with pytest.raises(RuntimeError, match="the load failed"):
+        with Rehearsal():
+            with builder.rehearsal():
+                builder.build("op", [("k", hold, _CONFIG)])
+            raise RuntimeError("the load failed")
+    pool = BuildPool.get()
+    assert pool._pool is None and not pool.accepting()
+    assert builder._pending == [] and builder.stats("op").built == 0
+
+
 def test_with_the_rehearsal_off_a_rehearsal_lists_and_builds_nothing(monkeypatch, tmp_path):
     monkeypatch.setenv(kernel_builder.REHEARSAL_ENV, "0")
     kb = KernelBuilder(enabled=True)

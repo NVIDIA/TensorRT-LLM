@@ -188,6 +188,8 @@ class _DummyModelEngine:
         self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
         self.max_num_seq_slots = 4
+        # Built with the checkpoint loaded, so the creator runs no rehearsal.
+        self.has_deferred_checkpoint = False
         sparse_attention_config = (
             SimpleNamespace(algorithm=sparse_algorithm) if sparse_algorithm is not None else None
         )
@@ -248,6 +250,7 @@ def _make_llm_args():
         custom_tokenizer=None,
         trust_remote_code=False,
         mm_encoder_only=False,
+        multimodal_config=SimpleNamespace(encoder_cuda_graph=None),
         enable_chunked_prefill=False,
         sparse_attention_config=None,
         attn_backend="TRTLLM",
@@ -316,6 +319,7 @@ def _run_create_py_executor(
         rank=0,
         tp_size=1,
         pp_size=1,
+        cp_size=1,
         has_pp=lambda: False,
         has_cp_helix=lambda: False,
         enable_attention_dp=False,

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune, build_kernels
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.kernel_builder import KernelBuilder
@@ -24,6 +24,7 @@ from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.nccl_window_graph import nccl_window_allocation_suppressed
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
@@ -345,6 +346,86 @@ class DecoderWarmup:
         ):
             return self._warmup_scheduled(resource_manager, kv_cache_manager)
 
+    def rehearse(self, resource_manager: ResourceManager) -> None:
+        """The autotuner warmup's forwards, run eagerly in the autotuner's build state
+        on whatever weights the model holds, inside the caller's KernelBuilder rehearsal.
+
+        They supply the largest shapes: each op the forwards reach sweeps its own shapes
+        down from them, and an op that tunes queues the builds its tuning will time.
+        Every rank calls it. Its requests are released and its workspaces freed.
+        """
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if kv_cache_manager is None or not self._context_warmups_supported:
+            return
+        if self.mapping.cp_size > 1 and self.mapping.cp_config.get("cp_type") != CpType.HELIX:
+            return
+        # Tuning queued here (TuningConfig.tune_in_rehearsal) splits across the ranks of
+        # its tuning group as the warmup's does.
+        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
+        if self._config.enable_autotuner:
+            # The MXFP8 methods dispatch as the autotuner warmup will tune them.
+            _select_mxfp8_methods(self)
+        warmup_configs, _ = _autotuner_warmup_configs(
+            self, resource_manager, _autotuner_warmup_mode(self)
+        )
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+        try:
+            # force_eager: no torch.compile traces, whole-model or op-level. Window
+            # requests come from plain memory, so the NCCL window pool grows only with
+            # the warmup that sizes it, not with these eager forwards' buffers too.
+            with (
+                torch.inference_mode(),
+                torch.compiler.set_stance("force_eager"),
+                self._torch_compile_bypass(),
+                nccl_window_allocation_suppressed(),
+                self._graphs.no_cuda_graph(),
+                build_kernels(),
+            ):
+                for num_tokens, num_gen_requests in warmup_configs:
+                    self._rehearse_batch(resource_manager, num_tokens, num_gen_requests)
+        except BaseException:
+            self._reset_moe_alltoall_state()
+            raise
+        finally:
+            torch.cuda.synchronize()
+            MoERunner.clear_all_workspaces()
+            clear_memory_buffers()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def _rehearse_batch(
+        self, resource_manager: ResourceManager, num_tokens: int, num_gen_requests: int
+    ) -> None:
+        """One forward of the rehearsal, on a batch as the autotuner warmup builds it."""
+        warmup_request = self._dummy_requests.create_warmup_request(
+            resource_manager, num_tokens, num_gen_requests
+        )
+        with self._dummy_requests.release_batch_context(warmup_request, resource_manager) as batch:
+            if not self._agreement.should_run_warmup_batch(
+                batch,
+                num_tokens,
+                f"rehearsal, num_tokens={num_tokens}, num_gen_requests={num_gen_requests}",
+            ):
+                return
+            with self._warmup_timer.phase(
+                f"rehearsal shape num_tokens={num_tokens}, num_gen_requests={num_gen_requests}",
+                record=False,
+                log_start=True,
+            ):
+                with discard_nccl_window_tensor_outputs(
+                    (getattr(self, "_warmup_inputs", None), batch)
+                ):
+                    self._forward_warmup(
+                        batch,
+                        resource_manager,
+                        enable_spec_decode=self._config.is_spec_decode,
+                        runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                    )
+                torch.cuda.synchronize()
+
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager
     ) -> list[tuple[int, int]]:
@@ -474,12 +555,10 @@ class DecoderWarmup:
             and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager)
         )
-        # Helix ranks on a disaggregated generation server and decode-only
-        # workers never run a context batch, so every phase below warms up
-        # pure-generation shapes only. Aggregated Helix ranks prefill too. All
-        # follow from the configuration, so every rank takes the same branch.
-        disagg_helix = self.mapping.has_cp_helix() and self._config.is_disagg
-        generation_only = disagg_helix or is_decode_only(self.sparse_attention_config)
+        # Helix CP and decode-only workers never run a context batch, so every
+        # phase below warms up pure-generation shapes only. Both follow from the
+        # configuration, so every rank takes the same branch.
+        generation_only = _generation_only(self)
         # A capturable guided decoder rules out the general warmup's generation
         # requests only: the autotuner below runs its context step with the
         # decoder installed. Run the context requests anyway, so that the
@@ -557,13 +636,7 @@ class DecoderWarmup:
                 ),
                 self._torch_compile_bypass(),
             ):
-                if generation_only:
-                    mode = AutotunerWarmupMode.GENERATION_ONLY
-                elif self.mapping.has_cp_helix():
-                    mode = AutotunerWarmupMode.CONTEXT_AND_FULL_GENERATION
-                else:
-                    mode = AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION
-                self._run_autotuner_warmup(resource_manager, mode=mode)
+                self._run_autotuner_warmup(resource_manager, mode=_autotuner_warmup_mode(self))
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
             # for Mamba hybrid models. Runs regardless of enable_autotuner,
@@ -1241,73 +1314,14 @@ class DecoderWarmup:
 
         ``mode`` selects the batches to tune on; see ``AutotunerWarmupMode``.
         """
-        from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-            IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
-            MXFP8GemmRunner,
-        )
-        from tensorrt_llm._torch.modules.linear import (
-            MXFP8LinearMethod,
-            flashinfer_mxfp8_autotune,
-            mxfp8_gemm_backend_override,
-        )
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
+        from tensorrt_llm._torch.modules.linear import flashinfer_mxfp8_autotune
 
         enable_trtllm_autotuner = self._config.enable_autotuner
         if not enable_trtllm_autotuner:
             return
 
-        mxfp8_methods = []
-        for module in self.model.modules():
-            quant_method = getattr(module, "quant_method", None)
-            if isinstance(quant_method, MXFP8LinearMethod):
-                mxfp8_methods.append(quant_method)
-
-        # This engine owns startup warmup, so it explicitly opts its MXFP8
-        # methods into native tuning. Standalone modules and engine paths that
-        # skip this warmup remain on the direct native op.
-        for method in mxfp8_methods:
-            method.enable_native_autotune()
-
-        # Native and FlashInfer tuning are independent. Capture native
-        # eligibility before enabling graph-only FlashInfer dispatch.
-        native_mxfp8_methods = [method for method in mxfp8_methods if method.needs_native_autotune]
-        compile_all_batches = (
-            self._config.torch_compile_enabled and not self._config.torch_compile_prefill_only
-        )
-        if compile_all_batches and mxfp8_gemm_backend_override() is None:
-            # Compiled auto dispatch uses native; do not tune unused backends.
-            # Prefill-only compile retains the eager generation-graph policy.
-            for method in mxfp8_methods:
-                method.disable_flashinfer_auto()
-        use_mxfp8_flashinfer_graph_default = (
-            self._graphs.enabled
-            and not compile_all_batches
-            and mxfp8_gemm_backend_override() is None
-            and any(
-                getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
-                for module in self.model.modules()
-            )
-        )
-        if use_mxfp8_flashinfer_graph_default:
-            for quant_method in mxfp8_methods:
-                quant_method.enable_flashinfer_auto()
-        # PP has no handoff for the per-operator cache in the FlashInfer pass.
-        tune_mxfp8_backends = (
-            not compile_all_batches
-            and not self.mapping.has_pp()
-            and IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
-        )
-        for quant_method in mxfp8_methods:
-            quant_method.tune_mxfp8_backends = (
-                tune_mxfp8_backends and quant_method.backend == "auto"
-            )
-        # An explicit auto setting stays intact, but compiled auto dispatch
-        # uses native GEMM. Do not run or mark an unused FlashInfer tuning pass.
-        flashinfer_mxfp8_methods = [
-            method
-            for method in mxfp8_methods
-            if method.needs_flashinfer_autotune
-            and (not compile_all_batches or method.backend == "flashinfer")
-        ]
+        mxfp8_methods, native_mxfp8_methods, flashinfer_mxfp8_methods = _select_mxfp8_methods(self)
 
         # Every TP and PP rank must make the same backend decision before any
         # rank returns or enters a tuning forward with model collectives.
@@ -1340,26 +1354,9 @@ class DecoderWarmup:
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
-        kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER
+        warmup_configs, curr_max_num_tokens = _autotuner_warmup_configs(
+            self, resource_manager, mode
         )
-        tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
-        num_gen_requests = min(
-            self._config.max_batch_size,
-            self._config.max_num_tokens // tokens_per_gen_request,
-        )
-        max_gen_batch_tokens = num_gen_requests * tokens_per_gen_request
-        if mode is AutotunerWarmupMode.GENERATION_ONLY:
-            curr_max_num_tokens = max_gen_batch_tokens
-        else:
-            token_num_upper_bound = min(
-                self._config.max_num_tokens,
-                self._config.max_batch_size * (self._config.max_seq_len - 1),
-            )
-            curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-                token_num_upper_bound=token_num_upper_bound,
-                max_num_draft_tokens=self._config.original_max_draft_len,
-            )
 
         # The warmup runs again after the KV cache is rebuilt; when the token
         # shape is unchanged and no MXFP8 tuning is pending, the profiling
@@ -1388,21 +1385,6 @@ class DecoderWarmup:
             f"native MXFP8={enable_native_mxfp8_autotuner}, "
             f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})..."
         )
-
-        if mode is AutotunerWarmupMode.GENERATION_ONLY:
-            warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
-        else:
-            warmup_configs = [(curr_max_num_tokens, 0)]
-            if (
-                self.guided_decoder is None
-                and not self.mapping.has_pp()
-                and not is_context_only_kv_cache(kv_cache_manager)
-            ):
-                # Add generation requests to warmup the autotuner cache.
-                if mode is AutotunerWarmupMode.CONTEXT_AND_FULL_GENERATION:
-                    warmup_configs.append((max_gen_batch_tokens, num_gen_requests))
-                else:
-                    warmup_configs.append((tokens_per_gen_request, 1))
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""
@@ -1927,3 +1909,134 @@ class DecoderWarmup:
         if self.mapping.tp_size > 1 and self.dist is not None:
             self.dist.tp_allgather(1)
         logger.info("MiniMax-M3 MSA indexer prewarm complete")
+
+
+def _autotuner_warmup_configs(
+    warmup: DecoderWarmup, resource_manager: ResourceManager, mode: AutotunerWarmupMode
+) -> tuple[list[tuple[int, int]], int]:
+    """The autotuner warmup's batches for ``mode`` as ``(num_tokens, num_gen_requests)``, and
+    its largest token count. A function of the warmup, not a method: tests run the warmup's
+    methods on stand-in objects.
+
+    A context batch of the most tokens this rank's KV cache holds, then generation requests:
+    one with its draft tokens, or ``max_batch_size`` of them (``CONTEXT_AND_FULL_GENERATION``);
+    with ``GENERATION_ONLY``, the generation batch alone.
+    """
+    kv_cache_manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+    tokens_per_gen_request = 1 + warmup._config.max_total_draft_tokens
+    num_gen_requests = min(
+        warmup._config.max_batch_size,
+        warmup._config.max_num_tokens // tokens_per_gen_request,
+    )
+    max_gen_batch_tokens = num_gen_requests * tokens_per_gen_request
+    if mode is AutotunerWarmupMode.GENERATION_ONLY:
+        return [(max_gen_batch_tokens, num_gen_requests)], max_gen_batch_tokens
+    token_num_upper_bound = min(
+        warmup._config.max_num_tokens,
+        warmup._config.max_batch_size * (warmup._config.max_seq_len - 1),
+    )
+    curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+        token_num_upper_bound=token_num_upper_bound,
+        max_num_draft_tokens=warmup._config.original_max_draft_len,
+    )
+    warmup_configs = [(curr_max_num_tokens, 0)]
+    if (
+        warmup.guided_decoder is None
+        and not warmup.mapping.has_pp()
+        and not is_context_only_kv_cache(kv_cache_manager)
+    ):
+        # Add generation requests to warmup the autotuner cache.
+        if mode is AutotunerWarmupMode.CONTEXT_AND_FULL_GENERATION:
+            warmup_configs.append((max_gen_batch_tokens, num_gen_requests))
+        else:
+            warmup_configs.append((tokens_per_gen_request, 1))
+    return warmup_configs, curr_max_num_tokens
+
+
+def _select_mxfp8_methods(warmup: DecoderWarmup) -> tuple[list, list, list]:
+    """This rank's MXFP8 linear methods, and those the autotuner warmup tunes. A
+    function of the warmup, not a method: tests run the warmup's methods on
+    stand-in objects.
+
+    Returns ``(all, native, flashinfer)``. It also sets each method's dispatch
+    for the warmup and serving, the same way on every call; the warmup then
+    agrees the FlashInfer choice across ranks.
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+        IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
+    )
+    from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod, mxfp8_gemm_backend_override
+
+    mxfp8_methods = []
+    for module in warmup.model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, MXFP8LinearMethod):
+            mxfp8_methods.append(quant_method)
+
+    # This engine owns startup warmup, so it explicitly opts its MXFP8
+    # methods into native tuning. Standalone modules and engine paths that
+    # skip this warmup remain on the direct native op.
+    for method in mxfp8_methods:
+        method.enable_native_autotune()
+
+    # Native and FlashInfer tuning are independent. Capture native
+    # eligibility before enabling graph-only FlashInfer dispatch.
+    native_mxfp8_methods = [method for method in mxfp8_methods if method.needs_native_autotune]
+    compile_all_batches = (
+        warmup._config.torch_compile_enabled and not warmup._config.torch_compile_prefill_only
+    )
+    if compile_all_batches and mxfp8_gemm_backend_override() is None:
+        # Compiled auto dispatch uses native; do not tune unused backends.
+        # Prefill-only compile retains the eager generation-graph policy.
+        for method in mxfp8_methods:
+            method.disable_flashinfer_auto()
+    use_mxfp8_flashinfer_graph_default = (
+        warmup._graphs.enabled
+        and not compile_all_batches
+        and mxfp8_gemm_backend_override() is None
+        and any(
+            getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
+            for module in warmup.model.modules()
+        )
+    )
+    if use_mxfp8_flashinfer_graph_default:
+        for quant_method in mxfp8_methods:
+            quant_method.enable_flashinfer_auto()
+    # PP has no handoff for the per-operator cache in the FlashInfer pass.
+    tune_mxfp8_backends = (
+        not compile_all_batches
+        and not warmup.mapping.has_pp()
+        and IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+    )
+    for quant_method in mxfp8_methods:
+        quant_method.tune_mxfp8_backends = tune_mxfp8_backends and quant_method.backend == "auto"
+    # An explicit auto setting stays intact, but compiled auto dispatch
+    # uses native GEMM. Do not run or mark an unused FlashInfer tuning pass.
+    flashinfer_mxfp8_methods = [
+        method
+        for method in mxfp8_methods
+        if method.needs_flashinfer_autotune
+        and (not compile_all_batches or method.backend == "flashinfer")
+    ]
+    return mxfp8_methods, native_mxfp8_methods, flashinfer_mxfp8_methods
+
+
+def _generation_only(warmup: DecoderWarmup) -> bool:
+    """Whether the warmup runs pure-generation shapes only: Helix ranks on a disaggregated
+    generation server and decode-only workers never run a context batch; aggregated Helix ranks
+    prefill too. All follow from the configuration, so every rank agrees. A function of the
+    warmup, not a method: tests run the warmup's methods on stand-in objects.
+    """
+    disagg_helix = warmup.mapping.has_cp_helix() and warmup._config.is_disagg
+    return disagg_helix or is_decode_only(warmup.sparse_attention_config)
+
+
+def _autotuner_warmup_mode(warmup: DecoderWarmup) -> AutotunerWarmupMode:
+    """The batches the autotuner warmup tunes on (``AutotunerWarmupMode``), which the rehearsal
+    runs too. A function of the warmup, not a method: tests run the warmup's methods on stand-in
+    objects."""
+    if _generation_only(warmup):
+        return AutotunerWarmupMode.GENERATION_ONLY
+    if warmup.mapping.has_cp_helix():
+        return AutotunerWarmupMode.CONTEXT_AND_FULL_GENERATION
+    return AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION

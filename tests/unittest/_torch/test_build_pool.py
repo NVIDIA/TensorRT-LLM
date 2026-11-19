@@ -303,6 +303,21 @@ def test_a_submit_returns_before_its_builds_end_and_its_batch_waits_for_them(poo
     assert [result.status for result in results] == ["built"] and started.exists()
 
 
+def test_wait_idle_returns_once_every_build_queued_has_ended(pool, tmp_path):
+    started, release = tmp_path / "started", tmp_path / "release"
+    idle = threading.Event()
+    with pool.pass_scope():
+        batch = pool.submit([Build(_HOLD, (str(started), str(release), 60.0))])
+        assert pool.threads.submit(lambda: None, "f")
+        waiter = threading.Thread(target=lambda: (pool.wait_idle(), idle.set()))
+        waiter.start()
+        assert not idle.wait(timeout=0.5)
+        release.write_text("")
+        assert idle.wait(timeout=60)
+        waiter.join()
+        assert batch.done() and pool.threads.counts() == {"built": 1}
+
+
 def test_a_build_returns_the_value_of_its_function(pool):
     with pool.pass_scope():
         doubled, unpicklable = pool.build(

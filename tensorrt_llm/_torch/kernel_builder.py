@@ -272,12 +272,14 @@ class KernelBuilder:
         """Whether a rehearsal is running: an op queues its builds and does not wait for them."""
         return self.enabled and self._rehearsals > 0
 
-    def join(self) -> None:
-        """Wait for the builds the rehearsal queued, and log how they ended."""
+    def join(self, wait: bool = True) -> None:
+        """Wait for the builds the rehearsal queued, and log how they ended; with ``wait``
+        False, forget them (a rehearsal that failed)."""
         with self._lock:
             pending, self._pending = self._pending, []
-        for settle in pending:
-            settle()
+        if wait:
+            for settle in pending:
+                settle()
 
     # Registration.
 
