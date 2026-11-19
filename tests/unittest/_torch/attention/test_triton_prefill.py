@@ -690,7 +690,7 @@ class TestTritonPrefillWithPrefix:
         num_heads, num_kv_heads, head_dim = 8, 4, 512
         sm_scale = 1.0
         page_size = 16
-        prefix_len, extend_len = 48, 16
+        prefix_len, extend_len = 144, 16
 
         prefix_k = torch.randn(
             prefix_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
@@ -749,6 +749,60 @@ class TestTritonPrefillWithPrefix:
         )
 
         torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
+
+        # Reuse the paged cache for a blob spanning prefix and new tokens,
+        # then for generic bounds whose upper limit lies inside the prefix.
+        for prefix_only in (False, True):
+            starts = (q_pos - 7).clamp_min(0).to(torch.int32)
+            ends = q_pos.to(torch.int32)
+            if prefix_only:
+                starts.fill_(69)
+                ends.fill_(95)
+            else:
+                in_blob = q_pos < prefix_len + 8
+                starts[in_blob] = 64
+                ends[in_blob] = prefix_len + 7
+            interval_mask = (kv_pos[None, :] >= starts[:, None]) & (
+                kv_pos[None, :] <= ends[:, None]
+            )
+            args = dict(
+                q=q,
+                k=k,
+                v=v,
+                qo_indptr=qo_indptr,
+                kv_cache=kv_cache,
+                prefix_lens=prefix_lens_t,
+                page_table_indptr=pt_indptr,
+                page_table_indices=pt_indices,
+                page_size=page_size,
+                sm_scale=sm_scale,
+                max_len_extend=extend_len,
+            )
+            dense = torch.empty_like(q)
+            compact = torch.empty_like(q)
+            triton_prefill_with_custom_mask(
+                **args, output=dense, custom_mask=interval_mask.flatten().contiguous()
+            )
+            triton_prefill_with_custom_mask(
+                **args,
+                output=compact,
+                custom_mask=None,
+                variable_window_token_starts=starts,
+                variable_window_token_ends=ends,
+            )
+            reference = _sdpa_reference_with_prefix(
+                q,
+                k,
+                v,
+                prefix_k=[prefix_k],
+                prefix_v=[prefix_v],
+                seq_lens=[extend_len],
+                prefix_lens=[prefix_len],
+                mask=[interval_mask],
+                sm_scale=sm_scale,
+            )
+            torch.testing.assert_close(dense, reference, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(compact, reference, atol=1e-2, rtol=1e-2)
 
     def test_batch_mixed_prefix_lengths(self, device):
         """Batch: seq 0 has no prefix, seq 1 has prefix."""

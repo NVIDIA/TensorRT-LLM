@@ -2386,11 +2386,17 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self.v_head_dim = mla_params.v_head_dim
 
     def supports_variable_window(self, metadata: AttentionMetadata) -> bool:
+        """Triton pads head dimensions to powers of two (dot requires at least 16).
+
+        Grouped-query indexing requires an integral number of query heads per KV head.
+        """
         return (self.flashinfer_backend in ("fa2", "fa3")
                 and isinstance(metadata, FlashInferAttentionMetadata)
                 and metadata.kv_cache_manager is not None
                 and metadata.num_contexts > 0 and not self.has_fp8_kv_cache
-                and not self.is_mla_enable)
+                and not self.is_mla_enable and self.head_dim >= 16
+                and self.num_heads > 0 and self.num_kv_heads > 0
+                and self.num_heads % self.num_kv_heads == 0)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
@@ -2852,8 +2858,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 custom_mask=attention_mask_data,
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
-                max_len_extend=(int(metadata.seq_lens[:num_contexts].max())
-                                if has_variable_window else None),
+                max_len_extend=int(metadata.seq_lens[:num_contexts].max()),
                 sm_scale=1 /
                 (math.sqrt(self.head_dim) *
                  (self.q_scaling if self.q_scaling is not None else 1.0)),
@@ -2861,9 +2866,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             )
 
             if num_generations > 0:
-                # Per-query bounds apply only to prefill; decode retains the
-                # normal fa2/fa3 sliding window. Preserve the existing
-                # trtllm-gen dense-custom-mask fallback's planning behavior.
+                # Custom masks and per-query bounds apply only to prefill.
+                # Generation tokens use the layer's causal sliding window.
                 decode_plan_params = metadata.plan(
                     self.num_heads,
                     self.num_kv_heads,
@@ -2871,8 +2875,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     q_dtype=q.dtype,
                     kv_dtype=kv_cache.dtype,
                     q_scaling=self.q_scaling,
-                    attention_window_size=(attention_window_size
-                                           if has_variable_window else None),
+                    attention_window_size=attention_window_size,
                     attention_mask_type=int(AttentionMaskType.causal),
                     attention_mask_data=None,
                     flashinfer_backend=self.flashinfer_backend)

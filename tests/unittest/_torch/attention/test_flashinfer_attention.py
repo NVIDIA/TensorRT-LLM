@@ -1004,6 +1004,28 @@ class TestFlashInferAttention(unittest.TestCase):
                                            rtol=1e-2)
                 torch.testing.assert_close(actual[length:], reference[length:])
 
+                # Dense custom-mask fallback must preserve decode's sliding window too.
+                kv_positions = torch.arange(prefix + length, device=device)
+                dense_mask = ((kv_positions[None, :] >= starts[:, None])
+                              & (kv_positions[None, :] <= positions[:, None]))
+                with mock.patch.object(flashinfer_attn, "flashinfer_backend",
+                                       "trtllm-gen"):
+                    dense_actual = flashinfer_attn.forward(
+                        q,
+                        k,
+                        v,
+                        attn_metadata,
+                        attention_window_size=window,
+                        attention_mask_data=dense_mask.flatten().contiguous())
+                torch.testing.assert_close(dense_actual[:length],
+                                           reference[:length],
+                                           atol=1e-2,
+                                           rtol=1e-2)
+                torch.testing.assert_close(dense_actual[length:],
+                                           reference[length:],
+                                           atol=1e-2,
+                                           rtol=1e-2)
+
                 # The same cached-prefix mixed batch must work in NHD as well.
                 # Preserve logical values while changing the physical layout.
                 hnd_cache = kv_cache_manager.get_buffers(
@@ -1047,6 +1069,13 @@ class TestFlashInferAttention(unittest.TestCase):
                         flashinfer_attn.supports_variable_window(attn_metadata))
                 self.assertFalse(
                     flashinfer_attn.supports_variable_window(SimpleNamespace()))
+                for geometry in (dict(head_dim=8), dict(num_kv_heads=0),
+                                 dict(num_heads=0),
+                                 dict(num_heads=3, num_kv_heads=2)):
+                    with mock.patch.multiple(flashinfer_attn, **geometry):
+                        self.assertFalse(
+                            flashinfer_attn.supports_variable_window(
+                                attn_metadata))
                 quant_config = flashinfer_attn.quant_config
                 try:
                     for config, expected in ((None, True), (QuantConfig(

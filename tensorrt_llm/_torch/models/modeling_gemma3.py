@@ -127,6 +127,9 @@ def build_gemma_attention_mask(
     return output
 
 
+# Conservative long-prefill cutoff: two dense bool masks cost 128 MiB at 8K.
+# Routing uses the batch's token-weighted length, not its longest request;
+# even [8192, 1] stays dense.
 _MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS = 8192
 
 
@@ -553,6 +556,8 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         variable_window_token_ends = None
         if image_token_mask is not None:
             context_lens = self._get_image_context_lengths(attn_metadata)
+            # Both global and sliding layers consume bounds; each backend must
+            # support them under its current per-layer quantization settings.
             if (_use_compact_image_mask_for_lengths(context_lens) and all(
                     layer.self_attn.attn.supports_variable_window(attn_metadata)
                     for layer in self.model.layers)):
