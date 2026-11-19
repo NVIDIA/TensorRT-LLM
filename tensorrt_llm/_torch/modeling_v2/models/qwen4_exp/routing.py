@@ -7,7 +7,9 @@ of the layouts in `_LAYOUTS`, and Qwen3.8-Flash-Next-FP8 (FP8_BLOCK_SCALES) on
 `qwen3_8_flash_next_fp8__sm_103__unified` at one of `_FP8_LAYOUTS`, each with one-model
 MTP-Eagle (not at dep2) or no speculative decoding. The target's `check_deployment` then
 declines the checkpoints and engine choices it does not run, so `auto` falls back to the
-built-in implementation instead of failing in the build.
+built-in implementation instead of failing in the build. The NVFP4 route returns the target's
+vision-language model, which holds its language model and its vision tower; the FP8 target
+encodes media in its own forward.
 """
 
 from __future__ import annotations
@@ -106,7 +108,8 @@ def route(
         return ModelingV2Qwen38FlashNextFp8Sm103Unified
     from .qwen3_8_flash_next_nvfp4__sm_103__default.modeling import (
         ModelingV2Qwen38FlashNextNvfp4Sm103Default,
+        ModelingV2Qwen38FlashNextNvfp4Sm103DefaultForConditionalGeneration,
     )
 
     ModelingV2Qwen38FlashNextNvfp4Sm103Default.check_deployment(model_config, llm_args, member)
-    return ModelingV2Qwen38FlashNextNvfp4Sm103Default
+    return ModelingV2Qwen38FlashNextNvfp4Sm103DefaultForConditionalGeneration

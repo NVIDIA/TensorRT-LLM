@@ -28,6 +28,7 @@ from tensorrt_llm.llmapi.llm_args import (
     NGramDecodingConfig,
     TorchLlmArgs,
 )
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -38,7 +39,7 @@ _DUMMY_MODEL = "/tmp/dummy_model"
 _ARCH = "Qwen4ExpForConditionalGeneration"
 _TARGET = (
     "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.modeling."
-    "ModelingV2Qwen38FlashNextNvfp4Sm103Default"
+    "ModelingV2Qwen38FlashNextNvfp4Sm103DefaultForConditionalGeneration"
 )
 
 # The four-rank layouts, as the LLM API's parallel arguments build them. tp4 leaves the
@@ -546,3 +547,28 @@ def test_a_misspelled_ple_host_table_mode_fails_at_routing(monkeypatch):
         modeling_v2_resolve(_model_config(**_LAYOUTS["tep4"]), _llm_args("auto"))
     monkeypatch.setenv(ple_host_table.PLE_HOST_TABLE_ENV, "Node")
     _claimed(_model_config(**_LAYOUTS["tep4"]))
+
+
+def test_an_encoder_budget_past_one_tower_call_declines(monkeypatch):
+    """Startup profiling fills the encoder token budget (`encoder_max_num_tokens`, else
+    `max_num_tokens`) with dummy images, and one tower call takes at most 32768 patches. A
+    larger budget falls back under `auto`, with one log line naming the setting and the
+    limit, and fails under `require`. Without a tower the budget is not used."""
+    config = _model_config(**_LAYOUTS["tep4"])
+    assert _llm_args().encoder_max_num_tokens is None
+    assert _llm_args().max_num_tokens == 8192
+    _claimed(config)
+    _claimed(config, encoder_max_num_tokens=32768)
+    lines = []
+    monkeypatch.setattr(logger, "info", lines.append)
+    _declined(
+        config,
+        match=r"budget of 65536 \(encoder_max_num_tokens.* at most 32768 patches",
+        encoder_max_num_tokens=65536,
+    )
+    routing_lines = [line for line in lines if line.startswith("modeling_v2:")]
+    assert len(routing_lines) == 1, lines
+    assert "encoder_max_num_tokens" in routing_lines[0], routing_lines
+    assert "at most 32768 patches" in routing_lines[0], routing_lines
+    _declined(config, match="budget of 32769", max_num_tokens=32769)
+    _claimed(replace(config, disable_mm_encoder=True), encoder_max_num_tokens=65536)

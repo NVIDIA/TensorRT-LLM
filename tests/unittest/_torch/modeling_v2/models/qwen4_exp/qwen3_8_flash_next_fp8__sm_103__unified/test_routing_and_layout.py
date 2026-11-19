@@ -82,7 +82,7 @@ _TARGET = (
 )
 _NVFP4_DEFAULT_TARGET = (
     "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.modeling."
-    "ModelingV2Qwen38FlashNextNvfp4Sm103Default"
+    "ModelingV2Qwen38FlashNextNvfp4Sm103DefaultForConditionalGeneration"
 )
 
 # The quantization the engine resolves for the FP8 (128x128 blocks) and the NVFP4 exports.
@@ -495,7 +495,8 @@ def test_a_switch_that_would_do_nothing_declines(on_sm103, monkeypatch):
 
 @pytest.mark.cpu_only
 def test_the_quantization_picks_the_checkpoint(on_sm103):
-    """MIXED_PRECISION routes to the NVFP4 target (its own checks mocked), FP8_BLOCK_SCALES here."""
+    """MIXED_PRECISION routes to the NVFP4 target's vision-language model (its own checks
+    mocked), FP8_BLOCK_SCALES here."""
     from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
         modeling as nvfp4_modeling,
     )
