@@ -1794,11 +1794,11 @@ class SpecMetadata:
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling or self.enable_penalty
                 or self.watermark_ready) and self.batch_slot_ids is not None:
-            self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
+            step_inputs.copy_metadata_(
+                self.batch_slot_ids[:len(per_request_slot_ids)],
                 torch.tensor(per_request_slot_ids,
                              dtype=torch.long,
                              pin_memory=prefer_pinned()),
-                non_blocking=True,
             )
 
         # Penalties are independent of the greedy/advanced split -- they rewrite the

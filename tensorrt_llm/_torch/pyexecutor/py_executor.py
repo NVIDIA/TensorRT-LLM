@@ -8190,6 +8190,9 @@ class PyExecutor:
         defer_kv_close = self._defer_generation_only_release
         if defer_kv_close:
             self.kv_cache_manager.enable_deferred_close(True)
+        # The events' optional per-iteration call (ExecutorEvents).
+        on_iteration = (getattr(self._executor_events, "on_iteration", None)
+                        if self._executor_events is not None else None)
         with self._overlap_loop_stream_scope(), self._profiler() as profile_step, \
                 self.hang_detector:
             iter_start_time = time.time()
@@ -8200,6 +8203,8 @@ class PyExecutor:
                 self.hang_detector.checkpoint()
                 profile_step()
                 self._stage_begin()
+                if on_iteration is not None:
+                    on_iteration(self.iter_counter)
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 self._start_response_staging_iteration()
