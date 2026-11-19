@@ -47,6 +47,10 @@ _MONITOR_EVENTS = (
 )
 
 
+class _PeerGoneWhileClosing(Exception):
+    """The command peer disconnected while the sender was writing final commands."""
+
+
 class _CommandConnection:
     """Tell a command-peer disconnect apart from an unrelated connection.
 
@@ -176,6 +180,9 @@ class _RequestSender:
         self._monitor: zmq.Socket | None = None
         self._connection = _CommandConnection()
         self._connection_lost: ConnectionError | None = None
+        # A disconnect after close() began is expected (rank 0 exits after the
+        # stop sentinel), so it is not a failure; it only ends final writes.
+        self._peer_gone_while_closing = False
         self._connected = False
         self._direct_send = direct_send
         self._close_deadline = float("inf")
@@ -324,8 +331,17 @@ class _RequestSender:
         *,
         send_sentinel: bool = False,
         cancel_ids: tuple[int, ...] = (),
+        wait: bool = True,
     ) -> None:
-        """Request bounded owner-thread shutdown; the owner writes final commands."""
+        """Request bounded owner-thread shutdown; the owner writes final commands.
+
+        Args:
+            timeout: Bound on the final writes and, when waiting, on the join.
+            send_sentinel: Also send the worker-stop sentinel.
+            cancel_ids: Requests to cancel before closing.
+            wait: Join the owner thread. Callers on an event loop pass False
+                and join later through another close().
+        """
         if self._is_finalizing():
             return
         with self._cond:
@@ -338,7 +354,7 @@ class _RequestSender:
             self._start()
             thread = self._thread
             self._wake_locked()
-        if thread is not threading.current_thread():
+        if wait and thread is not threading.current_thread():
             thread.join(timeout)
             if thread.is_alive():
                 self._record_failure(TimeoutError("Executor command sender shutdown timed out"))
@@ -356,7 +372,9 @@ class _RequestSender:
             if event == zmq.EVENT_HANDSHAKE_SUCCEEDED:
                 self._connected = True
             lost = self._connection.observe(event, message["value"], self._peer_attached)
-            if lost and not self._closed and self._connection_lost is None:
+            if lost and self._closed:
+                self._peer_gone_while_closing = True
+            elif lost and self._connection_lost is None:
                 self._connection_lost = ConnectionError(
                     "Executor command connection was lost; request delivery is uncertain"
                 )
@@ -383,6 +401,8 @@ class _RequestSender:
         connect_deadline = time.monotonic() + self._connect_timeout
         while True:
             self._check_terminal()
+            if self._peer_gone_while_closing:
+                raise _PeerGoneWhileClosing()
             remaining = (
                 min(
                     deadline,
@@ -415,7 +435,12 @@ class _RequestSender:
                 self._request_queue.put(None, timeout=self.SEND_TIMEOUT)
                 return
             except zmq.Again:
-                if self._connection_lost is not None or time.monotonic() >= deadline:
+                if self._monitor is not None:
+                    with self._cond:
+                        self._poll_connection_locked()
+                if self._connection_lost is not None or self._peer_gone_while_closing:
+                    raise _PeerGoneWhileClosing()
+                if time.monotonic() >= deadline:
                     raise TimeoutError("Executor stop sentinel could not be queued")
 
     def _take_batch(self) -> list[tuple[bytes, bool, int | None]] | None:
@@ -501,6 +526,9 @@ class _RequestSender:
                     for start in range(0, len(self._shutdown_cancel_ids), self.MAX_BATCH_SIZE):
                         ids = self._shutdown_cancel_ids[start : start + self.MAX_BATCH_SIZE]
                         self._put_until([pickle.dumps(CancellingRequest(i)) for i in ids])
+                except _PeerGoneWhileClosing:
+                    # The engine is gone; nothing is left to cancel.
+                    pass
                 except (zmq.ZMQError, TimeoutError, EngineDeadError) as error:
                     self._record_failure(error)
             sentinel_queued = False
@@ -511,6 +539,8 @@ class _RequestSender:
                     else:
                         self._put_sentinel_after_failure()
                     sentinel_queued = True
+                except _PeerGoneWhileClosing:
+                    pass
                 except (zmq.ZMQError, TimeoutError, EngineDeadError) as error:
                     self._record_failure(error)
             try:
@@ -524,8 +554,9 @@ class _RequestSender:
                 # including a stop sentinel behind large commands. Discard only
                 # when the command peer itself is gone, or when a failed
                 # sender queued nothing that must still arrive.
-                keep_queued = self._terminal_error is None or (
-                    sentinel_queued and self._connection_lost is None
+                keep_queued = not self._peer_gone_while_closing and (
+                    self._terminal_error is None
+                    or (sentinel_queued and self._connection_lost is None)
                 )
                 linger = CLOSE_LINGER_MS if keep_queued else 0
                 self._request_queue.socket.setsockopt(zmq.LINGER, linger)

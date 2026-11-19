@@ -399,13 +399,20 @@ class GenerationExecutorProxy(GenerationExecutor):
         super()._set_fatal_error(error)
         self._mark_engine_dead(error)
 
+    # Whether recording engine death also stops the command sender. An
+    # attached frontend keeps it: its own fatal error may leave the shared
+    # engine running, and pre_shutdown must still cancel this frontend's
+    # in-flight requests there. The sender stops itself if the command
+    # connection is lost, and submit() refuses new work once dead.
+    _fail_sender_on_engine_death = True
+
     def _mark_engine_dead(self, error: Optional[BaseException] = None) -> None:
         """Set the sticky flag and push EngineDeadError onto pending results."""
         if self._engine_dead:
             return
         self._engine_dead = True
         sender = self._request_sender
-        if sender is not None:
+        if sender is not None and self._fail_sender_on_engine_death:
             sender.fail(error or EngineDeadError())
         dead_error = EngineDeadError(error)
         # Snapshot to avoid mutation-during-iteration; best-effort per result.
@@ -1194,12 +1201,14 @@ class GenerationExecutorProxy(GenerationExecutor):
     def _close_request_sender(self,
                               send_sentinel: bool = False,
                               *,
-                              cancel_ids: tuple[int, ...] = ()) -> None:
+                              cancel_ids: tuple[int, ...] = (),
+                              wait: bool = True) -> None:
         """Request bounded shutdown from the command socket's owner."""
         if self._request_sender is not None:
             self._request_sender.close(timeout=7.0,
                                        send_sentinel=send_sentinel,
-                                       cancel_ids=cancel_ids)
+                                       cancel_ids=cancel_ids,
+                                       wait=wait)
 
     def _get_next_client_id(self) -> int:
         client_id = super()._get_next_client_id()
@@ -1648,6 +1657,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
     shutdown sentinel -- that right is the launcher frontend's alone.
     """
 
+    _fail_sender_on_engine_death = False
+
     def __init__(
         self,
         attach_info: dict,
@@ -1759,8 +1770,9 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         # slots. The owner sends these in bounded batches after draining its
         # queue, so a full control queue cannot silently discard cleanup.
         # Never send the None engine-shutdown sentinel: only the launcher
-        # frontend owns the engine lifecycle.
-        self._close_request_sender(cancel_ids=tuple(self._results))
+        # frontend owns the engine lifecycle. check_health runs this on the
+        # event loop, so do not wait for the cancels here; shutdown() joins.
+        self._close_request_sender(cancel_ids=tuple(self._results), wait=False)
 
     def shutdown(self):
         self.pre_shutdown()

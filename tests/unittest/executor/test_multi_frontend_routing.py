@@ -363,6 +363,53 @@ class TestClassicFrontendProxyEndToEnd:
             )
             worker_ingress.close()
 
+    def test_frontend_fatal_error_still_cancels_its_requests_on_the_engine(self):
+        # Regression: an attached frontend's own fatal error failed its command
+        # sender, so pre_shutdown sent no cancellations and its in-flight
+        # requests kept generating on the shared, still healthy engine.
+        from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+            result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
+            assert worker_ingress.poll(5)
+            assert isinstance(pickle.loads(worker_ingress.get()[0]), GenerationRequest)
+
+            # A frontend-local failure drained by /health, on the event loop.
+            proxy._error_queue.put(RuntimeError("dispatch thread failed"))
+            started = time.monotonic()
+            assert not proxy.check_health()
+            assert time.monotonic() - started < 1.0, "/health waited for shutdown writes"
+
+            assert worker_ingress.poll(5), "in-flight request was never cancelled"
+            cancel = pickle.loads(worker_ingress.get()[0])
+            assert isinstance(cancel, CancellingRequest) and cancel.id == result.request_id
+            proxy.shutdown()
+            assert not worker_ingress.poll(1), "an attached frontend sent the stop sentinel"
+            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+            worker_ingress.close()
+
+    def test_frontend_shutdown_after_engine_loss_does_not_wait_out_the_close_timeout(self):
+        from tensorrt_llm.executor.request import GenerationRequest
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+            proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
+            assert worker_ingress.poll(5)
+            worker_ingress.get()
+            # Rank 0 is gone; the frontend learns of it from the watchdog.
+            worker_ingress.close()
+            proxy._set_fatal_error(RuntimeError("launcher frontend exited"))
+            started = time.monotonic()
+            proxy.pre_shutdown()
+            assert time.monotonic() - started < 1.0
+            proxy.shutdown()
+            # Cancels to a gone peer stop at the disconnect, not after 7 s.
+            assert time.monotonic() - started < 4.0
+            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+
     def test_dispatch_routes_own_lane_responses(self):
         import zmq
 
