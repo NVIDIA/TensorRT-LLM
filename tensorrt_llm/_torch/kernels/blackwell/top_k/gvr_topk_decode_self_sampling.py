@@ -73,6 +73,35 @@ from . import gvr_topk_decode_self_sampling_fp16 as _fp16
 C = sys.modules[__name__]
 
 
+@dsl_user_op
+def _pdl_wait(*, loc=None, ip=None):
+    """``griddepcontrol.wait`` as a memory barrier for the compiler (no load moves above it)."""
+    llvm.inline_asm(
+        None,
+        [],
+        "griddepcontrol.wait;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _pdl_release(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "griddepcontrol.launch_dependents;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
 def fused_cluster_store(staging, position, value):
     address = staging.iterator.toint() + position * cutlass.Int32(4)
@@ -3026,8 +3055,11 @@ class GvrMainKernel:
         samp_rounds: int = 0,
         env_first: bool = False,
         load_ahead: bool = False,
+        pdl: bool = False,
     ) -> None:
         self.det = bool(det)
+        # pdl: wait for the predecessor before any load, then release the dependents.
+        self.pdl = bool(pdl)
         self.fused_k = int(fused_k) if det else 0  # det: compile-time top-K
         self.regsel = bool(regsel) and dtype is cutlass.BFloat16
         self.envf = (
@@ -3456,6 +3488,9 @@ class GvrMainKernel:
         idv = cutlass.Int32(
             0
         )  # DET: typed predeclaration (det branch assigns it; the DSL hoists to None otherwise)
+        if cutlass.const_expr(self.pdl):
+            _pdl_wait()
+            _pdl_release()
         if cutlass.const_expr(self.staged_k > 0):
             k = cutlass.Int32(self.staged_k)
         BLK = self.blk
@@ -8222,7 +8257,13 @@ class GvrMainKernel:
             amin,
             sd_en,
             tsh_en,
-        ).launch(grid=(R, b, 1), block=(self.blk, 1, 1), stream=stream, min_blocks_per_mp=self.minb)
+        ).launch(
+            grid=(R, b, 1),
+            block=(self.blk, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -8251,6 +8292,7 @@ def get_compiled(
     samp_rounds: int = 0,
     env_first: bool = False,
     load_ahead: bool = False,
+    pdl: bool = False,
 ) -> Any:
     """Return the compiled gvr_main launcher for ``tpl``, cached per option set.
 
@@ -8306,6 +8348,7 @@ def get_compiled(
             )
             + (("regsel",) if regsel else ())
             + (("envf",) if envf else ())
+            + (("pdl",) if pdl else ())
         )
         if l2ef:
             key = key + (("l2ef", True),)
@@ -8371,6 +8414,7 @@ def get_compiled(
                 samp_rounds=int(samp_rounds),
                 env_first=bool(env_first),
                 load_ahead=bool(load_ahead),
+                pdl=pdl,
             )
         r0, c0 = cute.sym_int(), cute.sym_int()
         r1, c1 = cute.sym_int(), cute.sym_int()
@@ -16353,6 +16397,7 @@ conditional retry clus.sync cannot deadlock.
 QUADC_CLUS__clus = C.QUADC_CLUS
 
 _NEG_INF__clus = float("-inf")
+_FIN_INT32_MAX = 2147483647  # finalize fold: the sort key of a dropped selection
 
 
 # ---------------------------------------------------------------------------
@@ -16515,6 +16560,9 @@ class GvrClusKernel:
         fused_merge_bf16: bool = False,
         push_merge_bf16: bool = False,
         wave_sms: int = 148,
+        pdl: bool = False,
+        fin_k: int = 0,
+        fin_page: int = 64,
     ) -> None:
         self.det = bool(det)
         self.wave_sms = int(wave_sms)  # route() wave budget of the big-occupancy flag
@@ -16529,6 +16577,30 @@ class GvrClusKernel:
         self.fused_merge_bf16 = (
             bool(fused_merge_bf16) and dtype is cutlass.BFloat16 and not self.det and nbs == 256
         )
+        # pdl: wait for the predecessor before any load, then release the dependents.
+        self.pdl = bool(pdl)
+        # fin_k > 0 (``call_fin``): each row's rank-0 CTA also runs the CSA2 paged decode finalize
+        # of its fin_k selections, as ``FinalizeShuffleSelectionKernel`` does.
+        self.fin = int(fin_k) > 0
+        self.fin_k = int(fin_k)
+        self.fin_page = int(fin_page)
+        if self.fin:
+            # The host folds FP32 rows only; BF16 rows may skip the exit cluster barrier it needs.
+            assert varlen and not det and dtype is cutlass.Float32, (
+                "the finalize fold serves the FP32 varlen decode engine"
+            )
+            assert fin_k % 2 == 0 and fin_k <= 1024, "fold: even k <= 1024 (two keys per thread)"
+            self.fin_padded = max(64, 1 << (fin_k - 1).bit_length())
+            self.fin_threads = self.fin_padded // 2
+            rounds = []
+            size = 2
+            while size <= self.fin_padded:
+                stride = size // 2
+                while stride >= 1:
+                    rounds.append((size, stride))
+                    stride //= 2
+                size *= 2
+            self.fin_rounds = tuple(rounds)
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
         # constexpr logits dtype: 16-bit builds (BFloat16 / Float16) share the
@@ -16570,6 +16642,118 @@ class GvrClusKernel:
         self.ck_off = self.cbuf_bytes  # inside the blob
         self.dyn_bytes = nbs * 4 + self.cbuf_bytes + cmp_ * 8 + nbs * 4
         # == host smc = SNB*8 + (SCAP+4)*8 + CMP*8
+        if self.fin:
+            # the fold's exchange reuses rank 0's staging buffer, free once the row is written
+            assert 2 * self.fin_padded * 4 <= self.cbuf_bytes
+        # The fold assembles the row in rank 0's shared memory (the other ranks' P5 stores arrive
+        # over DSMEM): the row list (fin_padded slots) and its visible length follow ck64c.
+        self.fin_list_bytes = self.fin_padded * 4 + 16 if self.fin else 0
+
+    # ------------------------------------------------------------------
+    # finalize fold: rank 0 of each row, after every write of the row
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _fin_tail(self, out, row, tidx, sbase, f_valid, f_width, f_vstride):
+        # Threads [0, fin_threads) hold two keys each; the network's shared-memory rounds sync only
+        # the key holders (named barrier 1; the body uses 0).
+        NT = self.fin_threads
+        PADDED = self.fin_padded
+        KF = self.fin_k
+        cute.arch.barrier()  # ---- barrier (rank 0's writes of the row) ----
+        if tidx < cutlass.Int32(NT):
+            exchange = cute.make_tensor(
+                cute.make_ptr(cutlass.Int32, sbase, cute.AddressSpace.smem, assumed_align=16),
+                cute.make_layout((2 * PADDED,)),
+            )
+            key0 = cutlass.Int32(_FIN_INT32_MAX)
+            key1 = cutlass.Int32(_FIN_INT32_MAX)
+            if tidx < cutlass.Int32(KF // 2):
+                s_list = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Int32,
+                        sbase + cutlass.Int32(self.ck_off + self.cmp * 8),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((PADDED + 4,)),
+                )
+                o0 = s_list[2 * tidx]
+                o1 = s_list[2 * tidx + 1]
+                length = s_list[PADDED]
+                limit = f_width
+                if length < limit:
+                    limit = length
+                vbase = cutlass.Int64(row) * cutlass.Int64(f_vstride)
+                for r in cutlass.range_constexpr(2):
+                    offset = o0
+                    if cutlass.const_expr(r == 1):
+                        offset = o1
+                    key = cutlass.Int32(_FIN_INT32_MAX)
+                    if (offset >= cutlass.Int32(0)) & (offset < limit):
+                        page = vbase + cutlass.Int64(offset // cutlass.Int32(self.fin_page))
+                        if cutlass.Uint8(f_valid[page]) != cutlass.Uint8(0):
+                            key = offset
+                    if cutlass.const_expr(r == 0):
+                        key0 = key
+                    else:
+                        key1 = key
+            buffer = 0
+            for round_index in cutlass.range_constexpr(len(self.fin_rounds)):
+                size, stride = self.fin_rounds[round_index]
+                ascending = ((2 * tidx) & size) == 0
+                if cutlass.const_expr(stride == 1):
+                    lo = key0
+                    hi = key1
+                    if key1 < key0:
+                        lo = key1
+                        hi = key0
+                    if ascending:
+                        key0 = lo
+                        key1 = hi
+                    else:
+                        key0 = hi
+                        key1 = lo
+                else:
+                    half = stride // 2
+                    keep_min = ((tidx & half) == 0) == ascending
+                    if cutlass.const_expr(stride <= 32):
+                        other0 = cute.arch.shuffle_sync_bfly(key0, offset=half)
+                        other1 = cute.arch.shuffle_sync_bfly(key1, offset=half)
+                    else:
+                        base = buffer * PADDED
+                        exchange[base + 2 * tidx] = key0
+                        exchange[base + 2 * tidx + 1] = key1
+                        cute.arch.barrier(
+                            barrier_id=1, number_of_threads=NT
+                        )  # ---- fold exchange ----
+                        partner = tidx ^ half
+                        other0 = exchange[base + 2 * partner]
+                        other1 = exchange[base + 2 * partner + 1]
+                        buffer = 1 - buffer
+                    lo0 = key0
+                    hi0 = other0
+                    if other0 < key0:
+                        lo0 = other0
+                        hi0 = key0
+                    lo1 = key1
+                    hi1 = other1
+                    if other1 < key1:
+                        lo1 = other1
+                        hi1 = key1
+                    if keep_min:
+                        key0 = lo0
+                        key1 = lo1
+                    else:
+                        key0 = hi0
+                        key1 = hi1
+            if tidx < cutlass.Int32(KF // 2):
+                for r in cutlass.range_constexpr(2):
+                    key = key1
+                    if cutlass.const_expr(r == 0):
+                        key = key0
+                    if key == cutlass.Int32(_FIN_INT32_MAX):
+                        key = cutlass.Int32(-1)
+                    out[row, 2 * tidx + r] = key
 
     # ------------------------------------------------------------------
     # GVR_EMITK: classify+stage one survivor.
@@ -16631,7 +16815,13 @@ class GvrClusKernel:
         if bn >= B:
             p = C.atomic_add_cta(s_mrg.iterator + bn, cutlass.Int32(1))
             if p < lim1:
-                out_row[p] = idv
+                if cutlass.const_expr(self.fin):
+                    # into rank 0's row list, after its ck64c
+                    C._st_shared_cluster_i32(
+                        rk64 + cutlass.Int32(self.cmp * 8) + p * cutlass.Int32(4), idv
+                    )
+                else:
+                    out_row[p] = idv
             else:
                 if whole == cutlass.Int32(0):
                     q2 = p - above
@@ -16793,6 +16983,97 @@ class GvrClusKernel:
         TGT2: cutlass.Int32,
         bigf: cutlass.Int32,
     ):
+        # The selection only; the finalize arguments are unused stand-ins (``fin`` off).
+        self._body(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            n,
+            npad,
+            k,
+            SCAP,
+            CMP,
+            SMP,
+            TGT,
+            Q,
+            SS2,
+            TGT2,
+            bigf,
+            kv_lens,
+            kv_lens,
+            n,
+            n,
+        )
+
+    @cute.kernel
+    def kern_fin(
+        self,
+        logits: cute.Tensor,
+        pre_idx: cute.Tensor,
+        kv_lens: cute.Tensor,
+        out: cute.Tensor,
+        n: cutlass.Int32,
+        npad: cutlass.Int32,
+        k: cutlass.Int32,
+        SCAP: cutlass.Int32,
+        CMP: cutlass.Int32,
+        SMP: cutlass.Int32,
+        TGT: cutlass.Int32,
+        Q: cutlass.Int32,
+        SS2: cutlass.Int32,
+        TGT2: cutlass.Int32,
+        bigf: cutlass.Int32,
+        f_valid: cute.Tensor,
+        f_visible: cute.Tensor,
+        f_width: cutlass.Int32,
+        f_vstride: cutlass.Int32,
+    ):
+        self._body(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            n,
+            npad,
+            k,
+            SCAP,
+            CMP,
+            SMP,
+            TGT,
+            Q,
+            SS2,
+            TGT2,
+            bigf,
+            f_valid,
+            f_visible,
+            f_width,
+            f_vstride,
+        )
+
+    @cute.jit
+    def _body(
+        self,
+        logits: cute.Tensor,
+        pre_idx: cute.Tensor,
+        kv_lens: cute.Tensor,
+        out: cute.Tensor,
+        n: cutlass.Int32,
+        npad: cutlass.Int32,
+        k: cutlass.Int32,
+        SCAP: cutlass.Int32,
+        CMP: cutlass.Int32,
+        SMP: cutlass.Int32,
+        TGT: cutlass.Int32,
+        Q: cutlass.Int32,
+        SS2: cutlass.Int32,
+        TGT2: cutlass.Int32,
+        bigf: cutlass.Int32,
+        f_valid: cute.Tensor,
+        f_visible: cute.Tensor,
+        f_width: cutlass.Int32,
+        f_vstride: cutlass.Int32,
+    ):
         BLK = self.blk
         U = self.u
         NBS = self.nbs
@@ -16801,6 +17082,9 @@ class GvrClusKernel:
         STEPC = self.stepc
         NW = BLK // 32
 
+        if cutlass.const_expr(self.pdl):
+            _pdl_wait()
+            _pdl_release()
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # (rank, row)
         rank = bx
@@ -16827,6 +17111,16 @@ class GvrClusKernel:
                 if tidx >= env_smp:
                     ep8 = (tidx - env_smp) * env_ss2 * cutlass.Int32(2) + cutlass.Int32(1)
                 ld_g_16x8_pair(self.dtype, None, env_x_addr, ep8, env_fsa, env_fsb)
+        # The fold: rank 0 loads the row's previous output (the slots the selection leaves keep it)
+        # and its visible length up front; they land in shared memory once it is allocated.
+        fin_old = cutlass.Int32(-1)
+        fin_vis = cutlass.Int32(0)
+        if cutlass.const_expr(self.fin):
+            if rank == cutlass.Int32(0):
+                if tidx < cutlass.Int32(self.fin_k):
+                    fin_old = cutlass.Int32(out[row, tidx])
+                if tidx == cutlass.Int32(0):
+                    fin_vis = cutlass.Int32(f_visible[row])
 
         # ============ per-row varlen prologue — shared contract lives in ======
         # GvrMainKernel's prologue (per-row n from kv_lens; ladder scalars are
@@ -16982,9 +17276,11 @@ class GvrClusKernel:
         s_hist = smem.allocate_tensor(  # hist[NBS] @ blob start
             cutlass.Int32, cute.make_ordered_layout((self.hb,), order=(0,)), byte_alignment=128
         )
-        blob = smem.allocate_tensor(  # cbuf(int2) | ck64c
+        blob = smem.allocate_tensor(  # cbuf(int2) | ck64c [| fold row list]
             cutlass.Int8,
-            cute.make_ordered_layout((self.cbuf_bytes + self.cmp * 8,), order=(0,)),
+            cute.make_ordered_layout(
+                (self.cbuf_bytes + self.cmp * 8 + self.fin_list_bytes,), order=(0,)
+            ),
             byte_alignment=16,
         )
         s_mrg = smem.allocate_tensor(  # mrg[NBS]
@@ -17067,6 +17363,28 @@ class GvrClusKernel:
             cute.make_ptr(cutlass.Uint64, ck_addr, cute.AddressSpace.smem, assumed_align=16),
             cute.make_layout((self.cmp,)),
         )
+        if cutlass.const_expr(self.fin):
+            # The row list starts as the output before this launch's writes (a short row's
+            # identity), ahead of the first cluster barrier and every other rank's DSMEM store.
+            s_list = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Int32,
+                    ck_addr + cutlass.Int32(self.cmp * 8),
+                    cute.AddressSpace.smem,
+                    assumed_align=16,
+                ),
+                cute.make_layout((self.fin_padded + 4,)),
+            )
+            if rank == cutlass.Int32(0):
+                if tidx < cutlass.Int32(self.fin_k):
+                    lv = fin_old
+                    if short != cutlass.Int32(0):
+                        lv = cutlass.Int32(-1)
+                        if tidx < nv:
+                            lv = tidx
+                    s_list[tidx] = lv
+                if tidx == cutlass.Int32(0):
+                    s_list[self.fin_padded] = fin_vis
 
         # ---- whole-body short-row guard (cluster-uniform: `short` is a pure
         # function of `row`, identical across all CS ranks and threads, so
@@ -17086,7 +17404,10 @@ class GvrClusKernel:
             p_addr = pre_idx.iterator.toint() + cutlass.Int64(prow) * cutlass.Int64(
                 k
             ) * cutlass.Int64(4)
-            out_row = out[row, None]
+            if cutlass.const_expr(self.fin):
+                out_row = s_list  # rank 0's own writes; the P5 stores reach it over DSMEM
+            else:
+                out_row = out[row, None]
 
             # ---- interleaved chunk ownership ----
             if cutlass.const_expr(self.dtype == cutlass.Float32):
@@ -18980,6 +19301,12 @@ class GvrClusKernel:
                             )
                             it = it + cutlass.Int32(1)
 
+        # The finalize fold runs after the row's last write: the other ranks' writes precede the
+        # exit cluster barrier, rank 0's own ones the CTA barrier in the tail.
+        if cutlass.const_expr(self.fin):
+            if rank == cutlass.Int32(0):
+                self._fin_tail(out, row, tidx, sbase, f_valid, f_width, f_vstride)
+
     # ------------------------------------------------------------------
     # host launcher: grid dim3(CS, b) + cluster (CS,1,1);
     # min_blocks_per_mp=1 == __launch_bounds__(1024, 1) 64-register wall.
@@ -19018,6 +19345,65 @@ class GvrClusKernel:
             cluster=(self.cs, 1, 1),
             stream=stream,
             min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
+        )
+
+    @cute.jit
+    def call_fin(
+        self,
+        logits: cute.Tensor,
+        pre_idx: cute.Tensor,
+        kv_lens: cute.Tensor,
+        out: cute.Tensor,
+        n: cutlass.Int32,
+        npad: cutlass.Int32,
+        k: cutlass.Int32,
+        SCAP: cutlass.Int32,
+        CMP: cutlass.Int32,
+        SMP: cutlass.Int32,
+        TGT: cutlass.Int32,
+        Q: cutlass.Int32,
+        SS2: cutlass.Int32,
+        TGT2: cutlass.Int32,
+        f_valid: cute.Tensor,
+        f_visible: cute.Tensor,
+        f_width: cutlass.Int32,
+        f_vstride: cutlass.Int32,
+        stream,
+    ):
+        """``__call__`` with the finalize fold: ``f_valid`` uint8 page validity (row ``r`` at
+        ``r*f_vstride``), ``f_visible`` int32 per row, ``f_width`` the logits width."""
+        b = out.shape[0]
+        bigf = cutlass.Int32(0)
+        if b * cutlass.Int32(self.cs) <= cutlass.Int32(self.wave_sms):
+            bigf = cutlass.Int32(1)
+        self.kern_fin(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            n,
+            npad,
+            k,
+            SCAP,
+            CMP,
+            SMP,
+            TGT,
+            Q,
+            SS2,
+            TGT2,
+            bigf,
+            f_valid,
+            f_visible,
+            f_width,
+            f_vstride,
+        ).launch(
+            grid=(self.cs, b, 1),
+            block=(self.blk, 1, 1),
+            cluster=(self.cs, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
         )
 
 
@@ -19044,11 +19430,16 @@ def get_compiled__clus(
     envf: bool = False,
     push_merge_bf16: bool = False,
     wave_sms: int = 148,
+    pdl: bool = False,
+    fin_k: int = 0,
+    fin_page: int = 64,
+    cached_only: bool = False,
 ) -> Any:
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
     reachable route has 8192/2048 — asserted by run__clus()). ``wave_sms`` is the
-    host route's wave budget (``wave_sms()`` in the host module).
+    host route's wave budget (``wave_sms()`` in the host module). ``fin_k`` > 0
+    compiles ``call_fin`` with CSA2's paged finalize; ``cached_only`` returns None on a miss.
 
     ``dtype`` is the logits tag ('f32', 'bf16' or 'f16'); 16-bit tags need
     ``hint_free`` and ``det=False``. ``sample_floor`` applies to the 16-bit tags and to
@@ -19075,9 +19466,11 @@ def get_compiled__clus(
         + (("envf",) if envf else ())
         + (("push_merge_bf16",) if push_merge_bf16 and dtype == "bf16" else ())
         + ((("wave_sms", int(wave_sms)),) if int(wave_sms) != 148 else ())
+        + (("pdl",) if pdl else ())
+        + (("fin", int(fin_k), int(fin_page)) if fin_k else ())
     )
     hit = _COMPILE_CACHE__clus.get(key)
-    if hit is not None:
+    if hit is not None or cached_only:
         return hit
     blk, u, minb, nbs, cs = tpl
     kern = GvrClusKernel(
@@ -19100,6 +19493,9 @@ def get_compiled__clus(
         envf=bool(envf),
         push_merge_bf16=bool(push_merge_bf16) if dtype == "bf16" else False,
         wave_sms=wave_sms,
+        pdl=pdl,
+        fin_k=fin_k,
+        fin_page=fin_page,
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -19118,16 +19514,39 @@ def get_compiled__clus(
         cutlass.Int32, (v0,), stride_order=(0,), assumed_align=4
     )
     fake_stream = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
-    compiled = cute.compile(
-        kern,
-        logits_fake,
-        pre_fake,
-        kv_fake,
-        out_fake,
-        *([cutlass.Int32(0)] * 10),
-        stream=fake_stream,
-        options=("--enable-tvm-ffi " + options_extra).strip(),
-    )
+    if fin_k:
+        v1, v2 = cute.sym_int(), cute.sym_int()
+        valid_fake = _crt.make_fake_compact_tensor(
+            cutlass.Uint8, (v1,), stride_order=(0,), assumed_align=1
+        )
+        vis_fake = _crt.make_fake_compact_tensor(
+            cutlass.Int32, (v2,), stride_order=(0,), assumed_align=4
+        )
+        compiled = cute.compile(
+            kern.call_fin,
+            logits_fake,
+            pre_fake,
+            kv_fake,
+            out_fake,
+            *([cutlass.Int32(0)] * 10),
+            valid_fake,
+            vis_fake,
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            stream=fake_stream,
+            options=("--enable-tvm-ffi " + options_extra).strip(),
+        )
+    else:
+        compiled = cute.compile(
+            kern,
+            logits_fake,
+            pre_fake,
+            kv_fake,
+            out_fake,
+            *([cutlass.Int32(0)] * 10),
+            stream=fake_stream,
+            options=("--enable-tvm-ffi " + options_extra).strip(),
+        )
     _COMPILE_CACHE__clus[key] = compiled
     return compiled
 
