@@ -23,7 +23,8 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
+from tensorrt_llm.inputs.prompt_embeds import (RESERVED_CACHE_SALT_PREFIX,
+                                               PromptEmbeds)
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.kv_hints.protocol import snapshot_kv_hints
 
@@ -194,6 +195,10 @@ class GenerationRequest:
                     f"cache_salt UTF-8 byte length ({cache_salt_byte_len}) "
                     f"exceeds the maximum supported length "
                     f"({self.MAX_CACHE_SALT_LEN}).")
+            if cache_salt.startswith(RESERVED_CACHE_SALT_PREFIX):
+                raise ValueError(
+                    f"cache_salt must not start with the reserved prefix "
+                    f"{RESERVED_CACHE_SALT_PREFIX!r}.")
         self.cache_salt = cache_salt
         self.arrival_time = arrival_time
         self.encoder_input_token_ids = self._normalize_optional_token_ids(

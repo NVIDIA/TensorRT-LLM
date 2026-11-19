@@ -146,6 +146,9 @@ def test_worker_cache_salt(v2: bool, connector: Optional[object], keys_rows: boo
     assert BaseWorker._effective_cache_salt(worker, plain) == "s"
     salt = BaseWorker._effective_cache_salt(worker, embeds)
     assert salt == ("s" if keys_rows else prompt_embeds_cache_salt("s", pe.digest))
+    # A plain request cannot claim the derived salt of an embedding request.
+    with pytest.raises(ValueError, match="reserved prefix"):
+        GenerationRequest([1, 2, 3], params, cache_salt=prompt_embeds_cache_salt("s", pe.digest))
     restored = pickle.loads(pickle.dumps(embeds))
     assert torch.equal(restored.prompt_embeds.embeds, pe.embeds)
     assert restored.prompt_embeds.row_digests == pe.row_digests

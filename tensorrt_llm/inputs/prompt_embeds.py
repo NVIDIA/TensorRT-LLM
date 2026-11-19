@@ -20,7 +20,9 @@ PROMPT_EMBEDS_IDENTITY_VERSION = 1
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-_SALT_PREFIX = f"prompt_embeds.v{PROMPT_EMBEDS_IDENTITY_VERSION}:"
+# Caller cache salts may not start with this, so no plain request can reproduce a derived salt.
+RESERVED_CACHE_SALT_PREFIX = "prompt_embeds."
+_SALT_PREFIX = f"{RESERVED_CACHE_SALT_PREFIX}v{PROMPT_EMBEDS_IDENTITY_VERSION}:"
 
 
 @dataclass(frozen=True)
