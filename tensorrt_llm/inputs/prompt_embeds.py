@@ -120,9 +120,18 @@ def build_prompt_embeds(
 ) -> Tuple[List[int], PromptEmbeds]:
     """Validate a ``TokensPrompt``/``EmbedsPrompt`` request and snapshot its rows.
 
+    The contract is on ``TokensPrompt.prompt_embeds``.
+
+    Args:
+        prompt_token_ids: Full-length ids, or None when every position is an embedding.
+        prompt_embeds: ``[K, H]`` float16, bfloat16 or float32 rows, in mask order.
+        prompt_embeds_mask: Length-``L`` bools selecting the ``K`` positions;
+            optional when ``K == L``.
+        placeholder_token_id: Id scheduled everywhere when ``prompt_token_ids`` is None.
+
     Returns:
-        The prompt token ids to schedule (``placeholder_token_id`` everywhere
-        when ``prompt_token_ids`` is None) and the owned snapshot.
+        The prompt token ids to schedule and an owned CPU snapshot; later writes
+        to ``prompt_embeds`` do not affect it.
     """
     if not isinstance(prompt_embeds, torch.Tensor):
         raise TypeError(f"prompt_embeds must be a torch.Tensor, got {type(prompt_embeds).__name__}")
