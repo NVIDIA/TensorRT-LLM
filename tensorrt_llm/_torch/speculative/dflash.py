@@ -2613,7 +2613,7 @@ class DFlashWorker(SpecWorkerBase):
         stored, since no more tokens are accepted than were verified.
         """
         width = self._draft_tokens_per_req
-        if not spec_metadata.is_ragged_verify:
+        if not getattr(spec_metadata, "is_ragged_verify", False):
             return captured_hs[gen_start : gen_start + num_gens * width]
         first = gen_start + spec_metadata.qo_indptr[:num_gens].long()
         last = spec_metadata.verify_lens[:num_gens].long() - 1
