@@ -76,8 +76,9 @@ Cohere2 scaling, or custom/model-specific logits processors.
 Unsupported configurations do not reserve the projection workspace. These paths
 retain their existing projection and CUDA graph selection behavior. On them, and
 in any step where a request has a per-request `logits_processor`, the context
-logits are stored right after the forward, before any logits processor runs, so
-they hold the model's own scores. Eager
+logits are stored before any logits processor or guided-decoding mask edits a
+row, so they hold the model's own scores. Prompt logprobs, including the entry
+for the first generated token, also come from these scores. Eager
 execution is required only when the bounded projection plan is active. The
 workspace bounds projection, gather-output and dtype-conversion storage; it does
 not guarantee that model activations, sampling outputs, or unrelated runtime

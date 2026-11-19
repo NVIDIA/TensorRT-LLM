@@ -161,7 +161,7 @@ class PrefillCompiledModel(torch.nn.Module):
             return getattr(super().__getattr__("eager_model"), name)
 
 
-def _holds_token_rows(logits: Any) -> bool:
+def _holds_token_rows(logits: object) -> bool:
     """Whether ``logits`` is a plain ``[tokens, vocab]`` tensor.
 
     Models that do not generate text, such as process reward models, return
@@ -175,12 +175,15 @@ def _full_context_rows_need_storing(scheduled_requests: ScheduledRequests) -> bo
 
     They can stay for the sampler only when every row is a requested context
     row (no other context request, whose single sampling row the sampler
-    expects) and no post-processor will edit one of them.
+    expects) and nothing edits a row before the sampler: no logits
+    post-processor, and no guided decoding, whose mask reads one row per
+    request.
     """
     return any(
         not request.py_return_context_logits for request in scheduled_requests.context_requests
     ) or any(
         getattr(request, "py_logits_post_processors", None)
+        or getattr(request, "py_guided_decoding_params", None) is not None
         for request in scheduled_requests.all_requests()
     )
 

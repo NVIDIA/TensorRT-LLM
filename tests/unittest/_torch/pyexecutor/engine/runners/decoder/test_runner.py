@@ -686,9 +686,15 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
         engine, _, _, _, _ = _make_decoder_runner(None)
         for last_chunk in (False, True):
             with self.subTest(last_chunk=last_chunk):
-                calls = []
+                calls: list[int] = []
 
-                def processor(req_id, logits, token_ids, stream_ptr, client_id):
+                def processor(
+                    req_id: int,
+                    logits: torch.Tensor,
+                    token_ids: list[list[int]],
+                    stream_ptr: int | None,
+                    client_id: int | None,
+                ) -> None:
                     calls.append(req_id)
 
                 request = SimpleNamespace(
