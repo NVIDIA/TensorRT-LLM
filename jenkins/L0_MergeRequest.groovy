@@ -1883,6 +1883,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     }
 
     def relatedFileList = [
+        "3rdparty/fetch_content.json",
+        "3rdparty/patches/nanobind_pytorch_profiler.patch",
         "cpp/CMakeLists.txt",
         "cpp/include/tensorrt_llm/batch_manager/",
         "cpp/include/tensorrt_llm/common/profiler.h",
