@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/evictionController.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/storagePolicy.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
@@ -38,11 +39,16 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Forward declarations to break circular includes.
 class StorageManager;
 class KvCache;
+class UncommittedPage;
 class PageHolder;
 class UniqPageLock;
 class SharedPageLock;
 class Page;
 using RetentionExpiryQueue = std::multimap<std::chrono::steady_clock::time_point, WeakPtr<Page>>;
+
+//! One allocation for the pages a request creates together, with their holders and locks, so
+//! that walking a request's pages stays local in memory however long the process has run.
+using PageSlab = SlabArena<UncommittedPage, PageHolder, UniqPageLock>;
 
 // ---------------------------------------------------------------------------
 // Page — base class for all KV-cache pages.
@@ -57,6 +63,8 @@ public:
     CacheLevel cacheLevel;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    //! Dedupes the pages of one batched call: the StorageManager::nextVisitStamp() of the last call that took it.
+    uint64_t visitStamp = 0;
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 
@@ -79,18 +87,21 @@ public:
 
     PageStatus status() const noexcept;
 
+    // Locality domain whose memory backs this page's slot; nullopt off a localized GPU tier.
+    [[nodiscard]] std::optional<LocalityDomainId> localityDomainId() const;
+
     bool scheduledForEviction() const noexcept
     {
         return nodeRef.has_value();
     }
 
-    // Prevent the page from being dropped (returns/creates a PageHolder).
-    SharedPtr<PageHolder> hold();
+    // Prevent the page from being dropped (returns/creates a PageHolder, in `slab` when given).
+    SharedPtr<PageHolder> hold(PageSlab* slab = nullptr);
 
     // Acquire a shared lock at the current level. The caller handles any migration.
     // skip_wait: caller guarantees the page is ready on kvCache's stream.
-    SharedPageLock lock(
-        KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
+    SharedPageLock lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle,
+        bool skipWait = false, PageSlab* slab = nullptr);
 
 private:
     friend class StorageManager;
@@ -169,8 +180,10 @@ public:
     //
     // `numTokensInBlock` records the page's token count. See
     // CommittedPage::numTokensInBlock for its attention and SSM interpretations.
-    SharedPtr<CommittedPage> convertToCommitted(
-        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock);
+    // An attention page takes the retention of `retentionSource` if given (the block's page it supersedes), else its
+    // own.
+    SharedPtr<CommittedPage> convertToCommitted(SharedPtr<Block> block, CachedCudaEvent readyEvent,
+        int numTokensInBlock, Page const* retentionSource = nullptr);
 };
 
 // ---------------------------------------------------------------------------
@@ -186,9 +199,9 @@ public:
     PageHolder(PageHolder const&) = delete;
     PageHolder& operator=(PageHolder const&) = delete;
 
-    // Acquire a shared lock (creates or reuses the UniqPageLock).
-    SharedPageLock lock(
-        KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
+    // Acquire a shared lock (creates or reuses the UniqPageLock, creating it in `slab` when given).
+    SharedPageLock lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle,
+        bool skipWait = false, PageSlab* slab = nullptr);
 
     SharedPtr<Page> page;
     WeakPtr<UniqPageLock> uniqLock; // non-null → LOCKED
@@ -217,8 +230,10 @@ public:
     // Append a finish event, merging when count exceeds 32 to prevent unbounded growth.
     void notifyFinish(CachedCudaEvent event);
 
+    using FinishEvents = FinishEventVec<CachedCudaEvent>;
+
     SharedPtr<PageHolder> holder;
-    std::vector<CachedCudaEvent> finishEvents;
+    FinishEvents finishEvents;
 };
 
 // ---------------------------------------------------------------------------
@@ -250,8 +265,9 @@ public:
     SharedPageLock(SharedPageLock const&) = delete;
     SharedPageLock& operator=(SharedPageLock const&) = delete;
 
-    // Explicitly release the lock (called by destructor if not already released).
-    SharedPtr<Page> unlock();
+    // Explicitly release the lock (called by destructor if not already released). With
+    // keepPageIndex the owner's page-index entry is left for the owner to invalidate in bulk.
+    SharedPtr<Page> unlock(bool keepPageIndex = false);
 
     [[nodiscard]] SharedPtr<Page> const& page() const;
 

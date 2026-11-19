@@ -8,6 +8,10 @@ used to return the gated norm after ``squeeze(1)``, which stays
 ``[tokens * heads, head_dim]`` and makes that cat raise. Decode-only tests
 never cat, so they miss it.
 
+The same mixed batch must also fill the breakable-CUDA-graph core buffer
+when the graph's KDA callback passes one (``output``), as Hopper's FLA
+decode does.
+
 Needs 1 GPU + fla. Random weights, no checkpoint, and no optimized kernels:
 both prefill and decode are forced onto FLA, which is the dispatch that hit
 the failure.
@@ -78,6 +82,7 @@ def _mixed_metadata(num_ctx_tokens: int, num_decodes: int) -> SimpleNamespace:
     cu_seqlens = torch.tensor([0, num_ctx_tokens], device=device, dtype=torch.long)
     mamba = SimpleNamespace(
         state_indices=state_indices,
+        replay_state_indices=state_indices,
         query_start_loc_long=cu_seqlens,
         query_start_loc=cu_seqlens.to(torch.int32),
         has_initial_states=torch.zeros(num_prefills, device=device, dtype=torch.bool),
@@ -141,3 +146,35 @@ def test_fla_mixed_batch_cores_share_prefill_layout():
         HEAD_DIM,
     )
     assert torch.isfinite(core).all()
+
+
+@torch.no_grad()
+def test_fla_mixed_batch_fills_breakable_graph_output_buffer():
+    """Mixed prefill + single-token decode under a breakable CUDA graph.
+
+    The graph's KDA callback passes the core buffer as ``output``. On FLA
+    (Hopper), decode must fill it like the eager path returns the core.
+    """
+    torch.manual_seed(0)
+    runtime = _make_fla_runtime()
+    num_ctx_tokens, num_decodes = 4, 2
+    num_tokens = num_ctx_tokens + num_decodes
+    hidden = torch.randn(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
+
+    eager_metadata = _mixed_metadata(num_ctx_tokens, num_decodes)
+    eager_cache = eager_metadata.kv_cache_manager.mamba_layer_cache(0)
+    graph_metadata = _mixed_metadata(num_ctx_tokens, num_decodes)
+    graph_cache = graph_metadata.kv_cache_manager.mamba_layer_cache(0)
+    graph_cache.conv.copy_(eager_cache.conv)
+    graph_cache.temporal.copy_(eager_cache.temporal)
+
+    expected = runtime._forward_impl(hidden, eager_metadata)
+    buffer = torch.full(
+        (num_tokens, NUM_HEADS, HEAD_DIM), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    result = runtime._forward_impl(hidden, graph_metadata, output=buffer)
+
+    assert result.data_ptr() == buffer.data_ptr()
+    torch.testing.assert_close(buffer, expected, rtol=0, atol=0)
+    torch.testing.assert_close(graph_cache.conv, eager_cache.conv, rtol=0, atol=0)
+    torch.testing.assert_close(graph_cache.temporal, eager_cache.temporal, rtol=0, atol=0)

@@ -33,6 +33,7 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/prepareCustomMask.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/locality_domain/locality_domain_utils.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -531,8 +532,7 @@ bool MHA::convertMMHAParamsToXQAParams(
         // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
         xqaParams.data_type = DATA_TYPE_E4M3;
     }
-    if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
+    if (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90)
     {
         xqaParams.multi_block_mode = false;
     }
@@ -2136,6 +2136,15 @@ MHA::MHA(AttentionBase const& key)
             // TODO: add the support for cross attention + contiguous kv cache.
             TLLM_LOG_WARNING("Fall back to unfused MHA because of cross attention + contiguous kv cache.");
         }
+        else if (cross_attention && use_kv_cache && quant_mode.hasKvCacheQuant()
+            && !(mPagedKVCache && paged_context_fmha))
+        {
+            // The fused context kernel reads the encoder K/V back from the paged cross cache, and it is only told
+            // the cache's element type when paged-context FMHA is on. Without that it reads a quantized cache as
+            // the activation type. The unfused path reads K/V from the 16-bit workspace and writes the cache
+            // through the quantizing transpose, so it is correct for every cache type.
+            TLLM_LOG_WARNING("Fall back to unfused MHA because of cross attention + quantized kv cache.");
+        }
         else
         {
             mEnableContextFMHA = true;
@@ -2881,6 +2890,46 @@ void MLA::prepareInputs(FmhaParams& p, bool isGen)
                 "Separate-K context FMHA requires contiguous K features within each token");
             TORCH_CHECK(p.value_input->strides()[1] == 1,
                 "Separate-V context FMHA requires contiguous V features within each token");
+            auto const& k = p.key_input.value();
+            auto const& v = p.value_input.value();
+            TORCH_CHECK(k.scalar_type() == v.scalar_type(), "MLA context k and v must have the same dtype.");
+            // FP8 k / v (and an FP8 Q in quant_q_buffer, if given with quant_scale_qkv): the caller already
+            // quantized them for the FP8 context FMHA, which reads them instead of quantizing BF16 inputs.
+            if (k.scalar_type() == torch::kFloat8_e4m3fn)
+            {
+                TORCH_CHECK(mFP8ContextMLA, "FP8 MLA context k / v require the FP8 context MLA FMHA.");
+                TORCH_CHECK(!p.fwd.latent_cache.has_value(),
+                    "FP8 MLA context k / v are for cached-KV context attention, without latent_cache.");
+                TORCH_CHECK(k.is_contiguous() && v.is_contiguous(), "FP8 MLA context k and v must be contiguous.");
+                TORCH_CHECK(k.size(1) == num_heads * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)
+                        && v.size(1) == num_heads * mMLAParams.v_head_dim,
+                    "FP8 MLA context k / v must be [kv_tokens, num_heads * qk_head_dim] / [kv_tokens, num_heads * "
+                    "v_head_dim].");
+                // The FMHA reads p.total_kv_len rows straight out of the caller's k / v;
+                // reject a short tensor instead of reading past its end.
+                TORCH_CHECK(k.size(0) >= p.total_kv_len && v.size(0) >= p.total_kv_len,
+                    "FP8 MLA context k / v must hold at least total_kv_len (", p.total_kv_len, ") tokens.");
+                if (p.fwd.quant_q_buffer.has_value() && p.fwd.quant_scale_qkv.has_value())
+                {
+                    auto const& quantQ = p.fwd.quant_q_buffer.value();
+                    TORCH_CHECK(quantQ.scalar_type() == torch::kFloat8_e4m3fn && quantQ.is_contiguous()
+                            && quantQ.numel() >= p.getQueryInput().numel(),
+                        "The FP8 MLA context quant_q_buffer must be a contiguous FP8 copy of q.");
+                    // The value is not read as a scale here; the FMHA dequantizes
+                    // Q / K / V with the kv cache scale, so it must equal
+                    // kv_scale_orig_quant. The mixed path (BF16 Q, FP8 k / v)
+                    // also quantizes Q with it.
+                    auto const& quantScaleQkv = p.fwd.quant_scale_qkv.value();
+                    TORCH_CHECK(quantScaleQkv.is_cuda() && quantScaleQkv.is_contiguous()
+                            && quantScaleQkv.scalar_type() == at::ScalarType::Float && quantScaleQkv.numel() >= 1,
+                        "The FP8 MLA context quant_scale_qkv must be a contiguous CUDA float scalar.");
+                }
+            }
+            else
+            {
+                TORCH_CHECK(k.scalar_type() == p.getQueryInput().scalar_type(),
+                    "MLA context k / v must be FP8 E4M3 or have the dtype of q.");
+            }
         }
     }
     else
@@ -3205,8 +3254,7 @@ bool MLA::fillXqaParams(XQAParams& xqaParams, FmhaParams const& p, bool forConfi
             // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
             xqaParams.data_type = DATA_TYPE_E4M3;
         }
-        if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-            || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
+        if (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90)
         {
             xqaParams.multi_block_mode = false;
         }
@@ -3291,6 +3339,12 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
     {
         mla.k_buf = p.getK<T>();
         mla.v_buf = p.getV<T>();
+        mla.fp8_kv_input = p.key_input.has_value() && p.key_input->scalar_type() == torch::kFloat8_e4m3fn;
+        // `quant_scale_qkv` is a presence flag for caller-quantized FP8 Q; its value
+        // is not read on this branch. The FP8 context FMHA dequantizes Q with the
+        // kv cache dequant scale (see the context scale comment below), so the
+        // caller must have quantized `quant_q_buffer` with kv_scale_orig_quant.
+        mla.fp8_q_input = mla.fp8_kv_input && p.fwd.quant_q_buffer.has_value() && p.fwd.quant_scale_qkv.has_value();
         mla.helix_position_offsets = p.getHelixPositionOffsets();
         mla.helix_is_inactive_rank = p.getHelixIsInactiveRank();
     }
@@ -3408,6 +3462,20 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
     mla.quant_scale_kv = p.getKvScaleOrigQuant();
     mla.dequant_scale_q = p.getKvScaleQuantOrig();
     mla.dequant_scale_kv = cache_type == KvCacheDataType::NVFP4 ? nullptr : p.getKvScaleQuantOrig();
+    // The FP8 context FMHA dequantizes Q / K / V with the kv cache dequant
+    // scale: quantizeCopyInputToFp8Kernel folds dequant_scale_q / dequant_scale_kv
+    // into bmm1_scale / bmm2_scale, and the FMHA reads those. Everything that
+    // reaches it must have been quantized with the cache quant scale -- the
+    // copies the op makes of BF16 Q / K / V, and any caller-quantized FP8 k / v
+    // or `quant_q_buffer`. On the non-sparse branch `quant_scale_qkv` only flags
+    // caller-quantized FP8 Q (its value is not read), so the copies take
+    // `quant_scale_kv` here. NVFP4 keeps a unit scale: its fp8 context buffers are
+    // an uncalibrated scratch quantization (nullptr dequant above). Sparse keeps
+    // the caller's scale set above, which its fused RoPE kernel quantizes Q with.
+    if (!use_sparse_attention && cache_type == KvCacheDataType::FP8)
+    {
+        mla.quant_scale_qkv = mla.quant_scale_kv;
+    }
     mla.host_bmm1_scale = 1 / (q_scaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
     // The sparse MLA is in the absorption mode for the context phase.
     mla.absorption_mode = useSparseMLA();
@@ -3453,8 +3521,21 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
             "FP8 v buffer is required for fp8 context MLA in non-sparse mode");
 
         fmhaParams.qPtr = reinterpret_cast<void const*>(fp8QBuf);
-        fmhaParams.kPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
-        fmhaParams.vPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
+        if (useSparseMLA())
+        {
+            fmhaParams.kPtr = nullptr;
+            fmhaParams.vPtr = nullptr;
+        }
+        else if (mla.fp8_kv_input)
+        {
+            fmhaParams.kPtr = reinterpret_cast<void const*>(mla.k_buf);
+            fmhaParams.vPtr = reinterpret_cast<void const*>(mla.v_buf);
+        }
+        else
+        {
+            fmhaParams.kPtr = reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
+            fmhaParams.vPtr = reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
+        }
     }
     else
     {
@@ -3679,7 +3760,11 @@ int MLA::enqueueGeneration(FmhaParams const& p, cudaStream_t stream)
 
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
-        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
+        // A locality-domain stream runs only on its Green Context's SMs, so size the KV split for those.
+        // GQA decode stays on the device count: at small batch its kernels run faster over-split.
+        auto const streamSmCount = static_cast<int>(tensorrt_llm::locality_domain::getLocalizedStreamSmCount(stream));
+        tllmRunnerParams.mMultiProcessorCount
+            = streamSmCount > 0 ? std::min(streamSmCount, mMultiProcessorCount) : mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
         tllmRunnerParams.mSfStartTokenIdx = p.token_offset;
 
@@ -3696,6 +3781,12 @@ int MLA::enqueueGeneration(FmhaParams const& p, cudaStream_t stream)
         if (useSparseMLA())
         {
             auto const& sparseParams = feature<torch_ext::SparseMlaFeature>().params();
+            if (auto const maxCtas = p.fwd.sparse_runtime_params.max_num_ctas_per_seq_kv; maxCtas.has_value())
+            {
+                TLLM_CHECK_WITH_INFO(*maxCtas > 0 && *maxCtas <= std::numeric_limits<int32_t>::max(),
+                    "Sparse MLA max_num_ctas_per_seq_kv must be a positive int32, got %ld", *maxCtas);
+                tllmRunnerParams.mMaxNumCtasPerSeqKv = static_cast<int32_t>(*maxCtas);
+            }
             bool const useDynamicSparseMLA = sparseParams.sparse_attn_kv_lens != nullptr;
             tllmRunnerParams.mSparseAttention
                 = useDynamicSparseMLA ? SparseType::DynamicTokenSparse : SparseType::StaticTokenSparse;
@@ -4053,6 +4144,7 @@ AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
     c.sage_attn_num_elts_per_blk_k = fwd.sage_attn_num_elts_per_blk_k;
     c.sage_attn_num_elts_per_blk_v = fwd.sage_attn_num_elts_per_blk_v;
     c.sage_attn_qk_int8 = fwd.sage_attn_qk_int8;
+    c.locality_domain_id = fwd.locality_domain_id;
     c.sage_attn_smooth_k = fwd.sage_attn_smooth_k;
     c.skip_correction_threshold = attn.skip_correction_threshold;
     return c;
@@ -4100,6 +4192,7 @@ std::string AttentionBase::toString() const
     TRTLLM_DUMP_FIELD(sage_attn_num_elts_per_blk_k)
     TRTLLM_DUMP_FIELD(sage_attn_num_elts_per_blk_v)
     TRTLLM_DUMP_FIELD(sage_attn_qk_int8)
+    TRTLLM_DUMP_FIELD(locality_domain_id)
     TRTLLM_DUMP_FIELD(sage_attn_smooth_k)
     TRTLLM_DUMP_FIELD(skip_correction_threshold)
 #undef TRTLLM_DUMP_FIELD
@@ -4386,19 +4479,19 @@ std::size_t std::hash<tensorrt_llm::torch_ext::AttentionBase>::operator()(
     tensorrt_llm::torch_ext::AttentionBase const& c) const noexcept
 {
     std::size_t h = 0;
-    for (auto const v :
-        {static_cast<std::int64_t>(c.device), static_cast<std::int64_t>(c.type), std::int64_t{c.is_fp8_out},
-            std::int64_t{c.is_fp4_out}, std::int64_t{c.use_kv_cache}, std::int64_t{c.cross_attention},
-            c.tokens_per_block, static_cast<std::int64_t>(c.mask_type), std::int64_t{c.use_variable_window},
-            static_cast<std::int64_t>(c.position_embedding_type), c.num_heads, c.num_kv_heads, c.head_size,
-            c.rotary_embedding_dim, static_cast<std::int64_t>(c.quant_mode.value()), std::int64_t{c.uses_spcompress},
-            std::int64_t{c.paged_context_fmha}, std::int64_t{c.is_spec_decoding_enabled},
-            c.spec_decoding_target_max_gen_len, std::int64_t{c.fuses_dsv4_inv_rope_fp8_quant},
-            std::int64_t{c.use_sparse_attention}, std::int64_t{c.use_tllm_gen_sparse_attention},
-            std::int64_t{c.use_nvfp4_mla_kv_cache}, std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank,
-            c.qk_nope_head_dim, c.qk_rope_head_dim, c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num,
-            std::int64_t{c.rope_append}, c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k,
-            c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}})
+    for (auto const v : {static_cast<std::int64_t>(c.device), static_cast<std::int64_t>(c.type),
+             std::int64_t{c.is_fp8_out}, std::int64_t{c.is_fp4_out}, std::int64_t{c.use_kv_cache},
+             std::int64_t{c.cross_attention}, c.tokens_per_block, static_cast<std::int64_t>(c.mask_type),
+             std::int64_t{c.use_variable_window}, static_cast<std::int64_t>(c.position_embedding_type), c.num_heads,
+             c.num_kv_heads, c.head_size, c.rotary_embedding_dim, static_cast<std::int64_t>(c.quant_mode.value()),
+             std::int64_t{c.uses_spcompress}, std::int64_t{c.paged_context_fmha},
+             std::int64_t{c.is_spec_decoding_enabled}, c.spec_decoding_target_max_gen_len,
+             std::int64_t{c.fuses_dsv4_inv_rope_fp8_quant}, std::int64_t{c.use_sparse_attention},
+             std::int64_t{c.use_tllm_gen_sparse_attention}, std::int64_t{c.use_nvfp4_mla_kv_cache},
+             std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank, c.qk_nope_head_dim, c.qk_rope_head_dim,
+             c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num, std::int64_t{c.rope_append},
+             c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k, c.sage_attn_num_elts_per_blk_v,
+             std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}, c.locality_domain_id})
     {
         h = hashCombine(h, v);
     }

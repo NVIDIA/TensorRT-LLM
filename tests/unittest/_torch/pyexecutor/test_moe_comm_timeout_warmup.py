@@ -78,6 +78,9 @@ class _CaptureGraphsStub(DecoderCudaGraphs):
     def run_cuda_graph_warmup(self, resource_manager: object) -> None:
         self.passes.append((self.cuda_graph_runner.is_warmup_only, self._guard.in_warmup))
 
+    def _warm_inforward_split(self, resource_manager: object) -> None:
+        pass
+
 
 def test_warmup_scope_switches_the_timeouts_both_ways(guard: MoECommTimeoutGuard) -> None:
     proxy = _RecordingProxy()
