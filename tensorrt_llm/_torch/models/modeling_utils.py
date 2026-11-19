@@ -1668,6 +1668,13 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
 
 
 def filter_weights(prefix, weights: Dict):
+    from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+        ConsumableWeightsDict
+
+    # Called once per module, so the scan below is quadratic on a large
+    # checkpoint; a ConsumableWeightsDict answers from its key index instead.
+    if prefix and isinstance(weights, ConsumableWeightsDict):
+        return weights.filter_prefix(prefix)
     result = {}
     for k, v in weights.items():
         if k.startswith(prefix):

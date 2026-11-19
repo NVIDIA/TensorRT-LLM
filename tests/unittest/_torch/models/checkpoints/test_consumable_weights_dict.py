@@ -3,6 +3,7 @@
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
+from tensorrt_llm._torch.models.modeling_utils import filter_weights
 
 
 class _Mapper(BaseWeightMapper):
@@ -31,6 +32,7 @@ def test_filter_prefix_matches_the_scan_it_replaces():
 
     for prefix in ("model", "model.layers.1", "model.layers.10", "model.norm", "absent"):
         assert weights.filter_prefix(prefix) == _scan(plain, prefix), prefix
+        assert filter_weights(prefix, weights) == _scan(plain, prefix), prefix
 
 
 def test_filter_prefix_spans_keys_that_sort_past_the_separator():
