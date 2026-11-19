@@ -1235,6 +1235,8 @@ def run_disaggregated_test(example_dir,
                                  "overlap_transceiver_runtime_python_bounce"))
 
     server_host = config.get("hostname", "localhost")
+    # The client gets the same budget as the readiness wait in
+    # setup_disagg_cluster: both resolve it from this post-override config.
     server_start_timeout = resolve_server_start_timeout(config,
                                                         server_start_timeout)
 

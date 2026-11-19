@@ -14,9 +14,10 @@
 # limitations under the License.
 """GPU-free unit tests for the disaggregated readiness budget.
 
-setup_disagg_cluster picks its readiness budget from the config when the
-caller passes none, so every pipeline-parallel config gets the longer budget
-without each test having to ask for it. Run with:
+setup_disagg_cluster picks its readiness budget from the config and the GPU
+when the caller passes none: 900s for a pipeline-parallel config on an
+SM100-family GPU, 300s otherwise. The expected budgets are written out as
+numbers so that a change to either constant fails here. Run with:
 
     pytest -sv disaggregated/test_server_start_timeout.py
 """
@@ -25,61 +26,85 @@ from pathlib import Path
 
 import pytest
 import yaml
-from disagg_test_utils import (
-    DEFAULT_SERVER_START_TIMEOUT,
-    PP_DISAGG_SERVER_START_TIMEOUT,
-    resolve_server_start_timeout,
-)
+from disagg_test_utils import resolve_server_start_timeout
 
 _TEST_CONFIGS = Path(__file__).parent / "test_configs"
 
 
 def _config(ctx_pp: int, gen_pp: int) -> dict:
     return {
-        "context_servers": {
-            "tensor_parallel_size": 1,
-            "pipeline_parallel_size": ctx_pp,
-        },
-        "generation_servers": {
-            "tensor_parallel_size": 1,
-            "pipeline_parallel_size": gen_pp,
-        },
+        "context_servers": {"tensor_parallel_size": 1, "pipeline_parallel_size": ctx_pp},
+        "generation_servers": {"tensor_parallel_size": 1, "pipeline_parallel_size": gen_pp},
     }
 
 
-@pytest.mark.parametrize("ctx_pp, gen_pp", [(2, 1), (1, 2), (4, 4)])
-def test_pipeline_parallel_config_gets_pp_budget(ctx_pp, gen_pp):
-    assert (
-        resolve_server_start_timeout(_config(ctx_pp, gen_pp), None)
-        == PP_DISAGG_SERVER_START_TIMEOUT
-    )
+@pytest.mark.parametrize(
+    "config, sm_version",
+    [
+        pytest.param(_config(2, 1), 100, id="ctx_pp2-sm100"),
+        pytest.param(_config(1, 2), 103, id="gen_pp2-sm103"),
+        pytest.param(_config(4, 4), 107, id="pp4-sm107"),
+    ],
+)
+def test_pp_on_sm100_family_gets_900s(config, sm_version):
+    assert resolve_server_start_timeout(config, None, sm_version) == 900
 
 
-def test_non_pp_config_gets_default_budget():
-    assert resolve_server_start_timeout(_config(1, 1), None) == DEFAULT_SERVER_START_TIMEOUT
+@pytest.mark.parametrize("sm_version", [90, 120], ids=["sm90", "sm120"])
+def test_pp_on_other_gpus_gets_300s(sm_version):
+    assert resolve_server_start_timeout(_config(4, 4), None, sm_version) == 300
 
 
-def test_missing_server_sections_get_default_budget():
-    assert resolve_server_start_timeout({}, None) == DEFAULT_SERVER_START_TIMEOUT
+def test_non_pp_config_gets_300s():
+    assert resolve_server_start_timeout(_config(1, 1), None, 100) == 300
 
 
-@pytest.mark.parametrize("config", [_config(1, 1), _config(4, 4)], ids=["no_pp", "pp4"])
-def test_explicit_budget_wins(config):
-    assert resolve_server_start_timeout(config, 1200) == 1200
+def test_missing_server_sections_get_300s():
+    assert resolve_server_start_timeout({}, None, 100) == 300
+
+
+def test_top_level_pp_applies_to_servers_without_their_own():
+    config = {"pipeline_parallel_size": 2, "context_servers": {}, "generation_servers": {}}
+    assert resolve_server_start_timeout(config, None, 100) == 900
+
+
+def test_server_pp_overrides_top_level_pp():
+    config = {
+        "pipeline_parallel_size": 2,
+        "context_servers": {"pipeline_parallel_size": 1},
+        "generation_servers": {"pipeline_parallel_size": 1},
+    }
+    assert resolve_server_start_timeout(config, None, 100) == 300
 
 
 @pytest.mark.parametrize(
-    "config_name",
+    "config, explicit",
     [
-        "disagg_config_ctxpp2_genpp2.yaml",
-        "disagg_config_ctxtp2_genpp2.yaml",
-        "disagg_config_ctxpp2_gentp2.yaml",
-        "disagg_config_ctxpp4_gentp4.yaml",
-        "disagg_config_ctxpp4_genpp4.yaml",
-        "disagg_config_ctxtp2pp2_gentp2pp2.yaml",
-        "disagg_config_overlap_gen_first_pp4.yaml",
+        pytest.param(_config(4, 4), 600, id="pp4-below_pp_budget"),
+        pytest.param(_config(1, 1), 1200, id="no_pp-above_default"),
     ],
 )
-def test_qwen3_pp_test_configs_get_pp_budget(config_name):
-    config = yaml.safe_load((_TEST_CONFIGS / config_name).read_text())
-    assert resolve_server_start_timeout(config, None) == PP_DISAGG_SERVER_START_TIMEOUT
+def test_explicit_budget_wins(config, explicit):
+    assert resolve_server_start_timeout(config, explicit, 100) == explicit
+
+
+def test_every_test_config_follows_pp_rule():
+    """Each checked-in disagg config gets 900s on SM100 exactly when a server section uses PP."""
+    mismatches = []
+    num_pp = 0
+    for path in sorted(_TEST_CONFIGS.glob("*.yaml")):
+        config = yaml.safe_load(path.read_text())
+        if not isinstance(config, dict):
+            continue
+        uses_pp = any(
+            (config.get(servers) or {}).get("pipeline_parallel_size", 1) > 1
+            for servers in ("context_servers", "generation_servers")
+        )
+        num_pp += uses_pp
+        expected = 900 if uses_pp else 300
+        actual = resolve_server_start_timeout(config, None, 100)
+        if actual != expected:
+            mismatches.append(f"{path.name}: {actual}s, expected {expected}s")
+    assert not mismatches, "\n".join(mismatches)
+    # The Qwen3-0.6B and DeepSeek-V3-Lite PP configs; guards against an empty glob.
+    assert num_pp >= 10

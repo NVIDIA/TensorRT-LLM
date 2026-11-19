@@ -31,6 +31,7 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
+from defs.conftest import is_sm_100f
 
 from tensorrt_llm.logger import logger
 
@@ -41,29 +42,45 @@ INACTIVE_TIMEOUT = 2
 CHECK_STATUS_INTERVAL = 3
 
 # Readiness budgets for a disaggregated cluster when the caller passes none.
-# Pipeline parallelism on SM100/SM103/SM107 enables the CuTe DSL BF16 GEMM/BMM
-# (see TorchLlmArgs.validate_cute_dsl_bf16), whose autotuning JIT-compiles
-# kernels on every rank. With cold caches, readiness of the Qwen3-0.6B PP
-# configurations then takes 350-650s on 4-8 Blackwell or Rubin GPUs.
+# Pipeline parallelism on the SM100 family (SM100/SM103/SM107) enables the
+# CuTe DSL BF16 GEMM/BMM (see TorchLlmArgs.validate_cute_dsl_bf16), whose
+# autotuning JIT-compiles kernels on every rank. With cold caches, readiness of
+# the Qwen3-0.6B PP configurations then takes 350-650s on 4-8 Blackwell or
+# Rubin GPUs. Other GPUs keep the default, so a PP cluster that never comes up
+# there still fails after 300s.
 DEFAULT_SERVER_START_TIMEOUT = 300
 PP_DISAGG_SERVER_START_TIMEOUT = 900
 
 
-def resolve_server_start_timeout(config: dict, server_start_timeout: int | None) -> int:
+def _uses_pipeline_parallelism(config: dict) -> bool:
+    """Whether the context or generation workers of a disagg config run with PP > 1.
+
+    A server section without its own ``pipeline_parallel_size`` inherits the
+    top-level value, as in ``build_worker_config``.
+    """
+    top_level_pp = config.get("pipeline_parallel_size", 1)
+    return any(
+        (config.get(servers) or {}).get("pipeline_parallel_size", top_level_pp) > 1
+        for servers in ("context_servers", "generation_servers")
+    )
+
+
+def resolve_server_start_timeout(
+    config: dict, server_start_timeout: int | None, sm_version: int | None = None
+) -> int:
     """Return the readiness budget for a disagg config.
 
     An explicit ``server_start_timeout`` wins. Otherwise a config whose context
-    or generation servers use pipeline parallelism gets
-    ``PP_DISAGG_SERVER_START_TIMEOUT`` and any other config gets
-    ``DEFAULT_SERVER_START_TIMEOUT``.
+    or generation workers use pipeline parallelism gets
+    ``PP_DISAGG_SERVER_START_TIMEOUT`` on an SM100-family GPU, and every other
+    case gets ``DEFAULT_SERVER_START_TIMEOUT``. ``sm_version`` defaults to the
+    local GPU's.
     """
     if server_start_timeout is not None:
         return server_start_timeout
-    uses_pp = any(
-        (config.get(servers) or {}).get("pipeline_parallel_size", 1) > 1
-        for servers in ("context_servers", "generation_servers")
-    )
-    return PP_DISAGG_SERVER_START_TIMEOUT if uses_pp else DEFAULT_SERVER_START_TIMEOUT
+    if _uses_pipeline_parallelism(config) and is_sm_100f(sm_version):
+        return PP_DISAGG_SERVER_START_TIMEOUT
+    return DEFAULT_SERVER_START_TIMEOUT
 
 
 class ProcessWrapper:
