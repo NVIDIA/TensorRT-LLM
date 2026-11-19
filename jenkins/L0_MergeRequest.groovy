@@ -2022,6 +2022,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/unittest/_torch/attention/multi_gpu/",
         "tests/unittest/_torch/distributed/test_nccl_profiler.py",
+        "tests/unittest/bindings/test_nanobind_profiler.py",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/moe/multi_gpu/",
         "tests/unittest/kv_cache_manager_v2_tests/",
