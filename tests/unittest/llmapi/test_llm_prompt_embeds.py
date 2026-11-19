@@ -239,15 +239,18 @@ def test_v1_reuse_scoped_to_embeddings(model_dir: str, table: torch.Tensor) -> N
         max_batch_size=4,
     ) as v1:
         ids = _token_ids(v1, [LONG_PROMPT])[0]
+        other_ids = _token_ids(v1, [LONG_PROMPT.replace("box", "crate")])[0]
+        n = min(len(ids), len(other_ids))
+        ids, other_ids = ids[:n], other_ids[:n]
         salt = uuid.uuid4().hex
-        expected = _run(v1, [ids], salt)[0]
-        request = {"prompt_token_ids": ids, "prompt_embeds": table[torch.tensor(ids)]}
-        first = v1.generate([request], _greedy(), cache_salt=salt)[0]
-        assert list(first.outputs[0].token_ids) == expected
-        assert first.cached_tokens == 0
-        second = v1.generate([request], _greedy(), cache_salt=salt)[0]
-        assert list(second.outputs[0].token_ids) == expected
-        assert second.cached_tokens > 0
+        # Same placeholder ids and user salt, two row payloads.
+        payloads = [(ids, _run(v1, [ids], salt)[0]), (other_ids, _run(v1, [other_ids])[0])]
+        for repeat in (False, True):
+            for rows, expected in payloads:
+                request = {"prompt_token_ids": ids, "prompt_embeds": table[torch.tensor(rows)]}
+                out = v1.generate([request], _greedy(), cache_salt=salt)[0]
+                assert list(out.outputs[0].token_ids) == expected
+                assert (out.cached_tokens > 0) == repeat
 
 
 def test_reuse_with_embedding_final_token(llm: LLM, table: torch.Tensor) -> None:
