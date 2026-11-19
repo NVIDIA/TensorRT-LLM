@@ -1209,7 +1209,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         return (
             EncoderGroup(("image",), self._encode_vision),
             EncoderGroup(("video",), self._encode_vision),
-            EncoderGroup(("audio",), self._get_audio_features),
+            # The audio tower runs every padded frame, and a clip costs its request's padded
+            # width (`_audio_item_lengths`), so requests of other widths are encoded apart.
+            EncoderGroup(("audio",), self._get_audio_features, pad_payloads=False),
         )
 
     def _encode_vision(

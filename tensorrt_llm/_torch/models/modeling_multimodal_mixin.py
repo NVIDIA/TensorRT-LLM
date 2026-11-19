@@ -148,6 +148,13 @@ class EncoderGroup:
     `pixel_values` batch of image rows then video rows, so the encoder needs
     no device concatenation of the two."""
 
+    pad_payloads: bool = True
+    """Whether one call may pad item tensors of different payloads to the
+    largest. False encodes payloads whose item tensors differ in size in
+    separate calls, for encoders that run every padded position (for example
+    an audio tower over padded frames), so a call is never wider than the
+    payloads the scheduler charged for it."""
+
     def __post_init__(self) -> None:
         if self.build_batched_input is None:
             # Frozen dataclasses require object.__setattr__ during construction.
@@ -296,17 +303,25 @@ def _device_policy(
     return named.get(key, named.get(""))
 
 
+def _item_sizes(value: torch.Tensor, axis: int) -> Tuple[int, ...]:
+    """The sizes of a tensor's dims other than its item axis."""
+    axis %= value.dim()
+    return tuple(value.shape[:axis]) + tuple(value.shape[axis + 1 :])
+
+
 def _share_one_call(
     fields: Dict[str, List[Any]],
     same_keys: bool,
     device_keys: Optional[Mapping[str, Mapping[str, bool]]] = None,
+    pad_payloads: bool = True,
 ) -> bool:
     """Whether gathered payloads can share one encoder call, the usual case.
 
     One check per key: its payloads share an item axis and padding value,
     shared values are one object or equal records, item values are tensors
     of one dtype or all lists, and tensors, shared ones too, are all bound
-    for the GPU or all kept on the host (`_device_policy`). Otherwise
+    for the GPU or all kept on the host (`_device_policy`). Without
+    `pad_payloads`, item tensors also have one size. Otherwise
     `_call_units` decides how to split, which also covers shared tensors
     that are not one object.
     """
@@ -325,6 +340,12 @@ def _share_one_call(
                 ):
                     return False
         elif len({getattr(value, "dtype", None) for value in values}) > 1:
+            return False
+        elif (
+            not pad_payloads
+            and isinstance(first, torch.Tensor)
+            and len({_item_sizes(value, axis) for value in values}) > 1
+        ):
             return False
         if (
             device_keys
@@ -354,12 +375,14 @@ def _payload_signature(
     modality: str,
     batch_as: Optional[Mapping[str, str]] = None,
     device_keys: Optional[Mapping[str, Mapping[str, bool]]] = None,
+    pad_payloads: bool = True,
 ) -> Dict[str, Tuple[Any, ...]]:
     """What payloads in one encoder call must share, per present declared key.
 
-    Item tensors of one call share their dtype, and tensors, shared ones too,
-    share whether the device paths send them to the GPU (`_device_policy`),
-    so a key made on the GPU never takes a value the owner keeps on the host.
+    Item tensors of one call share their dtype (and, without `pad_payloads`,
+    their size), and tensors, shared ones too, share whether the device paths
+    send them to the GPU (`_device_policy`), so a key made on the GPU never
+    takes a value the owner keeps on the host.
     """
     data = param.multimodal_data[modality]
     signature = {}
@@ -375,6 +398,8 @@ def _payload_signature(
             signature[name] = ("shared", value, on_host)
         elif isinstance(value, torch.Tensor):
             signature[name] = ("tensor", value.dtype, on_host)
+            if not pad_payloads:
+                signature[name] += (_item_sizes(value, partition.item_axis),)
         else:
             signature[name] = ("items",)
     return signature
@@ -423,7 +448,8 @@ def _call_units(
 
     Returns `(params, payloads)` per call, payloads being `(modality, request
     index)` in the group layout. Payloads of one call agree on every shared
-    value and tensor dtype of a key, and payloads of one modality provide the
+    value and tensor dtype of a key (and tensor size, without
+    `EncoderGroup.pad_payloads`), and payloads of one modality provide the
     same keys. If they all agree, there is one call over `params` unchanged;
     otherwise each call gets views of the requests that hold only its
     payloads. Only groups with the default builder are split.
@@ -434,7 +460,9 @@ def _call_units(
         for index, param in enumerate(params):
             if param.multimodal_data.get(modality) is None:
                 continue
-            signature = _payload_signature(param, modality, group.batch_as, device_keys)
+            signature = _payload_signature(
+                param, modality, group.batch_as, device_keys, group.pad_payloads
+            )
             for unit in units:  # First unit the payload fits, else a new one.
                 by_modality, by_key, _ = unit
                 known = by_modality.get(modality)
@@ -494,7 +522,7 @@ def _encode_group(
     if not _uses_default_builder(group):
         return group.encoder_fn(**group.build_batched_input(params))
     fields, same_keys = _gather_fields(group.modalities, params, group.batch_as)
-    if _share_one_call(fields, same_keys, device_keys):
+    if _share_one_call(fields, same_keys, device_keys, group.pad_payloads):
         return group.encoder_fn(**_batch_fields(fields, device_keys))
     calls = _call_units(group, params, device_keys)
     outputs = [
@@ -636,8 +664,9 @@ def encode_multimodal_by_groups(
     per-modality using the prompt-ordered output lengths in
     `MultimodalItemMetadata`, and reorder them by the same metadata's
     `item_refs`. With the default builder, payloads whose shared values or
-    tensor dtypes differ are encoded in separate calls, and their rows are
-    put back in the group layout first.
+    tensor dtypes differ (or tensor sizes, in a group that does not pad
+    payloads) are encoded in separate calls, and their rows are put back in
+    the group layout first.
 
     Shared entry point for both the aggregated (`MultimodalModelMixin`) and
     mm-encoder-only (`Qwen3VisionModelBase.forward`) paths so the ordering

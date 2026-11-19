@@ -541,6 +541,29 @@ class TestEncodeByGroups:
         assert out.dtype == torch.float32
         assert out[:, 0].tolist() == [0.5, 0.5, 2.5, 2.5, 2.5, 3.0]
 
+    @pytest.mark.parametrize("pad_payloads", [True, False])
+    def test_a_group_that_does_not_pad_encodes_each_size_apart(self, pad_payloads):
+        calls = []
+
+        def encode(frames):
+            calls.append(tuple(frames.shape))
+            return frames.sum(dim=1, keepdim=True)
+
+        group = EncoderGroup(("audio",), encode, pad_payloads=pad_payloads)
+        partitions = {"audio": {"frames": MultimodalItemPartition()}}
+        params = [
+            _request(
+                [("audio", index, 1) for index in range(clips)],
+                {"audio": {"frames": torch.full((clips, width), float(marker))}},
+                partitions,
+            )
+            for marker, clips, width in ((1, 1, 4), (2, 2, 2), (3, 1, 4), (4, 1, 2))
+        ]
+        out = encode_multimodal_by_groups([group], params)
+        # Padding to the widest payload, or one call per width, never wider than its payloads.
+        assert calls == ([(5, 4)] if pad_payloads else [(2, 4), (3, 2)])
+        assert out[:, 0].tolist() == [4.0, 4.0, 4.0, 12.0, 8.0]
+
     def test_own_builder_gets_the_original_params_in_one_call(self):
         received = []
 

@@ -2290,6 +2290,11 @@ def _audio_request(clip_frames, seed=0):
             [("audio", [37, 5]), ("audio", [16]), ("audio", [64, 64, 3])], 0, id="audio_only"
         ),
         pytest.param(
+            [("audio", [37, 5]), ("audio", [16, 3]), ("audio", [37]), ("audio", [9, 16])],
+            0,
+            id="audio_same_widths",
+        ),
+        pytest.param(
             [("image", [36]), ("audio", [21, 40]), ("image", [18, 9])], 1, id="image_audio"
         ),
         pytest.param(
@@ -2307,7 +2312,8 @@ def _audio_request(clip_frames, seed=0):
     ],
 )
 def test_gemma4_groups_match_per_request_encoding(requests, vision_calls):
-    """Each modality makes one call across requests; rows equal the per-request encode."""
+    """Each modality makes one call across requests (audio: one per padded width); rows equal
+    the per-request encode."""
     model = _Gemma4CpuEncoder()
     params = [
         _audio_request(spec[1], seed=index)
@@ -2322,11 +2328,14 @@ def test_gemma4_groups_match_per_request_encoding(requests, vision_calls):
     actual = model.encode_multimodal_inputs(params)
 
     assert model.vision_tower.calls == vision_calls
-    # The group pads features with zeros and masks with False before one audio call.
+    # Requests whose clips share a padded width share one audio call; no call is wider than
+    # its requests, since the audio tower runs every padded frame.
     audio_frames = [frames for spec in requests if spec[0] == "audio" for frames in spec[1]]
-    assert len(model.audio_calls) == (1 if audio_frames else 0)
-    if audio_frames:
-        assert model.audio_calls == [(len(audio_frames), max(audio_frames))]
+    clips_by_width = {}
+    for spec in requests:
+        if spec[0] == "audio":
+            clips_by_width[max(spec[1])] = clips_by_width.get(max(spec[1]), 0) + len(spec[1])
+    assert model.audio_calls == [(clips, width) for width, clips in clips_by_width.items()]
     if audio_frames:
         torch.testing.assert_close(actual, torch.cat(expected), rtol=1e-5, atol=1e-5)
     else:
@@ -2385,7 +2394,27 @@ def test_gemma4_audio_padding_matches_legacy(missing_mask):
         _declare_gemma4_partitions(param)
     model.audio_calls.clear()
     actual = model.encode_multimodal_inputs(params)
-    assert model.audio_calls == [(3 if not missing_mask else 2, 37)]
+    # Each request keeps its own width: 13 frames, then 37.
+    assert model.audio_calls == [(2 if not missing_mask else 1, 13), (1, 37)]
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.cpu_only
+def test_gemma4_audio_calls_run_only_the_charged_frames():
+    """A long clip next to short clips of other requests: no call pads a clip to another
+    request's width, so the tower runs the subsampled frames the scheduler charged, no more."""
+    model = _Gemma4CpuEncoder()
+    params = [_audio_request([256])] + [_audio_request([32], seed=seed) for seed in range(1, 9)]
+    expected = torch.cat([model.encode_like_legacy(param) for param in params])
+    model.audio_calls.clear()
+
+    actual = model.encode_multimodal_inputs(params)
+
+    # One 256-frame call and one 32-frame call, not nine clips padded to 256.
+    assert model.audio_calls == [(1, 256), (8, 32)]
+    charged = sum(sum(param.item_metadata.encoder_token_lengths) for param in params)
+    run = sum(clips * len(range(0, frames, 4)) for clips, frames in model.audio_calls)
+    assert run == charged == 64 + 8 * 8
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
