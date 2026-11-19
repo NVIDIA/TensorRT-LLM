@@ -68,8 +68,8 @@ def build_h3_vsa_metadata(segments, sparsity, device):
 
 
 def _cutedsl_fine(q, k, v, selected, metadata):
-    from ....cute_dsl_kernels.blackwell.video_sparse_attention.interface import (
-        block_sparse_attn_from_indices_cute,
+    from ....catalog.attention.block_sparse_attention import (
+        block_sparse_attention,
         is_cute_supported,
     )
 
@@ -101,7 +101,7 @@ def _cutedsl_fine(q, k, v, selected, metadata):
     restore = torch.arange(ntiles, device=q.device)
     restore[prefix:] += prefix % 2
     queries = q.view(batch, ntiles, 64, heads, -1).index_select(1, query_tiles).flatten(1, 2)
-    fine, _ = block_sparse_attn_from_indices_cute(
+    fine, _ = block_sparse_attention(
         *[x.transpose(1, 2).contiguous() for x in (queries, k, v)],
         q2k_idx=indices.index_select(2, query_tiles),
         q2k_num=counts.index_select(2, query_tiles),

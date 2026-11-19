@@ -36,10 +36,13 @@ Choose the boundary case by case. A target can specialize only the transformer a
 | --- | --- | --- |
 | One target | The target directory, including its local operations or kernels | Base Ref2VA conditioning and its TP text encoder, or FastH3's trained schedule |
 | Sibling H3 targets with the same contract | The H3 family | Packed rows, transformer blocks, attention modules and H3 parallel layouts. Targets import from the family and evolve independently of sibling targets. |
-| Different model families with the same operation contract | The [Modeling V2 catalog](../../../modeling_v2/catalog/) | A communication op selects a custom kernel or a general implementation given its inputs, layout and device capabilities. Each family retains its own attention and parallel composition. |
+| Multiple VisualGen families or backends consuming the same VisualGen-specific kernel contract | The [VisualGen catalog](../../catalog/) | H3 V2 and the existing VisualGen VSA backend share fine block-sparse attention over explicit KV tile indices. |
+| Domain-independent operations, including operations shared with LLM models | The [Modeling V2 catalog](../../../modeling_v2/catalog/) | Reuse existing attention and GEMM entries such as `thop_attention` and `cublas_mm`. |
 | Runtime services | The existing VisualGen runtime | Checkpoint discovery, process groups, executor and lifecycle interfaces |
 
-For example, H3 orders its asynchronous Ulysses transfers V, Q, K and joins them before attention. The [communication ops](../../../modeling_v2/catalog/comm/ulysses.py) select a packed exchange with a fused layout kernel or the general collective path. A second family can reuse that operation while scheduling its projections differently. For attention, share an operation when tensor layout, masking and precision agree. Keep the model's projections, positional encoding and attention policy in the family. See the [LLM Modeling V2 guide](../../../modeling_v2/README.md).
+**Attention.** Put a thin kernel entry in the VisualGen catalog when both callers can supply the same tensors, layout and explicit metadata. The [block-sparse attention op](../../catalog/attention/block_sparse_attention.py) takes head-major Q/K/V, selected KV tile indices, route counts, valid KV tile lengths and an optional scale. It returns attention output and logsumexp. [H3](ops/vsa.py) builds mixed-modality routes and applies its learned gate. The [VisualGen VSA backend](../../attention/backends/sparse/vsa/backend.py) supplies its predictor's routes and chooses its fallback. Both call the same CuTe kernel through the catalog. Keep whole attention modules, projections, checkpoint policy and model-specific masking in their families. Call a library operation such as PyTorch SDPA directly when it already provides the required interface.
+
+**Communication.** H3 orders its asynchronous Ulysses transfers V, Q, K and joins them before attention. The [communication ops](../../../modeling_v2/catalog/comm/ulysses.py) select a packed exchange with a fused layout kernel or the general collective path. A second family can reuse an operation while scheduling its projections differently. Both catalogs follow the same stateless `OpWrapper`, PyTorch reference and test-cell conventions. See the [LLM Modeling V2 guide](../../../modeling_v2/README.md).
 
 ## File map
 
@@ -83,7 +86,7 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 | [ops/rope.py](ops/rope.py) | Apply partial rotary embedding and expose fused Q/K norm and RoPE. |
 | [ops/trtllm_attention.py](ops/trtllm_attention.py) | Pack Q/K/V and issue TRTLLM attention with H3 masks and sparse routes. |
 | [ops/trtllm_attention_prims.py](ops/trtllm_attention_prims.py) | Maintain contiguous attention plans and quantization state for an H3 instance. |
-| [ops/vsa.py](ops/vsa.py) | Build tile metadata and run mixed-modality video sparse attention. |
+| [ops/vsa.py](ops/vsa.py) | Build H3 tile routes, run fine attention and combine it with coarse attention through the learned gate. |
 | [kernels/fused_adaln.py](kernels/fused_adaln.py) | Implement and register H3's fused AdaLN Triton kernels. |
 | [kernels/fused_rope.py](kernels/fused_rope.py) | Implement and register fused BF16 Q/K normalization and RoPE. |
 
@@ -91,6 +94,6 @@ Use the `trtllm::minimax_h3_v2_` prefix for H3 V2 Python-registered Triton ops s
 
 ## Test a change
 
-Mirror family and target code in the [unit tests](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/) and give each routed target a [whole-pipeline quality case](../../../../../tests/integration/defs/visual_gen/minimax_h3_v2/). A target change exercises that target. A shared family change exercises its consumers. Registry changes exercise both checkpoint targets and both switch settings. A catalog change exercises its category and consuming families.
+Mirror family and target code in the [unit tests](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/) and give each routed target a [whole-pipeline quality case](../../../../../tests/integration/defs/visual_gen/minimax_h3_v2/). Mirror VisualGen catalog entries under [visual_gen/catalog/ in the unit tests](../../../../../tests/unittest/_torch/visual_gen/catalog/), and compare each kernel with its reference on the declared cells. A target change exercises that target. A shared family change exercises its consumers. Registry changes exercise both checkpoint targets and both switch settings. A VisualGen catalog change also exercises its consuming model and backend paths.
 
 For V1/V2 comparisons, use the same checkpoint revision, seed, inputs, precision, backend, topology and explicit step count. Use 50 points on both sides for the base-H3 quality reference and test omitted defaults separately. Before retiring V1 and the opt-in switch, qualify generated video and audio, supported parallel paths, warmed latency and peak memory against V1 on representative deployments.

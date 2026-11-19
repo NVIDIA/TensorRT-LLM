@@ -19,7 +19,7 @@ plus the public API surface at `tensorrt_llm/visual_gen/` and the media
 helpers at `tensorrt_llm/media/`.
 
 For families with a routing module, narrow to mirrored tests and importing targets.
-Catalog-only changes are traced through the LLM and VisualGen source trees.
+Modeling V2 catalog entries are traced through the LLM and VisualGen source trees.
 
 Block membership:
 VisualGen does NOT have its own `condition.terms.backend`; VG test
@@ -68,6 +68,9 @@ _VG_SRC_PREFIXES: tuple[str, ...] = (
 )
 
 _VG_SCHEMA_PATH = "tensorrt_llm/schemas/trtllm-serve-visual-gen-config.schema.json"
+_CATALOG = "tensorrt_llm/_torch/modeling_v2/catalog/"
+_VG_CATALOG = "tensorrt_llm/_torch/visual_gen/catalog/"
+_CATALOG_CONTRACT_TEST = "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py"
 _SCHEMA_TEST_TARGET = "unittest/llmapi/test_trtllm_serve_config_schemas.py"
 
 # These packages expose shared protocol and media dependencies to serving.
@@ -132,7 +135,7 @@ def _is_vg_claim(path: str) -> bool:
     referenced by `tests/unittest/_torch/visual_gen/`), so edits to
     them must still force VG stages.
     """
-    if path == _VG_SCHEMA_PATH:
+    if path in (_VG_SCHEMA_PATH, _CATALOG + "_op.py"):
         return True
     if not path.startswith(_VG_SRC_PREFIXES):
         return False
@@ -150,7 +153,6 @@ def _vg_entries(block) -> list[str]:
 
 
 _MODELS = "tensorrt_llm/_torch/visual_gen/models/"
-_CATALOG = "tensorrt_llm/_torch/modeling_v2/catalog/"
 _VG_UNIT = "unittest/_torch/visual_gen/models"
 _VG_QUALITY = "visual_gen"
 
@@ -252,18 +254,25 @@ class VisualGenRule(Rule):
         outward = {f for f in claimed if f.startswith(_VG_OUTWARD_PREFIXES)}
 
         block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
-        schema_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
+        required_checks = {}
+        if _VG_SCHEMA_PATH in claimed:
+            required_checks[_SCHEMA_TEST_TARGET] = "schema"
+        if any(path.startswith(_VG_CATALOG) for path in claimed):
+            required_checks[_CATALOG_CONTRACT_TEST] = "catalog contract"
+        check_filters_by_target: dict[str, dict[tuple[str, int], dict[str, set[str]]]] = {
+            check: {} for check in required_checks
+        }
         for block in self.yaml_index.blocks:
             entries = _vg_entries(block)
             if not all_vg:
                 entries = _kept_entries(entries, selected)
-            if _VG_SCHEMA_PATH in claimed:
+            for check, filters in check_filters_by_target.items():
                 for entry in block.tests:
-                    if _covers_check(entry, _SCHEMA_TEST_TARGET):
+                    if _covers_check(entry, check):
                         key = (block.yaml_stem, block.block_index)
-                        schema_filters.setdefault(key, {}).setdefault(
-                            _entry_target(entry), set()
-                        ).add(entry)
+                        filters.setdefault(key, {}).setdefault(_entry_target(entry), set()).add(
+                            entry
+                        )
             if not entries:
                 continue
             key = (block.yaml_stem, block.block_index)
@@ -336,19 +345,17 @@ class VisualGenRule(Rule):
             affected |= resolve_affected_stages(
                 shared_filters, self.yaml_index, self._stages_by_yaml
             )
-        if _VG_SCHEMA_PATH in claimed:
-            schema_stages = resolve_affected_stages(
-                schema_filters, self.yaml_index, self._stages_by_yaml
-            )
-            if not schema_stages:
+        for check, filters in check_filters_by_target.items():
+            check_stages = resolve_affected_stages(filters, self.yaml_index, self._stages_by_yaml)
+            if not check_stages:
                 return RuleResult(
                     handled_files=claimed,
                     affected_stages=set(),
                     scope=None,
-                    reason="visualgen: schema validation stages unavailable — fallback",
+                    reason=f"visualgen: {required_checks[check]} validation stages unavailable — fallback",
                 )
-            affected |= schema_stages
-            for key, prefixes in schema_filters.items():
+            affected |= check_stages
+            for key, prefixes in filters.items():
                 for target, entries in prefixes.items():
                     block_filters.setdefault(key, {}).setdefault(target, set()).update(entries)
         perfsanity_relevant = bool(outward) or any(is_perf_stem(stem) for stem, _ in block_filters)

@@ -34,12 +34,12 @@ from .predictor import VSAForwardInputs, VSAPredictor, vsa_post_process
 
 _vsa_import_error = None
 try:
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
-        block_sparse_attn_from_indices_cute,
+    from tensorrt_llm._torch.visual_gen.catalog.attention.block_sparse_attention import (
+        block_sparse_attention,
         is_cute_supported,
     )
 except (ImportError, OSError) as error:
-    block_sparse_attn_from_indices_cute = None
+    block_sparse_attention = None
     is_cute_supported = None
     _vsa_import_error = error
 
@@ -293,7 +293,7 @@ class VSACuTeDSLAttention(CuTeDSLAttention):
             dtype=torch.int32,
             device=inputs.q.device,
         )
-        output_hnd, _lse = block_sparse_attn_from_indices_cute(
+        output_hnd, _lse = block_sparse_attention(
             q_hnd,
             k_hnd,
             v_hnd,

@@ -12,7 +12,7 @@ import pytest
 from click.testing import CliRunner
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Block, Stage, YAMLIndex
+from cbts.blocks import Block, Stage, YAMLIndex, parse_stages_from_groovy
 from cbts.command.main import Selector, _load_pr_inputs, main
 from cbts.rules.base import PRInputs
 from cbts.rules.python_formatting import PythonFormattingRule, is_formatting_only_change
@@ -314,7 +314,10 @@ def test_public_api_post_merge_can_use_post_merge_validation() -> None:
 @pytest.mark.parametrize(
     ("changed", "expected"),
     [
-        ("tensorrt_llm/_torch/modeling_v2/catalog/_op.py", {"default_pipeline", "fasth3", "ops"}),
+        (
+            "tensorrt_llm/_torch/modeling_v2/catalog/_op.py",
+            {"default_pipeline", "fasth3", "ops", "legacy"},
+        ),
         ("tensorrt_llm/_torch/modeling_v2/catalog/attention/core.py", {"fasth3", "ops"}),
         ("tensorrt_llm/_torch/modeling_v2/catalog/comm/ulysses.py", {"default_pipeline", "fasth3"}),
         ("tensorrt_llm/_torch/visual_gen/models/minimax_h3_v2/ops/vsa.py", {"fasth3", "ops"}),
@@ -365,6 +368,7 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
         },
         "fasth3": {f"{unit}/fasth3/test_pipeline.py", f"{quality}/fasth3/test_quality.py"},
         "ops": {f"{unit}/ops/test_vsa.py"},
+        "legacy": {"visual_gen/test_unrelated.py", "examples/visual_gen/test_minimax_h3_e2e.py"},
     }
     index = YAMLIndex()
     index.blocks = [
@@ -372,11 +376,7 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
             "l0_b200",
             0,
             {},
-            [
-                *set.union(*entries.values()),
-                "visual_gen/test_unrelated.py",
-                "examples/visual_gen/test_minimax_h3_e2e.py",
-            ],
+            sorted(set.union(*entries.values())),
         )
     ]
     rule = VisualGenRule(index, {}, tmp_path)
@@ -402,4 +402,21 @@ def test_h3_shared_quality_changes_select_v1_and_v2_entrypoints():
         "visual_gen/minimax_h3_v2/default_pipeline/test_loading.py",
         "visual_gen/minimax_h3_v2/default_pipeline/test_parallel_quality.py",
         "visual_gen/minimax_h3_v2/default_pipeline/test_quality.py",
+    } <= selected
+
+
+def test_visualgen_catalog_selects_block_sparse_attention_and_its_consumers():
+    index = YAMLIndex.load(REPO_ROOT / "tests/integration/test_lists/test-db")
+    stages = parse_stages_from_groovy(REPO_ROOT / "jenkins/L0_Test.groovy")
+    rule = VisualGenRule(index, stages, REPO_ROOT)
+    changed = "tensorrt_llm/_torch/visual_gen/catalog/attention/block_sparse_attention.py"
+    result = rule.apply(PRInputs([changed], {}))
+    assert result is not None and result.scope == "visualgenonly"
+    selected = {path for filters in result.block_filters.values() for path in filters}
+    assert {
+        "unittest/_torch/modeling_v2/test_modeling_v2_contracts.py",
+        "unittest/_torch/visual_gen/catalog/attention/test_block_sparse_attention.py",
+        "unittest/_torch/visual_gen/models/minimax_h3_v2/ops/test_minimax_h3_vsa.py",
+        "unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py",
+        "unittest/_torch/visual_gen/test_wan_vsa_pipeline.py",
     } <= selected
