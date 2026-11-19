@@ -609,7 +609,14 @@ class SamplingParams:
             # this fallback nothing terminates a request and every generation
             # runs to `max_tokens`.
             if self.end_id is None:
-                config_eos = getattr(hf_model_config, "eos_token_id", None)
+                # Multimodal configs often declare it only in their text
+                # config, as `_get_decoder_start_token_id` in llm.py also
+                # allows for.
+                config_eos = None
+                for config in (hf_model_config, getattr(hf_model_config, "text_config", None)):
+                    config_eos = getattr(config, "eos_token_id", None)
+                    if config_eos is not None:
+                        break
                 if isinstance(config_eos, (list, tuple)):
                     # Mirror the generation_config handling: first entry becomes
                     # end_id, any remaining ones become additional stop tokens.
