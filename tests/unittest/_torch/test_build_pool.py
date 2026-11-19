@@ -6,6 +6,7 @@ parallel, and the call returns once they have ended; this process then loads the
 The kernels are build_pool_targets.py's picklable stand-ins, so no GPU is needed.
 """
 
+import functools
 import os
 import threading
 import time
@@ -292,6 +293,102 @@ def test_a_kind_of_build_not_measured_yet_builds_one_at_a_time(pool, gpu, tmp_pa
     assert pool.peak_bytes("new") == 0
 
 
+def test_a_submit_returns_before_its_builds_end_and_its_batch_waits_for_them(pool, tmp_path):
+    started, release = tmp_path / "started", tmp_path / "release"
+    with pool.pass_scope():
+        batch = pool.submit([Build(_HOLD, (str(started), str(release), 60.0))])
+        assert not batch.done() and batch.wait(timeout=0.2) is None
+        release.write_text("")
+        results = batch.wait()
+    assert [result.status for result in results] == ["built"] and started.exists()
+
+
+def test_a_build_returns_the_value_of_its_function(pool):
+    with pool.pass_scope():
+        doubled, unpicklable = pool.build(
+            [Build(f"{targets.__name__}:double", (21,)), Build(f"{targets.__name__}:unpicklable")]
+        )
+    assert (doubled.status, doubled.value) == ("built", 42)
+    assert unpicklable.status == "failed" and "does not pickle" in unpicklable.error
+
+
+def test_an_overlapped_pass_sends_to_a_worker_every_build_its_threads_cannot_take(pool):
+    pool.min_build_s = 5.0
+    with pool.pass_scope(overlapped=True):
+        # A worker's cost is hidden behind the rank's other work, and nothing is measured here.
+        assert pool.worth_a_worker("new") and not pool.unmeasured("new")
+        assert pool.worth_a_worker("new", expected_s=1.0)
+        # A build the pass's threads can take goes to a worker only when long enough.
+        assert not pool.worth_a_worker("new", expected_s=1.0, thread_safe=True)
+        assert pool.worth_a_worker("new", expected_s=30.0, thread_safe=True)
+    with pool.pass_scope():
+        assert not pool.worth_a_worker("new") and pool.unmeasured("new")
+        assert not pool.worth_a_worker("new", expected_s=1.0)
+
+
+def test_in_an_overlapped_pass_a_build_waits_for_memory_until_the_pass_ends(pool, gpu, tmp_path):
+    gpu["free"] = 10 << 30
+    pool.record_peak("large", 4 << 30)
+    pool.record_peak("huge", 64 << 30)
+    with pool.pass_scope(overlapped=True):
+        batch = pool.submit([Build(_SPAN, (str(tmp_path / "large"), 0.0), "large")])
+        # It does not fit, with no other build running: it waits rather than being refused.
+        assert batch.wait(timeout=2.5) is None
+        gpu["free"] = 20 << 30
+        assert [result.status for result in batch.wait(timeout=60)] == ["built"]
+        waiting = pool.submit([Build(_SPAN, (str(tmp_path / "huge"), 0.0), "huge")])
+        assert waiting.wait(timeout=1.5) is None
+    assert [result.status for result in waiting.wait(timeout=60)] == ["refused"]
+    assert not (tmp_path / "huge").exists()
+
+
+def test_the_threads_take_builds_beside_the_caller_and_join_waits_for_them(pool):
+    ran = []
+    with pool.pass_scope():
+        lane = pool.threads
+        for value in range(4):
+            assert lane.submit(lambda value=value: ran.append((value, threading.get_ident())), "f")
+        assert lane.join() == {"built": 4}
+    assert sorted(value for value, _ in ran) == [0, 1, 2, 3]
+    assert threading.get_ident() not in {ident for _, ident in ran}
+    # Outside a pass there are no threads: the caller builds where it is.
+    assert pool.threads is None
+
+
+def test_thread_builds_that_do_not_fit_together_run_one_at_a_time(pool, gpu, tmp_path):
+    gpu["free"] = 20 << 30
+    paths = [tmp_path / f"s{i}" for i in range(2)]
+    with pool.pass_scope():
+        lane = pool.threads
+        for path in paths:
+            lane.submit(functools.partial(targets.span, str(path), 0.5), "large", 7 << 30)
+        assert lane.join() == {"built": 2}
+    assert not _overlap(_spans(paths))
+
+
+def test_a_thread_build_that_does_not_fit_alone_is_left_to_the_caller(pool, gpu, tmp_path):
+    gpu["free"] = 10 << 30
+    with pool.pass_scope():
+        lane = pool.threads
+        lane.submit(functools.partial(targets.span, str(tmp_path / "s"), 0.0), "huge", 4 << 30)
+        assert lane.join() == {"refused": 1}
+    assert not (tmp_path / "s").exists()
+
+
+def test_the_workers_and_the_threads_share_the_gpu_memory(pool, gpu, tmp_path):
+    # Room beside the 8 GiB kept free for one 7 GiB build, in a worker or on a thread, not for two.
+    gpu["free"] = 20 << 30
+    pool.record_peak("worker", 7 << 30)
+    paths = [tmp_path / "worker", tmp_path / "thread"]
+    with pool.pass_scope():
+        batch = pool.submit([Build(_SPAN, (str(paths[0]), 0.5), "worker")])
+        lane = pool.threads
+        lane.submit(functools.partial(targets.span, str(paths[1]), 0.5), "thread", 7 << 30)
+        assert lane.join() == {"built": 1}
+        assert [result.status for result in batch.wait()] == ["built"]
+    assert not _overlap(_spans(paths))
+
+
 def test_a_build_in_a_worker_measures_its_kind(pool, tmp_path):
     with pool.pass_scope():
         pool.build([Build(_RECORD, (str(tmp_path / "r"), 1), "recorded")])
@@ -342,19 +439,20 @@ def test_a_rank_loads_a_kernel_another_rank_claimed_once_it_is_built(share_dir, 
     monkeypatch.setattr(BuildPool, "_instance", rank)
     paths = _claimed_elsewhere(rank, (31,))
     other = targets.Kernel(31, -1, ())
-    build = rank.build
+    submit_kernels = rank.submit_kernels
     timers = []
 
-    def build_then_built_elsewhere(builds, on_done=None):
-        results = build(builds, on_done)
+    def submit_then_built_elsewhere(kernels):
+        batch = submit_kernels(kernels)
+        batch.wait()
         # The other rank's build ends once this rank's worker found it claimed.
         timers.append(
             threading.Timer(0.5, targets.export_kernel, (other, paths.obj, "", paths.meta))
         )
         timers[-1].start()
-        return results
+        return batch
 
-    monkeypatch.setattr(rank, "build", build_then_built_elsewhere)
+    monkeypatch.setattr(rank, "submit_kernels", submit_then_built_elsewhere)
     try:
         with rank.pass_scope():
             _build_kernels((31,))

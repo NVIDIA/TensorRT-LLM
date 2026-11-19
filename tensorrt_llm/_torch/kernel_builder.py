@@ -4,7 +4,7 @@
 
 An op whose kernels compile on first use, and that does not go through the autotuner,
 registers them here, the way an op that does registers its tactics with the autotuner.
-KernelBuilder has two modes:
+KernelBuilder has three modes:
 
 * Inference, outside any build pass: an op runs as it is and compiles a kernel it lacks.
 * Build, inside a build pass (:meth:`KernelBuilder.build_pass`, which the memory-profiling
@@ -13,6 +13,12 @@ KernelBuilder has two modes:
   ``TuningConfig`` turns a call into tuning buckets, and builds them on the rank's worker
   processes (``tensorrt_llm._torch.build_pool``), in parallel. The call goes on once they are
   built, and the op's calls find them built.
+* Rehearsal, inside :meth:`KernelBuilder.rehearsal` (the model's warmup forwards on dummy weights,
+  before the checkpoint load): build mode, except that a call queues its builds and goes on at
+  once, and nothing compiles in this process; the builds go on beside the load, in the
+  BuildPool's overlapped pass the rehearsal's caller holds, and :meth:`KernelBuilder.join` waits
+  for them. A build too short for a worker runs on the pass's threads when the op's
+  ``BuildConfig.thread_safe`` allows it, and is the op's otherwise.
 
 Workers take only builds long enough to repay them (``BuildPool.worth_a_worker``): an op's builds
 go to workers once they are measured, or expected (``BuildConfig.build_seconds``), to take
@@ -28,7 +34,7 @@ model's prewarm list, hands them to :meth:`KernelBuilder.build_kernels` as calls
 ``process_built`` compile functions.
 
 ``TLLM_KERNEL_BUILDER=0`` turns KernelBuilder and the worker processes off: every kernel compiles
-on first use.
+on first use. ``TLLM_KERNEL_BUILDER_REHEARSAL=0`` turns the rehearsal off.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import itertools
 import os
@@ -71,12 +78,17 @@ from .build_pool import (
     PRESENT,
     REFUSED,
     Build,
+    BuildBatch,
     BuildPool,
+    BuildResult,
     BuildStrategy,
     Claim,
+    _resolve,
 )
 
 __all__ = ["BuildConfig", "BuildStrategy", "BuildTask", "DynamicSpec", "KernelBuilder"]
+
+REHEARSAL_ENV = "TLLM_KERNEL_BUILDER_REHEARSAL"
 
 
 class BuildTask(NamedTuple):
@@ -117,12 +129,16 @@ class BuildConfig:
             kernels the others built from there.
         build_seconds: How long one build of the op takes, until builds of it are measured; it
             decides whether workers take them (``BuildPool.worth_a_worker``).
+        thread_safe: The op's builds run outside the GIL and may run on several threads of this
+            process at once, allocating no GPU memory: in a rehearsal, those too short for a
+            worker run on the pass's threads (``BuildPool.threads``) instead of being the op's.
     """
 
     dynamic_specs: Tuple[DynamicSpec, ...] = ()
     strategy: BuildStrategy = BuildStrategy.INDEPENDENT
     share_scope: Optional[Callable[[], str]] = None
     build_seconds: Optional[float] = None
+    thread_safe: bool = False
 
     def shapes(self, observed: Mapping[str, int]) -> List[Dict[str, int]]:
         """Every combination of the dimensions' buckets for a call that has ``observed``."""
@@ -139,11 +155,13 @@ class BuildConfig:
 class _OpStats:
     signatures: int = 0
     list_s: float = 0.0
-    # Builds made by this rank's workers, failed there, made by other ranks, left to the op.
+    # Builds made by this rank's workers, failed there, made by other ranks, left to the op,
+    # queued on the pass's threads.
     built: int = 0
     failed: int = 0
     elsewhere: int = 0
     inline: int = 0
+    threads: int = 0
     # Seconds the op's calls spent building, waits for other ranks included.
     build_s: float = 0.0
     late: int = 0
@@ -172,10 +190,17 @@ class KernelBuilder:
     _instance: Optional["KernelBuilder"] = None
     _instance_lock = threading.Lock()
 
-    def __init__(self, enabled: Optional[bool] = None):
+    def __init__(self, enabled: Optional[bool] = None, rehearse: Optional[bool] = None):
         self.enabled = os.environ.get(ENABLE_ENV, "1") != "0" if enabled is None else enabled
+        # Whether a rehearsal runs: the model loader defers the checkpoint for one.
+        self.rehearse = self.enabled and (
+            os.environ.get(REHEARSAL_ENV, "1") != "0" if rehearse is None else rehearse
+        )
         self._lock = threading.Lock()
         self._passes = 0
+        self._rehearsals = 0
+        # What join() does once a rehearsal's builds end: one entry per queued batch.
+        self._pending: List[Callable[[], None]] = []
         # The shapes listed so far for each (op, call signature).
         self._listed: Dict[Tuple[str, Hashable], set] = {}
         # The (op, key) of every build asked for so far.
@@ -221,9 +246,38 @@ class KernelBuilder:
             return self.build_pass("warmup")
         return contextlib.nullcontext()
 
+    @contextlib.contextmanager
+    def rehearsal(self) -> Iterator[None]:
+        """Rehearsal mode (see the module): inside, ops queue the builds of the shapes they sweep
+        and go on. The caller holds ``BuildPool.pass_scope(overlapped=True)`` open from before the
+        rehearsal until after :meth:`join`, so that the builds outlive the rehearsal's forwards."""
+        if not self.rehearse:
+            yield
+            return
+        with self._lock:
+            self._passes += 1
+            self._rehearsals += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._passes -= 1
+                self._rehearsals -= 1
+
     def active(self) -> bool:
-        """Whether an op builds its kernels ahead now (build mode)."""
+        """Whether an op builds its kernels ahead now (build or rehearsal mode)."""
         return self.enabled and self._passes > 0
+
+    def rehearsing(self) -> bool:
+        """Whether a rehearsal is running: an op queues its builds and does not wait for them."""
+        return self.enabled and self._rehearsals > 0
+
+    def join(self) -> None:
+        """Wait for the builds the rehearsal queued, and log how they ended."""
+        with self._lock:
+            pending, self._pending = self._pending, []
+        for settle in pending:
+            settle()
 
     # Registration.
 
@@ -244,7 +298,11 @@ class KernelBuilder:
         A failure to list leaves the kernels to the op, and so do builds of ``op`` too short for
         a worker (``BuildPool.worth_a_worker``), which are not listed.
         """
-        if not self.active() or not BuildPool.get().worth_a_worker(op, config.build_seconds):
+        if not self.active():
+            return
+        if not BuildPool.get().worth_a_worker(
+            op, config.build_seconds, config.thread_safe
+        ) and not (self.rehearsing() and config.thread_safe):
             return
         swept = config.shapes(observed)
         with self._lock:
@@ -280,7 +338,7 @@ class KernelBuilder:
     def build(self, op: str, builds: Sequence[Tuple[Hashable, BuildTask, BuildConfig]]) -> None:
         """In build mode, build the kernels of ``builds`` (``(key, BuildTask, BuildConfig)``)
         not asked for before on the rank's worker processes, in parallel, and return once they
-        are built.
+        are built; in a rehearsal, queue them and return at once (:meth:`join` waits for them).
 
         With the PARALLEL strategy, a build another rank's worker started first is that rank's:
         this one waits for the builds it left to other ranks, at most ``TLLM_JIT_SHARE_WAIT_S``
@@ -300,16 +358,40 @@ class KernelBuilder:
             return
         pool = BuildPool.get()
         expected = next((c.build_seconds for _, _, c in new if c.build_seconds is not None), None)
-        if not pool.worth_a_worker(op, expected):
-            with self._lock:
-                self._op_stats(op).inline += len(new)
+        if not pool.worth_a_worker(op, expected, all(c.thread_safe for _, _, c in new)):
+            self._too_short(op, new)
             return
         jobs = [
             Build(task.function, task.args, op, self._claim(op, key, config))
             for key, task, config in self._rotated(new)
         ]
         t0 = time.perf_counter()
-        results = pool.build(jobs)
+        batch = pool.submit(jobs)
+        if self.rehearsing():
+            with self._lock:
+                self._pending.append(functools.partial(self._settle, op, jobs, batch, t0))
+            return
+        self._settle(op, jobs, batch, t0)
+
+    def _too_short(
+        self, op: str, builds: Sequence[Tuple[Hashable, BuildTask, BuildConfig]]
+    ) -> None:
+        """Builds too short for a worker: in a rehearsal, those of a thread-safe op run on the
+        pass's threads; the others are the op's."""
+        lane = BuildPool.get().threads if self.rehearsing() else None
+        queued = 0
+        if lane is not None:
+            for _, task, config in builds:
+                if config.thread_safe and lane.submit(functools.partial(_run_task, task), op):
+                    queued += 1
+        with self._lock:
+            stats = self._op_stats(op)
+            stats.threads += queued
+            stats.inline += len(builds) - queued
+
+    def _settle(self, op: str, jobs: List[Build], batch: BuildBatch, t0: float) -> None:
+        """Wait for ``batch`` and for the builds it found other ranks making, and count them."""
+        results = batch.wait()
         counts = collections.Counter(result.status for result in results)
         claimed = [job.claim for job, result in zip(jobs, results) if result.status == CLAIMED]
         if claimed:
@@ -341,7 +423,9 @@ class KernelBuilder:
         (``BuildPool.worth_a_worker``) build on the rank's worker processes first, all together,
         and the calls load them; until a function's compiles are measured, its first kernel
         compiles here, timed. The other kernels, any a worker did not build, and those of any
-        other function compile in the calls, as in inference mode.
+        other function compile in the calls, as in inference mode. In a rehearsal, the workers'
+        builds are queued (:meth:`join` waits for them) and nothing compiles here: the op's calls
+        after the rehearsal load or compile each kernel.
         """
         kernels = list(dict.fromkeys(kernels))
         if self.active():
@@ -359,28 +443,44 @@ class KernelBuilder:
                     fn(*args)  # Measured here: the rule decides for the function's other kernels.
                 counts[compiler.name][REFUSED] += 1
             t0 = time.perf_counter()
-            results = pool.build_kernels(to_workers)
-            seconds = time.perf_counter() - t0
-            for (fn, _), result in zip(to_workers, results):
-                counts[fn._compiler.name][result.status] += 1
-            with self._lock:
-                for op, count in counts.items():
-                    stats = self._op_stats(op)
-                    stats.built += count[BUILT]
-                    stats.failed += count[FAILED]
-                    stats.elsewhere += count[PRESENT] + count[CLAIMED]
-                    stats.inline += count[REFUSED]
-                    if count[BUILT] + count[FAILED] + count[CLAIMED]:
-                        stats.build_s += seconds
-            if to_workers:
-                done = sum(result.status == BUILT for result in results)
-                logger.info(
-                    f"[KernelBuilder] {len(to_workers)} listed kernels: {done} built in worker "
-                    f"processes in {seconds:.1f}s"
-                )
+            batch = pool.submit_kernels(to_workers)
+            settle = functools.partial(self._settle_kernels, to_workers, batch, counts, t0)
+            if self.rehearsing():
+                # Nothing compiles here: the calls load the kernels once the workers built them.
+                with self._lock:
+                    self._pending.append(settle)
+                return len(kernels)
+            settle()
         for fn, args in kernels:
             fn(*args)
         return len(kernels)
+
+    def _settle_kernels(
+        self,
+        to_workers: List[Tuple[Callable[..., Any], tuple]],
+        batch: BuildBatch,
+        counts: Dict[str, collections.Counter],
+        t0: float,
+    ) -> None:
+        results: List[BuildResult] = batch.wait()
+        seconds = time.perf_counter() - t0
+        for (fn, _), result in zip(to_workers, results):
+            counts[fn._compiler.name][result.status] += 1
+        with self._lock:
+            for op, count in counts.items():
+                stats = self._op_stats(op)
+                stats.built += count[BUILT]
+                stats.failed += count[FAILED]
+                stats.elsewhere += count[PRESENT] + count[CLAIMED]
+                stats.inline += count[REFUSED]
+                if count[BUILT] + count[FAILED] + count[CLAIMED]:
+                    stats.build_s += seconds
+        if to_workers:
+            done = sum(result.status == BUILT for result in results)
+            logger.info(
+                f"[KernelBuilder] {len(to_workers)} listed kernels: {done} built in worker "
+                f"processes in {seconds:.1f}s"
+            )
 
     def _claim(self, op: str, key: Hashable, config: BuildConfig) -> Optional[Claim]:
         """The claim of a PARALLEL build in the directory the ranks share; None for a build that
@@ -432,6 +532,8 @@ class KernelBuilder:
                 )
             if stats.elsewhere:
                 parts.append(f"{stats.elsewhere} built by other ranks")
+            if stats.threads:
+                parts.append(f"{stats.threads} queued on build threads")
             if stats.inline:
                 parts.append(f"{stats.inline} left to the op")
             if stats.late:
@@ -452,3 +554,8 @@ class KernelBuilder:
             return builds
         offset = torch.cuda.current_device() % len(builds)
         return builds[offset:] + builds[:offset]
+
+
+def _run_task(task: BuildTask) -> None:
+    """Make ``task`` in this process, on a thread of the pass."""
+    _resolve(task.function)(*task.args)

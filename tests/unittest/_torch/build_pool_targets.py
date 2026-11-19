@@ -79,6 +79,16 @@ def fail() -> None:
     raise ValueError("a build that fails")
 
 
+def double(value: int) -> int:
+    """A build whose function returns a value: twice ``value``."""
+    return 2 * value
+
+
+def unpicklable() -> object:
+    """A build whose function returns a value that does not pickle."""
+    return lambda: None
+
+
 def hold(started: str, release: str, timeout: float = 120.0) -> None:
     """A build that creates the file ``started`` and runs until the file ``release`` exists,
     for at most ``timeout`` seconds."""

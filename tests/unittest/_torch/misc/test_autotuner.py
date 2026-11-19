@@ -3771,6 +3771,152 @@ def test_small_inputs_of_any_dtype_reach_a_worker_with_their_values(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_the_build_state_queues_every_tactic_on_the_workers_and_times_none(
+        tune_mode_workers, tmp_path, monkeypatch):
+    """In the build state (a rehearsal's, beside the checkpoint load), choose_one queues the
+    builds of every (profile, tactic) the op's tuning would time on the worker processes, times
+    none, and returns the tactic the op runs now; join_builds waits for the builds."""
+    import autotuner_worker_targets as targets
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_in_workers=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    timed = []
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel",
+                        lambda self, *args, **kwargs: timed.append(args))
+    with (tune_mode_workers.pass_scope(overlapped=True),
+          autotuner.build_kernels()):
+        best_runner, tactic = tuner.choose_one("test::build_state", [runner],
+                                               config, [x])
+        assert (best_runner, tactic) == (runner, -1)
+        assert tuner.join_builds() == {"built": 6}
+    built = sorted(os.listdir(tmp_path))
+    assert built == sorted(f"m{m}-t{t}" for m in (1, 2, 4) for t in (0, 1))
+    assert all(
+        int((tmp_path / name).read_text()) != os.getpid() for name in built)
+    assert timed == []
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_in_the_build_state_short_builds_of_a_thread_safe_op_run_on_threads(
+        tune_mode_workers, tmp_path, monkeypatch):
+    """An op whose compiles run outside the GIL (``parallel_jit_warmup``, as DeepGEMM's) has
+    its builds too short for a worker made on the pass's threads, in this process, each
+    admitted for twice its inputs' bytes."""
+    import autotuner_worker_targets as targets
+
+    tune_mode_workers.min_build_s = 5.0
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_in_workers=True,
+        build_seconds=2.0,
+        parallel_jit_warmup=-1,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    needs = []
+    with tune_mode_workers.pass_scope(overlapped=True):
+        lane = tune_mode_workers.threads
+        submit = lane.submit
+
+        def record_need(function, family=None, need_bytes=0):
+            needs.append(need_bytes)
+            return submit(function, family, need_bytes)
+
+        monkeypatch.setattr(lane, "submit", record_need)
+        with autotuner.build_kernels():
+            tuner.choose_one("test::thread_builds", [runner], config, [x])
+        assert lane.join() == {"built": 6}
+        assert tuner.join_builds() == {}
+    built = sorted(os.listdir(tmp_path))
+    assert built == sorted(f"m{m}-t{t}" for m in (1, 2, 4) for t in (0, 1))
+    assert all(
+        int((tmp_path / name).read_text()) == os.getpid() for name in built)
+    # A build's input is m rows of 8 float32 values.
+    assert sorted(needs) == sorted(2 * m * 8 * 4 for m in (1, 2, 4)
+                                   for _ in range(2))
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_the_build_state_keeps_no_input_of_the_call_alive(
+        tune_mode_workers, tmp_path):
+    """The queued builds hold specs of the call's inputs, not the inputs: a dummy weight that
+    the checkpoint load replaces is freed while the builds go on."""
+    import gc
+    import weakref
+
+    import autotuner_worker_targets as targets
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path), build_s=0.5)
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_in_workers=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    weight = torch.randn(1 << 21, device="cuda")
+    alive = weakref.ref(weight)
+    with (tune_mode_workers.pass_scope(overlapped=True),
+          autotuner.build_kernels()):
+        tuner.choose_one("test::no_inputs_kept", [runner], config, [x, weight])
+        del weight
+        gc.collect()
+        assert alive() is None
+        assert tuner.join_builds() == {"built": 6}
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_rehearsal_times_an_op_in_a_worker_and_the_warmup_finds_it_cached(
+        tune_mode_workers, tmp_path, monkeypatch):
+    """An op that sets ``tune_in_rehearsal`` has its profiles timed in a worker process once the
+    rehearsal's builds end; joining the RehearsalTuner caches the results, so that the warmup's
+    tuning times nothing."""
+    import autotuner_worker_targets as targets
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_in_workers=True,
+        tune_in_rehearsal=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    rehearsal_tuner = autotuner.RehearsalTuner.get()
+    with tune_mode_workers.pass_scope(overlapped=True):
+        with autotuner.build_kernels():
+            tuner.choose_one("test::rehearsal_timing", [runner], config, [x])
+        rehearsal_tuner.start()
+        assert tuner.join_builds() == {"built": 6}
+        rehearsal_tuner.join()
+    for profile in tuner._optimization_profiles(config, [x]):
+        hit, *_ = tuner.profiling_cache.search_cache(
+            "test::rehearsal_timing", [runner],
+            profile.get_opt_shapes(),
+            config,
+            apply_map_to_tuning_buckets=False)
+        assert hit
+    timed = []
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel",
+                        lambda self, *args, **kwargs: timed.append(args))
+    with autotune():
+        tuner.choose_one("test::rehearsal_timing", [runner], config, [x])
+    assert timed == []
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_each_runner_of_an_op_is_measured_on_its_own(tune_mode_workers,
                                                      tmp_path):
     """A runner whose kernels ship prebuilt, timed first, does not keep a JIT

@@ -237,6 +237,63 @@ def test_a_listed_function_that_is_not_process_built_is_called(builder, cute):
     assert cute(4).pid != os.getpid()
 
 
+_HOLD = f"{targets.__name__}:hold"
+
+
+def test_a_rehearsal_queues_its_builds_and_join_waits_for_them(builder, tmp_path):
+    started, release = tmp_path / "started", tmp_path / "release"
+    hold = BuildTask(_HOLD, (str(started), str(release), 60.0))
+    with BuildPool.get().pass_scope(overlapped=True):
+        with builder.rehearsal():
+            assert builder.rehearsing() and builder.active()
+            # The call goes on while its build runs: it waits for the file created below.
+            builder.build("op", [("k", hold, _CONFIG)])
+        assert not builder.rehearsing()
+        release.write_text("")
+        builder.join()
+    assert started.exists()
+    assert builder.stats("op").built == 1
+
+
+def test_in_a_rehearsal_listed_kernels_build_in_workers_and_none_compiles_here(builder, cute):
+    BuildPool.get().min_build_s = 5.0
+    with BuildPool.get().pass_scope(overlapped=True):
+        with builder.rehearsal():
+            # Not measured: in a rehearsal no kernel is measured here, and workers take them.
+            assert builder.build_kernels(_kernels((60,), (61,))) == 2
+            assert cute.cache_info().currsize == 0
+        builder.join()
+    assert all(cute(value).pid != os.getpid() for value in (60, 61))
+    assert builder.stats(targets.NAME).built == 2
+
+
+def test_in_a_rehearsal_short_builds_run_on_the_threads_when_the_op_allows_it(builder, tmp_path):
+    BuildPool.get().min_build_s = 5.0
+    safe = BuildConfig(_CONFIG.dynamic_specs, build_seconds=0.1, thread_safe=True)
+    unsafe = BuildConfig(_CONFIG.dynamic_specs, build_seconds=0.1)
+    pool = BuildPool.get()
+    with pool.pass_scope(overlapped=True):
+        with builder.rehearsal():
+            builder.build("safe", [("k", *_record(tmp_path / "safe", 1, safe))])
+            builder.build("unsafe", [("k", *_record(tmp_path / "unsafe", 2, unsafe))])
+        builder.join()
+        assert pool.threads.join() == {"built": 1}
+    # Beside the load a worker's cost is hidden: a build the threads cannot take goes to one.
+    assert int((tmp_path / "safe").read_text().split()[1]) == os.getpid()
+    assert int((tmp_path / "unsafe").read_text().split()[1]) != os.getpid()
+    assert (builder.stats("safe").threads, builder.stats("unsafe").built) == (1, 1)
+
+
+def test_with_the_rehearsal_off_a_rehearsal_lists_and_builds_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv(kernel_builder.REHEARSAL_ENV, "0")
+    kb = KernelBuilder(enabled=True)
+    assert not kb.rehearse
+    with kb.rehearsal():
+        assert not kb.rehearsing() and not kb.active()
+        kb.build("op", [("k", *_record(tmp_path / "x", 0))])
+    assert not (tmp_path / "x").exists()
+
+
 @pytest.fixture
 def shared(monkeypatch, tmp_path):
     """Ranks that share their JIT builds through a directory."""
@@ -316,16 +373,17 @@ def _ends_elsewhere(monkeypatch, path):
     """Once this rank's workers found its builds claimed, the other rank's build creates
     ``path`` (its done or failed mark)."""
     pool = BuildPool.get()
-    build = pool.build
+    submit = pool.submit
     timers = []
 
-    def build_then_end_elsewhere(builds, on_done=None):
-        results = build(builds, on_done)
+    def submit_then_end_elsewhere(builds, on_done=None):
+        batch = submit(builds, on_done)
+        batch.wait()
         timers.append(threading.Timer(0.5, lambda: open(path, "w").close()))
         timers[-1].start()
-        return results
+        return batch
 
-    monkeypatch.setattr(pool, "build", build_then_end_elsewhere)
+    monkeypatch.setattr(pool, "submit", submit_then_end_elsewhere)
     return timers
 
 

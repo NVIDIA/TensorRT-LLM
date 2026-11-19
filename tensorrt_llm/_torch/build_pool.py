@@ -39,6 +39,16 @@ compilers run there too, so every op builds the same way.
 * The workers start with ``subprocess`` in an environment of their own: without the launcher's
   MPI, PMIx and Slurm variables, since importing TensorRT-LLM initializes MPI, and with only this
   rank's GPU visible.
+* :meth:`BuildPool.submit` queues builds and returns at once; its :class:`BuildBatch` waits for
+  them. A build's function may return a value, which its result carries.
+* In a pass that runs beside other work of the rank (``pass_scope(overlapped=True)``, a rehearsal
+  beside the checkpoint load), a worker's cost is hidden behind that work: a build that cannot run
+  on the pass's threads goes to a worker whatever its time, and nothing is measured in this
+  process. A build waits for the GPU's memory there rather than being left to the caller at once,
+  since the rank's other work frees memory too.
+* The pass's in-process build threads (:attr:`BuildPool.threads`) take builds whose compilers run
+  outside the GIL and that do not repay a worker. Each runs on a CUDA stream of its own, and
+  starts only while the GPU has room for the bytes it says it allocates, beside the workers'.
 
 ``TLLM_KERNEL_BUILDER=0`` starts no worker: every kernel builds where it is first needed.
 ``TLLM_KERNEL_BUILDER_WORKERS`` caps the workers of a rank (default: this rank's share of the
@@ -73,6 +83,7 @@ from tensorrt_llm.logger import logger
 
 __all__ = [
     "Build",
+    "BuildBatch",
     "BuildPool",
     "BuildResult",
     "BuildStrategy",
@@ -105,6 +116,9 @@ _WORKER_ENDS = " (the worker's CUDA context is lost: the worker ends)"
 # A worker starts only while the rank's GPU has this much memory free: its CUDA context and
 # builds take about a GiB of it, and the rank's own warmup needs the rest.
 _MIN_FREE_GPU_BYTES = 8 << 30
+# In an overlapped pass, a build that does not fit with no other build running looks at the
+# GPU's free memory again after this many seconds, until the pass ends.
+_PATIENT_POLL_S = 1.0
 
 # How a build ended (BuildResult.status): a worker built it; it was built before; another rank's
 # worker claimed it, and makes it; it failed; no worker took it.
@@ -154,12 +168,13 @@ class BuildResult(NamedTuple):
     """How a build ended: ``status`` ``"built"``, ``"present"`` (built before), ``"claimed"``
     (another rank's worker makes it), ``"failed"``, or ``"refused"`` (no worker took it: its
     caller builds it); the seconds the worker took; the error of a failed build; the most GPU
-    memory the build allocated at once, in bytes."""
+    memory the build allocated at once, in bytes; what the build's function returned."""
 
     status: str
     seconds: float = 0.0
     error: str = ""
     peak_bytes: int = 0
+    value: Any = None
 
 
 class _Compiler(NamedTuple):
@@ -243,10 +258,11 @@ class _Paths(NamedTuple):
     failed: str
 
 
-class _Batch:
-    """The builds of one :meth:`BuildPool.build` call, which waits for all of them to end."""
+class BuildBatch:
+    """The builds of one :meth:`BuildPool.submit` call: :meth:`wait` returns their results, in
+    order, once every one has ended."""
 
-    def __init__(self, size: int, on_done: Optional[Callable[[int, BuildResult], None]]):
+    def __init__(self, size: int, on_done: Optional[Callable[[int, BuildResult], None]] = None):
         self.results: List[Optional[BuildResult]] = [None] * size
         self._left = size
         self._on_done = on_done
@@ -264,11 +280,22 @@ class _Batch:
             if not self._left:
                 self._ended.notify_all()
 
-    def wait(self) -> List[BuildResult]:
+    def done(self) -> bool:
+        """Whether every build of the batch has ended."""
+        with self._ended:
+            return not self._left
+
+    def wait(self, timeout: Optional[float] = None) -> Optional[List[BuildResult]]:
+        """The results once every build has ended; None when they have not within ``timeout``
+        seconds."""
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._ended:
             while self._left:
-                self._ended.wait()
-        return self.results
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return None
+                self._ended.wait(remaining)
+        return list(self.results)
 
 
 @dataclasses.dataclass(eq=False)
@@ -276,7 +303,7 @@ class _Task:
     # The pickled (function, args, claim).
     message: bytes
     family: Optional[str]
-    batch: _Batch
+    batch: BuildBatch
     index: int
     settled: bool = False
 
@@ -308,6 +335,86 @@ def _free_gpu_bytes(device: Optional[int]) -> Optional[int]:
 
     free, _ = torch.cuda.mem_get_info(device)
     return free
+
+
+def _cached_gpu_bytes(device: Optional[int]) -> int:
+    """The memory this process's allocator holds on GPU ``device`` without using it, which a build
+    in this process allocates from before it asks the GPU for more."""
+    import torch
+
+    if device is None or not torch.cuda.is_initialized():
+        return 0
+    return max(0, torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+
+
+class _Admission:
+    """The GPU memory a pass's builds may take, in the workers and on the pass's threads alike: a
+    build starts only while the GPU's free memory covers it beside the builds running, plus
+    ``_MIN_FREE_GPU_BYTES``. A build's need is the bytes it says it takes, or else the most a build
+    of its kind took so far in a worker; a kind not measured yet builds one at a time. A build that
+    does not fit with no other build running is refused, or, in an overlapped pass, waits for the
+    GPU's memory until the pass ends."""
+
+    def __init__(self, owner: "BuildPool", device: Optional[int]):
+        self._owner = owner
+        self.device = device
+        self._memory = threading.Condition()
+        self._stopping = False
+        # The builds running: their families and the memory they may take.
+        self._running: Dict[int, Tuple[Optional[str], int]] = {}
+
+    def admit(
+        self,
+        key: int,
+        family: Optional[str],
+        need: Optional[int] = None,
+        in_process: bool = False,
+    ) -> bool:
+        """Wait until the GPU has room for the build ``key`` (``need`` bytes, or its family's
+        measured peak), and count it running; False when it cannot start. ``in_process``: the
+        build allocates from this process's allocator, whose cached memory it reuses."""
+        with self._memory:
+            while not self._stopping:
+                free = _free_gpu_bytes(self.device)
+                if free is None:
+                    return True  # No GPU memory to keep.
+                if in_process:
+                    free += _cached_gpu_bytes(self.device)
+                if need is None:
+                    need = self._owner.peak_bytes(family)
+                    measured = need is not None
+                else:
+                    measured = True
+                if (
+                    not measured
+                    and family is not None
+                    and any(f == family for f, _ in self._running.values())
+                ):
+                    fits = False  # A kind of build not measured yet builds one at a time.
+                else:
+                    taken = sum(nbytes for _, nbytes in self._running.values())
+                    fits = free - taken - (need or 0) >= _MIN_FREE_GPU_BYTES
+                if fits:
+                    self._running[key] = (family, need or 0)
+                    return True
+                patient = self._owner.overlapping()
+                if not self._running and not patient:
+                    return False
+                self._memory.wait(_PATIENT_POLL_S if patient else None)
+                if not measured:
+                    need = None  # Measured meanwhile, perhaps.
+            return False
+
+    def release(self, key: int) -> None:
+        with self._memory:
+            self._running.pop(key, None)
+            self._memory.notify_all()
+
+    def stop(self) -> None:
+        """Refuse the builds waiting for memory, and every build asked for later."""
+        with self._memory:
+            self._stopping = True
+            self._memory.notify_all()
 
 
 def _default_workers() -> int:
@@ -350,7 +457,10 @@ class BuildPool:
         self._store_lock = threading.Lock()
         self._lock = threading.Lock()
         self._depth = 0
+        self._overlapped = 0
         self._pool: Optional[_Pool] = None
+        self._admission: Optional[_Admission] = None
+        self._lane: Optional[_ThreadLane] = None
         self._counts: collections.Counter = collections.Counter()
         self._build_s = 0.0
         self._workers_started = 0
@@ -371,20 +481,23 @@ class BuildPool:
     # Passes.
 
     @contextlib.contextmanager
-    def pass_scope(self) -> Iterator[None]:
+    def pass_scope(self, overlapped: bool = False) -> Iterator[None]:
         """A build pass: workers take the builds asked for inside it, and stop when the
         outermost pass ends. Once a worker takes a build, the rank's shared kernel caches
         (``tensorrt_llm._jit_share``) keep CuTe DSL kernels in the store the workers build into,
-        until the pass ends."""
+        until the pass ends. ``overlapped``: the pass runs beside other work of the rank, so
+        nothing is measured in this process and builds wait for memory (see the module)."""
         from tensorrt_llm import _jit_share
 
         with self._lock:
             self._depth += 1
+            self._overlapped += int(overlapped)
         try:
             yield
         finally:
             with self._lock:
                 self._depth -= 1
+                self._overlapped -= int(overlapped)
                 last = self._depth == 0
             if last:
                 self.stop()
@@ -394,6 +507,25 @@ class BuildPool:
     def accepting(self) -> bool:
         """Whether a worker takes a build asked for now."""
         return self.enabled and not self.in_worker and self._depth > 0
+
+    def overlapping(self) -> bool:
+        """Whether an overlapped pass is open (see :meth:`pass_scope`)."""
+        return self._overlapped > 0
+
+    @property
+    def threads(self) -> Optional["_ThreadLane"]:
+        """The pass's in-process build threads; None outside a pass and with workers off, when
+        the caller builds where it is."""
+        if not self.accepting():
+            return None
+        with self._lock:
+            if self._lane is None:
+                from .autotuner import _default_parallel_jit_warmup_threads
+
+                self._lane = _ThreadLane(
+                    self, self._ensure_admission(), _default_parallel_jit_warmup_threads()
+                )
+            return self._lane
 
     def takes(self, args: tuple) -> bool:
         """Whether a worker takes a build asked for now with ``args`` (see :meth:`build`)."""
@@ -405,15 +537,18 @@ class BuildPool:
             return False
         return len(message) <= _MAX_MESSAGE_BYTES
 
-    def worth_a_worker(self, family: str, expected_s: Optional[float] = None) -> bool:
+    def worth_a_worker(
+        self, family: str, expected_s: Optional[float] = None, thread_safe: bool = False
+    ) -> bool:
         """Whether a worker should take a build of ``family`` now: while workers take builds,
         when builds of the family take at least ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds
         (default 5; 0 sends every build to the workers). How long they take is their mean so far,
         here or in a worker, or ``expected_s`` until one is measured; a family that has neither
-        builds in this process."""
+        builds in this process. In an overlapped pass, a build that cannot run on the pass's
+        threads (not ``thread_safe``) goes to a worker whatever its time."""
         if not self.accepting():
             return False
-        if self.min_build_s <= 0:
+        if self.min_build_s <= 0 or (self.overlapping() and not thread_safe):
             return True
         estimate = self.build_seconds(family)
         if estimate is None:
@@ -423,9 +558,11 @@ class BuildPool:
     def unmeasured(self, family: str, expected_s: Optional[float] = None) -> bool:
         """Whether :meth:`worth_a_worker` cannot decide for ``family`` yet: while workers take
         builds and the rule is on, before a build of the family is measured, without
-        ``expected_s``. The caller then makes one build here, timed (:meth:`record_build`)."""
+        ``expected_s``, outside an overlapped pass. The caller then makes one build here, timed
+        (:meth:`record_build`)."""
         return (
             self.accepting()
+            and not self.overlapping()
             and self.min_build_s > 0
             and expected_s is None
             and self.build_seconds(family) is None
@@ -471,23 +608,36 @@ class BuildPool:
         on_done: Optional[Callable[[int, BuildResult], None]] = None,
     ) -> List[BuildResult]:
         """Run ``builds`` on the workers, in parallel, and return their results, in order, once
-        every one has ended. ``on_done(index, result)`` is called as each ends, on a thread of
-        the pool. A build no worker takes is ``"refused"``, and its caller builds it: outside a
-        pass, with workers off, with arguments that do not pickle or are too large to send, when
-        the store cannot be made, and when no worker can start."""
-        batch = _Batch(len(builds), on_done)
+        every one has ended (:meth:`submit`, then :meth:`BuildBatch.wait`)."""
+        return self.submit(builds, on_done).wait()
+
+    def submit(
+        self,
+        builds: Sequence[Build],
+        on_done: Optional[Callable[[int, BuildResult], None]] = None,
+    ) -> BuildBatch:
+        """Queue ``builds`` on the workers and return at once; the batch waits for them.
+        ``on_done(index, result)`` is called as each ends, on a thread of the pool. A build no
+        worker takes is ``"refused"``, and its caller builds it: outside a pass, with workers off,
+        with arguments that do not pickle or are too large to send, when the store cannot be
+        made, and when no worker can start."""
+        batch = BuildBatch(len(builds), on_done)
+        self._submit_into(batch, list(enumerate(builds)))
+        return batch
+
+    def _submit_into(self, batch: BuildBatch, builds: Sequence[Tuple[int, Build]]) -> None:
+        """Queue ``builds``, each settling the batch's result at its index."""
         pool = None
         if self.accepting() and builds:
             with self._lock:
                 pool = self._ensure_pool()
-        for index, build in enumerate(builds):
+        for index, build in builds:
             message = self._message(build) if pool is not None else None
             task = _Task(message, build.family, batch, index)
             if message is None:
                 self._settle(task, BuildResult(REFUSED))
             else:
                 pool.put(task)
-        return batch.wait()
 
     def _message(self, build: Build) -> Optional[bytes]:
         try:
@@ -506,40 +656,54 @@ class BuildPool:
         self, kernels: Sequence[Tuple[Callable[..., Any], tuple]]
     ) -> List[BuildResult]:
         """Build the kernels of ``(function, args)`` pairs of ``process_built`` functions into the
-        store on the workers, and return each one's result: ``"present"`` for a kernel in the store
-        already. With a shared store, the ranks split them. The calls ``function(*args)`` then load
-        them."""
+        store on the workers, and return each one's result once all have ended (see
+        :meth:`submit_kernels`)."""
+        return self.submit_kernels(kernels).wait()
+
+    def submit_kernels(self, kernels: Sequence[Tuple[Callable[..., Any], tuple]]) -> BuildBatch:
+        """Queue the kernels of ``(function, args)`` pairs of ``process_built`` functions for the
+        workers to build into the store, and return at once; the batch's results are each
+        kernel's, in order: ``"present"`` for a kernel in the store already. With a shared store,
+        the ranks split them. The calls ``function(*args)`` then load them."""
+        names = [fn._compiler.name for fn, _ in kernels]
+
+        def warn(index: int, result: BuildResult) -> None:
+            if result.status == FAILED:
+                error = result.error.splitlines()[0] if result.error else ""
+                logger.warning_once(
+                    f"[BuildPool] {names[index]}: a kernel a worker did not build is compiled "
+                    f"here ({error})",
+                    key=("build_pool", names[index], error),
+                )
+
+        batch = BuildBatch(len(kernels), warn)
         if not kernels:
-            return []
+            return batch
         if not self.accepting() or self._usable_store() is None:
-            return [BuildResult(REFUSED)] * len(kernels)
-        results: List[BuildResult] = [BuildResult(PRESENT)] * len(kernels)
-        builds, indices = [], []
+            for index in range(len(kernels)):
+                batch.settle(index, BuildResult(REFUSED))
+            return batch
+        builds = []
         for index, (fn, args) in enumerate(kernels):
             compiler = fn._compiler
             _, paths = self._paths(compiler.name, args)
             if os.path.exists(paths.obj):
+                batch.settle(index, BuildResult(PRESENT))
                 continue
             claim = Claim(paths.claim, paths.obj, paths.failed) if self._shared else None
             builds.append(
-                Build(
-                    f"{__name__}:_build_kernel",
-                    (compiler.where, args, paths),
-                    compiler.name,
-                    claim,
+                (
+                    index,
+                    Build(
+                        f"{__name__}:_build_kernel",
+                        (compiler.where, args, paths),
+                        compiler.name,
+                        claim,
+                    ),
                 )
             )
-            indices.append(index)
-        for index, build, result in zip(indices, builds, self.build(builds)):
-            results[index] = result
-            if result.status == FAILED:
-                error = result.error.splitlines()[0] if result.error else ""
-                logger.warning_once(
-                    f"[BuildPool] {build.family}: a kernel a worker did not build is compiled "
-                    f"here ({error})",
-                    key=("build_pool", build.family, error),
-                )
-        return results
+        self._submit_into(batch, builds)
+        return batch
 
     def load(self, name: str, args: tuple) -> Any:
         """The kernel of ``name(*args)`` in the store, or None. With a store the ranks share,
@@ -577,12 +741,27 @@ class BuildPool:
             logger.debug(f"[BuildPool] {name}{args}: exporting it failed: {e}")
 
     def stop(self) -> None:
-        """Stop the workers after the builds already queued, which frees their GPU memory."""
+        """Stop the workers and the threads, which frees the workers' GPU memory: the builds
+        running end, and those still waiting are refused."""
         with self._lock:
             pool, self._pool = self._pool, None
+            lane, self._lane = self._lane, None
+            admission, self._admission = self._admission, None
+        if admission is not None:
+            admission.stop()
+        if lane is not None:
+            lane.stop()
         if pool is not None:
             pool.stop(_STOP_TIMEOUT_S)
-            logger.info(f"[BuildPool] {self.report()}")
+        if pool is not None or lane is not None:
+            threads = f"; {lane.report()}" if lane is not None else ""
+            logger.info(f"[BuildPool] {self.report()}{threads}")
+
+    def join_threads(self) -> Dict[str, int]:
+        """Wait for the builds queued on the pass's threads; how many ended each way."""
+        with self._lock:
+            lane = self._lane
+        return lane.join() if lane is not None else {}
 
     def counts(self) -> Dict[str, int]:
         """How many builds ended each way (:class:`BuildResult`'s statuses)."""
@@ -623,8 +802,14 @@ class BuildPool:
 
             _jit_share.set_pool_store(store)
             env = {STORE_ENV: store, _SHARED_ENV: "1" if self._shared else "0"}
-            self._pool = _Pool(self, self.max_workers, store, env)
+            self._pool = _Pool(self, self.max_workers, store, env, self._ensure_admission())
         return self._pool
+
+    def _ensure_admission(self) -> "_Admission":
+        """The GPU memory admission of this pass; called holding ``self._lock``."""
+        if self._admission is None:
+            self._admission = _Admission(self, _current_device())
+        return self._admission
 
     def _worker_started(self) -> None:
         with self._lock:
@@ -689,7 +874,14 @@ class BuildPool:
 class _Pool:
     """The workers of one pass, which serve one queue of builds and start as builds come in."""
 
-    def __init__(self, owner: BuildPool, max_workers: int, cwd: str, extra_env: Dict[str, str]):
+    def __init__(
+        self,
+        owner: BuildPool,
+        max_workers: int,
+        cwd: str,
+        extra_env: Dict[str, str],
+        admission: _Admission,
+    ):
         self.queue: "queue.Queue[Optional[_Task]]" = queue.Queue()
         self._owner = owner
         self._max = max_workers
@@ -701,11 +893,8 @@ class _Pool:
         self._stopping = False
         self._processes: List[subprocess.Popen] = []
         self._threads: List[threading.Thread] = []
-        # The rank's GPU, whose free memory the serving threads check before a build starts.
-        self._device = _current_device()
-        self._memory = threading.Condition()
-        # The builds running: their families and the memory they may take.
-        self._running: Dict[int, Tuple[Optional[str], int]] = {}
+        # Which builds start, by the GPU memory they take beside those running.
+        self._admission = admission
 
     def put(self, task: _Task) -> None:
         """Queue ``task``, starting a worker when none is idle and the cap and the GPU's free
@@ -728,8 +917,7 @@ class _Pool:
             self._stopping = True
             for _ in self._threads:
                 self.queue.put(None)
-        with self._memory:
-            self._memory.notify_all()
+        self._admission.stop()
         deadline = time.monotonic() + timeout
         for thread in self._threads:
             thread.join(max(0.0, deadline - time.monotonic()))
@@ -795,7 +983,7 @@ class _Pool:
                     except OSError:
                         pass
                     return
-                if not self._admit(task):
+                if not self._admission.admit(id(task), task.family):
                     self._owner._settle(
                         task, BuildResult(REFUSED, 0.0, "the GPU has no room for the build")
                     )
@@ -812,49 +1000,18 @@ class _Pool:
                             FAILED, 0.0, f"the worker process ended ({e!r}): {_tail(stderr)}"
                         ),
                     )
-                    self._release(task)
+                    self._admission.release(id(task))
                     self._ended()
                     return
                 # The result records the memory the build took, before the builds waiting for
                 # room look again.
                 self._owner._settle(task, result)
-                self._release(task)
+                self._admission.release(id(task))
                 if result.status == FAILED and result.error.endswith(_WORKER_ENDS):
                     self._ended()
                     return
                 with self._lock:
                     self._idle += 1
-
-    def _admit(self, task: _Task) -> bool:
-        """Wait until the GPU has room for ``task`` beside the builds running, and count it
-        running; False when it has none with no other build running."""
-        with self._memory:
-            while not self._stopping:
-                free = _free_gpu_bytes(self._device)
-                if free is None:
-                    return True  # No GPU memory to keep.
-                need = self._owner.peak_bytes(task.family)
-                if (
-                    need is None
-                    and task.family is not None
-                    and any(family == task.family for family, _ in self._running.values())
-                ):
-                    fits = False  # A kind of build not measured yet builds one at a time.
-                else:
-                    taken = sum(nbytes for _, nbytes in self._running.values())
-                    fits = free - taken - (need or 0) >= _MIN_FREE_GPU_BYTES
-                if fits:
-                    self._running[id(task)] = (task.family, need or 0)
-                    return True
-                if not self._running:
-                    return False
-                self._memory.wait()
-            return False
-
-    def _release(self, task: _Task) -> None:
-        with self._memory:
-            self._running.pop(id(task), None)
-            self._memory.notify_all()
 
     def _ended(self) -> None:
         """A worker ended: with none left, refuse the builds still queued."""
@@ -872,6 +1029,136 @@ class _Pool:
                     stranded.append(task)
         for task in stranded:
             self._owner._settle(task, BuildResult(REFUSED, 0.0, "no worker process is left"))
+
+
+class _LaneBuild(NamedTuple):
+    function: Callable[[], Any]
+    family: Optional[str]
+    need_bytes: int
+
+
+class _ThreadLane:
+    """A pass's in-process build threads (:attr:`BuildPool.threads`), for builds whose compilers
+    run outside the GIL (nvcc, ninja, Triton) and that do not repay a worker process. A thread
+    starts with the builds, up to ``max_threads``; each runs its builds on a CUDA stream of its own
+    and synchronizes that stream alone, so that they go on beside the rank's other work. A build
+    starts only while the GPU has room for the ``need_bytes`` it says it allocates (the pass's
+    :class:`_Admission`); the threads never empty the allocator's cache, which synchronizes the
+    device: the pass's end does. A build that raises fails alone, and its caller builds it."""
+
+    def __init__(self, owner: BuildPool, admission: _Admission, max_threads: int):
+        self._owner = owner
+        self._admission = admission
+        self._max = max(1, max_threads)
+        self._queue: "queue.Queue[Optional[_LaneBuild]]" = queue.Queue()
+        self._cond = threading.Condition()
+        self._threads: List[threading.Thread] = []
+        self._pending = 0
+        self._stopping = False
+        self._counts: collections.Counter = collections.Counter()
+        self._seconds = 0.0
+
+    def submit(
+        self, function: Callable[[], Any], family: Optional[str] = None, need_bytes: int = 0
+    ) -> bool:
+        """Queue ``function()``, which allocates at most ``need_bytes`` of GPU memory at once;
+        False when the threads have stopped, and the caller builds it."""
+        with self._cond:
+            if self._stopping:
+                self._counts[REFUSED] += 1
+                return False
+            self._pending += 1
+            if len(self._threads) < min(self._max, self._pending):
+                thread = threading.Thread(
+                    target=self._serve,
+                    name=f"tllm-build-thread-{len(self._threads)}",
+                    daemon=True,
+                )
+                self._threads.append(thread)
+                thread.start()
+        self._queue.put(_LaneBuild(function, family, need_bytes))
+        return True
+
+    def join(self) -> Dict[str, int]:
+        """Wait until every build queued has ended; how many ended each way."""
+        with self._cond:
+            while self._pending:
+                self._cond.wait()
+            return dict(self._counts)
+
+    def counts(self) -> Dict[str, int]:
+        with self._cond:
+            return dict(self._counts)
+
+    def report(self) -> str:
+        with self._cond:
+            counts, seconds, threads = dict(self._counts), self._seconds, len(self._threads)
+        return (
+            f"{threads} build threads: {counts.get(BUILT, 0)} builds in {seconds:.1f}s, "
+            f"{counts.get(FAILED, 0)} failed, {counts.get(REFUSED, 0)} left to the caller"
+        )
+
+    def stop(self) -> None:
+        """Refuse the builds still queued, and wait for those running to end."""
+        stranded = 0
+        with self._cond:
+            self._stopping = True
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    stranded += 1
+            self._counts[REFUSED] += stranded
+            self._pending -= stranded
+            for _ in self._threads:
+                self._queue.put(None)
+            self._cond.notify_all()
+        for thread in self._threads:
+            thread.join()
+
+    def _serve(self) -> None:
+        stream = None
+        if self._admission.device is not None:
+            import torch
+
+            torch.cuda.set_device(self._admission.device)
+            stream = torch.cuda.Stream()
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            key = id(item)
+            status, seconds = REFUSED, 0.0
+            if self._admission.admit(key, item.family, item.need_bytes, in_process=True):
+                t0 = time.perf_counter()
+                try:
+                    if stream is None:
+                        item.function()
+                    else:
+                        import torch
+
+                        with torch.cuda.stream(stream):
+                            item.function()
+                        stream.synchronize()
+                    status = BUILT
+                except Exception as e:  # noqa: BLE001 - a build that fails here fails alone
+                    status = FAILED
+                    logger.debug(
+                        f"[BuildPool] {item.family}: a build on a thread failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                finally:
+                    self._admission.release(key)
+                seconds = time.perf_counter() - t0
+                if status == BUILT and item.family is not None:
+                    self._owner.record_build(item.family, seconds)
+            with self._cond:
+                self._counts[status] += 1
+                self._seconds += seconds
+                self._pending -= 1
+                self._cond.notify_all()
 
 
 def _tail(stream: IO[bytes]) -> str:
@@ -939,7 +1226,12 @@ def _worker_main(task_read: int, result_write: int) -> None:
             if ends:
                 result = (result[0], result[1], result[2] + _WORKER_ENDS, *result[3:])
             try:
-                _write(results, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+                data = pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+            except (pickle.PicklingError, TypeError, AttributeError) as e:
+                error = f"the build's value does not pickle: {type(e).__name__}: {e}"
+                data = pickle.dumps((FAILED, result[1], error), protocol=pickle.HIGHEST_PROTOCOL)
+            try:
+                _write(results, data)
             except BrokenPipeError:
                 return
             if ends:
@@ -991,7 +1283,7 @@ def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
             return (PRESENT if os.path.exists(claim.done) else CLAIMED, 0.0, "")
     t0 = time.perf_counter()
     try:
-        _resolve(function)(*args)
+        value = _resolve(function)(*args)
     except Exception as e:  # noqa: BLE001 - reported to the rank, which builds it itself
         if claim is not None:
             _jit_share._mark_failed(claim.failed, f"{type(e).__name__}: {e}")
@@ -1002,7 +1294,7 @@ def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
     peak = _release_gpu_memory()
     if claim is not None and not os.path.exists(claim.done):
         _touch(claim.done)
-    return (BUILT, seconds, "", peak)
+    return (BUILT, seconds, "", peak, value)
 
 
 def _release_gpu_memory() -> int:

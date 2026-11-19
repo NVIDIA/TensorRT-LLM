@@ -2442,12 +2442,17 @@ def fp8_prequantized_swap_ab_gemm(
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
     runner = Fp8PrequantizedSwapABGemmRunner(output_dtype, disable_ue8m0_cast)
-    _, best_tactic = AutoTuner.get().choose_one(
+    tuner = AutoTuner.get()
+    _, best_tactic = tuner.choose_one(
         "trtllm::fp8_prequantized_swap_ab_gemm",
         [runner],
         Fp8PrequantizedSwapABGemmRunner.tuning_config,
         [activation, activation_scale, weight, weight_scale],
     )
+    if tuner.is_build_mode:
+        # The build state queued this GEMM's builds; nothing runs.
+        return activation.new_zeros((activation.size(0), weight.size(0)),
+                                    dtype=output_dtype)
     return runner(
         inputs=[activation, activation_scale, weight, weight_scale],
         tactic=best_tactic,
@@ -2501,6 +2506,10 @@ def fp8_swap_ab_gemm(
         fp8SwapABGemmRunner.tuning_config,
         [input, weight, weight_scale],
     )
+    if tuner.is_build_mode:
+        # The build state queued this GEMM's builds; nothing runs.
+        return input.new_zeros((input.size(0), weight.size(0)),
+                               dtype=output_dtype)
     return gemm_runner(
         inputs=[input, weight, weight_scale],
         tactic=best_tactic,
