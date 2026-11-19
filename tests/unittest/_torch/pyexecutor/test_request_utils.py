@@ -16,7 +16,7 @@ import gc
 import pickle
 import sys
 import weakref
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import cloudpickle
@@ -2273,6 +2273,72 @@ def test_prepared_response_keeps_outputs_and_metadata_stable(
     assert response.result.per_pos_accepted[0] == 1
     assert response.result.spec_dec_totals == (1, 2)
     assert response.result.ctx_usage == {"prompt_tokens": 3}
+
+
+@pytest.mark.parametrize("output_kind", ["context", "generation"])
+@pytest.mark.parametrize("serializer", [pickle, cloudpickle])
+def test_response_bounds_additional_outputs(output_kind: str, serializer: ModuleType) -> None:
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        additional_outputs=["hidden", "single", "empty"],
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    if output_kind == "context":
+        append = request.py_result.append_additional_context_outputs
+    else:
+        append = request.py_result.append_additional_generation_outputs
+    first = torch.ones(1, 2)
+    append("hidden", first)
+    append("hidden", first * 2)
+    append("single", first)
+    response = request.create_response()
+    assert response is not None
+    snapshot = response.result._py_result
+    assert not hasattr(snapshot, "diff")
+    assert request.py_result.diff is not None
+    if output_kind == "context":
+        assert snapshot._additional_context_outputs is request.py_result._additional_context_outputs
+    else:
+        assert (
+            snapshot._additional_generation_outputs
+            is request.py_result._additional_generation_outputs
+        )
+
+    # Each name has its own boundary, including outputs first populated later.
+    append("hidden", first * 3)
+    append("single", first * 4)
+    append("empty", first * 5)
+    restored = serializer.loads(serializer.dumps(response))
+    diff = request.py_result.get_diff()
+    chunks = (
+        diff.additional_context_outputs_list
+        if output_kind == "context"
+        else diff.additional_generation_outputs_list
+    )
+    assert len(chunks) == 6
+    for result in (response.result, restored.result):
+        if output_kind == "context":
+            outputs = result.additional_context_outputs
+        else:
+            outputs = result.additional_generation_outputs
+        assert set(outputs) == {"hidden", "single"}
+        torch.testing.assert_close(outputs["hidden"], torch.cat([first, first * 2]))
+        torch.testing.assert_close(outputs["single"], first)
+    if output_kind == "context":
+        stored = restored.result._py_result._additional_context_outputs
+    else:
+        stored = restored.result._py_result._additional_generation_outputs
+    assert {name: len(chunks) for name, chunks in stored.items()} == {
+        "hidden": 2,
+        "single": 1,
+        "empty": 0,
+    }
+    assert not hasattr(restored.result._py_result, "diff")
 
 
 def test_suppressed_response_preserves_pending_logprobs() -> None:
