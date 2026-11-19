@@ -225,8 +225,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """Check that mRoPE positions are rows of the model's rotary table.
 
         The table has ``max_position_embeddings`` rows. Decode positions run up
-        to ``max_length - 1 + delta``; ``max_length`` defaults to the table size.
-        Raises ValueError, so a bad value fails the request and not the GPU.
+        to ``max_length - 1 + delta``, with ``max_length`` capped at the table
+        size, as the worker caps ``max_seq_len`` by default. Raises ValueError,
+        so a bad value fails the request and not the GPU.
         """
         text_config = getattr(self.config, "text_config", self.config)
         max_positions = getattr(text_config, "max_position_embeddings", None)
@@ -241,7 +242,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if delta != int(positions.max()) + 1 - prompt_length:
             raise ValueError("inconsistent Qwen mRoPE position delta")
         # Include every possible decode position before handing state to the GPU.
-        last_position = max_length - 1 + delta
+        # A configured max_seq_len above the table is capped by the worker.
+        last_position = min(max_length, max_positions) - 1 + delta
         if not 0 <= last_position < max_positions:
             raise ValueError("Qwen mRoPE decode positions exceed model bounds")
 
