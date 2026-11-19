@@ -66,6 +66,8 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ...build_pool import process_built
+from ...kernel_builder import KernelBuilder
 from . import fp8_block_scale_low_m_gemm as low_m_gemm
 from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
@@ -838,7 +840,7 @@ def cluster_size(num_tokens: int, num_candidates: int) -> int:
     return 8 if num_tokens <= 16 and num_candidates >= 4 else 4
 
 
-@functools.cache
+@process_built("kimi_k3_attn_res")
 def _compiled(
     num_candidates: int,
     add_mode: int,
@@ -917,8 +919,12 @@ def precompile(
     snapshots_after_wait: bool = False,
 ) -> None:
     """JIT-compile the variant :func:`run_attn_res` launches for these parameters (``cluster``
-    as :func:`cluster_size` picks it), so its first launch does not compile."""
-    _compiled(num_candidates, add_mode, cluster, hidden, mxfp8, snapshots_after_wait)
+    as :func:`cluster_size` picks it), so its first launch does not compile. In KernelBuilder's
+    build mode a worker process of the rank builds it if such compiles take long enough to repay
+    a worker (``BuildPool.worth_a_worker``)."""
+    KernelBuilder.get().build_kernels(
+        [(_compiled, (num_candidates, add_mode, cluster, hidden, mxfp8, snapshots_after_wait))]
+    )
 
 
 def mxfp8_scale_numel(num_tokens: int, hidden: int) -> int:

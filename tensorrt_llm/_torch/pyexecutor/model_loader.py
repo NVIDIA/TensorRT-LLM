@@ -4,8 +4,8 @@
 import copy
 import os
 import time
-from dataclasses import replace
-from typing import Any, Callable, Optional, Tuple
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 import torch
 
@@ -38,6 +38,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
+from ..kernel_builder import KernelBuilder
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..mmap_utils import (page_cache_bytes, release_file_page_cache,
                           wait_for_page_migration_to_settle)
@@ -419,6 +420,72 @@ def validate_lm_head_output_dtype(model: torch.nn.Module,
             f"{type(model).__name__}: no LMHead was constructed.")
 
 
+# Bounds for uniform dummy values of the 1-byte types torch cannot sample
+# directly. They are not the widest possible, only small enough to avoid NaNs.
+# FP4 bytes are 2 packed values: up to 64, the high 4 bits stay 0.
+_DUMMY_QUANTIZED_BOUNDS = {
+    torch.float8_e4m3fn: (-3.0, 3.0),
+    torch.int8: (-3.0, 3.0),
+    float4_e2m1x2: (0, 64),
+}
+
+
+def _fill_dummy_quantized(tensor: torch.Tensor,
+                          generator: torch.Generator) -> None:
+    """Uniform values of a type in `_DUMMY_QUANTIZED_BOUNDS`, sampled in FP16 and cast."""
+    low, high = _DUMMY_QUANTIZED_BOUNDS[tensor.dtype]
+    values = torch.empty(tensor.shape,
+                         dtype=torch.float16,
+                         device=tensor.device)
+    tensor.copy_(
+        values.uniform_(low, high, generator=generator).to(tensor.dtype))
+
+
+def runner_rehearses(model: torch.nn.Module, llm_args: TorchLlmArgs) -> bool:
+    """Whether the runner ``model`` starts with runs the KernelBuilder rehearsal's
+    forwards: a decoder runner with context warmups (``resolve_runner_type``),
+    not an encoder-decoder or multimodal-encoder one. Encode-only and pooling
+    (not generation) models run on encoder executors, without a decoder runner.
+    """
+    if llm_args.encode_only or not model.model_config.is_generation:
+        return False
+    from .engine.runners import DecoderRunner, resolve_runner_type
+
+    runner_cls = resolve_runner_type(model, llm_args)
+    return (issubclass(runner_cls, DecoderRunner)
+            and runner_cls._context_warmups_supported)
+
+
+def fill_rehearsal_values(tensors: Iterable[torch.Tensor],
+                          low: float = -1e-3,
+                          high: float = 1e-3,
+                          seed: int = 0) -> None:
+    """Values a forward can run on, for tensors that have none of their own.
+
+    Floating and quantized tensors get dummy values as `initialize_dummy_weights` gives
+    them; any other tensor gets zeros, so an index stays in range.
+    """
+    for tensor in tensors:
+        generator = torch.Generator(device=tensor.device)
+        generator.manual_seed(seed)
+        if tensor.dtype in _DUMMY_QUANTIZED_BOUNDS:
+            _fill_dummy_quantized(tensor, generator)
+        elif torch.is_floating_point(tensor) and tensor.element_size() >= 2:
+            tensor.uniform_(low, high, generator=generator)
+        else:
+            tensor.zero_()
+
+
+def _meta_tensor_slots(
+        model: torch.nn.Module) -> list[tuple[torch.nn.Module, str]]:
+    """The modules of ``model`` and the names of their parameters and buffers
+    that hold a meta tensor: a tensor with no value of its own."""
+    return [(module, name) for module in model.modules()
+            for tensors in (module._parameters, module._buffers)
+            for name, tensor in tensors.items()
+            if tensor is not None and tensor.is_meta]
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     low: float = -1e-3,
@@ -435,23 +502,6 @@ def initialize_dummy_weights(
     We simply generate values uniformly across an interval that has been empirically verified
     to not generate NaNs/inf for these.
     """
-
-    def _get_random_min_max(dtype: torch.dtype) -> Tuple[int, int]:
-        """Return safe (min, max) bounds for uniform sampling of `dtype`."""
-        # These values are not necessarily the largest possible min/max,
-        # they need to be small enough to avoid NaNs.
-        if dtype in (torch.float8_e4m3fn, torch.int8):
-            return (-3.0, 3.0)
-
-        elif dtype == float4_e2m1x2:
-            # These correspond to bits of 2 packed FP4 values.
-            # Because we only go up to 64, the high 4 bits will
-            # always be 0. But this is fine - we just need values
-            # that won't generate NaNs.
-            return (0, 64)
-
-        else:
-            raise NotImplementedError(f"Unknown quantized type: {dtype}.")
 
     # Calibration scalars (input_scale / inv_input_scale / kv_scales /
     # inv_kv_scales / alpha / scalar_alpha) must keep their create_weights
@@ -476,24 +526,26 @@ def initialize_dummy_weights(
         dtype = param.data.dtype
 
         if param.data.element_size() < 2:
-            # We need to do a cast/round since torch doesn't have uniform_
-            # support for these dtypes.
-            tmp_param = torch.empty(param.data.shape,
-                                    dtype=torch.float16,
-                                    device=param.data.device)
-
-            quant_min, quant_max = _get_random_min_max(dtype)
-            tmp_param = tmp_param.uniform_(quant_min,
-                                           quant_max,
-                                           generator=generator)
-
-            param.data.copy_(tmp_param.to(dtype))
+            if dtype not in _DUMMY_QUANTIZED_BOUNDS:
+                raise NotImplementedError(f"Unknown quantized type: {dtype}.")
+            _fill_dummy_quantized(param.data, generator)
 
         # Note: no need to to mess with int32 params, these are probably
         # constants and not weights.
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
 
+    initialize_dummy_states(model, low=low, high=high, seed=seed)
+
+
+def initialize_dummy_states(
+    model: torch.nn.Module,
+    low: float = -1e-3,
+    high: float = 1e-3,
+    seed: int = 0,
+) -> None:
+    """Let each module build, on dummy weights in place, what its load builds
+    beyond the checkpoint's tensors (``initialize_dummy_state``)."""
     # Non-persistent buffers are intentionally absent from state_dict(). Let
     # modules that need such buffers during dummy execution initialize them
     # explicitly after the regular state has been populated.
@@ -749,6 +801,104 @@ def _reject_dense_dwdp_update(model: torch.nn.Module, action: str) -> None:
             "this model's dense weights into staging slots shared across "
             "layers, so they cannot be rewritten in place. Launch without "
             "dwdp_config.enable_dense to update weights.")
+
+
+def _holds_its_bytes(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor``'s storage still holds its elements: post-load processing
+    can release a parameter's memory in place (``untyped_storage().resize_(0)``)."""
+    return (tensor.untyped_storage().nbytes()
+            >= (tensor.storage_offset() + tensor.numel()) *
+            tensor.element_size())
+
+
+class _ModuleTree:
+    """Each module's submodules, attributes and parameters, to put the module tree
+    back as it was.
+
+    Putting back a submodule slot is not enough: assigning a module to an attribute
+    (e.g. a draft's `embed_tokens = None` tied to the target's) moves the name from
+    the attributes to the submodules.
+    """
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self._modules = [(module, dict(module._modules), {
+            name: value
+            for name, value in vars(module).items()
+            if name not in ("_parameters", "_buffers", "_modules")
+        }) for module in model.modules()]
+        # Each parameter slot and its layout; the slots of one parameter share a key.
+        self._parameters = [(module, name, id(param), param.shape, param.dtype,
+                             param.device, param.requires_grad)
+                            for module in model.modules()
+                            for name, param in module._parameters.items()
+                            if param is not None]
+        # Each parameter's tensor as created, which keeps its memory allocated
+        # while post-load processing replaces the parameter (restore_parameters).
+        self._tensors = {
+            id(param): param.detach()
+            for module in model.modules()
+            for param in module._parameters.values() if param is not None
+        }
+
+    def restore(self) -> None:
+        """Put back the submodules, and the attributes as they were.
+
+        An attribute that was None is None again: what a forward or post-load
+        processing set it to since was built on dummy weights or a KV cache of
+        the rehearsal, or refers to a module this drops. The checkpoint load or
+        the first forward sets it again.
+        """
+        for module, children, attributes in self._modules:
+            module._modules.clear()
+            module._modules.update(children)
+            for name, value in attributes.items():
+                if value is None:
+                    module.__dict__[name] = None
+                else:
+                    module.__dict__.setdefault(name, value)
+
+    def restore_parameters(self) -> None:
+        """Give each parameter slot its layout back, for the checkpoint to load into.
+
+        A parameter that post-load processing released or replaced with another
+        layout gets its tensor as created back: the checkpoint loads into the
+        memory it was created in, as a load without the rehearsal does, so that
+        post-load processing frees the same memory and leaves the allocator's
+        cache as fragmented as it does then. One whose memory was released in
+        place is created again, empty. Slots that shared a parameter share one
+        again.
+        """
+        kept: dict[int, torch.nn.Parameter] = {}
+        for module, name, key, shape, dtype, device, _ in self._parameters:
+            param = module._parameters.get(name)
+            if (param is not None and param.shape == shape
+                    and param.dtype == dtype and param.device == device
+                    and _holds_its_bytes(param)):
+                kept.setdefault(key, param)
+        for module, name, key, shape, dtype, device, requires_grad in self._parameters:
+            if key not in kept:
+                tensor = self._tensors.get(key)
+                if tensor is None or not _holds_its_bytes(tensor):
+                    tensor = torch.empty(shape, dtype=dtype, device=device)
+                kept[key] = torch.nn.Parameter(tensor,
+                                               requires_grad=requires_grad)
+            module.__dict__.pop(name, None)
+            module._parameters[name] = kept[key]
+        # The parameters hold the tensors they need now.
+        self._tensors.clear()
+
+
+@dataclass
+class _DeferredCheckpoint:
+    """A checkpoint load `ModelLoader.load` left for `load_deferred_checkpoint`:
+    the inputs of its `LoadFormat.AUTO` read and the module tree as created."""
+    model_config: ModelConfig
+    checkpoint_dir: str
+    checkpoint_loader: BaseCheckpointLoader
+    loads_draft_weights: bool
+    source_identity: Optional[SourceIdentity]
+    post_transform_qualification: PostTransformQualificationDecision
+    tree: _ModuleTree
 
 
 _CheckpointStartupMetadata = dict[str,
@@ -1160,6 +1310,7 @@ class ModelLoader:
         self._weight_pool_proxy = None
         self._gms_backend = None
         self._checkpoint_loader: Optional[BaseCheckpointLoader] = None
+        self._deferred: Optional[_DeferredCheckpoint] = None
         # Mostly weight loading and processing time metrics, updated when load() is called.
         self._metrics: dict[str, float] = {}
         self._startup_metadata: _CheckpointStartupMetadata = {}
@@ -1366,6 +1517,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
+        defer_checkpoint: bool = False,
     ) -> tuple[DecoderModelForCausalLM, BaseMoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
@@ -1373,38 +1525,45 @@ class ModelLoader:
         Args:
             checkpoint_dir: The directory of the model checkpoint.
             checkpoint_loader: The loader object for model checkpoints.
+            defer_checkpoint: Where the checkpoint can load later as it would
+                now (`_can_defer_checkpoint`) and the KernelBuilder rehearsal
+                is on, return the model with dummy weights instead;
+                `has_deferred_checkpoint` then tells, and
+                `load_deferred_checkpoint` loads the checkpoint.
 
         Returns:
             The loaded and initialized PyTorch model.
         """
         # Reset before the total timer starts: the timer writes into this dict.
         self._metrics = {}
-        # Directories _timed_load read checkpoint files from.
+        self._deferred = None
+        # Directories the checkpoint load reads files from, in _timed_load or,
+        # deferred, in load_deferred_checkpoint.
         self._checkpoint_dirs_read: list[str] = []
         with timing_metric(
                 ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
                 self._metrics):
-            model, moe_load_balancer = self._timed_load(checkpoint_dir,
-                                                        checkpoint_loader)
-
-        release_seconds = _release_checkpoint_page_cache(
-            self._checkpoint_dirs_read)
-        if release_seconds is not None:
-            self._metrics[
-                _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
-
-        metrics = ", ".join(f"{name}={value:.4f}"
-                            for name, value in self._metrics.items())
-        logger.info(
-            f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+            model, moe_load_balancer = self._timed_load(
+                checkpoint_dir,
+                checkpoint_loader,
+                defer_checkpoint=defer_checkpoint)
+        # A deferred load finishes once load_deferred_checkpoint has read the
+        # checkpoint.
+        if self._deferred is None:
+            self._finish_load()
         return model, moe_load_balancer
 
     def _timed_load(
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
+        defer_checkpoint: bool = False,
     ) -> tuple[DecoderModelForCausalLM, BaseMoeLoadBalancer | None]:
-        """Do all the work of `load()`, which times it as the total loading time."""
+        """Do all the work of `load()`, which times it as the total loading time.
+
+        A deferred checkpoint load stops after the dummy weights
+        (`_load_rehearsal_weights`).
+        """
         self._checkpoint_loader = checkpoint_loader
         config: ModelConfig = self._load_and_validate_config(
             checkpoint_dir, checkpoint_loader)
@@ -1442,6 +1601,16 @@ class ModelLoader:
             speculative_mode=speculative_mode,
             loads_draft_weights=loads_draft_weights)
 
+        # Where the checkpoint load is deferred, the tensors that hold no value
+        # of their own until it loads get dummy values instead.
+        rehearsal_slots: list[tuple[torch.nn.Module, str]] = []
+        if defer_checkpoint and self._can_defer_checkpoint(
+                model,
+                checkpoint_loader,
+                is_meta_init=is_meta_init,
+                moe_load_balancer=moe_load_balancer):
+            rehearsal_slots = _meta_tensor_slots(model)
+
         # GMS allocates its own memory later
         if load_format != LoadFormat.GMS:
             weight_pool = memory_init.allocate_model_on_cuda(
@@ -1474,28 +1643,28 @@ class ModelLoader:
                                             == CheckpointFormat.MX),
             )
 
+        if rehearsal_slots:
+            self._deferred = self._load_rehearsal_weights(
+                model,
+                rehearsal_slots,
+                model_config=model_config,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_loader=checkpoint_loader,
+                loads_draft_weights=loads_draft_weights,
+                source_identity=source_identity,
+                post_transform_qualification=post_transform_qualification)
+            return model, moe_load_balancer
+
         weights_preloaded = False
-        weights_checkpoint_dir = getattr(model, "llm_checkpoint_dir",
-                                         checkpoint_dir)
         if load_format == LoadFormat.AUTO:
-            # read the checkpoint with the checkpoint loader, built-in or custom
-            self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
+            weights_preloaded = self._load_checkpoint_weights(
                 checkpoint_loader,
                 checkpoint_dir,
-                model_config=model_config,
                 model=model,
-                mapping=self.mapping,
-                llm_args=self.llm_args,
-                spec_config=self.spec_config,
+                model_config=model_config,
+                loads_draft_weights=loads_draft_weights,
                 source_identity=source_identity,
-                qualification=post_transform_qualification,
-                metrics=self._metrics,
-                startup_metadata=self._startup_metadata)
-            if not weights_preloaded:
-                self._checkpoint_dirs_read.append(weights_checkpoint_dir)
-            if loads_draft_weights:
-                self._checkpoint_dirs_read.append(
-                    self.spec_config.speculative_model)
+                post_transform_qualification=post_transform_qualification)
 
         elif load_format == LoadFormat.GMS:
             gms_result = gms_loading.load_gms_weights(
@@ -1523,7 +1692,8 @@ class ModelLoader:
             gms_writer = (gms_result.weight_mapper is not None
                           or gms_result.weights_preloaded)
             if gms_result.weight_mapper is not None:
-                self._checkpoint_dirs_read.append(weights_checkpoint_dir)
+                self._checkpoint_dirs_read.append(
+                    getattr(model, "llm_checkpoint_dir", checkpoint_dir))
             if gms_writer and loads_draft_weights:
                 self._checkpoint_dirs_read.append(
                     self.spec_config.speculative_model)
@@ -1545,6 +1715,153 @@ class ModelLoader:
             raise NotImplementedError(
                 f"No load support for load format: {load_format}")
 
+        self._post_load(
+            checkpoint_loader,
+            model,
+            checkpoint_dir=checkpoint_dir,
+            load_format=load_format,
+            weights_preloaded=weights_preloaded,
+            post_transform_qualification=post_transform_qualification,
+            source_identity=source_identity,
+            moe_load_balancer=moe_load_balancer)
+        return model, moe_load_balancer
+
+    def _can_defer_checkpoint(
+        self,
+        model: DecoderModelForCausalLM,
+        checkpoint_loader: BaseCheckpointLoader,
+        *,
+        is_meta_init: bool,
+        moe_load_balancer: BaseMoeLoadBalancer | None,
+    ) -> bool:
+        """Whether the checkpoint can load after a KernelBuilder rehearsal on
+        dummy weights as it would load now, and the rehearsal runs.
+
+        Only where the AUTO loader of a checkpoint that is not MX fills tensors
+        materialized from meta outside a weights memory tag, nothing else
+        holds them (MoE load balancer, pinned host copies), the module tree is
+        the Modeling V1 one the refit hooks cover, and every module of it can
+        reload its weights. And only for a model whose dummy weights build
+        what its checkpoint load builds, where its runner rehearses.
+        """
+        if not (self.llm_args.load_format == LoadFormat.AUTO
+                and checkpoint_loader.checkpoint_format != CheckpointFormat.MX
+                and is_meta_init and self.model_weights_memory_tag is None
+                and moe_load_balancer is None and getattr(
+                    model.model_config, "modeling_v2_target", None) is None):
+            return False
+        if not all(
+                getattr(module, "supports_weight_reload", True) and not getattr(
+                    module, "_requires_regular_checkpoint_loading", False)
+                for module in model.modules()):
+            return False
+        return (KernelBuilder.get().rehearse
+                and getattr(model, "rehearses_on_dummy_weights", False)
+                and runner_rehearses(model, self.llm_args))
+
+    def _load_rehearsal_weights(
+        self,
+        model: DecoderModelForCausalLM,
+        rehearsal_slots: list[tuple[torch.nn.Module, str]],
+        *,
+        model_config: ModelConfig,
+        checkpoint_dir: str,
+        checkpoint_loader: BaseCheckpointLoader,
+        loads_draft_weights: bool,
+        source_identity: Optional[SourceIdentity],
+        post_transform_qualification: PostTransformQualificationDecision,
+    ) -> _DeferredCheckpoint:
+        """What `LoadFormat.DUMMY` loads, into the tensors that hold no value
+        (``rehearsal_slots``), and the post-load hooks on these dummy weights.
+
+        Returns what `load_deferred_checkpoint` needs to load the checkpoint:
+        the module tree as created and the inputs of the load.
+        """
+        logger.info(
+            "Loading dummy weights for a KernelBuilder rehearsal; the checkpoint "
+            "loads after it.")
+        deferred = _DeferredCheckpoint(
+            model_config=model_config,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_loader=checkpoint_loader,
+            loads_draft_weights=loads_draft_weights,
+            source_identity=source_identity,
+            post_transform_qualification=post_transform_qualification,
+            tree=_ModuleTree(model),
+        )
+        with timing_metric(
+                ModelLoaderMetricNames.POST_LOAD_PROCESSING_SECONDS.value,
+                self._metrics):
+            # Read from the slots after the allocation; no reference outlives
+            # the fill, so what the post-load hooks release is freed.
+            fill_rehearsal_values(
+                getattr(module, name).detach()
+                for module, name in rehearsal_slots)
+            initialize_dummy_states(model)
+            if loads_draft_weights:
+                model.draft_model.load_weights_from_target_model(model)
+            model_hooks.walk_full_post_load(model)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            if LOW_M_GEMM_ACTIVE:
+                prepare_low_m_gemm(model)
+        return deferred
+
+    def _load_checkpoint_weights(
+        self,
+        checkpoint_loader: BaseCheckpointLoader,
+        checkpoint_dir: str,
+        *,
+        model: DecoderModelForCausalLM,
+        model_config: ModelConfig,
+        loads_draft_weights: bool,
+        source_identity: Optional[SourceIdentity],
+        post_transform_qualification: PostTransformQualificationDecision,
+    ) -> bool:
+        """The `LoadFormat.AUTO` read of the target and any separate draft
+        checkpoint; the directories it reads files from are recorded for the
+        page-cache release.
+
+        Returns:
+            Whether the checkpoint loader wrote the target weights into the
+            model directly.
+        """
+        # read the checkpoint with the checkpoint loader, built-in or custom
+        self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
+            checkpoint_loader,
+            checkpoint_dir,
+            model_config=model_config,
+            model=model,
+            mapping=self.mapping,
+            llm_args=self.llm_args,
+            spec_config=self.spec_config,
+            source_identity=source_identity,
+            qualification=post_transform_qualification,
+            metrics=self._metrics,
+            startup_metadata=self._startup_metadata)
+        if not weights_preloaded:
+            self._checkpoint_dirs_read.append(
+                getattr(model, "llm_checkpoint_dir", checkpoint_dir))
+        if loads_draft_weights:
+            self._checkpoint_dirs_read.append(
+                self.spec_config.speculative_model)
+        return weights_preloaded
+
+    def _post_load(
+        self,
+        checkpoint_loader: BaseCheckpointLoader,
+        model: DecoderModelForCausalLM,
+        *,
+        checkpoint_dir: str,
+        load_format: LoadFormat,
+        weights_preloaded: bool,
+        post_transform_qualification: PostTransformQualificationDecision,
+        source_identity: Optional[SourceIdentity],
+        moe_load_balancer: BaseMoeLoadBalancer | None,
+    ) -> None:
+        """The post-load hooks and publish step, the MoE load balancer's
+        finalization, the release of the memory they freed, the final weight
+        manifest and the low-M GEMM dispatch."""
         with timing_metric(
                 ModelLoaderMetricNames.POST_LOAD_PROCESSING_SECONDS.value,
                 self._metrics):
@@ -1608,7 +1925,70 @@ class ModelLoader:
 
             if LOW_M_GEMM_ACTIVE:
                 prepare_low_m_gemm(model)
-        return model, moe_load_balancer
+
+    def _finish_load(self) -> None:
+        """Drop the page cache of the checkpoint files the load read, and log
+        the loading metrics."""
+        release_seconds = _release_checkpoint_page_cache(
+            self._checkpoint_dirs_read)
+        if release_seconds is not None:
+            self._metrics[
+                _CHECKPOINT_PAGE_CACHE_RELEASE_SECONDS] = release_seconds
+
+        metrics = ", ".join(f"{name}={value:.4f}"
+                            for name, value in self._metrics.items())
+        logger.info(
+            f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+
+    @property
+    def has_deferred_checkpoint(self) -> bool:
+        """True after `load(defer_checkpoint=True)` returned a model with dummy
+        weights, until `load_deferred_checkpoint` loads the checkpoint."""
+        return self._deferred is not None
+
+    def load_deferred_checkpoint(self, model: DecoderModelForCausalLM) -> None:
+        """Load the checkpoint a `load(defer_checkpoint=True)` left out.
+
+        The model goes back to the state `load` had it in before it put dummy
+        weights in: the module tree as created, and each parameter in its
+        creation layout, through `pre_reload_weights` as for a weight update
+        and otherwise created again. The rest of the load then runs as `load`
+        runs it, the page-cache release of the files it reads included.
+
+        Args:
+            model: The model `load` returned.
+        """
+        deferred, self._deferred = self._deferred, None
+        assert deferred is not None, "no checkpoint load was deferred"
+        qualification = deferred.post_transform_qualification
+        with timing_metric(
+                ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
+                self._metrics):
+            torch.cuda.synchronize()
+            deferred.tree.restore()
+            for module in model.modules():
+                if hasattr(module, "pre_reload_weights") and not getattr(
+                        module, "_weights_removed", False):
+                    module.pre_reload_weights()
+            deferred.tree.restore_parameters()
+            model_hooks.reset_weights_transformed(model)
+            weights_preloaded = self._load_checkpoint_weights(
+                deferred.checkpoint_loader,
+                deferred.checkpoint_dir,
+                model=model,
+                model_config=deferred.model_config,
+                loads_draft_weights=deferred.loads_draft_weights,
+                source_identity=deferred.source_identity,
+                post_transform_qualification=qualification)
+            self._post_load(deferred.checkpoint_loader,
+                            model,
+                            checkpoint_dir=deferred.checkpoint_dir,
+                            load_format=LoadFormat.AUTO,
+                            weights_preloaded=weights_preloaded,
+                            post_transform_qualification=qualification,
+                            source_identity=deferred.source_identity,
+                            moe_load_balancer=None)
+        self._finish_load()
 
     def reload(self,
                model: DecoderModelForCausalLM,

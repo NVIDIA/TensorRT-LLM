@@ -37,11 +37,21 @@ def _scale_kwargs(input_dtype: torch.dtype, softmax_scale: float) -> dict:
     return {"softmax_scale": softmax_scale, "output_scale": 1.0}
 
 
+def _meta(tensor):
+    """A meta tensor of ``tensor``'s view, as a worker process builds a kernel from shapes."""
+    from tensorrt_llm._torch.autotuner import _TensorSpec
+
+    return _TensorSpec.make_meta(_TensorSpec.of(tensor, keep_values=False))
+
+
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("split_kv", [1, 4])
+@pytest.mark.parametrize("built_from_shapes", [False, True])
 def test_cute_dsl_mla_helix_stats_and_empty_local_kv(
-    input_dtype: torch.dtype, split_kv: int
+    monkeypatch, input_dtype: torch.dtype, split_kv: int, built_from_shapes: bool
 ) -> None:
+    """With ``built_from_shapes``, the kernel is compiled first from meta tensors of the inputs
+    (``CuteDSLNVMlaDecodeBlackwellRunner.build``): the call compiles nothing and runs it."""
     import cutlass
 
     from tensorrt_llm._torch.attention.attention import _helix_sanitize_empty_kv
@@ -127,11 +137,16 @@ def test_cute_dsl_mla_helix_stats_and_empty_local_kv(
         workspace,
         softmax_stats,
     ]
-    runner.forward(
-        inputs + _scale_inputs(input_dtype, softmax_scale, device),
-        tactic=((128, 128), (128, 256), split_kv, False),
-        **_scale_kwargs(input_dtype, softmax_scale),
-    )
+    inputs += _scale_inputs(input_dtype, softmax_scale, device)
+    tactic = ((128, 128), (128, 256), split_kv, False)
+    scale_kwargs = _scale_kwargs(input_dtype, softmax_scale)
+    if built_from_shapes:
+        monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "kernel_cache", {})
+        runner.build([_meta(t) for t in inputs], tactic=tactic, **scale_kwargs)
+        assert len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) == 1
+    runner.forward(inputs, tactic=tactic, **scale_kwargs)
+    if built_from_shapes:
+        assert len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) == 1
 
     # The existing Helix sanitizer makes a rank with no local pages the identity
     # contribution even though the MLA kernel may leave an empty row undefined.

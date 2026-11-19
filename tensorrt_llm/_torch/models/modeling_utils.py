@@ -663,6 +663,12 @@ class DecoderModelForCausalLM(nn.Module,
     # The model-specific TorchLlmArgs fields this model implements; the loader
     # rejects a set one that is not listed.
     model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
+    # Whether dummy weights (LoadFormat.DUMMY) give this model the modules and
+    # tensors a checkpoint load gives it (initialize_dummy_state), so that a
+    # forward on them runs the kernels a forward on the checkpoint runs, and the
+    # checkpoint can load after such a forward. Only such a model runs the
+    # KernelBuilder rehearsal (ModelLoader.load).
+    rehearses_on_dummy_weights: ClassVar[bool] = False
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(

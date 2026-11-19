@@ -70,6 +70,7 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .rehearsal import Rehearsal
 from .runtime_hooks import runtime_hooks_of
 from .scheduled_encoder_executor import ScheduledEncoderExecutor
 from .scheduler import gen_preemption
@@ -1044,6 +1045,14 @@ def _create_py_executor(
             model_weights_restore_mode = sleep_config.restore_modes[
                 ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
+        # The model is built on dummy weights for a KernelBuilder rehearsal; its
+        # checkpoint loads after the rehearsal below. Not with what takes the
+        # weights over as they load (DWDP) or captures graphs on them (the
+        # multimodal encoders' CUDA graphs), nor with a context parallelism
+        # other than Helix, whose forwards the rehearsal does not run
+        # (DecoderWarmup.rehearse).
+        mm_config = llm_args.multimodal_config
+        rehearsal_off = mapping.cp_size > 1 and not mapping.has_cp_helix()
         model_engine = ModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
@@ -1054,6 +1063,11 @@ def _create_py_executor(
             checkpoint_loader=checkpoint_loader,
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
+            defer_checkpoint=(dwdp_manager is None
+                              and dense_dwdp_manager is None
+                              and (mm_config is None
+                                   or not mm_config.encoder_cuda_graph)
+                              and not rehearsal_off),
         )
 
     is_generation = model_engine.model.model_config.is_generation
@@ -1458,6 +1472,15 @@ def _create_py_executor(
             skip_est=skip_est,
             is_disagg=is_disagg,
         )
+
+        if model_engine.has_deferred_checkpoint:
+            with Rehearsal() as rehearsal:
+                with _startup_timer.phase("rehearsal"):
+                    rehearsal.rehearse(model_engine, kv_cache_creator)
+                with _startup_timer.phase("checkpoint"):
+                    model_engine.load_deferred_checkpoint()
+                with _startup_timer.phase("gpu_builds"):
+                    rehearsal.join()
 
         if not skip_est:
             log_memory_usage("after loading weights")

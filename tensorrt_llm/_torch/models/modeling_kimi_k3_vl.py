@@ -467,6 +467,7 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
 
     _VISION_MODEL_CLS = KimiK3VisionModel
     mamba_metadata_cls = KimiLinearForCausalLM.mamba_metadata_cls
+    rehearses_on_dummy_weights = KimiLinearForCausalLM.rehearses_on_dummy_weights
 
     def __init__(
         self,

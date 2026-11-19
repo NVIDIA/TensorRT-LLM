@@ -3487,6 +3487,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     architecture is registered by that wrapper, not here."""
 
     mamba_metadata_cls = KimiK3MambaMetadata
+    rehearses_on_dummy_weights = True
     # Set from the environment in __init__; loaders that build the model without
     # it (modeling_v2 targets, checkpoint tests) inherit the defaults.
     _mxfp8_shared_expert: bool = False
@@ -4041,7 +4042,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         num_params = self._load_trunk_params(weights, params, name_map)
         num_params += self._load_attention_fp8(weights, prefix)
         self._load_expert_slices(weights, expert_jobs)
-        self._finalize_weight_load(num_params, len(expert_jobs))
+        self._finalize_loaded_weights()
+        logger.info(
+            f"Kimi K3: loaded {num_params} parameters and expert slices of {len(expert_jobs)} layers"
+        )
         device = next(self.parameters()).device
         if device.type == "cuda":
             # Lazy source mappings are load-scoped; finish nonblocking H2D
@@ -4549,8 +4553,35 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
             backend._weights_transformed = False
 
-    def _finalize_weight_load(self, num_params: int, num_moe_layers: int) -> None:
-        """Finalize checkpoint-loaded attention and optional BF16 MLP conversion."""
+    def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
+        """Lay out and finalize dummy weights as ``load_weights`` does a checkpoint's.
+
+        A forward on dummy weights then runs the modules a forward on the checkpoint runs.
+        """
+        del low, high, seed  # The dummy values are already in place.
+        for name, _, attention in self._attention_fp8_linears():
+            if name.endswith(".self_attn.mixer.kv_b_proj"):
+                self._take_mla_fp8_v_b(attention)
+        self._finalize_loaded_weights()
+
+    @staticmethod
+    def _take_mla_fp8_v_b(attention: nn.Module) -> None:
+        """Make ``v_b_proj`` the FP8 codes of the KV-B value rows, as ``_load_mla_fp8_kv_b`` does."""
+        h, n, v, k = (
+            attention.num_heads_tp,
+            attention.qk_nope_head_dim,
+            attention.v_head_dim,
+            attention.kv_lora_rank,
+        )
+        value_weight = _helix_cp_v_b_shard(
+            attention.kv_b_proj.weight[h * n :].view(h, v, k),
+            num_heads_tp_cp=attention.num_heads_tp_cp,
+            cp_rank=attention.mapping.cp_rank,
+        )
+        attention.v_b_proj = nn.Parameter(value_weight.clone().contiguous(), requires_grad=False)
+
+    def _finalize_loaded_weights(self) -> None:
+        """Finalize the loaded attention weights and the optional BF16 MLP conversion."""
         for layer in self.model.layers:
             if not _has_weights(layer):
                 continue
@@ -4576,9 +4607,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     # its fused copy, ~22.6 GiB at peak across K3's 69 KDA
                     # layers, which overflows a DEP8 context rank.
                     projection.transform_weights()
-        logger.info(
-            f"Kimi K3: loaded {num_params} parameters and expert slices of {num_moe_layers} layers"
-        )
         if self._mxfp8_shared_expert:
             if _rubin_mxfp8_is_available():
                 converted, kept = _convert_shared_experts_to_mxfp8(self.model)

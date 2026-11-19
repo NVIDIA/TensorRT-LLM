@@ -22,6 +22,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..build_pool import process_built
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, graph_safe_cute_tensor
 from ..flashinfer_utils import get_env_enable_pdl
 
@@ -201,7 +202,7 @@ def _row_view(rows: int, cols: int, stride: int, dtype, device) -> torch.Tensor:
     return torch.empty((rows, stride), dtype=dtype, device=device)[:, :cols]
 
 
-@functools.lru_cache(maxsize=None)
+@process_built("low_m_mma_gemm")
 def _compiled(
     m: int,
     k: int,

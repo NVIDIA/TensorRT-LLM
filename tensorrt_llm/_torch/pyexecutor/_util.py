@@ -16,7 +16,8 @@ import copy
 import dataclasses
 import os
 from contextlib import ExitStack
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
+from typing import (TYPE_CHECKING, Callable, Dict, List, Optional, Sequence,
+                    Union)
 
 import torch
 
@@ -2011,40 +2012,9 @@ class KvCacheCreator:
         # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
         num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
 
-        # KVCacheManagerV2 divides the quota derived from max_tokens across its
-        # pool groups. Scale the dummy workload by the inferred group count so
-        # each pool can hold a max-length request. This covers both VSWA pools
-        # (distinct attention windows) and hybrid recurrent/attention pools
-        # (distinct layer types without sliding windows).
-        num_pool_groups = 1
-        if self._is_kv_cache_manager_v2:
-            unified_layer_specs = self._build_unified_dflash_layer_specs(
-                self._kv_cache_config)
-            if unified_layer_specs and not issubclass(
-                    self._kv_cache_manager_cls, MambaHybridCacheManagerV2):
-                # Target and draft layers can differ in page size and life
-                # cycle, so the group count comes from the combined layout. In a
-                # manager hosting draft layers the dummy workload is the
-                # target's: the quota from max_tokens already charges the draft
-                # lifecycle its own pages, as a separate draft pool's quota would.
-                hosts_draft_layers = self._kv_cache_manager_hosts_draft_layers()
-                num_pool_groups = _get_num_storage_pool_groups([
-                    spec
-                    for spec in unified_layer_specs if not hosts_draft_layers
-                    or spec.owner is KVCacheLayerOwner.TARGET
-                ], self._tokens_per_block)
-            else:
-                model_cfg = self._model_engine.model.model_config
-                num_pool_groups = _get_num_pool_groups_for_estimation(
-                    model_cfg,
-                    self._model_engine.max_seq_len,
-                    self._kv_cache_config,
-                )
-                if unified_layer_specs:
-                    # A hybrid manager's appended draft layers.
-                    num_pool_groups += _get_num_storage_pool_groups(
-                        unified_layer_specs, self._tokens_per_block)
-        num_cache_blocks *= num_pool_groups
+        # Scale the dummy workload by the pool group count so each pool can hold
+        # a max-length request.
+        num_cache_blocks *= self._num_kv_pool_groups()
 
         # Dummy context requests use the configured maximum beam width. Scale
         # their block budget by the same value so the temporary KV cache used
@@ -2064,6 +2034,115 @@ class KvCacheCreator:
             kv_size_per_token.tokens_for_budget(max_memory) //
             self._tokens_per_block * self._tokens_per_block)
         return min(max_num_tokens_for_estimation, max_num_tokens_in_memory)
+
+    def _num_kv_pool_groups(self) -> int:
+        """How many pool groups KVCacheManagerV2 divides the quota derived from
+        max_tokens across (1 for V1): VSWA pools (distinct attention windows)
+        and hybrid recurrent/attention pools (distinct layer types without
+        sliding windows)."""
+        if not self._is_kv_cache_manager_v2:
+            return 1
+        unified_layer_specs = self._build_unified_dflash_layer_specs(
+            self._kv_cache_config)
+        if unified_layer_specs and not issubclass(self._kv_cache_manager_cls,
+                                                  MambaHybridCacheManagerV2):
+            # Target and draft layers can differ in page size and life cycle,
+            # so the group count comes from the combined layout. In a manager
+            # hosting draft layers the dummy workload is the target's: the quota
+            # from max_tokens already charges the draft lifecycle its own pages,
+            # as a separate draft pool's quota would.
+            hosts_draft_layers = self._kv_cache_manager_hosts_draft_layers()
+            return _get_num_storage_pool_groups([
+                spec for spec in unified_layer_specs if not hosts_draft_layers
+                or spec.owner is KVCacheLayerOwner.TARGET
+            ], self._tokens_per_block)
+        num_pool_groups = _get_num_pool_groups_for_estimation(
+            self._model_engine.model.model_config,
+            self._model_engine.max_seq_len,
+            self._kv_cache_config,
+        )
+        if unified_layer_specs:
+            # A hybrid manager's appended draft layers.
+            num_pool_groups += _get_num_storage_pool_groups(
+                unified_layer_specs, self._tokens_per_block)
+        return num_pool_groups
+
+    def _get_token_num_for_rehearsal(self) -> int:
+        """KV cache capacity for the KernelBuilder rehearsal's forwards
+        (``DecoderWarmup.rehearse``), which run one batch at a time: the larger
+        of the autotuner warmup's context batch and its generation-only batch,
+        as ``create_warmup_request`` allocates them."""
+        # The warmup's batch bounds are the model engine's.
+        engine = self._model_engine
+        tokens_per_block = self._tokens_per_block
+        extra_kv_tokens = get_num_extra_kv_tokens(self._speculative_config)
+        if self._should_unify_dflash_kv_cache():
+            # A drafter sharing the manager appends its block to each request.
+            extra_kv_tokens = max(extra_kv_tokens,
+                                  self._unified_drafter_block_width())
+        max_seq_len = max(1, engine.max_seq_len - 1)
+        # The context batch, in requests of up to max_seq_len - 1 tokens.
+        num_ctx_tokens = min(engine.max_num_tokens,
+                             engine.batch_size * max_seq_len)
+        num_full, remainder = divmod(num_ctx_tokens, max_seq_len)
+        ctx_blocks = num_full * ceil_div(max_seq_len + extra_kv_tokens,
+                                         tokens_per_block)
+        if remainder:
+            ctx_blocks += ceil_div(remainder + extra_kv_tokens,
+                                   tokens_per_block)
+        # The generation-only batch: each request holds its token (two under
+        # Helix), the extra KV tokens and the draft loop's tokens, for each
+        # beam.
+        helix = self._mapping.has_cp_helix()
+        num_gen_requests = max(
+            1,
+            min(engine.batch_size,
+                engine.max_num_tokens // (1 + engine.max_total_draft_tokens)))
+        gen_blocks = num_gen_requests * engine.max_beam_width * ceil_div(
+            (2 if helix else 1) + extra_kv_tokens +
+            engine.max_draft_loop_tokens, tokens_per_block)
+        # get_num_available_tokens also holds back the extra KV and draft
+        # tokens of a request.
+        num_blocks = max(ctx_blocks, gen_blocks) + ceil_div(
+            extra_kv_tokens + engine.max_total_draft_tokens, tokens_per_block)
+        num_blocks *= self._num_kv_pool_groups()
+        if helix:
+            # Helix capacities count the tokens of all the CP ranks.
+            num_blocks *= self._mapping.cp_size
+        return num_blocks * tokens_per_block
+
+    def _size_throwaway_kv_cache(self, get_tokens: Callable[[], int]) -> None:
+        """Size the KV cache config for throwaway managers
+        (``build_managers(estimating_kv_cache=True)``) that hold
+        ``get_tokens()`` tokens."""
+        # User-provided pool sizing can underprovision a throwaway cache and
+        # cause warmup to hang or fail. Override it before budgeting, as the
+        # pool group count depends on it; configure_kv_cache_capacity()
+        # restores it for serving.
+        self._kv_cache_config.pool_ratio = None
+        max_tokens = get_tokens()
+        if self._kv_cache_config.max_tokens is not None:
+            max_tokens = min(max_tokens, self._kv_cache_config.max_tokens)
+        self._kv_cache_config.avg_seq_len = self._max_seq_len
+        if self._is_kv_cache_manager_v2:
+            free_mem, _ = torch.cuda.mem_get_info()
+            max_gpu_total_bytes = int(
+                self._kv_cache_config.free_gpu_memory_fraction * free_mem)
+            if (self._max_gpu_total_bytes_in is not None
+                    and self._max_gpu_total_bytes_in > 0):
+                max_gpu_total_bytes = min(max_gpu_total_bytes,
+                                          self._max_gpu_total_bytes_in)
+            self._kv_cache_config.max_gpu_total_bytes = max_gpu_total_bytes
+        self._kv_cache_config.max_tokens = max_tokens
+
+    def prepare_rehearsal(self) -> None:
+        """Size the KV cache config for the KernelBuilder rehearsal's throwaway
+        managers from the rehearsal's own forwards, whether or not the capacity
+        estimation runs."""
+        # build_managers then builds from this config instead of sizing for
+        # serving (configure_kv_cache_capacity).
+        self._skip_est = False
+        self._size_throwaway_kv_cache(self._get_token_num_for_rehearsal)
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
@@ -2115,27 +2194,7 @@ class KvCacheCreator:
                 "models, disable it.")
 
         if estimating_kv_cache:
-            # User-provided pool sizing can underprovision the temporary
-            # estimation cache and cause warmup to hang or fail. Override it
-            # before budgeting, then restore it in configure_kv_cache_capacity().
-            self._kv_cache_config.pool_ratio = None
-            estimate_max_tokens = self._get_token_num_for_estimation()
-            max_tokens = min(
-                estimate_max_tokens, self._kv_cache_config.max_tokens
-            ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
-            self._kv_cache_config.avg_seq_len = self._max_seq_len
-            if self._is_kv_cache_manager_v2:
-                free_mem, _ = torch.cuda.mem_get_info()
-                max_gpu_total_bytes = int(
-                    self._kv_cache_config.free_gpu_memory_fraction * free_mem)
-                if (self._max_gpu_total_bytes_in is not None
-                        and self._max_gpu_total_bytes_in > 0):
-                    max_gpu_total_bytes = min(max_gpu_total_bytes,
-                                              self._max_gpu_total_bytes_in)
-                self._kv_cache_config.max_gpu_total_bytes = max_gpu_total_bytes
-                self._kv_cache_config.max_tokens = max_tokens
-            else:
-                self._kv_cache_config.max_tokens = max_tokens
+            self._size_throwaway_kv_cache(self._get_token_num_for_estimation)
         return estimating_kv_cache
 
     def _configure_helix_kv_cache_capacity(self) -> None:
