@@ -2566,7 +2566,10 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 # Render (and append the forced named-tool prefix, see
                 # ``_build_forced_tool_call_decoding``) while the media loads.
-                # Tokenization stays with the engine's input processor.
+                # Tokenization stays with the engine's input processor, except
+                # for a prompt that comes back as ids (control-token text in the
+                # messages, encoded as text). The engine adds no special tokens
+                # to ids and does not truncate them, so the renderer does.
                 render_task = render_conversation(
                     render_resources,
                     conversation=conversation,
@@ -2579,6 +2582,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     injected_chat_template_kwargs=request.
                     injected_chat_template_kwargs,
                     forced_prefix=forced_tool_begin_prefix,
+                    add_special_tokens=request.add_special_tokens,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens,
                 )
                 rendered, (mm_data, mm_embeddings) = await asyncio.gather(
                     render_task, mm_coroutines)
@@ -2586,10 +2591,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     prompt = rendered.token_ids
                 else:
                     prompt = rendered.text
-                    # Captured before the forced-tool prefix is appended:
-                    # resolve_prefilled_thinking() inspects what the chat
-                    # template rendered, and the prefix is not part of it.
-                    rendered_prompt = rendered.template_text
+                # Captured before the forced-tool prefix is appended:
+                # resolve_prefilled_thinking() inspects what the chat
+                # template rendered, and the prefix is not part of it.
+                rendered_prompt = rendered.template_text
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:

@@ -48,9 +48,10 @@ class RenderedPrompt:
     """A prompt after chat-template rendering and, optionally, tokenization.
 
     ``text`` is the rendered template string (``None`` when the prompt came out
-    of the template as token ids, or from a model-specific renderer such as
-    Harmony). ``token_ids`` is set when the caller asked for tokenization or the
-    renderer produced ids directly.
+    of the template as token ids, from a model-specific renderer such as
+    Harmony, or with control-token text from the inputs encoded as text, which
+    only ``token_ids`` carries). ``token_ids`` is set when the caller asked for
+    tokenization or the renderer produced ids directly.
     """
 
     text: Optional[str] = None
