@@ -57,7 +57,7 @@ What differs from a standard deployment:
 
 - `--max_num_tokens 32768`: long prompts prefill in larger chunks. The measurements below use it; the default
   token budget has not been measured on this target.
-- `--max_seq_len 131072` is the model's context length. Prompts of up to 13,312 tokens have been measured on this
+- `--max_seq_len 131072` is the model's context length. Prompts of up to 13K tokens have been measured on this
   target (the operations' certified cells stop there); longer ones are untested.
 - Without the glm5_next family library (a build whose CUDA architectures include no `100`, or without multi-device
   support) the target is not selected, and `modeling_v2: require` fails at startup.
@@ -71,7 +71,7 @@ What differs from a standard deployment:
 ## 6. Measured
 
 One node of 4x B200, the config and launch above, against the built-in GLM-5.3-Flash model (`modeling_v2: off`)
-with the same settings on the same node. Throughput: 13,312-token prompts, 33 output tokens (ignore_eos,
+with the same settings on the same node. Throughput: 13K-token prompts, about 30 output tokens (ignore_eos,
 temperature 0), the median of two runs of 32 requests at C1 and 64 or 128 at C8 / C32 / C64.
 
 | | built-in | this target |
