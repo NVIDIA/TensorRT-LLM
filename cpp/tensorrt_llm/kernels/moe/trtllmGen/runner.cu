@@ -24,6 +24,8 @@
 #include <tensorrt_llm/common/assert.h>
 #include <tensorrt_llm/common/envUtils.h>
 
+#include <algorithm>
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
@@ -495,7 +497,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
     int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
     void* bmm1Workspace, bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
-    int32_t validHiddenSize, int32_t validIntermediateSize)
+    int32_t validHiddenSize, int32_t validIntermediateSize, int32_t maxNumCtasInBatchDim)
 {
     if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
     {
@@ -506,6 +508,10 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
         validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
     }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    if (maxNumCtasInBatchDim > 0)
+    {
+        maxNumCgasInBatchDim = std::min(maxNumCgasInBatchDim, maxNumCtasInBatchDim);
+    }
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     int32_t intermediateSizeFactor = (is_gated_activation ? 2 : 1);
     mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, numTokens,
@@ -611,7 +617,7 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
     int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
     void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize,
-    int32_t validIntermediateSize)
+    int32_t validIntermediateSize, int32_t maxNumCtasInBatchDim)
 {
     if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
     {
@@ -619,6 +625,10 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
         validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
     }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    if (maxNumCtasInBatchDim > 0)
+    {
+        maxNumCgasInBatchDim = std::min(maxNumCgasInBatchDim, maxNumCtasInBatchDim);
+    }
     mRunner.run(numTokens, hiddenSize, intermediateSize, numTokens, validHiddenSize, validIntermediateSize, {},
         numTokens, numExperts, maxNumCgasInBatchDim, permutedHiddenState, permutedHiddenStateScale, weights,
         weightsScale, /* perTokensSfA */ nullptr,
@@ -869,7 +879,7 @@ void Runner::run(
         workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
         args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config,
         args.valid_hidden_size.value_or(args.hidden_size),
-        args.valid_intermediate_size.value_or(args.intermediate_size));
+        args.valid_intermediate_size.value_or(args.intermediate_size), args.max_num_ctas_in_batch_dim);
 
     // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
     TLLM_CHECK_WITH_INFO(!args.skip_gemm2 || !args.do_finalize, "skip_gemm2 requires do_finalize == false.");
@@ -896,7 +906,7 @@ void Runner::run(
         workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
         workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream, config.gemm2Config,
         args.valid_hidden_size.value_or(args.hidden_size),
-        args.valid_intermediate_size.value_or(args.intermediate_size));
+        args.valid_intermediate_size.value_or(args.intermediate_size), args.max_num_ctas_in_batch_dim);
 
     // Run finalize
     if (args.do_finalize)

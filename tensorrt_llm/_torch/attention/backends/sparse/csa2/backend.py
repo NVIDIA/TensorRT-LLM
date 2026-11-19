@@ -21,13 +21,20 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream, private_stream
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .indexer import CSA2Indexer
 from .metadata import CSA2TrtllmMetadata
-from .params import CSA2BackendForwardArgs, CSA2Layout, CSA2Mode, CSA2Params, select_csa2_backend
+from .params import (
+    CSA2BackendForwardArgs,
+    CSA2ForwardState,
+    CSA2Layout,
+    CSA2Mode,
+    CSA2Params,
+    select_csa2_backend,
+)
 
 if TYPE_CHECKING:
     from flashinfer.prefill import (
@@ -408,6 +415,14 @@ class CSA2TrtllmAttention(TrtllmAttention):
             and direct_decode_device_supported(device)
         )
 
+    def direct_decode_carveout(self, main_width, device) -> int:
+        """Shared-memory carveout (percent) the direct decode of this geometry runs at; 0 for the
+        driver's choice."""
+        from .direct_decode import _ROOM_CARVEOUT, _v2_engaged
+
+        engaged = _v2_engaged(self.num_heads, _SWA_TILE, main_width, device.index)
+        return _ROOM_CARVEOUT if engaged else 0
+
     def gen_fmha_applies(self, q, metadata, forward_args) -> bool:
         """Whether this staged tile runs the ``gen_fmha`` generation core instead of the
         native cubin: a ``gen_fmha_layer``'s generation tile of a forward without context tokens
@@ -469,7 +484,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
     def _forward_direct(self, q, metadata, forward_args):
         """Publish this layer's rows (and run its indexer), then attend the selected packed rows
         in one launch. Nothing is staged, so no staging scale is derived."""
-        from .direct_decode import direct_sparse_decode
+        from .direct_decode import direct_sparse_decode, main_rows_bytes
 
         self._validate_helper_output(q, forward_args)
         module = forward_args.sparse_backend_args
@@ -484,9 +499,31 @@ class CSA2TrtllmAttention(TrtllmAttention):
         query = q.view(metadata.num_tokens, self.num_heads, _HEAD_DIM)
         output = forward_args.output
         state = module.state
-        # Exported slots are final like the selections they map, so readiness keeps the mapping's.
-        main_ready = ready and reuse and inputs.main_mapping is not None
-        inputs, slots_out = self._exported_slots(inputs, metadata, module)
+        # A Reuse layer's main rows, selections and exported slots come from earlier layers: final
+        # once the cache write launched here has passed its own dependency wait, query ready or not.
+        main_ready = (
+            (ready or (rows_written and is_blackwell_datacenter()))
+            and reuse
+            and inputs.main_mapping is not None
+        )
+        # SM100/SM103 attention TP: a Full layer's decode starts once its selections are final; a
+        # programmatic edge from the indexer's stream would start it early but resume it late.
+        mapping = getattr(metadata, "mapping", None)
+        plain_edge = (
+            layout is not None
+            and layout.layer(self.layer_idx).mode == CSA2Mode.FULL
+            and is_blackwell_datacenter()
+            and not (mapping is not None and mapping.enable_attention_dp)
+        )
+        image = 0
+        if inputs.main_mapping is not None and inputs.topk_indices is not None:
+            image = main_rows_bytes(
+                self.num_heads,
+                int(inputs.swa_indices.shape[1]),
+                int(inputs.topk_indices.shape[1]),
+                q.device,
+            )
+        inputs, slots_out, rows = self._exported_slots(inputs, metadata, module, image)
         result = direct_sparse_decode(
             query,
             inputs.swa_pool,
@@ -499,20 +536,24 @@ class CSA2TrtllmAttention(TrtllmAttention):
             output=None if output is None else output.view_as(query),
             inputs_ready=ready,
             main_ready=main_ready,
+            plain_edge=plain_edge,
             query_rope=None if state is None else state.query_rope,
+            output_rope=state is not None and state.output_rope,
             slots_out=slots_out,
+            rows_out=rows if slots_out is not None else None,
+            rows_in=rows if main_ready else None,
         )
         return result.flatten(1)
 
-    def _exported_slots(self, inputs, metadata, module):
-        """An index-source layer's direct decode stores the slots its mapped selections resolve to
-        (returned as ``slots_out``), and a Reuse layer whose source exported them this forward
-        attends those slots unmapped instead (``inputs`` updated); the layout gives both layers one
-        cache owner and compression ratio, so the same visible lengths."""
+    def _exported_slots(self, inputs, metadata, module, image):
+        """An index source's direct decode exports the slots its mapped selections resolve to
+        (``slots_out``) and, with ``image`` bytes per query row, its decoded main rows (``rows``); a
+        Reuse layer of that source attends those slots unmapped and loads those rows. Both layers
+        have one cache owner and compression ratio, so the same visible lengths and main rows."""
         layout = self.sparse_params.layout
         state = module.state
         if layout is None or state is None or inputs.main_mapping is None:
-            return inputs, None
+            return inputs, None, None
         source = state.metadata
         exported = source.csa2_direct_slots
         layer = layout.layer(self.layer_idx)
@@ -520,16 +561,25 @@ class CSA2TrtllmAttention(TrtllmAttention):
         if layer.mode == CSA2Mode.REUSE:
             slots = exported.get(layer.index_source)
             if slots is None or slots.shape[1] != inputs.topk_indices.shape[1]:
-                return inputs, None
+                return inputs, None, None
             inputs = replace(inputs, topk_indices=slots[start : start + count], main_mapping=None)
-            return inputs, None
+            rows = source.csa2_direct_rows.get(layer.index_source)
+            if rows is None or rows.shape[1] != image:
+                return inputs, None, None
+            return inputs, None, rows[start : start + count]
         slots = source._get_csa2_buffer(
             f"direct_slots/{self.layer_idx}",
             (state.swa_kv.shape[0], inputs.topk_indices.shape[1]),
             torch.int64,
         )
         exported[self.layer_idx] = slots
-        return inputs, slots[start : start + count]
+        if not image:
+            return inputs, slots[start : start + count], None
+        rows = source._get_csa2_buffer(
+            f"direct_rows/{self.layer_idx}", (state.swa_kv.shape[0], image), torch.uint8
+        )
+        source.csa2_direct_rows[self.layer_idx] = rows
+        return inputs, slots[start : start + count], rows[start : start + count]
 
     def forward_fused_context(self, q, metadata, forward_args):
         """FP8 context attention of a shared-bank tile with one fused kernel.
@@ -603,15 +653,62 @@ class CSA2TrtllmAttention(TrtllmAttention):
             or metadata.num_query_heads != self.num_heads
         ):
             raise ValueError("CSA2 Q geometry/dtype must match its BF16 metadata")
-        inputs = self._resolve_sparse_inputs(count, forward_args)
+        # SM100/SM103: the row write releases a direct decode early; it reads rows after its wait.
+        release = is_blackwell_datacenter() and self.direct_decode_applies(
+            q, metadata, forward_args
+        )
+        inputs = self._resolve_sparse_inputs(count, forward_args, release_after_wait=release)
         if metadata.swa_pool.device != q.device:
             raise ValueError("CSA2 Q and metadata must be on the same CUDA device")
         return inputs
 
+    def publish_layer_rows(
+        self, state: CSA2ForwardState, *, release_after_wait: bool = False
+    ) -> CSA2ForwardState:
+        """Publish an entered layer's SWA (and a Full layer's global) rows in one quantize launch
+        that also packs an unpacked ``state.index_q``; returns ``state`` with packed queries."""
+        source = state.metadata
+        layer = self.sparse_params.layout.layer(self.layer_idx)
+        global_rows = None
+        if layer.mode == CSA2Mode.FULL and self.layer_idx in source.csa2_precomputed_kv_layers:
+            if state.main_kv is not None or state.index_k is not None:
+                raise ValueError("CED precomputed global KV must not be projected twice")
+        elif layer.mode == CSA2Mode.FULL:
+            if state.main_kv is None or state.index_k is None:
+                raise ValueError("Full mode requires main and index rows, including empty rows")
+            global_rows = (
+                layer.kv_source,
+                source.csa2_main_write_slots[layer.kv_source],
+                state.main_kv,
+                state.index_k,
+                state.main_transform,
+                state.index_transform,
+            )
+        elif state.main_kv is not None or state.index_k is not None:
+            raise ValueError("Only Full mode may write shared main/index caches")
+        pack_queries = (
+            layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX)
+            and state.index_q is not None
+            and state.index_q_scale is None
+        )
+        packed = source.kv_cache_manager.write_layer_rows(
+            self.layer_idx,
+            source.csa2_swa_write_slots[self.layer_idx],
+            state.swa_kv,
+            state.swa_transform,
+            global_rows=global_rows,
+            index_q=state.index_q if pack_queries else None,
+            release_after_wait=release_after_wait,
+        )
+        if packed is not None:
+            state = replace(state, index_q=packed[0], index_q_scale=packed[1])
+        return state
+
     def _resolve_sparse_inputs(
-        self, count: int, forward_args: AttentionForwardArgs
+        self, count: int, forward_args: AttentionForwardArgs, *, release_after_wait: bool = False
     ) -> CSA2BackendForwardArgs:
-        """Publish a module tile's cache rows, run its indexer and return its selections."""
+        """Publish a module tile's cache rows, run its indexer and return its selections;
+        ``release_after_wait``: the direct decode follows the rows (``prepare_sparse_inputs``)."""
         inputs = forward_args.sparse_backend_args
         if not isinstance(inputs, CSA2BackendForwardArgs):
             raise TypeError("CSA2 requires CSA2BackendForwardArgs")
@@ -629,47 +726,15 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 raise ValueError("CSA2 module inputs require the model layout")
             layer = layout.layer(self.layer_idx)
             start, end = inputs.query_start, inputs.query_start + count
-            if start == 0:
+            if start == 0 and not state.rows_published:
                 source.enter_layer(layer)
-                global_rows = None
-                if (
-                    layer.mode == CSA2Mode.FULL
-                    and self.layer_idx in source.csa2_precomputed_kv_layers
-                ):
-                    if state.main_kv is not None or state.index_k is not None:
-                        raise ValueError("CED precomputed global KV must not be projected twice")
-                elif layer.mode == CSA2Mode.FULL:
-                    if state.main_kv is None or state.index_k is None:
-                        raise ValueError(
-                            "Full mode requires main and index rows, including empty rows"
-                        )
-                    global_rows = (
-                        layer.kv_source,
-                        source.csa2_main_write_slots[layer.kv_source],
-                        state.main_kv,
-                        state.index_k,
-                        state.main_transform,
-                        state.index_transform,
-                    )
-                elif state.main_kv is not None or state.index_k is not None:
-                    raise ValueError("Only Full mode may write shared main/index caches")
-                # The SWA rows, the global rows and the index-query packing are
-                # one quantize launch; the indexer then consumes packed queries.
-                pack_queries = (
-                    layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX)
-                    and state.index_q is not None
-                    and state.index_q_scale is None
+                # A SWA / Reuse layer writes only its SWA rows, always here (main_ready relies on
+                # it); a Full layer's also writes shared main / index rows and releases at its end.
+                state = self.publish_layer_rows(
+                    state,
+                    release_after_wait=release_after_wait
+                    and layer.mode in (CSA2Mode.SWA, CSA2Mode.REUSE),
                 )
-                packed = manager.write_layer_rows(
-                    self.layer_idx,
-                    source.csa2_swa_write_slots[self.layer_idx],
-                    state.swa_kv,
-                    state.swa_transform,
-                    global_rows=global_rows,
-                    index_q=state.index_q if pack_queries else None,
-                )
-                if packed is not None:
-                    state = replace(state, index_q=packed[0], index_q_scale=packed[1])
             logical = None
             if layer.mode in (CSA2Mode.FULL, CSA2Mode.REINDEX):
                 if state.index_q is None or state.index_weights is None:
@@ -758,6 +823,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
         table, page_size, max_positions, requests, visible = mapping or (None, 0, 0, None, None)
         if forward_args.sparse_backend_args.query_ready is not None:
             forward_args.sparse_backend_args.query_ready.wait()
+        if inputs.state.decode_start is not None:
+            inputs.state.decode_start.record()
         quant_q = inputs.projected_quant_q
         torch.ops.trtllm.csa2_sparse_decode(
             q if quant_q is None else quant_q.view(q.shape),

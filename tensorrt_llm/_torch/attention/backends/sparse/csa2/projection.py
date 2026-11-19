@@ -133,6 +133,63 @@ def l2_touch(tensors: tuple[torch.Tensor, ...], sink: torch.Tensor, block: int =
     _l2_touch_kernel[(sink.numel(),)](*args, sink, block, num_warps=8)
 
 
+_PREFETCH_COMPILED = {}
+# Per device: a word whose only use is to carry the TVM FFI stream into the prefetch launch.
+_PREFETCH_ANCHOR: dict[int, torch.Tensor] = {}
+
+
+def prefetch_output_weights(
+    o_a_weight: torch.Tensor,
+    o_b_weight: torch.Tensor,
+    ctas: int,
+    budget_ns: int,
+) -> bool:
+    """TMA-prefetch E4M3 O-A ``[groups, R, D]`` and O-B ``[hidden, groups*R]`` into L2 from
+    ``ctas`` CTAs; False if a capture would compile the kernel."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from tensorrt_llm._torch.kernels.blackwell.csa2_weight_prefetch import Csa2WeightPrefetch
+    from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
+
+    shapes = tuple(
+        (weight.numel() // weight.shape[-1], weight.shape[-1])
+        for weight in (o_a_weight, o_b_weight)
+    )
+    device = o_a_weight.device
+    key = (device.index, shapes)
+    compiled = _PREFETCH_COMPILED.get(key)
+    anchor = _PREFETCH_ANCHOR.get(device.index)
+    if compiled is None or anchor is None:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        if anchor is None:
+            anchor = _PREFETCH_ANCHOR[device.index] = torch.zeros(
+                1, device=device, dtype=torch.int32
+            )
+        if compiled is None:
+            pointers = (
+                make_ptr(
+                    cutlass.Float8E4M3FN,
+                    weight.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                for weight in (o_a_weight, o_b_weight)
+            )
+            compiled = _PREFETCH_COMPILED[key] = cute.compile(
+                Csa2WeightPrefetch(*shapes).run,
+                *pointers,
+                cute.runtime.from_dlpack(anchor),
+                ctas,
+                budget_ns,
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                options="--opt-level 2 --enable-tvm-ffi",
+            )
+    compiled(o_a_weight.data_ptr(), o_b_weight.data_ptr(), anchor, ctas, budget_ns)
+    return True
+
+
 # QUANTIZE is a runtime value, so both modes run one compiled kernel and write the same BF16
 # rows; it only masks the MXFP8 stores.
 @triton.jit(do_not_specialize=["M", "QUANTIZE"])

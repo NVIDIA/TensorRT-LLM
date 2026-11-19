@@ -912,7 +912,15 @@ class CSA2CacheManager(KVCacheManagerV2):
         store_index_rows(self.get_index_pages(layer_idx), slots, index, index_transform)
 
     def write_layer_rows(
-        self, layer_idx, slots, values, transform=None, *, global_rows=None, index_q=None
+        self,
+        layer_idx,
+        slots,
+        values,
+        transform=None,
+        *,
+        global_rows=None,
+        index_q=None,
+        release_after_wait=False,
     ):
         """One launch for a layer's SWA rows, its global rows and its packed index queries.
 
@@ -936,6 +944,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             main=main,
             index=index,
             index_q=index_q,
+            release_after_wait=release_after_wait,
         )
 
     def _get_page_index_converter(self, layer_id, role):

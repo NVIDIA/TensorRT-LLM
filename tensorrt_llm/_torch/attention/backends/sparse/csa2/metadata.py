@@ -88,6 +88,10 @@ def csa2_side_stream(device, index: int = 0) -> torch.cuda.ExternalStream:
     return private_stream(torch.device(device).index, f"csa2_side_{index}")
 
 
+# ``csa2_side_stream`` index of a captured decode forward's SWA slot refresh.
+_SWA_REFRESH_STREAM = 3
+
+
 @functools.cache
 def _layout_layers(layout) -> tuple:
     """``layout.layer`` of every layer of the (immutable) ``layout``."""
@@ -245,6 +249,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     _csa2_pending_prepare: tuple | None = None
     _csa2_model_driven: bool = False
     _csa2_graph_reserved: bool = False
+    # (done event, model stream) of this forward's SWA slot refresh on its side stream.
+    _csa2_swa_fork: tuple | None = None
+    # A decode forward's SWA slot refresh launches at its first CSA2 layer's start.
+    _csa2_swa_fork_armed: bool = False
     # Set by ``_allocate``: (the allocation, the extra pool's first 512-element row) when both staging
     # pools are one bank for the ``gen_fmha`` core.
     gen_fmha_bank: tuple[torch.Tensor, int] | None = None
@@ -1780,6 +1788,17 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         """
         if self._csa2_pending_prepare is not None:
             self._prepare_deferred()
+        fork = self._csa2_swa_fork
+        if fork is not None:
+            # Every reader's stream waits for the forked refresh; the model stream's wait orders all
+            # later readers, so it ends the fork (outside a capture, a fork of an aborted capture).
+            if torch.cuda.is_current_stream_capturing():
+                current = torch.cuda.current_stream()
+                current.wait_event(fork[0])
+                if current == fork[1]:
+                    self._csa2_swa_fork = None
+            else:
+                self._csa2_swa_fork = None
         # None: not prepared by prepare_csa2.
         if getattr(self, "_csa2_swa_resolved", None) is not False:
             return
@@ -2690,6 +2709,58 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self.csa2_precomputed_kv_layers = set()
         self.csa2_replay_query_rows = None
         self.csa2_decoder_capture_lens = None
+        self._csa2_swa_fork = None
+        self._csa2_swa_fork_armed = self.num_contexts == 0
+
+    def _launch_swa_refresh_fork(self) -> None:
+        """Launch a captured attention-TP decode forward's SWA slot refresh on a side stream after
+        the model stream's work so far; the model stream's first ``_ensure_swa_slots`` joins it."""
+        from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
+        from tensorrt_llm._utils import is_blackwell_datacenter
+
+        from . import kernel
+
+        positions = getattr(self, "csa2_positions", None)
+        if (
+            positions is None
+            or not positions.is_cuda
+            or (self.mapping is not None and self.mapping.enable_attention_dp)
+            or not is_blackwell_datacenter()
+        ):
+            return
+        side = csa2_side_stream(positions.device, _SWA_REFRESH_STREAM)
+        if (
+            not torch.cuda.is_current_stream_capturing()
+            or is_in_breakable_cuda_graph()
+            or getattr(self, "_csa2_swa_resolved", None) is not False
+            or self._csa2_pending_prepare is not None
+            or getattr(self, "_csa2_swa_descriptors", None) is None
+            or positions.numel() == 0
+            or not kernel.dsl_available()
+        ):
+            return
+        manager = self.kv_cache_manager
+        layers, count = max(self._csa2_swa_page_tables, default=-1) + 1, positions.numel()
+        # The refresh's output slabs come from the model stream's allocations.
+        self._get_csa2_buffer("swa_reads", (layers, count, manager.layout.window_size), torch.int64)
+        self._get_csa2_buffer("swa_writes", (layers, count), torch.int64)
+        self._get_csa2_buffer("visible", (len(manager.layout.compress_ratios), count), torch.int64)
+        caller = torch.cuda.current_stream()
+        side.wait_stream(caller)
+        with torch.cuda.stream(side):
+            self._ensure_swa_slots()
+            done = torch.cuda.Event()
+            done.record()
+        self._csa2_swa_fork = (done, caller)
+
+    def join_swa_refresh_fork(self) -> None:
+        """End of a model forward: the current stream joins a forked SWA slot refresh no reader
+        consumed, so a capture never ends with the side stream unjoined."""
+        fork = self._csa2_swa_fork
+        if fork is not None:
+            if torch.cuda.is_current_stream_capturing():
+                torch.cuda.current_stream().wait_event(fork[0])
+            self._csa2_swa_fork = None
 
     def on_update_kv_lens(self) -> None:
         """Refresh query/cache addresses after device-side acceptance correction.
@@ -2862,8 +2933,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     def reset_routing(self) -> None:
         """Begin one packed forward; graph replay recomputes captured producers."""
         self.csa2_indices = {}
-        # Main slots an index-source layer's direct decode exported this forward.
+        # Main slots and decoded main rows an index source's direct decode exported this forward.
         self.csa2_direct_slots = {}
+        self.csa2_direct_rows = {}
         self.csa2_candidates = {}
         self.csa2_candidate_blocks = {}
         self.csa2_candidate_counts = {}
@@ -3628,6 +3700,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             self._refresh_live_endpoints()
 
     def get_compression_batch(self, owner: int):
+        if self._csa2_swa_fork_armed:
+            # The refresh forks here to overlap the first CSA2 layer's projections.
+            self._csa2_swa_fork_armed = False
+            self._launch_swa_refresh_fork()
         if self._csa2_pending_prepare is not None:
             self._prepare_deferred()
         if (

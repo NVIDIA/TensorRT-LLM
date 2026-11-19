@@ -36,9 +36,11 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.low_m_gemm import mxfp8_lowm_linear
 from tensorrt_llm._torch.modules.mhc.mhc_lowm import (
     LamportAllReduce, MnnvlLamportAllReduce, MoeUnfinalized,
-    mhc_allreduce_post_collapse_norm, mhc_post_collapse_norm)
+    defer_ob_projection, mhc_allreduce_post_collapse_norm,
+    mhc_post_collapse_norm)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     discard_nccl_window_tensor_outputs
@@ -1187,6 +1189,47 @@ def _mhc_moe_inputs(m: int, seed: int, rank: int, top_k: int = 6):
     return parts, res, post, comb, pre, weight
 
 
+def _mhc_ob_inputs(m: int, seed: int, rank: int, k: int = 2048):
+    """This rank's o_b input and MXFP8 weight (UE8M0 scales, linear layout) and the boundary operands."""
+    _, res, post, comb, pre, weight = _mhc_inputs(m, seed, rank)
+    gen = torch.Generator(device="cuda").manual_seed(seed * 100 + rank + 11)
+    o_lat = torch.randn(m, k, generator=gen, device="cuda").bfloat16()
+    ob_weight = (torch.randn(MHC_HIDDEN, k, generator=gen, device="cuda") *
+                 0.5).to(torch.float8_e4m3fn)
+    ob_scale = torch.randint(118,
+                             126, (MHC_HIDDEN, k // 32),
+                             generator=gen,
+                             device="cuda",
+                             dtype=torch.uint8)
+    return o_lat, ob_weight, ob_scale, res, post, comb, pre, weight
+
+
+def _flat(outputs):
+    for out in outputs:
+        if isinstance(out, tuple):
+            yield from out
+        else:
+            yield out
+
+
+def _mhc_allreduce_and_lamport(tp_size: int, mnnvl: bool, rank: int):
+    """The library all-reduce and the fused boundary's Lamport workspace of one protocol."""
+    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=rank)
+    if mnnvl:
+        # The MNNVL protocol on one node (fabric memory replaced by POSIX handles).
+        os.environ["TLLM_TEST_MNNVL"] = "1"
+        allreduce = AllReduce(mapping=mapping,
+                              strategy=AllReduceStrategy.MNNVL,
+                              dtype=torch.bfloat16)
+        assert allreduce.mnnvl_allreduce is not None
+        return allreduce, MnnvlLamportAllReduce(mapping)
+    allreduce = AllReduce(mapping=mapping,
+                          strategy=AllReduceStrategy.ONESHOT,
+                          dtype=torch.bfloat16)
+    return allreduce, LamportAllReduce(get_allreduce_workspace(mapping), rank,
+                                       tp_size)
+
+
 # Pool workers run later tests: restore the environment.
 @patch.dict(os.environ)
 @torch.inference_mode()
@@ -1196,21 +1239,7 @@ def run_mhc_allreduce_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
-        mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=rank)
-        if mnnvl:
-            # The MNNVL protocol on one node (fabric memory replaced by POSIX handles).
-            os.environ["TLLM_TEST_MNNVL"] = "1"
-            allreduce = AllReduce(mapping=mapping,
-                                  strategy=AllReduceStrategy.MNNVL,
-                                  dtype=torch.bfloat16)
-            assert allreduce.mnnvl_allreduce is not None
-            lamport = MnnvlLamportAllReduce(mapping)
-        else:
-            allreduce = AllReduce(mapping=mapping,
-                                  strategy=AllReduceStrategy.ONESHOT,
-                                  dtype=torch.bfloat16)
-            lamport = LamportAllReduce(get_allreduce_workspace(mapping), rank,
-                                       tp_size)
+        allreduce, lamport = _mhc_allreduce_and_lamport(tp_size, mnnvl, rank)
 
         def reference(x, res, post, comb, pre, weight):
             return mhc_post_collapse_norm(allreduce(x), res, post, comb, pre,
@@ -1250,11 +1279,98 @@ def run_mhc_allreduce_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
             for g, w in zip(got, want):
                 torch.testing.assert_close(g, w, rtol=0, atol=0)
 
-        # The MoE-finalize input.
-        parts, *args = _mhc_moe_inputs(24, 324, rank)
+        # The MoE-finalize input, with a cluster of CTAs per token (6 rows) and one CTA per token.
+        for m in (6, 24):
+            parts, *args = _mhc_moe_inputs(m, 300 + m, rank)
+            want = reference(parts.finalize(), *args)
+            for g, w in zip(fused(parts, *args), want):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
+
+        # Contiguous MoE views can have storage offsets that violate CuTe's alignment.
+        def offset_copy(value):
+            storage = torch.empty(value.numel() + 1,
+                                  dtype=value.dtype,
+                                  device=value.device)
+            view = storage[1:].view(value.shape)
+            view.copy_(value)
+            assert view.is_contiguous() and view.data_ptr() % 16
+            return view
+
+        parts = MoeUnfinalized(
+            **{
+                name: offset_copy(getattr(parts, name))
+                for name in ('shared', 'fc2', 'scales', 'perm')
+            })
         want = reference(parts.finalize(), *args)
         for g, w in zip(fused(parts, *args), want):
             torch.testing.assert_close(g, w, rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = fused(parts, *args)
+        parts.shared.mul_(.875)
+        want = reference(parts.finalize(), *args)
+        for _ in range(32):
+            graph.replay()
+        torch.cuda.synchronize()
+        for g, w in zip(captured, want):
+            torch.testing.assert_close(g, w, rtol=0, atol=0)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+# Pool workers run later tests: restore the environment.
+@patch.dict(os.environ)
+@torch.inference_mode()
+def run_mhc_ob_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
+    """The attention's o_b projected in the boundary's launch vs the o_b GEMM then the boundary:
+    the same bits, also with the NVFP4 copy of the output and in a replayed graph."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        allreduce, lamport = _mhc_allreduce_and_lamport(tp_size, mnnvl, rank)
+        nvfp4_scale = torch.tensor([0.37], device="cuda")
+        for m in (1, 6, 16):
+            o_lat, ob_weight, ob_scale, *args = _mhc_ob_inputs(m, 500 + m, rank)
+            deferred = defer_ob_projection(o_lat, ob_weight, ob_scale)
+            assert deferred is not None
+            partial = mxfp8_lowm_linear(o_lat, ob_weight, ob_scale)
+            for scale in (None, nvfp4_scale):
+                want = mhc_allreduce_post_collapse_norm(partial,
+                                                        *args,
+                                                        MHC_NORM_EPS,
+                                                        lamport,
+                                                        nvfp4_scale=scale)
+                got = mhc_allreduce_post_collapse_norm(deferred,
+                                                       *args,
+                                                       MHC_NORM_EPS,
+                                                       lamport,
+                                                       nvfp4_scale=scale)
+                for g, w in zip(_flat(got), _flat(want)):
+                    assert torch.equal(g.view(torch.uint8), w.view(torch.uint8))
+        # Replays of the o_b boundary between the MoE-finalize boundary and a library all-reduce
+        # on one workspace: whichever CTA arrives last hands the triple buffer over.
+        o_lat, ob_weight, ob_scale, *args = _mhc_ob_inputs(6, 507, rank)
+        parts, *moe_args = _mhc_moe_inputs(6, 508, rank)
+        lib_in = _mhc_inputs(6, 509, rank)[0]
+
+        def launches(deferred):
+            return (*mhc_allreduce_post_collapse_norm(parts, *moe_args,
+                                                      MHC_NORM_EPS, lamport),
+                    *mhc_allreduce_post_collapse_norm(deferred, *args,
+                                                      MHC_NORM_EPS, lamport),
+                    allreduce(lib_in))
+
+        want = launches(mxfp8_lowm_linear(o_lat, ob_weight, ob_scale))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got = launches(defer_ob_projection(o_lat, ob_weight, ob_scale))
+        for _ in range(50):
+            graph.replay()
+            torch.cuda.synchronize()
+            for g, w in zip(got, want):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
     except Exception:
         traceback.print_exc()
         raise
@@ -1276,5 +1392,122 @@ def test_mhc_allreduce_boundary_matches_allreduce_then_boundary(
     tp_size = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(run_mhc_allreduce_boundary_single_rank,
                                     *zip(*[(tp_size, mnnvl)] * tp_size))
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="needs 2 SM100/SM103 GPUs",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mhc_ob_boundary_matches_ob_then_boundary(mpi_pool_executor):
+    if not MnnvlMemory.supports_mnnvl():
+        pytest.skip("needs MNNVL memory")
+    tp_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(run_mhc_ob_boundary_single_rank,
+                                    *zip(*[(tp_size, True)] * tp_size))
+    for r in results:
+        assert r is True
+
+
+# Pool workers run later tests: restore the environment.
+@patch.dict(os.environ)
+@torch.inference_mode()
+def run_mhc_moe_boundary_behind_lowm_fc2_single_rank(tp_size: int):
+    """Captured layers of [attention boundary -> FC1-only MoE -> CuTe FC2 -> MoE boundary] on one
+    MNNVL workspace, the MoE boundaries prefetching an o_b weight into L2, give the eager bits."""
+    from _torch.moe.test_moe_lowm_fc2 import (_DSV41_EP_RANK,
+                                              _DSV41_ROUTED_SCALE,
+                                              _bitwise_tactics, _dsv41_inputs)
+
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import \
+        FP4BlockScaleMoERunner
+    from tensorrt_llm._torch.models.modeling_deepseekv41 import \
+        _MOE_CUTE_FC2_ROWS
+
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        _, lamport = _mhc_allreduce_and_lamport(tp_size, True, rank)
+        m, shape = 6, _DSV41_EP_RANK
+        top_k, local_offset = shape.top_k, rank * shape.local
+        inputs, _ = _dsv41_inputs(m, shape, local_offset, 900 + rank)
+        # Given routing weights, the runner uses them and leaves its own unwritten.
+        topk_weights = inputs[16]
+        runner = FP4BlockScaleMoERunner(shape.num_experts,
+                                        top_k,
+                                        None,
+                                        None,
+                                        shape.inter,
+                                        local_offset,
+                                        shape.local,
+                                        _DSV41_ROUTED_SCALE,
+                                        1,
+                                        False,
+                                        0,
+                                        cute_fc2_rows=_MOE_CUTE_FC2_ROWS)
+        tactic = _bitwise_tactics(runner.get_runner(), m, shape)[0]
+        layers = [(_mhc_inputs(m, 40 + i, rank), _mhc_inputs(m, 60 + i, rank))
+                  for i in range(3)]
+        ob_weights = (torch.zeros(5120,
+                                  1024,
+                                  dtype=torch.float8_e4m3fn,
+                                  device="cuda"),
+                      torch.zeros(5120, 32, dtype=torch.uint8, device="cuda"))
+
+        def chain(prefetch):
+            outs = []
+            for attn, ffn in layers:
+                outs.append(
+                    mhc_allreduce_post_collapse_norm(*attn, MHC_NORM_EPS,
+                                                     lamport))
+                fc2, _, perm = runner.forward(inputs, tactic=list(tactic))
+                parts = MoeUnfinalized(shared=ffn[0],
+                                       fc2=fc2,
+                                       scales=topk_weights,
+                                       perm=perm.flatten()[:m * top_k].view(
+                                           m, top_k))
+                outs.append(
+                    mhc_allreduce_post_collapse_norm(parts,
+                                                     *ffn[1:],
+                                                     MHC_NORM_EPS,
+                                                     lamport,
+                                                     l2_prefetch=prefetch))
+            return list(_flat(outs))
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            want = chain(())
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got = chain(ob_weights)
+        for _ in range(20):
+            graph.replay()
+        torch.cuda.synchronize()
+        for g, w in zip(got, want):
+            assert torch.equal(g.view(torch.uint8), w.view(torch.uint8))
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="needs 2 SM100/SM103 GPUs",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mhc_moe_boundary_behind_lowm_fc2(mpi_pool_executor):
+    if not MnnvlMemory.supports_mnnvl():
+        pytest.skip("needs MNNVL memory")
+    tp_size = mpi_pool_executor.num_workers
+    results = list(
+        mpi_pool_executor.map(run_mhc_moe_boundary_behind_lowm_fc2_single_rank,
+                              *zip(*[(tp_size, )] * tp_size)))
     for r in results:
         assert r is True
