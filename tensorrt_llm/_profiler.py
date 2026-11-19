@@ -162,7 +162,7 @@ def encode_metadata(region: str, metadata: Mapping[str, MetadataValue]) -> str:
     """
     fields = dict(metadata)
     _validate_metadata_value(fields)
-    encoded = json.dumps(fields, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    encoded = json.dumps(fields, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     return _METADATA_PREFIX + f"{len(region.encode('utf-8'))}:{region}" + encoded
 
 
