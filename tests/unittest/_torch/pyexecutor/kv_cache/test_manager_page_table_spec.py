@@ -281,6 +281,7 @@ def test_mixed_precision_layer_ids_follow_the_buffers_of_a_split_layer():
     [
         (DataType.BF16, False, None),
         (DataType.FP8, False, "fp8"),
+        (DataType.NVFP4, False, "nvfp4"),
         (DataType.FP8, True, "fp8_ds_mla"),
     ],
 )
