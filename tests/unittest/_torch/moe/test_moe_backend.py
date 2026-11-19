@@ -5223,6 +5223,7 @@ def run_backend_moe(
     dtype: torch.dtype,
     router_logits: torch.Tensor = None,
     trtllm_use_router_logits: bool = True,
+    input_sf_swizzled: bool = True,
 ) -> torch.Tensor:
     """
     Run MoE computation with backend-specific parameters.
@@ -5239,6 +5240,8 @@ def run_backend_moe(
             unless the backend routes outside its kernel. Otherwise it uses
             token_selected_experts and token_final_scales.
             Note: When both are provided, TRTLLM only uses (topk_ids and topk_weights).
+        input_sf_swizzled: Whether x_sf is in the swizzled layout. False passes the
+            linear layout that a post-quant all-to-all delivers.
     """
     # Common args for all backends (default: token_final_scales=float32)
     args = dict(
@@ -5274,11 +5277,12 @@ def run_backend_moe(
     # Mirror what each scheduler hands the backend: ExternalCommMoEScheduler
     # builds a plan on every path, FusedCommMoEScheduler never does because the
     # fused kernel owns the exchange. Single GPU with no comm strategy, so this
-    # is the no-comm plan: quantize_input ran locally and left the scale factors
-    # swizzled, no alltoall, and no workspace-backed output buffer.
+    # is the no-comm plan: quantize_input ran locally (scale factors swizzled
+    # unless the caller asks for the linear layout), no alltoall, and no
+    # workspace-backed output buffer.
     if backend.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM:
         args["comm_plan"] = MoECommPlan(
-            input_sf_swizzled=True,
+            input_sf_swizzled=input_sf_swizzled,
             enable_alltoall=False,
             moe_output=None,
             payload_in_workspace=False,
@@ -6036,37 +6040,41 @@ def test_moe_backend(
                 ref_fused_moe.check_accuracy(output, ref_output)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() != 90,
-    reason="The SM90 FP8 block-scale GEMM quantizes FC1 inputs in the row expansion",
-)
-@pytest.mark.parametrize("num_tokens", [1, 3, 8192])
-def test_cutlass_fp8_block_scales_skewed_routing(num_tokens: int):
-    """Row expansion with many rows per block, routed to few experts.
+def _skewed_router_logits(num_tokens: int, num_experts: int, dtype: torch.dtype) -> torch.Tensor:
+    """Router logits that send most rows to a few experts.
 
-    Most tokens pick the same four experts and the rest route randomly, so
-    each expansion block walks a long run of rows across expert boundaries,
-    past experts that received no rows, and into experts that received one.
+    7 of every 8 tokens pick experts 0, 7, 8 and 40; the others pick four of
+    experts 41-63, except tokens 7 and 15, which each send one row to expert 3
+    and 5. Experts 1, 2, 4, 6 and 9-39 receive no rows (with top 4 of 64).
+    """
+    router_logits = torch.randn((num_tokens, num_experts), dtype=dtype)
+    token = torch.arange(num_tokens)
+    hot = token % 8 != 7
+    router_logits[hot.nonzero().flatten()[:, None], torch.tensor([0, 7, 8, 40])] += 20.0
+    router_logits[(~hot).nonzero().flatten()[:, None], torch.arange(41, 64)] += 20.0
+    for single_token, expert in ((7, 3), (15, 5)):
+        if single_token < num_tokens:
+            router_logits[single_token, expert] += 40.0
+    return router_logits
+
+
+def _run_cutlass_skewed_routing(
+    quant_algo: QuantAlgo, num_tokens: int, input_sf_swizzled: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor, torch.nn.Module]:
+    """Run the CUTLASS backend and its reference on skewed routing.
+
+    Each row expansion block walks a long run of rows across expert
+    boundaries, past experts that received no rows, and into experts that
+    received one. Returns (output, reference output, reference module).
     """
     num_experts, top_k, hidden_size, intermediate_size = 64, 4, 512, 512
     dtype = torch.bfloat16
-    quant_algo = QuantAlgo.FP8_BLOCK_SCALES
     with torch.device("cuda"):
         torch.manual_seed(0)
         AutoTuner.get().setup_distributed_state(Mapping())
         routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
         x = torch.randn((num_tokens, hidden_size), dtype=dtype)
-        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype)
-        # 7 of every 8 tokens pick experts 0, 7, 8 and 40; the others pick four
-        # of experts 41-63, except tokens 7 and 15, which each send one row to
-        # expert 3 and 5. Experts 1, 2, 4, 6 and 9-39 receive no rows.
-        token = torch.arange(num_tokens)
-        hot = token % 8 != 7
-        router_logits[hot.nonzero().flatten()[:, None], torch.tensor([0, 7, 8, 40])] += 20.0
-        router_logits[(~hot).nonzero().flatten()[:, None], torch.arange(41, 64)] += 20.0
-        for single_token, expert in ((7, 3), (15, 5)):
-            if single_token < num_tokens:
-                router_logits[single_token, expert] += 40.0
+        router_logits = _skewed_router_logits(num_tokens, num_experts, dtype)
 
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
             quant_algo, x, MoeBackendType.CUTLASS
@@ -6104,7 +6112,9 @@ def test_cutlass_fp8_block_scales_skewed_routing(num_tokens: int):
                 assert counts[3] == counts[5] == 1
                 assert counts.max() >= num_tokens * 7 // 8
             ref_output = ref_fused_moe.forward(x, router_logits)
-            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            # Quantizing for a post-quant all-to-all leaves the scale factors in
+            # the linear layout, one row per token.
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=not input_sf_swizzled)
             output = run_backend_moe(
                 backend,
                 MoeBackendType.CUTLASS,
@@ -6114,8 +6124,288 @@ def test_cutlass_fp8_block_scales_skewed_routing(num_tokens: int):
                 token_final_scales,
                 dtype,
                 router_logits,
+                input_sf_swizzled=input_sf_swizzled,
             )
-        ref_fused_moe.check_accuracy(output, ref_output)
+    return output, ref_output, ref_fused_moe
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() != 90,
+    reason="The SM90 FP8 block-scale GEMM quantizes FC1 inputs in the row expansion",
+)
+@pytest.mark.parametrize("num_tokens", [1, 3, 8192])
+def test_cutlass_fp8_block_scales_skewed_routing(num_tokens: int):
+    """Row expansion with many rows per block, routed to few experts."""
+    output, ref_output, ref_fused_moe = _run_cutlass_skewed_routing(
+        QuantAlgo.FP8_BLOCK_SCALES, num_tokens
+    )
+    ref_fused_moe.check_accuracy(output, ref_output)
+
+
+def _skip_without_oss_cutlass_moe(what: str) -> None:
+    """Skip on a build that runs the bundled CUTLASS MoE kernels."""
+    if not collect_moe_environment().oss_cutlass_moe:
+        pytest.skip(f"{what} needs the open-source CUTLASS MoE kernels")
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("input_sf_swizzled", [True, False], ids=["swizzled_sf", "linear_sf"])
+@pytest.mark.parametrize("num_tokens", [1, 3, 8192])
+def test_cutlass_nvfp4_skewed_routing(num_tokens: int, input_sf_swizzled: bool):
+    """The pre-quantized NVFP4 row copy on skewed routing, for both input scale layouts."""
+    if not input_sf_swizzled:
+        _skip_without_oss_cutlass_moe("Linear input scale factors")
+    output, ref_output, ref_fused_moe = _run_cutlass_skewed_routing(
+        QuantAlgo.NVFP4, num_tokens, input_sf_swizzled
+    )
+    assert torch.isfinite(output).all()
+    ref_fused_moe.check_accuracy(output, ref_output)
+
+
+def _nvfp4_quantize_rows(rows: torch.Tensor, global_sf: torch.Tensor, swizzled: bool):
+    """NVFP4-quantize [n, k] rows; also return what the GEMM reads back (fp32)."""
+    values, sf = torch.ops.trtllm.fp4_quantize(rows, global_sf, 16, False, swizzled)
+    _, linear_sf = torch.ops.trtllm.fp4_quantize(rows, global_sf, 16, False, False)
+    dequantized = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+        values.cpu(), linear_sf.cpu().flatten(), (1.0 / global_sf).cpu().reshape(1), 16, 1, False
+    )
+    return values, sf, dequantized.to(rows.device)
+
+
+def _nvfp4_cutlass_moe_weights(weights: torch.Tensor):
+    """NVFP4 [experts, n, k] weights in the CUTLASS fused_moe layout.
+
+    Returns the FP4 values (int64), the scale factors swizzled and zero padded
+    to whole 128x4 atoms (int32), the per-expert global scales and the
+    dequantized weights.
+    """
+    num_experts, n, k = weights.shape
+    global_sf = (448 * 6) / weights.abs().amax(dim=(1, 2)).float()
+    values, sfs, dequantized = [], [], []
+    for expert in range(num_experts):
+        value, sf, dequant = _nvfp4_quantize_rows(weights[expert], global_sf[expert], False)
+        values.append(value.view(torch.int64))
+        sfs.append(sf.view(n, k // 16))
+        dequantized.append(dequant)
+    sf_swizzled = torch.ops.trtllm.block_scale_interleave(torch.stack(sfs))
+    return (
+        torch.stack(values),
+        sf_swizzled.view(torch.int32).view(num_experts, (n + 127) // 128 * 128, -1),
+        global_sf,
+        torch.stack(dequantized),
+    )
+
+
+def _nvfp4_fused_moe_case(
+    num_experts: int, hidden_size: int, intermediate_size: int, selected: torch.Tensor
+) -> SimpleNamespace:
+    """Random pre-quantized NVFP4 fused_moe inputs and their reference output.
+
+    Each token goes to one expert, ``selected`` [num_tokens, 1], with router
+    scale 1. Returns the FP4 input rows, their swizzled and linear scale
+    factors, the FP4 weights, the six fused_moe quant scales and the
+    dequantized reference output.
+    """
+    num_tokens, dtype = selected.shape[0], torch.bfloat16
+    x = torch.randn((num_tokens, hidden_size), dtype=dtype)
+    fc1 = torch.randn((num_experts, 2 * intermediate_size, hidden_size), dtype=dtype) * 0.05
+    fc2 = torch.randn((num_experts, hidden_size, intermediate_size), dtype=dtype) * 0.05
+
+    x_global_sf = (448 * 6) / x.abs().max().float()
+    fc1_values, fc1_sf, fc1_global_sf, fc1_dequant = _nvfp4_cutlass_moe_weights(fc1)
+    fc2_values, fc2_sf, fc2_global_sf, fc2_dequant = _nvfp4_cutlass_moe_weights(fc2)
+    x_values, linear_x_sf, x_dequant = _nvfp4_quantize_rows(x, x_global_sf, False)
+    swizzled_x_values, swizzled_x_sf, _ = _nvfp4_quantize_rows(x, x_global_sf, True)
+    assert torch.equal(x_values, swizzled_x_values)
+
+    # FC1 output is [up, gate]; FC2 reads the activation quantized to NVFP4.
+    up, gate = (
+        torch.bmm(fc1_dequant[selected[:, 0]], x_dequant.unsqueeze(2)).squeeze(2).chunk(2, dim=1)
+    )
+    activation = (torch.nn.functional.silu(gate) * up).to(dtype)
+    fc2_act_global_sf = (448 * 6) / activation.abs().max().float()
+    _, _, activation_dequant = _nvfp4_quantize_rows(activation, fc2_act_global_sf, False)
+    ref_output = torch.bmm(fc2_dequant[selected[:, 0]], activation_dequant.unsqueeze(2)).squeeze(2)
+
+    return SimpleNamespace(
+        x_values=x_values,
+        swizzled_x_sf=swizzled_x_sf,
+        linear_x_sf=linear_x_sf.view(num_tokens, -1),
+        fc1_values=fc1_values,
+        fc2_values=fc2_values,
+        quant_scales=[
+            x_global_sf,
+            fc1_sf,
+            1.0 / (x_global_sf * fc1_global_sf),
+            fc2_act_global_sf,
+            fc2_sf,
+            1.0 / (fc2_act_global_sf * fc2_global_sf),
+        ],
+        ref_output=ref_output.to(dtype),
+    )
+
+
+def _run_nvfp4_fused_moe(
+    case: SimpleNamespace,
+    selected: torch.Tensor,
+    x_sf: torch.Tensor,
+    swizzled: bool,
+    fc1_act_global_sf: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run fused_moe on an _nvfp4_fused_moe_case, optionally with another FC1 activation scale."""
+    quant_scales = list(case.quant_scales)
+    if fc1_act_global_sf is not None:
+        quant_scales[0] = fc1_act_global_sf
+    with torch.inference_mode():
+        return torch.ops.trtllm.fused_moe(
+            case.x_values,
+            selected,
+            torch.ones(selected.shape, dtype=torch.float32),
+            case.fc1_values,
+            None,
+            case.fc2_values,
+            None,
+            torch.bfloat16,
+            quant_scales,
+            input_sf=x_sf,
+            swizzled_input_sf=swizzled,
+        )[0]
+
+
+@skip_pre_blackwell
+def test_cutlass_nvfp4_partial_sf_group_empty_expert():
+    """Pre-quantized NVFP4 rows whose scale factors end in a partial group.
+
+    hidden_size = 96 gives 6 scale factors per row: one group of 4, a partial
+    group of 2, then K padding up to 8. Odd tokens go to expert 2 and even
+    tokens to expert 0, so expert 1 (between them) and expert 3 get no rows.
+    The swizzled and the linear input scale layouts carry the same values, so
+    both must give the same output, and it must match the reference.
+    """
+    _skip_without_oss_cutlass_moe("Linear input scale factors")
+    num_experts, hidden_size, intermediate_size, num_tokens = 4, 96, 128, 300
+    with torch.device("cuda"):
+        torch.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(Mapping())
+        selected = (torch.arange(num_tokens, dtype=torch.int32) % 2 * 2).unsqueeze(1)
+        assert torch.bincount(selected.flatten(), minlength=num_experts).tolist() == [
+            150,
+            0,
+            150,
+            0,
+        ]
+        case = _nvfp4_fused_moe_case(num_experts, hidden_size, intermediate_size, selected)
+        swizzled_output = _run_nvfp4_fused_moe(case, selected, case.swizzled_x_sf, True)
+        linear_output = _run_nvfp4_fused_moe(case, selected, case.linear_x_sf, False)
+    assert torch.isfinite(swizzled_output).all()
+    check_accuracy(swizzled_output, case.ref_output, rtol=0.1, atol=0.15, percent=0.97)
+    torch.testing.assert_close(linear_output, swizzled_output, rtol=0, atol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("num_experts", [1, 2])
+def test_cutlass_nvfp4_per_expert_fc1_act_scale(num_experts: int):
+    """Pre-quantized NVFP4 input with a [num_experts] FC1 activation scale.
+
+    With one local expert it is the same as the scalar scale, so the output
+    must be the same. With more, the rows were quantized before routing and
+    cannot follow a per-expert scale, so the op raises.
+    """
+    _skip_without_oss_cutlass_moe("The pre-quantized NVFP4 row copy checks")
+    hidden_size, intermediate_size, num_tokens = 128, 128, 64
+    with torch.device("cuda"):
+        torch.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(Mapping())
+        selected = (torch.arange(num_tokens, dtype=torch.int32) % num_experts).unsqueeze(1)
+        case = _nvfp4_fused_moe_case(num_experts, hidden_size, intermediate_size, selected)
+        per_expert_scale = case.quant_scales[0].repeat(num_experts)
+        if num_experts > 1:
+            with pytest.raises(RuntimeError, match="per-expert FC1 activation scale"):
+                _run_nvfp4_fused_moe(case, selected, case.swizzled_x_sf, True, per_expert_scale)
+            return
+        output = _run_nvfp4_fused_moe(case, selected, case.swizzled_x_sf, True)
+        per_expert_output = _run_nvfp4_fused_moe(
+            case, selected, case.swizzled_x_sf, True, per_expert_scale
+        )
+    assert torch.isfinite(output).all()
+    check_accuracy(output, case.ref_output, rtol=0.1, atol=0.15, percent=0.97)
+    torch.testing.assert_close(per_expert_output, output, rtol=0, atol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("misaligned", ["rows", "scale_factors"])
+def test_cutlass_nvfp4_misaligned_input_raises(misaligned: str):
+    """The pre-quantized NVFP4 row copy needs aligned input; it raises otherwise."""
+    _skip_without_oss_cutlass_moe("The pre-quantized NVFP4 row copy checks")
+    num_experts, top_k, hidden_size, intermediate_size, num_tokens = 8, 2, 512, 512, 16
+    dtype = torch.bfloat16
+    with torch.device("cuda"):
+        torch.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(Mapping())
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype)
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype)
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, MoeBackendType.CUTLASS
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        backend = create_test_backend(
+            backend_type=MoeBackendType.CUTLASS,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=Mapping(),
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            ref_output = ref_fused_moe.forward(x, router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+
+            def run(x_quantized, x_sf):
+                return run_backend_moe(
+                    backend,
+                    MoeBackendType.CUTLASS,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    dtype,
+                    router_logits,
+                )
+
+            # Same bytes at an address 4 bytes past 16-byte alignment (rows) or
+            # 1 byte past 4-byte alignment (scale factors)
+            offset, aligned_to, tensor = (
+                (4, 16, x_quantized) if misaligned == "rows" else (1, 4, x_sf)
+            )
+            storage = torch.empty(tensor.numel() + 64, dtype=tensor.dtype)
+            moved = storage[offset : offset + tensor.numel()].view(tensor.shape).copy_(tensor)
+            assert moved.data_ptr() % aligned_to != 0
+            with pytest.raises(RuntimeError, match=f"must be {aligned_to}-byte aligned"):
+                if misaligned == "rows":
+                    run(moved, x_sf)
+                else:
+                    run(x_quantized, moved)
+            # The op still runs after the error
+            output = run(x_quantized, x_sf)
+    ref_fused_moe.check_accuracy(output, ref_output)
 
 
 # =====================================================================

@@ -289,6 +289,10 @@ l0_b200:
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_nvfp4_skewed_routing
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_nvfp4_partial_sf_group_empty_expert
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_nvfp4_misaligned_input_raises
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_nvfp4_per_expert_fc1_act_scale
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_mxfp4_fp8_input_quantization
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
