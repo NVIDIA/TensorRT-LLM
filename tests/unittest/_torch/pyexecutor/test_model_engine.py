@@ -785,6 +785,54 @@ def test_breakable_multimodal_gate_and_runner_agree(
         assert prepare_inputs is None and input_buffers is None
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("registry", [None, "attn_layers", "mamba2_layers"])
+def test_breakable_multimodal_rejects_encoder_layers_in_the_registry(registry: str | None) -> None:
+    """Breakable prefill graphs run every registered layer with the decoder's metadata, so an
+    encoder layer in any layer registry must fail at startup, and the error names it."""
+    from _torch.helpers import check_breakable_prefill_startup
+
+    from tensorrt_llm._torch.attention.attention import Attention
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    config = ModelConfig(skip_create_weights_in_init=True)
+
+    def attention(**kwargs) -> Attention:
+        return Attention(
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=8,
+            bias=False,
+            layer_idx=0,
+            dtype=torch.bfloat16,
+            config=config,
+            **kwargs,
+        )
+
+    decoder = object.__new__(_BreakableMultimodalDecoder)
+    torch.nn.Module.__init__(decoder)
+    backend = Mock(**{"support_fused_qkv.return_value": True})
+    with patch("tensorrt_llm._torch.attention.attention.create_attention", return_value=backend):
+        decoder.model = attention()
+        # The "attn_layers" case is an encoder tower that forgot register_to_config=False.
+        encoder = attention(register_to_config=registry == "attn_layers")
+    if registry == "mamba2_layers":
+        config.extra_attrs[registry] = {"0": weakref.ref(encoder)}
+    owner = _BreakableMultimodalOwner(decoder, disable_mm_encoder=False)
+    owner.mm_encoder = encoder
+    owner.model_config = config
+
+    if registry is None:
+        check_breakable_prefill_startup(owner)
+        return
+    key = "0_0" if registry == "attn_layers" else "0"
+    with pytest.raises(
+        ValueError, match=rf"extra_attrs\['{registry}'\].*'{key}' \(mm_encoder, Attention\)"
+    ):
+        check_breakable_prefill_startup(owner)
+
+
 class ModelEngineTestCase(unittest.TestCase):
     def test_breakable_allows_text_decoder_with_multimodal_processor(self) -> None:
         engine = object.__new__(ModelEngine)

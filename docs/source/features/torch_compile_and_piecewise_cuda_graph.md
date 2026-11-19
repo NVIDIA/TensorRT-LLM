@@ -70,7 +70,10 @@ The following restrictions are enforced:
 - Multimodal models must expose a `DecoderModelForCausalLM` language model
   through `MultimodalModelMixin`, use a single pipeline stage, and have a
   language model that sets `supports_multimodal_breakable_cuda_graph` (default
-  false). Other multimodal models are rejected during engine initialization.
+  false). Every layer in the layer registries (`extra_attrs["*_layers"]`) must
+  belong to that language model, so encoder attention passes
+  `register_to_config=False`. Other multimodal models are rejected during
+  engine initialization.
   Encoder work and embedding fusion run outside the captured body. Calls whose
   optional inputs or tensor layouts differ from capture run the body eagerly.
 - A multimodal model with `disable_mm_encoder` and no local encoder keeps the
