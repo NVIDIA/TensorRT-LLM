@@ -339,9 +339,9 @@ async def async_request_openai_chat_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
-    ttft = 0.0
     st = time.perf_counter()
     most_recent_timestamp = st
+    last_output_timestamp = None
     try:
         async with request_session.post(url=api_url,
                                         json=payload,
@@ -354,16 +354,31 @@ async def async_request_openai_chat_completions(
                         data = json.loads(chunk)
 
                         if choices := data.get("choices"):
-                            content = choices[0]["delta"].get("content")
-                            # First token
-                            if ttft == 0.0:
-                                ttft = timestamp - st
-                                output.ttft = ttft
-
-                            # Decoding phase
-                            else:
-                                output.itl.append(timestamp -
-                                                  most_recent_timestamp)
+                            choice = choices[0]
+                            delta = choice.get("delta") or {}
+                            content = delta.get("content")
+                            # Exclude role-only and empty finish metadata
+                            # chunks; other chunks (including empty-content or
+                            # empty deltas without finish_reason for buffered
+                            # tokens) represent token steps. Keep a separate
+                            # timestamp so metadata cannot shorten the next
+                            # inter-token interval.
+                            delta_keys = {
+                                key
+                                for key, value in delta.items()
+                                if value is not None
+                            }
+                            is_role_only = delta_keys == {"role"}
+                            is_empty_finish = (not delta_keys
+                                               and choice.get("finish_reason")
+                                               is not None)
+                            if not (is_role_only or is_empty_finish):
+                                if last_output_timestamp is None:
+                                    output.ttft = timestamp - st
+                                else:
+                                    output.itl.append(timestamp -
+                                                      last_output_timestamp)
+                                last_output_timestamp = timestamp
 
                             generated_text += content or ""
 
@@ -377,6 +392,15 @@ async def async_request_openai_chat_completions(
 
                         most_recent_timestamp = timestamp
 
+                    # Without an output-bearing event there is no TTFT, and
+                    # the default of 0.0 would skew the aggregated TTFT and
+                    # TPOT, so the response is marked as failed instead.
+                    if last_output_timestamp is None:
+                        output.success = False
+                        output.error = (
+                            "Never received an output-bearing chunk to "
+                            "calculate TTFT. This response will be marked "
+                            "as failed!")
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
                 else:
