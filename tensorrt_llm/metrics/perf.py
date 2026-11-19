@@ -37,8 +37,6 @@ _RANK_FIELDS = frozenset(
         "kvCacheIterationStatsByPoolGroup",
         "kvCacheIterationStatsByColdPoolGroup",
         "kvCacheStorageStats",
-        "kvCacheMigrationTimings",
-        "kvCacheMigrationTimingsSkipped",
         "kvCacheLevelTiers",
         "iterSuspendedRequests",
         "iterResumedRequests",

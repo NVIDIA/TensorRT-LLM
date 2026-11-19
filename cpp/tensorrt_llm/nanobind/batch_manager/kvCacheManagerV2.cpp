@@ -3751,10 +3751,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_quota",
             [](kv::KvCacheManager const& self, int cacheLevel) { return self.getQuota(kv::CacheLevel{cacheLevel}); },
             nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>())
-        .def("take_migration_timings", &kv::KvCacheManager::takeMigrationTimings,
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Drain completed timing samples and return the lifetime cumulative skipped count. "
-            "Incomplete samples remain pending; the skipped count is not reset.")
         .def("get_committed_stats", &kv::KvCacheManager::getCommittedStats, nb::call_guard<nb::gil_scoped_release>())
         .def("get_and_reset_iteration_stats",
             [](kv::KvCacheManager& self)

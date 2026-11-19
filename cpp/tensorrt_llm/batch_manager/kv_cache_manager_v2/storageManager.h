@@ -35,7 +35,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -79,8 +78,6 @@ private:
 // ---------------------------------------------------------------------------
 // StorageStatistics — per-pool-group slot counts.
 // ---------------------------------------------------------------------------
-using MigrationTimingSamples = std::vector<std::tuple<int, int, int, float>>;
-
 struct StorageMovementStatistics
 {
     int64_t restoredBlocks = 0;
@@ -157,8 +154,6 @@ public:
     StorageManager& operator=(StorageManager const&) = delete;
 
     void destroy();
-    //! Drain completed samples; leave incomplete samples pending and return a cumulative skipped count.
-    std::pair<MigrationTimingSamples, int64_t> takeMigrationTimings();
 
     //! A fresh Page::visitStamp value; callers hold the manager's exclusive API lock.
     uint64_t nextVisitStamp() noexcept
@@ -642,23 +637,6 @@ private:
     void recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, bool belowPriorityThreshold = false);
     void recordDroppedPage(Page const& page, bool belowPriorityThreshold = false);
 
-    void submitMigrationBatchImpl(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
-        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
-
-    struct PendingMigrationTiming
-    {
-        int sourceLevel;
-        int destinationLevel;
-        int poolGroup;
-        SimplePool<CUevent_st>::PoolItem start;
-        SimplePool<CUevent_st>::PoolItem stop;
-    };
-
-    SimplePool<CUevent_st> mTimingEvents;
-    std::vector<PendingMigrationTiming> mPendingMigrationTimings;
-    std::map<std::tuple<CacheLevel, CacheLevel, PoolGroupIndex>, int64_t> mMigrationBatches;
-    int64_t mTimingSampleInterval;
-    int64_t mSkippedMigrationTimings = 0;
     bool mEnableStats;
     std::map<std::pair<CacheLevel, PoolGroupIndex>, StorageMovementStatistics> mMovementStats;
     LifeCycleRegistry const& mLifeCycles;

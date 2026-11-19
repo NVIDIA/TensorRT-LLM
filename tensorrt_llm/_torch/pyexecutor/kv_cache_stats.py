@@ -183,8 +183,6 @@ class KVCacheV2IterationStatsReport:
     # None when no connector can serve tokens.
     connector_cached_tokens: int | None = None
     storage_stats: list[KVCacheV2StorageIterationStats] = field(default_factory=list)
-    migration_timings: list[tuple[int, int, int, float]] = field(default_factory=list)
-    skipped_migration_timings: int | None = None
     num_conversations: int | None = None
 
 
@@ -282,9 +280,6 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     stats_dict["iterCachedTokensByLevel"] = list(kv_iter_stats.cached_tokens_by_level)
     if kv_iter_stats.cache_level_tiers:
         stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)
-    if kv_iter_stats.skipped_migration_timings is not None:
-        stats_dict["kvCacheMigrationTimings"] = list(kv_iter_stats.migration_timings)
-        stats_dict["kvCacheMigrationTimingsSkipped"] = kv_iter_stats.skipped_migration_timings
     if kv_iter_stats.storage_stats:
         stats_dict["kvCacheStorageStats"] = [
             {

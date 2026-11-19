@@ -45,7 +45,7 @@ for datasource/workload selection, API versus ConfigMap ownership, publication
 and recovery. Select one scrape path per engine to avoid duplicated observations.
 Optional panels remain hidden until native measurements arrive; dashboard setup
 does not enable instrumentation. See [tiered KV metrics](#tiered-kv-cache)
-for occupancy, movement, sampled migration timing and conversation counts.
+for occupancy, movement, and conversation counts.
 
 ## Metric reference
 
@@ -222,10 +222,6 @@ cannot be subtracted from host time to estimate CPU overhead. GPU forward time
 is matched to its batch. Request-completion metrics have a separate cadence and
 must not be rescaled by the iteration interval.
 
-The exporter adds CPU and exposition work. Optional KV migration CUDA timing is
-disabled by default; its costs and interpretation are described in the
-[migration timing section](#sampled-migration-latency).
-
 ## Tiered KV cache
 
 KVCacheManagerV2 reports storage metrics by `dp_rank`, `cache_level`, `cache_tier`, and
@@ -238,8 +234,6 @@ snapshots come from rank 0. Older native builds can omit unsupported fields.
 | `kv_cache_tier_bytes` | Gauge | Same states multiplied by the pool's summed slot sizes; logical capacity, excluding allocator padding. |
 | `kv_cache_tier_moved_blocks_total` | Counter | `operation`: restore, evict, drop_capacity or drop_priority. |
 | `kv_cache_tier_moved_bytes_total` | Counter | Movement multiplied by the attributed pool's slot size, not wire traffic. |
-| `kv_cache_tier_migration_duration_seconds` | Histogram | Sampled restore/evict batches, with source/destination level and tier labels. |
-| `kv_cache_migration_timing_skipped_total` | Counter | Eligible timing samples skipped at the pending-event limit. |
 
 Free slots are unallocated. Evictable slots hold pages reclaimable by the eviction policy.
 The exported `unavailable = total - free - evictable` includes retained cold-tier copies,
@@ -252,25 +246,6 @@ counts movement toward a colder level on the source pool. Capacity and priority 
 attributed to the last resident pool. Release, cache clear, and same-level copies are excluded.
 Counters measure accepted submissions. Async errors do not roll them back. Byte metrics
 use the attributed pool's logical slot size, which can differ from wire bytes.
-
-### Sampled migration latency
-
-Set `TRTLLM_KV_CACHE_TIMING_SAMPLE_INTERVAL=N` before creating the engine. Positive N samples
-the first and every Nth eligible batch per source/destination/pool path. Zero disables
-timing by default. With stats enabled, the manager polls up to 64 pending CUDA event pairs.
-Collection drains completed samples and counts samples skipped at capacity. A transfer
-that never completes occupies a slot until teardown.
-
-The histogram measures stream time for a migration batch, including codec and staging
-work on that path. Check sample coverage and skipped counts when interpreting percentiles.
-
-```promql
-histogram_quantile(0.95,
-  sum by (le, instance, source_cache_level, destination_cache_level) (
-    rate(trtllm_kv_cache_tier_migration_duration_seconds_bucket{operation="restore"}[5m])
-  )
-)
-```
 
 ### Conversations
 
