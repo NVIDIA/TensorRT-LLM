@@ -27,7 +27,7 @@ def initialize_engine_args(monkeypatch: pytest.MonkeyPatch) -> Callable[[], None
         get_runtime_sizes=lambda: (1, 8, 16, 2),
         encoder_max_batch_size=None,
         encoder_max_num_tokens=None,
-        multimodal_config=SimpleNamespace(video_pruning_rate=None),
+        multimodal_config=SimpleNamespace(video_pruning_rate=None, vision_gpu_normalize=False),
         checkpoint_format="HF",
         trust_remote_code=False,
     )

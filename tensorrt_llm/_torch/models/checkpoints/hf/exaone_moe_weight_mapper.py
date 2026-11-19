@@ -18,9 +18,10 @@ from torch import nn
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "ExaoneMoeForCausalLM")
+@register_mapper(CheckpointFormat.HF, "ExaoneMoeForCausalLM")
 class ExaoneMoeWeightMapper(HfWeightMapper):
     def __init__(self):
         super().__init__()

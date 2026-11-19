@@ -295,7 +295,7 @@ def test_minimax_workspace_constructors_use_tp_process_group(
 ) -> None:
     """Run the production constructors without MPI; only GPU allocation is substituted."""
     module = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
+        "tensorrt_llm._torch.modeling_v2.models.minimax_m3."
         f"minimax_m3_nvfp4__sm_103__tp{tp_size}.ops.m3_{kind}"
     )
     pg = _FakeProcessGroup()

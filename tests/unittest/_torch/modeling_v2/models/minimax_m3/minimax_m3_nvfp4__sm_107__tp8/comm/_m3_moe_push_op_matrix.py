@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import pytest
 import torch
@@ -278,18 +278,18 @@ def _run_one_rank() -> int:
     RANK, WORLD = rank, world
     assert WORLD == 8, f"the TP8 push is certified at 8 ranks, got {WORLD}"
 
-    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.m3_mc_allreduce as _ar  # noqa: E501
-    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.m3_prequant as _pq  # noqa: E501
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.comm.m3_mc_allreduce_norm import (  # noqa: E501
+    import tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.m3_mc_allreduce as _ar  # noqa: E501
+    import tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.m3_prequant as _pq  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.comm.m3_mc_allreduce_norm import (  # noqa: E501
         sf_written as _sf_written,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.moe.m3_moe_engine import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.moe.m3_moe_engine import (  # noqa: E501
         M3MoeState,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.moe.m3_moe_engine import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.moe.m3_moe_engine import (  # noqa: E501
         ar_push_desc as _desc_fn,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.moe.m3_moe_engine import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.moe.m3_moe_engine import (  # noqa: E501
         m3_moe_engine as _op,
     )
 
@@ -297,7 +297,12 @@ def _run_one_rank() -> int:
     sf_written = _sf_written
     # Spawned by file path, not collected by pytest: the sibling moe/ operands the plain way.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "moe"))
-    import _m3_moe_operands as _operands
+    if TYPE_CHECKING:
+        from _torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.moe import (
+            _m3_moe_operands as _operands,
+        )
+    else:
+        import _m3_moe_operands as _operands
 
     operands = _operands
     WS = _make_workspace()

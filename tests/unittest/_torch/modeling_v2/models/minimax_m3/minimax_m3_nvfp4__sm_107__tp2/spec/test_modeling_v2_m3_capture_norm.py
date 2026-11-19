@@ -5,10 +5,10 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_capture_norm import (
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_capture_norm import (
     CELLS_BY_TP as M3_CAPTURE_NORM_CELLS_BY_TP,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_capture_norm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_capture_norm import (  # noqa: E501
     m3_capture_norm as op,
 )
 

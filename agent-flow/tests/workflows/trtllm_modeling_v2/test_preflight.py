@@ -175,6 +175,49 @@ def test_a_unified_substrate_is_proven_by_the_first_member_the_stock_path_serves
     assert booted == [None]
 
 
+def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environment(tmp_path):
+    """Sessions and spools are where jobs queue; every other environment field is the boot's."""
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
+        resolve_environment,
+    )
+    from agent_flow.workflows.trtllm_modeling_v2.run.startup.bootstrap import (
+        substrate_inputs,
+        substrate_reuse,
+    )
+
+    def inputs(perf=None, **environment):
+        task = _task(tmp_path, environment=environment, perf=perf or {})
+        return substrate_inputs(task, resolve_environment(task, world_size=4))
+
+    gates = {"name": "gates", "spool": "/s/gates", "env": {"A": "1"}, "setup": ["source /e.sh"]}
+    block = {
+        "kind": "session_spool",
+        "python": "/venv/bin/python",
+        "container_image": "/images/trtllm.sqsh",
+        "mounts": ["/data:/data"],
+        "env": {"TMPDIR": _SCRATCH},
+        "sessions": [gates],
+    }
+    record = {"at": 0.0, "inputs": inputs(**block)}
+    perf = [
+        {**gates, "name": f"perf{n}", "spool": f"/s/perf{n}", "time_limit": "4h"} for n in (1, 2)
+    ]
+    resized = {**gates, "role": "gates", "nodes": 2, "gpus_per_node": 8, "handover_lead": "30m"}
+    grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *perf]}
+    assert substrate_reuse(record, inputs({"dev_spools": ["/s/perf2"]}, **grown), now=60.0)[0]
+    for changed in (
+        {"container_image": "/images/other.sqsh"},
+        {"mounts": ["/data:/data", "/models:/models"]},
+        {"env": {"TMPDIR": _SCRATCH, "NCCL_DEBUG": "INFO"}},
+        {"python": "/other/bin/python"},
+        {"sessions": [gates, {**gates, "name": "perf1", "setup": ["source /other.sh"]}]},
+        # A field no list names counts too.
+        {"gpu_memory_gib": 80},
+    ):
+        reusable, why = substrate_reuse(record, inputs(**{**block, **changed}), now=60.0)
+        assert not reusable and "environment" in why, changed
+
+
 def test_multirank_probe_launches_the_run_interpreter_on_claimed_devices():
     from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 
@@ -229,7 +272,7 @@ def _entry_source(impl, archs):
     arch_set = ", ".join(f"Arch.{a}" for a in archs)
     cell_list = "".join(f"Cell(why='c{i}', spec={{}}), " for i in range(2))
     return (
-        "from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper\n\n\n"
+        "from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper\n\n\n"
         "class Entry(OpWrapper):\n"
         '    """Mentions torch.ops.trtllm.neighbour in prose, which is not the op."""\n\n'
         f"    ARCHS = frozenset({{{arch_set}}})\n"
@@ -248,7 +291,7 @@ def _fake_repo(tmp_path, entries, model_ops=()):
     ``catalog/``; ``model_ops`` are ``(family/target, category/name.py, impl,
     archs)`` kept in a target's ``ops/``.
     """
-    catalog = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
+    catalog = tmp_path / "tensorrt_llm/_torch/modeling_v2/catalog"
     catalog.mkdir(parents=True)
     (catalog / "_op.py").write_text("class OpWrapper:\n    pass\n", encoding="utf-8")
     for path, impl, archs in entries:
@@ -256,7 +299,7 @@ def _fake_repo(tmp_path, entries, model_ops=()):
         py.parent.mkdir(parents=True, exist_ok=True)
         (py.parent / "__init__.py").write_text("", encoding="utf-8")
         py.write_text(_entry_source(impl, archs), encoding="utf-8")
-    models = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+    models = tmp_path / "tensorrt_llm/_torch/modeling_v2/models"
     for scope, path, impl, archs in model_ops:
         py = models / scope / "ops" / path
         py.parent.mkdir(parents=True, exist_ok=True)

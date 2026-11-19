@@ -165,6 +165,7 @@ Wide-EP introduces the concept of **expert slots** that are decoupled from speci
 - **Offline EPLB**: Pre-computed expert placement based on historical workload statistics
 - **Online EPLB**: Dynamic expert placement that adapts to real-time traffic patterns
 - **Per-layer dynamic EPLB**: Expert placement re-planned for every MoE layer on every forward pass, with hot-expert weights copied into helper slots on the GPU (`MEGAMOE_CUTEDSL` backend only)
+- **Warmup expert placement** (`moe_config.load_balancer.warmup_placement`, prototype): Placement of static load-balancer layers learned online from the served traffic, in up to `max_migrations` rounds that each swap a bounded share of slots between heavy and light ranks and move the expert weights GPU to GPU in place. It needs `layer_updates_per_iter: 0` and pure expert parallelism (`moe_expert_parallel_size` above 1 and equal to the world size, no MoE cluster parallelism), and re-places only `MEGAMOE_CUTEDSL` layers; a model whose MoE layers all run other backends is rejected at load
 - Layer-wise weight redistribution to minimize inference disruption
 
 ### Architecture Overview

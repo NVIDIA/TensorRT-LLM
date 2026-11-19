@@ -7,11 +7,9 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
-    FusedQkNormRope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import FusedQkNormRope
+from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import (  # noqa: E501
     fused_qk_norm_rope as op,
 )
 
@@ -180,7 +178,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
         Cell(
             why="qwen4_exp main rope, decode: one token, Gemma norm and interleaved mRoPE "
             "with three distinct position rows",

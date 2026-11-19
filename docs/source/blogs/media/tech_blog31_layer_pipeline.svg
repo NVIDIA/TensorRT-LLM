@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 438" width="1000" height="438" role="img" aria-label="Per-layer pipeline of the compute stream and the shared copy stream">
+<defs><marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,1 L8,5 L0,9 Z" fill="#4f5d75"/></marker><marker id="ahg" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,1 L8,5 L0,9 Z" fill="#3f6600"/></marker></defs>
+<rect width="1000" height="438" fill="#f5f5f5"/>
+<text x="20.0" y="124.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Compute stream</text>
+<text x="20.0" y="319.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Copy stream</text>
+<text x="20.0" y="337.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="start">(shared, FIFO)</text>
+<rect x="168.0" y="96.0" width="116.0" height="46.0" rx="0" fill="#e4e7ec" stroke="#bfc0c0" stroke-width="1"/>
+<text x="227.0" y="116.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">attention(l)</text>
+<text x="227.0" y="132.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">reads A(l)</text>
+<rect x="286.0" y="96.0" width="144.0" height="46.0" rx="0" fill="#e4e7ec" stroke="#bfc0c0" stroke-width="1"/>
+<text x="359.0" y="116.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">MoE block(l)</text>
+<text x="359.0" y="132.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">reads D(l), E(l)</text>
+<rect x="432.0" y="96.0" width="116.0" height="46.0" rx="0" fill="#e4e7ec" stroke="#bfc0c0" stroke-width="1"/>
+<text x="491.0" y="116.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">attention(l+1)</text>
+<text x="491.0" y="132.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">reads A(l+1)</text>
+<rect x="550.0" y="96.0" width="144.0" height="46.0" rx="0" fill="#e4e7ec" stroke="#bfc0c0" stroke-width="1"/>
+<text x="623.0" y="116.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">MoE block(l+1)</text>
+<text x="623.0" y="132.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">reads D(l+1), E(l+1)</text>
+<rect x="696.0" y="96.0" width="116.0" height="46.0" rx="0" fill="#e4e7ec" stroke="#bfc0c0" stroke-width="1"/>
+<text x="755.0" y="116.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">attention(l+2)</text>
+<text x="755.0" y="132.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">reads A(l+2)</text>
+<rect x="814.0" y="96.0" width="144.0" height="46.0" rx="0" fill="#e4e7ec" stroke="#bfc0c0" stroke-width="1"/>
+<text x="887.0" y="116.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">MoE block(l+2)</text>
+<text x="887.0" y="132.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">reads D(l+2), E(l+2)</text>
+<line x1="167.0" y1="70.0" x2="167.0" y2="146.0" stroke="#2d3142" stroke-width="1.4"/>
+<text x="167.0" y="65.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="700" fill="#2d3142" text-anchor="middle">H1</text>
+<line x1="285.0" y1="70.0" x2="285.0" y2="146.0" stroke="#2d3142" stroke-width="1.4"/>
+<text x="285.0" y="65.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="700" fill="#2d3142" text-anchor="middle">H2</text>
+<line x1="431.0" y1="70.0" x2="431.0" y2="146.0" stroke="#2d3142" stroke-width="1.4"/>
+<text x="431.0" y="65.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="700" fill="#2d3142" text-anchor="middle">H3 · H1</text>
+<line x1="549.0" y1="70.0" x2="549.0" y2="146.0" stroke="#2d3142" stroke-width="1.4"/>
+<text x="549.0" y="65.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="700" fill="#2d3142" text-anchor="middle">H2</text>
+<line x1="695.0" y1="70.0" x2="695.0" y2="146.0" stroke="#2d3142" stroke-width="1.4"/>
+<text x="695.0" y="65.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="700" fill="#2d3142" text-anchor="middle">H3 · H1</text>
+<line x1="813.0" y1="70.0" x2="813.0" y2="146.0" stroke="#2d3142" stroke-width="1.4"/>
+<text x="813.0" y="65.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="700" fill="#2d3142" text-anchor="middle">H2</text>
+<line x1="959.0" y1="70.0" x2="959.0" y2="146.0" stroke="#2d3142" stroke-width="1.4"/>
+<text x="959.0" y="65.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="700" fill="#2d3142" text-anchor="middle">H3 · H1</text>
+<line x1="168.0" y1="160.0" x2="284.0" y2="160.0" stroke="#3f6600" stroke-width="3"/>
+<text x="172.0" y="176.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#3f6600" text-anchor="start">A(l) read window</text>
+<line x1="168.0" y1="186.0" x2="430.0" y2="186.0" stroke="#3f6600" stroke-width="3"/>
+<text x="172.0" y="202.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#3f6600" text-anchor="start">D(l) read window</text>
+<line x1="302.0" y1="212.0" x2="386.0" y2="212.0" stroke="#3f6600" stroke-width="3"/>
+<text x="394.0" y="216.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#3f6600" text-anchor="start">E(l) read window</text>
+<clipPath id="lane"><rect x="168" y="266" width="792" height="96"/></clipPath>
+<g clip-path="url(#lane)">
+<rect x="128.0" y="296.0" width="150.0" height="36.0" rx="0" fill="#8d99ae" stroke="none" stroke-width="1"/>
+<text x="223.0" y="319.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#ffffff" text-anchor="middle">E(l+1)</text>
+<rect x="286.0" y="296.0" width="5.7" height="36.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="386.0" y="296.0" width="150.0" height="36.0" rx="0" fill="#8d99ae" stroke="none" stroke-width="1"/>
+<text x="461.0" y="319.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#ffffff" text-anchor="middle">E(l+2)</text>
+<rect x="550.0" y="296.0" width="5.7" height="36.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="650.0" y="296.0" width="150.0" height="36.0" rx="0" fill="#8d99ae" stroke="none" stroke-width="1"/>
+<text x="725.0" y="319.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#ffffff" text-anchor="middle">E(l+3)</text>
+<rect x="814.0" y="296.0" width="5.7" height="36.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+</g>
+<line x1="168.0" y1="333.0" x2="960.0" y2="333.0" stroke="#bfc0c0" stroke-width="1"/>
+<line x1="288.8" y1="334.0" x2="288.8" y2="346.0" stroke="#3f6600" stroke-width="1"/>
+<text x="288.8" y="360.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="700" fill="#3f6600" text-anchor="middle">L(l+2)</text>
+<line x1="552.8" y1="334.0" x2="552.8" y2="346.0" stroke="#3f6600" stroke-width="1"/>
+<text x="552.8" y="360.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="700" fill="#3f6600" text-anchor="middle">L(l+3)</text>
+<line x1="816.8" y1="334.0" x2="816.8" y2="346.0" stroke="#3f6600" stroke-width="1"/>
+<text x="816.8" y="360.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="700" fill="#3f6600" text-anchor="middle">L(l+4)</text>
+<path d="M285.0,146.0 L285.0,262.0 L287.0,262.0 L287.0,293.0" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#ah)"/>
+<text x="277.0" y="248.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="end">H2(l) enqueues L(l+2)</text>
+<line x1="386.0" y1="212.0" x2="386.0" y2="293.0" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#ah)"/>
+<text x="394.0" y="248.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">E(l+2) waits for the routed experts of layer l</text>
+<path d="M291.7,314.0 L305.7,314.0" fill="none" stroke="#3f6600" stroke-width="1.2"/>
+<path d="M305.7,314.0 L305.7,274.0 L689.0,274.0 L689.0,148.0" fill="none" stroke="#3f6600" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#ahg)"/>
+<text x="683.0" y="268.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#3f6600" text-anchor="end">H1(l+2) waits for L(l+2)</text>
+<rect x="168.0" y="409.0" width="14.0" height="14.0" rx="2" fill="#8d99ae" stroke="none" stroke-width="1"/>
+<text x="188.0" y="421.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="400" fill="#4f5d75" text-anchor="start">E(k): expert prefetch of layer k, 15.6 GB (DWDP16)</text>
+<rect x="568.0" y="409.0" width="14.0" height="14.0" rx="2" fill="#76b900" stroke="none" stroke-width="1"/>
+<text x="588.0" y="421.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="400" fill="#4f5d75" text-anchor="start">L(k): dense gather of layer k, 0.59 GB on average</text>
+</svg>

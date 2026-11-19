@@ -91,7 +91,6 @@ platform-neutral name, such as `ltx2.yaml`; supported GPUs are listed in
 
 Examples:
 
-- `wan21_t2v_14b_blackwell.yaml`
 - `wan22_i2v_a14b_blackwell.yaml`
 - `flux2_blackwell.yaml`
 - `ltx2.yaml`
@@ -104,35 +103,39 @@ stable server recipes.
 
 ```yaml
 metadata:
-  model_name: Wan2.1-T2V-14B-Diffusers
-  supported_gpus: [B200]
-
+  model_name: FLUX.2-dev
+  supported_gpus:
+    - B200
 hardware:
-  gpus_per_node: 8
-
+  gpus_per_node: 4
 environment:
   server_env_var: TLLM_LOG_LEVEL=info
   client_env_var: ""
-
 server_configs:
-  - name: wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on
-    model_path: Wan-AI/Wan2.1-T2V-14B-Diffusers
-    visual_gen_args_path: examples/visual_gen/serve/configs/foo.yml
+  - name: flux2_fp8_cfg1_ulysses4_teacache_on
     server_config:
+      quant_config:
+        quant_algo: FP8
+        dynamic: true
       attention_config:
-        backend: TRTLLM
+        backend: VANILLA
       parallel_config:
-        cfg_size: 2
+        cfg_size: 1
         ulysses_size: 4
+      cache_config:
+        cache_backend: teacache
+      cuda_graph_config:
+        enable: false
     client_configs:
-      - name: 832x480_33f_50s_con1
-        backend: openai-videos
-        generation_mode: t2v
-        size: 832x480
-        num_frames: 33
-        fps: 16
+      - name: 1024x1024_1f_50s_con1
+        prompt: A cat holding a sign that says hello world
+        backend: openai-images
+        generation_mode: t2i
+        size: 1024x1024
         num_inference_steps: 50
+        seed: 42
         max_concurrency: 1
+        num_prompts: 1
 ```
 
 ### Schema Notes
@@ -165,7 +168,7 @@ VisualGen uses two prefixes:
 - `vg`: run the case without posting new results
 
 `{config_base}` is the YAML filename without the `.yaml` extension (e.g.,
-`flux2_blackwell`, `wan21_t2v_14b_blackwell`).
+`flux2_blackwell`, `wan22_i2v_a14b_blackwell`).
 
 Both prefixes support two selector forms:
 
@@ -184,7 +187,7 @@ perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-{config_base}
 Example:
 
 ```text
-perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-wan21_t2v_1p3b_blackwell-wan21_1p3b_fp8_fa4_cfg1_ulysses1_teacache_on]
+perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on]
 ```
 
 ## CI Integration
@@ -219,7 +222,7 @@ To include the VisualGen perf sanity stage alongside the standard L0 suite:
 
 Model assets are read from `LLM_MODELS_ROOT` (defaults to
 `/home/scratch.trt_llm_data_ci/llm-models/`). The `model_path` in a YAML may
-use the HuggingFace `org/model` format (e.g. `Wan-AI/Wan2.1-T2V-14B-Diffusers`)
+use the HuggingFace `org/model` format (e.g. `Wan-AI/Wan2.2-I2V-A14B-Diffusers`)
 — the resolver tries the full path under `LLM_MODELS_ROOT` first, then falls
 back to stripping the org prefix, so CI layouts without subdirectories work
 automatically.
@@ -228,8 +231,6 @@ Important:
 
 - VisualGen perf sanity uses static pytest cases, like `test_perf_sanity.py`
 - Do **not** add pytest `--perf` for VisualGen perf sanity runs
-- VisualGen `PerfSanity` stages should not be routed through the legacy
-  `perfMode` path used by `test_perf.py`
 
 ## How to Add a Test Case
 
@@ -267,7 +268,7 @@ Important:
 
    The link pre-filters to `s_runtime: visual_gen`. To find a specific run,
    search for the server config name (e.g. `s_server_name:
-   wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on`) or narrow the time range
+   flux2_fp8_cfg1_ulysses4_teacache_on`) or narrow the time range
    to match the CI run timestamp.
 
 ## How to Add or Change a Match Key
@@ -299,7 +300,7 @@ extraction in `build_visual_gen_db_entry` and treat it as a baseline reset.
 
 ```bash
 # Run a single named recipe
-pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-wan21_t2v_14b_blackwell-wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on]
+pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on]
 
 # Run all server recipes from one family YAML without uploading
 pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-ltx2]
