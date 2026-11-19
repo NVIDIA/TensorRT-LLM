@@ -1351,6 +1351,22 @@ def test_dspark_requires_positive_max_draft_len(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_dspark_ancestral_draft_sampling_rejects_embedded_drafter(tmp_path):
+    (tmp_path / "config.json").write_text('{"model_type": "deepseek_v4"}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    use_rejection_sampling=True,
+                                    use_ancestral_draft_sampling=True)
+
+    with pytest.raises(ValueError, match="drafter embedded in the target"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+@pytest.mark.cpu_only
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
     """post_processor_hook + skip_tokenizer_init must fail fast.
 

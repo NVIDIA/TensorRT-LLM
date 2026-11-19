@@ -103,6 +103,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[bf16-kv]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[fp8-kv]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark[TRTLLM] # SM100+ only; l0_h100 runs [VANILLA]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[standard-fused_chain]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[block-per_position]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-trtllm_gen]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-trtllm_gen]
@@ -210,14 +212,25 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
   - unittest/_torch/modules/kimi_kda/test_kda_replay_acceptance.py
   # Shared catalog entries used by K3's generic path.
-  - unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
+  - unittest/_torch/modeling_v2/moe/ops/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
   - unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py::test_kimi_k3_routed_hidden
-  - unittest/_torch/modeling_v2/moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
+  - unittest/_torch/modeling_v2/moe/ops/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py::test_kimi_k3_mla_context_bf16_page64
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py::test_kimi_k3_mla_generation_bf16_page64
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_generation.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_append_paged_kv_assign_q.py
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_load_paged_kv_cache_for_mla.py
+  - unittest/_torch/modeling_v2/graph/test_modeling_v2_eager_on_graph.py
+  # Kimi K3 MLA tests that run on sm_100 only (the MLA kernels the generic path picks there).
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_cute_dsl_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_flashinfer_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_load_chunked_kv_cache_for_mla.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_modeling_v2_k3_merge_chunked_attention_for_mla.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_mla_steps.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_dspark_mla_ops.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_mla_drafter.py
+  # The family's attention-residual CUDA against the built-in ops it was copied from, on the targets' SM.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_attn_res_v1_parity.py
   # CuTe MTP verify kernel parity (trtllm::kda_mtp_decode).
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
@@ -293,6 +306,7 @@ l0_b200:
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   - unittest/_torch/moe/test_megamoe_streaming_load.py
+  - unittest/_torch/moe/test_megamoe_combine_dedup_tactic.py
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
@@ -379,7 +393,6 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
-  - unittest/_torch/modeling/test_modeling_gemma4_unified.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
   - unittest/_torch/modeling/test_gemma4_assistant.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
@@ -451,7 +464,6 @@ l0_b200:
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py
   - unittest/_torch/visual_gen/test_media_decode.py
-  - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
