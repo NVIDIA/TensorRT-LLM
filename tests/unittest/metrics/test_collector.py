@@ -1890,13 +1890,9 @@ def test_storage_report_exports_capacity_and_cumulative_movement(collector, scra
                 restored_blocks=4,
             )
         ],
-        migration_timings=[(1, 0, 2, 2.5)],
-        skipped_migration_timings=3,
     )
     record = IterationStatsRecord(IterationStats(), kv_iteration_stats=report, attention_dp_rank=3)
     collector.log_iteration_stats(record.to_dict())
-    # Timing observations are drained once; occupancy and movement are cumulative snapshots.
-    report.migration_timings.clear()
     for restored in (4, 6):
         report.storage_stats[0].restored_blocks = restored
         collector.log_iteration_stats(record.to_dict())
@@ -1907,13 +1903,6 @@ def test_storage_report_exports_capacity_and_cumulative_movement(collector, scra
     assert scrape("kv_cache_tier_moved_bytes_total", **labels, operation="restore") == [384]
     assert not scrape("kv_cache_tier_blocks", dp_rank=0)
     assert scrape("kv_cache_num_conversations", dp_rank=3) == [7]
-    assert scrape(
-        "kv_cache_tier_migration_duration_seconds_sum",
-        source_cache_tier="host",
-        destination_cache_tier="gpu",
-    ) == [0.0025]
-    assert scrape("kv_cache_tier_migration_duration_seconds_count") == [1]
-    assert scrape("kv_cache_migration_timing_skipped_total", dp_rank=3) == [3]
 
 
 @pytest.fixture

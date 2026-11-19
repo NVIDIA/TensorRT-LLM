@@ -29,8 +29,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdlib>
-#include <future>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1697,7 +1695,6 @@ TEST(KvCacheManagerV2StatsTest, DisabledStatsSuppressManagerCommit)
     manager->commitStats(KVCacheStatsDelta{4, 3, 2, 1});
     EXPECT_TRUE(manager->getCommittedStats().empty());
     EXPECT_TRUE(manager->getAndResetIterationStats().empty());
-    EXPECT_TRUE(manager->takeMigrationTimings().first.empty());
 }
 
 TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrentSnapshot)
@@ -1769,129 +1766,8 @@ TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrent
     EXPECT_EQ(primaryPeak[PoolGroupIndex{0}].evictable, 0);
 }
 
-TEST(KvCacheManagerV2StatsTest, PendingMigrationTimingsRespectBudgetAndRecoverAfterCompletion)
-{
-    constexpr char kTimingEnv[] = "TRTLLM_KV_CACHE_TIMING_SAMPLE_INTERVAL";
-    char const* priorValue = std::getenv(kTimingEnv);
-    std::optional<std::string> const prior = priorValue ? std::optional<std::string>{priorValue} : std::nullopt;
-    auto restoreEnv = FuncGuard(
-        [&]()
-        {
-            if (prior)
-            {
-                ::setenv(kTimingEnv, prior->c_str(), 1);
-            }
-            else
-            {
-                ::unsetenv(kTimingEnv);
-            }
-        });
-    ASSERT_EQ(::setenv(kTimingEnv, "1", 1), 0);
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    auto config = makeTieredConfig();
-    config.enableStats = true;
-    auto manager = std::make_shared<KvCacheManager>(config);
-    auto const apiLock = manager->lockExclusive();
-    auto& storage = manager->storage();
-    LifeCycleId const lifeCycle{0};
-    CacheLevel const coldLevel{1};
-    TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{1}, 1);
-    auto hotSlots = storage.newSlots(kHotLevel, oneSlot);
-    auto coldSlots = storage.newSlots(coldLevel, oneSlot);
-    cudaStream_t stream{};
-    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
-    std::promise<void> release;
-    auto ready = release.get_future().share();
-    bool released = false;
-    auto cleanup = FuncGuard(
-        [&]()
-        {
-            // Release the callback even when an assertion exits the test early.
-            if (!released)
-            {
-                release.set_value();
-            }
-            EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-            EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
-            storage.releaseSlot(lifeCycle, coldLevel, std::move(coldSlots[lifeCycle].front()));
-            storage.releaseSlot(lifeCycle, kHotLevel, std::move(hotSlots[lifeCycle].front()));
-        });
-    auto copy = [&]()
-    {
-        storage.copySlotData(lifeCycle, coldLevel, kHotLevel, coldSlots[lifeCycle].front().slotId(),
-            hotSlots[lifeCycle].front().slotId(), reinterpret_cast<CUstream>(stream));
-    };
-    PoolGroupIndex const hotPoolGroup = storage.getPoolGroupIndex(kHotLevel, lifeCycle);
-    auto const hotAddress = std::get<MemAddress>(
-        storage.slotAddress(kHotLevel, hotPoolGroup, hotSlots[lifeCycle].front().slotId(), PoolIndex{0}));
-    ASSERT_EQ(cudaMemsetAsync(
-                  reinterpret_cast<void*>(hotAddress), 0, storage.slotSize(hotPoolGroup).at(PoolIndex{0}), stream),
-        cudaSuccess);
-    // Warm up codec/module initialization before putting a blocking callback on the stream.
-    copy();
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    ASSERT_EQ(manager->takeMigrationTimings().first.size(), 1);
-    ASSERT_EQ(cudaLaunchHostFunc(
-                  stream, [](void* data) { static_cast<std::shared_future<void>*>(data)->wait(); }, &ready),
-        cudaSuccess);
-
-    constexpr int kPendingBudget = 64;
-    constexpr int kExtraSamples = 2;
-    for (int i = 0; i < kPendingBudget + kExtraSamples; ++i)
-    {
-        copy();
-    }
-    for (int poll = 0; poll < 3; ++poll)
-    {
-        auto const [samples, skipped] = manager->takeMigrationTimings();
-        EXPECT_TRUE(samples.empty());
-        EXPECT_EQ(skipped, kExtraSamples);
-    }
-    auto const [pendingSamples, pendingSkipped] = manager->takeMigrationTimings();
-    EXPECT_TRUE(pendingSamples.empty());
-    EXPECT_EQ(pendingSkipped, kExtraSamples);
-
-    release.set_value();
-    released = true;
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    auto const [completed, skipped] = manager->takeMigrationTimings();
-    EXPECT_EQ(completed.size(), kPendingBudget);
-    EXPECT_EQ(skipped, kExtraSamples);
-    for (auto const& [source, destination, poolGroup, elapsedMs] : completed)
-    {
-        EXPECT_EQ(source, kHotLevel.value());
-        EXPECT_EQ(destination, coldLevel.value());
-        EXPECT_EQ(poolGroup, 0);
-        EXPECT_GE(elapsedMs, 0.0f);
-    }
-    EXPECT_TRUE(manager->takeMigrationTimings().first.empty());
-
-    copy();
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    auto const [resumed, stillSkipped] = manager->takeMigrationTimings();
-    EXPECT_EQ(resumed.size(), 1);
-    EXPECT_EQ(stillSkipped, kExtraSamples);
-    EXPECT_TRUE(manager->takeMigrationTimings().first.empty());
-}
-
 TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPages)
 {
-    constexpr char kTimingEnv[] = "TRTLLM_KV_CACHE_TIMING_SAMPLE_INTERVAL";
-    char const* priorValue = std::getenv(kTimingEnv);
-    std::optional<std::string> const prior = priorValue ? std::optional<std::string>{priorValue} : std::nullopt;
-    auto restoreEnv = FuncGuard(
-        [&]()
-        {
-            if (prior)
-            {
-                ::setenv(kTimingEnv, prior->c_str(), 1);
-            }
-            else
-            {
-                ::unsetenv(kTimingEnv);
-            }
-        });
-    ASSERT_EQ(::setenv(kTimingEnv, "64", 1), 0);
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     auto manager = std::make_shared<KvCacheManager>(makeTieredConfig());
     auto& storage = manager->storage();
@@ -1992,20 +1868,6 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     EXPECT_EQ(onboarded, 2);
     EXPECT_EQ(storage.getStatistics(kHotLevel).movement.restoredBlocks, 2);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    auto const [timings, skipped] = manager->takeMigrationTimings();
-    EXPECT_EQ(skipped, 0);
-    ASSERT_EQ(timings.size(), 2);
-    for (auto const& [source, destination, poolGroup, elapsedMs] : timings)
-    {
-        EXPECT_NE(source, destination);
-        EXPECT_EQ(poolGroup, 0);
-        EXPECT_GE(elapsedMs, 0.0f);
-    }
-    EXPECT_EQ(std::get<0>(timings[0]), 0);
-    EXPECT_EQ(std::get<1>(timings[0]), 1);
-    EXPECT_EQ(std::get<0>(timings[1]), 1);
-    EXPECT_EQ(std::get<1>(timings[1]), 0);
-    EXPECT_TRUE(manager->takeMigrationTimings().first.empty());
     for (size_t index = 0; index < firstPages.size(); ++index)
     {
         MemAddress const address = std::get<MemAddress>(

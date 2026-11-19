@@ -29,7 +29,6 @@
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
-#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -297,16 +296,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     std::optional<std::vector<float>> const& initialPoolRatio, std::shared_ptr<EventSink> eventSink,
     float maxUtilForResume, Priority coldTierOffloadMinPriority, std::optional<BatchDesc> const& coldTypicalBatch,
     bool enableStats)
-    : mTimingEvents(
-        []() -> CUevent
-        {
-            CUevent event;
-            cuCheck(cuEventCreate(&event, CU_EVENT_DEFAULT));
-            return event;
-        },
-        [](CUevent event) { cuEventDestroy(event); }, 0, 128)
-    , mTimingSampleInterval(tensorrt_llm::common::getIntEnv("TRTLLM_KV_CACHE_TIMING_SAMPLE_INTERVAL").value_or(0))
-    , mEnableStats(enableStats)
+    : mEnableStats(enableStats)
     , mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
     , mColdTierOffloadMinPriority(coldTierOffloadMinPriority)
@@ -867,8 +857,6 @@ StorageManager::~StorageManager()
 
 void StorageManager::destroy()
 {
-    mPendingMigrationTimings.clear();
-    mTimingEvents.clear();
     // A transfer that missed its deadline gets one more transfer timeout to quiesce. One that still has not may yet
     // access its staging lease, its chunks and its client's registrations: all of them are leaked rather than reused.
     bool leakStaging = false;
@@ -1124,26 +1112,6 @@ Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, Slot
     return mLevels.at(level).storage->slotAddress(pgIdx, slotId).at(poolIdx);
 }
 
-std::pair<MigrationTimingSamples, int64_t> StorageManager::takeMigrationTimings()
-{
-    MigrationTimingSamples samples;
-    for (auto it = mPendingMigrationTimings.begin(); it != mPendingMigrationTimings.end();)
-    {
-        CUresult const status = cuEventQuery(it->stop.get());
-        if (status == CUDA_ERROR_NOT_READY)
-        {
-            ++it;
-            continue;
-        }
-        cuCheck(status);
-        float elapsedMs;
-        cuCheck(cuEventElapsedTime(&elapsedMs, it->start.get(), it->stop.get()));
-        samples.emplace_back(it->sourceLevel, it->destinationLevel, it->poolGroup, elapsedMs);
-        it = mPendingMigrationTimings.erase(it);
-    }
-    return {std::move(samples), mSkippedMigrationTimings};
-}
-
 bool StorageManager::encodeColdPages(
     LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
 {
@@ -1168,40 +1136,6 @@ bool StorageManager::decodeColdPages(
 
 void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
     PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
-{
-    std::optional<PendingMigrationTiming> timing;
-    if (mEnableStats && mTimingSampleInterval > 0 && srcLevel != dstLevel && numPages > 0)
-    {
-        bool const restoring = dstLevel < srcLevel;
-        CacheLevel const level = restoring ? dstLevel : srcLevel;
-        PoolGroupIndex const pgIdx = getPoolGroupIndex(level, batchingLayerGroupId);
-        auto& batches = mMigrationBatches[{srcLevel, dstLevel, pgIdx}];
-        constexpr size_t kMaxPending = 64;
-        if (batches++ % mTimingSampleInterval == 0)
-        {
-            if (mPendingMigrationTimings.size() < kMaxPending)
-            {
-                timing.emplace(PendingMigrationTiming{
-                    srcLevel.value(), dstLevel.value(), pgIdx.value(), mTimingEvents.get(), mTimingEvents.get()});
-                cuCheck(cuEventRecord(timing->start.get(), stream));
-            }
-            else
-            {
-                ++mSkippedMigrationTimings;
-            }
-        }
-    }
-    submitMigrationBatchImpl(dstLevel, srcLevel, batchingLayerGroupId, pageIndices, numPages, stream);
-    recordMigration(dstLevel, srcLevel, batchingLayerGroupId, numPages);
-    if (timing)
-    {
-        cuCheck(cuEventRecord(timing->stop.get(), stream));
-        mPendingMigrationTimings.push_back(std::move(*timing));
-    }
-}
-
-void StorageManager::submitMigrationBatchImpl(CacheLevel dstLevel, CacheLevel srcLevel,
-    LayerGroupId batchingLayerGroupId, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
 {
     TLLM_CHECK_DEBUG(pageIndices != nullptr && numPages > 0);
     PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
@@ -1587,6 +1521,7 @@ void StorageManager::copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, Ca
     LayerGroupId const batchingLayerGroupId = getMigrationBatchingLayerGroupId(dstLevel, srcLevel, lifeCycle);
     PageIndexPair const pageIndex{slotIdToPageIndexValue(dstSlotId), slotIdToPageIndexValue(srcSlotId)};
     submitMigrationBatch(dstLevel, srcLevel, batchingLayerGroupId, &pageIndex, 1, stream);
+    recordMigration(dstLevel, srcLevel, batchingLayerGroupId, 1);
 }
 
 CacheTier StorageManager::cacheTier(CacheLevel level) const
@@ -2792,6 +2727,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             {
                 submitMigrationBatch(
                     dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(), stream);
+                recordMigration(dstLevel, srcLevel, batchingLayerGroupId, pageIndices.size());
             }
         }
         updateReadyEvents.run();

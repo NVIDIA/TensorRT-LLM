@@ -1114,12 +1114,6 @@ KVCacheStatsDelta KvCacheManager::getCommittedStats() const
     return mCommittedStats.copy();
 }
 
-std::pair<MigrationTimingSamples, int64_t> KvCacheManager::takeMigrationTimings()
-{
-    auto const apiLock = lockExclusive();
-    return mStorage->takeMigrationTimings();
-}
-
 IterationStatsByLifeCycle KvCacheManager::getAndResetIterationStats()
 {
     auto const apiLock = lockExclusive();

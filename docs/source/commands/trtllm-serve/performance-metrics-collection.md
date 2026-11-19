@@ -109,19 +109,15 @@ alone is incomplete. The tool guards resource versions and reads back saved
 content. ConfigMap checkpoint plus native finalization is not a cross-system
 transaction; the README documents `--finalize-only` recovery.
 
-The 80 default metric templates include physical tier states/resident occupancy,
-restore/eviction turnover, final drops, sampled restore latency/skips and
-completed-request transfer duration. Native ratios use logical byte capacity and
-remain separated by level/tier and reporting rank. Unsupported observations hide
-optional panels. GPU active/available block charts retain their separate meaning:
-available blocks can contain reclaimable prefixes. These panels cannot prove
-which conversation prefix was evicted.
+The default dashboard shows tier occupancy, restore and eviction turnover,
+final drops, and completed-request transfer duration. Native ratios use logical
+byte capacity and remain separated by level, tier, and reporting rank.
+Unsupported observations hide optional panels. GPU available blocks can include
+reclaimable prefixes. These panels cannot identify which prefix was evicted.
 
 Select one application scrape job path to avoid duplicate engine observations.
-Existing `irate` charts use the last two samples in `counter_lookback`; new tier
-rate/turnover charts average the window, and sampled latency uses a 5-minute
-histogram window. Missing metrics, sparse timing samples, rank coverage and native
-build requirements still apply; dashboard creation does not enable instrumentation.
+Existing `irate` charts use the last two samples in `counter_lookback`. Tier
+turnover charts average the window. Dashboard creation does not enable instrumentation.
 
 The template includes optional KV-cache tier and transfer panels whose added
 instrumentation is provided separately by [PR #22083](https://github.com/NVIDIA/TensorRT-LLM/pull/22083).

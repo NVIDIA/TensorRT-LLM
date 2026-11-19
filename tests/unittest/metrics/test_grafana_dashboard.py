@@ -141,7 +141,7 @@ class DashboardTests(unittest.TestCase):
     def test_offline_render_has_no_auth_or_kubernetes_access(self) -> None:
         with patch("subprocess.run", side_effect=AssertionError("Cluster access during render")):
             dashboards, cm, scrape = app.render(config())
-        self.assertEqual(len(dashboards["metrics"]["elements"]), 80)
+        self.assertEqual(len(dashboards["metrics"]["elements"]), 76)
         panels = dashboards["metrics"]["elements"]
         self.assertTrue({"panel-106", "panel-132", "panel-104", "panel-129"}.isdisjoint(panels))
         for key in ("panel-114", "panel-140"):
@@ -186,7 +186,7 @@ class DashboardTests(unittest.TestCase):
             "@@",
         ):
             self.assertNotIn(unwanted, text)
-        self.assertEqual(len(dashboards["metrics"]["elements"]), 82)
+        self.assertEqual(len(dashboards["metrics"]["elements"]), 78)
         self.assertIn("/d/model-logs", text)
         self.assertIn("engine_role", text)
         for panel in dashboards["metrics"]["elements"].values():
@@ -390,7 +390,7 @@ class ReviewedPublicationTests(unittest.TestCase):
         dashboards, _, _ = app.render(c)
         metrics = dashboards["metrics"]
         panels = [p for key, p in metrics["elements"].items() if key.startswith("observability-")]
-        self.assertEqual(len(panels), 14)
+        self.assertEqual(len(panels), 10)
         for p in panels:
             spec = p["spec"]
             custom = spec["vizConfig"]["spec"]["fieldConfig"]["defaults"]["custom"]
@@ -405,9 +405,6 @@ class ReviewedPublicationTests(unittest.TestCase):
                     self.assertIn("rate(", expr)
                     self.assertIn("[2m]", expr)
                     self.assertIn("group_left", expr)
-                if "Sampled restore latency" in spec["title"]:
-                    self.assertIn("[5m]", expr)
-                    self.assertIn("source_cache_level,destination_cache_level", expr)
         for row in metrics["layout"]["spec"]["rows"]:
             for item in row["spec"]["layout"]["spec"]["items"]:
                 key = item["spec"]["element"]["name"]

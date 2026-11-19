@@ -9159,8 +9159,6 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self.enable_stats:
             return None
 
-        get_timings = getattr(self.impl, "take_migration_timings", None)
-        migration_timings, skipped_migration_timings = get_timings() if get_timings else ([], None)
         disk_prefetch_blocks = self.impl.get_and_reset_iteration_disk_prefetch_blocks()
         cached_tokens_by_level = self.impl.get_and_reset_iteration_cached_tokens_by_level()
         connector_cached_tokens = self.impl.get_and_reset_iteration_connector_cached_tokens()
@@ -9273,8 +9271,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 and self.conversation_manager.retention_enabled
                 else None
             ),
-            migration_timings=migration_timings,
-            skipped_migration_timings=skipped_migration_timings,
             storage_stats=[
                 KVCacheV2StorageIterationStats(
                     cache_level=level,

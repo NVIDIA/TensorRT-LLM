@@ -271,27 +271,6 @@ class PrometheusExposure:
             "Cumulative restored, evicted or dropped logical slot bytes",
             labelnames=[*storage_labels, "operation"])
         self._prev_tier_movement: dict[tuple[str, int, int, str], int] = {}
-        self.histogram_kv_cache_tier_migration = Histogram(
-            name=self.metric_prefix +
-            "kv_cache_tier_migration_duration_seconds",
-            documentation=
-            "Sampled cross-level migration batch stream duration in seconds",
-            labelnames=[
-                *storage_labels, "operation", "source_cache_level",
-                "source_cache_tier", "destination_cache_level",
-                "destination_cache_tier"
-            ],
-            buckets=[
-                0.00001, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
-                0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 60, 300
-            ])
-        self.kv_cache_migration_timing_skipped = Counter(
-            name=self.metric_prefix + "kv_cache_migration_timing_skipped_total",
-            documentation=
-            "Eligible timing samples skipped because the pending-event budget was full",
-            labelnames=iteration_labelnames)
-        self._prev_skipped_migration_timings: dict[str, int] = {}
-
         activity_labelnames = (*iteration_labelnames, "window")
         self.conversation_unique_seen = Gauge(
             name=self.metric_prefix + "conversation_unique_seen",
@@ -978,47 +957,6 @@ class PrometheusExposure:
     def _log_storage_stats(self, iteration_stats: dict, rank: str) -> None:
         """Export measured level/pool snapshots and deltas of cumulative movement counts."""
         tiers = iteration_stats.get("kvCacheLevelTiers", [])
-        skipped = iteration_stats.get("kvCacheMigrationTimingsSkipped")
-        if isinstance(skipped,
-                      int) and not isinstance(skipped, bool) and skipped >= 0:
-            previous = self._prev_skipped_migration_timings.get(rank, 0)
-            if skipped >= previous:
-                self._log_counter(self.kv_cache_migration_timing_skipped,
-                                  {self.labelname_dp_rank: rank},
-                                  skipped - previous)
-            self._prev_skipped_migration_timings[rank] = skipped
-        for source, destination, pool_group, elapsed_ms in iteration_stats.get(
-                "kvCacheMigrationTimings", []):
-            if (not all(
-                    isinstance(value, int) and not isinstance(value, bool)
-                    and value >= 0
-                    for value in (source, destination, pool_group))
-                    or source == destination
-                    or not isinstance(elapsed_ms, (int, float))
-                    or not math.isfinite(elapsed_ms) or elapsed_ms < 0):
-                continue
-            restoring = destination < source
-            level = destination if restoring else source
-            self._log_histogram(
-                self.histogram_kv_cache_tier_migration,
-                elapsed_ms / 1000.0,
-                labels={
-                    self.labelname_dp_rank:
-                    rank,
-                    **self._cache_level_labels(level, tiers),
-                    "pool_group":
-                    str(pool_group),
-                    "operation":
-                    "restore" if restoring else "evict",
-                    "source_cache_level":
-                    str(source),
-                    "source_cache_tier":
-                    tiers[source] if source < len(tiers) else "",
-                    "destination_cache_level":
-                    str(destination),
-                    "destination_cache_tier":
-                    tiers[destination] if destination < len(tiers) else "",
-                })
         for snapshot in iteration_stats.get("kvCacheStorageStats", []):
             level = snapshot.get("cacheLevel")
             pool_group = snapshot.get("poolGroupId")
