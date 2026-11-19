@@ -33,21 +33,25 @@ def is_modelopt_quant_config(raw: Any) -> bool:
     return (raw.get("producer") or {}).get("name") == "modelopt"
 
 
+#: `hf_quant_config.json` formats other than ModelOpt's that a model implementation reads itself,
+#: by `quant_method`. A model with such a format adds it here.
+FOREIGN_HF_QUANT_METHODS = frozenset({"inkling2"})
+
+
 def is_foreign_hf_quant_config(raw: Any) -> bool:
-    """Whether an `hf_quant_config.json` payload uses a format other than ModelOpt's.
+    """Whether an `hf_quant_config.json` payload is a known format other than ModelOpt's.
 
     Some checkpoints use `hf_quant_config.json` for precision metadata of their own
     (Inkling 2 declares `quant_method: inkling2` and lists per-tensor precisions),
     which only their model implementation can read. Such a file is authoritative: neither
     it nor an inline ModelOpt `quantization_config` in `config.json` configures
-    module-wide quantization. A payload that is not a dict or names no `quant_method` is
-    not recognized as such and keeps the ModelOpt parser's error.
+    module-wide quantization. Only the formats in `FOREIGN_HF_QUANT_METHODS` qualify; any
+    other payload, ModelOpt's or an unknown one, keeps the ModelOpt parser and its errors.
     """
     return (
         isinstance(raw, dict)
         and "quantization" not in raw
-        and "quant_method" in raw
-        and not is_modelopt_quant_config(raw)
+        and raw.get("quant_method") in FOREIGN_HF_QUANT_METHODS
     )
 
 

@@ -338,6 +338,25 @@ def test_inkling2_text_config_keeps_layout_in_step_with_later_assignments():
         text.local_layer_ids = [0, 6]
     assert text.local_layer_ids == [0, 2]
     assert text.layer_types[:3] == ["sliding_attention", "full_attention", "sliding_attention"]
+    # Shrinking the model keeps the explicit sliding-window layers it still has.
+    text.num_hidden_layers = 2
+    assert text.local_layer_ids == [0]
+    assert text.layer_types == ["sliding_attention", "full_attention"]
+
+
+def test_inkling2_text_config_shrinks_with_the_checkpoints_explicit_layout():
+    # The released config lists its 40 sliding-window layers; the usual dev shrink sets only
+    # num_hidden_layers (model_kwargs, or a from_dict keyword override) and must not fail.
+    released = [i for i in range(48) if i % 6 != 5]
+    text = Inkling2TextConfig(num_hidden_layers=48, local_layer_ids=released)
+    text.num_hidden_layers = 2
+    assert text.local_layer_ids == [0, 1]
+    assert text.layer_types == ["sliding_attention", "sliding_attention"]
+    shrunk = Inkling2TextConfig.from_dict(
+        {"num_hidden_layers": 48, "local_layer_ids": released}, num_hidden_layers=6
+    )
+    assert shrunk.local_layer_ids == [0, 1, 2, 3, 4]
+    assert shrunk.global_layer_ids == [5]
 
 
 @pytest.mark.parametrize("before, after", [(6, 12), (12, 6), (48, 2)])

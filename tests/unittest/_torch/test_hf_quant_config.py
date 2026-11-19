@@ -337,10 +337,15 @@ def test_llm_api_loader_leaves_a_foreign_hf_quant_config_to_the_model(tmp_path) 
     assert llm_args.quant_config.quant_algo is None
 
 
-@pytest.mark.parametrize("hf_quant_config", [{"model": {}}, ["inkling2"]])
+@pytest.mark.parametrize(
+    "hf_quant_config",
+    [{"model": {}}, ["inkling2"], {"quant_method": "fp8"}, {"quant_method": "my_format"}],
+    ids=["no_quant_method", "not_a_mapping", "other_quant_method", "unknown_quant_method"],
+)
 def test_unrecognized_hf_quant_config_still_fails(tmp_path, hf_quant_config) -> None:
-    # Without a quant_method, or not a mapping at all, the file is not recognized as a
-    # foreign format and the ModelOpt parser reports it as before.
+    # Only the formats a model implementation is known to read are deferred to it; anything else
+    # (no quant_method, not a mapping, a quant_method no model claims) still fails loudly in the
+    # ModelOpt parser instead of loading unquantized.
     _write_inkling2_checkpoint(tmp_path, hf_quant_config)
 
     with pytest.raises(ValueError):
