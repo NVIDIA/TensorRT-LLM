@@ -858,6 +858,97 @@ def test_idle_fetch_parks_with_local_heartbeats(clock, attention_dp):
     stub.request_broadcaster.broadcast.assert_called_once_with([], prefer_cpu=True)
 
 
+@pytest.mark.parametrize("poll_seconds", [None, 1.0, 0.25])
+def test_idle_fetch_publishes_rank_observations_before_wait(clock, poll_seconds):
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    activity = ConversationActivityStats(0, 1, 0, 0, 1, 0, 0, 0)
+    manager = Mock(snapshot_activity=Mock(return_value=activity)) if poll_seconds else None
+    poll = datetime.timedelta(seconds=poll_seconds) if poll_seconds else None
+    stub = _fetch_stub(
+        enable_attention_dp=False,
+        stats=[],
+        stats_lock=threading.Lock(),
+        max_stats_len=2,
+        _last_rank_observations={},
+        _disagg_coordinator=SimpleNamespace(transfer_outcomes=(0, 1, 0)),
+        _idle_kv_transfer_poll_timeout=lambda: poll,
+        _conversation_manager=manager,
+        _conversation_activity_capture_time=float("-inf"),
+        _conversation_activity_cached=None,
+    )
+    _bind(stub, "_snapshot_transfer_outcomes", "_snapshot_conversation_activity")
+    row = {"attentionDpRank": 0, "kvTransferOutcomes": {"success": 0, "error": 1, "timeout": 0}}
+    kwargs = {"wait_for_batch": True, "idle_tick": stub._idle_heartbeat_tick}
+    if manager is not None:
+        row["conversationActivity"] = activity.to_dict()
+        kwargs = {"wait_for_batch": True, "batch_wait_deadline": clock.value + poll_seconds}
+
+    def fetch(timeout, **options):
+        assert (timeout, options) == (poll, kwargs)
+        assert stub.stats == [("per_rank_dict", row)]
+        return []
+
+    stub.executor_request_queue.get_from_request_queue.side_effect = fetch
+    PyExecutor._fetch_and_enqueue_requests(stub, _WaitingQueue(), 0)
+    stub._publish_rank_observations()
+    assert stub.stats == [("per_rank_dict", row)]
+    if manager is not None:
+        manager.snapshot_activity.assert_called_once_with(clock.value)
+    stub.enable_iter_perf_stats = False
+    stub._disagg_coordinator.transfer_outcomes = (0, 2, 0)
+    stub._publish_rank_observations()
+    assert stub.stats == [("per_rank_dict", row)]
+
+
+@pytest.mark.parametrize("payload_kind", ["idle", "queued", "synthetic"])
+def test_adp_exchange_publishes_current_peer_observations(clock, payload_kind):
+    from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import ConversationActivityStats
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankState
+
+    rank0, rank1 = (_attention_dp_rank(rank, clock) for rank in (0, 1))
+    rank0._last_rank_observations = {}
+    rank0.max_stats_len = 1
+    rank0.stats.append("older sample")
+    activity = ConversationActivityStats(1, 1, 0, 0, 2, 0, 0, 0)
+    outcomes = Mock(return_value=(0, 0, 0))
+    rank1._adp_iter_stats = ADPIterStatsBuffer(
+        activity_snapshot=lambda: activity, transfer_outcomes_snapshot=outcomes
+    )
+    if payload_kind == "queued":
+        rank1._adp_iter_stats.queue(rank1.make_stats(), is_rank0=False)
+    elif payload_kind == "synthetic":
+        rank1._adp_iter_stats._ensure_zero_payload(rank1.iter_counter)
+
+    def exchange():
+        peer = RankState(rank=1, iter_stats=rank1._adp_iter_stats.next_payload())
+        for executor in (rank0, rank1):
+            executor._publish_adp_iter_stats(
+                [RankState(rank=0), RankState.deserialize(peer.serialize())],
+                idle_wait_follows=False,
+            )
+        assert rank1.stats == []
+
+    for count in (1, 2):
+        outcomes.return_value = (0, count, 0)
+        exchange()
+        assert rank0.stats == [
+            (
+                "per_rank_dict",
+                {
+                    "attentionDpRank": 1,
+                    "kvTransferOutcomes": {"success": 0, "error": count, "timeout": 0},
+                    "conversationActivity": activity.to_dict(),
+                },
+            )
+        ]
+        rank0.stats.clear()
+        exchange()
+        assert rank0.stats == []
+
+
 @pytest.mark.parametrize(
     "previous,pp_pending,native_transfer,control,close_outs",
     [
