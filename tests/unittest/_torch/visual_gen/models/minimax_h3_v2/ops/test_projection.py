@@ -38,7 +38,10 @@ def test_quantized_checkpoint_partition_matches_baseline(algo, kind, monkeypatch
     """Compare one rank's packed weights/scales and GEMM against the original H3 load path."""
     quant = QuantConfig(quant_algo=algo)
     config = SimpleNamespace(quant_config=quant, quant_config_dict=None, dynamic_weight_quant=True)
-    mapping = Mapping(world_size=2, tp_size=2, rank=1)
+    # This single-process test supplies its TP rank explicitly.
+    with monkeypatch.context() as patch:
+        patch.delenv("TLLM_DISABLE_MPI", raising=False)
+        mapping = Mapping(world_size=2, tp_size=2, rank=1)
     generator = torch.Generator(device="cuda").manual_seed(581)
     kwargs = dict(
         dtype=torch.bfloat16,
