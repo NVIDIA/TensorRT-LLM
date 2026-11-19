@@ -19,6 +19,7 @@ from tensorrt_llm._torch.weight_sharing.artifact_identity import (
     ArtifactIdentity,
 )
 from tensorrt_llm._torch.weight_sharing.post_transform_profiles import (
+    DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -72,6 +73,7 @@ from tensorrt_llm._torch.weight_sharing.weight_manifest import (
 
 __all__ = [
     "ARTIFACT_IDENTITY_FORMAT_VERSION",
+    "DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1",
     "LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1",
     "MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1",
     "PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1",

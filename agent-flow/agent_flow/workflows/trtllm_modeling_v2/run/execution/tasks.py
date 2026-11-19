@@ -13,9 +13,7 @@ move while checks run. Its verdict names that commit, is recorded under its
 marker, and is void when a command imported any other tree.
 
 A task that finishes leaves its receipt (``run/execution/handoff.py``), and a task
-that starts carries the receipt of each task it depends on. A gate that
-passes adds the engines it attested to ``runtime_facts.yaml``, which the
-planner's and every worker's prompt carries.
+that starts carries the receipt of each task it depends on.
 """
 
 from __future__ import annotations
@@ -40,10 +38,9 @@ from ...infra.compute.scheduler import WATCHER_STALE_S, watcher_records
 from ...infra.git import CommitPolicy
 from ...operators import survey_review
 from ...operators.coverage import QueueItem, VocabularyError, load_vocabulary, queue_item_from_ref
-from ...spec import lint as lint_mod
+from ...spec import sizing
 from ...spec import variants as variants_mod
 from ...spec.task_schema import assembly_units, members_for, parse_parallel_segment
-from ...tune import stage as tune_stage
 from .. import graph as graph_mod
 from .. import inbox as inbox_mod
 from ..orchestrator import (
@@ -59,8 +56,6 @@ from ..orchestrator import (
 from ..records.state import WorkflowState
 from ..validation import completion as deliver
 from ..validation import contract as contract_mod
-from ..validation import regression as regression_mod
-from ..validation import runtime_facts
 from ..validation.check_runner import CheckRunner
 from ..workspace import snapshots as snapshots_mod
 from ..workspace.integration import (
@@ -95,8 +90,6 @@ SURVEY_TASK_ID = "survey"
 PLANNER_ROLE = "planner"
 PROPOSED_GRAPH = "graph.proposed.yaml"
 TASKS_DIRNAME = "tasks"
-#: How many of the latest measured changes the planner's request lists.
-PLANNER_FACT_CHANGES = 8
 #: How many events, and operator messages, one planner turn lists (the newest), and
 #: the most of each one: a burst while a long turn ran must not swamp the next.
 PLANNER_EVENTS = 40
@@ -110,7 +103,6 @@ ROLE_BY_KIND = {
     "feature": "assembler",
     "integrate": "assembler",
     "investigate": "assembler",
-    "tune": "tuner",
 }
 #: Checks in flight at once on a run's sessions: each is a spool job, and the
 #: session's scheduler queues what its devices cannot start yet, by class.
@@ -122,12 +114,9 @@ class ExecutionStage:
 
     def __init__(self, workflow) -> None:
         self.workflow = workflow
-        #: The campaign the orchestrator handed over with the onboarding's verdict.
-        self.campaign = None
         self._turn_lock = threading.Lock()
         self._turns_by_key = {}
         self._tasks_dispatched = set()
-        self._regression_cleared = {}
         self._landed_attempts = {}
         self._merged = {}
         self._tls = workflow._tls
@@ -137,14 +126,9 @@ class ExecutionStage:
         print_rule("[bold magenta]execution stage[/bold magenta]", log)
         contract = self.workflow._contract
         self.state = state
-        tune = self.workflow._tune_requested()
         units = assembly_units(self.workflow.task_data)
-        # The campaign tunes the core: it starts once the core's required checks have passed.
-        # The features' and variants' checks go on beside it; delivery still owes them.
-        core_owed = [c.key for c in contract_mod.core_checks(contract, units[0] if units else None)]
-        core_boots = [
-            c.key for c in contract.required() if units and c.unit == units[0] and c.gate == "boot"
-        ]
+        # What shows the core runs: any of its checks (a pass, or a benchmark's score).
+        core_checks = [c.key for c in contract.required() if units and c.unit == units[0]]
         feature_refs = [*units[1:], *variants_mod.variants(self.workflow.task_data)]
         total = max(len(state.devices), self.workflow._gate_env().world_size, 1)
         self._integration = self._make_integration(state)
@@ -167,9 +151,8 @@ class ExecutionStage:
             stage_notes=self._take_stage_notes,
             narrow=getattr(self.workflow, "_narrowed", None),
             holds=getattr(self.workflow, "_verdict_holds", None),
-            regression=self._run_regression_check,
         )
-        self._own_paths = self._regression_paths()
+        self._own_paths = self._target_paths()
         orchestrator = GraphOrchestrator(
             services,
             contract,
@@ -188,9 +171,7 @@ class ExecutionStage:
             revision_cap=self.workflow.revision_cap,
             max_attempts=getattr(self.workflow, "max_attempts", graph_mod.MAX_ATTEMPTS),
             event_window_s=self.workflow.event_window_s,
-            required_kinds=("tune",) if tune else (),
-            start_after={"tune": core_owed} if core_owed else {},
-            after_core=(feature_refs, core_boots),
+            after_core=(feature_refs, core_checks),
             own_paths=self._own_paths,
             repo_root=self.workflow.task_data.get("trtllm_repo_path") or "",
         )
@@ -207,21 +188,18 @@ class ExecutionStage:
         services.held_gpus = held
         self._soft_dependencies = orchestrator.soft_dependencies
         self._mark_integrated = orchestrator.mark_integrated
-        # A campaign's turns, and the side turns, take only the agent slots the
-        # foreground work leaves idle; a campaign's, at most two while the onboarding works.
+        # The side turns take only the agent slots the required work leaves idle.
         gate = getattr(self.workflow, "_agent_gate", None)
         if gate is not None:
-            gate.background_limit = orchestrator.campaign_agent_slots
             gate.side_limit = orchestrator.idle_agent_slots
         # Beside the planner's first turn, as the run's other early work is.
         self.workflow._start_primers()
         try:
             verdict = orchestrator.run()
         finally:
-            # No foreground work is left to yield to: the closing turns run at once.
+            # No required work is left to yield to: the closing turns run at once.
             if gate is not None:
-                gate.background_limit = gate.side_limit = None
-        self.campaign = orchestrator.campaign
+                gate.side_limit = None
         marker = self.workflow._target_marker()
         evaluation = contract_mod.evaluate(
             contract,
@@ -233,15 +211,6 @@ class ExecutionStage:
             f"execution stage: {verdict}",
             contract_mod.standing(evaluation, self.workflow.workspace, marker),
         )
-        if verdict.startswith("stopped"):
-            # Preflight's substrate gate, running beside the first turns, found the run
-            # cannot go on here: nothing is closed, and the same command resumes once fixed.
-            print_message(
-                f"[bold yellow]⚠ execution stage {escape_markup(verdict)}; the run stays open: "
-                f"re-run the same command once the cause is fixed[/bold yellow]",
-                log,
-            )
-            return False
         if verdict not in ("delivered", "delivery-blocked"):
             self.workflow._close_run(state, log, verdict=verdict)
             return False
@@ -264,11 +233,7 @@ class ExecutionStage:
         """
         self.workflow._turns.consume([task.id])
         if task.kind == graph_mod.CHECK_KIND and task.status == "done":
-            cleared = self._regression_cleared.get(task.id, "")
-            if task.regression:
-                note = "the package tests passed after the changes to shared code it covers"
-            else:
-                note = f"its checks passed, with no agent turn: {', '.join(task.satisfies)}"
+            note = f"its checks passed, with no agent turn: {', '.join(task.satisfies)}"
             try:
                 handoff_mod.write(
                     self.workflow.workspace / TASKS_DIRNAME,
@@ -277,7 +242,6 @@ class ExecutionStage:
                         task.kind,
                         result=TaskResult(CHECKED, note),
                         attempt=task.attempts,
-                        cleared=cleared,
                     ),
                 )
             except OSError as exc:
@@ -353,34 +317,6 @@ class ExecutionStage:
         )
         self.workflow.journal.record_result(report, result)
         return TaskResult.answered(role, Path(target), report)
-
-    # ------------------------------------------------------- regression checks
-    def _run_regression_check(self, task: graph_mod.Task) -> list[str]:
-        """Run one regression check, with no agent turn; what failed, one line each.
-
-        In a read-only snapshot of the commit the checkout is at, as test jobs
-        on the run's devices (``run/validation/regression.py``). The head it finds clean
-        is the receipt's ``cleared``, the next check's base.
-        """
-        repo = Path(str(self.workflow.task_data.get("trtllm_repo_path") or ""))
-        head = self.workflow._head()
-        if not head:
-            return [f"{repo} has no commit to check"]
-        tree_at, run_job, python = regression_mod.job_runner(self.workflow, f"regression-{task.id}")
-        result = regression_mod.run_regression_check(
-            workspace=self.workflow.workspace,
-            repo=repo,
-            head=head,
-            tree_at=tree_at,
-            run_job=run_job,
-            python=python,
-            name=task.id,
-        )
-        self.workflow.journal.event("regression", f"{task.id}: {result.summary()}")
-        if result.passed:
-            with self._turn_lock:
-                self._regression_cleared[task.id] = head
-        return result.failures
 
     # ------------------------------------------------------ worktrees, devices
     def _make_integration(self, state: WorkflowState) -> Integration | None:
@@ -474,7 +410,7 @@ class ExecutionStage:
         return capacity if live else None
 
     # ---------------------------------------------------------------- planner
-    def _regression_paths(self) -> tuple[str, ...]:
+    def _target_paths(self) -> tuple[str, ...]:
         """The target's own paths (:func:`~..graph.own_paths`); none before preflight names it."""
         preflight = getattr(self.workflow, "_preflight", None)
         return graph_mod.own_paths(str(getattr(preflight, "target_rel", "") or ""))
@@ -538,8 +474,8 @@ class ExecutionStage:
     def _start_member(self, contract: contract_mod.Contract) -> str:
         """Where the core and each feature's first task work: the cheapest member one engine fits.
 
-        Sized as the intake lint sizes members (``spec.lint.engine_width``): the
-        checkpoint's weight bytes against ``environment.gpu_memory_gib``.
+        Sized from the checkpoint's weight bytes against ``environment.gpu_memory_gib``
+        (``spec.sizing.engine_width``).
         """
         cached = getattr(self, "_start_line", None)
         if cached:
@@ -550,9 +486,9 @@ class ExecutionStage:
             list(dict.fromkeys(c.member for c in contract.checks if c.unit == first))
             or members_for(task, first, self.workflow._gate_env().world_size)
         )
-        weights = lint_mod.checkpoint_weight_bytes(task.get("checkpoint_path"))
+        weights = sizing.checkpoint_weight_bytes(task.get("checkpoint_path"))
         memory = (task.get("environment") or {}).get("gpu_memory_gib")
-        width = lint_mod.engine_width(weights, memory)
+        width = sizing.engine_width(weights, memory)
         if width is None:
             line = (
                 f"`{members[0]}`: the cheapest member the contract checks the core at (the run "
@@ -563,7 +499,7 @@ class ExecutionStage:
             start = fits[0] if fits else members[-1]
             line = (
                 f"`{start}`: one engine of the checkpoint takes {width} device(s) (its weights "
-                f"at most {lint_mod.ENGINE_WEIGHT_FRACTION:.0%} of each {memory:g}-GiB device), "
+                f"at most {sizing.ENGINE_WEIGHT_FRACTION:.0%} of each {memory:g}-GiB device), "
                 f"and `{start}` is the cheapest member the contract checks the core at that "
                 "holds it. A narrower one cannot load the model."
             )
@@ -592,9 +528,6 @@ class ExecutionStage:
             "",
             self._start_member(contract),
         ]
-        facts = runtime_facts.render(self.workflow.workspace, changes=PLANNER_FACT_CHANGES)
-        if facts:
-            lines += ["", facts]
         own = getattr(self, "_own_paths", ())
         if own:
             lines += [
@@ -603,11 +536,9 @@ class ExecutionStage:
                 "",
                 "The target's own paths: "
                 + ", ".join(f"`{p}`" for p in own)
-                + ". Any other path a task touches is shared code; the orchestrator follows "
-                "every change to it with a regression check of its own, which you leave as it is.",
+                + ". Any other path a task touches is shared code, which other models run: "
+                "keep a change there the smallest general one.",
             ]
-            if turn.regression:
-                lines += ["", turn.regression]
         messages = _newest([e for e in turn.events if inbox_mod.is_message(e)], "messages")
         if messages:
             lines[:0] = [
@@ -667,8 +598,33 @@ class ExecutionStage:
             if tip and tip != before:
                 with self._turn_lock:
                     self._landed_attempts[task.id] = task.attempts
+        if decision.decision in FINISHED:
+            self._take_named_checks(task, decision)
         self._keep_receipt(task, decision)
         return decision.text
+
+    def _take_named_checks(self, task: graph_mod.Task, result: TaskResult) -> None:
+        """The ``satisfies`` the worker answers with is the task's: what its landing runs.
+
+        The planner names a task's checks before the work; the worker knows what
+        it changed. Without an answer the planner's stand. A key the contract
+        does not hold runs nothing, and the planner hears it.
+        """
+        named = result.data.get("satisfies")
+        contract = getattr(self.workflow, "_contract", None)
+        if not isinstance(named, list) or contract is None:
+            return
+        known = {c.key for c in contract.checks}
+        keys = list(dict.fromkeys(str(k) for k in named if str(k) in known))
+        unknown = [str(k) for k in named if str(k) not in known]
+        if keys != task.satisfies:
+            result.annotate(
+                f"its worker named the checks its landing runs: {', '.join(keys) or 'none'}"
+                f" (the plan named {', '.join(task.satisfies) or 'none'})"
+            )
+        if unknown:
+            result.annotate(f"not checks of the contract, so not run: {', '.join(unknown)}")
+        task.satisfies = keys
 
     def _integrated_tip(self, task_id: str) -> str:
         """The branch tip the integration last fast-forwarded in for ``task_id``; "" for none."""
@@ -679,8 +635,7 @@ class ExecutionStage:
         """Whether ``task``'s latest attempt landed commits though its turn did not finish.
 
         A failed receipt's guard tests do (``_land_failed_receipt``): they are a
-        change to the code they guard like any other, and a regression check
-        covers them.
+        change to the code they guard like any other.
         """
         return self._landed_attempts.get(task.id) == task.attempts
 
@@ -790,17 +745,6 @@ class ExecutionStage:
     def _work_task_body(self, task: graph_mod.Task) -> TaskResult:
         receipts = self._dependency_receipts(task)
         envelope = self._envelope(task, receipts)
-        if task.kind == "tune":
-            decision, note = tune_stage.run_tune_task(
-                self.workflow, self.state, self.workflow._head(), attempt=task.attempts
-            )
-            # The tune stage's verdict, wherever the campaign ends: here, or past the
-            # onboarding's close (`workflow._campaign_after_onboarding`).
-            ended = tune_stage.campaign_verdict(decision)
-            if ended:
-                self.state.tune["verdict"] = ended
-            self.workflow._checkpoint(self.state)
-            return TaskResult(decision, note)
         if task.kind == "kernel":
             item = self._queue_item(task)
             if item is None:
@@ -833,8 +777,8 @@ class ExecutionStage:
         header = (
             f"## Your task: `{task.id}` (tags: {', '.join(tags)})\n\n{task.goal}\n\n"
             f"The task envelope is `{envelope}`: the paths you may change (`touches`), the "
-            f"checks your work must pass (`satisfies`, run by the orchestrator, not you), "
-            f"and its priority."
+            f"checks the planner expects your work to answer for (`satisfies`), and its "
+            f"priority."
         )
         context = self._task_context(receipts, unit, task)
         parts = (header, context, tag_section(tags), prompt)
@@ -947,18 +891,23 @@ class ExecutionStage:
             return next((q for q in queue if str(q.n) == task.ref), None)
         return queue_item_from_ref(task.ref, task.id, task.goal)
 
-    # ---------------------------------------------- receipts, runtime facts
+    # ------------------------------------------------------------- receipts
     def _task_context(
         self, receipts: list[dict], unit: str | None, task: graph_mod.Task | None = None
     ) -> str:
         """What a task's turn carries beside its goal.
 
-        Its dependencies' receipts, the runtime facts, and, for a task that
-        starts beside its soft dependencies, where each of them stands.
+        Where the run's checks are and the task's ``satisfies``, its
+        dependencies' receipts and, for a task that starts beside its soft
+        dependencies, where each of them stands.
         """
+        contract = self.workflow.workspace / contract_mod.CONTRACT_FILENAME
         blocks = (
+            f"The run's checks are the keys of `{contract}`; this task's `satisfies`: "
+            f"{', '.join(f'`{k}`' for k in task.satisfies) or 'none'}."
+            if task is not None
+            else "",
             handoff_mod.render(receipts),
-            runtime_facts.render(self.workflow.workspace, unit=unit),
             self._soft_block(task) if task is not None else "",
         )
         return "\n\n".join(block for block in blocks if block)
@@ -1057,7 +1006,7 @@ class ExecutionStage:
     def _mark_correct(
         self, marker: str, evaluation: contract_mod.Evaluation
     ) -> contract_mod.Milestone | None:
-        """Every required check holds on the target (``marker``): name its commit, record it.
+        """Every required check passed and the final tree is confirmed: name its commit, record it.
 
         The branch is ``<target branch>-correct`` (:meth:`_deliver_milestone`).
         """
@@ -1066,8 +1015,8 @@ class ExecutionStage:
             marker,
             evaluation,
             self.workflow._contract.required(),
-            f"all {len(evaluation.passed)} required checks of the contract hold on it, "
-            "the delivery tier's included",
+            f"all {len(evaluation.passed)} required checks of the contract passed, the "
+            "delivery tier's included, and a check that passed on it confirms it",
         )
 
     def _take_stage_notes(self) -> list[str]:
@@ -1079,13 +1028,8 @@ class ExecutionStage:
 
 
 def held_gpus(task: Any) -> int:
-    """The devices of the run's sessions ``task`` holds while it runs.
-
-    Its ``gpus``; none for a campaign (a ``tune`` task), whatever spools it measures on: its
-    jobs queue below every job of the onboarding (``executor.PERF``), so it keeps no task of
-    the onboarding from starting, here or on a session.
-    """
-    return 0 if task.kind in graph_mod.BACKGROUND_KINDS else max(0, int(task.gpus or 0))
+    """The devices of the run's sessions ``task`` holds while it runs: its ``gpus``."""
+    return max(0, int(task.gpus or 0))
 
 
 def _newest(items: list[str], what: str) -> list[str]:

@@ -907,6 +907,11 @@ class MiniCPMV4_6Model(PreTrainedModel):
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
     }
 
+    @property
+    def mamba_metadata_cls(self):
+        """The Mamba metadata class of the language model's recurrent layers."""
+        return getattr(self.llm, "mamba_metadata_cls", None)
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config
         super().__init__(config)
