@@ -5,11 +5,13 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch._dynamo.testing import CompileCounter
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import prefill_attention as boundary
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (
@@ -36,7 +38,14 @@ from tensorrt_llm._torch.modules.linear import (
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.engine import model_setup
-from tensorrt_llm._torch.utils import torch_compiling
+from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
+from tensorrt_llm._torch.pyexecutor.engine.runners.common import pad_input_tokens
+from tensorrt_llm._torch.utils import (
+    get_global_attrs,
+    is_torch_compiling,
+    model_extra_attrs,
+    torch_compiling,
+)
 from tensorrt_llm.llmapi import PrefillCudaGraphBackend, TorchCompileConfig
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
@@ -247,3 +256,88 @@ def test_shell_installs_prefill_only_wrapper(
     for eligible in [True, False]:
         monkeypatch.setattr(f"{runner}.get_per_request_prefill_cuda_graph_flag", lambda: eligible)
         torch.testing.assert_close(shell.model(x), x.relu() if eligible else x)
+
+
+@pytest.mark.parametrize(
+    ("num_ctx_tokens", "num_gen_tokens", "expected_compiled"),
+    [
+        pytest.param(8, 0, True, id="prefill-at-ceiling"),
+        pytest.param(4, 2, True, id="mixed"),
+        pytest.param(0, 4, False, id="decode-only"),
+        pytest.param(9, 0, False, id="prefill-above-ceiling"),
+    ],
+)
+def test_tp4_routes_by_prefill_graph_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+    num_ctx_tokens: int,
+    num_gen_tokens: int,
+    expected_compiled: bool,
+) -> None:
+    observed_compile_policy = []
+
+    def model_body(input_ids: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        observed_compile_policy.append(is_torch_compiling())
+        return input_ids
+
+    eager_forward = Mock(side_effect=model_body)
+    compiled_forward = Mock(side_effect=model_body)
+    eager_model = torch.nn.Module()
+    eager_model.forward = eager_forward
+    compiled_model = torch.nn.Module()
+    compiled_model.forward = compiled_forward
+    monkeypatch.setattr(torch, "compile", Mock(return_value=compiled_model))
+
+    shell = object.__new__(tp4.ModelingV2MiniMaxM3Nvfp4Sm107Tp4)
+    torch.nn.Module.__init__(shell)
+    shell.model = eager_model
+    shell.model_config = Mock(extra_attrs={})
+    shell.spec_worker = None
+    shell.lm_head = torch.nn.Identity()
+    shell.logits_processor = Mock()
+    args = TorchLlmArgs.model_construct(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+        torch_compile_config=TorchCompileConfig(compile_only_piecewise_graphs=False),
+    )
+    model, prefill_only = model_setup.apply_torch_compile(
+        shell, "eager", llm_args=args, fullgraph=True
+    )
+    caller = ModelCaller(model, prefill_compile_only=prefill_only, nccl_window_scopes_enabled=False)
+
+    capture_ceiling = 8
+    num_tokens = num_ctx_tokens + num_gen_tokens
+    num_contexts = int(num_ctx_tokens > 0)
+    metadata = Mock(spec=AttentionMetadata, num_tokens=num_tokens, num_contexts=num_contexts)
+    input_ids = torch.ones(max(num_tokens, capture_ceiling), dtype=torch.long)
+    position_ids = torch.arange(input_ids.numel())
+    prior_policy = not expected_compiled
+    monkeypatch.setattr(
+        get_global_attrs(), "per_request_prefill_cuda_graph_flag", prior_policy, raising=False
+    )
+    padded_tokens = pad_input_tokens(
+        metadata,
+        num_tokens,
+        num_contexts,
+        None,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        dist=None,
+        enable_attention_dp=False,
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+        prefill_cuda_graph_num_tokens=[capture_ceiling],
+    )
+    with model_extra_attrs({}), torch_compiling(prior_policy):
+        caller(
+            attn_metadata=metadata,
+            input_ids=input_ids[:padded_tokens],
+            position_ids=position_ids[:padded_tokens],
+        )
+        assert is_torch_compiling() is prior_policy
+
+    selected, skipped = (
+        (compiled_forward, eager_forward)
+        if expected_compiled
+        else (eager_forward, compiled_forward)
+    )
+    selected.assert_called_once()
+    skipped.assert_not_called()
+    assert observed_compile_policy == [expected_compiled]
