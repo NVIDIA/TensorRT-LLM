@@ -208,7 +208,7 @@ def create_attention(
                 "DiffusionModelConfig for shared workspace allocation."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
-    kwargs.update(
+    return attn_cls(
         layer_idx=layer_idx,
         num_heads=num_heads,
         head_dim=head_dim,
@@ -217,6 +217,5 @@ def create_attention(
         dtype=dtype,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        **kwargs,
     )
-    attention = attn_cls(**kwargs)
-    return attention

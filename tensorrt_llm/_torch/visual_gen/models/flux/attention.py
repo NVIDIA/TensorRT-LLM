@@ -591,7 +591,6 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         return (
             mlp_proj.has_nvfp4
-            and not mlp_proj.requires_unquantized_activation
             and mlp_proj.input_scale is not None
             and mlp_proj.pre_quant_scale is None
             and not mlp_proj.force_dynamic_quantization

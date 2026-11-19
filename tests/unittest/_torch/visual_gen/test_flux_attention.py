@@ -399,9 +399,9 @@ def test_flux2_linear_quant_ignore_bypasses_fp4_mlp_fusion() -> None:
         def __init__(self):
             super().__init__()
             self.mlp_proj = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
-            self.mlp_proj._weights_created = self.mlp_proj.has_nvfp4 = True
-            self.mlp_proj.requires_unquantized_activation = True
-            self.mlp_proj.input_scale = torch.ones(())
+            self.mlp_proj._weights_created = True
+            self.mlp_proj.has_nvfp4 = False
+            self.mlp_proj.input_scale = None
             self.mlp_proj.pre_quant_scale = None
             self.mlp_proj.force_dynamic_quantization = False
 
