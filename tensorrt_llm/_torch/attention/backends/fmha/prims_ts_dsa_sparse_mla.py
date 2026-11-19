@@ -53,7 +53,12 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
 from .interface import Fmha
-from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha, get_prims_ts_toolchain_unsupported_reason
+from .prims_ts_sparse_mla import (
+    _max_warmup_rows,
+    _plan_kernel_variants,
+    _workspace_size,
+    get_prims_ts_toolchain_unsupported_reason,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
@@ -410,9 +415,7 @@ class PrimsTSDsaSparseMlaFmha(Fmha):
         plan_kwargs = self._plan_kwargs(topk)
         # One workspace per metadata object, shared by every plan and grown to the largest one:
         # plans run serially, and a plan's scratch is only live during its own launch.
-        required_bytes = int(
-            mla_decode._resolve_sparse_mla_plan(device, rows, heads, **plan_kwargs)[4]
-        )
+        required_bytes = _workspace_size(device, rows, heads, **plan_kwargs)
         shared = metadata.fmha_plan_caches.setdefault(self.WORKSPACE_CACHE_KEY, {})
         workspace = shared.get("buffer")
         if workspace is None or workspace.numel() < required_bytes:
@@ -444,38 +447,25 @@ class PrimsTSDsaSparseMlaFmha(Fmha):
         profile_key = (str(device), heads, topk)
         if profile_key in _WARMED_PROFILES:
             return
-        _WARMED_PROFILES.add(profile_key)
-        from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
-
         from . import prims_ts_precompile
 
         plan_kwargs = self._plan_kwargs(topk)
-        requests = int(metadata.max_num_requests or 0)
-        draft = int(metadata.max_total_draft_tokens or 0)
-        tokens = int(metadata.max_num_tokens or 0)
-        max_rows = requests * (1 + draft)
-        if tokens:
-            max_rows = min(max_rows, tokens) if max_rows else tokens
+        max_rows = _max_warmup_rows(metadata)
         candidates = list(range(1, min(max_rows, self.WARM_ROW_SCAN) + 1))
         candidates += [r for r in self.WARM_ROW_TAIL if self.WARM_ROW_SCAN < r <= max_rows]
         t_warm = time.perf_counter()
-        representative: dict = {}
-        for rows in candidates:
-            spec = mla_decode._resolve_sparse_mla_plan(device, rows, heads, **plan_kwargs)[2]
-            signature = mla_decode._mla_kernel_compile_signature(spec.kernel)
-            representative[signature] = rows
-        rows_list = sorted(representative.values(), reverse=True)
-        PrimsTSSparseMlaFmha._precompile_variants(
-            device,
-            heads,
-            plan_kwargs,
-            rows_list,
-            local_ranks=prims_ts_precompile.local_rank_count(metadata.mapping),
+        local_ranks = prims_ts_precompile.local_rank_count(metadata.mapping)
+        variants, payloads = _plan_kernel_variants(
+            device, heads, plan_kwargs, candidates, local_ranks=local_ranks
         )
-        for rows in rows_list:
+        if payloads:
+            prims_ts_precompile.precompile_payloads(payloads, local_ranks=local_ranks)
+        for rows in variants:
             self._get_plan(metadata=metadata, device=device, rows=rows, topk=topk)
+        if variants:
+            _WARMED_PROFILES.add(profile_key)
         logger.debug(
-            f"PrimTS DSA sparse MLA warmed {len(representative)} kernel variants "
+            f"PrimTS DSA sparse MLA warmed {len(variants)} kernel variants "
             f"(rows scanned up to {max_rows}): {(time.perf_counter() - t_warm) * 1e3:.0f} ms"
         )
 

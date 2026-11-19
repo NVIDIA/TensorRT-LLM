@@ -51,6 +51,7 @@ import functools
 import math
 import time
 import weakref
+from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
@@ -104,6 +105,52 @@ def _workspace_size(device: torch.device, rows: int, heads: int, **plan_kwargs) 
     )
 
     return int(get_prims_ts_sparse_mla_decode_workspace_size(device, rows, heads, **plan_kwargs))
+
+
+def _max_warmup_rows(metadata: "TrtllmAttentionMetadata") -> int:
+    requests = int(metadata.max_num_requests or 0)
+    draft = int(metadata.max_total_draft_tokens or 0)
+    tokens = int(metadata.max_num_tokens or 0)
+    rows = requests * (1 + draft)
+    return min(rows, tokens) if rows and tokens else rows or tokens
+
+
+def _plan_kernel_variants(
+    device: torch.device,
+    heads: int,
+    plan_kwargs: dict,
+    candidates: Sequence[int],
+    *,
+    local_ranks: int,
+) -> tuple[list[int], list[dict]]:
+    """Select the largest workspace per specialization and encode worker jobs for disk misses."""
+    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+
+    from . import prims_ts_precompile
+
+    if not candidates:
+        return [], []
+    sizes = {rows: _workspace_size(device, rows, heads, **plan_kwargs) for rows in candidates}
+    workspace = torch.empty(max(sizes.values()), device=device, dtype=torch.uint8)
+    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper(workspace_buffer=workspace)
+    # A disk lookup is useful only if at least two misses could start a pool.
+    check_cache = prims_ts_precompile.worker_count(2, local_ranks=local_ranks) > 1
+    variants = []
+    payloads = []
+    seen = set()
+    for rows in sorted(sizes, key=lambda r: (sizes[r], r), reverse=True):
+        wrapper.plan(device, rows, heads, compile=False, **plan_kwargs)
+        spec = wrapper._state["compile_spec"]
+        if spec in seen:
+            continue
+        seen.add(spec)
+        variants.append(rows)
+        if check_cache and not wrapper.is_kernel_cached():
+            device_index = device.index if device.index is not None else torch.cuda.current_device()
+            payloads.append(
+                prims_ts_precompile.encode_payload(device_index, rows, heads, plan_kwargs)
+            )
+    return variants, payloads
 
 
 def get_prims_ts_toolchain_unsupported_reason() -> Optional[str]:
@@ -568,47 +615,6 @@ class PrimsTSSparseMlaFmha(Fmha):
             )
         return plan_kwargs, holes_possible
 
-    def _kernel_variants(
-        self,
-        metadata: "TrtllmAttentionMetadata",
-        device: torch.device,
-        plan_kwargs: dict,
-    ) -> list[tuple[int, bool]]:
-        """Return one row count per specialization and whether it needs parallel precompilation."""
-        from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
-
-        from . import prims_ts_precompile
-
-        requests = int(metadata.max_num_requests or 0)
-        draft = int(metadata.max_total_draft_tokens or 0)
-        tokens = int(metadata.max_num_tokens or 0)
-        max_rows = requests * (1 + draft)
-        if tokens:
-            max_rows = min(max_rows, tokens) if max_rows else tokens
-        if not max_rows:
-            return []
-        heads = int(self.attn.num_heads)
-        sizes = {
-            rows: _workspace_size(device, rows, heads, **plan_kwargs)
-            for rows in range(1, max_rows + 1)
-        }
-        workspace = torch.empty(max(sizes.values()), device=device, dtype=torch.uint8)
-        wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper(workspace_buffer=workspace)
-        local_ranks = prims_ts_precompile.local_rank_count(metadata.mapping)
-        # A disk lookup is useful only if at least two misses could start a pool.
-        check_cache = prims_ts_precompile.worker_count(2, local_ranks=local_ranks) > 1
-        variants = []
-        seen = set()
-        # A spec can cover several row counts. Keep the one with the largest
-        # workspace (then the most rows), and query its disk entry only once.
-        for rows in sorted(sizes, key=lambda r: (sizes[r], r), reverse=True):
-            wrapper.plan(device, rows, heads, compile=False, **plan_kwargs)
-            spec = wrapper._state["compile_spec"]
-            if spec not in seen:
-                seen.add(spec)
-                variants.append((rows, check_cache and not wrapper.is_kernel_cached()))
-        return variants
-
     @staticmethod
     def _claim_contract_validation(contract_key: tuple) -> bool:
         """Return True exactly once per process for an index contract (never under capture).
@@ -827,6 +833,8 @@ def _warmup_profiles(profiles: list[_WarmupProfile], metadata: "TrtllmAttentionM
         return
     from . import prims_ts_precompile
 
+    candidates = range(1, _max_warmup_rows(metadata) + 1)
+    local_ranks = prims_ts_precompile.local_rank_count(metadata.mapping)
     payloads = []
     plans = []
     seen = set()
@@ -837,25 +845,18 @@ def _warmup_profiles(profiles: list[_WarmupProfile], metadata: "TrtllmAttentionM
         if key in seen:
             continue
         seen.add(key)
-        for rows, needs_worker in profile.library._kernel_variants(
-            metadata, profile.device, kwargs
-        ):
-            if needs_worker:
-                device_index = profile.device.index
-                if device_index is None:
-                    device_index = torch.cuda.current_device()
-                payloads.append(
-                    prims_ts_precompile.encode_payload(device_index, rows, heads, kwargs)
-                )
+        variants, missing = _plan_kernel_variants(
+            profile.device, heads, kwargs, candidates, local_ranks=local_ranks
+        )
+        payloads.extend(missing)
+        for rows in variants:
             workspace_bytes = _workspace_size(profile.device, rows, heads, **kwargs)
             plans.append((workspace_bytes, profile, rows))
     if not plans:
         return
     start = time.perf_counter()
     if payloads:
-        prims_ts_precompile.precompile_payloads(
-            payloads, local_ranks=prims_ts_precompile.local_rank_count(metadata.mapping)
-        )
+        prims_ts_precompile.precompile_payloads(payloads, local_ranks=local_ranks)
     # Allocate the largest workspace first so all profiles can share it. The
     # serving process must load every artifact even when the disk cache is warm.
     for _, profile, rows in sorted(plans, key=lambda plan: plan[0], reverse=True):
