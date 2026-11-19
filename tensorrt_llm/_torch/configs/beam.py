@@ -18,6 +18,7 @@ from os import PathLike
 from typing import Any, Optional, Union
 
 import torch
+from huggingface_hub.dataclasses import strict
 from transformers import PretrainedConfig
 
 BEAM_LAYER_TYPES = ("sliding_attention", "full_attention")
@@ -71,10 +72,13 @@ def _normalize_rope_parameters(raw: Optional[dict]) -> dict:
     return {"sliding_attention": normalized, "full_attention": None}
 
 
+@strict
 class BeamConfig(PretrainedConfig):
     """Architecture configuration of a Beam checkpoint (``config.json`` fields)."""
 
     model_type = "beam"
+    # Preserve full config equality for Beam fields set in __init__.
+    __eq__ = PretrainedConfig.__eq__
 
     def __init__(
         self,
@@ -163,6 +167,10 @@ class BeamConfig(PretrainedConfig):
         # as AutoConfig does, so the model loader can find the weight shards.
         kwargs.setdefault("name_or_path", str(pretrained_model_name_or_path))
         return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+    def validate_rope(self) -> None:
+        """Validate the per-layer settings at save time, including full attention without RoPE."""
+        _normalize_rope_parameters(self.rope_parameters)
 
     def _validate(self) -> None:
         if len(self.layer_types) != self.num_hidden_layers:
