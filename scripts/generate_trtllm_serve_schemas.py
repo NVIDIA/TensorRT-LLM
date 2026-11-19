@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 _DOCS_URL = "https://nvidia.github.io/TensorRT-LLM"
 _JSON_TYPES = {"string", "number", "integer", "boolean", "null", "array", "object"}
+_DYNAMIC_EPLB_PREFILL_SCHEMA = "DynamicEplbPrefill"
 SERVE_SCHEMA = "trtllm-serve-config.schema.json"
 DISAGG_SCHEMA = "trtllm-serve-disagg-config.schema.json"
 VISUAL_GEN_SCHEMA = "trtllm-serve-visual-gen-config.schema.json"
@@ -117,7 +118,53 @@ def _nullable(schema: dict) -> dict:
     return {"anyOf": [schema, {"type": "null"}]}
 
 
-def generate_serve_schema() -> dict:
+def _required_property(name: str, schema: dict) -> dict:
+    return {"type": "object", "required": [name], "properties": {name: schema}}
+
+
+def _dynamic_eplb_prefill_schema(inline_dynamic: dict, *, inherited_options: bool) -> dict:
+    """Describe the constraints on the inline per-layer dynamic EPLB form."""
+    from tensorrt_llm.llmapi.llm_args import (
+        _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS,
+        PrefillCudaGraphBackend,
+    )
+
+    capture_fields = {
+        "prefill_capture_num_tokens": {"const": [_PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS]},
+        "enable_attention_dp": {"const": True},
+        "moe_config": {
+            "properties": {
+                "load_balancer": {
+                    "properties": {"helper_slot_mode": {"const": "per_layer_resident"}},
+                },
+            },
+        },
+    }
+    capture: dict = {"properties": capture_fields}
+    if not inherited_options:
+        # The CLI can supply attention DP independently of the YAML file.
+        capture["required"] = ["prefill_capture_num_tokens"]
+
+    return {
+        "if": _required_property("moe_config", _required_property("load_balancer", inline_dynamic)),
+        "then": {
+            "properties": {
+                "prefill_cuda_graph_backend": {
+                    "enum": [PrefillCudaGraphBackend.DISABLED, PrefillCudaGraphBackend.BREAKABLE],
+                },
+                "torch_compile_config": {
+                    "not": _required_property("enable_piecewise_cuda_graph", {"const": True}),
+                },
+            },
+            "if": _required_property(
+                "prefill_cuda_graph_backend", {"const": PrefillCudaGraphBackend.BREAKABLE}
+            ),
+            "then": capture,
+        },
+    }
+
+
+def generate_serve_schema(*, inherited_options: bool = False) -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
     from tensorrt_llm.llmapi.llm_args import (
@@ -148,11 +195,16 @@ def generate_serve_schema() -> dict:
         {"$ref": f"#/$defs/{model.__name__}"}
         for model in (MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig)
     )
+    inline_dynamic = {**per_layer_dynamic, "required": ["mode"]}
     schema["$defs"]["MoeConfig"]["properties"]["load_balancer"]["anyOf"] = [
         standard,
-        {**per_layer_dynamic, "required": ["mode"]},
+        inline_dynamic,
         {"type": ["string", "null"]},
     ]
+    schema["$defs"][_DYNAMIC_EPLB_PREFILL_SCHEMA] = _dynamic_eplb_prefill_schema(
+        inline_dynamic, inherited_options=inherited_options
+    )
+    schema.setdefault("allOf", []).append({"$ref": f"#/$defs/{_DYNAMIC_EPLB_PREFILL_SCHEMA}"})
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):
@@ -181,7 +233,7 @@ def generate_disagg_schema() -> dict:
     )
     from tensorrt_llm.llmapi.llm_args import SERVE_CLI_CONFIG_FIELDS, TorchLlmArgs
 
-    schema = generate_serve_schema()
+    schema = generate_serve_schema(inherited_options=True)
     properties = schema["properties"]
     for config_name, aliases in SERVE_CLI_CONFIG_FIELDS.items():
         config = _schema_for(TorchLlmArgs.model_fields[config_name].annotation, schema)
@@ -199,6 +251,7 @@ def generate_disagg_schema() -> dict:
         "additionalProperties": True,
     }
     worker["additionalProperties"] = False
+    worker.setdefault("allOf", []).append({"$ref": f"#/$defs/{_DYNAMIC_EPLB_PREFILL_SCHEMA}"})
     schema["$defs"]["DisaggServerBlock"] = worker
 
     orchestrator = _schema_for(extract_disagg_cfg, schema)["properties"]

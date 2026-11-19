@@ -23,6 +23,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
@@ -60,7 +61,7 @@ from tensorrt_llm._torch.utils import (
     get_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_sm_version, nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     BaseSparseAttentionConfig,
     MiniMaxM3SparseAttentionConfig,
@@ -524,7 +525,16 @@ class DecoderRunner(ScheduledModelRunner):
         )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
-        return BreakableCUDAGraphRunner(decoder_model.model)
+        dynamic_eplb = isinstance(self._moe_load_balancer, PerLayerDynamicMoeLoadBalancer)
+        if dynamic_eplb and (
+            not getattr(decoder_model.model, "_supports_dynamic_eplb_breakable_prefill", False)
+            or get_sm_version() not in (100, 103)
+        ):
+            raise ValueError(
+                "Breakable prefill CUDA graph with per-layer dynamic EPLB "
+                "requires a DeepSeek-V4 decoder on SM100 or SM103"
+            )
+        return BreakableCUDAGraphRunner(decoder_model.model, capture_on_current_stream=dynamic_eplb)
 
     @property
     def _use_beam_search(self) -> bool:

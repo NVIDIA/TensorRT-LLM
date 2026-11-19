@@ -24,9 +24,11 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
+    "DynamicMoeGraphReplayError",
     "break_graph",
     "eager_on_graph",
     "get_current_replay_token",
+    "register_segment_replay",
 ]
 
 _current_capture: ContextVar[Optional["BreakableCUDAGraphCapture"]] = ContextVar(
@@ -46,6 +48,30 @@ _replay_token_counter = itertools.count(1)
 _original_wait_stream: Optional[Callable] = None
 _wait_stream_hook_lock = threading.Lock()
 _wait_stream_hook_refcount = 0
+
+
+class DynamicMoeGraphReplayError(RuntimeError):
+    """A partially submitted parent graph requires distributed worker teardown."""
+
+
+def register_segment_replay(
+    replay: Callable[[Callable[[], None]], None],
+    *,
+    side_stream: torch.cuda.Stream,
+    keepalive: tuple[torch.Tensor, ...],
+) -> None:
+    """Attach a replay wrapper and retain its tensors until the segment is reset."""
+    capture = _current_capture.get()
+    forked = _forked_streams.get()
+    if capture is None or forked is None or not torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Segment replay registration requires active capture")
+    graph = capture.cuda_graph
+    index = len(graph._segments) - 1
+    if index in graph._segment_replays:
+        raise RuntimeError("A graph segment must have exactly one dynamic MoE owner")
+    graph._segment_replays[index] = (replay, keepalive)
+    # The native event fork bypasses the Python wait_stream hook.
+    forked.add(side_stream)
 
 
 def get_current_stream(device: Optional[torch.device] = None) -> torch.cuda.Stream:
@@ -192,6 +218,9 @@ class BreakableCUDAGraph:
     def __init__(self) -> None:
         self._segments: list[torch.cuda.CUDAGraph] = []
         self._break_functions: list[Callable[[], Any]] = []
+        self._segment_replays: dict[
+            int, tuple[Callable[[Callable[[], None]], None], tuple[torch.Tensor, ...]]
+        ] = {}
 
     @property
     def num_segments(self) -> int:
@@ -211,9 +240,19 @@ class BreakableCUDAGraph:
         replay_token = _current_replay_token.set(next(_replay_token_counter))
         try:
             for index, segment in enumerate(self._segments):
-                segment.replay()
+                replay = self._segment_replays.get(index)
+                if replay is None:
+                    segment.replay()
+                else:
+                    replay[0](segment.replay)
                 if index < len(self._break_functions):
                     self._break_functions[index]()
+        except Exception as error:  # noqa: BLE001 - any partial submission can strand peers
+            if self._segment_replays:
+                raise DynamicMoeGraphReplayError(
+                    f"Dynamic MoE parent graph replay failed at segment {index}: {error}"
+                ) from error
+            raise
         finally:
             _current_replay_token.reset(replay_token)
             _current_stream.reset(stream_token)
@@ -223,6 +262,7 @@ class BreakableCUDAGraph:
             segment.reset()
         self._segments.clear()
         self._break_functions.clear()
+        self._segment_replays.clear()
 
 
 class BreakableCUDAGraphCapture:

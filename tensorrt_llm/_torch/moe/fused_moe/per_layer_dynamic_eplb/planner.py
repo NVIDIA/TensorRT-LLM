@@ -22,10 +22,13 @@ collective or auxiliary copy submitter is needed in the serving path.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import nvtx_range_debug
+from tensorrt_llm.llmapi.llm_args import _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
 from tensorrt_llm.logger import logger
 
 __all__ = [
@@ -174,6 +177,10 @@ class RebalanceSlotSchedulerGroup:
         self._lent_routes: Optional[torch.Tensor] = None
         self._execution_stream_handle: Optional[int] = None
         self._closed = False
+        self.graph_generation: torch.Tensor | None = None
+        self.is_capturing_parent_graph = False
+        self._captured_route_wait = False
+        self._graph_replay_failed = False
         self.scheduler = None
         self.symmetric = None
         self.broadcaster = None
@@ -288,6 +295,7 @@ class RebalanceSlotSchedulerGroup:
         self._closed = True
         self._execution_stream_handle = None
         self._plan_part = None
+        self.graph_generation = None
         self._pending_release = None
         self._routes_in_flight = None
         self._lent_rows = -1
@@ -325,6 +333,75 @@ class RebalanceSlotSchedulerGroup:
         if error != self._cuda_success:
             raise RuntimeError(f"cuStreamWaitValue64(rebalance) failed: {error!r}")
 
+    @contextmanager
+    def use_parent_moe_graph(self) -> Iterator[torch.Tensor]:
+        """Keep the READY cell at a fixed address across warmup and recapture."""
+        self._check_owner()
+        if self._graph_replay_failed or self.is_capturing_parent_graph:
+            raise RuntimeError("Parent MoE graph has a failed replay or nested capture")
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and self._plan_part is not None:
+            raise RuntimeError("Parent MoE capture requires a finished replica plan")
+        if self.graph_generation is None:
+            if capturing or self._route_target != self._generation * self.auxiliary_sms:
+                raise RuntimeError("Parent MoE graph requires an eager warmup on MAIN")
+            self.graph_generation = torch.empty(1, dtype=torch.int64, device=f"cuda:{self.device}")
+        self.is_capturing_parent_graph = capturing
+        try:
+            yield self.graph_generation
+            if capturing and self._plan_part is not None:
+                raise RuntimeError("Parent MoE capture left an unfinished replica plan")
+        finally:
+            if capturing:
+                self._plan_part = None
+                self._captured_route_wait = False
+                self.is_capturing_parent_graph = False
+
+    def publish_graph_generation(self, generation: int) -> None:
+        """Write the expected READY generation on MAIN ahead of the consumer."""
+        if self.graph_generation is None or not 1 <= generation < (1 << 63):
+            raise RuntimeError("The expected READY generation is invalid")
+        (result,) = self._driver.cuStreamWriteValue64(
+            self._execution_stream_handle, self.graph_generation.data_ptr(), generation, 0
+        )
+        if result != self._cuda_success:
+            raise RuntimeError(f"Cannot publish the READY generation: {result!r}")
+
+    def _replay_parent_segment(self, replay: Callable[[], None]) -> None:
+        try:
+            self._check_owner()
+            if (
+                self._graph_replay_failed
+                or self._plan_part is not None
+                or self._generation != self._finished_generation
+                or self._routes_in_flight is not None
+            ):
+                raise RuntimeError("A graph replay cannot reuse an unfinished live bank")
+            generation = self._generation + 1
+            route_target = generation * self.auxiliary_sms
+            if generation >= (1 << 63) or route_target >= (1 << 64):
+                raise RuntimeError("Captured generation exceeds the READY or route epoch ABI")
+            self._scheduled_generation = generation
+            if self._pending_release is not None:
+                self.lease.prove(self._pending_release[0])
+                self._pending_release = None
+            with nvtx_range_debug(
+                f"HALOQ.full_graph.prepare layer={self.layer_idx} g={generation}", category="MoE"
+            ):
+                self.broadcaster.prepare_graph_generation(generation)
+                self.publish_graph_generation(generation)
+            with nvtx_range_debug(f"HALOQ.full_moe_graph layer={self.layer_idx}", category="MoE"):
+                replay()
+            self._generation = generation
+            self._route_target = route_target
+            self._route_wait_generation = generation
+            self.plan_calls += 1
+            self.arena.publish_ready_generation(generation)
+            self.finish()
+        except Exception:  # noqa: BLE001 - any incomplete replay invalidates the live bank
+            self._graph_replay_failed = True
+            raise
+
     def plan_schedule(self, logical_expert_ids: torch.Tensor) -> Tuple[Any, int]:
         """Submit contiguous CUDA int32 routes [tokens, topk] without staging.
 
@@ -338,7 +415,11 @@ class RebalanceSlotSchedulerGroup:
         exchange.
         """
         self._check_owner()
-        if self._plan_part is not None or self._generation != self._finished_generation:
+        if (
+            self._plan_part is not None
+            or self._generation != self._finished_generation
+            or self._graph_replay_failed
+        ):
             raise RuntimeError("Previous rebalance plan has no paired finish")
         if self._routes_in_flight is not None:
             # Only a failed submission leaves routes that MAIN never waited for.
@@ -358,6 +439,26 @@ class RebalanceSlotSchedulerGroup:
             raise RuntimeError(f"Route chunk {num_tokens} exceeds {self.max_tokens_per_rank}")
 
         outputs = self.scheduler.outputs
+        part = (outputs, num_tokens)
+        if self.is_capturing_parent_graph:
+            from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph import (
+                register_segment_replay,
+            )
+
+            assert self.graph_generation is not None
+            if num_tokens != _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS:
+                raise ValueError("Parent MoE graph requires its fixed route count")
+            register_segment_replay(
+                self._replay_parent_segment,
+                side_stream=self.copy_stream,
+                keepalive=(logical_expert_ids, self.graph_generation),
+            )
+            self.broadcaster.capture_graph_submit(
+                logical_expert_ids, self.graph_generation, self._spin_bound.cycles()
+            )
+            self._plan_part = part
+            return part
+
         self._scheduled_generation = self._generation + 1
         if self._pending_release is not None:
             self.lease.prove(self._pending_release[0])
@@ -376,7 +477,6 @@ class RebalanceSlotSchedulerGroup:
             raise RuntimeError("TMA and HALO-Q generation mismatch")
         self._route_target = route_target
         self._generation = generation
-        part = (outputs, num_tokens)
         self._plan_part = part
         return part
 
@@ -393,6 +493,8 @@ class RebalanceSlotSchedulerGroup:
         outputs, num_tokens = part
         if not defer_wait:
             self.wait_for_routes()
+        if self.is_capturing_parent_graph:
+            return outputs.physical_slot_ids[:num_tokens], self._generation + 1
         physical = self._lent_routes
         if num_tokens != self._lent_rows:
             # A view of the scheduler's fixed output buffer; slicing it is
@@ -410,6 +512,16 @@ class RebalanceSlotSchedulerGroup:
         wait. Later calls of that generation return at once: their consumers
         are already ordered after it on MAIN.
         """
+        if self.is_capturing_parent_graph:
+            if not self._captured_route_wait:
+                if self._plan_part is None:
+                    raise RuntimeError("Captured route wait requires its producer")
+                assert self.graph_generation is not None
+                self.broadcaster.capture_graph_route_wait(
+                    self.graph_generation, self._spin_bound.cycles()
+                )
+                self._captured_route_wait = True
+            return
         generation = self._generation
         if generation > 0 and generation == self._route_wait_generation and not self._closed:
             return
@@ -438,6 +550,16 @@ class RebalanceSlotSchedulerGroup:
         queued so far: the MegaMoE launch that read this generation, if any.
         The next fused launch, submitted on MAIN, orders COPY after it.
         """
+        if self.is_capturing_parent_graph:
+            if completion_event is not None or not self._captured_route_wait:
+                raise RuntimeError(
+                    "Captured MoE release requires its parent segment and route wait"
+                )
+            # Join after the consumer so the shared expert overlaps scheduling and copy.
+            torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
+            self._plan_part = None
+            self._captured_route_wait = False
+            return
         self._check_owner()
         if (
             self._plan_part is not None

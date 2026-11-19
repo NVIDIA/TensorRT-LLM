@@ -2674,6 +2674,7 @@ def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
     group._scheduled_generation = 1
     group._route_wait_generation = 0
     group._pending_release = None
+    group.is_capturing_parent_graph = False
     group.plan_calls = 0
     group._execution_stream_handle = 23
     group.copy_stream = copy_stream

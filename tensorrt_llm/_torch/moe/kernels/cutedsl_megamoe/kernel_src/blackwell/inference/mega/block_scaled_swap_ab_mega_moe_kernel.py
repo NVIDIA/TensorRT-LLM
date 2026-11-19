@@ -1,8 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Fused pull-dispatch MegaMoE kernel composition for Blackwell."""
 
 import hashlib
 
-from typing import ClassVar, Optional, Tuple
+from typing import ClassVar, Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
 
@@ -111,6 +113,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
             "helper_expert_count": OptionalRequirement(int),
+            "ready_generation_from_device": OptionalRequirement(bool),
             "total_helper_slots": OptionalRequirement(int),
         }
 
@@ -165,6 +168,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
+        self.ready_generation_from_device = impl_desc.get("ready_generation_from_device", False)
+        if type(self.ready_generation_from_device) is not bool:
+            raise TypeError("ready_generation_from_device must be an exact bool")
+        if self.ready_generation_from_device and self.helper_expert_count <= 0:
+            raise ValueError("device READY generation requires helper_expert_count > 0")
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
         self.occupancy = 1
@@ -454,7 +462,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
             f"sfvec{self.sf_vec_size}_a{self.a_major_mode.name.lower()}_b{self.b_major_mode.name.lower()}_"
             f"e{self.expert_count}_ep{self.world_size}_topk{self.topk}_"
-            f"helpers{self.helper_expert_count}_"
+            f"helpers{self.helper_expert_count}{'_genptr' if self.ready_generation_from_device else ''}_"
             f"topkidx{dtype_name(self.topk_index_dtype)}_"
             f"h{self.hidden_size}_i{self.intermediate_gateup_size}_maxtoken{self.max_tokens_per_rank}_"
             f"tile{tile}_cluster{cluster}_{'2cta' if self.use_2cta_instrs else '1cta'}_"
@@ -552,7 +560,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     AddressSpace.gmem,
                     assumed_align=8,
                 ),
-                hot_expert_weight_ready_generation=cutlass.Uint64(1),
+                hot_expert_weight_ready_generation=(
+                    make_ptr(cutlass.Uint64, 0, AddressSpace.gmem, assumed_align=8)
+                    if self.ready_generation_from_device else cutlass.Uint64(1)
+                ),
             )
         if self.quant_kind.uses_global_scale:
             # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
@@ -630,7 +641,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
         hot_expert_weight_ready_flags: Optional[cute.Pointer] = None,  # uint64[EP]
-        hot_expert_weight_ready_generation: Optional[cutlass.Uint64] = None,
+        hot_expert_weight_ready_generation: Optional[Union[cute.Pointer, cutlass.Uint64]] = None,
         # (tokens,) fp32, this rank's own tokens, plain local memory (the router reads it here and
         # pushes it to the pool). Required iff the descriptor enables fc1_activation_per_token_scale.
         # Last on purpose: the AOT kwargs wrapper right-aligns its None defaults, so appending keeps
@@ -665,6 +676,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     f"fc1_activation_per_token_scale has {scale_rows} entries but topk_indices has {token_rows} rows."
                 )
 
+        if cutlass.const_expr(
+            self.helper_expert_count > 0
+            and self.ready_generation_from_device
+            != isinstance(hot_expert_weight_ready_generation, cute.Pointer)
+        ):
+            raise TypeError("READY generation argument does not match the kernel ABI mode")
         helper_ready_bundle = (
             hot_expert_weight_ready_flags,
             hot_expert_weight_ready_generation,
@@ -973,7 +990,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
         hot_expert_weight_ready_flags: Optional[cute.Pointer],
-        hot_expert_weight_ready_generation: Optional[cutlass.Uint64],
+        hot_expert_weight_ready_generation: Optional[Union[cute.Pointer, cutlass.Uint64]],
     ):
         """Compose TokenComm, Scheduler, Mainloop, and Epilogue."""
         self._mainloop.materialize_codegen_members()

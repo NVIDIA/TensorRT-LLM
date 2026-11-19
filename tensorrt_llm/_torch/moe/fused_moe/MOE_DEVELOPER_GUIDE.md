@@ -927,12 +927,14 @@ set wrong has a test that catches it:
   `ep_process_group` and `max_tokens_per_rank_capacity`.
 - DeepSeek-V4 selects the fused shared FC12 kernel when the routed backend
   declares per-layer dynamic support, the final projection quantization and
-  hardware (SM100 family) support that kernel, and the model runs eagerly
-  (`cuda_graph_config: null`). Per-layer dynamic EPLB is not a condition, but it
-  requires eager mode, so an EPLB-off baseline runs the same shared kernel only
-  with `cuda_graph_config: null`. Other runs keep the model's existing shared-MLP
-  backend. With per-layer dynamic EPLB, the active configuration supplies the
-  fused kernel an SM budget that leaves the copy kernel its auxiliary SMs.
+  hardware (SM100 family) support that kernel, and `cuda_graph_config` is
+  `null`. With per-layer dynamic EPLB, FC12 leaves the copy kernel its auxiliary
+  SMs.
+- DeepSeek-V4 NVFP4 on SM100/103 supports breakable prefill with an 8192-token
+  bucket, attention DP, and per-layer resident helpers. The parent segment
+  captures the COPY producer, the route wait, and the MAIN consumers. Replay
+  writes the current READY generation on MAIN, and the lease is released
+  after submission.
 
 ## Canonical Examples
 

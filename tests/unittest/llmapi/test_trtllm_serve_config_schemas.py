@@ -290,6 +290,63 @@ def test_load_balancer_schema_matches_runtime(
             MoeConfig(load_balancer=load_balancer)
 
 
+@pytest.mark.parametrize(
+    ("options", "helper_slot_mode", "valid"),
+    [
+        ({"enable_attention_dp": True}, "per_layer_resident", True),
+        ({}, "per_layer_resident", True),  # --enable_attention_dp may come from the CLI.
+        ({"prefill_cuda_graph_backend": "disabled"}, "shared_banks", True),
+        ({"prefill_cuda_graph_backend": "piecewise"}, "per_layer_resident", False),
+        (
+            {
+                "prefill_cuda_graph_backend": None,
+                "torch_compile_config": {"enable_piecewise_cuda_graph": True},
+            },
+            "per_layer_resident",
+            False,
+        ),
+        ({"prefill_capture_num_tokens": None}, "per_layer_resident", False),
+        ({"prefill_capture_num_tokens": [4096, 8192]}, "per_layer_resident", False),
+        ({"enable_attention_dp": False}, "per_layer_resident", False),
+        ({"enable_attention_dp": True}, "shared_banks", False),
+    ],
+)
+def test_per_layer_dynamic_eplb_prefill_schema(
+    schemas: dict[str, dict], options: dict, helper_slot_mode: str, valid: bool
+) -> None:
+    load_balancer = {
+        "mode": "per_layer_dynamic",
+        "num_slots": 320,
+        "helper_slot_mode": helper_slot_mode,
+    }
+    config = {
+        "moe_config": {"load_balancer": load_balancer},
+        "prefill_cuda_graph_backend": "breakable",
+        "prefill_capture_num_tokens": [8192],
+        **options,
+    }
+    config = {name: value for name, value in config.items() if value is not None}
+    errors = list(Draft202012Validator(schemas[generator.SERVE_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+def test_disagg_dynamic_eplb_prefill_allows_inherited_capture_fields(
+    schemas: dict[str, dict],
+) -> None:
+    validator = Draft202012Validator(schemas[generator.DISAGG_SCHEMA])
+    config = {
+        "enable_attention_dp": True,
+        "prefill_capture_num_tokens": [8192],
+        "context_servers": {
+            "prefill_cuda_graph_backend": "breakable",
+            "moe_config": {"load_balancer": {"mode": "per_layer_dynamic", "num_slots": 320}},
+        },
+    }
+    assert validator.is_valid(config)
+    config["context_servers"]["prefill_cuda_graph_backend"] = "piecewise"
+    assert not validator.is_valid(config)
+
+
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
     """Check literal top-level config accesses, without tracing aliases or dynamic keys."""
     function = next(

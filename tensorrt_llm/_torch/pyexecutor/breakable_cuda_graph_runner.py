@@ -17,6 +17,7 @@ from .breakable_cuda_graph import (
     BreakableCUDAGraphCapture,
     enable_breakable_cuda_graph,
 )
+from .breakable_cuda_graph.context import enable_parent_moe_graph
 
 
 class BreakableCUDAGraphRunnerState(Enum):
@@ -27,19 +28,26 @@ class BreakableCUDAGraphRunnerState(Enum):
 
 
 class BreakableCUDAGraphRunner:
-    """Capture and replay prefill model bodies as breakable CUDA graphs."""
+    """Capture and replay prefill model bodies as breakable CUDA graphs.
+
+    Current-stream capture keeps stream-bound producers on the executor
+    stream during warmup, capture, and replay.
+    """
 
     _WARMUP_STEPS = 2
 
     CUDA_GRAPH_WARMUP_METRIC = "cuda_graph_warmup_seconds"
     CUDA_GRAPH_CAPTURE_METRIC = "cuda_graph_capture_seconds"
 
-    def __init__(self, layer_model: nn.Module) -> None:
+    def __init__(self, layer_model: nn.Module, *, capture_on_current_stream: bool = False) -> None:
         self.layer_model = layer_model
         self._graphs: dict[int, BreakableCUDAGraph] = {}
         self._outputs: dict[int, torch.Tensor] = {}
         self._memory_pool = None
-        self._capture_stream = torch.cuda.Stream()
+        self._capture_on_current_stream = capture_on_current_stream
+        self._capture_stream: torch.cuda.Stream | None = (
+            None if capture_on_current_stream else torch.cuda.Stream()
+        )
         self._shared_output: Optional[torch.Tensor] = None
         self._state = BreakableCUDAGraphRunnerState.IDLE
         self._active_graph: Optional[BreakableCUDAGraph] = None
@@ -99,11 +107,25 @@ class BreakableCUDAGraphRunner:
             raise ValueError(f"BCG for num_tokens={num_tokens} is already captured")
 
         current_stream = torch.cuda.current_stream()
-        self._capture_stream.wait_stream(current_stream)
+        if self._capture_on_current_stream:
+            if current_stream.cuda_stream == 0:
+                raise RuntimeError("BCG capture requires a nondefault executor execution stream")
+            if self._capture_stream is not None and self._capture_stream != current_stream:
+                raise RuntimeError("BCG capture must use its bound execution stream")
+            self._capture_stream = current_stream
+        capture_stream = self._capture_stream
+        assert capture_stream is not None
+        if capture_stream != current_stream:
+            capture_stream.wait_stream(current_stream)
         graph = None
         created_memory_pool = False
+        parent_moe_scope = (
+            enable_parent_moe_graph()
+            if self._capture_on_current_stream
+            else contextlib.nullcontext()
+        )
         try:
-            with torch.cuda.stream(self._capture_stream):
+            with torch.cuda.stream(capture_stream), parent_moe_scope:
                 with timing_metric(self.CUDA_GRAPH_WARMUP_METRIC, self._metrics):
                     self.warmup(engine_forward, scope_inputs)
                     torch.cuda.synchronize()
@@ -124,7 +146,8 @@ class BreakableCUDAGraphRunner:
                     output = engine_forward()
                     torch.cuda.synchronize()
 
-            current_stream.wait_stream(self._capture_stream)
+            if capture_stream != current_stream:
+                current_stream.wait_stream(capture_stream)
             if not torch.is_tensor(output):
                 raise TypeError(
                     f"Breakable prefill capture requires a tensor body output, got {type(output)}"
@@ -206,6 +229,8 @@ class BreakableCUDAGraphRunner:
     def replay(self, num_tokens: int) -> torch.Tensor:
         if num_tokens not in self._graphs:
             raise KeyError(f"No BCG captured for num_tokens={num_tokens}")
+        if self._capture_on_current_stream and torch.cuda.current_stream() != self._capture_stream:
+            raise RuntimeError("BCG replay must use its bound execution stream")
         self._graphs[num_tokens].replay()
         return self._outputs[num_tokens]
 
@@ -244,3 +269,5 @@ class BreakableCUDAGraphRunner:
         self._outputs.clear()
         self._shared_output = None
         self._memory_pool = None
+        if self._capture_on_current_stream:
+            self._capture_stream = None

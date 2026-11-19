@@ -826,10 +826,16 @@ struct FusedSchedulerArgs
  * consumers run in the default one, so the release is system-scope. Each CTA
  * also waits for route_target before it reads the plan, which CTA 0 finishes
  * last, with the scheduler's spin bound. */
-__global__ void __launch_bounds__(512, 1) halo_q_tma_fused_kernel(FusedSchedulerArgs const scheduler,
-    GpuDirectStorage const direct, int warps, int total_slots, unsigned* completed_ctas, uint64_t flag_mc,
-    uint64_t generation, unsigned long long* route_epoch, unsigned long long route_target)
+__global__ void __launch_bounds__(512, 1)
+    halo_q_tma_fused_kernel(FusedSchedulerArgs const scheduler, GpuDirectStorage const direct, int warps,
+        int total_slots, unsigned* completed_ctas, uint64_t flag_mc, uint64_t generation,
+        unsigned long long* route_epoch, unsigned long long route_target, uint64_t const* replay_generation)
 {
+    if (replay_generation != nullptr)
+    {
+        generation = *replay_generation;
+        route_target = generation * static_cast<unsigned long long>(gridDim.x);
+    }
     tensorrt_llm::kernels::halo_q_scheduler_body(scheduler.routes, scheduler.out_slots, scheduler.out_ids,
         scheduler.out_levels, scheduler.out_owners, scheduler.peer_bases, scheduler.status, scheduler.partial,
         scheduler.route_aux, scheduler.grid_sync, scheduler.plan, scheduler.route_prefix, scheduler.ep,
@@ -1327,7 +1333,7 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint
         if (error == cudaSuccess)
             error = cudaMemset(d.resident, 0xFF, bytes); // -1: no expert is known to be resident.
         if (error == cudaSuccess)
-            error = cudaStreamSynchronize(nullptr); // Cold initialization only.
+            error = cudaStreamSynchronize(nullptr);      // Cold initialization only.
         if (error != cudaSuccess)
             return error;
     }
@@ -1340,7 +1346,7 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint
 
 int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
     tensorrt_llm::kernels::MoeRebalanceHaloQParams const& scheduler, uint64_t* route_epoch, uint64_t route_target,
-    uint64_t flag_mc, uint64_t generation, void* cuda_stream)
+    uint64_t flag_mc, uint64_t generation, void* cuda_stream, uint64_t const* replay_generation)
 {
     if (!state || !route_epoch || (reinterpret_cast<uintptr_t>(route_epoch) & 7) || !flag_mc || (flag_mc & 7)
         || !generation)
@@ -1368,8 +1374,10 @@ int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
     error = cudaStreamIsCapturing(stream, &capture);
     if (error != cudaSuccess)
         return error;
-    if (capture != cudaStreamCaptureStatusNone)
+    if (capture != (replay_generation != nullptr ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone))
+    {
         return cudaErrorStreamCaptureUnsupported;
+    }
     // One stream orders the scheduler workspace, the plan scratch and the residency table.
     if (state->work_queued && stream != state->last_stream)
         return cudaErrorInvalidValue;
@@ -1386,8 +1394,8 @@ int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
     unsigned* completed_ctas = state->completed_ctas;
     auto* epoch = reinterpret_cast<unsigned long long*>(route_epoch);
     unsigned long long target = route_target;
-    void* arguments[]
-        = {&scheduler_args, &direct, &warps, &total_slots, &completed_ctas, &flag_mc, &generation, &epoch, &target};
+    void* arguments[] = {&scheduler_args, &direct, &warps, &total_slots, &completed_ctas, &flag_mc, &generation, &epoch,
+        &target, &replay_generation};
     cudaLaunchConfig_t launch{};
     launch.gridDim = dim3(c.sms, 1, 1);
     launch.blockDim = dim3(kFusedThreads, 1, 1);
@@ -1404,6 +1412,50 @@ int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
         return error;
     }
     return cudaSuccess;
+}
+
+namespace
+{
+
+__global__ void wait_replay_route_epoch(
+    unsigned long long const* route_epoch, uint64_t const* replay_generation, unsigned ctas, uint64_t spin_cycles)
+{
+    if (threadIdx.x != 0)
+    {
+        return;
+    }
+    unsigned long long const target = *replay_generation * static_cast<uint64_t>(ctas);
+    uint64_t const start = clock64();
+    while (true)
+    {
+        unsigned long long observed;
+        asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(observed) : "l"(route_epoch) : "memory");
+        if (observed >= target)
+        {
+            return;
+        }
+        if (clock64() - start > spin_cycles)
+        {
+            printf("Captured HALO-Q route epoch timed out\n");
+            asm volatile("trap;" ::: "memory");
+        }
+        __nanosleep(32);
+    }
+}
+
+} // namespace
+
+int megamoe_tma_copy_wait_replay_routes(uint64_t const* route_epoch, uint64_t const* replay_generation, unsigned ctas,
+    uint64_t spin_cycles, void* cuda_stream)
+{
+    if (route_epoch == nullptr || replay_generation == nullptr || ctas == 0 || spin_cycles == 0
+        || cuda_stream == nullptr)
+    {
+        return cudaErrorInvalidValue;
+    }
+    wait_replay_route_epoch<<<1, 32, 0, reinterpret_cast<cudaStream_t>(cuda_stream)>>>(
+        reinterpret_cast<unsigned long long const*>(route_epoch), replay_generation, ctas, spin_cycles);
+    return cudaGetLastError();
 }
 
 extern "C" int megamoe_tma_copy_gpu_plan_result(MegamoeTmaCopyState* state, MegamoeTmaGpuPlanResult* result)

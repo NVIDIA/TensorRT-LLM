@@ -70,7 +70,12 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(
 }
 
 int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState*, tensorrt_llm::kernels::MoeRebalanceHaloQParams const&,
-    uint64_t*, uint64_t, uint64_t, uint64_t, void*)
+    uint64_t*, uint64_t, uint64_t, uint64_t, void*, uint64_t const*)
+{
+    return unsupported();
+}
+
+int megamoe_tma_copy_wait_replay_routes(uint64_t const*, uint64_t const*, unsigned, uint64_t, void*)
 {
     return unsupported();
 }

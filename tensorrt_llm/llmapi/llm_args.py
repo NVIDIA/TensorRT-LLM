@@ -6486,6 +6486,7 @@ class PrefillCudaGraphBackend(StrEnum):
 
 _DEFAULT_PREFILL_CAPTURE_NUM_TOKENS = [2**i for i in range(8)
                                        ] + [i for i in range(256, 3073, 256)]
+_PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS = 8192
 
 
 class TorchCompileConfig(StrictBaseModel):
@@ -7967,16 +7968,27 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_per_layer_dynamic_eplb_cuda_graph(self) -> 'TorchLlmArgs':
-        """Per-layer dynamic EPLB plans cannot be captured in CUDA graphs."""
-        if getattr(self.moe_config.load_balancer, "mode",
-                   None) != "per_layer_dynamic":
+        """Validate the supported prefill capture domain for dynamic EPLB."""
+        load_balancer = self.moe_config.load_balancer
+        if not isinstance(load_balancer, MoePerLayerDynamicLoadBalancerConfig):
             return self
-        if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
+        if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE:
             raise ValueError(
-                "per-layer dynamic EPLB does not support prefill CUDA graphs")
+                "per-layer dynamic EPLB does not support piecewise prefill CUDA graphs"
+            )
+        if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
+            bucket = _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
+            if (self.prefill_capture_num_tokens != [bucket]
+                    or not self.enable_attention_dp
+                    or load_balancer.helper_slot_mode != "per_layer_resident"):
+                raise ValueError(
+                    "per-layer dynamic EPLB with breakable prefill requires "
+                    f"prefill_capture_num_tokens=[{bucket}], enable_attention_dp=True, and "
+                    "helper_slot_mode='per_layer_resident'")
         if self.cuda_graph_config is not None:
-            logger.warning("per-layer dynamic EPLB does not support CUDA "
-                           "graphs; setting cuda_graph_config to None.")
+            logger.warning(
+                "per-layer dynamic EPLB does not support decode CUDA "
+                "graphs; setting cuda_graph_config to None.")
             self.cuda_graph_config = None
         return self
 

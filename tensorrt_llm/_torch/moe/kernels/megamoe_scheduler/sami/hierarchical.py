@@ -764,6 +764,30 @@ class HierarchicalSamiWeightBroadcast:
             self._generation = generation + 1
             return generation
 
+    def capture_graph_submit(
+        self, routes: torch.Tensor, generation: torch.Tensor, spin_cycles: int
+    ) -> None:
+        """Capture the producer on COPY using the live graph generation cell."""
+        torch.ops.trtllm.moe_rebalance_tma_submit_graph(
+            self._handle, routes, generation, spin_cycles
+        )
+
+    def capture_graph_route_wait(self, generation: torch.Tensor, spin_cycles: int) -> None:
+        """Capture the route dependency just before the first MAIN consumer."""
+        torch.ops.trtllm.moe_rebalance_tma_wait_graph_routes(
+            self._handle, generation, spin_cycles
+        )
+
+    def prepare_graph_generation(self, generation: int) -> None:
+        """Advance the producer lease after the prior consumer was ordered."""
+        with self._lock:
+            if self._handoff_aborted or self._scheduler is None or generation != self._generation:
+                raise RuntimeError("Graph replay has an invalid producer generation")
+            self._require_live_bank_reusable()
+            torch.ops.trtllm.moe_rebalance_tma_prepare_graph_generation(self._handle, generation)
+            self._active_generation = generation
+            self._generation = generation + 1
+
     def close(self) -> None:
         """Release the native copy context after all device work is drained."""
         with self._lock, torch.cuda.device(self.device):

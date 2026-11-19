@@ -1637,6 +1637,11 @@
     },
     "DisaggServerBlock": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/DynamicEplbPrefill"
+        }
+      ],
       "properties": {
         "_mpi_session": {
           "description": "Live objects require the Python LLM API.",
@@ -3475,6 +3480,87 @@
       },
       "title": "DynamicBatchConfig",
       "type": "object"
+    },
+    "DynamicEplbPrefill": {
+      "if": {
+        "properties": {
+          "moe_config": {
+            "properties": {
+              "load_balancer": {
+                "$ref": "#/$defs/MoePerLayerDynamicLoadBalancerConfig",
+                "required": [
+                  "mode"
+                ]
+              }
+            },
+            "required": [
+              "load_balancer"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "moe_config"
+        ],
+        "type": "object"
+      },
+      "then": {
+        "if": {
+          "properties": {
+            "prefill_cuda_graph_backend": {
+              "const": "breakable"
+            }
+          },
+          "required": [
+            "prefill_cuda_graph_backend"
+          ],
+          "type": "object"
+        },
+        "properties": {
+          "prefill_cuda_graph_backend": {
+            "enum": [
+              "disabled",
+              "breakable"
+            ]
+          },
+          "torch_compile_config": {
+            "not": {
+              "properties": {
+                "enable_piecewise_cuda_graph": {
+                  "const": true
+                }
+              },
+              "required": [
+                "enable_piecewise_cuda_graph"
+              ],
+              "type": "object"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "enable_attention_dp": {
+              "const": true
+            },
+            "moe_config": {
+              "properties": {
+                "load_balancer": {
+                  "properties": {
+                    "helper_slot_mode": {
+                      "const": "per_layer_resident"
+                    }
+                  }
+                }
+              }
+            },
+            "prefill_capture_num_tokens": {
+              "const": [
+                8192
+              ]
+            }
+          }
+        }
+      }
     },
     "Eagle3DecodingConfig": {
       "additionalProperties": false,
@@ -7997,6 +8083,11 @@
   "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc3/_static/schemas/trtllm-serve-disagg-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "$ref": "#/$defs/DynamicEplbPrefill"
+    }
+  ],
   "description": "Static YAML checks only; runtime validation remains authoritative.",
   "properties": {
     "_mpi_session": {

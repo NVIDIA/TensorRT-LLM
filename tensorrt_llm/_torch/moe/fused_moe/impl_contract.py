@@ -710,6 +710,7 @@ class MoEReplicaPlan:
     ready_generation: int
     reserved_sms: int
     _wait_for_routes: Callable[[], None] = field(repr=False, compare=False)
+    ready_generation_tensor: Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         resident = int(self.resident_experts_per_rank)

@@ -9,6 +9,7 @@ from typing import Iterator
 _breakable_cuda_graph_active: ContextVar[bool] = ContextVar(
     "breakable_cuda_graph_active", default=False
 )
+_parent_moe_graph_enabled: ContextVar[bool] = ContextVar("parent_moe_graph_enabled", default=False)
 
 
 def is_in_breakable_cuda_graph() -> bool:
@@ -24,3 +25,18 @@ def enable_breakable_cuda_graph() -> Iterator[None]:
         yield
     finally:
         _breakable_cuda_graph_active.reset(token)
+
+
+def is_parent_moe_graph_enabled() -> bool:
+    """Return whether a dynamic MoE parent graph is warming up or capturing."""
+    return _parent_moe_graph_enabled.get()
+
+
+@contextmanager
+def enable_parent_moe_graph() -> Iterator[None]:
+    """Opt into device-backed READY for the runner's warmup and capture."""
+    token = _parent_moe_graph_enabled.set(True)
+    try:
+        yield
+    finally:
+        _parent_moe_graph_enabled.reset(token)

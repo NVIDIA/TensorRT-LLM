@@ -365,18 +365,71 @@ class TestMoeConfigPerLayerDynamicEplb:
                           "helper_slot_mode": "shared_banks",
                       })
 
-    def test_per_layer_dynamic_disables_decode_cuda_graph(self) -> None:
-        args = TorchLlmArgs(
-            model=llama_model_path,
-            moe_config={"load_balancer": self._per_layer_dynamic()})
+    @pytest.mark.parametrize("helper_slot_mode",
+                             ["per_layer_resident", "shared_banks"])
+    def test_per_layer_dynamic_disables_decode_cuda_graph(
+            self, helper_slot_mode: str) -> None:
+        args = TorchLlmArgs(model=llama_model_path,
+                            moe_config={
+                                "load_balancer":
+                                dict(self._per_layer_dynamic(),
+                                     helper_slot_mode=helper_slot_mode)
+                            })
+        assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
         assert args.cuda_graph_config is None
 
-    def test_per_layer_dynamic_rejects_prefill_cuda_graph(self) -> None:
-        with pytest.raises(ValidationError, match="prefill CUDA graphs"):
+    @pytest.mark.parametrize("prefill_options", [
+        {
+            "prefill_cuda_graph_backend": PrefillCudaGraphBackend.PIECEWISE
+        },
+        {
+            "torch_compile_config": {
+                "enable_piecewise_cuda_graph": True
+            }
+        },
+    ])
+    def test_per_layer_dynamic_rejects_piecewise_prefill(
+            self, prefill_options: dict) -> None:
+        with pytest.raises(ValidationError,
+                           match="piecewise prefill CUDA graphs"):
             TorchLlmArgs(
                 model=llama_model_path,
-                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
-                moe_config={"load_balancer": self._per_layer_dynamic()})
+                moe_config={"load_balancer": self._per_layer_dynamic()},
+                **prefill_options)
+
+    @pytest.mark.parametrize(
+        ("tokens", "attention_dp", "helper_slot_mode", "valid"), [
+            ([8192], True, None, True),
+            (None, True, None, False),
+            ([], True, None, False),
+            ([4096], True, None, False),
+            ([4096, 8192], True, None, False),
+            ([8192, 8192], True, None, False),
+            ([8192], False, None, False),
+            ([8192], True, "shared_banks", False),
+        ])
+    def test_per_layer_dynamic_breakable_prefill(self, tokens: list[int] | None,
+                                                 attention_dp: bool,
+                                                 helper_slot_mode: str | None,
+                                                 valid: bool) -> None:
+        load_balancer = self._per_layer_dynamic()
+        if helper_slot_mode is not None:
+            load_balancer["helper_slot_mode"] = helper_slot_mode
+        options = dict(
+            model=llama_model_path,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_capture_num_tokens=tokens,
+            enable_attention_dp=attention_dp,
+            moe_config={"load_balancer": load_balancer})
+        if not valid:
+            with pytest.raises(ValidationError,
+                               match="with breakable prefill requires"):
+                TorchLlmArgs(**options)
+            return
+        args = TorchLlmArgs(**options)
+        assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE
+        assert args.prefill_capture_num_tokens == tokens
+        assert args.cuda_graph_config is None
 
     def test_legacy_yaml_defaults_to_standard_mode(self,
                                                    tmp_path: Path) -> None:

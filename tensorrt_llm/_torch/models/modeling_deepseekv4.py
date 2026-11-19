@@ -49,6 +49,7 @@ from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.llmapi.llm_args import _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -83,6 +84,7 @@ from ..moe.fused_moe import (
     is_moe_weight_owner,
 )
 from ..peft.lora.layer import LoraLayer
+from ..pyexecutor.breakable_cuda_graph.context import is_parent_moe_graph_enabled
 from ..speculative import SpecMetadata, get_num_extra_kv_tokens
 from ..utils import (
     AuxStreamType,
@@ -1956,6 +1958,23 @@ class DeepseekV4MoE(nn.Module):
         do_finalize: Optional[bool] = True,
         image_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        use_parent_graph = self._per_layer_dynamic_eplb_enabled and (is_parent_moe_graph_enabled())
+        if use_parent_graph and (
+            hidden_states_fp4 is not None
+            or not hidden_states.is_cuda
+            or hidden_states.ndim != 2
+            or hidden_states.shape[0] != _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
+            or not self.use_dp
+            or not do_finalize
+            or self.shared_experts is None
+            or do_multi_stream()
+            or self.experts.backend.tactic_autotune
+        ):
+            raise ValueError(
+                "Breakable prefill CUDA graph with dynamic EPLB requires a finalized "
+                "8192-token attention-DP MoE with shared experts and MegaMoE tactic autotuning disabled"
+            )
+
         if not do_finalize:
             assert not self.use_dp
 
@@ -2000,7 +2019,11 @@ class DeepseekV4MoE(nn.Module):
                     _shared_box["out"] = _compute_shared_output()
 
             with self.experts.load_balancer_overlap(_overlap_shared):
-                routed_output = _compute_routed_output()
+                if use_parent_graph:
+                    with self.experts.layer_load_balancer.use_parent_moe_graph():
+                        routed_output = _compute_routed_output()
+                else:
+                    routed_output = _compute_routed_output()
             # Compute shared experts here if the routed path did not run them.
             if "out" not in _shared_box:
                 _shared_box["out"] = _compute_shared_output()
@@ -2673,6 +2696,8 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
 
 
 class DeepseekV4Model(DecoderModel):
+    _supports_dynamic_eplb_breakable_prefill = True
+
     # Subclass hooks. ``uses_hc_head`` is False for checkpoints that ship no
     # ``hc_head`` weights and collapse the mHC stream some other way (V4.1).
     decoder_layer_cls = DeepseekV4DecoderLayer
