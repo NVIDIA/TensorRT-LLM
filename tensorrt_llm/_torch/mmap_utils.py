@@ -415,8 +415,9 @@ def _pread_into(fd: int, buf: memoryview, offset: int) -> None:
         buf, offset = buf[got:], offset + got
 
 
-def safetensors_layout_is_valid(header: dict, payload_bytes: int) -> bool:
-    """Whether the tensors' ``data_offsets`` tile ``[0, payload_bytes)`` exactly, as SafeTensors requires."""
+def safetensors_layout_is_valid(header: dict, payload_bytes: int | None) -> bool:
+    """Whether the tensors' ``data_offsets`` tile ``[0, payload_bytes)`` exactly, as SafeTensors
+    requires; with ``payload_bytes`` None, only that they tile from 0 without overlap or gap."""
     end = 0
     for begin, stop in sorted(
         info["data_offsets"] for name, info in header.items() if name != "__metadata__"
@@ -424,7 +425,7 @@ def safetensors_layout_is_valid(header: dict, payload_bytes: int) -> bool:
         if begin != end or stop < begin:
             return False
         end = stop
-    return end == payload_bytes
+    return payload_bytes in (None, end)
 
 
 class SafetensorsPreader:
@@ -447,9 +448,9 @@ class SafetensorsPreader:
         self._header = json.loads(header)
         self._header.pop("__metadata__", None)
         self._data_start = 8 + header_bytes
-        if not safetensors_layout_is_valid(
-            self._header, os.fstat(self._fd).st_size - self._data_start
-        ):
+        # No size lookup: an fstat per shard is a server round trip on NFS. A short
+        # payload still fails at its read.
+        if not safetensors_layout_is_valid(self._header, None):
             raise ValueError(f"invalid SafeTensors tensor layout in {path}")
         self._dtypes = dict(getattr(safetensors.torch, "_TYPES", {}), F8_E8M0=torch.float8_e8m0fnu)
 
