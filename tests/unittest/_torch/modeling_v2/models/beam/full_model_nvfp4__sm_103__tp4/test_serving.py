@@ -10,6 +10,30 @@ import torch
 pytestmark = pytest.mark.cpu_only
 
 
+def test_beam_config_equality_includes_model_fields():
+    from tensorrt_llm._torch.configs.beam import BeamConfig
+
+    assert BeamConfig() == BeamConfig()
+    assert BeamConfig() != BeamConfig(hidden_size=1024)
+
+
+@pytest.mark.parametrize(
+    "sliding", [None, {"rope_type": "linear", "rope_theta": 10000.0, "factor": 2.0}]
+)
+def test_save_pretrained_preserves_beam_rope(tmp_path, sliding):
+    from tensorrt_llm._torch.configs.beam import BeamConfig
+
+    config = (
+        BeamConfig()
+        if sliding is None
+        else BeamConfig(rope_parameters={"sliding_attention": sliding, "full_attention": None})
+    )
+    config.save_pretrained(tmp_path)
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["rope_parameters"]["full_attention"] is None
+    assert BeamConfig.from_pretrained(tmp_path).rope_parameters == config.rope_parameters
+
+
 def test_default_config_matches_supported_layout():
     from tensorrt_llm._torch.configs.beam import BeamConfig
     from tensorrt_llm._torch.modeling_v2.models.beam._constants import SUPPORTED_CONFIG
