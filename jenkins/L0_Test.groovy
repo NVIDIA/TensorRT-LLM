@@ -5019,6 +5019,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
+    // Any kubernetes-cpu stage mounting this NFS must be covered by cpu-model-scratch-nfs in
+    // trtllm-jenkins-shared-lib/resources/trtllm/ci/excluded_nodes.yaml.
     def llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
