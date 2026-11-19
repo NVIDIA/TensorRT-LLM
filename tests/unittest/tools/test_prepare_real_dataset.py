@@ -160,5 +160,6 @@ def test_real_dataset_does_not_warn_without_lora_options(
 def test_real_dataset_text_rows_do_not_get_the_ignored_lora_warning(monkeypatch, tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         rows = _run(monkeypatch, tmp_path, task_id=1, lora_dir="/loras")
+    assert len(rows) == len(_ROWS)
     assert all("lora_request" in row for row in rows)
     assert _ignored_warnings(caplog) == []
