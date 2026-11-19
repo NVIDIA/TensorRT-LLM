@@ -15,7 +15,7 @@ TLLM_VISUALGEN_MODELING2_H3=1 python examples/visual_gen/models/minimax_h3.py \
     --visual_gen_args examples/visual_gen/configs/minimax-h3-bf16-1gpu.yaml
 ```
 
-The [family registry](pipeline_registry.py) selects a V2 target from the resolved checkpoint before transformer construction. Check the fully qualified class in the loader log when comparing versions.
+The [family registry](pipeline_registry.py) selects a V2 target from the resolved checkpoint before transformer construction. Check the fully qualified class in the loader's `AutoPipeline: Creating` message before timing a target.
 
 | Checkpoint contract | V2 target | Denoising schedule |
 | --- | --- | --- |
@@ -28,7 +28,7 @@ Start in the target that supports the checkpoint. Keep a scenario there when exi
 
 Split out a sibling target when the differences need to evolve and be tested together. FastH3 illustrates this boundary. Its learned gate changes how trunk attention is built and its trained DMD schedule changes denoising. For a deployment such as NVFP4 on a fixed four-way Ulysses layout, ask whether changing its weight packing would also require changes to projection order and collectives. If those pieces must move together and would spread deployment-specific branches across the functional pipeline, give that path its own target.
 
-Choose the boundary case by case. A target can specialize only the transformer and denoising loop while reusing encoding and decoding. Include an encoder or decoder when its inputs, layout or execution order also diverge. For a deployment specialization, use `<checkpoint-and-quantization>__<sm>__<parallel>/`, add the match under the corresponding checkpoint contract in the registry, and retain its functional target as the fallback. The selected pipeline handles choices that depend on an individual request or step.
+Choose the boundary case by case. A target can specialize only the transformer and denoising loop while reusing encoding and decoding. Include an encoder or decoder when its inputs, layout or execution order also diverge. For a deployment specialization, use `<checkpoint-and-quantization>__<sm>__<parallel>/`. In `route(config, checkpoint_dir)`, check the specialization's effective precision, device capabilities, topology and required features and return its imported pipeline class by name so CI can identify the target. On a mismatch, return the functional target for the same checkpoint. A check deferred to the constructor can fail after selection. Test both the match and fallback through [`AutoPipeline.resolve_class`](../../pipeline_registry.py). The selected pipeline handles per-request and per-step decisions.
 
 ## Where to put code
 
@@ -48,7 +48,7 @@ Changing the fused RoPE tile size belongs in `kernels/`. Changing the rotation f
 
 ### Choose the sharing scope
 
-**Only fully model-independent operations belong in a catalog.** Independent callers must be able to use the same implementation unchanged. Express the computation in terms of tensors, layouts and explicit operation parameters. Model wrappers belong in their family or target, even when several models call the same native kernel. They own checkpoint interpretation, model-specific packing, masks, gates and collective scheduling.
+**Only fully model-independent operations belong in a catalog.** Add an entry when independent callers use the same implementation unchanged. Express the computation in terms of tensors, layouts and explicit operation parameters. Model wrappers belong in their family or target, even when several models call the same native kernel. They own checkpoint interpretation, model-specific packing, masks, gates and collective scheduling.
 
 | Scope of the change | Place it here | H3 example |
 | --- | --- | --- |
@@ -58,11 +58,17 @@ Changing the fused RoPE tile size belongs in `kernels/`. Changing the rotation f
 | An existing model-independent operation used by VisualGen and LLM callers | Its entry in the [Modeling V2 catalog](../../../modeling_v2/catalog/) | Import `thop_attention` and `cublas_mm` directly. |
 | Runtime services | The existing VisualGen runtime | Checkpoint discovery, process groups, executor and lifecycle interfaces |
 
-**Attention.** The [block-sparse attention op](../../catalog/attention/block_sparse_attention.py) takes head-major Q/K/V, selected KV tile indices, route counts, valid KV tile lengths and an optional scale. It returns attention output and logsumexp. [H3](ops/vsa.py) builds mixed-modality routes and applies its learned gate. The [VisualGen VSA backend](../../attention/backends/sparse/vsa/backend.py) supplies its predictor's routes and chooses its fallback. Both call the same operation unchanged. Each family owns its attention module and projections. Call a library operation such as PyTorch SDPA directly when it already provides the required interface.
+**Attention.** The [block-sparse attention op](../../catalog/attention/block_sparse_attention.py) takes head-major Q/K/V, selected KV tile indices, route counts, valid KV tile lengths and an optional scale. It returns attention output and logsumexp. [H3](ops/vsa.py) builds mixed-modality routes and applies its learned gate. The [VisualGen VSA backend](../../attention/backends/sparse/vsa/backend.py) supplies its predictor's routes and chooses its fallback. Both call the same operation unchanged. Each family owns its attention module and projections.
 
 **Communication.** The base and FastH3 targets share the [H3 Ulysses wrappers](ops/ulysses.py). They encode how H3 exchanges sequence shards for head shards and converts asynchronous receive buffers to the layout its attention expects. The [H3 parallel module](parallel/ulysses.py) owns the V, Q, K projection order, streams and barriers. Other families can call the same native kernels from their own wrappers.
 
 Both the H3 Ulysses wrappers and the block-sparse attention op use the [Modeling V2 `OpWrapper` contract](../../../modeling_v2/README.md#writing-operations) to define a reference and test cases. Mirror each operation's tests at the scope that owns it.
+
+### Reuse an existing backend implementation
+
+- **Kernel or library operation.** Call an existing tensor operation such as PyTorch SDPA directly when its inputs, outputs and layout match. A fixed hardware or dtype requirement can be part of the contract. To share a kernel through a catalog, make scales, valid lengths and other inputs explicit and test the same computation for its independent callers.
+- **Runner.** Use the backend's supported execution method when a kernel needs a plan or workspace. For example, [`CuDNNSdpaRunner.run_dense`](../../attention/backends/cudnn.py) owns cuDNN execution. The H3 component controls the runner's lifetime and passes it to [`DenseAttentionOp`](ops/attention.py). The runner manages its plans, workspace and device-specific dispatch. Put new per-instance orchestration with the component.
+- **Model or backend wrapper.** Keep packed-row mask construction, checkpoint recipes, learned gates and per-layer or per-step choices in the owning family or target, including fallback and weight-loading paths. Apply the [Modeling V1 dependency boundary](../../../modeling_v2/README.md#modeling-v1-code) to model classes, layers and complete attention backends. Reuse the underlying computation through a supported kernel or runner interface. The H3 pilot still calls private FlashInfer `_run_*` methods and CuTe quantization helpers in [its attention adapter](ops/attention.py). Treat these as backend internals. When a new caller needs one, expose the required tensor operation or execution method at its owner.
 
 ## File map
 
@@ -111,10 +117,12 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 | [kernels/fused_adaln.py](kernels/fused_adaln.py) | Implement and register H3's fused AdaLN Triton kernels. |
 | [kernels/fused_rope.py](kernels/fused_rope.py) | Implement and register fused BF16 Q/K normalization and RoPE. |
 
-Use the `trtllm::minimax_h3_v2_` prefix for H3 V2 Python-registered Triton ops so V1 and V2 can coexist in the process-wide dispatcher. Follow the [native code guide](../../../../../cpp/tensorrt_llm/modeling_v2/README.md) for a native family or target namespace.
+Use the `trtllm::minimax_h3_v2_` prefix for H3 V2 Python-registered Triton ops so V1 and V2 can coexist in the process-wide dispatcher. For a new C++/CUDA kernel, follow the [native code guide](../../../../../cpp/tensorrt_llm/modeling_v2/README.md) for namespaces and registration. [CMake discovery](../../../../../cpp/tensorrt_llm/modeling_v2/CMakeLists.txt) scans `_torch/modeling_v2/models/`. A family library under `_torch/visual_gen/models/` also needs build discovery and loading from the VisualGen path.
 
 ## Test a change
 
-Mirror family and target code in the [unit tests](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/) and give each routed target a [whole-pipeline quality case](../../../../../tests/integration/defs/visual_gen/minimax_h3_v2/). Mirror VisualGen catalog entries under [visual_gen/catalog/ in the unit tests](../../../../../tests/unittest/_torch/visual_gen/catalog/), and compare each kernel with its reference on the declared cells. A target change exercises that target. A shared family change exercises its consumers. Registry changes exercise both checkpoint targets and both switch settings. A VisualGen catalog change also exercises its consuming model and backend paths.
+Mirror family and target code in the [unit tests](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/) and give each routed target a [whole-pipeline quality case](../../../../../tests/integration/defs/visual_gen/minimax_h3_v2/). Mirror VisualGen catalog entries under [visual_gen/catalog/ in the unit tests](../../../../../tests/unittest/_torch/visual_gen/catalog/), and compare each operation with its reference on the declared cells. Register each new test by file or directory in the [CI test lists](../../../../../tests/integration/test_lists/test-db/) for the required hardware and rank count. A target's quality case can also run on an [owned QA schedule](../../../../../tests/integration/test_lists/qa/). Change-based test selection operates on registered entries.
+
+A target change exercises that target. A shared family change exercises its consumers. Registry changes exercise both checkpoint targets and both switch settings. A VisualGen catalog change also exercises its consuming model and backend paths.
 
 For V1/V2 comparisons, use the same checkpoint revision, seed, inputs, precision, backend, topology and explicit step count. Use 50 points on both sides for the base-H3 quality reference and test omitted defaults separately. Before retiring V1 and the opt-in switch, qualify generated video and audio, supported parallel paths, warmed latency and peak memory against V1 on representative deployments.
