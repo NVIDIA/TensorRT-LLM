@@ -54,6 +54,7 @@ _MADV_POPULATE_WRITE = 23  # Requires Linux >= 5.14.
 _MADV_ADVICE_BY_MODE = {
     "dontneed": _MADV_DONTNEED,
     "pageout": _MADV_PAGEOUT,
+    "populate_read": _MADV_POPULATE_READ,
     "populate_write": _MADV_POPULATE_WRITE,
 }
 _MMAP_FAILED = ctypes.c_void_p(-1).value
@@ -76,6 +77,7 @@ def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
     mode : str, optional
         "dontneed" -> MADV_DONTNEED (immediate discard, default)
         "pageout"  -> MADV_PAGEOUT  (asynchronous pageout, Linux 4.5+)
+        "populate_read" -> MADV_POPULATE_READ (fault every page in readable, Linux 5.14+)
         "populate_write" -> MADV_POPULATE_WRITE (fault every page in writable, Linux 5.14+)
 
     Raises
@@ -90,7 +92,7 @@ def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
     try:
         advice = _MADV_ADVICE_BY_MODE[mode]
     except KeyError:
-        raise ValueError("mode must be 'pageout', 'dontneed' or 'populate_write'.")
+        raise ValueError(f"mode must be one of {sorted(_MADV_ADVICE_BY_MODE)}.")
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     ret = libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(size), ctypes.c_int(advice))
     if ret != 0:
@@ -281,6 +283,22 @@ def advise_tensor_pageout(tensor, mode: str = "dontneed"):
 
     # madvise only the complete pages fully inside the tensor's bounds.
     madvise_range(start_aligned, end_aligned - start_aligned, mode)
+
+
+def populate_tensor_pages(tensor) -> None:
+    """Map a contiguous CPU tensor's pages (``MADV_POPULATE_READ``) on the CPU.
+
+    Best effort: a kernel without ``MADV_POPULATE_READ`` leaves the pages to
+    be faulted in by whatever reads them next.
+    """
+    nbytes = tensor.numel() * tensor.element_size()
+    if nbytes == 0:
+        return
+    start = tensor.data_ptr() & ~(mmap.PAGESIZE - 1)
+    try:
+        madvise_range(start, tensor.data_ptr() + nbytes - start, "populate_read")
+    except OSError:
+        pass
 
 
 _MEMINFO_PATH = "/proc/meminfo"

@@ -1150,9 +1150,7 @@ class HfWeightLoader(BaseWeightLoader):
                 weights = self._load_lazy_safetensors(checkpoint_dir,
                                                       use_consolidated)
             else:
-                weights = self._load_weights_in_parallel(
-                    weight_files, self._load_safetensors_file,
-                    "Mapping safetensors weights in parallel")
+                weights = self._map_safetensors_files(weight_files)
         except BaseException as error:
             mapping_error = error
         coordinated_mapping_error = coordinate_error(
@@ -1274,9 +1272,17 @@ class HfWeightLoader(BaseWeightLoader):
             else:
                 local_communicator.Barrier()
 
-        return self._load_weights_in_parallel(
-            weight_files, self._load_safetensors_file,
-            "Loading safetensors weights in parallel")
+        return self._map_safetensors_files(weight_files)
+
+    def _map_safetensors_files(
+            self, weight_files: List[str]) -> ConsumableWeightsDict:
+        # One file after another: mapping is per-tensor Python, so threads
+        # only contend for the GIL (26 threads took 5x as long as one).
+        weights = {}
+        for file in tqdm.tqdm(weight_files,
+                              desc="Mapping safetensors weights"):
+            weights.update(self._load_safetensors_file(file))
+        return ConsumableWeightsDict(weights)
 
     def _load_weights_in_parallel(self, weight_files: List[str], load_func,
                                   description: str) -> ConsumableWeightsDict:

@@ -15,6 +15,7 @@
 
 import mmap
 import os
+import resource
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from tensorrt_llm._torch import mmap_utils
 from tensorrt_llm._torch.mmap_utils import (
     page_cache_bytes,
     populate_file_pages,
+    populate_tensor_pages,
     release_file_page_cache,
     wait_for_page_migration_to_settle,
 )
@@ -47,6 +49,23 @@ def test_populate_file_pages_reports_exact_bounded_progress(tmp_path):
     assert sum(windows) == populated
     if windows:
         assert max(windows) <= mmap.PAGESIZE
+
+    # populate_tensor_pages maps a fresh file-backed tensor up front (here one
+    # starting and ending mid-page), so reading it takes no page faults.
+    torch = pytest.importorskip("torch")
+    pages = 64
+    data = os.urandom(pages * mmap.PAGESIZE)
+    file.write_bytes(data)
+    tensor = torch.from_file(str(file), size=len(data), dtype=torch.uint8)[1:-1]
+    populate_tensor_pages(tensor)
+    populate_tensor_pages(tensor[:0])  # empty: no-op
+    expected = sum(data[1:-1])
+    before = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt
+    checksum = int(tensor.numpy().sum(dtype="int64"))
+    faults = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt - before
+    assert checksum == expected
+    if populated == len(payload):  # MADV_POPULATE_READ is available
+        assert faults < pages // 2
 
 
 def test_populate_file_pages_rejects_bad_window_sizes(tmp_path):

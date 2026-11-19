@@ -27,7 +27,9 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     fp8_block_scale_gemm_autotuned, fp8_block_scale_swiglu_prefers_bf16,
     mxfp8_quantize_gemm_autotuned, small_m_applies_on_tuning_group)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
-from tensorrt_llm._utils import is_device_integrated, mpi_disabled
+from tensorrt_llm._torch.mmap_utils import populate_tensor_pages
+from tensorrt_llm._utils import (is_device_integrated, mpi_disabled,
+                                 pageable_copies_fault_in_driver)
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -273,6 +275,15 @@ def _uses_marlin_nvfp4_backend(module) -> bool:
             and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
 
 
+def _to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """``tensor.to(device)``, faulting a host source in on the CPU first where
+    the copy would otherwise take its page faults inside the driver."""
+    if (tensor.device.type == "cpu" and torch.device(device).type == "cuda"
+            and tensor.is_contiguous() and pageable_copies_fault_in_driver()):
+        populate_tensor_pages(tensor)
+    return tensor.to(device)
+
+
 def load_weight_shard(
     weight,
     tensor_parallel_size: int = 1,
@@ -303,9 +314,10 @@ def load_weight_shard(
                                           indices: list[slice] | None = None):
             if indices is None:
                 # Avoid unnecessary copy
-                result = (tensor.to(device), [slice(d) for d in tensor.shape])
+                result = (_to_device(tensor, device),
+                          [slice(d) for d in tensor.shape])
             else:
-                result = (tensor[indices].to(device), indices)
+                result = (_to_device(tensor[indices], device), indices)
             return result if return_slice_indices else result[0]
 
     # WAR to check whether it is a safetensor slice since safetensor didn't register the type to the module
@@ -4710,9 +4722,9 @@ class Linear(nn.Module):
                                               | None = None):
                 if indices is None:
                     # Avoid unnecessary copy
-                    return tensor.to(device)
+                    return _to_device(tensor, device)
                 else:
-                    return tensor[indices].to(device)
+                    return _to_device(tensor[indices], device)
 
         # WAR to check whether it is a safetensor slice since safetensor didn't register the type to the module
         # safetensors slice, supports lazy loading, type(weight) is `builtin.PySafeSlice`

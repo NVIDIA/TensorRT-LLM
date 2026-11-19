@@ -1453,6 +1453,24 @@ def is_device_integrated() -> bool:
     return torch.cuda.get_device_properties().is_integrated
 
 
+@lru_cache(maxsize=1)
+def pageable_copies_fault_in_driver() -> bool:
+    """Whether a host-to-device copy from pageable memory faults the source in
+    inside the driver.
+
+    GPUs that read pageable memory through the host page tables (e.g.
+    Grace-based GB200/GB300) take the page faults of a not-yet-mapped source,
+    such as a fresh mmap of a checkpoint, inside the copy, which is several
+    times slower than faulting the same pages on the CPU first.
+    """
+    if not torch.cuda.is_available():
+        return False
+    err, value = cudart.cudaDeviceGetAttribute(
+        cudart.cudaDeviceAttr.cudaDevAttrPageableMemoryAccessUsesHostPageTables,
+        torch.cuda.current_device())
+    return err == cudart.cudaError_t.cudaSuccess and value == 1
+
+
 # Environment variable to enable garbage collection profiling.
 # Set to "1" to enable recording of garbage collection events during profiling.
 PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
