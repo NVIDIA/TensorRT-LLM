@@ -3066,6 +3066,54 @@ def test_fp4_mla_attention_decode_cutedsl_4x_falls_back_to_packed(
     assert calls == ["2x"], calls
 
 
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_unavailable_device_runs_packed(monkeypatch) -> None:
+    """A device that cannot host the 4x kernel keeps a call inside the 4x envelope on the packed 2x path."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    reason = "the 4x kernel declares more shared memory per block than the device allows"
+    calls: list[str] = []
+    asked: list[torch.device] = []
+    recorded: list[str | None] = []
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    def unsupported(device):
+        asked.append(device)
+        return reason
+
+    monkeypatch.setattr(
+        fp4_mla_decode_4x, "_run_cutedsl_4x_decode", lambda *a, **k: calls.append("4x")
+    )
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    monkeypatch.setattr(host_4x, "device_unsupported_reason", unsupported)
+    monkeypatch.setattr(
+        fp4_mla_decode_4x, "_fp4_mla_4x_record", lambda why, *a, **k: recorded.append(why)
+    )
+    # the "h128-q4" case of test_fp4_mla_attention_decode_cutedsl_4x_matches_reference: 4x takes it otherwise
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=[131, 512],
+        seed=41,
+        query_len_per_seq=4,
+        packed_queries=True,
+        enable_4x=True,
+    )
+    assert calls == ["2x"], calls
+    # the backend asked about the device of the call, and the host's reason is the dispatcher's
+    assert asked and all(device.type == "cuda" for device in asked), asked
+    assert recorded == [reason], recorded
+
+
 @_requires_cutedsl_4x
 @pytest.mark.parametrize(
     "num_heads,query_len_per_seq,seq_lens,one_wave_min_kv",
