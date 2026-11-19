@@ -7,6 +7,7 @@ output of the equivalent token prompt exactly, whichever positions carry them.
 """
 
 import asyncio
+import json
 import os
 import pickle
 import uuid
@@ -84,6 +85,24 @@ def _token_ids(llm: LLM, prompts: List[str]) -> List[List[int]]:
 
 def _generated(outputs) -> List[List[int]]:
     return [list(o.outputs[0].token_ids) for o in outputs]
+
+
+def _placeholder_request(prompt_ids: List[int], mask: List[bool], table: torch.Tensor) -> dict:
+    """Schedule id 0 at masked positions; only the supplied rows carry the prompt there."""
+    return {
+        "prompt_token_ids": [0 if m else t for t, m in zip(prompt_ids, mask)],
+        "prompt_embeds": table[torch.tensor([t for t, m in zip(prompt_ids, mask) if m])],
+        "prompt_embeds_mask": mask,
+    }
+
+
+def _max_paused_requests(llm: LLM) -> int:
+    """Largest per-iteration paused-request count in the stats drained so far."""
+    paused = 0
+    for entry in llm.get_stats(timeout=2):
+        stats = json.loads(entry) if isinstance(entry, str) else entry
+        paused = max(paused, stats["inflightBatchingStats"]["numPausedRequests"])
+    return paused
 
 
 @pytest.fixture(scope="module", params=[QWEN3, TINYLLAMA])
@@ -314,12 +333,10 @@ def test_chunked_prefill(
         expected = _run(chunked, ids)
         n = len(ids[0])
         mask = [(p // 7) % 2 == 1 for p in range(n)]
+        # One run of embedding rows straddles the first chunk boundary.
+        assert mask[63] and mask[64]
         requests = [
-            {
-                "prompt_token_ids": ids[0],
-                "prompt_embeds": table[torch.tensor([t for t, m in zip(ids[0], mask) if m])],
-                "prompt_embeds_mask": mask,
-            },
+            _placeholder_request(ids[0], mask, table),
             {"prompt_embeds": table[torch.tensor(ids[1])]},
         ]
         assert _run(chunked, requests) == expected
@@ -376,25 +393,20 @@ def test_preemption_with_graphs_and_compile(model_dir: str, table: torch.Tensor)
         ),
         cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]),
         torch_compile_config=TorchCompileConfig(),
+        enable_iter_perf_stats=True,
         max_batch_size=4,
     ) as pressured:
         base = _token_ids(pressured, [LONG_PROMPT])[0][:200]
         ids = [base[: 200 - 7 * i] for i in range(4)]
         params = SamplingParams(max_tokens=96, temperature=0.0)
         expected = [list(o.outputs[0].token_ids) for o in pressured.generate(ids, params)]
-        requests = []
-        for prompt_ids in ids:
-            mask = [p % 3 == 1 for p in range(len(prompt_ids))]
-            requests.append(
-                {
-                    "prompt_token_ids": prompt_ids,
-                    "prompt_embeds": table[
-                        torch.tensor([t for t, m in zip(prompt_ids, mask) if m])
-                    ],
-                    "prompt_embeds_mask": mask,
-                }
-            )
+        _max_paused_requests(pressured)
+        requests = [
+            _placeholder_request(prompt_ids, [p % 3 == 1 for p in range(len(prompt_ids))], table)
+            for prompt_ids in ids
+        ]
         got = [list(o.outputs[0].token_ids) for o in pressured.generate(requests, params)]
+        assert _max_paused_requests(pressured) > 0, "no request was preempted"
         assert got == expected
 
 

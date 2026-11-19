@@ -10,12 +10,8 @@ the same batch must be unaffected.
 from copy import deepcopy
 from typing import Optional
 
+import test_modeling_gemma4 as gemma4_tests
 import torch
-from test_modeling_gemma4 import (
-    GEMMA4_PLE_CONFIG,
-    TestGemma4HFComparison,
-    _build_gemma4_kv_cache_manager,
-)
 
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -30,7 +26,7 @@ def _gemma4_context_logits(
     ple_input_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run one context pass; overlay ``embed_rows`` as the engine does."""
-    kv_cache_manager = _build_gemma4_kv_cache_manager(
+    kv_cache_manager = gemma4_tests._build_gemma4_kv_cache_manager(
         config, num_blocks=2, batch_size=len(seq_lens)
     )
     request_ids = list(range(1, len(seq_lens) + 1))
@@ -85,7 +81,9 @@ def _forward_inputs(
 @torch.no_grad()
 def test_gemma4_ple_mixed_batch() -> None:
     torch.random.manual_seed(0)
-    _, model, config = TestGemma4HFComparison()._make_hf_and_trt_models(deepcopy(GEMMA4_PLE_CONFIG))
+    _, model, config = gemma4_tests.TestGemma4HFComparison()._make_hf_and_trt_models(
+        deepcopy(gemma4_tests.GEMMA4_PLE_CONFIG)
+    )
     assert model.model.hidden_size_per_layer_input
     plain = torch.tensor([100, 200, 300, 400, 500, 600], dtype=torch.int32)
     embedded = torch.tensor([110, 210, 310, 410, 510, 610, 710], dtype=torch.int32)
