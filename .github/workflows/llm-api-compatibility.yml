@@ -20,6 +20,17 @@ on:
     types: [opened, edited, synchronize, reopened, labeled, unlabeled]
 
 jobs:
+  test-api-compatibility-policy:
+    name: Test API compatibility label policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: node --test .github/scripts/api_compatibility.test.js
+
   check-llm-api-compatibility:
     name: Check LLM API Compatibility Label
     runs-on: ubuntu-latest
@@ -35,6 +46,9 @@ jobs:
               'tests/unittest/api_stability/references_committed/',
               'tensorrt_llm/llmapi/llm_args.py',
               'tensorrt_llm/usage/llm_args_golden_manifest.json',
+              'tensorrt_llm/visual_gen/__init__.py',
+              'tensorrt_llm/visual_gen/args.py',
+              'tensorrt_llm/visual_gen/params.py',
             ];
             // Keep these names in sync with the PR template and API-change guide.
             const compatibleApiLabel = 'api-compatible';
@@ -54,7 +68,7 @@ jobs:
             );
 
             if (!apiReferenceChanged) {
-              core.info('No API stability reference changes detected.');
+              core.info('No tracked API contract changes detected.');
               return;
             }
 
@@ -67,7 +81,7 @@ jobs:
 
             if (apiChangeLabels.length !== 1) {
               core.setFailed(
-                'API stability reference files changed. Apply exactly one ' +
+                'Tracked API contract files changed. Apply exactly one ' +
                 `of these labels: '${compatibleApiLabel}' or '${breakingApiLabel}'.`
               );
               return;
@@ -77,8 +91,8 @@ jobs:
               apiChangeLabels[0] === breakingApiLabel &&
               !context.payload.pull_request.title.includes('BREAKING')
             ) {
-              core.setFailed("Breaking LLM API changes must include 'BREAKING' in the PR title.");
+              core.setFailed("Breaking API changes must include 'BREAKING' in the PR title.");
               return;
             }
 
-            core.info(`LLM API change label accepted: ${apiChangeLabels[0]}`);
+            core.info(`API change label accepted: ${apiChangeLabels[0]}`);
