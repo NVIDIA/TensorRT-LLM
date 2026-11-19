@@ -6713,7 +6713,9 @@ class PyExecutor:
         error path rather than adding a second one, and the rank that raises
         names itself in the message.
         """
-        if made_progress:
+        # A re-armed schedule stage waits for its client, not for transfers.
+        if made_progress or (self._benchmark_sweep
+                             and self._benchmark_stage_fetched() == 0):
             self._benchmark_fill_stall_since = None
             return
         timeout_s = self._benchmark_fill_stall_timeout_sec
@@ -9558,7 +9560,7 @@ class PyExecutor:
         self._benchmark_stage_started = False
         self._benchmark_gate_rearm_pending = False
         self._benchmark_stage_draining = False
-        self._benchmark_stage_idle_since = None
+        self._benchmark_stage_idle_since: Optional[float] = None
         self.benchmark_req_queues_size = self._benchmark_stages[0].fill_target
         for index, (requested, effective) in enumerate(
                 zip(requested_stages, self._benchmark_stages)):
@@ -9577,8 +9579,9 @@ class PyExecutor:
                                        total_num_live_requests: int) -> None:
         """Advance to the next stage once all ranks have drained this one.
 
-        Only replicated admission counts decide whether to vote, so all ranks
-        enter the allgather together.
+        Only replicated state decides whether to vote, so all ranks enter the
+        allgather together. Without attention DP the live count is rank-local
+        (a timed-out transfer is retired per rank), so it is only voted on.
         """
         if not self._benchmark_sweep or self.is_warmup or not self.is_benchmark_disagg:
             return
@@ -9607,7 +9610,7 @@ class PyExecutor:
                     f"{stage.num_requests} requests")
         if (not self._benchmark_stage_draining
                 or self._benchmark_fill_phase_active
-                or total_num_live_requests != 0):
+                or (self.enable_attention_dp and total_num_live_requests != 0)):
             return
 
         local_drained = (
@@ -9615,7 +9618,8 @@ class PyExecutor:
             and self.kv_cache_transceiver.check_gen_transfer_complete())
         status = self._allgather_model_parallel_status((int(local_drained), 0))
         if not all(item[0] for item in status):
-            time.sleep(0.001)  # the draining fetch does not block
+            if total_num_live_requests == 0:
+                time.sleep(0.001)  # the draining fetch does not block
             return
         self._log_benchmark_stage("drained")
         self._benchmark_stage_index += 1

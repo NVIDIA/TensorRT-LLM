@@ -1909,7 +1909,7 @@ class TestBenchmarkRequestStages:
         ex._allgather_model_parallel_status = Mock(side_effect=lambda status: [status])
         ex._maybe_advance_benchmark_stage(1 if blocker == "live" else 0)
         assert ex._benchmark_stage_index == 0
-        if blocker in ("fill", "live"):
+        if blocker == "fill":
             ex._allgather_model_parallel_status.assert_not_called()
         else:
             ex._allgather_model_parallel_status.assert_called_once_with((0, 0))

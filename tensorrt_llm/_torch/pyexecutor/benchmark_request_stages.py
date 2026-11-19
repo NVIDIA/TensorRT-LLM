@@ -16,8 +16,15 @@ class BenchmarkRequestStage(NamedTuple):
 def parse_benchmark_request_stages(value: str) -> list[BenchmarkRequestStage]:
     """Parse ``C``, ``C,C,...`` or ``C/N,C/N,...`` without losing budgets.
 
-    A scalar zero disables the gate. Other entries must be positive, with
-    a request budget at least as large as the requested fill target.
+    Args:
+        value: The ``TLLM_BENCHMARK_REQ_QUEUES_SIZE`` value. A bare ``C``
+            means ``C/C``.
+
+    Returns:
+        One stage per entry; ``[(0, 0)]`` for ``"0"``, which disables the gate.
+
+    Raises:
+        ValueError: An entry is malformed or violates ``0 < C <= N``.
     """
     if value.strip() == "0":
         return [BenchmarkRequestStage(0, 0)]
