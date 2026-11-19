@@ -66,6 +66,7 @@ from cutlass.cute import runtime as _crt
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 
+from ....cute_dsl_file_cache import KernelCache
 from . import gvr_topk_decode_self_sampling_bf16 as _bf16
 from . import gvr_topk_decode_self_sampling_fp16 as _fp16
 
@@ -8269,7 +8270,7 @@ class GvrMainKernel:
 # ---------------------------------------------------------------------------
 # compile cache + torch-facing entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE = {}
+_COMPILE_CACHE = KernelCache(f"{__name__}._COMPILE_CACHE", __file__)
 
 
 def get_compiled(
@@ -16069,7 +16070,7 @@ class GvrTopkRegKernel:
 # ---------------------------------------------------------------------------
 # host wrapper: compile cache + route()-driven entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE__reg: dict = {}
+_COMPILE_CACHE__reg: dict = KernelCache(f"{__name__}._COMPILE_CACHE__reg", __file__)
 
 
 def get_compiled__reg(
@@ -19410,7 +19411,7 @@ class GvrClusKernel:
 # ---------------------------------------------------------------------------
 # compile cache + torch-facing entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE__clus = {}
+_COMPILE_CACHE__clus = KernelCache(f"{__name__}._COMPILE_CACHE__clus", __file__)
 
 
 def get_compiled__clus(
@@ -23827,7 +23828,7 @@ class GvrRegClusKernel:
 # ---------------------------------------------------------------------------
 # host wrapper: compile cache + route()-driven entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE__regclus: dict = {}
+_COMPILE_CACHE__regclus: dict = KernelCache(f"{__name__}._COMPILE_CACHE__regclus", __file__)
 
 
 def get_compiled__regclus(
@@ -24509,7 +24510,9 @@ class ComplementKernel:
             )
 
 
-_COMPLEMENT_COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
+_COMPLEMENT_COMPILE_CACHE: dict[tuple[Any, ...], Any] = KernelCache(
+    f"{__name__}._COMPLEMENT_COMPILE_CACHE", __file__
+)
 
 
 def get_compiled_complement(

@@ -14,7 +14,8 @@
 # limitations under the License.
 """Persistent cache of ``cute.compile`` results, shared by the processes and ranks that use it.
 
-``TRTLLM_CUTE_DSL_CACHE_DIR=<dir>`` turns it on.
+``TRTLLM_CUTE_DSL_CACHE_DIR=<dir>`` turns it on. :class:`KernelCache` also keeps a module's
+compiled kernels there, so later processes skip tracing them as well.
 """
 
 import atexit
@@ -29,6 +30,7 @@ import threading
 import time
 import uuid
 
+from .._jit_share import _cute_identity, _export_kernel, _load_kernel
 from ..logger import logger
 
 _CACHE_DIR_ENV = "TRTLLM_CUTE_DSL_CACHE_DIR"
@@ -48,6 +50,7 @@ _stats_lock = threading.Lock()
 # Compiles and seconds per outcome (hit, miss, uncached) for the summary at exit.
 _stats: dict[str, tuple[int, float]] = {}
 _installed = False
+_source_digests: dict[str, str] = {}
 
 
 def _stable(value) -> str:
@@ -367,3 +370,97 @@ def install_cute_dsl_file_cache() -> None:
     atexit.register(_log_summary)
     _installed = True
     logger.info(f"[cute_dsl_file_cache] cute.compile results are cached in {directory}")
+
+
+def _source_digest(directory: str) -> str:
+    """sha256 of the ``.py`` files in ``directory``."""
+    digest = _source_digests.get(directory)
+    if digest is None:
+        h = hashlib.sha256()
+        for name in sorted(os.listdir(directory)):
+            if name.endswith(".py"):
+                with open(os.path.join(directory, name), "rb") as f:
+                    h.update(name.encode() + b"\0" + f.read())
+        digest = _source_digests[directory] = h.hexdigest()
+    return digest
+
+
+class KernelCache(dict):
+    """A module's ``key -> cute.compile result`` dict backed by ``TRTLLM_CUTE_DSL_CACHE_DIR``.
+
+    A lookup that misses loads the kernel a process stored for the key, so the caller neither
+    traces nor compiles it; storing a kernel exports it. An entry is keyed on ``owner``, the
+    ``repr`` of the key (keys whose ``repr`` holds an object address are not kept), the
+    TensorRT-LLM and CuTe DSL versions, the GPU's compute capability and the ``.py`` files beside
+    ``source_file``. A load or export that fails leaves the caller compiling as without the cache.
+    """
+
+    def __init__(self, owner: str, source_file: str):
+        super().__init__()
+        self.owner = owner
+        self.sources = os.path.dirname(os.path.abspath(source_file))
+        self._unusable: set[str] = set()
+
+    def _paths(self, key):
+        directory = os.environ.get(_CACHE_DIR_ENV, "")
+        if not directory:
+            return None
+        text = repr(key)
+        if " at 0x" in text:
+            return None
+        try:
+            identity = f"{_cute_identity()}|{_source_digest(self.sources)}|{self.owner}|{text}"
+        except Exception:  # noqa: BLE001 - no key: the caller compiles as without the cache
+            return None
+        name = "k" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+        base = os.path.join(os.path.abspath(os.path.expanduser(directory)), "kernels", name)
+        return name, base + ".o", base + ".json"
+
+    def __missing__(self, key):
+        paths = self._paths(key)
+        if paths is None or not os.path.exists(paths[1]):
+            raise KeyError(key)
+        name, obj, meta = paths
+        try:
+            kernel = _load_kernel(obj, name, meta)
+        except Exception as e:  # noqa: BLE001 - an unusable entry must never stop a compile
+            self._unusable.add(obj)
+            logger.warning_once(
+                f"[cute_dsl_file_cache] {self.owner}: entry {name} unusable "
+                f"({type(e).__name__}: {e}), compiling",
+                key=f"cute_dsl_file_cache.entry.{obj}",
+            )
+            raise KeyError(key) from None
+        dict.__setitem__(self, key, kernel)
+        logger.debug(f"[cute_dsl_file_cache] loaded {self.owner} {name}")
+        return kernel
+
+    def __contains__(self, key) -> bool:
+        return self.get(key) is not None
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __setitem__(self, key, kernel) -> None:
+        dict.__setitem__(self, key, kernel)
+        paths = self._paths(key)
+        if paths is None:
+            return
+        name, obj, meta = paths
+        if os.path.exists(obj) and obj not in self._unusable:
+            return
+        try:
+            os.makedirs(os.path.dirname(obj), exist_ok=True)
+            _export_kernel(kernel, obj, name, meta)
+        except Exception as e:  # noqa: BLE001 - the kernel works here; later processes compile it
+            logger.warning_once(
+                f"[cute_dsl_file_cache] {self.owner}: kernels are not stored "
+                f"({type(e).__name__}: {e})",
+                key=f"cute_dsl_file_cache.export.{self.owner}",
+            )
+            return
+        self._unusable.discard(obj)
+        logger.debug(f"[cute_dsl_file_cache] stored {self.owner} {name}")
