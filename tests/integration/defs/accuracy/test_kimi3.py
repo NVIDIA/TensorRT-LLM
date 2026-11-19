@@ -216,7 +216,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # Attention DP replicates every non-expert weight on each rank, so DEP8
     # holds far more weight per GPU than TEP8 does; only GB300-class memory
     # leaves room for the KV cache.
-    @pytest.mark.skip_less_device_memory(250000)
+    @pytest.mark.skip_less_device_memory(270000)
     def test_gsm8k_nvfp4_dep8(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Full GSM8K on the NVFP4 checkpoint with the aggregate DEP8 recipe.
 
@@ -227,7 +227,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.skip_less_device_memory(250000)
+    @pytest.mark.skip_less_device_memory(270000)
     def test_gsm8k_nvfp4_kv_dep8(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The DEP8 NVFP4 recipe on an NVFP4 KV cache, which selects FP4 MLA.
 
@@ -264,7 +264,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=8),
             moe_config=MoeConfig(
-                backend="TRTLLM",
+                tactic="trtllm_gen",
                 max_num_tokens=131072,
                 use_low_precision_moe_combine=True,
             ),
@@ -284,6 +284,48 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             if kv_cache_dtype == "nvfp4":
                 assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    # TP4 leaves about 203 GiB of weights per GPU; only GB300-class memory
+    # leaves room for the KV cache.
+    @pytest.mark.skip_less_device_memory(250000)
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    def test_gsm8k_nvfp4_tp4_helix2(self, kv_cache_dtype: str) -> None:
+        """Full GSM8K on the NVFP4 checkpoint with aggregated Helix (TP4 x CP2).
+
+        Helix splits each sequence's KV cache across the two CP ranks while
+        both ranks run the full prefill, so this covers the Helix KV capacity
+        profiling, the cross-rank KV layout and the Helix decode path in
+        aggregated serving.
+        """
+        with LLM(
+            self.NVFP4_MODEL_PATH,
+            tensor_parallel_size=4,
+            context_parallel_size=2,
+            moe_expert_parallel_size=8,
+            cp_config={"cp_type": "HELIX", "tokens_per_block": 64},
+            max_batch_size=8,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=8),
+            moe_config=MoeConfig(backend="CUTLASS"),
+            kv_cache_config=KvCacheConfig(
+                dtype=kv_cache_dtype,
+                enable_block_reuse=False,
+                tokens_per_block=64,
+                use_kv_cache_manager_v2=True,
+            ),
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            if kv_cache_dtype == "fp8":
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            else:
+                assert llm.args.quant_config.kv_cache_quant_algo is None
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -441,11 +483,10 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=True,
             enable_chunked_prefill=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8),
-            # Not the TRTLLM backend TestKimiK3 uses: trtllm-gen ships
-            # SiTu cubins only for W4A8_MXFP4_MXFP8, so K3's NVFP4 routed
-            # experts leave MEGAMOE_CUTEDSL and CUTLASS as the choices.
+            # K3's NVFP4 routed experts on the fused-comm MegaMoE CuteDSL
+            # kernels; TestKimiK3 covers them on TRTLLM-Gen.
             moe_config=MoeConfig(
-                backend="MEGAMOE_CUTEDSL", max_num_tokens=33024, use_low_precision_moe_combine=True
+                tactic="cutedsl.mega_moe", max_num_tokens=33024, use_low_precision_moe_combine=True
             ),
             kv_cache_config=kv_cache_config,
             max_stats_len=-1,
