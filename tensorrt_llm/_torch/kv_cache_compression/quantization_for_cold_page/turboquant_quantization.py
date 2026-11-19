@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """TurboQuant cold-page layout, metadata, and Triton kernel dispatch."""
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -37,8 +38,8 @@ _MAX_PIECES = 4
 _MAX_INSTANCE_WIDTH = 512
 _INSTANCE_WIDTH = 256
 _BIT_PLANES = {1: (1, 0), 2: (2, 0), 3: (2, 1), 4: (4, 0)}
-_SUPPORTED_BITS = (2, 3, 4)
 _LUT_STRIDE = 16  # fp32 entries per codebook in the kernels' centroid table (LUT_STRIDE)
+_MODES = {"mse": 0, "fractional": 1}
 # A 64-bit stand-in for the KVCM addresses when kernels are compiled ahead of use.
 _ADDRESS = 1 << 40
 
@@ -70,21 +71,23 @@ class _TurboQuantGeometry:
     """
 
     runtime_type: int
-    bits: int
+    mode: str
+    group_bits: tuple[int, ...]
     width: int
     stride: int
     start: int
     rows: int
+    tokens_per_page: int
 
     @property
     def blocked(self) -> bool:
-        """Whether a row wider than 512 is split into independent TurboQuant instances.
+        """Whether an mse row wider than 512 is split into independent TurboQuant instances.
 
         Decoding accumulates every output value of an instance on chip (at most 512 fp32
         columns of tensor memory, shared with the staged operand), so such a row is coded as
         pieces of 256 values and the rest, decoded on tensor cores.
         """
-        return self.width > _MAX_INSTANCE_WIDTH
+        return self.mode == "mse" and self.width > _MAX_INSTANCE_WIDTH
 
     @property
     def pieces(self) -> tuple[int, ...]:
@@ -95,11 +98,19 @@ class _TurboQuantGeometry:
         return _power_of_two_pieces(self.width)
 
     @property
+    def groups(self) -> tuple[tuple[int, int], ...]:
+        """(width, bits) of every coded group of a row, in coordinate order."""
+        if self.mode == "fractional":
+            return tuple((self.width // 2, bits) for bits in self.group_bits)
+        # One set of bit planes; blocked instances own consecutive chunks of it.
+        return ((self.width, self.group_bits[0]),)
+
+    @property
     def instances(self) -> tuple[int, ...]:
         """Width of every TurboQuant instance of a row (each has its own scale)."""
         if self.blocked:
             return self.pieces
-        return (self.width,)
+        return tuple(width for width, _ in self.groups)
 
     @property
     def element_bytes(self) -> int:
@@ -113,13 +124,16 @@ class _TurboQuantGeometry:
         """Byte offsets of every region of the section, and its total size under "end"."""
         offsets: dict[str, int] = {}
         cursor = 0
-        # One set of bit planes; blocked instances own consecutive chunks of it.
-        for plane, plane_bits in enumerate(_BIT_PLANES[self.bits]):
-            offsets[f"A{plane}"] = cursor
-            cursor += pad_up(self.rows * self.width * plane_bits // 8, _ALIGNMENT)
+        for group, (width, bits) in zip("AB", self.groups):
+            for plane, plane_bits in enumerate(_BIT_PLANES[bits]):
+                offsets[f"{group}{plane}"] = cursor
+                cursor += pad_up(self.rows * width * plane_bits // 8, _ALIGNMENT)
         # One BF16 scale per row and instance.
         offsets["scale"] = cursor
         cursor += pad_up(self.rows * 2 * len(self.instances), _ALIGNMENT)
+        if self.mode == "fractional":
+            offsets["mask"] = cursor
+            cursor += pad_up(self.rows // self.tokens_per_page * self.width // 8, _ALIGNMENT)
         offsets["raw"] = cursor
         cursor += pad_up(self.rows * self.raw_elements * self.element_bytes, _ALIGNMENT)
         offsets["end"] = cursor
@@ -140,30 +154,58 @@ class _TurboQuantGeometry:
         pieces = self.pieces
         chunk = min(min(width & -width for width in self.instances), 128)
         pages_per_tile, rows_pad = 1, self.rows
-        # Tensor-core tiles of 64+ rows accumulate in tensor memory: 512 fp32 columns shared by
-        # the accumulators and the staged operand. Decoding accumulates a whole instance; wider
-        # ones use 32-row tiles, whose accumulators live in registers.
-        accumulated = max(self.instances)
-        if encode and self.width == 128:
-            # Small tiles keep more programs in flight; encoding is bound by the host link.
-            block_m = 32
-        elif encode or accumulated <= 128:
-            block_m = 128 if self.width <= 128 else 64
-        elif accumulated <= 448:
-            block_m = 64
+        launch: dict[str, int] = {}
+        group_pieces: tuple[int, ...] = ()
+        if self.mode == "fractional":
+            # One program per KV head of a Page: the head's tokens vote on the channel split, then
+            # its rows are coded at most 32 at a time (a power of two dividing the head), so any
+            # number of tokens per Page fits. Each group is coded over its channels, G = width / 2
+            # values loaded as power-of-two pieces, one group at a time.
+            tile_rows = self.tokens_per_page
+            sub_rows = min(self.tokens_per_page & -self.tokens_per_page, 32)
+            block_m = max(16, sub_rows)
+            # Codes are rotated and stored in chunks of C coordinates, small enough for 32-row
+            # tiles to keep their operands in registers (measured on GB300).
+            chunk = min(chunk, 64 if self.width >= 512 else 32)
+            group_pieces = _power_of_two_pieces(self.width // 2)
+            # Measured on GB300: few warps per head, so that the vote's reductions stay within a
+            # few warps and many heads share an SM. Decoding rows wider than 448 takes four: with
+            # fewer, ptxas 13.x (with Triton's --regAllocOptLevel=2) falls back to 32 registers.
+            if encode:
+                warps = 1 if self.width <= 64 else 2
+            else:
+                warps = 1 if self.width <= 64 else 2 if self.width <= 448 else 4
+            launch = dict(num_warps=warps)
         else:
-            block_m = 32
-        launch = self._wide_mse_launch(encode, accumulated, capability)
-        block_m = launch.pop("block_m", block_m)
-        if self.rows < block_m:
-            rows_pad = triton.next_power_of_2(self.rows)
-            pages_per_tile = block_m // rows_pad
+            # Tensor-core tiles of 64+ rows accumulate in tensor memory: 512 fp32 columns shared
+            # by the accumulators and the staged operand. Decoding accumulates a whole instance;
+            # wider ones use 32-row tiles, whose accumulators live in registers.
+            accumulated = max(self.instances)
+            if encode and self.width == 128:
+                # Small tiles keep more programs in flight; encoding is bound by the host link.
+                block_m = 32
+            elif encode or accumulated <= 128:
+                block_m = 128 if self.width <= 128 else 64
+            elif accumulated <= 448:
+                block_m = 64
+            else:
+                block_m = 32
+            launch = self._wide_mse_launch(encode, accumulated, capability)
+            block_m = launch.pop("block_m", block_m)
+            tile_rows = sub_rows = block_m
+            if self.rows < block_m:
+                rows_pad = triton.next_power_of_2(self.rows)
+                pages_per_tile = block_m // rows_pad
         regions = self.regions()
-        planes = _BIT_PLANES[self.bits]
+        groups = self.groups
+        planes_a = _BIT_PLANES[groups[0][1]]
+        planes_b = _BIT_PLANES[groups[-1][1]] if len(groups) > 1 else (0, 0)
         codebooks = {}
-        bits = self.bits
-        # Instance 0 and those of its width use CB0, the last one (a blocked row's rest) CB1.
-        for name, width in zip("01", (self.instances[0], self.instances[-1])):
+        if self.blocked:  # instance 0 and those of its width use CB0, the last one CB1
+            coded = ((pieces[0], groups[0][1]), (pieces[-1], groups[0][1]))
+        else:
+            coded = (groups[0], groups[-1])
+        for name, (width, bits) in zip("01", coded):
             # Positive half of the symmetric codebook: thresholds T1..T7, centroids C0..C7.
             centroids, thresholds = tq_math.lloyd_max_codebook(width, bits)
             half = 1 << (bits - 1)
@@ -186,18 +228,27 @@ class _TurboQuantGeometry:
             P1=pieces[1] if len(pieces) > 1 else 0,
             P2=pieces[2] if len(pieces) > 2 else 0,
             P3=pieces[3] if len(pieces) > 3 else 0,
+            **{f"Q{i}": (group_pieces[i] if i < len(group_pieces) else 0) for i in range(4)},
             C=chunk,
             ROWS=self.rows,
             BLOCK_M=block_m,
+            TILE_ROWS=tile_rows,
+            SUB_ROWS=sub_rows,
             PAGES_PER_TILE=pages_per_tile,
             ROWS_PAD=rows_pad,
+            MODE=_MODES[self.mode],
             BLOCKED=self.blocked,
             **codebooks,
             OFF_A0=regions["A0"],
-            W_A0=planes[0],
+            W_A0=planes_a[0],
             OFF_A1=regions.get("A1", 0),
-            W_A1=planes[1],
+            W_A1=planes_a[1],
+            OFF_B0=regions.get("B0", 0),
+            W_B0=planes_b[0],
+            OFF_B1=regions.get("B1", 0),
+            W_B1=planes_b[1],
             OFF_SCALE=regions["scale"],
+            OFF_MASK=regions.get("mask", 0),
             OFF_RAW=regions["raw"],
             RAW=self.raw_elements,
             RAW_BLOCK=triton.next_power_of_2(max(self.raw_elements, 1)),
@@ -221,7 +272,7 @@ class _TurboQuantGeometry:
         """
         if self.blocked:
             return tuple((decode_pass, False) for decode_pass in range(len(self.instances)))
-        single = len(self.pieces) == 1
+        single = self.mode == "mse" and len(self.pieces) == 1
         return ((-1, bool(halves) and single),)
 
     def _wide_mse_launch(
@@ -236,7 +287,7 @@ class _TurboQuantGeometry:
         single instance wider than 448 (512 values) accumulates its output columns in two halves
         of 256, whose accumulators fit tensor memory.
         """
-        if self.width <= 256 or capability[0] != 10:
+        if self.mode != "mse" or self.width <= 256 or capability[0] != 10:
             return {}
         if encode:
             if self.blocked:
@@ -256,7 +307,7 @@ class _TurboQuantGeometry:
     def grid(constants: dict[str, Any], num_pages: int) -> tuple[int, int]:
         """(programs along the Page axis, tiles per buffer) for a call with ``num_pages``."""
         pages_per_tile = constants["PAGES_PER_TILE"]
-        tiles = -(-constants["ROWS"] // constants["BLOCK_M"]) if pages_per_tile == 1 else 1
+        tiles = -(-constants["ROWS"] // constants["TILE_ROWS"]) if pages_per_tile == 1 else 1
         return -(-num_pages // pages_per_tile), tiles
 
 
@@ -301,10 +352,14 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
     ) -> None:
         super().__init__(config, pretrained_config=pretrained_config)
         bits = float(config.turboquant_bits)
-        if bits not in _SUPPORTED_BITS:
-            raise ValueError(f"TurboQuant cold pages support 2, 3, or 4 bits, not {bits:g}")
-        self._bits = int(bits)
         self._seed = int(config.turboquant_seed)
+        if bits != int(bits):
+            # Outlier channels get the next bit width up, regular channels the one below.
+            self._mode = "fractional"
+            self._group_bits = (math.ceil(bits), math.floor(bits))
+        else:
+            self._mode = "mse"
+            self._group_bits = (int(bits),)
         self._parameters: dict[tuple, tuple[torch.Tensor, ...]] = {}
 
     def build_codec_state(
@@ -394,9 +449,10 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
         )
 
     def _check_quantized_width(self, width: int, layer_id: int, role: str) -> None:
-        if width <= 0 or width % 16:
+        unit = 32 if self._mode == "fractional" else 16
+        if width <= 0 or width % unit:
             raise ValueError(
-                "TurboQuant cold pages need a quantized width divisible by 16; "
+                f"TurboQuant cold pages ({self._mode}) need a quantized width divisible by {unit}; "
                 f"layer {layer_id} {role} has {width}"
             )
         if width >= 2 * _MAX_INSTANCE_WIDTH:
@@ -405,7 +461,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                 f"elements per vector; layer {layer_id} {role} has {width}"
             )
         rest = width % _INSTANCE_WIDTH
-        if width > _MAX_INSTANCE_WIDTH and rest & (rest - 1):
+        if self._mode == "mse" and width > _MAX_INSTANCE_WIDTH and rest & (rest - 1):
             raise NotImplementedError(
                 f"TurboQuant cold pages split vectors wider than {_MAX_INSTANCE_WIDTH} into "
                 f"{_INSTANCE_WIDTH}-value instances plus a power-of-two rest; layer {layer_id} "
@@ -514,11 +570,13 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                     )
                 geometry = _TurboQuantGeometry(
                     runtime_type=codec_state.runtime_type,
-                    bits=self._bits,
+                    mode=self._mode,
+                    group_bits=self._group_bits,
                     width=buffer.quantized_range_elements,
                     stride=layout.raw_row_stride_elements,
                     start=buffer.quantized_range_start,
                     rows=rows,
+                    tokens_per_page=layout.tokens_per_page,
                 )
                 quantized.setdefault(geometry, []).append((raw_base, raw_slot_bytes, cursor))
                 cursor += geometry.regions()["end"]
@@ -543,9 +601,16 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
         key = (geometry.width, device)
         if key in self._parameters:
             return self._parameters[key]
-        rotation = torch.block_diag(
-            *(tq_math.haar_rotation(self._seed, width) for width in geometry.instances)
-        )
+        widths = list(geometry.instances)
+        if self._mode == "fractional":
+            # The high-bit group (its channels in channel order) is rotated by R_hi, the other by
+            # R_lo: the diagonal blocks of one matrix.
+            rotation = torch.block_diag(
+                tq_math.haar_rotation(self._seed, widths[0], tq_math.ROTATION),
+                tq_math.haar_rotation(self._seed, widths[1], tq_math.REGULAR_ROTATION),
+            )
+        else:
+            rotation = torch.block_diag(*(tq_math.haar_rotation(self._seed, w) for w in widths))
         encode, decode = rotation.T, rotation
         parameters = (
             encode.to(device=device, dtype=torch.float16).contiguous(),

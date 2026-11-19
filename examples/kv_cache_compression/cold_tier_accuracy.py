@@ -31,7 +31,7 @@ ran to completion with a valid measurement.
 Run from a directory outside the TensorRT-LLM source tree, e.g. on 4 GPUs:
 
     python3 cold_tier_accuracy.py --model /path/to/Qwen3.8-Flash-Next-FP8 --tp-size 4 --ep-size 4 \
-        --formats none,nvfp4,tq-mse-4,tq-mse-3,tq-mse-2
+        --formats none,nvfp4,tq-mse-4,tq-mse-3.5,tq-mse-3,tq-mse-2.5
     python3 cold_tier_accuracy.py --model /path/to/GLM-5.3-Flash --tp-size 4 --ep-size 4 \
         --formats none,nvfp4,tq-mse-4
     python3 cold_tier_accuracy.py --model /path/to/GLM-5.3 --tp-size 4 --ep-size 4 \

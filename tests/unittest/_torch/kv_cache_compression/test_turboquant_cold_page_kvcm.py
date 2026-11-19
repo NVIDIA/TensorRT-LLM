@@ -275,8 +275,9 @@ def _assert_restored(provider, restored, original, max_nmse, rope_dim=0, num_tok
     [
         (4, True, 0.02),
         (3, False, 0.05),
+        (3.5, False, 0.03),
     ],
-    ids=["mse4-skip-rope", "mse3"],
+    ids=["mse4-skip-rope", "mse3", "mse3.5"],
 )
 def test_host_tier_round_trip(bits, skip_rope, max_nmse):
     provider = _provider(bits, skip_rope)
@@ -406,7 +407,9 @@ def test_deepseek_v4_csa_hca_lifecycle_migrates_through_host(skip_rope):
     prompt_len, pressure_len = 64 * tokens_per_block, 65 * tokens_per_block
     compress_ratios = [4, 128]
     provider = TurboQuantColdPageQuantizationCompression(
-        ColdPageQuantizationCompressionConfig(quant="turboquant", skip_rope_quantization=skip_rope),
+        ColdPageQuantizationCompressionConfig(
+            quant="turboquant", turboquant_bits=4, skip_rope_quantization=skip_rope
+        ),
         pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
     )
     quantized_width = 448 if skip_rope else 512

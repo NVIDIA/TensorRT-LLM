@@ -21,6 +21,7 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import 
 )
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.turboquant_quantization import (
     TurboQuantColdPageQuantizationCompression,
+    _TurboQuantGeometry,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
@@ -292,6 +293,24 @@ def test_fp16_decode_saturates_at_the_fp16_range():
 
 
 @requires_cuda
+@pytest.mark.parametrize("bits", (2.5, 3.5))
+@pytest.mark.parametrize("kind", ("gaussian", "outlier_channels"))
+def test_fractional_bits_lie_between_their_integer_neighbours(bits, kind):
+    errors = {}
+    for setting in (math.floor(bits), bits, math.ceil(bits)):
+        codec = _kv_codec(_provider(setting))
+        generator = torch.Generator(device="cuda").manual_seed(3)
+        values = {key: _vectors(kind, (4, 2, 32, 128), generator) for key in codec.hot}
+        restored = _round_trip(codec, values)
+        errors[setting] = sum(_nmse(values[k].to(codec.dtype), restored[k]) for k in values) / len(
+            values
+        )
+    assert errors[math.ceil(bits)] < errors[bits] < errors[math.floor(bits)], errors
+    if kind == "outlier_channels":  # the large channels land in the high-bit group
+        assert errors[bits] < 0.5 * (errors[math.ceil(bits)] + errors[math.floor(bits)])
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     "bits,runtime,limit",
     (
@@ -299,14 +318,16 @@ def test_fp16_decode_saturates_at_the_fp16_range():
         (3, "fp16", 1e-3),
         (2, "bf16", 1e-3),
         pytest.param(4, "fp8", 2e-2, marks=requires_fp8),
+        (3.5, "bf16", 0.1),
+        (2.5, "bf16", 0.1),
     ),
 )
 def test_repeated_round_trips_settle(bits, runtime, limit):
     """Re-encoding a decoded Page (an onboarded Page offloaded again) settles without compounding.
 
     After a few round trips the cold bytes repeat with period 1 or 2: most vectors reproduce their
-    codes and a few alternate between two codes. On GB300 every setting here settled within 14
-    round trips.
+    codes and a few alternate between two codes; fractional bits may first move channels between
+    their two groups. On GB300 every setting here settled within 14 round trips.
     """
 
     trips = 32
@@ -330,16 +351,19 @@ def test_repeated_round_trips_settle(bits, runtime, limit):
 
 
 @requires_cuda
-@pytest.mark.parametrize("bits", (2, 3, 4))
-def test_cold_page_bytes_stay_within_the_bit_budget(bits):
+@pytest.mark.parametrize(
+    "bits,code_bits",
+    ((2, 2), (3, 3), (4, 4), (2.5, 2.5), (3.5, 3.5)),
+)
+def test_cold_page_bytes_stay_within_the_bit_budget(bits, code_bits):
     codec = _kv_codec(_provider(bits), heads=8, layers=2)
     vectors, elements = 2 * 2 * 8 * 32, 2 * 2 * 8 * 32 * 128
-    side_bits = (codec.cold_page_bytes * 8 - bits * elements) / vectors
+    side_bits = (codec.cold_page_bytes * 8 - code_bits * elements) / vectors
     assert 0 < side_bits <= 64, side_bits
 
 
 @requires_cuda
-@pytest.mark.parametrize("bits", (2, 3))
+@pytest.mark.parametrize("bits", (3, 2.5))
 def test_encoding_is_deterministic_and_seeded(bits):
     generator = torch.Generator(device="cuda").manual_seed(6)
     values = {
@@ -359,7 +383,7 @@ def test_encoding_is_deterministic_and_seeded(bits):
 
 @requires_cuda
 @pytest.mark.parametrize("tokens", (32, 64))
-@pytest.mark.parametrize("bits", (4, 3))
+@pytest.mark.parametrize("bits", (4, 3, 3.5, 2.5))
 def test_mla_latent_with_a_lossless_auxiliary_buffer(bits, tokens):
     """A 576-wide key-only latent (not a power of two) plus raw DSA index keys."""
 
@@ -371,7 +395,12 @@ def test_mla_latent_with_a_lossless_auxiliary_buffer(bits, tokens):
         for key in codec.hot
     }
     restored = _round_trip(codec, values)
-    bound = 1.15 * PAPER_MSE[bits]
+    bound = {
+        4: 1.15 * PAPER_MSE[4],
+        3.5: PAPER_MSE[3],
+        3: 1.15 * PAPER_MSE[3],
+        2.5: PAPER_MSE[2],
+    }[bits]
     for (layer, role), value in values.items():
         if role == "index_key":
             assert torch.equal(
@@ -382,14 +411,15 @@ def test_mla_latent_with_a_lossless_auxiliary_buffer(bits, tokens):
 
 
 @requires_cuda
-@pytest.mark.parametrize("tokens", (64, 128))
-@pytest.mark.parametrize("width", (512, 576))
-def test_wide_rows_on_long_pages(width, tokens):
-    """Rows wider than 448 decode in tiles that fit tensor memory, also on Pages of 64 and 128
-    tokens (two heads per Page here)."""
+@pytest.mark.parametrize("tokens", (16, 64, 256))
+@pytest.mark.parametrize("width", (96, 512, 576))
+def test_fractional_heads_of_every_page_size(width, tokens):
+    """Each KV head votes on its channel split over all of its tokens, and is then coded in parts
+    of at most 32 rows (two heads per Page here). The split takes exactly half of the channels;
+    96 = 64 + 32 channels holds the smallest piece the codec loads."""
 
     codec = _Codec(
-        _provider(3), {0: {"key": (2, tokens, width)}}, num_kv_heads=(2,), head_dim=(width,)
+        _provider(3.5), {0: {"key": (2, tokens, width)}}, num_kv_heads=(2,), head_dim=(width,)
     )
     generator = torch.Generator(device="cuda").manual_seed(15)
     values = {
@@ -399,7 +429,14 @@ def test_wide_rows_on_long_pages(width, tokens):
     for key, value in values.items():
         for head in range(2):
             error = _nmse(value[:, head].to(codec.dtype), restored[key][:, head])
-            assert error < 1.15 * PAPER_MSE[3], (head, error)
+            assert error < PAPER_MSE[3], (head, error)
+    geometry = _TurboQuantGeometry(1, "fractional", (4, 3), width, width, 0, 2 * tokens, tokens)
+    start = geometry.regions()["mask"]
+    masks = codec.cold.view(-1, codec.cold_page_bytes)[:4, start : start + 2 * width // 8]
+    bits = (masks[..., None] >> torch.arange(8)) & 1
+    assert torch.all(bits.view(4, 2, width).sum(-1) == width // 2)
+    # The large channels of every vector (3 and width / 2 + 7) are high-bit channels.
+    assert torch.all(bits.view(4, 2, width)[..., [3, width // 2 + 7]] == 1)
 
 
 @requires_cuda
@@ -450,7 +487,7 @@ def test_skip_rope_quantization_keeps_rope_bytes(pretrained_config, roles, head_
 
 
 @requires_cuda
-@pytest.mark.parametrize("bits", (4, 3))
+@pytest.mark.parametrize("bits", (4, 3.5))
 @pytest.mark.parametrize("skip_rope", (False, True))
 def test_deepseek_v4_csa_rows_follow_skip_rope_and_keep_the_indexer(bits, skip_rope):
     """CSA rows are quantized whole, or their 448 NoPE values with skip_rope_quantization (RoPE
@@ -532,7 +569,7 @@ def test_mixed_head_dims_and_runtime_dtypes(runtime):
 
 
 @requires_cuda
-@pytest.mark.parametrize("bits", (4, 2))
+@pytest.mark.parametrize("bits", (4, 2.5))
 def test_partial_page_garbage_does_not_leak_into_valid_tokens(bits):
     codec = _kv_codec(_provider(bits))
     generator = torch.Generator(device="cuda").manual_seed(12)
@@ -542,7 +579,7 @@ def test_partial_page_garbage_does_not_leak_into_valid_tokens(bits):
         zero_tail[key] = value.clone()
         zero_tail[key][:, :, 20:] = 0.0
         value[:, :, 20:22] = float("nan")
-        # One NaN among zeros, in a large channel: the row's largest magnitude is still finite.
+        # One NaN among zeros, in an outlier channel: the row's largest magnitude is still finite.
         value[:, :, 22:24] = 0.0
         value[:, :, 22, 3] = float("nan")
         value[:, :, 23, 71] = float("nan")
@@ -551,10 +588,10 @@ def test_partial_page_garbage_does_not_leak_into_valid_tokens(bits):
     restored = _round_trip(codec, values)
     for key, value in values.items():
         error = _nmse(value[:, :, :20].to(codec.dtype), restored[key][:, :, :20])
-        assert error < 1.15 * PAPER_MSE[bits], error
+        assert error < (1.15 * PAPER_MSE[4] if bits == 4 else 0.5 * PAPER_MSE[2]), error
         assert torch.equal(restored[key][:, :, 28:].float(), torch.zeros_like(value[:, :, 28:]))
-    # Rows are coded independently: the valid tokens come back exactly as they do when the unused
-    # tokens are zero.
+    # Non-finite rows do not vote on the fractional split: the valid tokens come back exactly as
+    # they do when the unused tokens are zero.
     control = _round_trip(codec, zero_tail)
     for key in values:
         assert torch.equal(restored[key][:, :, :20], control[key][:, :, :20]), key

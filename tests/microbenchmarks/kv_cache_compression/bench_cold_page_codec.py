@@ -11,12 +11,16 @@ lifecycles (no model weights needed):
     case                       KV    TurboQuant  pages/call  geometry
     glm5-bf16-mse4             bf16  mse 4-bit   256         GLM-5 MLA: 78 x {K} x 1 x 32 x 576
     glm5-bf16-mse3             bf16  mse 3-bit   256         as glm5
+    glm5-bf16-mse3.5           bf16  3.5-bit     256         as glm5 (the default bit width)
     glm5-skiprope-bf16-mse4    bf16  mse 4-bit   256         as glm5, skip_rope_quantization
     mla-fp8-mse4               fp8   mse 4-bit   256         DeepSeek-V3.2 / Kimi-K3 MLA: 61 x {K} x 1 x 32 x 576
+    mla-fp8-mse3.5             fp8   3.5-bit     256         as mla-fp8
     dsv4-csa-bf16-mse4         bf16  mse 4-bit   256         DeepSeek-V4 CSA: 18 x {compressed, indexer} x 1 x 32
                                                              x {512, 34}, 128-token Pages
+    dsv4-csa-bf16-mse3.5       bf16  3.5-bit     256         as dsv4-csa
     dsv4-csa-skiprope-bf16-mse4  bf16  mse 4-bit   256       as dsv4-csa, skip_rope_quantization
     llama8b-bf16-mse4          bf16  mse 4-bit   256         Llama-3.1-8B GQA: 32 x {K, V} x 8 x 32 x 128
+    llama8b-bf16-mse3.5        bf16  3.5-bit     256         as llama8b
     gqa-hd64-bf16-mse4         bf16  mse 4-bit   256         GQA: 36 x {K, V} x 8 x 32 x 64
     glm5-bf16-mse4-8pages      bf16  mse 4-bit   8           as glm5; a latency case
 
@@ -53,7 +57,8 @@ the K/V vectors of the case and of each (layer, buffer). A format FAILS when a s
 byte differs, an nMSE is not finite, one buffer's nMSE is above four times the case-wide nMSE (a
 layer that decodes to zeros has nMSE 1, which a case-wide mean over many layers would hide), or
 the case-wide nMSE is above its bound: twice the paper's distortion for TurboQuant (0.0094, 0.034,
-0.117 at 4, 3, 2 bits) and 0.02 for NVFP4 (about twice what it measures on these inputs). Before
+0.117 at 4, 3, 2 bits; a fractional width uses the bound of the integer width below it) and 0.02
+for NVFP4 (about twice what it measures on these inputs). Before
 trusting a result, the check is run on two corrupted copies of the decode, all zeros and one
 flipped byte of a stored-unchanged element, and must reject both. Results that fail do not count. Cases with an FP8
 active KV cache are skipped on GPUs below compute capability 8.9, where TurboQuant does not admit
@@ -62,8 +67,11 @@ it. Non-finite values are written to --json as null.
 Run on one GPU, from the repository root::
 
     python3 tests/microbenchmarks/kv_cache_compression/bench_cold_page_codec.py \
-        [--cases glm5-bf16-mse4,dsv4-csa-bf16-mse4] [--formats turboquant,nvfp4] \
-        [--warmup 3] [--reps 20] [--json results.json] [--profile]
+        [--cases glm5-bf16-mse4,dsv4-csa-bf16-mse4] [--bits 2,2.5,3,3.5,4] \
+        [--formats turboquant,nvfp4] [--warmup 3] [--reps 20] [--json results.json] [--profile]
+
+``--bits`` runs every selected case at each of the given TurboQuant bit widths instead of its own
+(``glm5-bf16-mse4`` at 2.5 bits is reported as ``glm5-bf16-mse2.5``).
 
 ``--profile`` also lists the GPU kernels and copies of one encode and one decode per format and
 case, to confirm which kernels the default path runs. A format that cannot be built or run for a
@@ -75,9 +83,10 @@ import argparse
 import itertools
 import json
 import math
+import re
 import statistics
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 
 import torch
@@ -116,7 +125,7 @@ class Case:
     kv_heads: int
     head_dim: int
     runtime: str
-    bits: int
+    bits: float
     pages: int
     latency: bool = False
     skip_rope: bool = False
@@ -195,6 +204,7 @@ CASES = {
     for case in (
         Case("glm5-bf16-mse4", **_GLM_5, runtime="bf16", bits=4, pages=256),
         Case("glm5-bf16-mse3", **_GLM_5, runtime="bf16", bits=3, pages=256),
+        Case("glm5-bf16-mse3.5", **_GLM_5, runtime="bf16", bits=3.5, pages=256),
         Case(
             "glm5-skiprope-bf16-mse4",
             **_GLM_5,
@@ -204,7 +214,9 @@ CASES = {
             skip_rope=True,
         ),
         Case("mla-fp8-mse4", **_MLA, runtime="fp8", bits=4, pages=256),
+        Case("mla-fp8-mse3.5", **_MLA, runtime="fp8", bits=3.5, pages=256),
         Case("dsv4-csa-bf16-mse4", **_DSV4_CSA, runtime="bf16", bits=4, pages=256),
+        Case("dsv4-csa-bf16-mse3.5", **_DSV4_CSA, runtime="bf16", bits=3.5, pages=256),
         Case(
             "dsv4-csa-skiprope-bf16-mse4",
             **_DSV4_CSA,
@@ -214,6 +226,7 @@ CASES = {
             skip_rope=True,
         ),
         Case("llama8b-bf16-mse4", **_LLAMA_8B, runtime="bf16", bits=4, pages=256),
+        Case("llama8b-bf16-mse3.5", **_LLAMA_8B, runtime="bf16", bits=3.5, pages=256),
         Case("gqa-hd64-bf16-mse4", **_GQA_64, runtime="bf16", bits=4, pages=256),
         Case(
             "glm5-bf16-mse4-8pages",
@@ -450,7 +463,8 @@ def _check(fmt: str, case: Case, source: dict, decoded: dict, perm: torch.Tensor
         per_buffer[f"{layer}/{role}"] = buffer_total / keep.sum().clamp(min=1)
     per_buffer = {key: float(value) for key, value in per_buffer.items()}
     nmse = float(total / count)
-    bound = 2 * PAPER_MSE[case.bits] if fmt == "turboquant" else NVFP4_NMSE_BOUND
+    # Fractional bits lie between their integer neighbours: bound them by the one below.
+    bound = 2 * PAPER_MSE[math.floor(case.bits)] if fmt == "turboquant" else NVFP4_NMSE_BOUND
     finite = all(math.isfinite(value) for value in (nmse, *per_buffer.values()))
     worst = max(  # a non-finite buffer first
         per_buffer, key=lambda key: per_buffer[key] if math.isfinite(per_buffer[key]) else math.inf
@@ -653,7 +667,8 @@ def _print_case(case: Case, results: dict, sm_clock: int) -> None:
             )
     turboquant = measured.get("turboquant", {})
     bounds = ", ".join(f"{fmt} {result['nmse_bound']:.4f}" for fmt, result in measured.items())
-    print(f"  nMSE bounds (TurboQuant: 2x the paper's {case.bits}-bit distortion): {bounds}")
+    paper_bits = math.floor(case.bits)
+    print(f"  nMSE bounds (TurboQuant: 2x the paper's {paper_bits}-bit distortion): {bounds}")
     for fmt, result in measured.items():
         if result["changed_unchanged_bytes"]:
             print(f"  {fmt}: stored-unchanged bytes differ in {result['changed_unchanged_bytes']}")
@@ -679,11 +694,29 @@ def _csv(allowed) -> Callable[[str], list[str]]:
     return parse
 
 
+def _bit_widths(text: str) -> list[float]:
+    widths = []
+    for item in text.split(","):
+        try:
+            value = float(item)
+        except ValueError:
+            value = math.nan
+        if value not in (2, 2.5, 3, 3.5, 4):
+            raise argparse.ArgumentTypeError(
+                f"unknown bit width {item!r}; choose from 2,2.5,3,3.5,4"
+            )
+        widths.append(int(value) if value.is_integer() else value)
+    return list(dict.fromkeys(widths))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--cases", type=_csv(CASES), default=list(CASES), help="default: all")
+    parser.add_argument(
+        "--bits", type=_bit_widths, help="TurboQuant bit widths to run every case at (comma list)"
+    )
     parser.add_argument("--formats", type=_csv(FORMATS), default=list(FORMATS), help="default: all")
     parser.add_argument("--warmup", type=int, default=3, help="untimed calls first (default: 3)")
     parser.add_argument("--reps", type=int, default=20, help="timed calls (default: 20)")
@@ -694,15 +727,20 @@ def main() -> int:
     args = parser.parse_args()
     if args.warmup < 0 or args.reps < 1:
         parser.error("--warmup must be >= 0 and --reps >= 1")
+    cases = {}
+    for name in args.cases:
+        for bits in args.bits or (CASES[name].bits,):
+            case = replace(CASES[name], name=re.sub(r"mse[0-9.]+", f"mse{bits}", name), bits=bits)
+            cases.setdefault(case.name, case)
     # TurboQuant admits an FP8 active KV cache from compute capability 8.9 (Triton FP8) only.
     skipped = [
         name
-        for name in args.cases
-        if CASES[name].runtime == "fp8" and torch.cuda.get_device_capability() < (8, 9)
+        for name, case in cases.items()
+        if case.runtime == "fp8" and torch.cuda.get_device_capability() < (8, 9)
     ]
     for name in skipped:
         print(f"Skipping {name}: an FP8 active KV cache needs compute capability 8.9 or newer")
-    args.cases = [name for name in args.cases if name not in skipped]
+        del cases[name]
 
     properties = torch.cuda.get_device_properties()
     gpu = f"{properties.name}, sm_{properties.major}{properties.minor}"
@@ -718,7 +756,7 @@ def main() -> int:
             f" GPU reads pinned host {bandwidth['host_read']:.1f},"
             f" GPU writes pinned host {bandwidth['host_write']:.1f}"
         )
-        reports = [_run_case(CASES[name], args, bandwidth, stream) for name in args.cases]
+        reports = [_run_case(case, args, bandwidth, stream) for case in cases.values()]
 
     problems = [
         f"{report['name']} {fmt}: {result.get('error', 'correctness check FAILED')}"

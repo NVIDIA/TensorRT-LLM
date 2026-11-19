@@ -67,7 +67,7 @@ def _nvfp4_cold_pages(**options: object) -> dict:
 # (config, valid) pairs that the runtime model accepts or rejects for its cross-field rule: the
 # options of the format not selected.
 _COLD_PAGE_FORMAT_CASES = [
-    (_turboquant_cold_pages(turboquant_bits=3, turboquant_seed=7), True),
+    (_turboquant_cold_pages(turboquant_bits=3.5, turboquant_seed=7), True),
     (_turboquant_cold_pages(nvfp4_residual_dim=0), False),
     (_turboquant_cold_pages(scale_checkpoint_path="/ckpt"), False),
     (_nvfp4_cold_pages(quant="nvfp4", nvfp4_residual_dim=0, scale_checkpoint_path="/ckpt"), True),
@@ -282,8 +282,7 @@ _COLD_PAGE_FORMAT_CASES = [
             {"sparse_attention_config": {"algorithm": "csa2", "gvr_deterministic_topk": True}},
             False,
         ),
-        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits=2), True),
-        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits=2.5), False),
+        (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits=2.5), True),
         (
             generator.DISAGG_SCHEMA,
             _turboquant_cold_pages(turboquant_bits=3, turboquant_seed=7),

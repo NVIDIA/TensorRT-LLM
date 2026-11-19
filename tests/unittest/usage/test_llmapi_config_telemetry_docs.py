@@ -390,7 +390,7 @@ def test_cold_page_rope_residual_dim_captures_only_supported_values(residual_dim
     assert json.loads(metadata_json)["capture_succeeded"] is True
 
 
-@pytest.mark.parametrize("bits", [2, 3])
+@pytest.mark.parametrize("bits", [2.5, 3])
 def test_turboquant_cold_page_captures_format_options_but_not_the_seed(bits) -> None:
     from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig, TorchLlmArgs
     from tensorrt_llm.usage.llmapi_config import (
