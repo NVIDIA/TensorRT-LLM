@@ -970,14 +970,14 @@ async def test_release_encoder_cache_reports_release_and_idempotent_outcomes():
 
     def discard(reference):
         nonlocal present
-        assert reference.reference_format == "test-encoder"
+        assert reference.opaque_state == b"\x00\xffengine-owned"
         removed, present = present, False
         return removed
 
     inference._encoder_cache = SimpleNamespace(discard=discard)
     control = _servicer(inference=inference)
     req = encoding_pb2.ReleaseEncodedMediaRequest(
-        encoded_media=encoded_media_pb2.EncodedMediaRef(reference_format="test-encoder")
+        encoded_media=encoded_media_pb2.EncodedMediaRef(opaque_state=b"\x00\xffengine-owned")
     )
     for _ in range(2):
         result = await control.ReleaseEncodedMedia(req, FakeServicerContext())

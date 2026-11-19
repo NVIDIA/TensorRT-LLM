@@ -2753,7 +2753,7 @@ async def test_encoder_prefill_rejects_unusable_decode_state_and_reclaims_inputs
         media=[
             generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
         ],
-        encoded_media={"reference_format": "unused", "opaque_state": b"cache"},
+        encoded_media={"opaque_state": b"cache"},
         extra={"request_type": "context_only"},
     )
     context = FakeServicerContext()

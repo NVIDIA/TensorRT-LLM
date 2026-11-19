@@ -208,13 +208,12 @@ def test_openengine_server_serves_the_control_contract() -> None:
             inference.encoder_role = "encode"
             inference._encoder_cleanup_tasks = set()
             inference._encoder_cache = SimpleNamespace(
-                backend="test-encoder",
                 transfer=lambda cache, destination: transfers.append((cache, destination)),
                 close=lambda: None,
             )
             from tensorrt_llm._torch.disaggregation.encoder_output import EncodedMediaRef
 
-            reference = EncodedMediaRef("test-encoder", b"reference")
+            reference = EncodedMediaRef(b"\x00\xffreference")
             peer = encoder_transfer_pb2_grpc.EncoderTransferStub(channel)
             await peer.Transfer(
                 encoder_transfer_pb2.TransferEncoderCacheRequest(

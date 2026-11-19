@@ -12,7 +12,6 @@ from test_control import _inference, _servicer
 from test_encoder_nixl import pair as pair
 from utils.native_encoder import model, native_result, request
 
-from tensorrt_llm._torch.disaggregation import encoder_nixl as transport
 from tensorrt_llm._torch.disaggregation.encoder_output import EncodedMediaRef
 from tensorrt_llm.grpc.openengine.bindings import encoding_pb2
 from tensorrt_llm.grpc.openengine.encoder import portable_reference
@@ -30,7 +29,6 @@ async def test_release_rejects_deeply_nested_reference_without_changing_exports(
     inference.encoder_role = "encode"
     inference._encoder_cache = producer
     malformed = EncodedMediaRef(
-        reference_format=transport.BACKEND,
         opaque_state=b"[" * 10000 + b"0" + b"]" * 10000,
     )
     context = FakeServicerContext()

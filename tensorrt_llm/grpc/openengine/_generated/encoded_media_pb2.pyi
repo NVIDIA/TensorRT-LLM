@@ -8,9 +8,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class EncodedMediaRef(_message.Message):
-    __slots__ = ("reference_format", "opaque_state")
-    REFERENCE_FORMAT_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("opaque_state",)
     OPAQUE_STATE_FIELD_NUMBER: _ClassVar[int]
-    reference_format: str
     opaque_state: bytes
-    def __init__(self, reference_format: _Optional[str] = ..., opaque_state: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, opaque_state: _Optional[bytes] = ...) -> None: ...

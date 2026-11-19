@@ -22,7 +22,7 @@
   ],
   "source": {
     "url": "https://github.com/ai-dynamo/openengine.git",
-    "commit": "26b2f385475a743bd315adf1937f6302f9a398a6",
+    "commit": "59f1d5a7062629cf8c47031391a67a716b80b1ff",
     "publication": "local-only contract checkpoint for EPD validation; not pushed or published"
   }
 }

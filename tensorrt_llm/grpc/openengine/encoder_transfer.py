@@ -26,9 +26,7 @@ class EncoderTransferServicer(encoder_transfer_pb2_grpc.EncoderTransferServicer)
             return
         # Cancellation cannot release source buffers while a native WRITE may run.
         task = asyncio.create_task(
-            asyncio.to_thread(
-                transfer, EncodedMediaRef(cache.backend, request.reference), request.destination
-            )
+            asyncio.to_thread(transfer, EncodedMediaRef(request.reference), request.destination)
         )
         self._inference._encoder_cleanup_tasks.add(task)
 

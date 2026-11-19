@@ -591,7 +591,7 @@ async def test_unary_encode_validates_native_context_and_records_no_token_usage(
     else:
         response = await inference.Encode(req, context)
         assert response.request_id == req.request_id
-        assert response.encoded_media.reference_format
+        assert response.encoded_media.opaque_state
         assert "usage" not in response.DESCRIPTOR.fields_by_name
         assert outcomes == [("encode", "completed")]
         from tensorrt_llm.grpc.openengine.encoder import native_reference

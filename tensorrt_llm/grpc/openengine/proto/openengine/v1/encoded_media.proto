@@ -9,8 +9,10 @@ syntax = "proto3";
 package openengine.v1;
 
 message EncodedMediaRef {
-  // Versioned reference format, including its owning engine implementation.
-  string reference_format = 1;
-  // Engine-specific locator and validation metadata; tensor contents stay external.
+  reserved 1;
+  reserved "reference_format";
+
+  // Engine-serialized reference, including any format/version and validation
+  // metadata. Clients forward these bytes unchanged; tensor contents stay external.
   bytes opaque_state = 2;
 }

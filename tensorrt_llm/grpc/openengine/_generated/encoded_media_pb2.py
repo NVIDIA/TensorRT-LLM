@@ -27,7 +27,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n!openengine/v1/encoded_media.proto\x12\ropenengine.v1\"A\n\x0f\x45ncodedMediaRef\x12\x18\n\x10reference_format\x18\x01 \x01(\t\x12\x14\n\x0copaque_state\x18\x02 \x01(\x0c\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n!openengine/v1/encoded_media.proto\x12\ropenengine.v1\"?\n\x0f\x45ncodedMediaRef\x12\x14\n\x0copaque_state\x18\x02 \x01(\x0cJ\x04\x08\x01\x10\x02R\x10reference_formatb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,5 +35,5 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'tensorrt_llm.grpc.openengin
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_ENCODEDMEDIAREF']._serialized_start=52
-  _globals['_ENCODEDMEDIAREF']._serialized_end=117
+  _globals['_ENCODEDMEDIAREF']._serialized_end=115
 # @@protoc_insertion_point(module_scope)

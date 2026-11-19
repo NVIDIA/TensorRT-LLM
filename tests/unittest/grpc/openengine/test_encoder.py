@@ -29,7 +29,7 @@ def test_encoder_role_validation_fails_closed():
         validate_encoder(req, "encode")
     with pytest.raises(UnsupportedFeatureError):
         validate_encoder(req, "consume")
-    req.encoded_media.reference_format = oe.BACKEND
+    req.encoded_media.opaque_state = b"engine-owned"
     assert validate_encoder(req, "consume") == "consume"
     with pytest.raises(UnsupportedFeatureError):
         validate_encoder(req, "")
@@ -87,9 +87,10 @@ def test_input_identity_preserves_order_source_and_all_media_fields():
     assert oe._input_digest(encoder_input(req)) != original
 
 
-def test_native_reference_boundary_is_lossless():
+@pytest.mark.parametrize("payload", [b"", b"\x00\xffopaque", b'{"format":"custom","version":9}'])
+def test_native_reference_boundary_is_lossless(payload):
     from tensorrt_llm.grpc.openengine.encoder import native_reference, portable_reference
 
-    native = oe.EncodedMediaRef("framework-owned-v1", b"\x00\xffopaque")
+    native = oe.EncodedMediaRef(payload)
     assert native_reference(portable_reference(native)) == native
     assert encoder_input(wire_request()) == request()

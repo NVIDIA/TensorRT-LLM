@@ -65,9 +65,7 @@ def pair(monkeypatch):
 
         def Transfer(self, req, timeout):
             try:
-                producer.transfer(
-                    EncodedMediaRef(transport.BACKEND, req.reference), req.destination
-                )
+                producer.transfer(EncodedMediaRef(req.reference), req.destination)
             except transport.EncoderTransferRejected as error:
                 raise RpcFailure(
                     str(error), metadata=(ENCODER_TRANSFER_REJECTED_METADATA,)
@@ -107,7 +105,7 @@ def test_native_nixl_over_real_grpc_loopback():
 
     class Service(encoder_transfer_pb2_grpc.EncoderTransferServicer):
         def Transfer(self, req, context):
-            producer.transfer(EncodedMediaRef(transport.BACKEND, req.reference), req.destination)
+            producer.transfer(EncodedMediaRef(req.reference), req.destination)
             return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
     encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
@@ -143,7 +141,7 @@ def _native_encoder_producer(pipe):
 
     class Service(encoder_transfer_pb2_grpc.EncoderTransferServicer):
         def Transfer(self, req, context):
-            producer.transfer(EncodedMediaRef(transport.BACKEND, req.reference), req.destination)
+            producer.transfer(EncodedMediaRef(req.reference), req.destination)
             return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
     encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
@@ -180,7 +178,7 @@ def test_native_nixl_between_separate_processes():
             "", "a" * 40, device="cpu", request_transfer=rpc.request_transfer
         )
         llm, seen = model()
-        consumer.prepare(EncodedMediaRef(transport.BACKEND, wire), request(), llm, None)
+        consumer.prepare(EncodedMediaRef(wire), request(), llm, None)
         expected = [
             torch.arange(8, dtype=torch.float32).reshape(2, 4),
             torch.arange(6, dtype=torch.int64).reshape(3, 1, 2),
@@ -245,9 +243,7 @@ def test_real_grpc_marked_rejection_releases_receiver_and_allows_a_fresh_referen
     class Service(rpc.encoder_transfer_pb2_grpc.EncoderTransferServicer):
         def Transfer(self, req, context):
             try:
-                producer.transfer(
-                    EncodedMediaRef(transport.BACKEND, req.reference), req.destination
-                )
+                producer.transfer(EncodedMediaRef(req.reference), req.destination)
             except transport.EncoderTransferRejected as error:
                 context.set_trailing_metadata((ENCODER_TRANSFER_REJECTED_METADATA,))
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))

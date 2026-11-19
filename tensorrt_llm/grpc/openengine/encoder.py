@@ -55,14 +55,12 @@ def encoder_input(request: Any) -> EncoderInput:
 
 def native_reference(reference: Any) -> EncodedMediaRef:
     """Forward the framework-owned payload without interpreting it."""
-    return EncodedMediaRef(reference.reference_format, reference.opaque_state)
+    return EncodedMediaRef(reference.opaque_state)
 
 
 def portable_reference(reference: EncodedMediaRef) -> encoded_media_pb2.EncodedMediaRef:
     """Wrap a native reference for the portable transport."""
-    return encoded_media_pb2.EncodedMediaRef(
-        reference_format=reference.reference_format, opaque_state=reference.opaque_state
-    )
+    return encoded_media_pb2.EncodedMediaRef(opaque_state=reference.opaque_state)
 
 
 def validate_encoder(request: Any, role: str) -> str:

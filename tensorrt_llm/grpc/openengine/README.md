@@ -377,8 +377,10 @@ requirements do not change the ordinary PD preparation fallback or E+PD behavior
 
 `EncodeRequest` carries ordered media and optional prompt/token-ID context.
 Native TRT-LLM preparation requires that context; the portable API does not impose
-it on other frameworks. Encode returns one `EncodedMediaRef`, with a native
-`reference_format` and opaque bytes. The downstream Generate repeats the original
+it on other frameworks. Encode returns one `EncodedMediaRef` containing only an
+`opaque_state` byte field. TRT-LLM serializes and validates its own format and
+version inside those bytes; the adapter forwards them unchanged. The downstream
+Generate repeats the original
 context and media and supplies `encoded_media` to PD or P. The consumer does not
 fetch media or run its vision encoder. It reports the expanded prompt and
 generation usage. Text-only requests can bypass E.
