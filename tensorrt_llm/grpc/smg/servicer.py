@@ -28,7 +28,7 @@ from typing import List, Union
 import grpc
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
-from tensorrt_llm.executor.utils import EngineUnavailableError
+from tensorrt_llm.executor.utils import EngineDeadError, EngineUnavailableError
 from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
@@ -140,6 +140,9 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             # Track tokens sent per sequence index to avoid duplicates
             # TRT-LLM's token_ids_diff doesn't clear between iterations for n>1
             sent_token_counts: dict[int, int] = {}
+            # Whether any output reached the client; admission failures before
+            # it can be retried on another engine.
+            responded = False
 
             # Submit to request manager and stream outputs
             # The request manager now yields GenerationResult objects
@@ -163,6 +166,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                     for chunk_response in self._chunk_responses(
                         request_id, gen_result, prompt_token_ids, sent_token_counts
                     ):
+                        responded = True
                         yield chunk_response
 
                 # Send complete responses when finished (one per sequence for n>1)
@@ -170,6 +174,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                     for complete_response in self._complete_responses(
                         request_id, gen_result, prompt_token_ids
                     ):
+                        responded = True
                         yield complete_response
 
         except asyncio.CancelledError:
@@ -181,6 +186,13 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
         except EngineUnavailableError as e:
             await self.request_manager.abort(request_id)
             await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
+        except EngineDeadError as e:
+            logger.error(f"Engine failed for {request_id}: {e}")
+            await self.request_manager.abort(request_id)
+            # Before any output a router may retry elsewhere; after it, the
+            # client already holds a partial response.
+            code = grpc.StatusCode.INTERNAL if responded else grpc.StatusCode.UNAVAILABLE
+            await context.abort(code, str(e))
         except ValueError as e:
             logger.warning(f"Invalid request in Generate for {request_id}: {e}")
             await self.request_manager.abort(request_id)

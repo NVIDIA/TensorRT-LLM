@@ -52,8 +52,8 @@ from ..executor.postproc_worker import PostprocParams
 from ..executor.postprocessor_hook import (PostProcessorHook,
                                            load_post_processor_hook)
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
-from ..executor.utils import (EngineUnavailableError, RequestError,
-                              create_mpi_comm_session,
+from ..executor.utils import (EngineDeadError, EngineUnavailableError,
+                              RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
                       create_input_processor_with_hash,
@@ -871,8 +871,17 @@ class BaseLLM:
                 "generate_async() is not available when encode_only=True. "
                 "Use llm.encode() for encoder-only models.")
 
-        # Check if the worker is shutting down
-        if self._executor is None or self._executor.is_shutdown():
+        # A dead engine is not retryable on this instance; an orderly
+        # shutdown is. Check death first: is_shutdown() is true for both.
+        executor = self._executor
+        if executor is None:
+            dead_error = getattr(self, "_dead_engine_error", None)
+            if dead_error is not None:
+                raise EngineDeadError(dead_error)
+            raise EngineUnavailableError("LLM is shutting down")
+        if executor.engine_dead:
+            raise EngineDeadError(executor.fatal_error)
+        if executor.is_shutdown():
             raise EngineUnavailableError("LLM is shutting down")
 
         sampling_params = self._prepare_sampling_params(sampling_params)
@@ -1820,6 +1829,10 @@ class BaseLLM:
         """Release executors and any LLM-owned MPI session."""
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
+            if self._executor.engine_dead:
+                # Keep reporting the failure after the executor is released.
+                self._dead_engine_error = self._executor.fatal_error or EngineDeadError(
+                )
             self._executor = None
 
         if hasattr(self,

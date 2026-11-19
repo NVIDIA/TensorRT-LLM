@@ -132,6 +132,40 @@ def test_admission_failure_preserves_retryability() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("responded, code", [(False, "UNAVAILABLE"), (True, "INTERNAL")])
+def test_dead_engine_is_unavailable_until_output_reaches_the_client(responded, code) -> None:
+    """A dead engine's refusal can be retried elsewhere; a broken stream cannot."""
+    from tensorrt_llm.executor.utils import EngineDeadError
+
+    output = SimpleNamespace(index=0, token_ids=[10], logprobs=None, finish_reason=None)
+
+    async def fail(**kwargs: object) -> AsyncIterator[object]:
+        if responded:
+            yield SimpleNamespace(outputs=[output], cached_tokens=0, finished=False)
+        raise EngineDeadError(RuntimeError("rank 1 died"))
+
+    manager = SimpleNamespace(
+        get_model_config=lambda: {}, generate=fail, abort=AsyncMock(return_value=False)
+    )
+    servicer = TrtllmServiceServicer(manager)
+    request = pb2.GenerateRequest(
+        request_id="dead",
+        tokenized=pb2.TokenizedInput(input_token_ids=[1]),
+        max_tokens=4,
+        streaming=True,
+    )
+    context = _MockContext()
+
+    async def collect() -> list[pb2.GenerateResponse]:
+        return [response async for response in servicer.Generate(request, context)]
+
+    with pytest.raises(grpc.aio.AbortError):
+        asyncio.run(collect())
+    assert context.code == getattr(grpc.StatusCode, code)
+    manager.abort.assert_awaited_once_with("dead")
+
+
+@pytest.mark.cpu_only
 class TestSamplingParamsConversion:
     """Tests for proto to SamplingParams conversion."""
 

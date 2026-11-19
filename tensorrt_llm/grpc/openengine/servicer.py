@@ -546,6 +546,14 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         except EngineUnavailableError as error:
             await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
             return
+        except EngineDeadError as error:
+            # Nothing was streamed: a router can send the request to another
+            # engine, but this one failed, so record an engine failure.
+            if request_metrics is not None:
+                request_metrics.engine_failed()
+            logger.error(f"OpenEngine request {request_id} refused by a dead engine: {error}")
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            return
         except ValueError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
             return

@@ -136,7 +136,12 @@ class RequestError(RuntimeError):
 
 
 class EngineUnavailableError(RequestError):
-    """Retryable admission rejection while command delivery is unavailable."""
+    """The request was not admitted, but the engine has not failed.
+
+    Raised when the executor command queue is full (retry later) or when the
+    executor is shutting down in an orderly way (retry on another instance).
+    A terminally failed engine raises :class:`EngineDeadError` instead.
+    """
 
 
 # Machine-readable error code the OpenAI-compatible server attaches to

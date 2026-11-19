@@ -399,6 +399,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         super()._set_fatal_error(error)
         self._mark_engine_dead(error)
 
+    @property
+    def engine_dead(self) -> bool:
+        # Worker loss marks the engine dead before, or without, a fatal error
+        # being recorded (for example on an attached frontend until /health).
+        return self._engine_dead or self._fatal_error is not None
+
     # Whether recording engine death also stops the command sender. An
     # attached frontend keeps it: its own fatal error may leave the shared
     # engine running, and pre_shutdown must still cancel this frontend's

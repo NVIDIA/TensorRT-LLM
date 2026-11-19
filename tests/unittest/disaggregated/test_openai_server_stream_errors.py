@@ -160,7 +160,9 @@ async def test_admission_failure_preserves_retryable_status(
     assert all(promise.abort.call_count == (1 if partial else 0) for promise in accepted)
 
 
-@pytest.mark.parametrize("executor", [None, SimpleNamespace(is_shutdown=lambda: True)])
+@pytest.mark.parametrize(
+    "executor", [None, SimpleNamespace(engine_dead=False, is_shutdown=lambda: True)]
+)
 @pytest.mark.asyncio
 async def test_llm_shutdown_admission_returns_service_unavailable(executor):
     engine = _FailingEngine("")

@@ -337,6 +337,16 @@ class GenerationExecutor(ABC):
             self._fatal_error = error
             logger.error(f"Fatal engine error recorded: {repr(error)}")
 
+    @property
+    def fatal_error(self) -> Optional[BaseException]:
+        """The recorded unrecoverable engine error, or None."""
+        return self._fatal_error
+
+    @property
+    def engine_dead(self) -> bool:
+        """Whether the engine failed terminally, as opposed to shutting down."""
+        return self._fatal_error is not None
+
     def is_shutdown(self) -> bool:
         """Return True if the executor is shutting down or fatally errored."""
         return self.doing_shutdown or self._fatal_error is not None

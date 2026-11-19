@@ -746,6 +746,30 @@ def test_submission_failure_preserves_retryability(failure, code) -> None:
     assert error.value.code == code
 
 
+def test_dead_engine_refusal_is_unavailable_and_an_engine_failure() -> None:
+    # Regression: a dead engine's admission error mapped to INTERNAL when it
+    # arrived as EngineDeadError, or was counted as a retryable rejection when
+    # it arrived as EngineUnavailableError, depending on timing.
+    llm = _FakeLlm([])
+
+    def refuse(**kwargs):
+        raise EngineDeadError(RuntimeError("rank 1 died"))
+
+    llm.generate_async = refuse
+    outcomes = []
+    metrics = SimpleNamespace(record_outcome=lambda *args: outcomes.append(args))
+    servicer = OpenEngineInferenceServicer(llm, "test-model", metrics=metrics)
+    request = generation_pb2.GenerateRequest(request_id="dead", model="test-model", prompt="hi")
+
+    async def collect():
+        return [response async for response in servicer.Generate(request, FakeServicerContext())]
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(collect())
+    assert error.value.code == grpc.StatusCode.UNAVAILABLE
+    assert outcomes == [("aggregated", "engine_error")]
+
+
 def test_generate_releases_result_after_completion() -> None:
     """A finished stream releases its result while its consumer task is still alive."""
 

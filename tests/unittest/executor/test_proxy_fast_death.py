@@ -19,6 +19,7 @@ import queue as _queue
 import threading
 import time as _time
 from concurrent.futures import Future as _Future
+from types import SimpleNamespace
 from unittest.mock import Mock
 from unittest.mock import Mock as _Mock
 
@@ -590,6 +591,53 @@ def test_submit_rechecks_engine_death_after_registration(monkeypatch, failure):
 
     # The raced result must not be left dangling in _results.
     assert 42 not in proxy._results
+
+
+def _llm_with_executor(executor):
+    from tensorrt_llm.llmapi.llm import BaseLLM
+
+    llm = object.__new__(BaseLLM)
+    llm._encode_only = False
+    llm._executor = executor
+    return llm
+
+
+@pytest.mark.parametrize("state", ["dead", "dead_then_shut_down", "shutting_down"])
+def test_generate_async_tells_a_dead_engine_from_an_orderly_shutdown(state):
+    """Regression: a dead engine raised the retryable EngineUnavailableError.
+
+    is_shutdown() is also true once a fatal error is recorded, so integrations
+    that retry EngineUnavailableError kept sending work to a dead instance.
+    """
+    from tensorrt_llm.executor.utils import EngineUnavailableError
+
+    cause = RuntimeError("rank 1 died")
+    dead = state != "shutting_down"
+    executor = SimpleNamespace(
+        engine_dead=dead,
+        fatal_error=cause if dead else None,
+        is_shutdown=lambda: True,
+        shutdown=lambda: None,
+    )
+    llm = _llm_with_executor(executor)
+    if state == "dead_then_shut_down":
+        llm._shutdown_resources()
+        assert llm._executor is None
+    expected = EngineDeadError if dead else EngineUnavailableError
+    with pytest.raises(expected) as error:
+        llm.generate_async([1, 2, 3])
+    if dead:
+        assert "rank 1 died" in str(error.value)
+
+
+def test_proxy_reports_engine_death_before_a_fatal_error_is_recorded():
+    proxy = _bare_proxy()
+    proxy._fatal_error = None
+    proxy._engine_dead = False
+    assert not proxy.engine_dead
+    # Worker loss marks the engine dead first; /health records the error later.
+    proxy._engine_dead = True
+    assert proxy.engine_dead and proxy.fatal_error is None
 
 
 # --- Remote (TLLM_SPAWN_PROXY_PROCESS / trtllm-llmapi-launch) mode coverage ---
