@@ -2755,6 +2755,36 @@ def _causal_block_kv_bounds(
     return (bounds - after).clamp_min(0).reshape(-1).to(torch.int32)
 
 
+def _dflash2_eager_key_mask(
+    num_ctx: torch.Tensor, capacity: int, block_size: int, block_causal: bool, window: int
+) -> torch.Tensor:
+    """Per-query key mask ``[B, block, 1, capacity + block]`` for the eager DFlash 2 block decode.
+
+    The keys are the gathered context (``capacity`` columns, the first ``num_ctx[b]`` valid) and
+    then the block's ``block_size`` keys. Query ``j`` sits at position ``ctx_len + j``. When
+    block-causal, it sees block slots ``0..j`` only. With ``window > 0`` it sees only keys from
+    position ``ctx_len + j - window`` on, in the context and in the block alike.
+    """
+    device = num_ctx.device
+    batch = num_ctx.shape[0]
+    q_idx = torch.arange(block_size, device=device).view(1, block_size, 1)
+    ctx_len = num_ctx.view(-1, 1, 1)
+    cols = torch.arange(capacity, device=device).view(1, 1, -1)
+    ctx_ok = cols < ctx_len
+    slots = torch.arange(block_size, device=device).view(1, 1, block_size)
+    blk_ok = slots <= q_idx if block_causal else torch.ones_like(slots, dtype=torch.bool)
+    if window > 0:
+        ctx_ok = ctx_ok & (cols >= ctx_len + q_idx - window)
+        blk_ok = blk_ok & (slots >= q_idx - window)
+    return torch.cat(
+        [
+            ctx_ok.expand(batch, block_size, capacity),
+            blk_ok.expand(batch, block_size, block_size),
+        ],
+        dim=-1,
+    ).unsqueeze(2)
+
+
 def _window_mla_block_fixup(
     fixup: _MLABlockFixup,
     window: int,
@@ -4134,30 +4164,18 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 [ctx_valid, torch.ones(batch, block_size, dtype=torch.bool, device=device)], dim=1
             )
         # DFlash 2, eager only: a per-query key mask ([B, block, 1, T]) for the block-causal
-        # mask and the exact sliding window (query j at ctx_len + j sees keys from
-        # ctx_len + j - window on). None keeps the shared [B, 1, 1, T] mask above.
+        # mask and the exact sliding window, over the context and the block keys alike.
+        # None keeps the shared [B, 1, 1, T] mask above.
         dflash2_key_valid = None
         eager_window = window if window_source == "config" else 0
         if not use_kernel and (self._dflash2_block_causal or eager_window > 0):
-            q_idx = torch.arange(block_size, device=device).view(1, block_size, 1)
-            ctx_len = num_ctx_per_req[:batch].view(-1, 1, 1)
-            cols = torch.arange(capacity, device=device).view(1, 1, -1)
-            ctx_ok = cols < ctx_len
-            if eager_window > 0:
-                ctx_ok = ctx_ok & (cols >= ctx_len + q_idx - eager_window)
-            blk_ok = torch.arange(block_size, device=device).view(1, 1, block_size)
-            blk_ok = (
-                blk_ok <= q_idx
-                if self._dflash2_block_causal
-                else torch.ones_like(blk_ok, dtype=torch.bool)
+            dflash2_key_valid = _dflash2_eager_key_mask(
+                num_ctx_per_req[:batch],
+                capacity,
+                block_size,
+                self._dflash2_block_causal,
+                eager_window,
             )
-            dflash2_key_valid = torch.cat(
-                [
-                    ctx_ok.expand(batch, block_size, capacity),
-                    blk_ok.expand(batch, block_size, block_size),
-                ],
-                dim=-1,
-            ).unsqueeze(2)
         # Helix: the tokens this rank holds no key of, layer-invariant. Built
         # once here when the fused draft store is on, else per layer.
         helix_zero_kv = (

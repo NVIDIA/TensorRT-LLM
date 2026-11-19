@@ -34,6 +34,7 @@ from tensorrt_llm._torch.models.modeling_dspark import (
     GQADSparkForCausalLM,
     MLADSparkForCausalLM,
     _causal_block_kv_bounds,
+    _dflash2_eager_key_mask,
     _dflash2_shares_target_embedding,
     _DSparkHeadMixin,
 )
@@ -407,6 +408,42 @@ def test_causal_bounds_are_a_new_tensor():
     out = _causal_block_kv_bounds(kv_bounds, 5)
     assert out.data_ptr() != kv_bounds.data_ptr()
     assert kv_bounds.eq(12).all()
+
+
+# --- eager key mask -----------------------------------------------------------------------------
+
+
+def _key_visible(ctx_len: int, block_causal: bool, window: int, query: int, key_pos: int) -> bool:
+    """Brute force: whether block query ``query`` (at ``ctx_len + query``) sees the key at
+    ``key_pos`` (context keys at 0..ctx_len-1, block slot t at ctx_len + t)."""
+    q_pos = ctx_len + query
+    if key_pos >= ctx_len and block_causal and key_pos > q_pos:
+        return False
+    return window == 0 or key_pos >= q_pos - window
+
+
+@pytest.mark.parametrize("block_causal", [True, False])
+@pytest.mark.parametrize("window", [0, 1, 3, 7, 1023])
+def test_eager_key_mask_matches_brute_force(block_causal, window):
+    """Includes windows narrower than the block: the window then hides early block slots too."""
+    block_size, capacity = 8, 20
+    ctx_lens = torch.tensor([0, 2, 9, 20])
+    mask = _dflash2_eager_key_mask(ctx_lens, capacity, block_size, block_causal, window)
+    assert mask.shape == (len(ctx_lens), block_size, 1, capacity + block_size)
+    for b, ctx_len in enumerate(ctx_lens.tolist()):
+        for j in range(block_size):
+            for col in range(capacity):
+                expected = col < ctx_len and _key_visible(ctx_len, block_causal, window, j, col)
+                assert mask[b, j, 0, col].item() == expected, (b, j, col)
+            for t in range(block_size):
+                expected = _key_visible(ctx_len, block_causal, window, j, ctx_len + t)
+                assert mask[b, j, 0, capacity + t].item() == expected, (b, j, t)
+
+
+def test_window_narrower_than_the_block_hides_early_block_slots():
+    # sliding_window 4 -> window 3: query slot 7 sees block slots 4..7 only.
+    mask = _dflash2_eager_key_mask(torch.tensor([5]), 8, 8, True, 3)
+    assert mask[0, 7, 0, 8:].tolist() == [False] * 4 + [True] * 4
 
 
 # --- block width --------------------------------------------------------------------------------
