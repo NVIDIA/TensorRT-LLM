@@ -47,12 +47,11 @@ def _compile(host, cache, device, fused):
 
 
 def _grids(nsm, B, S, H):
-    """The SM-count dependent sizes of the launches: spare CTAs of the basis launch, whether the eigensolver CTAs
-    wait for the V scan, and the item and CTA counts of the Q/K pass, the V pass and the encode launch."""
+    """The SM-count dependent sizes of the launches: spare CTAs of the basis launch, and the item and CTA counts of
+    the Q/K pass, the V pass and the encode launch."""
     BH = B * H
     T = (S + 127) // 128
     nspare = max(nsm - BH, 16)
-    eigwait = 1 if BH + nspare <= nsm else 0
     nqk_items = 2 * BH * T
     nqk_cta = min(nqk_items, nsm)
     nv_items = BH * T
@@ -60,19 +59,19 @@ def _grids(nsm, B, S, H):
     nenc_cta = min(
         max((2 * BH * T * QK_CHANNELS + ENCODE_THREADS - 1) // ENCODE_THREADS, 1), 8 * nsm
     )
-    return nspare, eigwait, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta
+    return nspare, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta
 
 
-def scratch(B, S, H, nsm, vmax_words):
+def scratch(B, S, H, nsm):
     """The scratch of a chain at this shape on a device of nsm SMs, name -> (dtype, shape): the bases U^T, the V-scan
-    slots (vmax_words float32 words each), the group maxima and the provisional block scales, which every call
-    writes before it reads them, and the two counters of the basis launch (the V-scan barrier and the V-pass tile
-    counter), which must be zero when it starts."""
-    nspare, _, _, nqk_cta, _, _, _ = _grids(nsm, B, S, H)
+    slots (one float32 each), the group maxima and the provisional block scales, which every call writes before it
+    reads them, and the two counters of the basis launch (the V-scan barrier and the V-pass tile counter), which
+    must be zero when it starts."""
+    nspare, _, nqk_cta, _, _, _ = _grids(nsm, B, S, H)
     BH, T = B * H, (S + 127) // 128
     return {
         "ut": (torch.bfloat16, (BH * DEFAULT_RANK * HEAD_DIM,)),
-        "vmax": (torch.float32, (nspare * vmax_words,)),
+        "vmax": (torch.float32, (nspare,)),
         "gmax": (torch.float32, (nqk_cta * 8,)),
         "prov": (torch.bfloat16, (2 * BH * T * 1536,)),
         "done": (torch.int32, (2,)),
@@ -88,9 +87,10 @@ def run(host, cache, host_buffers, min_score_log2, q, k, v, qk_rows, buffers):
     T = (S + 127) // 128
     dev = q.device
     nsm = num_sms(dev)
-    nspare, eigwait, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta = _grids(nsm, B, S, H)
-    # the V pass shares the basis launch when the grid has room for it
-    fn = _compile(host, cache, dev, 4 * B * H <= nsm)
+    nspare, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta = _grids(nsm, B, S, H)
+    # the V pass shares the basis launch when the eigenproblems take at most a quarter of the SMs and the grid of the
+    # launch has at most as many CTAs as the device has SMs
+    fn = _compile(host, cache, dev, 4 * B * H <= nsm and B * H + nspare <= nsm)
     fn(
         q.data_ptr(),
         k.data_ptr(),
@@ -105,7 +105,6 @@ def run(host, cache, host_buffers, min_score_log2, q, k, v, qk_rows, buffers):
         T,
         min_score_log2,
         nspare,
-        eigwait,
         nqk_items,
         nqk_cta,
         nv_items,

@@ -65,7 +65,6 @@ def _host(
     T: Int32,
     msl: Int32,
     nspare: Int32,
-    eigwait: Int32,
     nqk_items: Int32,
     nqk_cta: Int32,
     nv_items: Int32,
@@ -75,8 +74,6 @@ def _host(
     FUSED: cutlass.Constexpr,
 ):
     BH = B * H
-    # the placeholder parameters _unused0.._unused2 of the V kernels, which read none of them
-    null = Int64(0)
     basis_kernel(
         q_p,
         k_p,
@@ -87,11 +84,8 @@ def _host(
         vmax_p,
         done_p,
         v8_p,
-        null,
-        null,
         vmean_p,
         v8s_p,
-        null,
         B,
         S,
         H,
@@ -99,18 +93,17 @@ def _host(
         NQK,
         BH,
         nspare,
-        eigwait,
         FUSED,
     ).launch(grid=(BH + nspare, 1, 1), block=(EIG_THREADS, 1, 1), stream=stream)
     if cutlass.const_expr(not FUSED):
-        v_kernel(
-            v_p, vmax_p, v8_p, null, null, vmean_p, v8s_p, null, S, H, T, nspare, nv_items, nv_cta
-        ).launch(grid=(nv_cta, 1, 1), block=(V_THREADS, 1, 1), stream=stream)
+        v_kernel(v_p, vmax_p, v8_p, vmean_p, v8s_p, S, H, T, nspare, nv_items, nv_cta).launch(
+            grid=(nv_cta, 1, 1), block=(V_THREADS, 1, 1), stream=stream
+        )
     qk_kernel(
         q_p, k_p, had_p, ut_p, q4_p, k4_p, prov_p, gmax_p, B, S, H, T, nqk_items, nqk_cta
     ).launch(grid=(nqk_cta, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
     encode_kernel(
-        prov_p, gmax_p, qsf_p, ksf_p, score_scale_p, done_p, B, H, T, nqk_cta, msl, nenc_cta
+        prov_p, gmax_p, qsf_p, ksf_p, score_scale_p, B, H, T, nqk_cta, msl, nenc_cta
     ).launch(grid=(nenc_cta, 1, 1), block=(ENCODE_THREADS, 1, 1), stream=stream)
 
 
@@ -134,10 +127,8 @@ _HOST_BUFFERS = (
 )
 
 
-def scratch(B, S, H, nsm):
-    """The scratch of the chain at this shape on a device of nsm SMs, name -> (dtype, shape) (chain.scratch), with
-    V-scan slots of two words."""
-    return chain.scratch(B, S, H, nsm, 2)
+# the scratch of the chain at a shape on a device of nsm SMs, name -> (dtype, shape): that of both chains
+scratch = chain.scratch
 
 
 def run(q, k, v, qk_rows, buffers):
