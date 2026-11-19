@@ -134,6 +134,9 @@ family's and its own operations and kernels. From the rest of TensorRT-LLM,
 it uses only runtime interfaces, for example:
 
 * `DecoderModel`, `DecoderModelForCausalLM`, `ModelConfig` and `Mapping`.
+* `MultimodalModelMixin` and `MultimodalEncoderMixin`. A vision-language target
+  may inherit these. It does not subclass or call a Modeling V1 model, vision
+  tower, layer, attention backend or MoE.
 * Attention and speculative metadata, and the KV cache managers.
 
 A target does not import, subclass or call Modeling V1 model code: the model
@@ -172,8 +175,10 @@ example that uses no Modeling V1 model code.
 ## Model lifecycle
 
 A target plugs into TensorRT-LLM through the existing `DecoderModel` and
-`DecoderModelForCausalLM` interfaces. It inherits these classes directly, not
-a Modeling V1 model class, and can override any of these steps:
+`DecoderModelForCausalLM` interfaces. A language model target inherits these
+classes directly, not a Modeling V1 model class. A vision-language target is a
+composite `MultimodalModelMixin` model that holds such a language model target
+as `llm`. Either can override any of these steps:
 
 * **Constructor:** builds the model structure and parameters.
 * **`load_weights`:** loads checkpoint weights into the model. Put weight
