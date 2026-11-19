@@ -500,8 +500,14 @@ class WorkerProcessWatch:
                     process.kill()
                     process.wait()
         finally:
-            process.stdin.close()
-            process.stdout.close()
+            for stream in (process.stdin, process.stdout):
+                try:
+                    stream.close()
+                except OSError:
+                    # Closing flushes a "stop" left buffered by a failed write
+                    # to a helper that already exited (BrokenPipeError). That
+                    # must not replace the error that is closing this watch.
+                    pass
 
 
 def supervise_worker_process(function):
@@ -511,9 +517,28 @@ def supervise_worker_process(function):
     def supervised(*args, _process_watch=None, **kwargs):
         if _process_watch is None:
             return function(*args, **kwargs)
-        from .._utils import mpi_rank
+        from .._errors import RuntimeInitError
+        from .._utils import mpi_comm, mpi_rank
 
-        watch = WorkerProcessWatch(_process_watch, mpi_rank())
+        watch, error = None, None
+        try:
+            watch = WorkerProcessWatch(_process_watch, mpi_rank())
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        # Agree on the outcome before the worker's first collective. A rank
+        # that raised here alone would leave its peers waiting in that
+        # collective, and the session could then not shut down.
+        errors = mpi_comm().allgather(error)
+        failed = [rank for rank, message in enumerate(errors) if message is not None]
+        if failed:
+            if watch is not None:
+                watch.close()
+            # Every rank raises the same error, so whichever rank's result the
+            # caller reads first reports the root cause.
+            raise RuntimeInitError(
+                f"Process watch failed to start on MPI ranks {failed}: {errors[failed[0]]}",
+                hint=WORKER_WATCH_HINT,
+            )
         try:
             return function(*args, **kwargs)
         finally:

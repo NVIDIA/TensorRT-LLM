@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 import zmq
@@ -490,6 +491,102 @@ def test_discovery_without_a_route_uses_an_interface_quietly(monkeypatch, caplog
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
     monkeypatch.setattr(remote, "_interface_ipv4s", lambda: {"lo": []})
     assert remote._discover_host()[0] == "127.0.0.1"
+
+
+class _FakeComm:
+    """Stand-in MPI communicator whose allgather returns the peers' outcomes."""
+
+    def __init__(self, rank, peers):
+        self.rank = rank
+        self.peers = peers
+        self.gathered = []
+
+    def allgather(self, value):
+        self.gathered.append(value)
+        outcomes = list(self.peers)
+        outcomes[self.rank] = value
+        return outcomes
+
+
+def _supervised_rank(monkeypatch, rank, peers):
+    import tensorrt_llm._utils as utils
+
+    comm = _FakeComm(rank, peers)
+    monkeypatch.setattr(utils, "mpi_comm", lambda: comm)
+    monkeypatch.setattr(utils, "mpi_rank", lambda: rank)
+    calls = []
+
+    @remote.supervise_worker_process
+    def worker_main():
+        # Stands in for worker_main, whose first step is an MPI barrier.
+        calls.append(True)
+        return "served"
+
+    return comm, calls, worker_main
+
+
+def test_peer_watch_failure_fails_every_rank_before_the_worker_collective(monkeypatch):
+    # Regression: each rank started its watch on its own before worker_main.
+    # When one rank failed, the others entered worker_main's barrier and waited
+    # there forever, so a caller-owned session could not shut down.
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monitor = remote.RemoteWorkerProcessMonitor(2)
+    try:
+        comm, calls, worker_main = _supervised_rank(
+            monkeypatch, 0, [None, "RuntimeInitError: MPI rank 1 process watch failed"]
+        )
+        with pytest.raises(RuntimeInitError, match=r"ranks \[1\]: RuntimeInitError: MPI rank 1"):
+            worker_main(_process_watch=monitor.endpoint)
+        assert calls == [], "a healthy rank entered the worker collective"
+        assert comm.gathered == [None]
+    finally:
+        monitor.close()
+
+
+def test_local_watch_failure_reaches_the_collective_before_raising(monkeypatch):
+    monkeypatch.setattr(remote, "_START_TIMEOUT", 0.2)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        unreachable = remote.ProcessWatchEndpoint(
+            f"tcp://127.0.0.1:{reservation.getsockname()[1]}", b"test-key"
+        )
+        comm, calls, worker_main = _supervised_rank(monkeypatch, 1, [None, None])
+        with pytest.raises(RuntimeInitError, match=r"ranks \[1\]") as error:
+            worker_main(_process_watch=unreachable)
+    assert calls == []
+    assert len(comm.gathered) == 1 and "failed to connect" in comm.gathered[0]
+    assert error.value.hint == remote.WORKER_WATCH_HINT
+
+
+def test_supervised_worker_runs_when_every_watch_starts(monkeypatch):
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monitor = remote.RemoteWorkerProcessMonitor(1)
+    try:
+        _comm, calls, worker_main = _supervised_rank(monkeypatch, 0, [None])
+        assert worker_main(_process_watch=monitor.endpoint) == "served"
+        assert calls == [True]
+    finally:
+        monitor.close()
+
+
+def test_watch_close_does_not_raise_for_a_helper_that_closed_its_input():
+    # Regression: closing stdin flushed a "stop" left buffered by a failed
+    # write, raising BrokenPipeError that replaced the startup error.
+    watch = remote.WorkerProcessWatch.__new__(remote.WorkerProcessWatch)
+    watch._process = subprocess.Popen(
+        [sys.executable, "-c", "import os, time; os.close(0); time.sleep(5)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.5)
+        watch.close()
+        assert watch._process.stdin.closed
+    finally:
+        if watch._process.poll() is None:
+            watch._process.kill()
+            watch._process.wait()
 
 
 def test_unreachable_watch_helper_reports_rank_endpoint_and_configuration_hint(monkeypatch):
