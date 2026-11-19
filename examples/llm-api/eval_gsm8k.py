@@ -39,7 +39,8 @@ directory receives ``results.jsonl`` (one line per question attempt), ``run_mani
 server still serves the model that the recorded replies came from. The exit status is 0 when
 every selected question completed without error, timeout or truncation (and, with
 ``--min-correct``, enough answers are correct), 1 when the run finished but did not pass, and
-2 when it was refused before asking.
+2 when it was refused before asking, and 3 for an unexpected execution or result-storage
+failure. Interrupted runs return 130.
 """
 
 from __future__ import annotations
@@ -166,11 +167,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _managed(args: argparse.Namespace) -> tuple[runner.ManagedServer, Optional[int], Optional[int]]:
     """The managed launch and the concurrency/max_seq_len its config implies."""
-    import yaml
+    try:
+        import yaml
+    except ImportError as error:
+        raise runner.EvaluationError("managed mode requires PyYAML") from error
 
     with open(args.config, "rb") as f:
         raw = f.read()
-    config = yaml.safe_load(raw)
+    try:
+        config = yaml.safe_load(raw)
+    except (yaml.YAMLError, UnicodeError) as error:
+        raise runner.EvaluationError(f"cannot parse config {args.config}: {error}") from error
     if not isinstance(config, dict):
         raise runner.EvaluationError(f"{args.config} is not a YAML mapping")
     argv = ["trtllm-serve", args.model, "--config", args.config]
@@ -219,19 +226,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     max_seq_len = args.max_seq_len
     identity_extra = {}
     try:
-        if args.model is not None:
-            managed, config_batch, config_seq = _managed(args)
-            if concurrency is None:
-                if config_batch is None:
-                    parser.error("the config sets no max_batch_size; pass --concurrency")
-                concurrency = config_batch
-            max_seq_len = max_seq_len if max_seq_len is not None else config_seq
-            identity_extra = {
-                "model": os.path.abspath(args.model),
-                "server_settings": dict(managed.settings),
-            }
-        elif concurrency is None:
-            concurrency = DEFAULT_CONCURRENCY
+        with runner._setup_errors():
+            if args.model is not None:
+                managed, config_batch, config_seq = _managed(args)
+                if concurrency is None:
+                    if config_batch is None:
+                        parser.error("the config sets no max_batch_size; pass --concurrency")
+                    concurrency = config_batch
+                max_seq_len = max_seq_len if max_seq_len is not None else config_seq
+                identity_extra = {
+                    "model": os.path.abspath(args.model),
+                    "server_settings": dict(managed.settings),
+                }
+            elif concurrency is None:
+                concurrency = DEFAULT_CONCURRENCY
         signal.signal(signal.SIGTERM, _interrupt)
         summary = runner.run(
             dataset_dir=args.dataset_dir,
@@ -248,15 +256,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             identity_extra=identity_extra,
             attempt_extra={"client_concurrency": concurrency},
         )
-    except (runner.EvaluationError, OSError) as error:
+        for problem in summary["verdict"]["problems"]:
+            print(f"problem: {problem}", file=sys.stderr)
+        return 0 if summary["verdict"]["passed"] else 1
+    except runner.EvaluationError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("interrupted; completed replies are kept and the run can be resumed", file=sys.stderr)
         return 130
-    for problem in summary["verdict"]["problems"]:
-        print(f"problem: {problem}", file=sys.stderr)
-    return 0 if summary["verdict"]["passed"] else 1
+    except Exception as error:
+        print(f"evaluation failed: {type(error).__name__}: {error}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

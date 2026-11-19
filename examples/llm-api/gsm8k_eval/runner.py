@@ -103,14 +103,26 @@ class _ExternalEndpoint:
 
 
 @contextmanager
+def _setup_errors() -> Iterator[None]:
+    """Classify input/resource failures before evaluation as refusals."""
+    try:
+        yield
+    except (OSError, ImportError) as error:
+        raise EvaluationError(f"cannot prepare evaluation: {error}") from error
+
+
+@contextmanager
 def _output_lock(path: Path) -> Iterator[None]:
     """Own an output directory until all server and result work has stopped."""
-    path.mkdir(parents=True, exist_ok=True)
-    with (path / ".lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise EvaluationError(f"{path} is already in use by another evaluation") from error
+    with _setup_errors():
+        path.mkdir(parents=True, exist_ok=True)
+        lock = (path / ".lock").open("a")
+    with lock:
+        with _setup_errors():
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise EvaluationError(f"{path} is already in use by another evaluation") from error
         try:
             yield
         finally:
@@ -138,7 +150,29 @@ def _write_json(path: Path, data: Any) -> None:
 def _read_json(path: Path) -> Optional[dict[str, Any]]:
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as error:
+        raise EvaluationError(f"cannot read run manifest {path}: {error}") from error
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("identity_sha256"), str)
+        or not isinstance(data.get("identity"), dict)
+        or not isinstance(data.get("protocol_id"), str)
+        or not isinstance(data.get("attempts"), list)
+        or any(not isinstance(attempt, dict) for attempt in data["attempts"])
+    ):
+        raise EvaluationError(f"malformed run manifest {path}; use a fresh output directory")
+    for attempt in data["attempts"]:
+        timing = attempt.get("timing", {})
+        if not isinstance(timing, dict):
+            raise EvaluationError(f"malformed attempt timing in {path}")
+        hours = timing.get("monitored_gpu_hours")
+        if hours is not None and (
+            type(hours) not in (int, float) or not math.isfinite(hours) or hours < 0
+        ):
+            raise EvaluationError(f"invalid monitored GPU hours in {path}")
+    return data
 
 
 def served_model_ids(base: str, deps: RunDeps) -> Optional[list[str]]:
@@ -452,11 +486,11 @@ def run(
             f"min_correct must be an integer in 0..{num_questions}, got {min_correct!r}"
         )
     deadline = started + float(time_budget_s)
-    manifest_sha256 = protocol.sha256_file(manifest_path)
     try:
+        manifest_sha256 = protocol.sha256_file(manifest_path)
         manifest = protocol.load_manifest(manifest_path)
         problems, dataset_files = protocol.load_problems(dataset_dir, manifest, num_questions)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, ImportError) as error:
         raise EvaluationError(
             f"the dataset is not usable: {type(error).__name__}: {error}"
         ) from error
@@ -476,61 +510,62 @@ def run(
     identity_sha256 = protocol.sha256_text(protocol.canonical_json(identity))
     results_dir = Path(output_dir)
     with _output_lock(results_dir):
-        manifest_file = results_dir / "run_manifest.json"
-        run_manifest = _read_json(manifest_file)
-        if run_manifest and run_manifest["identity_sha256"] != identity_sha256:
-            raise EvaluationError(
-                f"{results_dir} holds a run with identity {run_manifest['identity_sha256']}, not "
-                f"{identity_sha256} (changed protocol, selection, endpoint, inputs or settings); "
-                "use a fresh output directory"
+        with _setup_errors():
+            manifest_file = results_dir / "run_manifest.json"
+            run_manifest = _read_json(manifest_file)
+            if run_manifest and run_manifest["identity_sha256"] != identity_sha256:
+                raise EvaluationError(
+                    f"{results_dir} holds a run with identity {run_manifest['identity_sha256']}, not "
+                    f"{identity_sha256} (changed protocol, selection, endpoint, inputs or settings); "
+                    "use a fresh output directory"
+                )
+            ledger = records.Ledger(
+                results_dir / "results.jsonl",
+                identity_sha256,
+                {problem.id: (problem.index, problem.prompt_sha256) for problem in problems},
             )
-        ledger = records.Ledger(
-            results_dir / "results.jsonl",
-            identity_sha256,
-            {problem.id: (problem.index, problem.prompt_sha256) for problem in problems},
-        )
-        try:
-            state = ledger.load()
-        except records.LedgerError as error:
-            raise EvaluationError(f"cannot resume {results_dir}: {error}") from error
-        asked_models = state.served_models()
-        if len(asked_models) > 1:
-            raise EvaluationError(
-                f"cannot resume {results_dir}: its replies were asked of more than one model "
-                f"({', '.join(map(repr, asked_models))}); use a fresh output directory"
-            )
-        pending = [problem for problem in problems if problem.id not in state.completed]
+            try:
+                state = ledger.load()
+            except records.LedgerError as error:
+                raise EvaluationError(f"cannot resume {results_dir}: {error}") from error
+            asked_models = state.served_models()
+            if len(asked_models) > 1:
+                raise EvaluationError(
+                    f"cannot resume {results_dir}: its replies were asked of more than one model "
+                    f"({', '.join(map(repr, asked_models))}); use a fresh output directory"
+                )
+            pending = [problem for problem in problems if problem.id not in state.completed]
 
-        if run_manifest is None:
-            run_manifest = {
-                "protocol_id": protocol.PROTOCOL_ID,
-                "identity_sha256": identity_sha256,
-                "identity": identity,
-                "attempts": [],
+            if run_manifest is None:
+                run_manifest = {
+                    "protocol_id": protocol.PROTOCOL_ID,
+                    "identity_sha256": identity_sha256,
+                    "identity": identity,
+                    "attempts": [],
+                }
+            attempt = len(run_manifest["attempts"]) + 1
+            attempt_info: dict[str, Any] = {
+                "attempt": attempt,
+                "transport": transport,
+                "started_at": started_at,
+                "time_budget_s": time_budget_s,
+                "concurrency": concurrency,
+                "request_timeout_s": request_timeout_s,
+                "min_correct": min_correct,
+                "dataset_files": dataset_files,
+                "python": platform.python_version(),
+                "already_completed": len(problems) - len(pending),
+                "pending": len(pending),
+                "quarantined_partial_writes": state.quarantined,
+                **(attempt_extra or {}),
             }
-        attempt = len(run_manifest["attempts"]) + 1
-        attempt_info: dict[str, Any] = {
-            "attempt": attempt,
-            "transport": transport,
-            "started_at": started_at,
-            "time_budget_s": time_budget_s,
-            "concurrency": concurrency,
-            "request_timeout_s": request_timeout_s,
-            "min_correct": min_correct,
-            "dataset_files": dataset_files,
-            "python": platform.python_version(),
-            "already_completed": len(problems) - len(pending),
-            "pending": len(pending),
-            "quarantined_partial_writes": state.quarantined,
-            **(attempt_extra or {}),
-        }
-        if managed is not None:
-            attempt_info["server_command"] = list(
-                server.serve_argv(managed.argv, results_dir / f"server-attempt-{attempt}.addr")
-            )
-            attempt_info["server_settings"] = dict(managed.settings)
-        run_manifest["attempts"].append(attempt_info)
-        _write_json(manifest_file, run_manifest)
+            if managed is not None:
+                attempt_info["server_command"] = list(
+                    server.serve_argv(managed.argv, results_dir / f"server-attempt-{attempt}.addr")
+                )
+                attempt_info["server_settings"] = dict(managed.settings)
+            run_manifest["attempts"].append(attempt_info)
+            _write_json(manifest_file, run_manifest)
 
         def admit(model: str) -> Optional[str]:
             """Record the served model before the attempt's first request; why it is refused, if so."""
@@ -540,7 +575,8 @@ def run(
                     f"{results_dir} holds replies of model {asked_models[0]!r}, but {model!r} is "
                     "served now; a run never mixes models: use a fresh output directory"
                 )
-            _write_json(manifest_file, run_manifest)
+            with _setup_errors():
+                _write_json(manifest_file, run_manifest)
             return None
 
         timing: dict[str, Any] = {"verification_s": deps.monotonic() - started}
@@ -599,7 +635,12 @@ def run(
             _write_json(manifest_file, run_manifest)
             raise EvaluationError(timing["refused"])
 
-        final_state = ledger.load()
+        try:
+            final_state = ledger.load()
+        except records.LedgerError as error:
+            raise RuntimeError(
+                f"cannot read evaluation results in {results_dir}: {error}"
+            ) from error
         summary = records.summarize(final_state, problems)
         summary.update(
             transport=transport,

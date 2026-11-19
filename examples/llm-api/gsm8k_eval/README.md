@@ -82,7 +82,9 @@ Exit status: 0 when every selected question completed without an error, timeout 
 (and, with `--min-correct`, enough answers are correct); 1 when the run finished but did not
 pass; 2 when it was refused before asking (bad arguments, unusable dataset, a results directory
 of a different run, or a server that serves a different model than the recorded replies came
-from); 130 when interrupted.
+from); 3 for an unexpected execution or result-storage failure (including a write
+failure after requests have started); 130 when interrupted. A failure with exit 3 is
+not an accuracy result. Completed records are retained where storage permits.
 
 ## Protocol
 
