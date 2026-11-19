@@ -71,7 +71,8 @@ installed; neither is optional when it is.
   `internal-perf-nsight-system-analysis` products under `nsys_analysis/`),
   `server_nsys_metrics.nsys-rep` (Run A2a utilization pass),
   `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
-  `server_ncu.ncu-rep` (+ `ncu_details.txt` / `ncu_raw.csv`),
+  `microbench_<hotspot>.py`, `ncu_<hotspot>.ncu-rep[z]` (+ per-hotspot
+  details / raw CSV summaries),
   `perf_metrics.json`, `serve.log` — run artifacts you
   produce.
 - `progress.yaml` — record your turn with `append_analyzer_progress`.

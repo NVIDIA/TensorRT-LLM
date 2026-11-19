@@ -224,6 +224,8 @@ def test_analyzer_carries_the_ncu_deep_dive():
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
     assert "perf-nsight-compute-analysis" in prompt
     assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
+    assert "faithful hotspot microbenchmarks, never the full server" in prompt
+    assert "Do not wrap `trtllm-serve` in ncu" in prompt
     # The findings carry the dedicated section, degrading honestly.
     assert "## ncu kernel analysis" in prompt
     assert "ncu unavailable" in prompt
@@ -1265,11 +1267,10 @@ def test_kernel_coverage_needs_rebuild_requires_ruling_out_a_replacement():
 
 def test_kernel_coverage_note_bounds_the_capture():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
-    # Multi-pass with re-filtering on missing stems, bounded passes, and
-    # the honest degrade for kernels no pass reached.
-    assert "3 passes" in block
-    assert "still-missing stems" in block
-    assert "server_ncu_pass<k>.ncu-rep" in block
+    # Coverage keeps a faithful standalone reproduction for every row and
+    # degrades honestly for kernels no benchmark captured.
+    assert "faithful standalone microbenchmarks" in block
+    assert "ncu_<hotspot>.ncu-rep[z]" in block
     assert 'ncu: "unavailable: <reason>"' in block
     # Unactionable below-noise-floor items are not a valid answer.
     assert "below-materiality` dismissal wearing an item costume" in block
