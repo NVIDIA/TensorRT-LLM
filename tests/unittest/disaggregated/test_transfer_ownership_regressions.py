@@ -2053,8 +2053,57 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
     assert transceiver.check_gen_transfer_status(None) == ([], [], [])
 
 
-def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
-    """A receive written by context ranks 3 and 4, after rank 3 answered FAILED.
+@pytest.mark.cpu_only
+def test_recovery_cancel_before_writer_result_retains_gen_pages(monkeypatch) -> None:
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    rid = 119
+    receiver, rx, gen, request = _two_writer_receive_failed_by_one(rid, first_result=False)
+    sender = _make_sender_with_cleared_session(rid)
+    sender.shutdown = Mock()
+    sender.setup_session = Mock()
+    sender._recover_agent = Mock()
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda *_: SimpleNamespace(self_endpoint="gen")
+    )
+    sender._peer_requests[rid] = {0: SimpleNamespace(instance_name="gen", instance_rank=0)}
+    sender._get_or_connect_dealer = Mock(
+        return_value=Mock(send=Mock(side_effect=receiver._handle_cancel_session))
+    )
+    tx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=rid))
+    task._native_inflight = 1  # The native WRITE has not retired or reported its result.
+    tx.kv_tasks = [task]
+    ctx = object.__new__(KvCacheTransceiverV2)
+    assert not tx.resources_drained()
+    ctx._cancel_failed_transfers({rid: tx}, {rid})
+    assert task._native_inflight == 1 and rx.failed_receive_awaits_writers()
+    for _ in range(2):
+        assert gen.check_gen_transfer_status(0) == ([], [], [])
+        assert gen._recv_sessions[rid] is rx and receiver._get_session(rid) is rx
+    task._native_inflight = 0
+    for rank in (3, 4):
+        receiver._process_kv_agent_result(
+            b"ctx",
+            transfer_mod._make_kv_result_msg(
+                rank,
+                rid,
+                0,
+                True,
+                AgentResult.FAILED,
+                kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+            ),
+        )
+        if rank == 3:
+            assert gen.check_gen_transfer_status(0) == ([], [], [])
+            assert gen._recv_sessions[rid] is rx
+    assert gen.check_gen_transfer_status(0) == ([], [], [request])
+    assert rid not in receiver._sessions and rid not in gen._recv_sessions
+
+
+def _two_writer_receive_failed_by_one(
+    rid: int, timeout_s: float | None = None, *, first_result: bool = True
+):
+    """A two-writer receive, optionally after context rank 3 answered FAILED.
 
     Rank 3's session was cleared, so it answers through the real reply path;
     rank 4 has not reported yet. Returns the receiver, the receive, a
@@ -2101,7 +2150,8 @@ def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
         b"gen", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
     )
     (reply,) = [call.args[0] for call in dealer.send.call_args_list]
-    receiver._process_kv_agent_result(b"ctx", reply)
+    if first_result:
+        receiver._process_kv_agent_result(b"ctx", reply)
 
     request = SimpleNamespace(
         request_id=rid,
@@ -2118,7 +2168,7 @@ def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
     transceiver._send_sessions = {}
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
-    assert session.status == SessionStatus.ERROR
+    assert session.status == (SessionStatus.ERROR if first_result else SessionStatus.TRANSFERRING)
     return receiver, session, transceiver, request
 
 

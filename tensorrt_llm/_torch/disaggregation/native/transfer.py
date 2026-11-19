@@ -178,6 +178,7 @@ def agent_recovery_supported(
         and not context_first_ownership
         and agent_buffer_size_mb == 0
         and not use_pure_python_transfer_agent()
+        and getattr(NixlTransferAgent, "supports_handle_retirement", False)
     )
 
 
@@ -2614,8 +2615,8 @@ class Sender(SenderBase):
                 self._retired_rids[unique_rid] = time.monotonic()
         self._remove_req_info(unique_rid)
 
-    def send_cancel_to_receivers(self, unique_rid: int) -> None:
-        """Notify all receivers involved in this session to cancel."""
+    def send_cancel_to_receivers(self, unique_rid: int, *, failure: bool = False) -> None:
+        """Cancel peer receives, retaining their writers when failure precedes retirement."""
         # Snapshot under the lock to avoid RuntimeError if the listener thread
         # mutates the dict via _add_req_info() concurrently.
         with self._peer_requests_lock:
@@ -2626,9 +2627,10 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
-                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
-                )
+                message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                if failure:
+                    message.append(b"FAILED")
+                self._get_or_connect_dealer(peer_ri.self_endpoint).send(message)
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
 
@@ -3997,6 +3999,9 @@ class Receiver(ReceiverBase):
                 # cancellation from here, and an id on its own would read as a local cancel.
                 self._pre_cancelled_rids[unique_rid] = True
         if session is not None:
+            if message[2:] == [b"FAILED"]:
+                # Failure intent is not proof that the published writers have retired.
+                session._logical_outcomes.fail(RuntimeError("CTX transfer agent unavailable"))
             if session._enforce_physical_ownership:
                 session.cancel_local(by_peer=True)
             else:

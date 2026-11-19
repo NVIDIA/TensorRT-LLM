@@ -1148,12 +1148,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     continue
                 session._logical_outcomes.fail(RuntimeError("KV transfer agent unavailable"))
                 try:
-                    sent = session.cancel(by_peer=True)
-                    if not sent:
-                        if isinstance(session, RxSession):
-                            session.notify_cancel()
-                        else:
-                            session._sender.send_cancel_to_receivers(rid)
+                    if isinstance(session, TxSession):
+                        session.cancel_local(by_peer=True)
+                        session._sender.send_cancel_to_receivers(rid, failure=True)
+                    elif not session.cancel(by_peer=True):
+                        session.notify_cancel()
                     session._failure_cancel_notified = True
                 except RuntimeError as error:
                     logger.warning(f"Transfer {rid} failure cancellation will retry: {error}")
@@ -1224,7 +1223,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             [
                 rid
                 for rid in candidates
-                if rid in (intents | terminal)
+                if (rid in intents or rid in terminal)
                 and (rid not in sessions or not self._retirement_blocked(sessions[rid]))
             ]
             if recovery

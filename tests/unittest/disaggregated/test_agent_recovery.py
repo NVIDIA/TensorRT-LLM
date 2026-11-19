@@ -259,24 +259,29 @@ def test_fenced_agent_rejects_new_receive_publications(worker):
     assert not receiver._sessions
 
 
-def test_gen_terminal_sets_are_built_once_per_poll():
-    class CountedIds(list):
-        iterations = 0
+@pytest.mark.parametrize("side", ["gen", "ctx"])
+def test_terminal_sets_are_built_once_per_poll(side):
+    class CountedIntents(set):
+        unions = 0
 
-        def __iter__(self):
-            self.iterations += 1
-            return super().__iter__()
+        def __or__(self, other):
+            self.unions += 1
+            return super().__or__(other)
 
     count = 1024  # Detect repeated construction without a timing assertion.
-    cancelled, failed, completed = CountedIds([0]), CountedIds([1]), CountedIds(range(2, count))
+    intents = CountedIntents({count})
     node = object.__new__(KvCacheTransceiverV2)
     node.__dict__.update(
         _agent_recovery=True,
         _gen_idle_poll_skip=False,
         _gen_need_sync=False,
+        _ctx_need_tp_sync=False,
+        _ctx_need_pp_sync=False,
         _recv_sessions=dict.fromkeys(range(count + 2)),
+        _send_sessions=dict.fromkeys(range(count + 2)),
+        _dist=SimpleNamespace(tp_allgather=None),
         _gen_allgather=None,
-        _failure_intents=lambda *_: {count},
+        _failure_intents=lambda *_: intents,
         _cancel_failed_transfers=lambda *_: None,
         _retirement_blocked=lambda session: False,
         _local_agent_ready=lambda: True,
@@ -284,8 +289,12 @@ def test_gen_terminal_sets_are_built_once_per_poll():
 
     def vote(*args, **kwargs):
         assert args[6] == list(range(count + 1))
-        assert [ids.iterations for ids in (cancelled, failed, completed)] == [1, 1, 1]
-        return [], [], [], args[6], set(), {count}, True
+        assert intents.unions <= 1
+        return (
+            ([], [], [], args[6], set(), {count}, True)
+            if side == "gen"
+            else ([], [], [], args[6], {count}, True)
+        )
 
     node._consensus_outcome = vote
-    node._gen_consensus_outcome([], cancelled, failed, completed, [])
+    getattr(node, f"_{side}_consensus_outcome")([], [0], [1], list(range(2, count)), [])

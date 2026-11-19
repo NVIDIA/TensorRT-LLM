@@ -875,7 +875,7 @@ def _make_cache_config(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
+def _construct_worker_config(monkeypatch, cache_config, *, world_size=1) -> TransferWorkerConfig:
     """Build a KvCacheTransceiverV2 with all collectives/native setup mocked out.
 
     Returns the TransferWorkerConfig it wired.
@@ -913,7 +913,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     mapping = SimpleNamespace(
         rank=0,
         cp_size=1,
-        world_size=1,
+        world_size=world_size,
         pp_size=1,
         has_cp_helix=lambda: False,
         cp_config={},
@@ -924,7 +924,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
 
     KvCacheTransceiverV2(
         mapping=mapping,
-        dist=Mock(allgather=Mock(side_effect=lambda value: [value])),
+        dist=Mock(allgather=Mock(side_effect=lambda value: [value] * world_size)),
         kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4, is_disagg=False),
         cache_transceiver_config=cache_config,
     )
@@ -932,6 +932,21 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     worker_config = worker_constructor.call_args.args[0]
     assert isinstance(worker_config, TransferWorkerConfig)
     return worker_config
+
+
+def test_old_binding_disables_recovery_before_mpi_qualification(monkeypatch) -> None:
+    from tensorrt_llm._torch.disaggregation import transceiver as module
+    from tensorrt_llm._torch.disaggregation.native import transfer
+
+    monkeypatch.setattr(transfer.NixlTransferAgent, "supports_handle_retirement", False)
+    monkeypatch.setattr(module, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(module, "mpi_disabled", lambda: False)
+    qualify = Mock(side_effect=ValueError("MPI_THREAD_MULTIPLE is required"))
+    monkeypatch.setattr(module, "_retirement_executor_comm", qualify)
+    config = _construct_worker_config(monkeypatch, _make_cache_config(), world_size=2)
+    qualify.assert_not_called()
+    assert config.recovery_fatal_callback is None
+    assert not transfer.agent_recovery_supported(False, False, 0)
 
 
 @pytest.mark.parametrize("ownership_enabled", [False, True])
