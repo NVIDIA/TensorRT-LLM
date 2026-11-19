@@ -21,6 +21,7 @@ from test_common.visual_gen_quantization import (
     observe_quantization_paths,
 )
 
+from defs.examples.visual_gen.conftest import _visual_gen_deps as _visual_gen_deps
 from defs.examples.visual_gen.visual_gen_test_utils import (
     VISUAL_GEN_LPIPS_GOLDEN_DIR,
     ReusableLPIPSScorer,
@@ -557,6 +558,7 @@ def _run_ltx2_two_stage_generation(directory: Path, settings: dict) -> None:
         pipeline.cleanup()
 
 
+@pytest.mark.usefixtures("_visual_gen_deps")
 def test_ltx2_two_stage_linear_step_ignore_compile_cuda_graph(tmp_path: Path) -> None:
     if get_sm_version() not in (100, 103):
         pytest.skip("This FP8 two-stage fixture targets B200/SM103")
