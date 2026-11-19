@@ -408,12 +408,21 @@ def test_gms_checkpoint_policy_records_only_writer_disk_load(
     native_read = MagicMock(side_effect=read_native)
     monkeypatch.setattr(weight_loader, "_load_weights_native", native_read)
     monkeypatch.setattr(checkpoint_loader, "get_initialized_weight_mapper", MagicMock())
+    released_dirs = []
+    monkeypatch.setattr(
+        model_loader_mod,
+        "_release_checkpoint_page_cache",
+        lambda dirs: released_dirs.append(list(dirs)) or 2.5,
+    )
 
     loader.load("/ckpt", checkpoint_loader)
 
     assert loader.startup_metadata["checkpoint_io_policy"] == (expected if is_rw else None)
     paths = [call.args[0] for call in native_read.call_args_list]
     assert paths == (["/ckpt", "/draft"] if include_draft else ["/ckpt"] if is_rw else [])
+    # The page-cache release gets exactly the directories read from disk.
+    assert released_dirs == [paths]
+    assert loader.metrics["checkpoint_page_cache_release_seconds"] == 2.5
     if is_rw:
         backend.finalize_write.assert_called_once_with(model)
     else:

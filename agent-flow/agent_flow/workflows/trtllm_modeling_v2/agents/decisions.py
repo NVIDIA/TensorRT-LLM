@@ -130,24 +130,6 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "the run ends at the ceiling",
         ),
     ),
-    "tuner": (
-        Decision(
-            "CANDIDATE",
-            "a change is committed on its branch with its correctness tests and micro-bench",
-            "the orchestrator measures it end to end and keeps it only on its own gate",
-        ),
-        Decision(
-            "DROPPED",
-            "the micro-bench numbers that killed the hypothesis",
-            "the campaign moves on",
-        ),
-        Decision(
-            "BLOCKED",
-            "what is broken, with job receipts, or the runtime change or native rebuild "
-            "the candidate needs, with its evidence",
-            "the campaign records it",
-        ),
-    ),
 }
 
 
@@ -181,7 +163,7 @@ DECISION_REMINDER = "Before ending your turn, write your decision file to the pa
 #: The closed enum each role's decision file is validated against: its row of the
 #: decision table (``agents/decisions.py``).
 DECISIONS_BY_AGENT: dict[str, tuple[str, ...]] = {
-    role: names(role) for role in (*PLAN_ROLES, "kernel_writer", "assembler", "tuner")
+    role: names(role) for role in (*PLAN_ROLES, "kernel_writer", "assembler")
 }
 
 #: The keys besides ``summary`` and ``decision`` a role's decision file carries for the
@@ -206,9 +188,6 @@ EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
     # `uncertified` names the calls a unit makes, correct, outside their entries'
     # CELLS: the planner hears them with the task's end and adds the certification.
     "assembler": ("blocked_reason", "missing_entry", "uncertified"),
-    # The orchestrator re-reads the candidate's own decision file for the rest
-    # (micro-bench table, projection).
-    "tuner": ("slug", "kind", "worktree", "branch", "commits", "projection"),
 }
 
 

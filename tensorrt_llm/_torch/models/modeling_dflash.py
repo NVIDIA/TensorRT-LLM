@@ -23,7 +23,11 @@ except ImportError:
     _flashinfer_rope = None
 from ..distributed import AllReduce
 from ..modules.logits_processor import scale_and_soft_cap_logits
-from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
+from ..pyexecutor.config_utils import (
+    _is_sliding_attention_layer,
+    dspark_layer_window_size,
+    get_layer_attention_window,
+)
 from ..speculative.dflash_attention import (
     DFLASH_FOLDED_DECODE_LOWERING,
     DFlashTrtllmGenOps,
@@ -42,48 +46,6 @@ from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, reg
 # (modeling_dspark) multiply by this to get the natural-log LSE flashinfer's
 # merge expects. One constant, so a flashinfer convention change is fixed once.
 TRTLLM_GEN_LSE_LN2 = math.log(2.0)
-
-
-def dspark_layer_window_size(
-    use_swa: bool, swa_window: int, layer_types, layer_idx: int
-) -> tuple[int, int]:
-    """flash-attn ``window_size`` for one draft layer of the block decode.
-
-    Sliding-window block decode was introduced by the DSpark drafters
-    (deepseek-ai/DeepSpec) -- hence the name -- but it is an attention
-    configuration, not part of the DSpark head set, so it stays in the DFlash
-    base: the block decode below indexes the resolved windows directly and must
-    not depend on a subclass-only attribute.
-
-    Those drafters run the draft block through HF attention with
-    ``sliding_window`` set on 'sliding_attention' layers and is_causal=False.
-    HF's flash path (transformers/modeling_flash_attention_utils.py) translates
-    that to ``window_size = (sliding_window - 1, sliding_window - 1)``, i.e.
-    each query attends keys within ``swa_window - 1`` KV-index distance on both
-    sides. In the DFlash pool layout KV index == token position, so this limits
-    draft queries to the most recent ``swa_window`` context tokens plus the
-    (nearby) draft block. Full-attention layers and drafters that do not enable
-    the window keep flash-attn's default ``(-1, -1)`` (no window).
-
-    A drafter that sets `use_swa` but declares no sliding layer is windowed on
-    every layer: some DFlash 2 drafters are exported with all `full_attention`
-    layer types and the window only in `dflash_config`, and other serving
-    stacks window every layer of such a drafter. The per-layer filter applies
-    only when the layer types tell sliding layers from full ones, and it reads
-    them with `_is_sliding_attention_layer`, as the attention mask does.
-    """
-    if not use_swa:
-        return (-1, -1)
-    any_sliding = layer_types is not None and any(
-        _is_sliding_attention_layer(layer_type) for layer_type in layer_types
-    )
-    if (
-        any_sliding
-        and layer_idx < len(layer_types)
-        and not _is_sliding_attention_layer(layer_types[layer_idx])
-    ):
-        return (-1, -1)
-    return (swa_window - 1, swa_window - 1)
 
 
 def dflash_merge_future_block_attention(
@@ -1181,18 +1143,8 @@ class DFlashForCausalLM(nn.Module):
 
         # Load DFlash-specific weights directly
         self._load_target_projection(remapped)
-
         if "hidden_norm.weight" in remapped:
-            rms_norm_eps = getattr(self.config, "rms_norm_eps", 1e-6)
-            self.hidden_norm = nn.RMSNorm(
-                remapped["hidden_norm.weight"].shape[0],
-                eps=rms_norm_eps,
-                device="cuda",
-                elementwise_affine=True,
-                dtype=remapped["hidden_norm.weight"].dtype,
-            )
-            self.hidden_norm.weight.data.copy_(remapped["hidden_norm.weight"])
-            del remapped["hidden_norm.weight"]
+            self._load_hidden_norm(remapped.pop("hidden_norm.weight"))
 
         # allow_partial_loading is what lets the shared modules below be absent.
         # It is also why a truncated checkpoint loads clean, so gate it on the
@@ -1226,6 +1178,58 @@ class DFlashForCausalLM(nn.Module):
             weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=weight.dtype
         )
         self.fc.weight.data.copy_(weight)
+
+    def _load_hidden_norm(self, weight: torch.Tensor) -> None:
+        self.hidden_norm = nn.RMSNorm(
+            weight.shape[0],
+            eps=getattr(self.config, "rms_norm_eps", 1e-6),
+            device="cuda",
+            elementwise_affine=True,
+            dtype=weight.dtype,
+        )
+        self.hidden_norm.weight.data.copy_(weight)
+
+    def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
+        """Build the modules ``load_weights`` builds from the checkpoint, on dummy values.
+
+        ``fc`` and ``hidden_norm`` take the shapes the draft config gives the checkpoint's:
+        ``fc`` projects the captured target layers' hidden states, concatenated, to the
+        drafter's hidden size.
+        """
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(seed)
+
+        def dummy(*shape: int) -> torch.Tensor:
+            tensor = torch.empty(shape, dtype=self.config.torch_dtype, device="cuda")
+            return tensor.uniform_(low, high, generator=generator)
+
+        hidden_size = self.config.hidden_size
+        if "fc" not in self._modules:
+            self._load_target_projection(
+                {"fc.weight": dummy(hidden_size, self._target_projection_width())}
+            )
+        if "hidden_norm" not in self._modules:
+            self._load_hidden_norm(dummy(hidden_size))
+
+    def _target_projection_width(self) -> int:
+        """``fc``'s input width: one target hidden state per layer the worker captures.
+
+        The worker captures the layers ``speculative_config.target_layer_ids`` names, which
+        the draft config gives in ``dspark_config``, in ``dflash_config`` or at its top level.
+        The drafter runs on the target's embedding or LM head
+        (``load_weights_from_target_model``), so its hidden size is the target's where the
+        config gives no ``target_hidden_size``.
+        """
+        layer_ids = resolve_dspark_head_config(self.config, "target_layer_ids")
+        if not layer_ids:
+            raise ValueError(
+                f"{type(self).__name__}: the draft config names no target_layer_ids, so the "
+                "dummy fc cannot take the checkpoint's shape."
+            )
+        target_hidden_size = (
+            getattr(self.config, "target_hidden_size", None) or self.config.hidden_size
+        )
+        return len(layer_ids) * target_hidden_size
 
     def _load_dflash2_weights(self, weights: Dict, *, load_selector: bool = True) -> Dict:
         """Build the DFlash 2 convolutions and candidate selector.

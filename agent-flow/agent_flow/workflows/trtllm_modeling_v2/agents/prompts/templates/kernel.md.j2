@@ -44,7 +44,7 @@ Sourcing: no rung is recorded for this entry. Name the one its `__call__` wraps 
 {% else -%}
 Sourcing: **tier {{ tier }} — {{ tier_description }}** (recorded in `vocabulary.yaml` queue row {{ ctx.item.n }}).
 {% if writes_implementation -%}
-This entry has no implementation yet — you are writing it, not wrapping one. Correct-and-slow is acceptable; the tuning phase replaces it. Say in the contract what you rejected at the cheaper rungs.
+This entry has no implementation yet — you are writing it, not wrapping one. Correct-and-slow is acceptable. Say in the contract what you rejected at the cheaper rungs.
 {% elif kernel_library -%}
 The entry's `__call__` calls the FlashInfer callable directly — no trtllm op wraps it. Find it in the FlashInfer the run's interpreter has installed; certify the callable as the kernel sources below say.
 {% endif -%}

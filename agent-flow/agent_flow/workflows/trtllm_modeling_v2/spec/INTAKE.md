@@ -50,7 +50,7 @@ goal words cannot say.
 - `kv=` lists the KV dtypes in one word: the first is every gate's, each other one a variant
   (`gates: [accuracy]`) judged against the unit's own score.
 - Derive asks rather than guesses (and stops until the spec answers): `model_key` when
-  `config.json` names no model. A tuning goal that names no concurrency tunes at 1/32/128.
+  `config.json` names no model.
 
 ## 3. Map the request
 
@@ -64,8 +64,7 @@ goal words cannot say.
 | chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined (the lint blocks a cross product unless the notes accept the one the request names) |
 | disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
 | any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
-| workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192); `perf.workload` | |
-| "perf tune" | `perf.enabled: true`; `perf.workload.concurrency` 1/32/128 unless the goal names it; a `dep` member only the high point, a global total; a perf config's `cuda_graph_config` captures up to the live requests a rank holds (under attention DP the concurrency over the ranks, x1.5 as they finish unevenly) | it starts once the core's required checks hold, never holds the onboarding back (its jobs queue below the onboarding's, its verdict does not wait for it), and measures one baseline (no stock reference, no repeats); a goal is `ratio_to_baseline` or `pct_of_sol` |
+| workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192) | |
 
 **The smallest contract that covers the request.** Every check loads the model (minutes on a
 large checkpoint), and every change to the target runs the stale checks again, so the contract's
