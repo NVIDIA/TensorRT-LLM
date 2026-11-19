@@ -3137,6 +3137,9 @@ class PyExecutor:
     def _has_pending_context_retirement(self) -> bool:
         """Keep qualified source retirement live after the logical result leaves.
 
+        Always False under attention DP, which the context-first ownership
+        profile does not support yet.
+
         Returns:
             Whether a source claim still awaits TP-agreed retirement. All
             qualified cleanup paths retain these claims until group settlement.

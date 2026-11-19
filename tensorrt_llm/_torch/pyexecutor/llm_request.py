@@ -1115,7 +1115,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         Reported as usage cached_tokens. Unlike cached_tokens, it is kept
         across a recompute, whose prefill reuses blocks this request computed
-        itself.
+        itself. A generation-only request (disaggregated serving) holds the
+        prefix it matched in this worker's cache at its generation init.
         """
         return self._reported_cached_tokens or 0
 

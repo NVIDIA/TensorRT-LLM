@@ -144,7 +144,9 @@ class TestKVCacheAwareADPRouter:
         assert states[0].num_active_tokens == 100
 
     @pytest.mark.parametrize("account_for_in_transfer", [True, False])
-    def test_gather_all_rank_states_retiring_and_in_transfer(self, account_for_in_transfer):
+    def test_gather_all_rank_states_retiring_and_in_transfer(
+        self, account_for_in_transfer: bool
+    ) -> None:
         dist = _mock_dist(tp_rank=0)
         mgr = _mock_kv_cache_manager()
         transfer_mgr = MagicMock()

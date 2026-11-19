@@ -307,7 +307,8 @@ class RankState:
     num_in_transfer_requests: int = 0
     """Requests still sending KV to the generation server, which
     ``num_active_requests`` includes as routing load under
-    ``kv_cache_routing_account_for_in_transfer``. They need no forward step."""
+    ``kv_cache_routing_account_for_in_transfer``. They need no forward step.
+    Always 0 unless the KV-cache-aware router counts these sends as load."""
     has_pending_context_retirement: bool = False
     """Whether a context request on this rank awaits the retirement of its KV
     send (see ``supports_logical_context_cancellation``). The rank keeps
@@ -316,8 +317,11 @@ class RankState:
     # Marks the (tag, num_in_transfer_requests, has_pending_context_retirement)
     # section that serialize appends. Every rank of a fleet runs the same build,
     # so every message carries it; the tag only tells deserialize where the
-    # section is, so that the shorter layouts it also parses stay readable. No
-    # field of those layouts is -4: each is a count or a -1 default.
+    # section is, so that the shorter layouts it also parses stay readable. It
+    # reads the tag at a fixed position, the third value from the end, which in
+    # those layouts holds a count or a -1 default. The one other -4, the
+    # iteration stats version of the snapshot layouts, sits at index 5, which in
+    # them is never the third value from the end.
     _IN_TRANSFER_TAG: ClassVar[int] = -4
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:

@@ -2141,7 +2141,9 @@ def _make_adp_ranks_at_shutdown(
         gathered[rank] = message
         return list(gathered)
 
-    def route_to_rank1(states, new_requests, *_args, **_kwargs):
+    def route_to_rank1(
+        states: list[RankState], new_requests: list, *_args, **_kwargs
+    ) -> tuple[dict[int, list], int]:
         return {0: [], 1: list(new_requests)}, len(new_requests)
 
     ranks = []
@@ -2204,7 +2206,7 @@ def _stop_decisions(ranks: list[PyExecutor]) -> list[bool]:
 @pytest.mark.parametrize("account_for_in_transfer", [False, True])
 def test_adp_ranks_stop_on_same_iteration(
     account_for_in_transfer: bool, monkeypatch: pytest.MonkeyPatch
-):
+) -> None:
     """Attention-DP ranks at shutdown keep stepping while any rank has or gets a request.
 
     A rank that stopped alone would leave its peers' next collective without it. A request that
@@ -2238,7 +2240,7 @@ def test_adp_ranks_stop_on_same_iteration(
 @pytest.mark.parametrize("account_for_in_transfer", [False, True])
 def test_adp_ranks_wait_for_peer_context_retirement(
     account_for_in_transfer: bool, packed_sync: bool, monkeypatch: pytest.MonkeyPatch
-):
+) -> None:
     """Attention-DP ranks at shutdown keep stepping while a peer's context send awaits retirement.
 
     A context-first request whose KV send the transceiver retires keeps its rank stepping until

@@ -393,8 +393,9 @@ class TestRankState:
         wire = state.serialize(include_kv_cache_load)
         assert wire[5] == -4  # Payload version follows the five-field rank prefix.
         assert RankState.deserialize(wire) == state
+        # One trailing field short; the in-transfer section stays in place after it.
         with pytest.raises(ValueError, match="four trailing fields"):
-            RankState.deserialize(wire[:-1])
+            RankState.deserialize([*wire[:-4], *wire[-3:]])
 
     @pytest.mark.parametrize("include_kv_cache_load", [False, True])
     def test_pending_work_roundtrip_without_sampled_stats(
@@ -536,7 +537,8 @@ class TestRankState:
             ),
         )
         wire = state.serialize()
-        for invalid in (wire[:-1], [*wire, 0]):
+        # One trailing field short or one too many, the in-transfer section kept after them.
+        for invalid in ([*wire[:-4], *wire[-3:]], [*wire[:-3], 0, *wire[-3:]]):
             with pytest.raises(ValueError, match="four trailing fields"):
                 RankState.deserialize(invalid)
         wire[6] = 2  # The routing-load presence flag must be 0 or 1.

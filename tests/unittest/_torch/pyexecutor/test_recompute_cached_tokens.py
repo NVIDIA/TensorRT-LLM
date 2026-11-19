@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 from _torch.pyexecutor.llm_request_factory import make_llm_request
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import KVCacheAwareADPRouter
 from tensorrt_llm.bindings import executor as trtllm
@@ -26,19 +26,19 @@ GENERATED = [100, 101, 102]
 TOKENS_PER_BLOCK = 4
 
 
-def _prefill(req, reuse: int) -> None:
+def _prefill(req: LlmRequest, reuse: int) -> None:
     """What the KV cache manager and ``DecoderInputPreparer`` do at a prefill."""
     req.set_prepopulated_prompt_len(reuse, TOKENS_PER_BLOCK)
     req.cached_tokens = req.context_current_position
 
 
-def _router():
+def _router() -> KVCacheAwareADPRouter:
     dist = MagicMock(tp_rank=0, has_cp_helix=False)
     dist.mapping.dp_size = 1
     return KVCacheAwareADPRouter(dist=dist, kv_cache_manager=MagicMock())
 
 
-def _recomputed_request(first_reuse: int, streaming: bool = False):
+def _recomputed_request(first_reuse: int, streaming: bool = False) -> LlmRequest:
     req = make_llm_request(
         1,
         trtllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION,
@@ -66,7 +66,7 @@ def test_recompute_reports_the_first_prefill_cached_tokens(first_reuse: int) -> 
     assert req.cached_tokens == len(PROMPT)
 
 
-def _first_token_after_recompute():
+def _first_token_after_recompute() -> LlmRequest:
     """A streaming request, prefix hit 8, at its first token after the recompute prefill."""
     req = _recomputed_request(8, streaming=True)
     req.add_new_token(GENERATED[-1] + 1, 0)
