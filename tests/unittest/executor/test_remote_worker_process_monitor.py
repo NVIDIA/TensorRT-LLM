@@ -4,6 +4,7 @@
 
 import gc
 import json
+import logging
 import os
 import signal
 import socket
@@ -16,7 +17,6 @@ import zmq
 
 from tensorrt_llm._errors import ConfigInputError, ResourceError, RuntimeInitError
 from tensorrt_llm._startup_errors import classify_startup_error
-from tensorrt_llm._torch.disaggregation.native import utils as network_utils
 from tensorrt_llm.executor import remote_worker_process_monitor as remote
 from tensorrt_llm.executor.ipc import IpcQueue
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
@@ -50,8 +50,7 @@ def test_remote_rank_loss_wakes_existing_monitor_without_mpi(monkeypatch, lost_p
     # so serving must fail through the independent process monitor instead.
     if lost_process == "worker":
         monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
-        monkeypatch.setattr(network_utils, "get_local_ip", lambda: "127.0.1.1")
-        monkeypatch.setattr(remote.socket, "gethostbyname", lambda _host: "127.0.2.1")
+        monkeypatch.setattr(remote, "_discover_host", lambda: ("127.0.1.1", "test"))
     else:
         monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_TIMEOUT", "1.5")
@@ -99,7 +98,7 @@ def test_remote_rank_loss_wakes_existing_monitor_without_mpi(monkeypatch, lost_p
 
 def test_remote_readiness_requires_every_rank(monkeypatch, caplog):
     monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
-    monkeypatch.setattr(network_utils, "get_local_ip", lambda: "127.0.1.1")
+    monkeypatch.setattr(remote, "_discover_host", lambda: ("127.0.1.1", "test"))
     monitor = remote.RemoteWorkerProcessMonitor(2)
     watch = remote.WorkerProcessWatch(monitor.endpoint, 0)
     try:
@@ -146,7 +145,7 @@ def test_rank_missing_after_the_first_report_fails_startup(monkeypatch):
 def test_unresolvable_watch_host_reports_configuration_error(monkeypatch, override):
     if override is None:
         monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
-        monkeypatch.setattr(network_utils, "get_local_ip", lambda: "missing.invalid")
+        monkeypatch.setattr(remote, "_discover_host", lambda: ("missing.invalid", "test"))
     else:
         monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", override)
     failure = socket.gaierror("hostname cannot be resolved")
@@ -188,7 +187,7 @@ def test_explicit_watch_host_and_fixed_port_reach_standalone_helper(monkeypatch,
     def unexpected_discovery():
         raise AssertionError("Explicit watch host must take precedence over discovery")
 
-    monkeypatch.setattr(network_utils, "get_local_ip", unexpected_discovery)
+    monkeypatch.setattr(remote, "_discover_host", unexpected_discovery)
     monitor = remote.RemoteWorkerProcessMonitor(1)
     advertised_host = f"[{host}]" if family == socket.AF_INET6 else host
     try:
@@ -363,6 +362,136 @@ def test_fixed_watch_port_in_use_is_still_a_resource_error(monkeypatch):
         first.close()
 
 
+def _addrinfo(*addresses):
+    return [
+        (socket.AF_INET6 if ":" in a else socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, 0))
+        for a in addresses
+    ]
+
+
+@pytest.mark.parametrize(
+    "addresses, expected",
+    [
+        # Regression: a dual-stack name switched the listener to IPv6.
+        (("::1", "127.0.0.1"), "tcp://127.0.0.1:"),
+        # Regression: Debian's 127.0.1.1 hostname alias won over a routable address.
+        (("127.0.1.1", "192.0.2.1"), "tcp://192.0.2.1:"),
+    ],
+)
+def test_watch_host_name_prefers_ipv4_and_non_loopback(monkeypatch, addresses, expected):
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "worker-host")
+    monkeypatch.setattr(remote.socket, "getaddrinfo", lambda *_a, **_k: _addrinfo(*addresses))
+    monitor = remote.RemoteWorkerProcessMonitor(1)
+    try:
+        assert monitor.endpoint.address.startswith(expected)
+        assert not monitor.endpoint.ipv6
+    finally:
+        monitor.close()
+
+
+@pytest.mark.parametrize(
+    "override, warned",
+    [
+        # A hostname whose only entry is the Debian/Ubuntu 127.0.1.1 alias.
+        ("worker-host", True),
+        # Discovery that found no routable interface.
+        (None, True),
+        # Explicit loopback is a valid choice when all ranks share the namespace.
+        ("127.0.0.1", False),
+        ("localhost", False),
+    ],
+)
+def test_loopback_listener_address_warns_unless_chosen_explicitly(
+    monkeypatch, caplog, override, warned
+):
+    if override is None:
+        monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
+        monkeypatch.setattr(remote, "_discover_host", lambda: ("127.0.0.1", "test discovery"))
+    else:
+        monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", override)
+    address = "127.0.1.1" if override == "worker-host" else "127.0.0.1"
+    monkeypatch.setattr(remote.socket, "getaddrinfo", lambda *_a, **_k: _addrinfo(address))
+    monitor = remote.RemoteWorkerProcessMonitor(1)
+    try:
+        assert monitor.endpoint.address.startswith(f"tcp://{address}:")
+        assert ("advertises loopback address" in caplog.text) is warned
+        if warned:
+            assert address in caplog.text and "TRTLLM_WORKER_WATCH_HOST" in caplog.text
+    finally:
+        monitor.close()
+
+
+@pytest.mark.parametrize(
+    "variable, value, expected",
+    [
+        ("NCCL_SOCKET_IFNAME", "ib", "198.51.100.7"),
+        ("NCCL_SOCKET_IFNAME", "=ib0", "198.51.100.7"),
+        ("NCCL_SOCKET_IFNAME", "^docker", "203.0.113.5"),
+        ("GLOO_SOCKET_IFNAME", "ib0", "198.51.100.7"),
+        ("OMPI_MCA_oob_tcp_if_include", "10.0.0.0/8,ib0", "198.51.100.7"),
+    ],
+)
+def test_discovery_prefers_the_configured_inter_node_interface(
+    monkeypatch, variable, value, expected
+):
+    # Regression: discovery ignored the interface NCCL/MPI were pinned to and
+    # picked the default route, which may be firewalled between nodes.
+    for name in remote._INTERFACE_HINT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(variable, value)
+    monkeypatch.setattr(
+        remote,
+        "_interface_ipv4s",
+        lambda: {"docker0": [], "eth0": ["192.0.2.10"], "ib0": ["198.51.100.7"]},
+    )
+
+    class RouteProbe:
+        def __init__(self, *_args):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def connect(self, _address):
+            pass
+
+        def getsockname(self):
+            return ("203.0.113.5", 40000)
+
+    monkeypatch.setattr(remote.socket, "socket", RouteProbe)
+    assert remote._discover_host()[0] == expected
+
+
+def test_discovery_without_a_route_uses_an_interface_quietly(monkeypatch, caplog):
+    # Regression: discovery logged ERROR lines on every startup (netifaces is
+    # not installed) and then silently fell back to 127.0.0.1.
+    for name in remote._INTERFACE_HINT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(remote, "_interface_ipv4s", lambda: {"lo": [], "eth0": ["192.0.2.10"]})
+
+    class NoRoute:
+        def __init__(self, *_args):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def connect(self, _address):
+            raise OSError("Network is unreachable")
+
+    monkeypatch.setattr(remote.socket, "socket", NoRoute)
+    assert remote._discover_host() == ("192.0.2.10", "interface eth0")
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    monkeypatch.setattr(remote, "_interface_ipv4s", lambda: {"lo": []})
+    assert remote._discover_host()[0] == "127.0.0.1"
+
+
 def test_unreachable_watch_helper_reports_rank_endpoint_and_configuration_hint(monkeypatch):
     monkeypatch.setattr(remote, "_START_TIMEOUT", 0.1)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
@@ -377,6 +506,7 @@ def test_unreachable_watch_helper_reports_rank_endpoint_and_configuration_hint(m
     assert endpoint.address in message
     # Launchers that forward only text keep the hint in the message.
     assert "TRTLLM_WORKER_WATCH_HOST" in message and "firewall" in message
+    assert "loopback address" in message
     info = classify_startup_error(error.value)
     assert info.category == "runtime_init"
     assert info.hint == remote.WORKER_WATCH_HINT

@@ -57,6 +57,99 @@ WORKER_WATCH_HINT = (
 logger = logging.getLogger(__name__)
 
 
+# Interfaces a deployment already configured for inter-node traffic, in order.
+_INTERFACE_HINT_VARIABLES = (
+    "NCCL_SOCKET_IFNAME",
+    "GLOO_SOCKET_IFNAME",
+    "OMPI_MCA_oob_tcp_if_include",
+)
+
+
+def _usable_ipv4(address: str) -> bool:
+    ip = ipaddress.ip_address(address)
+    return ip.version == 4 and not (ip.is_loopback or ip.is_link_local or ip.is_unspecified)
+
+
+def _interface_ipv4s() -> dict[str, list[str]]:
+    """Return each interface's non-loopback, non-link-local IPv4 addresses."""
+    import psutil
+
+    return {
+        name: [a.address for a in addrs if a.family == socket.AF_INET and _usable_ipv4(a.address)]
+        for name, addrs in psutil.net_if_addrs().items()
+    }
+
+
+def _discover_host() -> tuple[str, str]:
+    """Choose a worker-reachable IPv4 address and describe where it came from.
+
+    Prefer an interface the deployment configured for inter-node traffic, then
+    the default route, then any interface. Failed steps log at debug level only;
+    the caller warns once if the result is loopback.
+    """
+    try:
+        interfaces = _interface_ipv4s()
+    except (ImportError, OSError) as error:
+        logger.debug("Cannot list network interfaces for process watch: %s", error)
+        interfaces = {}
+    for variable in _INTERFACE_HINT_VARIABLES:
+        value = os.environ.get(variable, "").strip()
+        # Exclusion lists ("^name") do not name an interface to use.
+        if not value or value.startswith("^"):
+            continue
+        # NCCL matches interface-name prefixes unless the list starts with "=".
+        prefix = variable == "NCCL_SOCKET_IFNAME" and not value.startswith("=")
+        for name in value.lstrip("=").split(","):
+            name = name.strip()
+            # Skip subnet (CIDR) entries, which some MPI options also accept.
+            if not name or "/" in name:
+                continue
+            for interface, addresses in interfaces.items():
+                matches = interface.startswith(name) if prefix else interface == name
+                if matches and addresses:
+                    return addresses[0], f"{variable}={value}"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            # Connecting a UDP socket sends nothing; it only selects a route.
+            probe.connect(("10.255.255.255", 1))
+            address = probe.getsockname()[0]
+        if _usable_ipv4(address):
+            return address, "the default route"
+    except OSError as error:
+        logger.debug("Cannot find the default route for process watch: %s", error)
+    for interface, addresses in interfaces.items():
+        if addresses:
+            return addresses[0], f"interface {interface}"
+    return "127.0.0.1", "no non-loopback interface"
+
+
+def _resolve_host(host: str) -> tuple[int, str]:
+    """Resolve host, preferring IPv4 and non-loopback results.
+
+    A dual-stack name keeps the listener on IPv4, and a name whose first entry
+    is a loopback alias (such as Debian's 127.0.1.1 hostname entry) uses a
+    routable address when the name also has one.
+    """
+    infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+
+    def preference(info):
+        return (ipaddress.ip_address(info[4][0]).is_loopback, info[0] != socket.AF_INET)
+
+    family, _, _, _, address = min(infos, key=preference)
+    return family, address[0]
+
+
+def _is_loopback_name(host: str | None) -> bool:
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _heartbeat_timeout_from_env(config_error: type) -> float:
     """Read TRTLLM_WORKER_WATCH_TIMEOUT, the lease in seconds, at construction."""
     value = os.environ.get("TRTLLM_WORKER_WATCH_TIMEOUT")
@@ -109,7 +202,6 @@ class RemoteWorkerProcessMonitor:
         import zmq
 
         from tensorrt_llm._errors import ConfigInputError, ResourceError, RuntimeInitError
-        from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
         from .ipc import IpcQueue
 
@@ -122,15 +214,29 @@ class RemoteWorkerProcessMonitor:
         self._first_report_at: float | None = None
         self._failure: dict | None = None
         self._heartbeat_timeout = _heartbeat_timeout_from_env(ConfigInputError)
-        host = os.environ.get("TRTLLM_WORKER_WATCH_HOST") or get_local_ip()
+        override = os.environ.get("TRTLLM_WORKER_WATCH_HOST")
+        if override:
+            host, source = override, "TRTLLM_WORKER_WATCH_HOST"
+        else:
+            host, source = _discover_host()
         try:
-            family, _, _, _, address = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)[0]
+            family, host = _resolve_host(host)
         except socket.gaierror as error:
             raise RuntimeInitError(
                 f"Cannot resolve process-watch host {host!r}. {WORKER_WATCH_HINT}",
                 hint=WORKER_WATCH_HINT,
             ) from error
-        host = address[0]
+        # An explicit loopback choice is valid when every rank shares this
+        # network namespace. Anything else that ends at loopback is usually a
+        # discovery or /etc/hosts problem that fails startup on other hosts.
+        if ipaddress.ip_address(host).is_loopback and not _is_loopback_name(override):
+            logger.warning(
+                "Process-watch listener advertises loopback address %s (from %s); ranks on "
+                "other hosts cannot reach it. Set TRTLLM_WORKER_WATCH_HOST to an address "
+                "every MPI rank can reach.",
+                host,
+                source,
+            )
         # Reject wildcard advertised addresses; this comparison does not bind.
         # Loopback is valid when every rank can report to this endpoint.
         if ipaddress.ip_address(host).is_unspecified:
@@ -361,10 +467,17 @@ class WorkerProcessWatch:
             if not readable or self._process.stdout.readline().strip() != "ready":
                 from tensorrt_llm._errors import RuntimeInitError
 
+                address_host = endpoint.address[len("tcp://") :].rsplit(":", 1)[0].strip("[]")
+                loopback = (
+                    " That is a loopback address, reachable only from the proxy's network "
+                    "namespace."
+                    if _is_loopback_name(address_host)
+                    else ""
+                )
                 # The hint stays in the message for launchers that forward only text.
                 raise RuntimeInitError(
-                    f"MPI rank {rank} process watch failed to connect to {endpoint.address}. "
-                    f"{WORKER_WATCH_HINT}",
+                    f"MPI rank {rank} process watch failed to connect to {endpoint.address}."
+                    f"{loopback} {WORKER_WATCH_HINT}",
                     hint=WORKER_WATCH_HINT,
                 )
         except BaseException:
