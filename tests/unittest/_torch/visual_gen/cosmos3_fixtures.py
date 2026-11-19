@@ -13,13 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Cosmos3 checkpoint settings built by hand, for tests that run a pipeline or a
-resolver without a checkpoint on disk."""
+resolver without a real checkpoint: either a :class:`Cosmos3Config` built in memory,
+or the checkpoint's JSON files written into a temporary directory."""
 
+import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Optional
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     DEFAULT,
+    VAE_FILE,
     Cosmos3ActionSettings,
     Cosmos3ArchitectureSettings,
     Cosmos3AudioSettings,
@@ -30,6 +34,24 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     ParameterResolver,
     Resolved,
 )
+
+# The VAE config of a test checkpoint; the resolver requires both factors of a shipped VAE.
+VAE_CONFIG = {"scale_factor_temporal": 4, "scale_factor_spatial": 16}
+
+
+def write_checkpoint_files(
+    checkpoint_dir: Path, files: Mapping[str, Any], *, vae: bool = False
+) -> Path:
+    """Write each ``{path under the checkpoint: JSON document}`` of ``files`` into
+    ``checkpoint_dir``, plus :data:`VAE_CONFIG` as the VAE config when ``vae`` is set.
+    Returns ``checkpoint_dir``."""
+    if vae:
+        files = {VAE_FILE: VAE_CONFIG, **files}
+    for name, doc in files.items():
+        path = checkpoint_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc))
+    return checkpoint_dir
 
 
 def bare_config(

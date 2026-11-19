@@ -21,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from cosmos3_fixtures import bare_config, bare_resolver
+from cosmos3_fixtures import VAE_CONFIG, bare_config, bare_resolver, write_checkpoint_files
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.overrides import ParameterOverride
 from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
@@ -51,21 +51,13 @@ FIXTURE = Path(__file__).parent / "test_data" / "cosmos3_checkpoint_configs.json
 T_LIST = [1.0, 0.9375, 0.8333333333333334, 0.625]
 
 
-def _write(checkpoint_dir: Path, files: dict) -> Path:
-    for name, doc in files.items():
-        path = checkpoint_dir / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(doc))
-    return checkpoint_dir
-
-
 def _files_on_disk(tmp_path: Path, files: dict) -> CheckpointFiles:
-    _write(tmp_path, files)
+    write_checkpoint_files(tmp_path, files)
     return CheckpointFiles(str(tmp_path), files.get(TRANSFORMER_FILE, {}))
 
 
 def _resolve(tmp_path: Path, files: dict):
-    _write(tmp_path, files)
+    write_checkpoint_files(tmp_path, files)
     return resolve_checkpoint(str(tmp_path), files.get(TRANSFORMER_FILE, {}))
 
 
@@ -126,7 +118,7 @@ def _files():
         SCHEDULER_FILE: {"fixed_step_sampler_config": {"t_list": T_LIST}},
         CONFIG_FILE: {"model": {"config": {"vlm_config": {"use_system_prompt": False}}}},
         MODEL_INDEX_FILE: {"default_use_system_prompt": True},
-        VAE_FILE: {"scale_factor_temporal": 4, "scale_factor_spatial": 16},
+        VAE_FILE: dict(VAE_CONFIG),
     }
 
 

@@ -6,7 +6,6 @@ and its pipeline wiring: scheduler loading, recipe validation, generation
 defaults, mode resolution, and the guidance-1.0 denoise-loop contract."""
 
 import dataclasses
-import json
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,11 +13,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from cosmos3_fixtures import bare_resolver
+from cosmos3_fixtures import bare_resolver, write_checkpoint_files
 from diffusers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_DEFAULTS
-from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import RequestParameters
+from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
+    CONFIG_FILE,
+    MODEL_INDEX_FILE,
+    SCHEDULER_FILE,
+    RequestParameters,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     Cosmos3OmniMoTPipeline,
     _validate_request_compatibility,
@@ -69,21 +73,15 @@ SKIP_NON_SCHEDULER = ["text_tokenizer", "tokenizer", "vae", "sound_tokenizer"]
 
 
 def _write_scheduler_config(checkpoint_dir: Path, config: dict) -> None:
-    scheduler_dir = checkpoint_dir / "scheduler"
-    scheduler_dir.mkdir(parents=True, exist_ok=True)
-    with open(scheduler_dir / "scheduler_config.json", "w") as f:
-        json.dump(config, f)
-    vae_dir = checkpoint_dir / "vae"
-    vae_dir.mkdir(parents=True, exist_ok=True)
-    with open(vae_dir / "config.json", "w") as f:
-        json.dump({"scale_factor_temporal": 4, "scale_factor_spatial": 16}, f)
+    write_checkpoint_files(checkpoint_dir, {SCHEDULER_FILE: config}, vae=True)
 
 
 def _write_trained_config(checkpoint_dir: Path, use_system_prompt) -> None:
     """The training config's prompt flag; ``None`` writes a config without it."""
     vlm_config = {} if use_system_prompt is None else {"use_system_prompt": use_system_prompt}
-    with open(checkpoint_dir / "config.json", "w") as f:
-        json.dump({"model": {"config": {"vlm_config": vlm_config}}}, f)
+    write_checkpoint_files(
+        checkpoint_dir, {CONFIG_FILE: {"model": {"config": {"vlm_config": vlm_config}}}}
+    )
 
 
 # The schedule every request on a distilled checkpoint resolves to.
@@ -1068,8 +1066,7 @@ class TestSystemPromptDefault:
     """use_system_prompt default: config.json's vlm_config, else model_index.json."""
 
     def _write_model_index(self, checkpoint_dir: Path, content: dict) -> None:
-        with open(checkpoint_dir / "model_index.json", "w") as f:
-            json.dump(content, f)
+        write_checkpoint_files(checkpoint_dir, {MODEL_INDEX_FILE: content})
 
     def _loaded_pipeline(self, tmp_path) -> Cosmos3OmniMoTPipeline:
         _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
@@ -1349,8 +1346,7 @@ class TestAudioWeightPresenceGuard:
 
 class TestRegistryDispatch:
     def test_model_index_class_name_dispatches(self, tmp_path):
-        with open(tmp_path / "model_index.json", "w") as f:
-            json.dump({"_class_name": "Cosmos3OmniPipeline"}, f)
+        write_checkpoint_files(tmp_path, {MODEL_INDEX_FILE: {"_class_name": "Cosmos3OmniPipeline"}})
         assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == "Cosmos3OmniMoTPipeline"
 
     def test_hf_id_registered(self):

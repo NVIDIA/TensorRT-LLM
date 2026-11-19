@@ -19,7 +19,7 @@ import numpy as np
 import PIL.Image
 import pytest
 import torch
-from cosmos3_fixtures import bare_resolver
+from cosmos3_fixtures import bare_resolver, write_checkpoint_files
 from diffusers import UniPCMultistepScheduler
 from utils.llm_data import get_checkpoint
 
@@ -37,6 +37,9 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.overrides import COSMOS3_OVERRIDES
 from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
+    CONFIG_FILE,
+    MODEL_INDEX_FILE,
+    SCHEDULER_FILE,
     ParameterResolver,
     RequestParameters,
 )
@@ -1094,13 +1097,10 @@ class TestSamplingRecipeMatrix:
     def test_component_loading_rejects_edge_without_native_flag(self, tmp_path):
         """End to end through load_standard_components: a UniPC Edge
         checkpoint whose model_index omits the flag must fail at load."""
-        import json
-
-        scheduler_dir = tmp_path / "scheduler"
-        scheduler_dir.mkdir()
-        (scheduler_dir / "scheduler_config.json").write_text(
-            json.dumps(
-                {
+        write_checkpoint_files(
+            tmp_path,
+            {
+                SCHEDULER_FILE: {
                     "_class_name": "UniPCMultistepScheduler",
                     "num_train_timesteps": 1000,
                     "flow_shift": 1.0,
@@ -1108,18 +1108,11 @@ class TestSamplingRecipeMatrix:
                     "use_flow_sigmas": True,
                     "use_karras_sigmas": True,
                     "solver_order": 2,
-                }
-            )
-        )
-        (tmp_path / "model_index.json").write_text(
-            json.dumps({"_class_name": "Cosmos3OmniPipeline"})
-        )
-        (tmp_path / "config.json").write_text(
-            json.dumps({"model": {"config": {"vlm_config": {"use_system_prompt": False}}}})
-        )
-        (tmp_path / "vae").mkdir()
-        (tmp_path / "vae" / "config.json").write_text(
-            json.dumps({"scale_factor_temporal": 4, "scale_factor_spatial": 16})
+                },
+                MODEL_INDEX_FILE: {"_class_name": "Cosmos3OmniPipeline"},
+                CONFIG_FILE: {"model": {"config": {"vlm_config": {"use_system_prompt": False}}}},
+            },
+            vae=True,
         )
 
         def fresh_pipeline():
@@ -1133,8 +1126,14 @@ class TestSamplingRecipeMatrix:
         with pytest.raises(ValueError, match="use_native_flow_schedule"):
             fresh_pipeline().load_standard_components(str(tmp_path), torch.device("cpu"), skip)
 
-        (tmp_path / "model_index.json").write_text(
-            json.dumps({"_class_name": "Cosmos3OmniPipeline", "use_native_flow_schedule": True})
+        write_checkpoint_files(
+            tmp_path,
+            {
+                MODEL_INDEX_FILE: {
+                    "_class_name": "Cosmos3OmniPipeline",
+                    "use_native_flow_schedule": True,
+                }
+            },
         )
         pipeline = fresh_pipeline()
         pipeline.load_standard_components(str(tmp_path), torch.device("cpu"), skip)
