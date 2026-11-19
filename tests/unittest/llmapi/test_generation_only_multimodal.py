@@ -15,7 +15,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 class Processor:
-    config = SimpleNamespace(text_config=SimpleNamespace(rope_scaling={"mrope_section": [1, 1, 1]}))
+    uses_mrope = True
 
     def get_mrope_config(self):
         raise AssertionError("mRoPE must be supplied by context")
@@ -28,7 +28,7 @@ class Processor:
 
 
 class PlainRopeProcessor(Processor):
-    config = SimpleNamespace(text_config=SimpleNamespace(rope_scaling={"rope_type": "llama3"}))
+    uses_mrope = False
 
 
 class VocabProcessor(Processor):
@@ -75,7 +75,10 @@ def test_expanded_tokens_skip_input_processor(llm):
 
 
 @pytest.mark.parametrize("missing", ["mrope_position_ids_handle", "mrope_position_deltas_handle"])
-def test_missing_mrope_fails_loudly(llm, missing):
+@pytest.mark.parametrize("processor", [Processor, PlainRopeProcessor])
+def test_missing_mrope_fails_loudly(llm, processor, missing):
+    # With plain RoPE too: a request that sends one handle must send both.
+    llm.input_processor = processor()
     disagg = params()
     setattr(disagg, missing, None)
     with pytest.raises(ValueError, match="requires portable mRoPE"):
@@ -136,6 +139,63 @@ def test_media_tokens_above_vocab_are_detected(llm):
         {"prompt_token_ids": [1, 2, 99]}, SamplingParams(max_tokens=4), disagg
     )
     assert mm is None
+
+
+class NoFlagProcessor:
+    """A processor that does not say whether it uses mRoPE, like a text model's."""
+
+    def get_mm_token_ids(self):
+        return torch.tensor([91, 92])
+
+
+@pytest.mark.parametrize(
+    "processor, required",
+    [(Processor, True), (PlainRopeProcessor, False), (NoFlagProcessor, False)],
+    ids=["mrope", "plain-rope", "no-flag"],
+)
+def test_input_processor_decides_if_mrope_is_required(llm, processor, required):
+    llm.input_processor = processor()
+    # The config is not read: only the processor flag counts.
+    llm.input_processor.config = SimpleNamespace(rope_scaling={"mrope_section": [1, 1, 1]})
+    llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(enable_block_reuse=False))
+    request = ({"prompt_token_ids": [1, 91, 2]}, SamplingParams(max_tokens=4))
+    disagg = DisaggregatedParams(request_type="generation_only")
+    if required:
+        with pytest.raises(ValueError, match="requires portable mRoPE"):
+            llm._preprocess(*request, disagg)
+    else:
+        _, _, mm, _ = llm._preprocess(*request, disagg)
+        assert mm is None
+
+
+def test_every_mrope_model_has_a_processor_that_says_so():
+    """A model reads mRoPE state exactly when its input processor sets uses_mrope."""
+    from importlib import import_module
+
+    from tensorrt_llm._torch.models._arch_index import (
+        MULTIMODAL_MODEL_TYPE_TO_MODULE,
+        is_builtin_zoo_module,
+    )
+    from tensorrt_llm.inputs.registry import INPUT_PROCESSOR_REGISTRY
+
+    for module in sorted(set(MULTIMODAL_MODEL_TYPE_TO_MODULE.values())):
+        import_module(f"tensorrt_llm._torch.models.{module}")
+    reads, declares = set(), set()
+    for model, processor in INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type.items():
+        if not is_builtin_zoo_module(model.__module__):
+            continue
+        # The engine moves these paths to the GPU; mRoPE models list the position IDs.
+        paths = getattr(model, "multimodal_data_device_paths", None)
+        if isinstance(paths, property):
+            paths = paths.fget(None)
+        if "mrope_config.mrope_position_ids" in (paths or ()):
+            reads.add(model.__name__)
+        if getattr(processor, "uses_mrope", False):
+            declares.add(model.__name__)
+    assert declares == reads
+    assert {"Qwen2VLModel", "Qwen2_5_VLModel", "Qwen3VLModel", "Qwen3_5VLModel"} <= declares
+    # EXAONE 4.5 reuses the Qwen2-VL processor but has plain RoPE.
+    assert "Exaone4_5_ForConditionalGeneration" not in declares
 
 
 def test_text_only_does_not_require_mrope(llm):
@@ -260,6 +320,16 @@ def test_generation_only_cache_reuse_requires_multimodal_identity(llm):
     )
     assert ids == [1, 91, 2]
     assert mm.multimodal_input is None
+
+
+def test_identity_spans_must_pair_up():
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+
+    identity = MultimodalInput.from_components([[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2])
+    # Changed after the constructor checks: the extra length must not be dropped silently.
+    identity.multimodal_lengths.append(1)
+    with pytest.raises(ValueError, match="zip"):
+        identity.validate_for_prompt(4)
 
 
 @pytest.mark.parametrize(
