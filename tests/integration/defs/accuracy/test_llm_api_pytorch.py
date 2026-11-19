@@ -6121,12 +6121,12 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
         mode: Literal["baseline", "mtp3", "dflash7"],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Replay eleven unseeded long-reasoning requests sequentially.
+        """Require eleven unseeded long-reasoning requests to finish naturally.
 
-        This exercises one repeated GPQA question, rather than estimating
-        GPQA accuracy. The pipeline records duration and resource usage.
+        Each request must complete within the token budget with GDN replay
+        disabled. This does not estimate GPQA accuracy or classify repetition.
+        The pipeline records duration and resource usage.
         """
-        assert "LLM_MODELS_ROOT" in os.environ, "Set LLM_MODELS_ROOT to the model cache"
         model_root = Path(llm_models_root())
         model_path = Path(self.MODEL_PATH)
         assert model_path.is_dir(), f"Missing target checkpoint: {model_path}"
@@ -6187,7 +6187,10 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
                 assert len(result.outputs) == 1
                 output = result.outputs[0]
                 assert output.token_ids
-                assert output.finish_reason in ("stop", "length")
+                assert output.finish_reason == "stop", (
+                    f"Generation did not finish naturally: "
+                    f"finish_reason={output.finish_reason}, "
+                    f"generated_tokens={len(output.token_ids)}")
 
 
 @skip_pre_blackwell
