@@ -510,14 +510,14 @@ Combining RMSNorm and SiLU saved 1716 ms on a 5964 ms video decode, the largest 
 
 *Table 2. Measured savings from individual changes on one GB200. For the first four rows, the percentage is the saved time divided by the original 5964 ms video-decode baseline. The last two rows use their own before-change baseline. Each increment was measured at its corresponding optimization state, so the rows do not form an ablation of the final implementation.*
 
-| Change | Workload | Time saved | Share of stated baseline |
-| :--- | :--- | ---: | ---: |
-| Fuse RMSNorm and SiLU | 189-frame 720p decode | 1716 ms | 29% |
-| Fold upsampling into 2 × 2 convolution, then gather | 189-frame 720p decode | 868 ms | 15% |
-| Fuse convolution bias into its consumer | 189-frame 720p decode | 221 ms | 4% |
-| Fuse residual addition into the next norm | 189-frame 720p decode | 24 ms | 0.4% |
-| Use Conv2d when no temporal history exists | Single-image 1024 × 1024 decode | 11.8 ms | 56% of 20.9 ms |
-| Fuse encoder downsampling and block-exit operations | 189-frame 720p encode | 180 ms | 20% of 921 ms |
+| Change | Workload | Share of stated baseline |
+| :--- | :--- | ---: |
+| Fuse RMSNorm and SiLU | 189-frame 720p decode | 29% |
+| Fold upsampling into 2 × 2 convolution, then gather | 189-frame 720p decode | 15% |
+| Fuse convolution bias into its consumer | 189-frame 720p decode | 4% |
+| Fuse residual addition into the next norm | 189-frame 720p decode | 0.4% |
+| Use Conv2d when no temporal history exists | Single-image 1024 × 1024 decode | 56% of 20.9 ms |
+| Fuse encoder downsampling and block-exit operations | 189-frame 720p encode | 20% of 921 ms |
 
 Isolated gains do not add reliably: removing a kernel changes cache use, clocks, and launch behavior for the others. Full encode and decode measurements determine the resulting gain.
 
