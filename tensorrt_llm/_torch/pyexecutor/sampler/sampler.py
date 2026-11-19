@@ -48,7 +48,7 @@ from .beam_search import (
     BeamHistory,
     BeamHistoryBuilder,
     BeamSearchHandler,
-    BeamSearchHandoff,
+    BeamSearchRelayState,
     BeamSearchParams,
     BeamSearchStep,
     BeamSearchStore,
@@ -285,7 +285,7 @@ class Sampler(ABC, Generic[GenericSampleState]):
     ) -> None:
         raise NotImplementedError
 
-    def prepare_handoff(self, state: GenericSampleState) -> None:
+    def prepare_pp_relay(self, state: GenericSampleState) -> None:
         """Complete ``state.host`` before it is handed to the other pipeline-parallel ranks.
 
         Called on the last pipeline-parallel rank, which is the only one that
@@ -528,12 +528,12 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
     """Whether `new_tokens` uses the compact `(num_requests,)` layout instead of
     `[step, slot, beam]`. Describes these host tensors, so it must live here rather
     than on `SampleStateTorch`: under pipeline parallelism only this object crosses
-    the ring hand-off, and a receiving rank would otherwise pair the compact buffer
+    the PP relay, and a receiving rank would otherwise pair the compact buffer
     with an outer flag left at its default."""
-    beam_handoff: BeamSearchHandoff | None = None
+    beam_relay: BeamSearchRelayState | None = None
     """Beam-search state for the pipeline-parallel ranks that do not sample;
     None without beam search or pipeline parallelism. Lives here because this
-    object is what the ring hand-off carries to them."""
+    object is what the PP relay carries to them."""
 
     def finish_reasons_list(self) -> FinishReasonsList:
         """`(num_seq_slots, num_steps)`"""
@@ -649,7 +649,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         enable_speculative_beam_history_d2h: bool = False
         share_beam_search_state: bool = False
         """Whether other pipeline-parallel ranks consume this sampler's
-        beam-search state (``SampleStateTensorsHostTorch.beam_handoff``)."""
+        beam-search state (``SampleStateTensorsHostTorch.beam_relay``)."""
         watermark_config: "Optional[WatermarkConfig]" = None
 
     def __init__(self, args: Args):
@@ -1612,13 +1612,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 beam_caps_cuda=beam_caps_tensor_cuda,
             )
 
-    def _start_beam_search_handoff(
+    def _start_beam_relay(
         self,
         requests: list[LlmRequest],
         seq_slots_cuda: torch.Tensor,
         seq_lens_host: torch.Tensor,
         num_context_requests: int,
-    ) -> BeamSearchHandoff:
+    ) -> BeamSearchRelayState:
         """Start the host copies of the step's beam-search state for the other ranks.
 
         Parent beam indices let each rank update its cache indirection without
@@ -1635,7 +1635,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store = self.store.beam_search_store
         assert beam_search_store is not None
         beam_widths = [_get_beam_width_out(request) for request in requests]
-        return BeamSearchHandoff(
+        return BeamSearchRelayState(
             request_ids=[request.py_request_id for request in requests],
             num_context_requests=num_context_requests,
             predecessor_beams=self._copy_to_host(
@@ -1647,10 +1647,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
     @override
-    @nvtx_range("prepare_handoff")
+    @nvtx_range("prepare_pp_relay")
     @torch.inference_mode()
-    def prepare_handoff(self, state: SampleStateTorch) -> None:
-        """Build the final beams of the requests the step finishes into the hand-off.
+    def prepare_pp_relay(self, state: SampleStateTorch) -> None:
+        """Build the final beams of the requests the step finishes for the PP relay.
 
         The builders stay on this rank, so the ranks that do not sample finalize
         those requests from the beams built here. ``update_requests`` uses them
@@ -1662,13 +1662,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """
         host = state.host
         beam_history_builders = state.beam_history_builders
-        if host is None or host.beam_handoff is None or beam_history_builders is None:
+        if host is None or host.beam_relay is None or beam_history_builders is None:
             return
         beam_histories: dict[int, BeamHistory] = {}
         try:
             first_finish_reasons_host = host.first_finish_reasons
             assert first_finish_reasons_host is not None, (
-                "Beam-search handoff requires first finish reasons"
+                "Beam-search relay requires first finish reasons"
             )
             finished_beam_prefix_lengths = self._finished_beam_prefix_lengths(
                 first_finish_reasons_host
@@ -1701,11 +1701,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 beam_histories[req.py_request_id] = beam_history
         except Exception as exception:
             logger.error(traceback.format_exc())
-            host.beam_handoff.error = f"{type(exception).__name__}: {exception}"
-        host.beam_handoff.beam_histories = beam_histories
+            host.beam_relay.error = f"{type(exception).__name__}: {exception}"
+        host.beam_relay.beam_histories = beam_histories
 
-    def _apply_beam_search_handoff(
-        self, requests: list[LlmRequest], beam_handoff: BeamSearchHandoff
+    def _apply_beam_relay(
+        self, requests: list[LlmRequest], beam_relay: BeamSearchRelayState
     ) -> None:
         """Apply the sampling rank's beam-parent update to this rank's cache indirection.
 
@@ -1714,11 +1714,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         Args:
             requests: This rank's requests of the step.
-            beam_handoff: The step's hand-off from the sampling rank.
+            beam_relay: The step's relay state from the sampling rank.
         """
         beam_search_store = self.store.beam_search_store
         assert beam_search_store is not None
-        assert beam_handoff.request_ids == [request.py_request_id for request in requests], (
+        assert beam_relay.request_ids == [request.py_request_id for request in requests], (
             "PP beam-search relay request order differs from the scheduled batch"
         )
         # Completed requests may have released their slots to a new request.
@@ -1731,13 +1731,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return
         seq_slots = [request.py_seq_slot for request in requests]
         seq_slots_cuda, seq_lens_cuda = torch.tensor(
-            [seq_slots, beam_handoff.seq_lens], dtype=torch.int64, pin_memory=prefer_pinned()
+            [seq_slots, beam_relay.seq_lens], dtype=torch.int64, pin_memory=prefer_pinned()
         ).to(device="cuda", non_blocking=True)
-        context_rows = [row for row in live_rows if row < beam_handoff.num_context_requests]
+        context_rows = [row for row in live_rows if row < beam_relay.num_context_requests]
         if context_rows:
             max_prompt_len = max(requests[row].py_prompt_len for row in context_rows)
-            if len(context_rows) == beam_handoff.num_context_requests:
-                context_slots = seq_slots_cuda[: beam_handoff.num_context_requests]
+            if len(context_rows) == beam_relay.num_context_requests:
+                context_slots = seq_slots_cuda[: beam_relay.num_context_requests]
             else:
                 context_slots = torch.tensor(
                     [seq_slots[row] for row in context_rows],
@@ -1747,12 +1747,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             beam_search_store.cache_indirection.narrow(2, 0, max_prompt_len).index_fill_(
                 0, context_slots, 0
             )
-        predecessor_beams_cuda = beam_handoff.predecessor_beams.to(device="cuda", non_blocking=True)
+        predecessor_beams_cuda = beam_relay.predecessor_beams.to(device="cuda", non_blocking=True)
         rows_by_width: dict[int, list[int]] = {}
         for row in live_rows:
-            beam_width = beam_handoff.beam_widths[row]
+            beam_width = beam_relay.beam_widths[row]
             rows_by_width.setdefault(beam_width, []).append(row)
-        num_positions = max(beam_handoff.seq_lens) + 1
+        num_positions = max(beam_relay.seq_lens) + 1
         for beam_width, rows in rows_by_width.items():
             if len(rows) == len(requests):
                 slots, lengths = seq_slots_cuda, seq_lens_cuda
@@ -1793,10 +1793,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._pending_steps[slot] -= 1
 
         assert state.host is not None
-        if state.host.beam_handoff is not None and state.host.beam_handoff.error is not None:
+        if state.host.beam_relay is not None and state.host.beam_relay.error is not None:
             raise RuntimeError(
                 "Building final beams on the last pipeline-parallel rank failed: "
-                f"{state.host.beam_handoff.error}"
+                f"{state.host.beam_relay.error}"
             )
         # Reuse sample_async's qualification instead of rechecking every
         # request after the asynchronous sample completes.
@@ -1834,20 +1834,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             finish_reasons = state.host.finish_reasons_list()
 
         beam_history_builders = state.beam_history_builders
-        beam_handoff = state.host.beam_handoff
+        beam_relay = state.host.beam_relay
         # Only the last pipeline-parallel rank samples and has the builders. The
         # other ranks update their requests from its host state, which hands
         # them the step's beam-search state instead.
-        relayed_beam_state = beam_history_builders is None and beam_handoff is not None
-        assert (beam_history_builders is not None or relayed_beam_state) == self._use_beam_search
+        is_relay_receiver = beam_history_builders is None and beam_relay is not None
+        assert (beam_history_builders is not None or is_relay_receiver) == self._use_beam_search
         beam_histories: dict[int, BeamHistory] | None = None
-        if beam_handoff is not None:
-            beam_histories = beam_handoff.beam_histories
-            assert beam_histories is not None or not relayed_beam_state, (
-                "beam-search state was handed off without the final beams"
-            )
-            if relayed_beam_state:
-                self._apply_beam_search_handoff(state.requests, beam_handoff)
+        if beam_relay is not None:
+            beam_histories = beam_relay.beam_histories
+            if is_relay_receiver:
+                assert beam_histories is not None, "PP relay state is missing final beam histories"
+                self._apply_beam_relay(state.requests, beam_relay)
 
         def _maybe_build_beam_history(req_idx: int, req: LlmRequest) -> BeamHistory | None:
             if beam_histories is not None:
@@ -1968,8 +1966,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     assert beam_search_store is not None
                     assert req.py_seq_slot is not None
                     beam_width = req.py_beam_width
-                    if beam_handoff is not None:
-                        first_gen_scores = beam_handoff.cum_log_probs[req_idx, :beam_width].tolist()
+                    if beam_relay is not None:
+                        first_gen_scores = beam_relay.cum_log_probs[req_idx, :beam_width].tolist()
                     else:
                         first_gen_scores = (
                             beam_search_store.cum_log_probs[req.py_seq_slot, :beam_width]
@@ -2135,7 +2133,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         first_finish_reasons_host: torch.Tensor | None = None
         beam_history_builders: list[BeamHistoryBuilder | None] | None = None
         beam_histories_deferred = False
-        beam_handoff: BeamSearchHandoff | None = None
+        beam_relay: BeamSearchRelayState | None = None
         # Forwarded to _record_sampler_event so SamplerEvent.synchronize
         # awaits any side-stream D2H copies host-side.
         side_stream_event: torch.cuda.Event | None = None
@@ -2176,7 +2174,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     )
                 )
                 if self._share_beam_search_state:
-                    beam_handoff = self._start_beam_search_handoff(
+                    beam_relay = self._start_beam_relay(
                         requests,
                         seq_slots_cuda,
                         seq_lens_host,
@@ -2214,7 +2212,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 first_finish_reasons=first_finish_reasons_host,
                 logprobs_state=logprobs_state,
                 single_step_greedy=single_step_greedy,
-                beam_handoff=beam_handoff,
+                beam_relay=beam_relay,
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,

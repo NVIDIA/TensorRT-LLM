@@ -1344,13 +1344,13 @@ class PyExecutor:
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
         self.pp_multi_stream_sample = os.environ.get(
             "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
-        self._beam_handoff_stream: Optional[torch.cuda.Stream] = None
+        self._beam_relay_stream: Optional[torch.cuda.Stream] = None
         if (self.dist.pp_size > 1 and self.dist.is_last_pp_rank
                 and not self.pp_async_broadcast_sample_state
                 and self.max_beam_width > 1
                 and getattr(self.llm_args,
                             "enable_speculative_beam_history_d2h", False)):
-            self._beam_handoff_stream = torch.cuda.Stream()
+            self._beam_relay_stream = torch.cuda.Stream()
         # Debug: compare each aggregated helix CP rank's schedule every
         # iteration; see _check_helix_schedule_consistency.
         check_requested = os.environ.get("TLLM_HELIX_AGG_CHECK_SCHEDULE",
@@ -4935,16 +4935,16 @@ class PyExecutor:
         if self.dist.is_last_pp_rank:
             # The other ranks only get the host part of the state; the sampler
             # completes it with what they need of the step before it leaves.
-            if self._beam_handoff_stream is None:
-                self.sampler.prepare_handoff(sample_state)
+            if self._beam_relay_stream is None:
+                self.sampler.prepare_pp_relay(sample_state)
             else:
                 # The inline relay owns these in-flight request slots until
                 # their updates finish. Its fallback copies can overlap the
                 # next microbatch without waiting for that forward.
                 if sample_state.sampler_event is not None:
                     sample_state.sampler_event.synchronize()
-                with torch.cuda.stream(self._beam_handoff_stream):
-                    self.sampler.prepare_handoff(sample_state)
+                with torch.cuda.stream(self._beam_relay_stream):
+                    self.sampler.prepare_pp_relay(sample_state)
         else:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
             with nvtx_range("recv_sample_state"):

@@ -21,7 +21,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTorch, TorchSampler
-from tensorrt_llm._torch.pyexecutor.sampler.beam_search import BeamSearchHandoff
+from tensorrt_llm._torch.pyexecutor.sampler.beam_search import BeamSearchRelayState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
@@ -80,9 +80,9 @@ def test_handoff_replays_parent_history_and_reinitializes_reused_slots() -> None
     def apply(
         parents: list[list[int]], lengths: list[int], widths: list[int], contexts: int
     ) -> None:
-        sampler._apply_beam_search_handoff(
+        sampler._apply_beam_relay(
             requests,
-            BeamSearchHandoff(
+            BeamSearchRelayState(
                 request_ids=[request.py_request_id for request in requests],
                 num_context_requests=contexts,
                 predecessor_beams=torch.tensor(parents, dtype=torch.int32),
@@ -144,13 +144,13 @@ def test_handoff_replays_variable_width_steps_with_bounded_payload(speculative_d
             )
             assert state.sampler_event is not None
             state.sampler_event.synchronize()
-            sender.prepare_handoff(state)
-            assert state.host is not None and state.host.beam_handoff is not None
-            handoff = state.host.beam_handoff
-            assert handoff.seq_lens == [length + step for length in prompt_lens]
-            assert handoff.beam_widths == [min(step + 2, 4), 3]
+            sender.prepare_pp_relay(state)
+            assert state.host is not None and state.host.beam_relay is not None
+            relay = state.host.beam_relay
+            assert relay.seq_lens == [length + step for length in prompt_lens]
+            assert relay.beam_widths == [min(step + 2, 4), 3]
             assert (
-                handoff.predecessor_beams.numel() * handoff.predecessor_beams.element_size() <= 32
+                relay.predecessor_beams.numel() * relay.predecessor_beams.element_size() <= 32
             )
             relayed = SampleStateTorch(
                 requests=received_requests, host=pickle.loads(pickle.dumps(state.host))
@@ -159,7 +159,7 @@ def test_handoff_replays_variable_width_steps_with_bounded_payload(speculative_d
             receiver.update_requests(relayed)
             for row, (sampled, received) in enumerate(zip(sampled_requests, received_requests)):
                 slot = sampled.py_seq_slot
-                width = handoff.beam_widths[row]
+                width = relay.beam_widths[row]
                 positions = prompt_lens[row] + step + 1
                 assert torch.equal(
                     sender_store.cache_indirection[slot, :width, :positions],
@@ -199,7 +199,7 @@ def test_handoff_preserves_reused_slots_of_completed_requests() -> None:
     state.sampler_event.synchronize()
     sampled_requests[0].finish_by_reason(FinishReason.CANCELLED)
     received_requests[0].finish_by_reason(FinishReason.CANCELLED)
-    sender.prepare_handoff(state)
+    sender.prepare_pp_relay(state)
     relayed = SampleStateTorch(
         requests=received_requests, host=pickle.loads(pickle.dumps(state.host))
     )

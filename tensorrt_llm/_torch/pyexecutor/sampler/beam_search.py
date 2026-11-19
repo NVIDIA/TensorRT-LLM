@@ -311,7 +311,7 @@ class BeamHistory:
 
 
 @dataclass(kw_only=True)
-class BeamSearchHandoff:
+class BeamSearchRelayState:
     """Beam-search state of one step, for the pipeline-parallel ranks that do not sample.
 
     Only the last pipeline-parallel rank samples, so only its store is updated
@@ -338,7 +338,7 @@ class BeamSearchHandoff:
     beam_histories: dict[int, BeamHistory] | None = None
     """Final beams of the requests the step finishes, by request id. Filled in
     on the last rank, once the step's copies have completed, right before the
-    hand-off."""
+    PP relay."""
     error: str | None = None
     """A builder failure to raise inside every rank's request-update handler."""
 
