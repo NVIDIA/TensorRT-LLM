@@ -187,6 +187,8 @@
 /tests/unittest/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
 /tests/unittest/_torch/multi_gpu_modeling @NVIDIA/trt-llm-models-devs
 /tests/unittest/_torch/multimodal @NVIDIA/trt-llm-models-devs
+/tests/unittest/_torch/multimodal/conformance/known_gaps.py @NVIDIA/trt-llm-models-devs
+/tests/unittest/_torch/multimodal/conformance/tiers.py @NVIDIA/trt-llm-models-devs
 /tests/unittest/models @NVIDIA/trt-llm-models-devs
 /tests/unittest/others/test_multimodal_registry.py @NVIDIA/trt-llm-models-devs
 

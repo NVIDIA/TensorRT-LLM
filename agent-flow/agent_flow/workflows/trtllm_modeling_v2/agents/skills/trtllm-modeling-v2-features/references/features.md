@@ -370,6 +370,8 @@ extra host sync under overlap costs throughput only, which no gate sees.
 
 ## 6. Multimodal inputs
 
+Once the shared V2 composite lands, implement a media-serving target as `ModelingV2<Target>ForConditionalGeneration` on that base. It must meet the same P0 requirements as other multimodal models. A text-only target must reject both raw media and attached encoder rows at admission, in `validate_multimodal_request_data`. See the [multimodal onboarding tiers](../../../../../../../../.claude/skills/trtllm-model-onboard-multimodal/SKILL.md#required-runtime-features-p0p1).
+
 **What.** An input processor prepares media, an encoder embeds it, and the
 embeddings replace placeholder tokens in the decoder's input
 (`docs/source/features/multi-modality.md`; onboarding hooks in

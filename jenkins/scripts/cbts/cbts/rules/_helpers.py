@@ -48,6 +48,33 @@ def block_filters_for_stem(
     return filters
 
 
+def covering_entry_filters(
+    yaml_index: YAMLIndex, yaml_stem: str, test_path: str
+) -> dict[tuple[str, int], dict[str, set[str]]]:
+    """Keep the longest entry of each `yaml_stem` block that covers `test_path`."""
+    filters: dict[tuple[str, int], dict[str, set[str]]] = {}
+    for block in yaml_index.blocks:
+        if block.yaml_stem != yaml_stem:
+            continue
+        covering = [
+            e for e in block.tests if _target_in_filter_subtree(test_path, _entry_target(e))
+        ]
+        if covering:
+            entry = max(covering, key=lambda e: len(_entry_target(e)))
+            filters[(block.yaml_stem, block.block_index)] = {_entry_target(entry): {entry}}
+    return filters
+
+
+def merge_block_filters(
+    filters: dict[tuple[str, int], dict[str, set[str]]],
+    more: dict[tuple[str, int], dict[str, set[str]]],
+) -> None:
+    """Add the prefixes and identifiers of `more` to `filters`."""
+    for key, prefixes in more.items():
+        for prefix, ids in prefixes.items():
+            filters.setdefault(key, {}).setdefault(prefix, set()).update(ids)
+
+
 def strip_noop_diff_lines(diff: str) -> str:
     """Normalize a unified diff so blank- and comment-only edits don't count.
 

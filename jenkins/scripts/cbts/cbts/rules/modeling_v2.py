@@ -85,6 +85,12 @@ whole (routing, native loading, contracts), so any change keeps them. The
 CPU guard for shared FP4 test helpers, `moe/test_modeling_v2_fp4_test_helpers.py`,
 is also kept for every modeling_v2 change.
 
+The multimodal conformance suite (`unittest/_torch/multimodal/conformance`)
+reads every route and the targets of vision-language architectures. A shared
+file, a `routing.py`, or a file of a target whose files import the multimodal
+contract (`tensorrt_llm._torch.models.multimodal` or the subtree's
+`multimodal.py`) also selects the CPU stage's entry that covers the suite.
+
 A unit test prefix that no entry of a block sits at or under keeps the
 longest entry of that block that covers it instead, such as a directory
 entry for all of `unittest/_torch/modeling_v2`.
@@ -127,7 +133,12 @@ from typing import Callable, Optional
 
 from cbts.blocks import Stage, YAMLIndex, _entry_target, _target_in_filter_subtree
 
-from ._helpers import resolve_affected_stages, stages_by_yaml_stem
+from ._helpers import (
+    covering_entry_filters,
+    merge_block_filters,
+    resolve_affected_stages,
+    stages_by_yaml_stem,
+)
 from .base import PRInputs, Rule, RuleResult
 from .docs import is_docs_path
 from .modeling_v2_source import PACKAGE, imported_names, package_names, routed_targets
@@ -142,6 +153,8 @@ _CPP_BUILD_FILES = frozenset({"cpp/cmake/modules/modeling_v2.cmake"})
 _IGNORE = re.compile(r"--ignore=(\S+)")
 
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
+_MULTIMODAL_CONFORMANCE = "unittest/_torch/multimodal/conformance"
+_MULTIMODAL_CONTRACT = ("tensorrt_llm._torch.models.multimodal", f"{PACKAGE}.multimodal")
 _ACCURACY_ROOT = "accuracy/modeling_v2"
 _PKG_MODULE = PACKAGE
 _M3_UNIT_ROOT = f"{_UNIT_ROOT}/models/minimax_m3"
@@ -298,6 +311,8 @@ class _ImportGraph:
         }
         # False when a file does not parse: a path through it would be missed.
         self.complete = True
+        # Module name -> the absolute names it imports.
+        self.imports: dict[str, set[str]] = {}
         self._importers: dict[str, set[str]] = defaultdict(set)
         # Package -> modules that import a computed name, which may be any module under it.
         self._computed: dict[str, set[str]] = defaultdict(set)
@@ -308,6 +323,7 @@ class _ImportGraph:
                 continue
             package = module if rel.name == "__init__.py" else module.rpartition(".")[0]
             names, computed = imported_names(tree, package)
+            self.imports[module] = names
             if computed:
                 self._computed[package].add(module)
             # A module depends on its own packages too: importing it runs their __init__.
@@ -411,6 +427,8 @@ class ModelingV2Rule(Rule):
         # routing.py trees, which both the targets and the import graph read.
         self._routing_trees: dict[Path, Optional[ast.AST]] = {}
         self._routed: dict[str, Optional[set[str]]] = {}
+        # Target directory or family file -> whether its files import the multimodal contract.
+        self._imports_contract: dict[PurePosixPath, bool] = {}
 
     def _parse(self, path: Path) -> Optional[ast.AST]:
         if path.name != "routing.py" or path.parent.parent != self._src_root / "models":
@@ -466,6 +484,54 @@ class ModelingV2Rule(Rule):
             elif len(parts) > 3 and self._is_target(parts[1], parts[2]):
                 targets |= self._target_tests(parts[1], parts[2])
         return targets, {f"{_UNIT_ROOT}/{test}" for test in tests}
+
+    def _reaches_multimodal_contract(self, path: str) -> bool:
+        """Whether a changed file can change what the multimodal conformance suite reads.
+
+        That is a shared file, a route, or a file of a target whose own files import
+        the multimodal contract (only the file itself for family code).
+        """
+        if not path.startswith(_MV2_SRC_PREFIXES[0]):
+            return False
+        rel = PurePosixPath(path[len(_MV2_SRC_PREFIXES[0]) :])
+        if _is_shared(rel) or rel.name == "routing.py":
+            return True
+        parts = rel.parts
+        if parts[0] == "models" and len(parts) > 3 and self._is_target(parts[1], parts[2]):
+            unit = PurePosixPath(*parts[:3])
+        elif rel.suffix == ".py":
+            unit = rel
+        else:
+            return False
+        if unit not in self._imports_contract:
+            self._imports_contract[unit] = self._imports_multimodal_contract(unit)
+        return self._imports_contract[unit]
+
+    def _imports_multimodal_contract(self, unit: PurePosixPath) -> bool:
+        """True when a file of `unit` imports the multimodal contract, or does not parse.
+
+        Reads the import graph when another change built it, so no file is parsed twice.
+        """
+        if self._graph is not None:
+            readings = [
+                self._graph.imports.get(module)
+                for module, rel in self._graph.files.items()
+                if rel == unit or unit in rel.parents
+            ]
+        else:
+            readings = []
+            for file in sorted((self._src_root / unit).rglob("*.py")) or [self._src_root / unit]:
+                rel = PurePosixPath(file.relative_to(self._src_root).as_posix())
+                package = _module_name(
+                    rel if rel.name == "__init__.py" else rel.parent / "__init__.py"
+                )
+                tree = self._parse(file)
+                readings.append(None if tree is None else imported_names(tree, package)[0])
+        return not readings or any(
+            names is None
+            or any(n == m or n.startswith(f"{m}.") for n in names for m in _MULTIMODAL_CONTRACT)
+            for names in readings
+        )
 
     def _family_unit_tests(self, family: str, subdir: PurePosixPath) -> set[str]:
         """The mirror unit directory of family code in `subdir`, else every family-level unit test."""
@@ -548,6 +614,12 @@ class ModelingV2Rule(Rule):
                 target = _entry_target(entry)
                 if target:
                     prefix_dict.setdefault(target, set()).add(entry)
+
+        if any(self._reaches_multimodal_contract(path) for path in claimed):
+            merge_block_filters(
+                block_filters,
+                covering_entry_filters(self.yaml_index, "l0_cpu", _MULTIMODAL_CONFORMANCE),
+            )
 
         if not block_filters:
             # Defensive: modeling_v2 source changed but no modeling_v2 block

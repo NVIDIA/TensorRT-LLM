@@ -76,6 +76,7 @@ file is reported to the planner for ownership; it is not silently omitted.
 
 ## Test and certify
 
+- For a vision-language target, also run `pytest tests/unittest/_torch/multimodal/conformance -k <Class>`.
 - Parametrize `op.CELLS`; use `_validating.py`'s `certifying` fixture so the
   entry's own `__call__` and `reference` both run. Derive the comparison band;
   bands wider than torch's dtype-aware default need wrong-variant negative
