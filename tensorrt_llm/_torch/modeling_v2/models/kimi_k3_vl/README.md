@@ -14,10 +14,11 @@
 | `kimi_k3_nvfp4__sm_107__dep16` | sm_107 | NVFP4 | generation: attention DP over 16 ranks, MoE EP16, `MEGAMOE_CUTEDSL` |
 | `kimi_k3_nvfp4__sm_107__helix8_moeep8` | sm_107 | NVFP4 | generation: Helix CP8 (TP1, no attention DP, NCCL off for the all-to-all), MoE EP8, `CUTEDSL_FC12` |
 | `kimi_k3_nvfp4__sm_107__helix8_moetp2ep4` | sm_107 | NVFP4 | generation: Helix CP8 as above, MoE TP2 x EP4, `CUTEDSL_FC12` |
+| `kimi_k3_nvfp4__sm_107__helix16_moetp16ep1` | sm_107 | NVFP4 | ultra-low-latency generation: Helix CP16 (TP1, no attention DP, NCCL off for the all-to-all), MoE TP16, DSpark 7, at most 4 requests |
 
 ## Rubin targets (sm_107)
 
-The NVFP4 checkpoint runs on sm_107 only, on four specialized targets, each one layout of the
+The NVFP4 checkpoint runs on sm_107 only, on five specialized targets, each one layout of the
 recipe below. Routing admits exactly these layouts; anything else raises `NoTarget` with the facts
 it saw (`modeling_v2="require"` turns that into an error). The layouts exclude each other, so the
 target never needs the disaggregated role: no target behaves differently by role, and routing
@@ -41,6 +42,14 @@ The recipe:
   the text config, the blocks (attention residual, KDA, MLA, MoE runtime), and the core and the
   shell with the engine hooks. `weights.py` holds the weight table and its transforms. The two
   helix8 targets each carry their own copy of the helix8 model.
+- The ultra-low-latency target (`helix16_moetp16ep1`) has the same three files. Its constants
+  are its feature profile (`ops/common/k3_ull_features.py`, `K3Features`). Its kernels and
+  OpWrappers are in the family directories, named `*_ull.py` where a family file of the same name
+  differs; its runtime pieces are `ops/common/k3_ull_runtime.py` (the step shell),
+  `ops/cache/k3_ull_cache_manager.py` and `ops/cache/k3_ull_kda_checkpoints.py` (its KV cache
+  manager and KDA checkpoints) and `ops/attention/k3_ull_helix_tail_workspace.py`; its specialized
+  decode kernels live under `kernels/k3r_*/ull/` and `kernels/k3r_comm/`, with
+  source and local changes recorded in `kernels/SOURCE.json`. `FLAT_*_SOURCE.json` map its functions to the served tree.
 - The targets share code only through the family directories:
   - `kernels/<kind>/`: the kernels. The SM107 ones are `k3r_*`; `k3_*` are the sm_100 targets'.
   - `ops/<kind>/`: their OpWrappers and the runtime pieces several targets and the drafter use
@@ -57,11 +66,14 @@ The SM107 targets and the family code they use read no environment variable
 (`test_kimi_k3_no_env_switches.py`): what a target runs is its constants. Engine-wide decisions
 the targets follow (forced MNNVL all-reduce, the MNNVL test override) come from the engine's
 helpers (`use_mnnvl_fabric_handle`, `MNNVLAllReduce.is_mnnvl`). Only `routing.py` reads the
-deployment's environment, to decline.
+deployment's environment, to decline. The one other read is of the device topology, not a switch:
+the ultra-low-latency target's step shell maps its CUDA device to the physical GPU through
+`CUDA_VISIBLE_DEVICES` to pin its executor thread near it.
 
 ### Log lines
 
-Each rank logs, at INFO, the target it builds and its constants:
+Each rank logs, at INFO, the target it builds and its constants (the ultra-low-latency target:
+its feature profile):
 
 ```
 Kimi K3 SM107 constants: kimi_k3_nvfp4__sm_107__<layout> (<n>): <field>=<value>, ...
@@ -73,5 +85,5 @@ Kimi K3 SM107 constants: kimi_k3_nvfp4__sm_107__<layout> (<n>): <field>=<value>,
   cover; the single-GPU ones run in the GR100 stage, the CPU ones in `l0_cpu`.
 - **Accuracy.** `tests/integration/defs/accuracy/modeling_v2/kimi_k3_vl/<target>/`: full GSM8K
   through the disaggregated perf-sanity harness, one deployment per case (context servers on the
-  tp1 target, generation on one of the other three), listed in
+  tp1 target, generation on one of the others), listed in
   `tests/integration/test_lists/qa/llm_perf_multinode.txt`.

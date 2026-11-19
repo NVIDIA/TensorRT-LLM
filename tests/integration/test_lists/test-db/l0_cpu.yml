@@ -89,6 +89,24 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_source_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_sandwich/test_k3_sandwich_source_checks.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_k3_moe_engines_source_checks.py
+  # Kimi K3 SM107 Helix16 GEN target: KDA checkpoint layout and cache manager on CPU buffers.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_kda_checkpoints.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_cache_manager.py
+  # The drafter's FP8 context: its declaration (the same as the context servers'), page bytes, transfer IDs.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_draft_cache.py
+  # Kimi K3 SM107 ULL chain: checkpoint readers on a synthetic lazy checkpoint, the layer plan and
+  # the KDA state contract (CPU tensors only).
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_chain_weights.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_chain_plan.py
+  # Kimi K3 SM107 ULL GEN-step boundary: the measured run's settings as constants, no environment
+  # reads, and the provenance manifest checked against the served commit's sources.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_boundary.py
+  # Kimi K3 SM107 ULL step shell: executor pin, GIL switch interval and the one-kernel input commit.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_runtime_shell.py
+  # Kimi K3 SM107 ULL target: the sm107 deployment routing, and the model's host-side layer schedule,
+  # step check, layer-0 dense slice and folded MLA projection layout.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_sm107_routing.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_model_structure.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py
@@ -185,6 +203,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ/test_k3r_situ.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_rms_norm_gated/test_k3r_rms_norm_gated.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_mla_decode/test_k3r_mla_helpers.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py

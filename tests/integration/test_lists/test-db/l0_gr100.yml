@@ -152,3 +152,14 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moeep8
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__tp1
+  # The Kimi K3 SM107 ULL target's single-GPU op cells (its CPU tests are in l0_cpu; the
+  # 16-rank tests are exempt in test_modeling_v2_ci_selection._NO_CI_STAGE).
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_mla_decode_fp8.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_helix_tail_ull.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_mla_q_fused_ull.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/embedding/test_k3_embedding_gather_ull.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_fp8w_gemm_cells_ull.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_mxfp8_gemm_ull.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_k3_attn_res_norm_ull.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_dspark_rope_ull.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_spec_decode_head_ull.py

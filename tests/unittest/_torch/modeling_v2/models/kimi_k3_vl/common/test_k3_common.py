@@ -9,6 +9,7 @@
   V1 code token for token; with the flag off both callables run in order on the calling stream.
 * ``weight_io``: ``filter_weights`` / ``run_concurrently`` as V1's; ``text_model_weights`` gives the
   text loader exactly what the vision-language wrapper gave it, without the vision tensors.
+* ``helix_kv_mask`` / ``spec_positions``: the V1 helpers token for token.
 """
 
 import importlib
@@ -24,6 +25,7 @@ pytestmark = pytest.mark.cpu_only
 _FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 _MULTI_STREAM_V1 = REPO / "tensorrt_llm/_torch/modules/multi_stream_utils.py"
 _MULTI_STREAM = REPO / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/common/multi_stream.py"
+_COMMON = _MULTI_STREAM.parent
 
 
 def _common(name):
@@ -62,6 +64,19 @@ def test_do_multi_stream_is_the_engine_flag():
 )
 def test_multi_stream_helpers_are_the_v1_code(name):
     assert function_dump(_MULTI_STREAM, name) == function_dump(_MULTI_STREAM_V1, name)
+
+
+@pytest.mark.parametrize(
+    "copy,source,name",
+    [
+        ("helix_kv_mask.py", "attention/attention.py", "_helix_zero_kv_mask"),
+        ("spec_positions.py", "models/modeling_speculative.py", "_slice_spec_position_ids"),
+    ],
+)
+def test_helpers_are_the_v1_code(copy, source, name):
+    assert function_dump(_COMMON / copy, name) == function_dump(
+        REPO / "tensorrt_llm/_torch" / source, name
+    )
 
 
 def test_single_stream_runs_in_order():
