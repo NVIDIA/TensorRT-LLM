@@ -1482,10 +1482,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @parametrize_with_ids("mtp_nextn",
-                          [0, pytest.param(2, marks=skip_pre_hopper)])
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+    def _evaluate_guided_decoding(self, backend: str, mtp_nextn: int, mocker,
+                                  **llm_kwargs):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
@@ -1498,10 +1496,25 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   cuda_graph_config=cuda_graph_config,
                   enable_chunked_prefill=True,
                   max_num_tokens=256,
-                  speculative_config=mtp_config)
+                  speculative_config=mtp_config,
+                  **llm_kwargs)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+        self._evaluate_guided_decoding(backend, mtp_nextn, mocker)
+
+    @skip_pre_hopper
+    def test_guided_decoding_breakable_prefill_cuda_graph(self, mocker):
+        self._evaluate_guided_decoding(
+            "xgrammar",
+            2,
+            mocker,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("mtp_nextn",
