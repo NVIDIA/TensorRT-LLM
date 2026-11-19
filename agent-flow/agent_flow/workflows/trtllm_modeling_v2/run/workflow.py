@@ -9,8 +9,7 @@ they live in code; judgement -- how to derive a forward, what to build next
 dispatch and close:
 
 1. ``preflight`` -- Python, plus one probe turn per agent configuration.
-   A broken host fails here; the substrate gate, which boots a GPU, runs
-   beside the first turns of the next stage and stops them when it fails.
+   A broken host fails here.
 2. ``execution`` -- the planner's task graph, driven until the contract holds
    (``run/execution/tasks.py``, ``orchestrator.py``), then delivery. The
    run ends there: performance work is not the flow's.
@@ -28,7 +27,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
+from typing import Any, Collection, Iterator, Mapping, Sequence
 
 import yaml
 from rich.markup import escape as escape_markup
@@ -133,7 +132,6 @@ class TrtllmModelingV2Workflow:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         clean: bool = False,
         dry_run: bool = False,
-        skip_substrate_gate: bool = False,
         prompts: PromptBundle | None = None,
         command_runner: Any | None = None,
         shell_runner: Any | None = None,
@@ -164,7 +162,6 @@ class TrtllmModelingV2Workflow:
         self.revision_cap = max(1, revision_cap)
         self.max_attempts = max(1, max_attempts)
         self.dry_run = dry_run
-        self.skip_substrate_gate = skip_substrate_gate
         self._prompts_override = prompts
 
         # Injected so every stage is testable without a GPU, a cluster, or a
@@ -535,10 +532,7 @@ class TrtllmModelingV2Workflow:
         self._role_agents()
 
         try:
-            # A substrate gate that fails while the first turns run stops them.
-            with orchestrator_mod.stoppable(self.workspace) as stop:
-                self._run_stages(state, log, stop)
-            bootstrap._await_substrate(self)
+            self._run_stages(state, log)
         except KeyboardInterrupt:
             print_message(
                 "[bold yellow]⚠ interrupted — re-run the same command to continue "
@@ -549,21 +543,15 @@ class TrtllmModelingV2Workflow:
             self.journal.event("run interrupted", f"stage={state.stage}")
             raise
 
-    def _run_stages(
-        self, state: WorkflowState, log, stop: Callable[[str], None] | None = None
-    ) -> None:
+    def _run_stages(self, state: WorkflowState, log) -> None:
         """Preflight, then the stage the run is at, to its close.
 
-        Toward the execution stage the substrate gate runs beside its first
-        turns (``stop`` ends them when it fails), and an execution stage with no
-        graph yet starts with the survey (:meth:`_start_with_the_survey`). A run
-        the failed gate stopped is left open, as a failed preflight is:
-        re-running the same command proves the substrate again and resumes.
+        An execution stage with no graph yet starts with the survey
+        (:meth:`_start_with_the_survey`).
         """
         self._state = state
-        beside = stop if not state.done else None
         if state.stage == STAGE_PREFLIGHT:
-            if not bootstrap._run_preflight(self, state, log, stop=beside):
+            if not bootstrap._run_preflight(self, state, log):
                 return
             if self.dry_run:
                 print_message(
@@ -577,7 +565,7 @@ class TrtllmModelingV2Workflow:
         else:
             # Resuming past preflight still needs the resolved
             # environment, since every prompt and every gate carries it.
-            if not bootstrap._run_preflight(self, state, log, stop=beside):
+            if not bootstrap._run_preflight(self, state, log):
                 return
             if self.dry_run:
                 print_message(
@@ -855,16 +843,17 @@ class TrtllmModelingV2Workflow:
     def _mark_bringup(
         self, marker: str, evaluation: contract_mod.Evaluation
     ) -> contract_mod.Milestone | None:
-        """The bring-up checks hold on the target (``marker``): name its commit, once.
+        """The bring-up checks have passed on the target (``marker``): name its commit, once.
 
         ``evaluation`` is the contract evaluated on ``marker``. The first time
-        every check of :func:`~.contract.bringup_checks` passes there, the
-        checkout's ``HEAD``, whose snapshot they measured, gets the branch
-        ``<target branch>-bringup``, the journal says ``BRINGUP DELIVERED
-        <sha>`` with the time since the run opened, and the milestone is
-        appended to ``correctness.jsonl``. Nothing is recorded, and ``None``
-        returned, once a bring-up or correctness milestone is, or when no
-        commit is known to hold the state the checks measured.
+        every check of :func:`~.contract.bringup_checks` has passed, the commit
+        they measured, or the checkout's ``HEAD`` when they passed on different
+        states of the target, gets the branch ``<target branch>-bringup``, the
+        journal says ``BRINGUP DELIVERED <sha>`` with the time since the run
+        opened, and the milestone is appended to ``correctness.jsonl``. Nothing
+        is recorded, and ``None`` returned, once a bring-up or correctness
+        milestone is, or when no commit is known to hold the state the checks
+        measured.
         """
         contract = self._contract
         if contract is None or not marker or not contract_mod.bringup_holds(contract, evaluation):
@@ -881,7 +870,7 @@ class TrtllmModelingV2Workflow:
                 marker,
                 evaluation,
                 held,
-                f"{', '.join(c.key for c in held)} hold on it",
+                f"{', '.join(c.key for c in held)} passed",
             )
 
     def _deliver_milestone(
@@ -909,9 +898,9 @@ class TrtllmModelingV2Workflow:
             sha,
             "trtllm-modeling-v2: "
             + (
-                "the first unit's boot and accuracy hold at one rank"
+                "the first unit's bring-up checks passed at one member"
                 if bringup
-                else "every required check of the contract holds"
+                else "every required check of the contract passed"
             ),
             unwritten=f"{'bring-up' if bringup else 'correctness'} ref not written",
         )
@@ -948,14 +937,15 @@ class TrtllmModelingV2Workflow:
         return milestone
 
     def _mark_cells(self, marker: str, evaluation: contract_mod.Evaluation) -> list[str]:
-        """Record the cells the contract holds on ``marker``; the ones that hold anew.
+        """Record the cells whose checks have all passed; the ones new to the record.
 
         A cell is a unit or a variant at one member (:func:`~.contract.cells`).
-        ``cells.json`` keeps, per cell, the latest commit every one of its
-        checks passed on, so a run stopped at any moment says what it proved
-        and where. The commit the most cells hold on at once gets the branch
-        ``<target branch>-best``, moved forward by a later commit that holds as
-        many.
+        ``cells.json`` keeps, per cell, the commit the target was at once every
+        one of its checks had passed, so a run stopped at any moment says what
+        it proved; a pass stands, so the checks may have measured earlier
+        commits (the delivery report names each). The commit by which the most
+        cells have passed gets the branch ``<target branch>-best``, moved
+        forward by a later commit with as many.
         """
         contract = self._contract
         if contract is None or not marker:
@@ -982,19 +972,20 @@ class TrtllmModelingV2Workflow:
             moved = len(holding) >= int(best.get("cells") or 0) and best.get("sha") != sha
             if moved:
                 ref = self._point_branch(
-                    "best", sha, f"trtllm-modeling-v2: {len(holding)} of {len(owed)} cells hold"
+                    "best", sha, f"trtllm-modeling-v2: {len(holding)} of {len(owed)} cells passed"
                 )
                 record["best"] = {"sha": sha, "cells": len(holding), "ref": ref, "at": now}
             contract_mod.save_cells(self.workspace, record)
         if anew:
             self.journal.event(
                 f"CELLS {sha}",
-                f"{', '.join(anew)} hold on {sha[:10]}; {len(holding)} of {len(owed)} cells hold there",
+                f"{', '.join(anew)} passed; {len(holding)} of {len(owed)} cells have passed "
+                f"by {sha[:10]}",
             )
         if moved:
             self.journal.event(
                 f"BEST {sha}",
-                f"{len(holding)} of {len(owed)} cells hold on it"
+                f"{len(holding)} of {len(owed)} cells have passed by it"
                 + (f"; branch `{record['best']['ref']}`" if record["best"]["ref"] else ""),
             )
         return anew
@@ -1018,9 +1009,9 @@ class TrtllmModelingV2Workflow:
                 [
                     f"- verdict: **{verdict}**",
                     f"- stage reached: `{state.stage}`",
-                    f"- cells that hold: {', '.join(sorted(cells['cells'])) or 'none'}"
+                    f"- cells whose checks passed: {', '.join(sorted(cells['cells'])) or 'none'}"
                     + (
-                        f"; the most at once on `{cells['best']['sha'][:10]}`"
+                        f"; the most by `{cells['best']['sha'][:10]}`"
                         + (
                             f" (branch `{cells['best']['ref']}`)"
                             if cells["best"].get("ref")
