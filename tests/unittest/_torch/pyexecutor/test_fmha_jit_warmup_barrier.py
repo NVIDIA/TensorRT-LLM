@@ -38,10 +38,18 @@ pytestmark = pytest.mark.cpu_only
 class _Recorder:
     """Records the order of barrier calls, rank syncs, timeout switches and graph passes."""
 
-    def __init__(self, drain_result: int = 0, async_enabled: bool = True):
+    def __init__(
+        self,
+        drain_result: int = 0,
+        async_enabled: bool = True,
+        peer_value: int | None = None,
+    ):
         self.events: list[str] = []
         self.drain_result = drain_result
         self.async_enabled = async_enabled
+        # What the (single) peer contributes to every allgather; by default
+        # it agrees with this rank.
+        self.peer_value = peer_value
 
     def drain_and_verify(self) -> int:
         self.events.append("drain_and_verify")
@@ -49,7 +57,7 @@ class _Recorder:
 
     def allgather(self, value):
         self.events.append("rank_sync")
-        return [value, value]
+        return [value, value if self.peer_value is None else self.peer_value]
 
     @contextlib.contextmanager
     def serving_timeouts(self) -> Iterator[None]:
@@ -222,7 +230,8 @@ def test_barrier_is_skipped_for_non_trtllm_attention_backends() -> None:
 
 def test_barrier_is_skipped_when_async_warmup_is_disabled() -> None:
     # Flag off (the default): the synchronous warmup already compiled
-    # everything inline, so there is nothing to drain, verify or sync on.
+    # everything inline, so there is nothing to drain or verify, and a single
+    # rank has no peers to meet.
     recorder = _Recorder(async_enabled=False)
     engine = _engine(recorder)
     with _patched(recorder):
@@ -230,14 +239,47 @@ def test_barrier_is_skipped_when_async_warmup_is_disabled() -> None:
     assert recorder.events == _GRAPH_PASSES
 
 
+def _run_two_ranks(recorder: _Recorder, **engine_kwargs) -> list[str]:
+    engine = _engine(recorder, world_size=2, **engine_kwargs)
+    with _patched(recorder):
+        engine.run(_resource_manager())
+    return recorder.events
+
+
 def test_ranks_meet_after_the_local_drain_and_before_the_graph_passes() -> None:
     # Each rank only waits for its own compilation; a rank entering the graph
     # passes while a peer is still compiling would wait on that peer inside an
     # all-to-all, so the ranks meet after draining and before the first pass.
-    recorder = _Recorder()
-    engine = _engine(recorder, world_size=2)
-    with _patched(recorder):
-        engine.run(_resource_manager())
-    # The leading sync is the phase-entry agreement that precedes every
-    # warmup phase; the one after the drain is the barrier's.
-    assert recorder.events == ["rank_sync", "drain_and_verify", "rank_sync", *_GRAPH_PASSES]
+    events = _run_two_ranks(_Recorder())
+    drain = events.index("drain_and_verify")
+    # Only the phase-entry agreements precede the drain; the sync right after
+    # it is the barrier's, and the graph passes follow with nothing in between.
+    assert set(events[:drain]) == {"rank_sync"}
+    assert events[drain + 1 :] == ["rank_sync", *_GRAPH_PASSES]
+
+
+def test_ranks_meet_even_when_this_rank_has_async_warmup_disabled() -> None:
+    # The flag is per process. A rank whose environment lacks it has nothing
+    # to drain, but it must still join the sync or its peers would wait here
+    # for it. The reference run skips the barrier altogether (non-TRTLLM
+    # backend), so it carries only the phase-entry agreements.
+    reference = _run_two_ranks(_Recorder(async_enabled=False), trtllm_attention=False)
+    events = _run_two_ranks(_Recorder(async_enabled=False))
+    assert "drain_and_verify" not in events
+    assert events.count("rank_sync") == reference.count("rank_sync") + 1
+    assert events[-len(_GRAPH_PASSES) - 1 :] == ["rank_sync", *_GRAPH_PASSES]
+
+
+def test_ranks_that_disagree_on_the_flag_are_reported() -> None:
+    # This rank has the flag set, its peer does not: both still meet, and the
+    # mismatch is logged so the peer's synchronous warmup is not mistaken for
+    # the background one.
+    recorder = _Recorder(peer_value=0)
+    with mock.patch.object(warmup_module, "logger") as warmup_logger:
+        events = _run_two_ranks(recorder)
+    drain = events.index("drain_and_verify")
+    assert events[drain + 1 :] == ["rank_sync", *_GRAPH_PASSES]
+    logged = " ".join(
+        str(arg) for call in warmup_logger.warning.call_args_list for arg in call.args
+    )
+    assert "TRTLLM_GEN_FMHA_ASYNC_WARMUP" in logged

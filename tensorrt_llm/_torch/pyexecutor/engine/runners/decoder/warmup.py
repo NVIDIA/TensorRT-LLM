@@ -636,31 +636,45 @@ class DecoderWarmup:
         kernel it missed (or a sweep whose background task failed) is compiled
         instead of on the first real request. Runs whether or not CUDA graphs
         are enabled, so configurations without graphs still finish
-        verification before readiness. A no-op unless async warmup is enabled
-        (``TRTLLM_GEN_FMHA_ASYNC_WARMUP=1``).
+        verification before readiness. The drain is a no-op unless async
+        warmup is enabled (``TRTLLM_GEN_FMHA_ASYNC_WARMUP=1``); the rank sync
+        after it runs whenever the forward group is reachable.
         """
         attention_backend = getattr(self._config, "attention_backend", None)
         if attention_backend is None or not issubclass(
             attention_backend.Metadata, TrtllmAttentionMetadata
         ):
             return
-        if not torch.ops.trtllm.trtllm_gen_fmha_async_jit_warmup_enabled():
+        enabled = bool(torch.ops.trtllm.trtllm_gen_fmha_async_jit_warmup_enabled())
+        if enabled:
+            with self._warmup_timer.phase("attention_jit_drain_and_verify"):
+                num_verified = torch.ops.trtllm.trtllm_gen_fmha_jit_warmup_drain_and_verify()
+                if num_verified:
+                    logger.info(
+                        f"TRTLLM-Gen FMHA JIT warmup: verified {num_verified} "
+                        "background warmup sweep(s) before CUDA graph capture."
+                    )
+        # Each rank only waited for its own compilation. The graph-shape
+        # warmup and capture forwards that follow run MoE all-to-alls, the
+        # capture pass under the serving timeouts, so a rank that enters
+        # one while a peer is still compiling could spend that timeout
+        # waiting. Meet the peers here first. The flag is read from each
+        # process's environment, so the sync does not depend on it: a rank
+        # with the flag unset still joins instead of leaving its peers
+        # waiting here. Under DWDP the forward group is not reachable through
+        # ``self.dist`` and there is no sync: a rank can then enter the
+        # graph-shape warmup pass while a DWDP peer is still compiling and
+        # wait for it inside that pass, under the warmup timeouts; the
+        # capture pass starts only once that pass has completed on every rank.
+        allgather = self._agreement.allgather()
+        if allgather is None:
             return
-        with self._warmup_timer.phase("attention_jit_drain_and_verify"):
-            num_verified = torch.ops.trtllm.trtllm_gen_fmha_jit_warmup_drain_and_verify()
-            if num_verified:
-                logger.info(
-                    f"TRTLLM-Gen FMHA JIT warmup: verified {num_verified} "
-                    "background warmup sweep(s) before CUDA graph capture."
-                )
-            # Each rank only waited for its own compilation. The graph-shape
-            # warmup and capture forwards that follow run MoE all-to-alls, the
-            # capture pass under the serving timeouts, so a rank that enters
-            # one while a peer is still compiling could spend that timeout
-            # waiting. Meet the peers here first.
-            allgather = self._agreement.allgather()
-            if allgather is not None:
-                allgather(1)
+        flags = allgather(int(enabled))
+        if any(flags) and not all(flags):
+            logger.warning(
+                "TRTLLM_GEN_FMHA_ASYNC_WARMUP is set on some ranks but not on others "
+                f"(per rank: {flags}); set it the same way on every rank."
+            )
 
     def _freeze_eager_workspace_floor(self) -> EagerWorkspaceReclaimer | None:
         if not self._eager_workspace_reclaimable:

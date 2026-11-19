@@ -617,17 +617,20 @@ private:
         {
             // Compile exactly what run() compiles (same target arch), so the warmed kernel is the one run() hits.
             // Serialize with the foreground run() path: the export library caches
-            // compiled kernels in an unsynchronized global LRU cache.
+            // compiled kernels in an unsynchronized global LRU cache. On the
+            // background thread this lock is held for the whole compile; see run()
+            // for what that costs the foreground.
             std::lock_guard<std::mutex> interfaceLock(getFmhaInterfaceMutex());
             FmhaConfig fmhaConfig = makeNvrtcConfig(options, ctaDim, grid);
             auto const compileStart = std::chrono::steady_clock::now();
-            recordJITCacheResult(mFmhaInterface.generateAndCompileKernel(fmhaConfig));
-            auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
-            auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
-            if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
+            auto const cacheStatus = mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            recordJITCacheResult(cacheStatus);
+            if (cacheStatus == FmhaInterface::KernelCacheStatus::CacheMiss)
             {
-                auto const& kernelName = fmhaConfig.mFunctionName;
-                TLLM_LOG_INFO("JIT Warmup: Warmup for %s took %.3f ms", kernelName.c_str(), compileElapsedMs);
+                auto const compileElapsedMs
+                    = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compileStart)
+                          .count();
+                TLLM_LOG_INFO("JIT Warmup: compiled %s in %.3f ms", fmhaConfig.mFunctionName.c_str(), compileElapsedMs);
             }
         }
     }
@@ -687,7 +690,13 @@ private:
     using JITWarmupRegistry = TllmGenFmhaJitWarmupRegistry<RunnerParams, TllmGenFmhaKernel>;
 
     // Process-wide; intentionally leaked (heap-allocated, never destroyed) so a
-    // background sweep can touch it at any point during process teardown.
+    // background sweep can touch it at any point during process teardown. Never
+    // cleared either: kernel objects live for the whole process (TllmFmhaKernelFactory
+    // caches them per device), so a later engine in the same process that requests a
+    // sweep registered here compiles nothing and relies on the export library's kernel
+    // cache still holding every kernel of that sweep. The cache's capacity is not
+    // visible from this side of the library; a kernel it has dropped is compiled by the
+    // first request that selects it, as it would be without any warmup.
     static JITWarmupRegistry& getJITWarmupRegistry()
     {
         static auto* const sRegistry = new JITWarmupRegistry();
@@ -732,12 +741,19 @@ private:
     }
 
     // Foreground verify pass (async mode only): the first eager (non-capturing,
-    // non-warmup) NVRTC-path run() re-runs the sweeps this kernel object
-    // scheduled on the current device. drainAndVerifyAllJITWarmups() normally
-    // gets there first; this is the fallback for callers that never invoke it.
+    // non-warmup) NVRTC-path run() after the worker has gone idle re-runs the
+    // sweeps this kernel object scheduled on the current device.
+    // drainAndVerifyAllJITWarmups() normally gets there first; this is the
+    // fallback for callers that never invoke it. The pass waits for an idle
+    // worker rather than for the first finished sweep: a verify loop takes
+    // getFmhaInterfaceMutex() once per grid point, the background holds that
+    // lock for every compile of a sweep still in flight, and the general
+    // warmup and autotuner forwards call run() during exactly that time.
     void maybeRunJITWarmupVerifyPass(RunnerParams const& liveParams)
     {
-        if (getJITWarmupRegistry().numUnverified() == 0 || liveParams.mJITWarmup)
+        if (liveParams.mJITWarmup || getJITWarmupRegistry().numUnverified() == 0
+            || (asyncJITWarmupWorkerCreated().load(std::memory_order_acquire)
+                && getAsyncJITWarmupWorker().numPendingTasks() > 0))
         {
             return;
         }
@@ -1075,20 +1091,27 @@ public:
 
             // nvrtc path - uses mFmhaInterface member for kernel caching
             // Serialize with the async JIT warmup thread: the export library caches
-            // compiled kernels in an unsynchronized global LRU cache.
+            // compiled kernels in an unsynchronized global LRU cache. The background
+            // sweep holds this lock for each whole compile (seconds per kernel) and
+            // std::mutex is not fair, so while a sweep is still compiling an
+            // acquisition here can wait for one compile, and the background can take
+            // the lock back between two of its compiles. The general warmup and
+            // autotuner forwards pay that per NVRTC-path layer per forward.
             std::lock_guard<std::mutex> interfaceLock(getFmhaInterfaceMutex());
             FmhaConfig fmhaConfig = makeNvrtcConfig(options, ctaDim, grid);
             auto const compileStart = std::chrono::steady_clock::now();
-            recordJITCacheResult(mFmhaInterface.generateAndCompileKernel(fmhaConfig));
-            auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
-            auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
-            if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
+            auto const cacheStatus = mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            recordJITCacheResult(cacheStatus);
+            if (cacheStatus == FmhaInterface::KernelCacheStatus::CacheMiss)
             {
-                auto const& kernelName = fmhaConfig.mFunctionName;
+                auto const compileElapsedMs
+                    = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compileStart)
+                          .count();
                 TLLM_LOG_WARNING(
-                    "Possible JIT Cache Missing: TRTLLM-Gen FMHA generateAndCompileKernel took %.3f ms, kernelName=%s, "
-                    "batchSize=%d, maxSeqLenQ=%d, maxSeqLenKv=%d. This could affect performance measurement.",
-                    compileElapsedMs, kernelName.c_str(), params.mBatchSize, params.mMaxSeqLenQ, params.mMaxSeqLenKv);
+                    "JIT cache miss: TRTLLM-Gen FMHA compiled %s in %.3f ms (batchSize=%d, maxSeqLenQ=%d, "
+                    "maxSeqLenKv=%d). A miss after warmup affects performance measurement.",
+                    fmhaConfig.mFunctionName.c_str(), compileElapsedMs, params.mBatchSize, params.mMaxSeqLenQ,
+                    params.mMaxSeqLenKv);
                 // Dump the kernel-selection options so a cache miss can be diffed
                 // against what the warmup sweep compiled for the same kernel name.
                 TLLM_LOG_WARNING(
