@@ -120,7 +120,7 @@ def test_first_requests_after_readiness_do_not_jit_compile(
         "unknown cache status; the miss count cannot be trusted"
     )
 
-# The warmup must have gone through the NVRTC path, otherwise the
+    # The warmup must have gone through the NVRTC path, otherwise the
     # invariant below would hold vacuously.  Skip when the model/config does
     # not trigger NVRTC compilation on this GPU (e.g. dense models on B200,
     # where shouldUseNvrtc only fires for sparse-token or head-dim-per-stage

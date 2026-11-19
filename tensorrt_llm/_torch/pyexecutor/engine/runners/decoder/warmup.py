@@ -637,7 +637,7 @@ class DecoderWarmup:
         instead of on the first real request. Runs whether or not CUDA graphs
         are enabled, so configurations without graphs still finish
         verification before readiness. A no-op unless async warmup is enabled
-(``TRTLLM_GEN_FMHA_ASYNC_WARMUP=1``).
+        (``TRTLLM_GEN_FMHA_ASYNC_WARMUP=1``).
         """
         attention_backend = getattr(self._config, "attention_backend", None)
         if attention_backend is None or not issubclass(

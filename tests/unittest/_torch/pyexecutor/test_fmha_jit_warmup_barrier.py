@@ -79,9 +79,10 @@ class _GraphRunnerStub:
 class _RecordingGraphs(DecoderCudaGraphs):
     """The real two-pass ``warmup_and_capture`` over a recording graph pass."""
 
-    def __init__(self, recorder: _Recorder) -> None:
+    def __init__(self, recorder: _Recorder, mapping=None) -> None:
         self.cuda_graph_runner = _GraphRunnerStub()
         self._recorder = recorder
+        self.mapping = mapping
 
     def run_cuda_graph_warmup(self, resource_manager: object) -> None:
         self._recorder.events.append(
@@ -117,7 +118,7 @@ def _engine(
     )
     engine._warmup_timer = _WarmupTimer(rank=0)
     engine._metrics = {}
-    engine._graphs = _RecordingGraphs(recorder)
+    engine._graphs = _RecordingGraphs(recorder, mapping=mapping)
     engine._inputs = SimpleNamespace(guided_decoder=None)
     engine._metadata = SimpleNamespace(attn_metadata=None)
     engine._context_warmups_supported = False
