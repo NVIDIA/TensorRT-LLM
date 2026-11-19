@@ -442,6 +442,7 @@ def test_another_moe_backend_or_gpu_or_no_gdn_replay_declines(on_sm103, monkeypa
     with pytest.raises(ValueError, match=f"{ple_host_table.PLE_HOST_TABLE_ENV}='nodes': expected"):
         modeling_v2_resolve(_routed_config("tep4"), _llm_args("auto"))
     monkeypatch.delenv(ple_host_table.PLE_HOST_TABLE_ENV)
+    assert ple_host_table.host_table_mode() == ple_host_table.NODE
 
 
 @pytest.mark.cpu_only

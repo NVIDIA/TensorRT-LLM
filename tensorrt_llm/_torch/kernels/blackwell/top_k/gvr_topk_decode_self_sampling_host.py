@@ -139,15 +139,15 @@ CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 # ---- device targets ----------------------------------------------------------
-# GVR V2 runs on Hopper (sm_90) and datacenter Blackwell (sm_100, sm_103): both have
+# GVR V2 runs on Hopper (sm_90), datacenter Blackwell (sm_100, sm_103) and Rubin (sm_107): all have
 # thread-block clusters, distributed shared memory and st.async, and the device module
 # compiles for either. The dispatch reads the device as (num_sms, sm_version):
 #   - ``num_sms`` sizes the register-resident waves on every target;
-#   - ``wave_sms`` sizes the streaming and clustered-register waves: Blackwell keeps the
-#     148-SM budget those paths were tuned at on every SKU, Hopper uses its SM count;
+#   - ``wave_sms`` sizes decode streaming and clustered-register waves: Blackwell/Rubin use
+#     148 SMs, Hopper uses its SM count; prefill uses physical counts on Hopper/Rubin;
 #   - ``cluster_fits`` keeps clustered plans to the clusters a Hopper GPU co-schedules.
-SUPPORTED_SM_VERSIONS = (90, 100, 103)
-_BLACKWELL_SM_VERSIONS = (100, 103)
+SUPPORTED_SM_VERSIONS = (90, 100, 103, 107)
+_BLACKWELL_SM_VERSIONS = (100, 103, 107)
 _BLACKWELL_WAVE_SMS = 148
 # Targets that take the register rungs and compile options below measured on hardware
 # (tuned on datacenter Blackwell, measured on Hopper H100 and H200 SXM and H20).
@@ -155,8 +155,13 @@ _TUNED_SM_VERSIONS = (90, 100, 103)
 
 
 def wave_sms(num_sms: int, sm_version: int) -> int:
-    """SM budget of the streaming and clustered-register wave arithmetic."""
+    """SM budget of the decode streaming and clustered-register wave arithmetic."""
     return _BLACKWELL_WAVE_SMS if sm_version in _BLACKWELL_SM_VERSIONS else num_sms
+
+
+def _prefill_wave_sms(num_sms: int, sm_version: int) -> int:
+    """Prefill keeps Blackwell's fixed budget and uses physical SM counts on Hopper/Rubin."""
+    return _BLACKWELL_WAVE_SMS if sm_version in (100, 103) else num_sms
 
 
 # Co-resident clusters per cluster size at one CTA per SM (cudaOccupancyMaxActiveClusters), by
@@ -322,8 +327,10 @@ def route(
     num_sms: int = 148,
     sm_version: int = 100,
     det: bool = False,
+    r_cap: int = 0,
 ) -> dict[str, object]:
-    """Select a kernel and launch resources from the shape and device properties."""
+    """Select a kernel and launch resources from the shape and device properties; ``r_cap`` > 0
+    caps the streaming split's CTAs per row (a split of 2..8 takes the cluster family)."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     if num_sms < 1:
@@ -532,6 +539,8 @@ def route(
             R = 1
     elif b <= wave // 2 and (n >> 2) >= 16384 and k <= 1024:  # shallow R=2 split
         R = 2
+    if r_cap > 0 and R > r_cap:
+        R = r_cap
 
     useclus = False
     if 2 <= R <= 8 and k <= 1024:
@@ -890,6 +899,8 @@ def route_streaming(
     sm_version: int = 100,
     regsel: bool = False,
     fp16: bool = False,
+    *,
+    wave_budget: int | None = None,
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
@@ -902,7 +913,7 @@ def route_streaming(
     logits (their K = 2048 rows take Hopper's 512-thread slab, see ``_wide_slab``)."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
-    wave = wave_sms(num_sms, sm_version)
+    wave = wave_sms(num_sms, sm_version) if wave_budget is None else wave_budget
     R = 1
     if b <= 32:
         r1 = max(wave // b, 1)
@@ -1907,6 +1918,8 @@ def _route_streaming_16bit(
     dtype: torch.dtype = torch.bfloat16,
     num_sms: int = 148,
     sm_version: int = 100,
+    *,
+    wave_budget: int | None = None,
 ) -> dict[str, object]:
     """16-bit form of ``route_streaming``.
 
@@ -1917,10 +1930,19 @@ def _route_streaming_16bit(
     whose chunk fills less than 3/4 of that tile takes the 8-byte-vector engine (``vec4``: FP32
     tile geometry, all threads active).
     """
-    wave = wave_sms(num_sms, sm_version)
+    wave = wave_sms(num_sms, sm_version) if wave_budget is None else wave_budget
     regsel = _regsel_rows(dtype, b, num_sms)
     plan = route_streaming(
-        b, n, npad, k, force_main, num_sms, sm_version, regsel, dtype is torch.float16
+        b,
+        n,
+        npad,
+        k,
+        force_main,
+        num_sms,
+        sm_version,
+        regsel,
+        dtype is torch.float16,
+        wave_budget=wave,
     )
     if plan["kernel"] in ("main", "clus"):
         tpl = plan["tpl"]
@@ -2048,15 +2070,20 @@ def _varlen_cache_for(dtype: torch.dtype) -> dict:
     return _VARLEN_CACHE
 
 
-# With wide_cta_rows (caller opt-in), varlen decode batches of this many rows whose plan is the
-# non-split gvr_main with 512-thread CTAs (two per SM) run it as one 1,024-thread CTA per row: twice
-# the loads in flight per row, so the batch's longest rows finish sooner. Same exact Top-K.
+# With wide_cta_rows (caller opt-in), varlen decode batches of this many rows can run the
+# non-split gvr_main as one 1,024-thread CTA per row: twice the loads in flight per row.
+# Rubin's shorter envelopes retain the sampling slab. Same exact Top-K.
 _WIDE_CTA_ROWS = (149, 296)
 
 
-def _varlen_key_flags(det: bool, wide_cta_rows: bool) -> tuple:
+def _varlen_key_flags(det: bool, wide_cta_rows: bool, pdl: bool = False, r_cap: int = 0) -> tuple:
     """``_VARLEN_CACHE`` key suffix of the opt-in launch flags (empty for the default launch)."""
-    return ((True,) if det else ()) + (("wide_cta_rows",) if wide_cta_rows else ())
+    return (
+        ((True,) if det else ())
+        + (("wide_cta_rows",) if wide_cta_rows else ())
+        + (("pdl",) if pdl else ())
+        + ((("r_cap", r_cap),) if r_cap else ())
+    )
 
 
 # ---- prefill launcher cache ------------------------------------------------
@@ -2148,7 +2175,7 @@ def _prefill_launcher(
     low = dtype in _DTYPES_16BIT
     if low and det:
         raise RuntimeError("deterministic mode requires float32 logits")
-    wave = wave_sms(num_sms, sm_version)
+    wave = _prefill_wave_sms(num_sms, sm_version)
     key = _prefill_cache_key(tier, k, n_bucket, _DTYPE_TAG[dtype], det, v16, wave)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
@@ -2157,10 +2184,20 @@ def _prefill_launcher(
     n_route = max(n_bucket, k + 1)
     if low:
         plan = _route_streaming_16bit(
-            b_route, n_route, n_route, k, True, dtype, num_sms, sm_version
+            b_route,
+            n_route,
+            n_route,
+            k,
+            True,
+            dtype,
+            num_sms,
+            sm_version,
+            wave_budget=wave,
         )
     else:
-        plan = route_streaming(b_route, n_route, n_route, k, True, num_sms, sm_version)
+        plan = route_streaming(
+            b_route, n_route, n_route, k, True, num_sms, sm_version, wave_budget=wave
+        )
     if plan["kernel"] != "main":
         raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
     rt = plan["rt"]
@@ -2523,6 +2560,8 @@ def _varlen_launcher(
     device_index: int | None = None,
     det: bool = False,
     wide_cta_rows: bool = False,
+    pdl: bool = False,
+    r_cap: int = 0,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher for one logits dtype.
 
@@ -2530,6 +2569,7 @@ def _varlen_launcher(
     their own plans, compile options and tuning scalars (many of them per dtype) and a near-K
     ``complement`` launcher. Batches ``_tallws_gate`` admits run the tall-batch engine. Every
     choice is a function of capture-stable quantities only.
+    ``pdl`` (FP32): the main and clus families wait, then release.
     """
     if dtype not in _DTYPE_TAG:
         raise RuntimeError(f"decode launcher requires float32, bfloat16 or float16, got {dtype}")
@@ -2544,7 +2584,7 @@ def _varlen_launcher(
         key = (num_rows, npad, k, n_env, next_n, cr, device_index, profile)
     else:
         key = (num_rows, npad, k, n_env, next_n, cr, profile) + _varlen_key_flags(
-            det, wide_cta_rows
+            det, wide_cta_rows, pdl, r_cap
         )
     cache = _varlen_cache_for(dtype)
     hit = cache.get(key)
@@ -2579,7 +2619,7 @@ def _varlen_launcher(
     if low:
         plan_free = _route_16bit(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
     else:
-        plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det)
+        plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
     if (
         dtype is torch.float16
         and k == 2048
@@ -3368,8 +3408,7 @@ def _varlen_launcher(
             clus_options["fused_merge_bf16"] = True
         if dtype is torch.bfloat16 and k <= 1024:
             clus_options["push_merge_bf16"] = True
-        fn = dev.get_compiled__clus(
-            tuple(plan_free["tpl"]),
+        compile_kwargs = dict(
             scap=rt_f["SCAP"],
             cmp_=rt_f["CMP"],
             varlen=True,
@@ -3379,7 +3418,9 @@ def _varlen_launcher(
             det=det,
             wave_sms=wave,
             **clus_options,
+            pdl=pdl and not det and not low,
         )
+        fn = dev.get_compiled__clus(tuple(plan_free["tpl"]), **compile_kwargs)
         e_smp, e_tgt, e_ss2, e_tgt2 = 0, 0, 0, 0
         if clus_options.get("envf", False):
             e_smp, e_tgt, e_ss2, e_tgt2 = _clus_env_samples(
@@ -3395,6 +3436,7 @@ def _varlen_launcher(
             "clus",
             fn,
             (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], e_smp, e_tgt, 0, e_ss2, e_tgt2),
+            (tuple(plan_free["tpl"]), compile_kwargs),
         )
     else:
         if low:
@@ -3477,7 +3519,15 @@ def _varlen_launcher(
                 if 2048 < n4 <= 3072 or (num_rows <= 6 * num_sms and 1536 < n4 <= 2048):
                     tpl = (256, 4, 4, tpl[3], 2, False, False)
             wide_min, wide_max = _WIDE_CTA_ROWS
-            if wide_cta_rows and wide_min <= num_rows <= wide_max and tpl[0] < 1024 and not tpl[5]:
+            if (
+                wide_cta_rows
+                and wide_min <= num_rows <= wide_max
+                and tpl[0] < 1024
+                and not tpl[5]
+                # The 1,024-thread slab skips sampling up to 16K columns for K <= 1,024.
+                # Rubin keeps the sampling slab for those shorter envelopes.
+                and (sm_version != 107 or k > 1024 or n_kernel > 16384)
+            ):
                 kpt = 1 if k <= 1024 else (2 if k <= 2048 else (4 if k <= 4096 else 8))
                 tpl = (1024, tpl[1], 1, tpl[3], kpt, tpl[5], tpl[6])
             main_options.update(
@@ -3487,6 +3537,7 @@ def _varlen_launcher(
                 staged_k=k
                 if k == 2048 and r_const == 1 and sm_version in _TUNED_SM_VERSIONS
                 else 0,
+                pdl=pdl and not det,
             )
         big = num_rows * r_const <= wave
         if (
@@ -3899,9 +3950,9 @@ def _device_num_sms(dev_index: int) -> int:
     return _unpack_device_profile(_device_profile_key(dev_index))[0]
 
 
-def _device_wave_sms(dev_index: int) -> int:
-    """Return the streaming / clustered wave budget of a CUDA device."""
-    return wave_sms(*_unpack_device_profile(_device_profile_key(dev_index)))
+def _device_prefill_wave_sms(dev_index: int) -> int:
+    """Return the prefill tier budget of a CUDA device."""
+    return _prefill_wave_sms(*_unpack_device_profile(_device_profile_key(dev_index)))
 
 
 # ---------------------------------------------------------------------------
@@ -4176,14 +4227,19 @@ def run_varlen(
     deterministic: bool = False,
     sorting: str | None = None,
     wide_cta_rows: bool = False,
+    pdl: bool = False,
+    r_cap: int = 0,
+    finalize: dict | None = None,
 ) -> None:
     """Run hint-free self-sampling Top-K with per-request device KV lengths.
 
     ``deterministic=True`` selects the deterministic kernels (fixed selected set — ties broken by the
     smaller index — and a fixed per-route output order); ``sorting="ascending"`` additionally sorts
     every row (requires deterministic). The default path is the original kernel, unchanged.
-    ``wide_cta_rows=True`` runs the non-split gvr_main plan of ``_WIDE_CTA_ROWS``-row batches with
-    1,024-thread CTAs.
+    ``wide_cta_rows=True`` opts non-split gvr_main plans of ``_WIDE_CTA_ROWS``-row batches into
+    1,024-thread CTAs; Rubin retains the sampling slab for envelopes <= 16K at K <= 1,024.
+    FP32 only: ``pdl`` (see ``_varlen_launcher``), ``r_cap`` (see ``route``) and ``finalize``
+    (CSA2's paged finalize, run by a clus launch that then sets ``finalize["done"]``).
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -4338,8 +4394,12 @@ def run_varlen(
         n_env = 1 << max(n_env - 1, 1).bit_length()
     n_env = min(max(n_env, 1), npad)
     det = _check_det_args(deterministic, sorting)
+    pdl = bool(pdl) and not det
+    r_cap = max(0, int(r_cap))
     profile = _device_profile_key(d)
-    key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(det, wide_cta_rows)
+    key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(
+        det, wide_cta_rows, pdl, r_cap
+    )
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
@@ -4358,6 +4418,8 @@ def run_varlen(
             sm_version,
             det=det,
             wide_cta_rows=wide_cta_rows,
+            pdl=pdl,
+            r_cap=r_cap,
         )
     idx = indices
     if idx.shape[1] != k:
@@ -4376,7 +4438,33 @@ def run_varlen(
     elif lc[0] == "clus":
         # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
         #                SCAP, CMP, dead DYN x5)
-        lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
+        fn = None
+        if finalize is not None and not det and k % 2 == 0 and k <= 1024:
+            # Each row's rank-0 CTA also runs CSA2's paged finalize (not compiled in a capture).
+            tpl, compile_kwargs = lc[3]
+            fn = _device().get_compiled__clus(
+                tpl,
+                **compile_kwargs,
+                fin_k=k,
+                fin_page=int(finalize["page"]),
+                cached_only=_is_capturing(),
+            )
+        if fn is not None:
+            valid = finalize["valid"].view(torch.uint8)
+            fn(
+                lg,
+                pre_arg,
+                kv_lens,
+                idx,
+                *lc[2],
+                valid.reshape(-1),
+                finalize["visible"],
+                int(finalize["width"]),
+                int(valid.stride(0)),
+            )
+            finalize["done"] = True
+        else:
+            lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
     else:
         _, fn, pre, tail = lc
         fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
@@ -4635,7 +4723,7 @@ def run_prefill(
     n_env = min(max(n_env, 1), npad)
     n_bucket = _prefill_bucket(n_env)
     num_sms, sm_version = _unpack_device_profile(_device_profile_key(d))
-    wave = wave_sms(num_sms, sm_version)
+    wave = _prefill_wave_sms(num_sms, sm_version)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
         tier = _prefill_tier(r1 - r0, n_env, k, wave)
@@ -4680,7 +4768,7 @@ def prefill_ready(
     n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
     n_env = min(max(n_env, 1), max(npad, 1))
     n_bucket = _prefill_bucket(n_env)
-    wave = _device_wave_sms(logits.get_device())
+    wave = _device_prefill_wave_sms(logits.get_device())
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k, wave)
         v16 = _prefill_v16(tier, logits.dtype, npad)
@@ -4698,14 +4786,16 @@ def varlen_ready(
     max_seq_len: int | None = None,
     deterministic: bool = False,
     wide_cta_rows: bool = False,
+    pdl: bool = False,
+    r_cap: int = 0,
 ) -> bool:
     """True iff ``run_varlen(logits, kv_lens, indices, next_n, compress_ratio,
-    max_seq_len=max_seq_len, deterministic=deterministic, wide_cta_rows=wide_cta_rows)``
-    without a workspace would launch without compiling: the launcher key it looks up (rows, row
-    stride, k, envelope, next_n, compression, device profile, dtype, det, wide_cta_rows) is cached
-    and the device's default workspace exists, so a caller can route around the engine under
-    CUDA graph capture. Host-only. Without ``max_seq_len`` run_varlen reads
-    ``kv_lens.max()`` on the host, so the answer is False."""
+    max_seq_len=max_seq_len, deterministic=deterministic, wide_cta_rows=wide_cta_rows, pdl=pdl,
+    r_cap=r_cap)`` without a workspace would launch without compiling: the launcher key it looks
+    up (rows, row stride, k, envelope, next_n, compression, device profile, dtype, det,
+    wide_cta_rows, pdl, r_cap) is cached and the device's default workspace exists, so a caller
+    can route around the engine under CUDA graph capture. Host-only. Without ``max_seq_len``
+    run_varlen reads ``kv_lens.max()`` on the host, so the answer is False."""
     if logits.dim() != 2 or indices.dim() != 2:
         return False
     num_rows = logits.shape[0]
@@ -4727,7 +4817,7 @@ def varlen_ready(
         key = (num_rows, npad, k, n_env, nn, cr, d, profile)
     else:
         key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(
-            deterministic, wide_cta_rows
+            deterministic, wide_cta_rows, bool(pdl) and not deterministic, max(0, int(r_cap))
         )
     return key in _varlen_cache_for(logits.dtype) and d in _ws_hot
 
@@ -4988,7 +5078,7 @@ def warmup_prefill(
     dtype: torch.dtype = torch.float32,
 ) -> None:
     """Compile every prefill engine ``run_prefill`` can request before serving:
-    the tier-0 arm per pow2 envelope bucket where a launch of at most ``wave_sms`` rows
+    the tier-0 arm per pow2 envelope bucket where a launch of at most the prefill wave's rows
     keeps it (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
     one launch each. ``num_rows_list`` defaults to one row count per tier.
     ``max_cols`` is the compressed max column count;
@@ -5001,7 +5091,7 @@ def warmup_prefill(
     if dtype in _DTYPES_16BIT and deterministic:
         raise RuntimeError("deterministic mode requires float32 logits")
     dev = torch.cuda.current_device()
-    wave = _device_wave_sms(dev)
+    wave = _device_prefill_wave_sms(dev)
     if num_rows_list is None:
         num_rows_list = (1, wave + 1, 2 * wave + 1)
     k = int(top_k)

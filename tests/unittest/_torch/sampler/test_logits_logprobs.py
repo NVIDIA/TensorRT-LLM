@@ -608,6 +608,69 @@ def test_logprobs_against_logits(
                 )
 
 
+def _assert_raw_logprobs_match_model_logits(completion) -> None:
+    """Check that each raw logprob is the log-softmax of the model's logits for that step."""
+    expected = torch.log_softmax(completion.generation_logits.to(device="cuda"), dim=-1).cpu()
+    assert len(completion.logprobs) == len(completion.token_ids)
+    for step, token_logprobs in enumerate(completion.logprobs):
+        assert completion.token_ids[step] in token_logprobs
+        for token_id, logprob_obj in token_logprobs.items():
+            torch.testing.assert_close(
+                torch.tensor(logprob_obj.logprob, dtype=torch.float32),
+                expected[step, token_id],
+                msg=f"raw logprob {logprob_obj.logprob} of token {token_id} at step {step} "
+                f"does not match the model's {expected[step, token_id].item()}",
+            )
+
+
+@pytest.mark.parametrize(
+    "logit_rewrite",
+    [
+        {"repetition_penalty": 1.3},
+        {"presence_penalty": 1.0, "frequency_penalty": 0.5},
+        {"bad": [" C"]},
+    ],
+    ids=["repetition_penalty", "presence_frequency_penalty", "bad_words"],
+)
+@pytest.mark.threadleak(enabled=False)
+def test_raw_logprobs_ignore_logit_rewrites(logit_rewrite: dict[str, Any], simple_llm: LLM):
+    """Raw logprobs come from the model's logits, before penalties and token bans rewrite them.
+
+    The prompt repeats its tokens, so the penalties and the banned word already change the
+    logits of the first generated token.
+    """
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        logprobs=3,
+        logprobs_mode=LogprobMode.RAW,
+        return_generation_logits=True,
+        **logit_rewrite,
+    )
+    for output in simple_llm.generate(["A B C A B C A B"], sampling_params=sampling_params):
+        _assert_raw_logprobs_match_model_logits(output.outputs[0])
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_raw_logprobs_ignore_logit_rewrites_in_a_mixed_batch(simple_llm: LLM):
+    """In a batch, the logits of each raw-logprob request are kept and put back in its own rows.
+
+    A processed-logprob request with a penalty comes first, so the raw requests' rows do not
+    start at 0, and each request has its own prompt, so a row put back in the wrong place
+    would not match the model's logits.
+    """
+    common = dict(max_tokens=8, logprobs=3, return_generation_logits=True)
+    sampling_params = [
+        SamplingParams(logprobs_mode=LogprobMode.PROCESSED, repetition_penalty=1.3, **common),
+        SamplingParams(logprobs_mode=LogprobMode.RAW, repetition_penalty=1.3, **common),
+        SamplingParams(logprobs_mode=LogprobMode.RAW, **common),
+    ]
+    outputs = simple_llm.generate(
+        ["A B C A B C A B", "1 2 3 1 2 3 1 2", "x y z x y z x y"], sampling_params=sampling_params
+    )
+    for output in outputs[1:]:
+        _assert_raw_logprobs_match_model_logits(output.outputs[0])
+
+
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
 @pytest.mark.threadleak(enabled=False)
 def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int, simple_llm: LLM):
@@ -921,7 +984,9 @@ class TestLogsprobsInBatchedSampling:
     VOCAB_SIZE = 123
 
     @staticmethod
-    def _build_test_cases(max_draft_len: int) -> list[tuple[list[SamplingParams], str]]:
+    def _build_test_cases(
+        max_draft_len: int, vocab_size: int
+    ) -> list[tuple[list[SamplingParams], str]]:
         """Return test cases for testing logprobs handling in batched sampling.
 
         Each test case consists of a list of sampling parameters and a human-readable
@@ -1111,6 +1176,31 @@ class TestLogsprobsInBatchedSampling:
             assert raw_configs
             test_cases += _combine_up_to_3_configs(raw_configs, allow_single_only=False)
 
+        # Raw logprobs of rows the sampler rewrites before sampling (embedding bias, bad words,
+        # min_length), alone and mixed with requests it leaves alone.
+        logit_rewrites = {
+            "embedding_bias": {"embedding_bias": torch.linspace(-5.0, 5.0, vocab_size)},
+            "bad_words": {"bad_token_ids": list(range(0, vocab_size, 2))},
+            "min_length": {"end_id": 5, "min_tokens": 10},
+        }
+        rewritten_configs = []
+        for rewrite_label, rewrite in logit_rewrites.items():
+            configs = [
+                SamplingParams(temperature=0.7, top_k=2, logprobs=params.logprobs, **rewrite)
+                for label, params in BASE_CASES.items()
+                if label.startswith("single-raw")
+            ]
+            assert configs
+            test_cases.append((configs, f"single_raw_rewritten_{rewrite_label}"))
+            rewritten_configs += configs
+        test_cases += _shuffle_mixed_batches(
+            (
+                rewritten_configs,
+                [params for label, params in BASE_CASES.items() if label.startswith("single")],
+            ),
+            ("raw_rewritten", "single"),
+        )
+
         return test_cases
 
     @pytest.fixture(scope="function")
@@ -1213,14 +1303,19 @@ class TestLogsprobsInBatchedSampling:
                     logprobs_mode=sampling_params.logprobs_mode,
                     num_logprobs=sampling_params.logprobs or 0,
                     return_log_probs=sampling_params.logprobs is not None,
+                    embedding_bias=sampling_params.embedding_bias,
+                    end_id=sampling_params.end_id,
                 )
                 for sampling_params, seq_slot, draft_len in zip(
                     sampling_params_list, seq_slots, draft_lens, strict=True
                 )
             ]
             # Patch up request state to correctly infer input beam width (inspects req.is_context_init_state)
-            for req in scheduled_requests.generation_requests:
+            for req, sampling_params in zip(
+                scheduled_requests.generation_requests, sampling_params_list
+            ):
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                req.py_bad_words = sampling_params._get_bad_words() or None
             return scheduled_requests
 
     @pytest.fixture(scope="function")
@@ -1462,7 +1557,7 @@ class TestLogsprobsInBatchedSampling:
                 [VOCAB_SIZE],
             )
             for (sampling_params_list, params_label) in _build_test_cases(
-                max_draft_len=max_draft_len
+                max_draft_len=max_draft_len, vocab_size=vocab_size
             )
         ],
     )
@@ -1506,6 +1601,8 @@ class TestLogsprobsInBatchedSampling:
         monkeypatch.setattr(sampler, "_sample_batched_by_strategy", _check_logprobs_capacity)
         sampler.setup_sampler_step(mock_requests)
 
+        # The logits as the sampler receives them; sample_async may rewrite its input in place.
+        reference_outputs = {"logits": model_outputs["logits"].clone()}
         sample_state = sampler.sample_async(
             mock_requests,
             model_outputs,
@@ -1516,7 +1613,7 @@ class TestLogsprobsInBatchedSampling:
 
         self._validate_logprobs(
             mock_requests=mock_requests,
-            model_outputs=model_outputs,
+            model_outputs=reference_outputs,
             sampler=sampler,
         )
 
@@ -1540,7 +1637,7 @@ class TestLogsprobsInBatchedSampling:
             sampler.update_requests(active_state)
             assert active_requests.all_requests()[0].state == LlmRequestState.GENERATION_IN_PROGRESS
             self._validate_logprobs(
-                mock_requests=active_requests, model_outputs=model_outputs, sampler=sampler
+                mock_requests=active_requests, model_outputs=reference_outputs, sampler=sampler
             )
 
 

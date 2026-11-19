@@ -23,6 +23,10 @@ skip_not_supported = pytest.mark.skipif(
     not torch.cuda.is_available() or get_sm_version() not in ss.SUPPORTED_SM_VERSIONS,
     reason="self-sampling GVR kernels target sm_90a, sm_100a and sm_103a",
 )
+skip_not_sm100 = pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason=f"CuTe DSL GVR Top-K only supports SM 100/103, got SM {get_sm_version()}",
+)
 
 # (batch, n, k): one shape per kernel family (reg, reg_clus, clus, main R=1, main SPLIT)
 _SHAPES = [
@@ -134,3 +138,59 @@ def test_default_path_is_the_original_kernel():
     assert set(out[0].tolist()) == _oracle(row, k)  # exact set on tie-free data
     with pytest.raises(ValueError):
         _run(scores, k, n, sorting="ascending")  # sorting needs deterministic=True
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_main_varlen_mtp_mixed_lengths(deterministic):
+    """Main-family MTP rows mask poisoned tails and pad short rows with -1."""
+    num_rows, width, top_k = 128, 65536, 2048
+    assert ss.route(num_rows, width, width, top_k, det=deterministic)["kernel"] == "main"
+    next_n, compress_ratio = 2, 4
+    row = _row(width, top_k, "unique")
+    lengths = torch.tensor(
+        [
+            -compress_ratio,
+            0,
+            (top_k - 1) * compress_ratio,
+            top_k * compress_ratio,
+            top_k * compress_ratio + 1,
+            (top_k + 1) * compress_ratio,
+            width * compress_ratio,
+            (width + 1) * compress_ratio,
+        ],
+        dtype=torch.int32,
+    ).repeat(num_rows // (next_n * 8))
+    row_indices = torch.arange(num_rows)
+    effective_lengths = (
+        (lengths[row_indices // next_n] - next_n + row_indices % next_n + 1) // compress_ratio
+    ).clamp(0, width)
+    scores = row.unsqueeze(0).repeat(num_rows, 1)
+    scores[torch.arange(width)[None, :] >= effective_lengths[:, None]] = 1e30
+    scores = scores.cuda()
+    lengths = lengths.cuda()
+    out = torch.full((num_rows, top_k), -99, dtype=torch.int32, device="cuda")
+    oracles = {
+        valid_length: _oracle(row[:valid_length], top_k)
+        for valid_length in set(effective_lengths.tolist())
+        if valid_length > top_k
+    }
+
+    ss.run_varlen(
+        scores,
+        lengths,
+        out,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        max_seq_len=width * compress_ratio,
+        deterministic=deterministic,
+    )
+    torch.cuda.synchronize()
+    out_host = out.cpu()
+    for row_index, valid_length in enumerate(effective_lengths.tolist()):
+        if valid_length <= top_k:
+            expected = torch.full((top_k,), -1, dtype=torch.int32)
+            expected[:valid_length] = torch.arange(valid_length, dtype=torch.int32)
+            assert torch.equal(out_host[row_index], expected)
+        else:
+            assert set(out_host[row_index].tolist()) == oracles[valid_length]

@@ -14,7 +14,9 @@ import triton.language as tl
 from torch import nn
 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream, private_stream
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_container
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._utils import is_blackwell_datacenter
 
 
 @triton.jit
@@ -32,6 +34,7 @@ def _collapse_kernel(x_ptr, pre_ptr, out_ptr, hidden, MULT: tl.constexpr, BLOCK:
     tl.store(out_ptr + row * hidden + cols, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
 
+@nccl_window_tensor_container
 @dataclass
 class HCState:
     """Inter-layer mHC pipeline state.
@@ -46,9 +49,12 @@ class HCState:
       ``post_mapping``; the 4 tensors carry the inputs needed for the next
       layer to absorb it via ``fused_hc``.
 
-    Only ``modeling_deepseekv4.py`` depends on this shape — the kernel-level
-    ``mHC.fused_hc`` still returns a 4-tuple so low-level callers (tests,
-    benchmarks) stay unchanged.
+    Passing a state to a scoped decoder layer hands its NCCL-window tensors
+    to that layer. In eager mode, tensors not returned by the layer are released
+    when it exits, so callers must not read a consumed state afterwards.
+
+    The kernel-level ``mHC.fused_hc`` still returns a 4-tuple so low-level
+    callers (tests, benchmarks) stay unchanged.
     """
 
     residual: torch.Tensor
@@ -150,6 +156,20 @@ def _boundary_kernel(device: torch.device, hidden_size: int):
 
 # Context-sized batches whose FFN input also feeds an FP8 1x128 consumer (the shared expert's DeepGEMM).
 FP8_1X128_MIN_ROWS = 1024
+# From here the tcgen05 coefficient kernel holds far fewer SMs than the mma.sync one.
+TC_MIN_ROWS = 512
+
+
+@functools.cache
+def _tc_min_rows() -> int:
+    from .mhc_lowm import MMA_SYNC_MAX_TOKENS
+
+    return TC_MIN_ROWS if is_blackwell_datacenter() else MMA_SYNC_MAX_TOKENS + 1
+
+
+# Rows up to which the coefficients of a TP-replicated split boundary take one CUDA-core launch.
+FMA_COEFF_MAX_ROWS = 8
+
 
 # Side streams with deferred Sinkhorn kernels that no consumer of comb has joined yet.
 _sinkhorn_pending: set[torch.cuda.ExternalStream] = set()
@@ -245,21 +265,53 @@ class mHC(nn.Module):
         # with a prepared copy of `fn` that the post-load hooks build and refresh.
         self.single_pass_boundary = single_pass_boundary
         self._boundary_weight: Optional[torch.Tensor] = None
+        # Arrival counters of the CuTe DSL coefficient kernels (split boundaries from 17 rows,
+        # SM100/SM103).
+        self._coeff_counters: Optional[torch.Tensor] = None
+        # The weight and arrival counters of the tcgen05 coefficient kernel (split boundaries from
+        # ``_tc_min_rows()`` rows), built on first use by ``coefficient_kernel_ready``.
+        self._tc_weight: Optional[torch.Tensor] = None
+        self._tc_counters: Optional[torch.Tensor] = None
+        # TF32-rounded weight and arrival ticket of the CUDA-core coefficient kernel, built lazily.
+        self._fma_weight: Optional[torch.Tensor] = None
+        self._fma_counter: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def cache_derived_state(self) -> None:
+        if self._fma_weight is not None:
+            from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_fma as fma
+
+            # In place: captured CUDA graphs keep the address; done before other streams read it.
+            self._fma_weight.copy_(fma.prepare_fma_weight(self.fn))
+            torch.cuda.current_stream().synchronize()
         kernel = self.single_pass_boundary and _boundary_kernel(self.fn.device, self.hidden_size)
         if not kernel or self.mult != kernel.MULT:
             return
         prepared = kernel.prepare_boundary_weight(self.fn)
+        if self._coeff_counters is None and is_blackwell_datacenter():
+            self._coeff_counters = kernel.coefficient_counters(self.fn.device)
         if self._boundary_weight is None:
             self._boundary_weight = prepared
         else:
             # In place: captured CUDA graphs keep the address.
             self._boundary_weight.copy_(prepared)
+        if self._tc_weight is not None:
+            self._tc_weight.copy_(kernel.prepare_coefficient_weight(self.fn))
         # The boundary kernel reads this weight, scale and base before its PDL wait, so their
         # writes must be complete before the next launch.
         torch.cuda.current_stream().synchronize()
+
+    @torch.no_grad()
+    def _build_tc_state(self) -> bool:
+        """Build the tcgen05 coefficient kernel's weight and counters; False where it cannot run."""
+        from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_tc as tc
+
+        if self._coeff_counters is None or not tc.MhcCoefficientTcKernel.supports(self.hidden_size):
+            return False
+        kernel = _boundary_kernel(self.fn.device, self.hidden_size)
+        self._tc_weight = kernel.prepare_coefficient_weight(self.fn)
+        self._tc_counters = tc.coefficient_counters(self.fn.device)
+        return True
 
     def post_load_weights(self) -> None:
         self.cache_derived_state()
@@ -578,19 +630,157 @@ class mHC(nn.Module):
             layer_input.view(*outer_shape, self.hidden_size),
         )
 
+    def coefficient_kernel_ready(self, num_tokens: int) -> bool:
+        """Whether :meth:`lagged_coefficients` can run the CuTe DSL coefficient kernel of
+        ``num_tokens`` rows now."""
+        from .mhc_lowm import MMA_SYNC_MAX_TOKENS
+
+        capturing = torch.cuda.is_current_stream_capturing()
+        if num_tokens >= _tc_min_rows():
+            # Built in the warm-up that precedes capture at the same shape.
+            if self._tc_weight is not None or (not capturing and self._build_tc_state()):
+                from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_tc as tc
+
+                return not capturing or tc.compiled(self.hidden_size, self.sinkhorn_iters)
+            if num_tokens > MMA_SYNC_MAX_TOKENS:
+                return False
+        if self._coeff_counters is None:
+            return False
+        kernel = _boundary_kernel(self._coeff_counters.device, self.hidden_size)
+        return not capturing or kernel.coefficients_compiled(self.hidden_size, self.sinkhorn_iters)
+
+    def _small_coefficients_ready(self, num_tokens: int) -> bool:
+        """Whether :meth:`lagged_coefficients` runs ``num_tokens`` rows as one small-batch launch
+        (the sizes where the pre-mapping may pick its many-CTA FMA GEMM)."""
+        from .mhc_cuda import _PRE_MAPPING_DG_ONLY_MAX_M
+        from .mhc_lowm import LOWM_MAX_TOKENS
+
+        if self._coeff_counters is None or self.replicated or not is_blackwell_datacenter():
+            return False
+        if not _PRE_MAPPING_DG_ONLY_MAX_M < num_tokens <= LOWM_MAX_TOKENS:
+            return False
+        kernel = _boundary_kernel(self._coeff_counters.device, self.hidden_size)
+        if not kernel.MhcSmallCoefficientKernel.supports(self.hidden_size):
+            return False
+        return not torch.cuda.is_current_stream_capturing() or kernel.small_coefficients_compiled(
+            self.hidden_size, self.sinkhorn_iters
+        )
+
+    def tc_rows(self, num_tokens: int) -> bool:
+        """Whether :meth:`lagged_coefficients` of ``num_tokens`` rows runs the tcgen05 kernel."""
+        return num_tokens >= _tc_min_rows() and self._tc_weight is not None
+
+    @torch.no_grad()
+    def _fma_coefficients_ready(self, num_tokens: int) -> bool:
+        """Whether :meth:`lagged_coefficients` runs ``num_tokens`` rows as one CUDA-core launch."""
+        if not (
+            self.replicated
+            and 0 < num_tokens <= FMA_COEFF_MAX_ROWS
+            and self.mult == 4
+            and is_blackwell_datacenter()
+        ):
+            return False
+        from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_fma as fma
+
+        if not fma.MhcCoefficientFmaKernel.supports(self.hidden_size):
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            # Built and compiled in the warm-up that precedes capture at the same shape.
+            return self._fma_weight is not None and fma.compiled(
+                num_tokens, self.hidden_size, self.sinkhorn_iters
+            )
+        if self._fma_weight is None:
+            self._fma_weight = fma.prepare_fma_weight(self.fn)
+            self._fma_counter = fma.fma_counter(self.fn.device)
+            # Every row count compiles at this first eager call (warm-up), not in a later step.
+            fma.compile_all(self.hidden_size, self.sinkhorn_iters)
+        return True
+
     def lagged_coefficients(
-        self, residual: torch.Tensor
+        self, residual: torch.Tensor, release_after_wait: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(pre, post, comb)`` of this boundary from its BF16 residual ``[M, mult, hidden]``.
 
-        The coefficient half of a split boundary (see ``split_hc_lagged``): the same kernels as
-        :meth:`pre_mapping_lagged` (mixer GEMM + sum of squares, then bigfuse), computed from the
-        BF16 residual like the reference ``hc_mixes``. Bigfuse's collapse output is discarded, so it
-        collapses an 8-column zero stand-in with a constant pre-mix (buffers that outlive any
-        side-stream use) instead of the residual: no residual read or layer-input write.
+        The coefficient half of a split boundary (see ``split_hc_lagged``), computed from the BF16
+        residual like the reference ``hc_mixes``. Above ``LOWM_MAX_TOKENS`` rows it is one launch of
+        the CuTe DSL coefficient kernel, which is never launched early (no PDL); from
+        ``_tc_min_rows()`` rows that is the tcgen05 kernel. Smaller batches may take one launch
+        (:meth:`_small_coefficients_ready`, :meth:`_fma_coefficients_ready`). Otherwise it runs
+        the kernels of :meth:`pre_mapping_lagged` (mixer GEMM + sum of squares, then bigfuse);
+        bigfuse's collapse output is discarded, so it collapses an 8-column zero stand-in with a
+        constant pre-mix (buffers that outlive any side-stream use) instead of the residual.
+        ``release_after_wait``: the one-launch CUDA-core kernel lets its dependents launch from its
+        dependency wait on (they must read the coefficients after their own).
         """
+        from .mhc_lowm import LOWM_MAX_TOKENS, MMA_SYNC_MAX_TOKENS
+
         n = self.mult
         m = residual.shape[0]
+        if self._fma_coefficients_ready(m):
+            from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_fma as fma
+
+            pre, post, comb = fma.mhc_coefficients_fma(
+                residual.reshape(m, self.hc_dim),
+                self._fma_weight,
+                self.scale,
+                self.base,
+                self.norm_eps,
+                self.eps,
+                self.sinkhorn_eps,
+                self.post_mult_value,
+                self.sinkhorn_iters,
+                self._fma_counter,
+                release_after_wait=release_after_wait,
+            )
+            return pre.view(m, n, 1), post.view(m, n, 1), comb.view(m, n, n)
+        # Without the tcgen05 weight (another architecture or hidden size) these rows take the
+        # mma.sync kernel up to MMA_SYNC_MAX_TOKENS rows, else the bigfuse path below.
+        if self.tc_rows(m):
+            from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_tc as tc
+
+            pre, post, comb = tc.mhc_coefficients_tc(
+                residual.view(m, n, self.hidden_size),
+                self._tc_weight,
+                self.scale,
+                self.base,
+                self.norm_eps,
+                self.eps,
+                self.sinkhorn_eps,
+                self.post_mult_value,
+                self.sinkhorn_iters,
+                self._tc_counters,
+            )
+            return pre.view(m, n, 1), post.view(m, n, 1), comb.view(m, n, n)
+        if self._small_coefficients_ready(m):
+            kernel = _boundary_kernel(residual.device, self.hidden_size)
+            pre, post, comb = kernel.mhc_small_coefficients(
+                residual.view(m, n, self.hidden_size),
+                self.fn,
+                self.scale,
+                self.base,
+                self.norm_eps,
+                self.eps,
+                self.sinkhorn_eps,
+                self.post_mult_value,
+                self.sinkhorn_iters,
+                self._coeff_counters,
+            )
+            return pre.view(m, n, 1), post.view(m, n, 1), comb.view(m, n, n)
+        if LOWM_MAX_TOKENS < m <= MMA_SYNC_MAX_TOKENS and self.coefficient_kernel_ready(m):
+            kernel = _boundary_kernel(residual.device, self.hidden_size)
+            pre, post, comb = kernel.mhc_coefficients(
+                residual.view(m, n, self.hidden_size),
+                self._boundary_weight,
+                self.scale,
+                self.base,
+                self.norm_eps,
+                self.eps,
+                self.sinkhorn_eps,
+                self.post_mult_value,
+                self.sinkhorn_iters,
+                self._coeff_counters,
+            )
+            return pre.view(m, n, 1), post.view(m, n, 1), comb.view(m, n, n)
         ones = _coefficient_scratch_pre(m, n, residual.device)
         standin = _coefficient_scratch_residual(m, n, residual.device)
         post_mix, comb_mix, _, pre_own = mhc_pre_mapping_fused_cuda(
@@ -625,6 +815,8 @@ class mHC(nn.Module):
         allreduce=None,
         mxfp8: bool = False,
         nvfp4_scale: Optional[torch.Tensor] = None,
+        residual_after_wait: bool = False,
+        coefficients_release_after_wait: bool = False,
     ) -> tuple:
         """Lagged boundary as a critical half and a coefficient half (decode-sized M).
 
@@ -633,6 +825,14 @@ class mHC(nn.Module):
         sublayer reads. This boundary's own ``pre`` / ``post`` / ``comb`` are only read by the next
         boundary, so with ``coeff_stream`` they are computed there, overlapping the sublayer, and the
         returned event must be waited on before they are read (``HCState.wait_coefficients``).
+
+        With ``x_prev`` the critical half reads ``residual_prev`` before its programmatic-dependency
+        wait. ``residual_prev`` must therefore come from an earlier boundary whose side-stream work
+        the current stream has joined (a split boundary's coefficients, a fused one's deferred
+        Sinkhorn): that work releases this launch only after the boundary has completed, so the
+        residual is complete when this launch starts. Otherwise pass ``residual_after_wait``.
+        ``coefficients_release_after_wait``: the next boundary reads the coefficients only after its
+        dependency wait (a split boundary), so their launch may release it from its own wait on.
 
         With ``allreduce`` (a :class:`~.mhc_lowm.LamportAllReduce`), ``x_prev`` is this rank's
         tensor-parallel partial sum and the critical half all-reduces it in the same launch.
@@ -644,12 +844,29 @@ class mHC(nn.Module):
         equal to ``fp4_quantize(layer_input, nvfp4_scale)``, the BF16 values in its
         ``unquantized_hidden_states``.
         """
-        from .mhc_lowm import mhc_allreduce_post_collapse_norm, mhc_post_collapse_norm
+        from .mhc_lowm import (
+            MMA_SYNC_MAX_TOKENS,
+            mhc_allreduce_post_collapse_norm,
+            mhc_post_collapse_norm,
+        )
 
         _join_sinkhorn()
         n = self.mult
         res_in = residual_prev.reshape(-1, n, self.hidden_size)
+        # A resolved residual is complete before the critical half: above MMA_SYNC_MAX_TOKENS rows
+        # its coefficients start beside it.
+        early = (
+            x_prev is None and coeff_stream is not None and res_in.shape[0] > MMA_SYNC_MAX_TOKENS
+        )
+        if early:
+            fork, done = events
+            fork.record()
+            with torch.cuda.stream(coeff_stream):
+                fork.wait()
+                pre, post, comb = self.lagged_coefficients(res_in)
+                done.record()
         if allreduce is not None and x_prev is not None:
+            assert not residual_after_wait, "the all-reduce boundary reads its residual early"
             residual, layer_input, *quantized = mhc_allreduce_post_collapse_norm(
                 x_prev,
                 res_in,
@@ -673,12 +890,15 @@ class mHC(nn.Module):
                 norm_eps,
                 mxfp8=mxfp8,
                 nvfp4_scale=nvfp4_scale,
+                residual_after_wait=residual_after_wait,
             )
         if nvfp4_scale is not None:
             (fp4, scales), quantized = quantized[0], ()
             layer_input = Fp4QuantizedTensor(
                 fp4, scales, is_sf_swizzled=False, unquantized_hidden_states=layer_input
             )
+        if early:
+            return residual, pre, post, comb, layer_input, done, *quantized
         if coeff_stream is None:
             pre, post, comb = self.lagged_coefficients(residual)
             return residual, pre, post, comb, layer_input, None, *quantized
@@ -686,7 +906,9 @@ class mHC(nn.Module):
         fork.record()
         with torch.cuda.stream(coeff_stream):
             fork.wait()
-            pre, post, comb = self.lagged_coefficients(residual)
+            pre, post, comb = self.lagged_coefficients(
+                residual, release_after_wait=coefficients_release_after_wait
+            )
             done.record()
         return residual, pre, post, comb, layer_input, done, *quantized
 
@@ -909,6 +1131,15 @@ class mHC(nn.Module):
         residual_flat = residual.view(-1, n, hidden)
         B = residual_flat.shape[0]
 
+        if self._coeff_counters is not None and do_multi_stream():
+            from .mhc_lowm import LOWM_MAX_TOKENS, mhc_post_update, split_max_tokens
+
+            # Decode batches that take split boundaries above low M: one CuTe DSL launch, the same
+            # bits.
+            if LOWM_MAX_TOKENS < B <= split_max_tokens():
+                return mhc_post_update(x, residual_flat, post_layer_mix, comb_res_mix).view(
+                    *outer_shape, n, hidden
+                )
         out = mhc_post_mapping_cuda(
             residual_flat,
             x.reshape(B, hidden),
