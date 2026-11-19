@@ -266,14 +266,11 @@ and its directory only grows: nothing prunes it, and kernels whose generated nam
 per-process value add an entry on every launch. An entry is keyed on everything the compile
 reads: the traced kernel, the compile pipeline and options, the CuTe DSL build, the target
 architecture and the call's TVM-FFI signature, so a changed kernel or toolchain compiles anew.
-The GVR Top-K kernels also keep their compiled kernels in its `kernels` subdirectory, keyed on
-their compile cache key, their source files, the `CUTE_DSL_*` settings, the TensorRT-LLM and
-CuTe DSL versions and the GPU's compute capability, so later processes load them without
-tracing them again. They are not kept while a `CUTE_DSL_*` setting asks for compile outputs or
-no caching. Entries run as compiled code, so only trusted users may write to the directory;
-the `kernels` subdirectory is used only when the directory belongs to this user and other
-users cannot write to it. A process killed while it writes an entry leaves a `.tmp.<pid>.<hex>`
-file, or a `.part` file in `kernels`, which the cache never reads and which can be deleted.
+The GVR Top-K kernels also keep their compiled kernels in its `kernels` subdirectory, so later
+processes load them without tracing them again; it is used only when the directory belongs to
+this user and other users cannot write to it. Entries run as compiled code, so only trusted
+users may write to the directory. A process killed while it writes an entry leaves a
+`.tmp.<pid>.<hex>` file, which the cache never reads and which can be deleted.
 
 The directories are created by their respective consumers when needed.
 TensorRT-LLM does not add cache locking or cleanup; per-rank isolation is
