@@ -29,6 +29,16 @@ template <typename T_IN>
 void invokeVectorizedPerTokenFP8Quant(
     void* output, float* scales, T_IN const* input, int hidden_size, int64_t num_tokens, cudaStream_t stream);
 
+//! \brief Per-token FP8 E4M3 quantization with one warp per row and 8 rows per CTA.
+//!
+//! Each row's scale is max(amax / 448, 1 / (448 * 512)); values are divided with IEEE round-to-nearest.
+//! With \p enablePdl (SM90+) the kernel waits on and triggers programmatic dependent launch. Falls back to
+//! invokeVectorizedPerTokenFP8Quant when numTokens < 2 * 8 * smCount, when hiddenSize is not a multiple of one
+//! 16-byte vector, or when \p input is not 16-byte aligned.
+template <typename T_IN>
+void invokeWarpPerTokenFP8Quant(void* output, float* scales, T_IN const* input, int hiddenSize, int64_t numTokens,
+    int smCount, bool enablePdl, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
