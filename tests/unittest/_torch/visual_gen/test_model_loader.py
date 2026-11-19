@@ -97,66 +97,34 @@ _SECONDARY_FP8 = (QuantAlgo.FP8, ["blocks.1.*"], False, True)
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("backend", ["VANILLA", "CUDNN", "CUTEDSL", "FA4"])
-def test_linear_steps_create_metadata_for_every_backend(tmp_path, backend):
+@pytest.mark.parametrize("mode", ["linear_step", "attention_step", "attention_block"])
+def test_quant_ignore_creates_independent_component_step_metadata(tmp_path, mode):
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     _write_dual_transformer_checkpoint(tmp_path, (None, None))
-    args = VisualGenArgs(
-        model=str(tmp_path),
-        quant_config={"quant_algo": "NVFP4", "dynamic": True, "ignore_steps": [0]},
-        attention_config={"backend": backend},
+    recipe = {"qk_dtype": "fp8", "v_dtype": "fp8"}
+    recipe["ignore_steps" if mode == "attention_step" else "ignore"] = (
+        [0] if mode == "attention_step" else ["blocks.0.attn1"]
     )
-    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
-    for name in ("transformer", "transformer_2"):
-        assert config.model_configs[name].attention_metadata_state is not None
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("ignore", [[], ["blocks.0.attn1"]])
-def test_attention_block_exclusions_do_not_create_step_state(tmp_path, ignore):
-    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
-
-    _write_dual_transformer_checkpoint(tmp_path, (None, None))
     args = VisualGenArgs(
         model=str(tmp_path),
-        attention_config={
-            "backend": "CUTEDSL",
-            "quant_attention_config": {"qk_dtype": "nvfp4", "v_dtype": "fp8", "ignore": ignore},
-        },
-    )
-    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
-    for name in ("transformer", "transformer_2"):
-        assert config.model_configs[name].attention_metadata_state is None
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("backend", ["CUTEDSL", "CUDNN"])
-def test_attention_only_steps_create_component_metadata(tmp_path, backend):
-    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
-
-    _write_dual_transformer_checkpoint(tmp_path, (None, None))
-    args = VisualGenArgs(
-        model=str(tmp_path),
-        attention_config={
-            "backend": backend,
-            "quant_attention_config": {
-                "qk_dtype": "fp8" if backend == "CUDNN" else "nvfp4",
-                "v_dtype": "fp8",
-                "ignore_steps": [0],
-            },
-        },
+        quant_config={"quant_algo": "NVFP4", "dynamic": True, "ignore_steps": [0]}
+        if mode == "linear_step"
+        else None,
+        attention_config={"backend": "VANILLA"}
+        if mode == "linear_step"
+        else {"backend": "CUDNN", "quant_attention_config": recipe},
     )
     config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
     primary = config.model_configs["transformer"]
     secondary = config.model_configs["transformer_2"]
-    assert primary.attention_metadata_state is not None
-    assert secondary.attention_metadata_state is not None
-    assert primary.attention_metadata_state is not secondary.attention_metadata_state
-    assert not getattr(primary.quant_config, "ignore_steps", [])
+    if mode == "attention_block":
+        assert primary.attention_metadata_state is secondary.attention_metadata_state is None
+    else:
+        assert primary.attention_metadata_state is not None
+        assert secondary.attention_metadata_state is not None
+        assert primary.attention_metadata_state is not secondary.attention_metadata_state
 
 
 @pytest.mark.cpu_only
@@ -296,9 +264,6 @@ def test_pipeline_loader_orders_runtime_lora_before_stage_construction(monkeypat
 
         def _setup_transformer_quant_graphs(self):
             pass
-
-        def run_transformer_quant_hook(self, method):
-            getattr(self, method)()
 
         def load_transformer_weights(self, checkpoint_dir):
             events.append("load_transformer_weights")

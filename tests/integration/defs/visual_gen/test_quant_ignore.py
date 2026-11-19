@@ -3,7 +3,6 @@
 
 """Complete FLUX.2-dev generations with observed quantization routes and shared goldens."""
 
-import hashlib
 import json
 import time
 from contextlib import ExitStack
@@ -115,15 +114,13 @@ def _tensor_storage_bytes(model: torch.nn.Module) -> int:
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _make_case_config(checkpoint: str, case: QuantIgnoreCase | None) -> dict:
+def _make_case_config(checkpoint: str, case: QuantIgnoreCase) -> dict:
     config = dict(
         model=checkpoint,
         torch_compile_config={"enable": False},
         cuda_graph_config={"enable": False},
         attention_config={"backend": "VANILLA"},
     )
-    if case is None:
-        return config
     ignore_config = (
         {"ignore_steps": [step for step in range(STEPS) if step != case.target]}
         if case.mode == "step"
@@ -181,19 +178,15 @@ def _module_inventory(model: torch.nn.Module) -> dict[str, list[str]]:
     }
 
 
-def _expected_routes(case: QuantIgnoreCase | None, inventory: dict[str, list[str]]) -> dict:
+def _expected_routes(case: QuantIgnoreCase, inventory: dict[str, list[str]]) -> dict:
     expected = {}
     for step in range(STEPS):
         for component in ("linear", "attention"):
             for name in inventory[component]:
-                quantized = (
-                    case is not None
-                    and component == case.component
-                    and (
-                        step == case.target
-                        if case.mode == "step"
-                        else name.startswith(inventory["blocks"][case.target] + ".")
-                    )
+                quantized = component == case.component and (
+                    step == case.target
+                    if case.mode == "step"
+                    else name.startswith(inventory["blocks"][case.target] + ".")
                 )
                 expected[step, name, component] = "quantized" if quantized else "bf16"
     return expected
@@ -204,7 +197,6 @@ def _save_case_artifacts(
     config: dict,
     image: torch.Tensor,
     trace: QuantizationTrace,
-    initial_noise_hash: str,
 ) -> None:
     Image.fromarray(image[0].numpy()).save(directory / "image.png")
     (directory / "routes.json").write_text(json.dumps(trace.events, indent=2), encoding="utf-8")
@@ -213,7 +205,6 @@ def _save_case_artifacts(
             {
                 "request": REQUEST,
                 "config": config,
-                "initial_noise_sha256": initial_noise_hash,
                 "method_entries": len(trace.events),
             },
             indent=2,
@@ -225,7 +216,7 @@ def _save_case_artifacts(
 def _run_generation(
     checkpoint: str,
     directory: Path,
-    case: QuantIgnoreCase | None = None,
+    case: QuantIgnoreCase,
     *,
     compiled: bool = False,
 ) -> GenerationResult:
@@ -253,7 +244,7 @@ def _run_generation(
     }
     try:
         actual_inventory = _module_inventory(pipeline.transformer)
-        if case is not None and case.component == "attention" and case.mode == "layer":
+        if case.component == "attention" and case.mode == "layer":
             for name, module in pipeline.transformer.named_modules():
                 if isinstance(module, Attention):
                     # Match the physical module path, including the single-stream local index.
@@ -261,8 +252,6 @@ def _run_generation(
                         name,
                         module.module_name,
                     )
-        initial_noise_hashes = []
-        prepare_latents = pipeline._prepare_latents
         publish_step = pipeline._publish_denoise_step
         observed = pipeline._transformer_quant_dispatchers
         observed = observed["transformer"] if "transformer" in observed else pipeline.transformer
@@ -281,15 +270,6 @@ def _run_generation(
             device_routes = []
             previous_step = None
 
-            def prepare(*args, **kwargs):
-                latents, ids = prepare_latents(*args, **kwargs)
-                initial_noise_hashes.append(
-                    hashlib.sha256(
-                        latents.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-                    ).hexdigest()
-                )
-                return latents, ids
-
             def publish(value):
                 nonlocal previous_step
                 if compiled and previous_step is not None:
@@ -301,7 +281,6 @@ def _run_generation(
 
             with (
                 ExitStack() as replay_observers,
-                patch.object(pipeline, "_prepare_latents", prepare),
                 patch.object(pipeline, "_publish_denoise_step", publish),
             ):
                 replays = (
@@ -319,8 +298,7 @@ def _run_generation(
                     assert all(replay.call_count > 0 for replay in replays)
         assert image.shape == (1, REQUEST["height"], REQUEST["width"], 3)
         assert image.dtype == torch.uint8 and image.float().std() > 0
-        assert len(initial_noise_hashes) == 1
-        _save_case_artifacts(directory, config, image, trace, initial_noise_hashes[0])
+        _save_case_artifacts(directory, config, image, trace)
         if compiled:
             assert len(device_routes) == STEPS, device_routes
             for step, counts in device_routes:
@@ -338,8 +316,7 @@ def _run_generation(
         report = json.loads(report_path.read_text(encoding="utf-8"))
         report["measurements"] = measurements
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        backend_name = case.backend if case is not None else "VANILLA"
-        expected_backend = get_visual_gen_attention_backend(backend_name).__name__
+        expected_backend = get_visual_gen_attention_backend(case.backend).__name__
         for event in trace.events:
             if event["component"] == "attention":
                 assert event["backend"] == expected_backend, event

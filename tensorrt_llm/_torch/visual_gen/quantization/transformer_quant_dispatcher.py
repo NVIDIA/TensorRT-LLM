@@ -115,16 +115,11 @@ class TransformerQuantDispatcher(nn.Module):
         key = self.forced_key if self.forced_key is not None else self.schedule.key(step)
         return self.variants[self.variant_name(self.stage, key)]
 
-    def forward(self, *args, **kwargs):
-        return self.select(self.step)(*args, **kwargs)
-
 
 @dataclass
 class TransformerWeightReuse:
     """Loading-only context; no model forward depends on this context."""
 
-    source: nn.Module | None
-    target: nn.Module
     require_dynamic_weights: bool
     reused_modules: frozenset[int] = frozenset()
 
@@ -200,7 +195,7 @@ def reuse_transformer_weights(
                 bound = _bind_linear(original, module)
                 parent.add_module(child_name, bound)
                 reused.add(id(bound))
-    reuse = TransformerWeightReuse(source, target, require_dynamic_weights, frozenset(reused))
+    reuse = TransformerWeightReuse(require_dynamic_weights, frozenset(reused))
     token = _weight_reuse.set({**_weight_reuse.get(), target.model_config.component_name: reuse})
     try:
         yield reuse

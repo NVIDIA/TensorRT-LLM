@@ -120,7 +120,7 @@ class RefSlotSpec(StrictBaseModel):
 
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
-    from .config import DiffusionPipelineConfig
+    from .config import DiffusionModelConfig, DiffusionPipelineConfig
     from .sleep import SleepRestoreMode
 
 
@@ -267,6 +267,11 @@ class BasePipeline(nn.Module):
             )
             for name, config in self._transformer_quant_source_configs.items()
         }
+        return self._pipeline_config_with_model_configs(configs)
+
+    def _pipeline_config_with_model_configs(
+        self, configs: dict[str, "DiffusionModelConfig"]
+    ) -> "DiffusionPipelineConfig":
         primary = configs["transformer"]
         return self.pipeline_config.model_copy(
             update={
@@ -313,47 +318,41 @@ class BasePipeline(nn.Module):
         self._publish_denoise_step(None)
 
     @contextlib.contextmanager
-    def transformer_quant_context(self, key: QuantIgnoreKey) -> Iterator[None]:
+    def transformer_quant_context(
+        self, key: QuantIgnoreKey, *, stage: str = "base"
+    ) -> Iterator[None]:
         """Bind real component models for a native pipeline lifecycle operation."""
         dispatchers = getattr(self, "_transformer_quant_dispatchers", {})
         if not dispatchers:
             yield
             return
-        original = self.pipeline_config
-        previous = {name: getattr(self, name) for name in dispatchers}
-        try:
-            configs = dict(original.model_configs)
-            for name, dispatcher in dispatchers.items():
-                effective = key if key in dispatcher.schedule.keys else (False, False)
-                model = dispatcher.variants[dispatcher.variant_name(dispatcher.stage, effective)]
-                setattr(self, name, model)
-                configs[name] = model.model_config
-            primary = configs["transformer"]
-            self.pipeline_config = original.model_copy(
-                update={
-                    "model_configs": configs,
-                    "quant_config": primary.quant_config,
-                    "quant_config_dict": primary.quant_config_dict,
-                    "dynamic_weight_quant": primary.dynamic_weight_quant,
-                    "force_dynamic_quantization": primary.force_dynamic_quantization,
-                    "attention": primary.attention,
-                }
-            )
-            yield
-            for name, dispatcher in dispatchers.items():
-                effective = key if key in dispatcher.schedule.keys else (False, False)
-                dispatcher.variants[dispatcher.variant_name(dispatcher.stage, effective)] = getattr(
-                    self, name
-                )
-        finally:
-            self.pipeline_config = original
-            for name, model in previous.items():
-                setattr(self, name, model)
+        with self.transformer_quant_stage(stage):
+            original = self.pipeline_config
+            previous = {name: getattr(self, name) for name in dispatchers}
+            try:
+                configs = dict(original.model_configs)
+                for name, dispatcher in dispatchers.items():
+                    effective = key if key in dispatcher.schedule.keys else (False, False)
+                    model = dispatcher.variants[dispatcher.variant_name(stage, effective)]
+                    setattr(self, name, model)
+                    configs[name] = model.model_config
+                self.pipeline_config = self._pipeline_config_with_model_configs(configs)
+                yield
+            finally:
+                self.pipeline_config = original
+                for name, model in previous.items():
+                    setattr(self, name, model)
+
+    def _transformer_quant_paths(self) -> Iterator[tuple[str, QuantIgnoreKey]]:
+        return itertools.product(
+            getattr(self, "_transformer_quant_stage_names", ("base",)),
+            getattr(self, "_transformer_quant_keys", ((False, False),)),
+        )
 
     def transformer_quant_models(
         self, component: str | None = None, *, stage: str | None = None
     ) -> Iterator[tuple[str, nn.Module]]:
-        """Visit every real model, including independent stage weight versions."""
+        """Yield registered module paths and models, including independent stages."""
         dispatchers = getattr(self, "_transformer_quant_dispatchers", {})
         for name in self.transformer_components:
             if component is not None and component != name:
@@ -363,7 +362,7 @@ class BasePipeline(nn.Module):
                 yield name, getattr(self, name)
             else:
                 for variant_name, model in dispatcher.models(stage):
-                    yield f"{name}_{variant_name}", model
+                    yield f"_transformer_quant_dispatchers.{name}.variants.{variant_name}", model
 
     def deferred_transformer_quant_tensor_ids(self) -> set[int]:
         """Avoid allocating duplicate Linear buffers for attention-only variants."""
@@ -413,19 +412,6 @@ class BasePipeline(nn.Module):
                     if source is not model:
                         share_non_linear_parameters(source, model)
 
-    def run_transformer_quant_hook(self, method: str) -> None:
-        """Run an existing pipeline hook with each fixed component configuration."""
-        self._quant_compile_visited_models = set() if method == "torch_compile" else None
-        try:
-            for stage in self._transformer_quant_stage_names:
-                with self.transformer_quant_stage(stage):
-                    for key in self._transformer_quant_keys:
-                        with self.transformer_quant_context(key):
-                            getattr(self, method)()
-        finally:
-            self._quant_compile_visited_models = None
-            self._publish_denoise_step(None)
-
     def _setup_transformer_quant_graphs(self) -> None:
         if not self._transformer_quant_dispatchers:
             self._setup_cuda_graphs()
@@ -433,20 +419,18 @@ class BasePipeline(nn.Module):
         runners = dict(self._cuda_graph_runners)
         seen = getattr(self, "_quant_graph_model_ids", set())
         self._quant_graph_model_ids = seen
-        for stage in self._transformer_quant_stage_names:
-            with self.transformer_quant_stage(stage):
-                for key in self._transformer_quant_keys:
-                    with self.transformer_quant_context(key):
-                        models = [getattr(self, name) for name in self.transformer_components]
-                        if all(id(model) in seen for model in models):
-                            continue
-                        self._cuda_graph_runners = {}
-                        self._setup_cuda_graphs()
-                        seen.update(id(model) for model in models)
-                        for name, runner in self._cuda_graph_runners.items():
-                            runners[
-                                f"{name}_{stage}_linear{int(key[0])}_attention{int(key[1])}"
-                            ] = runner
+        for stage, key in self._transformer_quant_paths():
+            with self.transformer_quant_context(key, stage=stage):
+                models = [getattr(self, name) for name in self.transformer_components]
+                if all(id(model) in seen for model in models):
+                    continue
+                self._cuda_graph_runners = {}
+                self._setup_cuda_graphs()
+                seen.update(id(model) for model in models)
+                for name, runner in self._cuda_graph_runners.items():
+                    runners[f"{name}_{TransformerQuantDispatcher.variant_name(stage, key)}"] = (
+                        runner
+                    )
         self._cuda_graph_runners = runners
 
     @contextlib.contextmanager
@@ -527,14 +511,12 @@ class BasePipeline(nn.Module):
     def all_offload_pipeline_components(self) -> dict[str, nn.Module]:
         """Expose every fixed path under its original logical offload component."""
         components: dict[str, list[nn.Module]] = {}
-        for stage in getattr(self, "_transformer_quant_stage_names", ("base",)):
-            with self.transformer_quant_stage(stage):
-                for key in getattr(self, "_transformer_quant_keys", ((False, False),)):
-                    with self.transformer_quant_context(key):
-                        for name, module in self.offload_pipeline_components().items():
-                            group = components.setdefault(name, [])
-                            if all(module is not other for other in group):
-                                group.append(module)
+        for stage, key in self._transformer_quant_paths():
+            with self.transformer_quant_context(key, stage=stage):
+                for name, module in self.offload_pipeline_components().items():
+                    group = components.setdefault(name, [])
+                    if all(module is not other for other in group):
+                        group.append(module)
         return {
             name: modules[0] if len(modules) == 1 else nn.ModuleList(modules)
             for name, modules in components.items()
@@ -851,8 +833,9 @@ class BasePipeline(nn.Module):
             self.transformer.load_weights(weights)
 
     def post_load_weights(self) -> None:
-        if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
-            self.transformer.post_load_weights()
+        for _, model in self.transformer_quant_models("transformer"):
+            if model is not None and hasattr(model, "post_load_weights"):
+                model.post_load_weights()
 
     def default_offload_stages(self) -> tuple[OffloadPipelineStage, ...]:
         """Return model-specific offload stages requested by shorthand config.
@@ -1180,19 +1163,10 @@ class BasePipeline(nn.Module):
         compile_mode = "default"
 
         # Compiling transformer blocks provides max performance value.
-        targets = self.transformer_components
-
-        for name in targets:
-            model = getattr(self, name, None)
+        for name, model in self.transformer_quant_models():
             if model is None:
                 logger.warning(f"torch.compile: component '{name}' not found, skipping")
                 continue
-            visited = getattr(self, "_quant_compile_visited_models", None)
-            if visited is not None:
-                if id(model) in visited:
-                    continue
-                visited.add(id(model))
-
             blocks_attr = self._find_transformer_blocks(model)
             if blocks_attr:
                 for block_name in blocks_attr:
@@ -1220,9 +1194,8 @@ class BasePipeline(nn.Module):
                     dynamic=None,
                     fullgraph=tc_config.enable_fullgraph,
                 )
-                setattr(self, name, compiled)
-                if visited is not None:
-                    visited.add(id(compiled))
+                self.set_submodule(name, compiled)
+        self._publish_denoise_step(None)
         # Hooks stay outside the lazy-compiled blocks, so their opaque operations
         # execute on every invocation rather than only while Dynamo traces.
         self._install_nccl_window_tensor_scope_hooks()

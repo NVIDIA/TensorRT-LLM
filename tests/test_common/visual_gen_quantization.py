@@ -294,22 +294,10 @@ class ToyAttentionBackend(AttentionBackend):
 class _ToyQuantizedLinearMethod:
     """CPU quantized-kernel double with FP8 storage; no kernel accuracy is asserted."""
 
-    requires_unquantized_activation = False
-    quantizes_nvfp4_activations = False
-
     def apply(
         self, module: _ToyLinear, inputs: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
         return F.linear(inputs, module.weight.to(inputs.dtype), bias)
-
-    def apply_slice(
-        self, module: _ToyLinear, inputs: torch.Tensor, start: int, end: int
-    ) -> torch.Tensor:
-        bias = module.bias[start:end] if module.bias is not None else None
-        return F.linear(inputs, module.weight[start:end].to(inputs.dtype), bias)
-
-    def prepare_output_slice(self, module: _ToyLinear, start: int, end: int) -> None:
-        pass
 
 
 class _ToyLinear(nn.Linear):
@@ -404,8 +392,6 @@ class ToyDiT(nn.Module):
         block_count: int = 2,
         linear_ignore: tuple[str, ...] = (),
         attention_ignore: tuple[str, ...] = (),
-        linear_quant_ignore_steps: tuple[int, ...] = (),
-        attention_quant_ignore_steps: tuple[int, ...] = (),
         quantized_linear: bool = True,
         quantized_attention: bool = True,
         real_kernels: bool = False,
@@ -416,7 +402,6 @@ class ToyDiT(nn.Module):
             quant_config=LinearQuantConfig(
                 quant_algo=("NVFP4" if real_kernels else "FP8") if quantized_linear else None,
                 exclude_modules=list(linear_ignore),
-                ignore_steps=list(linear_quant_ignore_steps),
             ),
             dynamic_weight_quant=True,
             force_dynamic_quantization=True,
@@ -426,7 +411,6 @@ class ToyDiT(nn.Module):
                     qk_dtype="nvfp4",
                     v_dtype="fp8",
                     ignore=list(attention_ignore),
-                    ignore_steps=list(attention_quant_ignore_steps),
                 )
                 if quantized_attention
                 else None,
@@ -439,8 +423,6 @@ class ToyDiT(nn.Module):
             ToyDiTBlock(self.model_config, index, real_kernels=real_kernels)
             for index in range(block_count)
         )
-        if linear_quant_ignore_steps or attention_quant_ignore_steps:
-            raise ValueError("Construct fixed ToyDiT paths with make_toy_quant_dispatcher")
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:

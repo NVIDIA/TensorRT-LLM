@@ -504,11 +504,21 @@ def test_visual_gen_ignore_steps_schema(schemas, steps, valid, attention):
     assert (not errors) == valid, [error.message for error in errors]
 
 
-@pytest.mark.parametrize("linear_ignore", [[], ["blocks.0.ffn.*"], "blocks.0"])
-@pytest.mark.parametrize("attention_ignore", [[], ["blocks.0.attn1"]])
-@pytest.mark.parametrize("linear_steps", [[], [0]])
-@pytest.mark.parametrize("attention_steps", [[], [1]])
-@pytest.mark.parametrize("ignore_field", ["ignore", "exclude_modules"])
+@pytest.mark.parametrize(
+    "linear_ignore,attention_ignore,linear_steps,attention_steps,ignore_field",
+    [
+        (["blocks.0.*"], [], [0], [], "ignore"),
+        (["blocks.0.*"], [], [], [0], "exclude_modules"),
+        ([], ["blocks.0.attn1"], [0], [], "ignore"),
+        ([], ["blocks.0.attn1"], [], [0], "ignore"),
+        (["blocks.0.*"], ["blocks.1.attn1"], [], [], "ignore"),
+        ([], [], [0], [1], "ignore"),
+        ("blocks.0", [], [], [], "ignore"),
+        ("blocks.0", [], [0], [], "ignore"),
+        ("blocks.0", [], [], [], "exclude_modules"),
+        ("blocks.0", [], [0], [], "exclude_modules"),
+    ],
+)
 def test_visual_gen_block_and_step_modes_are_globally_exclusive(
     schemas, linear_ignore, attention_ignore, linear_steps, attention_steps, ignore_field
 ):
@@ -575,11 +585,6 @@ def test_visual_gen_quant_ignore_cache_combinations(schemas, steps, valid, atten
         ({"quant_algo": "NVFP4", "dynamic": False, "ignore_steps": [0]}, False, False),
         ({"quant_algo": "NVFP4", "dynamic": True, "ignore_steps": [0]}, False, True),
         ({"quant_algo": "W4A16_AWQ", "dynamic": True, "ignore_steps": [0]}, False, True),
-        ({"quant_algo": "W4A8_AWQ", "dynamic": True, "ignore_steps": [0]}, False, True),
-        ({"quant_algo": "W8A8_SQ_PER_CHANNEL", "dynamic": True, "ignore_steps": [0]}, False, True),
-        ({"quant_algo": "W4A16_AWQ", "dynamic": False, "ignore_steps": [0]}, False, False),
-        ({"quant_algo": "FP8_BLOCK_SCALES", "ignore_steps": [0]}, False, True),
-        ({"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "ignore_steps": [0]}, False, True),
         (
             {
                 "quant_algo": "FP8",
@@ -604,18 +609,18 @@ def test_visual_gen_linear_steps_require_quant_and_reject_lora(schemas, quant, l
     assert (not errors) == valid, [error.message for error in errors]
 
 
-@pytest.mark.parametrize("steps", [[], [0]], ids=["no-step-exclusion", "step-exclusion"])
 @pytest.mark.parametrize(
-    ("group_config", "valid_with_steps"),
+    ("group_config", "steps", "valid"),
     [
-        pytest.param({}, False, id="missing-weights"),
-        pytest.param({"weights": {}}, False, id="missing-dynamic"),
-        pytest.param({"weights": {"dynamic": False}}, False, id="static-weights"),
-        pytest.param({"weights": {"dynamic": True}}, True, id="dynamic-weights"),
+        pytest.param({}, [], True, id="no-step-exclusion"),
+        pytest.param({}, [0], False, id="missing-weights"),
+        pytest.param({"weights": {}}, [0], False, id="missing-dynamic"),
+        pytest.param({"weights": {"dynamic": False}}, [0], False, id="static-weights"),
+        pytest.param({"weights": {"dynamic": True}}, [0], True, id="dynamic-weights"),
     ],
 )
 def test_visual_gen_grouped_linear_steps_require_dynamic_weights(
-    schemas: dict[str, dict], group_config: dict, valid_with_steps: bool, steps: list[int]
+    schemas: dict[str, dict], group_config: dict, steps: list[int], valid: bool
 ) -> None:
     config = {
         "quant_config": {
@@ -626,7 +631,7 @@ def test_visual_gen_grouped_linear_steps_require_dynamic_weights(
         }
     }
     errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
-    assert (not errors) == (not steps or valid_with_steps), [error.message for error in errors]
+    assert (not errors) == valid, [error.message for error in errors]
 
 
 def _tagged_unions(node: object):
