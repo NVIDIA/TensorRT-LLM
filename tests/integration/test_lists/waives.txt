@@ -78,6 +78,7 @@ full:CPU/unittest/_torch/pyexecutor/test_idle_iter_stats.py::test_idle_fetch_req
 full:CPU/unittest/_torch/pyexecutor/test_idle_iter_stats.py::test_idle_fetch_requires_all_ranks_to_drain[peer-pending-work] SKIP (https://nvbugs/7117788)
 full:CPU/unittest/_torch/pyexecutor/test_idle_iter_stats.py::test_idle_fetch_requires_all_ranks_to_drain[transfer] SKIP (https://nvbugs/7117788)
 full:CPU/unittest/_torch/pyexecutor/test_idle_iter_stats.py::test_idle_fetch_requires_all_ranks_to_drain[waiting] SKIP (https://nvbugs/7117788)
+full:CPU/unittest/llmapi/test_sampling_params.py::test_prepare_sampling_params_explicit_end_id_strings_without_tokenizer_are_rejected[words1] SKIP (https://nvbugs/7117674)
 full:CPU/unittest/scripts/test_subprocess_timeouts.py::test_every_subprocess_run_call_in_test_code_must_set_timeout SKIP (https://nvbugs/6929769)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True] SKIP (https://nvbugs/6633268)
 full:DGX_B200/unittest/_torch/attention/test_fmha_paged_context_fp8.py::test_stage_kv_cubins_match_the_kernel_inputs_they_were_built_against SKIP (https://nvbugs/7114472)
