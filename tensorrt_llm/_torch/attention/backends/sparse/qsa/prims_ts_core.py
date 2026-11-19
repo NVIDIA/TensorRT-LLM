@@ -33,7 +33,7 @@ _PREFILL_ROW_BUCKET = 64
 # decode batches stay on Triton there.
 _MIN_DECODE_ROWS = 2
 _MIN_INDEXER_DECODE_ROWS = 32
-_INDEXER_DECODE_TRITON_CAPABILITIES = ((10, 7),)
+_INDEXER_DECODE_PRIMTS_CAPABILITIES = ((10, 0), (10, 3))
 _KV_BLOCK_SIZE = 4
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _SUPPORTED_Q_DTYPES = (torch.float16, torch.bfloat16)
@@ -141,7 +141,8 @@ def use_prims_ts_indexer(
             return False
         if (
             q.is_cuda
-            and torch.cuda.get_device_capability(q.device) in _INDEXER_DECODE_TRITON_CAPABILITIES
+            and torch.cuda.get_device_capability(q.device)
+            not in _INDEXER_DECODE_PRIMTS_CAPABILITIES
         ):
             return False
     reason = None
