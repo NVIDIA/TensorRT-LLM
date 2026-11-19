@@ -408,11 +408,10 @@ Communication
 > `{2048, 2560, 3584, 4096, 5120, 6144, 7168}` and `top_k <= 16`.
 
 > **Notes**
-> - The backend recommendations summarize `bench_moe` sweeps of the nine models below on TensorRT-LLM `v1.4.0rc3` (`9e334fbaae`).
-> - Coverage: B300 at `world_size` 4/8; GB300 and Vera Rubin NVL72 at 4/8/16/32, within one NVLink domain. All nine models use NVFP4; all except Muse Spark Open also cover W4A8_MXFP4_MXFP8.
+> - The backend recommendations summarize `bench_moe` sweeps of the five models below on TensorRT-LLM `v1.4.0rc3` (`9e334fbaae`).
+> - Coverage: B300 at `world_size` 4/8; GB300 and Vera Rubin NVL72 at 4/8/16/32, within one NVLink domain. All five models cover NVFP4 and W4A8_MXFP4_MXFP8.
 > - `MEGAMOE_*` requires `num_slots % moe_ep_size == 0` (`num_slots == num_experts` without EPLB).
-> - Muse Spark Open is an exception to the tree: NVFP4 requires TRTLLM for per-expert output normalization.
-> - For MiniMax M3.1 Flash and Mistral Large 4 W4A8 attention-DP prefill at 16/32 GPUs, NVLINK_TWO_SIDED was faster than NVLINK_ONE_SIDED on GB300 and Rubin.
+> - For MiniMax M3.1 Flash W4A8 attention-DP prefill at 16/32 GPUs, NVLINK_TWO_SIDED was faster than NVLINK_ONE_SIDED on GB300 and Rubin.
 > - The sweeps use balanced routing and request `--use_low_precision_moe_combine`. Real routing imbalance can change latency and backend rankings.
 > - The decision tree is a fit to those sweeps, and may not be optimal for a specific workload. Meanwhile, results can become outdated as kernels and autotuning change. To push performance further, test the options yourself with `bench_moe`, as described in *Tuning a Specific Workload*.
 
@@ -536,7 +535,7 @@ The JSON has `results` (one object per candidate) and `rankings` grouped by `(nu
 
 Search axes and further recipes: [`BENCH_MOE_USER_GUIDE.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/microbenchmarks/bench_moe/BENCH_MOE_USER_GUIDE.md).
 
-Historical cross-validation against end-to-end disaggregated serving is detailed in *Appendix*. The nine-model sweep above measures the MoE module only.
+Historical cross-validation against end-to-end disaggregated serving is detailed in *Appendix*. The five-model sweep above measures the MoE module only.
 
 ## Advanced Techniques
 
@@ -629,10 +628,6 @@ Covered Models with MoE Configuration:
 | GLM 5.3 Flash | 288 | 8 | 4096 | 2048 |
 | MiniMax M3.1 Flash | 128 | 4 | 6144 | 3072 |
 | Inkling 2 Small | 384 | 8 | 4608 | 2304 |
-| GLM 5.3 | 256 | 8 | 6144 | 2048 |
-| Muse Spark Open | 256 | 8 | 4096† | 4096 |
-| Mistral Large 4 | 128 | 4 | 6144 | 6144 |
-| Reflection Beam | 256 | 8 | 5120 | 2560 |
 
 † For latent/pooled MoE models, `hidden_size` is the routed-expert input width rather than the checkpoint's top-level model hidden size.
 
