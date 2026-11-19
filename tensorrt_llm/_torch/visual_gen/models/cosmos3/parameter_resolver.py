@@ -269,6 +269,22 @@ class Cosmos3Config:
     def source_of(self, name: str) -> str:
         return self.resolved[name].source
 
+    def require_vae_compression(self, checkpoint_dir: str) -> None:
+        """Raise unless ``vae/config.json`` declares both compression factors, as a
+        checkpoint that ships a VAE must."""
+        temporal = self.resolved.get("vae.temporal_compression")
+        declared = {
+            "scale_factor_temporal": temporal is not None
+            and temporal.where.startswith(f"{VAE_FILE}:"),
+            "scale_factor_spatial": self.vae.spatial_compression is not None,
+        }
+        missing = [key for key, present in declared.items() if not present]
+        if missing:
+            raise ValueError(
+                f"Cosmos3 config: {checkpoint_dir} ships a VAE but {VAE_FILE} declares no "
+                f"{' or '.join(missing)}."
+            )
+
     def describe(self) -> str:
         lines = ["Cosmos3 config:"]
         for name, r in sorted(self.resolved.items()):

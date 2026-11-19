@@ -192,6 +192,15 @@ class TestCheckpoint:
         del files[VAE_FILE]["scale_factor_spatial"]
         assert _resolve(tmp_path, files).vae.spatial_compression is None
 
+    @pytest.mark.parametrize("key", ["scale_factor_temporal", "scale_factor_spatial"])
+    def test_a_shipped_vae_must_declare_its_compression(self, tmp_path, key):
+        files = _files()
+        _resolve(tmp_path, files).require_vae_compression(str(tmp_path))
+        del files[VAE_FILE][key]
+        cfg = _resolve(tmp_path, files)
+        with pytest.raises(ValueError, match=f"declares no {key}"):
+            cfg.require_vae_compression(str(tmp_path))
+
     def test_sigmas_are_coerced_to_floats(self, tmp_path):
         files = _files()
         files[SCHEDULER_FILE]["fixed_step_sampler_config"]["t_list"] = [1, "0.5"]

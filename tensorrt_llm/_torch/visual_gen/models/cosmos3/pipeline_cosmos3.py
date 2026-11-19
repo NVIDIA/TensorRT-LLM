@@ -594,11 +594,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self.vae_scale_factor_spatial = cfg.vae.spatial_compression
 
         if PipelineComponent.VAE not in skip_components:
-            if self.vae_scale_factor_spatial is None:
-                raise ValueError(
-                    f"Cosmos3 config: {checkpoint_dir} ships a VAE but vae/config.json declares "
-                    "no scale_factor_spatial."
-                )
+            cfg.require_vae_compression(checkpoint_dir)
             logger.info("Loading VAE...")
             vae_device = (
                 torch.device("cpu")
