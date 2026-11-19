@@ -16,6 +16,7 @@
 import os
 from typing import TypeAlias
 
+from .beam_shared_prefix import BeamSharedPrefixFmha
 from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
@@ -45,6 +46,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     from .msa_decode import MsaDecodeFmha
     from .msa_prefill import MsaPrefillFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
+    from .prims_ts_dsa_sparse_mla import PrimsTSDsaSparseMlaFmha
     from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
 
     return {
@@ -64,6 +66,10 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # DeepSeek-V4 on SM100, so every other model and architecture never
         # sees it; everything else keeps the TRTLLM-Gen libraries below.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
+        # DSA generation on the PrimTS D576 sparse MLA kernel over NVFP4 KV records. It only
+        # reports itself available for DSA layers whose cache uses the ``fp8rope`` NVFP4 layout,
+        # and DSATrtllmAttention then hands it the records instead of gathered FP8 rows.
+        "prims_ts_dsa_sparse_mla": PrimsTSDsaSparseMlaFmha,
         # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
         # trtllm-gen with the module's KV append / deferred prologue.
         "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
@@ -72,12 +78,18 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "gqa_segmented": GqaSegmentedFmha,
         "gqa_decode": GqaDecodeFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
+        # Opt-in wide-beam generation path (TLLM_FMHA_LIBS=+beam_shared_prefix);
+        # takes generation-only beam-search batches ahead of the fallback.
+        "beam_shared_prefix": BeamSharedPrefixFmha,
         "fallback": FallbackFmha,
     }
 
 
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
-_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts"})
+# Libraries left out of the default set and enabled explicitly through
+# TLLM_FMHA_LIBS: dense PrimTS can add host overhead; beam_shared_prefix is a
+# narrow-scope beam-search path.
+_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts", "beam_shared_prefix"})
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
     name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
 )
@@ -128,10 +140,16 @@ def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
     return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
 
 
+def is_fmha_lib_enabled(name: str) -> bool:
+    """Whether ``TLLM_FMHA_LIBS`` enables the library registered as ``name``."""
+    return name in _parse_fmha_libs_env()
+
+
 __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
     "FmhaCls",
     "get_enabled_fmha_lib_classes",
     "init_fmha_libs",
+    "is_fmha_lib_enabled",
 ]

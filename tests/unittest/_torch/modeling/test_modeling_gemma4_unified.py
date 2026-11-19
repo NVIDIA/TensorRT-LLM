@@ -48,6 +48,8 @@ from tensorrt_llm._torch.models.modeling_utils import (
     get_model_architecture,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 _UNIFIED_ARCH = "Gemma4UnifiedForConditionalGeneration"
 
 # Mirrors the structure (not the full contents) of the 12B checkpoint's

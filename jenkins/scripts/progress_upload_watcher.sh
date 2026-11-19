@@ -18,8 +18,10 @@
 # that runs the tests. Every PROGRESS_INTERVAL seconds it prepares a checkpoint with
 # progress_snapshot.sh, after copying a Slurm batch job's latest results back with
 # progress_collect_slurm.sh, and uploads it to each target that lacks its content. Once
-# PROGRESS_DONE_FILE exists, it takes the final snapshot, uploads it, and exits. It always exits 0:
-# every failure is logged, and none fails the step.
+# PROGRESS_DONE_FILE exists, it takes the final snapshot, uploads it, and exits. A step that cannot
+# create that file sends the watcher USR1 instead, to the same effect, so that the step never waits
+# for a watcher that cannot learn that the tests have ended. It always exits 0: every failure is
+# logged, and none fails the step.
 #
 # The credentials come from a netrc that the pipeline writes for this watcher alone. The watcher
 # reads it into memory and removes it before anything else, and the step starts the tests only once
@@ -34,13 +36,14 @@
 #   CHECKPOINT_NETRC_FILE  the netrc, alone in its directory, with an entry for each target's host;
 #                          without it, the watcher prepares its snapshots but uploads none
 #   CHECKPOINT_TARGETS     space-separated <location>=<upload URL> pairs, in upload order
-#   PROGRESS_DONE_FILE     once this file exists, the watcher takes the final snapshot and exits
+#   PROGRESS_DONE_FILE     once this file exists, or once USR1 arrives, the watcher takes the final
+#                          snapshot and exits
 #   PROGRESS_INTERVAL      seconds between checkpoints
 #   LABEL_PREFIX           log label of a checkpoint, e.g. "checkpoint" or "rerun2 checkpoint"
 #   FINAL_LABEL            log label of the final snapshot, e.g. "run1 final snapshot"
 #
 # Optional:
-#   POST_TAG, TIMEOUT_XML_SCRIPT     passed on to progress_snapshot.sh
+#   POST_TAG, TIMEOUT_XML_SCRIPT, TIMEOUT_INPUT_FINAL     passed on to progress_snapshot.sh
 #   XML_PATH            a checkpoint is taken only when this file's mtime has advanced, or while a
 #                       target still lacks the content of the last one
 #   SNAPSHOT_REQUIRES   no checkpoint is taken while the tests run unless this file exists; on a
@@ -52,7 +55,13 @@
 #   PROGRESS_STOP_FILE  once this file exists, no new checkpoint starts, and while one is under way
 #                       ${PROGRESS_STOP_FILE}.busy exists. A Slurm batch stage's step creates it
 #                       before it copies the job's last results back, and waits for .busy to go, so
-#                       that the copy and a checkpoint never write the results at the same time.
+#                       that the copy and a checkpoint never write the results at the same time. If
+#                       the watcher cannot remove .busy then, it exits, which ends that wait too. It
+#                       first takes the final snapshot, unless the step may already be copying.
+#                       Between checkpoints, it tries again within 5 seconds of the stop file's
+#                       creation to remove a .busy that an earlier checkpoint has left behind. A
+#                       final snapshot that comes before the step's copies has no timeout results,
+#                       since the list of unfinished tests is final only after them.
 #   SLURM_SSH_STAT_CMD, the other SLURM_* commands, and PROGRESS_MTIME_FILE
 #                       a Slurm batch stage: each checkpoint first runs progress_collect_slurm.sh
 #                       with them
@@ -62,6 +71,21 @@ set +x
 
 log() {
     echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: $*"
+}
+
+# --- The end of the tests: PROGRESS_DONE_FILE, or USR1 from a step that cannot create it ---
+# The trap is set before anything else, since USR1 ends a process that does not trap it. bash runs
+# a trap only once the command under way returns, so the signal cuts no checkpoint short.
+tests_ended=0
+trap 'tests_ended=1' USR1
+# 1 once the mark of a checkpoint under way cannot be removed while PROGRESS_STOP_FILE exists; see
+# remove_busy_mark. A step creates that file only once its tests have ended.
+mark_stuck=0
+# 1 if the watcher then ends without its final snapshot; see begin_checkpoint.
+final_snapshot_skipped=0
+
+tests_done() {
+    [ "$tests_ended" = 1 ] || [ "$mark_stuck" = 1 ] || [ -e "$PROGRESS_DONE_FILE" ]
 }
 
 # --- Credentials: read the netrc into a variable that is not exported, then remove it ---
@@ -212,13 +236,34 @@ take_checkpoint() {
     esac
 }
 
+# Removes the mark of a checkpoint under way. The step that has created PROGRESS_STOP_FILE and then
+# seen the mark waits until the mark is gone or the watcher has exited. If the mark cannot be
+# removed then, the watcher ends, so that this wait ends too.
+remove_busy_mark() {
+    rm -f "${PROGRESS_STOP_FILE}.busy"
+    if [ -e "${PROGRESS_STOP_FILE}.busy" ] && [ -e "$PROGRESS_STOP_FILE" ]; then
+        log "the mark of a checkpoint under way could not be removed; the watcher ends, so that" \
+            "the step's wait for the mark ends"
+        mark_stuck=1
+    fi
+}
+
 # Returns 1 once PROGRESS_STOP_FILE exists. Otherwise marks a checkpoint as under way. The mark
 # comes before the check, so that the step either sees the mark or the watcher sees the stop file.
 begin_checkpoint() {
+    local mark_is_new=1
     [ -z "$PROGRESS_STOP_FILE" ] && return 0
+    [ -e "${PROGRESS_STOP_FILE}.busy" ] && mark_is_new=0
     : > "${PROGRESS_STOP_FILE}.busy"
     if [ -e "$PROGRESS_STOP_FILE" ]; then
-        rm -f "${PROGRESS_STOP_FILE}.busy"
+        remove_busy_mark
+        # The step looks for the mark once it has created the stop file. If it looked before this
+        # call created the mark, it is at its copies by now, and the final snapshot must not run
+        # beside them.
+        if [ "$mark_stuck" = 1 ] && [ "$mark_is_new" = 1 ]; then
+            log "no final snapshot, since the step may be at its last copies"
+            final_snapshot_skipped=1
+        fi
         return 1
     fi
     return 0
@@ -226,26 +271,46 @@ begin_checkpoint() {
 
 end_checkpoint() {
     if [ -n "$PROGRESS_STOP_FILE" ]; then
-        rm -f "${PROGRESS_STOP_FILE}.busy"
+        remove_busy_mark
     fi
 }
 
-while [ ! -e "$PROGRESS_DONE_FILE" ]; do
-    # Check for the done file every 5 seconds, so that the step does not wait out a whole interval
-    # once the tests end.
+# Tells, between two checkpoints, whether the step waits for a mark left behind: one that the last
+# checkpoint could not remove, at a time when PROGRESS_STOP_FILE did not exist yet.
+step_waits_for_mark() {
+    [ -n "$PROGRESS_STOP_FILE" ] && [ -e "${PROGRESS_STOP_FILE}.busy" ] &&
+        [ -e "$PROGRESS_STOP_FILE" ]
+}
+
+while ! tests_done; do
+    # Check for the end of the tests every 5 seconds, so that the step does not wait out a whole
+    # interval once they end. The loop also ends once the step waits for a mark left behind:
+    # begin_checkpoint then tries again to remove the mark.
     remaining=$interval
-    while [ "$remaining" -gt 0 ] && [ ! -e "$PROGRESS_DONE_FILE" ]; do
+    while [ "$remaining" -gt 0 ] && ! tests_done && ! step_waits_for_mark; do
         nap=5
         [ "$remaining" -lt "$nap" ] && nap=$remaining
         sleep "$nap"
         remaining=$((remaining - nap))
     done
-    [ -e "$PROGRESS_DONE_FILE" ] && break
+    tests_done && break
     if begin_checkpoint; then
         take_checkpoint
         end_checkpoint
     fi
 done
-take_checkpoint final
+if [ "$mark_stuck" != 1 ] && [ ! -e "$PROGRESS_DONE_FILE" ]; then
+    log "the step signalled the end of the tests without the done file"
+fi
+# A watcher that ends over a mark its step has seen takes the final snapshot while the step waits,
+# so before the step's last copies, as it does on USR1 from a step that cannot create the stop file.
+# Those copies bring the final list of unfinished tests. Before them the list is the last
+# checkpoint's, and names tests that were only running at the time, so this snapshot gets no
+# timeout results: progress_snapshot.sh makes none without TIMEOUT_XML_SCRIPT.
+if [ -n "$PROGRESS_STOP_FILE" ] &&
+        { [ "$mark_stuck" = 1 ] || [ ! -e "$PROGRESS_STOP_FILE" ]; }; then
+    unset TIMEOUT_XML_SCRIPT
+fi
+[ "$final_snapshot_skipped" = 1 ] || take_checkpoint final
 log "watcher exiting"
 exit 0

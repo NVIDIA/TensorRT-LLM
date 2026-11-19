@@ -21,9 +21,11 @@ every interval, and uploads the final snapshot once the done file appears.
 
 The watcher runs with ``bash`` in a temporary workspace, with stubs on ``PATH``:
 
-- ``sleep`` returns at once. A one-second sleep is the watcher's wait before a checkpoint, and
-  before the n-th one the stub runs the shell snippet ``tick.<n>`` that a test wrote: it changes
-  the results, or creates the done file. Other sleeps, the pauses between tries, are only recorded.
+- ``sleep`` returns at once and records its length. In the m-th sleep of any length the stub runs
+  the shell snippet ``sleep.<m>`` that a test wrote. A one-second sleep ends the watcher's wait
+  before a checkpoint, and is the whole wait with the one-second interval that the tests set by
+  default: in the n-th one the stub also runs the test's ``tick.<n>``, which changes the results
+  or creates the done file.
 - ``curl`` records each request: its arguments and environment, the netrc it was given, the
   tarball it sent, and the state of the files around it. It answers with the status that the test
   queued for the request's location, 201 by default. A queued "000 <exit code>" stands for a
@@ -36,6 +38,8 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import tarfile
 from dataclasses import dataclass
@@ -77,6 +81,8 @@ _DROPPED_VARIABLES = {
     "POST_TAG",
     "XML_PATH",
     "TIMEOUT_XML_SCRIPT",
+    "TIMEOUT_EVIDENCE_FILE",
+    "TIMEOUT_INPUT_FINAL",
     "BASH_ENV",
     "ENV",
 }
@@ -136,10 +142,14 @@ exit "${code:-0}"
 """
 
 _SLEEP_STUB = r"""
-# Nothing sleeps. A one-second sleep is the watcher's wait before a checkpoint: before the n-th,
-# run the test's tick.<n>. Other sleeps are only recorded.
+# Nothing sleeps. Each sleep is recorded, and the m-th runs the test's sleep.<m>. A one-second sleep
+# ends the watcher's wait before a checkpoint: the n-th also runs the test's tick.<n>.
 state=$STUB_STATE
 echo "$*" >> "$state/sleep.log"
+m=$(( $(wc -l < "$state/sleep.log") ))
+if [ -f "$state/sleep.$m" ]; then
+    . "$state/sleep.$m"
+fi
 [ "$*" = 1 ] || exit 0
 n=$(( $(cat "$state/tick.count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$state/tick.count"
@@ -277,6 +287,11 @@ class Watcher:
         """Run ``command`` just before the watcher's n-th checkpoint."""
         with (self.state / f"tick.{n}").open("a") as tick:
             tick.write(f"{command}\n")
+
+    def during_sleep(self, m: int, command: str) -> None:
+        """Run ``command`` in the m-th sleep of any length."""
+        with (self.state / f"sleep.{m}").open("a") as sleep:
+            sleep.write(f"{command}\n")
 
     def stop_at(self, n: int) -> None:
         """Create the done file in place of the watcher's n-th checkpoint."""
@@ -522,6 +537,7 @@ def test_the_done_file_brings_the_final_snapshot(watcher: Watcher) -> None:
     assert [request.location for request in result.requests] == ["urm", "aws"]
     for request in result.requests:
         assert f"{STAGE}/results-timeout.xml" in request.tarball
+    assert "the step signalled" not in result.output
     assert "run1 final snapshot uploaded to aws" in result.output
     assert result.output.splitlines()[-1] == f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting"
     assert watcher.hash_file.exists()
@@ -652,3 +668,549 @@ def test_a_batch_stage_takes_no_checkpoint_once_its_step_asks_it_to_stop(
     assert not Path(f"{stop}.busy").exists()
     # The final snapshot still comes with the done file.
     assert "sbatch final snapshot content unchanged, skipping upload" in result.output
+
+
+def _ticks(watcher: Watcher) -> int:
+    """Return how many times the watcher waited for its next checkpoint."""
+    return int((watcher.state / "tick.count").read_text())
+
+
+def test_a_signal_brings_the_final_snapshot_as_the_done_file_does(watcher: Watcher) -> None:
+    """USR1, from a step that cannot create the done file, brings the final snapshot and the exit."""
+    _write_xml(watcher.xml, mtime=1000)
+    # The step signals in place of the watcher's first checkpoint. The done file never appears.
+    watcher.tick(1, "kill -s USR1 $PPID")
+
+    result = watcher.run(FINAL_REQUIRES=str(watcher.xml))
+
+    assert result.returncode == 0, result.output
+    assert not watcher.done.exists()
+    assert _ticks(watcher) == 1
+    assert [request.location for request in result.requests] == ["urm", "aws"]
+    lines = result.output.splitlines()
+    signalled = lines.index(
+        f"[PROGRESS-UPLOAD] {STAGE}: the step signalled the end of the tests without the done file"
+    )
+    uploaded = f"[PROGRESS-UPLOAD] {STAGE}: run1 final snapshot uploaded to aws"
+    assert uploaded in lines[signalled + 1 :]
+    assert lines[-1] == f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting"
+
+
+def test_a_signal_during_a_checkpoint_lets_it_finish(watcher: Watcher) -> None:
+    """A signal that arrives while a checkpoint is under way does not cut the checkpoint short."""
+    remote = watcher.tmp_path / "remote"
+    _write_xml(remote / "results.xml", tests=3)
+    pid_file = shlex.quote(str(watcher.state / "watcher.pid"))
+    stop = watcher.workspace / f".checkpoint-stop-{STAGE}"
+    watcher.tick(1, f"echo $PPID > {pid_file}")
+
+    # The signal arrives while the first checkpoint asks the job for its results.
+    result = watcher.run(
+        PROGRESS_STOP_FILE=str(stop),
+        **watcher.batch_env(
+            SLURM_SSH_STAT_CMD=f"kill -s USR1 $(cat {pid_file}); echo 5000",
+            SLURM_SCP_XML_CMD=f"cp {shlex.quote(str(remote))}/results*.xml {STAGE}/",
+        ),
+    )
+
+    assert result.returncode == 0, result.output
+    assert _ticks(watcher) == 1
+    # That checkpoint still copied the results back and reached both targets, under its mark.
+    assert [request.location for request in result.requests] == ["urm", "aws"]
+    assert [request.checkpoint_mark for request in result.requests] == ["busy", "busy"]
+    assert [_suite_tests(request.tarball) for request in result.requests] == ["3", "3"]
+    assert not Path(f"{stop}.busy").exists()
+    # The final snapshot follows it, with neither the stop file nor the done file.
+    assert not stop.exists()
+    assert not watcher.done.exists()
+    assert "sbatch final snapshot content unchanged, skipping upload" in result.output
+    assert result.output.splitlines()[-1] == f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting"
+
+
+def _stuck_mark(watcher: Watcher) -> Path:
+    """Leave a busy mark that the watcher cannot remove, and return the stop file it belongs to."""
+    stop = watcher.workspace / f".checkpoint-stop-{STAGE}"
+    # rm -f removes no directory, whoever runs it.
+    Path(f"{stop}.busy").mkdir()
+    return stop
+
+
+_MARK_STUCK = (
+    f"[PROGRESS-UPLOAD] {STAGE}: the mark of a checkpoint under way could not be removed; "
+    "the watcher ends, so that the step's wait for the mark ends"
+)
+
+
+@pytest.mark.parametrize("stop_file_appears", ["during a checkpoint", "between two checkpoints"])
+def test_a_watcher_that_cannot_remove_its_busy_mark_ends_once_the_stop_file_exists(
+    watcher: Watcher, stop_file_appears: str
+) -> None:
+    """A watcher that cannot remove its busy mark ends once the stop file exists.
+
+    The step that created the stop file waits until the mark is gone or the watcher has exited, so
+    a watcher that went on would keep that step waiting.
+    """
+    remote = watcher.tmp_path / "remote"
+    _write_xml(remote / "results.xml", tests=3)
+    stop = _stuck_mark(watcher)
+    create_stop_file = f"touch {shlex.quote(str(stop))}"
+    stat = "echo 5000"
+    if stop_file_appears == "during a checkpoint":
+        # The step creates the stop file while the first checkpoint asks the job for its results.
+        stat = f"{create_stop_file}; {stat}"
+        checkpoints = 1
+    else:
+        # The first checkpoint ends with no step waiting, so the watcher goes on to the second.
+        watcher.tick(2, create_stop_file)
+        checkpoints = 2
+
+    result = watcher.run(
+        PROGRESS_STOP_FILE=str(stop),
+        **watcher.batch_env(
+            SLURM_SSH_STAT_CMD=stat,
+            SLURM_SCP_XML_CMD=f"cp {shlex.quote(str(remote))}/results*.xml {STAGE}/",
+        ),
+    )
+
+    assert result.returncode == 0, result.output
+    # The watcher ends there, without the done file and without a signal.
+    assert _ticks(watcher) == checkpoints
+    assert not watcher.done.exists()
+    assert "the step signalled" not in result.output
+    # Only the first checkpoint uploads: no second one starts, and the final snapshot is unchanged.
+    assert [request.location for request in result.requests] == ["urm", "aws"]
+    # The step has seen the mark and waits, so the final snapshot still comes, before its copies.
+    log = [line for line in result.output.splitlines() if line.startswith("[PROGRESS-UPLOAD]")]
+    assert log[-3:] == [
+        _MARK_STUCK,
+        f"[PROGRESS-UPLOAD] {STAGE}: sbatch final snapshot content unchanged, skipping upload",
+        f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting",
+    ]
+
+
+def _rm_that_leaves_the_mark(watcher: Watcher, times: str) -> None:
+    """Put an ``rm`` before the real one that leaves a busy mark in place, once or always."""
+    rm = shutil.which("rm")
+    assert rm is not None
+    left = shlex.quote(str(watcher.state / "rm.left"))
+    leave = 'echo "rm: the mark stays" >&2; exit 1'
+    if times == "once":
+        leave = f"[ -e {left} ] || {{ : > {left}; {leave}; }}"
+    _write_stub(
+        watcher.tmp_path / "bin" / "rm",
+        f'case "$*" in *.busy) {leave} ;; esac\nexec {shlex.quote(rm)} "$@"\n',
+    )
+
+
+def test_a_mark_left_behind_ends_the_wait_for_the_next_checkpoint_once_the_stop_file_exists(
+    watcher: Watcher,
+) -> None:
+    """A watcher that has left its busy mark behind looks at it again once the stop file exists.
+
+    The step that created the stop file waits for the mark, and the watcher's next checkpoint may
+    be a whole interval away.
+    """
+    remote = watcher.tmp_path / "remote"
+    _write_xml(remote / "results.xml", tests=3)
+    stop = _stuck_mark(watcher)
+    # With an interval of 6 seconds the watcher sleeps for 5 seconds and then for 1 before each
+    # checkpoint. The first checkpoint ends with no step waiting and leaves its mark. The step
+    # creates the stop file in the sleep after it, the third.
+    watcher.during_sleep(3, f"touch {shlex.quote(str(stop))}")
+
+    result = watcher.run(
+        PROGRESS_INTERVAL="6",
+        PROGRESS_STOP_FILE=str(stop),
+        **watcher.batch_env(
+            SLURM_SSH_STAT_CMD="echo 5000",
+            SLURM_SCP_XML_CMD=f"cp {shlex.quote(str(remote))}/results*.xml {STAGE}/",
+        ),
+    )
+
+    assert result.returncode == 0, result.output
+    # The watcher does not sleep out the rest of the interval.
+    assert result.sleeps == ["5", "1", "5"]
+    assert not watcher.done.exists()
+    assert [request.location for request in result.requests] == ["urm", "aws"]
+    # The step has seen the mark and waits, so the final snapshot still comes, before its copies.
+    log = [line for line in result.output.splitlines() if line.startswith("[PROGRESS-UPLOAD]")]
+    assert log[-3:] == [
+        _MARK_STUCK,
+        f"[PROGRESS-UPLOAD] {STAGE}: sbatch final snapshot content unchanged, skipping upload",
+        f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting",
+    ]
+
+
+def test_a_mark_left_behind_is_removed_once_the_stop_file_exists(watcher: Watcher) -> None:
+    """A watcher that can remove a mark left behind does so for the waiting step, and goes on.
+
+    The step then copies the last results back and creates the done file, which brings the final
+    snapshot as usual.
+    """
+    remote = watcher.tmp_path / "remote"
+    _write_xml(remote / "results.xml", tests=3)
+    stop = watcher.workspace / f".checkpoint-stop-{STAGE}"
+    mark = shlex.quote(f"{stop}.busy")
+    seen = watcher.state / "mark.seen"
+    # The first checkpoint cannot remove its mark. The step creates the stop file in the sleep
+    # after it, the third, sees the mark, and creates the done file before the second checkpoint.
+    _rm_that_leaves_the_mark(watcher, "once")
+    watcher.during_sleep(3, f"touch {shlex.quote(str(stop))}")
+    watcher.during_sleep(3, f"[ -e {mark} ] && : > {shlex.quote(str(seen))}")
+    watcher.stop_at(2)
+
+    result = watcher.run(
+        PROGRESS_INTERVAL="6",
+        PROGRESS_STOP_FILE=str(stop),
+        **watcher.batch_env(
+            SLURM_SSH_STAT_CMD="echo 5000",
+            SLURM_SCP_XML_CMD=f"cp {shlex.quote(str(remote))}/results*.xml {STAGE}/",
+        ),
+    )
+
+    assert result.returncode == 0, result.output
+    assert result.output.count("rm: the mark stays") == 1
+    assert seen.exists()
+    assert not Path(f"{stop}.busy").exists()
+    assert _MARK_STUCK not in result.output
+    # The watcher cuts the second interval short for the mark, and then waits out a whole one.
+    assert result.sleeps == ["5", "1", "5", "5", "1"]
+    assert [request.location for request in result.requests] == ["urm", "aws"]
+    log = [line for line in result.output.splitlines() if line.startswith("[PROGRESS-UPLOAD]")]
+    assert log[-2:] == [
+        f"[PROGRESS-UPLOAD] {STAGE}: sbatch final snapshot content unchanged, skipping upload",
+        f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting",
+    ]
+
+
+def test_a_watcher_takes_no_final_snapshot_over_a_mark_its_step_may_not_have_seen(
+    watcher: Watcher,
+) -> None:
+    """A mark that cannot be removed right after its creation ends the watcher with no snapshot.
+
+    The step looks for the mark once it has created the stop file. If it looked before the watcher
+    created the mark, it is at its copies, and a final snapshot would run beside them.
+    """
+    # The stage has results that a final snapshot would upload.
+    _write_xml(watcher.xml)
+    stop = watcher.workspace / f".checkpoint-stop-{STAGE}"
+    # rm leaves the mark in place, as in a workspace that turns unwritable once the mark exists.
+    _rm_that_leaves_the_mark(watcher, "always")
+    # The step creates the stop file before the first checkpoint, when there is no mark to see.
+    watcher.tick(1, f"touch {shlex.quote(str(stop))}")
+
+    result = watcher.run(
+        PROGRESS_STOP_FILE=str(stop), **watcher.batch_env(SLURM_SSH_STAT_CMD="echo 5000")
+    )
+
+    assert result.returncode == 0, result.output
+    assert _ticks(watcher) == 1
+    assert Path(f"{stop}.busy").exists()
+    # The watcher still ends, in case the step waits for the mark, but uploads nothing.
+    assert not watcher.tarball.exists()
+    assert result.requests == []
+    log = [line for line in result.output.splitlines() if line.startswith("[PROGRESS-UPLOAD]")]
+    assert log[-3:] == [
+        _MARK_STUCK,
+        f"[PROGRESS-UPLOAD] {STAGE}: no final snapshot, since the step may be at its last copies",
+        f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("the_step_cannot", "after_the_copies"),
+    [
+        ("create the stop file", False),
+        ("see the busy mark go", False),
+        ("create the done file", True),
+    ],
+)
+def test_a_batch_final_snapshot_has_timeout_results_only_after_the_steps_copies(
+    watcher: Watcher, the_step_cannot: str, after_the_copies: bool
+) -> None:
+    """A final snapshot that comes before a batch step's last copies has no timeout results.
+
+    Those copies bring the final list of unfinished tests. The list in the stage's folder before
+    them is the last checkpoint's, and names tests that were only running at the time.
+    """
+    _write_xml(watcher.xml)
+    (watcher.stage_dir / "unfinished_test.txt").write_text("unittest/llmapi/test_llm.py\n")
+    stop = watcher.workspace / f".checkpoint-stop-{STAGE}"
+    create_stop_file = f"touch {shlex.quote(str(stop))}"
+    signal_the_watcher = "kill -s USR1 $PPID"
+    if the_step_cannot == "create the stop file":
+        # The step ends the watcher with a signal, before its copies.
+        watcher.tick(1, signal_the_watcher)
+    elif the_step_cannot == "see the busy mark go":
+        # The watcher ends over the mark while the step waits for it, before its copies.
+        _stuck_mark(watcher)
+        watcher.tick(1, create_stop_file)
+    else:
+        # The step has created the stop file and made its copies. It signals at its end.
+        watcher.tick(1, f"{create_stop_file}; {signal_the_watcher}")
+
+    result = watcher.run(
+        PROGRESS_STOP_FILE=str(stop),
+        TIMEOUT_XML_SCRIPT=str(TIMEOUT_XML_SCRIPT),
+        **watcher.batch_env(SLURM_SSH_STAT_CMD="echo 5000"),
+    )
+
+    assert result.returncode == 0, result.output
+    assert not watcher.done.exists()
+    # The final snapshot is the only upload.
+    assert [request.location for request in result.requests] == ["urm", "aws"]
+    assert "sbatch final snapshot uploaded to aws" in result.output
+    in_the_snapshot = [
+        f"{STAGE}/results-timeout.xml" in request.tarball for request in result.requests
+    ]
+    assert in_the_snapshot == [after_the_copies, after_the_copies]
+    assert (watcher.stage_dir / "results-timeout.xml").exists() == after_the_copies
+
+
+L0_TEST = REPO_ROOT / "jenkins" / "L0_Test.groovy"
+
+
+def _step_lines(first: str, last: str, count: int) -> list[str]:
+    r"""Return the ``count`` runs of step lines in L0_Test.groovy from ``first`` to its ``last``.
+
+    A run ends at the next ``last`` that has the indentation of ``first``, so that it holds every
+    block nested in it whole and none starts inside a block to end outside it. The lines come back
+    as the shell gets them, without the ``\`` that keeps Groovy from expanding a ``$``.
+
+    These tests run the steps' own lines, so they depend on the text of the steps. If a step words
+    its ``first`` or ``last`` line differently, or another step gets such lines, the count is off
+    and the assertion below names the lines it looked for.
+    """
+    pattern = rf"^([ \t]*){re.escape(first)}.*?^\1{re.escape(last)}$"
+    runs = re.finditer(pattern, L0_TEST.read_text(encoding="utf-8"), re.M | re.S)
+    lines = [run[0].replace("\\$", "$") for run in runs]
+    assert len(lines) == count, (
+        f"expected {count} run(s) of step lines from {first!r} to {last!r} in {L0_TEST.name}, "
+        f"found {len(lines)}"
+    )
+    return lines
+
+
+def _batch_step_lines() -> tuple[str, str]:
+    """Return what a batch step does with the watcher once its job has ended, in two parts.
+
+    Between the two, the step copies the job's last results back.
+    """
+    (before_the_copies,) = _step_lines("watcher_ended=0", "fi", count=1)
+    (after_the_copies,) = _step_lines(
+        'if [ "\\$watcher_ended" -eq 0 ]; then', "exit \\$rc", count=1
+    )
+    return before_the_copies, after_the_copies
+
+
+def _step_ending(step: str) -> str:
+    """Return what ``step`` does with the watcher once its tests have ended."""
+    if step == "batch":
+        return "\n".join(_batch_step_lines())
+    rerun, first_run = _step_lines('touch "\\$PROGRESS_DONE_FILE"', "exit \\$rc", count=2)
+    return {"rerun": rerun, "first run": first_run}[step]
+
+
+def _run_beside_the_watcher(watcher: Watcher, lines: str, **env: str) -> tuple[int, str]:
+    """Run ``lines`` in a step that has the watcher in its background, as ``sh`` does.
+
+    The lines run while the watcher is in its first sleep, where it stays until the step signals it
+    or creates the done file or the stop file. A step's tests end long after the watcher has
+    started, and a signal that reaches bash while it expands a command substitution, as a starting
+    watcher does, can be lost; one that arrives during a command is not.
+
+    An outer shell prints "the step exits" once the step has exited, so the output shows whether
+    the watcher ended before its step.
+
+    Returns the step's exit code and output. A step that does not return is killed, and so is a
+    watcher that outlives its step.
+    """
+    signalled = shlex.quote(str(watcher.state / "signalled"))
+    step_acts = (
+        f'[ -e {signalled} ] || [ -e "$PROGRESS_DONE_FILE" ] || [ -e "$PROGRESS_STOP_FILE" ]'
+    )
+    watcher.tick(1, f"until {step_acts}; do :; done")
+    script = "\n".join(
+        [
+            "set +e",
+            # Records that the step has sent USR1, for the watcher's first sleep to end.
+            f'kill() {{ command kill "$@" && case "$*" in *USR1*) : > {signalled} ;; esac; }}',
+            f"bash {shlex.quote(str(WATCHER))} &",
+            "WATCHER_PID=$!",
+            # As in the steps, the tests start only once the watcher has removed its netrc.
+            'while [ -e "$CHECKPOINT_NETRC_FILE" ]; do :; done',
+            # They end once the watcher is in its first sleep.
+            'while [ ! -e "$STUB_STATE/tick.count" ]; do :; done',
+            "rc=7",
+            lines,
+        ]
+    )
+    proc = subprocess.Popen(
+        ["sh", "-c", 'sh -c "$1"; rc=$?; echo "the step exits"; exit "$rc"', "sh", script],
+        env={**watcher.env, **env},
+        cwd=watcher.cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        output, _ = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        output, _ = proc.communicate()
+        pytest.fail(f"the step did not return:\n{output}")
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return proc.returncode, output
+
+
+@pytest.mark.parametrize("step", ["batch", "rerun", "first run"])
+def test_a_step_that_cannot_create_the_done_file_still_returns(watcher: Watcher, step: str) -> None:
+    """Each step returns the tests' exit code although its done file cannot be created.
+
+    The watcher exits only once it learns that the tests have ended, and the step waits for it, so
+    a step that could only signal through the done file would never return.
+    """
+    env = {
+        "PROGRESS_DONE_FILE": str(watcher.workspace / "missing" / "done"),
+        "FINAL_REQUIRES": str(watcher.xml),
+    }
+    stop = watcher.workspace / f".checkpoint-stop-{STAGE}"
+    if step == "batch":
+        # Only a batch step has a stop file. This one can create it, so the watcher still runs
+        # when the step comes to the done file.
+        env["PROGRESS_STOP_FILE"] = str(stop)
+    _write_xml(watcher.xml, mtime=1000)
+
+    returncode, output = _run_beside_the_watcher(watcher, _step_ending(step), **env)
+
+    assert returncode == 7, output
+    assert stop.exists() == (step == "batch")
+    assert "the step signalled the end of the tests without the done file" in output
+    assert "run1 final snapshot" in output
+    # The step waits for the watcher: it exits only after the watcher has.
+    assert output.splitlines()[-2:] == [
+        f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting",
+        "the step exits",
+    ]
+
+
+@pytest.mark.parametrize("step", ["batch", "rerun", "first run"])
+def test_a_step_that_can_create_the_done_file_sends_no_signal(watcher: Watcher, step: str) -> None:
+    """Each step that can create its done file ends the watcher with that file alone.
+
+    The signal names the watcher only by its PID, so a step sends it only when the file fails.
+    """
+    env = {"FINAL_REQUIRES": str(watcher.xml)}
+    if step == "batch":
+        env["PROGRESS_STOP_FILE"] = str(watcher.workspace / f".checkpoint-stop-{STAGE}")
+    _write_xml(watcher.xml, mtime=1000)
+
+    returncode, output = _run_beside_the_watcher(watcher, _step_ending(step), **env)
+
+    assert returncode == 7, output
+    assert watcher.done.exists()
+    assert not (watcher.state / "signalled").exists(), output
+    assert "the step signalled" not in output
+    assert output.splitlines()[-2:] == [
+        f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting",
+        "the step exits",
+    ]
+
+
+def test_a_batch_step_that_cannot_create_the_stop_file_ends_the_watcher_first(
+    watcher: Watcher,
+) -> None:
+    """Without the stop file, the batch step ends the watcher before it copies the last results.
+
+    The watcher cannot be asked to pause then, and a mark of a checkpoint under way that could not
+    be removed would otherwise keep the step waiting.
+    """
+    before_the_copies, after_the_copies = _batch_step_lines()
+    still_runs = 'kill -0 $WATCHER_PID 2>/dev/null && echo "the watcher still runs"'
+    _write_xml(watcher.xml, mtime=1000)
+
+    # The done file cannot be created either, so that only the step's signal can end the watcher.
+    returncode, output = _run_beside_the_watcher(
+        watcher,
+        "\n".join([before_the_copies, still_runs, after_the_copies]),
+        PROGRESS_STOP_FILE=str(watcher.workspace / "missing" / "stop"),
+        PROGRESS_DONE_FILE=str(watcher.workspace / "missing" / "done"),
+        FINAL_REQUIRES=str(watcher.xml),
+    )
+
+    assert returncode == 7, output
+    assert "the step signalled the end of the tests without the done file" in output
+    assert "the watcher still runs" not in output
+    assert f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting" in output
+
+
+# For the place of a batch step's copies: the watcher's PID passes to a process that has nothing to
+# do with it. When the step exits, TERM ends that process, unless USR1 from the step has ended it
+# before. The trap comes after the process has started: bash with an EXIT trap catches TERM, and a
+# child keeps that handler until it runs its command, so a TERM sent before then would be lost.
+_BYSTANDER = "\n".join(
+    [
+        "tail -f /dev/null > /dev/null 2>&1 &",
+        "WATCHER_PID=$!",
+        "trap 'kill $WATCHER_PID; wait $WATCHER_PID; echo \"the bystander ended with $?\"' EXIT",
+    ]
+)
+
+
+def test_a_batch_step_that_ended_the_watcher_leaves_its_pid_alone(watcher: Watcher) -> None:
+    """A batch step that has ended the watcher neither signals its PID again nor waits for it.
+
+    The copies come between the watcher's end and the step's, and by then the PID may belong to
+    another process, which USR1 would end.
+    """
+    before_the_copies, after_the_copies = _batch_step_lines()
+    _write_xml(watcher.xml, mtime=1000)
+
+    returncode, output = _run_beside_the_watcher(
+        watcher,
+        "\n".join([before_the_copies, _BYSTANDER, after_the_copies]),
+        PROGRESS_STOP_FILE=str(watcher.workspace / "missing" / "stop"),
+        PROGRESS_DONE_FILE=str(watcher.workspace / "missing" / "done"),
+        FINAL_REQUIRES=str(watcher.xml),
+    )
+
+    assert returncode == 7, output
+    assert f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting" in output
+    assert f"the bystander ended with {128 + signal.SIGTERM}" in output
+
+
+def test_a_batch_step_goes_on_once_a_watcher_that_cannot_remove_its_mark_has_ended(
+    watcher: Watcher,
+) -> None:
+    """A batch step does not wait for good for a busy mark that the watcher cannot remove.
+
+    The step waits until the mark is gone or the watcher has exited. The watcher ends when it
+    cannot remove the mark, and the step then leaves its PID alone, as it does after it has ended
+    the watcher itself.
+    """
+    before_the_copies, after_the_copies = _batch_step_lines()
+    still_runs = 'kill -0 $WATCHER_PID 2>/dev/null && echo "the watcher still runs"'
+    stop = _stuck_mark(watcher)
+    _write_xml(watcher.xml, mtime=1000)
+
+    # The done file cannot be created either, as in a workspace that has turned unwritable.
+    returncode, output = _run_beside_the_watcher(
+        watcher,
+        "\n".join([before_the_copies, still_runs, _BYSTANDER, after_the_copies]),
+        PROGRESS_STOP_FILE=str(stop),
+        PROGRESS_DONE_FILE=str(watcher.workspace / "missing" / "done"),
+        FINAL_REQUIRES=str(watcher.xml),
+    )
+
+    assert returncode == 7, output
+    assert stop.exists()
+    assert _MARK_STUCK in output
+    assert "the watcher still runs" not in output
+    assert f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting" in output
+    assert f"the bystander ended with {128 + signal.SIGTERM}" in output
