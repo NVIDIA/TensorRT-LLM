@@ -69,40 +69,32 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 
 
 def _junit_all_tests_skipped(xml_path: str) -> bool:
-    """Whether every testcase in a JUnit report was skipped.
+    """Whether every named testcase in a JUnit report was skipped.
 
     The inner pytest exits 0 in that case, so ``test_unittests_v2`` would
-    otherwise be recorded as PASSED. A missing, empty, or mixed report
-    returns False.
+    otherwise be recorded as PASSED. A missing, empty, malformed, or mixed
+    report returns False.
+
+    Counts ``skipped`` elements on the testcases. pytest's ``LogXML`` records
+    a non-strict xfail as ``<skipped type="pytest.xfail">`` and includes it in
+    the suite ``skipped`` attribute, but those tests ran. ``PeriodicJUnitXML``
+    always writes the suite counts, so this does not read them.
     """
     import xml.etree.ElementTree as ElementTree
     try:
         root = ElementTree.parse(xml_path).getroot()
     except (OSError, ElementTree.ParseError):
         return False
-    suites = list(root.iter("testsuite"))
-    if root.tag == "testsuite":
-        suites = [root]
-    tests = skipped = failures = errors = 0
-    counted_suite = False
-    for suite in suites:
-        if "tests" not in suite.attrib:
-            continue
-        counted_suite = True
-        try:
-            tests += int(suite.attrib.get("tests", "0"))
-            skipped += int(suite.attrib.get("skipped", "0"))
-            failures += int(suite.attrib.get("failures", "0"))
-            errors += int(suite.attrib.get("errors", "0"))
-        except ValueError:
+    cases = [case for case in root.iter("testcase") if case.get("name")]
+    skipped = 0
+    for case in cases:
+        if case.find("failure") is not None or case.find("error") is not None:
             return False
-    if not counted_suite:
-        cases = [case for case in root.iter("testcase") if case.get("name")]
-        tests = len(cases)
-        skipped = sum(1 for case in cases if case.find("skipped") is not None)
-        failures = sum(1 for case in cases if case.find("failure") is not None)
-        errors = sum(1 for case in cases if case.find("error") is not None)
-    return tests > 0 and failures == 0 and errors == 0 and skipped == tests
+        skipped_node = case.find("skipped")
+        if (skipped_node is not None
+                and skipped_node.get("type") != "pytest.xfail"):
+            skipped += 1
+    return len(cases) > 0 and skipped == len(cases)
 
 
 def _junit_culprits(xml_path: str) -> list[str]:

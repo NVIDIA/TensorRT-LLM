@@ -103,6 +103,54 @@ def test_junit_all_tests_skipped(tmp_path: Path) -> None:
     assert _junit_all_tests_skipped(str(report)) is False
     assert _junit_all_tests_skipped(str(tmp_path / "missing.xml")) is False
 
+    report.write_text("<testsuites>", encoding="utf-8")
+    assert _junit_all_tests_skipped(str(report)) is False
+
+    # PeriodicJUnitXML always writes suite counts. A report without them still
+    # classifies from testcase nodes, which is the only path this helper uses.
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest">
+    <testcase classname="pkg.test_awq" name="test_a"><skipped message="SM100" /></testcase>
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_tests_skipped(str(report)) is True
+
+    # Non-strict xfail is <skipped type="pytest.xfail"> and is included in the
+    # suite skipped count, but the test body ran.
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="2" tests="2">
+    <testcase classname="pkg.test_awq" name="test_a">
+      <skipped type="pytest.xfail" message="known" />
+    </testcase>
+    <testcase classname="pkg.test_awq" name="test_b">
+      <skipped type="pytest.xfail" message="known" />
+    </testcase>
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_tests_skipped(str(report)) is False
+
+    # A retry merge can leave suite skipped="0" while the kept testcase skipped.
+    report.write_text(
+        """<testsuites>
+  <testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1">
+    <testcase classname="pkg.test_awq" name="test_a">
+      <skipped type="pytest.skip" message="SM100" />
+    </testcase>
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    assert _junit_all_tests_skipped(str(report)) is True
+
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:
     prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_modeling_v2_attn_res"
