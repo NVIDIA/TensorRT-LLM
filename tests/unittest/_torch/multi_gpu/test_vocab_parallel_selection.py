@@ -526,6 +526,17 @@ def _fused_draft_head_body(rank, tp):
             graph.replay()
             torch.cuda.synchronize()
             assert all(torch.equal(o, expected) for o in outs)
+        # A weight refit (in place, then the rebuild) keeps the head the graph holds: replays
+        # see the new weights.
+        lm_head.weight.data.neg_()
+        worker.build_fused_draft_head(SimpleNamespace(lm_head=lm_head))
+        assert worker.fused_draft_head is head
+        expected = torch.argmax(lm_head(x).float(), dim=-1).to(torch.int32)
+        for _ in range(2):
+            graph.replay()
+            torch.cuda.synchronize()
+            assert all(torch.equal(o, expected) for o in outs)
+        lm_head.weight.data.neg_()
 
         # Fallbacks: more rows than a launch takes, advanced draft sampling, guided decoding.
         assert worker._fused_draft_head_for(head.max_rows + 1, draft_md) is None
