@@ -73,6 +73,8 @@ _PARAMETER_TAG_START = re.compile(r"<\s*parameter\s*=")
 # A parameter that ends only at its closing tag, as grammar-constrained output
 # writes every parameter.
 _CLOSED_PARAMETER = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
+# A tag that can end a parameter value: its closing tag or the next opening tag.
+_PARAMETER_END_TAG = re.compile(r"<\s*(?:/\s*parameter\s*>|parameter\s*=)")
 
 
 def _trim_wrapping_newlines(value: str) -> str:
@@ -233,6 +235,10 @@ class Qwen3CoderToolParser(BaseToolParser):
         ] = {}  # Track what parameter content we've streamed
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
+        # How much of the current call's body was seen by the last streaming
+        # step, and where the last "<" in that text is.
+        self._body_seen_len: int = 0
+        self._body_last_lt: int = -1
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -404,6 +410,8 @@ class Qwen3CoderToolParser(BaseToolParser):
                         continue
                     self._current_function_name = function_name
                     self._function_name_sent = True
+                    self._body_seen_len = 0
+                    self._body_last_lt = -1
 
                     # Initialize tool call tracking
                     if self.current_tool_id == -1:
@@ -454,10 +462,14 @@ class Qwen3CoderToolParser(BaseToolParser):
                     )
                     if function_end != -1:
                         body = self._buf[:function_end]
-                parameter_calls = self._parse_and_stream_parameters(
-                    body, param_config, complete=end_pos != -1
-                )
-                calls.extend(parameter_calls)
+                # Until the call ends, its body only grows, and the values
+                # parsed from it change only when a tag that ends a value
+                # arrives. Skip the reparse of the whole body otherwise.
+                if end_pos != -1 or self._parameter_end_tag_arrived(body):
+                    parameter_calls = self._parse_and_stream_parameters(
+                        body, param_config, complete=end_pos != -1
+                    )
+                    calls.extend(parameter_calls)
 
                 # Check if tool call is complete
                 if end_pos != -1:
@@ -487,6 +499,27 @@ class Qwen3CoderToolParser(BaseToolParser):
         self._buf = ""
         self._reset_streaming_state()
         return result
+
+    def _parameter_end_tag_arrived(self, body: str) -> bool:
+        """Whether a tag that can end a parameter value ends in the new text of ``body``.
+
+        ``body`` is the current call's body, grown since the last streaming
+        step. A value ends at ``</parameter>`` or at the next ``<parameter=``,
+        so the values parsed from ``body`` can differ from the last step's only
+        when one of these tags ends in the new text. Scanning only the new text
+        and the one tag that may straddle it keeps each step's cost independent
+        of how long the body already is. Records ``body`` as seen for the next
+        step.
+        """
+        seen, last_lt = self._body_seen_len, self._body_last_lt
+        self._body_seen_len = len(body)
+        self._body_last_lt = max(last_lt, body.rfind("<", seen))
+        # A tag that began in the earlier text began at its last "<".
+        if last_lt != -1:
+            tag = _PARAMETER_END_TAG.match(body, last_lt)
+            if tag and tag.end() > seen:
+                return True
+        return _PARAMETER_END_TAG.search(body, seen) is not None
 
     def _parse_and_stream_parameters(
         self, text_to_parse: str, param_config: dict, *, complete: bool = False

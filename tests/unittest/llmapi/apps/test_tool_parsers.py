@@ -2973,6 +2973,59 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert json.loads(whole.calls[0].parameters) == {"code": code, "n": 2}
         assert streamed == whole.calls[0].parameters
 
+    def test_streaming_long_value_reparses_body_a_fixed_number_of_times(
+            self, monkeypatch):
+        """Streaming a long value does not reparse the body for every delta.
+
+        The body is parsed again only when a tag that can end a value arrives,
+        here split across deltas and written with spaces, so the parses do not
+        grow with the value; parsing it for every delta makes streaming
+        quadratic in the value's length.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string"
+                        },
+                        "code": {
+                            "type": "string"
+                        },
+                    },
+                },
+            ),
+        )
+        parameter_values = Qwen3CoderToolParser._parameter_values
+        parses = []
+
+        def counting_parameter_values(self, body, *args):
+            parses.append(body)
+            return parameter_values(self, body, *args)
+
+        monkeypatch.setattr(Qwen3CoderToolParser, "_parameter_values",
+                            counting_parameter_values)
+
+        def parses_streaming(lines):
+            code = "if a < b:\n    x = a >= b\n" * lines
+            text = ("<tool_call>\n<function=f>\n<parameter=path>\na.py\n"
+                    "</parameter>\n< parameter = code>\n" + code +
+                    "\n</ parameter >\n</function>\n</tool_call>")
+            streaming_parser = Qwen3CoderToolParser()
+            parses.clear()
+            streamed = ""
+            for i in range(0, len(text), 3):
+                for call in streaming_parser.parse_streaming_increment(
+                        text[i:i + 3], [tool]).calls:
+                    streamed += call.parameters or ""
+            assert json.loads(streamed) == {"path": "a.py", "code": code}
+            return len(parses)
+
+        assert parses_streaming(200) == parses_streaming(20)
+
     @pytest.mark.parametrize("streaming", [False, True],
                              ids=["non_streaming", "streaming"])
     def test_parse_preserves_string_and_null_types(self, parser, streaming):
