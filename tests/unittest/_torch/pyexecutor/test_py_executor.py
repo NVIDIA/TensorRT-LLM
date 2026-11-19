@@ -2113,11 +2113,12 @@ def test_adp_running_counts_update_without_a_new_block_sample():
 
 
 def _make_adp_ranks_at_shutdown(
-    account_for_in_transfer: bool, monkeypatch: pytest.MonkeyPatch
+    account_for_in_transfer: bool, monkeypatch: pytest.MonkeyPatch, packed_sync: bool = False
 ) -> list[PyExecutor]:
     """Build two idle attention-DP ranks that consumed the shutdown.
 
     They share one rank-state allgather, and every rank routes the requests it pops to rank 1.
+    With ``packed_sync`` the rank states ride the packed loop-head exchange.
     """
     from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
         AsyncTransferManager,
@@ -2132,6 +2133,8 @@ def _make_adp_ranks_at_shutdown(
     )
     # Each rank's last message to the rank-state and prefix-match allgathers.
     states = [RankState(rank=rank).serialize() for rank in range(2)]
+    # The packed loop-head exchange appends the error, blocked and timeout votes.
+    packed_rows = [[*state, 0, 0, 0] for state in states]
     prefix_matches = [[], []]
 
     def allgather(gathered: list, message: list[int], rank: int) -> list:
@@ -2146,6 +2149,7 @@ def _make_adp_ranks_at_shutdown(
         executor = _make_executor_with_kv_cache_manager(None)
         executor.enable_attention_dp = True
         executor.enable_iter_perf_stats = False
+        executor._packed_sync_enabled = packed_sync
         executor._kv_load_tracker = KvLoadTracker(None, rank=rank, enabled=False)
         executor.dist = types.SimpleNamespace(
             rank=rank, tp_rank=rank, cp_config={}, cp_rank=0, cp_size=1
@@ -2173,6 +2177,7 @@ def _make_adp_ranks_at_shutdown(
                 allgather(states, message, rank), dtype=np.int64
             ),
             tp_allgather=lambda message, rank=rank: allgather(prefix_matches, message, rank),
+            allgather_ints=lambda values, rank=rank: allgather(packed_rows, values, rank),
         )
         executor.adp_router = KVCacheAwareADPRouter(
             router_dist,
@@ -2189,6 +2194,9 @@ def _stop_decisions(ranks: list[PyExecutor]) -> list[bool]:
     """Fetch one iteration's requests on every rank, then return each rank's stop decision."""
     # Rank 1 sends its message before rank 0 gathers it.
     for executor in reversed(ranks):
+        if executor._packed_sync_enabled:
+            # As in the executor loop, the fetch then reads the exchanged rank states.
+            executor._adp_apply_loop_head_actions(executor._adp_loop_head_exchange())
         executor._fetch_new_requests(executor.waiting_queue, executor.active_requests)
     return [executor.should_stop_processing for executor in ranks]
 
@@ -2226,16 +2234,17 @@ def test_adp_ranks_stop_on_same_iteration(
     assert _stop_decisions(ranks) == [True, True]
 
 
+@pytest.mark.parametrize("packed_sync", [False, True])
 @pytest.mark.parametrize("account_for_in_transfer", [False, True])
 def test_adp_ranks_wait_for_peer_context_retirement(
-    account_for_in_transfer: bool, monkeypatch: pytest.MonkeyPatch
+    account_for_in_transfer: bool, packed_sync: bool, monkeypatch: pytest.MonkeyPatch
 ):
     """Attention-DP ranks at shutdown keep stepping while a peer's context send awaits retirement.
 
     A context-first request whose KV send the transceiver retires keeps its rank stepping until
     the send retires, so its peers step with it.
     """
-    ranks = _make_adp_ranks_at_shutdown(account_for_in_transfer, monkeypatch)
+    ranks = _make_adp_ranks_at_shutdown(account_for_in_transfer, monkeypatch, packed_sync)
     for executor in ranks:
         # A transceiver that holds a context-first send until the send retires.
         executor.kv_cache_transceiver = types.SimpleNamespace(
@@ -2247,7 +2256,7 @@ def test_adp_ranks_wait_for_peer_context_retirement(
             kv_cache_manager=None,
             dist=types.SimpleNamespace(world_size=2),
             effects=Mock(),
-            registry=Mock(),
+            registry=Mock(active_requests=Mock(return_value=[])),
             enable_attention_dp=True,
         )
     retiring = types.SimpleNamespace(py_request_id=7, py_orig_prompt_len=16, cached_tokens=0)
