@@ -835,22 +835,47 @@ class ProfileController:
     def _stop_window(self) -> None:
         # The trace flush stalls every rank for longer than the hang timeout.
         with self._pause_hang_detector():
-            if self._active_enable_torch_trace and self._torch_profiler is not None:
-                self._torch_profiler.stop()
-                trace_path = _profile_trace_path(
-                    self._active_torch_trace_path,
-                    self._active_profile_start_iter,
-                    self._current_iteration(),
-                    self._active_env_trace and self._env_multiple_ranges,
-                )
-                self._torch_profiler.export_chrome_trace(trace_path)
-                logger.info(
-                    f"Profiling stopped at iteration "
-                    f"{self._current_iteration()}, "
-                    f"trace saved to {trace_path}"
-                )
-            torch.cuda.cudart().cudaProfilerStop()
-            self._calibrator.stop()
+            failure: Exception | None = None
+            try:
+                try:
+                    if self._active_enable_torch_trace and self._torch_profiler is not None:
+                        self._torch_profiler.stop()
+                        trace_path = _profile_trace_path(
+                            self._active_torch_trace_path,
+                            self._active_profile_start_iter,
+                            self._current_iteration(),
+                            self._active_env_trace and self._env_multiple_ranges,
+                        )
+                        self._torch_profiler.export_chrome_trace(trace_path)
+                        logger.info(
+                            f"Profiling stopped at iteration "
+                            f"{self._current_iteration()}, "
+                            f"trace saved to {trace_path}"
+                        )
+                except (AssertionError, OSError, RuntimeError, ValueError) as error:
+                    failure = error
+                finally:
+                    for stop in (
+                        lambda: torch.cuda.cudart().cudaProfilerStop(),
+                        self._calibrator.stop,
+                    ):
+                        try:
+                            stop()
+                        except (AssertionError, OSError, RuntimeError, ValueError) as error:
+                            if failure is None:
+                                failure = error
+                            else:
+                                logger.debug(f"profile cleanup after {failure!r}: {error!r}")
+            finally:
+                # Prevent context exit from retrying an already stopped observer.
+                self._window_open = False
+                self._torch_profiler = None
+                self._active_torch_trace_path = None
+                self._active_enable_torch_trace = False
+                with self._profile_state_lock:
+                    self._profile_enabled = False
+            if failure is not None:
+                raise failure
 
     # ---- shutdown --------------------------------------------------
 
