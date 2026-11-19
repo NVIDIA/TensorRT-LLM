@@ -42,7 +42,10 @@ from tensorrt_llm._torch.pyexecutor._util import (
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import _autotuner_warmup_configs
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
+    AutotunerWarmupMode,
+    _autotuner_warmup_configs,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
     KVCacheManagerV2,
@@ -562,10 +565,16 @@ def _make_rehearsal_creator(
 
 
 @pytest.mark.parametrize(
-    "engine, generation_only",
+    "engine, mode",
     [
-        (dict(batch_size=8, max_num_tokens=8192, max_seq_len=1025), False),
-        (dict(batch_size=4, max_num_tokens=8192, max_seq_len=4097, max_beam_width=4), False),
+        (
+            dict(batch_size=8, max_num_tokens=8192, max_seq_len=1025),
+            AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION,
+        ),
+        (
+            dict(batch_size=4, max_num_tokens=8192, max_seq_len=4097, max_beam_width=4),
+            AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION,
+        ),
         (
             dict(
                 batch_size=16,
@@ -574,7 +583,7 @@ def _make_rehearsal_creator(
                 max_total_draft_tokens=7,
                 max_draft_loop_tokens=24,
             ),
-            False,
+            AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION,
         ),
         (
             dict(
@@ -584,7 +593,7 @@ def _make_rehearsal_creator(
                 max_total_draft_tokens=3,
                 max_draft_loop_tokens=3,
             ),
-            True,
+            AutotunerWarmupMode.GENERATION_ONLY,
         ),
         (
             dict(
@@ -595,13 +604,31 @@ def _make_rehearsal_creator(
                 max_draft_loop_tokens=3,
                 helix_cp_size=4,
             ),
-            True,
+            AutotunerWarmupMode.GENERATION_ONLY,
+        ),
+        (
+            dict(
+                batch_size=64,
+                max_num_tokens=1024,
+                max_seq_len=8192,
+                max_total_draft_tokens=3,
+                max_draft_loop_tokens=3,
+                helix_cp_size=4,
+            ),
+            AutotunerWarmupMode.CONTEXT_AND_FULL_GENERATION,
         ),
     ],
-    ids=["multi_sequence_context", "beam_search", "draft_loop", "generation_only", "helix"],
+    ids=[
+        "multi_sequence_context",
+        "beam_search",
+        "draft_loop",
+        "generation_only",
+        "disagg_helix",
+        "aggregated_helix",
+    ],
 )
 @pytest.mark.parametrize("extra_kv_tokens", [0, 3])
-def test_rehearsal_kv_cache_holds_the_warmup_batches(engine, generation_only, extra_kv_tokens):
+def test_rehearsal_kv_cache_holds_the_warmup_batches(engine, mode, extra_kv_tokens):
     """The rehearsal's own KV cache admits the autotuner warmup's batches at
     their full size without the capacity estimation."""
     creator = _make_rehearsal_creator(**engine)
@@ -650,10 +677,8 @@ def test_rehearsal_kv_cache_holds_the_warmup_batches(engine, generation_only, ex
     warmup = SimpleNamespace(
         _config=config, guided_decoder=None, mapping=Mock(**{"has_pp.return_value": False})
     )
-    warmup_configs, max_num_tokens = _autotuner_warmup_configs(
-        warmup, resource_manager, generation_only=generation_only
-    )
-    if not generation_only:
+    warmup_configs, max_num_tokens = _autotuner_warmup_configs(warmup, resource_manager, mode)
+    if mode is not AutotunerWarmupMode.GENERATION_ONLY:
         assert max_num_tokens == min(
             config.max_num_tokens, config.max_batch_size * (config.max_seq_len - 1)
         )
