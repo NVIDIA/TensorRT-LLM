@@ -60,7 +60,7 @@ Video quality is generally more sensitive to BMM1 accuracy than BMM2 accuracy, s
 - The `CUDNN` backend requires Q/K and V to use the same format. Use `fp8` for per-tensor scaling or `mxfp8` for block scaling.
 - For VC-Attention (`vc_attention: true`), `vc_repair_budget: 0.005` (0.5% of the tokens as repair rows) runs faster than the default tile means at unchanged quality; `0.005` to `0.02` is the useful range.
 - For `CUTEDSL` MXFP8 or NVFP4 recipes, `v_block_size: 1` uses a separate V scale per head and channel, while `v_block_size: 0` uses one tensor-wide V scale. Try the per-channel variant when the tensor-wide scale loses quality.
-- For DeCo-Attention (`deco_attention: true`), `v_dtype: fp8` keeps V at 8 bits; where `v_dtype: nvfp4` is available, it also runs BMM2 at 4 bits. Compare both on the target model.
+- For DeCo-Attention (`deco_attention: true`), `v_dtype: fp8` keeps V at 8 bits; where `v_dtype: nvfp4` is available, it also runs BMM2 at 4 bits.
 
 After a recipe meets the quality target, benchmark its end-to-end throughput with the production workload.
 

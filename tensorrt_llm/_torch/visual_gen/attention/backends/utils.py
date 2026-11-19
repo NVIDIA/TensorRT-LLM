@@ -59,7 +59,7 @@ def get_visual_gen_attention_backend(
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
         - "CUTEDSL": CuTe DSL kernels: dense/SkipSoftmax FMHA, VSA or SOL depending on
-                     ``sparse_algorithm``, or DeCo-Attention with ``deco_attention``.
+                     ``sparse_algorithm``, or DeCo-Attention.
         - "CUDNN": cuDNN fused SDPA. Unquantized by default; quant_attention_config
                    selects per-tensor FP8 or block-scaled MXFP8 (Blackwell).
     """
@@ -154,8 +154,8 @@ def create_attention(
             forward its quantization or sparsity configuration.
         attention_metadata_state: Optional per-component VisualGen attention state.
             It keeps shape-stable attention metadata alive across layers and
-            CUDA Graph captures. Required for TRTLLM and shared by FlashInfer and
-            DeCo-Attention layers.
+            CUDA Graph captures. Required for TRTLLM and FlashInfer; forwarded to the
+            CuTe DSL classes, whose layers may share state through it.
         **kwargs: Additional backend-specific arguments
 
     Returns:
@@ -171,7 +171,6 @@ def create_attention(
     quant_attention_config = (
         attention_config.quant_attention_config if attention_config is not None else None
     )
-    is_deco = quant_attention_config is not None and quant_attention_config.deco_attention
 
     backend_name = backend.upper()
     attn_cls = get_visual_gen_attention_backend(
@@ -205,13 +204,10 @@ def create_attention(
                 "DiffusionModelConfig for shared workspace allocation."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
-    elif is_deco and backend_name == "CUTEDSL":
-        if attention_metadata_state is None:
-            raise ValueError(
-                "DeCo-Attention requires `attention_metadata_state` from "
-                "DiffusionModelConfig: its layers share one workspace buffer."
-            )
-        kwargs["attention_metadata_state"] = attention_metadata_state
+    elif backend_name == "CUTEDSL":
+        # A CuTe DSL class takes the state when its layers share something through it.
+        if attention_metadata_state is not None:
+            kwargs["attention_metadata_state"] = attention_metadata_state
     return attn_cls(
         layer_idx=layer_idx,
         num_heads=num_heads,
