@@ -43,7 +43,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
     _fp4_mla_generation_hp_page_ids,
-    _fp4_mla_generation_num_blocks_device,
     _fp4_mla_generation_page_ids,
     _fp4_mla_uniform_generation_lengths,
     _materialize_fp4_mla_device_page_table_for_forward,
@@ -57,7 +56,6 @@ from ...ops.attention._fp4_mla_decode import backend_plan_geometry
 from ...ops.attention._k3_fp4_mla_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
-    _maybe_update_triton_v_packed_cache,
     _prepare_fp4_mla_q_buffers,
     _repack_cutedsl_v_packed_cache,
 )
@@ -587,11 +585,6 @@ def _scatter_generation_kv_only(
     v_pack_page_ids = _fp4_mla_generation_page_ids(
         metadata, metadata.num_seqs - metadata.num_contexts
     )
-    v_pack_num_valid = None
-    if getattr(metadata, "is_cuda_graph", False):
-        # Frozen launch grids cannot follow the per-replay page count;
-        # the repack kernels stride over this device-side count instead.
-        v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
     if cutedsl_backend and not fused_v_transpose and not direct_v_packed_write:
         cutedsl_repack_page_indptr = None
         cutedsl_repack_kv_lens = None
@@ -622,18 +615,6 @@ def _scatter_generation_kv_only(
             generation_lens=cutedsl_repack_generation_lens,
             max_touched_pages=cutedsl_repack_max_touched_pages,
         )
-    _maybe_update_triton_v_packed_cache(
-        metadata,
-        layer_idx,
-        kv_cache,
-        v_pack_page_ids,
-        num_queries=num_tokens,
-        v_head_dim=v_head_dim,
-        page_size=metadata.page_size,
-        local_layer=local_layer,
-        v_sf=v_sf[local_layer],
-        num_valid_pages=v_pack_num_valid,
-    )
     state.generation_cache_scattered = hp_pool_updated
     return hp_pool_updated
 

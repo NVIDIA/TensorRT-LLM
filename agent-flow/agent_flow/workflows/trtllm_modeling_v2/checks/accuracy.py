@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Accuracy evaluation, reference lookup and cross-member findings."""
+"""Accuracy evaluation and reference lookup."""
 
 from __future__ import annotations
 
@@ -18,12 +18,11 @@ from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..infra.files import write_text_atomic
 from ..spec.task_schema import resolve_per_unit, resolve_samples
-from . import accuracy_policy, check_config, feature_evidence
-from .check_config import check_configuration, engine_declaration, resolve_llm_api_options
+from . import accuracy_policy, check_config
+from .check_config import check_configuration, resolve_llm_api_options
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
-from .gate_records import KIND_FINDING, GateRecord, GateRecords, open_findings
-from .runtime_evidence import EVAL_NOT_ATTESTED, attest_engine, engine_failure, engine_records
-from .verdict import UNKNOWN_TREE_STATE, GateResult, inspect_tree, lost_session, verdict_factory
+from .runtime_evidence import reuse_failure
+from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
 ACCURACY_TIMEOUT_S = 4 * 60 * 60
 
@@ -76,7 +75,7 @@ def eval_command(
     unit: str | None = None,
     member: str | None = None,
 ) -> list[str]:
-    """Public trtllm-eval CLI using the same resolved configuration the verdict attests."""
+    """Public trtllm-eval CLI using the same resolved configuration the other gates send."""
     accuracy = dict(task_data.get("accuracy") or {})
     options = dict(config["llm"])
     options.pop("model")
@@ -266,8 +265,7 @@ def run_accuracy_gate(
     fixed ``reference - tolerance`` under ``accuracy.floor.rule: tolerance``.
     ``relative``: ``reference`` is the unit's own score at this member on this
     target (a configuration variant's ``anchor: relative``), and the SE is that
-    of the difference. The engine is held to the unit's options file
-    (:func:`engine_declaration`).
+    of the difference.
     """
     accuracy = dict(task_data.get("accuracy") or {})
     timeout = int(accuracy.get("timeout", ACCURACY_TIMEOUT_S)) if timeout is None else timeout
@@ -322,22 +320,11 @@ def run_accuracy_gate(
             **ran,
             **floor_fields(planned),
         )
-    options = resolve_llm_api_options(accuracy, unit)
-    declared = engine_declaration(config, mode=MODE_REQUIRE)
-    asks = bool(declared.get("block_reuse"))
-    attested = attest_engine(combined, declared, absent=EVAL_NOT_ATTESTED)
-    ran["engine"] = engine_records((attested,))
-    failure = engine_failure(combined, attested, options=options, asks=asks)
+    failure = reuse_failure(
+        combined, config["llm"], options=resolve_llm_api_options(accuracy, unit)
+    )
     if failure:
         return _verdict(passed=False, detail=failure, **ran, **floor_fields(planned))
-    unobserved = feature_evidence.unobserved(attested, check_config.subject_fields(task_data, unit))
-    if unobserved:
-        return _verdict(
-            passed=False,
-            detail=feature_evidence.unobserved_detail(unobserved),
-            **ran,
-            **floor_fields(planned),
-        )
 
     pattern = resolve_per_unit(accuracy, "score_pattern", unit)
     measured = parse_eval_score(combined, pattern)
@@ -364,80 +351,12 @@ def run_accuracy_gate(
         detail=(
             f"measured {measured:.4f} {'>=' if passed else '<'} {floor.value:.4f} "
             f"({floor.describe()}; count from {source}); score validation only; "
-            + (
-                f"engine observability UNKNOWN for {', '.join(attested.not_attested)}; "
-                if attested.not_attested
-                else ""
-            )
-            + "eval cache reuse was not probed (zero hits are not a failure)"
+            "eval cache reuse was not probed (zero hits are not a failure)"
         ),
         measured=measured,
         **ran,
         **floor_fields(floor),
     )
-
-
-def check_systematic_shift(
-    results: Sequence[GateResult],
-    accuracy: Mapping[str, Any],
-    unit: str | None,
-) -> accuracy_policy.ShiftFinding | None:
-    """The cross-member check over one unit's accuracy verdicts (:func:`.accuracy_policy.systematic_shift`).
-
-    Verdicts without a measurement or an SE are left out.
-    """
-    policy = accuracy_policy.resolve_floor_policy(accuracy)
-    readings = {
-        str(r.member): (float(r.measured), float(r.reference), float(r.se))
-        for r in results
-        if r.measured is not None and r.reference is not None and r.se is not None
-    }
-    return accuracy_policy.systematic_shift(
-        unit,
-        readings,
-        min_members=policy.shift_min_members,
-        acknowledged=policy.acknowledged,
-    )
-
-
-#: The key a systematic-shift finding is recorded under, per unit.
-SHIFT_FINDING = "systematic_shift"
-
-
-def note_systematic_shift(
-    records: GateRecords,
-    results: Sequence[GateResult],
-    accuracy: Mapping[str, Any],
-    unit: str | None,
-) -> accuracy_policy.ShiftFinding | None:
-    """Run :func:`check_systematic_shift` and record its outcome either way.
-
-    A unit with no shift records a resolved entry, so a finding raised by an
-    earlier turn of the same unit stops blocking once a later turn is clean.
-    """
-    finding = check_systematic_shift(results, accuracy, unit)
-    tree = results[-1].tree_state if results else UNKNOWN_TREE_STATE
-    records.append(
-        GateRecord(
-            kind=KIND_FINDING,
-            key={"finding": SHIFT_FINDING, "unit": str(unit)},
-            tree=tree,
-            passed=finding is None or bool(finding.acknowledged),
-            values={
-                "detail": finding.describe() if finding else "no systematic shift",
-                "members": {
-                    str(r.member): {"measured": r.measured, "reference": r.reference, "se": r.se}
-                    for r in results
-                },
-            },
-        )
-    )
-    return finding
-
-
-def blocking_findings(records: GateRecords, accuracy: Mapping[str, Any]) -> list[GateRecord]:
-    """Findings that refuse delivery under the CURRENT ``accuracy.floor.acknowledge``."""
-    return open_findings(records, accuracy_policy.resolve_floor_policy(accuracy).acknowledged)
 
 
 def resolve_reference(
@@ -480,13 +399,9 @@ def resolve_model_key(task_data: Mapping[str, Any], unit: str | None = None) -> 
 __all__ = [
     "resolve_model_key",
     "ACCURACY_TIMEOUT_S",
-    "SHIFT_FINDING",
-    "blocking_findings",
-    "check_systematic_shift",
     "eval_command",
     "eval_harness_command",
     "load_reference_score",
-    "note_systematic_shift",
     "parse_eval_score",
     "resolve_discriminators",
     "resolve_floor",

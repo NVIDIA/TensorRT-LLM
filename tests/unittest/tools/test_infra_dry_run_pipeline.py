@@ -198,7 +198,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
 
         self.assertIn("--resolve-pin cbts_db_pin.json", audit)
         self.assertIn("pinPlan.pin_upload_required", audit)
-        self.assertIn("trtllm_utils.uploadArtifacts", audit)
+        self.assertIn("trtllm_utils.uploadToTargets(", audit)
         self.assertNotIn("curl --noproxy", audit)
 
 

@@ -3,9 +3,11 @@
 
 import copy
 import os
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import replace
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
 
@@ -79,6 +81,7 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
                           "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
                           "mixed_nvfp4_bfloat16")
 _SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
+_WEIGHT_LOAD_THREADS_ENV = "TLLM_WEIGHT_LOAD_THREADS"
 
 # TorchLlmArgs fields that only the model classes listing them in
 # `model_specific_llm_args` implement.
@@ -226,12 +229,17 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     sparse_config = model_config.sparse_attention_config
     uses_minimax_m3_msa = (is_minimax_m3(sparse_config)
                            and sparse_config.implementation == "msa")
+    # DSA never hands trtllm-gen its NVFP4 latent cache: attention reads FP8
+    # rows gathered from it, or PrimTS reads its records in place.
+    uses_dsa_nvfp4_latent = (sparse_config is not None
+                             and sparse_config.algorithm == "dsa"
+                             and not pyt_kv_cache_dtype.startswith("mixed_"))
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
             and not getattr(getattr(model_config, "modeling_v2_target", None),
                             "supports_nvfp4_kv_cache", False)
-            and not uses_minimax_m3_msa and torch.cuda.is_available()
-            and get_sm_version() == 107):
+            and not uses_minimax_m3_msa and not uses_dsa_nvfp4_latent
+            and torch.cuda.is_available() and get_sm_version() == 107):
         if pyt_kv_cache_dtype.startswith("mixed_"):
             raise ValueError(
                 f'kv_cache_config.dtype="{pyt_kv_cache_dtype}" keeps the history '
@@ -629,6 +637,59 @@ def construct_checkpoint_loader(
         **extra_kwargs)
 
     return checkpoint_loader
+
+
+def _weight_load_num_threads() -> Optional[int]:
+    """Threads ``TLLM_WEIGHT_LOAD_THREADS`` asks for, capped at usable CPUs."""
+    value = os.environ.get(_WEIGHT_LOAD_THREADS_ENV)
+    if value is None or not value.strip():
+        return None
+    try:
+        requested = int(value)
+    except ValueError as error:
+        raise ConfigInputError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                               f"integer, got {value!r}") from error
+    if requested <= 0:
+        raise ConfigInputError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                               f"integer, got {value!r}")
+    try:
+        available = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available = os.cpu_count() or 1
+    return min(requested, available)
+
+
+@contextmanager
+def _weight_load_threads(requested: Optional[int]) -> Iterator[None]:
+    """Run this thread's load on ``requested`` torch threads.
+
+    None keeps the process's count. Only raises; restores on exit and on error.
+    """
+    previous = torch.get_num_threads()
+    if requested is None or requested <= previous:
+        yield
+        return
+    # The native backend sets one count per process, once; a raise would stay.
+    if "ATen parallel backend: OpenMP" not in torch.__config__.parallel_info():
+        logger.warning(f"Ignoring {_WEIGHT_LOAD_THREADS_ENV}: only torch's "
+                       "OpenMP backend can restore the thread count")
+        yield
+        return
+    logger.info(f"Weight loading uses {requested} torch threads (was "
+                f"{previous}), as {_WEIGHT_LOAD_THREADS_ENV} asks")
+    try:
+        # The first call also sizes torch's pthreadpool for good; keep its size.
+        torch.set_num_threads(previous)
+        torch.set_num_threads(requested)
+        # New threads start from torch's process-wide count; set it back from
+        # another thread so this one keeps the raise and loader pools do not.
+        setter = threading.Thread(target=torch.set_num_threads,
+                                  args=(previous, ))
+        setter.start()
+        setter.join()
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 def _inspect_shadow_weight_load_plan(
@@ -1116,6 +1177,9 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
 
+    # Loaders built without __init__ keep the process's torch thread count.
+    _weight_load_num_threads: Optional[int] = None
+
     def __init__(self,
                  llm_args: TorchLlmArgs,
                  mapping: Mapping,
@@ -1151,6 +1215,7 @@ class ModelLoader:
         self.lora_config = lora_config
         self.model_weights_memory_tag = model_weights_memory_tag
         self.model_weights_restore_mode = model_weights_restore_mode
+        self._weight_load_num_threads = _weight_load_num_threads()
         self.weight_mapper = None
         self._weight_pool_proxy = None
         self._gms_backend = None
@@ -1474,18 +1539,19 @@ class ModelLoader:
                                          checkpoint_dir)
         if load_format == LoadFormat.AUTO:
             # read the checkpoint with the checkpoint loader, built-in or custom
-            self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
-                checkpoint_loader,
-                checkpoint_dir,
-                model_config=model_config,
-                model=model,
-                mapping=self.mapping,
-                llm_args=self.llm_args,
-                spec_config=self.spec_config,
-                source_identity=source_identity,
-                qualification=post_transform_qualification,
-                metrics=self._metrics,
-                startup_metadata=self._startup_metadata)
+            with _weight_load_threads(self._weight_load_num_threads):
+                self.weight_mapper, weights_preloaded = load_model_from_auto_load_format(
+                    checkpoint_loader,
+                    checkpoint_dir,
+                    model_config=model_config,
+                    model=model,
+                    mapping=self.mapping,
+                    llm_args=self.llm_args,
+                    spec_config=self.spec_config,
+                    source_identity=source_identity,
+                    qualification=post_transform_qualification,
+                    metrics=self._metrics,
+                    startup_metadata=self._startup_metadata)
             if not weights_preloaded:
                 self._checkpoint_dirs_read.append(weights_checkpoint_dir)
             if loads_draft_weights:
@@ -1648,11 +1714,12 @@ class ModelLoader:
         _check_compile_wrapper_before_reload(model)
         if not allow_partial_loading:
             model_hooks.reset_weights_transformed(model)
-        model_hooks.call_load_weights(
-            model.load_weights,
-            weights,
-            self.weight_mapper,
-            allow_partial_loading=allow_partial_loading)
+        with _weight_load_threads(self._weight_load_num_threads):
+            model_hooks.call_load_weights(
+                model.load_weights,
+                weights,
+                self.weight_mapper,
+                allow_partial_loading=allow_partial_loading)
         if torch.cuda.is_available():  # CPU guard
             torch.cuda.current_stream().synchronize()
 
