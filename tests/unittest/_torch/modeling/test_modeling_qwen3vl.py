@@ -574,6 +574,104 @@ def test_qwenvl_opted_in_decoder_captures_and_refreshes(family, num_levels):
     check_stand_in_body_replay(runner, body, inputs, [image_step, text_step], num_tokens=4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
+@torch.inference_mode()
+def test_qwen3vl_decoder_replays_breakable_prefill_graph(attn_backend):
+    """A real two-layer Qwen3 decoder in the Qwen3-VL wrapper captures once, then replays new
+    embeddings and token ids exactly as eager runs them, with both attention backends that run
+    through the attention custom op under the graph."""
+    import weakref
+
+    from _torch.helpers import check_breakable_prefill_replay
+    from transformers import Qwen3Config
+
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForCausalLM
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.bindings import DataType
+    from tensorrt_llm.bindings.executor import KvCacheConfig
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.mapping import Mapping
+
+    config = Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        max_position_embeddings=32,
+        rope_scaling=None,
+        tie_word_embeddings=False,
+        torch_dtype=torch.bfloat16,
+    )
+    model_config = ModelConfig(
+        pretrained_config=config, attn_backend=attn_backend, max_num_tokens=4, max_seq_len=32
+    )
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(0)
+        with torch.device("cuda"):
+            llm = Qwen3ForCausalLM(model_config).eval()
+        for parameter in llm.parameters():
+            if parameter.ndim == 1:
+                parameter.fill_(1.0)
+            else:
+                parameter.normal_(mean=0.0, std=0.02)
+        embeds = torch.randn((2, 4, 128), device="cuda").bfloat16()
+    model = Qwen3VLModel.__new__(Qwen3VLModel)
+    torch.nn.Module.__init__(model)
+    model.llm = llm
+    # The startup check reads the layer registry of this config.
+    model.model_config = model_config
+    model.deepstack_num_level = 0
+
+    # FlashInfer prefill reads the paged KV cache.
+    kv_cache_manager = KVCacheManager(
+        KvCacheConfig(max_tokens=32),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=32,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=DataType.BF16,
+    )
+    try:
+        kv_cache_manager.add_dummy_requests([0], [4])
+        metadata = get_attention_backend(attn_backend).Metadata(
+            seq_lens=torch.tensor([4], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+            max_num_requests=1,
+            max_num_tokens=4,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=[0],
+            prompt_lens=[4],
+        )
+
+        def forward(inputs):
+            metadata.prepare()
+            return llm(attn_metadata=metadata, return_context_logits=True, **inputs)
+
+        positions = torch.arange(4, dtype=torch.int32, device="cuda")
+        steps = [
+            {"inputs_embeds": embeds[0], "position_ids": positions},
+            {"inputs_embeds": embeds[1], "position_ids": positions},
+            # A text batch replays the same graph on the wrapper's token embeddings.
+            {"input_ids": positions + 3, "position_ids": positions},
+        ]
+        attrs = {**model_config.extra_attrs, "attention_metadata": weakref.ref(metadata)}
+        check_breakable_prefill_replay(model, attrs, forward, steps, num_tokens=4)
+    finally:
+        kv_cache_manager.shutdown()
+
+
 @pytest.mark.cpu_only
 def test_qwenvl_breakable_graphs_read_model_buffers_in_place():
     """The DeepStack and MRoPE cos/sin inputs view model buffers that are written before each
