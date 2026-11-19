@@ -33,7 +33,7 @@ class SiluAndMul(OpWrapper):
     Fusion boundary: the clamp, SiLU, product and optional output quantization; no GEMM.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # Only GLM-5.3-Flash calls this entry: its dense MLP and shared expert, with the clamp on.
     # Its own cells are the kernel's tiling edges at those widths; the target's row counts are

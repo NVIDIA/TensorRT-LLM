@@ -38,7 +38,7 @@ class Dsv3RouterGemm(OpWrapper):
       step of more than 16 rows, and any call with a bias or a non-FP32 output.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # Only GLM-5.3-Flash calls this entry. Its own cells are the boundary between the two
     # kernels at GLM's router shape; the target's row counts are in the test.

@@ -75,7 +75,7 @@ class Fp8Quantize1x128(OpWrapper):
     into `[K/128, M]` are inside; no GEMM is fused.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # Only GLM-5.3-Flash calls this entry, so its own cells are the op's row-count edges at
     # GLM's hidden width; the widths and row counts the target quantizes are in the test.

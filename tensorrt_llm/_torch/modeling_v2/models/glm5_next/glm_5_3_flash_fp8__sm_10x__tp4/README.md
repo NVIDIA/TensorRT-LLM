@@ -1,22 +1,22 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# GLM-5.3-Flash FP8 on 4x B200: deployment
+# GLM-5.3-Flash FP8 on 4x B200 / B300: deployment
 
-This target (`glm_5_3_flash_fp8__sm_10x__tp4`) serves the GLM-5.3-Flash FP8 checkpoint on one node of four
-B200 (sm_100) GPUs with tensor parallelism 4 and MTP-3 speculative decoding. Routing does not select it on
-sm_103 (B300 / GB300), where it has not run. Compared with a standard
+This target (`glm_5_3_flash_fp8__sm_10x__tp4`) serves the GLM-5.3-Flash FP8 checkpoint on four Blackwell GPUs of one
+node, B200 / GB200 (sm_100) or B300 / GB300 (sm_103), with tensor parallelism 4 and MTP-3 speculative decoding.
+Compared with a standard
 GLM-5.3-Flash deployment, it needs `modeling_v2: require` in the server config and a larger `--max_num_tokens`; its
 CUDA kernels are in the glm5_next family library the build compiles.
 
 ## 1. Build
 
-Build or install TensorRT LLM as usual, for a CUDA architecture list that includes `100` and with multi-device
+Build or install TensorRT LLM as usual, for a CUDA architecture list that includes `100` or `103` and with multi-device
 support (the default): the build then compiles the target's kernels into `libth_modeling_v2_glm5_next.so`.
 
 ## 2. Hardware and checkpoint
 
-- One node, 4x B200, NVLink.
+- One node, 4x B200 or B300 (or one GB200 / GB300 tray of four GPUs), NVLink.
 - The GLM-5.3-Flash FP8 checkpoint (128 x 128 block-FP8 experts and MLA projections).
 
 ## 3. Server config
@@ -59,7 +59,7 @@ What differs from a standard deployment:
   token budget has not been measured on this target.
 - `--max_seq_len 131072` is the model's context length. Prompts of up to 13,312 tokens have been measured on this
   target (the operations' certified cells stop there); longer ones are untested.
-- Without the glm5_next family library (a build whose CUDA architectures include no `100`, or without multi-device
+- Without the glm5_next family library (a build whose CUDA architectures include neither `100` nor `103`, or without multi-device
   support) the target is not selected, and `modeling_v2: require` fails at startup.
 - Keep the all-reduce strategy at its default (AUTO, or ONESHOT): the target runs the one-shot all-reduce, whose
   workspace its fused kernels share, and routing declines other strategies.

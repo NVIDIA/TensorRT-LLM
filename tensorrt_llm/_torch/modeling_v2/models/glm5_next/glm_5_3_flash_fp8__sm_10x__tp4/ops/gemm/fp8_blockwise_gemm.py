@@ -60,7 +60,7 @@ class Fp8BlockwiseGemm(OpWrapper):
     rows.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # Only GLM-5.3-Flash calls this entry. Its own cells are the M-tile edges at GLM's widest
     # FFN projection; the projections and row counts the target runs are in the test.

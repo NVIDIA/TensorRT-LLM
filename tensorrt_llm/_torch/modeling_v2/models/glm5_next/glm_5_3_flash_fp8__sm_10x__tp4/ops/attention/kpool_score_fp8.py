@@ -42,7 +42,7 @@ class KpoolScoreFp8(OpWrapper):
     - None when there is no row or no complete pool (``max_kv_len < kpool``).
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # The indexer has 32 heads of 128 and scores pools of 4 over 32-token blocks. Each cell
     # gives (cached, new) per context request and the scored row range (a rank's ceil(T / 4)
     # sequence-parallel rows); max_kv_len is the largest visible length among those rows, as
