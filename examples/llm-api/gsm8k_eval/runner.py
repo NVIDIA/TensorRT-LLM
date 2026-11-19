@@ -445,7 +445,7 @@ def _report(summary: Mapping[str, Any], timing: Mapping[str, Any]) -> str:
 
     memory = timing.get("gpu_memory") or {}
     lines = [
-        f"GSM8K ({summary['protocol_id']}, first {summary['total']} questions, "
+        f"GSM8K (first {summary['total']} questions, "
         f"{summary['verdict']['mode']} mode, {summary['transport']} transport): "
         f"{summary['correct']}/{summary['total']} correct",
         f"  served model: {summary['served_model']}",
@@ -479,7 +479,7 @@ def run(
     *,
     dataset_dir: str | os.PathLike,
     output_dir: str | os.PathLike,
-    num_questions: int = protocol.NUM_QUESTIONS,
+    num_questions: int = protocol.DEFAULT_NUM_QUESTIONS,
     concurrency: int,
     time_budget_s: float,
     endpoint: Optional[str] = None,

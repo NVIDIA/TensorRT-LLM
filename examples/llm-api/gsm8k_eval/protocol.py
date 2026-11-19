@@ -54,7 +54,9 @@ SPLIT_FILES = {
 }
 
 #: The first-100 selection frozen by ``manifest.json``.
-NUM_QUESTIONS = 100
+MANIFEST_QUESTIONS = 100
+#: Number selected when a caller omits the question count.
+DEFAULT_NUM_QUESTIONS = 100
 #: Rows of the pinned test split; the largest selectable question count.
 TEST_SPLIT_ROWS = 1319
 #: SHA-256 of ``canonical_json(inventory_rows(...))`` over the whole pinned test split.
@@ -137,7 +139,7 @@ def protocol_definition() -> dict[str, Any]:
         },
         "selection": {
             "split": "test",
-            "count": NUM_QUESTIONS,
+            "count": MANIFEST_QUESTIONS,
             "order": "original test-split order: row indices 0..99",
         },
         "exemplars": {
@@ -319,7 +321,7 @@ def build_manifest(
     indices = exemplar_indices(len(train))
     exemplars = [train[i] for i in indices]
     questions = []
-    for index in range(NUM_QUESTIONS):
+    for index in range(MANIFEST_QUESTIONS):
         question, answer = test[index]
         extract_gold(answer)
         questions.append(
@@ -368,9 +370,9 @@ def load_manifest(path: str | os.PathLike = MANIFEST_PATH) -> dict[str, Any]:
     if manifest.get("protocol") != protocol_definition():
         raise ValueError(f"{path}: the manifest's protocol differs from protocol_definition()")
     questions = manifest.get("questions", [])
-    if [q.get("index") for q in questions] != list(range(NUM_QUESTIONS)):
-        raise ValueError(f"{path}: questions must be test rows 0..{NUM_QUESTIONS - 1} in order")
-    if [q.get("id") for q in questions] != [question_id(i) for i in range(NUM_QUESTIONS)]:
+    if [q.get("index") for q in questions] != list(range(MANIFEST_QUESTIONS)):
+        raise ValueError(f"{path}: questions must be test rows 0..{MANIFEST_QUESTIONS - 1} in order")
+    if [q.get("id") for q in questions] != [question_id(i) for i in range(MANIFEST_QUESTIONS)]:
         raise ValueError(f"{path}: question ids do not follow the row indices")
     shots = [item.get("index") for item in manifest.get("exemplars", {}).get("items", [])]
     if len(shots) != NUM_SHOTS or len(set(shots)) != NUM_SHOTS:
@@ -414,7 +416,7 @@ def build_problems(
     manifest: Mapping[str, Any],
     train: Sequence[tuple[str, str]],
     test: Sequence[tuple[str, str]],
-    count: int = NUM_QUESTIONS,
+    count: int = DEFAULT_NUM_QUESTIONS,
     *,
     test_rows_sha256: Optional[str] = None,
 ) -> list[Problem]:
@@ -475,7 +477,7 @@ def build_problems(
 
 
 def load_problems(
-    dataset_dir: str | os.PathLike, manifest: Mapping[str, Any], count: int = NUM_QUESTIONS
+    dataset_dir: str | os.PathLike, manifest: Mapping[str, Any], count: int = DEFAULT_NUM_QUESTIONS
 ) -> tuple[list[Problem], dict[str, Any]]:
     """Read the staged splits under ``dataset_dir`` and return the first ``count`` problems.
 
