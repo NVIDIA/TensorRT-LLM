@@ -63,6 +63,7 @@ __all__ = [
     "assert_weight_layout",
     "build_layer_descriptors",
     "derive_block",
+    "engram_table_is_mxfp4",
     "layout_for_role",
     "parse_quantization_layout",
     "quant_role_for_weight_key",
@@ -374,6 +375,17 @@ _EXPECTED_LAYOUT: Dict[str, DeepseekV41QuantLayout] = {
     ),
 }
 
+# Engram tables of a checkpoint with ``quantization_config.engram_embed_quant == "mxfp4"``: e2m1
+# pairs in uint8, element ``2k`` in byte ``k``'s low nibble, one e8m0 scale per 32 columns.
+_ENGRAM_EMBED_MXFP4 = DeepseekV41QuantLayout(
+    weight_dtype="mxfp4_e2m1",
+    storage_dtype="uint8",
+    scale_dtype="float8_e8m0",
+    element_block=(1, 32),
+    pack_factor=2,
+    packed_dim=1,
+)
+
 
 # Only the *routed* experts are MXFP4 — verified against the checkpoint: the
 # int8-packed tensors are exactly `{layers,mtp}.N.ffn.experts.M.w{1,2,3}.weight` and
@@ -466,29 +478,104 @@ def parse_quantization_layout(
         if expert_aliases_dense:
             layout[DeepseekV41QuantRole.EXPERT] = overridden
 
+    engram_quant = cfg.get("engram_embed_quant")
+    if engram_quant == "mxfp4":
+        block_size = cfg.get("engram_embed_block_size", 32)
+        scale_dtype = cfg.get("engram_embed_scale_dtype", "ue8m0")
+        if (block_size, scale_dtype) != (32, "ue8m0"):
+            raise ValueError(
+                "DeepSeek-V4.1 MXFP4 Engram tables need one ue8m0 scale per 32 columns, got "
+                f"engram_embed_block_size {block_size!r} and engram_embed_scale_dtype "
+                f"{scale_dtype!r}."
+            )
+        layout[DeepseekV41QuantRole.ENGRAM_EMBED] = _ENGRAM_EMBED_MXFP4
+    elif engram_quant is not None:
+        raise ValueError(
+            "DeepSeek-V4.1 expects quantization_config.engram_embed_quant 'mxfp4', or none for "
+            f"fp8 Engram tables, got {engram_quant!r}."
+        )
+
     return layout
 
 
+def engram_table_is_mxfp4(quantization_config: Optional[Dict[str, Any]], layer_id: int) -> bool:
+    """Whether Engram layer ``layer_id``'s table is MXFP4; tables of one checkpoint share a format."""
+    layout = layout_for_role(DeepseekV41QuantRole.ENGRAM_EMBED, quantization_config)
+    if layout.weight_dtype != _ENGRAM_EMBED_MXFP4.weight_dtype:
+        return False
+    layers = (quantization_config or {}).get("engram_embed_layers")
+    if layers is not None and layer_id not in layers:
+        raise ValueError(
+            f"Engram layer {layer_id} is not in quantization_config.engram_embed_layers {layers}; "
+            "checkpoints mixing MXFP4 and fp8 Engram tables are not supported."
+        )
+    return True
+
+
 _DECODER_BOUNDED_REPLAY_ENV = "TRTLLM_V41_DECODER_BOUNDED_REPLAY"
+_ENCODER_REPLAY_ENV = "TRTLLM_V41_ENCODER_REPLAY"
+_BOUNDED_REPLAY_TOKENS_ENV = "TRTLLM_V41_BOUNDED_REPLAY_TOKENS"
+# Encoder/Decoder replay length when unset; a wider required SWA window raises it to that window + 1.
+DEFAULT_BOUNDED_REPLAY_TOKENS = 140
 
 
-def encoder_replay_enabled() -> bool:
-    """Allow independent Encoder state eviction and bounded recovery on a miss."""
-    enabled = os.environ.get("TRTLLM_V41_ENCODER_REPLAY", "0") not in ("0", "", "false", "False")
-    if enabled and not decoder_bounded_replay_enabled():
-        raise ValueError("TRTLLM_V41_ENCODER_REPLAY requires TRTLLM_V41_DECODER_BOUNDED_REPLAY=1")
+def bounded_replay_tokens(required_window: int) -> int:
+    """Resolve the shared Encoder/Decoder replay length, which must exceed the required SWA window."""
+    value = os.environ.get(_BOUNDED_REPLAY_TOKENS_ENV)
+    if value is None:
+        return max(DEFAULT_BOUNDED_REPLAY_TOKENS, required_window + 1)
+    try:
+        tokens = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{_BOUNDED_REPLAY_TOKENS_ENV} must be an integer, got {value!r}") from exc
+    if tokens <= required_window:
+        raise ValueError(
+            f"{_BOUNDED_REPLAY_TOKENS_ENV}={tokens} must exceed the required SWA window "
+            f"{required_window}"
+        )
+    return tokens
+
+
+def encoder_replay_enabled(
+    *, max_num_tokens: int | None = None, replay_window: int = 0, supported: bool = True
+) -> bool:
+    """Allow independent Encoder state eviction and bounded recovery on a miss.
+
+    Enabled by default when Decoder bounded replay is enabled, the replay topology is
+    ``supported`` and the token budget can fit recovery rows plus at least one new token.
+    An explicit request that the topology cannot serve is an error.
+    """
+    decoder_enabled = decoder_bounded_replay_enabled()
+    value = os.environ.get(_ENCODER_REPLAY_ENV)
+    enabled = (
+        decoder_enabled and supported if value is None else value not in ("0", "", "false", "False")
+    )
+    if enabled and not decoder_enabled:
+        raise ValueError(f"{_ENCODER_REPLAY_ENV} requires {_DECODER_BOUNDED_REPLAY_ENV}=1")
+    if enabled and not supported:
+        raise ValueError(
+            f"{_ENCODER_REPLAY_ENV}={value} requires a Decoder bounded replay topology with CED "
+            "precompute; unset it to keep required Encoder checkpoints"
+        )
+    if enabled and max_num_tokens is not None and max_num_tokens <= replay_window:
+        logger.warning_once(
+            f"DeepSeek-V4.1 Encoder bounded replay disabled: max_num_tokens={max_num_tokens} "
+            f"cannot fit a {replay_window}-token recovery window plus a new token; "
+            "using required Encoder checkpoints."
+        )
+        return False
     return enabled
 
 
 def decoder_bounded_replay_enabled() -> bool:
     """Enable approximate bounded replay by default; 0 selects full decoder prefill.
 
-    Decoder queries retain one SWA window, enlarged for embedded DSpark captures,
+    Encoder and Decoder queries use ``bounded_replay_tokens`` rows of history,
     while global KV is produced from the full encoder input. Ordinary text
-    requests execute the tail of every context chunk.
-    Model defaults enable chunked prefill and disable prefix block reuse and SWA
-    scratch reuse; explicit user settings take precedence. Unsupported topologies
-    and scratch reuse retain full prefill. Full-context consumers retain all rows.
+    requests execute each context chunk's intersection with the final window.
+    Model defaults enable chunked prefill and SWA scratch reuse and disable prefix
+    block reuse; explicit user settings take precedence. Unsupported topologies
+    retain full prefill. Full-context consumers retain all rows.
     """
     return os.environ.get(_DECODER_BOUNDED_REPLAY_ENV, "1") not in ("0", "", "false", "False")
 

@@ -21,17 +21,7 @@ import torch
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.logger import logger
 
-from ..attention.backends.interface import AttentionRuntimeFeatures
-from .engine.cuda_graph import plan_cuda_graphs
-from .engine.model_setup import (
-    compile_model,
-    create_model_loader,
-    init_process_setup,
-    prepare_loaded_model,
-    resolve_attention_backend,
-    resolve_max_num_tokens,
-    resolve_max_seq_len,
-)
+from .engine.model_setup import build_encoder_runner
 from .engine.runners.encoder import EncoderRunner
 from .engine.runners.interface import PackedInputs
 
@@ -102,66 +92,22 @@ class EncoderExecutor:
                 "encode_only runs in-process on a single GPU and does not support "
                 "tensor, pipeline or context parallelism."
             )
-        init_process_setup(mapping, dist)
-        max_beam_width, max_num_tokens, max_seq_len, max_batch_size = llm_args.get_runtime_sizes()
-        model_loader = create_model_loader(
+        with build_encoder_runner(
             llm_args,
-            mapping,
-            spec_config=None,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-        )
-        try:
-            # With one rank moe_ep_size is 1, so no MoE load balancer is created.
-            model, _ = model_loader.load(
-                checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader
-            )
-            prepare_loaded_model(model, llm_args)
-            max_seq_len = resolve_max_seq_len(model, max_seq_len)
-            max_num_tokens = resolve_max_num_tokens(
-                max_num_tokens, max_seq_len=max_seq_len, max_batch_size=max_batch_size
-            )
-            plan = plan_cuda_graphs(
-                llm_args.cuda_graph_config,
-                llm_args.prefill_capture_num_tokens,
-                max_batch_size=max_batch_size,
-                max_num_tokens=max_num_tokens,
-                max_seq_len=max_seq_len,
-                decode_tokens_per_request=1,
-            )
-            compiled = compile_model(
-                model,
-                llm_args=llm_args,
-                mapping=mapping,
-                dist=dist,
-                max_num_tokens=max_num_tokens,
-                prefill_capture_num_tokens=plan.prefill_num_tokens,
-            )
-            runner = EncoderRunner.create(
-                compiled.model,
-                llm_args=llm_args,
-                mapping=mapping,
-                dist=dist,
-                max_batch_size=max_batch_size,
-                max_num_tokens=max_num_tokens,
-                max_seq_len=max_seq_len,
-                max_beam_width=max_beam_width,
-                model_caller=compiled.caller,
-                attention_backend=resolve_attention_backend(compiled.model, llm_args),
-                attention_runtime_features=AttentionRuntimeFeatures(),
-            )
+            model_path=model_path,
+            checkpoint_loader=checkpoint_loader,
+            mapping=mapping,
+            dist=dist,
+        ) as built:
             return cls(
-                runner,
-                model_loader=model_loader,
-                max_batch_size=max_batch_size,
-                max_num_tokens=max_num_tokens,
-                max_seq_len=max_seq_len,
-                pretrained_config=model.model_config.pretrained_config,
+                built.runner,
+                model_loader=built.model_loader,
+                max_batch_size=built.max_batch_size,
+                max_num_tokens=built.max_num_tokens,
+                max_seq_len=built.max_seq_len,
+                pretrained_config=built.model_config.pretrained_config,
                 dist=dist,
             )
-        except BaseException:
-            model_loader.cleanup()
-            raise
 
     def batch_forward(
         self, inputs: dict[str, Any], *, gather_context_logits: bool = False

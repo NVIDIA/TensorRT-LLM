@@ -672,7 +672,7 @@ models:
         required: false
       reasoning_effort:
         kind: openai
-        type: Optional[ReasoningEffort | Literal['low', 'medium', 'high', 'max', 'none']]
+        type: Optional[ReasoningEffort | Literal['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'none']]
         default: "ReasoningEffort.LOW"
         status: stable
         required: false
@@ -940,6 +940,12 @@ models:
       speculative_decoding:
         kind: extension
         type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
+      token_ids:
+        kind: extension
+        type: Optional[List[int]]
         default: null
         status: prototype
         required: false

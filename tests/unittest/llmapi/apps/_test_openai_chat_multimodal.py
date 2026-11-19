@@ -72,8 +72,8 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
     ]
     # The tests below send media as local paths under the test data root.
     env = os.environ.copy()
-    env["TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"] = str(llm_models_root() /
-                                                 "multimodals" / "test_data")
+    env["TRTLLM_MEDIA_ALLOWED_INPUT_DIR"] = str(llm_models_root() /
+                                                "multimodals" / "test_data")
     with RemoteOpenAIServer(model_path, args, env=env) as remote_server:
         yield remote_server
 
@@ -449,6 +449,7 @@ async def test_chat_streaming_image(async_client: openai.AsyncOpenAI,
     str_chunks: List[str] = []
 
     finish_reason_counter = 0
+    delta = None
     finish_reason: str = None
     async for chunk in stream:
         choice = chunk.choices[0]

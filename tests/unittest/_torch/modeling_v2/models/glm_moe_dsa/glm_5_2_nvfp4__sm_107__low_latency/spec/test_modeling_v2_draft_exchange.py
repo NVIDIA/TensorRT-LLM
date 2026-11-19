@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models import glm_moe_dsa
+from tensorrt_llm._torch.modeling_v2.models import glm_moe_dsa
 
 # This collective setup helper has no native dependency.
 _SOURCE = (

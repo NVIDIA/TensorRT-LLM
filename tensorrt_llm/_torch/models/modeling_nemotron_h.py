@@ -40,6 +40,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.mamba2_mixer import Mamba2Mixer
+from ..modules.mamba.replay_metadata import ReplayMamba2Metadata
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
@@ -790,6 +791,9 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                                                        NemotronHConfig
                                                        | NemotronHPuzzleConfig]
                            ):
+    # The Mamba2 layers' metadata, with the replay slots and work items their
+    # replay kernel reads, whichever cache manager serves the model.
+    mamba_metadata_cls = ReplayMamba2Metadata
 
     def __init__(
         self,

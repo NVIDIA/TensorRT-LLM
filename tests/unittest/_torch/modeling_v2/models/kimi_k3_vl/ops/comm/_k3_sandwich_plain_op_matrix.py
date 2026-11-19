@@ -29,13 +29,18 @@ the ranks (``_k3_sandwich_common``).
 import sys
 import zlib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "comm"))
 import _k3_sandwich_common as cm  # noqa: E402
-import _lockstep as ls  # noqa: E402
+
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls  # noqa: E402
 
 assert torch.cuda.is_available(), "k3_sandwich_plain requires CUDA devices"
 
@@ -180,7 +185,7 @@ CHECKS = [
 def _run_one_rank(args) -> int:
     global R, WORKSPACE, WS_A, WS_B, validating
     R = ls.Rank(args)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_plain import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_plain import (
         K3SandwichWorkspace,
     )
 

@@ -50,6 +50,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_to_layer_group
 
+pytestmark = pytest.mark.cpu_only
+
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------

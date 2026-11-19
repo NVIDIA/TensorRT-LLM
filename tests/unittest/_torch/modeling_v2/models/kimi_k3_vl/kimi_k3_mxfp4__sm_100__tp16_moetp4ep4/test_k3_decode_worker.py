@@ -32,20 +32,14 @@ import torch
 from torch import nn
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import (
-    op as ctx_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_markov import (
-    op as markov_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept import (
-    op as accept_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import op as ctx_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_markov import op as markov_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept import op as accept_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
     KimiK3DFlashWorker,
     KimiK3DSparkWorker,
 )
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.models import modeling_dflash
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
@@ -136,7 +130,10 @@ def _accept_case():
         num_contexts=0,
         num_seqs=NUM_GENS,
         kv_cache_manager=_kda_manager(),
-        mamba_metadata=SimpleNamespace(state_indices=torch.zeros(4, dtype=torch.int32)),
+        mamba_metadata=SimpleNamespace(
+            state_indices=torch.zeros(4, dtype=torch.int32),
+            replay_state_indices=torch.zeros(4, dtype=torch.int32),
+        ),
         draft_kv_cache_block_offsets=torch.zeros(1, 4, 2, 3, dtype=torch.int32),
         kv_lens_cuda=torch.zeros(4, dtype=torch.int32),
     )
@@ -235,8 +232,8 @@ _ACCEPT_DECLINES = {
     "no replay record": _set("attn.kv_cache_manager._kda_replay.prev_num_accepted_tokens", None),
     "no dummy-request mask": _set("attn.kv_cache_manager._dummy_request_mask_buffer", None),
     "no Mamba metadata": _set("attn.mamba_metadata", None),
-    "int64 state indices": _set(
-        "attn.mamba_metadata.state_indices", torch.zeros(4, dtype=torch.int64)
+    "int64 replay state indices": _set(
+        "attn.mamba_metadata.replay_state_indices", torch.zeros(4, dtype=torch.int64)
     ),
     "the private context arena": _set("worker._ctx_block_tables", None),
     "a sliding-window draft pool": _set("worker._ctx_pool_windowed", True),

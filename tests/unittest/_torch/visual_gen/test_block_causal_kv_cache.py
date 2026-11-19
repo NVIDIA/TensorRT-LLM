@@ -91,7 +91,7 @@ def cache(request):
         mgr.shutdown()
 
 
-def rand_kv(n):
+def rand_kv(n) -> tuple[torch.Tensor, torch.Tensor]:
     k = torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
     return k, torch.randn_like(k)
 

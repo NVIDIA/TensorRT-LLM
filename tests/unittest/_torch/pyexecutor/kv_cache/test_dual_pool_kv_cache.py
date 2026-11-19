@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, WhisperConfig
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -656,7 +656,9 @@ class TestCrossKvCacheConstruction:
         distributed = Mock()
         distributed.allreduce.side_effect = lambda value, op: value
         impl = Mock(
-            layer_grouping=[list(range(num_decoder_layers))],
+            buffer_grouping=[
+                [SimpleNamespace(layer_id=layer, role="key") for layer in range(num_decoder_layers)]
+            ],
             pool_group_descs=[],
             all_buffer_ids=[],
         )
@@ -727,6 +729,60 @@ class TestCrossKvCacheConstruction:
         _, _, _, max_seq_len = creator._get_cross_kv_cache_layout(fallback_max_seq_len=2048)
 
         assert max_seq_len == 1536
+
+    @staticmethod
+    def _make_whisper_creator(max_input_len: int) -> KvCacheCreator:
+        """Creator for openai/whisper-large-v3 geometry with a feature encoder."""
+        config = _make_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=8 * (1 << 30),
+        )
+        model_config = ModelConfig(
+            pretrained_config=WhisperConfig(
+                architectures=["WhisperForConditionalGeneration"],
+                d_model=1280,
+                encoder_layers=32,
+                decoder_layers=32,
+                encoder_attention_heads=20,
+                decoder_attention_heads=20,
+                max_source_positions=1500,
+                max_target_positions=448,
+            )
+        )
+        creator = _make_creator(config, model_config=model_config)
+        creator._model_engine.input_processor = SimpleNamespace(
+            requires_encoder_features=True, encoder_output_len=1500
+        )
+        creator._llm_args.max_input_len = max_input_len
+        return creator
+
+    @pytest.mark.parametrize("engine_max_seq_len", [1500, 4096])
+    @pytest.mark.parametrize("max_input_len", [512, 2048])
+    def test_cross_layout_uses_encoder_positions_for_feature_encoder(
+        self, max_input_len: int, engine_max_seq_len: int
+    ) -> None:
+        """Size a feature encoder's cross pool to its encoder output length.
+
+        Whisper's prompt is the decoder prefix, and every request emits
+        ``encoder_output_len`` encoder positions, so neither ``max_input_len``
+        nor a larger engine ``max_seq_len`` changes the cross pool.
+        """
+        creator = self._make_whisper_creator(max_input_len)
+
+        layout = creator._get_cross_kv_cache_layout(fallback_max_seq_len=engine_max_seq_len)
+
+        assert layout == (32, 20, 64, 1500)
+
+    def test_cross_layout_rejects_max_seq_len_below_feature_encoder_output(self) -> None:
+        """A max_seq_len below the encoder output fails at startup.
+
+        ``max_seq_len=448`` (Whisper's ``max_target_positions``) would
+        otherwise under-size the cross pool for every request.
+        """
+        creator = self._make_whisper_creator(max_input_len=1024)
+
+        with pytest.raises(ValueError, match=r"max_seq_len \(448\).*1500 encoder positions"):
+            creator._get_cross_kv_cache_layout(fallback_max_seq_len=448)
 
     def test_build_managers_cross_pool_ignores_mutated_self_max_seq_len(self):
         config = _make_kv_cache_config(
