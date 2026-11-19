@@ -31,7 +31,9 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <array>
 #include <limits>
+#include <mutex>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -475,12 +477,36 @@ __global__ void __launch_bounds__(kThreads, 1) lmHeadArgmaxKernel(Params const p
 #endif // __CUDA_ARCH__ >= 900
 }
 
+//! Devices whose properties the launch path caches.
+constexpr int kMaxDevices = 64;
+
+//! Lets lmHeadArgmaxKernel<NS, KC, kFp16> use up to limit bytes of dynamic shared memory on device, once per device.
+template <int NS, int KC, bool kFp16>
+void allowSmemOnce(int device, size_t limit)
+{
+    static std::array<std::once_flag, kMaxDevices> once;
+    std::call_once(once[device],
+        [limit]
+        {
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(lmHeadArgmaxKernel<NS, KC, kFp16>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(limit)));
+        });
+}
+
 template <int NS, int KC>
-void launchStages(Params const& p, int ctas, cudaStream_t stream, bool enablePdl)
+void launchStages(Params const& p, int ctas, cudaStream_t stream, bool enablePdl, int device, size_t limit)
 {
     auto kernel = p.fp16 ? lmHeadArgmaxKernel<NS, KC, true> : lmHeadArgmaxKernel<NS, KC, false>;
+    // The ring was chosen to fit limit (the device's opt-in maximum), which the kernel is allowed once.
+    if (p.fp16)
+    {
+        allowSmemOnce<NS, KC, true>(device, limit);
+    }
+    else
+    {
+        allowSmemOnce<NS, KC, false>(device, limit);
+    }
     int const smem = static_cast<int>(smemBytes<NS, KC>(p.m, p.k));
-    TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     int const rowsPerCta = (p.n + ctas - 1) / ctas;
     cudaLaunchConfig_t config{};
     cudaLaunchAttribute attrs[1];
@@ -521,20 +547,20 @@ int ringStages(int m, int k, size_t limit)
 }
 
 template <int KC>
-void launchRing(Params const& p, int stages, int ctas, cudaStream_t stream, bool enablePdl)
+void launchRing(Params const& p, int stages, int ctas, cudaStream_t stream, bool enablePdl, int device, size_t limit)
 {
     using D = Depths<KC>;
     if (stages == D::kDeep)
     {
-        launchStages<D::kDeep, KC>(p, ctas, stream, enablePdl);
+        launchStages<D::kDeep, KC>(p, ctas, stream, enablePdl, device, limit);
     }
     else if (stages == D::kMid)
     {
-        launchStages<D::kMid, KC>(p, ctas, stream, enablePdl);
+        launchStages<D::kMid, KC>(p, ctas, stream, enablePdl, device, limit);
     }
     else
     {
-        launchStages<D::kShallow, KC>(p, ctas, stream, enablePdl);
+        launchStages<D::kShallow, KC>(p, ctas, stream, enablePdl, device, limit);
     }
 }
 
@@ -566,22 +592,35 @@ int stagesFor(int kc, int m, int k, size_t limit)
     }
 }
 
-//! Opt-in shared memory per block of the current device, or 0 before SM90.
-size_t smemLimit()
+//! The current device.
+int currentDevice()
 {
-    if (tensorrt_llm::common::getSMVersion() < 90)
-    {
-        return 0;
-    }
-    return static_cast<size_t>(tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin());
+    int device = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    TLLM_CHECK_WITH_INFO(device >= 0 && device < kMaxDevices, "lm_head_argmax: device %d out of range", device);
+    return device;
 }
 
-} // namespace
+//! Opt-in shared memory per block of device, or 0 before SM90 (queried once per device).
+size_t smemLimit(int device)
+{
+    static std::array<std::once_flag, kMaxDevices> once;
+    static std::array<size_t, kMaxDevices> limits{};
+    std::call_once(once[device],
+        [device]
+        {
+            int major = 0;
+            int optInBytes = 0;
+            TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+            TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&optInBytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+            limits[device] = major < 9 ? 0 : static_cast<size_t>(optInBytes);
+        });
+    return limits[device];
+}
 
-int maxRows(int k)
+int maxRowsFor(int k, size_t limit)
 {
     int const kc = chunkFor(k);
-    size_t const limit = smemLimit();
     for (int m = kMaxRows; m >= 1; --m)
     {
         if (stagesFor(kc, m, k, limit) > 0)
@@ -592,9 +631,18 @@ int maxRows(int k)
     return 0;
 }
 
+} // namespace
+
+int maxRows(int k)
+{
+    return maxRowsFor(k, smemLimit(currentDevice()));
+}
+
 void launch(Params const& params, int ctas, cudaStream_t stream, bool enablePdl)
 {
-    TLLM_CHECK_WITH_INFO(params.m >= 1 && params.m <= maxRows(params.k) && params.n >= 1,
+    int const device = currentDevice();
+    size_t const limit = smemLimit(device);
+    TLLM_CHECK_WITH_INFO(params.m >= 1 && params.m <= maxRowsFor(params.k, limit) && params.n >= 1,
         "lm_head_argmax: unsupported shape m=%d n=%d k=%d", params.m, params.n, params.k);
     TLLM_CHECK_WITH_INFO(
         params.ranks >= 1 && params.ranks <= kMaxRanks && params.rank >= 0 && params.rank < params.ranks,
@@ -603,14 +651,14 @@ void launch(Params const& params, int ctas, cudaStream_t stream, bool enablePdl)
         "lm_head_argmax: the exchange needs an epoch counter and room for the rows");
     ctas = std::max(1, std::min({ctas, kMaxCtas, params.n}));
     int const kc = chunkFor(params.k);
-    int const stages = stagesFor(kc, params.m, params.k, smemLimit());
+    int const stages = stagesFor(kc, params.m, params.k, limit);
     switch (kc)
     {
-    case 1280: launchRing<1280>(params, stages, ctas, stream, enablePdl); break;
-    case 1024: launchRing<1024>(params, stages, ctas, stream, enablePdl); break;
-    case 768: launchRing<768>(params, stages, ctas, stream, enablePdl); break;
-    case 512: launchRing<512>(params, stages, ctas, stream, enablePdl); break;
-    default: launchRing<256>(params, stages, ctas, stream, enablePdl); break;
+    case 1280: launchRing<1280>(params, stages, ctas, stream, enablePdl, device, limit); break;
+    case 1024: launchRing<1024>(params, stages, ctas, stream, enablePdl, device, limit); break;
+    case 768: launchRing<768>(params, stages, ctas, stream, enablePdl, device, limit); break;
+    case 512: launchRing<512>(params, stages, ctas, stream, enablePdl, device, limit); break;
+    default: launchRing<256>(params, stages, ctas, stream, enablePdl, device, limit); break;
     }
 }
 
