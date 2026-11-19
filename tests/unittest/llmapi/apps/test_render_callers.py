@@ -29,6 +29,7 @@ from .render_helpers import (
     KIMI_K3,
     SERVER_TEMPLATE,
     WEATHER_TOOL,
+    byte_level_tokenizer,
     chat_request,
     fallback_processor,
     make_tokenizer,
@@ -135,6 +136,69 @@ def router(tokenizer):
 
 
 class TestRouterWriteBack:
+    @pytest.mark.parametrize("render_at_router", [False, True], ids=["direct-forward", "kv-aware"])
+    def test_tool_schema_and_history_survive_router_and_worker_rendering(
+        self, render_at_router
+    ) -> None:
+        import msgspec
+
+        from tensorrt_llm.serve.openai_client import _encode_request_body
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        tokenizer = byte_level_tokenizer(
+            "{% for tool in tools %}{{ tool.function.name }}"
+            "{% if tool.function.strict is defined %}<strict>{{ tool.function.strict }}</strict>"
+            "{% endif %}|{% endfor %}"
+            "{% set call = messages[-2].tool_calls[0].function %}"
+            "{{ call.name }}({{ call.arguments.path }}) -> {{ messages[-1].content }}"
+        )
+        call = {
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path":"main.py"}'},
+        }
+        request = chat_request(
+            messages=[
+                {"role": "user", "content": "Read the file."},
+                {"role": "assistant", "content": None, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                        },
+                    },
+                },
+                {"type": "function", "function": {"name": "list_files", "strict": False}},
+                {"type": "function", "function": {"name": "write_file", "strict": True}},
+            ],
+        )
+        expected = (
+            "read_file|list_files<strict>False</strict>|write_file<strict>True</strict>|"
+            "read_file(main.py) -> file contents"
+        )
+        expected_ids = tokenizer.encode(expected, add_special_tokens=False)
+        if render_at_router:
+            router = _Router.build(tokenizer, ["worker"])
+            try:
+                assert router._tokenize(request)[0] == expected_ids
+            finally:
+                router._test_patcher.stop()
+
+        # A KV-aware router without a worker fingerprint also forwards the messages.
+        assert request.prompt_token_ids is None
+        forwarded = ChatCompletionRequest.model_validate(
+            msgspec.msgpack.decode(_encode_request_body(request))
+        )
+        worker_prompt = render_chat(forwarded, resources(tokenizer))
+        assert worker_prompt.text == expected
+        assert worker_prompt.token_ids == expected_ids
+
     def _expected_ids(self, tokenizer, request):
         return render_chat(
             request, resources(tokenizer, allow_request_chat_template=True)
