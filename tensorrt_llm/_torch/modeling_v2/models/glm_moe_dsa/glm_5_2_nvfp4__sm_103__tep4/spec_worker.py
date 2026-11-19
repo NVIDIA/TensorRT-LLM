@@ -581,14 +581,21 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
         spec_metadata=None,
         mapping_lm_head_tp=None,
         tokens_out: torch.Tensor | None = None,
+        vocab_sharded: bool | None = None,
     ) -> torch.Tensor:
-        """The base contract: with `tokens_out` the tokens are written there and it is returned."""
-        if mapping_lm_head_tp is None:
+        """The base contract: with `tokens_out` the tokens are written there and it is returned.
+        Logits the caller marks as this rank's vocab shard (`vocab_sharded`) keep the built-in
+        code, whose argmax spans the TP group."""
+        if mapping_lm_head_tp is None and not vocab_sharded:
             tokens = self._glm_pick(logits, "greedy_draft", out=tokens_out)
             if tokens is not None:
                 return tokens
         return super().greedy_sample_draft_with_tp_gather(
-            logits, spec_metadata, mapping_lm_head_tp, tokens_out=tokens_out
+            logits,
+            spec_metadata,
+            mapping_lm_head_tp,
+            tokens_out=tokens_out,
+            vocab_sharded=vocab_sharded,
         )
 
     def _sample_tokens_for_batch(

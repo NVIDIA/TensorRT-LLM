@@ -1063,7 +1063,7 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
         },
         "enable_attention_dp": True,
         "moe_config": {
-            "backend": "CUTLASS",
+            "tactic": "cutlass",
         },
         "cuda_graph_config": {
             "enable_padding": True,

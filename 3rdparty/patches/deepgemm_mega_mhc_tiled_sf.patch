@@ -13,31 +13,47 @@
 # limitations under the License.
 #
 # mega_mhc: wave-aware split count, and y_tiled_sf written in CUTLASS's 128x4 scale-factor layout with
-# TensorRT-LLM's scale rule (DeepSeek-V4.1 mHC).
+# TensorRT-LLM's scale rule (DeepSeek-V4.1 mHC). Shifted mHC keeps each task's X1 in tensor memory until its
+# m-block's statistics complete; SM107 runs it as its own kernel, sm107_shifted_mega_mhc.
 
 diff --git a/csrc/apis/mega_mhc.hpp b/csrc/apis/mega_mhc.hpp
-index 1cbc0c8..2cb19e0 100644
+index 1cbc0c8..554935c 100644
 --- a/csrc/apis/mega_mhc.hpp
 +++ b/csrc/apis/mega_mhc.hpp
-@@ -20,7 +20,16 @@
-     const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
+@@ -12,15 +12,28 @@
+ 
+ namespace mhc_layout = layout::mega_mhc;
+ 
+-static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidden, const uint32_t num_sms) {
++static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidden, const uint32_t num_sms,
++                               const bool is_shifted) {
++    // Shifted keeps a task's X1 in tensor memory beside the accumulators, which fits 10 K blocks
++    const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
++    const uint32_t min_num_splits = is_shifted ? math::ceil_div(num_k_blocks, 10u) : 1u;
+     if (heuristics_runtime->get_deterministic_algorithms())
+-        return mhc_layout::kDefaultNumSplits;
++        return cute::max(mhc_layout::kDefaultNumSplits, min_num_splits);
+ 
+     // Fewest splits that still reach the shortest possible longest task
+-    const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
      const uint32_t max_num_splits = cute::min(
          mhc_layout::kNumMaxSplits, cute::max(mhc_layout::kDefaultNumSplits, num_sms / num_m_blocks));
 -    return math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
-+    const uint32_t num_splits = math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
++    const uint32_t num_splits = cute::max(
++        min_num_splits, math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits)));
 +
 +    // A partly filled last wave of tasks runs slowly: take the most splits whose tasks fit one wave fewer when
 +    // that still leaves each SM fewer K blocks
 +    const uint32_t num_waves = math::ceil_div(num_m_blocks * num_splits, num_sms);
 +    const uint32_t num_fewer_splits = (num_waves - 1) * num_sms / num_m_blocks;
-+    if (num_fewer_splits > 0 and (num_waves - 1) * math::ceil_div(num_k_blocks, num_fewer_splits) <
++    if (num_fewer_splits >= min_num_splits and (num_waves - 1) * math::ceil_div(num_k_blocks, num_fewer_splits) <
 +            num_waves * math::ceil_div(num_k_blocks, num_splits))
 +        return num_fewer_splits;
 +    return num_splits;
  }
  
  static const torch::Tensor& get_split_barriers(const torch::TensorOptions& options) {
-@@ -70,6 +79,7 @@
+@@ -70,6 +83,7 @@
   *     y_routed_sf                    [T,H/128] int32 | None
   *     y_shared_sf                    [T,H/128] int32 | None
   *     shared_sf_block_m              int
@@ -45,7 +61,7 @@ index 1cbc0c8..2cb19e0 100644
   *
   * Returns:
   *     None
-@@ -84,7 +94,10 @@
+@@ -84,7 +98,10 @@
   *     With y_fp8, supply exactly either y_gemm_sf alone, or y_routed_sf and
   *     y_shared_sf together. y_gemm_sf is TMA-aligned column-major,
   *     y_routed_sf is contiguous row-major, and y_shared_sf is the Mega MoE
@@ -57,7 +73,7 @@ index 1cbc0c8..2cb19e0 100644
   */
  static void mega_mhc(const torch::Tensor& x,
                       const torch::Tensor& residual,
-@@ -112,14 +125,16 @@
+@@ -112,14 +129,16 @@
                       const std::optional<torch::Tensor>& y_gemm_sf,
                       const std::optional<torch::Tensor>& y_routed_sf,
                       const std::optional<torch::Tensor>& y_shared_sf,
@@ -77,7 +93,30 @@ index 1cbc0c8..2cb19e0 100644
      DG_HOST_ASSERT(y_shared_sf.has_value() ? shared_sf_block_m > 0 : shared_sf_block_m == 0);
  
      const auto [num_tokens, hidden] = get_shape<2>(x);
-@@ -240,6 +255,17 @@
+@@ -223,7 +242,21 @@
+     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+     const auto num_sms = runtime->get_num_sms();
+     const auto num_m_blocks = mhc_layout::Workspace<>::get_num_m_blocks(static_cast<uint32_t>(num_tokens));
+-    const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms));
++    // The TMEM Shifted kernel is qualified on SM107; other architectures run the SM100 kernel.
++    // Ten K blocks per split fit beside the accumulators, with at most kNumMaxSplits.
++    const bool use_tmem_x1 = is_shifted and jit->device.get_arch_minor() == 7 and
++        hidden <= mhc_layout::kNumMaxSplits * 10 * mhc_layout::BLOCK_K and
++        (not y_bf16.has_value() or reinterpret_cast<uintptr_t>(y_bf16->data_ptr()) % 32 == 0) and
++        (not y_fp8.has_value() or reinterpret_cast<uintptr_t>(y_fp8->data_ptr()) % 32 == 0);
++    const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms),
++                                           is_shifted);
++    // A CTA holding a third task of one m-block would wait on its own X1 drain
++    DG_HOST_ASSERT(not is_shifted or num_splits <= 2 * static_cast<uint32_t>(num_sms));
++    // Shifted Norm stores whole 32-byte sectors
++    DG_HOST_ASSERT(not is_shifted or not y_bf16.has_value() or
++                   reinterpret_cast<uintptr_t>(y_bf16->data_ptr()) % 32 == 0);
++    DG_HOST_ASSERT(not is_shifted or not y_fp8.has_value() or
++                   reinterpret_cast<uintptr_t>(y_fp8->data_ptr()) % 32 == 0);
+     const auto num_mhc_scratch_bytes = mhc_layout::Workspace<>::get_num_scratch_bytes(num_m_blocks, num_splits);
+ 
+     const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted;
+@@ -240,6 +273,17 @@
      // GEMM and routed SF differ only in strides and share one primary writer.
      const auto& y_primary_sf = y_routed_sf.has_value() ? y_routed_sf : y_gemm_sf;
  
@@ -95,7 +134,7 @@ index 1cbc0c8..2cb19e0 100644
      sm100_mega_mhc(
          x, residual, post_mix, comb_res_mix, shifted_prev_mix,
          fn, mix_scales, mix_bases,
-@@ -247,8 +273,9 @@
+@@ -247,8 +291,9 @@
          rmsnorm_weight, rmsnorm_eps,
          new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
          y_bf16_storage, y_bf16.has_value(), scratch, split_barriers,
@@ -103,11 +142,11 @@ index 1cbc0c8..2cb19e0 100644
 -        shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms);
 +        y_fp8, y_primary_sf, y_tiled_sf.has_value() ? y_tiled_sf_words : y_shared_sf,
 +        y_tiled_sf.has_value() ? static_cast<int>(mhc_layout::kTiledSFBlockM) : shared_sf_block_m,
-+        rmsnorm_scale, num_tokens, hidden, num_splits, num_sms);
++        rmsnorm_scale, num_tokens, hidden, num_splits, num_sms, use_tmem_x1);
  }
  
  static void register_apis(pybind11::module_& m) {
-@@ -281,7 +308,8 @@
+@@ -281,7 +326,8 @@
          py::arg("y_gemm_sf") = std::nullopt,
          py::arg("y_routed_sf") = std::nullopt,
          py::arg("y_shared_sf") = std::nullopt,
@@ -118,10 +157,67 @@ index 1cbc0c8..2cb19e0 100644
  
  } // namespace deep_gemm::mega_mhc
 diff --git a/csrc/jit_kernels/impls/sm100_mega_mhc.hpp b/csrc/jit_kernels/impls/sm100_mega_mhc.hpp
-index 3be09f3..037f18b 100644
+index 3be09f3..d9a9a68 100644
 --- a/csrc/jit_kernels/impls/sm100_mega_mhc.hpp
 +++ b/csrc/jit_kernels/impls/sm100_mega_mhc.hpp
-@@ -115,7 +115,7 @@
+@@ -4,6 +4,7 @@
+ #include <format>
+ 
+ #include <deep_gemm/layout/mega_mhc.cuh>
++#include <deep_gemm/layout/mega_mhc_tmem.cuh>
+ 
+ #include "../../runtime/jit.hpp"
+ #include "../heuristics/sm100.hpp"
+@@ -31,7 +32,7 @@
+     const std::optional<torch::Tensor>& y_primary_sf,
+     const std::optional<torch::Tensor>& y_shared_sf,
+     const int& shared_sf_block_m, const float& rmsnorm_scale,
+-    const int& num_tokens, const int& hidden, const int& num_splits, const int& num_sms) {
++    const int& num_tokens, const int& hidden, const int& num_splits, const int& num_sms, const bool use_tmem_x1) {
+     const bool is_shifted = shifted_prev_mix.has_value();
+ 
+     const auto make_hidden_tma_desc = [&](const torch::Tensor& tensor) {
+@@ -50,7 +51,7 @@
+             static_cast<int>(tensor.stride(0)), swizzle_mode);
+     };
+ 
+-    const auto smem_size = static_cast<int>(sizeof(mhc_layout::SharedStorage));
++    const auto smem_size = static_cast<int>((use_tmem_x1 ? sizeof(layout::mega_mhc_tmem::SharedStorage) : sizeof(mhc_layout::SharedStorage)));
+     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+ 
+     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+@@ -107,7 +108,29 @@
+     };
+ 
+     // Compile
+-    const auto kernel = jit->compile("sm100_mega_mhc", std::format(R"(
++    decltype(jit->compile("", "")) kernel;
++    if (use_tmem_x1) {
++        kernel = jit->compile("sm107_shifted_mega_mhc", std::format(R"(
++#include <deep_gemm/impls/sm107_shifted_mega_mhc.cuh>
++
++using namespace deep_gemm;
++
++static void __instantiate_kernel() {{
++    auto ptr = reinterpret_cast<void*>(&sm107_mhc::sm107_shifted_mega_mhc_impl<
++        {}, {}, {},
++        {}, {}, {}, {}u, {}
++    >);
++}};
++)",
++        hidden, num_splits, num_sms,
++        mix_args.new_prev_mix != nullptr,
++        store_bf16,
++        norm_args.y_fp8 != nullptr,
++        static_cast<uint32_t>(shared_sf_block_m),
++        use_tmem_x1));
++
++    } else {
++        kernel = jit->compile("sm100_mega_mhc", std::format(R"(
+ #include <deep_gemm/impls/sm100_mega_mhc.cuh>
+ 
+ using namespace deep_gemm;
+@@ -115,7 +138,7 @@
  static void __instantiate_kernel() {{
      auto ptr = reinterpret_cast<void*>(&sm100_mega_mhc_impl<
          {}, {}, {},
@@ -130,20 +226,188 @@ index 3be09f3..037f18b 100644
      >);
  }};
  )",
-@@ -123,7 +123,7 @@
+@@ -123,7 +146,9 @@
          mix_args.new_prev_mix != nullptr,
          store_bf16,
          norm_args.y_fp8 != nullptr,
 -        shared_sf_block_m));
 +        static_cast<uint32_t>(shared_sf_block_m)));
++
++    }
  
      // Launch
      jit->launch(
 diff --git a/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh b/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh
-index 24960b7..76f0da3 100644
+index 24960b7..0818a90 100644
 --- a/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh
 +++ b/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh
-@@ -113,12 +113,31 @@
+@@ -13,7 +13,7 @@
+ using namespace layout::mega_mhc;
+ 
+ // Reduce one token's split partials and produce its Mix coefficients.
+-template <uint32_t kHidden, bool kIsShifted, uint32_t kNumSplits>
++template <uint32_t kHidden, bool kIsShifted, uint32_t kNumSplits, bool kRegisterSinkhorn = kIsShifted>
+ CUTLASS_DEVICE float run_mix_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
+                                   const MixArgs& mix_args,
+                                   const uint32_t& token_idx, const uint32_t& lane_idx) {
+@@ -60,46 +60,127 @@
+     }
+     __syncwarp();
+ 
+-    const auto sinkhorn_normalize = [&](float value) {
+-        // Comb logits occupy a row-major route x route region after Pre and Post.
+-        value = is_comb_lane ? value : 0.0f;
+-        const float row_max = math::warp_reduce_max<kNumRoutes>(value);
+-        value = __expf(value - row_max);
+-        float row_sum = math::warp_reduce_sum<kNumRoutes>(value);
+-        value = value * math::fast_rcp(row_sum) + mix_args.sinkhorn_eps;
+-
+-        const auto get_col_sum = [](const float& element) {
+-            // For four routes, these XORs combine adjacent rows, then the two row pairs.
+-            float sum = element + __shfl_xor_sync(0xffffffff, element, kNumRoutes);
+-            sum += __shfl_xor_sync(0xffffffff, sum, 6 * kNumRoutes);
+-            return sum;
++    if constexpr (kIsShifted and kRegisterSinkhorn) {
++        // Shifted Mix warps are dedicated: every lane normalizes the whole comb matrix in registers, so no Sinkhorn step
++        // waits on a shuffle. Row and column sums keep the order of the lane butterflies: (x0 + x2) + (x1 + x3) per row,
++        // (x0 + x1) + (x2 + x3) per column. Normal runs the Mix on each token's critical path beside five other workers,
++        // where fewer instructions win: each comb lane normalizes its own element.
++        DG_STATIC_ASSERT(kNumRoutes == 4, "The Sinkhorn sums are written for four routes");
++        float comb[kNumRoutes][kNumRoutes];
++        #pragma unroll
++        for (uint32_t i = 0; i < kNumRoutes * kNumRoutes; ++ i)
++            comb[i / kNumRoutes][i % kNumRoutes] = __shfl_sync(0xffffffff, mix_value, kFirstCombLane + i);
++        const auto get_row_sum = [&](const uint32_t& r) { return (comb[r][0] + comb[r][2]) + (comb[r][1] + comb[r][3]); };
++        const auto get_col_sum = [&](const uint32_t& c) { return (comb[0][c] + comb[1][c]) + (comb[2][c] + comb[3][c]); };
++        const auto normalize_cols = [&]() {
++            #pragma unroll
++            for (uint32_t c = 0; c < kNumRoutes; ++ c) {
++                const float scale = math::fast_rcp(get_col_sum(c) + mix_args.sinkhorn_eps);
++                #pragma unroll
++                for (uint32_t r = 0; r < kNumRoutes; ++ r)
++                    comb[r][c] *= scale;
++            }
+         };
+-
+-        value *= math::fast_rcp(get_col_sum(value) + mix_args.sinkhorn_eps);
++        #pragma unroll
++        for (uint32_t r = 0; r < kNumRoutes; ++ r) {
++            const float row_max = fmaxf(fmaxf(comb[r][0], comb[r][2]), fmaxf(comb[r][1], comb[r][3]));
++            #pragma unroll
++            for (uint32_t c = 0; c < kNumRoutes; ++ c)
++                comb[r][c] = __expf(comb[r][c] - row_max);
++            const float scale = math::fast_rcp(get_row_sum(r));
++            #pragma unroll
++            for (uint32_t c = 0; c < kNumRoutes; ++ c)
++                comb[r][c] = comb[r][c] * scale + mix_args.sinkhorn_eps;
++        }
++        normalize_cols();
+         #pragma unroll 1
+         for (uint32_t iteration = 1; iteration < mix_args.num_sinkhorn_iters; ++ iteration) {
+-            row_sum = math::warp_reduce_sum<kNumRoutes>(value);
+-            value *= math::fast_rcp(row_sum + mix_args.sinkhorn_eps);
++            #pragma unroll
++            for (uint32_t r = 0; r < kNumRoutes; ++ r) {
++                const float scale = math::fast_rcp(get_row_sum(r) + mix_args.sinkhorn_eps);
++                #pragma unroll
++                for (uint32_t c = 0; c < kNumRoutes; ++ c)
++                    comb[r][c] *= scale;
++            }
++            normalize_cols();
++        }
++
++        if (is_pre_or_post_lane) {
++            float* mix_output = is_pre_lane ? mix_args.new_prev_mix : mix_args.new_post_mix;
++            mix_output[token_idx * kNumRoutes + (lane_idx & (kNumRoutes - 1))] = mix_value;
++        }
++        if (lane_idx == 0) {
++            const auto comb_output = reinterpret_cast<float4*>(mix_args.new_comb_res_mix + token_idx * kNumRoutes * kNumRoutes);
++            #pragma unroll
++            for (uint32_t r = 0; r < kNumRoutes; ++ r)
++                comb_output[r] = make_float4(comb[r][0], comb[r][1], comb[r][2], comb[r][3]);
++        }
++    } else {
++        const auto sinkhorn_normalize = [&](float value) {
++            // Comb logits occupy a row-major route x route region after Pre and Post.
++            value = is_comb_lane ? value : 0.0f;
++            const float row_max = math::warp_reduce_max<kNumRoutes>(value);
++            value = __expf(value - row_max);
++            float row_sum = math::warp_reduce_sum<kNumRoutes>(value);
++            value = value * math::fast_rcp(row_sum) + mix_args.sinkhorn_eps;
++
++            const auto get_col_sum = [](const float& element) {
++                // For four routes, these XORs combine adjacent rows, then the two row pairs.
++                float sum = element + __shfl_xor_sync(0xffffffff, element, kNumRoutes);
++                sum += __shfl_xor_sync(0xffffffff, sum, 6 * kNumRoutes);
++                return sum;
++            };
++
+             value *= math::fast_rcp(get_col_sum(value) + mix_args.sinkhorn_eps);
++            #pragma unroll 1
++            for (uint32_t iteration = 1; iteration < mix_args.num_sinkhorn_iters; ++ iteration) {
++                row_sum = math::warp_reduce_sum<kNumRoutes>(value);
++                value *= math::fast_rcp(row_sum + mix_args.sinkhorn_eps);
++                value *= math::fast_rcp(get_col_sum(value) + mix_args.sinkhorn_eps);
++            }
++            return value;
++        };
++
++        const float normalized_comb = sinkhorn_normalize(mix_value);
++
++        // Only Shifted stores the new Pre coefficients.
++        if (is_hc_output_lane and (kIsShifted or not is_pre_lane)) {
++            float* mix_output = is_pre_lane ? mix_args.new_prev_mix :
++                                is_comb_lane ? mix_args.new_comb_res_mix : mix_args.new_post_mix;
++            const uint32_t mix_output_stride = is_comb_lane ? kNumRoutes * kNumRoutes : kNumRoutes;
++            const uint32_t mix_output_idx = is_comb_lane ? lane_idx - kFirstCombLane : lane_idx & (kNumRoutes - 1);
++            mix_output[token_idx * mix_output_stride + mix_output_idx] = is_comb_lane ? normalized_comb : mix_value;
+         }
+-        return value;
+-    };
+-
+-    const float normalized_comb = sinkhorn_normalize(mix_value);
+-
+-    // Only Shifted stores the new Pre coefficients.
+-    if (is_hc_output_lane and (kIsShifted or not is_pre_lane)) {
+-        float* mix_output = is_pre_lane ? mix_args.new_prev_mix :
+-                            is_comb_lane ? mix_args.new_comb_res_mix : mix_args.new_post_mix;
+-        const uint32_t mix_output_stride = is_comb_lane ? kNumRoutes * kNumRoutes : kNumRoutes;
+-        const uint32_t mix_output_idx = is_comb_lane ? lane_idx - kFirstCombLane : lane_idx & (kNumRoutes - 1);
+-        mix_output[token_idx * mix_output_stride + mix_output_idx] = is_comb_lane ? normalized_comb : mix_value;
+     }
+     __syncwarp();
+ 
+     return mix_value;
+ }
+ 
++// Shifted Mix workers share one CTA task queue. Tickets keep the CTA's token set and their m-block order: ticket t
++// takes the (t / 4)-th grid stride of token residue t % 4.
++template <uint32_t kHidden, uint32_t kNumSMs, uint32_t kNumSplits>
++CUTLASS_DEVICE void run_shifted_mix_worker(SharedStorage& smem, const Workspace<kNumSplits>& workspace,
++                                           uint64_t* gmem_split_barriers, const MixArgs& mix_args,
++                                           const uint32_t& num_tokens, const uint32_t& lane_idx) {
++    while (true) {
++        uint32_t task_ticket;
++        if (cute::elect_one_sync())
++            task_ticket = atomicAdd(&smem.next_mix_task_ticket, 1u);
++        task_ticket = ptx::exchange(task_ticket, 0);
++        const uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + task_ticket % kNumWarpsPerWG +
++                                   task_ticket / kNumWarpsPerWG * (kNumSMs * kNumWarpsPerWG);
++        if (token_idx >= num_tokens)
++            return;
++        // While the CTA streams, the lane-parallel Sinkhorn issues fewer instructions; afterwards the
++        // register one has the shorter chain.
++        if (*reinterpret_cast<volatile uint32_t*>(&smem.streaming_done))
++            run_mix_task<kHidden, true, kNumSplits, true>(workspace, gmem_split_barriers, mix_args, token_idx, lane_idx);
++        else
++            run_mix_task<kHidden, true, kNumSplits, false>(workspace, gmem_split_barriers, mix_args, token_idx, lane_idx);
++    }
++}
++
+ // Every warp-wide pack spans 256 hidden elements.
+ constexpr uint32_t kHiddenPerNormPack = 256;
+ constexpr uint32_t kHiddenPerNormLane = kHiddenPerNormPack / 32;
+@@ -113,12 +194,31 @@
      return __float22bfloat162_rn(__fmul2_rn(__fmul2_rn(__bfloat1622float2(input), {scale, scale}), __bfloat1622float2(weight)));
  }
  
@@ -179,7 +443,7 @@ index 24960b7..76f0da3 100644
  }
  
  CUTLASS_DEVICE uint32_t store_fp8_and_pack_sf(const NormArgs& norm_args, const uint64_t& output_offset,
-@@ -221,7 +240,7 @@
+@@ -221,7 +321,7 @@
          const uint64_t output_offset = static_cast<uint64_t>(token_idx) * kHidden;
          uint32_t shared_sf_row_idx = 0;
          if constexpr (SF_BLOCK_M > 0)
@@ -188,7 +452,7 @@ index 24960b7..76f0da3 100644
  
          const auto weight_packs = reinterpret_cast<const uint4*>(
              norm_args.weight + hidden_pack_begin * kHiddenPerNormPack + lane_idx * kHiddenPerNormLane);
-@@ -248,10 +267,11 @@
+@@ -248,10 +348,11 @@
                  const uint32_t sf_word_idx = hidden_pack_idx * kNumSFWordsPerNormPack + lane_idx / kNumLanesPerSFWord;
                  const uint32_t packed_sf = store_fp8_and_pack_sf(
                      norm_args, output_offset + hidden_idx, retained[hidden_pack_offset],
@@ -202,46 +466,1743 @@ index 24960b7..76f0da3 100644
                          norm_args.y_shared_sf[shared_sf_row_idx + sf_word_idx * norm_args.y_shared_sf_stride_word] = packed_sf;
                      }
                  } else {
-@@ -332,8 +352,8 @@
-     const float rms_scale = rsqrtf(x1_sqr_sum * kInvHidden + norm_args.eps) * norm_args.scale;
-     const float2 rms_scales = {ptx::exchange(rms_scale, 0), ptx::exchange(rms_scale, 1)};
-     if constexpr (SF_BLOCK_M > 0) {
+@@ -280,148 +381,163 @@
+     }
+ }
+ 
+-// Shifted Norm consumes materialized X1 and handles two tokens per task.
+-constexpr uint32_t kNumTokensPerShiftedNormTask = 2;
+-
+-struct ShiftedNormPack {
+-    uint4 x1[kNumTokensPerShiftedNormTask];
+-    uint4 weight;
+-};
+-
+-template <uint32_t kHidden, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, uint32_t kNumSplits>
+-CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
+-                                          const NormArgs& norm_args,
+-                                          const uint32_t& task_idx,
+-                                          const uint32_t& num_partitions, const uint32_t& lane_idx) {
+-    constexpr uint32_t kNumHiddenPacks = kHidden / kHiddenPerNormPack;
+-    // task_idx flattens [token pair, hidden-pack partition].
+-    const uint32_t partition_idx = task_idx % num_partitions;
+-    const uint32_t hidden_pack_begin = partition_idx * kNumHiddenPacks / num_partitions;
+-    const uint32_t hidden_pack_end = (partition_idx + 1) * kNumHiddenPacks / num_partitions;
+-    const uint32_t m_idx = task_idx / num_partitions * kNumTokensPerShiftedNormTask;
+-    const uint32_t m_block_idx = m_idx / BLOCK_M;
+-    const bool has_second_token = m_idx + 1 < norm_args.num_tokens;
+-    uint2 shared_sf_row_indices = {};
+-
+-    sched::mega_mhc::Norm::wait<kNumSplits>(gmem_split_barriers, m_block_idx);
+-    const auto load_pack = [&](const uint64_t output_offset, const uint32_t hidden_idx) {
+-        return ShiftedNormPack{
+-            {ptx::ld_evict_first(reinterpret_cast<const uint4*>(norm_args.y_bf16 + output_offset)),
+-             ptx::ld_evict_first(reinterpret_cast<const uint4*>(
+-                 norm_args.y_bf16 + output_offset + (has_second_token ? kHidden : 0)))},
+-            *reinterpret_cast<const uint4*>(norm_args.weight + hidden_idx)};
+-    };
+-
+-    // Keep current/next packs in registers and prefetch two ahead to hide the BF16 reread.
+-    ShiftedNormPack pack, next_pack;
+-    const uint32_t first_hidden_idx = hidden_pack_begin * kHiddenPerNormPack + lane_idx * kHiddenPerNormLane;
+-    const uint64_t first_output_offset = static_cast<uint64_t>(m_idx) * kHidden + first_hidden_idx;
+-    pack = load_pack(first_output_offset, first_hidden_idx);
+-    if (hidden_pack_begin + 1 < hidden_pack_end)
+-        next_pack = load_pack(first_output_offset + kHiddenPerNormPack, first_hidden_idx + kHiddenPerNormPack);
+-
+-    float x1_sqr_sum = 0.0f;
+-    if (lane_idx < kNumTokensPerShiftedNormTask and m_idx + lane_idx < norm_args.num_tokens) {
+-        const auto x1_sqr_sum_partials = workspace.get_x1_sqr_sum_partial_ptr(m_block_idx * kNumSplits);
+-        #pragma unroll
+-        for (uint32_t k_split_idx = 0; k_split_idx < kNumSplits; ++ k_split_idx)
+-            x1_sqr_sum += x1_sqr_sum_partials[k_split_idx * kNumSqrSumPartialElementsPerTask +
+-                                               m_idx % BLOCK_M + lane_idx];
+-    }
+-    constexpr float kInvHidden = 1.0f / static_cast<float>(kHidden);
+-    const float rms_scale = rsqrtf(x1_sqr_sum * kInvHidden + norm_args.eps) * norm_args.scale;
+-    const float2 rms_scales = {ptx::exchange(rms_scale, 0), ptx::exchange(rms_scale, 1)};
+-    if constexpr (SF_BLOCK_M > 0) {
 -        shared_sf_row_indices.x = get_shared_sf_row_idx<SF_BLOCK_M>(m_idx);
 -        shared_sf_row_indices.y = get_shared_sf_row_idx<SF_BLOCK_M>(m_idx + 1);
-+        shared_sf_row_indices.x = get_shared_sf_row_idx<kHidden, SF_BLOCK_M>(m_idx);
-+        shared_sf_row_indices.y = get_shared_sf_row_idx<kHidden, SF_BLOCK_M>(m_idx + 1);
-     }
-     for (uint32_t hidden_pack_idx = hidden_pack_begin; hidden_pack_idx < hidden_pack_end; ++ hidden_pack_idx) {
-         const uint32_t hidden_idx = hidden_pack_idx * kHiddenPerNormPack + lane_idx * kHiddenPerNormLane;
-@@ -363,12 +383,13 @@
-             const auto packed_amax = math::warp_reduce_max<kNumLanesPerSF>(nv_bfloat162(
-                 math::get_packed_bf16_amax(values_pairs[0]),
-                 has_second_token ? math::get_packed_bf16_amax(values_pairs[1]) : __ushort_as_bfloat16(0)));
+-    }
+-    for (uint32_t hidden_pack_idx = hidden_pack_begin; hidden_pack_idx < hidden_pack_end; ++ hidden_pack_idx) {
+-        const uint32_t hidden_idx = hidden_pack_idx * kHiddenPerNormPack + lane_idx * kHiddenPerNormLane;
+-        const uint64_t output_offset = static_cast<uint64_t>(m_idx) * kHidden + hidden_idx;
+-        const bool has_prefetch = hidden_pack_idx + 2 < hidden_pack_end;
+-        ShiftedNormPack prefetch_pack;
+-        if (has_prefetch)
+-            prefetch_pack = load_pack(output_offset + 2 * kHiddenPerNormPack, hidden_idx + 2 * kHiddenPerNormPack);
+-        uint4 values[kNumTokensPerShiftedNormTask] = {};
+-        const auto input = reinterpret_cast<const nv_bfloat162*>(pack.x1);
+-        const auto weight = reinterpret_cast<const nv_bfloat162*>(&pack.weight);
+-        auto output = reinterpret_cast<nv_bfloat162*>(values);
+-        #pragma unroll
+-        for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx) {
+-            output[pair_idx] = normalize_bf16_pair(input[pair_idx], weight[pair_idx], rms_scales.x);
+-            output[kNumBF16PairsPerLane + pair_idx] =
+-                normalize_bf16_pair(input[kNumBF16PairsPerLane + pair_idx], weight[pair_idx], rms_scales.y);
+-        }
+-        if constexpr (kStoreBF16) {
+-            *reinterpret_cast<uint4*>(norm_args.y_bf16 + output_offset) = values[0];
+-            if (has_second_token)
+-                *reinterpret_cast<uint4*>(norm_args.y_bf16 + output_offset + kHidden) = values[1];
+-        }
+-        if constexpr (kStoreFP8) {
+-            const auto values_pairs = reinterpret_cast<const nv_bfloat162(*)[4]>(values);
+-            // Pack both tokens' amaxes into one BF16 pair to share a single warp reduction
+-            const auto packed_amax = math::warp_reduce_max<kNumLanesPerSF>(nv_bfloat162(
+-                math::get_packed_bf16_amax(values_pairs[0]),
+-                has_second_token ? math::get_packed_bf16_amax(values_pairs[1]) : __ushort_as_bfloat16(0)));
 -            const uint2 sf_exponents = {math::get_ue8m0_sf_exp(packed_amax.x),
 -                                        math::get_ue8m0_sf_exp(packed_amax.y)};
-+            const uint2 sf_exponents = {get_sf_exp<SF_BLOCK_M>(packed_amax.x),
-+                                        get_sf_exp<SF_BLOCK_M>(packed_amax.y)};
-             const uint32_t sf_word_idx = hidden_pack_idx * kNumSFWordsPerNormPack + lane_idx / kNumLanesPerSFWord;
-             const uint32_t first_packed_sf = store_fp8_and_pack_sf(norm_args, output_offset, values[0], sf_exponents.x);
-             if (lane_idx % kNumLanesPerSFWord == 0) {
+-            const uint32_t sf_word_idx = hidden_pack_idx * kNumSFWordsPerNormPack + lane_idx / kNumLanesPerSFWord;
+-            const uint32_t first_packed_sf = store_fp8_and_pack_sf(norm_args, output_offset, values[0], sf_exponents.x);
+-            if (lane_idx % kNumLanesPerSFWord == 0) {
 -                norm_args.y_primary_sf[m_idx * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = first_packed_sf;
-+                if constexpr (SF_BLOCK_M != kTiledSFBlockM)
-+                    norm_args.y_primary_sf[m_idx * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = first_packed_sf;
-                 if constexpr (SF_BLOCK_M > 0)
-                     norm_args.y_shared_sf[static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word + shared_sf_row_indices.x] = first_packed_sf;
-             }
-@@ -376,7 +397,8 @@
-                 const uint32_t second_packed_sf = store_fp8_and_pack_sf(
-                     norm_args, output_offset + kHidden, values[1], sf_exponents.y);
-                 if (lane_idx % kNumLanesPerSFWord == 0) {
+-                if constexpr (SF_BLOCK_M > 0)
+-                    norm_args.y_shared_sf[static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word + shared_sf_row_indices.x] = first_packed_sf;
+-            }
+-            if (has_second_token) {
+-                const uint32_t second_packed_sf = store_fp8_and_pack_sf(
+-                    norm_args, output_offset + kHidden, values[1], sf_exponents.y);
+-                if (lane_idx % kNumLanesPerSFWord == 0) {
 -                    norm_args.y_primary_sf[(m_idx + 1) * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = second_packed_sf;
+-                    if constexpr (SF_BLOCK_M > 0)
+-                        norm_args.y_shared_sf[static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word + shared_sf_row_indices.y] = second_packed_sf;
+-                }
+-            }
+-        }
+-        if (hidden_pack_idx + 1 < hidden_pack_end)
+-            pack = next_pack;
+-        if (has_prefetch)
+-            next_pack = prefetch_pack;
+-    }
++// Shifted X1 buffer 0 takes the upper 16 lanes of each lane quadrant, which the M = 64 MMA leaves unused; buffer 1
++// starts after the accumulators.
++template <uint32_t kX1TmemStartColumn>
++CUTLASS_DEVICE uint32_t get_x1_tmem_offset(const uint32_t& buffer_idx) {
++    return buffer_idx == 0 ? (16u << 16) : kX1TmemStartColumn;
+ }
+ 
++// Shifted Norm: the CTA that produced a task's X1 normalizes it from tensor memory once the m-block's X1 statistics
++// complete. WG5 (worker 0) drains every task's buffer in order; on the CTA's last task the two retired Post workers
++// take every third K block as well. Each thread owns one row of its warp's lane quadrant and, per K block, one
++// 32-element SF group: tensor memory holds a row's hidden pairs in consecutive columns.
+ template <uint32_t kHidden, uint32_t kNumSMs, uint32_t kNumRegisters, bool kStoreBF16, bool kStoreFP8,
+-          uint32_t SF_BLOCK_M, uint32_t kNumSplits>
++          uint32_t SF_BLOCK_M, uint32_t kX1TmemStartColumn, uint32_t kNumSplits>
+ CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace<kNumSplits>& workspace,
+-                                            uint64_t* gmem_split_barriers,
+-                                            const NormArgs& norm_args,
++                                            uint64_t* gmem_split_barriers, const NormArgs& norm_args,
++                                            const uint32_t& tmem_base, const uint32_t& num_tasks,
++                                            const uint32_t& worker_idx, const uint32_t& warp_idx_in_wg,
+                                             const uint32_t& lane_idx) {
+-    constexpr uint32_t kNumTasksPerGridWave = kNumSMs * kNumWarpsPerWG;
+-    constexpr uint32_t kNumHiddenPacks = kHidden / kHiddenPerNormPack;
+-    const uint32_t num_token_pairs = math::ceil_div(norm_args.num_tokens, kNumTokensPerShiftedNormTask);
+-    // Only subdivide underfilled FP8 grids when a token pair can span multiple CTAs.
+-    constexpr uint32_t kNumFP8Partitions =
+-        kNumSplits > kDefaultNumSplits and kNumHiddenPacks > 2 * kNumWarpsPerWG ? kNumHiddenPacks / 2 : 2;
+-    const uint32_t num_partitions = kStoreFP8 ? kNumFP8Partitions : cute::max(
+-        math::ceil_div(kNumHiddenPacks, cute::max(
+-            1u, num_token_pairs * kNumHiddenPacks / kNumTasksPerGridWave)), 2u);
+-    const uint32_t num_tasks = num_token_pairs * num_partitions;
+-    const uint32_t cta_task_base = blockIdx.x * kNumWarpsPerWG;
+-    if (cta_task_base >= num_tasks)
++    constexpr uint32_t kNumWorkers = 3;
++    constexpr uint32_t kNumKBlocksPerSplit = kHidden / BLOCK_K / kNumSplits;
++    constexpr uint32_t kNumLongSplits = kHidden / BLOCK_K % kNumSplits;
++    constexpr uint32_t kNumX1TmemColumnsPerKBlock = BLOCK_K / 2;
++    constexpr uint32_t kNumRowsPerWarp = BLOCK_M / kNumWarpsPerWG;
++    constexpr uint32_t kNumPacksPerGroup = kHiddenPerSF / (2 * kNumBF16PairsPerLane);
++    DG_STATIC_ASSERT(BLOCK_K == 2 * kHiddenPerSF and kNumRowsPerWarp == 16, "One K block is two SF groups of 16 rows");
++    if (blockIdx.x >= num_tasks)
+         return;
+ 
+     cutlass::arch::warpgroup_reg_alloc<kNumRegisters>();
+-    while (true) {
+-        uint32_t task_ticket;
+-        if (cute::elect_one_sync())
+-            task_ticket = atomicAdd(&smem.next_norm_task_ticket, 1u);
+-        task_ticket = ptx::exchange(task_ticket, 0);
+-        // Preserve the four CTA-local warp residue classes, then advance by one grid-wide worker wave.
+-        const uint32_t task_idx = cta_task_base + task_ticket % kNumWarpsPerWG +
+-                                  task_ticket / kNumWarpsPerWG * kNumTasksPerGridWave;
+-        if (task_idx >= num_tasks)
+-            return;
+-        run_shifted_norm_task<kHidden, kStoreBF16, kStoreFP8, SF_BLOCK_M>(
+-            workspace, gmem_split_barriers, norm_args, task_idx, num_partitions, lane_idx);
++    const uint32_t num_cta_tasks = math::ceil_div(num_tasks - blockIdx.x, kNumSMs);
++    const uint32_t row_idx = warp_idx_in_wg * kNumRowsPerWarp + lane_idx % kNumRowsPerWarp;
++    const uint32_t group_idx_in_k_block = lane_idx / kNumRowsPerWarp;
++    for (uint32_t cta_task_idx = worker_idx == 0 ? 0 : num_cta_tasks - 1; cta_task_idx < num_cta_tasks; ++ cta_task_idx) {
++        const uint32_t task_idx = blockIdx.x + cta_task_idx * kNumSMs;
++        const uint32_t split_idx = task_idx % kNumSplits;
++        const uint32_t m_block_idx = task_idx / kNumSplits;
++        const uint32_t num_task_k_blocks = kNumKBlocksPerSplit + (split_idx < kNumLongSplits);
++        const uint32_t task_k_begin = split_idx * (kNumKBlocksPerSplit * BLOCK_K) + cute::min(split_idx, kNumLongSplits) * BLOCK_K;
++        const uint32_t buffer_idx = cta_task_idx % kNumX1Buffers;
++        const bool is_last_task = cta_task_idx + 1 == num_cta_tasks;
++
++        const uint32_t first_k_block_idx = is_last_task ? worker_idx : 0;
++        const uint32_t k_block_step = is_last_task ? kNumWorkers : 1;
++        const auto get_hidden_idx = [&](const uint32_t& k_block_idx) {
++            return task_k_begin + k_block_idx * BLOCK_K + group_idx_in_k_block * kHiddenPerSF;
++        };
++        // Weights stream one K block ahead, the first ones while the m-block's statistics complete
++        const auto load_weights = [&](const uint32_t& k_block_idx, uint4 (&weights)[kNumPacksPerGroup]) {
++            const auto weight_packs = reinterpret_cast<const uint4*>(norm_args.weight + get_hidden_idx(k_block_idx));
++            #pragma unroll
++            for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx)
++                weights[pack_idx] = weight_packs[pack_idx];
++        };
++        uint4 weights[kNumPacksPerGroup];
++        if (first_k_block_idx < num_task_k_blocks)
++            load_weights(first_k_block_idx, weights);
++
++        // Wait for the task's X1 columns, then its m-block's split statistics
++        smem.full_x1_barriers[buffer_idx].wait((cta_task_idx / kNumX1Buffers) & 1);
++        ptx::tcgen05_after_thread_sync();
++        sched::mega_mhc::Norm::wait<kNumSplits>(gmem_split_barriers, m_block_idx);
++
++        const uint32_t token_idx = m_block_idx * BLOCK_M + row_idx;
++        const bool is_valid_token = token_idx < norm_args.num_tokens;
++        float rms_scale = 0.0f;
++        if (is_valid_token) {
++            const auto x1_sqr_sum_partials = workspace.get_x1_sqr_sum_partial_ptr(m_block_idx * kNumSplits);
++            float x1_sqr_sum = 0.0f;
++            #pragma unroll
++            for (uint32_t k_split_idx = 0; k_split_idx < kNumSplits; ++ k_split_idx)
++                x1_sqr_sum += x1_sqr_sum_partials[k_split_idx * kNumSqrSumPartialElementsPerTask + row_idx];
++            constexpr float kInvHidden = 1.0f / static_cast<float>(kHidden);
++            rms_scale = rsqrtf(x1_sqr_sum * kInvHidden + norm_args.eps) * norm_args.scale;
++        }
++        uint32_t shared_sf_row_idx = 0;
++        if constexpr (SF_BLOCK_M > 0)
++            shared_sf_row_idx = get_shared_sf_row_idx<kHidden, SF_BLOCK_M>(token_idx);
++
++        const uint32_t x1_tmem_addr = tmem_base + get_x1_tmem_offset<kX1TmemStartColumn>(buffer_idx);
++        for (uint32_t k_block_idx = first_k_block_idx; k_block_idx < num_task_k_blocks; k_block_idx += k_block_step) {
++            // Threads 0-15 take the K block's first SF group of rows 0-15, threads 16-31 its second.
++            uint32_t x1[kHiddenPerSF / 2];
++            cute::SM100_TMEM_LOAD_16dp32b16x::copy(
++                x1_tmem_addr + k_block_idx * kNumX1TmemColumnsPerKBlock,
++                x1[0], x1[1], x1[2], x1[3], x1[4], x1[5], x1[6], x1[7],
++                x1[8], x1[9], x1[10], x1[11], x1[12], x1[13], x1[14], x1[15]);
++            cutlass::arch::fence_view_async_tmem_load();
++            const bool has_next_k_block = k_block_idx + k_block_step < num_task_k_blocks;
++            uint4 next_weights[kNumPacksPerGroup];
++            if (has_next_k_block)
++                load_weights(k_block_idx + k_block_step, next_weights);
++            if (is_valid_token) {
++                const uint32_t hidden_idx = get_hidden_idx(k_block_idx);
++                const uint64_t output_offset = static_cast<uint64_t>(token_idx) * kHidden + hidden_idx;
++                uint4 packs[kNumPacksPerGroup];
++                #pragma unroll
++                for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx) {
++                    const auto weight_pairs = reinterpret_cast<const nv_bfloat162*>(&weights[pack_idx]);
++                    const auto x1_pairs = reinterpret_cast<const nv_bfloat162*>(x1 + pack_idx * kNumBF16PairsPerLane);
++                    const auto values = reinterpret_cast<nv_bfloat162*>(&packs[pack_idx]);
++                    #pragma unroll
++                    for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx)
++                        values[pair_idx] = normalize_bf16_pair(x1_pairs[pair_idx], weight_pairs[pair_idx], rms_scale);
++                }
++                // Whole 32-byte sectors per store: a partly written sector costs L2 a DRAM fill.
++                const auto store_256 = [](void* ptr, const uint4& lo, const uint4& hi) {
++                    alignas(32) const uint4 values[2] = {lo, hi};
++                    *reinterpret_cast<ptx::longlong4_t*>(ptr) = *reinterpret_cast<const ptx::longlong4_t*>(values);
++                };
++                if constexpr (kStoreBF16) {
++                    store_256(norm_args.y_bf16 + output_offset, packs[0], packs[1]);
++                    store_256(norm_args.y_bf16 + output_offset + 16, packs[2], packs[3]);
++                }
++                if constexpr (kStoreFP8) {
++                    // The amax tree of the lane-parallel form: four 8-element packs, (0, 2) and (1, 3) first.
++                    nv_bfloat16 pack_amaxes[kNumPacksPerGroup];
++                    #pragma unroll
++                    for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx)
++                        pack_amaxes[pack_idx] = math::get_packed_bf16_amax(reinterpret_cast<const nv_bfloat162(&)[4]>(packs[pack_idx]));
++                    const uint32_t sf_exp = get_sf_exp<SF_BLOCK_M>(
++                        __hmax(__hmax(pack_amaxes[0], pack_amaxes[2]), __hmax(pack_amaxes[1], pack_amaxes[3])));
++                    const auto sf_inv = __bfloat162bfloat162(math::get_ue8m0_sf_inv<nv_bfloat16>(sf_exp));
++                    uint32_t fp8_values[kNumPacksPerGroup * 2];
++                    #pragma unroll
++                    for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx) {
++                        const auto bf16x2 = reinterpret_cast<const nv_bfloat162*>(&packs[pack_idx]);
++                        fp8_values[pack_idx * 2] = math::scale_bf16x2_into_fp8x4(bf16x2[0], bf16x2[1], sf_inv, sf_inv);
++                        fp8_values[pack_idx * 2 + 1] = math::scale_bf16x2_into_fp8x4(bf16x2[2], bf16x2[3], sf_inv, sf_inv);
++                    }
++                    store_256(norm_args.y_fp8 + output_offset, make_uint4(fp8_values[0], fp8_values[1], fp8_values[2], fp8_values[3]),
++                              make_uint4(fp8_values[4], fp8_values[5], fp8_values[6], fp8_values[7]));
++
++                    // Byte k of a packed SF word is its k-th 32-element group.
++                    const uint32_t sf_word_idx = hidden_idx / kHiddenPerSFWord;
++                    const uint32_t sf_byte_idx = hidden_idx / kHiddenPerSF % (kHiddenPerSFWord / kHiddenPerSF);
 +                    if constexpr (SF_BLOCK_M != kTiledSFBlockM)
-+                        norm_args.y_primary_sf[(m_idx + 1) * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = second_packed_sf;
-                     if constexpr (SF_BLOCK_M > 0)
-                         norm_args.y_shared_sf[static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word + shared_sf_row_indices.y] = second_packed_sf;
++                        reinterpret_cast<uint8_t*>(norm_args.y_primary_sf + token_idx * norm_args.y_primary_sf_stride_token +
++                                                   sf_word_idx * norm_args.y_primary_sf_stride_word)[sf_byte_idx] = sf_exp;
++                    if constexpr (SF_BLOCK_M > 0)
++                        reinterpret_cast<uint8_t*>(norm_args.y_shared_sf + static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word +
++                                                   shared_sf_row_idx)[sf_byte_idx] = sf_exp;
++                }
++            }
++            if (has_next_k_block) {
++                #pragma unroll
++                for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx)
++                    weights[pack_idx] = next_weights[pack_idx];
++            }
++        }
++
++        // Hand the buffer to the task two ahead; nothing follows the last task.
++        if (worker_idx == 0 and not is_last_task) {
++            ptx::tcgen05_before_thread_sync();
++            __syncwarp();
++            if (cute::elect_one_sync())
++                smem.empty_x1_barriers[buffer_idx].arrive();
++        }
+     }
+ }
+ 
+diff --git a/deep_gemm/include/deep_gemm/epilogue/sm107_shifted_mega_mhc.cuh b/deep_gemm/include/deep_gemm/epilogue/sm107_shifted_mega_mhc.cuh
+new file mode 100644
+index 0000000..7972353
+--- /dev/null
++++ b/deep_gemm/include/deep_gemm/epilogue/sm107_shifted_mega_mhc.cuh
+@@ -0,0 +1,349 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <cute/arch/cluster_sm90.hpp>
++#include <cutlass/arch/reg_reconfig.h>
++
++#include <deep_gemm/common/math.cuh>
++#include <deep_gemm/layout/mega_mhc_tmem.cuh>
++#include <deep_gemm/epilogue/sm100_mega_mhc.cuh>
++#include <deep_gemm/ptx/ld_st.cuh>
++#include <deep_gemm/scheduler/mega_mhc_tmem.cuh>
++
++namespace deep_gemm::epilogue::mega_mhc_tmem {
++
++using namespace layout::mega_mhc_tmem;
++using SharedStorage = layout::mega_mhc_tmem::SharedStorage;
++
++// Reduce one token's split partials and produce its Mix coefficients.
++template <uint32_t kHidden, bool kIsShifted, uint32_t kNumSplits>
++CUTLASS_DEVICE float run_mix_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
++                                  const MixArgs& mix_args,
++                                  const uint32_t& token_idx, const uint32_t& lane_idx) {
++    const uint32_t m_block_idx = token_idx / BLOCK_M;
++    const uint32_t row_idx = token_idx % BLOCK_M;
++    sched::mega_mhc_tmem::Mix::wait<kNumSplits>(gmem_split_barriers, m_block_idx);
++
++    // Reduce HC norm statistics and GEMM outputs across the split tasks.
++    const bool is_hc_output_lane = lane_idx < kNumHCOutputs;
++    const uint32_t first_task_idx = m_block_idx * kNumSplits;
++    const auto hc_norm_sqr_sum_partials = workspace.get_hc_norm_sqr_sum_partial_ptr(first_task_idx);
++    float hc_norm_sqr_sum = 0.0f;
++    #pragma unroll
++    for (uint32_t k_split_idx = lane_idx; k_split_idx < kNumSplits; k_split_idx += 32)
++        hc_norm_sqr_sum += hc_norm_sqr_sum_partials[
++            k_split_idx * kNumSqrSumPartialElementsPerTask + row_idx];
++    hc_norm_sqr_sum = math::warp_reduce_sum(hc_norm_sqr_sum);
++
++    const uint32_t safe_hc_output_idx = cute::min(lane_idx, kNumHCOutputs - 1);
++    const auto gemm_partials = workspace.get_gemm_partial_ptr(first_task_idx);
++    float hc_output = 0.0f;
++    #pragma unroll
++    for (uint32_t k_split_idx = 0; k_split_idx < kNumSplits; ++ k_split_idx)
++        hc_output += gemm_partials[k_split_idx * kNumGemmPartialElementsPerTask +
++                                   row_idx * kNumHCOutputs + safe_hc_output_idx];
++    hc_output = is_hc_output_lane ? hc_output : 0.0f;
++    const float hc_rms_scale = rsqrtf(hc_norm_sqr_sum * (1.0f / static_cast<float>(kNumRoutes * kHidden)) + mix_args.hc_norm_eps);
++
++    // Warp lanes map to [Pre routes | Post routes | Comb routes x routes | inactive].
++    constexpr uint32_t kFirstCombLane = 2 * kNumRoutes;
++    const bool is_pre_lane = lane_idx < kNumRoutes;
++    const bool is_pre_or_post_lane = lane_idx < kFirstCombLane;
++    const bool is_comb_lane = is_hc_output_lane and not is_pre_or_post_lane;
++    float mix_value = 0.0f;
++    if (is_hc_output_lane) {
++        const uint32_t mix_scale_idx = is_pre_lane ? 0u : is_pre_or_post_lane ? 1u : 2u;
++        const float affine_value = hc_output * hc_rms_scale * mix_args.scales[mix_scale_idx] + mix_args.bases[lane_idx];
++        if (is_pre_or_post_lane) {
++            const float sigmoid = math::fast_rcp(1.0f + __expf(-affine_value));
++            mix_value = is_pre_lane ? sigmoid + mix_args.hc_pre_eps : sigmoid * mix_args.hc_post_scale;
++        } else {
++            mix_value = affine_value;
++        }
++    }
++    __syncwarp();
++
++    if constexpr (kIsShifted) {
++        // Shifted Mix warps are dedicated: every lane normalizes the whole comb matrix in registers, so no Sinkhorn step
++        // waits on a shuffle. Row and column sums keep the order of the lane butterflies: (x0 + x2) + (x1 + x3) per row,
++        // (x0 + x1) + (x2 + x3) per column. Normal runs the Mix on each token's critical path beside five other workers,
++        // where fewer instructions win: each comb lane normalizes its own element.
++        DG_STATIC_ASSERT(kNumRoutes == 4, "The Sinkhorn sums are written for four routes");
++        float comb[kNumRoutes][kNumRoutes];
++        #pragma unroll
++        for (uint32_t i = 0; i < kNumRoutes * kNumRoutes; ++ i)
++            comb[i / kNumRoutes][i % kNumRoutes] = __shfl_sync(0xffffffff, mix_value, kFirstCombLane + i);
++        const auto get_row_sum = [&](const uint32_t& r) { return (comb[r][0] + comb[r][2]) + (comb[r][1] + comb[r][3]); };
++        const auto get_col_sum = [&](const uint32_t& c) { return (comb[0][c] + comb[1][c]) + (comb[2][c] + comb[3][c]); };
++        const auto normalize_cols = [&]() {
++            #pragma unroll
++            for (uint32_t c = 0; c < kNumRoutes; ++ c) {
++                const float scale = math::fast_rcp(get_col_sum(c) + mix_args.sinkhorn_eps);
++                #pragma unroll
++                for (uint32_t r = 0; r < kNumRoutes; ++ r)
++                    comb[r][c] *= scale;
++            }
++        };
++        #pragma unroll
++        for (uint32_t r = 0; r < kNumRoutes; ++ r) {
++            const float row_max = fmaxf(fmaxf(comb[r][0], comb[r][2]), fmaxf(comb[r][1], comb[r][3]));
++            #pragma unroll
++            for (uint32_t c = 0; c < kNumRoutes; ++ c)
++                comb[r][c] = __expf(comb[r][c] - row_max);
++            const float scale = math::fast_rcp(get_row_sum(r));
++            #pragma unroll
++            for (uint32_t c = 0; c < kNumRoutes; ++ c)
++                comb[r][c] = comb[r][c] * scale + mix_args.sinkhorn_eps;
++        }
++        normalize_cols();
++        #pragma unroll 1
++        for (uint32_t iteration = 1; iteration < mix_args.num_sinkhorn_iters; ++ iteration) {
++            #pragma unroll
++            for (uint32_t r = 0; r < kNumRoutes; ++ r) {
++                const float scale = math::fast_rcp(get_row_sum(r) + mix_args.sinkhorn_eps);
++                #pragma unroll
++                for (uint32_t c = 0; c < kNumRoutes; ++ c)
++                    comb[r][c] *= scale;
++            }
++            normalize_cols();
++        }
++
++        if (is_pre_or_post_lane) {
++            float* mix_output = is_pre_lane ? mix_args.new_prev_mix : mix_args.new_post_mix;
++            mix_output[token_idx * kNumRoutes + (lane_idx & (kNumRoutes - 1))] = mix_value;
++        }
++        if (lane_idx == 0) {
++            const auto comb_output = reinterpret_cast<float4*>(mix_args.new_comb_res_mix + token_idx * kNumRoutes * kNumRoutes);
++            #pragma unroll
++            for (uint32_t r = 0; r < kNumRoutes; ++ r)
++                comb_output[r] = make_float4(comb[r][0], comb[r][1], comb[r][2], comb[r][3]);
++        }
++    } else {
++        const auto sinkhorn_normalize = [&](float value) {
++            // Comb logits occupy a row-major route x route region after Pre and Post.
++            value = is_comb_lane ? value : 0.0f;
++            const float row_max = math::warp_reduce_max<kNumRoutes>(value);
++            value = __expf(value - row_max);
++            float row_sum = math::warp_reduce_sum<kNumRoutes>(value);
++            value = value * math::fast_rcp(row_sum) + mix_args.sinkhorn_eps;
++
++            const auto get_col_sum = [](const float& element) {
++                // For four routes, these XORs combine adjacent rows, then the two row pairs.
++                float sum = element + __shfl_xor_sync(0xffffffff, element, kNumRoutes);
++                sum += __shfl_xor_sync(0xffffffff, sum, 6 * kNumRoutes);
++                return sum;
++            };
++
++            value *= math::fast_rcp(get_col_sum(value) + mix_args.sinkhorn_eps);
++            #pragma unroll 1
++            for (uint32_t iteration = 1; iteration < mix_args.num_sinkhorn_iters; ++ iteration) {
++                row_sum = math::warp_reduce_sum<kNumRoutes>(value);
++                value *= math::fast_rcp(row_sum + mix_args.sinkhorn_eps);
++                value *= math::fast_rcp(get_col_sum(value) + mix_args.sinkhorn_eps);
++            }
++            return value;
++        };
++
++        const float normalized_comb = sinkhorn_normalize(mix_value);
++
++        // Only Shifted stores the new Pre coefficients.
++        if (is_hc_output_lane and (kIsShifted or not is_pre_lane)) {
++            float* mix_output = is_pre_lane ? mix_args.new_prev_mix :
++                                is_comb_lane ? mix_args.new_comb_res_mix : mix_args.new_post_mix;
++            const uint32_t mix_output_stride = is_comb_lane ? kNumRoutes * kNumRoutes : kNumRoutes;
++            const uint32_t mix_output_idx = is_comb_lane ? lane_idx - kFirstCombLane : lane_idx & (kNumRoutes - 1);
++            mix_output[token_idx * mix_output_stride + mix_output_idx] = is_comb_lane ? normalized_comb : mix_value;
++        }
++    }
++    __syncwarp();
++
++    return mix_value;
++}
++
++// Shifted Mix workers share one CTA task queue. Tickets keep the CTA's token set and their m-block order: ticket t
++// takes the (t / 4)-th grid stride of token residue t % 4.
++template <uint32_t kHidden, uint32_t kNumSMs, uint32_t kNumSplits>
++CUTLASS_DEVICE void run_shifted_mix_worker(SharedStorage& smem, const Workspace<kNumSplits>& workspace,
++                                           uint64_t* gmem_split_barriers, const MixArgs& mix_args,
++                                           const uint32_t& num_tokens, const uint32_t& lane_idx) {
++    while (true) {
++        uint32_t task_ticket;
++        if (cute::elect_one_sync())
++            task_ticket = atomicAdd(&smem.next_mix_task_ticket, 1u);
++        task_ticket = ptx::exchange(task_ticket, 0);
++        const uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + task_ticket % kNumWarpsPerWG +
++                                   task_ticket / kNumWarpsPerWG * (kNumSMs * kNumWarpsPerWG);
++        if (token_idx >= num_tokens)
++            return;
++        run_mix_task<kHidden, true>(workspace, gmem_split_barriers, mix_args, token_idx, lane_idx);
++    }
++}
++
++using epilogue::mega_mhc::kNumBF16PairsPerLane;
++using epilogue::mega_mhc::normalize_bf16_pair;
++using epilogue::mega_mhc::get_sf_exp;
++using epilogue::mega_mhc::get_shared_sf_row_idx;
++using epilogue::mega_mhc::run_normal_worker;
++
++// Shifted X1 buffer 0 takes the upper 16 lanes of each lane quadrant, which the M = 64 MMA leaves unused; buffer 1
++// starts after the accumulators.
++template <uint32_t kX1TmemStartColumn>
++CUTLASS_DEVICE uint32_t get_x1_tmem_offset(const uint32_t& buffer_idx) {
++    return buffer_idx == 0 ? (16u << 16) : kX1TmemStartColumn;
++}
++
++// Shifted Norm: the CTA that produced a task's X1 normalizes it from tensor memory once the m-block's X1 statistics
++// complete. WG5 (worker 0) drains every task's buffer in order; on the CTA's last task the two retired Post workers
++// take every third K block as well. Each thread owns one row of its warp's lane quadrant and, per K block, one
++// 32-element SF group: tensor memory holds a row's hidden pairs in consecutive columns.
++template <uint32_t kHidden, uint32_t kNumSMs, uint32_t kNumRegisters, bool kStoreBF16, bool kStoreFP8,
++          uint32_t SF_BLOCK_M, uint32_t kX1TmemStartColumn, uint32_t kNumSplits>
++CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace<kNumSplits>& workspace,
++                                            uint64_t* gmem_split_barriers, const NormArgs& norm_args,
++                                            const uint32_t& tmem_base, const uint32_t& num_tasks,
++                                            const uint32_t& worker_idx, const uint32_t& warp_idx_in_wg,
++                                            const uint32_t& lane_idx) {
++    constexpr uint32_t kNumWorkers = 3;
++    constexpr uint32_t kNumKBlocksPerSplit = kHidden / BLOCK_K / kNumSplits;
++    constexpr uint32_t kNumLongSplits = kHidden / BLOCK_K % kNumSplits;
++    constexpr uint32_t kNumX1TmemColumnsPerKBlock = BLOCK_K / 2;
++    constexpr uint32_t kNumRowsPerWarp = BLOCK_M / kNumWarpsPerWG;
++    constexpr uint32_t kNumPacksPerGroup = kHiddenPerSF / (2 * kNumBF16PairsPerLane);
++    DG_STATIC_ASSERT(BLOCK_K == 2 * kHiddenPerSF and kNumRowsPerWarp == 16, "One K block is two SF groups of 16 rows");
++    if (blockIdx.x >= num_tasks)
++        return;
++
++    cutlass::arch::warpgroup_reg_alloc<kNumRegisters>();
++    const uint32_t num_cta_tasks = math::ceil_div(num_tasks - blockIdx.x, kNumSMs);
++    const uint32_t row_idx = warp_idx_in_wg * kNumRowsPerWarp + lane_idx % kNumRowsPerWarp;
++    const uint32_t group_idx_in_k_block = lane_idx / kNumRowsPerWarp;
++    for (uint32_t cta_task_idx = worker_idx == 0 ? 0 : num_cta_tasks - 1; cta_task_idx < num_cta_tasks; ++ cta_task_idx) {
++        const uint32_t task_idx = blockIdx.x + cta_task_idx * kNumSMs;
++        const uint32_t split_idx = task_idx % kNumSplits;
++        const uint32_t m_block_idx = task_idx / kNumSplits;
++        const uint32_t num_task_k_blocks = kNumKBlocksPerSplit + (split_idx < kNumLongSplits);
++        const uint32_t task_k_begin = split_idx * (kNumKBlocksPerSplit * BLOCK_K) + cute::min(split_idx, kNumLongSplits) * BLOCK_K;
++        const uint32_t buffer_idx = cta_task_idx % kNumX1Buffers;
++        const bool is_last_task = cta_task_idx + 1 == num_cta_tasks;
++
++        const uint32_t first_k_block_idx = is_last_task ? worker_idx : 0;
++        const uint32_t k_block_step = is_last_task ? kNumWorkers : 1;
++        const auto get_hidden_idx = [&](const uint32_t& k_block_idx) {
++            return task_k_begin + k_block_idx * BLOCK_K + group_idx_in_k_block * kHiddenPerSF;
++        };
++        // Weights stream one K block ahead, the first ones while the m-block's statistics complete
++        const auto load_weights = [&](const uint32_t& k_block_idx, uint4 (&weights)[kNumPacksPerGroup]) {
++            const auto weight_packs = reinterpret_cast<const uint4*>(norm_args.weight + get_hidden_idx(k_block_idx));
++            #pragma unroll
++            for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx)
++                weights[pack_idx] = weight_packs[pack_idx];
++        };
++        uint4 weights[kNumPacksPerGroup];
++        if (first_k_block_idx < num_task_k_blocks)
++            load_weights(first_k_block_idx, weights);
++
++        // Wait for the task's X1 columns, then its m-block's split statistics
++        smem.full_x1_barriers[buffer_idx].wait((cta_task_idx / kNumX1Buffers) & 1);
++        ptx::tcgen05_after_thread_sync();
++        sched::mega_mhc_tmem::Norm::wait<kNumSplits>(gmem_split_barriers, m_block_idx);
++
++        const uint32_t token_idx = m_block_idx * BLOCK_M + row_idx;
++        const bool is_valid_token = token_idx < norm_args.num_tokens;
++        float rms_scale = 0.0f;
++        if (is_valid_token) {
++            const auto x1_sqr_sum_partials = workspace.get_x1_sqr_sum_partial_ptr(m_block_idx * kNumSplits);
++            float x1_sqr_sum = 0.0f;
++            #pragma unroll
++            for (uint32_t k_split_idx = 0; k_split_idx < kNumSplits; ++ k_split_idx)
++                x1_sqr_sum += x1_sqr_sum_partials[k_split_idx * kNumSqrSumPartialElementsPerTask + row_idx];
++            constexpr float kInvHidden = 1.0f / static_cast<float>(kHidden);
++            rms_scale = rsqrtf(x1_sqr_sum * kInvHidden + norm_args.eps) * norm_args.scale;
++        }
++        uint32_t shared_sf_row_idx = 0;
++        if constexpr (SF_BLOCK_M > 0)
++            shared_sf_row_idx = get_shared_sf_row_idx<kHidden, SF_BLOCK_M>(token_idx);
++
++        const uint32_t x1_tmem_addr = tmem_base + get_x1_tmem_offset<kX1TmemStartColumn>(buffer_idx);
++        for (uint32_t k_block_idx = first_k_block_idx; k_block_idx < num_task_k_blocks; k_block_idx += k_block_step) {
++            // Threads 0-15 take the K block's first SF group of rows 0-15, threads 16-31 its second.
++            uint32_t x1[kHiddenPerSF / 2];
++            cute::SM100_TMEM_LOAD_16dp32b16x::copy(
++                x1_tmem_addr + k_block_idx * kNumX1TmemColumnsPerKBlock,
++                x1[0], x1[1], x1[2], x1[3], x1[4], x1[5], x1[6], x1[7],
++                x1[8], x1[9], x1[10], x1[11], x1[12], x1[13], x1[14], x1[15]);
++            cutlass::arch::fence_view_async_tmem_load();
++            const bool has_next_k_block = k_block_idx + k_block_step < num_task_k_blocks;
++            uint4 next_weights[kNumPacksPerGroup];
++            if (has_next_k_block)
++                load_weights(k_block_idx + k_block_step, next_weights);
++            if (is_valid_token) {
++                const uint32_t hidden_idx = get_hidden_idx(k_block_idx);
++                const uint64_t output_offset = static_cast<uint64_t>(token_idx) * kHidden + hidden_idx;
++                uint4 packs[kNumPacksPerGroup];
++                #pragma unroll
++                for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx) {
++                    const auto weight_pairs = reinterpret_cast<const nv_bfloat162*>(&weights[pack_idx]);
++                    const auto x1_pairs = reinterpret_cast<const nv_bfloat162*>(x1 + pack_idx * kNumBF16PairsPerLane);
++                    const auto values = reinterpret_cast<nv_bfloat162*>(&packs[pack_idx]);
++                    #pragma unroll
++                    for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx)
++                        values[pair_idx] = normalize_bf16_pair(x1_pairs[pair_idx], weight_pairs[pair_idx], rms_scale);
++                }
++                // Whole 32-byte sectors per store: a partly written sector costs L2 a DRAM fill.
++                const auto store_256 = [](void* ptr, const uint4& lo, const uint4& hi) {
++                    alignas(32) const uint4 values[2] = {lo, hi};
++                    *reinterpret_cast<ptx::longlong4_t*>(ptr) = *reinterpret_cast<const ptx::longlong4_t*>(values);
++                };
++                if constexpr (kStoreBF16) {
++                    store_256(norm_args.y_bf16 + output_offset, packs[0], packs[1]);
++                    store_256(norm_args.y_bf16 + output_offset + 16, packs[2], packs[3]);
++                }
++                if constexpr (kStoreFP8) {
++                    // The amax tree of the lane-parallel form: four 8-element packs, (0, 2) and (1, 3) first.
++                    nv_bfloat16 pack_amaxes[kNumPacksPerGroup];
++                    #pragma unroll
++                    for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx)
++                        pack_amaxes[pack_idx] = math::get_packed_bf16_amax(reinterpret_cast<const nv_bfloat162(&)[4]>(packs[pack_idx]));
++                    const uint32_t sf_exp = get_sf_exp<SF_BLOCK_M>(
++                        __hmax(__hmax(pack_amaxes[0], pack_amaxes[2]), __hmax(pack_amaxes[1], pack_amaxes[3])));
++                    const auto sf_inv = __bfloat162bfloat162(math::get_ue8m0_sf_inv<nv_bfloat16>(sf_exp));
++                    uint32_t fp8_values[kNumPacksPerGroup * 2];
++                    #pragma unroll
++                    for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx) {
++                        const auto bf16x2 = reinterpret_cast<const nv_bfloat162*>(&packs[pack_idx]);
++                        fp8_values[pack_idx * 2] = math::scale_bf16x2_into_fp8x4(bf16x2[0], bf16x2[1], sf_inv, sf_inv);
++                        fp8_values[pack_idx * 2 + 1] = math::scale_bf16x2_into_fp8x4(bf16x2[2], bf16x2[3], sf_inv, sf_inv);
++                    }
++                    store_256(norm_args.y_fp8 + output_offset, make_uint4(fp8_values[0], fp8_values[1], fp8_values[2], fp8_values[3]),
++                              make_uint4(fp8_values[4], fp8_values[5], fp8_values[6], fp8_values[7]));
++
++                    // Byte k of a packed SF word is its k-th 32-element group.
++                    const uint32_t sf_word_idx = hidden_idx / kHiddenPerSFWord;
++                    const uint32_t sf_byte_idx = hidden_idx / kHiddenPerSF % (kHiddenPerSFWord / kHiddenPerSF);
++                    if constexpr (SF_BLOCK_M != kTiledSFBlockM)
++                        reinterpret_cast<uint8_t*>(norm_args.y_primary_sf + token_idx * norm_args.y_primary_sf_stride_token +
++                                                   sf_word_idx * norm_args.y_primary_sf_stride_word)[sf_byte_idx] = sf_exp;
++                    if constexpr (SF_BLOCK_M > 0)
++                        reinterpret_cast<uint8_t*>(norm_args.y_shared_sf + static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word +
++                                                   shared_sf_row_idx)[sf_byte_idx] = sf_exp;
++                }
++            }
++            if (has_next_k_block) {
++                #pragma unroll
++                for (uint32_t pack_idx = 0; pack_idx < kNumPacksPerGroup; ++ pack_idx)
++                    weights[pack_idx] = next_weights[pack_idx];
++            }
++        }
++
++        // Hand the buffer to the task two ahead; nothing follows the last task.
++        if (worker_idx == 0 and not is_last_task) {
++            ptx::tcgen05_before_thread_sync();
++            __syncwarp();
++            if (cute::elect_one_sync())
++                smem.empty_x1_barriers[buffer_idx].arrive();
++        }
++    }
++}
++
++} // namespace deep_gemm::epilogue::mega_mhc_tmem
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh b/deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh
+index eaf618c..24651bf 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh
+@@ -30,10 +30,28 @@
+ constexpr uint32_t UMMA_K = 32 / sizeof(float);
+ constexpr uint32_t kNumTokenRowsPerLane = 2;
+ 
++// A ring whose stage count is set at run time.
++struct RuntimeRingPipeline {
++    uint32_t num_stages, stage_idx = 0, phase = 0;
++
++    CUTLASS_DEVICE explicit RuntimeRingPipeline(const uint32_t& num_stages): num_stages(num_stages) {}
++
++    // Callers advance by at most one full ring.
++    CUTLASS_DEVICE cute::tuple<uint32_t, uint32_t> advance(const uint32_t step = 1) {
++        const uint32_t current_stage_idx = stage_idx, current_phase = phase;
++        stage_idx += step;
++        if (stage_idx >= num_stages) {
++            stage_idx -= num_stages;
++            phase ^= 1u;
++        }
++        return cute::tuple<uint32_t, uint32_t>(current_stage_idx, current_phase);
++    }
++};
++
+ } // namespace mega_mhc
+ 
+ // Persistent mHC with static grid-stride roles and TMA-native layouts.
+-// Norm receives one arrival only after Shifted X1 stores and statistics are committed.
++// Norm receives one arrival only after Shifted X1 statistics are committed.
+ template <uint32_t kHidden, uint32_t kNumSplits, uint32_t kNumSMs,
+           bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M>
+ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
+@@ -60,14 +78,26 @@
+                      "Splits must contain nonempty, aligned K blocks");
+     DG_STATIC_ASSERT(SF_BLOCK_M == 0 or kStoreFP8, "Shared SF requires FP8 output");
+ 
+-    // MMA and tensor memory configs
+-    constexpr uint32_t kNumTmemColumnsPerAStage = kNumRoutes * UMMA_K;
+-    constexpr uint32_t kAccumTmemStartColumn = kNumAStages * kNumTmemColumnsPerAStage;
+-    constexpr uint32_t kNumTmemCols =
+-        utils::get_num_aligned_tmem_cols<kAccumTmemStartColumn + kNumAccumStages * BLOCK_N>();
+     // Task geometry
+     constexpr uint32_t kNumKBlocksPerSplit = kHidden / BLOCK_K / kNumSplits;
+     constexpr uint32_t kNumLongSplits = kHidden / BLOCK_K % kNumSplits;
++    constexpr uint32_t kMaxNumTaskKBlocks = kNumKBlocksPerSplit + (kNumLongSplits > 0 ? 1 : 0);
++    // All A stages when the X1 buffers still fit in tensor memory beside them, else half
++    constexpr uint32_t kNumAStages =
++        layout::mega_mhc::kNumMaxAStages * kNumRoutes * UMMA_K + kNumAccumStages * BLOCK_N +
++        (kIsShifted ? kMaxNumTaskKBlocks * BLOCK_K / 2 : 0) <= 512 ? layout::mega_mhc::kNumMaxAStages
++                                                                   : layout::mega_mhc::kNumMaxAStages / 2;
++
++    // MMA and tensor memory configs
++    constexpr uint32_t kNumTmemColumnsPerAStage = kNumRoutes * UMMA_K;
++    constexpr uint32_t kAccumTmemStartColumn = kNumAStages * kNumTmemColumnsPerAStage;
++    // Shifted holds each task's X1 (BF16 pairs, one row per lane) in tensor memory until its m-block's statistics
++    // complete; the second X1 buffer starts after the accumulators.
++    constexpr uint32_t kNumX1TmemColumnsPerKBlock = BLOCK_K / 2;
++    constexpr uint32_t kX1TmemStartColumn = kAccumTmemStartColumn + kNumAccumStages * BLOCK_N;
++    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<
++        kX1TmemStartColumn + (kIsShifted ? kMaxNumTaskKBlocks * kNumX1TmemColumnsPerKBlock : 0)>();
++    DG_STATIC_ASSERT(kNumTmemCols <= 512, "X1 buffers exceed tensor memory");
+     const auto get_task_k_begin = [&](const uint32_t split_idx) {
+         return split_idx * (kNumKBlocksPerSplit * BLOCK_K) + cute::min(split_idx, kNumLongSplits) * BLOCK_K;
+     };
+@@ -116,6 +146,8 @@
+     const uint32_t num_m_blocks = Workspace<kNumSplits>::get_num_m_blocks(norm_args.num_tokens);
+     const uint32_t num_tasks = num_m_blocks * kNumSplits;
+     Workspace<kNumSplits> workspace(gmem_scratch, num_m_blocks);
++    // Grids of up to two task waves keep every A stage in flight; longer grids stream faster on four.
++    const uint32_t num_used_a_stages = num_tasks <= 2 * kNumSMs ? kNumAStages : cute::min(kNumAStages, 4u);
+ 
+     // Shared memory
+     extern __shared__ __align__(kSwizzleAlignment) uint8_t smem_buffer[];
+@@ -130,6 +162,8 @@
+     // Descriptor cache hints and barriers are initialized once per persistent CTA.
+     if (warp_idx == 0 and cute::elect_one_sync()) {
+         smem.next_norm_task_ticket = 0;
++        smem.next_mix_task_ticket = 0;
++        smem.streaming_done = 0;
+ 
+         // Normal aliases the shifted-only descriptors to valid maps, so prefetch unconditionally.
+         for (const auto& tensor_map: {&tensor_map_residual, &tensor_map_x, &tensor_map_fn,
+@@ -159,6 +193,8 @@
+         smem.full_stats_barrier.init(kNumPostWarps);
+         smem.empty_stats_barrier.init(kNumWarpsPerWG + (kIsShifted ? 1 : 0));
+         smem.mix_arrival_barrier.init(kNumWarpsPerWG + (kIsShifted ? 0 : 1));
++        init_barriers(smem.full_x1_barriers, kNumPostWarps);
++        init_barriers(smem.empty_x1_barriers, kNumWarpsPerWG);
+         cutlass::arch::fence_barrier_init();
+     }
+ 
+@@ -210,9 +246,16 @@
+         };
+ 
+         if (warp_idx == 0) {
++            bool is_first_io_load = true;
+             // Warp 0: residual and X TMA-load worker
+             run_tma_load_worker(smem.empty_io_barriers,
+                 [&](const uint32_t& stage_idx, const uint32_t& k_idx, const uint32_t& m_idx) {
++                    // The second stage waits for the first to land, so every CTA's first K block arrives ahead of
++                    // the rest of the initial fill.
++                    if (stage_idx == 1 and is_first_io_load) {
++                        smem.full_io_barriers[0].wait(0);
++                        is_first_io_load = false;
++                    }
+                     tma::copy<BLOCK_K, BLOCK_M, kSwizzleMode, nv_bfloat16, true>(
+                         &tensor_map_residual, &smem.full_io_barriers[stage_idx],
+                         reinterpret_cast<nv_bfloat16*>(smem.residual[stage_idx][0]), k_idx, m_idx);
+@@ -238,7 +281,7 @@
+                                                                                 cute::UMMA::Major::K, cute::UMMA::Major::K>();
+ 
+             RingPipeline<kNumFnStages> fn_pipeline;
+-            RingPipeline<kNumAStages> a_pipeline;
++            RuntimeRingPipeline a_pipeline(num_used_a_stages);
+             RingPipeline<kNumAccumStages> accum_pipeline;
+ 
+             for (uint32_t task_idx = blockIdx.x; task_idx < num_tasks; task_idx += kNumSMs) {
+@@ -307,7 +350,7 @@
+                 return stage_idx;
+             };
+ 
+-            // The first task has no preceding store-drain window, so seed its coefficients here.
++            // Seed the first task's coefficients; every task then fetches its successor's.
+             if (blockIdx.x < num_tasks) {
+                 const uint32_t coeff_stage_idx = advance_coeff_pipeline();
+                 if (cute::elect_one_sync())
+@@ -319,9 +362,15 @@
+                 const uint32_t split_idx = task_idx % kNumSplits;
+                 const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
+                 const uint32_t m_block_idx = task_idx / kNumSplits;
++                // A task ahead: the Post workers wait on them at their next task switch.
++                if (task_idx + kNumSMs < num_tasks) {
++                    const uint32_t next_coeff_stage_idx = advance_coeff_pipeline();
++                    if (cute::elect_one_sync())
++                        issue_coeff_tma((task_idx + kNumSMs) / kNumSplits * BLOCK_M, next_coeff_stage_idx);
++                    __syncwarp();
++                }
+                 if constexpr (kIsShifted)
+                     sched::mega_mhc::Norm::wait_init<kNumSplits>(gmem_split_barriers, m_block_idx);
+-                uint32_t next_coeff_stage_idx = 0;
+ 
+                 #pragma unroll 1
+                 for (uint32_t k_block_idx = 0; k_block_idx < num_task_k_blocks; ++ k_block_idx) {
+@@ -331,13 +380,6 @@
+ 
+                     const uint32_t k_idx = get_task_k_begin(split_idx) + k_block_idx * BLOCK_K;
+                     const uint32_t m_idx = m_block_idx * BLOCK_M;
+-                    const bool should_prefetch_next_coeff =
+-                        k_block_idx == num_task_k_blocks - 1 and task_idx + kNumSMs < num_tasks;
+-
+-                    // Wait for a reusable slot before entering the final store-drain overlap window.
+-                    if (should_prefetch_next_coeff)
+-                        next_coeff_stage_idx = advance_coeff_pipeline();
+-
+                     if (cute::elect_one_sync()) {
+                         // New residual is re-read by the fused Normal workers, so it stays in L2
+                         // (EVICT_LAST); Shifted consumes it only in the next layer.
+@@ -345,15 +387,7 @@
+                                           k_idx, m_idx, 0u,
+                                           kIsShifted ? cute::TMA::CacheHintSm100::EVICT_NORMAL
+                                                      : cute::TMA::CacheHintSm100::EVICT_LAST);
+-                        if constexpr (kIsShifted)
+-                            ptx::tma_store_2d(&tensor_map_y_bf16, smem.x[io_stage_idx], k_idx,
+-                                              m_idx, cute::TMA::CacheHintSm100::EVICT_LAST);
+-
+                         cute::tma_store_arrive();
+-                        // Issue next-task coefficients here to avoid competing with the task's main TMA wave.
+-                        if (should_prefetch_next_coeff)
+-                            issue_coeff_tma((task_idx + kNumSMs) / kNumSplits * BLOCK_M, next_coeff_stage_idx);
+-
+                         // Complete the destination writes before releasing this IO stage.
+                         ptx::tma_store_wait<0>();
+                         smem.empty_io_barriers[io_stage_idx].arrive();
+@@ -382,6 +416,9 @@
+                     smem.mix_arrival_barrier.arrive();
                  }
+             }
++            if (cute::elect_one_sync())
++                *reinterpret_cast<volatile uint32_t*>(&smem.streaming_done) = 1;
++            __syncwarp();
+         }
+     } else if (warp_idx < kWorkspaceEpilogueWGIdx * kNumWarpsPerWG) {
+         // WG1-2: Post workers, one per WG
+@@ -401,18 +438,19 @@
+         DG_STATIC_ASSERT(UMMA_K % kNumLanesPerRowGroup == 0, "Invalid Post geometry");
+ 
+         const auto run_post_worker = [&](auto post_worker) {
+-            constexpr uint32_t kPostWorkerIdx = decltype(post_worker)::value;
++            const uint32_t post_worker_idx = post_worker;
+             cutlass::arch::warpgroup_reg_alloc<kNumPostRegisters>();
+             const uint32_t col_pair_idx = lane_idx & (kNumLanesPerRowGroup - 1);
+             const uint32_t first_row_idx = get_first_row_idx();
+             const uint32_t row_indices[kNumTokenRowsPerLane] = {first_row_idx, first_row_idx + kNumRowGroupsPerWarp};
+ 
+             RingPipeline<kNumIOStages> io_pipeline;
+-            RingPipeline<kNumAStages> a_pipeline;
++            RuntimeRingPipeline a_pipeline(num_used_a_stages);
+             RingPipeline<kNumCoeffStages> coeff_pipeline;
++            RingPipeline<kNumX1Buffers> x1_pipeline;
+ 
+             // Each Post worker maps to one WG; offset them so their A stages interleave.
+-            a_pipeline.advance(kPostWorkerIdx);
++            a_pipeline.advance(post_worker_idx);
+ 
+             for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += kNumSMs, task_phase ^= 1u) {
+                 const uint32_t split_idx = task_idx % kNumSplits;
+@@ -447,6 +485,16 @@
+                     smem.empty_coeff_barriers[coeff_stage_idx].arrive();
+                 }
+ 
++                // Wait for the Norm workers to drain this task's X1 buffer
++                uint32_t x1_buffer_idx = 0, x1_tmem_addr = 0;
++                if constexpr (kIsShifted) {
++                    CUTE_TIE_DECL(x1_pipeline.advance(), buffer_idx, buffer_phase);
++                    smem.empty_x1_barriers[buffer_idx].wait(buffer_phase ^ 1u);
++                    ptx::tcgen05_after_thread_sync();
++                    x1_buffer_idx = buffer_idx;
++                    x1_tmem_addr = tmem_base + epilogue::mega_mhc::get_x1_tmem_offset<kX1TmemStartColumn>(buffer_idx);
++                }
++
+                 // Round-robin UMMA atoms across Post workers and retain statistics until the split ends.
+                 #pragma unroll 1
+                 for (uint32_t k_block_idx = 0; k_block_idx < num_task_k_blocks; ++ k_block_idx) {
+@@ -455,8 +503,8 @@
+                     smem.full_io_barriers[io_stage_idx].wait(io_phase);
+ 
+                     #pragma unroll
+-                    for (uint32_t umma_k_idx = kPostWorkerIdx; umma_k_idx < BLOCK_K / UMMA_K;
+-                         umma_k_idx += kNumPostWGs) {
++                    for (uint32_t atom_idx = 0; atom_idx < BLOCK_K / UMMA_K / kNumPostWGs; ++ atom_idx) {
++                        const uint32_t umma_k_idx = atom_idx * kNumPostWGs + post_worker_idx;
+                         const uint32_t hidden_pair_idx = umma_k_idx * (UMMA_K / 2) +
+                                                          col_pair_idx * (UMMA_K / kNumLanesPerRowGroup / 2);
+                         float2 x[kNumTokenRowsPerLane];
+@@ -515,13 +563,18 @@
+                                                                 tmem_values[3][0], tmem_values[3][1], tmem_values[3][2], tmem_values[3][3], tmem_addr);
+ 
+                         if constexpr (kIsShifted) {
++                            uint32_t x1_values[kNumTokenRowsPerLane];
+                             #pragma unroll
+                             for (uint32_t row_idx = 0; row_idx < kNumTokenRowsPerLane; ++ row_idx) {
+                                 const nv_bfloat162 x1_bf16 = __float22bfloat162_rn(x1[row_idx]);
+                                 // NOTES: X1 is already rounded to BF16; accumulate without unpacking it back to FP32.
+                                 ptx::accumulate_square(x1_sqr_sums[row_idx], x1_bf16);
+-                                smem.x[io_stage_idx][get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = x1_bf16;
++                                x1_values[row_idx] = *reinterpret_cast<const uint32_t*>(&x1_bf16);
+                             }
++                            // One X1 column per hidden pair: the lane's two rows at its column pair, as for A.
++                            cute::SM100_TMEM_STORE_16dp128b1x::copy(
++                                x1_values[0], x1_values[1],
++                                x1_tmem_addr + k_block_idx * kNumX1TmemColumnsPerKBlock + umma_k_idx * (UMMA_K / 2));
+                         }
+ 
+                         // All four warps have issued their route stores before A becomes visible to the MMA warp.
+@@ -538,6 +591,14 @@
+                     }
+                 }
+ 
++                if constexpr (kIsShifted) {
++                    cutlass::arch::fence_view_async_tmem_store();
++                    ptx::tcgen05_before_thread_sync();
++                    __syncwarp();
++                    if (cute::elect_one_sync())
++                        smem.full_x1_barriers[x1_buffer_idx].arrive();
++                }
++
+                 // Wait only when register-held statistics are committed to shared rows reused by the next task.
+                 smem.empty_stats_barrier.wait(task_phase ^ 1u);
+ 
+@@ -550,11 +611,11 @@
+                     reduced_x1_1 = math::warp_reduce_sum<kNumLanesPerRowGroup>(x1_sqr_sums[1].x + x1_sqr_sums[1].y);
+                 }
+ 
+-                smem.hc_norm_sqr_sums[kPostWorkerIdx][row_indices[0]] = reduced_hc_norm_0;
+-                smem.hc_norm_sqr_sums[kPostWorkerIdx][row_indices[1]] = reduced_hc_norm_1;
++                smem.hc_norm_sqr_sums[post_worker_idx][row_indices[0]] = reduced_hc_norm_0;
++                smem.hc_norm_sqr_sums[post_worker_idx][row_indices[1]] = reduced_hc_norm_1;
+                 if constexpr (kIsShifted) {
+-                    smem.x1_sqr_sums[kPostWorkerIdx][row_indices[0]] = reduced_x1_0;
+-                    smem.x1_sqr_sums[kPostWorkerIdx][row_indices[1]] = reduced_x1_1;
++                    smem.x1_sqr_sums[post_worker_idx][row_indices[0]] = reduced_x1_0;
++                    smem.x1_sqr_sums[post_worker_idx][row_indices[1]] = reduced_x1_1;
+                 }
+                 __syncwarp();
+ 
+@@ -563,8 +624,8 @@
+                 __syncwarp();
+             }
+         };
+-        warp_idx < (kFirstPostWGIdx + 1) * kNumWarpsPerWG ?
+-            run_post_worker(cute::Int<0>{}) : run_post_worker(cute::Int<1>{});
++        // One code copy for both workers: two copies thrash the instruction cache
++        run_post_worker(warp_idx / kNumWarpsPerWG - kFirstPostWGIdx);
+         cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
+     } else if (warp_idx < kMixWGIdx * kNumWarpsPerWG) {
+         // WG3: workspace-epilogue worker, draining one split accumulator block per grid-stride task
+@@ -654,15 +715,9 @@
+             }
+         }
+     } else if (warp_idx < kNormWGIdx * kNumWarpsPerWG) {
+-        // WG4: four shifted Mix workers, one per warp
+-        if constexpr (kIsShifted) {
++        // WG4: shifted Mix workers, started with the Norm workers below
++        if constexpr (kIsShifted)
+             cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
+-            const uint32_t warp_idx_in_mix_wg = warp_idx - kMixWGIdx * kNumWarpsPerWG;
+-            for (uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + warp_idx_in_mix_wg;
+-                 token_idx < norm_args.num_tokens; token_idx += kNumSMs * kNumWarpsPerWG)
+-                epilogue::mega_mhc::run_mix_task<kHidden, true>(
+-                    workspace, gmem_split_barriers, mix_args, token_idx, lane_idx);
+-        }
+     }
+ 
+     if constexpr (not kIsShifted) {
+@@ -681,12 +736,17 @@
+             gmem_split_barriers, mix_args, norm_args);
+         cutlass::arch::warpgroup_reg_dealloc<kNumControlRegisters>();
+     } else {
+-        // WG5 starts immediately; retired Post workers join the same Norm task queue.
++        // WG5 normalizes each task's X1 as its m-block completes; the retired Post workers share the CTA's last task.
++        // WG4 starts the Mix task queue, which WG3 joins once its last split accumulator has drained.
+         const uint32_t wg_idx = warp_idx / kNumWarpsPerWG;
+         if ((wg_idx >= kFirstPostWGIdx and wg_idx < kWorkspaceEpilogueWGIdx) or wg_idx == kNormWGIdx) {
+             epilogue::mega_mhc::run_shifted_norm_worker<kHidden, kNumSMs, kNumShiftedNormRegisters,
+-                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M>(
+-                smem, workspace, gmem_split_barriers, norm_args, lane_idx);
++                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M, kX1TmemStartColumn>(
++                smem, workspace, gmem_split_barriers, norm_args, tmem_base, num_tasks,
++                wg_idx == kNormWGIdx ? 0 : wg_idx - kFirstPostWGIdx + 1, warp_idx % kNumWarpsPerWG, lane_idx);
++        } else if (wg_idx == kWorkspaceEpilogueWGIdx or wg_idx == kMixWGIdx) {
++            epilogue::mega_mhc::run_shifted_mix_worker<kHidden, kNumSMs>(
++                smem, workspace, gmem_split_barriers, mix_args, norm_args.num_tokens, lane_idx);
+         }
+     }
+ 
+diff --git a/deep_gemm/include/deep_gemm/impls/sm107_shifted_mega_mhc.cuh b/deep_gemm/include/deep_gemm/impls/sm107_shifted_mega_mhc.cuh
+new file mode 100644
+index 0000000..cf50115
+--- /dev/null
++++ b/deep_gemm/include/deep_gemm/impls/sm107_shifted_mega_mhc.cuh
+@@ -0,0 +1,739 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunknown-attributes"
++
++#include <cutlass/arch/barrier.h>
++#include <cutlass/arch/reg_reconfig.h>
++
++#include <deep_gemm/common/cute_tie.cuh>
++#include <deep_gemm/common/math.cuh>
++#include <deep_gemm/common/ring_pipeline.cuh>
++#include <deep_gemm/common/tma_copy.cuh>
++#include <deep_gemm/common/utils.cuh>
++#include <deep_gemm/layout/mega_mhc_tmem.cuh>
++#include <deep_gemm/mma/sm100.cuh>
++#include <deep_gemm/ptx/ld_st.cuh>
++#include <deep_gemm/ptx/tma.cuh>
++#include <deep_gemm/ptx/tcgen05.cuh>
++#include <deep_gemm/ptx/utils.cuh>
++#include <deep_gemm/scheduler/mega_mhc_tmem.cuh>
++#include <deep_gemm/epilogue/sm107_shifted_mega_mhc.cuh>
++
++namespace deep_gemm::sm107_mhc {
++
++using namespace layout::mega_mhc_tmem;
++using SharedStorage = layout::mega_mhc_tmem::SharedStorage;
++
++namespace mega_mhc {
++
++// A task is one (m-block, K-split) pair, subdivided into BLOCK_K blocks.
++// UMMA_K is the per-route hidden width of one TF32 UMMA instruction.
++constexpr uint32_t UMMA_K = 32 / sizeof(float);
++constexpr uint32_t kNumTokenRowsPerLane = 2;
++
++} // namespace mega_mhc
++
++// Persistent mHC with static grid-stride roles and TMA-native layouts.
++// Norm receives one arrival only after Shifted X1 statistics are committed.
++template <uint32_t kHidden, uint32_t kNumSplits, uint32_t kNumSMs,
++          bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M,
++          bool kUseRuntimePostWorker = false>
++CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
++    sm107_shifted_mega_mhc_impl(const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
++                        const __grid_constant__ cute::TmaDescriptor tensor_map_x,
++                        const __grid_constant__ cute::TmaDescriptor tensor_map_fn,
++                        const __grid_constant__ cute::TmaDescriptor tensor_map_post_mix,
++                        const __grid_constant__ cute::TmaDescriptor tensor_map_comb_res_mix,
++                        const __grid_constant__ cute::TmaDescriptor tensor_map_shifted_prev_mix,
++                        const __grid_constant__ cute::TmaDescriptor tensor_map_new_residual,
++                        const __grid_constant__ cute::TmaDescriptor tensor_map_y_bf16,
++                        const __grid_constant__ MixArgs mix_args,
++                        const __grid_constant__ NormArgs norm_args,
++                        void* gmem_scratch,
++                        uint64_t* gmem_split_barriers) {
++#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
++    using namespace mega_mhc;
++    using Allocator = cute::TMEM::Allocator1Sm;
++    // Each Post worker occupies exactly one WG; the role dispatch hardwires two of them.
++    constexpr uint32_t kNumPostWGs = 2;
++
++    // Template checks
++    DG_STATIC_ASSERT(kHidden > 0 and kHidden % BLOCK_K == 0 and kNumSplits <= kHidden / BLOCK_K,
++                     "Splits must contain nonempty, aligned K blocks");
++    DG_STATIC_ASSERT(SF_BLOCK_M == 0 or kStoreFP8, "Shared SF requires FP8 output");
++    DG_STATIC_ASSERT(kIsShifted, "TMEM mHC requires Shifted mode");
++
++    // Task geometry
++    constexpr uint32_t kNumKBlocksPerSplit = kHidden / BLOCK_K / kNumSplits;
++    constexpr uint32_t kNumLongSplits = kHidden / BLOCK_K % kNumSplits;
++    constexpr uint32_t kMaxNumTaskKBlocks = kNumKBlocksPerSplit + (kNumLongSplits > 0 ? 1 : 0);
++
++    // MMA and tensor memory configs
++    constexpr uint32_t kNumTmemColumnsPerAStage = kNumRoutes * UMMA_K;
++    constexpr uint32_t kAccumTmemStartColumn = kNumAStages * kNumTmemColumnsPerAStage;
++    // Shifted holds each task's X1 (BF16 pairs, one row per lane) in tensor memory until its m-block's statistics
++    // complete; the second X1 buffer starts after the accumulators.
++    constexpr uint32_t kNumX1TmemColumnsPerKBlock = BLOCK_K / 2;
++    constexpr uint32_t kX1TmemStartColumn = kAccumTmemStartColumn + kNumAccumStages * BLOCK_N;
++    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<
++        kX1TmemStartColumn + (kIsShifted ? kMaxNumTaskKBlocks * kNumX1TmemColumnsPerKBlock : 0)>();
++    DG_STATIC_ASSERT(kNumTmemCols <= 512, "X1 buffers exceed tensor memory");
++    const auto get_task_k_begin = [&](const uint32_t split_idx) {
++        return split_idx * (kNumKBlocksPerSplit * BLOCK_K) + cute::min(split_idx, kNumLongSplits) * BLOCK_K;
++    };
++    const auto get_num_task_k_blocks = [&](const uint32_t split_idx) {
++        return kNumKBlocksPerSplit + (split_idx < kNumLongSplits);
++    };
++
++    // CTA role assignments
++    constexpr uint32_t kFirstPostWGIdx = 1;
++    constexpr uint32_t kWorkspaceEpilogueWGIdx = kFirstPostWGIdx + kNumPostWGs;
++    constexpr uint32_t kMixWGIdx = kWorkspaceEpilogueWGIdx + 1;
++    constexpr uint32_t kNormWGIdx = kMixWGIdx + 1;
++    constexpr uint32_t kNumWGsPerCTA = kNormWGIdx + 1;
++    constexpr uint32_t kNumPostWarps = kNumPostWGs * kNumWarpsPerWG;
++    DG_STATIC_ASSERT(kNumWGsPerCTA == 6, "Unexpected CTA topology");
++
++    // Register reconfigurations
++    constexpr uint32_t kNumControlRegisters = 32;
++    constexpr uint32_t kNumPostRegisters = kIsShifted ? 136 : 112;
++    constexpr uint32_t kNumLightweightRegisters = 40;
++    constexpr uint32_t kNumShiftedNormRegisters = 96;
++    constexpr uint32_t kNumNormalRegisters = 80;
++
++    // WG3 epilogue and WG4 Mix use the same lightweight allocation.
++    constexpr uint32_t kStaticRoleRegisterBudget = kNumControlRegisters + kNumPostRegisters * kNumPostWGs +
++                                                   2 * kNumLightweightRegisters + kNumShiftedNormRegisters;
++    constexpr uint32_t kMaxRegisterBudget = cute::max(kStaticRoleRegisterBudget, kNumNormalRegisters * kNumWGsPerCTA);
++    DG_STATIC_ASSERT(kMaxRegisterBudget * 128 <= 64512, "Register reconfiguration exceeds the SM budget");
++    DG_STATIC_ASSERT(kMaxRegisterBudget <= 80 * kNumWGsPerCTA, "Register reconfiguration exceeds the CTA entry pool");
++
++    // Thread indices
++    const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
++    const uint32_t lane_idx = ptx::get_lane_idx();
++
++    // Post and workspace-epilogue warps share this mapping: each lane owns two rows and one column pair.
++    // NOTES: runtime indices are recomputed per role branch so no value stays live across the
++    // register reconfigurations (which would spill to local memory).
++    constexpr uint32_t kNumRowsPerWarp = BLOCK_M / kNumWarpsPerWG;
++    constexpr uint32_t kNumRowGroupsPerWarp = kNumRowsPerWarp / kNumTokenRowsPerLane;
++    constexpr uint32_t kNumLanesPerRowGroup = 32 / kNumRowGroupsPerWarp;
++    const auto get_first_row_idx = [&] {
++        return warp_idx % kNumWarpsPerWG * kNumRowsPerWarp + lane_idx / kNumLanesPerRowGroup;
++    };
++
++    // Runtime state
++    const uint32_t num_m_blocks = Workspace<kNumSplits>::get_num_m_blocks(norm_args.num_tokens);
++    const uint32_t num_tasks = num_m_blocks * kNumSplits;
++    Workspace<kNumSplits> workspace(gmem_scratch, num_m_blocks);
++
++    // Shared memory
++    extern __shared__ __align__(kSwizzleAlignment) uint8_t smem_buffer[];
++    auto& smem = *reinterpret_cast<SharedStorage*>(smem_buffer);
++
++    const auto init_barriers = [](auto& barriers, const uint32_t count) {
++        #pragma unroll
++        for (auto& barrier: barriers)
++            barrier.init(count);
++    };
++
++    // Descriptor cache hints and barriers are initialized once per persistent CTA.
++    if (warp_idx == 0 and cute::elect_one_sync()) {
++        smem.next_norm_task_ticket = 0;
++        smem.next_mix_task_ticket = 0;
++
++        // Normal aliases the shifted-only descriptors to valid maps, so prefetch unconditionally.
++        for (const auto& tensor_map: {&tensor_map_residual, &tensor_map_x, &tensor_map_fn,
++                                      &tensor_map_post_mix, &tensor_map_comb_res_mix,
++                                      &tensor_map_shifted_prev_mix, &tensor_map_new_residual,
++                                      &tensor_map_y_bf16})
++            cute::prefetch_tma_descriptor(tensor_map);
++
++        init_barriers(smem.full_io_barriers, 1);
++        init_barriers(smem.empty_io_barriers, 1);
++        init_barriers(smem.store_ready_io_barriers, kNumPostWarps);
++        init_barriers(smem.full_coeff_barriers, 1);
++        init_barriers(smem.empty_coeff_barriers, kNumPostWarps);
++        cutlass::arch::fence_barrier_init();
++    } else if (warp_idx == 1 and cute::elect_one_sync()) {
++        // Fn load pipeline.
++        init_barriers(smem.full_fn_barriers, 1);
++        init_barriers(smem.empty_fn_barriers, 1);
++        cutlass::arch::fence_barrier_init();
++    } else if (warp_idx == 2 and cute::elect_one_sync()) {
++        // MMA, Post, and workspace-epilogue pipelines.
++        init_barriers(smem.full_a_barriers, 128);
++        init_barriers(smem.empty_a_barriers, 1);
++        init_barriers(smem.full_accum_barriers, 1);
++        init_barriers(smem.empty_accum_barriers, kNumWarpsPerWG);
++
++        smem.full_stats_barrier.init(kNumPostWarps);
++        smem.empty_stats_barrier.init(kNumWarpsPerWG + (kIsShifted ? 1 : 0));
++        smem.mix_arrival_barrier.init(kNumWarpsPerWG + (kIsShifted ? 0 : 1));
++        init_barriers(smem.full_x1_barriers, kNumPostWarps);
++        init_barriers(smem.empty_x1_barriers, kNumWarpsPerWG);
++        cutlass::arch::fence_barrier_init();
++    }
++
++    // Warp 3 owns the CTA-wide TMEM allocation.
++    if (warp_idx == 3)
++        Allocator().allocate(kNumTmemCols, &smem.tmem_base);
++
++    // Local initialization can overlap the preceding grid, but persistent split barriers cannot.
++    cudaGridDependencySynchronize();
++    if (warp_idx == kFirstPostWGIdx * kNumWarpsPerWG + 1 and cute::elect_one_sync()) {
++        for (uint32_t m_block_idx = blockIdx.x; m_block_idx < num_m_blocks; m_block_idx += kNumSMs)
++            sched::mega_mhc_tmem::Mix::init(gmem_split_barriers, m_block_idx);
++    }
++    if constexpr (kIsShifted) {
++        if (warp_idx == kFirstPostWGIdx * kNumWarpsPerWG and cute::elect_one_sync()) {
++            for (uint32_t m_block_idx = blockIdx.x; m_block_idx < num_m_blocks; m_block_idx += kNumSMs)
++                sched::mega_mhc_tmem::Norm::init(gmem_split_barriers, m_block_idx);
++        }
++    }
++
++    __syncthreads();
++    const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_base);
++
++    // Static roles follow the execution graph: WG0 TMA/MMA, WG1-2 Post, WG3 workspace epilogue, WG4 Mix, and WG5 Norm.
++    if (warp_idx < kFirstPostWGIdx * kNumWarpsPerWG) {
++        // WG0: producer pipelines
++        cutlass::arch::warpgroup_reg_dealloc<kNumControlRegisters>();
++
++        // IO and Fn warp workers follow the same task traversal; only their hidden-block copies differ.
++        const auto run_tma_load_worker = [&](auto& empty_barriers, const auto& load_hidden_block) {
++            constexpr uint32_t kNumStages = sizeof(empty_barriers) / sizeof(empty_barriers[0]);
++            RingPipeline<kNumStages> pipeline;
++
++            if (cute::elect_one_sync()) {
++                for (uint32_t task_idx = blockIdx.x; task_idx < num_tasks; task_idx += kNumSMs) {
++                    const uint32_t split_idx = task_idx % kNumSplits;
++                    const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
++                    const uint32_t m_idx = task_idx / kNumSplits * BLOCK_M;
++
++                    #pragma unroll 1
++                    for (uint32_t k_block_idx = 0; k_block_idx < num_task_k_blocks; ++ k_block_idx) {
++                        CUTE_TIE_DECL(pipeline.advance(), stage_idx, stage_phase);
++                        empty_barriers[stage_idx].wait(stage_phase ^ 1u);
++                        load_hidden_block(stage_idx, get_task_k_begin(split_idx) + k_block_idx * BLOCK_K, m_idx);
++                    }
++                }
++            }
++            __syncwarp();
++        };
++
++        if (warp_idx == 0) {
++            // Warp 0: residual and X TMA-load worker
++            run_tma_load_worker(smem.empty_io_barriers,
++                [&](const uint32_t& stage_idx, const uint32_t& k_idx, const uint32_t& m_idx) {
++                    tma::copy<BLOCK_K, BLOCK_M, kSwizzleMode, nv_bfloat16, true>(
++                        &tensor_map_residual, &smem.full_io_barriers[stage_idx],
++                        reinterpret_cast<nv_bfloat16*>(smem.residual[stage_idx][0]), k_idx, m_idx);
++                    tma::copy<BLOCK_K, BLOCK_M, kSwizzleMode, nv_bfloat16>(
++                        &tensor_map_x, &smem.full_io_barriers[stage_idx],
++                        reinterpret_cast<nv_bfloat16*>(smem.x[stage_idx]), k_idx, m_idx);
++                    smem.full_io_barriers[stage_idx].arrive_and_expect_tx(sizeof(smem.residual[0]) + sizeof(smem.x[0]));
++                });
++        } else if (warp_idx == 1) {
++            // Warp 1: Fn TMA-load worker
++            run_tma_load_worker(smem.empty_fn_barriers,
++                [&](const uint32_t& stage_idx, const uint32_t& k_idx, const uint32_t&) {
++                    tma::copy<BLOCK_K, kNumRoutes * kNumHCOutputs, kSwizzleMode, float, true>(
++                        &tensor_map_fn, &smem.full_fn_barriers[stage_idx],
++                        smem.fn[stage_idx][0][0], k_idx, 0u);
++                    smem.full_fn_barriers[stage_idx].arrive_and_expect_tx(sizeof(smem.fn[0]));
++                });
++        } else if (warp_idx == 2) {
++            // Warp 2: HC MMA worker
++            using umma_t = cute::SM100_MMA_TF32_TS<cutlass::tfloat32_t, cutlass::tfloat32_t, float, BLOCK_M, BLOCK_N,
++                                                   cute::UMMA::Major::K, cute::UMMA::Major::K>;
++            const auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc<cutlass::tfloat32_t, cutlass::tfloat32_t, float, BLOCK_M, BLOCK_N,
++                                                                                cute::UMMA::Major::K, cute::UMMA::Major::K>();
++
++            RingPipeline<kNumFnStages> fn_pipeline;
++            RingPipeline<kNumAStages> a_pipeline;
++            RingPipeline<kNumAccumStages> accum_pipeline;
++
++            for (uint32_t task_idx = blockIdx.x; task_idx < num_tasks; task_idx += kNumSMs) {
++                const uint32_t split_idx = task_idx % kNumSplits;
++                const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
++
++                // Wait workspace-epilogue accumulator release
++                CUTE_TIE_DECL(accum_pipeline.advance(), accum_stage_idx, accum_phase);
++                smem.empty_accum_barriers[accum_stage_idx].wait(accum_phase ^ 1u);
++                ptx::tcgen05_after_thread_sync();
++
++                #pragma unroll 1
++                for (uint32_t k_block_idx = 0; k_block_idx < num_task_k_blocks; ++ k_block_idx) {
++                    // Wait TMA Fn arrival
++                    CUTE_TIE_DECL(fn_pipeline.advance(), fn_stage_idx, fn_phase);
++                    smem.full_fn_barriers[fn_stage_idx].wait(fn_phase);
++                    ptx::tcgen05_after_thread_sync();
++
++                    #pragma unroll
++                    for (uint32_t umma_k_idx = 0; umma_k_idx < BLOCK_K / UMMA_K; ++ umma_k_idx) {
++                        // Wait Post A arrival
++                        CUTE_TIE_DECL(a_pipeline.advance(), a_stage_idx, a_phase);
++                        smem.full_a_barriers[a_stage_idx].wait(a_phase);
++                        ptx::tcgen05_after_thread_sync();
++
++                        // Hidden blocks, UMMA K atoms, and routes accumulate into one HC output block in fixed order.
++                        #pragma unroll
++                        for (uint32_t route_idx = 0; route_idx < kNumRoutes; ++ route_idx) {
++                            auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, BLOCK_N, kFnAtomK, kSwizzleMode>(
++                                            smem.fn[fn_stage_idx][umma_k_idx * UMMA_K / kFnAtomK][route_idx],
++                                            0, umma_k_idx * UMMA_K % kFnAtomK);
++                            umma_t::fma(tmem_base + a_stage_idx * kNumTmemColumnsPerAStage + route_idx * UMMA_K,
++                                        b_desc, tmem_base + kAccumTmemStartColumn + accum_stage_idx * BLOCK_N,
++                                        k_block_idx > 0 or umma_k_idx > 0 or route_idx > 0, runtime_instr_desc);
++                        }
++                        // Release the A stage
++                        cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(&smem.empty_a_barriers[a_stage_idx]));
++                    }
++                    // Release the Fn stage
++                    cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(&smem.empty_fn_barriers[fn_stage_idx]));
++                }
++                // Commit this split's accumulator
++                cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(&smem.full_accum_barriers[accum_stage_idx]));
++            }
++        } else {
++            // Warp 3: output-store, coefficient-prefetch, and Norm-arrival worker
++            RingPipeline<kNumIOStages> io_pipeline;
++            RingPipeline<kNumCoeffStages> coeff_pipeline;
++
++            const auto issue_coeff_tma = [&](const uint32_t& m_idx, const uint32_t& stage_idx) {
++                tma::copy<kNumRoutes, BLOCK_M, 0, float>(&tensor_map_post_mix, &smem.full_coeff_barriers[stage_idx],
++                                                        smem.post_coeff[stage_idx][0], 0u, m_idx);
++                tma::copy<kNumRoutes * kNumRoutes, BLOCK_M, kSwizzleMode / 2, float>(
++                    &tensor_map_comb_res_mix, &smem.full_coeff_barriers[stage_idx], smem.comb_coeff[stage_idx][0], 0u, m_idx);
++                if constexpr (kIsShifted)
++                    tma::copy<kNumRoutes, BLOCK_M, 0, float>(&tensor_map_shifted_prev_mix, &smem.full_coeff_barriers[stage_idx],
++                                                             smem.pre_coeff[stage_idx][0], 0u, m_idx);
++                smem.full_coeff_barriers[stage_idx].arrive_and_expect_tx(sizeof(smem.post_coeff[0]) + sizeof(smem.comb_coeff[0]) +
++                                                                         (kIsShifted ? sizeof(smem.pre_coeff[0]) : 0));
++            };
++
++            // The coefficient ring advances once per task, independently of the per-block IO ring.
++            auto advance_coeff_pipeline = [&]() {
++                CUTE_TIE_DECL(coeff_pipeline.advance(), stage_idx, phase);
++                smem.empty_coeff_barriers[stage_idx].wait(phase ^ 1u);
++                return stage_idx;
++            };
++
++            // Seed the first task's coefficients; every task then fetches its successor's.
++            if (blockIdx.x < num_tasks) {
++                const uint32_t coeff_stage_idx = advance_coeff_pipeline();
++                if (cute::elect_one_sync())
++                    issue_coeff_tma(blockIdx.x / kNumSplits * BLOCK_M, coeff_stage_idx);
++                __syncwarp();
++            }
++
++            for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += kNumSMs, task_phase ^= 1u) {
++                const uint32_t split_idx = task_idx % kNumSplits;
++                const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
++                const uint32_t m_block_idx = task_idx / kNumSplits;
++                // A task ahead: the Post workers wait on them at their next task switch.
++                if (task_idx + kNumSMs < num_tasks) {
++                    const uint32_t next_coeff_stage_idx = advance_coeff_pipeline();
++                    if (cute::elect_one_sync())
++                        issue_coeff_tma((task_idx + kNumSMs) / kNumSplits * BLOCK_M, next_coeff_stage_idx);
++                    __syncwarp();
++                }
++                if constexpr (kIsShifted)
++                    sched::mega_mhc_tmem::Norm::wait_init<kNumSplits>(gmem_split_barriers, m_block_idx);
++
++                #pragma unroll 1
++                for (uint32_t k_block_idx = 0; k_block_idx < num_task_k_blocks; ++ k_block_idx) {
++                    // Wait for all Post route stores of this hidden block
++                    CUTE_TIE_DECL(io_pipeline.advance(), io_stage_idx, io_phase);
++                    smem.store_ready_io_barriers[io_stage_idx].wait(io_phase);
++
++                    const uint32_t k_idx = get_task_k_begin(split_idx) + k_block_idx * BLOCK_K;
++                    const uint32_t m_idx = m_block_idx * BLOCK_M;
++                    if (cute::elect_one_sync()) {
++                        // New residual is re-read by the fused Normal workers, so it stays in L2
++                        // (EVICT_LAST); Shifted consumes it only in the next layer.
++                        ptx::tma_store_3d(&tensor_map_new_residual, smem.residual[io_stage_idx][0],
++                                          k_idx, m_idx, 0u,
++                                          kIsShifted ? cute::TMA::CacheHintSm100::EVICT_NORMAL
++                                                     : cute::TMA::CacheHintSm100::EVICT_LAST);
++                        cute::tma_store_arrive();
++                        // Complete the destination writes before releasing this IO stage.
++                        ptx::tma_store_wait<0>();
++                        smem.empty_io_barriers[io_stage_idx].arrive();
++                    }
++                }
++
++                if constexpr (kIsShifted) {
++                    // Arrive at Norm only after both Post workers have committed their row statistics.
++                    smem.full_stats_barrier.wait(task_phase);
++                    const auto x1_sqr_sum_partial = workspace.get_x1_sqr_sum_partial_ptr(task_idx);
++                    float2 row_sqr_sums = {};
++                    #pragma unroll
++                    for (uint32_t post_worker_idx = 0; post_worker_idx < kNumPostWGs; ++ post_worker_idx) {
++                        row_sqr_sums.x += smem.x1_sqr_sums[post_worker_idx][lane_idx];
++                        row_sqr_sums.y += smem.x1_sqr_sums[post_worker_idx][lane_idx + 32];
++                    }
++
++                    x1_sqr_sum_partial[lane_idx] = row_sqr_sums.x;
++                    x1_sqr_sum_partial[lane_idx + 32] = row_sqr_sums.y;
++                    __syncwarp();
++                    if (cute::elect_one_sync()) {
++                        smem.empty_stats_barrier.arrive();
++                        sched::mega_mhc_tmem::Norm::arrive<kNumSplits>(gmem_split_barriers, m_block_idx);
++                    }
++                } else if (cute::elect_one_sync()) {
++                    smem.mix_arrival_barrier.arrive();
++                }
++            }
++        }
++    } else if (warp_idx < kWorkspaceEpilogueWGIdx * kNumWarpsPerWG) {
++        // WG1-2: Post workers, one per WG
++        const auto get_bf16x2_offset = [](const uint32_t& row_idx, const uint32_t& col_idx) {
++            constexpr uint32_t kNumColsPerRow = kSwizzleMode / sizeof(nv_bfloat162);
++            constexpr uint32_t kNumColsPerBank = 16 / sizeof(nv_bfloat162);
++            const uint32_t bank_group_idx = (col_idx / kNumColsPerBank) ^ (row_idx & (kSwizzleMode / 16 - 1));
++            return row_idx * kNumColsPerRow + bank_group_idx * kNumColsPerBank + col_idx % kNumColsPerBank;
++        };
++
++        // Comb rows use a separate 64B swizzle to distribute each four-float group across banks.
++        const auto load_comb_coeff = [](const float* row, const uint32_t& row_idx, const uint32_t& coeff_idx) {
++            const uint32_t bank_group_idx = (coeff_idx / 4) ^ ((row_idx / 2) & 3);
++            return row[bank_group_idx * 4 + coeff_idx % 4];
++        };
++
++        DG_STATIC_ASSERT(UMMA_K % kNumLanesPerRowGroup == 0, "Invalid Post geometry");
++
++        const auto run_post_worker = [&](auto post_worker) {
++            const uint32_t post_worker_idx = post_worker;
++            cutlass::arch::warpgroup_reg_alloc<kNumPostRegisters>();
++            const uint32_t col_pair_idx = lane_idx & (kNumLanesPerRowGroup - 1);
++            const uint32_t first_row_idx = get_first_row_idx();
++            const uint32_t row_indices[kNumTokenRowsPerLane] = {first_row_idx, first_row_idx + kNumRowGroupsPerWarp};
++
++            RingPipeline<kNumIOStages> io_pipeline;
++            RingPipeline<kNumAStages> a_pipeline;
++            RingPipeline<kNumCoeffStages> coeff_pipeline;
++            RingPipeline<kNumX1Buffers> x1_pipeline;
++
++            // Each Post worker maps to one WG; offset them so their A stages interleave.
++            a_pipeline.advance(post_worker_idx);
++
++            for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += kNumSMs, task_phase ^= 1u) {
++                const uint32_t split_idx = task_idx % kNumSplits;
++                const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
++
++                CUTE_TIE_DECL(coeff_pipeline.advance(), coeff_stage_idx, coeff_phase);
++                float2 hc_norm_sqr_sums[kNumTokenRowsPerLane] = {};
++                float2 x1_sqr_sums[kNumTokenRowsPerLane] = {};
++
++                // Coefficients stay in registers for every hidden block, so release their SMEM stage immediately.
++                smem.full_coeff_barriers[coeff_stage_idx].wait(coeff_phase);
++                float2 row_pre_coeff[kNumRoutes];
++                float2 row_post_coeff[kNumRoutes];
++                #pragma unroll
++                for (uint32_t route_idx = 0; route_idx < kNumRoutes; ++ route_idx) {
++                    if constexpr (kIsShifted)
++                        row_pre_coeff[route_idx] = {smem.pre_coeff[coeff_stage_idx][row_indices[0]][route_idx],
++                                                    smem.pre_coeff[coeff_stage_idx][row_indices[1]][route_idx]};
++                    row_post_coeff[route_idx] = {smem.post_coeff[coeff_stage_idx][row_indices[0]][route_idx],
++                                                 smem.post_coeff[coeff_stage_idx][row_indices[1]][route_idx]};
++                }
++
++                float2 row_comb_coeff[kNumRoutes * kNumRoutes];
++                #pragma unroll
++                for (uint32_t coeff_idx = 0; coeff_idx < kNumRoutes * kNumRoutes; ++ coeff_idx)
++                    row_comb_coeff[coeff_idx] = {load_comb_coeff(smem.comb_coeff[coeff_stage_idx][row_indices[0]], row_indices[0], coeff_idx),
++                                                 load_comb_coeff(smem.comb_coeff[coeff_stage_idx][row_indices[1]], row_indices[1], coeff_idx)};
++
++                __syncwarp();
++                if (cute::elect_one_sync()) {
++                    cutlass::arch::fence_view_async_shared();
++                    smem.empty_coeff_barriers[coeff_stage_idx].arrive();
++                }
++
++                // Wait for the Norm workers to drain this task's X1 buffer
++                uint32_t x1_buffer_idx = 0, x1_tmem_addr = 0;
++                if constexpr (kIsShifted) {
++                    CUTE_TIE_DECL(x1_pipeline.advance(), buffer_idx, buffer_phase);
++                    smem.empty_x1_barriers[buffer_idx].wait(buffer_phase ^ 1u);
++                    ptx::tcgen05_after_thread_sync();
++                    x1_buffer_idx = buffer_idx;
++                    x1_tmem_addr = tmem_base + epilogue::mega_mhc_tmem::get_x1_tmem_offset<kX1TmemStartColumn>(buffer_idx);
++                }
++
++                // Round-robin UMMA atoms across Post workers and retain statistics until the split ends.
++                #pragma unroll 1
++                for (uint32_t k_block_idx = 0; k_block_idx < num_task_k_blocks; ++ k_block_idx) {
++                    // Wait TMA residual and X arrival
++                    CUTE_TIE_DECL(io_pipeline.advance(), io_stage_idx, io_phase);
++                    smem.full_io_barriers[io_stage_idx].wait(io_phase);
++
++                    #pragma unroll
++                    for (uint32_t atom_idx = 0; atom_idx < BLOCK_K / UMMA_K / kNumPostWGs; ++ atom_idx) {
++                        const uint32_t umma_k_idx = atom_idx * kNumPostWGs + post_worker_idx;
++                        const uint32_t hidden_pair_idx = umma_k_idx * (UMMA_K / 2) +
++                                                         col_pair_idx * (UMMA_K / kNumLanesPerRowGroup / 2);
++                        float2 x[kNumTokenRowsPerLane];
++                        float2 residual[kNumTokenRowsPerLane][kNumRoutes];
++                        #pragma unroll
++                        for (uint32_t row_idx = 0; row_idx < kNumTokenRowsPerLane; ++ row_idx) {
++                            x[row_idx] = __bfloat1622float2(
++                                smem.x[io_stage_idx][get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)]);
++                            #pragma unroll
++                            for (uint32_t input_route_idx = 0; input_route_idx < kNumRoutes; ++ input_route_idx)
++                                residual[row_idx][input_route_idx] = __bfloat1622float2(
++                                    smem.residual[io_stage_idx][input_route_idx][get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)]);
++                        }
++
++                        // Wait MMA release of this worker's next A stage
++                        CUTE_TIE_DECL(a_pipeline.advance(kNumPostWGs), a_stage_idx, a_phase);
++                        smem.empty_a_barriers[a_stage_idx].wait(a_phase ^ 1u);
++                        ptx::tcgen05_after_thread_sync();
++
++                        float2 x1[kNumTokenRowsPerLane] = {};
++                        float2 post_values[kNumRoutes][kNumTokenRowsPerLane];
++                        #pragma unroll
++                        for (uint32_t row_idx = 0; row_idx < kNumTokenRowsPerLane; ++ row_idx) {
++                            #pragma unroll
++                            for (uint32_t output_route_idx = 0; output_route_idx < kNumRoutes; ++ output_route_idx) {
++                                const float2 post = row_post_coeff[output_route_idx];
++                                const float post_coeff = row_idx == 0 ? post.x : post.y;
++                                auto& post_value = post_values[output_route_idx][row_idx];
++                                post_value = __fmul2_rn(x[row_idx], {post_coeff, post_coeff});
++                                #pragma unroll
++                                for (uint32_t input_route_idx = 0; input_route_idx < kNumRoutes; ++ input_route_idx) {
++                                    const uint32_t comb_idx = input_route_idx * kNumRoutes + output_route_idx;
++                                    const float2 comb = row_comb_coeff[comb_idx];
++                                    const float coeff = row_idx == 0 ? comb.x : comb.y;
++                                    post_value = __ffma2_rn(residual[row_idx][input_route_idx], {coeff, coeff}, post_value);
++                                }
++                                // NOTES: this BF16 round is the shared numerical boundary for all consumers.
++                                const nv_bfloat162 post_value_bf16 = __float22bfloat162_rn(post_value);
++                                post_value = __bfloat1622float2(post_value_bf16);
++                                smem.residual[io_stage_idx][output_route_idx][
++                                    get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = post_value_bf16;
++                                hc_norm_sqr_sums[row_idx] = __ffma2_rn(post_value, post_value, hc_norm_sqr_sums[row_idx]);
++                                if constexpr (kIsShifted) {
++                                    const float2 pre = row_pre_coeff[output_route_idx];
++                                    const float coeff = row_idx == 0 ? pre.x : pre.y;
++                                    x1[row_idx] = __ffma2_rn(post_value, {coeff, coeff}, x1[row_idx]);
++                                }
++                            }
++                        }
++
++                        const auto tmem_values = reinterpret_cast<const uint32_t(*)[4]>(post_values);
++                        const uint32_t tmem_addr = tmem_base + a_stage_idx * kNumTmemColumnsPerAStage;
++                        cute::SM100_TMEM_STORE_16dp256b4x::copy(tmem_values[0][0], tmem_values[0][1], tmem_values[0][2], tmem_values[0][3],
++                                                                tmem_values[1][0], tmem_values[1][1], tmem_values[1][2], tmem_values[1][3],
++                                                                tmem_values[2][0], tmem_values[2][1], tmem_values[2][2], tmem_values[2][3],
++                                                                tmem_values[3][0], tmem_values[3][1], tmem_values[3][2], tmem_values[3][3], tmem_addr);
++
++                        if constexpr (kIsShifted) {
++                            uint32_t x1_values[kNumTokenRowsPerLane];
++                            #pragma unroll
++                            for (uint32_t row_idx = 0; row_idx < kNumTokenRowsPerLane; ++ row_idx) {
++                                const nv_bfloat162 x1_bf16 = __float22bfloat162_rn(x1[row_idx]);
++                                // NOTES: X1 is already rounded to BF16; accumulate without unpacking it back to FP32.
++                                ptx::accumulate_square(x1_sqr_sums[row_idx], x1_bf16);
++                                x1_values[row_idx] = *reinterpret_cast<const uint32_t*>(&x1_bf16);
++                            }
++                            // One X1 column per hidden pair: the lane's two rows at its column pair, as for A.
++                            cute::SM100_TMEM_STORE_16dp128b1x::copy(
++                                x1_values[0], x1_values[1],
++                                x1_tmem_addr + k_block_idx * kNumX1TmemColumnsPerKBlock + umma_k_idx * (UMMA_K / 2));
++                        }
++
++                        // All four warps have issued their route stores before A becomes visible to the MMA warp.
++                        cutlass::arch::fence_view_async_tmem_store();
++                        ptx::tcgen05_before_thread_sync();
++                        smem.full_a_barriers[a_stage_idx].arrive();
++                    }
++
++                    // Make generic-proxy writes visible before the output-store warp reads through the TMA async proxy.
++                    __syncwarp();
++                    if (cute::elect_one_sync()) {
++                        cute::tma_store_fence();
++                        smem.store_ready_io_barriers[io_stage_idx].arrive();
++                    }
++                }
++
++                if constexpr (kIsShifted) {
++                    cutlass::arch::fence_view_async_tmem_store();
++                    ptx::tcgen05_before_thread_sync();
++                    __syncwarp();
++                    if (cute::elect_one_sync())
++                        smem.full_x1_barriers[x1_buffer_idx].arrive();
++                }
++
++                // Wait only when register-held statistics are committed to shared rows reused by the next task.
++                smem.empty_stats_barrier.wait(task_phase ^ 1u);
++
++                // Four lanes own both column pairs of a row, independent of token batch size and SM scheduling.
++                const float reduced_hc_norm_0 = math::warp_reduce_sum<kNumLanesPerRowGroup>(hc_norm_sqr_sums[0].x + hc_norm_sqr_sums[0].y);
++                const float reduced_hc_norm_1 = math::warp_reduce_sum<kNumLanesPerRowGroup>(hc_norm_sqr_sums[1].x + hc_norm_sqr_sums[1].y);
++                float reduced_x1_0, reduced_x1_1;
++                if constexpr (kIsShifted) {
++                    reduced_x1_0 = math::warp_reduce_sum<kNumLanesPerRowGroup>(x1_sqr_sums[0].x + x1_sqr_sums[0].y);
++                    reduced_x1_1 = math::warp_reduce_sum<kNumLanesPerRowGroup>(x1_sqr_sums[1].x + x1_sqr_sums[1].y);
++                }
++
++                smem.hc_norm_sqr_sums[post_worker_idx][row_indices[0]] = reduced_hc_norm_0;
++                smem.hc_norm_sqr_sums[post_worker_idx][row_indices[1]] = reduced_hc_norm_1;
++                if constexpr (kIsShifted) {
++                    smem.x1_sqr_sums[post_worker_idx][row_indices[0]] = reduced_x1_0;
++                    smem.x1_sqr_sums[post_worker_idx][row_indices[1]] = reduced_x1_1;
++                }
++                __syncwarp();
++
++                if (cute::elect_one_sync())
++                    smem.full_stats_barrier.arrive();
++                __syncwarp();
++            }
++        };
++        // A shared Shifted Post body reduces instruction-cache pressure on SM107. Host selection remains
++        // exact even when the JIT compiles the SM100 family target.
++        if constexpr (kUseRuntimePostWorker) {
++            run_post_worker(warp_idx / kNumWarpsPerWG - kFirstPostWGIdx);
++        } else {
++            warp_idx < (kFirstPostWGIdx + 1) * kNumWarpsPerWG ?
++                run_post_worker(cute::Int<0>{}) : run_post_worker(cute::Int<1>{});
++        }
++        cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
++    } else if (warp_idx < kMixWGIdx * kNumWarpsPerWG) {
++        // WG3: workspace-epilogue worker, draining one split accumulator block per grid-stride task
++        cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
++
++        const uint32_t warp_idx_in_wg = warp_idx % kNumWarpsPerWG;
++        const uint32_t col_pair_idx = lane_idx & (kNumLanesPerRowGroup - 1);
++        const uint32_t first_row_idx = get_first_row_idx();
++        const uint32_t row_indices[kNumTokenRowsPerLane] = {first_row_idx, first_row_idx + kNumRowGroupsPerWarp};
++
++        RingPipeline<kNumAccumStages> accum_pipeline;
++
++        for (uint32_t task_idx = blockIdx.x, task_phase = 0; task_idx < num_tasks; task_idx += kNumSMs, task_phase ^= 1u) {
++            const uint32_t m_block_idx = task_idx / kNumSplits;
++            if (warp_idx_in_wg == 0)
++                sched::mega_mhc_tmem::Mix::wait_init<kNumSplits>(gmem_split_barriers, m_block_idx);
++
++            const uint32_t token_indices[kNumTokenRowsPerLane] = {m_block_idx * BLOCK_M + row_indices[0],
++                                                                  m_block_idx * BLOCK_M + row_indices[1]};
++            const auto gemm_partial = workspace.get_gemm_partial_ptr(task_idx);
++
++            // Wait this split's accumulated HC outputs
++            CUTE_TIE_DECL(accum_pipeline.advance(), accum_stage_idx, accum_phase);
++            smem.full_accum_barriers[accum_stage_idx].wait(accum_phase);
++            ptx::tcgen05_after_thread_sync();
++
++            // Each group covers eight FP32 outputs per row; the 2x and 1x loads fetch all three groups.
++            constexpr uint32_t kNumOutputValuesPerLoad = 32 / sizeof(float);
++            constexpr uint32_t kNumOutputValuesPerLane = kNumOutputValuesPerLoad / kNumLanesPerRowGroup;
++            DG_STATIC_ASSERT(kNumOutputValuesPerLoad % kNumLanesPerRowGroup == 0,
++                             "Invalid workspace epilogue geometry");
++
++            DG_STATIC_ASSERT(BLOCK_N == 3 * kNumOutputValuesPerLoad, "Unsupported workspace output width");
++            uint32_t values[3 * kNumLanesPerRowGroup];
++            const uint32_t tmem_addr = tmem_base + kAccumTmemStartColumn + accum_stage_idx * BLOCK_N;
++            cute::SM100_TMEM_LOAD_16dp256b2x::copy(tmem_addr, values[0], values[1], values[2], values[3],
++                                                              values[4], values[5], values[6], values[7]);
++            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr + 2 * kNumOutputValuesPerLoad,
++                                                   values[8], values[9], values[10], values[11]);
++            cutlass::arch::fence_view_async_tmem_load();
++
++            #pragma unroll
++            for (uint32_t output_idx = 0; output_idx < BLOCK_N; output_idx += kNumOutputValuesPerLoad) {
++                const uint32_t value_idx = output_idx / kNumOutputValuesPerLane;
++                float2 row_values[kNumTokenRowsPerLane] = {
++                    {__uint_as_float(values[value_idx]), __uint_as_float(values[value_idx + 1])},
++                    {__uint_as_float(values[value_idx + 2]), __uint_as_float(values[value_idx + 3])}};
++                #pragma unroll
++                for (uint32_t row_idx = 0; row_idx < kNumTokenRowsPerLane; ++ row_idx) {
++                    if (token_indices[row_idx] >= norm_args.num_tokens)
++                        row_values[row_idx] = {0.0f, 0.0f};
++                }
++
++                *reinterpret_cast<float2*>(
++                    gemm_partial + row_indices[0] * BLOCK_N + output_idx + col_pair_idx * kNumOutputValuesPerLane) = row_values[0];
++                *reinterpret_cast<float2*>(
++                    gemm_partial + row_indices[1] * BLOCK_N + output_idx + col_pair_idx * kNumOutputValuesPerLane) = row_values[1];
++            }
++
++            ptx::tcgen05_before_thread_sync();
++            if (cute::elect_one_sync())
++                smem.empty_accum_barriers[accum_stage_idx].arrive();
++
++            // Gate this split's Mix arrival on all four epilogue warps and, in Normal, the output-store warp.
++            smem.full_stats_barrier.wait(task_phase);
++
++            if (lane_idx < kNumRowsPerWarp) {
++                const uint32_t row_idx = warp_idx_in_wg * kNumRowsPerWarp + lane_idx;
++                const auto hc_norm_sqr_sum_partial = workspace.get_hc_norm_sqr_sum_partial_ptr(task_idx);
++                float row_hc_norm_sqr_sum = 0.0f;
++                #pragma unroll
++                for (uint32_t post_worker_idx = 0; post_worker_idx < kNumPostWGs; ++ post_worker_idx)
++                    row_hc_norm_sqr_sum += smem.hc_norm_sqr_sums[post_worker_idx][row_idx];
++                hc_norm_sqr_sum_partial[row_idx] = row_hc_norm_sqr_sum;
++            }
++
++            __syncwarp();
++            if (cute::elect_one_sync()) {
++                smem.empty_stats_barrier.arrive();
++                smem.mix_arrival_barrier.arrive();
++            }
++
++            if (warp_idx_in_wg == 0) {
++                smem.mix_arrival_barrier.wait(task_phase);
++                if (cute::elect_one_sync())
++                    sched::mega_mhc_tmem::Mix::arrive<kNumSplits>(gmem_split_barriers, m_block_idx);
++            }
++        }
++    } else if (warp_idx < kNormWGIdx * kNumWarpsPerWG) {
++        // WG4: shifted Mix workers, started with the Norm workers below
++        if constexpr (kIsShifted)
++            cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
++    }
++
++    if constexpr (not kIsShifted) {
++        // Normal repurposes WG4-5 immediately and each producer WG as soon as its static role retires.
++        if (warp_idx >= kMixWGIdx * kNumWarpsPerWG)
++            cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
++
++        const uint32_t wg_idx_in_cta = warp_idx / kNumWarpsPerWG;
++
++        // Each Normal worker owns a distinct named barrier.
++        cutlass::arch::NamedBarrier::sync(128, 1 + wg_idx_in_cta);
++        cutlass::arch::warpgroup_reg_alloc<kNumNormalRegisters>();
++
++        epilogue::mega_mhc_tmem::run_normal_worker<kHidden, kNumSMs, kStoreBF16, kStoreFP8, SF_BLOCK_M>(
++            smem, workspace, wg_idx_in_cta, warp_idx % kNumWarpsPerWG, lane_idx,
++            gmem_split_barriers, mix_args, norm_args);
++        cutlass::arch::warpgroup_reg_dealloc<kNumControlRegisters>();
++    } else {
++        // WG5 normalizes each task's X1 as its m-block completes; the retired Post workers share the CTA's last task.
++        // WG4 starts the Mix task queue, which WG3 joins once its last split accumulator has drained.
++        const uint32_t wg_idx = warp_idx / kNumWarpsPerWG;
++        if ((wg_idx >= kFirstPostWGIdx and wg_idx < kWorkspaceEpilogueWGIdx) or wg_idx == kNormWGIdx) {
++            epilogue::mega_mhc_tmem::run_shifted_norm_worker<kHidden, kNumSMs, kNumShiftedNormRegisters,
++                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M, kX1TmemStartColumn>(
++                smem, workspace, gmem_split_barriers, norm_args, tmem_base, num_tasks,
++                wg_idx == kNormWGIdx ? 0 : wg_idx - kFirstPostWGIdx + 1, warp_idx % kNumWarpsPerWG, lane_idx);
++        } else if (wg_idx == kWorkspaceEpilogueWGIdx or wg_idx == kMixWGIdx) {
++            epilogue::mega_mhc_tmem::run_shifted_mix_worker<kHidden, kNumSMs>(
++                smem, workspace, gmem_split_barriers, mix_args, norm_args.num_tokens, lane_idx);
++        }
++    }
++
++    // All roles must retire before the allocating warp releases TMEM.
++    __syncthreads();
++    if (warp_idx == 3)
++        Allocator().free(tmem_base, kNumTmemCols);
++#else
++    if (blockIdx.x == 0 and threadIdx.x == 0)
++        DG_DEVICE_ASSERT(false and "This kernel only supports sm_100f");
++#endif
++}
++
++} // namespace deep_gemm::sm107_mhc
++#pragma clang diagnostic pop
 diff --git a/deep_gemm/include/deep_gemm/layout/mega_mhc.cuh b/deep_gemm/include/deep_gemm/layout/mega_mhc.cuh
-index de59a59..a88c4bb 100644
+index de59a59..cf9a652 100644
 --- a/deep_gemm/include/deep_gemm/layout/mega_mhc.cuh
 +++ b/deep_gemm/include/deep_gemm/layout/mega_mhc.cuh
 @@ -13,6 +13,9 @@
@@ -254,3 +2215,241 @@ index de59a59..a88c4bb 100644
  
  // Kernel tile and pipeline geometry
  static constexpr uint32_t BLOCK_M = 64;
+@@ -24,8 +27,11 @@
+ static constexpr uint32_t kNumIOStages = 4;
+ static constexpr uint32_t kNumFnStages = 2;
+ static constexpr uint32_t kNumAStages = 4;
++// The SM100 kernel's A stages (halved when tensor memory is short); SM107's TMEM kernel uses kNumAStages.
++static constexpr uint32_t kNumMaxAStages = 8;
+ static constexpr uint32_t kNumAccumStages = 2;
+ static constexpr uint32_t kNumCoeffStages = 2;
++static constexpr uint32_t kNumX1Buffers = 2;
+ static constexpr uint32_t kNumWarpsPerWG = 4;
+ static constexpr uint32_t kNumThreads = 6 * kNumWarpsPerWG * 32;
+ 
+@@ -147,8 +153,8 @@
+     alignas(Barrier) Barrier full_fn_barriers[kNumFnStages];
+     alignas(Barrier) Barrier empty_fn_barriers[kNumFnStages];
+ 
+-    alignas(Barrier) Barrier full_a_barriers[kNumAStages];
+-    alignas(Barrier) Barrier empty_a_barriers[kNumAStages];
++    alignas(Barrier) Barrier full_a_barriers[kNumMaxAStages];
++    alignas(Barrier) Barrier empty_a_barriers[kNumMaxAStages];
+ 
+     alignas(Barrier) Barrier full_accum_barriers[kNumAccumStages];
+     alignas(Barrier) Barrier empty_accum_barriers[kNumAccumStages];
+@@ -161,9 +167,17 @@
+ 
+     // Gate each split's Mix arrival on all WG3 warps and, in Normal, the output-store worker.
+     alignas(Barrier) Barrier mix_arrival_barrier;
++
++    // Shifted X1 tensor-memory buffers: Post fills one per task, the Norm workers drain it.
++    alignas(Barrier) Barrier full_x1_barriers[kNumX1Buffers];
++    alignas(Barrier) Barrier empty_x1_barriers[kNumX1Buffers];
+     alignas(uint32_t) uint32_t tmem_base;
+-    // Shifted Norm and fused Normal workers share this mutually exclusive task queue.
++    // Fused Normal workers' task queue.
+     alignas(uint32_t) uint32_t next_norm_task_ticket;
++    // Shifted Mix workers' task queue.
++    alignas(uint32_t) uint32_t next_mix_task_ticket;
++    // Set once the CTA's last split is stored; read by the Mix workers.
++    alignas(uint32_t) uint32_t streaming_done;
+ };
+ 
+ } // namespace deep_gemm::layout::mega_mhc
+diff --git a/deep_gemm/include/deep_gemm/layout/mega_mhc_tmem.cuh b/deep_gemm/include/deep_gemm/layout/mega_mhc_tmem.cuh
+new file mode 100644
+index 0000000..dba25ff
+--- /dev/null
++++ b/deep_gemm/include/deep_gemm/layout/mega_mhc_tmem.cuh
+@@ -0,0 +1,61 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <deep_gemm/layout/mega_mhc.cuh>
++namespace deep_gemm::layout::mega_mhc_tmem {
++using namespace layout::mega_mhc;
++struct SharedStorage {
++    using Barrier = cutlass::arch::ClusterTransactionBarrier;
++
++    // Route-major TMA layouts keep every 64 x 64 destination contiguous.
++    alignas(kSwizzleAlignment) nv_bfloat162 residual[kNumIOStages][kNumRoutes][BLOCK_M * BLOCK_K / 2];
++    alignas(kSwizzleAlignment) nv_bfloat162 x[kNumIOStages][BLOCK_M * BLOCK_K / 2];
++
++    // Each Fn TMA fills all routes for one 32-element TF32 swizzle atom.
++    alignas(kSwizzleAlignment) float fn[kNumFnStages][BLOCK_K / kFnAtomK][kNumRoutes][kNumHCOutputs * kFnAtomK];
++
++    // Coeff tensors retain their TMA-native per-token layouts.
++    alignas(kSwizzleMode) float pre_coeff[kNumCoeffStages][BLOCK_M][kNumRoutes];
++    alignas(kSwizzleMode) float post_coeff[kNumCoeffStages][BLOCK_M][kNumRoutes];
++    alignas(kSwizzleMode) float comb_coeff[kNumCoeffStages][BLOCK_M][kNumRoutes * kNumRoutes];
++
++    // Post workers own independent partials reduced before the Mix/Norm barrier arrivals.
++    alignas(kSwizzleMode) float hc_norm_sqr_sums[2][BLOCK_M];
++    alignas(kSwizzleMode) float x1_sqr_sums[2][BLOCK_M];
++    // Fused Normal workers use dedicated scratch instead of aliasing Shifted statistics.
++    alignas(kSwizzleMode) float normal_scratch[BLOCK_M];
++
++    // Full/empty pairs connect static roles without CTA-wide block-boundary synchronization.
++    alignas(Barrier) Barrier full_io_barriers[kNumIOStages];
++    alignas(Barrier) Barrier empty_io_barriers[kNumIOStages];
++    alignas(Barrier) Barrier store_ready_io_barriers[kNumIOStages];
++
++    alignas(Barrier) Barrier full_fn_barriers[kNumFnStages];
++    alignas(Barrier) Barrier empty_fn_barriers[kNumFnStages];
++
++    alignas(Barrier) Barrier full_a_barriers[kNumAStages];
++    alignas(Barrier) Barrier empty_a_barriers[kNumAStages];
++
++    alignas(Barrier) Barrier full_accum_barriers[kNumAccumStages];
++    alignas(Barrier) Barrier empty_accum_barriers[kNumAccumStages];
++
++    alignas(Barrier) Barrier full_coeff_barriers[kNumCoeffStages];
++    alignas(Barrier) Barrier empty_coeff_barriers[kNumCoeffStages];
++
++    alignas(Barrier) Barrier full_stats_barrier;
++    alignas(Barrier) Barrier empty_stats_barrier;
++
++    // Gate each split's Mix arrival on all WG3 warps and, in Normal, the output-store worker.
++    alignas(Barrier) Barrier mix_arrival_barrier;
++
++    alignas(uint32_t) uint32_t tmem_base;
++    // Shifted Norm and fused Normal workers share this mutually exclusive task queue.
++    alignas(uint32_t) uint32_t next_norm_task_ticket;
++    // Shifted X1 tensor-memory buffers: Post fills one per task, the Norm workers drain it.
++    alignas(Barrier) Barrier full_x1_barriers[kNumX1Buffers];
++    alignas(Barrier) Barrier empty_x1_barriers[kNumX1Buffers];
++    // Shifted Mix workers' task queue.
++    alignas(uint32_t) uint32_t next_mix_task_ticket;
++};
++
++} // namespace deep_gemm::layout::mega_mhc_tmem
+diff --git a/deep_gemm/include/deep_gemm/scheduler/mega_mhc.cuh b/deep_gemm/include/deep_gemm/scheduler/mega_mhc.cuh
+index 8685c44..64cfef5 100644
+--- a/deep_gemm/include/deep_gemm/scheduler/mega_mhc.cuh
++++ b/deep_gemm/include/deep_gemm/scheduler/mega_mhc.cuh
+@@ -21,6 +21,20 @@
+         return (grid_idx + 1) * kNumSplitBarriers * kNumMaxSplits + num_arrived_splits;
+     }
+ 
++    // Poll with relaxed loads and back off between polls (an acquire load per poll would invalidate L1), then acquire
++    // once the barrier has completed.
++    template <typename is_done_t>
++    static CUTLASS_DEVICE void poll_then_acquire(const uint64_t* split_barrier_ptr, const is_done_t& is_done) {
++        while (true) {
++            uint64_t state;
++            asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(state) : "l"(split_barrier_ptr) : "memory");
++            if (is_done(state))
++                break;
++            __nanosleep(64);
++        }
++        ptx::ld_acq_gpu(split_barrier_ptr);
++    }
++
+     static CUTLASS_DEVICE void init(uint64_t* gmem_split_barriers, const uint32_t& m_block_idx) {
+         ptx::st_rel(get_ptr(gmem_split_barriers, m_block_idx), encode_state(ptx::get_grid_idx()));
+     }
+@@ -30,7 +44,9 @@
+         const auto current_grid_barrier_base = encode_state(ptx::get_grid_idx());
+         const auto split_barrier_ptr = get_ptr(gmem_split_barriers, m_block_idx);
+         // NOTES: unsigned distance rejects stale grid tags but accepts any current-grid arrival count.
+-        while (ptx::ld_acq_gpu(split_barrier_ptr) - current_grid_barrier_base >= kNumSplits);
++        poll_then_acquire(split_barrier_ptr, [&](const uint64_t& state) {
++            return state - current_grid_barrier_base < kNumSplits;
++        });
+     }
+ 
+     template <uint32_t kNumSplits>
+@@ -44,11 +60,11 @@
+     static CUTLASS_DEVICE void wait(uint64_t* gmem_split_barriers, const uint32_t& m_block_idx) {
+         const auto all_splits_arrived_state = encode_state(ptx::get_grid_idx(), kNumSplits);
+         const auto split_barrier_ptr = get_ptr(gmem_split_barriers, m_block_idx);
+-        while (ptx::ld_acq_gpu(split_barrier_ptr) != all_splits_arrived_state);
++        poll_then_acquire(split_barrier_ptr, [&](const uint64_t& state) { return state == all_splits_arrived_state; });
+     }
+ };
+ 
+-// Norm is used only by Shifted after materializing X1 and its statistics.
++// Norm is used only by Shifted, once a split's X1 statistics are committed.
+ using Norm = SplitBarrier<0>;
+ using Mix = SplitBarrier<1>;
+ 
+diff --git a/deep_gemm/include/deep_gemm/scheduler/mega_mhc_tmem.cuh b/deep_gemm/include/deep_gemm/scheduler/mega_mhc_tmem.cuh
+new file mode 100644
+index 0000000..33fd505
+--- /dev/null
++++ b/deep_gemm/include/deep_gemm/scheduler/mega_mhc_tmem.cuh
+@@ -0,0 +1,73 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <deep_gemm/layout/mega_mhc.cuh>
++#include <deep_gemm/ptx/ld_st.cuh>
++#include <deep_gemm/ptx/utils.cuh>
++
++namespace deep_gemm::sched::mega_mhc_tmem {
++
++using namespace layout::mega_mhc;
++
++// Every split arrives once; wait observes all split writes through the
++// terminal release sequence. wait_init prevents a producer from racing the grid tag.
++template <uint32_t kBarrierIndex>
++struct SplitBarrier {
++    static CUTLASS_DEVICE uint64_t* get_ptr(uint64_t* gmem_split_barriers, const uint32_t m_block_idx) {
++        const auto line_idx = static_cast<uint64_t>(kBarrierIndex) * kNumMaxMBlocks + m_block_idx;
++        return math::advance_ptr<uint64_t>(gmem_split_barriers, line_idx * kSplitBarrierLineBytes);
++    }
++
++    static CUTLASS_DEVICE uint64_t encode_state(const uint64_t grid_idx, const uint32_t num_arrived_splits = 0) {
++        return (grid_idx + 1) * kNumSplitBarriers * kNumMaxSplits + num_arrived_splits;
++    }
++
++    // Poll with relaxed loads and back off between polls (an acquire load per poll would invalidate L1), then acquire
++    // once the barrier has completed.
++    template <typename is_done_t>
++    static CUTLASS_DEVICE void poll_then_acquire(const uint64_t* split_barrier_ptr, const is_done_t& is_done) {
++        while (true) {
++            uint64_t state;
++            asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(state) : "l"(split_barrier_ptr) : "memory");
++            if (is_done(state))
++                break;
++            __nanosleep(64);
++        }
++        ptx::ld_acq_gpu(split_barrier_ptr);
++    }
++
++    static CUTLASS_DEVICE void init(uint64_t* gmem_split_barriers, const uint32_t& m_block_idx) {
++        ptx::st_rel(get_ptr(gmem_split_barriers, m_block_idx), encode_state(ptx::get_grid_idx()));
++    }
++
++    template <uint32_t kNumSplits>
++    static CUTLASS_DEVICE void wait_init(uint64_t* gmem_split_barriers, const uint32_t& m_block_idx) {
++        const auto current_grid_barrier_base = encode_state(ptx::get_grid_idx());
++        const auto split_barrier_ptr = get_ptr(gmem_split_barriers, m_block_idx);
++        // NOTES: unsigned distance rejects stale grid tags but accepts any current-grid arrival count.
++        poll_then_acquire(split_barrier_ptr, [&](const uint64_t& state) {
++            return state - current_grid_barrier_base < kNumSplits;
++        });
++    }
++
++    template <uint32_t kNumSplits>
++    static CUTLASS_DEVICE void arrive(uint64_t* gmem_split_barriers, const uint32_t& m_block_idx) {
++        const auto state_ptr = get_ptr(gmem_split_barriers, m_block_idx);
++        // NOTES: SM100 can retire the release reduction asynchronously while this CTA starts its next task.
++        ptx::red_async_inc_rel(state_ptr);
++    }
++
++    template <uint32_t kNumSplits>
++    static CUTLASS_DEVICE void wait(uint64_t* gmem_split_barriers, const uint32_t& m_block_idx) {
++        const auto all_splits_arrived_state = encode_state(ptx::get_grid_idx(), kNumSplits);
++        const auto split_barrier_ptr = get_ptr(gmem_split_barriers, m_block_idx);
++        poll_then_acquire(split_barrier_ptr, [&](const uint64_t& state) { return state == all_splits_arrived_state; });
++    }
++};
++
++// Norm is used only by Shifted, once a split's X1 statistics are committed.
++using Norm = SplitBarrier<0>;
++using Mix = SplitBarrier<1>;
++
++} // namespace deep_gemm::sched::mega_mhc_tmem

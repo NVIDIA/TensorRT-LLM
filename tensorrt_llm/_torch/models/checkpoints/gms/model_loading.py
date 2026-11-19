@@ -302,7 +302,10 @@ def _load_gms_writer_draft_weights(
 ) -> None:
     """Load draft/MTP weights from ``speculative_model`` into the one-engine model."""
 
-    draft_load_kwargs = mx_loading.get_mx_draft_load_weights_kwargs(checkpoint_loader)
+    draft_load_kwargs = {
+        **model_hooks.draft_checkpoint_load_kwargs(model),
+        **mx_loading.get_mx_draft_load_weights_kwargs(checkpoint_loader),
+    }
     with timing_metric(ModelLoaderMetricNames.DRAFT_CHECKPOINT_PREPARATION_SECONDS.value, metrics):
         draft_weights = checkpoint_loader.load_weights(
             speculative_model, mapping=mapping, **draft_load_kwargs
@@ -312,7 +315,11 @@ def _load_gms_writer_draft_weights(
         model, target_weight_mapper
     )
     with timing_metric(ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.value, metrics):
-        model_hooks.call_load_weights(model.load_draft_weights, draft_weights, draft_weight_mapper)
+        model_hooks.call_load_weights(
+            model.load_draft_weights,
+            model_hooks.select_draft_weights(draft_weights, draft_load_kwargs.get("key_prefixes")),
+            draft_weight_mapper,
+        )
         if torch.cuda.is_available():  # CPU guard
             torch.cuda.synchronize()
 

@@ -318,8 +318,9 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
     TLLM_CHECK_WITH_INFO(!(kv_cache_quant_mode.hasFp4KvCache() && input_dtype == torch::kFloat32),
         "FP32 input is not supported when writing an NVFP4 MLA cache.");
     int head_size = lora_size + rope_size;
-    TLLM_CHECK_WITH_INFO(residual_dim == 0 || residual_dim == rope_size,
-        "MLA KV residual_dim must be 0 or rope_size (%ld), got %ld", rope_size, residual_dim);
+    // residual_dim == 2 * rope_size selects the inline-scale record with E4M3 RoPE.
+    TLLM_CHECK_WITH_INFO(residual_dim == 0 || residual_dim == rope_size || residual_dim == 2 * rope_size,
+        "MLA KV residual_dim must be 0, rope_size or 2 * rope_size (rope_size %ld), got %ld", rope_size, residual_dim);
     TLLM_CHECK_WITH_INFO(kv_cache_quant_mode.hasFp4KvCache() || residual_dim == 0,
         "MLA KV residual quantization requires an NVFP4 KV cache.");
     int const storage_head_size = head_size + static_cast<int>(residual_dim);
@@ -331,7 +332,9 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
     auto& kv_scale_cache_buffer = kv_cache_buffers.kvScaleCacheBuffer;
     if (kv_cache_quant_mode.hasFp4KvCache())
     {
-        TLLM_CHECK_WITH_INFO(kv_scale_cache_buffer.data != nullptr, "NVFP4 MLA cache requires a block-scale pool.");
+        // The inline-scale record keeps its block scales in the data pool.
+        TLLM_CHECK_WITH_INFO(residual_dim == 2 * rope_size || kv_scale_cache_buffer.data != nullptr,
+            "NVFP4 MLA cache requires a block-scale pool.");
     }
     tk::KvCacheDataType cache_type = tk::cacheTypeFromQuantMode(kv_cache_quant_mode);
 
