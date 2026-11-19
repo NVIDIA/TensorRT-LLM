@@ -289,6 +289,7 @@ l0_b200:
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_bf16_deterministic_tactic_independent_of_token_count
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_mxfp4_fp8_input_quantization

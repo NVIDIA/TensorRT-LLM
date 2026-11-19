@@ -8102,3 +8102,64 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
         if bias:
             torch.testing.assert_close(restored.w3_w1_bias, module.w3_w1_bias)
             torch.testing.assert_close(restored.w2_bias, module.w2_bias)
+
+
+@pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Relu2])
+@pytest.mark.parametrize("top_k", [1, 8])
+def test_cutlass_bf16_deterministic_tactic_independent_of_token_count(
+    monkeypatch, activation, top_k
+):
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("Fixed BF16 MoE arithmetic is supported on SM100/SM103")
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    monkeypatch.setattr(MoERunner, "runner_dict", {})
+    torch.manual_seed(17)
+    experts, hidden, intermediate, tokens = 16, 2048, 512, 65
+    fc1_rows = intermediate * (2 if activation == ActivationType.Swiglu else 1)
+    w1 = (torch.randn(experts, fc1_rows, hidden, device="cuda") * 0.02).bfloat16()
+    w2 = (torch.randn(experts, hidden, intermediate, device="cuda") * 0.02).bfloat16()
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    ids = torch.argsort(torch.randn(tokens, experts, device="cuda"), dim=1)
+    ids = ids[:, :top_k].int().contiguous()
+    scales = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=-1)
+
+    def cached_tactic(self, name, runners, config, inputs, *, gemm_idx):
+        # A warmed prefill shape and a decode cache miss can pick different
+        # valid GEMM/activation implementations. Keep the arithmetic real.
+        runner = runners[0]
+        tactic = runner.fused_moe_runner.get_tactic_num(gemm_idx) - 1
+        return runner, -1 if inputs[0].shape[0] == 1 else tactic
+
+    monkeypatch.setattr(AutoTuner, "choose_one", cached_tactic)
+
+    def run(n):
+        return torch.ops.trtllm.fused_moe(
+            x[:n],
+            ids[:n],
+            scales[:n],
+            w1,
+            None,
+            w2,
+            None,
+            torch.bfloat16,
+            quant_scales=[],
+            activation_type=int(activation),
+        )[0]
+
+    single = run(1)
+    for n in (7, tokens):
+        torch.testing.assert_close(run(n)[:1], single, atol=0, rtol=0)
+
+    # Replay must consume new inputs, including new expert assignments.
+    run(tokens)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(tokens)
+    x.add_(0.125)
+    ids.copy_(ids.roll(1, dims=0))
+    graph.replay()
+    torch.testing.assert_close(captured, run(tokens), atol=0, rtol=0)
+    torch.testing.assert_close(captured[:1], run(1), atol=0, rtol=0)
