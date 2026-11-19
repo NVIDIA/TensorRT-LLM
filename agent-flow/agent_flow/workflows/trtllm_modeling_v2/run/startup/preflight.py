@@ -948,7 +948,7 @@ def resolve_target_identity(
         models = (
             Path(str(task_data.get("trtllm_repo_path") or ".")) / MODELING_V2_PACKAGE / "models"
         )
-        routed = re.compile(rf"@routes\([^)]*[\"']{re.escape(architecture)}[\"']")
+        routed = re.compile(rf"^\s*@routes\([^)]*[\"']{re.escape(architecture)}[\"']", re.M)
         family = next(
             (
                 routing.parent.name

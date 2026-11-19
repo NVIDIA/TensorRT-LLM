@@ -94,6 +94,7 @@ def test_a_routed_architecture_takes_the_directory_of_the_family_that_routes_it(
     family = tmp_path / MODELING_V2_PACKAGE / "models" / "kimi_k3_vl"
     family.mkdir(parents=True)
     (family / "routing.py").write_text(
+        '# @routes("FooBarForCausalLM") was the old name\n'
         '@routes("KimiK3ForConditionalGeneration")\ndef route(config, llm_args, cc):\n    pass\n'
     )
     task = _task(tmp_path, parallel="tp4")
@@ -102,7 +103,7 @@ def test_a_routed_architecture_takes_the_directory_of_the_family_that_routes_it(
     )
     assert routed == "kimi_k3_vl"
     assert target == f"{MODELING_V2_PACKAGE}/models/kimi_k3_vl/ckpt__sm_103__tp4"
-    # An architecture no family routes yet names a new family after itself.
+    # An architecture no family routes yet (a comment is no registration) names a new family.
     fresh, _ = preflight.resolve_target_identity(task, {"architectures": ["FooBarForCausalLM"]})
     assert fresh == "foo_bar"
 
