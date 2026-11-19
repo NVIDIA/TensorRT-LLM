@@ -155,7 +155,7 @@ def _prmt_trunc_bf16x2(
     )
     return mlir_llvm.bitcast(
         mlir_ir.VectorType.get([2], cutlass.BFloat16.mlir_type, loc=loc),
-        packed_i32,
+        cutlass.Int32(packed_i32).ir_value(loc=loc, ip=ip),
         loc=loc,
         ip=ip,
     )
