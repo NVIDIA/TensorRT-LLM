@@ -489,3 +489,31 @@ def load_problems(
         }
         rows[split] = read_split(path)
     return build_problems(manifest, rows["train"], rows["test"], count), files
+
+
+if __name__ == "__main__":
+    import argparse
+    import platform
+
+    parser = argparse.ArgumentParser(
+        description="Regenerate the pinned GSM8K manifest and checksum."
+    )
+    parser.add_argument("dataset_dir", type=Path, help="directory with the original staged splits")
+    parser.add_argument("--output", type=Path, required=True, help="destination manifest JSON")
+    args = parser.parse_args()
+    paths = {split: args.dataset_dir / name for split, name in SPLIT_FILES.items()}
+    train, test = read_split(paths["train"]), read_split(paths["test"])
+    if len(test) != TEST_SPLIT_ROWS:
+        parser.error(f"expected {TEST_SPLIT_ROWS} test rows, found {len(test)}")
+    manifest = build_manifest(
+        train,
+        test,
+        file_sha256={split: sha256_file(path) for split, path in paths.items()},
+        python_version=platform.python_version(),
+    )
+    exemplars = [train[item["index"]] for item in manifest["exemplars"]["items"]]
+    checksum = sha256_text(canonical_json(inventory_rows(exemplars, test)))
+    args.output.write_text(
+        json.dumps(manifest, indent=1, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    print(f'TEST_ROWS_SHA256 = "{checksum}"')

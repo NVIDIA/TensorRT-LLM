@@ -127,6 +127,22 @@ changing the request fields requires a fresh output directory.
   reply before the budget is a timeout. Errors, timeouts, truncations and unanswered questions
   each fail the run regardless of the score.
 
+### Regenerating the benchmark pins
+
+For an intentional benchmark change, run this from the repository root against the original
+Parquet files at the dataset revision listed above. Update `PROTOCOL_ID` first if the benchmark
+definition changes.
+
+```bash
+python examples/llm-api/gsm8k_eval/protocol.py "$LLM_MODELS_ROOT/datasets/openai/gsm8k" \
+  --output examples/llm-api/gsm8k_eval/manifest.json
+```
+
+The command writes the first-100 manifest and prints the `TEST_ROWS_SHA256` assignment for
+all 1,319 rows. Copy that assignment into `protocol.py` and review both changes together.
+The CPU test `test_staged_gsm8k_matches_committed_pins` checks the staged data against those
+pins and skips when neither split is staged. A partially staged dataset fails the check.
+
 ## Outputs and resume
 
 The server inherits the caller's environment, with `--server-env NAME=VALUE` overriding

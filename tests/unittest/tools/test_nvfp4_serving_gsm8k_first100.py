@@ -32,6 +32,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from utils.llm_data import llm_models_root
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "examples" / "llm-api"
 sys.path.insert(0, str(EXAMPLES_DIR))
@@ -170,6 +171,20 @@ def test_committed_manifest_pins_the_first_100_rows_and_ten_exemplars():
     assert manifest["exemplars"]["generated_with"]["call"] == (
         "random.Random(42).sample(range(7473), 10)"
     )
+
+
+def test_staged_gsm8k_matches_committed_pins():
+    root = llm_models_root()
+    if root is None:
+        pytest.skip("LLM models root is unavailable")
+    dataset_dir = root / "datasets/openai/gsm8k"
+    if not any((dataset_dir / name).exists() for name in protocol.SPLIT_FILES.values()):
+        pytest.skip("GSM8K dataset is not staged")
+    manifest = protocol.load_manifest()
+    problems, _ = protocol.load_problems(dataset_dir, manifest)
+    assert [p.prompt_sha256 for p in problems] == [
+        q["prompt_sha256"] for q in manifest["questions"]
+    ]
 
 
 def _rows(count, split):
