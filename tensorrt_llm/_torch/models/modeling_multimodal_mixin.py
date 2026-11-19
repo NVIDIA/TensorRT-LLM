@@ -17,6 +17,7 @@
 import contextlib
 import copy
 import itertools
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -59,7 +60,7 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
-from .multimodal import SupportsMultimodal, get_multimodal_data_device_paths
+from .multimodal import MultimodalFeature, SupportsMultimodal, get_multimodal_data_device_paths
 
 
 class MultimodalEncoderContractError(ValueError):
@@ -279,6 +280,8 @@ def encode_multimodal_by_groups(
 
 
 if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
@@ -429,6 +432,9 @@ class MultimodalModelMixin:
     supports_multimodal: ClassVar[Literal[True]] = True
     """Opt in to the shared model contract without requiring mixin inheritance."""
 
+    multimodal_opt_outs: ClassVar[Mapping[MultimodalFeature, str]] = {}
+    """Features excluded for every deployment, each with a reason and tracking ID."""
+
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
 
@@ -450,6 +456,13 @@ class MultimodalModelMixin:
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
     _encoder_forward_context: Callable[[], contextlib.AbstractContextManager[None]] | None = None
+
+    @classmethod
+    def multimodal_feature_limits(
+        cls, model_config: ModelConfig | None, llm_args: Optional["TorchLlmArgs"]
+    ) -> Mapping[MultimodalFeature, str]:
+        """Return additional features excluded for this deployment."""
+        return {}
 
     @property
     def multimodal_encoder_cache(self) -> Optional[TensorLRUCache]:

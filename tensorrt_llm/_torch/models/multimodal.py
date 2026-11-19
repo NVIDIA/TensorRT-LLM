@@ -9,13 +9,17 @@ without depending on the shared mixin.
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeGuard
 
+from strenum import StrEnum
+
 __all__ = [
+    "MultimodalFeature",
     "SupportsMultimodal",
     "get_multimodal_data_device_paths",
     "is_multimodal_model",
+    "supports_feature",
 ]
 
 if TYPE_CHECKING:
@@ -24,8 +28,24 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
     from tensorrt_llm.inputs.multimodal import MultimodalParams
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
     from .modeling_multimodal_mixin import EncoderGroup, PreparedLlmInputs
+
+
+class MultimodalFeature(StrEnum):
+    ITEM_SCHEDULING = "item_scheduling"
+    ENCODER_CACHE = "encoder_cache"  # Independent of item scheduling.
+    ENCODER_CUDA_GRAPH = "encoder_cuda_graph"
+    ENCODER_DP = "encoder_dp"
+    ENCODER_TP = "encoder_tp"
+    LLM_BREAKABLE_CUDA_GRAPH = "llm_breakable_cuda_graph"
+    LLM_PIECEWISE_CUDA_GRAPH = "llm_piecewise_cuda_graph"  # Includes LLM-scoped torch.compile.
+    CHUNKED_PREFILL_MEDIA = "chunked_prefill_media"
+    KV_REUSE_MEDIA = "kv_reuse_media"
+    DISAGG_E_TO_P = "disagg_e_to_p"
+    DISAGG_P_TO_D = "disagg_p_to_d"
+    UINT8_MEDIA = "uint8_media"
 
 
 class SupportsMultimodal(Protocol):
@@ -47,6 +67,7 @@ class SupportsMultimodal(Protocol):
     """
 
     supports_multimodal: ClassVar[Literal[True]]
+    multimodal_opt_outs: ClassVar[Mapping[MultimodalFeature, str]]
     supports_encoder_cache: ClassVar[bool]
     supports_mm_encoder_item_scheduling: ClassVar[bool]
     supported_encoder_attention_backends: ClassVar[dict[str, frozenset[str]]]
@@ -54,6 +75,13 @@ class SupportsMultimodal(Protocol):
     support_mm_disagg: ClassVar[bool]
 
     model_config: ModelConfig[Any]
+
+    @classmethod
+    def multimodal_feature_limits(
+        cls, model_config: ModelConfig[Any] | None, llm_args: TorchLlmArgs | None
+    ) -> Mapping[MultimodalFeature, str]:
+        """Return deployment-specific exclusions, each with a reason and tracking ID."""
+        ...
 
     @property
     def mm_encoder_groups(self) -> Sequence[EncoderGroup]:
@@ -126,7 +154,7 @@ class SupportsMultimodal(Protocol):
     def prepare_multimodal_encoder_inputs(
         self, selected_items: Sequence[tuple[MultimodalParams, int]]
     ) -> list[tuple[MultimodalParams, Sequence[int], str]]:
-        """Prepare selected items before H2D, retaining scheduler order."""
+        """Prepare selected items before they are copied to the GPU, in scheduler order."""
         ...
 
     def forward_multimodal_encoder_items(
@@ -151,12 +179,60 @@ class SupportsMultimodal(Protocol):
 def is_multimodal_model(model: object) -> TypeGuard[SupportsMultimodal]:
     """Read the explicit class marker without evaluating encoder properties.
 
-    This is a declaration, not runtime signature validation. Implementations are checked
-    statically against ``SupportsMultimodal``; feature gates still check the relevant
-    declaration and configuration. Avoid structural introspection on each executor step.
+    The marker is a declaration; it does not check method signatures. Implementations are
+    checked statically against ``SupportsMultimodal``; feature gates still check the
+    relevant declaration and configuration. Avoid structural introspection on each executor step.
     The marker is read from ``model.__class__``, as ``isinstance`` does.
     """
     return getattr(model.__class__, "supports_multimodal", False) is True
+
+
+_FEATURE_FLAGS = {
+    MultimodalFeature.ITEM_SCHEDULING: "supports_mm_encoder_item_scheduling",
+    MultimodalFeature.ENCODER_CACHE: "supports_encoder_cache",
+    MultimodalFeature.DISAGG_E_TO_P: "support_mm_disagg",
+}
+
+
+def supports_feature(
+    model_cls: type,
+    feature: MultimodalFeature,
+    model_config: ModelConfig[Any] | None = None,
+    llm_args: TorchLlmArgs | None = None,
+) -> bool:
+    """Return model-class eligibility, subject to any limits for this deployment.
+
+    Breakable CUDA graphs follow the language model: its class declares
+    ``supports_multimodal_breakable_cuda_graph``, or the model passes the rows to the
+    language model (``language_model_takes_rows``). A model that builds its language
+    model at init has no class to read here; the engine checks the instance at setup.
+    A feature without its own flag is eligible unless the model opts out or limits it.
+    """
+    if getattr(model_cls, "supports_multimodal", False) is not True:
+        return False
+    if feature in getattr(model_cls, "multimodal_opt_outs", {}):
+        return False
+    limits = getattr(model_cls, "multimodal_feature_limits", None)
+    if limits is not None and feature in limits(model_config, llm_args):
+        return False
+
+    if feature in _FEATURE_FLAGS:
+        return bool(getattr(model_cls, _FEATURE_FLAGS[feature], False))
+    if feature in (MultimodalFeature.ENCODER_DP, MultimodalFeature.ENCODER_TP):
+        get_modes = getattr(model_cls, "get_supported_encoder_parallel_modes", None)
+        if model_config is not None and callable(get_modes):
+            modes = get_modes(model_config)
+        else:
+            modes = getattr(model_cls, "supported_encoder_parallel_modes", ())
+        return ("dp" if feature == MultimodalFeature.ENCODER_DP else "tp") in modes
+    if feature == MultimodalFeature.LLM_BREAKABLE_CUDA_GRAPH:
+        language_model = getattr(model_cls, "language_model_class", None)
+        return getattr(model_cls, "language_model_takes_rows", False) is True or bool(
+            getattr(language_model, "supports_multimodal_breakable_cuda_graph", False)
+        )
+    if feature == MultimodalFeature.LLM_PIECEWISE_CUDA_GRAPH:
+        return callable(getattr(model_cls, "apply_llm_torch_compile", None))
+    return True
 
 
 def get_multimodal_data_device_paths(model: object) -> list[str] | None:

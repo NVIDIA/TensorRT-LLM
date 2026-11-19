@@ -131,33 +131,33 @@ For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.p
 
 #### Multimodal Models
 
-`tensorrt_llm._torch.models.multimodal.SupportsMultimodal` defines the model-facing
-multimodal contract, and `MultimodalModelMixin` implements it. Reuse the mixin for
-its common implementation. The `supports_multimodal = True` class marker declares
-the contract; it is not runtime signature validation and does not enable optional
-features.
+`tensorrt_llm._torch.models.multimodal.SupportsMultimodal` lists what the runtime
+reads from a multimodal model, and `MultimodalModelMixin` implements it. Subclass
+the mixin: the executor still checks for it until it reads the protocol. The
+`supports_multimodal = True` class marker declares the contract. It does not check
+method signatures and does not turn on any feature.
 
 - Declare encoder caching and item scheduling separately. Item scheduling also
-  requires processor item metadata and a compatible runtime configuration.
-- Report attention backends with the `supported_encoder_attention_backends`
-  class attribute. Its empty default declares no support; concrete integrations
-  supply their supported sets.
-- Keep the existing `MultimodalParams` input and tensor return contracts.
-  Selected-item preparation runs before H2D, and item outputs retain selection
-  order.
+  needs the processor's item metadata and a runtime configuration that allows it.
+- List skipped `MultimodalFeature` values in `multimodal_opt_outs`, or in
+  `multimodal_feature_limits` when the skip depends on the deployment. The
+  [conformance suite](source:tests/unittest/_torch/multimodal/conformance) checks
+  them against the required features in the multimodal onboarding skill.
+- Declare attention backends in the `supported_encoder_attention_backends`
+  class attribute. Its empty default declares none.
+- Keep the existing `MultimodalParams` inputs and tensor outputs. Selected items
+  are prepared before they are copied to the GPU, and item outputs keep the
+  selection order.
 - `multimodal_data_device_paths` stays optional for every model. Read it through
   `get_multimodal_data_device_paths()`; without it, every tensor in
   `multimodal_data` moves to the device.
 - Expose the existing model-owned cache through `multimodal_encoder_cache` and
-  `initialize_multimodal_encoder_cache()`. The latter preserves the mixin's
-  existing initialization hook. Item scheduling and persistent reuse share this
-  cache; they do not create separate owners.
+  `initialize_multimodal_encoder_cache()`. Item scheduling and encoder output
+  reuse share this cache.
 
-`EncoderGroup` continues to describe modalities that share an encoder call.
-`MultimodalEncoderMixin` continues to provide native encoder attention metadata
-and graph integration. Processor prompt expansion and disaggregated transport
-retain their existing interfaces; implementing this Protocol does not enable a
-new model, modality, encoder backend, or E/P path by itself.
+`EncoderGroup` still describes the modalities that share an encoder call, and
+`MultimodalEncoderMixin` still provides encoder attention metadata and CUDA
+graphs. Prompt expansion and disaggregated serving keep their interfaces.
 
 ### Weight Loading
 
