@@ -82,13 +82,13 @@ UCX_ENV_RULES = [
         "*",
         {"UCX_NET_DEVICES": "mlx5_0:1,mlx5_1:1,mlx5_3:1,mlx5_4:1,eth0"},
     ),
-    # nsc-svg: pin the usable mlx5 ports and include the bonded TCP interface.
+    # nsc-svg: UCX picks wrong RDMA devices; pin the usable mlx5 ports.
     (
         "nsc-svg*",
         "*",
         {
             "UCX_NET_DEVICES": "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,"
-            "mlx5_4:1,mlx5_5:1,mlx5_10:1,mlx5_11:1,bond0",
+            "mlx5_4:1,mlx5_5:1,mlx5_10:1,mlx5_11:1",
         },
     ),
     # aws-cmh: UCX transport/device auto-selection hangs on this fabric; pin

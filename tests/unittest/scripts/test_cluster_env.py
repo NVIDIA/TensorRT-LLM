@@ -90,7 +90,7 @@ def test_gpu_type_from_supported_gpus(
         (
             "nsc-svg-slurm-1",
             "export UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,"
-            "mlx5_4:1,mlx5_5:1,mlx5_10:1,mlx5_11:1,bond0",
+            "mlx5_4:1,mlx5_5:1,mlx5_10:1,mlx5_11:1",
         ),
         (
             "oci-hsg-cs-001",
@@ -262,16 +262,14 @@ def test_apply_ucx_env_detection_preserves_explicit_devices(monkeypatch, cluster
     assert environ["UCX_NET_DEVICES"] == "eth-custom"
 
 
-@pytest.mark.parametrize("gpu_type", ("B200", "B300"))
-def test_apply_ucx_env_cluster_device_bypasses_detection(monkeypatch, gpu_type):
+def test_apply_ucx_env_cluster_device_bypasses_detection(monkeypatch):
     def unexpected_detection():
         pytest.fail("Cluster-configured devices must bypass detection")
 
     monkeypatch.setattr(cluster_env, "_local_net_device", unexpected_detection)
     environ = {}
-    applied = cluster_env.apply_ucx_env(environ, cluster_name="nsc-svg", gpu_type=gpu_type)
+    applied = cluster_env.apply_ucx_env(environ, cluster_name="nsc-svg", gpu_type="B300")
     assert applied["UCX_NET_DEVICES"].startswith("mlx5_0:1,")
-    assert "bond0" in applied["UCX_NET_DEVICES"].split(",")
 
 
 @pytest.mark.parametrize(
