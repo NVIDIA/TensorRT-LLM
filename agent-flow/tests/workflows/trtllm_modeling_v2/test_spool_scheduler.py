@@ -482,6 +482,35 @@ def test_an_ending_session_is_handed_over_to_the_next_session_on_its_spool(tmp_p
     )
 
 
+def test_a_successor_that_stops_heart_beating_is_dropped_and_jobs_start_again(
+    _spool_scheduler_spool, _spool_scheduler_clock
+):
+    """The successor's allocation was cancelled a minute after its watcher started."""
+    spool, clock = _spool_scheduler_spool, _spool_scheduler_clock
+    old = _spool_scheduler_make(
+        spool,
+        clock,
+        watcher_id="old",
+        devices=("0",),
+        ends_at=clock.now + 6 * _spool_sessions_HOUR,
+        handover_lead_s=_spool_sessions_HOUR,
+    )
+    old.device_memory_mib = lambda: {"0": 0}
+    _spool_scheduler_make(
+        spool, clock, watcher_id="new", ends_at=clock.now + 20 * _spool_sessions_HOUR
+    ).heartbeat()
+    _spool_scheduler_submit(spool, "next", header="gpus=1 wall=30m")
+    old.tick()
+    assert old.pending_reasons["next"] == "this session is handing over to new"
+
+    clock.advance(_spool_scheduler_scheduler.WATCHER_STALE_S + 1)
+    old.tick()
+    assert old.handover == {}, "a successor that is gone is no reason to exit"
+    _spool_scheduler_pump(old, lambda: _spool_scheduler_rc(spool, "next") is not None)
+    assert _spool_scheduler_rc(spool, "next") == 0
+    assert "out of hand-over" in SpoolPaths(spool).status.read_text()
+
+
 def test_monitor_cli_tells_a_busy_orchestrator_from_one_that_has_exited(
     tmp_path, monkeypatch, capsys
 ):
