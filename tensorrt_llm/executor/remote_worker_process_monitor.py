@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -35,6 +36,8 @@ _HEARTBEAT_INTERVAL = 0.5
 # that dies itself sends no report, so only the lease detects it.
 _HEARTBEAT_TIMEOUT = 15.0
 _RECEIVE_WAIT = 0.1
+# Upper bound on one authenticated report frame; real reports are far smaller.
+_MAX_REPORT_BYTES = 4096
 # A worker call that returns or raises reports its outcome through MPI, which
 # arrives after the helper's final report. Defer to that outcome briefly.
 _RETURN_GRACE = 2.0
@@ -147,18 +150,36 @@ class RemoteWorkerProcessMonitor:
                 raise ConfigInputError("TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535")
             port = str(port_number)
         ipv6 = family == socket.AF_INET6
-        # The advertised address may be forwarded from outside this namespace.
-        # IpcQueue checks HMAC before unpickling; restrict ingress to MPI workers.
-        bind_address = f"tcp://{'[::]' if ipv6 else '0.0.0.0'}:{port}"  # nosec B104
+        advertised_host = f"[{host}]" if ipv6 else host
+        queue_options = dict(
+            is_server=True,
+            socket_type=zmq.PULL,
+            name="remote_worker_process_watch",
+            receive_hwm=max(64, world_size * 4),
+            ipv6=ipv6,
+            # libzmq drops a connection that announces a larger frame before
+            # allocating it. Reports are a few hundred bytes.
+            socket_options={zmq.MAXMSGSIZE: _MAX_REPORT_BYTES},
+        )
+        # Listen only on the advertised address. IpcQueue checks HMAC before
+        # unpickling; restrict ingress to MPI workers.
+        bind_address = f"tcp://{advertised_host}:{port}"
         try:
-            self._queue = IpcQueue(
-                (bind_address, None),
-                is_server=True,
-                socket_type=zmq.PULL,
-                name="remote_worker_process_watch",
-                receive_hwm=max(64, world_size * 4),
-                ipv6=ipv6,
-            )
+            try:
+                self._queue = IpcQueue((bind_address, None), **queue_options)
+            except zmq.ZMQError as error:
+                if error.errno != errno.EADDRNOTAVAIL:
+                    raise
+                # The advertised address is not on this host, for example a
+                # forwarded or translated address from TRTLLM_WORKER_WATCH_HOST.
+                bind_address = f"tcp://{'[::]' if ipv6 else '0.0.0.0'}:{port}"  # nosec B104
+                logger.warning(
+                    "Process-watch host %s is not a local address; listening on all "
+                    "interfaces at %s. Restrict ingress to MPI workers.",
+                    host,
+                    bind_address,
+                )
+                self._queue = IpcQueue((bind_address, None), **queue_options)
         except zmq.ZMQError as error:
             raise ResourceError(
                 f"Cannot bind process-watch listener {bind_address}. {WORKER_WATCH_HINT}",
@@ -166,7 +187,6 @@ class RemoteWorkerProcessMonitor:
                 hint=WORKER_WATCH_HINT,
             ) from error
         port = self._queue.address[0].rsplit(":", 1)[1]
-        advertised_host = f"[{host}]" if ipv6 else host
         self.endpoint = ProcessWatchEndpoint(
             f"tcp://{advertised_host}:{port}", self._queue.address[1], ipv6
         )

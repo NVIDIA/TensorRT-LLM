@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Remote rank death must be observable even when MPI makes no progress."""
 
+import gc
 import json
 import os
 import signal
@@ -13,10 +14,11 @@ import threading
 import pytest
 import zmq
 
-from tensorrt_llm._errors import ConfigInputError, RuntimeInitError
+from tensorrt_llm._errors import ConfigInputError, ResourceError, RuntimeInitError
 from tensorrt_llm._startup_errors import classify_startup_error
 from tensorrt_llm._torch.disaggregation.native import utils as network_utils
 from tensorrt_llm.executor import remote_worker_process_monitor as remote
+from tensorrt_llm.executor.ipc import IpcQueue
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.worker_process_monitor import WorkerProcessMonitor
 
@@ -293,6 +295,72 @@ def test_invalid_heartbeat_lease_is_a_configuration_error(monkeypatch, value):
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_TIMEOUT", value)
     with pytest.raises(ConfigInputError, match="TRTLLM_WORKER_WATCH_TIMEOUT"):
         remote.RemoteWorkerProcessMonitor(1)
+
+
+@pytest.mark.timeout(30, method="thread")
+def test_listener_binds_only_the_advertised_address_and_caps_frames(monkeypatch):
+    # Regression: the listener bound every interface and accepted frames of any
+    # size, so any host that could reach the port could make it buffer them.
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.setattr(remote, "_START_TIMEOUT", 1.0)
+    monitor = remote.RemoteWorkerProcessMonitor(1)
+    try:
+        assert monitor._queue.address_endpoint.startswith("tcp://127.0.0.1:")
+        assert monitor._queue.socket.getsockopt(zmq.MAXMSGSIZE) == remote._MAX_REPORT_BYTES
+        port = monitor.endpoint.address.rsplit(":", 1)[1]
+        # Another local address does not reach a listener bound to 127.0.0.1.
+        other = remote.ProcessWatchEndpoint(f"tcp://127.0.0.2:{port}", monitor.endpoint.key)
+        with pytest.raises(RuntimeInitError):
+            remote.WorkerProcessWatch(other, 0)
+        # An oversized frame is dropped without disturbing real reports.
+        with zmq.Context() as context, context.socket(zmq.PUSH) as channel:
+            channel.setsockopt(zmq.LINGER, 250)
+            channel.connect(monitor.endpoint.address)
+            channel.send(b"x" * (remote._MAX_REPORT_BYTES * 2))
+        watch = remote.WorkerProcessWatch(monitor.endpoint, 0)
+        try:
+            assert monitor.wait_ready(timeout=5)
+            assert monitor.failure is None
+        finally:
+            watch.close()
+    finally:
+        monitor.close()
+
+
+def test_listener_falls_back_to_all_interfaces_for_a_non_local_address(monkeypatch, caplog):
+    # A forwarded or translated address cannot be bound; keep it advertised.
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "192.0.2.1")
+    monitor = remote.RemoteWorkerProcessMonitor(1)
+    try:
+        assert monitor._queue.address_endpoint.startswith("tcp://0.0.0.0:")
+        assert monitor.endpoint.address.startswith("tcp://192.0.2.1:")
+        assert "not a local address" in caplog.text
+    finally:
+        monitor.close()
+
+
+def test_failed_bind_releases_the_queue_without_a_finalizer_error(monkeypatch):
+    # Regression: a failed bind closed the socket but kept the handle, so
+    # ZeroMqQueue.__del__ raised on the closed socket during the fallback.
+    gc.collect()
+    unraisable = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
+    with pytest.raises(zmq.ZMQError):
+        IpcQueue(("tcp://192.0.2.1:0", None), is_server=True, socket_type=zmq.PULL)
+    gc.collect()
+    from_queue = [u.exc_value for u in unraisable if "ZeroMqQueue" in repr(u.object)]
+    assert not from_queue
+
+
+def test_fixed_watch_port_in_use_is_still_a_resource_error(monkeypatch):
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    first = remote.RemoteWorkerProcessMonitor(1)
+    try:
+        monkeypatch.setenv("TRTLLM_WORKER_WATCH_PORT", first.endpoint.address.rsplit(":", 1)[1])
+        with pytest.raises(ResourceError, match="Cannot bind process-watch listener"):
+            remote.RemoteWorkerProcessMonitor(1)
+    finally:
+        first.close()
 
 
 def test_unreachable_watch_helper_reports_rank_endpoint_and_configuration_hint(monkeypatch):

@@ -58,7 +58,8 @@ class ZeroMqQueue:
                  use_hmac_encryption: bool = True,
                  send_hwm: Optional[int] = None,
                  receive_hwm: Optional[int] = None,
-                 ipv6: bool = False):
+                 ipv6: bool = False,
+                 socket_options: Optional[dict[int, int | bytes]] = None):
         '''
         Parameters:
             address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
@@ -68,6 +69,9 @@ class ZeroMqQueue:
             name (str, optional): The name of the queue. Defaults to None.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
             ipv6 (bool): Enable IPv6 before binding or connecting. Defaults to False.
+            socket_options (dict, optional): Extra ZMQ socket options applied
+                before binding or connecting. Some options, such as
+                MAXMSGSIZE, have no effect when set after bind.
         '''
 
         if not use_hmac_encryption:
@@ -93,6 +97,8 @@ class ZeroMqQueue:
             self.socket.setsockopt(zmq.SNDHWM, send_hwm)
         if receive_hwm is not None:
             self.socket.setsockopt(zmq.RCVHWM, receive_hwm)
+        for option, value in (socket_options or {}).items():
+            self.socket.setsockopt(option, value)
 
         # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
         self._last_identity = None
@@ -119,9 +125,17 @@ class ZeroMqQueue:
             )
 
         if self.should_bind_socket():
-            self.socket.bind(
-                self.address_endpoint
-            )  # Binds to the address and occupy a port immediately
+            try:
+                # Binds to the address and occupies a port immediately.
+                self.socket.bind(self.address_endpoint)
+            except zmq.ZMQError:
+                # The caller never receives this queue, so release it here.
+                # Clear the handles so close() from __del__ does nothing.
+                self.socket.close(linger=0)
+                self.context.term()
+                self.socket = None
+                self.context = None
+                raise
             self.address_endpoint = self.socket.getsockopt(
                 zmq.LAST_ENDPOINT).decode()
             logger_debug(
