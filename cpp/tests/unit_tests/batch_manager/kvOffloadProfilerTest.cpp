@@ -365,6 +365,7 @@ void expectV2RoundTrip(v2::CacheTier coldTier, bool inputs, bool selected, bool 
     manager->shutdown();
 }
 
+#if !defined(TRTLLM_KV_OFFLOAD_DISABLED_TEST)
 //! Check V2 host offload and restore metadata with both callback-input modes and a real round trip.
 TEST_P(V2KvOffloadProfilerTest, ProductionEvictionAndOnboardingPreservePayload)
 {
@@ -391,7 +392,9 @@ TEST_P(V2OtherTierProfilerTest, ProductionMigrationDoesNotMislabelOtherTiersOrEm
 
 INSTANTIATE_TEST_SUITE_P(
     ColdTier, V2OtherTierProfilerTest, ::testing::Values(v2::CacheTier::GPU_MEM, v2::CacheTier::DISK));
+#endif
 
+#if defined(TRTLLM_KV_OFFLOAD_DISABLED_TEST)
 class KvOffloadDisabledTest : public ::testing::Test
 {
 protected:
@@ -404,7 +407,6 @@ protected:
             GTEST_SKIP() << "CUDA device required";
         }
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-        // gtest_discover_tests launches each case in a fresh process, before selector caching.
 #if defined(_WIN32)
         ASSERT_EQ(_putenv_s("TLLM_PROFILE_CUSTOM_REGIONS", "none"), 0);
 #else
@@ -420,6 +422,7 @@ TEST_F(KvOffloadDisabledTest, V2ProductionRoundTripPreservesPayload)
 {
     expectV2RoundTrip(v2::CacheTier::HOST_MEM, true, false);
 }
+#endif
 
 class LegacyKvOffloadProfilerTest
     : public KvOffloadProfilerTest,
@@ -504,19 +507,24 @@ void expectLegacyRoundTrip(
     }
 }
 
+#if !defined(TRTLLM_KV_OFFLOAD_DISABLED_TEST)
 //! Compare V1 payload bytes to the actual full or partial copy for each tested layout and dtype.
 TEST_P(LegacyKvOffloadProfilerTest, ReportsActualPoolPayloadAndPreservesRoundTrip)
 {
     auto const [layerFirst, scales, tokens, expectedBytes, dtype] = GetParam();
     expectLegacyRoundTrip(layerFirst, scales, tokens, expectedBytes, dtype, true);
 }
+#endif
 
+#if defined(TRTLLM_KV_OFFLOAD_DISABLED_TEST)
 //! Verify disabling probes preserves a V1 partial-copy round trip without emitting events.
 TEST_F(KvOffloadDisabledTest, LegacyProductionRoundTripPreservesPayload)
 {
     expectLegacyRoundTrip(false, false, 3, 192, tensorrt_llm::DataType::kFLOAT, false);
 }
+#endif
 
+#if !defined(TRTLLM_KV_OFFLOAD_DISABLED_TEST)
 //! Verify an intra-device V1 reuse copy does not emit host offload or restore events.
 TEST_F(KvOffloadProfilerTest, LegacyDeviceReuseIsNotOffload)
 {
@@ -542,4 +550,5 @@ INSTANTIATE_TEST_SUITE_P(PayloadPaths, LegacyKvOffloadProfilerTest,
         std::tuple{true, false, 3, 512, tensorrt_llm::DataType::kFLOAT},
         std::tuple{false, false, 3, 64, tensorrt_llm::DataType::kINT4},
         std::tuple{false, false, 3, 64, tensorrt_llm::DataType::kFP4}));
+#endif
 } // namespace

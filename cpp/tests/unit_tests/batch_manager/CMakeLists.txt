@@ -14,21 +14,25 @@
 # the License.
 
 if(BUILD_PYT)
-  add_tllm_gtest(
-    kvOffloadProfilerTest
-    FULL_STACK
-    OWNER
-    batch-manager
-    SOURCES
-    kvOffloadProfilerTest.cpp
-    LINK_LIBRARIES
-    ${TORCH_LIBRARIES}
-    LABELS
-    "unit;batch-manager;gpu")
-  target_include_directories(
-    kvOffloadProfilerTest
-    PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
-            ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+  # Each binary uses one process-cached selector while sharing transfer checks.
+  foreach(test_name kvOffloadProfilerTest kvOffloadDisabledTest)
+    add_tllm_gtest(
+      ${test_name}
+      FULL_STACK
+      OWNER
+      batch-manager
+      SOURCES
+      kvOffloadProfilerTest.cpp
+      LINK_LIBRARIES
+      ${TORCH_LIBRARIES}
+      LABELS
+      "unit;batch-manager;gpu")
+    target_include_directories(
+      ${test_name} PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+                           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+  endforeach()
+  target_compile_definitions(kvOffloadDisabledTest
+                             PRIVATE TRTLLM_KV_OFFLOAD_DISABLED_TEST)
 endif()
 
 # Whole-archive keeps the poison listener's static registration in each test.
