@@ -97,7 +97,8 @@ def supports_sharded_target_sampling(spec_config, mapping) -> bool:
 def _temperature_only(spec_metadata, temperature_capable: bool) -> bool:
     """Graph key bit of the temperature-only variant: the variant is captured,
     the batch samples, every sampled row can be drawn on the sharded logits
-    (temperature only, no seed of its own), and the batch takes neither
+    (temperature only, no seed of its own, a temperature at or above the
+    greedy threshold), and the batch takes neither
     rejection sampling nor penalties. Seeded rows keep main's per-row Philox
     streams on the stock sampler."""
     return bool(spec_metadata.temperature_only_graphs and temperature_capable
@@ -1637,8 +1638,12 @@ class SpecMetadata:
 
             has_non_greedy_requests |= not params.is_greedy
             all_temperature_only &= params.is_greedy or params.is_shard_sampleable
+            # The key exchange draws rows below the greedy threshold by
+            # argmax (the lowest id of tied maxima), while the stock sampler
+            # still samples them (tied maxima evenly): such rows keep it.
             if (temperature_graphs and not params.is_greedy
-                    and not params.is_shard_sampleable):
+                    and not (params.is_shard_sampleable and params.temperature
+                             >= GREEDY_TEMPERATURE_THRESHOLD)):
                 temperature_capable = False
 
             per_request_normalized.append(
