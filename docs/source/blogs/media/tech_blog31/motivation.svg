@@ -6,7 +6,7 @@
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:date>2026-11-19T09:40:45.564667</dc:date>
+    <dc:date>2026-11-19T10:10:24.034533</dc:date>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -75,125 +75,6 @@ z
    <g id="matplotlib.axis_1"/>
    <g id="matplotlib.axis_2"/>
    <g id="text_1">
-    <!-- 39% -->
-    <g style="fill: #ffffff" transform="translate(200.935791 104.310654) scale(0.13 -0.13)">
-     <defs>
-      <path id="DejaVuSans-Bold-16" d="M 2981 2516
-Q 3453 2394 3698 2092
-Q 3944 1791 3944 1325
-Q 3944 631 3412 270
-Q 2881 -91 1863 -91
-Q 1503 -91 1142 -33
-Q 781 25 428 141
-L 428 1069
-Q 766 900 1098 814
-Q 1431 728 1753 728
-Q 2231 728 2486 893
-Q 2741 1059 2741 1369
-Q 2741 1688 2480 1852
-Q 2219 2016 1709 2016
-L 1228 2016
-L 1228 2791
-L 1734 2791
-Q 2188 2791 2409 2933
-Q 2631 3075 2631 3366
-Q 2631 3634 2415 3781
-Q 2200 3928 1806 3928
-Q 1516 3928 1219 3862
-Q 922 3797 628 3669
-L 628 4550
-Q 984 4650 1334 4700
-Q 1684 4750 2022 4750
-Q 2931 4750 3382 4451
-Q 3834 4153 3834 3553
-Q 3834 3144 3618 2883
-Q 3403 2622 2981 2516
-z
-" transform="scale(0.015625)"/>
-      <path id="DejaVuSans-Bold-1c" d="M 641 103
-L 641 966
-Q 928 831 1190 764
-Q 1453 697 1709 697
-Q 2247 697 2547 995
-Q 2847 1294 2900 1881
-Q 2688 1725 2447 1647
-Q 2206 1569 1925 1569
-Q 1209 1569 770 1986
-Q 331 2403 331 3084
-Q 331 3838 820 4291
-Q 1309 4744 2131 4744
-Q 3044 4744 3544 4128
-Q 4044 3513 4044 2388
-Q 4044 1231 3459 570
-Q 2875 -91 1856 -91
-Q 1528 -91 1228 -42
-Q 928 6 641 103
-z
-M 2125 2350
-Q 2441 2350 2600 2554
-Q 2759 2759 2759 3169
-Q 2759 3575 2600 3781
-Q 2441 3988 2125 3988
-Q 1809 3988 1650 3781
-Q 1491 3575 1491 3169
-Q 1491 2759 1650 2554
-Q 1809 2350 2125 2350
-z
-" transform="scale(0.015625)"/>
-      <path id="DejaVuSans-Bold-8" d="M 4959 1925
-Q 4738 1925 4616 1733
-Q 4494 1541 4494 1184
-Q 4494 825 4614 633
-Q 4734 441 4959 441
-Q 5184 441 5303 633
-Q 5422 825 5422 1184
-Q 5422 1541 5301 1733
-Q 5181 1925 4959 1925
-z
-M 4959 2450
-Q 5541 2450 5875 2112
-Q 6209 1775 6209 1184
-Q 6209 594 5875 251
-Q 5541 -91 4959 -91
-Q 4378 -91 4042 251
-Q 3706 594 3706 1184
-Q 3706 1772 4042 2111
-Q 4378 2450 4959 2450
-z
-M 2094 -91
-L 1403 -91
-L 4319 4750
-L 5013 4750
-L 2094 -91
-z
-M 1453 4750
-Q 2034 4750 2367 4411
-Q 2700 4072 2700 3481
-Q 2700 2891 2367 2550
-Q 2034 2209 1453 2209
-Q 872 2209 539 2550
-Q 206 2891 206 3481
-Q 206 4072 539 4411
-Q 872 4750 1453 4750
-z
-M 1453 4225
-Q 1228 4225 1106 4031
-Q 984 3838 984 3481
-Q 984 3122 1106 2926
-Q 1228 2731 1453 2731
-Q 1678 2731 1798 2926
-Q 1919 3122 1919 3481
-Q 1919 3838 1797 4031
-Q 1675 4225 1453 4225
-z
-" transform="scale(0.015625)"/>
-     </defs>
-     <use xlink:href="#DejaVuSans-Bold-16"/>
-     <use xlink:href="#DejaVuSans-Bold-1c" transform="translate(69.578125 0)"/>
-     <use xlink:href="#DejaVuSans-Bold-8" transform="translate(139.15625 0)"/>
-    </g>
-   </g>
-   <g id="text_2">
     <!-- 26.6 s -->
     <g style="fill: #1f2933" transform="translate(103.471641 125.818609) scale(0.23 -0.23)">
      <defs>
@@ -297,7 +178,7 @@ z
      <use xlink:href="#DejaVuSans-Bold-56" transform="translate(281.53125 0)"/>
     </g>
    </g>
-   <g id="text_3">
+   <g id="text_2">
     <!-- per 901-frame clip -->
     <g style="fill: #5f6b76" transform="translate(91.695859 144.733852) scale(0.11 -0.11)">
      <defs>
@@ -597,7 +478,7 @@ L 16.72 248.907969
 z
 " style="fill: #76b900; stroke: #ffffff; stroke-width: 3; stroke-linejoin: miter"/>
     </g>
-    <g id="text_4">
+    <g id="text_3">
      <!-- VAE decode: 10.5 s (39%) -->
      <g style="fill: #203044" transform="translate(42.72 258.007969) scale(0.13 -0.13)">
       <defs>
@@ -905,7 +786,7 @@ L 16.72 268.408984
 z
 " style="fill: #4c5b6b; stroke: #ffffff; stroke-width: 3; stroke-linejoin: miter"/>
     </g>
-    <g id="text_5">
+    <g id="text_4">
      <!-- Transformer rollout: 12.2 s (46%) -->
      <g style="fill: #203044" transform="translate(42.72 277.508984) scale(0.13 -0.13)">
       <defs>
@@ -1099,7 +980,7 @@ L 16.72 287.91
 z
 " style="fill: #9aa7b3; stroke: #ffffff; stroke-width: 3; stroke-linejoin: miter"/>
     </g>
-    <g id="text_6">
+    <g id="text_5">
      <!-- Prompt + VAE encode: 3.9 s (15%) -->
      <g style="fill: #203044" transform="translate(42.72 297.01) scale(0.13 -0.13)">
       <defs>

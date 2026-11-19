@@ -40,6 +40,8 @@ DISPLAY_WIDTHS = {
     "cudnn_sweep": 545,
     "latency": 465,
     "halo_latency": 505,
+    "halo_exchange": 495,
+    "strip_allgather": 540,
     "nvfp4_error": 490,
 }
 
@@ -192,9 +194,6 @@ def causal_first_frame() -> None:
                     fontsize=24,
                     color="#9AA7B3",
                 )
-                ax.text(
-                    x + 0.45, tile_y - 0.25, "Term vanishes", ha="center", fontsize=10, color=GREY
-                )
             else:
                 for n in range(1, 5):
                     ax.plot([x + n * 0.18] * 2, [tile_y, tile_y + 0.9], color="white", lw=0.7)
@@ -235,32 +234,24 @@ def causal_first_frame() -> None:
             bbox={"facecolor": "white", "edgecolor": "none", "pad": 2},
         )
         node(ax, 5.2, tile_y + 0.1, 0.9, 0.7, r"$y_0$" if first else r"$y_t$", "#E3EFD3", 17)
-        ax.text(
-            3.2,
-            line_y - 0.31,
-            "One spatial convolution" if first else "Three spatial convolutions, summed",
-            ha="center",
-            fontsize=12,
-            color=INK,
-        )
     save(fig, "causal_first_frame")
 
 
 def transform_stages() -> None:
-    fig, ax = plt.subplots(figsize=(6.4, 4.3))
-    ax.set(xlim=(0, 6.4), ylim=(0, 4.3))
+    fig, ax = plt.subplots(figsize=(6.4, 3.1))
+    ax.set(xlim=(0, 6.4), ylim=(-0.12, 3.1))
     ax.axis("off")
-    node(ax, 0.1, 3.15, 2.5, 0.8, "Input transform\nv = Bᵀd", "#DCE9F7", 15)
-    node(ax, 3.8, 3.15, 2.5, 0.8, "Filter transform\nu = Gg", "#FBE5D3", 15)
-    ax.text(1.35, 2.82, "Per tile · SIMT", ha="center", fontsize=13, color=BLUE)
-    ax.text(5.05, 2.82, "Once at weight loading", ha="center", fontsize=13, color="#BD5B16")
-    node(ax, 1.55, 1.55, 3.3, 0.76, "Products: mᵢ = vᵢuᵢ", "#E3EFD3", 15)
-    arrow(ax, (1.35, 2.65), (2.4, 2.35))
-    arrow(ax, (5.05, 2.65), (4.0, 2.35))
-    ax.text(3.2, 1.23, "With channels: batched GEMM on Tensor Cores", ha="center", fontsize=12)
-    node(ax, 1.55, 0.05, 3.3, 0.65, "Output transform\ny = Aᵀm", "#EAF0F6", 14)
-    arrow(ax, (3.2, 1.10), (3.2, 0.75))
-    ax.text(5.05, 0.35, "Per tile\nSIMT", fontsize=12, va="center", color=GREY)
+    for x, label, equation, color in [
+        (0.12, "Input tile", r"$v=B^{T}d$", "#DCE9F7"),
+        (3.81, "Filter", r"$u=Gg$", "#FBE5D3"),
+    ]:
+        ax.text(x + 1.22, 2.84, label, ha="center", va="center", fontsize=14)
+        node(ax, x, 2.05, 2.44, 0.55, equation, color, 15)
+    arrow(ax, (1.34, 2.00), (2.60, 1.54))
+    arrow(ax, (5.03, 2.00), (3.80, 1.54))
+    node(ax, 2.0, 0.95, 2.4, 0.5, r"$m_i=v_i u_i$", "#E3EFD3", 15)
+    arrow(ax, (3.2, 0.90), (3.2, 0.54))
+    node(ax, 2.0, 0.02, 2.4, 0.45, r"$y=A^{T}m$", "#EAF0F6", 15)
     save(fig, "transform_stages")
 
 
@@ -289,10 +280,12 @@ def decoder_breakdown(data: dict) -> None:
 
 def hardware(data: dict, key: str) -> None:
     rows = data[key]["results"]
-    fig, axs = plt.subplots(4, 2, figsize=(6.4, 9.0), layout="constrained")
+    fig = plt.figure(figsize=(6.4, 7.1), layout="constrained")
+    panels = fig.subfigures(4, 1)
     for i, (shape, title) in enumerate(WORKLOADS):
-        for j, op in enumerate(["encode", "decode"]):
-            ax = axs[i, j]
+        panels[i].suptitle(title, x=0.02, ha="left", fontsize=12, weight="bold")
+        axes = panels[i].subplots(1, 2)
+        for ax, op in zip(axes, ["encode", "decode"]):
             target = shape
             metric = "median_ms"
             subtitle = op.capitalize()
@@ -318,8 +311,11 @@ def hardware(data: dict, key: str) -> None:
                 )
             ax.set_ylim(0, max(vals) * 1.32)
             ax.set_xticks([])
-            ax.set_ylabel("GPU time (ms)", fontsize=11)
-            ax.set_title(f"{title}\n{subtitle}", fontsize=11, pad=7)
+            ax.set_title(subtitle + " (ms)", fontsize=10, loc="left", pad=3)
+            ax.spines["left"].set_visible(False)
+            ax.tick_params(axis="y", length=0)
+            ax.grid(axis="y", alpha=0.18)
+            ax.set_axisbelow(True)
             ax.spines[["top", "right"]].set_visible(False)
             ax.tick_params(labelsize=10)
     fig.legend(
@@ -336,7 +332,7 @@ def hardware(data: dict, key: str) -> None:
 def scaling(data: dict) -> None:
     rows = data["b200_strong_scaling"]["results"]
     for op in ["encode", "decode"]:
-        fig, axs = plt.subplots(2, 2, figsize=(6.4, 5.9), layout="constrained")
+        fig, axs = plt.subplots(2, 2, figsize=(6.4, 5.2), layout="constrained")
         for ax, (shape, title) in zip(axs.flat, WORKLOADS):
             target = shape
             metric = "median_ms"
@@ -347,7 +343,7 @@ def scaling(data: dict) -> None:
                 )
                 if op == "decode":
                     metric = "step_ms"
-            for backend in NAMES:
+            for backend, marker in zip(NAMES, ["^", "s", "o"]):
                 selected = sorted(
                     (
                         r
@@ -359,7 +355,8 @@ def scaling(data: dict) -> None:
                 ax.plot(
                     [r["gpus"] for r in selected],
                     [r[metric] for r in selected],
-                    "o-",
+                    marker=marker,
+                    label=NAMES[backend],
                     color=COLORS[backend],
                     lw=2,
                     markersize=4,
@@ -369,15 +366,14 @@ def scaling(data: dict) -> None:
             ax.set_xticks([1, 2, 4, 8], ["1", "2", "4", "8"])
             ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda x, _: f"{x:g}"))
             ax.set_title(title, fontsize=11)
-            ax.set_xlabel("GPUs", fontsize=11)
-            ax.set_ylabel("GPU time (ms)", fontsize=11)
             ax.tick_params(labelsize=10)
             ax.grid(alpha=0.2)
             ax.spines[["top", "right"]].set_visible(False)
+        fig.supylabel("GPU time (ms)", fontsize=12)
+        fig.supxlabel("GPUs", fontsize=12)
         fig.legend(
-            [Patch(color=COLORS[b]) for b in NAMES],
-            list(NAMES.values()),
-            loc="outside lower center",
+            *axs[0, 0].get_legend_handles_labels(),
+            loc="outside upper center",
             ncol=3,
             frameon=False,
             fontsize=11,
@@ -386,41 +382,41 @@ def scaling(data: dict) -> None:
 
 
 def final_profile(data: dict) -> None:
-    fig, axs = plt.subplots(2, 1, figsize=(6.4, 7.2))
-    palettes = [
-        ["#76B900", "#2F5D8F", "#7FA7D6", "#B7CDE8", "#D6E3F3", "#1F2937", "#D1D5DB"],
-        ["#3E6B00", "#76B900", "#A6D65A", "#D3EBAE", "#2F5D8F", "#1F2937", "#B7CDE8", "#D1D5DB"],
-    ]
-    for ax, backend, colors in zip(axs, ["native", "winovae"], palettes):
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(6.6, 5.75),
+        layout="constrained",
+        sharex=True,
+        gridspec_kw={"height_ratios": [7, 8]},
+    )
+    convolution = {
+        "Direct convolution",
+        "Fused spatial convolution",
+        "Winograd GEMMs",
+        "Winograd transforms",
+    }
+    for ax, backend in zip(axes, ["native", "winovae"]):
         row = data["b300_decoder_profile"]["results"][backend]
         cats = row["kernel_seconds"]
-        vals = list(cats.values())
-        wedges, _ = ax.pie(
-            vals,
-            colors=colors,
-            startangle=90,
-            counterclock=False,
-            wedgeprops={"width": 0.4, "edgecolor": "white"},
+        total = sum(cats.values())
+        for i, (label, seconds) in enumerate(cats.items()):
+            ax.barh(i, seconds, height=0.65, color=GREEN if label in convolution else BLUE)
+            duration = f"{seconds * 1000:.1f} ms" if seconds < 0.01 else f"{seconds:.2f} s"
+            share = f"{seconds / total:.0%}" if seconds / total >= 0.005 else "<1%"
+            ax.text(seconds + 0.025, i, f"{duration} ({share})", va="center", fontsize=10)
+        ax.set_yticks(range(len(cats)), cats.keys(), fontsize=11)
+        ax.invert_yaxis()
+        ax.set_title(
+            f"{NAMES[backend]}   ·   {row['median_span_s']:.2f} s per decode",
+            loc="left",
+            fontsize=13,
         )
-        ax.text(0, 0.06, f"{row['median_span_s']:.2f} s", ha="center", fontsize=21, weight="bold")
-        ax.text(0, -0.20, "per decode", ha="center", fontsize=11, color=GREY)
-        ax.set_title(NAMES[backend], fontsize=15, weight="bold")
-        labels = []
-        for label, value in cats.items():
-            duration = f"{value:.2f} s" if value >= 0.01 else f"{value * 1000:.1f} ms"
-            fraction = f"{100 * value / sum(vals):.0f}%" if value / sum(vals) >= 0.005 else "<1%"
-            labels.append(f"{label}\n{duration} · {fraction}")
-        ax.legend(
-            wedges,
-            labels,
-            loc="center left",
-            bbox_to_anchor=(0.97, 0.5),
-            fontsize=10,
-            frameon=False,
-            labelspacing=0.55,
-            handlelength=1,
-        )
-    fig.subplots_adjust(left=0.0, right=0.48, hspace=0.38, top=0.95, bottom=0.03)
+        ax.tick_params(length=0, labelsize=10)
+        ax.set_axisbelow(True)
+        ax.grid(axis="x", alpha=0.2)
+        ax.spines[["top", "left", "right"]].set_visible(False)
+    axes[-1].set(xlim=(0, 2.55), xticks=[0, 0.5, 1.0, 1.5, 2.0], xlabel="Kernel time (seconds)")
     save(fig, "final_profile")
 
 

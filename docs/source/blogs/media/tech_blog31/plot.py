@@ -72,8 +72,7 @@ def flow() -> None:
 
 
 def tiles() -> None:
-    fig, ax = canvas(3.3)
-    text(ax, 3.2, 3.03, "Two-dimensional Winograd notation", weight="bold")
+    fig, ax = canvas(2.78)
     text(ax, 3.2, 2.54, r"$F(h\times w,\;h_f\times w_f)$")
     for x, label in [(1.4, "Input tile"), (3.45, "Filter"), (5.45, "Output tile")]:
         text(ax, x, 2.0, label)
@@ -86,16 +85,15 @@ def tiles() -> None:
         text(ax, x - 0.2, y + height / 2, height_label, rotation=90)
         text(ax, x + width / 2, y - 0.23, width_label)
     text(ax, 2.55, 1.02, "∗")
-    arrow(ax, (4.05, 1.02), (4.6, 1.02))
+    arrow(ax, (4.02, 1.02), (4.46, 1.02))
     save(fig, "spatial_tiles")
 
 
 def gemm() -> None:
-    fig, ax = plt.subplots(figsize=(9.4, 6.3))
+    fig, ax = plt.subplots(figsize=(9.4, 5.85))
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    ax.set(xlim=(0, 9.4), ylim=(0, 6.3))
+    ax.set(xlim=(0, 9.4), ylim=(0, 5.85))
     ax.axis("off")
-    text(ax, 4.70, 6.05, r"$F(2\times2,\;3\times3)$: 16 GEMMs", weight="bold")
     for x, size, label, color in [
         (0.50, 4, "Input tiles", PALE_GREEN),
         (5.15, 3, "Filters", PALE_BLUE),
@@ -117,7 +115,6 @@ def gemm() -> None:
     text(ax, 4.22, 5.08, r"$V_0,\ldots,V_{15}$")
     arrow(ax, (6.03, 5.08), (7.38, 5.08))
     text(ax, 6.705, 5.51, "Filter\ntransform")
-    ax.text(7.15, 4.72, "Once at weight loading", ha="center", va="center", color=GREY, fontsize=13)
     text(ax, 8.06, 5.08, r"$U_0,\ldots,U_{15}$")
     text(ax, 2.45, 4.58, r"$M_i=V_iU_i$")
     specs = [(0.15, 1.35, "V"), (1.88, 1.10, "U"), (3.40, 1.35, "M")]
@@ -174,16 +171,15 @@ def fusion() -> None:
         arrow(ax, (1.55, y + 0.59), (1.55, y + 0.39))
         arrow(ax, (1.55, y - 0.02), (1.55, y - 0.11))
         arrow(ax, (4.85, y + 0.53), (4.85, y - 0.1))
-    text(ax, 4.85, 0.88, "Intermediates stay on chip")
     for x in [1.55, 4.85]:
         arrow(ax, (x, 4.43), (x, 4.22))
-        arrow(ax, (x, 0.72), (x, 0.52))
+        arrow(ax, (x, 1.11), (x, 0.52))
     box(ax, 0.1, 0.02, 6.2, 0.48, "Write the convolution input to HBM", PALE_GREY)
     save(fig, "fusion")
 
 
 def upsample_fold() -> None:
-    fig, ax = canvas(6.0)
+    fig, ax = canvas(4.18)
     colors = [PALE_BLUE, PALE_ORANGE, PALE_GREEN, "#E8DFF4"]
 
     def grid(
@@ -206,9 +202,11 @@ def upsample_fold() -> None:
                     colors[groups[row][col]],
                 )
 
-    text(ax, 3.2, 5.76, "Two paths to the same output", weight="bold")
-    text(ax, 2.65, 5.35, "Upsampled 2×")
-    text(ax, 4.85, 5.35, "3 × 3 filter")
+    for y, label in [(3.95, "Upsampled input"), (1.55, "Original input")]:
+        text(ax, 1.25, y, label)
+    text(ax, 4.24, 3.95, "3 × 3 filter")
+    text(ax, 4.24, 1.55, "Folded 2 × 2 filter")
+
     repeated = [
         ["A", "A", "B", "B"],
         ["A", "A", "B", "B"],
@@ -216,73 +214,99 @@ def upsample_fold() -> None:
         ["C", "C", "D", "D"],
     ]
     groups = [[0, 0, 1, 1], [0, 0, 1, 1], [2, 2, 3, 3], [2, 2, 3, 3]]
-    grid(1.8, 3.5, repeated, groups, 0.42, 0.42)
-    # This top-left window matches the odd-row, odd-column weight grouping.
-    ax.add_patch(
-        Rectangle(
-            (1.8, 3.92), 1.26, 1.26, fill=False, edgecolor=GREEN, linewidth=2.5, linestyle="--"
-        )
-    )
-    groups = [[0, 0, 1], [0, 0, 1], [2, 2, 3]]
+    grid(0.41, 1.98, repeated, groups, 0.42, 0.42)
+    ax.add_patch(Rectangle((0.41, 2.40), 1.26, 1.26, fill=False, edgecolor=GREEN, lw=2, ls="--"))
     grid(
-        4.15, 3.72, [[rf"$w_{3 * r + c}$" for c in range(3)] for r in range(3)], groups, 0.46, 0.46
+        3.47,
+        2.06,
+        [[rf"$w_{3 * r + c}$" for c in range(3)] for r in range(3)],
+        [[0, 0, 1], [0, 0, 1], [2, 2, 3]],
+        0.51,
+        0.51,
     )
-    text(ax, 3.8, 4.4, r"$\ast$")
-    arrow(ax, (5.6, 4.4), (6.0, 4.4))
-    text(ax, 6.2, 4.4, "$y$")
-    text(ax, 4.85, 3.38, "9 products")
 
-    text(ax, 0.75, 3.15, "Low-res\ninput")
-    grid(0.2, 1.8, [["A", "B"], ["C", "D"]], [[0, 1], [2, 3]], 0.55, 0.55)
-    arrow(ax, (1.32, 2.85), (1.75, 4.2))
-    text(ax, 0.75, 4.15, "Upsample\n+ convolve")
-    arrow(ax, (1.32, 1.85), (3.08, 1.05))
-    text(ax, 1.5, 0.85, "Convolve at\nlow resolution")
-
-    arrow(ax, (4.85, 3.12), (4.85, 2.05))
-    text(ax, 3.1, 2.65, "Fold weights applied\nto the same pixel")
-    text(ax, 4.35, 1.78, "Folded 2 × 2 filter")
+    grid(0.70, 0.12, [["A", "B"], ["C", "D"]], [[0, 1], [2, 3]], 0.55, 0.55)
     folded = [["$w_0+w_1$\n$+w_3+w_4$", "$w_2+w_5$"], ["$w_6+w_7$", "$w_8$"]]
-    grid(3.15, 0.35, folded, [[0, 1], [2, 3]], 1.2, 0.6)
-    arrow(ax, (5.6, 0.95), (6.0, 0.95))
-    text(ax, 6.2, 0.95, "$y$")
-    text(ax, 5.85, 0.1, "4 products")
+    grid(3.04, 0.09, folded, [[0, 1], [2, 3]], 1.2, 0.58)
+    for middle in [2.83, 0.67]:
+        text(ax, 2.55, middle, r"$\ast$")
+        arrow(ax, (5.48, middle), (5.90, middle))
+        text(ax, 6.10, middle, "$y$")
     save(fig, "upsample_fold")
 
 
+def frame_strip(
+    ax: plt.Axes,
+    x: float,
+    y: float,
+    columns: range,
+    step: float,
+    *,
+    halos: tuple[int, ...] = (),
+    labels_above: bool = False,
+) -> None:
+    # The same contour and column numbers identify a strip in every buffer.
+    ridge = [0.22, 0.34, 0.71, 0.43, 0.31, 0.57, 0.77, 0.46, 0.26]
+    for i, j in enumerate(columns):
+        left = x + i * step
+        if j in (-1, 8):
+            ax.add_patch(Rectangle((left, y), step, 0.85, facecolor=PALE_GREY, edgecolor="white"))
+            ax.text(left + step / 2, y + 0.425, "0", ha="center", va="center", color=GREY)
+            continue
+        fill, edge = (PALE_BLUE, BLUE) if j < 4 else (PALE_GREEN, GREEN)
+        ax.add_patch(Rectangle((left, y), step, 0.85, facecolor=fill, edgecolor="white"))
+        ax.fill_between(
+            [left, left + step],
+            y,
+            [y + ridge[j], y + ridge[j + 1]],
+            color=edge,
+            alpha=0.60,
+            linewidth=0,
+        )
+        if j in halos:
+            ax.add_patch(
+                Rectangle((left, y), step, 0.85, fill=False, edgecolor=edge, ls="--", lw=1.4)
+            )
+        ax.text(
+            left + step / 2,
+            y + 0.94 if labels_above else y - 0.12,
+            str(j),
+            ha="center",
+            va="bottom" if labels_above else "top",
+            fontsize=11,
+        )
+
+
 def halo() -> None:
-    fig, ax = canvas(5.0)
-    colors = [PALE_BLUE, PALE_GREEN, PALE_ORANGE, "#E8DFF4"]
-    text(ax, 3.2, 4.75, "One frame, four spatial strips", weight="bold")
-    for g in range(4):
-        box(ax, 0.2 + 1.5 * g, 3.85, 1.5, 0.6, f"GPU {g}", colors[g])
-    text(ax, 3.2, 3.46, "Buffers before each 3 × 3 convolution")
-    for x, title in [(2.0, "Left halo"), (3.7, "Own strip"), (5.4, "Right halo")]:
-        text(ax, x, 2.95, title)
-    for g in range(4):
-        y = 2.32 - 0.57 * g
-        text(ax, 0.6, y + 0.24, f"GPU {g}")
-        box(
+    fig, ax = canvas(3.55)
+    step = 0.45
+    origin = 1.75
+    for rank, first, last, y, halo_column in [(0, -1, 4, 2.35, 4), (1, 3, 8, 0.35, 3)]:
+        ax.text(0.78, y + 0.43, f"GPU {rank}", va="center", ha="right", fontsize=14)
+        frame_strip(
             ax,
-            1.25,
+            origin + first * step,
             y,
-            1.5,
-            0.48,
-            "zeros" if g == 0 else f"from {g - 1}",
-            PALE_GREY if g == 0 else colors[g - 1],
+            range(first, last + 1),
+            step,
+            halos=(halo_column,),
+            labels_above=rank == 0,
         )
-        box(ax, 2.9, y, 1.6, 0.48, f"{g}", colors[g])
-        box(
-            ax,
-            4.65,
-            y,
-            1.5,
-            0.48,
-            "zeros" if g == 3 else f"from {g + 1}",
-            PALE_GREY if g == 3 else colors[g + 1],
-        )
-    text(ax, 3.2, 0.25, "Send the last column right; the first column left.")
-    save(fig, "halo_strips")
+    for j, start, end, color in [(3, 2.35, 1.20, BLUE), (4, 1.20, 2.35, GREEN)]:
+        x = origin + (j + 0.5) * step
+        arrow(ax, (x, start), (x, end), color)
+    save(fig, "halo_exchange")
+
+    fig, ax = canvas(3.15)
+    step = 0.36
+    ax.text(1.82, 2.88, "Local strip", ha="center", fontsize=14)
+    ax.text(4.83, 2.88, "After all-gather", ha="center", fontsize=14)
+    for rank, y in [(0, 1.66), (1, 0.25)]:
+        ax.text(0.87, y + 0.43, f"GPU {rank}", va="center", ha="right", fontsize=14)
+        frame_strip(ax, 1.1, y, range(4 * rank, 4 * rank + 4), step)
+        arrow(ax, (2.62, y + 0.425), (3.28, y + 0.425))
+        frame_strip(ax, 3.39, y, range(8), step)
+    save(fig, "strip_allgather")
 
 
 def costs(data: dict) -> None:
@@ -302,7 +326,8 @@ def costs(data: dict) -> None:
         values = np.array([r[key] for r in rows])
         if unit == "KiB":
             values = values / 1024
-        ax.plot(xs, values, "o-", color=ORANGE, lw=2.3)
+        ax.plot(xs[:1], values[:1], "o", color=ORANGE)
+        ax.plot(xs[1:], values[1:], "o-", color=ORANGE, lw=2.3)
         ax.set_title(title, loc="left", fontsize=17, pad=16)
         if unit == "FLOPs":
             simt = [r["transform_ops_per_output_pixel"] for r in rows]
@@ -349,7 +374,7 @@ def sweep(data: dict) -> None:
             ]
             if points:
                 x, y = zip(*points)
-                style = "s:" if key == "fused 1D F(2,3)" else "o-"
+                style = {"F(2×2) cuBLAS": "o-", "F(4×4) KF": "^-", "fused 1D F(2,3)": "s:"}[key]
                 ax.plot(x, y, style, label=label, color=color, lw=2.3)
         ax.axhline(1, color=GREY, ls="--", lw=1.5)
         ax.set(ylim=(0, 2.7), yticks=[0, 1, 2])
@@ -358,8 +383,10 @@ def sweep(data: dict) -> None:
     handles, labels = axs[2].get_legend_handles_labels()
     fig.legend(handles, labels, loc="outside upper center", frameon=False, fontsize=13)
     axs[1].set_ylabel("Speedup over direct cuDNN")
-    axs[-1].set_xticks([0, 2, 4, 6], ["45×80", "180×320", "720×1280", "1440×2560"])
-    axs[-1].tick_params(axis="x", labelsize=15, rotation=20)
+    sizes = [(r["height"], r["width"]) for r in rows if r["channels"] == 256]
+    axs[-1].set_xticks(
+        range(len(sizes)), [f"{h}×{w}" for h, w in sizes], rotation=40, ha="right", fontsize=12
+    )
     axs[-1].set_xlabel("Feature-frame size")
     save(fig, "cudnn_sweep")
 
@@ -406,17 +433,6 @@ def motivation(data: dict) -> None:
         frameon=False,
         fontsize=13,
         handlelength=1.2,
-    )
-    angle = np.deg2rad(90 - 180 * values[0] / total)
-    ax.text(
-        0.85 * np.cos(angle),
-        0.85 * np.sin(angle),
-        f"{100 * values[0] / total:.0f}%",
-        ha="center",
-        va="center",
-        fontsize=13,
-        weight="bold",
-        color="white",
     )
     ax.text(
         0,

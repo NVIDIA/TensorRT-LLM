@@ -250,7 +250,7 @@ In $F(m,r)$, $m$ is the number of outputs and $r$ the filter length. The constru
 
 </div>
 
-*Figure 6. The four stages of the one-dimensional construction. The fixed matrices B, G, and A implement input transformation, filter transformation, and reconstruction. Filter preparation runs once at weight loading. SIMT denotes ordinary GPU instruction execution. The channel contractions can use Tensor Cores. Each product index identifies one transform coordinate.*
+*Figure 6. The four stages of the one-dimensional construction. The fixed matrices B, G, and A implement input transformation, filter transformation, and reconstruction. Filter preparation runs once at weight loading. Input and output transforms run per tile on ordinary GPU execution units. With multiple channels, the product stage can use batched GEMMs on Tensor Cores. Each product index identifies one transform coordinate.*
 
 #### Mapping channels and tiles to GEMMs
 
@@ -409,19 +409,19 @@ A spatial 3 × 3 convolution also needs one column from either neighboring strip
 
 <div align="center">
 
-![GPU 0 owns the blue columns and GPU 1 owns the green columns. Arrows show each GPU writing its border column into the other GPU's halo. Outer boundaries contain zero padding.](../media/tech_blog31/halo2.png)
+![GPU 0 writes column 3 into GPU 1’s left halo. GPU 1 writes column 4 into GPU 0’s right halo.](../media/tech_blog31/halo_exchange.svg)
 
 </div>
 
-*Figure 11(a). Halo exchange for a width split across two GPUs. Blue and green identify the GPU that computes each column. Each buffer contains its own strip plus a halo column on either side. The arrows show Fused GPUDirect P2P writes into the neighbor's halo. The outer image boundaries use zero padding. Interior GPUs in a larger partition exchange borders with both neighbors.*
+*Figure 11(a).* A width split of one feature frame. GPU 0 owns columns 0–3 (blue) and GPU 1 owns columns 4–7 (green). Each arrow follows one Fused GPUDirect P2P write into a dashed halo slot. The gray cells hold zero padding at the frame edges. With more than two GPUs, an interior strip exchanges a column with each neighbor.
 
 <div align="center">
 
-![Before all-gather, GPU 0 holds the blue strip and GPU 1 holds the green strip. After all-gather, both GPUs hold the whole frame, containing both strips.](../media/tech_blog31/allgather2.png)
+![Each GPU starts with its own half of the frame. After all-gather, each holds columns 0 through 7 in spatial order.](../media/tech_blog31/strip_allgather.svg)
 
 </div>
 
-*Figure 11(b). All-gather combines the strips on every GPU. Attention gathers keys and values across the full spatial extent while queries remain local. At the end of decoding, a separate all-gather assembles complete video frames from the decoded strips. These operations transfer all strips, whereas halo exchange transfers only border columns.*
+*Figure 11(b).* All-gather on the same width split. Each GPU receives the entire strip owned by its peer. Attention gathers keys and values this way while queries stay local. A separate all-gather assembles complete frames at the decoder output.
 
 The partition need not divide the latent width evenly. For example, the 52-column latent grid of an 832-pixel-wide video can be split across eight GPUs into four seven-column strips and four six-column strips. WinoVAE tracks each rank's valid extent as resolution changes. Attention gathers accommodate unequal row counts, and the final gather retains only valid output regions. This supports resolutions that an equal-width split would reject. The wider strips still determine part of the load imbalance.
 
@@ -797,7 +797,7 @@ Choosing one of [cuDNN's Winograd convolution algorithms](https://docs.nvidia.co
 
 </div>
 
-*Figure 20. One B300, 189-frame 720p decode, one latent frame per chunk, CUDA-graph replay, November 1, 2026. Ring fractions use the sum of categorized CUPTI kernel durations. Central values show median first-to-last kernel time. Green includes direct convolution, Winograd GEMMs, input/output transforms, and fused spatial convolution. The two totals are from this same profiling run.*
+*Figure 20. One B300, 189-frame 720p decode, one latent frame per chunk, CUDA-graph replay, November 1, 2026. Bar lengths show kernel durations on a common scale. Percentages use the sum of categorized CUPTI kernel durations for each decoder. The panel headings give median first-to-last kernel time from the same run. Green marks convolution, including the Winograd transforms.*
 
 On one B300, decode fell from 4.63 to 1.26 seconds even as convolution’s share of categorized kernel time rose from about 40% to 74% (Figure 20). The 74% includes Winograd transforms. Fusing normalization, activation, and residual work removed enough overhead that the optimized decoder now spends most of its time filtering feature maps.
 
