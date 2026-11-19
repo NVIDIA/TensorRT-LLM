@@ -14,6 +14,7 @@
 # limitations under the License.
 """MoE backend unit tests."""
 
+import ast
 import collections
 import dataclasses
 import importlib
@@ -445,6 +446,243 @@ def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
 
     with pytest.raises(ValueError, match="got 2 counts for EP size 4"):
         scheduler._strip_adp_padding(x, router_logits, None, [6, 5])
+
+
+def _dummy_allreduce_moe(
+    rank: int, enabled: bool, events: List[str], **backend_overrides
+) -> SimpleNamespace:
+    """A fused-comm MoE that records its debug collectives, quantization and kernel launches."""
+
+    def run_moe(ctx: MoERunContext) -> torch.Tensor:
+        events.append("run_moe")
+        return ctx.x + 1
+
+    backend = dict(
+        input_requirement=MoEInputRequirement(),
+        fused_route_quant_enabled=False,
+        quantize_input=lambda x: events.append("quantize") or (x, None),
+        run_moe=run_moe,
+    )
+    backend.update(backend_overrides)
+    return SimpleNamespace(
+        mapping=SimpleNamespace(moe_ep_rank=rank, moe_ep_size=2),
+        parallel_size=2,
+        use_dp=True,
+        moe_max_num_tokens=2,
+        split_chunk=_split_chunk,
+        repeat_idx=0,
+        repeat_count=1,
+        apply_router_weight_on_input=False,
+        enable_dummy_allreduce=enabled,
+        dummy_allreduce=lambda: events.append("allreduce"),
+        layer_load_balancer=None,
+        num_slots=4,
+        _enable_perfect_router_expert_ids=False,
+        routing_method=SimpleNamespace(
+            experts_per_token=1,
+            apply=lambda logits, ids: (
+                torch.zeros((logits.shape[0], 1), dtype=torch.int32),
+                torch.ones((logits.shape[0], 1), dtype=torch.float32),
+            ),
+        ),
+        _using_dynamic_load_balancer=lambda: False,
+        _load_balancer_uses_replica_plan=lambda: False,
+        _warmup_placement_route_counters=lambda offset: None,
+        _maybe_get_perfect_router_expert_ids=lambda routes: routes,
+        _load_balancer_start_wait_gpu_stage=Mock(),
+        _load_balancer_start_set_cpu_stage=Mock(),
+        _load_balancer_done_set_cpu_stage=Mock(),
+        backend=SimpleNamespace(**backend),
+    )
+
+
+def _run_dummy_allreduce_scheduler(
+    scheduler: FusedCommMoEScheduler, token_counts: Tuple[int, int]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Attention-DP padding must not turn an idle rank into a nonempty chunk.
+    x = torch.arange(max(token_counts) * 8, dtype=torch.float32).reshape(-1, 8)
+    output = scheduler.forward(
+        x,
+        torch.zeros((x.shape[0], 4)),
+        do_finalize=True,
+        output_dtype=x.dtype,
+        all_rank_num_tokens=list(token_counts),
+        use_dp_padding=True,
+        input_ids=None,
+    )
+    return x, output
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("token_counts", [(2, 1), (5, 1), (5, 0), (0, 0)])
+def test_fused_comm_dummy_allreduce_brackets_every_chunk(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, token_counts: tuple[int, int]
+) -> None:
+    """Ranks with empty/tail chunks must issue the same debug collectives as their peers."""
+    scheduler_module = importlib.import_module(FusedCommMoEScheduler.__module__)
+    monkeypatch.setattr(scheduler_module, "_record_routes", lambda moe, routes, slots: routes)
+    monkeypatch.setattr(scheduler_module, "get_active_route_capture", lambda: None)
+    num_chunks = max(1, (max(token_counts) + 1) // 2)
+
+    for rank, num_tokens in enumerate(token_counts):
+        events = []
+        chunk_sizes = []
+        moe = _dummy_allreduce_moe(rank, enabled, events)
+        run_moe = moe.backend.run_moe
+
+        def record_chunk(ctx: MoERunContext, run_moe=run_moe) -> torch.Tensor:
+            chunk_sizes.append(ctx.x.shape[0])
+            return run_moe(ctx)
+
+        moe.backend.run_moe = record_chunk
+        x, output = _run_dummy_allreduce_scheduler(FusedCommMoEScheduler(moe), token_counts)
+
+        chunk_events = ["quantize", "run_moe"]
+        if enabled:
+            chunk_events = ["allreduce", *chunk_events, "allreduce"]
+        assert events == chunk_events * num_chunks
+        assert chunk_sizes == _split_chunk(num_tokens, num_chunks)
+        torch.testing.assert_close(output, x[:num_tokens] + 1, atol=0, rtol=0)
+
+
+@pytest.fixture
+def rubin_fused_comm_scheduler_type() -> type:
+    # Importing the GLM Rubin target loads its SM107 native library. Execute just its scheduler
+    # class on top of the real shared scheduler, so this CPU test needs neither.
+    source = (
+        Path(__file__).resolve().parents[4]
+        / "tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa"
+        / "glm_5_2_nvfp4__sm_107__high_throughput/ops/moe/megamoe.py"
+    )
+    tree = ast.parse(source.read_text())
+    scheduler = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "RubinFusedCommScheduler"
+    )
+    namespace = {
+        "FusedCommMoEScheduler": FusedCommMoEScheduler,
+        "MoERunContext": MoERunContext,
+        "get_active_route_capture": lambda: None,
+        "ExpertStatistic": SimpleNamespace(should_record=lambda: False),
+        "get_calibrator": lambda: SimpleNamespace(mode=None),
+        "Mode": SimpleNamespace(NONE=None),
+    }
+    exec(compile(ast.Module(body=[scheduler], type_ignores=[]), str(source), "exec"), namespace)
+    return namespace["RubinFusedCommScheduler"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fused_comm_dummy_allreduce_covers_forward_chunk_override(
+    monkeypatch: pytest.MonkeyPatch, rubin_fused_comm_scheduler_type: type, enabled: bool
+) -> None:
+    """A rank on the GLM Rubin direct stage and an idle rank issue the same debug collectives."""
+    scheduler_module = importlib.import_module(FusedCommMoEScheduler.__module__)
+    monkeypatch.setattr(scheduler_module, "_record_routes", lambda moe, routes, slots: routes)
+    monkeypatch.setattr(scheduler_module, "get_active_route_capture", lambda: None)
+    token_counts = (5, 0)
+    num_chunks = 3
+
+    rank_events = []
+    for rank, num_tokens in enumerate(token_counts):
+        events = []
+        stage = SimpleNamespace(
+            topk_idx=torch.zeros((2, 1), dtype=torch.int32),
+            topk_weights=torch.ones((2, 1)),
+        )
+        prepare_direct_stage = Mock(return_value=stage)
+        moe = _dummy_allreduce_moe(
+            rank,
+            enabled,
+            events,
+            prepare_direct_stage=prepare_direct_stage,
+            route_and_quantize_into=lambda *args: stage,
+            quantize_input_into=lambda x, stage: events.append("quantize_into") or (x, None),
+            set_adaptive_launch_tokens=Mock(),
+        )
+        x, output = _run_dummy_allreduce_scheduler(
+            rubin_fused_comm_scheduler_type(moe), token_counts
+        )
+
+        assert prepare_direct_stage.call_count == (num_chunks if num_tokens else 0)
+        torch.testing.assert_close(output, x[:num_tokens] + 1, atol=0, rtol=0)
+        rank_events.append(events)
+
+    def expected(quantize: str) -> List[str]:
+        chunk_events = [quantize, "run_moe"]
+        if enabled:
+            chunk_events = ["allreduce", *chunk_events, "allreduce"]
+        return chunk_events * num_chunks
+
+    # Rank 0 runs the direct stage; the idle rank 1 falls back to the base path.
+    assert rank_events == [expected("quantize_into"), expected("quantize")]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_dummy_allreduce_uses_nccl_whatever_the_model_strategy(
+    monkeypatch: pytest.MonkeyPatch, attention_dp: bool
+) -> None:
+    """TWOSHOT at TP 2/4 rejects the 4-element dummy tensor, so the dummy sync has its own NCCL
+    reducer; under attention TP the layer's output reduction keeps the model's strategy."""
+    import tensorrt_llm._torch.distributed as distributed
+    from tensorrt_llm.functional import AllReduceStrategy
+
+    class RecordingAllReduce:
+        def __init__(self, *, mapping, strategy, dtype):
+            self.strategy = strategy
+            self.inputs = []
+
+        def __call__(self, x):
+            self.inputs.append(x)
+            return x
+
+    class ReducerTestMoE(MoE):
+        def create_weights(self):
+            raise NotImplementedError
+
+        def load_weights(self, weights, allow_partial_loading=False):
+            raise NotImplementedError
+
+        def quantize_input(self, x, **kwargs):
+            return x, None
+
+        def run_moe(self, ctx, *, workspace=None):
+            raise NotImplementedError
+
+    monkeypatch.setattr(distributed, "AllReduce", RecordingAllReduce)
+    monkeypatch.setenv("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "1")
+    moe = ReducerTestMoE(
+        routing_method=DefaultMoeRoutingMethod(top_k=1),
+        num_experts=4,
+        hidden_size=8,
+        intermediate_size=16,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=ModelConfig(
+            mapping=Mapping(world_size=2, tp_size=2, rank=0, enable_attention_dp=attention_dp),
+            allreduce_strategy=AllReduceStrategy.TWOSHOT,
+        ),
+        init_load_balancer=False,
+    )
+
+    assert moe.dummy_all_reduce.strategy == AllReduceStrategy.NCCL
+    if attention_dp:
+        # No output reduction under attention DP: the layer keeps the NCCL reducer, as before.
+        assert moe.all_reduce is moe.dummy_all_reduce
+    else:
+        assert moe.all_reduce.strategy == AllReduceStrategy.TWOSHOT
+
+    zeros = torch.zeros
+    monkeypatch.setattr(torch, "zeros", lambda *args, device=None, **kwargs: zeros(*args, **kwargs))
+    moe.dummy_allreduce()
+
+    (dummy,) = moe.dummy_all_reduce.inputs
+    assert dummy.shape == (4,) and dummy.dtype == torch.float32
+    if not attention_dp:
+        assert moe.all_reduce.inputs == []
 
 
 @pytest.mark.cpu_only
@@ -4636,17 +4874,19 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=sm_version)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=sm_version)
     assert (len(decode), len(prefill)) == (decode_count, prefill_count)
-    assert all(len(t) == 11 for t in decode + prefill)
-    assert {t[-2] for t in decode} == {(1, 1)}
-    assert {t[-2] for t in prefill} == {(2, 4)}
-    assert {t[-1] for t in decode + prefill} == {"expert"}
+    assert all(len(t) == 12 for t in decode + prefill)
+    assert {t[-3] for t in decode} == {(1, 1)}
+    assert {t[-3] for t in prefill} == {(2, 4)}
+    assert {t[-2] for t in decode + prefill} == {"expert"}
+    assert {t[-1] for t in decode + prefill} == {False}
     for tactic in decode + prefill:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     default_tactics = [
         megamoe_op.default_megamoe_tactic(num_tokens) for num_tokens in (64, 4096, 16384)
     ]
-    assert all(len(tactic) == 11 for tactic in default_tactics)
-    assert {tactic[-1] for tactic in default_tactics} == {"expert"}
+    assert all(len(tactic) == 12 for tactic in default_tactics)
+    assert {tactic[-2] for tactic in default_tactics} == {"expert"}
+    assert {tactic[-1] for tactic in default_tactics} == {False}
     for tactic in default_tactics:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     if sm_version == 107:
@@ -4660,7 +4900,7 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
                 in_kernel_fc2_reduce=False,
                 combine_format="bf16",
             )
-            assert len(selected) == 11
+            assert len(selected) == 12
             assert selected == megamoe_op._unpack_tactic(tactic)
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
     invalid_tactic[3] = ("grouped", 0)
@@ -4669,9 +4909,10 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
     megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
     assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
-    v4 = megamoe_op.default_megamoe_tactic(64)[:-1]
-    megamoe_op.validate_megamoe_tactic(v4, sm_version=sm_version)
-    assert megamoe_op._unpack_tactic(v4) == megamoe_op.default_megamoe_tactic(64)
+    for legacy_len in (11, 10):  # v5 (no combine_dedup) and v4 (no READY granularity)
+        legacy = megamoe_op.default_megamoe_tactic(64)[:legacy_len]
+        megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
+        assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
 
 
 @pytest.mark.cpu_only
@@ -5060,6 +5301,7 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
         BlockPhase,
         map_phase_interleaved_fc12_work_id,
         resolve_phase_interleaved_fc1_claim_target,
+        resolve_phase_interleaved_stream_extent,
     )
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
         PhaseInterleavedFc12Scheduler,
@@ -5133,6 +5375,8 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
             pipeline_init_wait(cluster_shape_mn=(1, 1))
             worker = self.scheduler._work_id_worker
             state = self.scheduler._task_mapping_state
+            # Mirror PhaseInterleavedFc12Scheduler.gen_next_work initialization.
+            state = resolve_phase_interleaved_stream_extent(state)
             _, fc1_valid, state = map_phase_interleaved_fc12_work_id(
                 Int32(0), Int32(BlockPhase.Linear1), (Int32(0), Int32(0), Int32(0)), state
             )

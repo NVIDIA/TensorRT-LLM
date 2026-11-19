@@ -27,13 +27,13 @@ differently or lack it.
   --task task.yaml --unit <unit or variant> --member <m>`; `--mode off` (boot
   only) runs the stock path; `--tree <dir>` measures a worktree as it is;
   `--json` prints the verdict.
-- **Engine read-back.** The rank hook (`checks/harness/rankhook/sitecustomize.py`)
-  wraps `BaseWorker.setup_engine` and every rank prints `MV2FLOW_RANK_ENGINE`
-  (`checks/harness/engine_facts.py`). The fields held to the declaration are
-  `ATTESTED_FIELDS` in `checks/runtime_evidence.py`; which observation proves
-  which feature is `checks/feature_evidence.py`. A declared field the engine
-  ran differently fails the gate; a check about a feature also fails when the
-  feature's field is UNKNOWN or was read only from the request.
+- **What a gate knows of the configuration.** A gate sends the unit's options
+  to the engine and does not read back what the engine resolved.
+  `modeling_v2="require"` makes the engine raise rather than fall back to its
+  own implementation. Block reuse, chunked prefill and speculation each have
+  an observation of their own (sections 1, 2 and 7). Whether a cache dtype, a
+  CUDA-graph list or a width took effect is in the engine's own log and in
+  the benchmark score, nowhere else.
 - **Step contract.** A target that implements `step_args` checks the metadata
   it consumes on its first forward when `TRTLLM_MODELING_V2_VALIDATE=1` reaches
   the ranks (pass it through `env_overrides`); see `_router_index.py`.
@@ -105,17 +105,19 @@ V2 pool, `TRTLLM_KV_FRESH_PAGE_FILL=nan` and `TRTLLM_KV_GUARD_PAGE=nan`
 (diagnostic only) make a read of a page the request does not own visible
 instead of returning another request's KV.
 
-**Flow proof.** Every boot runs the reuse probe (`checks/harness/reuse_probe.py`):
-one prompt (the smallest snapshot boundary, else one block, plus two blocks)
-sent twice after completion under a fresh `cache_salt`, pinned to attention-DP
-rank 0, `max_tokens` 1. With reuse declared, the gate fails if the second
-response reports zero `cached_tokens`, or if the engine logged that it turned
-reuse off. A probe that could not run records UNKNOWN, never a failure; a check
-about reuse then rests on every rank's manager reporting reuse enabled.
+**Flow proof.** A boot and an acceptance load run the reuse probe
+(`checks/harness/reuse_probe.py`): one prompt (the smallest snapshot boundary,
+else one block, plus two blocks) sent twice after completion under a fresh
+`cache_salt`, pinned to attention-DP rank 0, `max_tokens` 1. With reuse
+declared, the gate fails if the second response reports zero `cached_tokens`,
+or if the engine logged that it turned reuse off. A probe that could not run
+records UNKNOWN, never a failure. A benchmark runs no probe: a `reuse` variant
+with `gates: [accuracy]` is judged by its score alone, and nothing observes
+that it reused. Report such a feature as configured, not verified.
 
 **Blind spots.** The probe proves the manager matched blocks, not that the
 forward over the cached prefix is right: its one token is compared with
-nothing, and when it cannot run the managers' enabled flag is all that is left.
+nothing, and when it cannot run nothing shows reuse.
 Cache hits do not attest recurrent-snapshot restoration. Only attention-DP
 rank 0 is probed. Correctness under reuse rests on the accuracy run, whose
 few-shot prompts share a long prefix. Side state outside the pools stays
@@ -162,13 +164,13 @@ MLA entries `mla_rope_append_paged_kv_assign_q` and
 a prompt longer than 2n tokens; compare greedy token ids with a run whose
 `--max_num_tokens` exceeds the prompt.
 
-**Flow proof.** `runtime.chunked_prefill: true` in every gate plus one `chunked`
-variant (`gates: [accuracy]`) whose `max_num_tokens` is below the benchmark's
-prompts (`spec/INTAKE.md`: e.g. 512 for 8-shot GSM8K). A boot of a check about
-chunking appends a probe of about twice `max_num_tokens` and fails unless some
-request computed more than `max_num_tokens` tokens past what the cache resumed
-(`chunk_shortfall`, `checks/boot.py`). The variant's accuracy check fails
-unless every rank reports its chunking setting.
+**Flow proof.** One `chunked` variant (`gates: [accuracy]`) whose
+`max_num_tokens` is below the benchmark's prompts (`spec/INTAKE.md`), so the
+engine must split every prompt, and the result is scored. A variant whose
+gates include `boot` also sends, in that boot, a prompt of about twice
+`max_num_tokens`, and fails unless some request computed more than
+`max_num_tokens` tokens past what the cache resumed (`chunk_shortfall`,
+`checks/boot.py`).
 
 **Blind spots.** The boot evidence is inferred from lengths, not a chunk count,
 and the probe's single token is compared with nothing. A wrong later-chunk path
@@ -262,15 +264,13 @@ node: `launch_disaggregated_llm` starts every worker on one host. It gets two
 engines' devices at the member's width, at most a node's (`dep4` on a 4-GPU
 node: write the test for two engines of two; `accuracy.disagg.devices`
 overrides, never past a node), and passes only when every test the node id
-selects passed: a skip (too few devices, no `LLM_MODELS_ROOT`) fails it. The
-intake lint's `disagg-placement` says whether two engines of the checkpoint fit
-the node.
+selects passed: a skip (too few devices, no `LLM_MODELS_ROOT`) fails it.
 
 **Blind spots.** Boot and accuracy never cross the hop; only the test does, and
 it judges a benchmark score, not token identity with an aggregated engine. A
 hop that loses part of the state can still score within the floor on short
 answers. The transceiver backend and runtime the workers actually ran are not
-read back per rank.
+read back.
 
 ## 4. KV-cache dtype (fp8, nvfp4) and scales
 
@@ -329,14 +329,14 @@ writes them). Naming no anchor row of its own, a variant is judged against its
 unit's own score at the same member on the same target (`anchor: relative`, a
 floor 2 SE of the difference under it); with
 `accuracy.discriminators.kv_cache_quant_algo` it is judged against that dtype's
-own row instead. The accuracy check fails unless every rank's worker resolved the
-declared dtype (an NVFP4 request that resolved FP8 is a mismatch); intake lint
-blocks a dtype the engine does not load. Feature `kv_quant` (native storage
+own row instead. Feature `kv_quant` (native storage
 instead of bf16 containers) is a unit like the others: its boot and accuracy
 run with the native storage on.
 
-**Blind spots.** The attested value is the engine's resolved quant config, not
-what the forward wrote or which scale it used: a missing or unit scale shows
+**Blind spots.** No gate reads the dtype the engine resolved: an NVFP4 request
+that fell back to FP8 passes unless the score shows it, and the loader's
+KV-quantization log line is the place to read it. Read it, and report the
+dtype as verified only if the line says so. A missing or unit scale shows
 only as an accuracy shift against `auto`, which a relative floor catches when
 it is larger than the two runs' noise. Whether
 `kv_quant` really stores fewer bytes per token is not checked: the engine's
@@ -395,14 +395,11 @@ in `_torch/pyexecutor/cuda_graph_runner.py`, `DecoderCudaGraphs` in
 captured exactly and at one that is padded. Add
 `TLLM_CUDA_GRAPH_STRICT_BUFFERS=1` while debugging.
 
-**Flow proof.** `runtime.cuda_graph: true` in every gate (lint blocks an eager
-accuracy check). Each rank reports its CUDA-graph settings (batch sizes,
-padding), held to the declaration, and must also report the engine's planned
-capture list. `overlap_scheduler` is read back only as an argument.
+**Flow proof.** `runtime.cuda_graph: true` in every gate: the accuracy run is
+the proof.
 
-**Blind spots.** Settings and plan are not captures or replays: the plan's
-contents are not compared, and whether the workload's batches replayed a graph
-or ran eager is not observed. A host value frozen into a graph shows only at batch sizes the
+**Blind spots.** Whether the engine captured the declared batches, and whether
+the workload's batches replayed a graph or ran eager, is not observed. A host value frozen into a graph shows only at batch sizes the
 accuracy run replays; the boot's batch is small. The overlap scheduler
 has no check of its own; an extra host sync under overlap serializes steps and
 costs throughput only, which no gate sees.
@@ -449,13 +446,15 @@ builds the language model alone and must load and route with the tower absent.
 --modality image --media <image>`. `tests/integration/test_input_files/merlion.png`
 (git-lfs) is a known image.
 
-**Flow proof.** No engine field. A `multimodal` unit is judged by its boot
-sending an image (default the merlion photograph, with keywords such as
-"merlion", "statue", "fountain"), or by an image benchmark
-(`mmmu`, `mmstar`, `chartqa`, ...). The serve gate also sends an image chat.
+**Flow proof.** No engine field. A `multimodal` unit's boot sends an image
+(default the merlion photograph) and the serve gate sends an image chat: both
+show that a request with an image is answered. That the
+image was seen is shown only by an image benchmark (`mmmu`, `mmstar`,
+`chartqa`, ...).
 
-**Blind spots.** One keyword in one description is weak evidence, and a text
-benchmark says nothing about the vision path. Nothing exercises image tokens
+**Blind spots.** Boot and serve do not judge what an answer says, so a target
+that ignores the image passes them, and a text benchmark says nothing about
+the vision path. Nothing exercises image tokens
 split across a chunk, or image-prefix reuse, unless a prompt is built for it.
 For `text_only`, absent by design and absent by accident look alike.
 
@@ -505,17 +504,15 @@ from the iteration statistics.
 
 **Flow proof.** Features `mtp`, `eagle3`, `dflash` and `dspark` owe the
 acceptance gate (`checks/acceptance.py`; `gate acceptance --unit <feature>
---member <m>`): accepted tokens per iteration, iteration-weighted per prompt
-(32 prompts and 32 draft iterations by default), held against
-`TRTLLM_MODELING_V2=off` on the same prompts (fails under a 0.95 ratio when a
-paired test finds the drop significant), against the previous tree, and above
-1.0. Without a stock path the unit declares `measured_reference` or
-`min_absolute` with its `floor_source`. Each rank also reports the algorithm and
-draft depth it runs.
+--member <m>`): accepted tokens per iteration, iteration-weighted over the
+workload (32 prompts and 32 draft iterations by default), in one load, held
+above 1.0 and to the floor the unit declares (`measured_reference` or
+`min_absolute`, with its `floor_source`). A unit that declares none is held to
+1.0 alone.
 
 **Blind spots.** Boot and accuracy: rejection sampling preserves the output
-distribution, so a wrong draft path yields correct text, slower. For a new architecture the floor is a number the
-run declares.
+distribution, so a wrong draft path yields correct text, slower. The floor is
+a number the run declares: without one, a drafter that accepts little passes.
 
 ## 8. Attention DP, TP and EP where they meet these features
 
@@ -540,8 +537,8 @@ run declares.
 - **Tests.** `tests/unittest/_torch/multi_gpu/`, `tests/unittest/_torch/modeling_v2/comm/`,
   `tests/unittest/_torch/pyexecutor/test_adp_router.py`,
   `tests/unittest/disaggregated/test_cache_transceiver_single_process.py`.
-- **Flow proof.** Every rank's worker reports `tp`, `ep`, `attention_dp` and
-  `pp`; a width the engine ran other than declared fails the gate.
+- **Flow proof.** Each member's own boot and benchmark; no gate reads back
+  the widths the engine ran.
 - **Blind spots.** The reuse probe covers attention-DP rank 0 only. With
   `benchmark_members: <member>` the benchmark runs at that member alone; the
   other members rest on their boots (`task.example.yaml`).

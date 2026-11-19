@@ -6,11 +6,12 @@ from typing import Callable, List, Optional, Tuple
 
 import pytest
 import torch
+from test_common.moe_tactics import fp8_block_scales_moe_config
 from torch.multiprocessing.reductions import reduce_tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
-from utils.util import getSMVersion, skip_pre_hopper
+from utils.util import skip_pre_hopper
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.utils import get_device_uuid
@@ -170,6 +171,13 @@ def run_generate(
     return llm_logits, ref_logits
 
 
+def _moe_config(model_dir: str) -> MoeConfig:
+    """``MoeConfig`` for ``model_dir``: the FP8 checkpoints use block scales, the others BF16."""
+    if model_dir.endswith("-FP8"):
+        return fp8_block_scales_moe_config()
+    return MoeConfig(tactic="cutlass")
+
+
 @skip_pre_hopper
 @pytest.mark.parametrize(
     "model_dir",
@@ -188,7 +196,7 @@ def test_llm_update_weights(model_dir):
     hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
+    moe_config = _moe_config(model_dir)
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -242,7 +250,7 @@ def test_llm_partial_update_weights(model_dir):
     hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
+    moe_config = _moe_config(model_dir)
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -316,7 +324,7 @@ def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir, kv_cache
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
     )
-    moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
+    moe_config = fp8_block_scales_moe_config()
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",

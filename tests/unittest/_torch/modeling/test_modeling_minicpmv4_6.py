@@ -273,7 +273,7 @@ def test_minicpmv46_multimodal_forward():
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6Model
     from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
-    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+    from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
     from tensorrt_llm.inputs.multimodal import MultimodalParams
 
     raw = _minicpmv4_6_config_dict()
@@ -342,7 +342,7 @@ def test_minicpmv46_multimodal_forward():
             num_contexts=1,
             request_ids=[1],
             kv_cache_params=KVCacheParams(use_cache=False, num_cached_tokens_per_seq=[0]),
-            mamba_metadata=Mamba2Metadata(1, chunk_size=128, max_num_tokens=4),
+            mamba_metadata=GDNMambaMetadata(1, chunk_size=128, max_num_tokens=4),
         )
         metadata.prepare()
         input_ids = torch.tensor([65, 3, 7, 11], dtype=torch.int32, device="cuda")

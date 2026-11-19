@@ -130,8 +130,15 @@ class RankIterStatsPayload:
     _ITER_STATS_FIELD_COUNT: ClassVar[int] = 9
     _KV_LOAD_FIELD_COUNT: ClassVar[int] = 3
     _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -3
-    _TRANSFER_WIRE_VERSION: ClassVar[int] = -4
-    _ACTIVITY_WIRE_VERSION: ClassVar[int] = -5
+    _TRANSFER_WIRE_VERSION: ClassVar[int] = -5
+    _ACTIVITY_WIRE_VERSION: ClassVar[int] = -6
+    _QUEUED_WIRE_VERSION: ClassVar[int] = -4
+    _QUEUED_FIELDS: ClassVar[tuple[str, ...]] = (
+        "num_queued_context_requests",
+        "num_queued_ctx_tokens",
+        "num_queued_gen_requests",
+        "num_queued_gen_kv_tokens",
+    )
     _SNAPSHOT_HEADER_SIZE: ClassVar[int] = 6
 
     has_iter_stats: int = 0
@@ -150,6 +157,13 @@ class RankIterStatsPayload:
     cross_kv_cache_stats: RankKvCacheStats | None = None
     specdec_stats: RankSpecDecodingStats | None = None
     scheduling_counters: RankSchedulingCounters | None = None
+    num_queued_context_requests: int = 0
+    num_queued_ctx_tokens: int = 0
+    num_queued_gen_requests: int = 0
+    num_queued_gen_kv_tokens: int = 0
+    # Current activity is refreshed at each routing exchange, independently
+    # of the sampled iteration whose counters travel in this payload.
+    has_pending_work: bool = False
     kv_transfer_outcomes: tuple[int, int, int] | None = None
     conversation_activity: ConversationActivityStats | None = None
 
@@ -180,11 +194,14 @@ class RankIterStatsPayload:
             self.specdec_stats,
             self.scheduling_counters,
         )
-        if (
-            any(snapshot is not None for snapshot in snapshots)
+        queued_values = [getattr(self, name) for name in self._QUEUED_FIELDS]
+        has_extended_stats = (
+            any(queued_values)
+            or self.has_pending_work
             or self.kv_transfer_outcomes is not None
             or self.conversation_activity is not None
-        ):
+        )
+        if any(snapshot is not None for snapshot in snapshots) or has_extended_stats:
             # The negative version cannot be confused with has_iter_stats (0/1).
             # Presence flags frame the snapshots and the independent load fields.
             values = [
@@ -192,6 +209,8 @@ class RankIterStatsPayload:
                 if self.conversation_activity is not None
                 else self._TRANSFER_WIRE_VERSION
                 if self.kv_transfer_outcomes is not None
+                else self._QUEUED_WIRE_VERSION
+                if has_extended_stats
                 else self._SNAPSHOT_WIRE_VERSION,
                 int(include_kv_cache_load),
                 *(int(snapshot is not None) for snapshot in snapshots),
@@ -205,6 +224,9 @@ class RankIterStatsPayload:
             for snapshot in snapshots:
                 if snapshot is not None:
                     values.extend(snapshot)
+        if has_extended_stats:
+            values.extend(queued_values)
+            values.append(int(self.has_pending_work))
         if self.kv_transfer_outcomes is not None:
             values.extend(self.kv_transfer_outcomes)
         if self.conversation_activity is not None:
@@ -232,6 +254,7 @@ class RankIterStatsPayload:
             or data[0]
             not in (
                 cls._SNAPSHOT_WIRE_VERSION,
+                cls._QUEUED_WIRE_VERSION,
                 cls._TRANSFER_WIRE_VERSION,
                 cls._ACTIVITY_WIRE_VERSION,
             )
@@ -256,6 +279,7 @@ class RankIterStatsPayload:
                 if data[0] == cls._ACTIVITY_WIRE_VERSION
                 else 0
             )
+            + (len(cls._QUEUED_FIELDS) + 1 if data[0] <= cls._QUEUED_WIRE_VERSION else 0)
         )
 
     @classmethod
@@ -294,6 +318,12 @@ class RankIterStatsPayload:
                     values[cursor : cursor + RankSchedulingCounters.wire_size()]
                 )
                 cursor += RankSchedulingCounters.wire_size()
+            if values[0] <= cls._QUEUED_WIRE_VERSION:
+                queue_end = cursor + len(cls._QUEUED_FIELDS)
+                for name, value in zip(cls._QUEUED_FIELDS, values[cursor:queue_end]):
+                    setattr(result, name, int(value))
+                result.has_pending_work = bool(values[queue_end])
+                cursor = queue_end + 1
             if values[0] == cls._TRANSFER_WIRE_VERSION or (
                 values[0] == cls._ACTIVITY_WIRE_VERSION and values[6]
             ):

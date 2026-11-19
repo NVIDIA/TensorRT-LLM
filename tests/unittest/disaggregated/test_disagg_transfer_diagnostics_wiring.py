@@ -1865,7 +1865,10 @@ def test_transfer_failure_is_exported_before_idle_wait_without_another_batch(mon
     executor.is_shutdown = False
     executor._has_pending_connector_transfers = Mock(return_value=False)
     executor._disable_mpi = False
-    executor.dist = SimpleNamespace(rank=0)
+    executor.dist = SimpleNamespace(rank=0, pp_size=1)
+    executor.async_transfer_manager = None
+    executor.previous_batch = None
+    executor._has_close_outs_pending_iter_stats = False
     executor.request_accumulated = []
     executor.hang_detector = SimpleNamespace(pause=nullcontext)
     collector = MetricsCollector({"model_name": "test"}, registry=CollectorRegistry())

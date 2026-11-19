@@ -32,6 +32,9 @@ class IterationStatsRecord(NamedTuple):
     gpu_forward_time_ms: float | None = None
     mm_encoder_stats: dict[str, object] | None = None
     executor_loop: dict[str, object] | None = None
+    # The record was taken without a forward pass: it reports the queues, and
+    # its duration and per-loop timings are not measurements.
+    is_queue_snapshot: bool = False
     kv_transfer_outcomes: tuple[int, int, int] | None = None
 
     @classmethod
@@ -91,4 +94,7 @@ class IterationStatsRecord(NamedTuple):
             stats["kvTransferOutcomes"] = dict(
                 zip(("success", "error", "timeout"), self.kv_transfer_outcomes)
             )
+        # Measured records do not have the key.
+        if self.is_queue_snapshot:
+            stats["isQueueSnapshot"] = True
         return stats
