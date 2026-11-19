@@ -16,11 +16,14 @@
 CuTe DSL attention backend family for visual generation models.
 
   fmha.py — CuTeDSLAttention (dense and blockscaled JIT FMHA)
+  deco.py — DeCoAttention (DeCo-Attention: NVFP4 Q/K with compensation, FP8 or NVFP4 PV)
 """
 
+from .deco import DeCoAttention
 from .fmha import CuTeDSLAttention, _cute_dsl_import_error
 
 __all__ = [
     "CuTeDSLAttention",
+    "DeCoAttention",
     "_cute_dsl_import_error",
 ]

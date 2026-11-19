@@ -55,8 +55,9 @@ class QuantAttentionConfig(StrictBaseModel):
 
     Bare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is
     backend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V
-    on SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. Unsupported recipes are rejected
-    by AttentionConfig's validator with a ValueError.
+    on SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. CUTEDSL runs NVFP4 Q/K with FP8 V,
+    or with NVFP4 V on SM120, as DeCo-Attention when deco_attention is set. Unsupported
+    recipes are rejected by AttentionConfig's validator with a ValueError.
     """
 
     qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4"] = Field(
@@ -130,6 +131,16 @@ class QuantAttentionConfig(StrictBaseModel):
             "Fraction of tokens VC-Attention appends as V repair rows instead of restoring "
             "tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the "
             "fastest setting measured at unchanged quality. vc_attention only."
+        ),
+    )
+    deco_attention: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Run the recipe as DeCo-Attention on the CUTEDSL backend. nvfp4 Q/K are "
+            "Hadamard-rotated and carry compensation channels for the first-order "
+            "quantization error of the scores; V is smoothed over blocks of keys and quantized "
+            "to fp8, or to nvfp4 on SM120. Self-attention with head dimension 128."
         ),
     )
 
@@ -232,6 +243,13 @@ class AttentionConfig(StrictBaseModel):
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "nvfp4", (0, 0, 0)),
         }
+        # DeCo-Attention quantizes Q/K to NVFP4 with compensation channels and runs the PV in
+        # FP8, or in NVFP4 on SM120 (the backend checks the hardware). Its preparation sets
+        # every scaling granularity, so the block sizes stay 0.
+        DECO_ATTENTION_RECIPES = {
+            ("nvfp4", "fp8", (0, 0, 0)),
+            ("nvfp4", "nvfp4", (0, 0, 0)),
+        }
 
         if self.quant_attention_config is None:
             return self
@@ -239,6 +257,10 @@ class AttentionConfig(StrictBaseModel):
         q_config = self.quant_attention_config
         block_sizes = (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size)
         recipe = (q_config.qk_dtype, q_config.v_dtype, block_sizes)
+        if q_config.deco_attention and self.backend != "CUTEDSL":
+            raise ValueError(
+                f"deco_attention is a CUTEDSL backend option, got backend='{self.backend}'."
+            )
         if self.backend == "TRTLLM":
             sm_version = get_sm_version()
             if q_config.vc_attention:
@@ -292,12 +314,16 @@ class AttentionConfig(StrictBaseModel):
                 f"got backend='{self.backend}'."
             )
         elif self.backend == "CUTEDSL":
-            if recipe not in CUTEDSL_RECIPES:
+            if q_config.deco_attention:
+                recipes, family = DECO_ATTENTION_RECIPES, "DeCo-Attention recipes"
+            else:
+                recipes, family = CUTEDSL_RECIPES, "recipes"
+            if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='CUTEDSL'. Supported recipes "
+                    f"for backend='CUTEDSL'. Supported {family} "
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
-                    f"{sorted(CUTEDSL_RECIPES)}."
+                    f"{sorted(recipes)}."
                 )
         elif self.backend == "CUDNN":
             if recipe not in CUDNN_RECIPES:
@@ -359,9 +385,12 @@ class AttentionConfig(StrictBaseModel):
         # so accepting a recipe there would silently ignore user configuration.
         # SkipSoftmax is part of the dense path itself and can compose.
         # VC-Attention is a dense recipe of the PrimTS kernels and is not
-        # composed with any sparse algorithm.
+        # composed with any sparse algorithm. DeCo-Attention has its own dense
+        # kernels, which take no sparse configuration either.
         if self.quant_attention_config.vc_attention:
             raise ValueError("vc_attention does not compose with sparse_attention_config.")
+        if self.quant_attention_config.deco_attention:
+            raise ValueError("deco_attention does not compose with sparse_attention_config.")
         if self.backend == "TRTLLM":
             return self
         algorithm = self.sparse_attention_config.algorithm
