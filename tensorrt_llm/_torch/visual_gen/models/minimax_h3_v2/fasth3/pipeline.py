@@ -33,7 +33,8 @@ from .schedule import set_dmd_timesteps
 
 
 def configure_checkpoint(config: DiffusionPipelineConfig, manifest: dict) -> None:
-    if config.mapping.world_size != 1:
+    mapping = getattr(config, "visual_gen_mapping", None) or config.mapping
+    if mapping.world_size != 1:
         raise ValueError("FastH3 VSA requires a single GPU.")
     if config.extra_attrs.get("workflow") == "ref2va":
         raise ValueError("FastH3 VSA supports text-to-video only.")

@@ -6,6 +6,8 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.catalog.attention.block_sparse_attention import (
     block_sparse_attention,
+)
+from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention.interface import (
     is_cute_supported,
 )
 

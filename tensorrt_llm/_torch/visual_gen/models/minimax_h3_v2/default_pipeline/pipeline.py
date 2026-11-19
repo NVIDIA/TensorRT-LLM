@@ -77,7 +77,7 @@ class MiniMaxH3Pipeline(H3PipelineBase):
                     "Other attention backends do not support the required "
                     "packed-row padding mask."
                 )
-        self._setup_text_encoder_group(pipeline_config, world_size)
+        self._setup_text_encoder_group(world_size)
 
         self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
         super().__init__(pipeline_config)
@@ -120,7 +120,7 @@ class MiniMaxH3Pipeline(H3PipelineBase):
             )
         return super().load_transformer_weights(checkpoint_dir)
 
-    def _setup_text_encoder_group(self, pipeline_config, world_size):
+    def _setup_text_encoder_group(self, world_size):
         self._text_encoder_tp_group = None
         if (
             self._uses_tensor_parallel_text_encoder
@@ -133,7 +133,6 @@ class MiniMaxH3Pipeline(H3PipelineBase):
             )
         if self._uses_tensor_parallel_text_encoder and dist.is_initialized():
             text_encoder_tp_ranks = list(range(self.text_encoder_tp_size))
-            rank = int(getattr(pipeline_config.mapping, "rank", 0))
             if self.text_encoder_tp_size == world_size:
                 group = dist.group.WORLD
             else:
@@ -141,7 +140,7 @@ class MiniMaxH3Pipeline(H3PipelineBase):
                     ranks=text_encoder_tp_ranks,
                     use_local_synchronization=False,
                 )
-            if rank in text_encoder_tp_ranks:
+            if self.rank in text_encoder_tp_ranks:
                 self._text_encoder_tp_group = group
 
     def _load_tensor_parallel_text_encoder(

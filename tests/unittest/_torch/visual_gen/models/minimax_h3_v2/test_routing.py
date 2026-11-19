@@ -14,8 +14,8 @@ import torch.multiprocessing as mp
 from test_common.visual_gen.h3_rollout import H3_V2
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -77,6 +77,9 @@ def _check_rank_agreement(rank, root):
         MiniMaxH3Pipeline,
     )
 
+    visual_mapping = VisualGenMapping(world_size=2, rank=rank, ulysses_size=2)
+    tp_mapping = visual_mapping.to_llm_mapping()
+    assert tp_mapping.world_size == 1
     dist.init_process_group(
         "gloo",
         init_method=(root / "store").as_uri(),
@@ -86,7 +89,8 @@ def _check_rank_agreement(rank, root):
     )
     try:
         config = DiffusionPipelineConfig.from_pretrained(str(root / "base"))
-        config.mapping = Mapping(world_size=2, rank=rank, tp_size=2)
+        config.visual_gen_mapping = visual_mapping
+        config.mapping = tp_mapping
         assert AutoPipeline.resolve_class(config, str(root / "base")) is MiniMaxH3Pipeline
         with pytest.raises(
             ValueError if rank else RuntimeError, match="FastH3 VSA requires a single GPU"

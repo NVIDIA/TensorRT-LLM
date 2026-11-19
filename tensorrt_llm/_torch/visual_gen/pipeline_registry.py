@@ -184,7 +184,7 @@ class AutoPipeline:
         config: "DiffusionPipelineConfig", checkpoint_dir: str
     ) -> Type["BasePipeline"]:
         """Select an implementation on every worker before any constructor enters collectives."""
-        mapping = getattr(config, "mapping", None)
+        mapping = getattr(config, "visual_gen_mapping", None) or getattr(config, "mapping", None)
         distributed = getattr(mapping, "world_size", 1) > 1 and dist.is_initialized()
         if distributed:
             error = None

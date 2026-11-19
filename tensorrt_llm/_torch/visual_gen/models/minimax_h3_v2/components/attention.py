@@ -333,6 +333,9 @@ class MiniMaxH3VSAAttention(MiniMaxH3Attention):
     def __init__(
         self, *, model_config, hidden_size, num_attention_heads, attention_head_dim, **kwargs
     ):
+        mapping = model_config.visual_gen_mapping or model_config.mapping
+        if mapping.world_size != 1:
+            raise ValueError("MiniMax-H3 VSA currently supports a single GPU.")
         super().__init__(
             model_config=model_config,
             hidden_size=hidden_size,
@@ -343,8 +346,6 @@ class MiniMaxH3VSAAttention(MiniMaxH3Attention):
         self._vsa_backend = model_config.attention.backend
         if self._vsa_backend not in ("TRTLLM", "CUTEDSL"):
             raise ValueError("MiniMax-H3 VSA requires the TRTLLM or CUTEDSL backend.")
-        if model_config.mapping.world_size != 1:
-            raise ValueError("MiniMax-H3 VSA currently supports a single GPU.")
         self.to_gate_compress = Linear(
             hidden_size,
             num_attention_heads * attention_head_dim,
