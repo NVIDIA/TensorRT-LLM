@@ -244,6 +244,7 @@ SLURM_MEMORY_LIMIT = "12Gi"
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
 
+// Whole-core budget shared by pod CPU limits and CPU-only pytest thread limits.
 TESTER_CPU_ONLY_CORES = "2"
 TESTER_CPU_ONLY_MEMORY = "12Gi"
 

@@ -24,7 +24,10 @@ Scope: this directory and its descendants. Supplements the repository-root
 Keep `TESTER_CPU_ONLY_CORES` as the single CPU-only worker budget: it controls
 both the test container's CPU requests/limits and the pytest process's
 `OMP_NUM_THREADS` / `MKL_NUM_THREADS`, inherited by unittest subprocesses.
-Apply these startup limits only to `CPU-` test stages, not GPU stages.
+Keep this setting a positive whole-number CPU count, not a millicore value such
+as `1500m`: it is also passed directly to the native thread-count variables.
+Apply these startup limits only to `CPU-` test stages. GPU-stage thread policy
+is outside this setting's scope; a shared pod CPU limit is not a per-rank budget.
 
 ## Stage maintenance
 
