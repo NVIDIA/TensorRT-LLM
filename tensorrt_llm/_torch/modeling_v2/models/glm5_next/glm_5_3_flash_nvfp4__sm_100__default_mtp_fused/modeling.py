@@ -76,6 +76,7 @@ from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_T
 from tensorrt_llm._torch.speculative.spec_tail_kernels import strict_accept
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import async_tensor_h2d
+from tensorrt_llm.inputs.multimodal import has_media_or_embeddings
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -92,9 +93,6 @@ from . import weights as _weights
 # The GPU architecture this target IS. Routing will not send another one here, but a direct instantiation could,
 # and the certification is per arch.
 _SM = (10, 0)
-
-#: ``multimodal_data`` entries that carry media for an encoder, or encoder output in place of it.
-_MEDIA_KEYS = frozenset({"audio", "image", "video", "multimodal_embedding"})
 
 #: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
 #: tensorrt_llm import of this module that computes (this target's unit tests check the list both ways, with
@@ -144,6 +142,8 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.distributed.ops.allgather",
     "tensorrt_llm._torch.speculative.interface.INVALID_PROMPT_LOOKAHEAD_TOKEN",
     "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer_set_repeated_for_next_layer",
+    # The admission check that refuses media (`validate_multimodal_request_data`).
+    "tensorrt_llm.inputs.multimodal.has_media_or_embeddings",
 )
 
 
@@ -2479,14 +2479,10 @@ class ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused(Glm5NextForCausalLM):
         _weights.load(self, weights, weight_mapper)
 
     def validate_multimodal_request_data(self, mm_data: dict) -> None:
-        """Refuse, at admission, a request whose multimodal payload carries media: this target runs no encoder.
-
-        Refusing here fails that request alone; the forward would otherwise serve its text without the media.
-        A payload without media is accepted.
-        """
-        media = sorted(key for key in _MEDIA_KEYS if mm_data.get(key) is not None)
-        if media:
+        """Admission check: this target serves text only, so a request with media or
+        embeddings fails alone here instead of failing its batch in forward. A payload of
+        M-RoPE positions only passes."""
+        if has_media_or_embeddings(mm_data):
             raise ValueError(
-                f"{type(self).__name__} serves this checkpoint's language model only and does not accept "
-                f"multimodal input; the request carries {', '.join(media)}"
+                f"{type(self).__name__} serves text only; send no images, videos or embeddings"
             )

@@ -791,6 +791,36 @@ def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:
     assert kwargs == {"requests": [requests[1]], "charge_budget": False}
 
 
+def test_text_only_model_fails_only_the_media_request() -> None:
+    """A text-only model's admission hook refuses media alone: the image request fails with
+    its own error and no budget charge, while a text request and an M-RoPE-only generation
+    request (disaggregated serving) are admitted."""
+    from tensorrt_llm.inputs.multimodal import has_media_or_embeddings
+
+    def validate_multimodal_request_data(mm_data) -> None:
+        if has_media_or_embeddings(mm_data):
+            raise ValueError("serves text only")
+
+    requests = [_make_admission_request(i) for i in range(3)]
+    requests[0].py_multimodal_data = None
+    requests[1].py_multimodal_data = {"image": {"pixel_values": torch.zeros(1)}}
+    requests[2].py_multimodal_data = {"mrope_config": {"mrope_position_deltas": torch.zeros(1, 1)}}
+    model = types.SimpleNamespace(
+        validate_multimodal_request_data=Mock(side_effect=validate_multimodal_request_data)
+    )
+    executor = _make_admission_executor(model, requests)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == [requests[0], requests[2]]
+    assert executor.active_requests == [requests[0], requests[2]]
+    executor._handle_errors.assert_called_once_with(
+        "serves text only", requests=[requests[1]], charge_budget=False
+    )
+    # The hook runs only for a request that carries multimodal data.
+    assert model.validate_multimodal_request_data.call_count == 2
+
+
 def test_model_validation_runs_after_the_sampler_and_before_the_budget() -> None:
     order = []
     model = types.SimpleNamespace(validate_request=lambda request: order.append("model"))

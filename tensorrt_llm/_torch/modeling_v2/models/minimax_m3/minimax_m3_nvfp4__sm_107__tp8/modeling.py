@@ -235,6 +235,7 @@ from tensorrt_llm._torch.speculative.interface import (
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 from tensorrt_llm._utils import mpi_rank, prefer_pinned
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.inputs.multimodal import has_media_or_embeddings
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -5855,6 +5856,15 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp8(
         super().post_load_weights()
         self.model.post_load_weights()
 
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Admission check: this target serves text only, so a request with media or
+        embeddings fails alone here instead of failing its batch in forward. A payload of
+        M-RoPE positions only passes."""
+        if has_media_or_embeddings(mm_data):
+            raise ValueError(
+                f"{type(self).__name__} serves text only; send no images, videos or embeddings"
+            )
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -5869,7 +5879,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp8(
         """One engine step: the target forward, then the logits (or, with speculation, the worker's verify and
         draft, and on a decode step the spec fold's store of its outputs). Text only."""
         multimodal_params = kwargs.pop("multimodal_params", None) or []
-        if any(p is not None and getattr(p, "multimodal_data", None) for p in multimodal_params):
+        if any(
+            p is not None and has_media_or_embeddings(p.multimodal_data) for p in multimodal_params
+        ):
             raise ValueError(
                 "this MiniMax-M3 target is text only; the request carries multimodal input"
             )

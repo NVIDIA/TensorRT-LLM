@@ -18,6 +18,7 @@ from concurrent import futures
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm.inputs.multimodal import has_media_or_embeddings
 from tensorrt_llm.logger import logger
 
 __all__ = [
@@ -89,8 +90,12 @@ def text_model_weights(weights) -> Any:
 
 
 def check_text_only(multimodal_params: Optional[List[Any]]) -> None:
-    """Refuse a step carrying multimodal input (the engine passes only requests with content)."""
-    if multimodal_params:
+    """Refuse a step carrying media or embeddings. M-RoPE positions alone pass, as they pass the
+    targets' admission check (``has_media_or_embeddings``)."""
+    if any(
+        p is not None and has_media_or_embeddings(p.multimodal_data)
+        for p in multimodal_params or []
+    ):
         raise ValueError(
             "this Kimi K3 target is text only: it builds no vision tower, and a request carried "
             "multimodal input"

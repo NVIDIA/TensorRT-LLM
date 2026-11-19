@@ -24,21 +24,19 @@ def test_the_target_defines_the_admission_hook():
 
 
 @pytest.mark.parametrize(
-    "mm_data, carried",
+    "mm_data",
     [
-        ({"image": {"pixel_values": None, "image_grid_thw": None}}, "image"),
-        ({"video": {"pixel_values_videos": None, "video_grid_thw": None}}, "video"),
-        ({"audio": object()}, "audio"),
-        ({"multimodal_embedding": object()}, "multimodal_embedding"),
-        ({"image": object(), "video": object()}, "image, video"),
+        {"image": {"pixel_values": None, "image_grid_thw": None}},
+        {"video": {"pixel_values_videos": None, "video_grid_thw": None}},
+        {"audio": object()},
+        {"multimodal_embedding": object()},
+        {"image": object(), "video": object()},
     ],
     ids=["image", "video", "audio", "embedding", "image-and-video"],
 )
-def test_media_is_refused_at_admission(mm_data, carried):
+def test_media_is_refused_at_admission(mm_data):
     # The hook reads no model state, so it runs without building the model.
-    with pytest.raises(
-        ValueError, match=f"does not accept multimodal input; the request carries {carried}$"
-    ):
+    with pytest.raises(ValueError, match="serves text only; send no images, videos or embeddings$"):
         getattr(Target, _HOOK)(types.SimpleNamespace(), mm_data)
 
 

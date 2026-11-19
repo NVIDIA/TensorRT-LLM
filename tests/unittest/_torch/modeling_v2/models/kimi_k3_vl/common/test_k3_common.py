@@ -13,6 +13,7 @@
 
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -132,11 +133,14 @@ def test_text_model_weights_skip_the_vision_tower():
 
 
 def test_check_text_only():
+    """The forward refuses what the targets' admission check refuses, and passes the rest."""
     fam = _common("weight_io")
     fam.check_text_only(None)
     fam.check_text_only([])
-    with pytest.raises(ValueError, match="text only"):
-        fam.check_text_only([object()])
+    fam.check_text_only([SimpleNamespace(multimodal_data={"mrope_config": {}})])
+    for data in ({"image": {"pixel_values": 1}}, {"multimodal_embedding": 1}):
+        with pytest.raises(ValueError, match="text only"):
+            fam.check_text_only([SimpleNamespace(multimodal_data=data)])
 
 
 def test_common_imports_no_target_code():

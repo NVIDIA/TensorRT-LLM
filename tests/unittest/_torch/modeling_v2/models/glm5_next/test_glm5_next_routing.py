@@ -588,12 +588,13 @@ def test_fp8_constructor_refuses_what_route_declines():
 @pytest.mark.parametrize(
     "multimodal_data, refused",
     [
-        (None, None),
-        ({}, None),
-        ({"image": {"pixel_values": torch.zeros(1)}}, "image"),
-        ({"video": {"pixel_values_videos": torch.zeros(1)}}, "video"),
+        (None, False),
+        ({}, False),
+        ({"mrope_config": {"mrope_position_deltas": None}}, False),
+        ({"image": {"pixel_values": torch.zeros(1)}}, True),
+        ({"video": {"pixel_values_videos": torch.zeros(1)}}, True),
     ],
-    ids=["text", "empty-payload", "image", "video"],
+    ids=["text", "empty-payload", "mrope-only", "image", "video"],
 )
 def test_fp8_target_refuses_media_on_admission(multimodal_data, refused):
     """The text-only target fails a media request on admission, as that request's own error."""
@@ -603,9 +604,9 @@ def test_fp8_target_refuses_media_on_admission(multimodal_data, refused):
         ModelingV2Glm53FlashFp8Sm10xTp4,
     )
 
-    request = SimpleNamespace(py_multimodal_data=multimodal_data)
-    if refused is None:
-        ModelingV2Glm53FlashFp8Sm10xTp4.validate_request(None, request)
+    validate = ModelingV2Glm53FlashFp8Sm10xTp4.validate_multimodal_request_data
+    if not refused:
+        validate(SimpleNamespace(), multimodal_data)
         return
-    with pytest.raises(ValueError, match=f"carries {refused} input"):
-        ModelingV2Glm53FlashFp8Sm10xTp4.validate_request(None, request)
+    with pytest.raises(ValueError, match="serves text only"):
+        validate(SimpleNamespace(), multimodal_data)

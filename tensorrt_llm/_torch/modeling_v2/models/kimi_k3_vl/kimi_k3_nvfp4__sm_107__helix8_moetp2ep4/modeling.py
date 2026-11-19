@@ -130,7 +130,7 @@ from tensorrt_llm._torch.utils import (
 )
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalParams, has_media_or_embeddings
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -7709,6 +7709,15 @@ class ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4(KimiK3Sm107ForConditionalGenerat
     def runtime_hooks(self) -> RuntimeHooks:
         """The family's hooks, with ``KimiK3Sm107Helix8CacheManager`` as the KV cache manager."""
         return replace(super().runtime_hooks, kv_cache_manager_cls=KimiK3Sm107Helix8CacheManager)
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Admission check: this target serves text only, so a request with media or
+        embeddings fails alone here instead of failing its batch in forward. A payload of
+        M-RoPE positions only passes."""
+        if has_media_or_embeddings(mm_data):
+            raise ValueError(
+                f"{type(self).__name__} serves text only; send no images, videos or embeddings"
+            )
 
 
 __all__ = ["ModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4"]
