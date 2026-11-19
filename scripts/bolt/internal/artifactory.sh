@@ -24,8 +24,8 @@
 #       Honours BOLT_PROFILE_REF: when set, pulls the immutable
 #       bolt-profile-<ref>-<triple>.tar.gz instead of the mutable latest.tar.gz,
 #       so every consumer in a pipeline can be pinned to one bundle.
-#       Exits 0 when the bundle is unpacked, 3 when neither location has it, and
-#       4 when the store could not be read.
+#       Exits 0 when the bundle is unpacked, 3 when the store does not have it,
+#       and 4 when the store could not be read.
 #
 #   resolve-latest <branch> <triple>
 #       Print the ref latest.tar.gz currently points at, for a caller that wants
@@ -36,7 +36,8 @@
 # The premerge "override" case does NOT use promote: the gen recipe packages a
 # bundle locally and apply consumes it directly (run-scoped, never promoted).
 #
-# Artifactory layout, the same in the repository of each location:
+# Artifactory layout, in the repository sw-tensorrt-llm-generic-local on
+# artifactory.nvidia.com:
 #   <PREFIX>/<branch>/<triple>/bolt-profile-<ref>-<triple>.tar.gz
 #   <PREFIX>/<branch>/<triple>/latest.tar.gz
 # PREFIX is llm-artifacts/bolt-profiles unless BOLT_PROFILE_PREFIX replaces it.
@@ -47,15 +48,15 @@
 # Reads (pull-latest, resolve-latest) go through the read helper,
 # jenkins/scripts/fetch_build_artifact.sh, found from the repository root
 # relative to this script. They ask for the legacy path
-# sw-tensorrt-generic/<PREFIX>/..., which the helper maps to each location: it
-# asks the primary location first and the other location only when the file is
-# absent there, never after a rejected request, and checks the SHA-1 of a
-# download. No read is anonymous on the aws location, and none goes around the
-# helper, so a caller provides what the helper reads from its environment:
-#   LLM_ARTIFACTS_PRIMARY      aws (the default) or urm
-#   ARTIFACTORY_NETRC          netrc file with the credential for the aws location
+# sw-tensorrt-generic/<PREFIX>/..., which the helper maps to that repository,
+# and the helper checks the SHA-1 of a download. No read is anonymous, and none
+# goes around the helper, so a caller provides what the helper reads from its
+# environment:
+#   ARTIFACTORY_NETRC          netrc file with the credential for
+#                              artifactory.nvidia.com
 #   ARTIFACTORY_CREDENTIAL_ID  name of the CI credential behind that file, which
-#                              the helper's message names when aws rejects it
+#                              the helper's message names when the credential
+#                              is rejected
 #
 # Writes:
 #   promote -> `jf` (JFrog) CLI, the developer path; CI does not use it. If
@@ -80,7 +81,7 @@ FETCH_ABSENT=2
 FETCH_REJECTED=3
 FETCH_TRANSFER_FAILED=4
 FETCH_USAGE=64
-# Exit statuses of pull-latest and resolve-latest: neither location has the
+# Exit statuses of pull-latest and resolve-latest: the store does not have the
 # bundle, and a read of the store was refused or failed.
 BOLT_NO_BUNDLE=3
 BOLT_STORE_UNREADABLE=4
@@ -89,12 +90,6 @@ log()  { echo "[artifactory] $1" >&2; }
 die()  { echo "[artifactory][ERROR] $1" >&2; exit 2; }
 # fail <status> <message>: as die, with the exit status of a read.
 fail() { echo "[artifactory][ERROR] $2" >&2; exit "$1"; }
-
-# url_host <url>: prints the host, with its port, of a URL.
-url_host() {
-    local rest="${1#*://}"
-    echo "${rest%%/*}"
-}
 
 promote_dir() { echo "${REPO}/${PREFIX}/$1/$2"; }       # <branch> <triple>
 read_dir()    { echo "${LEGACY_REPO}/${PREFIX}/$1/$2"; }  # <branch> <triple>
@@ -174,29 +169,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# store_read [--properties] <path> <dest-file>, or store_read --exists <path>:
-# runs the read helper, which inherits its environment from the caller of this
-# script. Returns 0 when the helper wrote <dest-file>, and FETCH_ABSENT when
-# neither location has the file (with --properties: has properties for it).
-# Any other outcome ends the script with BOLT_STORE_UNREADABLE; the helper has
-# logged the cause by then, with the credential's name for a rejection. The
-# helper's stdout joins stderr, so that resolve-latest prints nothing but the
-# ref. With --exists the stdout is the answer, "<url> <sha1>" of the copy on
-# the first location that holds the file, so it is left alone; a caller that
-# captures it runs this in a subshell and has to end the script itself.
+# store_read [--properties] <path> <dest-file>: runs the read helper, which
+# inherits its environment from the caller of this script. Returns 0 when the
+# helper wrote <dest-file>, and FETCH_ABSENT when the store does not have the
+# file (with --properties: has no properties for it). Any other outcome ends
+# the script with BOLT_STORE_UNREADABLE; the helper has logged the cause by
+# then, with the credential's name for a rejection. The helper's stdout joins
+# stderr, so that resolve-latest prints nothing but the ref.
 store_read() {
     local rc=0 reason
     if [[ ! -f "$FETCH_HELPER" ]]; then
         fail "$BOLT_STORE_UNREADABLE" "the read helper is missing: $FETCH_HELPER"
     fi
-    if [[ "$1" == --exists ]]; then
-        bash "$FETCH_HELPER" "$@" || rc=$?
-    else
-        bash "$FETCH_HELPER" "$@" >&2 || rc=$?
-    fi
+    bash "$FETCH_HELPER" "$@" >&2 || rc=$?
     case "$rc" in
         0 | "$FETCH_ABSENT") return "$rc" ;;
-        "$FETCH_REJECTED") reason="the primary location rejected the request" ;;
+        "$FETCH_REJECTED") reason="the credential was rejected" ;;
         "$FETCH_TRANSFER_FAILED") reason="the transfer failed" ;;
         "$FETCH_USAGE") reason="the read helper rejected its arguments or its environment" ;;
         *) reason="the read helper ended unexpectedly" ;;
@@ -215,12 +203,6 @@ store_read() {
 # `ref` out of manifest.json. A caller that gets nothing back should stay
 # unpinned rather than guess.
 #
-# The label has to be that of the copy that readers get. The helper asks the
-# primary location first, for the file and for its properties alike, but a
-# file without properties on the primary sends the properties lookup on to the
-# other location's copy. So the properties count only when they come from the
-# host that holds the file for readers; otherwise the manifest answers.
-#
 # No read has an overall time limit, so a caller that must not wait on a
 # stalled transfer bounds the call itself.
 cmd_resolve_latest() {
@@ -231,28 +213,14 @@ cmd_resolve_latest() {
     local path; path="$(read_dir "$branch" "$triple")/latest.tar.gz"
     WORK_DIR="$(mktemp -d)"
 
-    local rc=0 ref="" held="" properties=""
-    held="$(store_read --exists "$path")" || rc=$?
-    if (( rc == FETCH_ABSENT )); then
-        log "no latest.tar.gz for $branch/$triple on either location"
-        return 0
-    elif (( rc != 0 )); then
-        exit "$rc"
-    fi
-
-    rc=0
+    local rc=0 ref=""
     store_read --properties "$path" "$WORK_DIR/properties.json" || rc=$?
     if (( rc == 0 )); then
-        # { "properties": { "bolt.ref": [ "<ref>" ] }, "uri": "<storage URL>" } --
-        # fixed, tiny shape, so a sed extraction avoids depending on python3 or
-        # jq, neither of which is guaranteed on every pod that might call this.
-        properties="$(tr -d ' \n' < "$WORK_DIR/properties.json")"
-        if [[ "$(url_host "$(sed -n 's/.*"uri":"\([^"]*\)".*/\1/p' <<<"$properties")")" \
-            == "$(url_host "${held%% *}")" ]]; then
-            ref="$(sed -n 's/.*"bolt\.ref":\["\([^"]*\)"\].*/\1/p' <<<"$properties")"
-        else
-            log "the properties of $path are another location's; not using them"
-        fi
+        # { "properties": { "bolt.ref": [ "<ref>" ] } } -- fixed, tiny shape, so a
+        # sed extraction avoids depending on python3 or jq, neither of which is
+        # guaranteed on every pod that might call this.
+        ref="$(tr -d ' \n' < "$WORK_DIR/properties.json" \
+               | sed -n 's/.*"bolt\.ref":\["\([^"]*\)"\].*/\1/p')"
     fi
     if [[ -n "$ref" ]]; then
         printf '%s\n' "$ref"
@@ -263,7 +231,7 @@ cmd_resolve_latest() {
     rc=0
     store_read "$path" "$WORK_DIR/latest.tar.gz" || rc=$?
     if (( rc == FETCH_ABSENT )); then
-        log "latest.tar.gz for $branch/$triple is no longer on either location"
+        log "no latest.tar.gz for $branch/$triple"
         return 0
     fi
     if tar -xzf "$WORK_DIR/latest.tar.gz" -C "$WORK_DIR" manifest.json 2>/dev/null; then
@@ -298,12 +266,11 @@ cmd_pull_latest() {
     mkdir -p "$dest"
     log "Pulling $path -> $dest"
     # The helper retries a transient failure itself, so one call decides: the
-    # bundle is here, neither location has it, or the store cannot be read.
+    # bundle is here, the store does not have it, or the store cannot be read.
     local rc=0
     store_read "$path" "$dest/latest.tar.gz" || rc=$?
     if (( rc == FETCH_ABSENT )); then
-        fail "$BOLT_NO_BUNDLE" \
-            "no promoted bundle at $path on either location (branch may have none yet)"
+        fail "$BOLT_NO_BUNDLE" "no promoted bundle at $path (branch may have none yet)"
     fi
     tar -xzf "$dest/latest.tar.gz" -C "$dest"
     rm -f "$dest/latest.tar.gz"

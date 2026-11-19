@@ -22,10 +22,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# A build's image-tag map is read with the read helper, which looks for it in the primary artifact
-# location (LLM_ARTIFACTS_PRIMARY) first and in the other one only when it is absent there,
-# authenticating with the ARTIFACTORY_NETRC file. The helper is the one beside this script, so a
-# copy of this script needs the helper copied beside it.
+# A build's image-tag map is read with the read helper, which reads it from
+# artifactory.nvidia.com, authenticating with the ARTIFACTORY_NETRC file. The helper is the one
+# beside this script, so a copy of this script needs the helper copied beside it.
 _FETCH_BUILD_ARTIFACT = Path(__file__).resolve().parent / "fetch_build_artifact.sh"
 # Exit codes of the read helper that this script acts on, by the names the helper gives them;
 # tests/unittest/scripts/test_fetch_build_artifact.py checks that they match.
@@ -38,10 +37,8 @@ _IMAGE_MAP_NAME = "imageKeyToTag.json"
 
 # What each failure exit status of the read helper means.
 _HELPER_FAILURES = {
-    _FETCH_REJECTED: "the primary location rejected the request",
-    _FETCH_TRANSFER_FAILED: (
-        "the transfer failed after retries, or the secondary location failed or rejected the request"
-    ),
+    _FETCH_REJECTED: "the location rejected the request",
+    _FETCH_TRANSFER_FAILED: "the transfer failed after retries",
     _FETCH_USAGE: "a usage, path, or configuration error",
 }
 
@@ -57,15 +54,15 @@ def _helper_failure(artifact_path: str, status: int) -> RuntimeError:
 
 
 def _image_map_path(pipeline_name: str, build_number: int) -> str:
-    """Legacy path of a build's image-tag map, which the read helper maps to each location."""
+    """Legacy path of a build's image-tag map, which the read helper maps."""
     return f"sw-tensorrt-generic/llm-artifacts/{pipeline_name}/{build_number}/{_IMAGE_MAP_NAME}"
 
 
 def _read_image_map(pipeline_name: str, build_number: int) -> bytes | None:
-    """Content of a build's image-tag map, or None when neither location has it.
+    """Content of a build's image-tag map, or None when the map is absent.
 
     The helper's stdout is discarded, since this script's stdout carries only the map; its stderr,
-    which names the location that served the map or says why it could not, goes to the job log.
+    which says that the map was served or why it could not be, goes to the job log.
 
     Raises:
         RuntimeError: The helper could not be run, or exited with a status other than success and
@@ -91,7 +88,7 @@ def _read_image_map(pipeline_name: str, build_number: int) -> bytes | None:
 
 
 def _read_image_map_or_exit(pipeline_name: str, build_number: int) -> bytes | None:
-    """Content of a build's image-tag map, or None when neither location has it.
+    """Content of a build's image-tag map, or None when the map is absent.
 
     A read that fails any other way ends the script with status 1: a rejected request or a failed
     transfer says nothing about whether the build has a map, and would fail for another build too.

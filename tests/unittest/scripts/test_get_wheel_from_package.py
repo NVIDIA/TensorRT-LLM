@@ -34,7 +34,7 @@ pytestmark = pytest.mark.cpu_only
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "get_wheel_from_package.py"
 HELPER_PATH = REPO_ROOT / "jenkins" / "scripts" / "fetch_build_artifact.sh"
-# The legacy path the image build passes as --artifact_path; the helper maps it to each location.
+# The legacy path the image build passes as --artifact_path, which the helper maps.
 ARTIFACT_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/88"
 TARBALL = "TensorRT-LLM.tar.gz"
 NETRC = "/run/secrets/artifactory_netrc"
@@ -92,7 +92,6 @@ def wheel_script() -> ModuleType:
 def read_helper_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARTIFACTORY_NETRC", NETRC)
     monkeypatch.setenv("ARTIFACTORY_CREDENTIAL_ID", CREDENTIAL_ID)
-    monkeypatch.delenv("LLM_ARTIFACTS_PRIMARY", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -117,7 +116,6 @@ def _download(wheel_script: ModuleType, timeout: int = 60) -> None:
 def test_download_runs_the_read_helper_with_the_environment(
     wheel_script: ModuleType, monkeypatch: pytest.MonkeyPatch, sleeps: list[float]
 ) -> None:
-    monkeypatch.setenv("LLM_ARTIFACTS_PRIMARY", "aws")
     run = _fake_run(wheel_script, monkeypatch, [0])
 
     _download(wheel_script)
@@ -130,7 +128,6 @@ def test_download_runs_the_read_helper_with_the_environment(
     assert env == dict(os.environ)
     assert env["ARTIFACTORY_NETRC"] == NETRC
     assert env["ARTIFACTORY_CREDENTIAL_ID"] == CREDENTIAL_ID
-    assert env["LLM_ARTIFACTS_PRIMARY"] == "aws"
     # The helper's served-by line and its error messages belong in the build log.
     assert not kwargs.get("capture_output")
     assert kwargs.get("stderr") is None
@@ -164,15 +161,9 @@ def test_download_times_out_after_timeout_attempts(
     assert sleeps == [60, 60]
 
 
-@pytest.mark.parametrize("primary", (None, "", "aws"))
 def test_download_stops_when_the_credentials_are_rejected(
-    primary: str | None,
-    wheel_script: ModuleType,
-    monkeypatch: pytest.MonkeyPatch,
-    sleeps: list[float],
+    wheel_script: ModuleType, monkeypatch: pytest.MonkeyPatch, sleeps: list[float]
 ) -> None:
-    if primary is not None:
-        monkeypatch.setenv("LLM_ARTIFACTS_PRIMARY", primary)
     run = _fake_run(wheel_script, monkeypatch, [3])
 
     with pytest.raises(PermissionError) as excinfo:
@@ -199,24 +190,6 @@ def test_rejected_credentials_name_a_placeholder_when_the_credential_id_is_unset
     ):
         _download(wheel_script)
 
-    assert len(run.calls) == 1
-    assert sleeps == []
-
-
-def test_rejected_anonymous_request_when_urm_is_primary(
-    wheel_script: ModuleType, monkeypatch: pytest.MonkeyPatch, sleeps: list[float]
-) -> None:
-    monkeypatch.setenv("LLM_ARTIFACTS_PRIMARY", "urm")
-    run = _fake_run(wheel_script, monkeypatch, [3])
-
-    with pytest.raises(PermissionError) as excinfo:
-        _download(wheel_script)
-
-    message = str(excinfo.value)
-    assert "rejected the anonymous request" in message
-    assert f"{ARTIFACT_PATH}/{TARBALL}" in message
-    assert CREDENTIAL_ID not in message
-    assert [signature for signature in RETRY_SIGNATURES if signature in message] == []
     assert len(run.calls) == 1
     assert sleeps == []
 

@@ -34,17 +34,17 @@
 #   3  no bundle promoted for the branch (cold start / new branch): nothing to
 #      consume -- await/trigger a postmerge BoltProfileGen (PROMOTE=true), or turn
 #      BOLT_CONSUME off for this build.
-#   4  the profile store could not be read: a location refused the request or the
-#      read failed, so whether a bundle is promoted is unknown. Trying another
-#      branch would fail the same way.
+#   4  the profile store could not be read: it refused the request or the read
+#      failed, so whether a bundle is promoted is unknown. Trying another branch
+#      would fail the same way.
 #
 # Usage: apply_latest.sh <branch> <triple> <in_artifact> <out_bolted_artifact>
 #        <in_artifact> is a release tarball or a .whl.
 # Requires: llvm-bolt on PATH (staged here when it is missing); and, for
 #           artifactory.sh pull-latest, the environment that
-#           jenkins/scripts/fetch_build_artifact.sh reads: LLM_ARTIFACTS_PRIMARY,
-#           ARTIFACTORY_NETRC (a netrc file with the credential for the aws
-#           location), and ARTIFACTORY_CREDENTIAL_ID.
+#           jenkins/scripts/fetch_build_artifact.sh reads: ARTIFACTORY_NETRC (a
+#           netrc file with the credential for artifactory.nvidia.com) and
+#           ARTIFACTORY_CREDENTIAL_ID.
 #
 # The credential is for the pull alone. Once the bundle is pulled, the script
 # unsets ARTIFACTORY_NETRC and ARTIFACTORY_CREDENTIAL_ID, so nothing it starts
@@ -89,7 +89,7 @@ PULL_STATUS=0
 bash "$HERE/artifactory.sh" pull-latest "$BRANCH" "$TRIPLE" "$DEST" || PULL_STATUS=$?
 if [ "$PULL_STATUS" -eq "$BOLT_STORE_UNREADABLE" ]; then
     echo "[apply_latest] FATAL: the BOLT profile store could not be read for ${BRANCH}/${TRIPLE}." >&2
-    echo "[apply_latest]   a location refused the request or the read failed; the messages above say why." >&2
+    echo "[apply_latest]   the store refused the request or the read failed; the messages above say why." >&2
     exit "$BOLT_STORE_UNREADABLE"
 elif [ "$PULL_STATUS" -ne 0 ]; then
     echo "[apply_latest] FATAL: no promoted bundle for ${BRANCH}/${TRIPLE}." >&2

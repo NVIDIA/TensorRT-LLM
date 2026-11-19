@@ -16,16 +16,15 @@
 """Tests for the promotion of a BOLT profile bundle in ``jenkins/BoltProfileGen.groovy``.
 
 ``promoteBundle`` builds a shell script that runs on a Slurm cluster's frontend and uploads the
-bundle to the profile store: to the primary location, which holds the required copy, and, while
-``aws`` is the primary, to ``urm`` as a replica. The script reads its credentials as a netrc on
-stdin, which the pipeline's agent writes with a line of shell in front of the ssh command. The
-tests take the text of both from the Groovy source, evaluate the Groovy statements around them in
-Python, and run the result the way the pipeline does: the agent's line with ``sh -xe``, and the
-script with ``bash`` from a file beside the bundle, with the netrc on stdin. The loopback servers
-of ``test_bolt_fetch_verified`` stand in for the two Artifactory locations, each on its own host,
-because curl matches netrc entries by host name. No request leaves the loopback interface. The
-tests cut curl's retry count in the script's text, so that each test takes a few seconds at most.
-One test also reads ``publishBoltedCanonical``, whose upload script runs curl the same way.
+bundle to the profile store, which is on the ``aws`` Artifactory location. The script reads its
+credential as a netrc on stdin, which the pipeline's agent writes with a line of shell in front
+of the ssh command. The tests take the text of both from the Groovy source, evaluate the Groovy
+statements around them in Python, and run the result the way the pipeline does: the agent's line
+with ``sh -xe``, and the script with ``bash`` from a file beside the bundle, with the netrc on
+stdin. A loopback server of ``test_bolt_fetch_verified`` stands in for the location. No request
+leaves the loopback interface. The tests cut curl's retry count in the script's text, so that
+each test takes a few seconds at most. One test also reads ``publishBoltedCanonical``, whose
+upload script runs curl the same way.
 """
 
 from __future__ import annotations
@@ -63,101 +62,65 @@ BUNDLE_NAME = f"bolt-profile-{REF}-{TRIPLE}.tar.gz"
 # Short enough that no curl version asks the server to confirm the upload before sending it.
 BUNDLE = b"profile bundle " * 32
 
-HOSTS = {"aws": "127.0.0.1", "urm": "127.0.0.2"}
-# Where the store is on each location: the location's repository, then the same path.
-REPOS = {"aws": "sw-tensorrt-llm-generic-local", "urm": "sw-tensorrt-generic"}
-# Each location's settings, as trtllm_utils.llmArtifactsLocations() of the shared library returns
-# them to the pipeline.
-LOCATIONS = {
-    "aws": {
-        "root": "https://artifactory.nvidia.com/artifactory",
-        "repo": REPOS["aws"],
-        "credential": "aws-artifactory-credentials",
-    },
-    "urm": {
-        "root": "https://urm.nvidia.com/artifactory",
-        "repo": REPOS["urm"],
-        "credential": "urm-artifactory-creds",
-    },
+# The fake server that stands in for the aws location, and the loopback address it listens on.
+AWS = "aws"
+HOST = "127.0.0.1"
+# The aws location's settings, as trtllm_utils.llmArtifactsLocations() of the shared library
+# returns them to the pipeline.
+AWS_LOCATION = {
+    "root": "https://artifactory.nvidia.com/artifactory",
+    "repo": "sw-tensorrt-llm-generic-local",
+    "credential": "aws-artifactory-credentials",
 }
 LAYOUT_DIR = f"llm-artifacts/bolt-profiles/{BRANCH}/{TRIPLE}"
-STORE = {location: f"/artifactory/{repo}/{LAYOUT_DIR}" for location, repo in REPOS.items()}
+# Where the store is on the location: the location's repository, then the store's directory.
+STORE = f"/artifactory/{AWS_LOCATION['repo']}/{LAYOUT_DIR}"
 # latest.tar.gz as its upload names it: the matrix parameters set the three properties in the same
 # request as the bytes.
 LATEST = f"latest.tar.gz;bolt.ref={REF};bolt.branch={BRANCH};bolt.triple={TRIPLE}"
 # The permissions that the upload of each file needs, as a rejection names them.
 PERMISSION = {BUNDLE_NAME: "deploy or delete", LATEST: "deploy, annotate, or delete"}
 
-LOGINS = {"aws": "ci-publisher-aws", "urm": "ci-publisher-urm"}
-# Each holds a printf conversion and a shell expansion, which must reach the netrc as written.
-PASSWORDS = {
-    "aws": "Pw-aws-7f3a91-%d-$HOME-must-never-be-printed",
-    "urm": "Pw-urm-c08e55-%d-$HOME-must-never-be-printed",
-}
-BASIC_TOKENS = {
-    location: base64.b64encode(f"{LOGINS[location]}:{PASSWORDS[location]}".encode()).decode()
-    for location in HOSTS
-}
+NETRC_LOGIN = "ci-publisher-aws"
+# It holds a printf conversion and a shell expansion, which must reach the netrc as written.
+NETRC_PASSWORD = "Pw-aws-7f3a91-%d-$HOME-must-never-be-printed"
+BASIC_TOKEN = base64.b64encode(f"{NETRC_LOGIN}:{NETRC_PASSWORD}".encode()).decode()
 
 # The statements of promoteBundle that the tests evaluate in Python instead of taking their
 # text. Each must be in the function as written here: a change to one of them needs the same
-# change wherever the Python stands for it: _promotion_locations, _layout_dir,
-# _location_values, _promote_script, _netrc_feed, and Promotion.write_netrc. The binding of each
-# location's credential and the check that a replica's credential binds are among them, because
-# the tests take every credential to bind.
+# change wherever the Python stands for it: _layout_dir, _location_values, _promote_script,
+# _netrc_feed, and Promotion.write_netrc. The binding of the location's credential is among them,
+# because the tests give the agent's shell the two variables that it names.
 _MIRRORED_STATEMENTS = (
     "def bundleName = bundle.tokenize('/').last()",
     "def layoutDir = trtllm_utils.llmArtifactsLayoutPath(promoteDir)",
-    'def locations = primary == "aws" ? ["aws", "urm"] : ["urm"]',
-    "for (location in locations) {",
-    "def base = trtllm_utils.llmArtifactsUrl(location, promoteDir)",
+    'def base = trtllm_utils.llmArtifactsUrl("aws", promoteDir)',
     r"""def host = base.replaceFirst(/^https?:\/\//, "").tokenize('/').first()""",
-    "def repo = LLM_ARTIFACTS_LOCATIONS[location].repo",
-    "def credentialId = LLM_ARTIFACTS_LOCATIONS[location].credential",
-    'def userVariable = "ART_USER_" + location.toUpperCase()',
-    'def passwordVariable = "ART_PASS_" + location.toUpperCase()',
-    "def binding = pipeline.usernamePassword(credentialsId: credentialId,",
-    "usernameVariable: userVariable, passwordVariable: passwordVariable)",
-    "if (location != primary) {",
-    "pipeline.withCredentials([binding]) {}",
-    "continue",
-    "bindings.add(binding)",
+    "def repo = LLM_ARTIFACTS_LOCATIONS.aws.repo",
+    "def credentialId = LLM_ARTIFACTS_LOCATIONS.aws.credential",
     "def runPromote = bashRemoteScriptFile(pipeline, remote, promote,",
-    "pipeline.withCredentials(bindings) {",
+    "pipeline.withCredentials([pipeline.usernamePassword(credentialsId: credentialId,",
+    "usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {",
     "script: feed + Utils.sshUserCmd(remote, runPromote))",
 )
 # How many lines of promoteBundle name each variable that the tests rebuild in Python, comment
 # lines aside. The tests take each one's value from the statements above and from the strings
 # they read, so one more line that names a variable could change it where the tests do not look:
-# another location or another order, text added to the script, or a second reader of the netrc.
+# another address, repository, or credential, text added to the script, or a second reader of the
+# netrc.
 _NAMED_ON_LINES = {
-    "locations": 3,
-    "uploads": 3,
+    "base": 3,
+    "host": 5,
+    "repo": 2,
+    "credentialId": 3,
     "promote": 3,
-    "bindings": 3,
-    "netrcEntries": 3,
     "runPromote": 2,
     "feed": 2,
 }
 # The same, for the locations' settings. The shared library holds them and the helpers that map a
-# legacy path to a location's address, and its own tests cover both; LOCATIONS below stands for
-# the settings here.
+# legacy path to a location's address, and its own tests cover both; AWS_LOCATION above stands for
+# the aws location's settings here.
 _MIRRORED_HELPER_STATEMENTS = ("LLM_ARTIFACTS_LOCATIONS = trtllm_utils.llmArtifactsLocations()",)
-
-# What ends a location's part of the script when its upload fails: a replica's failure by
-# default, and the required copy's when the location is the primary.
-_ON_FAILURE = re.compile(
-    r'^\s*def onFailure = "(?P<replica>(?:[^"\\\n]|\\.)*)"\n'
-    r"\s*if \(location == primary\) \{\n"
-    r'\s*onFailure = "(?P<required>(?:[^"\\\n]|\\.)*)"\n'
-    r"\s*\}$",
-    re.M,
-)
-
-# The line of shell that writes a location's netrc entry on the agent.
-_NETRC_ENTRY = re.compile(r'^\s*netrcEntries\.add\("(?P<entry>(?:[^"\\\n]|\\.)*)"\)$', re.M)
-# Where the agent's text holds the entries of all locations.
-_JOINED_ENTRIES = "${netrcEntries.join('; ')}"
 
 # What Artifactory sends besides the status when it has stored a file.
 _STORED = b'{"repo": "store", "created": "2026-01-01T00:00:00.000Z"}\n'
@@ -235,47 +198,33 @@ def _promote_bundle() -> str:
     return function[0]
 
 
-def _locations() -> dict[str, dict[str, str]]:
-    """Return ``LLM_ARTIFACTS_LOCATIONS`` as the shared library gives it to the pipeline."""
-    return LOCATIONS
-
-
-def _promotion_locations(primary: str) -> list[str]:
-    """Return the locations that a promotion uploads to, the required copy first."""
-    return ["aws", "urm"] if primary == "aws" else ["urm"]
-
-
 def _layout_dir(function: str) -> str:
-    """Return the store's directory below a location's repository, from ``promoteBundle``."""
+    """Return the store's directory below the location's repository, from ``promoteBundle``."""
     promote_dir = _gstring(
         _definition(function, "promoteDir"), {"BRANCH": BRANCH, "TRIPLE": TRIPLE}
     )
     return re.sub(r"^sw-tensorrt-generic(-local)?/", "", promote_dir)
 
 
-def _location_values(location: str, root: str, layout_dir: str) -> dict[str, str]:
-    """Return the values of the variables that ``promoteBundle`` sets for ``location``.
+def _location_values(root: str, layout_dir: str) -> dict[str, str]:
+    """Return the values of the variables that ``promoteBundle`` sets from the aws location.
 
     ``root`` is the location's root, in place of the one in ``LLM_ARTIFACTS_LOCATIONS``.
     """
-    settings = _locations()[location]
-    base = f"{root}/{settings['repo']}/{layout_dir}"
+    base = f"{root}/{AWS_LOCATION['repo']}/{layout_dir}"
     return {
         "base": base,
         "host": base.split("://", 1)[1].split("/", 1)[0],
-        "repo": settings["repo"],
-        "credentialId": settings["credential"],
-        "userVariable": "ART_USER_" + location.upper(),
-        "passwordVariable": "ART_PASS_" + location.upper(),
+        "repo": AWS_LOCATION["repo"],
+        "credentialId": AWS_LOCATION["credential"],
     }
 
 
-def _promote_script(primary: str, roots: Mapping[str, str], bundle: Path) -> str:
+def _promote_script(root: str, bundle: Path) -> str:
     """Return the script that ``promoteBundle`` builds to promote ``bundle``.
 
-    The script's text, the store's directory, and each location's repository and credential come
-    from the Groovy source. ``roots`` gives each location's root, in place of the one in
-    ``LLM_ARTIFACTS_LOCATIONS``. Every location's credential is taken to bind.
+    The script's text and the store's directory come from the Groovy source. ``root`` is the
+    location's root, in place of the one in ``LLM_ARTIFACTS_LOCATIONS``.
     """
     function = _promote_bundle()
     values = {
@@ -288,55 +237,29 @@ def _promote_script(primary: str, roots: Mapping[str, str], bundle: Path) -> str
     for name in ("netrc", "response"):
         values[name] = _gstring(_definition(function, name), values)
     values["layoutDir"] = _layout_dir(function)
+    values.update(_location_values(root, values["layoutDir"]))
 
-    on_failure = _ON_FAILURE.search(function)
-    if on_failure is None:
-        pytest.fail("promoteBundle: cannot find what it does when an upload fails")
-    # Each string must end where its statement does: text that Groovy appended after it would
+    # The string must end where its statement does: text that Groovy appended after it would
     # be missing from the script that the tests run.
-    upload = _between(function, 'uploads += """', '""".stripIndent()\n')
-    uploads = ""
-    for location in _promotion_locations(primary):
-        location_values = {
-            **values,
-            **_location_values(location, roots[location], values["layoutDir"]),
-        }
-        outcome = "required" if location == primary else "replica"
-        location_values["onFailure"] = _gstring(on_failure[outcome], location_values)
-        uploads += _strip_indent(_gstring(upload, location_values))
-
-    promote = _between(function, 'def promote = """', '""".stripIndent() + uploads\n')
-    return _strip_indent(_gstring(promote, values)) + uploads
+    promote = _between(function, 'def promote = """', '""".stripIndent()\n')
+    return _strip_indent(_gstring(promote, values))
 
 
-def _netrc_feed(
-    primary: str, roots: Mapping[str, str], hosts: Mapping[str, str] | None = None
-) -> str:
+def _netrc_feed(root: str, host: str | None = None) -> str:
     """Return the shell text that the agent runs in front of the ssh command.
 
-    It writes the promotion's netrc to the pipe: an entry for each location, with the login and
-    the password from the variables that the location's credential is bound to. The text comes
-    from the Groovy source.
+    It writes the promotion's netrc to the pipe: one entry, with the login and the password from
+    the variables that the location's credential is bound to. The text comes from the Groovy
+    source.
 
     Args:
-        primary: The primary location, ``aws`` or ``urm``.
-        roots: Each location's root, in place of the one in ``LLM_ARTIFACTS_LOCATIONS``.
-        hosts: A host for each location's entry to name, in place of the one in its root.
+        root: The location's root, in place of the one in ``LLM_ARTIFACTS_LOCATIONS``.
+        host: A host for the entry to name, in place of the one in the root.
     """
     function = _promote_bundle()
-    entry = _NETRC_ENTRY.search(function)
-    if entry is None:
-        pytest.fail("promoteBundle: cannot find the netrc entry that it adds for a location")
-    layout_dir = _layout_dir(function)
-    entries = []
-    for location in _promotion_locations(primary):
-        values = _location_values(location, roots[location], layout_dir)
-        if hosts is not None:
-            values["host"] = hosts[location]
-        entries.append(_gstring(entry["entry"], values))
-    feed = _definition(function, "feed")
-    assert feed.count(_JOINED_ENTRIES) == 1, f"the agent's text does not join the entries: {feed}"
-    return _gstring(feed.replace(_JOINED_ENTRIES, "${entries}"), {"entries": "; ".join(entries)})
+    if host is None:
+        host = _location_values(root, _layout_dir(function))["host"]
+    return _gstring(_definition(function, "feed"), {"host": host})
 
 
 def _with_one_retry(script: str) -> str:
@@ -371,7 +294,7 @@ class Result:
 
 
 class Promotion:
-    """Runs the script that ``promoteBundle`` builds against the fake locations."""
+    """Runs the script that ``promoteBundle`` builds against the fake location."""
 
     def __init__(self, tmp_path: Path, fake: FakeServers) -> None:
         self.fake = fake
@@ -389,11 +312,8 @@ class Promotion:
         self.bundle.write_bytes(BUNDLE)
         # A curlrc that would show the Authorization header in the output, were curl to read it.
         (home / ".curlrc").write_text("verbose\n")
-        # Each location's root on its fake server, with the path of the pipeline's root.
-        self.roots = {
-            location: fake.url(location, urlsplit(settings["root"]).path)
-            for location, settings in _locations().items()
-        }
+        # The location's root on its fake server, with the path of the pipeline's root.
+        self.root = fake.url(AWS, urlsplit(AWS_LOCATION["root"]).path)
         # The runner's proxy settings, curl configuration folders, and shell start-up files are
         # left out. Where `sh` is a bash that reads BASH_ENV, as it can be in the CI image, that
         # file's commands would be traced in front of the agent's.
@@ -407,24 +327,29 @@ class Promotion:
         env.update({"HOME": str(home), "TMPDIR": str(self._tmpdir), "LC_ALL": "C"})
         self._env = env
 
-    def write_netrc(
-        self, primary: str, roots: Mapping[str, str], hosts: Mapping[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
+    def write_netrc(self, root: str, host: str | None = None) -> subprocess.CompletedProcess[str]:
         """Run the agent's part of a promotion, with a stand-in for the ssh command.
 
-        The agent's shell step traces its commands, and it has the credential of each of the
-        promotion's locations bound to that location's variables. The stand-in keeps what it
-        reads on stdin in a file, as ssh passes its stdin to the cluster. The step's own output
-        goes to the build's log, so it must be empty. In the result, the output is what the
-        stand-in read, which is the netrc, and the error output is the trace.
+        The agent's shell step traces its commands, and it has the location's credential bound
+        to the two variables that the binding names. The stand-in keeps what it reads on stdin in
+        a file, as ssh passes its stdin to the cluster. The step's own output goes to the build's
+        log, so it must be empty. In the result, the output is what the stand-in read, which is
+        the netrc, and the error output is the trace.
+
+        Args:
+            root: The location's root, in place of the one in ``LLM_ARTIFACTS_LOCATIONS``.
+            host: A host for the netrc entry to name, in place of the one in the root.
         """
-        env = dict(self._env, PS4="+ ", SSH_STDIN=str(self._ssh_stdin))
-        for location in _promotion_locations(primary):
-            env["ART_USER_" + location.upper()] = LOGINS[location]
-            env["ART_PASS_" + location.upper()] = PASSWORDS[location]
+        env = dict(
+            self._env,
+            PS4="+ ",
+            SSH_STDIN=str(self._ssh_stdin),
+            ART_USER=NETRC_LOGIN,
+            ART_PASS=NETRC_PASSWORD,
+        )
         self._ssh_stdin.unlink(missing_ok=True)
         step = subprocess.run(
-            ["sh", "-xe", "-c", _netrc_feed(primary, roots, hosts) + 'cat > "$SSH_STDIN"'],
+            ["sh", "-xe", "-c", _netrc_feed(root, host) + 'cat > "$SSH_STDIN"'],
             env=env,
             cwd=self._cwd,
             # The step has no input of its own for the stand-in to read.
@@ -438,24 +363,23 @@ class Promotion:
         return subprocess.CompletedProcess(step.args, step.returncode, netrc, step.stderr)
 
     def run(
-        self, primary: str, *, before_netrc: Callable[[], None] | None = None, **roots: str
+        self, *, before_netrc: Callable[[], None] | None = None, root: str | None = None
     ) -> Result:
-        """Promote the bundle with ``primary`` as the primary location.
+        """Promote the bundle.
 
-        The netrc on stdin is the one that the agent's part writes, except that each entry names
-        its fake server's address without the port: curl looks an entry up by host name alone.
-        Every run checks that no password reaches the script, its output, or the agent's trace,
-        and that the script leaves nothing beside the bundle but itself.
+        The netrc on stdin is the one that the agent's part writes, except that its entry names
+        the fake server's address without the port: curl looks an entry up by host name alone.
+        Every run checks that the password reaches neither the script, nor its output, nor the
+        agent's trace, and that the script leaves nothing beside the bundle but itself.
 
         Args:
-            primary: The primary location, ``aws`` or ``urm``.
             before_netrc: Called when the script has started and its stdin is still empty.
-            **roots: A root to use for a location in place of its fake server's.
+            root: A root to use for the location in place of its fake server's.
         """
-        roots = {**self.roots, **roots}
-        script = _with_one_retry(_promote_script(primary, roots, self.bundle))
+        root = self.root if root is None else root
+        script = _with_one_retry(_promote_script(root, self.bundle))
         self._script.write_text(script)
-        agent = self.write_netrc(primary, roots, HOSTS)
+        agent = self.write_netrc(root, HOST)
         assert agent.returncode == 0, agent.stderr
 
         with subprocess.Popen(
@@ -480,7 +404,7 @@ class Promotion:
                     proc.kill()
                     raise
 
-        for secret in (*PASSWORDS.values(), *BASIC_TOKENS.values()):
+        for secret in (NETRC_PASSWORD, BASIC_TOKEN):
             assert secret not in script
             assert secret not in agent.stderr + stdout + stderr
         left = sorted(path.name for path in self._store.iterdir())
@@ -494,7 +418,7 @@ class Promotion:
 
 @pytest.fixture
 def fake() -> Iterator[FakeServers]:
-    servers = FakeServers(HOSTS)
+    servers = FakeServers({AWS: HOST})
     yield servers
     servers.close()
 
@@ -504,15 +428,15 @@ def promotion(tmp_path: Path, fake: FakeServers) -> Promotion:
     return Promotion(tmp_path, fake)
 
 
-def _path(location: str, name: str) -> str:
-    """Return the request path of the store's file ``name`` on ``location``."""
-    return f"{STORE[location]}/{name}"
+def _path(name: str) -> str:
+    """Return the request path of the store's file ``name``."""
+    return f"{STORE}/{name}"
 
 
-def _accept(fake: FakeServers, location: str) -> None:
-    """Make ``location`` accept the upload of the bundle and of ``latest.tar.gz``."""
+def _accept(fake: FakeServers) -> None:
+    """Make the location accept the upload of the bundle and of ``latest.tar.gz``."""
     for name in (BUNDLE_NAME, LATEST):
-        fake.routes[(location, _path(location, name))] = Reply(201, _STORED)
+        fake.routes[(AWS, _path(name))] = Reply(201, _STORED)
 
 
 def _failure(status: int) -> Reply:
@@ -520,19 +444,19 @@ def _failure(status: int) -> Reply:
     return Reply(status, b'{"errors": [{"status": %d, "message": "failed"}]}\n' % status)
 
 
-def _uploads(fake: FakeServers) -> list[tuple[str, str, str]]:
-    """Return the requests in the order received, as ``(server, method, path)``."""
-    return [(request.server, request.method, request.path) for request in fake.requests]
+def _uploads(fake: FakeServers) -> list[tuple[str, str]]:
+    """Return the requests in the order received, as ``(method, path)``."""
+    return [(request.method, request.path) for request in fake.requests]
 
 
-def _promoted(fake: FakeServers, location: str) -> str:
-    """Return the line that the script logs when it has promoted the bundle on ``location``."""
-    return f"[INFO] promoted {BUNDLE_NAME} and latest.tar.gz on {fake.host(location)}"
+def _promoted(fake: FakeServers) -> str:
+    """Return the line that the script logs when it has promoted the bundle."""
+    return f"[INFO] promoted {BUNDLE_NAME} and latest.tar.gz on {fake.host(AWS)}"
 
 
-def _puts(location: str) -> list[tuple[str, str, str]]:
-    """Return a location's two uploads in order: the versioned bundle, then ``latest.tar.gz``."""
-    return [(location, "PUT", _path(location, name)) for name in (BUNDLE_NAME, LATEST)]
+def _puts() -> list[tuple[str, str]]:
+    """Return the two uploads in order: the versioned bundle, then ``latest.tar.gz``."""
+    return [("PUT", _path(name)) for name in (BUNDLE_NAME, LATEST)]
 
 
 # ---------------------------------------------------------------------------
@@ -549,11 +473,8 @@ def test_groovy_gstring_processing() -> None:
             _gstring(literal, values)
 
 
-@pytest.mark.parametrize("primary", ["aws", "urm"])
-def test_script_is_valid_bash_and_holds_no_credential(
-    promotion: Promotion, tmp_path: Path, primary: str
-) -> None:
-    script = _promote_script(primary, promotion.roots, promotion.bundle)
+def test_script_is_valid_bash_and_holds_no_credential(promotion: Promotion, tmp_path: Path) -> None:
+    script = _promote_script(promotion.root, promotion.bundle)
     path = tmp_path / "promote.sh"
     path.write_text(script)
 
@@ -562,26 +483,24 @@ def test_script_is_valid_bash_and_holds_no_credential(
     assert proc.returncode == 0, proc.stderr
     # Groovy turned each escaped dollar into a shell expansion.
     assert 'status=$(http_status --speed-time 300 --speed-limit 1024 -T "' in script
-    # The credentials are bound on the agent and reach the script only as the netrc on stdin.
+    # The credential is bound on the agent and reaches the script only as the netrc on stdin.
     assert "ART_USER" not in script and "ART_PASS" not in script
     assert f'cat > "{promotion.netrc}"' in script
-    assert script.count("if promote_to ") == len(_promotion_locations(primary))
+    assert script.count("if promote_to ") == 1
 
 
-@pytest.mark.parametrize("primary", ["aws", "urm"])
-def test_agent_writes_a_netrc_entry_for_each_location(promotion: Promotion, primary: str) -> None:
-    roots = {location: settings["root"] for location, settings in _locations().items()}
+def test_agent_writes_one_netrc_entry_for_the_aws_host(promotion: Promotion) -> None:
+    root = AWS_LOCATION["root"]
 
-    agent = promotion.write_netrc(primary, roots)
+    agent = promotion.write_netrc(root)
 
     assert agent.returncode == 0, agent.stderr
-    # With the pipeline's roots, each entry names its location's host.
-    assert agent.stdout == "".join(
-        f"machine {urlsplit(roots[location]).netloc} login {LOGINS[location]} "
-        f"password {PASSWORDS[location]}\n"
-        for location in _promotion_locations(primary)
+    # With the pipeline's root, the entry names the location's host.
+    assert (
+        agent.stdout
+        == f"machine {urlsplit(root).netloc} login {NETRC_LOGIN} password {NETRC_PASSWORD}\n"
     )
-    # The step's trace was on, and it ends before the commands that hold the credentials.
+    # The step's trace was on, and it ends before the command that holds the credential.
     assert agent.stderr.splitlines() == ["+ set +x"]
 
 
@@ -596,53 +515,50 @@ def test_upload_scripts_keep_curl_from_reading_a_curlrc(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# aws as the primary
+# The uploads
 # ---------------------------------------------------------------------------
 
 
-def test_aws_primary_promotes_to_aws_and_then_to_urm(promotion: Promotion) -> None:
+def test_promotion_uploads_the_bundle_and_then_latest(promotion: Promotion) -> None:
     fake = promotion.fake
-    _accept(fake, "aws")
-    _accept(fake, "urm")
+    _accept(fake)
 
-    result = promotion.run("aws")
+    result = promotion.run()
 
     assert result.returncode == 0, result.stderr
-    assert _uploads(fake) == _puts("aws") + _puts("urm")
+    assert _uploads(fake) == _puts()
     assert {request.body for request in fake.requests} == {BUNDLE}
-    # Each location gets its own credential and no other.
-    for location in HOSTS:
-        assert {request.headers.get("authorization") for request in fake.received(location)} == {
-            f"Basic {BASIC_TOKENS[location]}"
-        }
-    assert result.stdout.splitlines() == [_promoted(fake, "aws"), _promoted(fake, "urm")]
+    # Both uploads carry the location's credential.
+    assert {request.headers.get("authorization") for request in fake.requests} == {
+        f"Basic {BASIC_TOKEN}"
+    }
+    assert result.stdout.splitlines() == [_promoted(fake)]
     assert result.stderr == ""
 
 
 @pytest.mark.parametrize("status", [401, 403])
 @pytest.mark.parametrize("name", [BUNDLE_NAME, LATEST], ids=["bundle", "latest"])
-def test_aws_rejection_fails_the_promotion_and_names_the_credential(
+def test_rejection_fails_the_promotion_and_names_the_credential(
     promotion: Promotion, name: str, status: int
 ) -> None:
     fake = promotion.fake
-    _accept(fake, "aws")
-    _accept(fake, "urm")
-    fake.routes[("aws", _path("aws", name))] = _failure(status)
+    _accept(fake)
+    fake.routes[(AWS, _path(name))] = _failure(status)
 
-    result = promotion.run("aws")
+    result = promotion.run()
 
     assert result.returncode == 1
-    # The rejected request is not repeated, the uploads stop at it, and urm is not asked.
+    # The rejected request is not repeated, and the uploads stop at it.
     rejected = (BUNDLE_NAME, LATEST).index(name)
-    assert _uploads(fake) == _puts("aws")[: rejected + 1]
+    assert _uploads(fake) == _puts()[: rejected + 1]
     [error] = result.lines("ERROR")
     assert error in result.stderr
     file_name = name.split(";")[0]
-    assert f"{fake.host('aws')} rejected the credentials for {LAYOUT_DIR}/{file_name} " in error
+    assert f"{fake.host(AWS)} rejected the credentials for {LAYOUT_DIR}/{file_name} " in error
     assert f"(HTTP {status})" in error
-    assert f"credential '{_locations()['aws']['credential']}'" in error
-    assert f"lacks {PERMISSION[name]} permission on {REPOS['aws']}." in error
-    assert result.lines("INFO") == [] and result.lines("WARNING") == []
+    assert f"credential '{AWS_LOCATION['credential']}'" in error
+    assert f"lacks {PERMISSION[name]} permission on {AWS_LOCATION['repo']}." in error
+    assert result.lines("INFO") == []
 
 
 @pytest.mark.parametrize(
@@ -650,127 +566,36 @@ def test_aws_rejection_fails_the_promotion_and_names_the_credential(
     [(302, 1), (404, 1), (409, 1), (500, 2), (503, 2)],
     ids=["redirect", "not-found", "conflict", "server-error", "unavailable"],
 )
-def test_aws_failure_fails_the_promotion_with_its_status(
+def test_failure_fails_the_promotion_with_its_status(
     promotion: Promotion, status: int, requests: int
 ) -> None:
     fake = promotion.fake
-    _accept(fake, "aws")
-    _accept(fake, "urm")
-    fake.routes[("aws", _path("aws", BUNDLE_NAME))] = _failure(status)
+    _accept(fake)
+    fake.routes[(AWS, _path(BUNDLE_NAME))] = _failure(status)
 
-    result = promotion.run("aws")
+    result = promotion.run()
 
     assert result.returncode == 1
-    # curl repeats a request that a server error answered, once here; urm is not asked.
-    assert _uploads(fake) == _puts("aws")[:1] * requests
+    # curl repeats a request that a server error answered, once here.
+    assert _uploads(fake) == _puts()[:1] * requests
     assert result.lines("ERROR") == [
-        f"[ERROR] The request for {LAYOUT_DIR}/{BUNDLE_NAME} on {fake.host('aws')} failed "
+        f"[ERROR] The request for {LAYOUT_DIR}/{BUNDLE_NAME} on {fake.host(AWS)} failed "
         f"(HTTP {status})."
     ]
     assert result.lines("INFO") == []
 
 
-def test_aws_out_of_reach_fails_the_promotion(promotion: Promotion) -> None:
+def test_host_out_of_reach_fails_the_promotion(promotion: Promotion) -> None:
     fake = promotion.fake
-    _accept(fake, "urm")
-    closed = f"{HOSTS['aws']}:{_unused_port(HOSTS['aws'])}"
+    closed = f"{HOST}:{_unused_port(HOST)}"
 
-    result = promotion.run("aws", aws=f"http://{closed}/artifactory")
+    result = promotion.run(root=f"http://{closed}/artifactory")
 
     assert result.returncode == 1
     assert fake.requests == []
     [error] = result.lines("ERROR")
     assert f"{LAYOUT_DIR}/{BUNDLE_NAME} on {closed} failed (HTTP 000)" in error
-
-
-# ---------------------------------------------------------------------------
-# urm as the replica
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("status", [401, 403, 404, 500])
-@pytest.mark.parametrize("name", [BUNDLE_NAME, LATEST], ids=["bundle", "latest"])
-def test_urm_replica_failure_is_logged_and_the_promotion_stands(
-    promotion: Promotion, name: str, status: int
-) -> None:
-    fake = promotion.fake
-    _accept(fake, "aws")
-    _accept(fake, "urm")
-    fake.routes[("urm", _path("urm", name))] = _failure(status)
-
-    result = promotion.run("aws")
-
-    assert result.returncode == 0, result.stderr
-    # aws holds both files before urm is asked, and urm's uploads stop at the one that failed.
-    failed = (BUNDLE_NAME, LATEST).index(name)
-    assert _uploads(fake)[:2] == _puts("aws")
-    assert set(_uploads(fake)[2:]) == set(_puts("urm")[: failed + 1])
-    assert result.lines("INFO") == [_promoted(fake, "aws")]
-    [warning] = result.lines("WARNING")
-    assert warning in result.stderr
-    assert f"{LAYOUT_DIR}/{name.split(';')[0]} " in warning
-    assert f"(HTTP {status})" in warning
-    assert f"{fake.host('urm')} holds a replica, so the promotion stands." in warning
-    if status in (401, 403):
-        assert f"credential '{_locations()['urm']['credential']}'" in warning
-        assert f"lacks {PERMISSION[name]} permission on {REPOS['urm']}." in warning
-    assert result.lines("ERROR") == []
-
-
-def test_urm_replica_out_of_reach_is_logged_and_the_promotion_stands(
-    promotion: Promotion,
-) -> None:
-    fake = promotion.fake
-    _accept(fake, "aws")
-    closed = f"{HOSTS['urm']}:{_unused_port(HOSTS['urm'])}"
-
-    result = promotion.run("aws", urm=f"http://{closed}/artifactory")
-
-    assert result.returncode == 0, result.stderr
-    assert _uploads(fake) == _puts("aws")
-    assert result.lines("INFO") == [_promoted(fake, "aws")]
-    [warning] = result.lines("WARNING")
-    assert f"{LAYOUT_DIR}/{BUNDLE_NAME} on {closed} failed (HTTP 000)" in warning
-    assert result.lines("ERROR") == []
-
-
-# ---------------------------------------------------------------------------
-# urm as the primary
-# ---------------------------------------------------------------------------
-
-
-def test_urm_primary_promotes_to_urm_alone(promotion: Promotion) -> None:
-    fake = promotion.fake
-    _accept(fake, "aws")
-    _accept(fake, "urm")
-
-    result = promotion.run("urm")
-
-    assert result.returncode == 0, result.stderr
-    assert _uploads(fake) == _puts("urm")
-    assert {request.body for request in fake.requests} == {BUNDLE}
-    assert {request.headers.get("authorization") for request in fake.requests} == {
-        f"Basic {BASIC_TOKENS['urm']}"
-    }
-    assert result.stdout.splitlines() == [_promoted(fake, "urm")]
-    assert result.stderr == ""
-
-
-@pytest.mark.parametrize("status", [403, 500])
-def test_urm_primary_failure_fails_the_promotion(promotion: Promotion, status: int) -> None:
-    fake = promotion.fake
-    _accept(fake, "aws")
-    fake.routes[("urm", _path("urm", BUNDLE_NAME))] = _failure(status)
-
-    result = promotion.run("urm")
-
-    assert result.returncode == 1
-    assert fake.received("aws") == []
-    assert {request.path for request in fake.received("urm")} == {_path("urm", BUNDLE_NAME)}
-    [error] = result.lines("ERROR")
-    assert f"{LAYOUT_DIR}/{BUNDLE_NAME} " in error and f"(HTTP {status})" in error
-    assert fake.host("urm") in error
-    assert result.lines("INFO") == [] and result.lines("WARNING") == []
+    assert result.lines("INFO") == []
 
 
 # ---------------------------------------------------------------------------
@@ -797,23 +622,22 @@ def test_netrc_is_private_from_its_creation_to_the_last_upload(promotion: Promot
         uploading.append(stat.S_IMODE(netrc.stat().st_mode) if netrc.exists() else None)
         return Reply(201, _STORED)
 
-    for location in HOSTS:
-        for name in (BUNDLE_NAME, LATEST):
-            fake.routes[(location, _path(location, name))] = accept
+    for name in (BUNDLE_NAME, LATEST):
+        fake.routes[(AWS, _path(name))] = accept
 
-    result = promotion.run("aws", before_netrc=wait_for_netrc)
+    result = promotion.run(before_netrc=wait_for_netrc)
 
     assert result.returncode == 0, result.stderr
     # Only its owner can read the netrc, from before it holds a credential until the uploads
     # are over; run() checks that it is gone afterwards, with the response file.
     assert created == [0o600]
-    assert uploading == [0o600] * 4
+    assert uploading == [0o600] * 2
 
 
 def test_missing_bundle_fails_before_any_request(promotion: Promotion) -> None:
     promotion.bundle.unlink()
 
-    result = promotion.run("aws")
+    result = promotion.run()
 
     assert result.returncode == 1
     assert promotion.fake.requests == []

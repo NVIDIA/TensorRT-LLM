@@ -14,18 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Reads one file under llm-artifacts/ from the primary Artifactory location, and from the secondary
-# location only when the primary does not have it. CI reads a build's build_info.txt, packaged
-# builds, and waive_list/ with it, and it reads any other file there the same way. With --list, it
-# prints the files in one folder there on both locations, which is how CI finds a run's test
-# results. With --secondary-optional, a failure of the secondary gets an exit code of its own, for
-# readers that go on without the secondary's answer. While urm is the primary, it asks urm alone
-# about a run's test results, so that a rollback to urm sends no request about them to aws. Run it
-# with --help for the interface and the exit codes.
+# Reads one file under llm-artifacts/ from artifactory.nvidia.com. CI reads a build's
+# build_info.txt, packaged builds, and waive_list/ with it, and it reads any other file there the
+# same way. With --list, it prints the files in one folder there, which is how CI finds a run's
+# test results. Run it with --help for the interface and the exit codes.
 #
-# Credentials go to the aws location only, through curl's --netrc-file; urm is read anonymously.
-# The script turns off xtrace that a caller passes on, because a trace would show response URLs,
-# which can carry a CDN's signature. Never pass a secret on a command line.
+# Credentials come from a netrc file, through curl's --netrc-file. The script turns off xtrace
+# that a caller passes on, because a trace would show response URLs, which can carry a CDN's
+# signature. Never pass a secret on a command line.
 
 # The steps run through with_retries and cleanup runs from a trap, so shellcheck cannot see that
 # they are reachable.
@@ -37,27 +33,20 @@ set -uo pipefail
 readonly PROG="fetch_build_artifact"
 readonly MAX_ATTEMPTS=3
 readonly AWS_BASE_URL="https://artifactory.nvidia.com/artifactory/sw-tensorrt-llm-generic-local"
-readonly URM_BASE_URL="https://urm.nvidia.com/artifactory/sw-tensorrt-generic"
 # Exit codes other than success. Readers that act on one define the same name for it, and
 # tests/unittest/scripts/test_fetch_build_artifact.py checks that the values match.
 readonly FETCH_ABSENT=2
 readonly FETCH_REJECTED=3
 readonly FETCH_TRANSFER_FAILED=4
-readonly FETCH_SECONDARY_FAILED=5
 readonly FETCH_USAGE=64
 
 usage() {
     cat <<'EOF'
 Usage: fetch_build_artifact.sh [--properties | --exists] <artifact-path> [<dest-file>]
        fetch_build_artifact.sh --list <directory-path>
-       fetch_build_artifact.sh --secondary-optional [--exists] <artifact-path> [<dest-file>]
-       fetch_build_artifact.sh --secondary-optional --list <directory-path>
 
-Reads a build artifact from the primary Artifactory location, and from the secondary location
-only when the primary does not have it. A rejected request, a server or connection error, or a
-checksum mismatch never falls back. --list lists a folder on both locations instead. While urm
-is the primary, a run's test results (its test-results/ folder and the files in it) are asked of
-urm alone: their listing does not ask aws, and a file that urm does not have is absent.
+Reads a build artifact from artifactory.nvidia.com, repository sw-tensorrt-llm-generic-local,
+which CI calls the aws location. --list lists a folder there instead.
 
 Arguments:
   <artifact-path>  A legacy path (sw-tensorrt-generic/llm-artifacts/... or
@@ -66,50 +55,29 @@ Arguments:
   <dest-file>      Output file, written as <dest-file>.part and renamed when complete.
                    Required unless --exists is given; not allowed with --list.
   --properties     Write the artifact's properties (storage API JSON) instead of the file.
-  --exists         Write no file; print "<url> <sha1>" for the location that holds the artifact.
-  --list           Print "<location> <name>" for each file directly in the folder
-                   <directory-path>, a legacy or layout path that may end in "/": the
-                   primary's files, then the secondary's, so a name on both appears twice.
-                   The secondary is not asked when the primary rejects the request, nor for a
-                   run's test-results/ folder while urm is the primary.
-  --secondary-optional
-                   Report a failure or a rejection on the secondary, after the primary
-                   answered, with exit code 5 in place of 4, for a reader that goes on
-                   without the secondary's answer. Not allowed with --properties. It changes
-                   nothing where the secondary is not asked.
+  --exists         Write no file; print "<url> <sha1>" for the artifact.
+  --list           Print the name of each file directly in the folder <directory-path>, a
+                   legacy or layout path that may end in "/", one name per line.
 
 Environment:
-  LLM_ARTIFACTS_PRIMARY      aws (the default) or urm; the other location is the secondary.
   ARTIFACTORY_NETRC          netrc file holding an Artifactory access token for
-                             artifactory.nvidia.com; required whenever aws is contacted.
+                             artifactory.nvidia.com; required.
   ARTIFACTORY_CREDENTIAL_ID  Name of the CI credential behind ARTIFACTORY_NETRC, for messages.
-  LLM_ARTIFACTS_AWS_URL, LLM_ARTIFACTS_URM_URL
-                             Replace a location's base URL, <root>/<repository>.
+  LLM_ARTIFACTS_AWS_URL      Replaces the base URL, <root>/<repository>.
 
 Exit codes:
-  0   Success; stderr gets "fetch_build_artifact: served-by=<aws|urm> path=<layout path>".
-      With --list, every location asked answered and at least one has the folder; stderr
-      ends with "fetch_build_artifact: listed <n> on <primary>, <m> on <secondary>
-      path=<layout path>", or, for a run's test-results/ folder while urm is the primary,
-      "fetch_build_artifact: listed <n> on urm, aws not asked while urm is the primary
-      path=<layout path>", as it does when --list exits 2, 4, or 5.
-  2   Neither location has the artifact (with --properties: has properties for it; with
-      --list: has the folder). For a run's test results while urm is the primary, urm alone
-      does not have it.
-  3   The primary rejected the request; the secondary was not contacted.
+  0   Success; stderr ends with "fetch_build_artifact: served-by=aws path=<layout path>".
+      With --list, the folder exists; stderr ends with
+      "fetch_build_artifact: listed <n> path=<layout path>", as it does when --list exits 2
+      or 4.
+  2   artifactory.nvidia.com does not have the artifact (with --properties: has no
+      properties for it; with --list: does not have the folder).
+  3   artifactory.nvidia.com rejected the credential (HTTP 401 or 403).
   4   The transfer failed after retries: a connection or server error, a persistent CDN
-      rejection, a checksum mismatch, or a failure other than "absent" on the secondary.
-      A file that was deleted or replaced between its lookup and its download is looked up
-      again before the next attempt, and is absent on that location when it is gone.
-      With --list, a listing failed after retries or the secondary rejected the request; the
-      files listed on the other location are still printed.
-  5   Only with --secondary-optional, in place of 4: the primary does not have the artifact,
-      and the secondary failed after retries or rejected the request. With --list, the
-      primary listed the folder, or does not have it, and the secondary's listing failed or
-      was rejected; the primary's files are still printed. A message names the secondary's
-      host and says that its answer was not required.
-  64  Usage error, unmappable path, bad LLM_ARTIFACTS_PRIMARY, missing ARTIFACTORY_NETRC,
-      or a missing tool.
+      rejection, or a checksum mismatch. A file that was deleted or replaced between its
+      lookup and its download is looked up again before the next attempt, and is absent
+      when it is gone. With --list, the listing failed after retries.
+  64  Usage error, unmappable path, missing ARTIFACTORY_NETRC, or a missing tool.
 EOF
 }
 
@@ -158,22 +126,6 @@ url_host() {
     printf '%s\n' "${rest,,}"
 }
 
-# use_location <aws|urm>: sets LOC, LOC_BASE (<root>/<repository>), LOC_ROOT, LOC_REPO, and
-# LOC_HOST. Fails when the base URL does not have that shape.
-use_location() {
-    LOC="$1"
-    if [[ "$LOC" == aws ]]; then
-        LOC_BASE="${LLM_ARTIFACTS_AWS_URL:-$AWS_BASE_URL}"
-    else
-        LOC_BASE="${LLM_ARTIFACTS_URM_URL:-$URM_BASE_URL}"
-    fi
-    LOC_BASE="${LOC_BASE%/}"
-    LOC_ROOT="${LOC_BASE%/*}"
-    LOC_REPO="${LOC_BASE##*/}"
-    LOC_HOST="$(url_host "$LOC_BASE")"
-    [[ "$LOC_ROOT" =~ ^https?://[^/]+ && -n "$LOC_REPO" ]]
-}
-
 file_url() {
     printf '%s/%s\n' "$LOC_BASE" "$LAYOUT_PATH"
 }
@@ -183,7 +135,7 @@ storage_url() {
 }
 
 require_netrc() {
-    local need="reading $LAYOUT_PATH from aws needs a netrc file with an Artifactory access token"
+    local need="reading $LAYOUT_PATH needs a netrc file with an Artifactory access token"
     need+=" for artifactory.nvidia.com."
     if [[ -z "${ARTIFACTORY_NETRC:-}" ]]; then
         fail "$FETCH_USAGE" "ARTIFACTORY_NETRC is not set; $need"
@@ -194,22 +146,19 @@ require_netrc() {
 }
 
 # http_get <output file> <url> [<curl option>...]
-# Sends one GET and follows redirects, with the netrc only when the location is aws; curl applies
-# a netrc entry only to the host it names, so a redirect to another host carries no credential.
-# Sets HTTP_STATUS (000 when no response arrived) and FINAL_HOST (host[:port] of the last URL
-# requested), and returns curl's exit status.
+# Sends one GET with the netrc and follows redirects; curl applies a netrc entry only to the host
+# it names, so a redirect to another host carries no credential. Sets HTTP_STATUS (000 when no
+# response arrived) and FINAL_HOST (host[:port] of the last URL requested), and returns curl's
+# exit status.
 http_get() {
     local output="$1" url="$2" result rc
     shift 2
-    if [[ "$LOC" == aws ]]; then
-        set -- --netrc-file "$ARTIFACTORY_NETRC" "$@"
-    fi
     # Start from an empty file, so that it never holds the body of an earlier attempt.
     : >"$output"
     # -q must come first. It keeps curl from reading a curlrc, which could, for example, turn on
     # verbose output that prints the Authorization header.
     result="$(curl -q --silent --show-error --location --connect-timeout 30 \
-        --speed-limit 1 --speed-time 300 "$@" \
+        --speed-limit 1 --speed-time 300 --netrc-file "$ARTIFACTORY_NETRC" "$@" \
         --output "$output" --write-out '%{http_code} %{url_effective}' "$url")"
     rc=$?
     HTTP_STATUS="${result%% *}"
@@ -415,25 +364,21 @@ with_retries() {
             return "$rc"
         fi
         if (( attempt >= MAX_ATTEMPTS )); then
-            log "attempt $attempt of $MAX_ATTEMPTS on $LOC ($LOC_HOST) failed: $FAILURE;" \
+            log "attempt $attempt of $MAX_ATTEMPTS on $LOC_HOST failed: $FAILURE;" \
                 "giving up on $LAYOUT_PATH."
             return "$FETCH_TRANSFER_FAILED"
         fi
         delay=$(( 2 ** attempt ))
-        log "attempt $attempt of $MAX_ATTEMPTS on $LOC ($LOC_HOST) failed: $FAILURE;" \
+        log "attempt $attempt of $MAX_ATTEMPTS on $LOC_HOST failed: $FAILURE;" \
             "retrying in ${delay}s."
         sleep "$delay"
     done
 }
 
-# read_from <aws|urm>: reads the artifact from one location. Returns 0 (served), FETCH_ABSENT,
-# FETCH_REJECTED, or FETCH_TRANSFER_FAILED (failed after retries).
-read_from() {
+# Reads the artifact as MODE asks. Returns 0 (served), FETCH_ABSENT, FETCH_REJECTED, or
+# FETCH_TRANSFER_FAILED (failed after retries).
+read_artifact() {
     local rc
-    use_location "$1"
-    if [[ "$LOC" == aws ]]; then
-        require_netrc
-    fi
     if [[ "$MODE" == properties ]]; then
         with_retries properties_step
         return
@@ -443,105 +388,44 @@ read_from() {
     if (( rc != 0 )) || [[ "$MODE" == exists ]]; then
         return "$rc"
     fi
-    # The lookup found the file here, so a failed download is a transfer failure and never
-    # sends the read to the other location, unless a new lookup shows that the file is gone.
+    # The lookup found the file, so a failed download is a transfer failure, unless a new lookup
+    # shows that the file is gone.
     STALE_LOOKUP=false
     with_retries fetch_step
-}
-
-# list_on <aws|urm>: lists the folder on one location and, once the listing is complete, prints
-# "<location> <name>" for each file directly in it. Sets LISTED to the number of files printed.
-# Returns 0, FETCH_ABSENT, FETCH_REJECTED, or FETCH_TRANSFER_FAILED (failed after retries).
-list_on() {
-    local rc name
-    use_location "$1"
-    LISTED=0
-    with_retries list_step
-    rc=$?
-    if (( rc == 0 )); then
-        while IFS= read -r name; do
-            printf '%s %s\n' "$LOC" "$name"
-            LISTED=$(( LISTED + 1 ))
-        done <"$WORK_DIR/files"
-    fi
-    return "$rc"
 }
 
 # The message names both causes for a 401 and a 403 alike, so that a missing permission is never
 # taken for an expired token.
 report_rejection() {
-    if [[ "$LOC" == aws ]]; then
-        log "$LOC_HOST rejected the credentials for $LAYOUT_PATH (HTTP $REJECTED_STATUS)."
-        log "the Artifactory access token in credential" \
-            "'${ARTIFACTORY_CREDENTIAL_ID:-<unset: ARTIFACTORY_CREDENTIAL_ID>}' needs renewal" \
-            "or lacks read permission on $LOC_REPO;" \
-            "an Artifactory access token for artifactory.nvidia.com is required."
-    else
-        log "$LOC_HOST rejected the anonymous request for $LAYOUT_PATH (HTTP $REJECTED_STATUS)."
-    fi
+    log "$LOC_HOST rejected the credentials for $LAYOUT_PATH (HTTP $REJECTED_STATUS)."
+    log "the Artifactory access token in credential" \
+        "'${ARTIFACTORY_CREDENTIAL_ID:-<unset: ARTIFACTORY_CREDENTIAL_ID>}' needs renewal" \
+        "or lacks read permission on $LOC_REPO;" \
+        "an Artifactory access token for artifactory.nvidia.com is required."
 }
 
-served() {
-    if [[ "$MODE" == exists ]]; then
-        printf '%s %s\n' "$(file_url)" "$SHA1"
-    fi
-    log "served-by=$LOC path=$LAYOUT_PATH"
-    exit 0
-}
-
-# Returns the exit code for a failure or a rejection on the secondary, the location in LOC, after
-# the primary answered: FETCH_TRANSFER_FAILED, or, with --secondary-optional,
-# FETCH_SECONDARY_FAILED after a message that the secondary's answer was not required.
-secondary_failure() {
-    if [[ "$SECONDARY_OPTIONAL" != true ]]; then
-        return "$FETCH_TRANSFER_FAILED"
-    fi
-    log "the secondary, $LOC ($LOC_HOST), gave no answer for $LAYOUT_PATH;" \
-        "its answer was not required."
-    return "$FETCH_SECONDARY_FAILED"
-}
-
-# Lists the folder on the primary and, unless the primary rejects the request or URM_ALONE holds,
-# on the secondary. Exits as usage() describes for --list.
+# Lists the folder and, once the listing is complete, prints the name of each file directly in
+# it. Exits as usage() describes for --list.
 list_folder() {
-    local primary_rc primary_listed secondary_rc status=0
-    # Unless URM_ALONE holds, the listing asks aws, so the netrc is checked before any request.
-    if [[ "$URM_ALONE" != true ]]; then
-        require_netrc
-    fi
-    list_on "$PRIMARY"
-    primary_rc=$?
-    if (( primary_rc == FETCH_REJECTED )); then
-        report_rejection
-        exit "$FETCH_REJECTED"
-    fi
-    if [[ "$URM_ALONE" == true ]]; then
-        if (( primary_rc == FETCH_ABSENT )); then
-            log "urm does not have $LAYOUT_PATH."
-        fi
-        log "listed $LISTED on urm, aws not asked while urm is the primary path=$LAYOUT_PATH"
-        exit "$primary_rc"
-    fi
-    primary_listed="$LISTED"
-    list_on "$SECONDARY"
-    secondary_rc=$?
-    if (( secondary_rc == FETCH_REJECTED )); then
-        # A rejection by the secondary is reported like any other failure there.
-        report_rejection
-        secondary_rc="$FETCH_TRANSFER_FAILED"
-    fi
-    if (( primary_rc == FETCH_TRANSFER_FAILED )); then
-        status="$FETCH_TRANSFER_FAILED"
-    elif (( secondary_rc == FETCH_TRANSFER_FAILED )); then
-        # The primary listed the folder or does not have it.
-        secondary_failure
-        status=$?
-    elif (( primary_rc == FETCH_ABSENT && secondary_rc == FETCH_ABSENT )); then
-        status="$FETCH_ABSENT"
-        log "neither $PRIMARY nor $SECONDARY has $LAYOUT_PATH."
-    fi
-    log "listed $primary_listed on $PRIMARY, $LISTED on $SECONDARY path=$LAYOUT_PATH"
-    exit "$status"
+    local rc name listed=0
+    with_retries list_step
+    rc=$?
+    case "$rc" in
+        0)
+            while IFS= read -r name; do
+                printf '%s\n' "$name"
+                listed=$(( listed + 1 ))
+            done <"$WORK_DIR/files"
+            ;;
+        "$FETCH_ABSENT") log "$LOC_HOST does not have $LAYOUT_PATH." ;;
+        "$FETCH_REJECTED")
+            report_rejection
+            exit "$FETCH_REJECTED"
+            ;;
+        *) ;;
+    esac
+    log "listed $listed path=$LAYOUT_PATH"
+    exit "$rc"
 }
 
 cleanup() {
@@ -552,7 +436,6 @@ cleanup() {
 }
 
 MODE=download
-SECONDARY_OPTIONAL=false
 ARGS=()
 while (( $# > 0 )); do
     case "$1" in
@@ -566,7 +449,6 @@ while (( $# > 0 )); do
             fi
             MODE="${1#--}"
             ;;
-        --secondary-optional) SECONDARY_OPTIONAL=true ;;
         --)
             shift
             ARGS+=("$@")
@@ -577,10 +459,6 @@ while (( $# > 0 )); do
     esac
     shift
 done
-
-if [[ "$MODE" == properties && "$SECONDARY_OPTIONAL" == true ]]; then
-    usage_error "--properties and --secondary-optional cannot be combined."
-fi
 
 case "$MODE:${#ARGS[@]}" in
     download:2 | properties:2 | exists:1 | exists:2 | list:1) ;;
@@ -611,52 +489,35 @@ if [[ "$MODE" == download || "$MODE" == properties ]]; then
     PART="$DEST.part"
 fi
 
-PRIMARY="${LLM_ARTIFACTS_PRIMARY:-aws}"
-case "$PRIMARY" in
-    aws) SECONDARY=urm ;;
-    urm) SECONDARY=aws ;;
-    *) fail "$FETCH_USAGE" "LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '$PRIMARY'." ;;
-esac
-
-# While urm is the primary, a run's test results are asked of urm alone: --list lists a
-# test-results/ folder on urm only, and a file in one that urm does not have is absent. A rollback
-# to urm, as an outage of aws calls for, then sends no request about test results to aws. A final
-# archive that only aws holds, from a stage that started before the rollback and whose upload to
-# urm failed, is then missed.
-URM_ALONE=false
-if [[ "$PRIMARY" == urm ]]; then
-    case "$LAYOUT_PATH" in
-        llm-artifacts/*/test-results | llm-artifacts/*/test-results/*) URM_ALONE=true ;;
-        *) ;;
-    esac
+# The base URL, <root>/<repository>, and its parts. Messages show it, so it must not carry
+# credentials.
+LOC_BASE="${LLM_ARTIFACTS_AWS_URL:-$AWS_BASE_URL}"
+authority="${LOC_BASE#*://}"
+if [[ "${authority%%/*}" == *@* ]]; then
+    fail "$FETCH_USAGE" "LLM_ARTIFACTS_AWS_URL must not contain credentials;" \
+        "ARTIFACTORY_NETRC provides them."
 fi
-
-for location in aws urm; do
-    override="LLM_ARTIFACTS_${location^^}_URL"
-    # Messages show the base URL, so it must not carry credentials.
-    authority="${!override:-}"
-    authority="${authority#*://}"
-    if [[ "${authority%%/*}" == *@* ]]; then
-        fail "$FETCH_USAGE" "$override must not contain credentials; ARTIFACTORY_NETRC provides them."
-    fi
-    if ! use_location "$location"; then
-        fail "$FETCH_USAGE" "$override must be an http(s) URL of the form <root>/<repository>, not '$LOC_BASE'."
-    fi
-done
+LOC_BASE="${LOC_BASE%/}"
+LOC_ROOT="${LOC_BASE%/*}"
+LOC_REPO="${LOC_BASE##*/}"
+LOC_HOST="$(url_host "$LOC_BASE")"
+if [[ ! "$LOC_ROOT" =~ ^https?://[^/]+ || -z "$LOC_REPO" ]]; then
+    fail "$FETCH_USAGE" "LLM_ARTIFACTS_AWS_URL must be an http(s) URL of the form" \
+        "<root>/<repository>, not '$LOC_BASE'."
+fi
 
 command -v curl >/dev/null 2>&1 || fail "$FETCH_USAGE" "curl is required."
 if [[ "$MODE" == download ]]; then
     command -v sha1sum >/dev/null 2>&1 || fail "$FETCH_USAGE" "sha1sum is required."
 fi
+require_netrc
 
-LOC=""
 SHA1=""
 STALE_LOOKUP=false
 FAILURE=""
 REJECTED_STATUS=""
 HTTP_STATUS=""
 FINAL_HOST=""
-LISTED=0
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fetch_build_artifact.XXXXXX")" \
     || fail "$FETCH_USAGE" "cannot create a temporary directory."
 trap cleanup EXIT
@@ -667,44 +528,26 @@ if [[ "$MODE" == list ]]; then
     list_folder
 fi
 
-read_from "$PRIMARY"
+read_artifact
 case $? in
-    0) served ;;
-    "$FETCH_ABSENT") ;;
+    0)
+        if [[ "$MODE" == exists ]]; then
+            printf '%s %s\n' "$(file_url)" "$SHA1"
+        fi
+        log "served-by=aws path=$LAYOUT_PATH"
+        exit 0
+        ;;
+    "$FETCH_ABSENT")
+        if [[ "$MODE" == properties ]]; then
+            log "$LOC_HOST has no properties for $LAYOUT_PATH."
+        else
+            log "$LOC_HOST does not have $LAYOUT_PATH."
+        fi
+        exit "$FETCH_ABSENT"
+        ;;
     "$FETCH_REJECTED")
         report_rejection
         exit "$FETCH_REJECTED"
         ;;
     *) exit "$FETCH_TRANSFER_FAILED" ;;
 esac
-
-if [[ "$URM_ALONE" == true ]]; then
-    if [[ "$MODE" == properties ]]; then
-        log "urm has no properties for $LAYOUT_PATH;" \
-            "aws is not asked for test results while urm is the primary."
-    else
-        log "urm does not have $LAYOUT_PATH;" \
-            "aws is not asked for test results while urm is the primary."
-    fi
-    exit "$FETCH_ABSENT"
-fi
-
-read_from "$SECONDARY"
-case $? in
-    0) served ;;
-    "$FETCH_ABSENT")
-        if [[ "$MODE" == properties ]]; then
-            log "neither $PRIMARY nor $SECONDARY has properties for $LAYOUT_PATH."
-        else
-            log "neither $PRIMARY nor $SECONDARY has $LAYOUT_PATH."
-        fi
-        exit "$FETCH_ABSENT"
-        ;;
-    "$FETCH_REJECTED")
-        # A rejection by the secondary is reported like any other failure there.
-        report_rejection
-        ;;
-    *) ;;
-esac
-secondary_failure
-exit $?

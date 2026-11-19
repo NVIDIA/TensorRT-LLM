@@ -52,18 +52,10 @@ SCAN_ROOT = "scan"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
-// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
-// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
-// selects it. Reads fall back to the other location only when a file is absent. The shared
-// library holds the locations and maps the legacy paths above to them (trtllm_utils.llmArtifacts*).
-def llmArtifactsPrimary()
-{
-    def primary = env.LLM_ARTIFACTS_PRIMARY ?: "aws"
-    if (!(primary in ["aws", "urm"])) {
-        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
-    }
-    return primary
-}
+// Everything under llm-artifacts/ is published to and read from artifactory.nvidia.com alone, the
+// location that the shared library names "aws". The library holds the locations and maps the
+// legacy paths above to them (trtllm_utils.llmArtifacts*); the read helper,
+// jenkins/scripts/fetch_build_artifact.sh, maps them the same way.
 
 // Credential with which the read helper reads from artifactory.nvidia.com: the publishing
 // credential, the one the pipelines publish build artifacts and test results with and that
@@ -77,17 +69,14 @@ READ_INCOMPLETE = 1
 // archive and its checkpoint. An extended regular expression, as read_test_results.sh takes it.
 TEST_RESULT_ARCHIVE_ERE = '^results-.*\\.tar\\.gz$'
 
-// The upload target of a folder of this run's outputs, such as "test-results", on a location.
-def testResultsDirTarget(String location, String directory)
+// The upload target of a folder of this run's outputs, such as "test-results".
+def testResultsDirTarget(String directory)
 {
-    if (location == "aws") {
-        return "${trtllm_utils.llmArtifactsRepoPath('aws', UPLOAD_PATH)}/${directory}/"
-    }
-    return "${UPLOAD_PATH}/${directory}/"
+    return "${trtllm_utils.llmArtifactsRepoPath('aws', UPLOAD_PATH)}/${directory}/"
 }
 
 // Marks the current stage UNSTABLE and leaves the build result alone, as the steps that fail to
-// read a run's test results do. A lost replica is only logged (see trtllm_utils.uploadToTargets).
+// read a run's test results do.
 def markStageUnstable(String reason)
 {
     catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
@@ -95,11 +84,11 @@ def markStageUnstable(String reason)
     }
 }
 
-// Uploads filePattern to a folder of this run's outputs, such as "test-results", on each of
-// targets (see trtllm_utils.uploadToTargets). Returns the locations that received the file.
-def uploadTestResult(String filePattern, String directory, List targets, boolean requiredFailureFails = true)
+// Uploads filePattern to a folder of this run's outputs, such as "test-results". A failed upload
+// fails the step.
+def uploadTestResult(String filePattern, String directory)
 {
-    return trtllm_utils.uploadToTargets(filePattern, "${UPLOAD_PATH}/${directory}/", targets, requiredFailureFails)
+    trtllm_utils.uploadArtifacts(filePattern, testResultsDirTarget(directory), "aws")
 }
 
 // GitLab project id for TRT-LLM repo, used to set GitLab status. Only needed when triggering by timer or by hand.
@@ -391,10 +380,6 @@ def JOB_TYPE = "job_type"
 // apply consistent stage scheduling; null otherwise.
 @Field
 def POST_MERGE_BUILD_NUMBER = "post_merge_build_number"
-// The primary location of build artifacts (see llmArtifactsPrimary), passed to every child job.
-// Child jobs run on other Jenkins controllers, whose own LLM_ARTIFACTS_PRIMARY can differ.
-@Field
-def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
 // Release scripts repository (nspect.py, kitmaker_wheel.py) as [url: ..., commit: ...],
 // resolved once in setupPipelineEnvironment from the TRTLLM_RELEASE_REPO credential and
 // jenkins/ci_versions.properties.
@@ -732,11 +717,8 @@ def mergeWaiveList(pipeline, globalVars)
             --diff-file=diff_content.txt \
             --output-file=waives.txt
         """
-        def primary = llmArtifactsPrimary()
-        def waiveListTarget = primary == "aws" ?
-            "${trtllm_utils.llmArtifactsRepoPath('aws', UPLOAD_PATH)}/waive_list/" : "${UPLOAD_PATH}/waive_list/"
-        trtllm_utils.uploadArtifacts("waives*.txt", waiveListTarget, primary)
-        def waiveListUrl = trtllm_utils.llmArtifactsUrl(primary, "${UPLOAD_PATH}/waive_list/waives.txt")
+        trtllm_utils.uploadArtifacts("waives*.txt", testResultsDirTarget("waive_list"), "aws")
+        def waiveListUrl = trtllm_utils.llmArtifactsUrl("aws", "${UPLOAD_PATH}/waive_list/waives.txt")
         echo "New merged test waive list: ${waiveListUrl}"
     } catch (InterruptedException e) {
         throw e
@@ -842,11 +824,8 @@ def preparation(pipeline, testFilter, globalVars)
                     "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
                     "jenkins_url=${env.BUILD_URL}"
                 writeFile file: 'build_info.txt', text: buildInfo
-                def primary = llmArtifactsPrimary()
-                def buildInfoTarget = primary == "aws" ?
-                    "${trtllm_utils.llmArtifactsRepoPath('aws', UPLOAD_PATH)}/" : "${UPLOAD_PATH}/"
-                trtllm_utils.uploadArtifacts("build_info.txt", buildInfoTarget, primary)
-                def buildInfoUrl = trtllm_utils.llmArtifactsUrl(primary, "${UPLOAD_PATH}/build_info.txt")
+                trtllm_utils.uploadArtifacts("build_info.txt", trtllm_utils.llmArtifactsRepoPath("aws", "${UPLOAD_PATH}/"), "aws")
+                def buildInfoUrl = trtllm_utils.llmArtifactsUrl("aws", "${UPLOAD_PATH}/build_info.txt")
                 pipeline.echo "Build info: ${buildInfoUrl}"
             } catch (InterruptedException e) {
                 throw e
@@ -911,10 +890,9 @@ def launchReleaseCheck(pipeline, globalVars)
                     error "Release Check failed (warn-only): ${e.getMessage()}"
                 }
             } finally {
-                def primary = llmArtifactsPrimary()
                 def scanLogDir = "${UPLOAD_PATH}/guardwords-scan-results/"
-                trtllm_utils.uploadToTargets("${LLM_ROOT}/scan.log", scanLogDir, trtllm_utils.llmArtifactsTargets(primary), true)
-                echo "Guardwords Scan Results: ${trtllm_utils.llmArtifactsBrowseUrl(primary, scanLogDir + 'scan.log')}"
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", trtllm_utils.llmArtifactsRepoPath("aws", scanLogDir), "aws")
+                echo "Guardwords Scan Results: ${trtllm_utils.llmArtifactsBrowseUrl('aws', scanLogDir + 'scan.log')}"
             }
         }
 
@@ -1518,9 +1496,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                 }
                 // Tar/upload from the workspace: rtUpload patterns are workspace-relative; /tmp uploads 0 files.
                 sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${archiveFiles.join(' ')}"
-                trtllm_utils.uploadToTargets("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/",
-                    trtllm_utils.llmArtifactsTargets(llmArtifactsPrimary()), true)
-                // Set only once the required copy is published: the test stages read the archive
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz",
+                    trtllm_utils.llmArtifactsRepoPath("aws", "${UPLOAD_PATH}/cbts/"), "aws")
+                // Set only once the archive is published: the test stages read the archive
                 // by this path, in its legacy form, through the read helper.
                 result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
                 pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
@@ -1611,26 +1589,20 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
         }
 
         // artifact.py reads the coverage DB pin, build_info.txt, and the coverage archives with
-        // jenkins/scripts/fetch_build_artifact.sh, which looks in the primary location first and
-        // authenticates to aws with this netrc. It holds the publishing credential, the one the
+        // jenkins/scripts/fetch_build_artifact.sh, which reads from artifactory.nvidia.com and
+        // authenticates to it with this netrc. It holds the publishing credential, the one the
         // pipelines publish build artifacts and test results with.
-        // When artifactory.nvidia.com is the primary location and rejects the credential, the
-        // helper prints a message naming it, artifact.py exits 1, and the coverage tier declines
-        // like after any other failure. A rejection while it is the secondary counts as a failed
-        // read: the tier declines when the read is the pin's, and artifact.py skips the build when
-        // the read is a build's.
-        // While artifactory.nvidia.com is the primary location (the default) and is down or
-        // unreachable, every read there fails after the helper's retries. --resolve-pin reads the
-        // pin first, so the coverage tier declines as soon as that one read has failed, before any
-        // build is tried. When the pin's read answers and a later read fails, artifact.py skips
-        // each build whose read fails. Setup Environment, which runs this before any build starts,
-        // waits for those reads; build_commit in artifact.py says how long each takes and what
-        // changes after a rollback to urm.
-        def artifactsPrimary = llmArtifactsPrimary()
+        // When artifactory.nvidia.com rejects the credential, the helper prints a message naming
+        // it, artifact.py exits 1, and the coverage tier declines like after any other failure.
+        // While artifactory.nvidia.com is down or unreachable, every read there fails after the
+        // helper's retries. --resolve-pin reads the pin first, so the coverage tier declines as
+        // soon as that one read has failed, before any build is tried. When the pin's read
+        // answers and a later read fails, artifact.py skips each build whose read fails. Setup
+        // Environment, which runs this before any build starts, waits for those reads;
+        // build_commit in artifact.py says how long each takes.
         artifactoryNetrc = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
         trtllm_utils.writeArtifactoryNetrc(artifactoryNetrc)
         def artifactEnv = [
-            "LLM_ARTIFACTS_PRIMARY=${artifactsPrimary}",
             "ARTIFACTORY_NETRC=${artifactoryNetrc}",
             "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
         ]
@@ -1672,8 +1644,8 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
 
         if (pinPlan.pin_upload_required) {
             try {
-                trtllm_utils.uploadToTargets("${LLM_ROOT}/${pinPlan.pin_path}", pinPlan.pin_target,
-                    trtllm_utils.llmArtifactsTargets(artifactsPrimary), true)
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/${pinPlan.pin_path}",
+                    trtllm_utils.llmArtifactsRepoPath("aws", pinPlan.pin_target), "aws")
                 pipeline.echo("CBTS audit: pinned coverage DB build ${pinPlan.build} " +
                               "for PR head ${prHead}")
             } catch (InterruptedException e) {
@@ -2140,10 +2112,10 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
 
 // Runs body with the scripts that read a run's test results, from the run's commit:
 // jenkins/scripts/read_test_results.sh and the read helper it calls,
-// jenkins/scripts/fetch_build_artifact.sh. body gets both paths. The helper reads from the primary
-// location first and authenticates to aws with a netrc that holds the publishing credential, the
-// one the pipelines publish test results with. The netrc exists only while body runs. A failure
-// to set up the scripts, or of body, is logged and marks the stage unstable.
+// jenkins/scripts/fetch_build_artifact.sh. body gets both paths. The helper authenticates to
+// artifactory.nvidia.com with a netrc that holds the publishing credential, the one the
+// pipelines publish test results with. The netrc exists only while body runs. A failure to set
+// up the scripts, or of body, is logged and marks the stage unstable.
 def withTestResultsReader(Closure body)
 {
     def readerDir = "${pwd(tmp: true)}/test-results-reader-${UUID.randomUUID().toString()}"
@@ -2157,7 +2129,6 @@ def withTestResultsReader(Closure body)
         }
         trtllm_utils.writeArtifactoryNetrc(netrcPath)
         withEnv([
-            "LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}",
             "ARTIFACTORY_NETRC=${netrcPath}",
             "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
         ]) {
@@ -2176,8 +2147,7 @@ def withTestResultsReader(Closure body)
 // lists ${UPLOAD_PATH}/test-results and keeps the names that match nameEre and not excludeEre
 // (extended regular expressions; an empty excludeEre drops nothing). It reads every final archive,
 // and a stage attempt's checkpoint only where its final archive could not be read or is not a
-// valid archive. While aws is the primary, a failure on urm is only logged; while urm is the
-// primary, urm alone is asked. The script logs what each location holds and what it read. This
+// valid archive. The script logs what it listed and what it read. This
 // marks the stage unstable when the script reports that a listing failed, a name could not be
 // read, or a file it read is not a valid archive, and fails on any other status, which
 // withTestResultsReader turns into an unstable stage.
@@ -2232,11 +2202,10 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
                                 --out-sqlite cov/cbts_touchmap.sqlite
                         """
                         sh "cd cov && tar czf cbts_pystart_report_${arch}.tar.gz cbts_touchmap.sqlite"
-                        def primary = llmArtifactsPrimary()
                         trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}.tar.gz",
-                            testResultsDirTarget(primary, "cbts-coverage"), primary)
+                            testResultsDirTarget("cbts-coverage"), "aws")
                         echo "CBTS early coverage (${arch}): " +
-                            trtllm_utils.llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz")
+                            trtllm_utils.llmArtifactsBrowseUrl("aws", "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz")
                     } else {
                         echo "CBTS early coverage (${arch}): no data files found, skipping."
                     }
@@ -2313,11 +2282,8 @@ def collectTestResults(pipeline, testFilter, globalVars)
                 """
                 if (fileExists("rerun/rerun_report.html")) {
                     try {
-                        def primary = llmArtifactsPrimary()
-                        def uploaded = uploadTestResult("rerun/rerun_report.html", "test-results", trtllm_utils.llmArtifactsTargets(primary), false)
-                        if (primary in uploaded) {
-                            echo "Rerun report: ${trtllm_utils.llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/test-results/rerun_report.html")}"
-                        }
+                        uploadTestResult("rerun/rerun_report.html", "test-results")
+                        echo "Rerun report: ${trtllm_utils.llmArtifactsBrowseUrl('aws', "${UPLOAD_PATH}/test-results/rerun_report.html")}"
                     } catch (Exception e) {
                         echo "Failed to upload rerun report: ${e.toString()}"
                     }
@@ -2361,10 +2327,9 @@ def collectTestResults(pipeline, testFilter, globalVars)
                     """
                     // Upload compressed only: the guardword scanner byte-matches raw files but not archives.
                     sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_touchmap.sqlite cbts_report"
-                    def primary = llmArtifactsPrimary()
-                    trtllm_utils.uploadArtifacts("cov/cbts_pystart_report.tar.gz", testResultsDirTarget(primary, "cbts-coverage"), primary)
+                    trtllm_utils.uploadArtifacts("cov/cbts_pystart_report.tar.gz", testResultsDirTarget("cbts-coverage"), "aws")
                     echo "CBTS coverage (touch DB + report): " +
-                        trtllm_utils.llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz")
+                        trtllm_utils.llmArtifactsBrowseUrl("aws", "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz")
                 } // Test coverage
             }
             catch (InterruptedException e)
@@ -2529,8 +2494,8 @@ def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
         return ""
     }
     def ref = ""
-    // artifactory.sh reads the profile store through the read helper, which takes the location
-    // and the credential from the environment. The netrc exists only around the lookup.
+    // artifactory.sh reads the profile store through the read helper, which takes the
+    // credential from the environment. The netrc exists only around the lookup.
     def netrcPath = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
     def refPath = "${pwd(tmp: true)}/bolt-profile-ref-${UUID.randomUUID().toString()}"
     // The lookup's time limit, and the time at which its timeout step is entered.
@@ -2540,7 +2505,6 @@ def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
         trtllm_utils.writeArtifactoryNetrc(netrcPath)
         def status = null
         withEnv([
-            "LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}",
             "ARTIFACTORY_NETRC=${netrcPath}",
             "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
         ]) {
@@ -2657,7 +2621,6 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additio
     // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
     // trigger "Argument list too long" when passed to downstream jobs.
     def globalVarsToPass = globalVars.findAll { key, value -> key != CACHED_CHANGED_FILE_LIST }
-    globalVarsToPass[LLM_ARTIFACTS_PRIMARY_KEY] = llmArtifactsPrimary()
     String globalVarsJson = writeJSON returnText: true, json: globalVarsToPass
     parameters += [
         'enableFailFast': enableFailFast,

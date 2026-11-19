@@ -23,8 +23,8 @@
 #   fat_build_inline.sh <fat_sqsh_path> <base_sqsh_path> <llm_tar_artifact_path> <tar_name>
 #
 # The tarball is read on the host with fetch_build_artifact.sh (FAT_FETCH_HELPER_PATH), which
-# takes LLM_ARTIFACTS_PRIMARY, ARTIFACTORY_NETRC and ARTIFACTORY_CREDENTIAL_ID from the
-# environment. ARTIFACTORY_NETRC is deleted as soon as the download ends.
+# takes ARTIFACTORY_NETRC and ARTIFACTORY_CREDENTIAL_ID from the environment. ARTIFACTORY_NETRC
+# is deleted as soon as the download ends.
 #
 # Exits 0 on success (fat sqsh written atomically to <fat_sqsh_path>).
 # The caller uses || true so failures are non-fatal; the GPU test job will then
