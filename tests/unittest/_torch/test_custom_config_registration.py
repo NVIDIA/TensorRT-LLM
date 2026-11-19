@@ -301,6 +301,45 @@ def test_inkling2_text_config_derives_layout_from_local_layer_ids():
         Inkling2TextConfig(num_hidden_layers=4, local_layer_ids=[0, 4])
 
 
+def test_inkling2_text_config_derives_layout_after_from_dict_overrides():
+    # from_dict sets keyword overrides after construction; the layout follows the final values.
+    from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
+
+    text, unused = Inkling2TextConfig.from_dict(
+        {"num_hidden_layers": 4, "local_layer_ids": [0, 2]},
+        local_layer_ids=[3, 1],
+        sliding_window_size=512,
+        not_a_field=1,
+        return_unused_kwargs=True,
+    )
+    assert unused == {"not_a_field": 1}
+    assert text.local_layer_ids == [1, 3]
+    assert text.layer_types == [
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+    ]
+    assert [get_layer_attention_window(text, i) for i in range(4)] == [None, 512, None, 512]
+    with pytest.raises(ValueError, match="outside the 4 decoder layers"):
+        Inkling2TextConfig.from_dict({"num_hidden_layers": 4}, local_layer_ids=[1, 4])
+
+
+def test_inkling2_text_config_keeps_layout_in_step_with_later_assignments():
+    # model_kwargs assign fields of an existing config the same way.
+    text = Inkling2TextConfig(num_hidden_layers=4, local_layer_ids=[0, 2])
+    text.sliding_window_size = 2048
+    text.model_max_length = 4096
+    assert (text.sliding_window, text.max_position_embeddings) == (2048, 4096)
+    text.num_hidden_layers = 6
+    assert text.layer_types[4:] == ["full_attention", "full_attention"]
+    # A rejected value leaves the config as it was.
+    with pytest.raises(ValueError, match="outside the 6 decoder layers"):
+        text.local_layer_ids = [0, 6]
+    assert text.local_layer_ids == [0, 2]
+    assert text.layer_types[:3] == ["sliding_attention", "full_attention", "sliding_attention"]
+
+
 def test_edge_text_config_keeps_legacy_torch_dtype():
     cfg = Cosmos3EdgeTextConfig(torch_dtype="float16")
     assert cfg.dtype == torch.float16

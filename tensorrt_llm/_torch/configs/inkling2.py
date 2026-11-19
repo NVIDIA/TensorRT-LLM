@@ -13,12 +13,18 @@ for the rest), `sliding_window` and `max_position_embeddings`.
 
 from transformers import PretrainedConfig
 
+#: The fields `layer_types`, `sliding_window` and `max_position_embeddings` are derived from.
+_DERIVATION_SOURCES = frozenset(
+    {"num_hidden_layers", "local_layer_ids", "sliding_window_size", "model_max_length"}
+)
+
 
 class Inkling2TextConfig(PretrainedConfig):
     """Text decoder of Inkling 2 (`text_config`).
 
     Defaults mirror the Inkling-2-Small release; values in a checkpoint's `config.json` take
-    precedence.
+    precedence. The derived attributes follow their source fields when those are set after
+    construction, as `from_dict` keyword overrides and `model_kwargs` do.
     """
 
     model_type = "inkling2_text"
@@ -70,22 +76,41 @@ class Inkling2TextConfig(PretrainedConfig):
         for derived in ("layer_types", "sliding_window", "max_position_embeddings"):
             fields.pop(derived, None)
         super().__init__(**fields)
-        num_layers = self.num_hidden_layers
-        if self.local_layer_ids is None:
+        self.__dict__.update(self._derived(self.__dict__))
+
+    def __setattr__(self, key, value):
+        if key in _DERIVATION_SOURCES and "layer_types" in self.__dict__:
+            # Validate against the new value before anything changes, then keep the derived
+            # attributes in step with their sources.
+            derived = self._derived({**self.__dict__, key: value})
+            super().__setattr__(key, value)
+            self.__dict__.update(derived)
+        else:
+            super().__setattr__(key, value)
+
+    @staticmethod
+    def _derived(fields) -> dict:
+        """The engine-facing attributes for the source values in `fields`."""
+        num_layers = fields["num_hidden_layers"]
+        local_layer_ids = fields["local_layer_ids"]
+        if local_layer_ids is None:
             # The released pattern: five sliding-window layers, then one global layer.
-            self.local_layer_ids = [i for i in range(num_layers) if i % 6 != 5]
-        self.local_layer_ids = sorted(int(i) for i in self.local_layer_ids)
-        out_of_range = [i for i in self.local_layer_ids if not 0 <= i < num_layers]
+            local_layer_ids = [i for i in range(num_layers) if i % 6 != 5]
+        local_layer_ids = sorted(int(i) for i in local_layer_ids)
+        out_of_range = [i for i in local_layer_ids if not 0 <= i < num_layers]
         if out_of_range:
             raise ValueError(
                 f"local_layer_ids {out_of_range} are outside the {num_layers} decoder layers"
             )
-        local = set(self.local_layer_ids)
-        self.layer_types = [
-            "sliding_attention" if i in local else "full_attention" for i in range(num_layers)
-        ]
-        self.sliding_window = self.sliding_window_size
-        self.max_position_embeddings = self.model_max_length
+        local = set(local_layer_ids)
+        return {
+            "local_layer_ids": local_layer_ids,
+            "layer_types": [
+                "sliding_attention" if i in local else "full_attention" for i in range(num_layers)
+            ],
+            "sliding_window": fields["sliding_window_size"],
+            "max_position_embeddings": fields["model_max_length"],
+        }
 
     @property
     def global_layer_ids(self) -> list:
