@@ -4,6 +4,11 @@ The 52-layer Beam target uses ModelingV2/StairCase with NVFP4 experts, attention
 MoE TP4/EP1 and BF16 KV on four GB300 GPUs. Supply an authorized checkpoint separately.
 Execution is eager, with overlap scheduling disabled.
 
+Tool calling is unsupported with `reasoning_parser: beam_harmony_text`.
+Chat Completions and Responses reject nonempty `tools` lists with HTTP 400 before
+generation, including streaming requests and `tool_choice: none`. Omit `tools`
+or pass an empty list for text-only requests.
+
 Create `beam-baseline.yaml`:
 
 ```yaml
