@@ -428,16 +428,13 @@ class BaseWorker(GenerationExecutor):
                           KVCacheManagerV2)
 
     def _check_prompt_embeds(self, request: GenerationRequest) -> None:
-        """Reject prompt embeddings this engine cannot place correctly.
-
-        Generation-only requests carry only the identity but get the same checks.
-        """
+        """Reject prompt embeddings this engine cannot place correctly."""
         prompt_embeds = request.prompt_embeds
         if prompt_embeds is None:
             return
         request_type = (request.disaggregated_params.request_type
                         if request.disaggregated_params is not None else None)
-        if prompt_embeds.embeds is None and request_type != "generation_only":
+        if prompt_embeds.embeds is None:
             raise RequestError("prompt_embeds carries no rows.")
         if self.llm_args is None:
             raise RequestError("prompt_embeds requires the PyTorch backend.")

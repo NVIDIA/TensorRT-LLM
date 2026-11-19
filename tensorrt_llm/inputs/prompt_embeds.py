@@ -28,8 +28,8 @@ class PromptEmbeds:
     """Owned prompt-embedding rows and the prompt positions they replace.
 
     Attributes:
-        embeds: ``[K, H]`` contiguous CPU tensor, or None when only the
-            identity travels (generation-only disaggregated requests).
+        embeds: ``[K, H]`` contiguous CPU tensor, or None in a finished
+            request's client copy (``identity_only``).
         positions: ``[K]`` int64 CPU tensor of strictly increasing positions.
         hidden_size: ``H``.
         row_digests: ``K`` concatenated 32-byte SHA-256 digests, one per row.

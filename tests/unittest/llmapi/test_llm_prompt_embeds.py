@@ -424,12 +424,12 @@ def test_disaggregated_handoff() -> None:
 
 
 def test_generation_only_passes_deployment_checks() -> None:
-    # Generation workers reject what context workers reject, from the identity alone.
+    # Generation workers reject what context workers reject.
     _, pe = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
     request = GenerationRequest(
         [1, 2, 3],
         SamplingParams(max_tokens=1),
-        prompt_embeds=pe.identity_only(),
+        prompt_embeds=pe,
         disaggregated_params=DisaggregatedParams(request_type="generation_only"),
     )
     worker = SimpleNamespace(

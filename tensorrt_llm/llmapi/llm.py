@@ -921,9 +921,6 @@ class BaseLLM:
                     prompt_embeds, inputs["prompt_token_ids"], prompt_token_ids,
                     multimodal_item_spans(multimodal_input)
                     if multimodal_input is not None else [])
-            if is_gen_only:
-                # The prompt's KV is transferred; only the identity travels.
-                prompt_embeds = prompt_embeds.identity_only()
 
         if (not self.args.mm_encoder_only and disaggregated_params is not None
                 and disaggregated_params.multimodal_input_layout is not None):
