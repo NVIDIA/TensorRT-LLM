@@ -297,6 +297,69 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
     assert out.stop == ["</s>"]
 
 
+# gen_kwargs of lm-eval's LongBench tasks (longbench_v1).
+LONGBENCH_GEN_KWARGS = {
+    "max_gen_toks": 32,
+    "temperature": 1,
+    "do_sample": False,
+    "until": [],
+}
+
+
+@pytest.mark.parametrize(
+    "sampling_params",
+    [None, SamplingParams(max_tokens=1024)],
+    ids=["no_caller_params", "caller_params"],
+)
+def test_do_sample_false_decodes_greedily(sampling_params):
+    """do_sample=False means greedy decoding whatever the temperature.
+
+    lm-eval's HF and vLLM backends decode the LongBench tasks greedily.
+    """
+    wrapper = _make_lm_eval_wrapper(sampling_params=sampling_params, sampling_override=False)
+    out = wrapper._get_sampling_params(dict(LONGBENCH_GEN_KWARGS))
+    assert out.temperature == 0.0
+    assert out.max_tokens == 32
+
+
+def test_do_sample_true_keeps_task_temperature():
+    wrapper = _make_lm_eval_wrapper(sampling_params=None, sampling_override=False)
+    gen_kwargs = {"temperature": 0.6, "do_sample": True, "max_gen_toks": 64}
+    out = wrapper._get_sampling_params(gen_kwargs)
+    assert out.temperature == 0.6
+
+
+def test_do_sample_false_keeps_cli_sampling_override():
+    """With sampling_override, the CLI's sampling recipe still wins."""
+    sp = SamplingParams(max_tokens=1024, temperature=1.0, top_p=0.95)
+    wrapper = _make_lm_eval_wrapper(sampling_params=sp, sampling_override=True)
+    out = wrapper._get_sampling_params(dict(LONGBENCH_GEN_KWARGS))
+    assert out.temperature == 1.0
+    assert out.top_p == 0.95
+
+
+def test_get_sampling_params_leaves_request_gen_kwargs_intact():
+    """lm-eval passes one gen_kwargs dict for every repeat of a request.
+
+    Every repeat must get the task's settings, and the dict lm-eval logs
+    with the samples must keep them.
+    """
+    wrapper = _make_lm_eval_wrapper(sampling_params=None, sampling_override=False)
+    gen_kwargs = {
+        "until": ["</s>"],
+        "do_sample": False,
+        "temperature": 0.0,
+        "max_gen_toks": 32768,
+    }
+    expected = dict(gen_kwargs)
+    for _ in range(2):
+        out = wrapper._get_sampling_params(gen_kwargs)
+        assert out.max_tokens == 32768
+        assert out.stop == ["</s>"]
+        assert out.temperature == 0.0
+    assert gen_kwargs == expected
+
+
 # ===========================================================================
 # Multimodal wrapper interleave — apply_chat_template content_parts
 # ===========================================================================
