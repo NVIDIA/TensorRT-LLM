@@ -12,6 +12,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.profiler import profile as TorchProfile
 
 from tensorrt_llm._torch.pyexecutor import profiling
 
@@ -172,6 +173,83 @@ def test_trace_path_rejects_extension_that_cannot_fit_window(tmp_path: Path) -> 
     source.touch()
     with pytest.raises(ValueError, match="extension and iteration boundaries"):
         profiling._profile_trace_path(str(source), 1, 3, True)
+
+
+@pytest.mark.parametrize(
+    ("early_exit", "cleanup_fails"), [(False, False), (True, False), (False, True)]
+)
+def test_trace_path_failure_closes_window_once(
+    cpu_runtime: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    early_exit: bool,
+    cleanup_fails: bool,
+) -> None:
+    """Keep the filename error and release profiling when a window cannot be named."""
+    name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
+    extension = "x" * (name_max - len(b"a-rank-7.") - len(b".tmp"))
+    monkeypatch.setenv("TLLM_PROFILE_START_STOP", "1-3,5-7")
+    monkeypatch.setenv("TLLM_TORCH_PROFILE_TRACE", str(tmp_path / f"a.{extension}"))
+    calibrator = Mock()
+    if cleanup_fails:
+        calibrator.stop.side_effect = ValueError("calibrator cleanup failed")
+    monkeypatch.setattr(profiling, "get_calibrator", lambda: calibrator)
+    cuda_stop = Mock(side_effect=RuntimeError("CUDA cleanup failed") if cleanup_fails else None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "cudart",
+        lambda: SimpleNamespace(cudaProfilerStart=lambda: None, cudaProfilerStop=cuda_stop),
+    )
+    original_stop = TorchProfile.stop
+    stops: list[TorchProfile] = []
+
+    def stop_once(observer: TorchProfile) -> None:
+        stops.append(observer)
+        original_stop(observer)
+
+    monkeypatch.setattr(TorchProfile, "stop", stop_once)
+    executor = _Executor()
+    with pytest.raises(ValueError, match="extension and iteration boundaries"):
+        with _profile_step(executor) as step:
+            _advance(executor, step, 0, 2 if early_exit else 3)
+    assert len(stops) == 1
+    cuda_stop.assert_called_once_with()
+    calibrator.stop.assert_called_once_with()
+    assert not executor.controller._window_open
+    assert not executor.controller.enabled
+    assert executor.controller._torch_profiler is None
+
+
+@pytest.mark.parametrize("boundary", ["cuda", "calibrator"])
+def test_cleanup_failure_closes_exported_window(
+    cpu_runtime: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, boundary: str
+) -> None:
+    """Finish remaining cleanup and preserve its first failure after a real export."""
+    monkeypatch.setenv("TLLM_PROFILE_START_STOP", "1-3")
+    monkeypatch.setenv("TLLM_TORCH_PROFILE_TRACE", str(tmp_path / "chrome.json"))
+    original = RuntimeError(f"{boundary} cleanup failed")
+    calibrator = Mock()
+    cuda_stop = Mock()
+    if boundary == "cuda":
+        cuda_stop.side_effect = original
+    else:
+        calibrator.stop.side_effect = original
+    monkeypatch.setattr(profiling, "get_calibrator", lambda: calibrator)
+    monkeypatch.setattr(
+        torch.cuda,
+        "cudart",
+        lambda: SimpleNamespace(cudaProfilerStart=lambda: None, cudaProfilerStop=cuda_stop),
+    )
+    executor = _Executor()
+    with pytest.raises(RuntimeError) as caught:
+        with _profile_step(executor) as step:
+            _advance(executor, step, 0, 3)
+    assert caught.value is original
+    cuda_stop.assert_called_once_with()
+    calibrator.stop.assert_called_once_with()
+    assert {"iteration-1", "iteration-2"} <= _event_names(tmp_path / "chrome-rank-7.json")
+    assert not executor.controller._window_open
+    assert not executor.controller.enabled
 
 
 @pytest.mark.parametrize("headroom", [0, 18])
