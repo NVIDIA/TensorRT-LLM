@@ -64,16 +64,8 @@ _LAYER_MODULE = re.compile(r"model\.layers\.(\d+)\.(.+)")
 
 
 def _nvfp4_experts_mixed_precision(normalized: dict, pretrained_config: Any) -> Tuple[bool, str]:
-    """Whether a MIXED_PRECISION export quantizes the layers the tp8 target serves as
-    GLM-5.2-NVFP4 does, and its per-layer quantization in words.
-
-    GLM-5.3-NVFP4 is such an export: the routed experts of every MoE layer are NVFP4,
-    the dense MLPs of the first ``first_k_dense_replace`` layers are FP8, and attention,
-    the shared experts and the MTP layer are not quantized. The MoE layers therefore
-    hold the same weights as GLM-5.2-NVFP4's, which this target was built for; the
-    dense layers differ only in their MLP, which the target leaves to the built-in
-    model unless it is bf16. Any other quantized module (attention, shared experts,
-    a routed expert that is not NVFP4, a quantized MTP layer) declines.
+    """Whether a MIXED_PRECISION export quantizes only NVFP4 routed experts (in every MoE
+    layer) and dense MLPs before the first MoE layer, as GLM-5.3-NVFP4 does, and why not.
     """
     layers = normalized.get("quantized_layers")
     if not isinstance(layers, dict) or not layers:
@@ -83,30 +75,26 @@ def _nvfp4_experts_mixed_precision(normalized: dict, pretrained_config: Any) -> 
     if not isinstance(first_moe, int):
         return False, "MIXED_PRECISION on a config without first_k_dense_replace"
     nvfp4_expert_layers = set()
-    dense_algos = set()
     for name, entry in layers.items():
         match = _LAYER_MODULE.fullmatch(name) if isinstance(name, str) else None
-        algo = entry.get("quant_algo") if isinstance(entry, dict) else None
         try:
-            algo = QuantAlgo(canonicalize_quant_algo(algo))
+            # read_modelopt_quant_config already canonicalized the per-layer names.
+            algo = QuantAlgo(entry.get("quant_algo") if isinstance(entry, dict) else None)
         except ValueError:
             return False, f"MIXED_PRECISION with an unreadable algorithm for {name!r}"
         if match is None:
             return False, f"MIXED_PRECISION quantizing {name!r} ({algo.name})"
         layer, module = int(match.group(1)), match.group(2)
-        if layer >= num_layers:
+        if layer >= num_layers:  # the per-layer map, not only exclude_modules, must agree
             return False, f"MIXED_PRECISION with the MTP layer quantized ({name!r}, {algo.name})"
         if module == "mlp.experts" and layer >= first_moe and algo == QuantAlgo.NVFP4:
             nvfp4_expert_layers.add(layer)
-        elif module in _DENSE_MLP_MODULES and layer < first_moe:
-            dense_algos.add(algo.name)
-        else:
+        elif not (module in _DENSE_MLP_MODULES and layer < first_moe):
             return False, f"MIXED_PRECISION quantizing {name!r} as {algo.name}"
     missing = sorted(set(range(first_moe, num_layers)) - nvfp4_expert_layers)
     if missing:
         return False, f"MIXED_PRECISION without NVFP4 routed experts in layers {missing}"
-    dense = f", {'/'.join(sorted(dense_algos))} dense MLPs" if dense_algos else ""
-    return True, f"MIXED_PRECISION (NVFP4 routed experts{dense})"
+    return True, "MIXED_PRECISION (NVFP4 routed experts)"
 
 
 def _nvfp4_with_bf16_mtp_layer(pretrained_config: Any) -> Tuple[bool, str]:
@@ -120,10 +108,6 @@ def _nvfp4_with_bf16_mtp_layer(pretrained_config: Any) -> Tuple[bool, str]:
     parsed, so a config this target does not serve cannot fail here. The export
     keeps the whole MTP layer (layer ``num_hidden_layers``) in bf16; the draft
     fast paths read bf16 weights there.
-
-    A MIXED_PRECISION export is served when its per-layer map matches
-    GLM-5.2-NVFP4 on every MoE layer (``_nvfp4_experts_mixed_precision``), as
-    GLM-5.3-NVFP4's does.
     """
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -150,10 +134,10 @@ def _nvfp4_with_bf16_mtp_layer(pretrained_config: Any) -> Tuple[bool, str]:
     unquantized = QuantConfig(exclude_modules=excluded).is_module_excluded_from_quantization(
         mtp_layer
     )
-    words = f"{quant_algo.name} with the MTP layer {'unquantized' if unquantized else 'quantized'}"
     if quant_algo == QuantAlgo.MIXED_PRECISION and unquantized:
         served, layers = _nvfp4_experts_mixed_precision(normalized, pretrained_config)
         return served, f"{layers} with the MTP layer unquantized"
+    words = f"{quant_algo.name} with the MTP layer {'unquantized' if unquantized else 'quantized'}"
     return quant_algo == QuantAlgo.NVFP4 and unquantized, words
 
 
@@ -335,8 +319,8 @@ def route(
         and not mapping.enable_attention_dp
     )
     pattern = tuple(getattr(pretrained_config, name, None) for name in _TP8_PATTERN_FIELDS)
-    # GLM-5.2-NVFP4 (bf16 MTP layer), or GLM-5.3-NVFP4, whose MoE layers are quantized
-    # the same way, on 8 B300s (sm103), tp8, one-model MTP-Eagle as a
+    # GLM-5.2-NVFP4 (bf16 MTP layer) or GLM-5.3-NVFP4 (MIXED_PRECISION, same MoE layers)
+    # on 8 B300s (sm103), tp8, one-model MTP-Eagle as a
     # linear chain of five draft tokens, with an fp8 latent KV cache. The quantization is
     # read last, and only for such a deployment.
     quantization = "not read"
@@ -380,8 +364,8 @@ def route(
         "with one-model MTP-Eagle as a linear chain at max_draft_len 1, 3 or 5 (no dynamic "
         "tree) or no speculative decoding, both "
         "with an fp8 latent KV cache (not the packed fp8_ds_mla layout); and the "
-        "GLM-5.2 modelopt NVFP4 checkpoint (bf16 MTP layer), or a MIXED_PRECISION export with "
-        "NVFP4 routed experts and the same MoE layers (GLM-5.3-NVFP4), on sm103, tp8 (8 ranks, "
+        "GLM-5.2 modelopt NVFP4 checkpoint (bf16 MTP layer) or GLM-5.3-NVFP4 (MIXED_PRECISION, "
+        "same MoE layers) on sm103, tp8 (8 ranks, "
         "tensor-parallel attention and experts, no attention DP), with one-model "
         "MTP-Eagle as a linear chain at max_draft_len=5, without the suffix-automaton "
         "enhancer or relaxed acceptance, also with an fp8 latent KV cache"
