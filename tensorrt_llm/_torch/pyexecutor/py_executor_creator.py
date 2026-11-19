@@ -43,6 +43,8 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 if TYPE_CHECKING:
     from tensorrt_llm.executor.ipc import IpcQueue
 
+    from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
@@ -53,7 +55,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, create_py_executor_resources,
-                    instantiate_sampler, is_disagg_enabled, is_mla)
+                    instantiate_sampler, is_agg_helix, is_disagg_enabled,
+                    is_mla)
 from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -68,6 +71,7 @@ from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
 from .runtime_hooks import runtime_hooks_of
+from .scheduled_encoder_executor import ScheduledEncoderExecutor
 from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -279,6 +283,35 @@ def _check_dense_dwdp_launch(llm_args: TorchLlmArgs) -> Optional[DenseMode]:
     return None
 
 
+_AGG_HELIX_SPARSE_ERROR = (
+    "Aggregated Helix context parallelism supports dense MLA only. Every sparse "
+    "attention algorithm is rejected, including skip_softmax: it keeps dense MLA "
+    "but is not yet supported with aggregated Helix. Helix with sparse attention "
+    "requires disaggregated serving.")
+
+
+def _validate_agg_helix_args(llm_args: TorchLlmArgs) -> None:
+    """Reject aggregated Helix settings that are known before weights load.
+
+    The checks that need the loaded model (MLA architecture, sparse attention
+    supplied by the checkpoint, and the engine's chunked-prefill and KV cache
+    manager choices) run again after the model engine is built.
+    """
+    if get_sm_version() < 100:
+        raise NotImplementedError(
+            "Aggregated Helix context parallelism requires SM100 or newer.")
+    if getattr(llm_args.sparse_attention_config, "algorithm", None) is not None:
+        raise NotImplementedError(_AGG_HELIX_SPARSE_ERROR)
+    if not llm_args.enable_chunked_prefill:
+        raise ValueError(
+            "Aggregated Helix context parallelism requires chunked prefill; "
+            "set enable_chunked_prefill=True.")
+    if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
+        raise ValueError(
+            "Aggregated Helix context parallelism requires KVCacheManagerV2; "
+            "set kv_cache_config.use_kv_cache_manager_v2=True.")
+
+
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
                                           spec_config) -> bool:
     """Whether this speculation is qualified on the FlashInfer target backend.
@@ -452,6 +485,66 @@ def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
             "max_num_tokens are rejected.")
 
 
+def _check_scheduled_encoder_support(llm_args: TorchLlmArgs,
+                                     mapping: Mapping) -> None:
+    """Reject the settings ScheduledEncoderExecutor cannot serve a non-generation model with."""
+    _check_no_kv_execution(llm_args, mapping, is_generation=False)
+    if mapping.cp_size > 1:
+        raise ValueError(
+            "Context parallelism is not supported for non-generation models; "
+            "set context_parallel_size=1.")
+    checks = (
+        ("lora_config", llm_args.lora_config is not None),
+        ("speculative_config", llm_args.speculative_config is not None),
+        ("cache_transceiver_config",
+         is_disagg_enabled(llm_args.cache_transceiver_config)),
+        ("kv_connector_config", llm_args.kv_connector_config is not None),
+        ("dwdp_config", llm_args.dwdp_config is not None),
+        ("moe_config.load_balancer", llm_args.moe_config.load_balancer
+         is not None),
+        ("enable_resource_governor", llm_args.enable_resource_governor),
+        ("sleep_config", llm_args.sleep_config is not None),
+        ("orchestrator_type='ray'", llm_args.orchestrator_type == "ray"),
+    )
+    settings = [name for name, used in checks if used]
+    if settings:
+        message = (
+            f"Non-generation models do not support {', '.join(settings)}; "
+            "remove these settings.")
+        if llm_args.orchestrator_type == "ray":
+            message += (
+                " AsyncLLM and TLLM_DISABLE_MPI=1 select orchestrator_type='ray' "
+                "themselves; serve these models with LLM and MPI enabled.")
+        raise ValueError(message)
+
+
+def _create_scheduled_encoder_executor(
+        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str],
+        checkpoint_loader: "BaseCheckpointLoader", startup_timer: _StartupTimer,
+        creation_metrics: dict[str, float]) -> ScheduledEncoderExecutor:
+    mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+    _check_scheduled_encoder_support(llm_args, mapping)
+    dist = Distributed.get(mapping)
+    startup_timer.mark_initialization("configuration_and_distributed_init")
+    with startup_timer.phase("scheduled_encoder_creation",
+                             metrics=creation_metrics,
+                             metric_name="scheduled_encoder_creation_seconds"):
+        executor = ScheduledEncoderExecutor.create(
+            llm_args,
+            model_path=checkpoint_dir,
+            checkpoint_loader=checkpoint_loader,
+            mapping=mapping,
+            dist=dist,
+        )
+    if mapping.rank == 0:
+        logger.info(f"LLM Args:\n{llm_args}")
+    with startup_timer.phase("executor_start_worker",
+                             metrics=creation_metrics,
+                             metric_name="worker_start_seconds"):
+        executor.start_worker()
+    return executor
+
+
 def _get_mapping(_mapping: Mapping) -> Mapping:
     if _mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -509,7 +602,9 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 
 
 def _load_config_and_create_checkpoint_loader(
-        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: Optional[str] = None
+) -> tuple[TorchLlmArgs, "BaseCheckpointLoader", bool]:
     torch.cuda.set_per_process_memory_fraction(1.0)
     checkpoint_loader = construct_checkpoint_loader(
         llm_args.checkpoint_loader,
@@ -519,9 +614,9 @@ def _load_config_and_create_checkpoint_loader(
         load_format=llm_args.load_format,
         partial_model_loading=llm_args.is_partial_model_loading,
     )
-    llm_args = ModelLoader.load_config_and_apply_defaults(
+    llm_args, config = ModelLoader.load_config_with_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
-    return llm_args, checkpoint_loader
+    return llm_args, checkpoint_loader, config.is_generation
 
 
 def create_encoder_executor(
@@ -544,7 +639,7 @@ def create_encoder_executor(
     """
     from .encoder_executor import EncoderExecutor
 
-    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+    llm_args, checkpoint_loader, _ = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
@@ -588,7 +683,7 @@ def _create_py_executor_impl(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue: "Optional[IpcQueue]" = None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
     Loads model configuration, applies model-specific defaults, constructs the
@@ -632,15 +727,21 @@ def _create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create and initialize a PyExecutor while recording scoped metrics."""
     initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
     with timing_metric("config_and_checkpoint_loader_initialization_seconds",
                        creation_metrics):
-        llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+        llm_args, checkpoint_loader, is_generation = _load_config_and_create_checkpoint_loader(
             llm_args, checkpoint_dir)
+
+    if not llm_args.mm_encoder_only and not is_generation:
+        return _create_scheduled_encoder_executor(llm_args, checkpoint_dir,
+                                                  checkpoint_loader,
+                                                  _startup_timer,
+                                                  creation_metrics)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -795,15 +896,6 @@ def _create_py_executor(
     enable_sleep = sleep_config is not None
 
     cache_transceiver_config = llm_args.cache_transceiver_config
-    # TODO(TRTLLM-17127): remove once aggregated helix is validated end to end.
-    if (mapping.has_cp_helix()
-            and not is_disagg_enabled(cache_transceiver_config)
-            and os.environ.get("TRTLLM_HELIX_AGG_EXPERIMENTAL", "0") != "1"):
-        raise NotImplementedError(
-            "Helix context parallelism is supported only on disaggregated "
-            "generation servers; aggregated serving with Helix is not "
-            "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
-            "development only).")
     if (is_decode_only(llm_args.sparse_attention_config)
             and not is_disagg_enabled(cache_transceiver_config)):
         raise NotImplementedError(
@@ -811,6 +903,8 @@ def _create_py_executor(
             "servers: it admits one input token per request per step, so it "
             "cannot serve context requests. Set cache_transceiver_config, or "
             "disable sparse_attention_config.enable_kv_cache_offload.")
+    if is_agg_helix(mapping, cache_transceiver_config):
+        _validate_agg_helix_args(llm_args)
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -1004,6 +1098,16 @@ def _create_py_executor(
 
     # Resolve this before cache reuse and cache manager selection consume it.
     resolve_cache_transceiver_config(cache_transceiver_config)
+
+    if is_agg_helix(mapping, cache_transceiver_config):
+        if not is_mla(model_engine.model.model_config.pretrained_config):
+            raise NotImplementedError(
+                "Aggregated Helix context parallelism supports MLA models only."
+            )
+        # The checkpoint can supply a sparse attention config that llm_args
+        # does not carry.
+        if getattr(sparse_attention_config, "algorithm", None) is not None:
+            raise NotImplementedError(_AGG_HELIX_SPARSE_ERROR)
 
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = model_engine.max_num_seq_slots
@@ -1563,7 +1667,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create a PyExecutor and roll back a partially initialized DWDP runtime.
 
     On an error, a DWDP manager and a dense DWDP manager registered during the

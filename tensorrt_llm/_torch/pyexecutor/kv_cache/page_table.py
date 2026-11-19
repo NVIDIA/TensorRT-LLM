@@ -18,45 +18,45 @@ buffer (``BufferSite``) or a rank's place (``rank_topology``) says about it."""
 
 from __future__ import annotations
 
+import enum
 import types
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
-# The role layouts a manager's spec names (disaggregation.base.role_layout), for managers to
-# import from here.
-from ...disaggregation.base.role_layout import ByHead as ByHead
-from ...disaggregation.base.role_layout import Own as Own
-from ...disaggregation.base.role_layout import RankTopology
-from ...disaggregation.base.role_layout import Replicated as Replicated
-from ...disaggregation.base.role_layout import RingSlots as RingSlots
-from ...disaggregation.base.role_layout import RoleLayoutV2 as RoleLayoutV2
-from ...disaggregation.base.role_layout import Sectioned as Sectioned
-
-__all__ = [
-    "QUANT_MODES",
-    "BufferSite",
-    "ByHead",
-    "Own",
-    "PageTableSpec",
-    "Replicated",
-    "RingSlots",
-    "RoleLayoutV2",
-    "Sectioned",
-    "kv_dtype_name",
-    "layer_groups",
-    "rank_topology",
-    "state_split",
-]
+from .sharing.role_layout import ByHead as ByHead
+from .sharing.role_layout import Own as Own
+from .sharing.role_layout import RankTopology
+from .sharing.role_layout import Replicated as Replicated
+from .sharing.role_layout import RingSlots as RingSlots
+from .sharing.role_layout import RoleLayoutV2 as RoleLayoutV2
+from .sharing.role_layout import Sectioned as Sectioned
 
 QUANT_MODES = frozenset({"fp8", "nvfp4", "fp8_ds_mla", "csa2_packed"})
 """The ways a spec says a manager's KV data is quantized (``PageTableSpec.quant_mode``)."""
 
 
+def virtual_layers(
+    attn_to_layer_id: Mapping[tuple[int, enum.Enum], int] | None,
+) -> tuple[dict[int, tuple[int, int]], int] | None:
+    """(internal id -> (model layer, attention type), type count) of a manager keeping several
+    caches per model layer, from its (model layer, attention type) -> internal id map; None for an
+    empty map. An internal id shared by several attention types of one model layer, as DeepSeek-V4
+    keeps them, takes the first. A cache several model layers share enters the map only under the
+    model layer that owns it, as CSA2's does, so its name does not depend on which layers a stage
+    holds. Every member of the attention-type enum counts, so stages holding different attention
+    types agree."""
+    if not attn_to_layer_id:
+        return None
+    types_of: dict[int, tuple[int, int]] = {}
+    for (model_layer, attn_type), layer in attn_to_layer_id.items():
+        types_of.setdefault(int(layer), (int(model_layer), int(attn_type.value)))
+    kinds = type(next(iter(attn_to_layer_id))[1])
+    return types_of, max(int(member.value) for member in kinds) + 1
+
+
 def layer_groups(manager: object) -> list[list[int]]:
-    """Internal layer ids per cache group (``impl.buffer_grouping``), in cache-group order, each
-    once in the order of the group's buffers; a layer whose buffers the reuse policies split is in
-    each of its groups. Cache groups are not the deprecated layer groups (``impl.layer_grouping``)
-    the ``get_disagg_*`` hooks index, which a split layer cannot be listed in."""
+    """Internal layer ids per runtime layer group, in layer-group order, each once in the order of
+    the group's buffers; a layer whose buffers the reuse policies split is in each of its groups."""
     return [
         list(dict.fromkeys(int(buffer.layer_id) for buffer in group))
         for group in manager.impl.buffer_grouping
@@ -81,9 +81,6 @@ def rank_topology(mapping: object) -> RankTopology:
         dp_rank=tp_rank if adp else 0,
         attention_dp=adp,
     )
-
-
-# -- what a manager says of its pages: its PageTableSpec ------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -127,45 +124,45 @@ def _frozen_roles(roles: Iterable[str], name: str) -> frozenset[str]:
 class PageTableSpec:
     """What a manager says of its pages that its runtime config and storage do not.
 
-    A manager returns it from ``page_table_spec``. The base manager's says K/V and their block
-    scales split by KV head; a manager with other roles, or one of these laid out otherwise,
-    returns its own, usually the base one with a few fields replaced (``dataclasses.replace``).
-    Specs with equal fields compare equal; a spec holds mappings, so it is not hashable.
+    A manager returns it from ``page_table_spec``; ``build_page_table`` reads it with the
+    manager's storage. The base manager's says K/V and their block scales split by KV head; a
+    manager with other roles, or one of these laid out otherwise, returns its own, usually the
+    base one with a few fields replaced (``dataclasses.replace``). Specs with equal fields
+    compare equal; a spec holds mappings, so it is not hashable.
 
     Attributes:
         role_layouts: Role -> how its bytes spread over ranks.
         default_layout: The layout of a role ``role_layouts`` does not name, or None.
         untransferred_roles: Roles that hold nothing a peer needs: they stay in local copies of
             whole pages but never move.
-        derived_roles: Roles derived from the transferred ones, which a transfer leaves for
-            ``rebuild_disagg_imported_cache`` to rebuild after the import.
+        derived_roles: Roles derived from the transferred ones, which no transfer moves, native
+            or through a lender: the receiver rebuilds them (``rebuild_disagg_imported_cache``)
+            after a whole receive and up to the position a request resumes on a prefix it read.
         request_rebuilt_roles: Roles the manager, receiving, rebuilds for some requests rather
-            than receiving them, so a peer may hold none of them for a model layer it holds.
-        layer_ids: Internal layer id -> (global layer id, model layer) of every layer the
-            manager's storage holds, as disaggregated transfer names them: a layer's model layer
-            (``pp_layers``) or, keeping several caches per model layer, model layer x attention
-            types + attention type (``_layer_attn_to_layer_id``); under mixed-precision KV, high
-            layers ``2 * L + 1``, holding the high type (``mixed_precision``), and every other
-            layer twice its id; with the FP4 MLA cache layout, a model layer's cache ``2 * m``,
-            its high-precision tail ``2 * m + 1`` and a recurrent layer ``2 * m``. Every
-            manager's spec states it (``_disagg_layer_names``); None only in a spec made without
-            a manager.
+            than receiving them (``disagg_untransferred_buffers``), so a peer may hold none of
+            them for a model layer it holds.
+        layer_ids: Internal layer id -> (global layer id, model layer); None for those of the
+            manager's model layers (``pp_layers``) or, keeping several caches per model layer,
+            of its (model layer, attention type) map (``_layer_attn_to_layer_id``). Stated under
+            mixed-precision KV, whose high layers take global layers ``2 * L + 1`` and every other
+            layer twice the id it has without; the high layers hold the high type.
         quant_mode: How the manager's own KV data is quantized, as configured: None unquantized,
             else one of ``QUANT_MODES``: ``"fp8"``, ``"nvfp4"``, ``"fp8_ds_mla"`` (FP8 pages
             carrying their own scales) or ``"csa2_packed"`` (CSA2's fixed packed FP8/FP4 records,
-            whatever its staging type). Under mixed-precision KV, the layers it keeps mixed hold
-            the types ``mixed_precision`` names instead. It does not state per-layer element
-            types, such as FP4 MLA's FP8 fallback layers.
-        mixed_precision: Under mixed-precision KV, the (low, high) element types by lower-case
-            ``DataType`` name (``"nvfp4"``; ``"half"``, ``"bf16"`` or ``"fp8"``), as
-            ``("nvfp4", "bf16")``: a mixed layer keeps its history in rows of the low
-            type, scales inline, and its first and last tokens in its high layer, of the high
-            type. Under the cold-page first/last-N window both are the model's KV type, as
-            ``("bf16", "bf16")``: the high layer holds a copy of its layer's page, and only pages
-            leaving the GPU are quantized. None without.
+            whatever its staging type). Under mixed-precision KV it is the high type's, as the
+            manager's ``dtype`` is. It does not state per-layer element types, such as FP4 MLA's
+            FP8 fallback layers or the low type of the layers kept mixed.
+        mixed_precision: Reserved for the (low, high) element types of mixed-precision KV by
+            lower-case ``DataType`` name (``"nvfp4"``; ``"half"``, ``"bf16"`` or ``"fp8"``), as
+            ``("nvfp4", "bf16")``: a mixed layer keeps its history in rows of the low type, scales
+            inline, and its first and last tokens in its high layer, of the high type. No manager
+            fills it today, so it is None under mixed-precision KV too, and neither the page table
+            nor a peer's check reads it.
         retention_margins: Whether the windows it keeps may hold margins of its own beyond the
             window its attention reads, such as draft tokens, a rewind or a lifecycle of their
-            own: they then do not say how far back it reads.
+            own, that the windows its layers declare they read (``_declared_read_windows``) do not
+            leave out: they then do not say how far back it reads, and a transfer to it compares
+            none of them (``layout_mapping.check_compatible``).
 
     Raises:
         TypeError: If a role set is one role, or a layout is not a ``RoleLayoutV2``.
@@ -241,3 +238,64 @@ def state_split(manager: object) -> tuple[str, ...]:
         if int(getattr(mapping, "tp_size", 1)) == 1:
             return ("cp",)
     return ("tp",)
+
+
+def layer_ids_of(manager: object, spec: PageTableSpec | None = None) -> dict[int, tuple[int, int]]:
+    """Internal layer id -> (global layer id, model layer) of each layer of ``manager``'s layer
+    groups, as its page table names them: the ``layer_ids`` of its spec (``spec``, else its
+    ``page_table_spec()``) or, without them, its model layers (``_layer_ids``).
+
+    Raises:
+        ValueError: If its model layers name no global layer for some layer.
+    """
+    spec = manager.page_table_spec() if spec is None else spec
+    if spec.layer_ids is not None:
+        return dict(spec.layer_ids)
+    internal = sorted({lid for group in layer_groups(manager) for lid in group})
+    return _layer_ids(manager, internal)
+
+
+def _layer_ids(manager: object, internal: list[int]) -> dict[int, tuple[int, int]]:
+    """Internal layer id -> (global layer id, model layer), the same under any pipeline split:
+    the model layer itself, or ``model_layer * num_types + type`` for a manager keeping several
+    caches per model layer (``virtual_layers``)."""
+    pp_layers = list(manager.pp_layers)
+    virtual = virtual_layers(getattr(manager, "_layer_attn_to_layer_id", None))
+    if virtual is None:
+        unnamed = [lid for lid in internal if not 0 <= lid < len(pp_layers)]
+        if unnamed:
+            raise ValueError(
+                f"internal layers {unnamed} are no local layers, and the manager names no model "
+                "layer for them (_layer_attn_to_layer_id, PageTableSpec.layer_ids)"
+            )
+        # Internal layer i is the stage's i-th model layer, as layer_offsets numbers it.
+        offsets = getattr(manager, "layer_offsets", None)
+        if offsets is not None:
+            renumbered = [lid for lid in internal if offsets.get(int(pp_layers[lid])) != lid]
+            if renumbered:
+                raise ValueError(
+                    f"internal layers {renumbered} are not the local index layer_offsets gives "
+                    "their model layers; a manager numbering its layers otherwise names them "
+                    "(_layer_attn_to_layer_id, PageTableSpec.layer_ids)"
+                )
+        return {lid: (int(pp_layers[lid]),) * 2 for lid in internal}
+    types_of, num_types = virtual
+    unnamed = [lid for lid in internal if lid not in types_of]
+    if unnamed:
+        raise ValueError(
+            f"internal layers {unnamed} have no (model layer, type) in _layer_attn_to_layer_id"
+        )
+    return {
+        lid: (types_of[lid][0] * num_types + types_of[lid][1], types_of[lid][0]) for lid in internal
+    }
+
+
+def explicit_layer_specs(manager: object) -> dict[int, Any]:
+    """Model layer -> the storage ``manager`` was given for it (``KVCacheLayerSpec``: its KV heads
+    on this rank and the roles it stores): every layer's of a manager built from ``layer_specs``,
+    else those of the drafter's layers a hybrid manager appends after its own
+    (``_appended_draft_layer_specs``); none of a manager laying out its layers itself."""
+    specs = getattr(manager, "layer_specs", None)
+    if specs is None:
+        specs = (getattr(manager, "_appended_draft_layer_specs", None) or {}).values()
+    return {int(spec.global_layer_id): spec for spec in specs}

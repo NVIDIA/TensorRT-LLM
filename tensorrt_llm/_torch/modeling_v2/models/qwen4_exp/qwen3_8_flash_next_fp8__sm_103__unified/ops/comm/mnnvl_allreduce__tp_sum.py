@@ -3,7 +3,12 @@
 """Sum across the TP group through a multicast NVLink (MNNVL) workspace, nothing fused.
 
 This target's variant of `catalog/comm/mnnvl_allreduce` (which certifies only the residual +
-RMSNorm fusion) for the decode-sized calls of `tp_sum`: the op's plain sum (fusion `NONE`)."""
+RMSNorm fusion) for the decode-sized calls of `tp_sum`: the op's plain sum (fusion `NONE`).
+
+The kernel releases its programmatic dependents right after its own grid dependency wait
+(`trigger_completion_at_end=False`), so the kernel after it can start its prologue (the
+hyper-connection site streams its weight slice) during the exchange; dependents read the sum
+only after their own wait, so the values are unchanged."""
 
 from __future__ import annotations
 
@@ -50,7 +55,16 @@ class MnnvlTpSum(OpWrapper):
         """`world` is not passed to the op, which reads it from the workspace; it is here so
         `is_valid` can size the call against the buffer."""
         return torch.ops.trtllm.mnnvl_fusion_allreduce(
-            input, None, None, 1e-6, comm_buffer, buffer_flags, False, None, NONE
+            input,
+            None,
+            None,
+            1e-6,
+            comm_buffer,
+            buffer_flags,
+            False,
+            None,
+            NONE,
+            trigger_completion_at_end=False,
         )[0]
 
     def reference(self, inputs_in_rank_order: Sequence[torch.Tensor]) -> torch.Tensor:

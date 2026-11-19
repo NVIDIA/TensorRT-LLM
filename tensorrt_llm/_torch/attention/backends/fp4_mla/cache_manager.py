@@ -85,10 +85,6 @@ def is_fp4_mla_context_only_cache(is_disagg: bool) -> bool:
     return bool(is_disagg) and os.getenv(_DISAGG_ROLE_ENV) == "context"
 
 
-# An FP4 MLA latent cache: token-major, one latent head every tensor rank holds whole.
-_FP4_MLA_LATENT = ByHead(token_major=True, total=1)
-
-
 @dataclass(frozen=True)
 class Fp4MlaPageTableSpec:
     """Stable page-table conversion contract consumed by FP4 MLA kernels."""
@@ -116,11 +112,13 @@ class Fp4MlaV2CacheLayoutPolicy:
     therefore request-private: it does not constrain prefix matching, and the
     radix tree retains only the full-history FP4 pages.
 
-    Hybrid linear-attention managers compose the same policy with
-    their SSM lifecycle and forward only attention-layout operations here.
-    Such a manager keeps its own disaggregation declarations and merges the
+    The Kimi K3 hybrid linear-attention manager selects it for its MLA latent
+    cache (``configure_manager``) and composes it with its SSM lifecycle:
+    ``MambaHybridCacheManagerV2`` forwards only attention-layout operations
+    here, calling the generic methods below with itself. Such a manager keeps
+    its own disaggregation declarations and merges the
     policy's attention roles into them (``DISAGG_ROLE_MAPPER_KINDS``,
-    ``DISAGG_IGNORED_ROLES``, ``_fp4_mla_disagg_global_layer_id``), so the
+    ``DISAGG_IGNORED_ROLES``, ``disagg_global_layer_id``), so the
     recurrent-state roles keep their own transfer mappings.
     """
 
@@ -267,6 +265,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         max_rewind_len = int(spec_config.tokens_per_gen_step - 1) if spec_config else 0
         manager._fp4_mla_hp_pool_size = HP_BLOCK_SIZE + max_rewind_len
         manager._fp4_mla_view_cache = {}
+        manager._fp4_mla_snapshot_realignment_logged = False
         manager._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
         Fp4MlaV2CacheLayoutPolicy.install_manager_capabilities(manager)
         return kv_cache_config
@@ -312,13 +311,9 @@ class Fp4MlaV2CacheLayoutPolicy:
             # The lifecycle manager owns the disaggregation declarations and
             # composes them with its own roles through the policy's
             # DISAGG_ROLE_MAPPER_KINDS, DISAGG_IGNORED_ROLES,
-            # _fp4_mla_disagg_global_layer_id, and _fp4_mla_disagg_role_layouts;
-            # its page table spec composes them through _fp4_mla_disagg_page_table_spec
-            # and _fp4_mla_disagg_layer_names.
+            # _fp4_mla_disagg_global_layer_id, and _fp4_mla_disagg_role_layouts.
             "_fp4_mla_disagg_global_layer_id",
             "_fp4_mla_disagg_role_layouts",
-            "_fp4_mla_disagg_page_table_spec",
-            "_fp4_mla_disagg_layer_names",
             "rebuild_disagg_imported_cache",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
@@ -339,6 +334,56 @@ class Fp4MlaV2CacheLayoutPolicy:
             with torch.cuda.stream(manager._stream):
                 v_scale_pool.zero_()
             manager._stream.synchronize()
+
+    # Attention-layout operations of a lifecycle manager that composes this
+    # policy (MambaHybridCacheManagerV2), which calls them with itself.
+
+    def virtual_layer_pool_roles(
+        self, layer_id: int
+    ) -> Optional[tuple[DataRole, Optional[DataRole]]]:
+        """Pool roles of a virtual layer this layout appended (an HP ring), else ``None``."""
+        if LayerId(layer_id) in self._hp_manager_layer_ids:
+            return Role.MLA_HP_TAIL, None
+        return None
+
+    def disagg_global_layer_id(self, internal_layer: int) -> Optional[int]:
+        """Transfer ID of an MLA cache or HP-ring layer (``_fp4_mla_disagg_global_layer_id``).
+
+        Model layer ``L`` takes ``2 * L`` and ``2 * L + 1``, so a lifecycle
+        manager gives its other layers ``2 * L`` to keep the IDs collision-free.
+        """
+        return self._fp4_mla_disagg_global_layer_id(internal_layer)
+
+    def disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
+        """Transfer geometry of the HP ring (``_fp4_mla_disagg_role_layouts``)."""
+        return self._fp4_mla_disagg_role_layouts()
+
+    def iter_physical_pool_views(self) -> Iterable[torch.Tensor]:
+        """Page-major views of each physical MLA pool (``_iter_fp4_mla_physical_pool_views``)."""
+        return self._iter_fp4_mla_physical_pool_views()
+
+    def align_snapshot_points(self, request: "LlmRequest") -> None:
+        """Move a hybrid manager's recurrent-state snapshots onto full cache blocks.
+
+        The FP4 MLA cache quantizes the latent cache in 16-token tiles and
+        disables partial-block reuse, so a reused prefix always ends on a
+        cache block. A snapshot inside a block would restore the recurrent
+        state of a later token than the reused prefix ends at; one below the
+        first block can never be reused. Snapshot points also end the
+        context chunks, which keeps every non-final chunk tile-aligned.
+        """
+        block = self.tokens_per_block
+        points = request.expect_snapshot_points
+        aligned = sorted({point // block * block for point in points if point >= block})
+        if aligned != sorted(set(points)) and not self._fp4_mla_snapshot_realignment_logged:
+            self._fp4_mla_snapshot_realignment_logged = True
+            logger.info(
+                "FP4 MLA moves Mamba snapshot points down to "
+                f"{block}-token cache blocks and drops points below the "
+                f"first block (logged once; request {request.py_request_id}: "
+                f"{sorted(set(points))} -> {aligned})."
+            )
+        request.expect_snapshot_points = aligned
 
     @property
     def fp4_mla_hp_pool_size(self) -> int:
@@ -1137,30 +1182,31 @@ class Fp4MlaV2CacheLayoutPolicy:
 
     def page_table_spec(self) -> PageTableSpec:
         """Latents token-major by head, as the FP4 MLA kernels write them, and the policy's other
-        roles (``_fp4_mla_disagg_page_table_spec``). The cache is K-only: any other role it
-        registers is a latent cache too."""
-        spec = super().page_table_spec()
-        return self._fp4_mla_disagg_page_table_spec(
-            replace(spec, role_layouts={}, default_layout=_FP4_MLA_LATENT)
+        roles and layer names (``_fp4_mla_page_table_spec``). The cache is K-only: any other role
+        it registers is a latent cache too."""
+        spec = KVCacheManagerV2.page_table_spec(self)
+        return self._fp4_mla_page_table_spec(
+            replace(spec, role_layouts={}, default_layout=ByHead(token_major=True, total=1)),
+            recurrent=lambda layer: False,
         )
 
-    def _disagg_layer_names(self) -> dict[int, tuple[int, int]]:
-        """The FP4 MLA layer names (``_fp4_mla_disagg_layer_names``), no layer recurrent."""
-        return self._fp4_mla_disagg_layer_names(recurrent=lambda layer: False)
+    def _fp4_mla_page_table_spec(
+        self, spec: PageTableSpec, recurrent: Callable[[int], bool]
+    ) -> PageTableSpec:
+        """``spec`` with the MLA roles and layer names laid over it.
 
-    def _fp4_mla_disagg_layer_names(
-        self, recurrent: Callable[[int], bool]
-    ) -> dict[int, tuple[int, int]]:
-        """Internal layer id -> (global layer id, model layer) of every layer the storage holds.
-
-        A model layer's cache and its high-precision tail are two internal layers, global layers
-        ``2 * m`` and ``2 * m + 1`` of model layer ``m``; a layer ``recurrent`` names takes
-        ``2 * m``, so every name stays distinct and alike under any pipeline split.
-
-        Raises:
-            ValueError: For a layer that is neither recurrent nor an FP4 MLA layer.
-        """
-        names = {}
+        K and K block scales are token-major by their one latent head, which every rank holds
+        whole. The high-precision tail is a ring of BF16 latent tokens alike on every rank,
+        sized by this worker's speculative rewind, so a context and a generation worker may size
+        it differently. V scales and packed V derive from K and K scales; the generation worker
+        rebuilds them locally in rebuild_disagg_imported_cache. A model layer's cache and its
+        high-precision tail are two internal layers, global layers ``2 * m`` and ``2 * m + 1``
+        of model layer ``m``; an appended draft layer and a layer ``recurrent`` names take
+        ``2 * m``, so every name stays distinct and alike under any pipeline split. The tail's
+        window keeps the rewind beyond the tokens attention reads, and the lifecycles of the FP8
+        fallback and appended draft layers a window past ``max_seq_len``
+        (``retention_margins``)."""
+        layer_ids = {}
         for layers in layer_groups(self):
             for internal in layers:
                 if recurrent(internal):
@@ -1169,27 +1215,21 @@ class Fp4MlaV2CacheLayoutPolicy:
                     global_layer = self._fp4_mla_disagg_global_layer_id(internal)
                     if global_layer is None:
                         raise ValueError(f"Unknown FP4 MLA V2 internal layer {internal}.")
-                names[internal] = (global_layer, global_layer // 2)
-        return names
-
-    def _fp4_mla_disagg_page_table_spec(self, spec: PageTableSpec) -> PageTableSpec:
-        """``spec`` with the MLA roles laid over it.
-
-        K and K block scales are token-major by their one latent head, which every rank holds
-        whole. The high-precision tail is a ring of BF16 latent tokens alike on every rank,
-        sized by this worker's speculative rewind, so a context and a generation worker may size
-        it differently. V scales and packed V derive from K and K scales; the generation worker
-        rebuilds them locally in rebuild_disagg_imported_cache."""
+                layer_ids[internal] = (global_layer, global_layer // 2)
         return replace(
             spec,
             role_layouts={
                 **spec.role_layouts,
-                Role.KEY: _FP4_MLA_LATENT,
-                Role.KEY_BLOCK_SCALE: _FP4_MLA_LATENT,
+                Role.KEY: ByHead(token_major=True, total=1),
+                Role.KEY_BLOCK_SCALE: ByHead(token_major=True, total=1),
                 Role.MLA_HP_TAIL: RingSlots(self._fp4_mla_hp_pool_size, dtype="bfloat16"),
             },
-            derived_roles=spec.derived_roles | Fp4MlaV2CacheLayoutPolicy.DISAGG_IGNORED_ROLES,
+            derived_roles=spec.derived_roles | {Role.MLA_V_SCALE, Role.MLA_V_PACKED},
+            retention_margins=True,
+            layer_ids=layer_ids,
         )
+
+    extend_page_table_spec = _fp4_mla_page_table_spec
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         return {Role.ALL: MapperKind.NHD, **self.DISAGG_ROLE_MAPPER_KINDS}

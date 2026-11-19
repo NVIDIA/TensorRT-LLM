@@ -88,7 +88,8 @@ def _warn_fallback(requested: str, running: str, why: str) -> None:
 
 def chunk_rows(rows: int, cols: int, align: int = CHUNK_ALIGN) -> int:
     """Rows of one chunk: an even split of `rows` over `CHUNKS`, rounded up so a chunk's bytes
-    (`cols` one-byte columns a row) are a multiple of `align`."""
+    are a multiple of `align` for any whole-byte element size. The element count is aligned,
+    so the row partition is independent of dtype."""
     unit = align // math.gcd(align, cols)
     per = -(-rows // CHUNKS)
     return -(-per // unit) * unit
@@ -311,8 +312,9 @@ class _VmmChunks:
 
     def view(self, rows: int, cols: int, dtype, device) -> torch.Tensor:
         index = device.index if device.index is not None else torch.cuda.current_device()
-        flat = pack_strided_memory(self.va, rows * cols, rows * cols, 1, torch.uint8, index)
-        return flat.view(rows, cols).view(dtype)
+        nbytes = rows * cols * torch.empty(0, dtype=dtype).element_size()
+        flat = pack_strided_memory(self.va, nbytes, nbytes, 1, torch.uint8, index)
+        return flat.view(dtype).view(rows, cols)
 
     def resident_on_host(self) -> bool:
         host = cuda_driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
@@ -349,7 +351,7 @@ def _all_agree(ok: bool) -> bool:
 
 
 class PleHostTable:
-    """One rank's storage of the PLE n-gram table (`rows` x `cols` one-byte elements).
+    """One rank's storage of the PLE n-gram table (`rows` x `cols` elements of `dtype`).
 
     After `fill`: `table` is the view the gather reads, `window` its `row_window` (None for the
     whole table), `needs_sum` whether the caller sums the gathered rows over the attention-TP
@@ -374,7 +376,7 @@ class PleHostTable:
         log: Callable[[str], None] = logger.info,
     ) -> None:
         assert mode in _MODES, mode
-        assert torch.empty(0, dtype=dtype).element_size() == 1, dtype
+        self.itemsize = torch.empty(0, dtype=dtype).element_size()
         self.requested = mode
         self.rows, self.cols, self.dtype, self.device = rows, cols, dtype, device
         self.rank, self.world, self.dp = rank, world, dp
@@ -436,7 +438,7 @@ class PleHostTable:
             self._node_error = "no table identity"
             return
         try:
-            chunk_bytes = chunk_rows(self.rows, self.cols, self.align) * self.cols
+            chunk_bytes = chunk_rows(self.rows, self.cols, self.align) * self.cols * self.itemsize
             node = device_numa_node(self.device)
             index = (
                 self.device.index if self.device.index is not None else torch.cuda.current_device()

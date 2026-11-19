@@ -143,6 +143,7 @@ def apply_moe_impl_construction_state(
     # same None it saw when ``reduce_results`` was False, rather than an
     # AttributeError from a completely different-looking place.
     module.all_reduce = None
+    module.dummy_all_reduce = None
     module.enable_dummy_allreduce = os.environ.get("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
 
     # Same defaults ``MoE.__init__`` used when ``init_load_balancer=False``.

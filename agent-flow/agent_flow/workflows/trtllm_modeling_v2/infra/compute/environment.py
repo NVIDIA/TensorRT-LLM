@@ -88,8 +88,6 @@ class RunEnvironment:
     spool: str | None = None
     # Every declared session an agent may submit to.
     sessions: tuple[SessionSpec, ...] = ()
-    # ``perf.dev_spools``: the sessions the tuners submit to; no other prompt names them.
-    dev_spools: tuple[str, ...] = ()
 
     @property
     def ntasks(self) -> int:
@@ -328,21 +326,6 @@ def resolve_environment(
         container_image=block.get("container_image"),
         spool=block.get("spool"),
         sessions=declared,
-        dev_spools=_dev_spools(task_data.get("perf")),
-    )
-
-
-def _dev_spools(perf: Any) -> tuple[str, ...]:
-    """``perf.dev_spools``, less any spool that also measures (``perf.spools``).
-
-    Only a declared list: the campaign's fallback to its measuring spools is not one, and a gate
-    beside a measurement would skew it.
-    """
-    if not isinstance(perf, Mapping):
-        return ()
-    measuring = {Path(str(s)) for s in perf.get("spools") or ()}
-    return tuple(
-        str(s) for s in perf.get("dev_spools") or () if s and Path(str(s)) not in measuring
     )
 
 

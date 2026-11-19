@@ -15,12 +15,20 @@
 """A rank's place and the parallel dimensions recurrent state splits over, as a page table reads
 them."""
 
+import collections
 from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base.role_layout import RankTopology, grid_place
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
+from tensorrt_llm._torch.disaggregation.base.role_layout import (
+    ByHead,
+    RankTopology,
+    Replicated,
+    RingSlots,
+    Sectioned,
+    check_pieces,
+    grid_place,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import rank_topology, state_split
 
 pytestmark = pytest.mark.cpu_only
@@ -51,7 +59,7 @@ def test_rank_topology_reads_the_rank_s_place_from_its_mapping(attention_dp):
 @pytest.mark.parametrize("attention_dp", [False, True])
 @pytest.mark.parametrize("cp_size", [1, 2])
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
-def test_recurrent_state_splits_as_the_native_transfer_shards_it(tp_size, cp_size, attention_dp):
+def test_recurrent_state_rank_in_the_shard_grid(tp_size, cp_size, attention_dp):
     for tp_rank in range(tp_size):
         for cp_rank in range(cp_size):
             mapping = SimpleNamespace(
@@ -62,15 +70,59 @@ def test_recurrent_state_splits_as_the_native_transfer_shards_it(tp_size, cp_siz
                 enable_attention_dp=attention_dp,
             )
             manager = SimpleNamespace(mapping=mapping, _has_cp_helix=cp_size > 1)
-            rank_info = SimpleNamespace(
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                cp_size=cp_size,
-                cp_rank=cp_rank,
-                attention=SimpleNamespace(enable_attention_dp=attention_dp),
-            )
             topology = rank_topology(mapping)
-
             split = state_split(manager)
+            if attention_dp:
+                expected = (cp_size, cp_rank) if tp_size == 1 else (1, 0)
+            else:
+                expected = (tp_size * cp_size, tp_rank * cp_size + cp_rank)
+            assert grid_place(topology, split) == expected, topology
 
-            assert grid_place(topology, split) == MambaPolicy._mamba_tp(rank_info), topology
+
+def _site(size, *, kv_heads=(0, None), state=False, split=("tp",), ranks=1, tokens=32):
+    """The facts of one buffer that a layout in a manager's spec resolves against."""
+    return SimpleNamespace(
+        size=size, kv_heads=kv_heads, state=state, split=split, ranks=ranks, tokens=tokens
+    )
+
+
+_RANK_COUNTS = (1, 2, 4, 8)
+
+
+def _kv_site(heads, head_bytes, ranks, **kwargs):
+    """An attention buffer of ``heads`` KV heads of ``head_bytes`` bytes over ``ranks`` ranks."""
+    local = max(1, heads // ranks)
+    return _site(local * head_bytes, kv_heads=(local, heads), ranks=ranks, **kwargs)
+
+
+# Each case: ranks -> (the layout a manager's spec states, one rank's buffer's facts).
+_TILING_CASES = {
+    "kv_by_head": lambda n: (ByHead(), _kv_site(8, 64, n)),
+    "kv_token_major": lambda n: (ByHead(token_major=True), _kv_site(8, 64, n, tokens=4)),
+    "kv_heads_held_by_several_ranks": lambda n: (ByHead(), _kv_site(2, 64, n)),
+    "mla_latent": lambda n: (ByHead(total=1), _site(576, kv_heads=(1, None), ranks=n)),
+    "recurrent_state": lambda n: (ByHead(head_bytes=32), _site(8 // n * 32, state=True, ranks=n)),
+    "sections": lambda n: (Sectioned((64 // n, 32 // n, 32 // n)), _site(128 // n, ranks=n)),
+    "replicated": lambda n: (Replicated(), _site(96, ranks=n)),
+    "ring": lambda n: (RingSlots(4), _site(96, ranks=n)),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_TILING_CASES))
+def test_ranks_of_every_topology_together_hold_one_space_whole(case):
+    spaces = set()
+    for ranks in _RANK_COUNTS:
+        layout, site = _TILING_CASES[case](ranks)
+        resolved = layout.resolve(site)
+        resolved.check(site.size)
+        held = collections.Counter()
+        for rank in range(ranks):
+            check_pieces(resolved, site.size, ranks, rank)
+            for piece in resolved.pieces(site.size, ranks, rank):
+                held.update(range(piece.at, piece.at + piece.size))
+        # Every byte of the space from 0 up is held, each by as many ranks as every other.
+        assert sorted(held) == list(range(len(held))), (case, ranks)
+        assert len(set(held.values())) == 1, (case, ranks)
+        spaces.add(resolved.space(site.size, ranks))
+    # Peers of any two of these rank counts lay out the same space, so they correspond.
+    assert len(spaces) == 1, (case, spaces)

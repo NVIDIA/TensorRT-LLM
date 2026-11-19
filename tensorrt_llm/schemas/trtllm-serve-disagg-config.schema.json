@@ -410,6 +410,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -1156,6 +1167,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "skip_ctx_buffer_budget_check": {
           "default": false,
           "description": "Skip the config-time check that the pooled-context K/V buffers fit in the memory left free after the KV-cache pool commits. The estimate is deliberately conservative; set this to proceed when you know the device has the headroom. The token-budget check is not affected.",
@@ -1363,6 +1385,21 @@
           "title": "Confidence Min Predicted Gain",
           "type": "number"
         },
+        "context_recompute_tail": {
+          "anyOf": [
+            {
+              "minimum": -1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0,
+          "description": "Prompt-tail tokens to recompute through the target forward when a request takes a KV-cache prefix hit, so a standalone DSpark drafter gets context K/V for reused tokens. Acceptance drops on hits with or without a draft KV pool paired with the target's block reuse, so the tail trades TTFT for acceptance in either layout. 0 (default) disables it; -1 forces a full re-prefill on a hit; None resolves from the draft model config to the drafter's attention window when every layer's context attention is windowed, else -1 (0 for the embedded drafter). A disaggregated context server recomputes only when the draft layers share the target's KV cache manager, the one layout whose draft pages reach the generation server. A smaller tail trades acceptance length for TTFT. The V2 KV cache manager requires the all_reusable block-reuse policy; the V1 manager requires chunked prefill and no sliding-window target layers; otherwise the managers disable it with a warning. On recurrent-state targets a positive tail becomes -1 (full re-prefill).",
+          "status": "prototype",
+          "title": "Context Recompute Tail"
+        },
         "decoding_type": {
           "const": "DSpark",
           "default": "DSpark",
@@ -1545,6 +1582,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -1601,6 +1649,13 @@
           "default": null,
           "description": "Target model layer indices whose hidden states are captured for cross-attention in the draft model. If None, read from the draft model config (dspark_target_layer_ids).",
           "title": "Target Layer Ids"
+        },
+        "use_ancestral_draft_sampling": {
+          "default": false,
+          "description": "Sampled drafts of a standalone drafter with a Markov head are drawn ancestrally when the deployment drops the sampling filters (advanced_sampling_mode='no_topk_no_topp'): each position is sampled given the token drawn before it by a fused Triton chain, so the stored proposals are the drafter's joint distribution, which raises acceptance. If true, all other sampled drafts are drawn ancestrally too, at one sampler call per draft position. False (default) chains the Markov bias of the other sampled drafts through the greedy argmax and samples every position at once. Requires use_rejection_sampling=True; standalone drafters only, not supported with confidence scheduling.",
+          "status": "prototype",
+          "title": "Use Ancestral Draft Sampling",
+          "type": "boolean"
         },
         "use_rejection_sampling": {
           "default": false,
@@ -4294,6 +4349,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -4825,6 +4891,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "sa_config": {
           "anyOf": [
             {
@@ -5142,6 +5219,17 @@
           "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
           "status": "prototype",
           "title": "Moe Tactic"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 3,
@@ -6660,6 +6748,17 @@
           "description": "Number of MTP layers in the model checkpoint. Auto-populated from the target pretrained config, or from speculative_model's config.json when MTP heads are loaded separately. Do not set manually.",
           "title": "Num Nextn Predict Layers"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "relaxed_delta": {
           "default": 0.0,
           "description": "Probability threshold for relaxed acceptance. Only candidates with prob >= (top-1 prob - delta) are kept.",
@@ -7244,7 +7343,7 @@
       "not": {
         "pattern": "^[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*\\*(\\.\\*){0,3}[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$"
       },
-      "pattern": "^[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)(\\.(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)){0,3}[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$",
+      "pattern": "^[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[aA][cC][tT]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)(\\.(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[aA][cC][tT]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)){0,3}[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$",
       "type": "string"
     },
     "MoeWarmupPlacementConfig": {
@@ -7892,6 +7991,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -8186,6 +8296,17 @@
           "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
           "status": "prototype",
           "title": "Moe Tactic"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "sa_config": {
           "anyOf": [
@@ -9234,6 +9355,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -9520,6 +9652,17 @@
         "output_directory": {
           "description": "Directory path where hidden states data files will be saved. The directory is created if it does not exist.",
           "title": "Output Directory",
+          "type": "string"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
           "type": "string"
         },
         "spec_dec_variant": {
@@ -10168,6 +10311,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "resource_manager": {
           "type": "null"
         },
@@ -10319,7 +10473,7 @@
       "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-disagg-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc5/_static/schemas/trtllm-serve-disagg-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "allOf": [
@@ -12474,6 +12628,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc4 trtllm-serve disaggregated --config",
+  "title": "TensorRT-LLM 1.4.0rc5 trtllm-serve disaggregated --config",
   "type": "object"
 }

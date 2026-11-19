@@ -15,11 +15,13 @@
 """Scheduled pooling: a non-generation model served through LLM.generate()."""
 
 import random
+import threading
 
 import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import ScheduledEncoderExecutor
 from tensorrt_llm.executor.utils import RequestError, is_context_length_exceeded_message
 
 from .test_llm import get_model_path
@@ -83,13 +85,50 @@ def test_prompt_that_fills_max_seq_len_matches_encode():
     torch.testing.assert_close(scheduled.reshape(-1), encoded.reshape(-1), rtol=1e-4, atol=1e-4)
 
 
-def test_overlap_loop_completes_requests_that_ask_for_more_tokens():
+def test_requests_that_ask_for_more_tokens_get_the_same_pooled_row():
     prompts = [_prompt(16, seed=seed) for seed in range(4)]
 
     with _llm() as llm:
-        overlapped = [_pooled(llm, prompt, max_tokens=4) for prompt in prompts]
-    with _llm(disable_overlap_scheduler=True) as llm:
+        longer = [_pooled(llm, prompt, max_tokens=4) for prompt in prompts]
         reference = [_pooled(llm, prompt) for prompt in prompts]
 
-    for got, expected in zip(overlapped, reference):
+    for got, expected in zip(longer, reference):
         assert torch.equal(got, expected)
+
+
+def test_cancelling_a_queued_request_finishes_it(monkeypatch):
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    params = SamplingParams(max_tokens=1, return_context_logits=True)
+
+    with _llm(max_batch_size=1) as llm:
+        engine = llm._executor.engine
+        assert isinstance(engine, ScheduledEncoderExecutor)
+        # The first forward waits for the abort, so the last request is still queued when it lands.
+        aborted = threading.Event()
+        forward = engine._runner.forward
+
+        def forward_after_abort(*args, **kwargs):
+            assert aborted.wait(timeout=60)
+            return forward(*args, **kwargs)
+
+        monkeypatch.setattr(engine._runner, "forward", forward_after_abort)
+        futures = [
+            llm.generate_async(_prompt(32, seed=seed), sampling_params=params) for seed in range(50)
+        ]
+        futures[-1].abort()
+        aborted.set()
+        finished = [future.result(timeout=60).outputs[0].finish_reason for future in futures]
+
+    assert finished == ["length"] * 49 + ["cancelled"]
+
+
+def test_startup_metrics_report_model_loading_and_executor_phases():
+    with _llm() as llm:
+        metrics = llm.startup_metrics
+
+    assert {
+        "scheduled_encoder_creation_seconds",
+        "worker_start_seconds",
+        "total_py_executor_creation_seconds",
+    } <= metrics["py_executor"].keys()
+    assert metrics["model_loader"]

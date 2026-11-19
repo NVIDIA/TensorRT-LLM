@@ -32,7 +32,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _Role(str):
-    """A str subclass, to check that a spec keeps roles as plain strings."""
+    """A role as the runtime names one: a string subclass."""
 
 
 def test_spec_names_roles_and_layer_ids_by_plain_values():
@@ -54,15 +54,14 @@ def test_spec_names_roles_and_layer_ids_by_plain_values():
 
 def test_spec_names_mixed_precision_types_as_a_pair():
     assert PageTableSpec(mixed_precision=["nvfp4", "bf16"]).mixed_precision == ("nvfp4", "bf16")
-    # The cold-page window keeps both at the model's KV type.
-    assert PageTableSpec(mixed_precision=("bf16", "bf16")).mixed_precision == ("bf16", "bf16")
     assert PageTableSpec().mixed_precision is None
     with pytest.raises(ValueError, match="low and a high type"):
         PageTableSpec(mixed_precision=("nvfp4",))
 
 
 def test_spec_states_retention_margins_as_a_flag():
-    """Windows hold no margins beyond the window attention reads unless the spec says so."""
+    """Windows hold no margins the windows its layers declare they read do not leave out
+    (``_declared_read_windows``) unless the spec says so."""
     assert PageTableSpec().retention_margins is False
     assert PageTableSpec(retention_margins=1).retention_margins is True
 
