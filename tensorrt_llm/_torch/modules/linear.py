@@ -25,7 +25,8 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     _FP8_BLOCK_SCALE_GEMM_AUTOTUNED_OP, IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
     BufferKind, FP8BlockScaleGemmRunner, MXFP8QuantizeRunner,
     fp8_block_scale_gemm_autotuned, fp8_block_scale_swiglu_prefers_bf16,
-    mxfp8_quantize_gemm_autotuned, small_m_applies_on_tuning_group)
+    mxfp8_quantize_gemm_autotuned, prebuild_flashinfer_mxfp8_gemm,
+    small_m_applies_on_tuning_group)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -4025,6 +4026,13 @@ class MXFP8LinearMethod(LinearMethodBase):
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
                 act_e4m3, act_sf = mxfp8_quantize_activation(input)
+                if self.needs_flashinfer_autotune and not is_torch_compiling():
+                    # The warmup will tune FlashInfer's GEMM: in the autotuner's
+                    # build state, build it now.
+                    prebuild_flashinfer_mxfp8_gemm(act_e4m3, act_sf,
+                                                   module.weight,
+                                                   module.weight_scale,
+                                                   module.dtype)
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or

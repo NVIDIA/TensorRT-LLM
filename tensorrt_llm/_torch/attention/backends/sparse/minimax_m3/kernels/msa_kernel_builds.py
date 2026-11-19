@@ -16,6 +16,10 @@ directory and under the file lock the package's own lookup uses, and the run goe
 are built: its lookups load them. The plan, split-KV reduction and sparse top-k modules, and the
 k2q CSR extension the sparse prefill loads, need nothing from a call: they build with the
 variants of the first run in build mode.
+
+In a KernelBuilder rehearsal the builds are queued and the run is itself such a replay: it
+compiles and launches nothing, and its outputs hold what a run over no keys gives, zeros and a
+maximum score of -inf.
 """
 
 from __future__ import annotations
@@ -193,7 +197,28 @@ class _Package:
                         self._list, q, k, v, plan_args, plan_options, num_kv_splits, run_options
                     ),
                 )
+        if builder.rehearsing():
+            return self._rehearse(q, k, v, plan_info, *args, **kwargs)
         return self.run_fn(q, k, v, plan_info, *args, **kwargs)
+
+    def _rehearse(self, q, k, v, plan_info, *args, **kwargs):
+        """The package's run with its variant and split-KV reduction stubbed; its outputs are set
+        to what a run over no keys gives: zeros and a maximum score of -inf."""
+        _replay.found = {}
+        try:
+            result = self.run_fn(q, k, v, plan_info, *args, **kwargs)
+        finally:
+            _replay.found = None
+        out, max_score = result if isinstance(result, tuple) else (result, None)
+        for tensor, value in (
+            (out, 0.0),
+            (kwargs.get("out"), 0.0),
+            (max_score, float("-inf")),
+            (kwargs.get("max_score"), float("-inf")),
+        ):
+            if isinstance(tensor, torch.Tensor):
+                tensor.fill_(value)
+        return result
 
     def _list(
         self, q, k, v, plan_args, plan_options, num_kv_splits, run_options, shapes

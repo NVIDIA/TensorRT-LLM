@@ -1183,3 +1183,77 @@ def test_mxfp8_loaded_tactic_primes_before_graph_capture(
     graph.replay()
     torch.testing.assert_close(captured, runner(inputs, tactic=tactic), atol=0, rtol=0)
     reloaded._profile_single_kernel.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_mxfp8_builds_are_queued_in_the_build_state_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tensorrt_llm._torch.flashinfer_utils as flashinfer_utils
+    from tensorrt_llm._torch.autotuner import build_kernels
+
+    def gen_trtllm_utils_module():
+        raise AssertionError("only a worker process describes the module")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.jit.tllm_utils",
+        SimpleNamespace(gen_trtllm_utils_module=gen_trtllm_utils_module),
+    )
+    queued = []
+    monkeypatch.setattr(
+        flashinfer_utils,
+        "queue_flashinfer_module_build",
+        lambda name, gen_spec: queued.append((name, gen_spec)),
+    )
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    chosen = []
+    monkeypatch.setattr(
+        tuner,
+        "choose_one",
+        lambda op, runners, config, inputs, **kwargs: chosen.append((runners, config))
+        or (runners[0], -1),
+    )
+    act = torch.zeros(4, 128, dtype=torch.float8_e4m3fn)
+    act_sf = torch.zeros(16, dtype=torch.uint8)
+    weight = torch.zeros(64, 128, dtype=torch.float8_e4m3fn)
+    weight_sf = torch.zeros(256, dtype=torch.uint8)
+    prebuild = custom_ops_module.prebuild_flashinfer_mxfp8_gemm
+
+    prebuild(act, act_sf, weight, weight_sf, torch.bfloat16)
+    assert queued == [] and chosen == []
+    with build_kernels():
+        prebuild(act, act_sf, weight, weight_sf, torch.bfloat16)
+    # The warmup tunes the GEMM through FlashInfer, whose tuning loads the delay kernel of
+    # FlashInfer's trtllm_utils module.
+    assert queued == [("trtllm_utils", gen_trtllm_utils_module)]
+    # The build state queues the GEMM's own builds, which its runner declares.
+    [([runner], config)] = chosen
+    assert type(runner) is custom_ops_module.FlashInferMXFP8GemmRunner
+    assert config.build_in_workers
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_mxfp8_runner_builds_one_cutlass_module_for_every_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = []
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.gemm.gemm_base",
+        SimpleNamespace(get_cutlass_mxfp8_gemm_module=loaded.append),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
+    runner = custom_ops_module.FlashInferMXFP8GemmRunner(torch.bfloat16)
+    # Its builds read no input: a worker process gets meta tensors.
+    assert runner.builds_from_shapes
+    inputs = [torch.empty(4, 128, device="meta")]
+    runner.build(inputs, tactic=runner.CUTE_DSL)
+    assert loaded == []
+    runner.build(inputs, tactic=runner.CUTLASS)
+    assert loaded == [10]
+    # One module per tactic serves every shape, so the builds of every profile are one.
+    for tactic in (runner.CUTLASS, runner.CUTE_DSL):
+        assert runner.build_key(Mock(), tactic) == runner.build_key(Mock(), tactic)
+    assert runner.build_key(Mock(), runner.CUTLASS) != runner.build_key(Mock(), runner.CUTE_DSL)

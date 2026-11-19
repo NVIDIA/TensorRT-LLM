@@ -7,6 +7,7 @@
 
 import dataclasses
 import sys
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -813,3 +814,112 @@ def test_race_times_device_work_not_host_launch(pdl: str, monkeypatch) -> None:
     tuner.clear_cache()
     assert winners[True] is slow_launch
     assert winners[False] is slow_kernel
+
+
+@_skip_non_sm10x
+@torch.inference_mode()
+def test_a_rehearsal_times_the_race_on_kernels_worker_processes_build(
+    monkeypatch, tmp_path
+) -> None:
+    """In a KernelBuilder rehearsal the race's warp-MMA kernels build in worker processes and its
+    profiles are timed in a worker process, on those kernels, while this process synchronizes the
+    device as the checkpoint load does; the warmup's tuning then finds every profile in the
+    cache."""
+    from tensorrt_llm._torch.autotuner import RehearsalTuner, build_kernels
+    from tensorrt_llm._torch.build_pool import BuildPool
+    from tensorrt_llm._torch.kernel_builder import KernelBuilder
+    from tensorrt_llm._torch.modules import low_m_mma_gemm
+    from tensorrt_llm._torch.modules.low_m_gemm import _M_DIM_SPEC
+
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._init_runners()
+    config = dispatcher._tuning_config
+    assert config.tune_in_rehearsal
+    config = dataclasses.replace(
+        config,
+        dynamic_tensor_specs=(dataclasses.replace(_M_DIM_SPEC, gen_tuning_buckets=(1, 2)),),
+    )
+    runners = [dispatcher._cublas_no_bias, dispatcher._warp_mma]
+    tuner = AutoTuner()
+    pool = BuildPool(workers=4, enabled=True, store=str(tmp_path))
+    for cls, instance in (
+        (AutoTuner, tuner),
+        (BuildPool, pool),
+        (RehearsalTuner, RehearsalTuner()),
+        (KernelBuilder, KernelBuilder(enabled=True, rehearse=True)),
+    ):
+        monkeypatch.setattr(cls, "_instance", instance)
+    low_m_mma_gemm._compiled.cache_clear()
+
+    n, k = 256, 1024
+    a = torch.randn((2, k), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    inputs = [a, weight.t()]
+    op = "test::low_m_rehearsal"
+    stop, load_errors = threading.Event(), []
+
+    def load():
+        while not stop.is_set():
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError as e:
+                load_errors.append(e)
+                return
+            time.sleep(0.001)
+
+    loader = threading.Thread(target=load)
+    try:
+        # The rehearsal's caller holds the pass open beside the checkpoint load.
+        with pool.pass_scope(overlapped=True):
+            with KernelBuilder.get().rehearsal(), build_kernels():
+                tuner.choose_one(op, runners, config, inputs, bias=None)
+            loader.start()
+            RehearsalTuner.get().start()
+            built = tuner.join_builds()
+            RehearsalTuner.get().join()
+            # This process ran no warp-MMA kernel: worker processes built and timed them.
+            assert low_m_mma_gemm._compiled.cache_info().currsize == 0
+    finally:
+        stop.set()
+        if loader.is_alive():
+            loader.join()
+        low_m_mma_gemm._compiled.cache_clear()
+    assert not load_errors
+    assert built.get("built", 0) > 0 and built.get("failed", 0) == 0
+    assert f"{op}:" in str(tuner.stats)
+    for profile in tuner._optimization_profiles(config, inputs):
+        hit, *_ = tuner.profiling_cache.search_cache(
+            op, runners, profile.get_opt_shapes(), config, apply_map_to_tuning_buckets=False
+        )
+        assert hit, profile.get_opt_shapes()
+
+    def no_profiling(*args, **kwargs):
+        raise AssertionError("the warmup's tuning timed a profile the rehearsal timed")
+
+    monkeypatch.setattr(tuner, "_profile_runners", no_profiling)
+    with autotune():
+        runner, tactic = tuner.choose_one(op, runners, config, inputs, bias=None)
+    out = runner(inputs, tactic=tactic, bias=None)
+    torch.testing.assert_close(out, a @ weight.t(), rtol=1e-2, atol=5e-3)
+
+
+def test_runners_that_build_nothing_ahead_send_one_empty_build_on_meta_tensors(
+    monkeypatch,
+) -> None:
+    """The race's cuBLAS, split-K and direct runners build nothing ahead (cuBLAS ships its
+    kernels; FlashInfer compiles the others as the tuning times them): one empty build on meta
+    tensors stands for all of a runner's profiles and tactics, so a rehearsal sends the workers
+    one build per runner, not one per (profile, tactic)."""
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._init_runners()
+    profiles = [MagicMock(), MagicMock()]
+    for runner in (dispatcher._cublas_no_bias, dispatcher._runner_no_bias, dispatcher._direct):
+        assert runner.builds_from_shapes
+        assert len({runner.build_key(p, t) for p in profiles for t in ((1, 2), (3, 4))}) == 1
+        runner.build([torch.empty(2, 128, device="meta")], tactic=(1, 2))
+    # The warp-MMA runner's builds compile a kernel each.
+    warp_mma = dispatcher._warp_mma
+    assert not warp_mma.builds_from_shapes
+    assert len({warp_mma.build_key(p, t) for p in profiles for t in ((1, 2), (3, 4))}) > 1

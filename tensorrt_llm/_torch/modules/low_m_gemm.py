@@ -108,6 +108,8 @@ class _CuBLASGemmRunner(TunableRunner):
     """
 
     _TACTIC = ("cublas",)
+    # build() builds nothing: a worker process gets meta tensors.
+    builds_from_shapes = True
 
     def __init__(self, *, has_bias: bool) -> None:
         self.has_bias = has_bias
@@ -125,6 +127,10 @@ class _CuBLASGemmRunner(TunableRunner):
 
     def build(self, inputs: List[torch.Tensor], *, tactic: Any = -1, **kwargs: Any) -> None:
         """Nothing to build: cuBLAS ships its kernels."""
+
+    def build_key(self, profile: Any, tactic: Any) -> tuple:
+        # One empty build stands for every profile and tactic.
+        return ()
 
     def forward(
         self,
@@ -166,6 +172,9 @@ class _DirectGemmRunner(TunableRunner):
 
     inputs: ``[a [M,K] BF16, b_t [K,N] col-major BF16]``.
     """
+
+    # build() builds nothing: a worker process gets meta tensors.
+    builds_from_shapes = True
 
     def __init__(self, *, pdl: bool, whole_bucket_tiles: bool = False) -> None:
         self.pdl = pdl
@@ -224,6 +233,14 @@ class _DirectGemmRunner(TunableRunner):
             seen = dict.fromkeys((block, outputs, 1) for block, outputs, _ in seen)
         return list(seen)
 
+    def build(self, inputs: List[torch.Tensor], *, tactic: Any = -1, **kwargs: Any) -> None:
+        """Nothing to build ahead: FlashInfer compiles this kernel the first time it runs,
+        which is when the tuning times it."""
+
+    def build_key(self, profile: Any, tactic: Any) -> tuple:
+        # One empty build stands for every profile and tactic.
+        return ()
+
     def forward(
         self,
         inputs: List[torch.Tensor],
@@ -263,6 +280,9 @@ class _SplitKGemmRunner(TunableRunner):
     inputs: ``[a [M,K] BF16, b_t [K,N] BF16]``; ``bias`` passed as a kwarg.
     """
 
+    # build() builds nothing: a worker process gets meta tensors.
+    builds_from_shapes = True
+
     def __init__(self, *, has_bias: bool, pdl: bool) -> None:
         self.has_bias = has_bias
         self.pdl = pdl
@@ -296,6 +316,14 @@ class _SplitKGemmRunner(TunableRunner):
         for t in (default_tactic(m, n, k), *autotune_tactics(m, n, k)):
             seen.setdefault(dataclasses.astuple(t), None)
         return list(seen)
+
+    def build(self, inputs: List[torch.Tensor], *, tactic: Any = -1, **kwargs: Any) -> None:
+        """Nothing to build ahead: FlashInfer compiles this kernel the first time it runs,
+        which is when the tuning times it."""
+
+    def build_key(self, profile: Any, tactic: Any) -> tuple:
+        # One empty build stands for every profile and tactic.
+        return ()
 
     def forward(
         self,
@@ -647,6 +675,9 @@ class LowMGemmDispatcher:
             # processes before the race is timed, when they take long enough to repay
             # a worker.
             build_in_workers=True,
+            # In a rehearsal the warp-MMA kernels build in worker processes while the
+            # checkpoint loads, and the race is timed there as well.
+            tune_in_rehearsal=True,
         )
         # Mark prepared only after all runners and the tuning config exist so the
         # invariant "_prepared implies runners are non-None" always holds.

@@ -69,7 +69,11 @@ def package(monkeypatch, tmp_path):
     builder = KernelBuilder(enabled=True)
     monkeypatch.setattr(KernelBuilder, "_instance", builder)
     # The variants take long enough for a worker; none is started here.
-    monkeypatch.setattr(BuildPool, "worth_a_worker", lambda self, family, expected_s=None: True)
+    monkeypatch.setattr(
+        BuildPool,
+        "worth_a_worker",
+        lambda self, family, expected_s=None, thread_safe=False: True,
+    )
     return types.SimpleNamespace(module=module, builder=builder, events=events, fail=fail)
 
 
@@ -121,6 +125,27 @@ def test_a_replay_that_raises_leaves_the_kernels_to_their_first_use(package, bui
     assert build_mode == []
     assert msa_kernel_builds._replay.found is None
     assert package.events == [("lookup", (128, False))]
+
+
+def test_a_run_in_a_rehearsal_queues_its_builds_and_launches_nothing(package, monkeypatch):
+    built = []
+    monkeypatch.setattr(package.builder, "rehearse", True)
+    monkeypatch.setattr(package.builder, "build", lambda op, builds: built.extend(builds))
+    lens = torch.tensor([3, 100], dtype=torch.int32)
+    q = torch.zeros(103, 2, 8)
+    k = v = torch.zeros(16, 2, 8)
+    out = torch.full_like(q, float("nan"))
+    max_score = torch.zeros(103, 2)
+    with package.builder.rehearsal():
+        plan = package.module.fmha_sm100_plan(lens, lens.clone())
+        package.module.fmha_sm100(q, k, v, plan, out=out, max_score=max_score)
+    assert _variants(built) == {_SHORT, _LONG}
+    # Neither the replays nor the run itself looked a variant up: nothing compiled or ran,
+    # and the outputs hold what a run over no keys gives.
+    assert package.events == []
+    assert msa_kernel_builds._replay.found is None
+    assert torch.equal(out, torch.zeros_like(out))
+    assert torch.equal(max_score, torch.full_like(max_score, float("-inf")))
 
 
 def test_in_inference_mode_a_run_builds_nothing(package, monkeypatch):

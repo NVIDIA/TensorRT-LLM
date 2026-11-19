@@ -216,6 +216,7 @@ class MsaDecodeFmha(PhasedFmha):
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
             output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
+            max_num_requests=int(params.meta.max_num_requests),
             **nvfp4_args,
         )
 

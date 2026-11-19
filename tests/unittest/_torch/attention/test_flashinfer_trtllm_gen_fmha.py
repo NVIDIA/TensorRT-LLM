@@ -309,3 +309,86 @@ def test_sm107_serves_only_extra_page_sizes(
         assert supported is expected, reason
         if not expected:
             assert "SM107" in reason
+
+
+@pytest.mark.parametrize("run", ["run_context", "run_generation", "run_mla_generation"])
+def test_a_rehearsal_runs_no_trtllm_gen_kernel(monkeypatch: pytest.MonkeyPatch, run: str) -> None:
+    from tensorrt_llm._torch import kernel_builder
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen
+
+    builder = kernel_builder.KernelBuilder(enabled=True, rehearse=True)
+    monkeypatch.setattr(kernel_builder.KernelBuilder, "_instance", builder)
+    queued = []
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen, "queue_trtllm_gen_fmha_module_build", lambda: queued.append(True)
+    )
+    fmha = FlashInferTrtllmGenFmha(FakeAttention())
+    # Nothing but the output: any step past it would fail on the missing inputs.
+    params = SimpleNamespace(output=torch.ones(4))
+    with builder.rehearsal():
+        getattr(fmha, run)(params)
+    # The call queued the build of the kernels' module instead of running them.
+    assert queued == [True]
+    assert torch.equal(params.output, torch.zeros(4))
+
+
+def _gen_spec():
+    raise AssertionError("only a worker process describes the module")
+
+
+def test_a_flashinfer_module_build_goes_to_a_worker_process_in_a_rehearsal_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch import build_pool, flashinfer_utils, kernel_builder
+
+    monkeypatch.setattr(flashinfer_utils, "IS_FLASHINFER_AVAILABLE", True)
+    monkeypatch.setattr(build_pool.BuildPool, "_instance", build_pool.BuildPool(enabled=False))
+    builder = kernel_builder.KernelBuilder(enabled=True, rehearse=True)
+    monkeypatch.setattr(kernel_builder.KernelBuilder, "_instance", builder)
+    built = []
+    monkeypatch.setattr(builder, "build", lambda op, builds: built.append((op, builds)))
+    flashinfer_utils.queue_flashinfer_module_build("module", _gen_spec)
+    with builder.build_pass("warmup"):
+        flashinfer_utils.queue_flashinfer_module_build("module", _gen_spec)
+    assert built == []
+    with builder.rehearsal():
+        flashinfer_utils.queue_flashinfer_module_build("module", _gen_spec)
+    [(op, [(key, task, config)])] = built
+    assert (op, key) == ("flashinfer", "module")
+    assert task == kernel_builder.BuildTask(
+        "tensorrt_llm._torch.flashinfer_utils:build_flashinfer_module", (_gen_spec,)
+    )
+    # Not thread-safe, so a worker process takes it; the ranks that share FlashInfer's JIT
+    # directory split the modules.
+    assert not config.thread_safe
+    assert config.strategy is kernel_builder.BuildStrategy.PARALLEL
+
+
+@pytest.mark.parametrize(
+    "aot, compiled, jit_off, built",
+    [
+        (False, False, False, True),
+        (True, False, False, False),
+        (False, True, False, False),
+        (False, False, True, False),
+    ],
+    ids=["missing", "aot", "compiled", "jit_off"],
+)
+def test_a_worker_builds_a_flashinfer_module_only_where_its_first_use_would(
+    monkeypatch: pytest.MonkeyPatch, aot: bool, compiled: bool, jit_off: bool, built: bool
+) -> None:
+    from tensorrt_llm._torch.flashinfer_utils import build_flashinfer_module
+
+    if jit_off:
+        monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    else:
+        monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    locked_builds = []
+    spec = SimpleNamespace(
+        is_aot=aot,
+        is_compiled=compiled,
+        build=lambda need_lock: locked_builds.append(need_lock),
+    )
+    assert build_flashinfer_module(lambda: spec) is built
+    # Under the lock FlashInfer's own build_and_load takes.
+    assert locked_builds == ([True] if built else [])
