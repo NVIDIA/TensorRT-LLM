@@ -3741,6 +3741,33 @@ def test_selfsampling_topk_fp16_dense_window_geometry() -> None:
         )
 
 
+def test_selfsampling_topk_main_kernel_compile_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh main-family specialization traces ``GvrMainKernel.kern`` with the launcher ABI
+    and the resulting executable is reused from the compile cache."""
+    from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling as dev
+
+    compile_kernel = dev.cute.compile
+    compiled_kernels = []
+
+    def record_compile(kernel, *args, **kwargs):
+        assert isinstance(kernel, dev.GvrMainKernel)
+        assert kernel.kern is not None
+        assert len(args) == 21
+        compiled_kernels.append(kernel)
+        return compile_kernel(kernel, *args, **kwargs)
+
+    monkeypatch.setattr(dev, "_COMPILE_CACHE", {})
+    monkeypatch.setattr(dev.cute, "compile", record_compile)
+    tpl = (256, 4, 4, 256, 8, False, False)
+
+    compiled = dev.get_compiled(tpl)
+
+    assert dev.get_compiled(tpl) is compiled
+    assert len(compiled_kernels) == 1
+    kernel = compiled_kernels[0]
+    assert (kernel.blk, kernel.u, kernel.minb, kernel.nbs, kernel.kpt, kernel.split) == tpl[:6]
+
+
 @pytest.mark.parametrize(
     "rows,ncols,top_k",
     [
