@@ -105,6 +105,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     llm_args = SimpleNamespace(
         load_format=LoadFormat.GMS,
         lm_head_output_dtype="auto",
+        enable_wide_ep_fault_tolerance=False,
         gms_config=SimpleNamespace(socket_path="/tmp/gms.sock", mode="auto", tag="weights"),
     )
     loader = ModelLoader(
