@@ -17,10 +17,11 @@ from tensorrt_llm._torch.attention.backends import (FlashInferAttention,
                                                     FlashInferAttentionMetadata)
 from tensorrt_llm._torch.attention.backends import \
     flashinfer as flashinfer_backend
+from tensorrt_llm._torch.attention.backends import triton_prefill
 from tensorrt_llm._torch.attention.backends.flashinfer import (
     FlashInferWrappers, PlanParams)
-from tensorrt_llm._torch.attention.backends.interface import \
-    PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.interface import (
+    CustomAttentionMask, PredefinedAttentionMask)
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
@@ -1008,15 +1009,27 @@ class TestFlashInferAttention(unittest.TestCase):
                 kv_positions = torch.arange(prefix + length, device=device)
                 dense_mask = ((kv_positions[None, :] >= starts[:, None])
                               & (kv_positions[None, :] <= positions[:, None]))
-                with mock.patch.object(flashinfer_attn, "flashinfer_backend",
-                                       "trtllm-gen"):
+                dense_mask_flat = dense_mask.flatten().contiguous()
+                with mock.patch.object(
+                        flashinfer_attn, "flashinfer_backend",
+                        "trtllm-gen"), mock.patch.object(
+                            triton_prefill,
+                            "triton_prefill_with_custom_mask",
+                            wraps=triton_prefill.triton_prefill_with_custom_mask
+                        ) as prefill:
                     dense_actual = flashinfer_attn.forward(
                         q,
                         k,
                         v,
                         attn_metadata,
                         attention_window_size=window,
-                        attention_mask_data=dense_mask.flatten().contiguous())
+                        attention_mask=CustomAttentionMask.CUSTOM,
+                        attention_mask_data=dense_mask_flat)
+                prefill.assert_called_once()
+                self.assertIs(prefill.call_args.kwargs["custom_mask"],
+                              dense_mask_flat)
+                self.assertEqual(prefill.call_args.kwargs["max_len_extend"],
+                                 length)
                 torch.testing.assert_close(dense_actual[:length],
                                            reference[:length],
                                            atol=1e-2,
