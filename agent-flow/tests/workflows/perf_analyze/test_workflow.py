@@ -696,6 +696,37 @@ def test_orchestration_prompts_keep_serving_roles_in_one_turn(tmp_path):
         assert "foreground" in captured[role], role
 
 
+def test_external_benchmark_driving_prompt_uses_user_contract(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    workflow.task_path.write_text(
+        yaml.safe_dump(
+            {
+                "benchmark": {
+                    "type": "external",
+                    "path": "/opt/aiperf",
+                    "command": "aiperf benchmark --dataset traces",
+                    "notes": "Read tps_user_p10 from stdout.",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, str] = {}
+    original = workflow.benchmarker
+    workflow.benchmarker = lambda prompt: captured.setdefault("prompt", prompt)
+    try:
+        workflow._run_benchmarker()
+    finally:
+        workflow.benchmarker = original
+        workflow.close()
+
+    prompt = captured["prompt"]
+    assert "/opt/aiperf" in prompt
+    assert "aiperf benchmark --dataset traces" not in prompt  # supplied by the system prompt
+    assert "external benchmark" in prompt
+    assert "benchmark_serving.py" not in prompt
+
+
 def test_each_agent_has_its_progress_tools(tmp_path):
     workflow = Workflow(workspace=tmp_path / "ws")
     expected = {

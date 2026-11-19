@@ -1,5 +1,4 @@
 from ._common import (
-    BENCHMARK_FLAGS_REFERENCE,
     BOTTLENECK_TAXONOMY,
     CASEBOOK_CONSULTATION,
     DORMANT_CAPABILITY_SWEEP,
@@ -162,7 +161,7 @@ acceptance gate, so it must be defensible:
   `server_nsys_metrics.nsys-rep` (Run A2a utilization
   pass), `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
   `server_ncu.ncu-rep` + `ncu_details.txt` / `ncu_raw.csv`, `serve.log`,
-  and any benchmark result JSON you produce
+  and any benchmark output you produce
   while replaying the load.
 - `progress.yaml` — record your turn with `append_analyzer_progress`.
 
@@ -222,8 +221,6 @@ context — do not touch them.
     + SERVE_FLAGS_REFERENCE
     + "\n"
     + TUNING_CONFIG_NOTE
-    + "\n"
-    + BENCHMARK_FLAGS_REFERENCE
     + "\n"
     + MEASUREMENT_PROTOCOL
     + "\n"

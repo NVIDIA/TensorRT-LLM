@@ -76,6 +76,7 @@ _READABLE_AGENTS = (*_AGENTS, "optimizer_evaluator")
 EVALUATOR_DECISIONS = ("APPROVE", "REJECT", "PUSH_BACK")
 EVALUATOR_REASON_CATEGORIES = ("none", "code_quality", "functionality", "perf_shortfall")
 INTEGRATOR_DECISIONS = ("APPROVE", "FALLBACK_BEST", "REJECT")
+BENCHMARK_MEASUREMENT_STATUSES = ("MEASURED", "TARGET_METRIC_MISSING")
 
 # Per-point curve measurements (Pareto-curve mode only: when
 # ``benchmark.concurrency`` in task.yaml is a list). Shared by the
@@ -372,12 +373,66 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
 
         return append_summary_progress
 
-    append_benchmarker_progress = _make_summary_tool(
-        "benchmarker",
-        "Short human-readable summary: the serve + benchmark commands you "
-        "ran, the operating point (ISL/OSL/concurrency), and the headline "
-        "baseline metrics. Name the result files you wrote.",
+    @tool(
+        "append_benchmarker_progress",
+        (
+            "Record the benchmark result and target-metric handoff in progress.yaml. "
+            "Call this exactly once as the last action of your turn."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Short human-readable summary of the benchmark run, "
+                    "headline metrics, and files written.",
+                },
+                "measurement_status": {
+                    "type": "string",
+                    "enum": list(BENCHMARK_MEASUREMENT_STATUSES),
+                    "description": "MEASURED when optimize.target_metric was found in the "
+                    "benchmark output; TARGET_METRIC_MISSING otherwise.",
+                },
+                "target_metric": {
+                    "type": "string",
+                    "description": "The exact optimize.target_metric name from task.yaml.",
+                },
+                "target_metric_value": {
+                    "type": "number",
+                    "description": "The measured target metric value. Required when "
+                    "measurement_status is MEASURED; omit when it is missing.",
+                },
+                "metric_source": {
+                    "type": "string",
+                    "description": "Where the value was read, or which outputs were "
+                    "inspected when the metric was missing.",
+                },
+            },
+            "required": ["summary", "measurement_status", "target_metric", "metric_source"],
+        },
     )
+    async def append_benchmarker_progress(args: dict[str, Any]) -> str:
+        status = args["measurement_status"]
+        if status == "MEASURED" and "target_metric_value" not in args:
+            raise ValueError("target_metric_value is required when measurement_status is MEASURED")
+        entry = _base_entry("benchmarker")
+        entry.update(
+            {
+                key: args[key]
+                for key in (
+                    "summary",
+                    "measurement_status",
+                    "target_metric",
+                    "metric_source",
+                )
+            }
+        )
+        if "target_metric_value" in args:
+            entry["target_metric_value"] = args["target_metric_value"]
+        stored = _append_for_context(entry)
+        _log_progress_write("benchmarker", stored)
+        return _ack("benchmarker")
+
     append_projector_progress = _make_summary_tool(
         "projector",
         "Short human-readable summary: the sources you used (skill, peaks "
