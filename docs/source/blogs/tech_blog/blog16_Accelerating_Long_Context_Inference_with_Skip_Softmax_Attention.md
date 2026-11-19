@@ -239,12 +239,14 @@ trtllm-eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
 
 ```bash
 # Evaluate LongBench V2.
+# Medium subset of LongBench V2.
+# Truncate the prompt length to 256k.
 trtllm-eval --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
 --max_batch_size 1 --max_num_tokens 262144 \
 --extra_llm_api_options extra_llm_api_options.yaml \
 longbench_v2 \
---length medium \  # Medium subset of LongBench V2
---max_input_length 256000 \  # Truncate the prompt length to 256k
+--length medium \
+--max_input_length 256000 \
 --output_dir ${OUTPUT_DIR}  # Dump dataset for perf benching
 ```
 
