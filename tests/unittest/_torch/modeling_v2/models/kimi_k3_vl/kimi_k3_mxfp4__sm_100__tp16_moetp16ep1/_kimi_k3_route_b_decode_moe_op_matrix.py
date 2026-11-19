@@ -38,13 +38,17 @@ import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "comm"))
-import _lockstep as ls  # noqa: E402
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls  # noqa: E402
 
 assert torch.cuda.is_available(), "the Kimi K3 target's MoE decode path requires CUDA devices"
 
@@ -378,7 +382,7 @@ def _run_one_rank(args) -> int:
     import importlib
 
     T = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling"
     )
     DM = T._decode_moe

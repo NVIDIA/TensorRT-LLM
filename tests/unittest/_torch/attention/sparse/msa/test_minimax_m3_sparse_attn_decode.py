@@ -138,7 +138,7 @@ def _make_inputs(
     decode_query_len=1,
     topk=MSA_REQUIRED_TOPK,
     seed=0,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (q, k_paged, v_paged, topk_idx, block_table, seq_lens), in that order.
 
     The order matches both the kernel wrapper and the oracle, so a test can
@@ -718,10 +718,10 @@ def test_msa_prefill_selector_strides_cuda_graph(
     logical = torch.where(columns < valid_count, (rows + heads) % 4 + columns, -1).to(torch.int32)
     if layout == "broadcast":
         logical = logical[:1, :1].expand(num_queries, num_kv_heads, topk)
-        backing.copy_(logical[:1, :1])
+        selected[:1, :1].copy_(logical[:1, :1])
     elif layout == "column-broadcast":
         logical = (4 * ((rows + heads) % 4)).expand(num_queries, num_kv_heads, topk).to(torch.int32)
-        backing.copy_(logical[:, :, :1])
+        selected[:, :, :1].copy_(logical[:, :, :1])
     else:
         selected.copy_(logical)
 
@@ -751,9 +751,9 @@ def test_msa_prefill_selector_strides_cuda_graph(
     for shift in (0, 4):
         current = torch.where(logical >= 0, logical + shift, -1)
         if layout == "broadcast":
-            backing.copy_(current[:1, :1])
+            selected[:1, :1].copy_(current[:1, :1])
         elif layout == "column-broadcast":
-            backing.copy_(current[:, :, :1])
+            selected[:, :, :1].copy_(current[:, :, :1])
         else:
             selected.copy_(current)
         # Gather the known page values directly, independently of MSA's

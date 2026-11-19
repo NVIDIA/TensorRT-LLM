@@ -439,6 +439,14 @@ class SamplingParams:
                 f"under the greedy decoding."
             )
 
+        # An empty stop string tokenizes to no tokens, and the sampler rejects a
+        # stop word without tokens while setting up the request, which fails
+        # every request in flight with it instead of just this one.
+        if self.stop is not None:
+            stop_strings = [self.stop] if isinstance(self.stop, str) else self.stop
+            if any(stop_string == "" for stop_string in stop_strings):
+                raise ValueError("stop must not contain an empty string")
+
         self.logprobs_mode = LogprobMode(self.logprobs_mode)
 
         if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
@@ -592,20 +600,7 @@ class SamplingParams:
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
-        def _encode(tokenizer, text, add_special_tokens):
-            try:
-                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
-            except TypeError:
-                # For tiktokenizer, the encode method does not have add_special_tokens argument
-                return tokenizer.encode(text)
-
-        if self.bad is not None:
-            strs = [self.bad] if isinstance(self.bad, str) else self.bad
-            self._bad_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
-
-        if self.stop is not None:
-            strs = [self.stop] if isinstance(self.stop, str) else self.stop
-            self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
+        self._setup_word_ids(tokenizer, add_special_tokens)
 
         # Add eos_token_id in generation_config to stop_token_ids
         # The eos_token_id in generation_config are really mean to stop the text generation.
@@ -623,6 +618,28 @@ class SamplingParams:
                 self.stop_token_ids = None
 
         return self
+
+    def _setup_word_ids(self, tokenizer, add_special_tokens: bool = False) -> None:
+        """Tokenize the ``stop`` and ``bad`` strings into the token sequences the engine matches.
+
+        This only depends on the tokenizer, so it is needed whether or not ``end_id`` was
+        given explicitly.
+        """
+
+        def _encode(text):
+            try:
+                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            except TypeError:
+                # For tiktokenizer, the encode method does not have add_special_tokens argument
+                return tokenizer.encode(text)
+
+        if self.bad is not None:
+            strs = [self.bad] if isinstance(self.bad, str) else self.bad
+            self._bad_word_ids = [_encode(s) for s in strs]
+
+        if self.stop is not None:
+            strs = [self.stop] if isinstance(self.stop, str) else self.stop
+            self._stop_word_ids = [_encode(s) for s in strs]
 
     def _get_bad_words(self) -> List[List[int]]:
         words = []

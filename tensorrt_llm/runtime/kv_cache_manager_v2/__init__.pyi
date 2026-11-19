@@ -67,6 +67,9 @@ class LogicError(Exception):
 
 class OutOfPagesError(Exception): ...
 
+class RemoteMemError(Exception):
+    """A remote cache level failed a transfer or claim; its contents can no longer be trusted."""
+
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
 
@@ -80,6 +83,11 @@ class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
     DISK = 2
+    REMOTE = 3
+
+class RemoteTransport(enum.Enum):
+    NIXL = 0
+    FABRIC = 1
 
 class PageStatus(enum.Enum):
     LOCKED = enum.auto()
@@ -174,6 +182,8 @@ class StorageStatistics:
     @property
     def evictable(self) -> int: ...
     @property
+    def retained_copies(self) -> int: ...
+    @property
     def available(self) -> int: ...
     @property
     def unavailable(self) -> int: ...
@@ -214,6 +224,7 @@ class ReusedBlocksByLevel:
     full: list[int]
     partial: list[int]
 
+@dataclass(slots=True)
 class SsmSnapshotIterationStatsDelta:
     iter_snapshot_lookups: int = 0
     iter_snapshot_hits: int = 0
@@ -258,6 +269,7 @@ class CacheTierConfig(Protocol):
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int
+    enable_locality_domains: bool = False
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -266,6 +278,7 @@ class GpuCacheTierConfig:
 class HostCacheTierConfig:
     quota: int
     max_quota: int | None = None
+    # Deprecated: set KVCacheManagerConfig.host_mem_backing. False still makes the placement strict.
     allow_remote_numa_fallback: bool = True
     @property
     def tier(self) -> CacheTier: ...
@@ -275,6 +288,30 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int
     path: str
+    num_io_threads: int = 0
+    keep_copy_after_restore: bool = False
+    write_through: bool = False
+    protected_copy_fraction: float = 1.0
+    @property
+    def tier(self) -> CacheTier: ...
+    def validate(self) -> None: ...
+
+@dataclass(slots=True)
+class RemoteTransferConfig:
+    """How a remote tier's pages move, apart from the memory it declares."""
+
+    transport: RemoteTransport = RemoteTransport.NIXL
+    timeout_ms: int = ...  # how long one batch may take before the level fails
+    backend_params: dict[str, str] = ...  # NIXL only: e.g. {"device_list": "mlx5_0"}
+
+@dataclass(slots=True)
+class RemoteCacheTierConfig:
+    quota: int
+    path: str  # the rendezvous directory
+    wait_timeout_ms: int = ...
+    expected_donors: int = 0  # 0: unknown
+    pool_ratio: list[float] = ...  # empty: the hot level's split
+    transfer: RemoteTransferConfig = ...
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -401,7 +438,7 @@ class SparseCacheConfig:
     Setting both on one buffer is rejected.
     """
 
-    selection_id: int | None
+    selection_id: int | None = None
     """Layers whose selection is one selection, named so they can say so.
 
     A model running one indexer across several layers hands them all the same units every
@@ -459,6 +496,39 @@ class SsmLayerConfig:
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
+class RegionAllocationUnit(enum.IntEnum):
+    # One slot per KV cache and beam, held for the cache's lifetime.
+    REQUEST = 0
+    # One page per token block. Not supported yet.
+    TOKEN_BLOCK = 1
+
+@dataclass(slots=True)
+class RegionBuffer:
+    """One buffer of a region; the layer id places it in the per-layer address space."""
+
+    layer_id: LayerId
+    buffer: BufferConfig
+
+@dataclass(slots=True)
+class RegionConfig:
+    """Buffers that share a life cycle of the region's own, never merged with another one.
+
+    Only REQUEST regions with the PRIVATE reuse policy are supported: one slot per living
+    KV cache and beam, never published for reuse, returned when the cache closes. Each
+    buffer sits on a layer that has an SsmLayerConfig and sets no reuse policy of its own.
+
+    ``fixed_slot_count`` set gives the region a pool group of its own with exactly that many
+    GPU slots, which ratio-based sizing (construction, resize(), adjust() and the tuner)
+    leaves alone; a GPU quota too small to hold it is raised. None sizes it by ratio.
+    """
+
+    name: str
+    buffers: list[RegionBuffer]
+    allocation_unit: RegionAllocationUnit = RegionAllocationUnit.REQUEST
+    reuse_policy: ReusePolicy = ReusePolicy.PRIVATE
+    fixed_slot_count: int | None = None
+    def validate(self) -> None: ...
+
 @dataclass(slots=True)
 class KVCacheDesc:
     capacity: int
@@ -482,6 +552,16 @@ class PoolRebalanceConfig:
     target_ratio_update_interval: int = 100
     ratio_tolerance: float = 0.25
     moving_average_decay: float = 0.9999
+
+# Host bytes held by live page slabs in this process.
+def live_slab_bytes() -> int: ...
+
+# How the manager backs the host cache tier's memory; the tier does not read it.
+@dataclass(slots=True)
+class HostMemBackingConfig:
+    numa_node: int | None = None
+    allow_remote_numa_fallback: bool = True
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class KVCacheManagerConfig:
@@ -515,6 +595,13 @@ class KVCacheManagerConfig:
     # gives way between them. The two can only conflict if the floors alone exceed this
     # budget, which construction rejects.
     host_sparse_pool_quota: int | None = None
+    # Regions, each with a life cycle of its own, numbered after every layer life cycle in
+    # declaration order. A (layer, role) pair belongs to one layer config or one region.
+    regions: list[RegionConfig] = ...
+    host_mem_backing: HostMemBackingConfig = ...
+    # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
+    # per-layer-group slot-count proportions at cold page sizes.
+    cold_typical_step: BatchDesc | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -742,6 +829,9 @@ class _KVCache:
     @property
     def num_blocks(self) -> int: ...
     @property
+    def page_storage_version(self) -> int:
+        """Changes whenever this cache's page indices, block count, beam width or history block change."""
+    @property
     def batch_row(self) -> BatchRow | None:
         """Row this cache occupies in its :class:`Batch`, or ``None`` when it belongs to none.
 
@@ -809,7 +899,12 @@ class _KVCache:
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
         is_end: bool = False,
+        ssm_from_pending: bool = False,
     ) -> None: ...
+    def acquire_ssm_snapshot_slot(self) -> int | None: ...
+    @property
+    def pending_ssm_snapshot_slot(self) -> int | None: ...
+    def release_ssm_snapshot_slot(self) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...
     @property
@@ -821,6 +916,8 @@ class _KVCache:
     def committed_tokens(self) -> list[TokenIdExt]: ...
     @property
     def reuse_scope(self) -> ReuseScope: ...
+    @property
+    def locality_domain_id(self) -> int | None: ...
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None:
@@ -884,6 +981,7 @@ class PoolDesc:
     pool_index: PoolIndex
     base_address: MemAddress
     slot_bytes: int
+    mapped_ranges: list[tuple[int, int]]
 
     storage_medium: CacheTier
     """What this pool's pages actually are.
@@ -1783,6 +1881,7 @@ class KVCacheManager:
         text_only: bool | None = None,
         enable_request_stats: bool = False,
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+        locality_domain_id: int | None = None,
     ) -> _KVCache:
         """Create a suspended cache with a prefill-to-generation boundary.
 
@@ -1804,6 +1903,10 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> int: ...
+    def probe_reuse_domains(
+        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+    ) -> list[int]:
+        """GPU-resident pages of the reuse match for input_tokens, counted per locality domain."""
     def probe_first_new_block_key(
         self,
         reuse_scope: ReuseScope | None = None,
@@ -1845,7 +1948,16 @@ class KVCacheManager:
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property
+    def any_remote_level_failed(self) -> bool:
+        """Whether any remote level failed on this rank (a transfer, or its donor went away). Lock-free."""
+        ...
+    @property
     def tokens_per_block(self) -> int: ...
+    @property
+    def num_locality_domains(self) -> int: ...
+    def get_mapped_buffer_views(
+        self, layer_id: LayerId, role: DataRole
+    ) -> list[tuple[MemAddress, int]]: ...
     @property
     def event_manager(self) -> Any | None: ...
     @property
@@ -1883,6 +1995,8 @@ class KVCacheManager:
     # Deprecated: use get_buffer_group_id. Raises RuntimeError for a split layer.
     def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
     def get_buffer_group_id(self, layer_id: LayerId, role: DataRole) -> CacheGroupId: ...
+    # Raises IndexError for a name no region declares.
+    def get_region_group_id(self, name: str) -> CacheGroupId: ...
     # Deprecated: use buffer_grouping. Raises RuntimeError if any layer is split.
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...

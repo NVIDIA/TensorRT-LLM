@@ -27,11 +27,11 @@ TARGET_REL = f"{catalog_paths.MODELING_V2_PACKAGE}/models/gpt_oss/gpt_oss_120b__
 _MODELING = '''\
 """A synthetic target, just enough for the static checks."""
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul import (
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.catalog.activation.silu_and_mul import (
     SiluAndMul,
 )
 
@@ -71,7 +71,7 @@ MODEL_WEIGHTS = SyntheticWeights()
 
 
 _ENTRY = """\
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 
 class Entry(OpWrapper):
@@ -270,7 +270,6 @@ def driver_records(accepted: int = 320, iterations: int = 100, prompts: int = 32
         record = {
             "index": n,
             "id": f"d{n}",
-            "prompt_sha": f"p{n}",
             "tokens": accepted,
             "iterations": iterations,
             "token_ids": list(range(accepted)),
@@ -306,9 +305,6 @@ def _workflow(tmp_path, **kwargs):
     # Scripted like every other outside answer: the fixture repo is not a
     # checkout. An explicit `git_runner=None` selects the real, local git.
     kwargs.setdefault("git_runner", fake_git())
-    # The substrate gate issues a boot-shaped command of its own, which a shell
-    # scripted to fail a specific boot would answer; its test turns it on.
-    kwargs.setdefault("skip_substrate_gate", True)
     # A primer turn per role would answer from the same scripted agents.
     kwargs.setdefault("primers", False)
     return TrtllmModelingV2Workflow(workspace=tmp_path / "ws", **kwargs)
@@ -401,7 +397,3 @@ def _git(repo: Path, *args: str) -> str:
 
 def _state(tmp_path):
     return load_state(tmp_path / "ws" / _STATE)
-
-
-def _substrate_boot(command: str) -> bool:
-    return "TRTLLM_MODELING_V2=off" in command and "engine_driver" in command

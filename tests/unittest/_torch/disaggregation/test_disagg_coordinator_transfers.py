@@ -407,6 +407,71 @@ def test_post_batch_timeout_check_is_gated_on_an_inflight_context_send(clock) ->
     assert gen.py_kv_transfer_timed_out
 
 
+def test_context_timeout_does_not_count_the_wait_for_the_peer_to_ask(clock) -> None:
+    """Nothing is written until the generation peer asks, and under load its
+    request can queue past the timeout; that wait must not expire the send
+    (nvbugs/6621362). Once the peer has asked, the transfer gets the full
+    budget."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: True
+    req = _Request(1)
+    h.send(req)
+    clock["t"] += 2.0
+
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    peer_ready_at = clock["t"]
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: False
+    h.transceiver.context_transfer_peer_ready_time = lambda req: peer_ready_at
+    clock["t"] += 0.5
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 1.0
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
+def test_context_transfer_is_timed_from_when_its_peers_asked(clock) -> None:
+    """Peers that ask between two checks start the transfer clock themselves.
+
+    The check may first see the send only after the peers asked, e.g. after a
+    long executor iteration; the time before they asked is still not charged.
+    """
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    req = _Request(1)
+    h.send(req)
+    peer_ready_at = clock["t"] + 2.5
+    h.transceiver.context_transfer_peer_ready_time = lambda req: peer_ready_at
+    clock["t"] += 3.0
+
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 0.6
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
+def test_context_send_whose_peer_never_asks_still_times_out(clock) -> None:
+    """The deadline is the only thing that ends a send whose peer never asks,
+    so the peer wait is bounded."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    h.transceiver.context_transfer_is_waiting_for_peer = lambda req: True
+    req = _Request(1)
+    h.send(req)
+    ceiling_s = coordinator_module._CTX_PEER_WAIT_TIMEOUT_MULTIPLIER * 1.0
+
+    clock["t"] += ceiling_s
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 1.5
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
 def test_timeout_check_is_inert_without_a_configured_timeout(clock) -> None:
     h = _Harness(kv_transfer_timeout_ms=None)
     req = _Request(1)
@@ -451,6 +516,48 @@ def test_timed_out_requests_under_adp_fail_only_at_the_synced_drain() -> None:
     h.coordinator.handle_timeouts_synced()
     assert h.dist.tp_allgather_int64.call_args_list[-1].args == ([False],)
     assert len(h.effects.failed) == 1
+
+
+def test_fail_timed_out_ends_the_receive_state_of_cancelled_requests() -> None:
+    """Failing a cancelled receive ends its in-progress state.
+
+    A receive that completed after its deadline keeps its state.
+    """
+    h = _Harness()
+    cancelled = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+    completed_late = _Request(
+        2,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+    )
+
+    h.coordinator.fail_timed_out([cancelled, completed_late])
+
+    assert cancelled.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert completed_late.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert h.effects.failed == [
+        ("Request 1 timed out", [cancelled], False),
+        ("Request 2 timed out", [completed_late], False),
+    ]
+
+
+def test_fail_timed_out_ends_the_receive_state_before_the_adp_buffer() -> None:
+    """Under multi-rank ADP the state ends when the request is buffered, not at the synced drain."""
+    h = _Harness(enable_attention_dp=True, world_size=2)
+    req = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+
+    h.coordinator.fail_timed_out([req])
+
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == []
 
 
 def test_fatal_error_during_the_synced_drain_leaves_no_stale_pending_state() -> None:

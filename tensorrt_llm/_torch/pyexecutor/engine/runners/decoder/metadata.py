@@ -38,6 +38,8 @@ if TYPE_CHECKING:
         AttentionRuntimeFeatures,
     )
     from tensorrt_llm._torch.distributed import Distributed
+    from tensorrt_llm._torch.host_staging import HostUploader
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
     from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
@@ -46,9 +48,15 @@ if TYPE_CHECKING:
     from .inputs import DecoderInputBuffers
 
 
-def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
-    """Resolve the model-specific Mamba metadata class with a default."""
-    return getattr(model, "mamba_metadata_cls", None) or Mamba2Metadata
+def resolve_mamba_metadata_cls(
+    model: torch.nn.Module, kv_cache_manager: object | None = None
+) -> type[Mamba2Metadata]:
+    """Resolve the Mamba metadata class: the model's, else the cache manager's, else the default."""
+    return (
+        getattr(model, "mamba_metadata_cls", None)
+        or getattr(kv_cache_manager, "mamba_metadata_cls", None)
+        or Mamba2Metadata
+    )
 
 
 class DecoderMetadata:
@@ -56,6 +64,7 @@ class DecoderMetadata:
 
     # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
     runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+    _host_uploader: HostUploader | None = None
 
     def __init__(
         self,
@@ -65,6 +74,7 @@ class DecoderMetadata:
         model: torch.nn.Module,
         buffers: DecoderInputBuffers,
         attention_runtime_features: AttentionRuntimeFeatures,
+        host_uploader: HostUploader | None = None,
     ) -> None:
         self._config = config
         self.mapping = mapping
@@ -72,6 +82,8 @@ class DecoderMetadata:
         self.runtime_hooks = runtime_hooks_of(model)
         self._buffers = buffers
         self._attention_runtime_features = attention_runtime_features
+        # Uploads the per-step metadata between decode replays.
+        self._host_uploader = host_uploader
         # This field is initialized lazily on the first forward pass.
         # This is convenient because:
         # 1) The attention metadata depends on the KV cache manager.
@@ -115,7 +127,11 @@ class DecoderMetadata:
             self.attn_metadata.mamba_chunk_size = getattr(
                 config, "chunk_size", self.attn_metadata.mamba_chunk_size
             )
-        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
+        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(
+            self.model, kv_cache_manager
+        )
+        if isinstance(self.attn_metadata, TrtllmAttentionMetadata):
+            self.attn_metadata.host_uploader = self._host_uploader
         self._arm_msa_policy(kv_cache_manager)
 
         return self.attn_metadata
@@ -157,7 +173,10 @@ class DecoderMetadata:
         self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
         self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
         if self.runtime_hooks.pack_spec_rng_uploads:
-            logger.info("[M3 host] sampled-step Philox uploads staged into the step-input pack")
+            logger.info(
+                "Sampled-step Philox uploads: written by the steady MTP stager on its steps, "
+                "else staged into the step-input pack when one is open"
+            )
         if self.runtime_hooks.spec_small_h2d:
             logger.info(
                 "[M3 host] spec step small uploads off the boundary (accepted counts packed, static slot ids)"
@@ -315,6 +334,26 @@ def get_spec_managers(
     return spec_resource_manager, getattr(spec_resource_manager, "spec_tree_manager", None)
 
 
+def supports_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mapping | None) -> bool:
+    """Whether the MTP-Eagle fast paths' decode CUDA graphs can capture the temperature-only variant."""
+    # It draws the sampled rows on vocabulary-sharded logits without the watermark, so a
+    # watermark configuration keeps the ordinary sampler.
+    return (
+        config.cuda_graph_config is not None
+        and config.spec_decode_fast_paths
+        and config.watermark_config is None
+        and supports_sharded_target_sampling(config.spec_config, mapping)
+    )
+
+
+def captures_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mapping | None) -> bool:
+    """Whether temperature-only batches get graphs of their own rather than the advanced ones."""
+    listed = getattr(config.cuda_graph_config, "sampling_variants", None)
+    return supports_temperature_only_graphs(config, mapping) and (
+        listed is None or "temperature_only" in listed
+    )
+
+
 def create_spec_metadata(
     config: DecoderRunnerConfig,
     pretrained_config: object,
@@ -322,7 +361,7 @@ def create_spec_metadata(
     mapping: Mapping | None = None,
 ) -> SpecMetadata | None:
     """Create speculative metadata sized by the runner capacities."""
-    return get_spec_metadata(
+    metadata = get_spec_metadata(
         config.spec_config,
         pretrained_config,
         config.max_batch_size,
@@ -330,15 +369,16 @@ def create_spec_metadata(
         spec_resource_manager=spec_resource_manager,
         max_seq_len=config.max_seq_len,
         num_seq_slots=config.num_seq_slots,
-        # The decode CUDA graphs then capture the temperature-only variant. It draws the
-        # sampled rows on vocabulary-sharded logits without the watermark, so a watermark
-        # configuration keeps the ordinary sampler.
-        temperature_only_graphs=config.cuda_graph_config is not None
-        and config.spec_decode_fast_paths
-        and config.watermark_config is None
-        and supports_sharded_target_sampling(config.spec_config, mapping),
+        # The decode CUDA graphs then capture the temperature-only variant.
+        temperature_only_graphs=captures_temperature_only_graphs(config, mapping),
         watermark_config=config.watermark_config,
     )
+    if metadata is not None:
+        metadata.samples_from_vocab_shards = config.samples_from_vocab_shards
+        listed = getattr(config.cuda_graph_config, "sampling_variants", None)
+        metadata.greedy_graphs = listed is None or "greedy" in listed
+        metadata.shard_temperature_only_graphs = listed is None or "temperature_only" in listed
+    return metadata
 
 
 def update_spec_metadata(
@@ -387,11 +427,22 @@ def update_spec_metadata(
     )
 
 
+def samples_from_adp_head_shards(spec_metadata: SpecMetadata | None, mapping: Mapping) -> bool:
+    """Whether attention-DP ranks sample target rows from shards of a shared LM head."""
+    return (
+        mapping.enable_attention_dp
+        and spec_metadata is not None
+        and spec_metadata.samples_from_vocab_shards
+    )
+
+
 def sync_group_all_greedy_sample(
     spec_metadata: SpecMetadata,
     mapping: Mapping,
     dist: Distributed | None,
     *,
+    cuda_graph_runner: CUDAGraphRunner | None = None,
+    batch: ScheduledRequests | None = None,
     confidence_enabled: bool = False,
 ) -> None:
     """All-gather the per-rank greedy flags and store the group AND.
@@ -406,25 +457,51 @@ def sync_group_all_greedy_sample(
     subgroup. A dedicated host all-gather rather than a piggyback on the
     ``all_rank_num_tokens`` exchange, which runs in ``prepare_inputs`` --
     after the graph key, too late for the key to see the synced value.
+
+    Ranks that sample target rows from shards of a shared head also agree on
+    the temperature-only variant, whose kernels exchange data across the
+    group. Their flags ride the padding exchange of ``batch``'s forward
+    (``one_model_sampling_mode``), which every rank runs before the key;
+    only without one (CUDA graphs off) do they take the exchange here.
     """
-    # Confidence needs the same group-uniform rejection decision even without
-    # LM-head TP. Feature-off execution retains the existing gate.
+    shard_sampling = samples_from_adp_head_shards(spec_metadata, mapping)
+    # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
+    # Mapping.__init__), so ADP needs no separate check here. Confidence needs the
+    # same group-uniform rejection decision even without LM-head TP.
     if not (
-        spec_metadata.use_rejection_sampling
-        and (mapping.enable_lm_head_tp_in_adp or confidence_enabled)
+        (
+            spec_metadata.use_rejection_sampling
+            and (mapping.enable_lm_head_tp_in_adp or confidence_enabled)
+        )
+        or shard_sampling
     ):
         return
-    local_flag = bool(spec_metadata.is_all_greedy_sample)
-    if mapping.tp_size > 1:
-        all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
-        spec_metadata.group_all_greedy_sample = bool(all_flags.all())
-    else:
-        spec_metadata.group_all_greedy_sample = local_flag
+    local = (
+        int(spec_metadata.is_all_greedy_sample) | int(spec_metadata.local_all_temperature_only) << 1
+    )
+    modes = (
+        cuda_graph_runner.take_sampling_modes(batch)
+        if shard_sampling and cuda_graph_runner is not None
+        else None
+    )
+    if modes is None:
+        modes = dist.tp_allgather_int64([local])[:, 0].tolist() if mapping.tp_size > 1 else [local]
+    elif modes[mapping.tp_rank] != local:
+        raise RuntimeError(
+            f"rank {mapping.tp_rank} sent sampling mode {modes[mapping.tp_rank]} "
+            f"for a batch whose scan gives {local}"
+        )
+    spec_metadata.group_all_greedy_sample = all(mode & 1 for mode in modes)
     # Also overwrite the live flag directly: this iteration's scan already
     # ran (update_is_all_greedy_sample just returned) and the CUDA graph
     # key reads the flag next -- the stored override only takes effect on
     # the NEXT rescan (populate), which is after key selection.
     spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+    if shard_sampling:
+        spec_metadata.group_all_temperature_only = all(mode & 2 for mode in modes)
+        spec_metadata.is_all_temperature_only = (
+            spec_metadata.group_all_temperature_only and not spec_metadata.is_all_greedy_sample
+        )
 
 
 def supports_advanced_draft_sampling(spec_config: DecodingBaseConfig | None) -> bool:
@@ -453,6 +530,7 @@ def set_spec_metadata_all_rank_num_tokens(
     spec_all_rank_num_tokens: list[int],
     all_rank_num_seqs: list[int],
     all_rank_num_gens: list[int] | None = None,
+    all_rank_draft_lens: list[int] | None = None,
 ) -> None:
     # Eagle3 / MTP-eagle one-model use subseq_all_rank_num_tokens for
     # draft loop iterations i>0 (per-sequence counts, since each
@@ -469,6 +547,10 @@ def set_spec_metadata_all_rank_num_tokens(
     # chunk loop identical across EP ranks.
     if all_rank_num_gens is not None:
         spec_metadata.all_rank_num_gens = all_rank_num_gens
+    # Each rank picks its draft length from its own batch, so a rank whose
+    # schedule turned speculation off still has to know whether a peer drafts.
+    if all_rank_draft_lens is not None:
+        spec_metadata.all_rank_draft_lens = all_rank_draft_lens
     if (
         spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
         or spec_metadata.spec_dec_mode.is_eagle3_one_model()

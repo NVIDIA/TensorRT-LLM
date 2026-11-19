@@ -20,6 +20,8 @@ from typing import ClassVar
 import numpy as np
 import pytest
 from PIL import Image
+from pytest_mock import MockerFixture
+from test_common.moe_tactics import skip_unless_moe_tactic_runs_here
 from transformers import AutoProcessor
 
 from tensorrt_llm import LLM
@@ -317,9 +319,9 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(183000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_tactic",
         [
-            (4, 1, 4, False, True, True, "TRTLLM"),
+            (4, 1, 4, False, True, True, "trtllm_gen"),
         ],
         ids=[
             "latency_moe_trtllm",
@@ -327,15 +329,16 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_4gpus(
         self,
-        tp_size,
-        pp_size,
-        ep_size,
-        attention_dp,
-        cuda_graph,
-        overlap_scheduler,
-        moe_backend,
-        mocker,
-    ):
+        tp_size: int,
+        pp_size: int,
+        ep_size: int,
+        attention_dp: bool,
+        cuda_graph: bool,
+        overlap_scheduler: bool,
+        moe_tactic: str,
+        mocker: MockerFixture,
+    ) -> None:
+        skip_unless_moe_tactic_runs_here(moe_tactic)
         mocker.patch.dict(
             MMMU.EVALUATE_KWARGS,
             {
@@ -346,7 +349,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_config=MoeConfig(backend=moe_backend),
+            moe_config=MoeConfig(tactic=moe_tactic),
         )
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
@@ -512,6 +515,9 @@ class TestQwen3_8_Flash_Next_VL(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(
                 max_batch_size=self.MAX_BATCH_SIZE, enable_padding=True
             ),
+            # Stays on a backend literal: on SM103 the default modeling_v2
+            # routes this checkpoint to the Qwen3.8-Flash-Next target, which
+            # honors no tactic, so a tactic would build the built-in model.
             moe_config=MoeConfig(backend=moe_backend),
             speculative_config=MTPDecodingConfig(max_draft_len=3),
         ) as llm:
@@ -638,7 +644,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         """MMMU-val on the K3 VL checkpoint (16 GPUs, DEP16).
 
         No automated L0 stage schedules 16-GPU functional tests; this case is
-        registered in qa/llm_function_multinode.yml and run by QA's weekly
+        registered in qa/functional/llm_function_multinode.yml and run by QA's weekly
         multinode pipeline (qualified on 4x4 GB300 nodes; reference in
         references/mmmu.yaml). Mirrors examples/kimi_k3/run_eval_kimi_k3.sbatch
         --task mmmu: the base eval_extra_llm_options.yaml serving config with
@@ -656,17 +662,10 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
             moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
-            # use_kv_cache_manager_v2=False: the VL wrapper inherits K2.5's
-            # V2 cache-manager preference, but the qualified K3 MMMU
-            # configuration ran V1, and under V2 this test's long-generation
-            # shape (max_seq_len 24576, 16k-token outputs) stalled with all
-            # GPUs idle in QA validation (the GSM8K legs' shorter shape runs
-            # fine under V2). Pin V1 until the V2 x KDA-hybrid path is
-            # qualified at this shape.
             kv_cache_config=KvCacheConfig(
                 free_gpu_memory_fraction=0.25,
                 tokens_per_block=64,
-                use_kv_cache_manager_v2=False,
+                use_kv_cache_manager_v2=True,
             ),
         ) as llm:
             # Reference-key contract: the K3 checkpoint carries its

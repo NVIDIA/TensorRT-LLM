@@ -13,6 +13,7 @@ from torch import nn
 
 import tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph as bcg
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -476,6 +477,27 @@ def test_runner_captures_break_graphs_only_in_capture_break_graphs():
     assert runner.num_break_graphs == 0 and runner._break_graph_pool is None
 
 
+def test_runner_capture_promotes_window_releases_before_warmup(monkeypatch):
+    # Windows released on another stream must be reusable from the capture stream on every
+    # rank before warmup requests any, else best-fit diverges across ranks and deadlocks.
+    runner = BreakableCUDAGraphRunner(_Body().cuda())
+    events = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner."
+        "promote_synchronized_nccl_window_releases",
+        lambda: events.append("promote"),
+    )
+    monkeypatch.setattr(runner, "warmup", lambda *_args: events.append("warmup"))
+
+    def engine_forward():
+        raise RuntimeError("stop after warmup")
+
+    with pytest.raises(RuntimeError, match="stop after warmup"):
+        runner.capture(4, engine_forward)
+
+    assert events == ["promote", "warmup"]
+
+
 def test_runner_clear_releases_memory_pool_after_graph_reset(monkeypatch):
     runner = BreakableCUDAGraphRunner(_Body().cuda())
     pool = (12345, 67890)
@@ -525,6 +547,68 @@ def test_runner_graph_miss_nested_execute_and_exception_recovery():
         runner.execute(4, fail)
     assert runner.state == BreakableCUDAGraphRunnerState.IDLE
     assert body.forward == original_forward
+
+
+def test_runner_refreshes_pre_capture_state_through_a_model_wrapper():
+    """Replay matches eager when the body reads state computed outside capture (Engram hashes)."""
+
+    class StatefulBody(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hashes = torch.zeros((8, 4), device="cuda")
+
+        def refresh(self, value):
+            self.hashes[: value.shape[0]].copy_(value * 10)
+
+        def forward(self, value):
+            if not torch.cuda.is_current_stream_capturing():
+                self.refresh(value)
+            return value + self.hashes[: value.shape[0]]
+
+    body = StatefulBody().cuda()
+
+    class CausalLM(DecoderModelForCausalLM):
+        def prepare_breakable_cuda_graph_replay(self, inputs):
+            self.model.refresh(inputs["value"])
+
+        def forward(self, value):
+            return self.model(value=value)
+
+    causal_lm = object.__new__(CausalLM)
+    nn.Module.__init__(causal_lm)
+    causal_lm.model = body
+
+    class Wrapper(nn.Module):
+        """Exposes the causal LM only as ``llm``, like a multimodal model."""
+
+        def __init__(self):
+            super().__init__()
+            self.llm = causal_lm
+
+        def forward(self, value):
+            return self.llm(value)
+
+    model = Wrapper()
+    decoder_runner = object.__new__(DecoderRunner)
+    decoder_runner._model = model
+    decoder_runner._config = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        prefill_cuda_graph_num_tokens=[4],
+    )
+    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    staged = torch.zeros((4, 4), device="cuda")
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: model(staged))
+        return model(staged)
+
+    runner.capture(4, engine_forward)
+    for value in (2.0, 7.0):
+        staged.fill_(value)
+        replayed = runner.execute(4, engine_forward).clone()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(replayed, model(staged))
 
 
 def test_runner_warmup_exception_restores_idle_state():
@@ -664,6 +748,11 @@ class _PositionBody(nn.Module):
 
 class _EchoWorker:
     """Spec worker stand-in returning the target hidden states."""
+
+    reads_lm_head_dtype_logits = False
+
+    def takes_vocab_sharded_target_logits(self, *args):
+        return False
 
     def target_logits(self, hidden_states, *args):
         return hidden_states

@@ -345,6 +345,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
         self.all_reduce = None
+        self.dummy_all_reduce = None
         # Debug function for eliminating imbalance during performance analysis.
         self.enable_dummy_allreduce = os.environ.get(
             "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
@@ -353,11 +354,15 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 mapping=self.mapping,
                 strategy=model_config.allreduce_strategy,
                 dtype=self.dtype)
-        elif self.enable_dummy_allreduce:
+        if self.enable_dummy_allreduce:
+            # Always NCCL: the model's strategy (e.g. TWOSHOT at TP 2/4)
+            # rejects the 4-element dummy tensor.
             from tensorrt_llm.functional import AllReduceStrategy
-            self.all_reduce = AllReduce(mapping=self.mapping,
-                                        strategy=AllReduceStrategy.NCCL,
-                                        dtype=self.dtype)
+            self.dummy_all_reduce = AllReduce(mapping=self.mapping,
+                                              strategy=AllReduceStrategy.NCCL,
+                                              dtype=self.dtype)
+            if self.all_reduce is None:
+                self.all_reduce = self.dummy_all_reduce
 
         # Initialize load balancer related attributes
         if init_load_balancer:
@@ -380,6 +385,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 range(self.slot_start, self.slot_end))
             self.initial_global_assignments = list(range(self.num_experts))
             self.allreduce = None
+            self._warmup_placement = None
+            self._warmup_placement_index = None
 
         # The DWDP layout is not set here: ConfigurableMoE sizes a layer DWDP
         # manages once its backend exists (_decide_dwdp), and every other layer
@@ -529,6 +536,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         self.layer_load_balancer = None
         self.repeat_idx = 0
         self.repeat_count = 1
+        self._warmup_placement = None
+        self._warmup_placement_index = None
 
         # Get global load balancer instance
         moe_load_balancer = get_moe_load_balancer()
@@ -617,6 +626,21 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
 
             self.layer_load_balancer.set_initial_weight_assignments(
                 self.initial_global_assignments)
+
+            warmup_placement = getattr(moe_load_balancer, "warmup_placement",
+                                       None)
+            if warmup_placement is not None:
+                self._warmup_placement = warmup_placement
+                self._warmup_placement_index = warmup_placement.register_layer(
+                    self,
+                    self.layer_load_balancer,
+                    self.num_experts,
+                    top_k,
+                    self.expert_size_per_partition,
+                    self.initial_global_assignments,
+                    row_space=model_config.moe_row_space,
+                    rows_per_request=model_config.moe_row_space_rows_per_request
+                )
 
             from tensorrt_llm.logger import logger
             logger.info(
@@ -738,6 +762,29 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             yield
         finally:
             self._load_balancer_overlap_fn = None
+
+    def _warmup_placement_route_counters(self, row_offset: Optional[int]):
+        """This layer's warmup placement counters for a routing launch that counts its own picks
+        (``row_offset``: the chunk's first row in the forward; None for rows already counted), or
+        None when the placement does not learn the layer."""
+        if self._warmup_placement_index is None or row_offset is None:
+            return None
+        return self._warmup_placement.route_counters(
+            self._warmup_placement_index, row_offset)
+
+    def _load_balancer_count_warmup(self, token_selected_experts: torch.Tensor,
+                                    router_logits: Optional[torch.Tensor],
+                                    row_offset: Optional[int]) -> None:
+        """Count this chunk's picks for the warmup placement in a separate launch (while it
+        learns; inside a captured graph the launch exits on the device flag once frozen)."""
+        if self._warmup_placement_index is None or row_offset is None:
+            return
+        counters = self._warmup_placement.counters(self._warmup_placement_index,
+                                                   row_offset)
+        if counters is None:
+            return
+        from .moe_warmup_placement import count_routing
+        count_routing(token_selected_experts, counters, router_logits)
 
     def _load_balancer_route(self, token_selected_experts: torch.Tensor,
                              use_dp: bool) -> torch.Tensor:
@@ -923,6 +970,10 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 raise NotImplementedError(
                     "the `trtllm::moe_custom_op` graph path cannot carry prerouted routing"
                 )
+            if kwargs.get("lamport_fc2_out") is not None:
+                raise NotImplementedError(
+                    "the `trtllm::moe_custom_op` graph path cannot carry a Lamport FC2 output"
+                )
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x
             x_sf = x.scaling_factor if isinstance(x,
@@ -967,6 +1018,11 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         """
         return False
 
+    @property
+    def has_comm_strategy(self) -> bool:
+        """ has_comm_strategy (bool): whether the layer holds a communication strategy """
+        return False
+
     def can_use_deep_ep_direct_metadata(
             self, supports_post_quant_dispatch: bool) -> bool:
         """Return whether this backend instance can consume DeepEP counts directly.
@@ -1001,12 +1057,12 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         return outputs
 
     def dummy_allreduce(self):
-        assert self.enable_dummy_allreduce and self.all_reduce is not None, "Dummy allreduce is not enabled"
+        assert self.enable_dummy_allreduce and self.dummy_all_reduce is not None, "Dummy allreduce is not enabled"
         """
         Debug function for eliminating imbalance during performance analysis.
         Creates a small dummy tensor and performs allreduce to synchronize processes
         and eliminate timing imbalances for more accurate profiling measurements.
         """
         dummy_tensor = torch.zeros(4, dtype=torch.float32, device="cuda")
-        dummy_tensor = self.all_reduce(dummy_tensor)
+        dummy_tensor = self.dummy_all_reduce(dummy_tensor)
         return dummy_tensor

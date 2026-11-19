@@ -15,7 +15,10 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
+    AutotunerWarmupMode,
+    DecoderWarmup,
+)
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
@@ -255,6 +258,8 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
 
     def observe(phase):
         def forward(*args, **kwargs):
+            if phase == "_run_autotuner_warmup":
+                assert kwargs == {"mode": AutotunerWarmupMode.CONTEXT_AND_SINGLE_GENERATION}
             observed.append((phase, model.use_compiled_forward()))
 
         return forward
@@ -270,6 +275,11 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         "_freeze_eager_workspace_floor",
     ):
         monkeypatch.setattr(warmup, method, Mock())
+    monkeypatch.setattr(
+        warmup,
+        "_prewarm_fmha_libraries",
+        lambda _: observed.append(("_prewarm_fmha_libraries", None)),
+    )
     for method in (
         "_run_attention_warmup",
         "_run_autotuner_warmup",
@@ -278,6 +288,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     ):
         monkeypatch.setattr(warmup, method, observe(method))
     monkeypatch.setattr(graphs, "run_cuda_graph_warmup", observe("_run_cuda_graph_warmup"))
+    monkeypatch.setattr(graphs, "_warm_inforward_split", Mock())
     monkeypatch.setattr(warmup_module, "warmup_sampling_module", Mock())
     monkeypatch.setattr(warmup_module, "log_mem_snapshot", Mock())
     monkeypatch.setattr(warmup_module.AutoTuner, "get", Mock())
@@ -297,6 +308,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         warmup._warmup_scheduled(Mock(), SimpleNamespace(context_swa_layer_limit=None))
 
     assert observed == [
+        ("_prewarm_fmha_libraries", None),
         ("_run_attention_warmup", not enabled),
         ("_general_warmup", True),
         ("_run_autotuner_warmup", not enabled),

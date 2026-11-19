@@ -36,31 +36,19 @@ from __future__ import annotations
 
 import math
 import zlib
-from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3 import routing
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.deepseek_v3 import routing
+from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
     weights as D,
 )
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _limit_cpu_threads() -> Iterator[None]:
-    """Keep small tensor transforms within CPU-constrained workers' thread budget."""
-    previous_threads = torch.get_num_threads()
-    torch.set_num_threads(min(previous_threads, 2))
-    try:
-        yield
-    finally:
-        torch.set_num_threads(previous_threads)
 
 
 _LAYOUTS = sorted(routing._DEFAULT_LAYOUTS)
