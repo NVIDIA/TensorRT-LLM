@@ -14,7 +14,7 @@ import os
 
 # Only serializes reports; IpcQueue authenticates frames before deserialization.
 import pickle  # nosec B403
-import select
+import selectors
 import socket
 
 # Runs this interpreter and this helper with fixed argv, without a shell.
@@ -46,6 +46,17 @@ WORKER_WATCH_HINT = (
     "supervision."
 )
 logger = logging.getLogger(__name__)
+
+
+def _wait_readable(stream, timeout: float) -> bool:
+    """Wait until a pipe is readable without select()'s FD_SETSIZE limit.
+
+    Workers can hold more than 1024 descriptors (CUDA, NCCL, sockets), so the
+    helper's pipe may be numbered beyond what select.select() accepts.
+    """
+    with selectors.DefaultSelector() as selector:
+        selector.register(stream, selectors.EVENT_READ)
+        return bool(selector.select(timeout))
 
 
 @dataclass(frozen=True)
@@ -300,7 +311,7 @@ class WorkerProcessWatch:
         try:
             self._process.stdin.write(json.dumps(config) + "\n")
             self._process.stdin.flush()
-            readable, _, _ = select.select([self._process.stdout], [], [], _START_TIMEOUT)
+            readable = _wait_readable(self._process.stdout, _START_TIMEOUT)
             if not readable or self._process.stdout.readline().strip() != "ready":
                 from tensorrt_llm._errors import RuntimeInitError
 
@@ -391,8 +402,7 @@ def _watch_process() -> int:
             if report["kind"] != "alive":
                 return 0
             report["sequence"] += 1
-            readable, _, _ = select.select([sys.stdin], [], [], _HEARTBEAT_INTERVAL)
-            if readable:
+            if _wait_readable(sys.stdin, _HEARTBEAT_INTERVAL):
                 # A stop request means the worker call ended in a live process;
                 # end of input without one means the worker process is gone.
                 stopped = sys.stdin.readline().strip() == "stop"

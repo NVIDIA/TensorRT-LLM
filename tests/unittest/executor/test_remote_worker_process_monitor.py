@@ -235,6 +235,40 @@ def test_disabled_supervision_is_silent_without_network_settings(monkeypatch, ca
         monitor.close()
 
 
+@pytest.mark.timeout(30, method="thread")
+def test_watch_starts_when_worker_descriptors_exceed_fd_setsize(monkeypatch):
+    # Regression: select.select() raises ValueError for descriptors >= 1024,
+    # and workers often hold that many (CUDA, NCCL, sockets), so the helper's
+    # pipe failed every startup on such a rank.
+    resource = pytest.importorskip("resource")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = 1100
+    if hard != resource.RLIM_INFINITY and hard < wanted:
+        pytest.skip("hard RLIMIT_NOFILE is too low to cross FD_SETSIZE")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, wanted), hard))
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monitor = remote.RemoteWorkerProcessMonitor(1)
+    filler = []
+    watch = None
+    try:
+        while True:
+            fd = os.open(os.devnull, os.O_RDONLY)
+            if fd >= 1030:
+                os.close(fd)
+                break
+            filler.append(fd)
+        watch = remote.WorkerProcessWatch(monitor.endpoint, 0)
+        assert watch._process.stdout.fileno() >= 1024
+        assert monitor.wait_ready(timeout=5)
+    finally:
+        if watch is not None:
+            watch.close()
+        monitor.close()
+        for fd in filler:
+            os.close(fd)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
 def test_unreachable_watch_helper_reports_rank_endpoint_and_configuration_hint(monkeypatch):
     monkeypatch.setattr(remote, "_START_TIMEOUT", 0.1)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
