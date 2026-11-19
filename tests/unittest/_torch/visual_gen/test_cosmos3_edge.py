@@ -1123,8 +1123,10 @@ class TestSamplingRecipeMatrix:
             return pipeline
 
         skip = ["text_tokenizer", "tokenizer", "vae", "sound_tokenizer"]
+        pipeline = fresh_pipeline()
+        pipeline._read_checkpoint_settings(str(tmp_path))
         with pytest.raises(ValueError, match="use_native_flow_schedule"):
-            fresh_pipeline().load_standard_components(str(tmp_path), torch.device("cpu"), skip)
+            pipeline.load_standard_components(str(tmp_path), torch.device("cpu"), skip)
 
         write_checkpoint_files(
             tmp_path,
@@ -1136,6 +1138,7 @@ class TestSamplingRecipeMatrix:
             },
         )
         pipeline = fresh_pipeline()
+        pipeline._read_checkpoint_settings(str(tmp_path))
         pipeline.load_standard_components(str(tmp_path), torch.device("cpu"), skip)
         assert pipeline.sampling.native_flow_schedule is True
         scheduler = pipeline._scheduler_for(_native_flow_schedule(3.0))

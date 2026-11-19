@@ -426,8 +426,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def resolver(self) -> ParameterResolver:
-        """The checkpoint's settings; available once ``load_standard_components`` has
-        read the checkpoint."""
+        """The checkpoint's settings; available once ``load_transformer_weights`` has
+        read them."""
         if self._resolver is None:
             raise RuntimeError("Cosmos3 pipeline: the checkpoint has not been loaded yet.")
         return self._resolver
@@ -556,13 +556,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.transformer.load_weights(transformer_weights)
             self.transformer.eval()
 
-    def load_standard_components(
-        self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
-    ) -> None:
-        skip_components = skip_components or []
-
-        # The transformer config is read from the checkpoint directory, not from the
-        # loaded pretrained config, whose omitted keys the transformer has already filled.
+    def _read_checkpoint_settings(self, checkpoint_dir: str) -> None:
+        """Resolve the checkpoint's settings from its JSON files. Raises on a checkpoint
+        whose files omit a required setting or disagree on one."""
         self.resolver = ParameterResolver.from_checkpoint(
             checkpoint_dir, self.family, log=self.rank == 0
         )
@@ -570,6 +566,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if self.rank == 0:
             logger.info(cfg.describe())
         self.use_native_flow_schedule = cfg.sampling.native_flow_schedule
+
+    def load_transformer_weights(self, checkpoint_dir: str) -> dict[str, torch.Tensor]:
+        # Settings first: a checkpoint they reject fails before its weights are read.
+        self._read_checkpoint_settings(checkpoint_dir)
+        return super().load_transformer_weights(checkpoint_dir)
+
+    def load_standard_components(
+        self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
+    ) -> None:
+        skip_components = skip_components or []
+        cfg = self.resolver.config()
 
         if self.audio_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
             logger.info("Loading audio tokenizer...")

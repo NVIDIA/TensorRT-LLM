@@ -85,6 +85,14 @@ def _write_trained_config(checkpoint_dir: Path, use_system_prompt: Optional[bool
     )
 
 
+def _load_scheduler(pipeline: Cosmos3OmniMoTPipeline, checkpoint_dir: Path) -> None:
+    """Load the checkpoint's settings and its scheduler, in the loader's order."""
+    pipeline._read_checkpoint_settings(str(checkpoint_dir))
+    pipeline.load_standard_components(
+        str(checkpoint_dir), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
+    )
+
+
 # The schedule every request on a distilled checkpoint resolves to.
 _FIXED = SamplingSchedule(grid="fixed", flow_shift=1.0)
 
@@ -624,9 +632,7 @@ class TestPipelineSchedulerLoading:
         _write_trained_config(tmp_path, False)
         pipeline = _bare_pipeline()
 
-        pipeline.load_standard_components(
-            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
-        )
+        _load_scheduler(pipeline, tmp_path)
 
         assert isinstance(pipeline.scheduler, FlowMatchEulerDiscreteScheduler)
         assert pipeline.sampling.is_distilled
@@ -637,9 +643,7 @@ class TestPipelineSchedulerLoading:
         _write_trained_config(tmp_path, False)
         pipeline = _bare_pipeline()
 
-        pipeline.load_standard_components(
-            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
-        )
+        _load_scheduler(pipeline, tmp_path)
 
         assert isinstance(pipeline.scheduler, UniPCMultistepScheduler)
         assert not pipeline.sampling.is_distilled
@@ -650,9 +654,7 @@ class TestPipelineSchedulerLoading:
         _write_trained_config(tmp_path, False)
         pipeline = _bare_pipeline(audio_gen=True)
 
-        pipeline.load_standard_components(
-            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
-        )
+        _load_scheduler(pipeline, tmp_path)
 
         assert isinstance(pipeline.audio_scheduler, FlowMatchEulerDiscreteScheduler)
         assert pipeline.audio_scheduler is not pipeline.scheduler
@@ -1072,9 +1074,7 @@ class TestSystemPromptDefault:
     def _loaded_pipeline(self, tmp_path) -> Cosmos3OmniMoTPipeline:
         _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
         pipeline = _bare_pipeline()
-        pipeline.load_standard_components(
-            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
-        )
+        _load_scheduler(pipeline, tmp_path)
         return pipeline
 
     def test_checkpoint_declared_true(self, tmp_path):
@@ -1099,6 +1099,21 @@ class TestSystemPromptDefault:
         _write_trained_config(tmp_path, None)
         with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt"):
             self._loaded_pipeline(tmp_path)
+
+    def test_rejected_settings_fail_before_the_weights_are_read(self, tmp_path):
+        # No transformer directory exists, so reaching the weights would raise
+        # FileNotFoundError; the settings error comes first.
+        _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt"):
+            _bare_pipeline().load_transformer_weights(str(tmp_path))
+
+    def test_components_need_the_settings_first(self, tmp_path):
+        _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        _write_trained_config(tmp_path, False)
+        with pytest.raises(RuntimeError, match="has not been loaded"):
+            _bare_pipeline(resolver=None).load_standard_components(
+                str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
+            )
 
     @pytest.mark.parametrize("trained", [False, True])
     def test_trained_config_wins_over_model_index(self, tmp_path, trained):
