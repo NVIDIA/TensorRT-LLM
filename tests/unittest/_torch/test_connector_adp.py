@@ -1356,8 +1356,8 @@ def test_rank_state_preserves_transfer_snapshot_and_old_payloads() -> None:
         connector_poll_failed=True,
     )
     assert RankState.deserialize(state.serialize()) == state
-    # The layout before the connector counters and the tagged in-transfer count.
-    old_state = RankState.deserialize(state.serialize()[:-4])
+    # The layout before the connector counters and the tagged in-transfer section.
+    old_state = RankState.deserialize(state.serialize()[:-5])
     assert old_state.iter_stats == stats
     assert old_state.num_connector_transfers == 0
     assert not old_state.connector_poll_failed
