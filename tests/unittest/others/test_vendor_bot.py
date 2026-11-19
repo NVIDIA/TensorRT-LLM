@@ -3048,17 +3048,34 @@ def test_completed_promotion_clears_stale_problem_without_remote_writes(monitor:
 
 
 @pytest.mark.parametrize("monitor", [_SCOPED_LOCK], ids=["scoped-vendor-lock"], indirect=True)
-@pytest.mark.parametrize("status", ["added", "removed", "renamed", "modified"])
+@pytest.mark.parametrize(
+    ("status", "moved_away"),
+    [
+        ("added", False),
+        ("removed", False),
+        ("renamed", False),
+        ("renamed", True),
+        ("modified", False),
+    ],
+    ids=["added", "removed", "renamed", "renamed-away", "modified"],
+)
 def test_lock_creation_removal_is_not_a_promotion_but_other_404s_fail(
     monitor: b.Monitor,
     monkeypatch: pytest.MonkeyPatch,
     status: str,
+    moved_away: bool,
 ) -> None:
     original = monitor.gh.api
+    change = {"filename": monitor.gh.lock, "status": status}
+    if moved_away:
+        change.update(
+            filename="models/other/3rdparty/vendor_sources.lock.yaml",
+            previous_filename=monitor.gh.lock,
+        )
 
     def files(endpoint: str, **kwargs):
         if "/files?" in endpoint:
-            return [{"filename": monitor.gh.lock, "status": status}]
+            return [change]
         return original(endpoint, **kwargs)
 
     def missing(*args):

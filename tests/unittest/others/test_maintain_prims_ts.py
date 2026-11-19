@@ -2026,7 +2026,7 @@ def test_bot_recovers_publication_after_cache_loss(
             "worktree"
             if arguments[:2] == ("worktree", "add")
             else "stage"
-            if arguments[0] == "add"
+            if arguments[0] == "update-index"
             else "commit"
             if arguments[0] == "commit"
             else "branch"

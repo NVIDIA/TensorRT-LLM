@@ -42,7 +42,9 @@ _INCLUDE = "**/*.py"
 
 
 def _command_env() -> dict[str, str]:
-    env = os.environ.copy()
+    # Inherited Git variables, such as GIT_INDEX_FILE from a commit hook, would point the
+    # temporary repositories at the outer repository's index.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",

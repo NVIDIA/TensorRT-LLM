@@ -57,7 +57,11 @@ The tool writes its persistent patches to
 `<scope>/3rdparty/vendor_patches/<vendor>.patch` and records them in the lock as
 `3rdparty/vendor_patches/<vendor>.patch`. The repository lock is the case where
 `<scope>` is the repository root; a lock in any other directory is a scoped
-vendor lock.
+vendor lock. Lock discovery treats every file named `vendor_sources.lock.yaml`
+in the Git index as a lock, and a file with that name whose parent directory is
+not `3rdparty` is an error rather than being skipped. Committing such a file,
+for example a test fixture, therefore fails the pre-commit check for every
+commit until the file is renamed or moved.
 
 Put a vendor used by only one subtree, such as the kernels of one Modeling V2
 model, in a scoped vendor lock for that subtree, and use the repository lock for

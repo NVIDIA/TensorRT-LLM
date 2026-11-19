@@ -782,10 +782,9 @@ class Monitor:
     def _inputs(self, pr: dict) -> tuple[manage.Vendor, manage.Vendor] | None:
         for change in _pages(self.gh, f"{self.prefix}/pulls/{pr['number']}/files"):
             # Creating, moving, or removing the entire lock is not a source update.
-            if change["filename"] == self.gh.lock and change.get("status") in (
-                "added",
-                "removed",
-                "renamed",
+            if change.get("status") in ("added", "removed", "renamed") and self.gh.lock in (
+                change["filename"],
+                change.get("previous_filename"),
             ):
                 return None
         if pr.get("merged"):
