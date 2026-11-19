@@ -19,9 +19,16 @@ import unittest
 import pytest
 import torch
 from parameterized import parameterized
-from utils.util import skip_pre_blackwell_unittest, unittest_name_func
+from utils.util import isSM100Family, skip_pre_blackwell_unittest, unittest_name_func
 
 import tensorrt_llm
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    Fp4QuantKernelRunner,
+    Fp4QuantTactic,
+    _fp4_quantize_dispatch,
+)
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
 try:
     from flashinfer.fp4_quantization import nvfp4_quantize as flashinfer_nvfp4_quantize
@@ -29,6 +36,11 @@ try:
     HAS_FLASHINFER = True
 except ImportError:
     HAS_FLASHINFER = False
+
+skip_no_flashinfer_cute_dsl = pytest.mark.skipif(
+    not (IS_FLASHINFER_AVAILABLE and IS_CUTLASS_DSL_AVAILABLE and isSM100Family()),
+    reason="the FlashInfer CuTe DSL tactic needs FlashInfer, CuTe DSL and SM100/103/107",
+)
 
 
 @skip_pre_blackwell_unittest
@@ -217,6 +229,67 @@ class TestFp4QuantizeFlashinfer(unittest.TestCase):
                 rtol=0,
                 msg="Scale factors from tunable op differ from TRTLLM reference",
             )
+
+
+def _nvfp4_global_scale(x: torch.Tensor) -> torch.Tensor:
+    return (448.0 * 6.0 / x.float().abs().amax()).reshape(1)
+
+
+def _quantize(x: torch.Tensor, global_scale: torch.Tensor, tactic: int):
+    return _fp4_quantize_dispatch(x, global_scale, 16, False, True, tactic)
+
+
+@skip_no_flashinfer_cute_dsl
+@pytest.mark.parametrize(
+    "sf_use_ue8m0,is_sf_swizzled_layout,expected",
+    [(False, True, True), (True, True, False), (False, False, False)],
+)
+def test_cute_dsl_tactic_only_for_swizzled_nvfp4(sf_use_ue8m0, is_sf_swizzled_layout, expected):
+    x = torch.randn(128, 3072, dtype=torch.bfloat16, device="cuda")
+    runner = Fp4QuantKernelRunner(16, sf_use_ue8m0, is_sf_swizzled_layout)
+    tactics = runner.get_valid_tactics([x, _nvfp4_global_scale(x)], profile=None)
+    assert (Fp4QuantTactic.FLASHINFER_CUTE_DSL in tactics) == expected
+
+
+@skip_no_flashinfer_cute_dsl
+@pytest.mark.parametrize("m,k", [(1, 3072), (4177, 3072), (4177, 9216)])
+def test_cute_dsl_tactic_matches_trtllm_bitwise(m, k):
+    """FP4 data and swizzled scales, padding rows included, equal the TRTLLM tactic's."""
+    torch.manual_seed(0)
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    x[-1, :16].zero_()
+    global_scale = _nvfp4_global_scale(x)
+    actual = _quantize(x, global_scale, Fp4QuantTactic.FLASHINFER_CUTE_DSL)
+    expected = _quantize(x, global_scale, Fp4QuantTactic.TRTLLM)
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+
+@skip_no_flashinfer_cute_dsl
+def test_cute_dsl_tactic_graph_replay():
+    """Replays read the input and the device global scale written after capture."""
+    torch.manual_seed(0)
+    x = torch.randn(4177, 3072, dtype=torch.bfloat16, device="cuda")
+    global_scale = _nvfp4_global_scale(x)
+
+    def run():
+        return _quantize(x, global_scale, Fp4QuantTactic.FLASHINFER_CUTE_DSL)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    for magnitude in (0.01, 30.0):
+        x.copy_(torch.randn_like(x) * magnitude)
+        global_scale.copy_(_nvfp4_global_scale(x))
+        graph.replay()
+        expected = _quantize(x, global_scale, Fp4QuantTactic.TRTLLM)
+        for actual_tensor, expected_tensor in zip(captured, expected):
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
