@@ -3991,7 +3991,11 @@ def test_decode_graph_output_projection_matches_plain(rows):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("rows,columns,depth", [(1, 256, 128)])
+@pytest.mark.parametrize(
+    "rows,columns,depth",
+    # The second runs the N-major schedule of large inputs, at the O-B shape.
+    [(1, 256, 128), (16384 + 130, 5120, 8192)],
+)
 @torch.inference_mode()
 def test_dense_mxfp8_gemm_matches_native(rows, columns, depth):
     """The persistent CuTe DSL MXFP8 GEMM equals the native CUTLASS GEMM byte for byte."""

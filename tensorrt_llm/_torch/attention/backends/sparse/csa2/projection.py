@@ -485,7 +485,7 @@ def dense_or_native_mxfp8_gemm(
         and linear.weight_scale.numel() == columns * depth // 32
         and (
             not torch.cuda.is_current_stream_capturing()
-            or dense_mxfp8_gemm_compiled(activation.device, columns, depth)
+            or dense_mxfp8_gemm_compiled(activation.device, columns, depth, activation.shape[0])
         )
     ):
         return dense_mxfp8_gemm(
@@ -1343,16 +1343,28 @@ def grouped_output_mxfp8(
 
 
 _DENSE_TILE, _DENSE_CLUSTER = (256, 256), (2, 2)
+# From this many bytes of E4M3 input, the 2-CTA kernel walks each 256-row input block's output
+# columns before the next block (N-major, on 2x1 clusters), so the block stays in L2 rather than
+# streaming the input once per column tile (same bits). GB300, O-B (N 5120, K 8192), cold weights:
+# 16K rows 484 -> 460 us, 32K rows 982 -> 917 us; equal at 8K rows, slower at 4K.
+_DENSE_N_MAJOR_MIN_BYTES = 128 << 20  # 128 MiB
 
 
-def _dense_key(device: torch.device, columns: int, depth: int) -> tuple:
-    return ("dense", device.index, _DENSE_TILE, _DENSE_CLUSTER, columns, depth)
+def _dense_schedule(rows: int, depth: int) -> tuple:
+    """Tile, cluster shape and M-major tile order of ``dense_mxfp8_gemm`` for ``[rows, depth]``."""
+    if rows * depth >= _DENSE_N_MAJOR_MIN_BYTES:
+        return _DENSE_TILE, (2, 1), False
+    return _DENSE_TILE, _DENSE_CLUSTER, True
 
 
-def dense_mxfp8_gemm_compiled(device: torch.device, columns: int, depth: int) -> bool:
-    """Whether ``dense_mxfp8_gemm`` is compiled for an ``[N, K]`` weight, so a graph capture can
-    run it."""
-    return _dense_key(device, columns, depth) in _COMPILED
+def _dense_key(device: torch.device, columns: int, depth: int, rows: int) -> tuple:
+    return ("dense", device.index, *_dense_schedule(rows, depth), columns, depth)
+
+
+def dense_mxfp8_gemm_compiled(device: torch.device, columns: int, depth: int, rows: int) -> bool:
+    """Whether ``dense_mxfp8_gemm`` is compiled for ``rows`` rows and an ``[N, K]`` weight, so a
+    graph capture can run it."""
+    return _dense_key(device, columns, depth, rows) in _COMPILED
 
 
 def dense_mxfp8_gemm(
@@ -1397,8 +1409,8 @@ def dense_mxfp8_gemm(
         )
     ):
         raise ValueError("CSA2 dense MXFP8 GEMM got an unsupported input")
-    tile, cluster = _DENSE_TILE, _DENSE_CLUSTER
-    key = _dense_key(activation.device, columns, depth)
+    tile, cluster, raster_along_m = _dense_schedule(rows, depth)
+    key = _dense_key(activation.device, columns, depth, rows)
     sf_rows = triton.cdiv(rows, 128) * 128
     if (
         out is not None
@@ -1426,7 +1438,7 @@ def dense_mxfp8_gemm(
             for tensor, dtype in zip(tensors, dtypes)
         ]
         # One group of the grouped O-A kernel is a plain [M, N] GEMM.
-        kernel = _kernel_type()(32, tile, cluster)
+        kernel = _kernel_type()(32, tile, cluster, raster_along_m=raster_along_m)
         active = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
         _COMPILED[key] = cute.compile(
             kernel.wrapper_grouped,
