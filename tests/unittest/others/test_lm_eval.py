@@ -319,6 +319,7 @@ def test_do_sample_false_decodes_greedily(sampling_params):
     wrapper = _make_lm_eval_wrapper(sampling_params=sampling_params, sampling_override=False)
     out = wrapper._get_sampling_params(dict(LONGBENCH_GEN_KWARGS))
     assert out.temperature == 0.0
+    assert out._greedy_decoding
     assert out.max_tokens == 32
 
 
@@ -327,6 +328,7 @@ def test_do_sample_true_keeps_task_temperature():
     gen_kwargs = {"temperature": 0.6, "do_sample": True, "max_gen_toks": 64}
     out = wrapper._get_sampling_params(gen_kwargs)
     assert out.temperature == 0.6
+    assert not out._greedy_decoding
 
 
 def test_do_sample_false_keeps_cli_sampling_override():
