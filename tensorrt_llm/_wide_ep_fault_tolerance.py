@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Definitions that the modules of Wide-EP fault tolerance share."""
+"""Configuration checks and environment variables of Wide-EP fault tolerance."""
+
+from collections.abc import Sequence
 
 # The rendezvous store's host:port. The authority hosts the store.
 RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
@@ -20,3 +22,14 @@ RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"
 # The alternative that each error about an unmet fault tolerance requirement offers.
 TURN_FAULT_TOLERANCE_OFF = "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
+
+
+def check_fault_tolerance_requirements(checks: Sequence[tuple[bool, str]]) -> None:
+    """Raise ValueError naming every unmet ``(met, requirement)`` check."""
+    missing = [requirement for met, requirement in checks if not met]
+    if missing:
+        raise ValueError(
+            "Wide-EP fault tolerance requires "
+            + "; ".join(missing)
+            + f"; change the configuration or {TURN_FAULT_TOLERANCE_OFF}"
+        )
