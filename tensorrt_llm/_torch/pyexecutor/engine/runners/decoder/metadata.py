@@ -339,10 +339,15 @@ def supports_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mappi
     draws temperature-only target tokens on the LM head's vocabulary shard, on the MTP-Eagle fast
     paths or through the stock workers' vocab-parallel selection."""
     # It draws the sampled rows on vocabulary-sharded logits without the watermark, so a
-    # watermark configuration keeps the ordinary sampler.
+    # watermark configuration keeps the ordinary sampler. With rejection sampling or penalties
+    # (deploy-time switches of the spec config) no batch selects it (_temperature_only), so
+    # capturing it would only add a warmup pass per shape.
+    spec_config = config.spec_config
     return (
         config.cuda_graph_config is not None
         and config.watermark_config is None
+        and not getattr(spec_config, "use_rejection_sampling", False)
+        and not getattr(spec_config, "enable_penalty", False)
         and (
             config.spec_samples_sharded_temperature
             or (
