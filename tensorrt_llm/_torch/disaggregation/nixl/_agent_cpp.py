@@ -40,6 +40,7 @@ class BindingsNixlTransferStatus(TransferStatus):
     def __init__(self, cpp_status, agent_name: str = "?"):
         self._cpp_status = cpp_status
         self._agent_name = agent_name
+        self.in_progress = True
 
     def is_completed(self) -> bool:
         """Check if transfer is completed (releases GIL)."""
@@ -47,7 +48,11 @@ class BindingsNixlTransferStatus(TransferStatus):
 
     @nvtx_range("BindingsNixlTransferStatus.wait")
     def wait(self, timeout_ms=None, *, stop_requested: Callable[[], bool] | None = None) -> bool:
-        """Wait for transfer to complete (releases GIL)."""
+        """Poll a transfer, optionally stopping when its agent is fenced.
+
+        A False result can still be IN_PROGRESS. Callers must retain the handle
+        and its memory until a later wait observes a terminal native result.
+        """
         start_time = time.time()
         if timeout_ms is None:
             timeout_ms = -1
@@ -65,8 +70,10 @@ class BindingsNixlTransferStatus(TransferStatus):
                     deadline is not None and time.monotonic() >= deadline
                 ):
                     break
+        self.in_progress = result == TransferState.IN_PROGRESS
         if result != TransferState.SUCCESS:
-            logger.error(
+            log = logger.debug if self.in_progress else logger.error
+            log(
                 f"NIXL (cpp binding) wait returned non-SUCCESS state={result} "
                 f"after {time.time() - start_time:.3f}s (agent={self._agent_name})."
             )

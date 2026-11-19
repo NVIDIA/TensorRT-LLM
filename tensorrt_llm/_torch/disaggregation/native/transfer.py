@@ -169,6 +169,18 @@ class OlderReleaseRequestError(ValueError):
         self.req_info = req_info
 
 
+def agent_recovery_supported(
+    enforce_physical_ownership: bool, context_first_ownership: bool, agent_buffer_size_mb: int
+) -> bool:
+    """Whether the native, direct-transfer profile supports agent replacement."""
+    return (
+        not enforce_physical_ownership
+        and not context_first_ownership
+        and agent_buffer_size_mb == 0
+        and not use_pure_python_transfer_agent()
+    )
+
+
 class _AgentOperationGate:
     """Serialize agent replacement with complete transfer-handle lifetimes."""
 
@@ -1131,6 +1143,15 @@ class Sender(SenderBase):
                     with self._admission_lock:
                         if self._agent_failed:
                             return False, "NIXL agent recovery is pending"
+                        if self._shutdown_requested:
+                            raise _TransferNotSubmittedError("NIXL transfer admission is closed")
+                        if session is not None:
+                            if getattr(session, "_agent_generation", None) is None:
+                                session._agent_generation = generation
+                            elif session._agent_generation != generation:
+                                raise _TransferNotSubmittedError(
+                                    "NIXL session belongs to a retired agent"
+                                )
                         with task.lock:
                             task._native_inflight += 1
                 try:
@@ -1147,17 +1168,23 @@ class Sender(SenderBase):
                             if index == 0 and on_submitted is not None:
                                 with disagg_diagnostics.suppress_diagnostic_errors():
                                     on_submitted()
-                            completed = status.wait(stop_requested=lambda: self._agent_failed)
+                            completed = status.wait(
+                                timeout_ms=max(1, int(self._retirement_timeout_s * 1000)),
+                                stop_requested=lambda: self._agent_failed,
+                            )
                             if not completed:
                                 detail = status.last_status_str()
                         except RuntimeError as error:
                             completed, detail = False, str(error)
                         finally:
                             if status is not None:
-                                try:
-                                    retired = status.release()
-                                except RuntimeError:
+                                if getattr(status, "in_progress", False) is True:
                                     retired = False
+                                else:
+                                    try:
+                                        retired = status.release()
+                                    except RuntimeError:
+                                        retired = False
                                 # An interrupted wait is not a terminal backend result.
                                 if not completed and self._agent_failed:
                                     retired = False
@@ -2198,7 +2225,13 @@ class Sender(SenderBase):
                     self._loaded_remote_agents.add(agent_name)
                     return
                 replacing = previous is not None and previous != ri.transfer_engine_info
-                with self._agent_operation_gate.metadata() if replacing else nullcontext():
+                if replacing:
+                    self._remote_agent_descriptors[agent_name] = ri.transfer_engine_info
+                    with self._admission_lock:
+                        self._agent_failed = True
+                    self._recover_agent(self._agent_generation)
+                    return
+                with nullcontext():
                     if replacing:
                         self._agent.invalidate_remote_agent(agent_name)
                     self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
@@ -2656,7 +2689,7 @@ class TxSession(TxSessionBase):
             sender, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
         )
         self._sender: Sender  # narrow base class type for Pylance
-        self._agent_generation = getattr(sender, "_agent_generation", 0)
+        self._agent_generation: Optional[int] = None
         self.request_id = request_id
         self._retirement = None
         if retirement_watchdog is not None and self._enforce_physical_ownership:
@@ -2949,10 +2982,12 @@ class TxSession(TxSessionBase):
     def resources_drained(self) -> bool:
         if not getattr(self, "_enforce_physical_ownership", False):
             tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
-            return not any(
-                task.status == TaskStatus.TRANSFERRING or getattr(task, "_native_inflight", 0) > 0
-                for task in tasks
-            )
+            if any(getattr(task, "_native_inflight", 0) > 0 for task in tasks):
+                return False
+            sender = getattr(self, "_sender", None)
+            if getattr(sender, "_recover_agent", None) is None:
+                return True
+            return not any(task.status == TaskStatus.TRANSFERRING for task in tasks)
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
             return False
@@ -3001,10 +3036,16 @@ class TxSession(TxSessionBase):
             # error, our own side asking is an ordinary end.
             self.cancelled_by_peer = by_peer
             exc = RuntimeError(f"TxSession {self.disagg_request_id} cancelled")
+            direct_recovery = (
+                not self._enforce_physical_ownership
+                and getattr(self._sender, "_recover_agent", None) is not None
+            )
             for task in self.kv_tasks:
-                if task.status == TaskStatus.INIT:
+                if task.status == TaskStatus.INIT or direct_recovery:
                     task.fail(exc)
-            if self.aux_task is not None and self.aux_task.status == TaskStatus.INIT:
+            if self.aux_task is not None and (
+                self.aux_task.status == TaskStatus.INIT or direct_recovery
+            ):
                 self.aux_task.fail(exc)
             req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
             if report_unsubmitted_aux:
@@ -3391,6 +3432,7 @@ class Receiver(ReceiverBase):
         self._pre_cancelled_rids: dict[int, bool] = {}
         self._shutdown = False
         self._ownership_admission_lock = threading.Lock()
+        self._recovery_sender: Optional[weakref.ReferenceType[Sender]] = None
         self._ownership_poisoned: Optional[Exception] = None
 
         self._start_listener()
@@ -3474,6 +3516,11 @@ class Receiver(ReceiverBase):
             with self._sessions_lock:
                 if self._shutdown:
                     raise RuntimeError("cannot create an RxSession after Receiver shutdown")
+                sender_ref = getattr(self, "_recovery_sender", None)
+                sender = sender_ref() if sender_ref is not None else None
+                with sender._admission_lock if sender is not None else nullcontext():
+                    if sender is not None and (sender._agent_failed or sender._shutdown_requested):
+                        raise RuntimeError("NIXL receive admission is closed during agent recovery")
                 if getattr(rx_session, "_enforce_physical_ownership", False):
                     self._sessions[rx_session.disagg_request_id] = rx_session
                 else:
@@ -5136,13 +5183,24 @@ class TransferWorker:
         assert callback is not None
         callback(event)
 
+    @property
+    def agent_available(self) -> bool:
+        """Whether new direct sends and receive publications may use the agent."""
+        sender = getattr(self, "_sender", None)
+        return sender is None or not (
+            getattr(sender, "_agent_failed", False) is True
+            or getattr(sender, "_shutdown_requested", False) is True
+        )
+
     def request_shutdown(self) -> None:
         """Close admission and start drain before any potentially blocking teardown."""
         sender = getattr(self, "_sender", None)
         if sender is not None:
-            sender._shutdown_requested = True
-            if sender._recover_agent is not None and sender._agent_failed:
-                sender._recover_agent(sender._agent_generation)
+            if getattr(sender, "_recover_agent", None) is not None:
+                with sender._admission_lock:
+                    sender._shutdown_requested = True
+                if sender._agent_failed:
+                    sender._recover_agent(sender._agent_generation)
         watchdog = getattr(self, "_retirement_watchdog", None)
         if watchdog is not None:
             watchdog.request_shutdown()
@@ -5268,26 +5326,56 @@ class TransferWorker:
             self._agent_recovery_lock = threading.Lock()
             self._agent_recovery_stop = threading.Event()
             self._agent_recovery_thread: Optional[threading.Thread] = None
-            if (
-                os.environ.get("TRTLLM_ENABLE_NIXL_AGENT_RECOVERY", "0") == "1"
-                and not self._config.enforce_physical_ownership
-                and not self._config.context_first_ownership
-                and self._config.agent_buffer_size_mb == 0
-                and not use_pure_python_transfer_agent()
+            if agent_recovery_supported(
+                self._config.enforce_physical_ownership,
+                self._config.context_first_ownership,
+                self._config.agent_buffer_size_mb,
             ):
-                if getattr(self._agent, "supports_handle_retirement", False):
-                    if self._config.recovery_fatal_callback is None:
-                        raise ValueError("NIXL recovery requires a captured executor fatal handler")
-                    self._sender._recovery_fatal_callback = self._config.recovery_fatal_callback
+                if (
+                    getattr(self._agent, "supports_handle_retirement", False)
+                    and self._config.recovery_fatal_callback is not None
+                ):
+                    fatal_callback = self._config.recovery_fatal_callback
+                    if getattr(fatal_callback, "__self__", None) is not None:
+                        weak_fatal = weakref.WeakMethod(fatal_callback)
+                        fatal_comm = getattr(fatal_callback.__self__, "_retirement_mpi_comm", None)
+
+                        def fatal(event: QuiescenceFatalEvent) -> None:
+                            callback = weak_fatal()
+                            if callback is None:
+                                from tensorrt_llm._torch.pyexecutor.hang_detector import (
+                                    propagate_hard_kill,
+                                )
+
+                                logger.critical("NIXL recovery owner disappeared before retirement")
+                                propagate_hard_kill(diagnostics=False, communicator=fatal_comm)
+                                raise SystemExit("NIXL retirement owner unavailable")
+                            callback(event)
+
+                        self._sender._recovery_fatal_callback = fatal
+                    else:
+                        self._sender._recovery_fatal_callback = fatal_callback
                     timeout_s = self._config.tx_overall_timeout_s
                     self._sender._retirement_timeout_s = (
                         timeout_s
                         if timeout_s is not None and timeout_s > 0
                         else _FALLBACK_TX_OVERALL_TIMEOUT_S
                     )
-                    self._sender._recover_agent = self._request_agent_recovery
+                    callback = weakref.WeakMethod(self._request_agent_recovery)
+
+                    def request_recovery(generation: int) -> None:
+                        recover = callback()
+                        if recover is not None:
+                            recover(generation)
+
+                    self._sender._recover_agent = request_recovery
+                    self._receiver._recovery_sender = weakref.ref(self._sender)
                 else:
-                    logger.warning("NIXL agent recovery requires rebuilt request-release bindings")
+                    logger.warning(
+                        "NIXL agent recovery requires rebuilt request-release bindings"
+                        if not getattr(self._agent, "supports_handle_retirement", False)
+                        else "NIXL agent recovery unavailable without an executor fatal handler"
+                    )
         except Exception:
             # shutdown()'s getattr guards handle whichever attrs got set before the failure.
             try:
@@ -5316,7 +5404,10 @@ class TransferWorker:
                     try:
                         torch.cuda.set_device(self._config.device_id)
                         CUASSERT(cudart.cudaSetDevice(self._config.device_id))
-                        self._recover_transfer_agent(self._sender._agent_generation)
+                        self._recover_transfer_agent(
+                            self._sender._agent_generation,
+                            deadline=started_at + self._sender._retirement_timeout_s,
+                        )
                     except Exception as error:
                         logger.error(f"NIXL recovery setup failed: {error}")
                     with self._agent_recovery_lock:
@@ -5341,7 +5432,9 @@ class TransferWorker:
             )
             self._agent_recovery_thread.start()
 
-    def _recover_transfer_agent(self, failed_generation: int) -> bool:
+    def _recover_transfer_agent(
+        self, failed_generation: int, *, deadline: Optional[float] = None
+    ) -> bool:
         """Rebuild a drained send agent without replacing the model or sockets.
 
         All send handles are inside the sender's reader gate. Its writer gate
@@ -5349,21 +5442,35 @@ class TransferWorker:
         publications during reset. An active receive defers reset until its
         published destinations are no longer in use.
         """
+
+        def check_deadline() -> None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("NIXL agent reconstruction exceeded its retirement deadline")
+
         sender, receiver = self._sender, self._receiver
         # Match registration's lock order: descriptor lock, then writer gate.
         with sender._loaded_remote_agents_lock, sender._agent_operation_gate.metadata():
             if failed_generation != sender._agent_generation or not sender._agent_failed:
                 return True
             with receiver._sessions_lock:
+                for rid, entry in list(receiver._sessions.items()):
+                    if isinstance(entry, weakref.ReferenceType) and entry() is None:
+                        del receiver._sessions[rid]
                 if receiver._sessions:
                     return False
+                for status, _task, _retired in sender._unreleased_statuses:
+                    if getattr(status, "in_progress", False) is True:
+                        status.wait(timeout_ms=0)
+                        if getattr(status, "in_progress", False) is True:
+                            return False
                 old_agent = self._agent
                 try:
                     if old_agent is not None:
                         old_agent.shutdown()
                         self._agent = None
-                    # shutdown drains the native backend, including any handle
-                    # whose explicit release failed. Keep roots until it returns.
+                    check_deadline()
+                    # Only terminal handles may reach teardown. Interrupted writes
+                    # remain rooted and are polled above until they are terminal.
                     for _status, task, retired in sender._unreleased_statuses:
                         with task.lock:
                             task._native_inflight -= 1
@@ -5379,8 +5486,10 @@ class TransferWorker:
                         world_size=mapping.world_size,
                     )
                     try:
+                        check_deadline()
                         for desc in self._registered_mem:
                             agent.register_memory(desc)
+                            check_deadline()
                         for name, descriptor in list(sender._remote_agent_descriptors.items()):
                             try:
                                 agent.load_remote_agent(name, descriptor)
@@ -5389,6 +5498,7 @@ class TransferWorker:
                                 del sender._remote_agent_descriptors[name]
                                 sender._loaded_remote_agents.discard(name)
                         descriptor = bytes(agent.get_local_agent_desc())
+                        check_deadline()
                     except Exception:
                         agent.shutdown()
                         raise

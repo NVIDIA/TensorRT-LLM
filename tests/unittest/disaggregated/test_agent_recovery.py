@@ -15,6 +15,7 @@ from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import (
     TransferState,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
 
@@ -170,6 +171,8 @@ def test_stalled_sibling_drains_for_recovery():
     entered, failure_reported = threading.Event(), threading.Event()
 
     def stalled_wait(timeout_ms):
+        if timeout_ms == 0:
+            return TransferState.SUCCESS
         assert 0 <= timeout_ms <= 100
         entered.set()
         assert failure_reported.wait(2)
@@ -646,8 +649,8 @@ def test_shutdown_drains_a_new_failed_generation_before_recovery_thread_exits():
     replacement.submit_transfer_requests.return_value = status
     recover = worker._recover_transfer_agent
 
-    def paused_recovery(generation):
-        result = recover(generation)
+    def paused_recovery(generation, **kwargs):
+        result = recover(generation, **kwargs)
         if generation == 0:
             installed.set()
             assert resume.wait(2)
@@ -862,3 +865,344 @@ def test_session_lock_covers_the_interval_before_native_reservation():
         finally:
             resume.set()
         assert pending.result(timeout=2) == (True, None)
+
+
+def test_recovery_does_not_destroy_an_interrupted_write():
+    worker = make_worker()
+    status = Mock()
+    status.in_progress = True
+    task = make_task()
+    task._native_inflight = 1
+    retired = threading.Event()
+    worker._sender._unreleased_statuses = [(status, task, retired)]
+    with patch.object(transfer, "_create_nixl_agent") as create:
+        assert not worker._recover_transfer_agent(0)
+        worker._agent.shutdown.assert_not_called()
+        create.assert_not_called()
+        assert task._native_inflight == 1
+        assert not retired.is_set()
+
+        def terminal(**_kwargs):
+            status.in_progress = False
+            return True
+
+        status.wait.side_effect = terminal
+        assert worker._recover_transfer_agent(0)
+        assert task._native_inflight == 0
+        assert retired.is_set()
+
+
+def test_receiver_rejects_new_publication_while_agent_is_fenced():
+    import weakref
+
+    worker = make_worker()
+    receiver = object.__new__(transfer.Receiver)
+    receiver._sessions_lock = threading.Lock()
+    receiver._sessions = {}
+    receiver._shutdown = False
+    receiver._recovery_sender = weakref.ref(worker._sender)
+    session = SimpleNamespace(_enforce_physical_ownership=False, disagg_request_id=73)
+    with pytest.raises(RuntimeError, match="receive admission is closed"):
+        receiver.setup_session(session)
+    assert not receiver._sessions
+
+
+def test_shutdown_does_not_disable_ownership_quiescence_messages():
+    worker = make_worker()
+    worker._sender._recover_agent = None
+    worker.request_shutdown()
+    assert not worker._sender._shutdown_requested
+
+
+def test_changed_peer_descriptor_defers_replacement_without_blocking_listener():
+    sender = make_sender(Mock())
+    sender._device_id, sender._registrar = 0, Mock()
+    info = SimpleNamespace(instance_name="decode", instance_rank=11, transfer_engine_info=b"new")
+    with (
+        patch.object(transfer.torch.cuda, "set_device"),
+        patch.object(transfer.cudart, "cudaSetDevice", return_value=0),
+        patch.object(transfer, "CUASSERT"),
+        patch.object(transfer.RankInfo, "from_bytes", return_value=info),
+        patch.object(
+            sender._agent_operation_gate, "metadata", side_effect=AssertionError("blocked listener")
+        ),
+    ):
+        sender._register_peer_rank(b"peer", [b"register", b"descriptor"])
+    assert sender._agent_failed
+    assert sender._remote_agent_descriptors["decode11"] == b"new"
+    sender._recover_agent.assert_called_once_with(0)
+    sender._agent.invalidate_remote_agent.assert_not_called()
+
+
+@pytest.mark.parametrize("ranks", [2, 4])
+def test_failure_intent_uses_existing_outcome_exchange_and_waits_for_all_ranks(ranks):
+    from fake_dist import FakeDistGroup
+
+    group = FakeDistGroup(ranks, tp_size=ranks)
+    sessions = []
+    transceivers = []
+    for rank in range(ranks):
+        sender = make_sender(Mock())
+        sender._get_req_info = Mock(return_value={})
+        sender.send_cancel_to_receivers = Mock()
+        sender.clear_session = Mock()
+        session = object.__new__(transfer.TxSession)
+        session._base_args = SimpleNamespace(params=SimpleNamespace(disagg_request_id=73))
+        session._sender = sender
+        session._retirement = None
+        session._enforce_physical_ownership = False
+        session._terminal_status = None
+        session._exception = RuntimeError("agent failed") if rank == ranks - 1 else None
+        session._logical_outcomes = transfer._LogicalOutcomes()
+        session._closed = False
+        session._aux_buffer = None
+        session.aux_slot = None
+        session.lock = threading.Lock()
+        session.kv_tasks = [
+            transfer.SendTaskBase(transfer.DisaggregatedParams(disagg_request_id=73))
+        ]
+        session.kv_tasks[0].status = transfer.TaskStatus.TRANSFERRING
+        session.kv_tasks[0]._native_inflight = 1
+        session.aux_task = None
+        session._need_aux = session._has_last_slice = False
+        session._claim_unsubmitted_aux_failures_locked = Mock(return_value=[])
+        session._report_unsubmitted_aux_failures = Mock()
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._agent_recovery = True
+        transceiver._send_sessions = {73: session}
+        transceiver._dist = group.rank(rank)
+        transceiver._ctx_need_tp_sync = True
+        transceiver._ctx_need_pp_sync = False
+        sessions.append(session)
+        transceivers.append(transceiver)
+
+    def poll(rank):
+        return transceivers[rank]._ctx_consensus_outcome([], [], [], [], [])
+
+    first = group.run(poll)
+    assert all(result[1] == [73] and result[3] == [] for result in first)
+    assert all(session._logical_outcomes.failed for session in sessions)
+    assert all(session.cancelled_by_peer for session in sessions)
+    assert all(not session.close() for session in sessions)
+    for session in sessions[:-1]:
+        session.kv_tasks[0].status = transfer.TaskStatus.ERROR
+        session.kv_tasks[0]._native_inflight = 0
+    assert all(not result[3] for result in group.run(poll))
+    sessions[-1].kv_tasks[0].status = transfer.TaskStatus.ERROR
+    sessions[-1].kv_tasks[0]._native_inflight = 0
+    final = group.run(poll)
+    assert all(result[1] == [73] and result[3] == [73] for result in final)
+    assert all(session.close() for session in sessions)
+    # One pre-existing outcome collective per poll; no separate failure vote.
+    assert all(len(group.rank(rank).calls) == 3 for rank in range(ranks))
+
+
+def test_refused_send_session_close_keeps_request_tracked_for_retry():
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    session = SimpleNamespace(_enforce_physical_ownership=False, close=Mock(return_value=False))
+    request = SimpleNamespace(py_kv_send_session_retired=False)
+    transceiver._send_sessions = {73: session}
+    transceiver._send_reqs = {73: request}
+    transceiver._retire_send_session(73)
+    assert transceiver._send_sessions == {73: session}
+    assert not request.py_kv_send_session_retired
+    session.close.return_value = True
+    transceiver._retire_send_session(73)
+    assert not transceiver._send_sessions
+    assert request.py_kv_send_session_retired
+
+
+def test_unsubmitted_session_can_bind_to_the_replacement_generation():
+    sender = make_sender(Mock())
+    sender._agent_generation = 1
+    status = Mock()
+    status.wait.return_value = status.release.return_value = True
+    sender._agent.submit_transfer_requests.return_value = status
+    session = SimpleNamespace(
+        lock=threading.Lock(),
+        _closed=False,
+        _agent_generation=None,
+        has_failed=lambda: False,
+        status=transfer.SessionStatus.INIT,
+    )
+    assert sender._submit_transfer(make_task(), 11, make_request(), session=session) == (True, None)
+    assert session._agent_generation == 1
+
+
+def test_late_replacement_is_not_published():
+    worker = make_worker()
+    replacement = Mock()
+    clock = [0.0]
+    replacement.register_memory.side_effect = lambda _desc: clock.__setitem__(0, 11.0)
+    with (
+        patch.object(transfer.time, "monotonic", side_effect=lambda: clock[0]),
+        patch.object(transfer, "_create_nixl_agent", return_value=replacement),
+    ):
+        assert not worker._recover_transfer_agent(0, deadline=10.0)
+    replacement.shutdown.assert_called_once()
+    assert worker._sender._agent_failed
+    assert worker._sender._agent_generation == 0
+    assert worker._rank_info.transfer_engine_info == b"old-descriptor"
+
+
+@pytest.mark.parametrize("ranks,cp_size", [(2, 1), (4, 2)])
+def test_gen_admission_stays_closed_until_every_rank_recovers(ranks, cp_size):
+    from fake_dist import FakeDistGroup
+
+    group = FakeDistGroup(ranks, tp_size=ranks // cp_size, cp_size=cp_size)
+    nodes = []
+    for rank in range(ranks):
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._agent_recovery = True
+        transceiver._recv_sessions = {}
+        transceiver._gen_idle_poll_skip = True
+        transceiver._gen_deferred_receives = 0
+        transceiver._pending_rank_info_admissions = None
+        transceiver._gen_allgather = (
+            group.rank(rank).tp_cp_allgather if cp_size > 1 else group.rank(rank).tp_allgather
+        )
+        transceiver._gen_need_sync = True
+        transceiver._transfer_worker = SimpleNamespace(agent_available=rank != ranks - 1)
+        nodes.append(transceiver)
+
+    def poll(rank):
+        return nodes[rank]._gen_consensus_outcome([], [], [], [], [])
+
+    group.run(poll)
+    assert all(not node.can_admit_gen_requests and not node._gen_idle_agreed for node in nodes)
+    nodes[-1]._transfer_worker.agent_available = True
+    group.run(poll)
+    assert all(node.can_admit_gen_requests and node._gen_idle_agreed for node in nodes)
+
+
+def test_mpi_failure_outcome_uses_existing_tp_then_pp_exchange():
+    from mpi4py import MPI
+
+    world = MPI.COMM_WORLD
+    if world.Get_size() != 4:
+        pytest.skip("launch this test with mpirun -np 4")
+    rank = world.Get_rank()
+    tp = world.Split(rank // 2, rank)
+    pp = world.Split(rank % 2, rank)
+    node = object.__new__(KvCacheTransceiverV2)
+    try:
+        # Rank 3 is the sole origin. First reconcile TP, then propagate that
+        # result along PP using exactly the production outcome reducer.
+        first = node._consensus_outcome(
+            [73],
+            [],
+            [],
+            [],
+            tp.allgather,
+            True,
+            [73] if rank != 3 else [],
+            failure_intents=[73] if rank == 3 else [],
+            agent_ready=rank != 3,
+        )
+        c, f, d, q, intents, ready = first
+        result = node._consensus_outcome(
+            [73], c, f, d, pp.allgather, True, q, failure_intents=list(intents), agent_ready=ready
+        )
+        assert result[1] == [73]
+        assert result[3] == []
+        assert result[-1] is False
+        # Once all ranks have drained, the same exchange permits retirement.
+        drained = node._consensus_outcome(
+            [73], [], [73], [], tp.allgather, True, [73], failure_intents=[73], agent_ready=True
+        )
+        c, f, d, q, intents, ready = drained
+        final = node._consensus_outcome(
+            [73], c, f, d, pp.allgather, True, q, failure_intents=list(intents), agent_ready=ready
+        )
+        assert final[1] == [73] and final[3] == [73]
+        assert final[-1] is True
+    finally:
+        tp.Free()
+        pp.Free()
+
+
+def test_recovery_shutdown_drains_an_active_send_before_closing():
+    worker = make_worker()
+    sender = worker._sender
+    sender.setup_session = Mock()
+    sender.clear_session = Mock()
+    sender._get_req_info = Mock(return_value={})
+    cancelled = threading.Event()
+    sender.send_cancel_to_receivers = Mock(side_effect=lambda _rid: cancelled.set())
+    params = transfer.DisaggregatedParams(disagg_request_id=73)
+    session = transfer.TxSession(73, params, sender)
+    task = transfer.SendTaskBase(params)
+    task.status, task._native_inflight = transfer.TaskStatus.TRANSFERRING, 1
+    session.kv_tasks = [task]
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._agent_recovery = True
+    transceiver._transfer_worker = worker
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(transceiver._close_session_or_raise, session, 73, "shutdown")
+        try:
+            assert cancelled.wait(2)
+            assert not pending.done()
+            assert not session._closed
+            assert task._native_inflight == 1
+        finally:
+            with task.lock:
+                task._native_inflight = 0
+        pending.result(timeout=2)
+    assert session._closed
+    sender.clear_session.assert_called_once_with(73)
+
+
+def test_context_first_admission_waits_for_recovery_without_waiting_for_a_peer():
+    node = object.__new__(KvCacheTransceiverV2)
+    node._ctx_agent_ready = False
+    node._wait_reqs, node._send_sessions = {}, {}
+    node._transfer_worker = SimpleNamespace(agent_available=False)
+    node._validate_bridge_req = Mock(return_value=True)
+    node._ctx_consensus = Mock(side_effect=lambda ids: ids)
+    request = SimpleNamespace(
+        py_request_id=73,
+        py_disaggregated_params=transfer.DisaggregatedParams(
+            disagg_request_id=73, schedule_style=transfer.DisaggScheduleStyle.CONTEXT_FIRST
+        ),
+    )
+    node.prepare_context_requests([request])
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+    node._transfer_worker.agent_available = True
+    node.prepare_context_requests([])
+    assert request.state == LlmRequestState.CONTEXT_INIT
+    assert not node._wait_reqs
+
+    node._ctx_agent_ready = True
+    node.prepare_context_requests([request])
+    assert node._ctx_consensus.call_count == 2
+
+
+@pytest.mark.parametrize("with_fatal_handler", [True, False])
+def test_engine_setup_enables_recovery_without_an_opt_in_flag(with_fatal_handler):
+    worker = make_worker()
+    agent, sender = worker._agent, worker._sender
+    sender._recover_agent = None
+    agent.supports_handle_retirement = True
+    worker._config = transfer.TransferWorkerConfig(
+        kv_cache_manager=SimpleNamespace(mapping=SimpleNamespace(rank=0, world_size=1)),
+        device_id=0,
+        instance_name="ctx",
+        recovery_fatal_callback=Mock() if with_fatal_handler else None,
+    )
+    worker._aux_buffer = worker._retirement_watchdog = worker._rank_info_auth_key = None
+    worker._peer_registrar = Mock()
+    worker._register_kv_cache = Mock()
+    worker.shutdown = Mock()
+    receiver = SimpleNamespace(endpoint="tcp://receiver")
+    with (
+        patch.dict(transfer.os.environ, {"TRTLLM_ENABLE_NIXL_AGENT_RECOVERY": "0"}),
+        patch.object(transfer.torch.cuda, "set_device"),
+        patch.object(transfer.cudart, "cudaSetDevice", return_value=0),
+        patch.object(transfer, "CUASSERT"),
+        patch.object(transfer, "use_pure_python_transfer_agent", return_value=False),
+        patch.object(transfer, "_create_nixl_agent", return_value=agent),
+        patch.object(transfer, "Sender", return_value=sender),
+        patch.object(transfer, "Receiver", return_value=receiver),
+    ):
+        worker._setup_transfer_engine()
+    assert (sender._recover_agent is not None) == with_fatal_handler

@@ -973,16 +973,16 @@ def test_scheduler_retirement_probe_is_local_and_fresh_under_adp() -> None:
 
     group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
     assert all(h.coordinator.has_retiring_gen_receives for h in ranks)
-    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-        detect_stall(0)
+    detect_stall(0)
+    assert schedulers[0]._failed_requests == [blocked]
     detect_stall(1)
     assert schedulers[1]._stalled_schedules == 0
 
     # Local retirement is equally visible before the fleet snapshot refreshes.
     ranks[1].coordinator._retiring_gen_receives.clear()
     assert all(h.coordinator.has_retiring_gen_receives for h in ranks)
-    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-        detect_stall(1)
+    detect_stall(1)
+    assert schedulers[1]._failed_requests == [blocked]
 
 
 def test_pace_idle_observes_off_list_receive_retirement(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -258,14 +258,17 @@ class DisaggTransferCoordinator:
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         """Let the transceiver gate generation-first context requests.
 
-        Context-first context requests are schedulable at once; for
-        generation-first ones the transceiver decides when the peer is ready.
+        Context-first requests need no peer handshake, but wait for agent
+        recovery. Generation-first requests also wait until the peer is ready.
         """
         gen_first_ctx_requests = [
             req
             for req in new_requests
             if req.is_context_only_request
-            and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            and (
+                req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+                or getattr(self._transceiver, "can_admit_ctx_requests", True) is False
+            )
         ]
         # Always call prepare_context_requests, with new requests or without,
         # so the consensus inside it can promote requests whose peer info has
@@ -275,6 +278,10 @@ class DisaggTransferCoordinator:
     @nvtx_range("poll_gen_transfers")
     def poll_gen_transfers(self) -> None:
         """Poll receive-side transfers and their timeouts; rank-synchronized."""
+        if getattr(self._transceiver, "can_admit_ctx_requests", True) is False:
+            # Continue the existing send outcome exchange after the last failed
+            # request retires, so recovery can reopen context admission while idle.
+            self.reap_context_sends(0)
         if not uses_async_gen_transfer():
             return
         if self._defer_unready_gen_receives:
@@ -458,6 +465,10 @@ class DisaggTransferCoordinator:
         # the number of blocking transfers started in one executor iteration.
         if is_gen_only_no_context_benchmark():
             return fitting_gen_init, False
+
+        if getattr(self._transceiver, "can_admit_gen_requests", True) is False:
+            self.revert_deferred_gen_init(fitting_gen_init, [], reason="agent_recovery")
+            return [], True
 
         if not (self._transfer_window_is_active() and fitting_gen_init):
             return fitting_gen_init, False

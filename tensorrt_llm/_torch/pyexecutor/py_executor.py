@@ -8992,7 +8992,9 @@ class PyExecutor:
         transfer_manager = getattr(self, "async_transfer_manager", None)
         if transceiver is None or transfer_manager is None:
             return None
-        local_inflight = bool(transfer_manager.has_any_inflight_requests())
+        local_inflight = bool(
+            transfer_manager.has_any_inflight_requests()) or (getattr(
+                transceiver, "has_pending_agent_recovery", False) is True)
         tp_size = getattr(self.dist, "tp_size", 1)
         if getattr(self, "enable_attention_dp", False) and tp_size > 1:
             any_inflight = bool(
