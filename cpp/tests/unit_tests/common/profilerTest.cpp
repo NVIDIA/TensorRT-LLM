@@ -228,11 +228,13 @@ TEST(ProfilerStartupDeathTest, NoneSelectionNeverEvaluatesFactoriesOrEmitsScopes
 TEST(ProfilerMetadataTest, NativeGoldenIncludesUnicodeEscapingSignedIntegersAndEmptyLists)
 {
     tc::ProfilerMetadata metadata{"workflow"};
-    metadata.add("quoted'key", "slash\\line\n\t'雪");
+    metadata.add("quoted'雪", "slash\\line\n\t'雪🚀");
     metadata.add("rank", std::int64_t{-7});
     metadata.add("ids", std::vector<std::int64_t>{});
+    auto const payload = std::move(metadata).take();
+    EXPECT_TRUE(std::all_of(payload.begin(), payload.end(), [](unsigned char value) { return value < 0x80; }));
     EXPECT_EQ(
-        std::move(metadata).take(), R"(TRTLLM1:8:workflow{"quoted'key":"slash\\line\n\t'雪","rank":-7,"ids":[]})");
+        payload, R"(TRTLLM1:8:workflow{"quoted'\u96ea":"slash\\line\n\t'\u96ea\ud83d\ude80","rank":-7,"ids":[]})");
 }
 
 //! Check UTF-8 region byte lengths, control-byte escapes, and signed integer boundary literals.

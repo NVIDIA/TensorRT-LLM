@@ -159,12 +159,14 @@ def test_decoder_handles_native_and_unicode_golden_payloads(
 
 def test_python_encoder_preserves_supported_values() -> None:
     metadata: dict[str, profiler.MetadataValue] = {
-        "quoted'key": "slash\\line\n\t'雪\x00",
+        "quoted'雪": "slash\\line\n\t'雪🚀\x00",
         "rank": -(2**63),
         "ids": [],
         "nested": {"values": [None, True, 1.5, ["x", -2]]},
     }
-    assert decode_profiler_metadata(profiler.encode_metadata("workflow", metadata)) == (
+    payload = profiler.encode_metadata("workflow", metadata)
+    assert payload.isascii()
+    assert decode_profiler_metadata(payload) == (
         "workflow",
         metadata,
     )
@@ -257,21 +259,24 @@ def test_active_scope_preserves_result_and_records_real_cpu_event(
 def test_real_execution_trace_receives_metadata(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Preserve typed fields in a real execution-trace observer output."""
+    """Preserve Unicode fields through the real execution-trace observer's JSON escaping."""
     select_regions(monkeypatch, "workflow")
+    metadata: dict[str, profiler.MetadataValue] = {
+        "rank": -7,
+        "ids": [],
+        "quoted'雪": "slash\\line\n\t'雪🚀\x00",
+    }
     trace_file = tmp_path / "execution.json"
     with execution_trace_observer(trace_file) as observer:
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU], execution_trace_observer=observer
         ):
-            with profiler.record_function_metadata_scope(
-                "payload", "workflow", lambda: {"rank": -7, "ids": []}
-            ):
+            with profiler.record_function_metadata_scope("payload", "workflow", lambda: metadata):
                 torch.ones(1)
     (node,) = profiler_nodes(trace_file, "payload")
     assert decode_node_metadata(node) == (
         "workflow",
-        {"rank": -7, "ids": []},
+        metadata,
     )
 
 

@@ -168,7 +168,7 @@ void ProfilerMetadata::add(std::string_view name, std::vector<std::int64_t> cons
 
 std::string ProfilerMetadata::take() &&
 {
-    return std::move(mPrefix) + mFields.dump();
+    return std::move(mPrefix) + mFields.dump(-1, ' ', /*ensure_ascii=*/true);
 }
 
 //! Prepare a same-thread user scope only when the selected region has an active callback.
