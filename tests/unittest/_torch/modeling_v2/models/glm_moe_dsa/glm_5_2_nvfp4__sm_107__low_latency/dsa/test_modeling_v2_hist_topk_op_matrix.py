@@ -18,7 +18,8 @@ pytestmark = pytest.mark.skipif(
     reason="requires SM107 and at least four visible GPUs",
 )
 
-assert torch.cuda.is_available(), "hist_topk requires CUDA devices"
+if not torch.cuda.is_available():
+    pytest.skip("hist_topk requires CUDA devices", allow_module_level=True)
 
 
 # Each case spawns its own 4 rank processes over the visible devices; under xdist several

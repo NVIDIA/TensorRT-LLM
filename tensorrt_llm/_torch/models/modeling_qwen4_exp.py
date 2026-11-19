@@ -37,6 +37,7 @@ from ..distributed import AllReduce, AllReduceParams, allgather
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fla.gdn_metadata import GDNMambaMetadata, gdn_metadata_for_batch
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.mamba.layernorm_gated import rms_norm_gated_token_major
@@ -790,16 +791,7 @@ class Qwen4ExpModel(DecoderModel):
                 "same time, and must specify either one"
             )
 
-        # Refresh mamba metadata for the batch size, mirroring Qwen3NextModel.
-        mamba_metadata = getattr(attn_metadata, "mamba_metadata", None)
-        if (
-            mamba_metadata is not None
-            and getattr(mamba_metadata, "max_batch_size", None) != attn_metadata.max_num_requests
-        ):
-            attn_metadata.mamba_metadata = Mamba2Metadata(
-                attn_metadata.max_num_requests, chunk_size=128
-            )
-            mamba_metadata = attn_metadata.mamba_metadata
+        mamba_metadata = gdn_metadata_for_batch(attn_metadata)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -912,16 +904,21 @@ class Qwen4ExpLogitsProcessor(nn.Module):
         lm_head: nn.Module,
         attn_metadata: AttentionMetadata,
         return_context_logits: bool = False,
+        *,
+        keep_lm_head_dtype: bool = False,
     ) -> torch.Tensor:
+        """Logits as fp32, or in the LM head's dtype with ``keep_lm_head_dtype``."""
         if not self.model_config.mapping.is_last_pp_rank():
-            return lm_head(hidden_states).float()
+            logits = lm_head(hidden_states)
+            return logits if keep_lm_head_dtype else logits.float()
         if not return_context_logits:
             if attn_metadata is not None:
                 last_tokens = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
                 hidden_states = hidden_states[last_tokens]
             else:
                 hidden_states = hidden_states[-1]
-        return lm_head(self._collapse(hidden_states)).float()
+        logits = lm_head(self._collapse(hidden_states))
+        return logits if keep_lm_head_dtype else logits.float()
 
 
 class Qwen4ExpMTPHead(Qwen4ExpLogitsProcessor):
@@ -1138,6 +1135,9 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
     recurrent one-model MTP layer.
     """
 
+    # The GDN layers' Mamba metadata, whichever cache manager serves the model.
+    mamba_metadata_cls = GDNMambaMetadata
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         _normalize_qwen35_exclude_modules(model_config)
         _normalize_qwen35_quant_config_dict(model_config)
@@ -1251,7 +1251,11 @@ _QWEN4_EXP_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 class Qwen4ExpForConditionalGeneration(Qwen3VLModelBase):
     """Composite model using the production Qwen3-VL vision stack."""
 
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
+
     supports_encoder_cache = True
+    # The inner decoder's GDN layers read it.
+    mamba_metadata_cls = Qwen4ExpForCausalLM.mamba_metadata_cls
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:

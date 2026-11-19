@@ -667,6 +667,7 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         self.vision_model = RADIOVisionModel(
             vision_model_config,
             disable_quantization=True,
+            vision_attn_backend=model_config.get_encoder_attention_backend("vision", "FLASHINFER"),
             encoder_cuda_graph_config=encoder_cuda_graph_config,
         )
 
@@ -2902,8 +2903,18 @@ _NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     placeholder_metadata=_NEMOTRON_H_MM_PLACEHOLDER_METADATA,
 )
 class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"}),
+        "audio": frozenset(),  # Parakeet uses fixed relative-position SDPA.
+    }
+
     _supports_flash_attn = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
+
+    @property
+    def mamba_metadata_cls(self):
+        """The Mamba metadata class of the language model's recurrent layers."""
+        return getattr(self.llm, "mamba_metadata_cls", None)
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config

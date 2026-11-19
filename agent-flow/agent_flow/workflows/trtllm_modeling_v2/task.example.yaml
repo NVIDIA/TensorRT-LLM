@@ -1,5 +1,5 @@
 # trtllm-modeling-v2 task specification: every key the spec accepts, with its default. Fill it in
-# by following spec/INTAKE.md, lint it with `trtllm-modeling-v2 intake lint --task task.yaml`, and check it
+# by following spec/INTAKE.md and check it
 # with `trtllm-modeling-v2 --task task.yaml --workspace W --dry-run`. `trtllm-modeling-v2 intake
 # derive --checkpoint <dir> --repo <checkout> --goal "..." --out D` writes a starting spec. Or derive one:
 # `trtllm-modeling-v2 --checkpoint <dir> --site site.yaml --goal "..." --workspace W` writes
@@ -41,9 +41,10 @@ features: []
 #   kv_fp8:
 #     unit: core                    # default core
 #     members: [tep4]               # default: the unit's, and the benchmark runs at one of them
-#     gates: [accuracy]             # default [boot, accuracy]: a variant that boots, boots at every
-#                                   # member of its unit; accuracy alone checks the setting took
-#                                   # effect (spec/INTAKE.md). `acceptance` needs a speculator unit
+#     gates: [accuracy]             # default [boot, accuracy]: a variant that boots, boots at the
+#                                   # members of its unit its benchmark does not run at; accuracy
+#                                   # alone judges the setting by its score (spec/INTAKE.md).
+#                                   # `acceptance` needs a speculator unit
 #     runtime: {extra_flags: [--kv_cache_dtype=fp8]}      # over the unit's; flags appended
 #     llm_api_options: {kv_cache_config: {dtype: fp8}}    # merged into the unit's YAML
 #     env: {}                       # added to the gate command's environment
@@ -56,14 +57,10 @@ features: []
 #   # on a feature unit that changes a KV dtype or chunking is a combination; core's own variant
 #   # proves the axis, so add it only when the request names it.
 
-# A requested feature@member cell no check covers (`coverage.yaml`) stops the run at preflight
-# unless accepted here: `<feature>@<member>`, `<feature>@*` for a row, `<unit>+<unit>` for a pair.
-# coverage: {accept: [mtp7@tp4, disagg+multimodal@*]}
-
 # `smoke` (a unit's boot alone), `bringup` (each unit at its cheapest member; no variant, no
 # delivery check, and no CI files: the accuracy test, its test list entry, the anchor's row,
 # when every unit is smoke or bringup), `standard` (the default: this file as written), `certified` (also the
-# boot boundary phases and the serve gate, and each benchmark at every member). For the
+# serve gate, and each benchmark at every member). For the
 # run, or per unit and variant over `default`. A switch the spec sets itself keeps its value.
 # profile: {default: standard, multimodal: smoke}
 
@@ -91,10 +88,10 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 #   chunked_prefill: false     # default false
 #   overlap_scheduler: true    # default true  (--disable_overlap_scheduler)
 #   kv_cache_reuse: false      # default false: block reuse is a non-core feature, proven by a
-#                              # `reuse` variant (kv_cache_config.enable_block_reuse: true)
+#                              # `reuse` variant (runtime: {kv_cache_reuse: true})
 #   # Anything else the gate command needs, verbatim. Without --max_seq_len the engine sizes its
 #   # cache for `max_position_embeddings` (`Impossible to fit in any sequence in kvCache`).
-#   # max_seq_len = isl + osl; max_batch_size >= the per-rank concurrency the perf block claims.
+#   # max_seq_len = isl + osl; max_batch_size >= the concurrency the workload claims (a global total).
 #   extra_flags: [--max_seq_len=9216, --max_batch_size=64, --kv_cache_fraction=0.7]
 #
 # Per unit, layered over `default`: {default: {extra_flags: [...]}, multimodal: {...}}. A setting
@@ -110,7 +107,7 @@ environment:
   kind: local
 
   # REQUIRED: the interpreter every Python command runs under, the editable install to measure.
-  # It must exist at launch (`intake lint` checks a path visible from this host).
+  # It must exist at launch.
   python: /path/to/TensorRT-LLM/.venv-3.12/bin/python
 
   # Exported to every command. Preflight requires TMPDIR and CLAUDE_CODE_TMPDIR outside /tmp, and
@@ -119,19 +116,14 @@ environment:
     TMPDIR: /path/to/scratch/tmp
     CLAUDE_CODE_TMPDIR: /path/to/scratch/tmp
 
-  # A checkpoint the STOCK modeling path supports, booted by the substrate gate when the stock path
-  # does not know the run's own architecture (and only then). Prefer it to `--skip-substrate-gate`,
-  # which also gives up the MPI spawn and NVRTC checks.
-  # substrate_checkpoint: /path/to/Qwen3-30B-A3B
-
   # --- session_spool ------------------------------------------------------
   # REQUIRED with session_spool: the gate spool, a directory a running session watches.
   # spool: /path/to/scratch/spool
   # gpus_per_node: 4
-  # gpu_memory_gib: 288                     # per device: the lint sizes engines and disagg by it
+  # gpu_memory_gib: 288                     # per device: engines and disagg are sized by it
   # time_limit: "04:00:00"                  # the bare spool's own session
-  # The image the GPU jobs run in, if any, and how host paths appear inside it: the intake lint
-  # checks the run's paths through them. How the image is started is yours.
+  # The image the GPU jobs run in, if any, and how host paths appear inside it. How the image is
+  # started is yours.
   # container_image: /path/to/image
   # mounts: [/data:/data]
   #
@@ -171,13 +163,10 @@ accuracy:
 
   # `statistical` (default): reference - k x SE, the SE binomial over the benchmark's sample count
   # (0.75 points for GSM8K's 1319 questions at 92 %: k = 2 puts the floor 1.5 points down);
-  # `tolerance`: reference - `tolerance`. A unit gated at `shift_min_members` or more whose every
-  # member scores over 1 SE low is a FINDING, blocking delivery until `acknowledge` gives a reason.
+  # `tolerance`: reference - `tolerance`.
   # floor:
   #   rule: statistical
   #   k: 2.0                   # default
-  #   shift_min_members: 2     # default
-  #   acknowledge: {dspark: "every member -0.9..-1.1: drafter changes rounding, see 06-gates/..."}
 
   # In benchmark points; read only under `floor.rule: tolerance`. Default 5.0.
   tolerance: 5.0
@@ -222,10 +211,10 @@ accuracy:
   #   tests: []                    # more node ids, each run as a job of its own
   #   timeout: 7200                # default, seconds
 
-  # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration per prompt
-  # against built-in modeling (`=off`; fails under a 0.95 ratio when a paired test finds the drop
-  # significant), against the previous tree's verdict, and against 1.0. With no `=off` path, declare
-  # `measured_reference` (floor 0.95 x it) or `min_absolute` with its `floor_source`, per unit.
+  # The ACCEPTANCE gate, where a unit keeps speculation on: accepted tokens per iteration over the
+  # workload, in one load, held to 1.0 (every draft rejected) and to the floor the unit declares:
+  # `measured_reference` (floor 0.95 x it) or `min_absolute`, with its `floor_source`. A unit that
+  # declares none is held to 1.0 alone, and its verdict says so.
   # acceptance:
   #   # Default: the first `num_prompts` questions of the accuracy dataset, from the local cache.
   #   # Each workload key below also works inside a unit's entry, for that unit alone.
@@ -235,49 +224,23 @@ accuracy:
   #   # prompts: [...]              # or the prompts outright, or prompts_file: a YAML/JSON list
   #   max_tokens: 256               # default
   #   min_draft_iterations: 32      # default; fewer fails as "workload too short"
-  #   min_prompts: 32               # default; fewer fails as "workload too small"
-  #   regression: {alpha: 0.05, min_effect: 0.1}   # the defaults
   #   mtp: {min_absolute: 1.5, floor_source: "03-plan/acceptance-spike.md: reference 2.31"}
   #   dspark: {measured_reference: 3.32}   # floor 3.15
 
-  # The BOOT gate's workload, run-wide or per unit; keywords match
-  # generated text only. A `multimodal` unit with no image prompt sends the tree's
-  # tests/integration/test_input_files/merlion.png.
+  # The BOOT gate's workload, run-wide or per unit. An answer must not be empty; what it
+  # says is the benchmark's to judge. A `multimodal` unit with no image prompt sends the
+  # tree's tests/integration/test_input_files/merlion.png.
   # boot:
   #   prompts:
   #     - "The capital of France is"
-  #     - prompt: "Natalia sold 48 clips in April and half as many in May. How many in all?"
-  #       keywords: ["72"]
+  #     - "In one sentence, photosynthesis is"
   #   # prompts_file: boot_prompts.yaml   # or a YAML/JSON list of plain prompts
-  #   keywords: [Paris]             # each must appear in some generated text
   #   max_tokens: 32                # default
   #   multimodal:
   #     prompts:
   #       - prompt: "<|User|><image>What vegetable is this? One word.<|Assistant|>"
   #         images: [examples/images/carrots.jpeg]   # beside this file, or in the tree
   #         render: raw                              # pre-rendered; or `loader`
-  #         keywords_any: [carrot]
-
-  # Optional BOOT BOUNDARIES, off unless `enabled: true` or `profile: certified`.
-  # One member's boot of each unit (`members`, else attention DP first, then the widest; never a
-  # configuration variant's) adds sequential probes then loaded requests in the SAME engine.
-  # Both probe outputs must contain and match at least `agree_tokens` tokens (EOS ignored), but for
-  # a near-tie: legs that part on two tokens within `tie_margin` nats in a leg's own top-5 log-probs.
-  # Long inputs are exactly max_seq_len - max_tokens - 1 tokens, capped at max_num_tokens - 1
-  # without chunked prefill. Needs explicit max_seq_len; long_prompts: 0 disables long inputs.
-  # Submitted concurrency is at most max_batch_size, not proof of actual scheduler batches or
-  # CUDA graph execution. Cache reuse stays as declared. Stock-path substrate boots omit these.
-  # envelope:
-  #   enabled: true
-  #   max_tokens: 16               # default
-  #   agree_tokens: 4              # default
-  #   long_prompts: 2              # default
-  #   tie_margin: 0.15             # default, nats
-  #   members: [dep4]              # default: one per unit, as above
-  #   # One right continuation each: open-ended prompts have near-tied tokens that flip with batch
-  #   # shape (MoE routing, low-precision GEMM tactics) far more often than these.
-  #   probes: ["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]
-  #   timeout: 3600                # default, seconds for the complete boot; CLI --timeout overrides
 
   # The SERVE gate: `trtllm-serve` starts each unit's target with the accuracy gate's options at its
   # widest member and answers one completion (and an image chat for a unit whose boot sends one).
@@ -315,7 +278,7 @@ accuracy:
 # agents:
 #   defaults: {backend: claude-code, model: <your-model-id>, reasoning_effort: <your-effort>}
 #   roles:
-#     tuner: {backend: codex, model: <your-codex-model-id>, reasoning_effort: high}
+#     planner: {backend: codex, model: <your-codex-model-id>, reasoning_effort: high}
 #   # defaults: {extra_mcp_servers: {knowledge-base: {type: http, url: https://example.test/mcp}}}
 
 # ----------------------------------------------------------- commit policy
@@ -327,85 +290,3 @@ accuracy:
 #   allow_co_authors: false    # the default
 #   base_ref: origin/main      # delivery audits merge-base(HEAD, base_ref)..HEAD; default
 #                              # origin/main, else upstream/main, else main
-
-# ------------------------------------------------------------- performance
-# The tune campaign (tune/stage.py): with `enabled: true`, a `tune` task that starts once the
-# core's correctness checks hold (on a target onboarded elsewhere, `trtllm-modeling-v2 tune --task
-# task.yaml --workspace W`). Perf is never a release gate. A micro/module candidate is judged by
-# its micro-bench, projected to e2e through `microbench.share`, with its outputs held roughly to
-# the control's; a win keeps at once. A checkpoint every few keeps measures e2e, the first output
-# token's distribution and the target's suite on the best tree, and a failure rolls those keeps
-# back. The accuracy benchmark runs once, on the final tree.
-# perf:
-#   enabled: true
-#   workload: {isl: 8192, osl: 1024, concurrency: [1, 32, 128]}   # default 1024, 1024, [1, 32, 128]
-#                                  # derive gives a dep member only the high point; a concurrency
-#                                  # and a batch size are global totals across attention-DP ranks
-#   identity_configs: [<LLM-API yaml>]   # default: derived from the workload
-#   configs:                       # instead of `workload`: serving validation workloads
-#     - name: chat                 # system-wide candidates and final cumulative e2e cover all
-#       workload: {isl: 1024, osl: 256, concurrency: [1, 16]}
-#       constraint: {tpot_ms_max: 30}          # breaking it is a loss (also ttft_ms_max)
-#     - name: batch
-#       workload: {isl: 8192, osl: 1024, concurrency: [128]}
-#       llm_api_options: {enable_chunked_prefill: true}   # over the derived serving config
-#     - name: agent                # `client: agentx` replays InferenceX's AgentX traces (multi-turn
-#       workload:                  # agent sessions sharing long prefixes) with its aiperf client
-#         client: agentx           # (agentx-harness 1.0.12 in a per-job uv venv, from PyPI);
-#         isl: 8192                # isl/osl only describe the requests
-#         osl: 1024
-#         concurrency: [1]
-#         duration_s: 900                      # default 900; per point
-#         dataset: semianalysis_cc_traces_weka_062126_256k   # the default corpus
-#         # warmup_per_lane: 3, max_context_length: 262144, extra_args: [...]: aiperf's own flags
-#         # hf_home: <corpus cache>            # default <workspace>/tune/agentx-cache/hf
-#       llm_api_options: {enable_chunked_prefill: true, kv_cache_config: {enable_block_reuse: true}}
-#       constraint: {kv_hit_pct_min: 95}       # prompt tokens served from the KV cache, percent
-#       # Its points rank as InferenceX ranks AgentX: tok_s_user = 1 / P90 full-response ITL,
-#       # throughputs over the profiling window (total_tok_s_gpu counts cached input too). MTP
-#       # results comparable with the published ones force its golden acceptance length in
-#       # env_script (TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS = AL - 1); without it the
-#       # campaign measures the acceptance the traces reach.
-#   goal: {ratio_to_baseline: 1.1}   # stop once every headline is 1.1x the baseline; or/and
-#                                    # pct_of_sol: 0.7, 70% of each headline's SOL ceiling
-#   sol:                           # public roofline turns; input schema: tune/sol.py
-#     enabled: true                # default; optional `gpu` is a label: capacities need public sources
-#     methods: [analytic, code, profile]   # independent analyses: config formulas, the code
-#                                  # as written, a profile (its counted traffic bounds the work)
-#     tolerance: 0.15              # ceilings this close agree (the highest is taken); the rest
-#                                  # is ruled on once, by choosing an analysis, or stays unknown
-#   spools: [<whole-node session spools for e2e measurements>]   # default: the sessions' spools
-#   dev_spools: [<sessions for 1-GPU tuner jobs and the correctness checks>]   # default: `spools`
-#   env_script: <sourced by every perf job>   # default <workspace>/tune/env.sh
-#   wall: 2h                       # default; one perf job's wall limit
-#   model: /path/to/checkpoint     # default checkpoint_path (and `target`: the run's target)
-#   source_workspace: <onboarding workspace>   # a standalone tune beside an onboarding of the
-#                                  # same checkout imports the commits the core's verdicts there
-#                                  # validate; default the tune's own workspace
-#   campaign:                      # every value shown is the default but max_hours (none)
-#     enabled: true                # false: the baseline only
-#     min_gain: 0.01               # an e2e win = max(min_gain, noise_factor x spread)
-#     min_projected_gain: 0.005    # a micro/module win: a point's projected e2e gain
-#     micro_noise: 0.02            # a micro-bench speedup this small counts as none
-#     module_tolerance: 0.05       # outputs farther than this (relative) from the control's
-#     checkpoint_keeps: 3          # a checkpoint every 3 keeps, or once they project
-#     checkpoint_gain: 0.05        # 5 % at a point; a LOSS or a correctness FAIL rolls them back
-#     logits: {top_k: 20, max_kl: 0.1, min_top1: 0.9, tie_margin: 0.15}   # and `prompts`
-#     noise_factor: 3.0
-#     ttft_tolerance: 0.1          # a first token this much slower at concurrency 1 is a loss
-#     max_parallel_tuners: 4
-#     max_iterations: 12
-#     split_variants: true         # a LOSS split by member asks for one member-gated variant
-#     max_consecutive_misses: 3
-#     max_roadmaps: 2              # a spent roadmap with budget left is refreshed on the best tree
-#     max_hours: 24                # the campaign's wall budget
-#     idle_settle_s: 120           # a measurement starts on a node idle this long
-#     retry_wait_s: 600            # a transient no-verdict (a job to finish, a session to come
-#     max_retries: 24              # back) is waited out in process this long, this many times;
-#                                  # past them the process ends and the next one resumes
-#     gate_tests: true             # the target's and the contract's tests, at each checkpoint
-#     kernel_ledger: require       # or off: no kernel ledger asked of a roadmap
-#     kernel_coverage_pct: 80      # the GPU time a roadmap's kernel ledger must cover
-#     accuracy: {unit: core, members: [dep4]}   # the final tree's; default the widest member;
-#                                  # {gate: off} also turns off the first-token check
-#   sister_engines: [<other engines' checkouts: prior art; kernels and strategies may be adapted>]

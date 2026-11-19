@@ -35,7 +35,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunnerConfig,
     EncoderKeyType,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.utils import torch_multi_arange, with_model_extra_attrs
 from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (
@@ -956,13 +956,7 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
     def warmup(self, resource_manager: ResourceManager | None = None) -> None:
-        if resource_manager is not None:
-            kv_cache_manager = resource_manager.get_resource_manager(
-                ResourceManagerType.KV_CACHE_MANAGER
-            )
-            assert kv_cache_manager is None, (
-                "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
-            )
+        del resource_manager
         AutoTuner.get()
         max_shape = (
             self._config.max_batch_size,
@@ -1118,9 +1112,19 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
     def forward_packed(
         self,
         inputs: PackedInputs,
+        *,
+        inputs_staged: torch.cuda.Event | None = None,
     ) -> dict[str, Any]:
-        """Execute packed inputs with their requested output options."""
+        """Execute packed inputs with their requested output options.
+
+        Args:
+            inputs: The packed batch.
+            inputs_staged: Recorded on the current stream once the host staging memory
+                this runner reuses across calls has been consumed.
+        """
         prepared = self._prepare_inputs(inputs)
+        if inputs_staged is not None:
+            inputs_staged.record()
         return self._execute_prepared(
             prepared,
             gather_context_logits=inputs.gather_context_logits,
@@ -1135,7 +1139,7 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
     ) -> dict[str, Any]:
         """Execute scheduled requests by packing them for ``forward_packed``."""
         del resource_manager, is_dummy
-        return self.forward_packed(self._pack_scheduled(inputs))
+        return self.forward_packed(self._pack_scheduled(inputs), inputs_staged=inputs.inputs_staged)
 
     def _pack_scheduled(self, inputs: ScheduledInputs) -> PackedInputs:
         requests = inputs.batch.context_requests
@@ -1203,14 +1207,21 @@ def resolve_scheduled_encoder_args(llm_args: TorchLlmArgs) -> TorchLlmArgs:
     drops_compile = llm_args.torch_compile_config == TorchCompileConfig()
     if drops_compile:
         update["torch_compile_config"] = None
+    graph_setting = (
+        "multimodal_config.encoder_cuda_graph"
+        if llm_args.mm_encoder_only
+        else "cuda_graph_config=EncodeCudaGraphConfig(...)"
+    )
     logger.warning(
         f"prefill_cuda_graph_backend={llm_args.prefill_cuda_graph_backend.value!r} is ignored "
         "for non-generation models, which use encoder CUDA graphs "
-        "(cuda_graph_config=EncodeCudaGraphConfig(...)) instead"
+        f"({graph_setting}) instead"
         + (
             "; the default torch_compile_config is dropped with it, so the model runs eagerly."
             if drops_compile
             else "; torch_compile_config still applies, without piecewise CUDA graphs."
+            if llm_args.torch_compile_config is not None
+            else "."
         )
     )
     return llm_args.model_copy(update=update)

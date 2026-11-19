@@ -36,6 +36,7 @@ import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as cuda_graph_runner_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -656,19 +657,24 @@ class TestStrictBufferCheckEnvVar:
 class _AttnMetadataStub:
     """Stand-in for create_cuda_graph_metadata(); returns a copy with is_cuda_graph=True."""
 
-    def __init__(self, is_cuda_graph: bool = False):
+    def __init__(self, is_cuda_graph: bool = False) -> None:
         self.is_cuda_graph = is_cuda_graph
+        self.forward_scratch_buffers: Buffers | None = None
 
     def create_cuda_graph_metadata(
         self,
-        max_batch_size,
-        sub_cross_metadata=False,
-        max_draft_tokens=0,
-        buffers=None,
-        encode_only=False,
-    ):
+        max_batch_size: int,
+        sub_cross_metadata: bool = False,
+        max_draft_tokens: int = 0,
+        buffers: Buffers | None = None,
+        encode_only: bool = False,
+        *,
+        forward_scratch_buffers: Buffers | None = None,
+    ) -> "_AttnMetadataStub":
         del max_batch_size, sub_cross_metadata, max_draft_tokens, buffers, encode_only
-        return _AttnMetadataStub(is_cuda_graph=True)
+        metadata = _AttnMetadataStub(is_cuda_graph=True)
+        metadata.forward_scratch_buffers = forward_scratch_buffers
+        return metadata
 
 
 def _make_generation_only_batch(req_id: int = 1) -> ScheduledRequests:
@@ -698,7 +704,7 @@ class TestCaptureAllowedGate:
 
         assert result == (None, None, None)
 
-    def test_maybe_get_cuda_graph_prepares_capture_inside_allow_capture(self):
+    def test_maybe_get_cuda_graph_prepares_capture_inside_allow_capture(self) -> None:
         """The same key inside allow_capture() returns graph metadata and a key."""
         runner = create_mock_cuda_graph_runner(batch_size=1)
         batch = _make_generation_only_batch()
@@ -710,6 +716,7 @@ class TestCaptureAllowedGate:
 
         assert key is not None
         assert attn_metadata is not None and attn_metadata.is_cuda_graph
+        assert attn_metadata.forward_scratch_buffers is runner.forward_scratch_buffers
         assert spec_metadata is None
 
     def test_allow_capture_resets_flag_on_exception(self):
@@ -725,3 +732,48 @@ class TestCaptureAllowedGate:
                 raise _Boom()
 
         assert runner._capture_allowed is False
+
+
+class TestStagedReplayInputs:
+    """The one-launch staging writes what the copy path writes."""
+
+    @pytest.mark.parametrize("with_offsets", [False, True], ids=["plain", "offsets"])
+    def test_replay_inputs_match_the_copy_path(self, monkeypatch, with_offsets):
+        launches = []
+        stage = cuda_graph_runner_module.stage_replay_inputs
+        monkeypatch.setattr(
+            cuda_graph_runner_module,
+            "stage_replay_inputs",
+            lambda *args: launches.append(stage(*args)) or launches[-1],
+        )
+        batch_size = 4
+        runner = create_mock_cuda_graph_runner(batch_size, max_num_tokens=batch_size)
+        runner.config.stage_decode_inputs = True
+        key = KeyType(batch_size=batch_size, draft_len=0)
+        num_tokens = runner._get_num_tokens_for_key(key)
+        attn_metadata = SimpleNamespace(num_ctx_tokens=0)
+        seen = []
+        runner.register_pre_replay_hook(
+            lambda key, count, tensors, inputs: seen.append(tensors["position_ids"].clone())
+        )
+
+        def inputs(value):
+            tokens = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+            return {
+                "attn_metadata": attn_metadata,
+                "input_ids": tokens + value,
+                "position_ids": (tokens * 3 + value).view(1, num_tokens),
+            }
+
+        runner.capture(key, lambda current: current["input_ids"].clone(), inputs(1))
+        for buffer in runner.shared_static_tensors.values():
+            buffer.fill_(SENTINEL)
+        offsets = torch.arange(num_tokens, device="cuda", dtype=torch.int32) - 2
+        current = inputs(7)
+        runner.replay(key, current, position_id_offsets=offsets if with_offsets else None)
+        static = runner.shared_static_tensors
+        assert torch.equal(static["input_ids"][:num_tokens], current["input_ids"])
+        assert torch.equal(static["position_ids"][..., :num_tokens], current["position_ids"])
+        expected = current["position_ids"] + offsets if with_offsets else current["position_ids"]
+        assert torch.equal(seen[-1], expected)
+        assert launches == [True]
