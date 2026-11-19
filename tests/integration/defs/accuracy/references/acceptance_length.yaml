@@ -26,6 +26,12 @@ TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp4]:
 TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl:
   ref_al: 4.433448078026391
   min_al: 4.211775674125072
+# nvidia/DeepSeek-V4-Pro-NVFP4 with MTP3 (max_draft_len 3), one-node DEP4 on
+# GB300: the body on MegaMoE CuTe DSL, the MTP block's MXFP4 experts on
+# TRTLLM-Gen (speculative_config.moe_backend AUTO).
+TestDeepSeekV4Pro::test_gsm8k_dep4_megamoe_cutedsl_mtp:
+  ref_al: 3.146462
+  min_al: 2.989139
 TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4:
   ref_al: 4.0738
   min_al: 3.8701
