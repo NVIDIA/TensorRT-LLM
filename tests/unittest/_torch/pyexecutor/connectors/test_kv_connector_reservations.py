@@ -323,7 +323,14 @@ def test_ranks_that_disagree_about_capacity_only_are_rejected(
     monkeypatch.setattr(
         connector, "mpi_allgather", lambda value: [value, (value[0], not value[1], *value[2:])]
     )
-    with pytest.raises(ValueError, match="capacity_only must be the same on every rank"):
+    declaring_rank = 0 if local_capacity_only else 1
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"capacity_only must be the same on every rank, but only "
+            rf"rank\(s\) \[{declaring_rank}\] of 2 declare it\. .*get_finished allgather"
+        ),
+    ):
         manager.configure_prefix_reservations(True)
 
 

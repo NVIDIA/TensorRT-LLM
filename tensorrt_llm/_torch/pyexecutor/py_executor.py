@@ -12798,7 +12798,7 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
-        connector = self.kv_connector_manager
+        connector = getattr(self, "kv_connector_manager", None)
         if self.enable_attention_dp and connector is not None:
             pending = connector.get_pending_transfer_requests()
             if self._kv_connector_failed or (pending and
@@ -13033,7 +13033,7 @@ class PyExecutor:
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
-        connector = self.kv_connector_manager
+        connector = getattr(self, "kv_connector_manager", None)
         if (self.enable_attention_dp and connector is not None
                 and connector.has_pending_transfers(request.request_id)):
             self._kv_connector_fail(
@@ -13437,7 +13437,7 @@ class PyExecutor:
         Returns:
             bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
         """
-        connector = self.kv_connector_manager
+        connector = getattr(self, "kv_connector_manager", None)
         if connector is not None:
             connector.release_unstarted_prefix_loads(request)
             if connector.defer_load_termination(request):
@@ -14264,7 +14264,7 @@ class PyExecutor:
                 "in-flight batch); call it from within control_action(), "
                 "which retires the in-flight batch on every rank first.")
 
-        connector = self.kv_connector_manager
+        connector = getattr(self, "kv_connector_manager", None)
         requests_to_recompute = []
         transfer_bound = []
         load_bound = []

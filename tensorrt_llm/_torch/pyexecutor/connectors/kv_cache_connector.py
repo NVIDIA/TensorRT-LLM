@@ -1129,8 +1129,17 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 "reports_failed_loads",
             )
             for index, declaration in enumerate(declarations, start=1):
-                if len({rank_probe[index] for rank_probe in probe}) != 1:
-                    raise ValueError(f"KV connector {declaration} must be the same on every rank")
+                declaring_ranks = [
+                    rank for rank, rank_probe in enumerate(probe) if rank_probe[index]
+                ]
+                if declaring_ranks and len(declaring_ranks) != len(probe):
+                    raise ValueError(
+                        f"KV connector {declaration} must be the same on every rank, but "
+                        f"only rank(s) {declaring_ranks} of {len(probe)} declare it. "
+                        "It gates collectives the other ranks still enter, such as the "
+                        "get_finished allgather, so a split hangs rather than fails. "
+                        "Give every rank of this server the same connector class and role."
+                    )
             capabilities = scheduler_methods + worker_capabilities
             if any(capabilities) and not all(capabilities):
                 raise ValueError(

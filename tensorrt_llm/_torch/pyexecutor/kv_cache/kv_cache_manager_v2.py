@@ -3558,6 +3558,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self._completion_waiter = None
         self._disagg_completion_capacity = None
         self._completion_dummy_ids: set[int] = set()
+        # Ledger blocks a padding cache from `add_dummy_requests` reaches in the
+        # forward it pads, including the generation step the scheduler adds.
+        self._completion_dummy_limits: dict[int, int] = {}
         blocker = self._disagg_completion_reservation_blocker()
         self._reserves_disagg_completion = blocker is None
         if self._reserves_disagg_completion:
@@ -6741,16 +6744,25 @@ class KVCacheManagerV2(BaseResourceManager):
         self._inflight_draft_lens.setdefault(request_id, []).append(draft_slots)
         return True
 
+    def _undo_generation_step(self, req: LlmRequest) -> None:
+        """Unwind per-step state a subclass keeps for `req`'s skipped generation step.
+
+        Both `revert_allocate_generation` and `keep_generation_allocation` call
+        this first, so a subclass that tracks per-step state overrides it once
+        instead of both. The base manager keeps none.
+        """
+
     def keep_generation_allocation(self, req: LlmRequest) -> None:
         """Keep a published allocation for the next attempt of a skipped step.
 
-        This is the connector counterpart of `revert_allocate_generation` and does not go through it. A subclass
-        that overrides the revert to unwind per-step state must handle this method too.
+        This is the connector counterpart of `revert_allocate_generation` and does not go through it. Per-step
+        state a subclass keeps is unwound through `_undo_generation_step`, as in the revert.
 
         The pages and connector save ownership remain intact. The skipped
         step leaves the in-flight queue until scheduling retries it, so an
         older overlapping forward still consumes only its own allocation.
         """
+        self._undo_generation_step(req)
         request_id = req.py_request_id
         draft_slots = self._allocated_draft_lens.pop(request_id, None)
         if draft_slots is None:
@@ -6775,6 +6787,7 @@ class KVCacheManagerV2(BaseResourceManager):
         Keyed on ``_allocated_draft_lens``: no entry means no growth to give back.
         Recording the width keeps the paired target/draft reverts in step.
         """
+        self._undo_generation_step(req)
         request_id = req.py_request_id
         draft_slots = self._allocated_draft_lens.pop(request_id, None)
         if draft_slots is None:
@@ -7552,10 +7565,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.completion_admission_blocked(req):
             return False
         self.validate_completion_capacity(req)
+        prompt_len = self._completion_prompt_len(req)
         limit = (
-            self._disagg_completion_limit(self._context_only_completion_end(req.prompt_len))
+            self._disagg_completion_limit(self._context_only_completion_end(prompt_len))
             if req.is_context_only_request
-            else self._disagg_generation_limit(req, req.prompt_len)
+            else self._disagg_generation_limit(req, prompt_len)
         )
         if not self._can_reserve_disagg_completion(req.py_request_id, limit):
             self._completion_waiter = req.py_request_id
@@ -7584,13 +7598,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         The construction-time budget already excludes the guard page. Other
         dummy caches can be allocated or resized during warmup or lazily at
-        runtime, and must not be promised to user requests. User allocations
-        do not reduce this budget; admission accounts for them separately.
+        runtime, and must not be promised to user requests; a padding cache
+        counts the generation step it still takes. User allocations do not
+        reduce this budget; admission accounts for them separately.
         """
         if self._disagg_completion_capacity is None:
             return None
         dummy_blocks = sum(
-            self.kv_cache_map[request_id].num_blocks
+            max(
+                self.kv_cache_map[request_id].num_blocks,
+                self._completion_dummy_limits.get(request_id, 0),
+            )
             for request_id in self._completion_dummy_ids
             if request_id in self.kv_cache_map
         )
@@ -7600,9 +7618,18 @@ class KVCacheManagerV2(BaseResourceManager):
         """Tokens a context-only request allocates: its prompt plus the speculative padding."""
         return prompt_len + self._kv_alloc_extra_tokens
 
+    def _completion_prompt_len(self, req: LlmRequest) -> int:
+        """Prompt tokens a completion bound covers.
+
+        Under helix CP `prompt_len` holds only this rank's strided slice, while
+        `_ledger_tokens_per_block` is scaled by `cp_size`, so the ledger sizes
+        off the full prompt in `total_input_len_cp`.
+        """
+        return req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+
     def _completion_blocks_required(self, req: LlmRequest) -> int:
         """Ledger blocks `req` needs to complete, excluding headroom and tail-copy extras."""
-        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        prompt_len = self._completion_prompt_len(req)
         end = (
             self._context_only_completion_end(prompt_len)
             if req.is_context_only_request
@@ -7652,19 +7679,50 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         candidate = self.kv_cache_map.get(request_id)
         needed = max(0, limit - (candidate.num_blocks if candidate is not None else 0))
-        for req_id, req_limit in self._disagg_completion_limits.items():
-            if req_id == request_id:
-                continue
-            kv_cache = self.kv_cache_map.get(req_id)
-            assert kv_cache is not None, (
-                f"Completion reservation for request {req_id} outlived its KV cache"
-            )
-            needed += max(0, req_limit - kv_cache.num_blocks)
+        return self._completion_blocks_fit(
+            needed + self._unallocated_completion_blocks(exclude_request_id=request_id)
+        )
+
+    def _unallocated_completion_blocks(self, exclude_request_id: int | None = None) -> int:
+        """Ledger blocks that admitted bounds and live padding forwards may still allocate."""
+        needed = 0
+        for limits in (self._disagg_completion_limits, self._completion_dummy_limits):
+            for req_id, req_limit in limits.items():
+                if req_id == exclude_request_id:
+                    continue
+                kv_cache = self.kv_cache_map.get(req_id)
+                assert kv_cache is not None, (
+                    f"Completion reservation for request {req_id} outlived its KV cache"
+                )
+                needed += max(0, req_limit - kv_cache.num_blocks)
+        return needed
+
+    def _completion_blocks_fit(self, blocks: int) -> bool:
+        """Whether every full-attention pool can still allocate `blocks` ledger blocks."""
         stats = self._get_storage_statistics(GPU_LEVEL)
         return all(
-            needed * count <= stats[pool_id].available
+            blocks * count <= stats[pool_id].available
             for pool_id, count in self._disagg_completion_pool_counts.items()
         )
+
+    def _reserve_padding_forward(self, req: LlmRequest, kv_cache: _KVCache, is_gen: bool) -> bool:
+        """Bound a padding cache's forward so it leaves admitted bounds whole.
+
+        Admitted requests reserve their completion growth without pages, so a
+        padding cache allocated after them could take a page one of them still
+        needs. Its pages, plus the generation step the scheduler adds to a
+        generation dummy, must fit beside the unallocated part of every bound.
+        Recording that step keeps later admissions from taking it.
+
+        Returns:
+            False when the padding cache does not fit; the caller releases it.
+        """
+        limit = kv_cache.num_blocks
+        if is_gen:
+            step_capacity = kv_cache.capacity + 1 + self._generation_draft_slots(req)
+            limit = max(limit, ceil_div(step_capacity, self.tokens_per_block))
+        self._completion_dummy_limits[req.py_request_id] = limit
+        return self._completion_blocks_fit(self._unallocated_completion_blocks())
 
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
@@ -7738,7 +7796,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if remote_tail_start is not None
             else (req.total_input_len_cp if self._has_cp_helix else req.prompt_len)
         )
-        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        prompt_len = self._completion_prompt_len(req)
         limit = None
         if self._reserves_disagg_completion:
             limit = self._disagg_generation_limit(req, prompt_len)
@@ -9827,6 +9885,12 @@ class KVCacheManagerV2(BaseResourceManager):
                         release_resources(req, free_draft_resources=True)
                         return None
 
+            if self._reserves_disagg_completion and not self._reserve_padding_forward(
+                req, kv_cache, is_gen
+            ):
+                release_resources(req, free_draft_resources=draft_kv_cache is not None)
+                return None
+
             if use_mrope:
                 _populate_dummy_mrope_config(req, token_num, is_gen)
             requests.append(req)
@@ -10129,6 +10193,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._reserves_disagg_completion:
             self._disagg_completion_limits.pop(request.py_request_id, None)
             self._completion_dummy_ids.discard(request.py_request_id)
+            self._completion_dummy_limits.pop(request.py_request_id, None)
 
         self._inflight_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
@@ -10558,6 +10623,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._reserves_disagg_completion:
             self._disagg_completion_limits.clear()
             self._completion_dummy_ids.clear()
+            self._completion_dummy_limits.clear()
             self._completion_waiter = None
         self._retained_generation_allocations.clear()
         self._disagg_receive_ready.clear()
