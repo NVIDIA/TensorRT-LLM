@@ -146,9 +146,10 @@ l0_gb300:
   # DSpark Markov chain and forked draft prep over IPC and MNNVL.
   - unittest/_torch/speculative/test_dspark_markov_chain.py
   - unittest/_torch/multi_gpu/test_dspark_draft_prep.py
-  # NVFP4 DSpark accuracy and acceptance gates cover TP4 and attention-DP4.
+  # NVFP4 DSpark accuracy and acceptance gates cover TP4 and attention-DP4; attention-DP4 runs the
+  # 1017 export with MXFP4 Engram tables (its FP8-table variant runs post-merge).
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-1017-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
   # Exact LongBench v2 offload parity: TP2/EP2 context and generation workers. Pre-merge
   # keeps GLM with an NVFP4 latent and V4 with block reuse; the FP8 variants run post-merge
