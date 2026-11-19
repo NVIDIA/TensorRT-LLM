@@ -13,22 +13,29 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-import grpc
 import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
-from .bindings import encoder_transfer_pb2, encoder_transfer_pb2_grpc
-from .bindings import generation_pb2 as pb
-from .encoder import _release, take_encoder_exports
-from .errors import ENCODER_TRANSFER_REJECTED_METADATA, EncoderTransferRejected
-from .preparation import _config_digest, _input_digest
+from .encoder_output import (
+    EncodedMediaRef,
+    EncoderInput,
+    EncoderTransferRejected,
+    _capture_encoder_decode_state,
+    _config_digest,
+    _encoder_input_params,
+    _encoder_output_params,
+    _input_digest,
+    _release,
+    take_encoder_exports,
+)
 
 BACKEND = "trtllm-nixl-encoder-v1"
 _MAX_REFERENCE_BYTES = 64 * 1024
 _MAX_TENSOR_BYTES = 64 * 1024 * 1024
 _MAX_CACHE_BYTES = 256 * 1024 * 1024
+_MAX_RECEIVE_SLOTS = 8
 _MAX_TENSORS = 64
 _TTL_SECONDS = 300
 _TIMEOUT_SECONDS = 30
@@ -43,8 +50,8 @@ _DTYPES = {
         torch.uint8,
     )
 }
-# An uncertain remote WRITE may still touch these buffers. Admission is stopped;
-# retain registrations and tensors until process exit rather than recycle memory.
+# An uncertain remote WRITE may still touch these buffers. Retain registrations
+# and tensors until process exit; quarantined receives remain charged to quota.
 _QUARANTINED = []
 
 
@@ -95,13 +102,20 @@ class _Export:
     metadata: dict
     created: float
     size: int
-    discard_requested: bool = False
 
 
 class NixlEncoderCache:
     backend = BACKEND
 
-    def __init__(self, endpoint, model_revision, *, device="cuda:0", agent_factory=_native_agent):
+    def __init__(
+        self,
+        endpoint,
+        model_revision,
+        *,
+        device="cuda:0",
+        agent_factory=_native_agent,
+        request_transfer=None,
+    ):
         if (
             not isinstance(model_revision, str)
             or len(model_revision) not in (40, 64)
@@ -113,8 +127,9 @@ class NixlEncoderCache:
         self.endpoint = endpoint
         self.model_revision = model_revision
         self.device = torch.device(device)
-        self.name = f"openengine-encoder-{uuid.uuid4().hex}"
+        self.name = f"trtllm-encoder-{uuid.uuid4().hex}"
         self._agent_factory = agent_factory
+        self._request_transfer = request_transfer
         # Fail startup before advertising a backend that cannot initialize.
         probe = agent_factory(f"{self.name}-probe")
         probe.shutdown()
@@ -123,6 +138,9 @@ class NixlEncoderCache:
         self._exports = {}
         self._claims = {}
         self._used = 0
+        self._receive_slots = 0
+        self._quarantined_receive_slots = 0
+        self._quarantined_receive_bytes = 0
         self.failed = False
         self._closed = False
         self._closing = False
@@ -145,6 +163,17 @@ class NixlEncoderCache:
             self.failed = True
             _QUARANTINED.append(resources)
 
+    def _quarantine_receive(self, total, agent, tensors, registration):
+        with self._lock:
+            self._quarantined_receive_slots += 1
+            self._quarantined_receive_bytes += total
+            if (
+                self._quarantined_receive_slots >= _MAX_RECEIVE_SLOTS
+                or self._quarantined_receive_bytes >= _MAX_CACHE_BYTES
+            ):
+                self.failed = True
+            _QUARANTINED.append((agent, tensors, registration))
+
     def _model_digest(self, llm):
         # The immutable revision is deployment-provided, independent of host paths.
         return hashlib.sha256(_encode([_config_digest(llm), self.model_revision])).hexdigest()
@@ -162,7 +191,7 @@ class NixlEncoderCache:
         if self.failed or self._closed or self._closing:
             raise unavailable_error("encoder NIXL transport unavailable; restart the engine")
 
-    def publish(self, result, request, llm):
+    def publish(self, result, request: EncoderInput, llm) -> EncodedMediaRef:
         with self._operation():
             if not self.endpoint:
                 raise ValueError("encoder producer requires an advertised endpoint")
@@ -206,7 +235,7 @@ class NixlEncoderCache:
                 state = _encode(
                     {"version": 1, "endpoint": self.endpoint, "id": identity, "metadata": metadata}
                 )
-                reference = pb.EncoderHandoffRef(transfer_backend=BACKEND, opaque_state=state)
+                reference = EncodedMediaRef(reference_format=BACKEND, opaque_state=state)
                 with self._lock:
                     self._healthy()
                     self._exports[identity] = _Export(tensors, metadata, time.monotonic(), total)
@@ -221,7 +250,7 @@ class NixlEncoderCache:
 
     @staticmethod
     def _reference(reference):
-        if reference.transfer_backend != BACKEND:
+        if reference.reference_format != BACKEND:
             raise ValueError("unsupported encoder transfer backend")
         value = _decode(reference.opaque_state)
         identity = value.get("id")
@@ -251,7 +280,6 @@ class NixlEncoderCache:
             if value.get("metadata") != item.metadata:
                 raise ValueError("encoder handoff metadata mismatch")
             if claimed:
-                item.discard_requested = True
                 return False
             del self._exports[identity]
             self._discard(item)
@@ -356,10 +384,7 @@ class NixlEncoderCache:
                     raise
                 with self._lock:
                     self._claims.pop(identity)
-                    if item.discard_requested:
-                        self._discard(item)
-                    else:
-                        self._exports[identity] = item
+                    self._discard(item)
                 raise EncoderTransferRejected(f"invalid encoder receiver: {error}") from error
             finally:
                 with self._lock:
@@ -389,9 +414,16 @@ class NixlEncoderCache:
             shapes.append((shape, dtype))
         with self._lock:
             self._healthy()
-            if total > _MAX_TENSOR_BYTES or self._used + total > _MAX_CACHE_BYTES:
+            if total > _MAX_TENSOR_BYTES:
                 raise ValueError("encoder receive exceeds the memory limit")
+            if self._used + total > _MAX_CACHE_BYTES:
+                raise RuntimeError("encoder receive cache is full")
+            if self._receive_slots >= _MAX_RECEIVE_SLOTS:
+                raise RuntimeError(
+                    "encoder receive slots exhausted; restart if transfers are quarantined"
+                )
             self._used += total
+            self._receive_slots += 1
         tensors = []
         agent = None
         registration = None
@@ -420,27 +452,19 @@ class NixlEncoderCache:
                     "descs": descs,
                 }
             )
-            with grpc.insecure_channel(value["endpoint"]) as channel:
-                attempted = True
-                encoder_transfer_pb2_grpc.EncoderTransferStub(channel).Transfer(
-                    encoder_transfer_pb2.TransferEncoderCacheRequest(
-                        cache=reference, destination=destination
-                    ),
-                    timeout=_TIMEOUT_SECONDS + 10,
-                )
+            if self._request_transfer is None:
+                raise RuntimeError("native encoder transfer transport is not configured")
+            attempted = True
+            self._request_transfer(value["endpoint"], reference, destination, _TIMEOUT_SECONDS + 10)
         except Exception as error:
-            rejected = (
-                isinstance(error, grpc.RpcError)
-                and error.code() == grpc.StatusCode.INVALID_ARGUMENT
-                and ENCODER_TRANSFER_REJECTED_METADATA in (error.trailing_metadata() or ())
-            )
+            rejected = isinstance(error, EncoderTransferRejected)
             uncertain = (attempted and not rejected) or (registration_attempted and not registered)
             if rejected:
-                raise EncoderTransferRejected(error.details()) from error
+                raise
             raise
         finally:
             if uncertain:
-                self._quarantine(agent, tensors, registration)
+                self._quarantine_receive(total, agent, tensors, registration)
             else:
                 try:
                     if registered:
@@ -448,14 +472,23 @@ class NixlEncoderCache:
                     if agent is not None:
                         agent.shutdown()
                 except Exception:
-                    self._quarantine(agent, tensors, registration)
+                    self._quarantine_receive(total, agent, tensors, registration)
                     raise
                 else:
                     with self._lock:
                         self._used -= total
+                        self._receive_slots -= 1
         return tensors
 
-    def prepare(self, reference, request, llm, sampling):
+    def prepare(
+        self,
+        reference,
+        request,
+        llm,
+        sampling,
+        disaggregated_params: DisaggregatedParams | None = None,
+    ):
+        params = _encoder_input_params(disaggregated_params)
         value = self._reference(reference)
         metadata = value.get("metadata", {})
         if metadata.get("input_digest") != _input_digest(request):
@@ -469,13 +502,7 @@ class NixlEncoderCache:
         ):
             raise ValueError("invalid encoder embedding layout")
         # Reject lossy decoding before consuming the single-use handoff.
-        if request.WhichOneof("input") == "prompt":
-            prompt = request.prompt
-        else:
-            ids = list(request.token_ids.ids)
-            prompt = llm.tokenizer.decode(ids, skip_special_tokens=False)
-            if llm.tokenizer.encode(prompt, add_special_tokens=False) != ids:
-                raise ValueError("encoder handoff requires lossless prompt token decoding")
+        prompt = request.prompt_text(llm.tokenizer)
         with self._operation():
             tensors = self._receive(reference, value)
         exports = []
@@ -491,14 +518,20 @@ class NixlEncoderCache:
                     "mrope_position_ids_handle": exports[-2],
                     "mrope_position_deltas_handle": exports[-1],
                 }
-            params = DisaggregatedParams(
-                request_type="context_and_generation",
-                multimodal_embedding_handles=exports[:count],
-                multimodal_hashes=metadata["hashes"],
-                **positions,
-            )
+            params = _encoder_output_params(params, exports[:count], metadata["hashes"], positions)
             inputs = llm.preprocess({"prompt": prompt}, sampling, params)
             exports.clear()
+            if params.request_type == "context_only":
+                _capture_encoder_decode_state(
+                    llm,
+                    inputs,
+                    {
+                        "mrope_position_ids": tensors[-2],
+                        "mrope_position_deltas": tensors[-1],
+                    }
+                    if metadata.get("has_mrope")
+                    else {},
+                )
             return inputs, params
         finally:
             _release(exports)

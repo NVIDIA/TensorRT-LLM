@@ -31,9 +31,7 @@ _PROTO_NAMES = (
     "openengine",
     "server",
 )
-_TRANSFER_PROTO = Path("trtllm/openengine/v1/encoder_transfer.proto")
-_PROTO_FILES = (*(_PROTO_PACKAGE / f"{name}.proto" for name in _PROTO_NAMES), _TRANSFER_PROTO)
-_GRPC_PROTO_FILES = (_PROTO_PACKAGE / "openengine.proto", _TRANSFER_PROTO)
+_GRPC_PROTO_NAME = "openengine"
 _COPYRIGHT_HEADER = (
     "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. "
     "All rights reserved.\n"
@@ -52,7 +50,7 @@ _GENERATOR_DISTRIBUTIONS = {
     "setuptools": "setuptools",
 }
 _TOP_LEVEL_OPENENGINE_IMPORT = re.compile(
-    r"^(?:from|import)\s+(?:openengine|trtllm\.openengine)(?:\.|\s)", re.MULTILINE
+    r"^(?:from\s+openengine(?:\.|\s)|import\s+openengine(?:\.|\s))", re.MULTILINE
 )
 _PROTOBUF_VERSION = re.compile(r"^# Protobuf Python Version: ([0-9.]+)$", re.MULTILINE)
 _GRPC_VERSION = re.compile(r"^GRPC_GENERATED_VERSION = ['\"]([0-9.]+)['\"]$", re.MULTILINE)
@@ -117,15 +115,15 @@ def _load_manifest(project_root: Path) -> tuple[Path, dict[str, object]]:
 def _rewrite_generated_file(path: Path) -> None:
     content = path.read_text(encoding="utf-8")
     content = re.sub(
-        r"^from (?:openengine\.v1|trtllm\.openengine\.v1) import ([A-Za-z0-9_]+) as ",
+        r"^from openengine\.v1 import ([A-Za-z0-9_]+) as ",
         r"from . import \1 as ",
         content,
         flags=re.MULTILINE,
     )
-    for proto in _PROTO_FILES:
+    for proto_name in _PROTO_NAMES:
         content = content.replace(
-            f"'{proto.with_suffix('').as_posix().replace('/', '.')}_pb2'",
-            f"'{_BINDINGS_PACKAGE}.{proto.stem}_pb2'",
+            f"'{_PROTO_PACKAGE.as_posix().replace('/', '.')}.{proto_name}_pb2'",
+            f"'{_BINDINGS_PACKAGE}.{proto_name}_pb2'",
         )
     if _TOP_LEVEL_OPENENGINE_IMPORT.search(content):
         raise RuntimeError(f"Generated binding retains a top-level OpenEngine import: {path}")
@@ -178,16 +176,13 @@ def _validate_gencode_versions(
             "Unexpected protobuf gencode version(s): " + ", ".join(sorted(protobuf_versions))
         )
 
-    for proto in _GRPC_PROTO_FILES:
-        grpc_path = generated_dir / f"{proto.stem}_pb2_grpc.py"
-        grpc_match = _GRPC_VERSION.search(grpc_path.read_text(encoding="utf-8"))
-        if grpc_match is None:
-            raise RuntimeError(f"Could not find the gRPC gencode version in {grpc_path}")
-        grpc_version = grpc_match.group(1)
-        if grpc_version != str(generator["grpc_gencode"]):
-            raise RuntimeError(
-                f"Expected gRPC gencode {generator['grpc_gencode']}, got {grpc_version}"
-            )
+    grpc_path = generated_dir / "openengine_pb2_grpc.py"
+    grpc_match = _GRPC_VERSION.search(grpc_path.read_text(encoding="utf-8"))
+    if grpc_match is None:
+        raise RuntimeError(f"Could not find the gRPC gencode version in {grpc_path}")
+    grpc_version = grpc_match.group(1)
+    if grpc_version != str(generator["grpc_gencode"]):
+        raise RuntimeError(f"Expected gRPC gencode {generator['grpc_gencode']}, got {grpc_version}")
 
     requirements_path = project_root / "requirements.txt"
     declared_protobuf_floor = _read_runtime_floor(requirements_path, "protobuf")
@@ -315,7 +310,7 @@ def _generate(project_root: Path, output_dir: Path) -> None:
     from grpc_tools import protoc
 
     schema_root, manifest = _load_manifest(project_root)
-    proto_files = [schema_root / proto for proto in _PROTO_FILES]
+    proto_files = [schema_root / _PROTO_PACKAGE / f"{name}.proto" for name in _PROTO_NAMES]
     output_dir.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="openengine-protos-", dir=output_dir.parent) as temp:
@@ -339,31 +334,30 @@ def _generate(project_root: Path, output_dir: Path) -> None:
             [
                 *common_args,
                 f"--grpc_python_out={temporary_root}",
-                *(str(schema_root / proto) for proto in _GRPC_PROTO_FILES),
+                str(schema_root / _PROTO_PACKAGE / f"{_GRPC_PROTO_NAME}.proto"),
             ]
         )
         if result != 0:
             raise RuntimeError(f"protoc failed while generating gRPC bindings (exit {result})")
 
+        nested_output = temporary_root / _PROTO_PACKAGE
+        staged_output = temporary_root / "package"
+        staged_output.mkdir()
         expected_files = {
-            *(proto.parent / f"{proto.stem}_pb2.py" for proto in _PROTO_FILES),
-            *(proto.parent / f"{proto.stem}_pb2.pyi" for proto in _PROTO_FILES),
-            *(proto.parent / f"{proto.stem}_pb2_grpc.py" for proto in _GRPC_PROTO_FILES),
+            *(f"{name}_pb2.py" for name in _PROTO_NAMES),
+            *(f"{name}_pb2.pyi" for name in _PROTO_NAMES),
+            "openengine_pb2_grpc.py",
         }
-        actual_files = {
-            path.relative_to(temporary_root) for path in temporary_root.rglob("*") if path.is_file()
-        }
+        actual_files = {path.name for path in nested_output.iterdir() if path.is_file()}
         if actual_files != expected_files:
             missing = sorted(expected_files - actual_files)
             unexpected = sorted(actual_files - expected_files)
             raise RuntimeError(
                 f"Unexpected generated binding set; missing={missing}, unexpected={unexpected}"
             )
-        staged_output = temporary_root / "package"
-        staged_output.mkdir()
-        for path in sorted(expected_files):
-            destination = staged_output / path.name
-            shutil.copyfile(temporary_root / path, destination)
+        for name in sorted(expected_files):
+            destination = staged_output / name
+            shutil.copyfile(nested_output / name, destination)
             _rewrite_generated_file(destination)
         (staged_output / "__init__.py").write_text(
             _GENERATED_INIT_CONTENT, encoding="utf-8", newline="\n"

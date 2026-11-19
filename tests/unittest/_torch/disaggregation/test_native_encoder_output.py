@@ -3,19 +3,24 @@
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from safetensors import safe_open
+from utils.native_encoder import (
+    _check_handoff_hash_initialization,
+    _check_malformed_handoff_hashes,
+    model,
+    native_result,
+    request,
+)
 
+from tensorrt_llm._torch.disaggregation import encoder_output as oe
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.grpc.openengine import encoder as oe
-from tensorrt_llm.grpc.openengine.bindings import generation_pb2 as pb
-from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError
-from tensorrt_llm.grpc.openengine.preparation import _input_digest
 
 pytestmark = pytest.mark.cpu_only
 
@@ -47,57 +52,104 @@ def test_collection_tolerates_a_concurrently_removed_file(tmp_path, monkeypatch,
     assert not claimed.exists()
 
 
-def request():
-    return pb.GenerateRequest(
-        request_id="encode",
-        model="qwen",
-        prompt="Describe <image_1>",
-        media=[pb.MediaItem(modality=pb.MODALITY_IMAGE, data_uri="data:image/png;base64,aW1hZ2U=")],
-    )
+@pytest.mark.parametrize("supplied", [False, True])
+def test_shared_handoff_restores_hash_validation_and_missing_hash_fallback(tmp_path, supplied):
+    cache = oe.EncoderCache(str(tmp_path))
+    _check_handoff_hash_initialization(cache, cache, supplied)
 
 
-def model():
-    values = {"model_type": "qwen3_vl"}
-    processor = SimpleNamespace(
-        config=SimpleNamespace(model_type="qwen3_vl", to_dict=lambda: values),
-        processor=SimpleNamespace(image_processor=None),
-        get_preferred_media_io_kwargs=lambda: {},
-        support_mm_disagg=True,
-    )
-    seen = {}
+@pytest.mark.parametrize("hashes", [[], [[1] * 7], [[1.0] * 8], ["bad"], 42, [[1] * 8] * 2])
+def test_shared_handoff_rejects_malformed_hashes_and_releases_exports(
+    tmp_path, monkeypatch, hashes
+):
+    cache = oe.EncoderCache(str(tmp_path))
+    _check_malformed_handoff_hashes(cache, cache, hashes, monkeypatch)
 
-    def preprocess(inputs, sampling, params):
-        seen["prompt"] = inputs["prompt"]
-        seen["metadata"] = params.multimodal_embedding_handles[0]["metadata"]
-        seen["hashes"] = params.multimodal_hashes
+
+@pytest.mark.parametrize("location", ["top", "output", "both"])
+def test_prefill_result_reclaims_new_exports_once_and_leaves_consumed_inputs(monkeypatch, location):
+    incoming, _ = native_result()
+    params = incoming.disaggregated_params
+    inputs = [params.mrope_position_ids_handle, params.mrope_position_deltas_handle]
+    for handle in [*params.multimodal_embedding_handles, *inputs]:
+        SharedTensorContainer.from_dict(handle).get_local_view()
+    owner = oe.PrefillResultExports(params)
+    released = []
+    release = SharedTensorContainer.release_dict
+
+    def record(handle):
+        released.append(handle)
+        release(handle)
+
+    monkeypatch.setattr(SharedTensorContainer, "release_dict", record)
+    owner.release(incoming)
+    assert [params.mrope_position_ids_handle, params.mrope_position_deltas_handle] == inputs
+    assert not released
+    for _ in range(2):
+        fresh, _ = native_result()
+        SharedTensorContainer.release_dict(
+            fresh.disaggregated_params.multimodal_embedding_handles[0]
+        )
+        released.clear()
         handles = [
-            *params.multimodal_embedding_handles,
-            params.mrope_position_ids_handle,
-            params.mrope_position_deltas_handle,
+            fresh.disaggregated_params.mrope_position_ids_handle,
+            fresh.disaggregated_params.mrope_position_deltas_handle,
         ]
-        seen["tensors"] = [
-            SharedTensorContainer.from_dict(h).get_local_view().clone() for h in handles
-        ]
-        return SimpleNamespace(multimodal_params=None)
+        result = SimpleNamespace(
+            disaggregated_params=(fresh.disaggregated_params if location != "output" else params),
+            outputs=[SimpleNamespace(disaggregated_params=fresh.disaggregated_params)]
+            if location != "top"
+            else [],
+        )
+        assert owner.has_exports(result)
+        assert owner.release(result)
+        assert released == handles
+        # Native result snapshots can repeat the same handles in new dictionaries.
+        owner.release(
+            SimpleNamespace(
+                disaggregated_params=DisaggregatedParams(
+                    mrope_position_ids_handle=dict(handles[0]),
+                    mrope_position_deltas_handle=dict(handles[1]),
+                )
+            )
+        )
+        assert released == handles
 
-    return SimpleNamespace(input_processor=processor, preprocess=preprocess), seen
 
-
-def native_result():
-    tensors = [
-        torch.arange(8, dtype=torch.float32).reshape(2, 4),
-        torch.arange(6, dtype=torch.int64).reshape(3, 1, 2),
-        torch.tensor([[1]]),
+@pytest.mark.parametrize("failure", [False, True])
+def test_encoder_release_reports_failure_and_deduplicates_output_exports(monkeypatch, failure):
+    result, _tensors = native_result()
+    params = result.disaggregated_params
+    handles = [
+        *params.multimodal_embedding_handles,
+        params.mrope_position_ids_handle,
+        params.mrope_position_deltas_handle,
     ]
-    handles = [SharedTensorContainer.from_tensor(tensor).dump_to_dict() for tensor in tensors]
-    handles[0]["metadata"] = {"image_grid_thw": [1, 2, 2]}
-    params = DisaggregatedParams(
-        multimodal_embedding_handles=[handles[0]],
-        multimodal_hashes=[[2147483647] * 8],
-        mrope_position_ids_handle=handles[1],
-        mrope_position_deltas_handle=handles[2],
-    )
-    return SimpleNamespace(disaggregated_params=params), tensors
+    result.outputs = [
+        SimpleNamespace(
+            disaggregated_params=DisaggregatedParams(
+                multimodal_embedding_handles=[dict(handles[0])],
+                mrope_position_ids_handle=dict(handles[1]),
+                mrope_position_deltas_handle=dict(handles[2]),
+            )
+        )
+    ]
+    release = SharedTensorContainer.release_dict
+    released = []
+
+    def record(handle):
+        released.append(handle)
+        if failure and handle == handles[0]:
+            raise RuntimeError("release failed")
+        release(handle)
+
+    monkeypatch.setattr(SharedTensorContainer, "release_dict", record)
+    assert oe.release_encoder_result(result) is not failure
+    assert released == handles
+    assert oe.release_encoder_result(result)
+    assert released == handles
+    if failure:
+        release(handles[0])
 
 
 def test_native_exports_roundtrip_once_with_metadata_and_mrope(tmp_path):
@@ -118,6 +170,21 @@ def test_native_exports_roundtrip_once_with_metadata_and_mrope(tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_shared_encoder_handoff_preserves_prefill_phase(tmp_path):
+    cache = oe.EncoderCache(str(tmp_path))
+    llm, seen = model()
+    ref = cache.publish(native_result()[0], request(), llm)
+    phase = DisaggregatedParams(
+        request_type="context_only", disagg_request_id=71, ctx_usage={"prompt_tokens": 88}
+    )
+    _, params = cache.prepare(ref, request(), llm, None, phase)
+    assert params.request_type == "context_only"
+    assert params.disagg_request_id == phase.disagg_request_id
+    assert params.ctx_usage == phase.ctx_usage
+    assert seen["hashes"] == [[2147483647] * 8]
+    assert not list(tmp_path.glob("*.safetensors"))
+
+
 def test_expiry_wrong_inputs_and_cross_host_are_rejected(tmp_path):
     cache = oe.EncoderCache(str(tmp_path))
     llm, _ = model()
@@ -125,11 +192,10 @@ def test_expiry_wrong_inputs_and_cross_host_are_rejected(tmp_path):
     ref = cache.publish(result, request(), llm)
     value = json.loads(ref.opaque_state)
     value["host"] = "another-host"
-    bad = pb.EncoderHandoffRef(transfer_backend=oe.BACKEND, opaque_state=json.dumps(value).encode())
+    bad = oe.EncodedMediaRef(reference_format=oe.BACKEND, opaque_state=json.dumps(value).encode())
     with pytest.raises(ValueError, match="same host"):
         cache.prepare(bad, request(), llm, None)
-    wrong = request()
-    wrong.prompt = "Another image prompt"
+    wrong = replace(request(), prompt="Another image prompt")
     with pytest.raises(ValueError, match="does not match"):
         cache.prepare(ref, wrong, llm, None)
     cache.prepare(ref, request(), llm, None)
@@ -155,8 +221,7 @@ def test_lossy_prompt_decoding_preserves_the_handoff(tmp_path):
     llm.tokenizer = SimpleNamespace(
         decode=lambda ids, **kwargs: "decoded prompt", encode=lambda prompt, **kwargs: [9]
     )
-    req = request()
-    req.token_ids.ids.extend([1, 2])
+    req = replace(request(), prompt=None, token_ids=(1, 2))
     result, _ = native_result()
     ref = cache.publish(result, req, llm)
     with pytest.raises(ValueError, match="lossless prompt token decoding"):
@@ -223,105 +288,6 @@ def test_encoder_role_requires_a_validated_handoff_processor(role, model_type):
     assert oe.encoder_role(llm, object()) == (role if model_type == "qwen3_vl" else "")
 
 
-def test_encoder_role_validation_fails_closed():
-    req = request()
-    req.encoder.SetInParent()
-    with pytest.raises(ValueError, match="exactly one"):
-        oe.validate_encoder(req, "encode")
-    req.encoder.encode_only.SetInParent()
-    assert oe.validate_encoder(req, "encode") == "encode"
-    with pytest.raises(UnsupportedFeatureError):
-        oe.validate_encoder(req, "")
-    req.encoder.handoff.transfer_backend = oe.BACKEND
-    assert req.encoder.WhichOneof("mode") == "handoff"
-    assert oe.validate_encoder(req, "consume") == "consume"
-    with pytest.raises(UnsupportedFeatureError, match="role consume"):
-        oe.validate_encoder(req, "encode")
-    req.ClearField("encoder")
-    with pytest.raises(UnsupportedFeatureError, match="encoder handoff"):
-        oe.validate_encoder(req, "consume")
-    req.kv.session.session_id = "prefilled"
-    assert oe.validate_encoder(req, "consume") == ""
-    req.encoder.handoff.transfer_backend = oe.BACKEND
-    with pytest.raises(UnsupportedFeatureError, match="must not consume an encoder handoff"):
-        oe.validate_encoder(req, "consume")
-
-
-@pytest.mark.parametrize(
-    "field, values",
-    [
-        ("sampling", {"temperature": 0.0}),
-        ("stopping", {"max_tokens": 1}),
-        ("guided", {"json_schema": "{}"}),
-        ("response", {"return_output_logprobs": False}),
-    ],
-)
-def test_encoder_only_rejects_language_options(field, values):
-    req = request()
-    req.encoder.encode_only.SetInParent()
-    getattr(req, field).SetInParent()
-    assert oe.validate_encoder(req, "encode") == "encode"
-    for name, value in values.items():
-        setattr(getattr(req, field), name, value)
-    with pytest.raises(UnsupportedFeatureError, match=field):
-        oe.validate_encoder(req, "encode")
-
-
-def test_encoder_only_rejects_lora_selection():
-    req = request()
-    req.encoder.encode_only.SetInParent()
-    req.lora_name = "adapter"
-    with pytest.raises(UnsupportedFeatureError, match="LoRA"):
-        oe.validate_encoder(req, "encode")
-
-
-@pytest.mark.parametrize("token_input", [False, True])
-def test_shared_handoff_accepts_field_equal_inputs_with_unknown_wire_fields(tmp_path, token_input):
-    req = request()
-    if token_input:
-        req.token_ids.ids.extend([1, 2])
-    equivalent = pb.GenerateRequest.FromString(req.SerializeToString())
-    equivalent.media[0].ParseFromString(
-        pb.MediaItem(data_uri=req.media[0].data_uri).SerializeToString()
-        + pb.MediaItem(modality=pb.MODALITY_IMAGE).SerializeToString()
-        + b"\xa0\x06\x01"
-    )
-    if token_input:
-        equivalent.token_ids.ParseFromString(b"\x08\x01\x08\x02\xa0\x06\x01")
-    assert req.SerializeToString() != equivalent.SerializeToString()
-    cache = oe.EncoderCache(str(tmp_path))
-    llm, _ = model()
-    llm.tokenizer = SimpleNamespace(
-        decode=lambda ids, **kwargs: "Describe <image_1>",
-        encode=lambda prompt, **kwargs: [1, 2],
-    )
-    ref = cache.publish(native_result()[0], req, llm)
-    cache.prepare(ref, equivalent, llm, None)
-
-
-def test_input_identity_preserves_order_source_and_all_media_fields():
-    req = request()
-    req.media.add(modality=pb.MODALITY_IMAGE, raw_bytes=b"second")
-    original = _input_digest(req)
-    mutations = (
-        lambda value: value.media.reverse(),
-        lambda value: setattr(value.media[0], "url", value.media[0].data_uri),
-        lambda value: setattr(value.media[0], "mime_type", "image/png"),
-        lambda value: setattr(value.media[0], "uuid", "another"),
-        lambda value: setattr(value.media[0], "modality", pb.MODALITY_VIDEO),
-        lambda value: setattr(value.media[1], "raw_bytes", b"different"),
-        lambda value: setattr(value, "prompt", value.prompt + "!"),
-    )
-    for mutate in mutations:
-        changed = pb.GenerateRequest.FromString(req.SerializeToString())
-        mutate(changed)
-        assert _input_digest(changed) != original
-    req.token_ids.ids.extend([1, 2])
-    original = _input_digest(req)
-    req.token_ids.ids.reverse()
-    assert _input_digest(req) != original
-
-
 def test_discard_is_idempotent_and_never_releases_a_claimed_handoff(tmp_path):
     cache = oe.EncoderCache(str(tmp_path))
     llm, _ = model()
@@ -353,8 +319,8 @@ def test_discard_rejects_foreign_and_malformed_references(tmp_path):
     ref = cache.publish(native_result()[0], request(), llm)
     value = json.loads(ref.opaque_state)
     for key, replacement in (("namespace", "foreign"), ("host", "foreign"), ("id", "../file")):
-        malformed = pb.EncoderHandoffRef(
-            transfer_backend=oe.BACKEND,
+        malformed = oe.EncodedMediaRef(
+            reference_format=oe.BACKEND,
             opaque_state=json.dumps({**value, key: replacement}).encode(),
         )
         with pytest.raises(ValueError):
@@ -368,7 +334,7 @@ def test_recursive_decode_is_invalid_without_consuming_handoff(tmp_path, monkeyp
     cache = oe.EncoderCache(str(tmp_path))
     llm, _ = model()
     ref = cache.publish(native_result()[0], request(), llm)
-    malformed = pb.EncoderHandoffRef(transfer_backend=oe.BACKEND, opaque_state=b"[" * 1024)
+    malformed = oe.EncodedMediaRef(reference_format=oe.BACKEND, opaque_state=b"[" * 1024)
 
     def fail_decode(_):
         raise RecursionError("maximum recursion depth exceeded while decoding JSON")
@@ -382,3 +348,9 @@ def test_recursive_decode_is_invalid_without_consuming_handoff(tmp_path, monkeyp
                 cache.prepare(malformed, request(), llm, None)
     assert len(list(tmp_path.glob("*.safetensors"))) == 1
     assert cache.discard(ref)
+
+
+@pytest.mark.parametrize("prompt,token_ids", [(None, None), ("context", (1, 2))])
+def test_native_input_requires_exactly_one_context(prompt, token_ids):
+    with pytest.raises(ValueError, match="prompt or token IDs"):
+        oe.EncoderInput(prompt, token_ids, request().media)

@@ -38,25 +38,6 @@ message ModelInfo {
   // contract: clients read it opportunistically and never depend on it for
   // correctness. Carried as a Struct so JSON types survive the wire.
   google.protobuf.Struct extra = 28;
-
-  // Negotiated encoder role and encoder-output reference formats.
-  EncoderCapabilities encoder = 29;
-}
-
-message EncoderCapabilities {
-  // Changes only for incompatible contract semantics, not compatible additions.
-  optional uint32 schema_version = 1;
-  optional bool encoder_only = 2;
-  optional bool accepts_handoff = 3;
-  // Consumer: reference formats this engine accepts.
-  repeated string supported_transfer_backends = 4;
-  // The producer can release unclaimed references through Abort.encoder_handoff.
-  optional bool supports_abort_cleanup = 5;
-  // Media generation requires encoder.handoff; text-only and KV-session decode
-  // requests do not require a handoff. Requires accepts_handoff.
-  optional bool requires_handoff = 6;
-  // Producer: the single reference format its handoffs use.
-  optional string transfer_backend = 7;
 }
 
 message GenerationCapabilities {

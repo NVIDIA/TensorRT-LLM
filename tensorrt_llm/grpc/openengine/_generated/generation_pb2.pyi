@@ -57,7 +57,7 @@ class MediaItem(_message.Message):
     def __init__(self, modality: _Optional[_Union[Modality, str]] = ..., url: _Optional[str] = ..., data_uri: _Optional[str] = ..., raw_bytes: _Optional[bytes] = ..., mime_type: _Optional[str] = ..., uuid: _Optional[str] = ...) -> None: ...
 
 class GenerateRequest(_message.Message):
-    __slots__ = ("request_id", "model", "prompt", "token_ids", "sampling", "stopping", "response", "kv", "guided", "media", "lora_name", "extra", "encoder")
+    __slots__ = ("request_id", "model", "prompt", "token_ids", "sampling", "stopping", "response", "kv", "guided", "media", "lora_name", "extra")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     PROMPT_FIELD_NUMBER: _ClassVar[int]
@@ -70,7 +70,6 @@ class GenerateRequest(_message.Message):
     MEDIA_FIELD_NUMBER: _ClassVar[int]
     LORA_NAME_FIELD_NUMBER: _ClassVar[int]
     EXTRA_FIELD_NUMBER: _ClassVar[int]
-    ENCODER_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     model: str
     prompt: str
@@ -83,34 +82,7 @@ class GenerateRequest(_message.Message):
     media: _containers.RepeatedCompositeFieldContainer[MediaItem]
     lora_name: str
     extra: _struct_pb2.Struct
-    encoder: EncoderOptions
-    def __init__(self, request_id: _Optional[str] = ..., model: _Optional[str] = ..., prompt: _Optional[str] = ..., token_ids: _Optional[_Union[TokenIds, _Mapping]] = ..., sampling: _Optional[_Union[SamplingParams, _Mapping]] = ..., stopping: _Optional[_Union[StoppingOptions, _Mapping]] = ..., response: _Optional[_Union[ResponseOptions, _Mapping]] = ..., kv: _Optional[_Union[KvOptions, _Mapping]] = ..., guided: _Optional[_Union[GuidedDecoding, _Mapping]] = ..., media: _Optional[_Iterable[_Union[MediaItem, _Mapping]]] = ..., lora_name: _Optional[str] = ..., extra: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., encoder: _Optional[_Union[EncoderOptions, _Mapping]] = ...) -> None: ...
-
-class EncoderHandoffRef(_message.Message):
-    __slots__ = ("transfer_backend", "opaque_state")
-    TRANSFER_BACKEND_FIELD_NUMBER: _ClassVar[int]
-    OPAQUE_STATE_FIELD_NUMBER: _ClassVar[int]
-    transfer_backend: str
-    opaque_state: bytes
-    def __init__(self, transfer_backend: _Optional[str] = ..., opaque_state: _Optional[bytes] = ...) -> None: ...
-
-class EncoderOptions(_message.Message):
-    __slots__ = ("encode_only", "handoff")
-    ENCODE_ONLY_FIELD_NUMBER: _ClassVar[int]
-    HANDOFF_FIELD_NUMBER: _ClassVar[int]
-    encode_only: EncodeOnly
-    handoff: EncoderHandoffRef
-    def __init__(self, encode_only: _Optional[_Union[EncodeOnly, _Mapping]] = ..., handoff: _Optional[_Union[EncoderHandoffRef, _Mapping]] = ...) -> None: ...
-
-class EncodeOnly(_message.Message):
-    __slots__ = ()
-    def __init__(self) -> None: ...
-
-class EncodeReady(_message.Message):
-    __slots__ = ("handoff",)
-    HANDOFF_FIELD_NUMBER: _ClassVar[int]
-    handoff: EncoderHandoffRef
-    def __init__(self, handoff: _Optional[_Union[EncoderHandoffRef, _Mapping]] = ...) -> None: ...
+    def __init__(self, request_id: _Optional[str] = ..., model: _Optional[str] = ..., prompt: _Optional[str] = ..., token_ids: _Optional[_Union[TokenIds, _Mapping]] = ..., sampling: _Optional[_Union[SamplingParams, _Mapping]] = ..., stopping: _Optional[_Union[StoppingOptions, _Mapping]] = ..., response: _Optional[_Union[ResponseOptions, _Mapping]] = ..., kv: _Optional[_Union[KvOptions, _Mapping]] = ..., guided: _Optional[_Union[GuidedDecoding, _Mapping]] = ..., media: _Optional[_Iterable[_Union[MediaItem, _Mapping]]] = ..., lora_name: _Optional[str] = ..., extra: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
 
 class SamplingParams(_message.Message):
     __slots__ = ("temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "seed", "num_sequences")
@@ -223,14 +195,13 @@ class JsonObjectConstraint(_message.Message):
     def __init__(self) -> None: ...
 
 class GenerateResponse(_message.Message):
-    __slots__ = ("request_id", "prompt", "token", "prefill_ready", "finished", "error", "encode_ready", "usage")
+    __slots__ = ("request_id", "prompt", "token", "prefill_ready", "finished", "error", "usage")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     PROMPT_FIELD_NUMBER: _ClassVar[int]
     TOKEN_FIELD_NUMBER: _ClassVar[int]
     PREFILL_READY_FIELD_NUMBER: _ClassVar[int]
     FINISHED_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
-    ENCODE_READY_FIELD_NUMBER: _ClassVar[int]
     USAGE_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     prompt: PromptOutput
@@ -238,9 +209,8 @@ class GenerateResponse(_message.Message):
     prefill_ready: PrefillReady
     finished: GenerationFinished
     error: _error_pb2.EngineError
-    encode_ready: EncodeReady
     usage: Usage
-    def __init__(self, request_id: _Optional[str] = ..., prompt: _Optional[_Union[PromptOutput, _Mapping]] = ..., token: _Optional[_Union[TokenOutput, _Mapping]] = ..., prefill_ready: _Optional[_Union[PrefillReady, _Mapping]] = ..., finished: _Optional[_Union[GenerationFinished, _Mapping]] = ..., error: _Optional[_Union[_error_pb2.EngineError, _Mapping]] = ..., encode_ready: _Optional[_Union[EncodeReady, _Mapping]] = ..., usage: _Optional[_Union[Usage, _Mapping]] = ...) -> None: ...
+    def __init__(self, request_id: _Optional[str] = ..., prompt: _Optional[_Union[PromptOutput, _Mapping]] = ..., token: _Optional[_Union[TokenOutput, _Mapping]] = ..., prefill_ready: _Optional[_Union[PrefillReady, _Mapping]] = ..., finished: _Optional[_Union[GenerationFinished, _Mapping]] = ..., error: _Optional[_Union[_error_pb2.EngineError, _Mapping]] = ..., usage: _Optional[_Union[Usage, _Mapping]] = ...) -> None: ...
 
 class PromptOutput(_message.Message):
     __slots__ = ("tokens",)

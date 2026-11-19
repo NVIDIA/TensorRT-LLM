@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Single-use, same-host encoder handoffs through a bounded shared directory."""
+"""Native multimodal encoder outputs, identities, and local output storage."""
 
 import fcntl
 import hashlib
@@ -9,7 +9,9 @@ import json
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +23,91 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.logger import logger
 
-from .bindings import generation_pb2
-from .errors import UnsupportedFeatureError
-from .preparation import _config_digest, _input_digest
+
+@dataclass(frozen=True)
+class EncodedMediaRef:
+    """Framework-owned transferable output reference, independent of serving RPCs."""
+
+    reference_format: str
+    opaque_state: bytes
+
+
+@dataclass(frozen=True)
+class EncoderMedia:
+    """Ordered original-media identity used to bind a prepared native output."""
+
+    modality: str
+    source_type: str
+    source: str | bytes
+    mime_type: str = ""
+    uuid: str = ""
+
+
+@dataclass(frozen=True)
+class EncoderInput:
+    """Native input context for encoder output publication and consumption."""
+
+    prompt: str | None
+    token_ids: tuple[int, ...] | None
+    media: tuple[EncoderMedia, ...]
+
+    def __post_init__(self) -> None:
+        if (self.prompt is None) == (self.token_ids is None):
+            raise ValueError("native encoder preparation requires prompt or token IDs")
+        if not self.media:
+            raise ValueError("native encoder preparation requires media")
+
+    def prompt_text(self, tokenizer: Any) -> str:
+        """Decode the prompt losslessly before preparing external embeddings."""
+        if self.prompt is not None:
+            return self.prompt
+        ids = list(self.token_ids)
+        prompt = tokenizer.decode(ids, skip_special_tokens=False)
+        if tokenizer.encode(prompt, add_special_tokens=False) != ids:
+            raise ValueError("encoder handoff requires lossless prompt token decoding")
+        return prompt
+
+
+class EncoderTransferRejected(ValueError):
+    """Reject a transfer before WRITE; receiver buffers can be released."""
+
+
+def _input_digest(inputs: EncoderInput) -> str:
+    digest = hashlib.sha256()
+
+    def field(value: bytes) -> None:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    field(b"prompt" if inputs.prompt is not None else b"token_ids")
+    field(
+        inputs.prompt.encode()
+        if inputs.prompt is not None
+        else json.dumps(inputs.token_ids).encode()
+    )
+    digest.update(len(inputs.media).to_bytes(8, "big"))
+    for item in inputs.media:
+        field(item.modality.encode())
+        field(item.source_type.encode())
+        field(item.source if isinstance(item.source, bytes) else item.source.encode())
+        field(item.mime_type.encode())
+        field(item.uuid.encode())
+    return digest.hexdigest()
+
+
+def _config_digest(llm: Any) -> str:
+    processor = llm.input_processor
+    config = processor.config.to_dict()
+    config.pop("_name_or_path", None)
+    image_processor = getattr(processor.processor, "image_processor", None)
+    identity = {
+        "model": config,
+        "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
+        "media_io": processor.get_preferred_media_io_kwargs(),
+        "image_processor": image_processor.to_dict() if image_processor is not None else None,
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
+
 
 BACKEND = "trtllm-shared-safetensors-v1"
 _MAX_TENSOR_BYTES = 64 * 1024 * 1024
@@ -39,12 +123,15 @@ def _model_digest(llm: Any) -> str:
     return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
 
 
-def _release(handles: list[dict]) -> None:
+def _release(handles: list[dict]) -> bool:
+    succeeded = True
     for handle in handles:
         try:
             SharedTensorContainer.release_dict(handle)
         except Exception as error:
+            succeeded = False
             logger.error(f"Failed to release abandoned encoder export: {error}")
+    return succeeded
 
 
 def take_encoder_exports(params: Any) -> tuple[list[dict], list[dict | None]]:
@@ -56,11 +143,101 @@ def take_encoder_exports(params: Any) -> tuple[list[dict], list[dict | None]]:
     return embeddings, mrope
 
 
-def release_encoder_result(result: Any) -> None:
+def _result_disaggregated_params(result: Any) -> Iterator[DisaggregatedParams]:
     params = getattr(result, "disaggregated_params", None)
     if params is not None:
+        yield params
+    outputs = getattr(result, "outputs", None)
+    if outputs:
+        output_params = getattr(outputs[0], "disaggregated_params", None)
+        if output_params is not None and output_params is not params:
+            yield output_params
+
+
+def release_encoder_result(result: Any) -> bool:
+    pending = {}
+    for params in _result_disaggregated_params(result):
         embeddings, mrope = take_encoder_exports(params)
-        _release([*embeddings, *(handle for handle in mrope if handle is not None)])
+        for handle in [*embeddings, *(handle for handle in mrope if handle is not None)]:
+            pending.setdefault(json.dumps(handle, sort_keys=True), handle)
+    return _release(list(pending.values()))
+
+
+class PrefillResultExports:
+    """Reclaim native mRoPE exports omitted from portable prefill responses."""
+
+    def __init__(self, params: DisaggregatedParams) -> None:
+        # Request handles were consumed by the language worker, not abandoned.
+        self._seen = {
+            json.dumps(handle, sort_keys=True)
+            for handle in (params.mrope_position_ids_handle, params.mrope_position_deltas_handle)
+            if handle is not None
+        }
+
+    @staticmethod
+    def has_exports(result: Any) -> bool:
+        return any(
+            params.mrope_position_ids_handle is not None
+            or params.mrope_position_deltas_handle is not None
+            for params in _result_disaggregated_params(result)
+        )
+
+    def release(self, result: Any) -> bool:
+        pending = []
+        with _EXPORT_LOCK:
+            for params in _result_disaggregated_params(result):
+                for handle in (
+                    params.mrope_position_ids_handle,
+                    params.mrope_position_deltas_handle,
+                ):
+                    if handle is None:
+                        continue
+                    key = json.dumps(handle, sort_keys=True)
+                    if key not in self._seen:
+                        self._seen.add(key)
+                        pending.append(handle)
+        return _release(pending)
+
+
+def _encoder_input_params(params: DisaggregatedParams | None) -> DisaggregatedParams:
+    if params is None:
+        return DisaggregatedParams(request_type="context_and_generation")
+    if params.request_type not in ("context_only", "context_and_generation"):
+        raise ValueError("encoder handoffs require a prefill or aggregated request")
+    return params
+
+
+def _encoder_output_params(
+    params: DisaggregatedParams,
+    handles: list[dict],
+    hashes: list[list[int]] | None,
+    mrope: dict[str, dict],
+) -> DisaggregatedParams:
+    """Apply native hash validation and the missing-hash fallback to a handoff."""
+    try:
+        return replace(
+            params,
+            multimodal_embedding_handles=handles,
+            multimodal_hashes=hashes,
+            mrope_position_ids_handle=mrope.get("mrope_position_ids_handle"),
+            mrope_position_deltas_handle=mrope.get("mrope_position_deltas_handle"),
+        )
+    except (AssertionError, TypeError) as error:
+        raise ValueError(f"invalid encoder handoff parameters: {error}") from error
+
+
+def _capture_encoder_decode_state(llm: Any, inputs: Any, mrope: dict) -> None:
+    capture = getattr(llm.input_processor, "_capture_prepared_decode", None)
+    if not callable(capture) or not mrope:
+        return
+    try:
+        # Native embedding preparation bypasses the processor's __call__ wrapper.
+        capture((inputs.prompt_token_ids, {"multimodal_data": {"mrope_config": mrope}}))
+    except Exception:
+        params = getattr(inputs, "multimodal_params", None)
+        if params is not None:
+            params.release_handles()
+        raise
 
 
 class EncoderCache:
@@ -159,13 +336,13 @@ class EncoderCache:
         finally:
             temporary.unlink(missing_ok=True)
         reference = {"version": 1, "namespace": self.namespace, "host": self.host, "id": identity}
-        return generation_pb2.EncoderHandoffRef(
-            transfer_backend=BACKEND,
+        return EncodedMediaRef(
+            reference_format=BACKEND,
             opaque_state=json.dumps(reference, separators=(",", ":")).encode(),
         )
 
     def _path(self, reference: Any) -> Path:
-        if reference.transfer_backend != BACKEND or len(reference.opaque_state) > 1024:
+        if reference.reference_format != BACKEND or len(reference.opaque_state) > 1024:
             raise ValueError("unsupported encoder handoff reference")
         try:
             value = json.loads(reference.opaque_state)
@@ -201,19 +378,21 @@ class EncoderCache:
                 return False
             return True
 
-    def prepare(self, reference: Any, request: Any, llm: Any, sampling: Any):
+    def prepare(
+        self,
+        reference: Any,
+        request: Any,
+        llm: Any,
+        sampling: Any,
+        disaggregated_params: DisaggregatedParams | None = None,
+    ):
+        params = _encoder_input_params(disaggregated_params)
         path = self._path(reference)
         identity = path.stem
         exports = []
         claimed = self.root / f"{identity}-{uuid.uuid4().hex}.tmp"
         try:
-            if request.WhichOneof("input") == "prompt":
-                prompt = request.prompt
-            else:
-                ids = list(request.token_ids.ids)
-                prompt = llm.tokenizer.decode(ids, skip_special_tokens=False)
-                if llm.tokenizer.encode(prompt, add_special_tokens=False) != ids:
-                    raise ValueError("encoder handoff requires lossless prompt token decoding")
+            prompt = request.prompt_text(llm.tokenizer)
             with self._lock():
                 self._collect()
                 if not path.is_file() or path.is_symlink():
@@ -242,24 +421,22 @@ class EncoderCache:
                         handle["metadata"] = item_metadata
                     handles.append(handle)
                 mrope = {}
+                mrope_tensors = {}
                 for key, field in (
                     ("mrope_ids", "mrope_position_ids_handle"),
                     ("mrope_deltas", "mrope_position_deltas_handle"),
                 ):
                     if key in stored.keys():
-                        handle = SharedTensorContainer.from_tensor(
-                            stored.get_tensor(key).clone()
-                        ).dump_to_dict()
+                        tensor = stored.get_tensor(key).clone()
+                        mrope_tensors[field.removesuffix("_handle")] = tensor
+                        handle = SharedTensorContainer.from_tensor(tensor).dump_to_dict()
                         exports.append(handle)
                         mrope[field] = handle
-            params = DisaggregatedParams(
-                request_type="context_and_generation",
-                multimodal_embedding_handles=handles,
-                multimodal_hashes=metadata["hashes"],
-                **mrope,
-            )
+            params = _encoder_output_params(params, handles, metadata["hashes"], mrope)
             inputs = llm.preprocess({"prompt": prompt}, sampling, params)
             exports.clear()  # PreprocessedInputs now owns the worker exports.
+            if params.request_type == "context_only":
+                _capture_encoder_decode_state(llm, inputs, mrope_tensors)
             return inputs, params
         finally:
             _release(exports)
@@ -281,35 +458,3 @@ def encoder_role(llm: Any, cache: EncoderCache | None) -> str:
     if getattr(llm.args, "disable_mm_encoder", False):
         return "consume"
     return ""
-
-
-def validate_encoder(request: Any, role: str) -> str:
-    if not request.HasField("encoder"):
-        if (
-            role == "consume"
-            and request.media
-            and not (request.HasField("kv") and request.kv.HasField("session"))
-        ):
-            raise UnsupportedFeatureError("encoder consumer requires an encoder handoff for images")
-        if role == "encode":
-            raise UnsupportedFeatureError("encoder-only engines require encoder.encode_only")
-        return ""
-    mode = request.encoder.WhichOneof("mode")
-    if mode is None:
-        raise ValueError("set exactly one of encoder.encode_only or encoder.handoff")
-    expected = "encode" if mode == "encode_only" else "consume"
-    if role != expected:
-        raise UnsupportedFeatureError(f"loaded engine does not support encoder role {expected}")
-    if request.HasField("kv") and request.kv.HasField("session"):
-        raise UnsupportedFeatureError("KV decode requests must not consume an encoder handoff")
-    if expected == "encode":
-        for name in ("sampling", "stopping", "guided", "response"):
-            if getattr(request, name).ListFields():
-                raise UnsupportedFeatureError(f"encoder-only requests do not support {name}")
-        if request.lora_name:
-            raise UnsupportedFeatureError("encoder-only requests do not support LoRA selection")
-    if not request.media or any(
-        item.modality != generation_pb2.MODALITY_IMAGE for item in request.media
-    ):
-        raise UnsupportedFeatureError("encoder handoffs require image inputs")
-    return expected

@@ -23,35 +23,6 @@ _MAX_DECODE_PREPARATION_BYTES = 2 * 1024 * 1024
 
 def _input_digest(request: Any) -> str:
     digest = hashlib.sha256()
-
-    def field(value: bytes) -> None:
-        digest.update(len(value).to_bytes(8, "big"))
-        digest.update(value)
-
-    # Hash field values, not protobuf encoding or unknown extension fields.
-    kind = request.WhichOneof("input")
-    if kind is None:
-        raise ValueError("encoder handoff requires prompt or token IDs")
-    field(kind.encode())
-    if kind == "prompt":
-        field(request.prompt.encode())
-    else:
-        field(np.asarray(request.token_ids.ids, dtype="<u4").tobytes())
-    digest.update(len(request.media).to_bytes(8, "big"))
-    for item in request.media:
-        digest.update(item.modality.to_bytes(4, "big", signed=True))
-        source = item.WhichOneof("source")
-        field((source or "").encode())
-        value = getattr(item, source) if source else b""
-        field(value if isinstance(value, bytes) else value.encode())
-        field(item.mime_type.encode())
-        field(item.uuid.encode())
-    return digest.hexdigest()
-
-
-def _decode_input_digest(request: Any) -> str:
-    """Hash prepared-decode inputs using the version-1 protobuf representation."""
-    digest = hashlib.sha256()
     kind = request.WhichOneof("input")
     data = request.prompt.encode() if kind == "prompt" else request.token_ids.SerializeToString()
     for part in chain((kind.encode(), data), (item.SerializeToString() for item in request.media)):
@@ -82,7 +53,7 @@ def _decode_preparation(
     payload = {
         "version": 1,
         "model_type": resolve_top_level_model_type(llm.input_processor.config),
-        "input_digest": _decode_input_digest(request),
+        "input_digest": _input_digest(request),
         "config_digest": _config_digest(llm),
         "state": capture["state"],
         "prompt_token_ids_u32le": base64.b64encode(
@@ -124,7 +95,7 @@ def _prepared_decode_from_request(request: Any, llm: Any) -> PreprocessedInputs 
         return None  # An unknown version retains the ordinary media preparation path.
     if payload.get("model_type") != resolve_top_level_model_type(llm.input_processor.config):
         raise ValueError("prepared decode metadata belongs to another model type")
-    if payload.get("input_digest") != _decode_input_digest(request):
+    if payload.get("input_digest") != _input_digest(request):
         raise ValueError("prepared decode metadata does not match the request inputs")
     if payload.get("config_digest") != _config_digest(llm):
         raise ValueError("prepared decode metadata belongs to another model configuration")
