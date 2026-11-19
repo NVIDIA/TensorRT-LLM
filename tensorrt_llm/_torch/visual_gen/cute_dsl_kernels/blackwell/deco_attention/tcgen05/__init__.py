@@ -35,7 +35,6 @@ out by the kernel package (its layout); a call writes every byte it reads, so th
 scale stays on the device, nothing reads device data back to the host and a call allocates nothing, so prepare and
 attention capture into one CUDA graph. The callers' arguments are checked by deco_attention.api, not here."""
 
-from .. import target
 from ..runtime import carve, num_sms, workspace_bytes
 from . import fp8pv
 from .qk import ranks
@@ -47,13 +46,6 @@ _KERNELS = {"fp8": fp8pv}
 DEFAULT_PV = "fp8"
 
 
-def _guard():
-    if target.kernel_family() != "tcgen05":
-        raise target.NoKernelError(
-            "the tcgen05 kernels run on B200, GB300 and Rubin (sm_100, sm_103, sm_107) only"
-        )
-
-
 def pv_formats():
     """The PV formats of the kernels of this family."""
     return tuple(_KERNELS)
@@ -62,7 +54,6 @@ def pv_formats():
 def workspace_size(b, s, h, device, pv, rank):
     """Bytes of the workspace of one call of this shape with the kernel of PV format pv (one of pv_formats()) at
     compensation rank `rank` (one of ranks()) on `device`; deco_attention.api checks both."""
-    _guard()
     return workspace_bytes(_KERNELS[pv].layout(b, s, h, rank, num_sms(device)))
 
 
@@ -70,7 +61,6 @@ def prepare(q, k, v, workspace, pv, rank, rows):
     """The buffers of the call, views into the workspace (name -> tensor, the layout of the kernel package), with the
     operands filled from raw BF16 q, k, v [B, S, H, 128] on the current stream. rows: the int32 indices of the
     sampled tokens that estimate the compensation basis of Q' and K' (inputs.sample_rows)."""
-    _guard()
     b, s, h, _ = q.shape
     kernel = _KERNELS[pv]
     buffers = carve(workspace, kernel.layout(b, s, h, rank, num_sms(q.device)))
@@ -80,5 +70,4 @@ def prepare(q, k, v, workspace, pv, rank, rows):
 
 def attention(buffers, o, pv, rank):
     """BF16 o [B, S, H, 128] from the buffers of prepare, on the current stream."""
-    _guard()
     _KERNELS[pv].attention(buffers, o, rank)

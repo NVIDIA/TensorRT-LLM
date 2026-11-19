@@ -125,8 +125,8 @@ def softmax_tile(
     q,
     lim: cutlass.Constexpr,
     mask_tail,
-    release=None,
-    refill=None,
+    release,
+    refill,
 ):
     """Online softmax of one S tile (rows g and g + 8 of the warp): P = E4M3(2^(s - anchor + 4)) into the PV fragments
     P[4 i + r], the row sums of the quantized P and its 16-key block sums (P[16], P[17]: the means-MMA B fragments),

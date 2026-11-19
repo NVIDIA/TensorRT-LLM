@@ -80,14 +80,11 @@ def _sample_rows(s, device, rank):
     return perm[: sample_count(s, rank)].to(torch.int32).contiguous()
 
 
+@functools.cache
 def hadamard(device):
     """BF16 [HEAD_DIM, HEAD_DIM] Hadamard matrix with rows scaled by random signs (H H^T = HEAD_DIM I, exact in BF16;
-    the signs of a generator seeded 0), built once per device (its host-to-device copy synchronizes)."""
-    return _hadamard(_indexed(device))
-
-
-@functools.cache
-def _hadamard(device):
+    the signs of a generator seeded 0), built once per device (its host-to-device copy synchronizes). device: that
+    of a tensor, which carries its index."""
     _not_under_capture(device, "rotation matrix")
     h = torch.ones(1, 1)
     while h.shape[0] < HEAD_DIM:

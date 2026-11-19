@@ -16,18 +16,11 @@
 rounded to three mantissa bits (round_m3)."""
 
 import cutlass.cute as cute
-from cutlass import Float32, Uint32
+from cutlass import Float32
 
-from ...common.expmath import f2u, rcp_or_zero, u2f
+from ...common.expmath import rcp_or_zero, round_m3
 from ...common.ptx import f32x8_to_e2m1x8
 from ..ptx import e2m1x8_to_f32x8
-
-
-def round_m3(x):
-    """Round x (FP32, >= 0) to 3 mantissa bits, nearest even, at any exponent."""
-    b = f2u(x)
-    b = b + Uint32(0x7FFFF) + ((b >> 20) & Uint32(1))
-    return u2f(b & Uint32(0xFFF00000))
 
 
 def _mul2_list(x, s):

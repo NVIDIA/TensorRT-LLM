@@ -22,9 +22,8 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.math import RoundingMode
 from cutlass.utils import SmemAllocator
 
-from ...common.expmath import e4m3x4, f2u, pow2_ceil, u2f
+from ...common.expmath import e4m3x4, f2u, pow2_ceil, u2f, warp_max
 from ...common.mem import gptr, load_vector, sptr, store_vector
-from .basis import warp_max_f32
 
 ENCODE_THREADS = 256
 
@@ -60,7 +59,7 @@ def encode_kernel(
                 gmv[j], u2f(cute.arch.load(gptr(Uint32, gmax_p + (Int64(i) * 8 + j) * 4), Uint32))
             )
     for j in cutlass.range_constexpr(6):
-        mv = warp_max_f32(gmv[j])
+        mv = warp_max(gmv[j])
         if lane == 0:
             cute.arch.store(sptr(Float32, red + (warp * 6 + j) * 4), mv)
     cute.arch.sync_threads()

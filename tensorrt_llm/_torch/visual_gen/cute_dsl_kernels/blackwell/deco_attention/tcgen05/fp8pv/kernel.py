@@ -113,10 +113,9 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         self.vs_tiles = 8
         self.vs_shift = self.vs_tiles.bit_length() - 1
         self.vs_rows = 8
-        self.head_dim = self.qk.head_dim
         self.head_dim_v = HEAD_DIM
         self.cta_tiler = (2 * mma_tiler[0], mma_tiler[1], self.head_dim_v)
-        self.qk_mma_tiler = (*mma_tiler, self.head_dim)
+        self.qk_mma_tiler = mma_tiler
         self.pv_mma_tiler = (mma_tiler[0], self.head_dim_v, mma_tiler[1])
         # keys per PV MMA (its K): 32, or 64 where the target has the K = 64 FP8 MMA
         self.pv_k = 64 if target.has_k64_fp8_mma() else 32
@@ -616,15 +615,9 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             return SplitTileScheduler(
                 tile_sched_params,
                 cute.arch.block_idx()[0] + tile_sched_params.n_full,
-                cute.arch.block_idx(),
                 cute.arch.grid_dim(),
             )
-        return TileScheduler(
-            tile_sched_params,
-            cute.arch.block_idx()[0],
-            cute.arch.block_idx(),
-            cute.arch.grid_dim(),
-        )
+        return TileScheduler(tile_sched_params, cute.arch.block_idx()[0], cute.arch.grid_dim())
 
     @cute.kernel
     def kernel(
@@ -720,14 +713,14 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         # TMEM accumulator layouts of S (one physical tile, which both QKs write) and of O_j: each role builds the
         # views it uses from the allocation base
         s_tmem_layout = qk_thr_mma.make_fragment_C(
-            qk_thr_mma.partition_shape_C(self.qk_mma_tiler[:2])
+            qk_thr_mma.partition_shape_C(self.qk_mma_tiler)
         ).layout
         o_tmem_layout = pv_thr_mma.make_fragment_C(
             pv_thr_mma.partition_shape_C(self.pv_mma_tiler[:2])
         ).layout
 
         tile_sched = self._tile_scheduler(tile_sched_params)
-        work_tile = tile_sched.initial_work_tile_info()
+        work_tile = tile_sched.get_current_work()
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         # TMEM: the allocator warp allocates, then every warp of the CTA passes one barrier at this common PC
         tmem.allocate(self.num_tmem_alloc_cols)
@@ -785,7 +778,6 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             s_tmem_layout=s_tmem_layout,
             o_tmem_layout=o_tmem_layout,
             # the work of the CTA
-            tile_sched_params=tile_sched_params,
             tile_sched=tile_sched,
             work_tile=work_tile,
             seqlen_k=seqlen_k,
@@ -960,7 +952,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             pipeline_args=(mma_si_consumer, si_epi_producer, pi_mma_producer),
             qk_thr_mma=st.qk_thr_mma,
             value_args=(st.seqlen_k, st.n_kv_tiles, score_scale),
-            sched_args=self.softmax_sched(st.tile_sched_params, st.tile_sched, st.work_tile),
+            sched_args=(st.tile_sched, st.work_tile),
             vs_row=vs_row,
         )
 

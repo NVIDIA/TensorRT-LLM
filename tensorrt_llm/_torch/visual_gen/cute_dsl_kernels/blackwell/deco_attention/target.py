@@ -48,18 +48,13 @@ _NAMES = {a: family for family in ("sm_100", "sm_103", "sm_107") for a in _archs
 _FAMILY = {**{a: "tcgen05" for a in _NAMES}, **{a: "sm120" for a in _archs("sm_120a")}}
 
 
-class NoKernelError(NotImplementedError):
-    """No DeCo kernel for the current target (arch), or a family's entry called on another family's target (e.g. the
-    tcgen05 preparation on sm_120): the one error a caller may answer with another implementation."""
-
-
 @functools.cache
 def arch():
-    """The architecture enum of the current compilation (NoKernelError for a target without DeCo kernels); cached, as
-    the target is fixed per process."""
+    """The architecture enum of the current compilation (NotImplementedError for a target without DeCo kernels: the
+    one error a caller may answer with another implementation); cached, as the target is fixed per process."""
     a = BaseDSL._get_dsl().get_arch_enum()
     if a not in _FAMILY:
-        raise NoKernelError(f"no DeCo attention kernels for {a}")
+        raise NotImplementedError(f"no DeCo attention kernels for {a}")
     return a
 
 
@@ -72,10 +67,7 @@ def kernel_family():
 
 def arch_name():
     """The family name CuTe's TMEM helpers take ("sm_100", "sm_103", "sm_107"); tcgen05 targets only."""
-    a = arch()
-    if a not in _NAMES:
-        raise NotImplementedError(f"{a} is not a tcgen05 target")
-    return _NAMES[a]
+    return _NAMES[arch()]
 
 
 def has_k96_fp4_mma():

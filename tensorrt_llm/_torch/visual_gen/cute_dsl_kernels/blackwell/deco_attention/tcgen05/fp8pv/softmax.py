@@ -50,7 +50,6 @@ from ...common.expmath import (
 from ...common.mem import sptr, store_vector
 from ...constants import RESCALE_THRESHOLD, SUBNORMAL_ULPS
 from ..tmem import ld_tmem_f32, st_tmem_f32
-from .sched import SplitTileScheduler
 
 E4M3_MAX = 448.0
 # P pre-scale: s_P = 2^floor(log2(largest finite E4M3) - T)
@@ -63,19 +62,6 @@ MIN_SCORE_LOG2 = -(SUBNORMAL_ULPS.bit_length() - 1)
 
 class SoftmaxRole:
     """The softmax warpgroups' methods of PingPongAttention (kernel.py), which holds the attributes they read."""
-
-    def softmax_sched(self, tile_sched_params, tile_sched, work_tile):
-        """In split mode the softmax warps get the 5-value work coordinate."""
-        if cutlass.const_expr(self.split):
-            sched = SplitTileScheduler(
-                tile_sched_params,
-                cute.arch.block_idx()[0] + tile_sched_params.n_full,
-                cute.arch.block_idx(),
-                cute.arch.grid_dim(),
-                1,
-            )
-            return sched, sched.initial_work_tile_info()
-        return tile_sched, work_tile
 
     @cute.jit
     def exp_cast(self, tTMEM_LOADrS, tTMEM_STORErS_x4, fma_ab):

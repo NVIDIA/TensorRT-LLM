@@ -28,7 +28,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.math import RoundingMode
 
 from ...common.dsl import Tcgen05Fence, tcgen05_fence
-from ...common.expmath import f2u, rcp_or_zero, u2f, warp_sum
+from ...common.expmath import f2u, hash01, rcp_or_zero, u2f, warp_sum
 from ...common.mem import cp_async16, gptr, load_invariant, load_vector, sptr, store_vector
 from ...common.ptx import vote_ballot
 from ...common.state import State
@@ -900,16 +900,6 @@ def _normalize_halves(st, twist):
 
 
 @cute.jit
-def _degen_seed(ii: Int32, slot: Int32) -> Float32:
-    # Integer avalanche mixing gives independent deterministic dense starts.
-    hsh = Uint32(ii + 1) ^ (Uint32(slot + 1) * Uint32(0x9E3779B9))
-    hsh = (hsh ^ (hsh >> Uint32(16))) * Uint32(0x7FEB352D)
-    hsh = (hsh ^ (hsh >> Uint32(15))) * Uint32(0x846CA68B)
-    hsh = hsh ^ (hsh >> Uint32(16))
-    return Float32(hsh >> Uint32(8)) * Float32(1.0 / 16777216.0) - Float32(0.5)
-
-
-@cute.jit
 def _degen_pivot_floor(value: Float32, floor: Float32) -> Float32:
     # Preserve pivot sign in the indefinite shifted tridiagonal solve.
     safe = Float32(cutlass.select_(value < Float32(0.0), -floor, floor))
@@ -1140,7 +1130,7 @@ def _cluster_repair(st, span: Float32):
         if st.tidx < nslot:
             if sE2[st.tidx] > Float32(0.5):
                 for ii in cutlass.range(128, unroll=4):
-                    sZ[ii, st.tidx] = _degen_seed(ii, st.tidx)
+                    sZ[ii, st.tidx] = hash01(ii, st.tidx + 1)
         # one projection: the kept vectors are far from parallel; the seed columns it reads only meet zero coefficients
         _orthogonalize_replaced(st, REPS=1, KEPT=True)
         pmin = cute.arch.fmax(span * Float32(1e-9), Float32(1e-30))
@@ -1322,29 +1312,34 @@ def _write_basis(st, uT: cute.Tensor, bh: Int32):
                 store_vector(gptr(Uint32, dst, 16), words)
 
 
-# ---------------------------------------------------------------- eigensolver: the CTA body
+# ---------------------------------------------------------------- eigensolver launch: the CTA body
 
 
-@cute.jit
-def _eig_body(
+@cute.kernel
+def eig_kernel(
     qtens: cute.Tensor,
     ktens: cute.Tensor,
     qk_rows: cute.Tensor,
     hadamard: cute.Tensor,
     uT: cute.Tensor,
-    tidx: Int32,
-    bh: Int32,
     S: Int32,
     H: Int32,
     NQK: Int32,
     NCQ: Int32,
     RANK: cutlass.Constexpr,
 ):
-    """The eigenproblem of (batch, head) bh in one CTA: the Q/K basis U of RANK directions. The body is the schedule
-    of the CTA: each step runs on the threads its docstring names, and each sync_threads is the CTA barrier that
-    publishes what the steps since the barrier before it wrote to shared memory. _gram and _cluster_repair have
+    """One eigenproblem per CTA, CTA bh that of (batch, head) bh: the Q/K basis U of RANK directions, U^T [B, H, RANK,
+    128]. The launch is a programmatic dependent of the clear launch and releases its own dependent at once: the V
+    pass launched beside it touches only the original V, its own outputs and its words of gmax. The body is the
+    schedule of the CTA: each step runs on the threads its docstring names, and each sync_threads is the CTA barrier
+    that publishes what the steps since the barrier before it wrote to shared memory. _gram and _cluster_repair have
     barriers of their own, the last of which publishes their result. st is the state that every step shares; rows,
     search and twist hold the registers and coordinates of the thread in one phase, built where that phase begins."""
+    # the preceding launch on this stream clears the per-call words that the launches after this one read
+    cute.arch.griddepcontrol_wait()
+    tidx, _, _ = cute.arch.thread_idx()
+    bh, _, _ = cute.arch.block_idx()
+    cute.arch.griddepcontrol_launch_dependents()
     st = _eig_state(tidx, RANK)
     # DMB/YLB hold aligned Gram operand images until TC completion. The normalized
     # matrix is then staged in VH, whose first reflector is written only after
@@ -1399,30 +1394,3 @@ def _eig_body(
     _back_transform(st)
     cute.arch.sync_threads()
     _write_basis(st, uT, bh)
-
-
-# ---------------------------------------------------------------- eigensolver launch
-
-
-@cute.kernel
-def eig_kernel(
-    q: cute.Tensor,
-    k: cute.Tensor,
-    qk_rows: cute.Tensor,
-    hadamard: cute.Tensor,
-    uT: cute.Tensor,
-    S: Int32,
-    H: Int32,
-    NQK: Int32,
-    NCQ: Int32,
-    RANK: cutlass.Constexpr,
-):
-    """One eigenproblem per CTA (_eig_body), CTA i that of (batch, head) i, for the RANK directions of U^T [B, H,
-    RANK, 128]. The launch is a programmatic dependent of the clear launch and releases its own dependent at once:
-    the V pass launched beside it touches only the original V, its own outputs and its words of gmax."""
-    # the preceding launch on this stream clears the per-call words that the launches after this one read
-    cute.arch.griddepcontrol_wait()
-    tidx, _, _ = cute.arch.thread_idx()
-    pid, _, _ = cute.arch.block_idx()
-    cute.arch.griddepcontrol_launch_dependents()
-    _eig_body(q, k, qk_rows, hadamard, uT, tidx, pid, S, H, NQK, NCQ, RANK)

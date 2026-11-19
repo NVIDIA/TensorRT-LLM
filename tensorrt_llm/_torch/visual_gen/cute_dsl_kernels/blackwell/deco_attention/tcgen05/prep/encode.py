@@ -14,12 +14,12 @@
 # limitations under the License.
 """Scale encoding of Q' and K' in the DeCo preparation, after the Q/K pass. The Q/K pass leaves the block scales of
 every 128-token tile as BF16 values in a write-coalesced tile layout (q_sfv, k_sfv) and the maxima of the three scale
-groups of each tensor in gmax. encode_qk_scales turns them into the UE4M3 scale-factor atoms the attention's QK reads
+groups of each tensor in gmax. encode_kernel turns them into the UE4M3 scale-factor atoms the attention's QK reads
 (q_sf, k_sf: [B, H, tiles, atoms, 512], one byte per 16 channels and token; an atom per 64 channels: three at rank 32,
 four at rank 64), with one power-of-two group scale per tensor and scale group folded in, and writes score_scale, the
 product of the group scales over 128 (the multiplier of the raw scores in log2 units). It runs on the
-encode_threads(rank) threads of every CTA of the encode launch (encode_kernel), a plain launch after the Q/K pass that
-also writes v8_scale, the power-of-two scale of the E4M3 V."""
+encode_threads(rank) threads of every CTA of the encode launch, a plain launch after the Q/K pass that also writes
+v8_scale, the power-of-two scale of the E4M3 V."""
 
 import cutlass
 import cutlass.cute as cute
@@ -63,27 +63,28 @@ def encode_stage_bytes(rank):
     return ENC_G * 2 * staged_tile_bytes(rank)
 
 
-@cute.jit
-def encode_qk_scales(
-    et: Int32,
-    sync,
-    stb: Int32,
-    bidx: Int32,
-    gdim: Int32,
-    ntile: Int32,
-    gmax: cute.Tensor,
+@cute.kernel
+def encode_kernel(
     q_sfv: cute.Tensor,
     k_sfv: cute.Tensor,
     q_sf: cute.Tensor,
     k_sf: cute.Tensor,
+    gmax: cute.Tensor,
     score_scale: cute.Tensor,
+    ntile: Int32,
+    v8_scale: cute.Tensor,
     MIN_PROD: cutlass.Constexpr,
     RANK: cutlass.Constexpr,
 ):
-    """The Q/K scale encoding by the encode_threads(RANK) threads of CTA bidx of gdim (et: the thread's index among
-    them, sync: their barrier, stb: their encode_stage_bytes(RANK) staging bytes in shared memory; ENC_G tiles per
-    round), once the Q/K pass has finished: the final Q/K UE4M3 atoms of the ntile tiles with the group scales folded
-    in (q_sf, k_sf), and score_scale. MIN_PROD: 128 times the smallest score scale the attention takes."""
+    """The Q/K scale encoding by the encode_threads(RANK) threads of a CTA (ENC_G tiles per round, staged in
+    encode_stage_bytes(RANK) bytes of shared memory), once the Q/K pass has finished: the final Q/K UE4M3 atoms of
+    the ntile tiles with the group scales folded in (q_sf, k_sf), score_scale and v8_scale. MIN_PROD: 128 times the
+    smallest score scale the attention takes."""
+    et, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    gdim, _, _ = cute.arch.grid_dim()
+    smem = utils.SmemAllocator()
+    stb = Int32(smem.allocate_array(Uint8, encode_stage_bytes(RANK), byte_alignment=16).toint())
     atoms = qk_scale_atoms(RANK)
     threads = encode_threads(RANK)  # a tile has twice as many words of UE4M3 scales
     sfv_bytes = sfv_tile_bytes(RANK)
@@ -134,7 +135,7 @@ def encode_qk_scales(
                 sptr(Uint32, stb + g * (2 * staged) + staged + encode_pad128(et * 16), 16),
                 (b2[0], b2[1], b2[2], b2[3]),
             )
-        sync()
+        cute.arch.sync_threads()
         for g in cutlass.range_constexpr(ENC_G):
             tb = tb0 + g
             if tb < ntile:
@@ -224,50 +225,11 @@ def encode_qk_scales(
                     cute.arch.store(
                         gptr(Uint32, kfb + Int64(tb) * Int64(512 * atoms) + Int64(rm * 4)), bk
                     )
-        sync()
+        cute.arch.sync_threads()
     if bidx == 0 and et == 0:
         cute.arch.store(
             gptr(Uint32, Int64(score_scale.iterator.toint())), f2u(prod / Float32(128.0))
         )
-
-
-@cute.kernel
-def encode_kernel(
-    q_sfv: cute.Tensor,
-    k_sfv: cute.Tensor,
-    q_sf: cute.Tensor,
-    k_sf: cute.Tensor,
-    gmax: cute.Tensor,
-    score_scale: cute.Tensor,
-    ntile: Int32,
-    v8_scale: cute.Tensor,
-    MIN_PROD: cutlass.Constexpr,
-    RANK: cutlass.Constexpr,
-):
-    """The Q/K scale encoding by the encode_threads(RANK) threads of a CTA (encode_qk_scales), and v8_scale."""
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    gdim, _, _ = cute.arch.grid_dim()
-    smem = utils.SmemAllocator()
-    st_p = smem.allocate_array(Uint8, encode_stage_bytes(RANK), byte_alignment=16)
-    encode_qk_scales(
-        tidx,
-        cute.arch.sync_threads,
-        Int32(st_p.toint()),
-        bidx,
-        gdim,
-        ntile,
-        gmax,
-        q_sfv,
-        k_sfv,
-        q_sf,
-        k_sf,
-        score_scale,
-        MIN_PROD,
-        RANK,
-    )
-    if bidx == 0 and tidx == 0:
         cute.arch.store(
-            gptr(Uint32, Int64(v8_scale.iterator.toint())),
-            f2u(pow2_ceil_448(_gmax(Int64(gmax.iterator.toint()), 6))),
+            gptr(Uint32, Int64(v8_scale.iterator.toint())), f2u(pow2_ceil_448(_gmax(gb, 6)))
         )

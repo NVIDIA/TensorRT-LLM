@@ -122,7 +122,8 @@ tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/deco_attention/
   sm120/          RTX PRO 6000
     ptx/            the inline PTX that the family alone issues: shared.py (what both kernels or prep/ use),
                     fp8pv.py and nvfp4pv.py (what one kernel alone uses)
-    prep/           preparation passes of Q and K: basis (eigensolver), Q/K pass, encode launch
+    prep/           preparation passes of Q and K: basis (eigensolver), Q/K pass, encode launch; chain.py, the
+                    host side that the preparation chains of both kernels share
     nvfp4pv/        the NVFP4-PV kernel: prep.py (its preparation chain), v_pass.py, launch.py, layout.py,
                     kernel.py, softmax.py
     fp8pv/          the FP8-PV kernel: prep.py, v_pass.py, scan.py, launch.py, layout.py, kernel.py, mma.py,

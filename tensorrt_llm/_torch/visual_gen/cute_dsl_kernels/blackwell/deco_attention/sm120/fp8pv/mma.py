@@ -142,7 +142,7 @@ def mma_phase(
         mbar_wait(swait[0], swait[1])
     if n_pv == 0 and kst is not None:
         w = k_ready()
-    for n in range(min(dist, len(steps))):
+    for n in range(dist):
         frags[n] = load(steps[n])
     if turn is not None:
         turn[0]()

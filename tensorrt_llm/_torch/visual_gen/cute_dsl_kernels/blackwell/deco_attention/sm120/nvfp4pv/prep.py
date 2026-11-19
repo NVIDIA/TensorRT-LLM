@@ -14,7 +14,7 @@
 # limitations under the License.
 """Host entry of the preparation of the sm_120 NVFP4-PV kernel (the passes of ../prep and this kernel's V pass): raw
 BF16 q, k, v into the operands of the attention kernel (kernel.py), launched through one host function per device and
-chain form.
+chain form (the host side that both kernel packages share is ../prep/chain.py).
 
 Launches, on the current stream: the basis launch (prep/basis.py with the V scan of v_pass.py: per (batch, head) the
 Gram matrices of the sampled q and k tokens and their top-32 eigenvectors; the other CTAs scan V for max|v - vbar|
@@ -25,17 +25,12 @@ the shape at run time, so each of the two forms of the chain (the V pass in the 
 once.
 """
 
-import inspect
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass import Int32, Int64
 
-from ...constants import DEFAULT_RANK, HEAD_DIM, QK_CHANNELS
-from ...inputs import hadamard
-from ...runtime import current_stream, num_sms
+from ..prep import chain
 from ..prep.basis import EIG_THREADS
 from ..prep.encode import ENCODE_THREADS, encode_kernel
 from ..prep.qk_pass import QK_THREADS, qk_kernel
@@ -118,38 +113,6 @@ def _host(
 
 _compiled = {}
 
-
-def _compile(device, fused):
-    fn = _compiled.get((device.index, fused))
-    if fn is None:
-        # placeholders of _host's run-time parameters (Int64 addresses, Int32 sizes), then the stream and the switch
-        args = [
-            Int64(0) if p.annotation is Int64 else Int32(1)
-            for p in inspect.signature(_host).parameters.values()
-            if p.annotation in (Int64, Int32)
-        ]
-        args += [cute.runtime.make_fake_stream(), fused]
-        fn = _compiled[(device.index, fused)] = cute.compile(_host, *args)
-    return fn
-
-
-def _grids(nsm, B, S, H):
-    """The SM-count dependent sizes of the launches: spare CTAs of the basis launch, whether the eigensolver CTAs
-    wait for the V scan, and the item and CTA counts of the Q/K pass, the V pass and the encode launch."""
-    BH = B * H
-    T = (S + 127) // 128
-    nspare = max(nsm - BH, 16)
-    eigwait = 1 if BH + nspare <= nsm else 0
-    nqk_items = 2 * BH * T
-    nqk_cta = min(nqk_items, nsm)
-    nv_items = BH * T
-    nv_cta = min(nv_items, 2 * nsm)
-    nenc_cta = min(
-        max((2 * BH * T * QK_CHANNELS + ENCODE_THREADS - 1) // ENCODE_THREADS, 1), 8 * nsm
-    )
-    return nspare, eigwait, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta
-
-
 # the buffers of a call whose addresses the host function takes after q, k, v, the rows and the rotation, in its order
 _HOST_BUFFERS = (
     "q4",
@@ -170,19 +133,9 @@ _HOST_BUFFERS = (
 
 
 def scratch(B, S, H, nsm):
-    """The scratch of the chain at this shape on a device of nsm SMs, name -> (dtype, shape): the bases U^T, the
-    V-scan slots, the group maxima and the provisional block scales, which every call writes before it reads them,
-    and the two counters of the basis launch (the V-scan barrier and the V-pass tile counter), which must be zero when
-    it starts."""
-    nspare, _, _, nqk_cta, _, _, _ = _grids(nsm, B, S, H)
-    BH, T = B * H, (S + 127) // 128
-    return {
-        "ut": (torch.bfloat16, (BH * DEFAULT_RANK * HEAD_DIM,)),
-        "vmax": (torch.float32, (nspare,)),
-        "gmax": (torch.float32, (nqk_cta * 8,)),
-        "prov": (torch.bfloat16, (2 * BH * T * 1536,)),
-        "done": (torch.int32, (2,)),
-    }
+    """The scratch of the chain at this shape on a device of nsm SMs, name -> (dtype, shape) (chain.scratch), with
+    V-scan slots of one word."""
+    return chain.scratch(B, S, H, nsm, 1)
 
 
 def run(q, k, v, qk_rows, buffers):
@@ -190,32 +143,4 @@ def run(q, k, v, qk_rows, buffers):
     BF16 q, k, v [B, S, H, 128]: Q'/K' (q4, k4, q_sf, k_sf), score_scale (floored at 2^MIN_SCORE_LOG2) and V' in V's
     own 128 channels (v4, v4_sf, v_mean, v4_scale). qk_rows: the sampled tokens of the Q/K basis
     (inputs.sample_rows)."""
-    B, S, H, _ = q.shape
-    T = (S + 127) // 128
-    dev = q.device
-    nsm = num_sms(dev)
-    nspare, eigwait, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta = _grids(nsm, B, S, H)
-    # the V pass shares the basis launch when the grid has room for it
-    fn = _compile(dev, 4 * B * H <= nsm)
-    fn(
-        q.data_ptr(),
-        k.data_ptr(),
-        v.data_ptr(),
-        qk_rows.data_ptr(),
-        hadamard(dev).data_ptr(),
-        *(buffers[n].data_ptr() for n in _HOST_BUFFERS),
-        B,
-        S,
-        H,
-        qk_rows.shape[0],
-        T,
-        MIN_SCORE_LOG2,
-        nspare,
-        eigwait,
-        nqk_items,
-        nqk_cta,
-        nv_items,
-        nv_cta,
-        nenc_cta,
-        current_stream(dev),
-    )
+    chain.run(_host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, qk_rows, buffers)
