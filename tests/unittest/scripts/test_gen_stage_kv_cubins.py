@@ -4,6 +4,9 @@
 
 import importlib.util
 import subprocess
+import tarfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 
@@ -31,6 +34,17 @@ def test_archive_ownership_and_reproducibility(
     payload = b"neutral cubin payload"
     archives = []
     listings = []
+    numeric_owners: list[tuple[int, int]] = []
+    open_archive = stage_kv_generator.tarfile.open
+
+    @contextmanager
+    def observe_archive(*arguments: object, **options: object) -> Iterator[tarfile.TarFile]:
+        with open_archive(*arguments, **options) as archive:
+            yield archive
+        with open_archive(archive.name, "r:") as written_archive:
+            numeric_owners.extend((member.uid, member.gid) for member in written_archive)
+
+    monkeypatch.setattr(stage_kv_generator.tarfile, "open", observe_archive)
     for directory_name in ("first", "second"):
         destination = tmp_path / directory_name
         destination.mkdir()
@@ -51,8 +65,11 @@ def test_archive_ownership_and_reproducibility(
         members = list(extracted.iterdir())
         assert len(members) == 1 and members[0].name == f"{stem}.cubin"
         assert members[0].read_bytes() == payload
+        assert members[0].stat().st_mtime == 0
 
     assert archives[0] == archives[1]
+    assert numeric_owners
+    assert all(uid == 0 and gid == 65534 for uid, gid in numeric_owners)
     for listing in listings:
         fields = listing.split()
         assert fields[0] == "-rw-r--r--"
