@@ -1084,6 +1084,25 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         rank_striped_read_ahead.RankStripedReadAheadSession._run = original_run
     communicator.Barrier()
 
+    # Only one of the two files holds the prefix; a rank that cannot read headers reads both.
+    original_read_header = weight_loader._read_safetensors_header
+    if rank == world_size - 1:
+
+        def fail_header(_path):
+            raise ValueError("rank-local header failure")
+
+        weight_loader._read_safetensors_header = fail_header
+    header_loader = _rank_striped_loader()
+    try:
+        with header_loader.open_weight_session(
+            checkpoint_dir, mapping=mapping, key_prefixes=("model.norm.",)
+        ) as header_weights:
+            pass
+        header_status = header_loader.last_checkpoint_io_status
+    finally:
+        weight_loader._read_safetensors_header = original_read_header
+    communicator.Barrier()
+
     return {
         "rank": rank,
         "success": success,
@@ -1095,6 +1114,10 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         "read_effective": read_status.effective,
         "read_reason": read_status.fallback_reason,
         "read_sum": float(read_weights["model.norm.weight"].sum()),
+        "header_effective": header_status.effective,
+        "header_reason": header_status.fallback_reason,
+        "header_sum": float(header_weights["model.norm.weight"].sum()),
+        "header_read_both_files": "lm_head.weight" in header_weights,
     }
 
 
@@ -1105,6 +1128,9 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_real_mpi_success_and_rank_local_failures(tmp_path, mpi_pool_executor):
     checkpoint_dir, expected = _write_checkpoint(tmp_path)
+    save_file(
+        {"lm_head.weight": torch.ones(6, 4)}, str(checkpoint_dir / "model-lm-head.safetensors")
+    )
     results = list(
         mpi_pool_executor.map(
             _run_real_mpi_scenarios,
@@ -1129,3 +1155,10 @@ def test_real_mpi_success_and_rank_local_failures(tmp_path, mpi_pool_executor):
     assert all(result["read_effective"] == "native" for result in results)
     assert all("rank-local read failure" in result["read_reason"] for result in results)
     assert all(result["read_sum"] == expected_sum for result in results)
+    assert all(result["header_effective"] == "native" for result in results)
+    assert all("rank-local header failure" in result["header_reason"] for result in results)
+    assert all(result["header_sum"] == expected_sum for result in results)
+    assert {result["rank"]: result["header_read_both_files"] for result in results} == {
+        0: False,
+        1: True,
+    }
