@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import List, Optional
 
 import msgpack
@@ -84,6 +84,10 @@ class RankInfo:
     num_draft_layers: int = 0
     # KV dtype of those draft layers (a DataType name); None without them.
     draft_kv_dtype: Optional[str] = None
+    # The draft layers come from a manager hosting them, whose share decision
+    # compares global KV heads; their views reshard like the target's at any
+    # attention TP.
+    draft_layers_reshard_across_tp: bool = False
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -99,6 +103,9 @@ class RankInfo:
         if self.draft_kv_dtype is None:
             # Preserve the wire shape for peers without shared draft layers.
             data.pop("draft_kv_dtype")
+        if not self.draft_layers_reshard_across_tp:
+            # Only a hosting manager's peers need the field.
+            data.pop("draft_layers_reshard_across_tp")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
@@ -166,6 +173,8 @@ class RankInfo:
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
             num_draft_layers=len(draft_layer_ids),
             draft_kv_dtype=draft_kv_dtype,
+            draft_layers_reshard_across_tp=shares_draft_layers
+            and getattr(kvm, "hosts_unified_draft_layers", False),
         )
 
     @classmethod
@@ -181,4 +190,12 @@ class RankInfo:
             unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
+        # A peer built with a newer RankInfo on the same protocol version can
+        # send fields this build does not define; reject it as incompatible.
+        unknown = sorted(set(unpacked) - {f.name for f in fields(cls)})
+        if unknown:
+            raise ValueError(
+                f"RankInfo from peer has fields this build does not define: {unknown}; "
+                "run the same TensorRT-LLM build on every worker."
+            )
         return cls(**unpacked)

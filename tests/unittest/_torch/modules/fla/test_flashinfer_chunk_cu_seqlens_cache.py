@@ -14,7 +14,7 @@
 # limitations under the License.
 """The direct FlashInfer GDN launch casts the metadata's int64 cu_seqlens to
 int32 once per iteration: the cast is cached per buffer until
-``Mamba2Metadata.prepare`` invalidates it, and inference-mode tensors (no
+``GDNMambaMetadata.prepare`` invalidates it, and inference-mode tensors (no
 version counter) are handled."""
 
 import pytest

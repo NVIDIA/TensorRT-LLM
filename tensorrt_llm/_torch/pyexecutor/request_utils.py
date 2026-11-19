@@ -6,10 +6,11 @@
 import dataclasses
 import os
 import time
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from .executor_request_queue import RequestQueueItem
+    from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
     from .scheduler import WaitingQueue
     from .scheduler.adp_router import ADPRouter
 
@@ -168,6 +169,26 @@ def get_from_waiting_queue(
     return items
 
 
+def drain_queued_items(
+    waiting_queue: "WaitingQueue", request_queue: "ExecutorRequestQueue"
+) -> Iterator["RequestQueueItem"]:
+    """Yield waiting items, then incoming items other than the shutdown signal."""
+    while waiting_queue:
+        yield waiting_queue.pop_request()
+
+    # Also drain executor_request_queue so items already queued
+    # but not yet fetched by the main loop are not scheduled
+    # after the CUDA context is corrupted. Safe to use empty()
+    # here because is_shutdown is True and the queue's active
+    # flag is about to be set False, so no new items arrive.
+    raw_queue = request_queue.get_request_queue()
+    while not raw_queue.empty():
+        item = raw_queue.get_nowait()
+        if item.is_shutdown_request:
+            continue
+        yield item
+
+
 def partition_context_for_helix(
     input_token_ids: np.ndarray, cp_rank: int, cp_size: int, tokens_per_block: int
 ) -> tuple[list[int], list[int], int, int]:
@@ -247,6 +268,7 @@ def merge_requests_to_llm_requests(
             exclude_last_generation_logits,
             input_token_ids=req_item.prompt_token_ids,
             track_unique_tokens=track_unique_tokens,
+            locality_domain_id=req_item.locality_domain_id,
         )
         req_with_children.append(req)
         if req.child_requests:
@@ -263,8 +285,9 @@ def merge_helix_requests(
 ) -> list[LlmRequest]:
     """Merge requests for Helix CP.
 
-    Note: Helix parallelism is a decode-only feature run with disaggregated serving.
-    This function gets called on gen server during initialization of a new request.
+    Called only for disaggregated Helix, on the generation server when a new
+    request is initialized; it slices the prompt across CP ranks. Aggregated
+    Helix keeps the full prompt on every rank (see ``merge_requests``).
 
     Args:
         new_requests: List of RequestQueueItem objects.
@@ -291,6 +314,7 @@ def merge_helix_requests(
             exclude_last_generation_logits=exclude_last_generation_logits,
             input_token_ids=input_ids_this_rank,
             position_ids=position_ids_this_rank,
+            locality_domain_id=req_item.locality_domain_id,
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)

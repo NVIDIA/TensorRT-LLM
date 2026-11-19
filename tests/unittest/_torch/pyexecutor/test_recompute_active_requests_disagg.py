@@ -32,6 +32,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager, PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -69,7 +70,9 @@ class _RecomputeExecutor:
         self.is_encoder_decoder = False
         self.previous_batch = previous_batch
         # The response routing of a request that continues after the recompute.
-        self.result_wait_queues = {r.py_request_id: object() for r in self.active_requests}
+        self._response_channel = ResponseChannel()
+        for r in self.active_requests:
+            self._response_channel.register([r.py_request_id], object())
         self.freed = []
         self.paused = []
         self.reset_calls = 0
@@ -140,14 +143,14 @@ class TestRecomputeSkipsTransferBoundRequests:
             _request(3, is_generation_only=True),
         ]
         ex = _RecomputeExecutor(reqs, transceiver=None, transfer_manager=None)
-        queues = dict(ex.result_wait_queues)
+        queues = dict(ex._response_channel.result_wait_queues)
 
         PyExecutor.recompute_active_requests(ex)
 
         assert ex.freed == reqs
         assert ex.paused == reqs
         assert ex.reset_calls == 1
-        assert ex.result_wait_queues == queues
+        assert ex._response_channel.result_wait_queues == queues
 
     def test_in_flight_batch_is_a_precondition_violation(self):
         """The control action retires the overlap batch first; recompute must

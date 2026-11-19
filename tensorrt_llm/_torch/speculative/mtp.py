@@ -255,6 +255,8 @@ class MTPSpecMetadata(SpecMetadata):
 
 class MTPWorker(SpecWorkerBase):
 
+    verifies_on_target_shard = True
+
     def __init__(self,
                  spec_config: "MTPDecodingConfig",
                  model_config=None,
@@ -291,6 +293,12 @@ class MTPWorker(SpecWorkerBase):
             getattr(draft_model, "mtp_layers", None) or ()),
                                       self.mapping,
                                       decline="attention DP" if adp else None)
+
+    def _verifies_target_by_argmax(self) -> bool:
+        # Relaxed acceptance reads the target's top-k distribution and the
+        # THOP kernel the full-vocab logits.
+        return (not self.spec_config.use_relaxed_acceptance_for_thinking
+                and not self.is_thop)
 
     def _commit_target_mamba_states(
         self,
@@ -496,7 +504,10 @@ class MTPWorker(SpecWorkerBase):
                 f"{draft_inputs['input_ids'].shape[0]} rows after attention",
                 key="spec_mtp_pick_rows")
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+        with self.draft_kv_cache_context(
+                attn_metadata,
+                draft_kv_cache_manager,
+                enable_draft_locality_domain_forkjoin=True):
             for i, mtp_layer in enumerate(
                     draft_model.mtp_layers[:runtime_draft_len]):
                 if self.guided_decoder is not None:

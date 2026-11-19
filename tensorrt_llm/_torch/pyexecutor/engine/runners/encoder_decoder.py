@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -946,6 +946,9 @@ class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
     are captured, and captures the mixed context/generation shapes planned
     from the encoder graph shapes.
     """
+
+    # Mixed shapes need the warmup-only pass; the move check misses the cross-attention metadata.
+    supports_single_pass_capture: ClassVar[bool] = False
 
     def __init__(
         self,

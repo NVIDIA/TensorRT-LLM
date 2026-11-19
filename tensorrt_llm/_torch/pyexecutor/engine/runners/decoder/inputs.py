@@ -8,6 +8,7 @@ import math
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields, replace
+from itertools import accumulate
 from typing import Any
 
 import numpy as np
@@ -15,7 +16,10 @@ import torch
 from torch.utils._pytree import tree_flatten
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    AttentionRuntimeFeatures,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.host_staging import HostUploader
@@ -69,7 +73,11 @@ from tensorrt_llm.inputs.multimodal import (
     check_mm_embed_cumsum_if_needed,
     strip_mm_data_for_generation,
 )
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    DSparkDecodingConfig,
+    PrefillCudaGraphBackend,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -89,6 +97,11 @@ from ..common import (
 )
 from ..interface import PreparedInputs
 from .config import DecoderRunnerConfig
+from .locality_domain import (
+    locality_domain_forkjoin_enabled,
+    locality_domain_row_splits,
+    sort_generation_requests_by_locality_domain,
+)
 from .metadata import set_spec_metadata_all_rank_num_tokens
 from .spec_overlap_inputs import stage_spec_overlap_inputs
 
@@ -104,6 +117,13 @@ def resolve_runtime_draft_len(
     if spec_config is not None and not spec_config.is_linear_tree:
         return get_static_draft_len(spec_config)
     return runtime_draft_len
+
+
+def dspark_schedules_draft_len(spec_config: DecodingBaseConfig | None) -> bool:
+    """Whether a DSpark draft length schedule can shorten a step's uniform verify window."""
+    return (
+        isinstance(spec_config, DSparkDecodingConfig) and spec_config.draft_len_schedule is not None
+    )
 
 
 def uses_full_generation_page_table(
@@ -326,6 +346,8 @@ class HostInputs:
     mrope_dummy_seq_slot: int
     extra_inputs: ExtraInputsCollector
     context_prompt_lookahead: list[int] | None
+    # Fork-join attention needs each domain's rows contiguous in the packed batch.
+    locality_domain_reorder: bool = False
     lists: HostLists = field(default_factory=HostLists)
 
     num_ctx_requests: int = 0
@@ -386,8 +408,10 @@ class DecoderInputPreparer:
         steady_gen_cache_supported: bool,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
         host_uploader: HostUploader | None = None,
+        attention_runtime_features: AttentionRuntimeFeatures | None = None,
     ) -> None:
         self._buffers = buffers
+        self._attention_runtime_features = attention_runtime_features or AttentionRuntimeFeatures()
         self._pinned_host_cache = {}
         self._pinned_host_active = {}
         self._mm_item_scheduler = mm_item_scheduler
@@ -595,6 +619,10 @@ class DecoderInputPreparer:
         ``spec_metadata.num_tokens``, ``num_generations`` and ``seq_lens`` for
         this batch before calling this. ``num_generations`` counts every
         generation request, CUDA-graph dummies included.
+
+        The step's draft length rides along: each rank picks it from its own
+        batch, and a drafter that crosses a cross-rank barrier has to know
+        whether any peer drafts this step.
         """
         if not self._config.enable_attention_dp:
             return None, None
@@ -602,6 +630,7 @@ class DecoderInputPreparer:
             spec_metadata.dp_num_tokens(),
             len(spec_metadata.seq_lens),
             spec_metadata.num_generations,
+            spec_metadata.runtime_draft_len,
         )
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the
@@ -1189,6 +1218,7 @@ class DecoderInputPreparer:
                 else None
             ),
         )
+        host.locality_domain_reorder = locality_domain_forkjoin_enabled(kv_cache_manager)
         self._pack_context_requests(host, scheduled_requests)
         self._classify_generation_requests(
             host,
@@ -1389,6 +1419,13 @@ class DecoderInputPreparer:
         multimodal_params_list = host.lists.multimodal_params_list
         extra_inputs = host.extra_inputs
         context_prompt_lookahead = host.context_prompt_lookahead
+
+        # Chunked prefill keeps the scheduler order: MLA context then runs on
+        # the single-kernel path and the context splits fall back to positional.
+        if host.locality_domain_reorder and not self._attention_runtime_features.chunked_prefill:
+            scheduled_requests.reset_context_requests(
+                sorted(scheduled_requests.context_requests, key=lambda r: r.py_locality_domain_id)
+            )
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -1604,6 +1641,13 @@ class DecoderInputPreparer:
         generation_requests = host.lists.generation_requests
         all_gen_request_ids = host.lists.all_gen_request_ids
 
+        # Reordering in place keeps the sampler and spec-decode on the same
+        # order as the model input, so no logit un-permutation is needed.
+        if host.locality_domain_reorder and scheduled_requests.generation_requests:
+            scheduled_requests.generation_requests = sort_generation_requests_by_locality_domain(
+                list(scheduled_requests.generation_requests), promoted_context_request_ids
+            )
+
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
         for request in scheduled_requests.generation_requests:
@@ -1658,11 +1702,12 @@ class DecoderInputPreparer:
                 return helix_local_len(global_len, _helix_phys, _helix_cp_size, _helix_cp_rank)
 
             def _helix_pack_extend(request, group: int) -> int:
-                # A helix gen worker's token list is the rank-LOCAL
-                # round-robin subset, so max_beam_num_tokens is not a global
-                # base; rebuild it from the global prompt length plus the
-                # rank-invariant generated count. Also repacks position_ids,
-                # which the caller filled from the local base.
+                # On a disaggregated helix gen worker the token list is the
+                # rank-LOCAL round-robin subset, so max_beam_num_tokens is not
+                # a global base. Rebuilding it from the global prompt length
+                # plus the rank-invariant generated count is exact in both
+                # helix modes. Also repacks position_ids, which the caller
+                # filled from the token-list base.
                 generated_len = request.max_beam_num_tokens - request.py_prompt_len
                 base = request.total_input_len_cp + generated_len - 1
                 helix_position_offsets.extend(range(base, base + group))
@@ -1822,13 +1867,13 @@ class DecoderInputPreparer:
                 )
                 if _has_cp_helix:
                     # Verify group [base, base+group) in GLOBAL positions.
-                    # On a helix gen worker the request's token list is the
-                    # rank-LOCAL round-robin subset, so max_beam_num_tokens
-                    # (= local_prompt + generated) must NOT be used as a
-                    # global base; reconstruct it from the global prompt
-                    # length plus the (rank-invariant) generated count. This
-                    # branch has no in-flight predecessor, so every value is
-                    # exact (no device correction needed).
+                    # On a disaggregated helix gen worker the request's token
+                    # list is the rank-LOCAL round-robin subset, so
+                    # max_beam_num_tokens (= local_prompt + generated) must NOT
+                    # be used as a global base; reconstruct it from the global
+                    # prompt length plus the (rank-invariant) generated count.
+                    # This branch has no in-flight predecessor, so every value
+                    # is exact (no device correction needed).
                     group = 1 + num_draft_tokens
                     base = _helix_pack_extend(request, group)
                     local_cached = _helix_local_len_host(base)
@@ -2699,7 +2744,10 @@ class DecoderInputPreparer:
                 ),
             )
 
-        if self._dspark_trims_submitted_tokens:
+        # Attention sizes its generation rows by the static draft ceiling
+        # unless told the step's window, which both the confidence scheduler
+        # and a draft length schedule can shorten.
+        if self._dspark_trims_submitted_tokens or dspark_schedules_draft_len(spec_config):
             self._publish_gen_token_layout(
                 attn_metadata,
                 scheduled_requests.generation_requests,
@@ -2804,6 +2852,10 @@ class DecoderInputPreparer:
             ),
         )
         attn_metadata.kv_cache_manager = kv_cache_manager
+        if host.locality_domain_reorder:
+            self._set_locality_domain_splits(
+                host, scheduled_requests, kv_cache_manager, attn_metadata
+            )
 
         if hasattr(self.model.model_config.pretrained_config, "chunk_size"):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
@@ -2822,6 +2874,56 @@ class DecoderInputPreparer:
         attn_metadata.prepare()
         host.num_cached_tokens_snapshot = num_cached_tokens_snapshot
         host.remote_tail_modes = remote_tail_modes
+
+    def _set_locality_domain_splits(
+        self,
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        """Record the per-domain request and token boundaries for fork-join attention.
+
+        The single ``attn_metadata.kv_cache_manager`` is shared across domains:
+        V2 addresses every domain through global block indices.
+        """
+        attn_metadata.locality_domain_enabled = True
+        num_locality_domains = kv_cache_manager.num_locality_domains
+        sequence_lengths = host.lists.sequence_lengths
+        num_ctx_requests = host.num_ctx_requests
+
+        # Context rows keep the scheduler order under chunked prefill, so the
+        # split follows ownership only when the domains are contiguous.
+        per_locality_domain_ctx_reqs, per_locality_domain_ctx_tokens = locality_domain_row_splits(
+            scheduled_requests.context_requests,
+            sequence_lengths[:num_ctx_requests],
+            num_locality_domains,
+            positional=False,
+        )
+
+        # Rows are packed extend then generation, which is not the domain-sorted
+        # order once the categories mix, so count from the packed list.
+        per_locality_domain_gen_reqs, per_locality_domain_gen_tokens = locality_domain_row_splits(
+            host.lists.extend_requests + host.lists.generation_requests,
+            sequence_lengths[num_ctx_requests:],
+            num_locality_domains,
+            positional=num_ctx_requests == 0,
+        )
+
+        attn_metadata.locality_domain_ctx_req_splits = [0] + list(
+            accumulate(per_locality_domain_ctx_reqs)
+        )
+        attn_metadata.locality_domain_gen_req_splits = [0] + list(
+            accumulate(per_locality_domain_gen_reqs)
+        )
+        attn_metadata.locality_domain_ctx_token_splits = [0] + list(
+            accumulate(per_locality_domain_ctx_tokens)
+        )
+        attn_metadata.locality_domain_gen_token_splits = [0] + list(
+            accumulate(per_locality_domain_gen_tokens)
+        )
+        attn_metadata.locality_domain_num_ctx_tokens = per_locality_domain_ctx_tokens
+        attn_metadata.locality_domain_num_gen_tokens = per_locality_domain_gen_tokens
 
     def _pad_inputs(
         self,
@@ -3257,10 +3359,16 @@ class DecoderInputPreparer:
         )
 
     def preprocess_inputs(
-        self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
+        self,
+        inputs: dict[str, Any],
+        *,
+        enable_spec_decode: bool,
+        runtime_draft_len: int,
+        mark_prologue_start: Callable[[Any], None] | None = None,
     ) -> dict[str, Any]:
         """
-        Make some changes to the device inputs and avoid blocking the async data transfer
+        Make some changes to the device inputs and avoid blocking the async data transfer.
+        ``mark_prologue_start(attn_metadata)`` runs behind the position correction, else at the end.
         """
         attn_meta = inputs.get("attn_metadata")
         # A model's decode prologue may replace the device work below with one
@@ -3272,6 +3380,8 @@ class DecoderInputPreparer:
         ):
             if self.guided_decoder is not None:
                 self.guided_decoder.token_event.record()
+            if mark_prologue_start is not None:
+                mark_prologue_start(attn_meta)
             return inputs
         # Overlap scheduling corrects kv_lens_cuda below from the runtime
         # accepted-token counts and calls on_update_kv_lens() again after it.
@@ -3322,6 +3432,10 @@ class DecoderInputPreparer:
                     inputs["position_ids"][0, num_ctx_tokens:] += (
                         self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
+                if mark_prologue_start is not None:
+                    # Behind the step's first launch, so a captured decode graph keeps a single root.
+                    mark_prologue_start(attn_meta)
+                    mark_prologue_start = None
 
                 if has_kv_lens_correction:
                     if fused_offsets:
@@ -3379,6 +3493,8 @@ class DecoderInputPreparer:
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
+        if mark_prologue_start is not None:
+            mark_prologue_start(attn_meta)
 
         return inputs
 
