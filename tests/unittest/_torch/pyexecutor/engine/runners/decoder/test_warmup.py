@@ -1116,6 +1116,16 @@ class TestWarmupCleanup(unittest.TestCase):
             if name in captures:
                 self.assertLess(prewarm, i, calls)
 
+    def test_warmup_frees_the_low_m_staging_buffers_of_its_thread(self) -> None:
+        """Serving stages padded low-M GEMM rows in buffers of its own thread, so the warmup frees
+        the ones its thread holds once it is done."""
+        from tensorrt_llm._torch.modules import low_m_gemm
+
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
+        low_m_gemm._staging_buffers()[("warmup",)] = torch.zeros(1)
+        _run_warmup_tracked(model_engine, resource_manager)
+        self.assertEqual(low_m_gemm._staging_buffers(), {})
+
     def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after
         _run_autotuner_warmup."""

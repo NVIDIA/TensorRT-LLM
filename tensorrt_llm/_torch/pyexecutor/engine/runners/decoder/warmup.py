@@ -330,6 +330,8 @@ class DecoderWarmup:
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
+        from tensorrt_llm._torch.modules.low_m_gemm import release_mma_staging_buffers
+
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
@@ -337,7 +339,11 @@ class DecoderWarmup:
         warmup_named_allreduce_topologies(self.model)
         # Retain a partial summary when a phase raises.
         with self._warmup_timer:
-            return self._warmup_scheduled(resource_manager, kv_cache_manager)
+            reclaimer = self._warmup_scheduled(resource_manager, kv_cache_manager)
+        # Serving runs on the executor's worker thread, whose padded low-M GEMM launches stage their
+        # rows in buffers of its own: free the ones the warmup forwards left on this thread.
+        release_mma_staging_buffers()
+        return reclaimer
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager

@@ -9,6 +9,7 @@ import dataclasses
 import functools
 import gc
 import sys
+import threading
 import time
 from typing import Any, Callable
 from unittest.mock import MagicMock, patch
@@ -841,12 +842,12 @@ def test_eager_rows_run_the_row_bucket_kernel_bitwise(
     eager = call()
     misses = compiled_mma.cache_info().misses
     # A padded call under capture keeps its buffer to the capture, out of the staging cache.
-    monkeypatch.setattr(_mod, "_A_STAGING", {})
+    monkeypatch.setattr(_mod, "_A_STAGING", threading.local())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = call()
     assert compiled_mma.cache_info().misses == misses
-    assert not _mod._A_STAGING
+    assert not _mod._staging_buffers()
     graph.replay()
     torch.cuda.synchronize()
     with flashinfer_mxfp8_decode_graph_capture():
@@ -904,7 +905,11 @@ def test_prewarm_compiles_every_row_bucket_of_eager_calls_only(
 def test_padded_calls_run_in_and_out_of_inference_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     """A padded call's staging buffer is a normal tensor: calls in and out of inference mode both
     write it, and both match the exact-row kernel."""
-    for name, fresh in (("_A_STAGING", {}), ("_MMA_SIGNATURES", {}), ("_MMA_BUILT", set())):
+    for name, fresh in (
+        ("_A_STAGING", threading.local()),
+        ("_MMA_SIGNATURES", {}),
+        ("_MMA_BUILT", set()),
+    ):
         monkeypatch.setattr(_mod, name, fresh)
     monkeypatch.setattr(_mod, "_MMA_ROUTES", {})
     w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
@@ -915,6 +920,51 @@ def test_padded_calls_run_in_and_out_of_inference_mode(monkeypatch: pytest.Monke
     with flashinfer_mxfp8_decode_graph_capture():
         exact = bf16_lowm_linear(x, w)
     assert torch.equal(inside, exact) and torch.equal(outside, exact)
+
+
+@_skip_no_lowm_fp8
+def test_padded_calls_of_two_threads_on_one_stream_keep_their_own_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each host thread pads into its own staging buffer: a padded call that another thread submits
+    to the same stream between this call's copy and its launch cannot overwrite this launch's rows."""
+    for name, fresh in (
+        ("_A_STAGING", threading.local()),
+        ("_MMA_SIGNATURES", {}),
+        ("_MMA_BUILT", set()),
+        ("_MMA_ROUTES", {}),
+    ):
+        monkeypatch.setattr(_mod, name, fresh)
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    x = {name: torch.randn(13, 512, device="cuda").to(torch.bfloat16) for name in "AB"}
+    expected = {name: bf16_lowm_linear(x[name], w) for name in "AB"}
+    mma_kernel = _mod._mma_kernel
+    copied, submitted = threading.Event(), threading.Event()
+
+    def launch_after_the_other_submits(m: int, *args: Any, **kwargs: Any) -> tuple[Any, int]:
+        fn, rows = mma_kernel(m, *args, **kwargs)
+        if threading.current_thread().name != "A":
+            return fn, rows
+
+        def launch(*launch_args: Any, **launch_kwargs: Any) -> Any:
+            copied.set()
+            assert submitted.wait(timeout=60)
+            return fn(*launch_args, **launch_kwargs)
+
+        return launch, rows
+
+    monkeypatch.setattr(_mod, "_mma_kernel", launch_after_the_other_submits)
+    out = {}
+    a = threading.Thread(target=lambda: out.update(A=bf16_lowm_linear(x["A"], w)), name="A")
+    a.start()
+    try:
+        assert copied.wait(timeout=60)
+        out["B"] = bf16_lowm_linear(x["B"], w)
+    finally:
+        submitted.set()
+        a.join(timeout=60)
+    torch.cuda.synchronize()
+    assert torch.equal(out["A"], expected["A"]) and torch.equal(out["B"], expected["B"])
 
 
 @_skip_no_lowm_fp8

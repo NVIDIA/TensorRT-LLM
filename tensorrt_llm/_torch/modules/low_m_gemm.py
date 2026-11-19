@@ -3,6 +3,7 @@
 
 import functools
 import os
+import threading
 import weakref
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -1208,14 +1209,30 @@ def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, 0) * (t.dim() - 1) + (0, rows - t.shape[0]))
 
 
-# Per (stream, device, dtype, rows, row shape): the A operand buffer of padded launches. Its rows past
-# a launch's own hold earlier launches' rows, which reach only output rows that launch drops.
-_A_STAGING: Dict[tuple, torch.Tensor] = {}
+# Per host thread, then per (stream, device, dtype, rows, row shape): the A operand buffer of padded
+# launches. Its rows past a launch's own hold earlier launches' rows, which reach only output rows
+# that launch drops. Threads that submit to one stream never share a buffer, and a thread's buffers
+# are freed when it exits.
+_A_STAGING = threading.local()
+
+
+def _staging_buffers() -> Dict[tuple, torch.Tensor]:
+    """The calling thread's staging buffers."""
+    buffers = getattr(_A_STAGING, "buffers", None)
+    if buffers is None:
+        buffers = _A_STAGING.buffers = {}
+    return buffers
+
+
+def release_mma_staging_buffers() -> None:
+    """Free the calling thread's staging buffers; its next padded eager launch allocates anew."""
+    _A_STAGING.buffers = {}
 
 
 def _a_operand(x: torch.Tensor, rows: int) -> Tuple[torch.Tensor, Any]:
     """The A operand of a launch on ``rows`` rows and its CuTe view: ``x`` itself when it has the
-    rows, else ``x`` copied into the first rows of a ``rows``-row buffer of the current stream."""
+    rows, else ``x`` copied into the first rows of a ``rows``-row buffer of the calling thread and
+    the current stream."""
     if x.shape[0] >= rows:
         return x, graph_safe_from_dlpack(x)
     shape = (rows,) + tuple(x.shape[1:])
@@ -1224,12 +1241,13 @@ def _a_operand(x: torch.Tensor, rows: int) -> Tuple[torch.Tensor, Any]:
         buf = x.new_zeros(shape)
         buf[: x.shape[0]].copy_(x)
         return buf, graph_safe_from_dlpack(buf)
+    staging = _staging_buffers()
     key = (torch.cuda.current_stream(x.device).cuda_stream, x.device, x.dtype, rows, x.shape[1:])
-    buf = _A_STAGING.get(key)
+    buf = staging.get(key)
     if buf is None:
         # A normal tensor even under inference mode, so calls in and out of it can both write it.
         with torch.inference_mode(False):
-            buf = _A_STAGING[key] = x.new_zeros(shape)
+            buf = staging[key] = x.new_zeros(shape)
     buf[: x.shape[0]].copy_(x)
     return buf, _cute_view(buf)
 
@@ -1624,4 +1642,5 @@ __all__ = [
     "mxfp8_lowm_linear",
     "prepare_low_m_gemm",
     "prewarm_mma_row_buckets",
+    "release_mma_staging_buffers",
 ]
