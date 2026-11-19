@@ -9280,7 +9280,13 @@ class PyExecutor:
         # The transport choice must be identical on every rank, so `idle` has
         # to be too: it follows the all-rank live-request count and the
         # replicated waiting queue.
-        broadcast_kwargs = {"prefer_cpu": idle}
+        # A benchmark schedule keeps the CPU transport throughout: without
+        # attention DP, a rank that retires a timed-out request alone reaches
+        # `idle` first, and the stage-vote request must still reach every rank.
+        broadcast_kwargs = {
+            "prefer_cpu":
+            idle or (self._benchmark_sweep and self.is_benchmark_disagg)
+        }
         if use_hint and new_requests_hint > 0:
             # Every rank agrees rank 0 holds requests: skip the count probe.
             broadcast_kwargs["known_nonempty"] = True
@@ -9579,7 +9585,8 @@ class PyExecutor:
     def _check_benchmark_schedule_request(self,
                                           request: ExecutorRequest) -> None:
         """Reject n > 1 requests, which a request-counting schedule can't fit."""
-        if self._benchmark_sweep and get_num_child_requests(request) > 0:
+        if (self._benchmark_sweep and self.is_benchmark_disagg
+                and get_num_child_requests(request) > 0):
             raise ValueError(
                 f"{BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} schedules count "
                 "requests and require n=1")
