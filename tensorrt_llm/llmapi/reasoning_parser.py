@@ -1167,7 +1167,10 @@ class InklingReasoningParser(BaseReasoningParser):
                 # framing. They close the previous block and hold any text until
                 # a visible content or tool-content marker opens a new block --
                 # except an end token closing a tool block, which belongs to the
-                # tool protocol and goes through with it.
+                # tool protocol and goes through with it. So the payloads of the
+                # other content kinds (`<|content_xml|>`, `<|content_tool_error|>`,
+                # `<|content_image|>`) are dropped; SGLang's `InklingDetector`
+                # drops them too, after the message header that opens them.
                 if self._kind == "tool":
                     content.append(token)
                 self._header = ""

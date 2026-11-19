@@ -58,18 +58,36 @@ class InklingToolParser(BaseToolParser):
             re.DOTALL,
         )
         self._current_header_name: Optional[str] = None
+        # A message header is `<|message_model|>` and the sender's name, up to the block's next
+        # control token: framing, not text, whatever block it opens.
+        self._message_header = re.compile(
+            re.escape(INKLING_MESSAGE_MODEL)
+            + r"[^<]*?(?="
+            + "|".join(re.escape(token) for token in INKLING_CONTROL_TOKENS)
+            + ")"
+        )
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Parse a whole response the way streaming parses it, delta by delta.
+
+        Text before, between and after the invocations is visible; the tool header naming an
+        invocation's tool is framing, as is an unfinished invocation at the end. A complete
+        invocation is a call, or is dropped on its own when its payload is malformed or rejected.
+        """
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=self._clean_normal_text(text))
 
         try:
             calls: List[ToolCallItem] = []
+            normal: List[str] = []
+            pos = 0
             for match in self.tool_call_regex.finditer(text):
-                # A malformed invocation is dropped on its own; the calls around it stand.
+                prefix, header_name = self._split_trailing_tool_header(text[pos : match.start()])
+                normal.append(prefix)
+                pos = match.end()
                 try:
                     payload = json.loads(match.group(1).strip())
                 except json.JSONDecodeError:
@@ -78,23 +96,18 @@ class InklingToolParser(BaseToolParser):
                 if not isinstance(payload, Mapping):
                     logger.warning(f"Invalid Inkling tool call payload: {payload}")
                     continue
-                _, header_name = self._split_trailing_tool_header(text[: match.start()])
                 call = self._tool_call_item(payload, tools, len(calls), header_name=header_name)
                 if call is not None:
                     calls.append(call)
-
-            if not calls:
-                # Every candidate was rejected (bad payload, or the header and
-                # the payload named different tools). Follow the contract the
-                # other parsers keep: normal_text is only what came BEFORE the
-                # tool marker. The rejected region is dropped, never handed back
-                # as visible content -- a half-parsed invocation is not an answer.
-                prefix, _ = self._split_trailing_tool_header(text[: text.find(self.bot_token)])
-                return StreamingParseResult(normal_text=self._clean_normal_text(prefix))
-
-            normal_prefix, _ = self._split_trailing_tool_header(text[: text.find(self.bot_token)])
+            # After the last complete invocation, an unfinished one and a trailing tool header
+            # are framing, as `finish()` treats them at the end of a stream.
+            tail = text[pos:]
+            if self.bot_token in tail:
+                tail = tail[: tail.find(self.bot_token)]
+            tail, _ = self._split_trailing_tool_header(tail)
+            normal.append(tail)
             return StreamingParseResult(
-                normal_text=self._clean_normal_text(normal_prefix), calls=calls
+                normal_text=self._clean_normal_text("".join(normal)), calls=calls
             )
         except Exception as exc:
             logger.error(f"Error in Inkling detect_and_parse: {exc}")
@@ -285,6 +298,7 @@ class InklingToolParser(BaseToolParser):
         return 0
 
     def _clean_normal_text(self, text: str) -> str:
+        text = self._message_header.sub("", text)
         for token in INKLING_CONTROL_TOKENS:
             text = text.replace(token, "")
         return text

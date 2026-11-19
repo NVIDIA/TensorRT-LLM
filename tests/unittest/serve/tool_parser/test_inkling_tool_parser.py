@@ -319,6 +319,59 @@ def test_streaming_judges_the_whole_framed_payload():
     assert [c.name for c in _parser().detect_and_parse("".join(deltas), tools).calls] == ["g"]
 
 
+_ONE_SHOT_EQUALS_STREAMING = [
+    (_call("f", {"a": 1}) + f"{MM}{CT}done{EM}", "done", ["f"]),
+    (
+        f"{CT}before {EM}"
+        + _call("f", {"a": 1})
+        + f"{MM}{CT}between {EM}"
+        + _call("g", {"b": 2})
+        + f"{MM}{CT}after{EM}",
+        "before between after",
+        ["f", "g"],
+    ),
+    (
+        _call("f", {"a": 1}, header="g") + f"{MM}{CT}after a rejected call{EM}",
+        "after a rejected call",
+        [],
+    ),
+    (f"{MM}f{CT}hello{EM}", "hello", []),
+    (f'{CT}text{EM}{MM}f{IT}{{"name":"f","ar', "text", []),
+]
+
+
+@pytest.mark.parametrize(
+    "text, normal_text, names",
+    _ONE_SHOT_EQUALS_STREAMING,
+    ids=[
+        "text_after_a_call",
+        "text_around_calls",
+        "after_a_rejected_call",
+        "named_header",
+        "unfinished_call",
+    ],
+)
+def test_one_shot_parse_equals_streaming(text, normal_text, names):
+    """A streaming and a non-streaming client get the same content and calls for one output."""
+    tools = _tools("f", "g")
+    batch = _parser().detect_and_parse(text, tools)
+    assert batch.normal_text == normal_text
+    assert [c.name for c in batch.calls] == names
+    for splits in ([], range(1, len(text))):
+        parser = _parser()
+        normal, calls = "", []
+        edges = [0, *splits, len(text)]
+        for a, b in zip(edges, edges[1:]):
+            result = parser.parse_streaming_increment(text[a:b], tools)
+            normal += result.normal_text
+            calls += result.calls
+        result = parser.finish(tools)
+        normal += result.normal_text
+        calls += result.calls
+        assert normal == normal_text
+        assert _assembled(calls) == [(c.name, c.parameters) for c in batch.calls]
+
+
 def test_structure_info_round_trip():
     """The structural tag must frame exactly what the parser accepts."""
     info = _parser().structure_info()("get_weather")

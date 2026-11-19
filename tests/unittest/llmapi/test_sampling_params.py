@@ -729,6 +729,21 @@ def test_setup_falls_back_to_model_config_eos():
     assert params.pad_id == 200006
 
 
+def test_setup_falls_back_to_the_text_configs_eos():
+    """A multimodal config may declare eos_token_id only in its text config."""
+    config = _FakeConfig(eos_token_id=None)
+    config.text_config = _FakeConfig(eos_token_id=[200006, 200010])
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), config, None)
+    assert params.end_id == 200006
+    assert params.stop_token_ids == [200010]
+    # When both declare one, the top-level value wins.
+    config.eos_token_id = 7
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), config, None)
+    assert params.end_id == 7
+
+
 def test_setup_model_config_eos_list_sets_end_id_and_stop_tokens():
     params = SamplingParams()
     params._setup(_FakeTokenizer(eos_token_id=None), _FakeConfig(eos_token_id=[7, 8, 9]), None)
