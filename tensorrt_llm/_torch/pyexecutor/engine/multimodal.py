@@ -9,6 +9,7 @@ byte budget before each decode step. This is a capability facet, orthogonal to
 the runner family axis -- it has no warmup or graph-capture phase.
 """
 
+import weakref
 from collections.abc import Hashable, Mapping
 from typing import Any
 
@@ -119,6 +120,38 @@ def keeps_text_prefill_body(model: nn.Module, disable_mm_encoder: bool) -> bool:
         and isinstance(getattr(model, "llm", None), DecoderModelForCausalLM)
         and getattr(model, "mm_encoder", None) is None
     )
+
+
+def check_layer_registries_in_language_model(model: nn.Module, language_model: nn.Module) -> None:
+    """Raise if a layer registry that the custom ops read holds a layer outside ``language_model``.
+
+    Under breakable prefill graphs the custom-op path covers the whole model forward, encoders
+    included. The custom ops find their layers in ``extra_attrs["*_layers"]`` and run them with
+    the decoder's attention metadata, so an encoder layer left there (e.g. ``Attention``
+    without ``register_to_config=False``) would get the wrong metadata. The registries are
+    read as ``ModelCaller`` binds them: the model's ``extra_attrs`` updated with its
+    ``ModelConfig``'s.
+    """
+    extra_attrs = {
+        **getattr(model, "extra_attrs", {}),
+        **getattr(getattr(model, "model_config", None), "extra_attrs", {}),
+    }
+    language_model_layers = {id(module) for module in language_model.modules()}
+    for registry_name, registry in extra_attrs.items():
+        if not registry_name.endswith("_layers") or not isinstance(registry, Mapping):
+            continue
+        for layer_name, layer_ref in registry.items():
+            layer = layer_ref() if isinstance(layer_ref, weakref.ref) else None
+            if layer is None or id(layer) in language_model_layers:
+                continue
+            module_names = {id(module): name for name, module in model.named_modules()}
+            module_name = module_names.get(id(layer), "a module outside the model")
+            raise ValueError(
+                "breakable prefill CUDA graph runs the layers in "
+                f"extra_attrs[{registry_name!r}] with the language model's metadata, but layer "
+                f"{layer_name!r} ({module_name}, {type(layer).__name__}) is not in the language "
+                "model; build encoder layers with register_to_config=False"
+            )
 
 
 def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool:

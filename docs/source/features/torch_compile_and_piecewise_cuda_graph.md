@@ -73,7 +73,10 @@ The following restrictions are enforced:
   `prepare_breakable_cuda_graph_inputs` stages every per-step input the
   language model reads. If the decoder comes from a custom module, the engine
   requires a custom wrapper that declares the flag on its own class.
-  Other multimodal models are rejected during engine initialization.
+  Every layer in the layer registries (`extra_attrs["*_layers"]`) must belong
+  to that language model, so encoder attention passes
+  `register_to_config=False`. Other multimodal models are rejected during
+  engine initialization.
   Encoder work and embedding fusion run outside the captured body. Calls whose
   optional inputs or tensor layouts differ from capture run the body eagerly.
 - A multimodal model with `disable_mm_encoder` and no local encoder keeps the

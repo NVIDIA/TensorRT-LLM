@@ -55,6 +55,7 @@ from .engine.model_setup import (
 )
 from .engine.multimodal import (
     MultimodalItemScheduler,
+    check_layer_registries_in_language_model,
     is_multimodal,
     keeps_text_prefill_body,
     mm_encoder_cache_enabled,
@@ -948,6 +949,7 @@ class ModelEngine:
                         "supports_multimodal_breakable_cuda_graph = True on your own wrapper "
                         "class to use breakable prefill CUDA graph, or use eager prefill"
                     )
+            check_layer_registries_in_language_model(self.model, language_model)
             return
         if isinstance(self.input_processor, BaseMultimodalInputProcessor):
             raise ValueError("breakable prefill CUDA graph does not support multimodal models")
