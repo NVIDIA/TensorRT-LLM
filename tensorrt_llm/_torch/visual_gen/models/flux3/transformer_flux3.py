@@ -19,22 +19,44 @@ from torch import Tensor, nn
 from tensorrt_llm._torch.distributed.ops import AllReduce
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, WeightMode
+from tensorrt_llm._torch.modules.linear import (
+    FP8RowwiseLinearMethod,
+    Linear,
+    NVFP4LinearMethod,
+    TensorParallelMode,
+    WeightMode,
+)
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.kernels.blackwell import pertoken_adaln
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import _split_linear_in_weights
+from tensorrt_llm._torch.visual_gen.models.flux3 import fused_gemm_common
 from tensorrt_llm._torch.visual_gen.models.flux3.packed import (
     NUM_POSITION_AXES,
     Bounds,
     Layout,
     bounds,
 )
+from tensorrt_llm._torch.visual_gen.models.flux3.prims_ts_fp8 import (
+    PrimsTsFP8Block,
+    prepare_prims_ts_fp8,
+)
+from tensorrt_llm._torch.visual_gen.models.flux3.prims_ts_qkv import (
+    PrimsTsQKV,
+    prepare_prims_ts_qkv,
+)
+from tensorrt_llm._torch.visual_gen.models.flux3.sm120_nvfp4 import (
+    Sm120NVFP4Block,
+    prepare_sm120_nvfp4,
+)
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm._utils import is_blackwell_datacenter
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -516,6 +538,8 @@ class Flux3Attention(Attention):
             layer_idx=layer_idx,
             module_name=module_name,
         )
+        # Set by post_load_weights when the static NVFP4 Q/K/V can run fused on Prims-TS.
+        self.prims_ts_qkv: Optional[PrimsTsQKV] = None
         if self.tp_size > 1:
             # The block all-reduces the attention and MLP partial sums together.
             self.to_out = nn.ModuleList(
@@ -556,13 +580,18 @@ class Flux3Attention(Attention):
         image_rotary_emb: Tuple[Tensor, Tensor],
         sample_bounds: Optional[Bounds] = None,
         timestep: Optional[Tensor] = None,
+        quantized: Optional[Fp4QuantizedTensor] = None,
     ) -> Tensor:
         """Attention before the output projection: [B, S, hidden] to [B, S, local heads * head_dim].
 
         ``image_rotary_emb`` (cos, sin) are [B, S, 1, head_dim]; ``sample_bounds`` limits attention.
+        ``quantized`` is ``hidden_states`` already quantized for the fused NVFP4 Q/K/V GEMM.
         """
         b = hidden_states.shape[0]
         cos, sin = image_rotary_emb
+        if self.prims_ts_qkv is not None and self.prims_ts_qkv.can_run(hidden_states, cos):
+            q, k, v = self.prims_ts_qkv(hidden_states, cos, sin, quantized)
+            return self.attend_projected(q, k, v, sample_bounds, timestep)
         if self.fuse_qk_norm_rope:
             qkv = self.qkv_proj(hidden_states)
             self.apply_packed_qk_norm_rope(
@@ -571,7 +600,7 @@ class Flux3Attention(Attention):
                 sin.reshape(-1, self.head_dim).contiguous(),
             )
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
-            return self._attend(q, k, v, sample_bounds, timestep)
+            return self.attend_projected(q, k, v, sample_bounds, timestep)
 
         q, k, v = self.get_qkv(hidden_states)
         q = q.view(b, -1, self.local_num_attention_heads, self.head_dim)
@@ -580,9 +609,11 @@ class Flux3Attention(Attention):
         q, k = self.apply_qk_norm(q, k)
         q = apply_rotary_emb(q, cos, sin).to(v.dtype)
         k = apply_rotary_emb(k, cos, sin).to(v.dtype)
-        return self._attend(q.flatten(2), k.flatten(2), v.flatten(2), sample_bounds, timestep)
+        return self.attend_projected(
+            q.flatten(2), k.flatten(2), v.flatten(2), sample_bounds, timestep
+        )
 
-    def _attend(
+    def attend_projected(
         self,
         q: Tensor,
         k: Tensor,
@@ -590,6 +621,7 @@ class Flux3Attention(Attention):
         sample_bounds: Optional[Bounds],
         timestep: Optional[Tensor] = None,
     ) -> Tensor:
+        """Attention of projected, normalized and rotated Q/K/V [B, S, local heads * head_dim]."""
         if sample_bounds is None:
             return self._attn_impl(q, k, v, timestep=timestep)
         if q.shape[0] == 1 and len(sample_bounds) > 1:
@@ -649,6 +681,10 @@ class _Flux3Block(nn.Module):
             has_bias=False,
             dtype=config.torch_dtype,
         )
+        # LayerNorm + per-token modulate in one CuTe DSL kernel where the GPU supports it.
+        self.fused_adaln = pertoken_adaln.fused_pertoken_adaln is not None and (
+            pertoken_adaln.is_supported(hidden_size, config.torch_dtype or torch.bfloat16)
+        )
         self.attn = Flux3Attention(
             hidden_size,
             arch.num_attention_heads,
@@ -674,6 +710,15 @@ class _Flux3Block(nn.Module):
         self._allreduce = (
             AllReduce(mapping, strategy=config.allreduce_strategy) if tp_size > 1 else None
         )
+        # Set by post_load_weights when the FP8-rowwise QKV and gate/up GEMMs can run fused
+        # on Prims-TS.
+        self.prims_ts_fp8: Optional[PrimsTsFP8Block] = None
+        # Set by post_load_weights when the static NVFP4 projections can run on the SM120
+        # kernels.
+        self.sm120_nvfp4: Optional[Sm120NVFP4Block] = None
+        # Set by post_load_weights when the fused NVFP4 Q/K/V GEMM and gate/up take the same
+        # quantized input, so the block quantizes it once.
+        self.share_nvfp4_quant = False
 
     def _update(
         self,
@@ -684,14 +729,50 @@ class _Flux3Block(nn.Module):
         timestep: Optional[Tensor],
     ) -> Tensor:
         shift, scale, gate = mod
-        norm_hidden_states = (1 + scale) * self.norm(hidden_states) + shift
-        attn = self.attn.attend(
-            norm_hidden_states, image_rotary_emb, sample_bounds=sample_bounds, timestep=timestep
-        )
-        mlp_out = self.ff(norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])).reshape(
-            *norm_hidden_states.shape[:-1], -1
-        )
-        output = self.attn.to_out[0](attn) + mlp_out
+        if (
+            self.fused_adaln
+            and not torch.is_grad_enabled()
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 3
+            and shift.shape == hidden_states.shape
+            and scale.shape == hidden_states.shape
+        ):
+            norm_hidden_states = pertoken_adaln.fused_pertoken_adaln(
+                hidden_states, shift, scale, None, None, self.norm.variance_epsilon
+            )
+        else:
+            norm_hidden_states = (1 + scale) * self.norm(hidden_states) + shift
+        fused = self.prims_ts_fp8 if self.prims_ts_fp8 is not None else self.sm120_nvfp4
+        if fused is not None:
+            # The gate/up weight is repacked for the fused SwiGLU, so GatedMLP cannot take over.
+            if not fused.can_run(norm_hidden_states, image_rotary_emb[0]):
+                raise RuntimeError(
+                    "FLUX 3 fused block GEMMs need CUDA BF16 inputs without autograd and a RoPE "
+                    "table that matches the packed tokens."
+                )
+            output = fused(norm_hidden_states, image_rotary_emb, sample_bounds, timestep)
+        else:
+            quantized = None
+            if self.share_nvfp4_quant and self.attn.prims_ts_qkv.can_run(
+                norm_hidden_states, image_rotary_emb[0]
+            ):
+                # One NVFP4 quantize feeds the fused Q/K/V GEMM and the gate/up GEMM.
+                quantized = self.attn.prims_ts_qkv.quantize(norm_hidden_states)
+            attn = self.attn.attend(
+                norm_hidden_states,
+                image_rotary_emb,
+                sample_bounds=sample_bounds,
+                timestep=timestep,
+                quantized=quantized,
+            )
+            mlp_in = (
+                quantized
+                if quantized is not None
+                else norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
+            )
+            mlp_out = self.ff(mlp_in).reshape(*norm_hidden_states.shape[:-1], -1)
+            output = self.attn.to_out[0](attn) + mlp_out
         if self._allreduce is not None:
             output = self._allreduce(output)
         return hidden_states + gate * output
@@ -768,6 +849,27 @@ def _mode_block_list(
 def format_names(names: List[str], limit: int = 10) -> str:
     """``3 [a, b, c]``: the count and at most ``limit`` of ``names``."""
     return f"{len(names)} [{', '.join(names[:limit])}{', ...' if len(names) > limit else ''}]"
+
+
+def _shares_nvfp4_quant(block: "_Flux3Block") -> bool:
+    """Whether the fused NVFP4 Q/K/V GEMM and gate/up read the same quantized block input."""
+    qkv = block.attn.prims_ts_qkv
+    gate_up = block.ff.gate_up_proj
+    return (
+        qkv is not None
+        and block.prims_ts_fp8 is None
+        and block.sm120_nvfp4 is None
+        and fused_gemm_common.nvfp4_projection_eligible(gate_up)
+        and bool(torch.equal(qkv.input_scale, gate_up.input_scale))
+    )
+
+
+def _has_quantized_blocks(blocks: Iterable[nn.Module]) -> bool:
+    return any(
+        isinstance(getattr(m, "quant_method", None), (FP8RowwiseLinearMethod, NVFP4LinearMethod))
+        for block in blocks
+        for m in block.modules()
+    )
 
 
 class Flux3Transformer2DModel(BaseDiffusionModel):
@@ -1175,3 +1277,36 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         for _, module in self.named_modules():
             if isinstance(module, (GatedMLP, Attention)):
                 module.post_load_weights()
+        self._prepare_fused_gemms()
+
+    def _prepare_fused_gemms(self) -> None:
+        """Move block GEMMs onto fused kernels where they beat TRT-LLM's at FLUX 3 shapes.
+
+        Prims-TS (SM100/103/107): the FP8-rowwise QKV + QK-norm + RoPE and gate/up + SwiGLU,
+        and the static-NVFP4 Q/K/V + QK-norm + RoPE. SM120/SM121: the static-NVFP4 Q/K/V and
+        gate/up GEMMs on CuTe DSL kernels. Plain GEMMs (attention-out, down) keep TRT-LLM's,
+        which match or beat the alternatives at FLUX 3 shapes.
+        """
+        enabled = fused_gemm_common.FUSED_GEMMS
+        blocks = [m for m in self.modules() if isinstance(m, _Flux3Block)]
+        attentions = [m for m in self.modules() if isinstance(m, Flux3Attention)]
+        fp8 = sum(prepare_prims_ts_fp8(block, enabled) is not None for block in blocks)
+        sm120 = sum(prepare_sm120_nvfp4(block, enabled) is not None for block in blocks)
+        qkv = sum(prepare_prims_ts_qkv(attn, enabled) is not None for attn in attentions)
+        for block in blocks:
+            block.share_nvfp4_quant = _shares_nvfp4_quant(block)
+        shared = sum(block.share_nvfp4_quant for block in blocks)
+        if fp8 or sm120 or qkv:
+            logger.info(
+                f"FLUX 3 fused GEMMs: {fp8}/{len(blocks)} Prims-TS FP8 blocks, "
+                f"{sm120}/{len(blocks)} SM120 NVFP4 blocks, {qkv}/{len(attentions)} Prims-TS "
+                f"NVFP4 QKV ({shared} sharing one quantize with gate/up)."
+            )
+        elif enabled and _has_quantized_blocks(blocks):
+            logger.warning_once(
+                "FLUX 3: no quantized block GEMM runs on a fused kernel. Fused GEMMs need "
+                "tp_size 1, an nvfp4 or fp8r checkpoint (static scales, plain SwiGLU) and "
+                "SM100/SM103/SM107 with flashinfer.prims_ts.gemm, or SM120/SM121 for nvfp4. "
+                "TRT-LLM's GEMMs run instead.",
+                key="flux3_no_fused_gemm",
+            )

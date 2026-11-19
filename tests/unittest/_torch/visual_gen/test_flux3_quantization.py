@@ -7,6 +7,7 @@ CPU cases are cpu_only, the rest need a GPU.
 """
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import torch
 from flux3_test_utils import (
     KLEIN_BASE_CONFIG,
     KLEIN_CONFIG,
+    assert_cuda_graph_replays,
     assert_parity,
     bfl_hf_quant_config,
     bfl_variant_excludes,
@@ -42,20 +44,28 @@ from tensorrt_llm._torch.modules.linear import (
     NVFP4LinearMethod,
     UnquantizedLinearMethod,
 )
+from tensorrt_llm._torch.utils import unswizzle_sf
 
 # Importing the models package registers every pipeline.
-from tensorrt_llm._torch.visual_gen import models  # noqa: F401
+from tensorrt_llm._torch.visual_gen import (
+    models,  # noqa: F401
+    prims_ts,
+)
 from tensorrt_llm._torch.visual_gen import pipeline_loader as pipeline_loader_module
-from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
+from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.models.flux3 import fused_gemm_common
 from tensorrt_llm._torch.visual_gen.models.flux3.packed import pack
 from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import (
     Flux3DistilledPipeline,
     Flux3Pipeline,
 )
+from tensorrt_llm._torch.visual_gen.models.flux3.sm120_nvfp4 import repack_swiglu_rows
 from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
+    Flux3Attention,
     Flux3Transformer2DModel,
     _checkpoint_module_names,
+    _Flux3Block,
     bfl_to_diffusers_key,
     bfl_to_diffusers_state_dict,
     diffusers_to_bfl_module,
@@ -729,3 +739,260 @@ def test_load_time_quant_pipeline_runs_and_keeps_its_bf16_linears(
 
     output = pipeline.forward("a red fox", height=64, width=64, num_inference_steps=2, seed=0)
     assert output.image.shape == (1, 64, 64, 3) and output.image.dtype == torch.uint8
+
+
+# =============================================================================
+# Fused block GEMMs: Prims-TS on SM100/SM103/SM107, CuTe DSL on SM120/SM121
+# =============================================================================
+
+PRIMS_TS_ARCHES = ((10, 0), (10, 3), (10, 7))
+SM120_ARCHES = ((12, 0), (12, 1))
+
+
+def _gpu_in(arches) -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in arches
+
+
+requires_prims_ts = pytest.mark.skipif(
+    not _gpu_in(PRIMS_TS_ARCHES), reason="Prims-TS GEMMs need SM100, SM103 or SM107"
+)
+requires_sm120 = pytest.mark.skipif(
+    not _gpu_in(SM120_ARCHES), reason="the FLUX 3 NVFP4 CuTe DSL kernels need SM120 or SM121"
+)
+# The fused QK-norm + RoPE epilogue needs head_dim 128; the FP8 kernels need N % 512 == 0.
+PRIMS_TS_OVERRIDES = dict(
+    attention_head_dim=128,
+    num_attention_heads=4,
+    axes_dims_rope=[32, 32, 32, 32],
+    num_single_layers=3,
+)
+
+
+def _assert_prims_ts_installed():
+    assert prims_ts.fp8_gemm_available() and prims_ts.nvfp4_qkv_available(), (
+        "flashinfer.prims_ts.gemm is missing; requirements.txt pins flashinfer-python 0.7.3"
+    )
+
+
+def _write_variant_checkpoint(tmp_path, variant):
+    """A calibrated klein ``variant`` checkpoint; returns its BF16 reference and inputs."""
+    weights = write_gpu_checkpoint(tmp_path, True, num_layers=2, **PRIMS_TS_OVERRIDES)
+    config = gpu_transformer_config(True, num_layers=2, **PRIMS_TS_OVERRIDES)
+    reference = bf16_transformer(config, weights)
+    kwargs = gpu_inputs(reference)
+    amax = {
+        name: INPUT_AMAX_MARGIN * value for name, value in input_amax(reference, kwargs).items()
+    }
+    write_variant(tmp_path, config, variant, quantize_variant(config, weights, variant, amax))
+    drop_transformer_weights(tmp_path)
+    return reference, kwargs
+
+
+def _variant_pipeline(tmp_path, monkeypatch, variant):
+    reference, kwargs = _write_variant_checkpoint(tmp_path, variant)
+    pipeline = load_gpu_pipeline(tmp_path, monkeypatch, pipeline_config={"variant": variant})
+    return pipeline, reference, kwargs
+
+
+def _trtllm_transformer(tmp_path, monkeypatch, variant):
+    """The same checkpoint loaded with every block GEMM on TRT-LLM."""
+    with monkeypatch.context() as patch:
+        patch.setattr(fused_gemm_common, "FUSED_GEMMS", False)
+        return load_gpu_pipeline(
+            tmp_path, monkeypatch, pipeline_config={"variant": variant}
+        ).transformer
+
+
+def _blocks(transformer, method):
+    return [
+        module
+        for module in transformer.modules()
+        if isinstance(module, _Flux3Block)
+        and isinstance(module.ff.gate_up_proj.quant_method, method)
+    ]
+
+
+def _block_inputs(attn, tokens=96, batch=1):
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    hidden = torch.randn(
+        batch, tokens, attn.hidden_size, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    angles = torch.rand(tokens, attn.head_dim // 2, device="cuda", generator=generator) * math.tau
+    cos = angles.cos().repeat_interleave(2, dim=-1).view(1, tokens, 1, attn.head_dim)
+    sin = angles.sin().repeat_interleave(2, dim=-1).view(1, tokens, 1, attn.head_dim)
+    return hidden, (cos, sin)
+
+
+@requires_prims_ts
+def test_nvfp4_qkv_runs_fused_on_prims_ts_and_tracks_trtllm(tmp_path, monkeypatch):
+    _assert_prims_ts_installed()
+    pipeline, reference, kwargs = _variant_pipeline(tmp_path, monkeypatch, "nvfp4")
+    transformer = pipeline.transformer
+    separate = [
+        module
+        for module in transformer.modules()
+        if isinstance(module, Flux3Attention) and module.qkv_mode == QKVMode.SEPARATE_QKV
+    ]
+    assert separate and all(attn.prims_ts_qkv is not None for attn in separate)
+    # The TRT-LLM projections read the packed buffer rather than keeping their own copies.
+    packed = separate[0].prims_ts_qkv.weight.untyped_storage().data_ptr()
+    assert separate[0].to_k.weight.untyped_storage().data_ptr() == packed
+    # Q/K/V and gate/up see the same input with the same scale, so it is quantized once.
+    fused_blocks = _blocks(transformer, NVFP4LinearMethod)
+    assert all(
+        block.share_nvfp4_quant for block in fused_blocks if block.attn.prims_ts_qkv is not None
+    )
+
+    # One fused GEMM + QK-norm + RoPE matches the three TRT-LLM GEMMs and eager norm/RoPE.
+    attn, tokens = separate[0], 96
+    hidden, (cos, sin) = _block_inputs(attn, tokens)
+    heads = attn.local_num_attention_heads
+    with torch.inference_mode():
+        fused = attn.prims_ts_qkv(hidden, cos, sin)
+        q, k, v = (t.view(1, tokens, heads, attn.head_dim) for t in attn.get_qkv(hidden))
+        q, k = attn.apply_qk_norm(q, k)
+        expected = (apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin), v)
+        # One sequence's RoPE table broadcasts over a batch.
+        batched = attn.prims_ts_qkv(hidden.expand(2, -1, -1).contiguous(), cos, sin)
+        assert_cuda_graph_replays(lambda: attn.prims_ts_qkv(hidden, cos, sin))
+    for name, actual, reference_plane, batch in zip("qkv", fused, expected, batched):
+        assert actual.shape == (1, tokens, heads * attn.head_dim), name
+        assert_parity(
+            actual, reference_plane.flatten(2).to(actual.dtype), relative_l2=0.02, cosine=0.9995
+        )
+        assert_parity(batch[1:], actual, relative_l2=1e-3, cosine=0.99999)
+
+    with torch.inference_mode():
+        actual = transformer(**kwargs)["x_image"]
+        expected_image = reference(**kwargs)["x_image"]
+    assert_parity(actual, expected_image, **PARITY["nvfp4"])
+
+
+@requires_prims_ts
+def test_fused_gemms_can_be_disabled(tmp_path, monkeypatch):
+    _assert_prims_ts_installed()
+    _write_variant_checkpoint(tmp_path, "nvfp4")
+    modules = list(_trtllm_transformer(tmp_path, monkeypatch, "nvfp4").modules())
+    for name in ("prims_ts_qkv", "prims_ts_fp8", "sm120_nvfp4"):
+        assert not any(getattr(m, name, None) is not None for m in modules), name
+    assert not any(getattr(m, "share_nvfp4_quant", False) for m in modules)
+
+
+@requires_prims_ts
+def test_fp8r_blocks_run_on_prims_ts_and_track_trtllm(tmp_path, monkeypatch):
+    _assert_prims_ts_installed()
+    pipeline, reference, kwargs = _variant_pipeline(tmp_path, monkeypatch, "fp8r")
+    transformer = pipeline.transformer
+    blocks = _blocks(transformer, FP8RowwiseLinearMethod)
+    assert blocks and all(block.prims_ts_fp8 is not None for block in blocks)
+    # The plain projections keep TRT-LLM's FP8-rowwise GEMM.
+    for block in blocks:
+        for layer in (block.attn.to_out[0], block.ff.down_proj):
+            assert type(layer.quant_method) is FP8RowwiseLinearMethod
+    # Prims-TS repacks gate/up in place, so the TRT-LLM reference loads separately.
+    trtllm = _trtllm_transformer(tmp_path, monkeypatch, "fp8r")
+    trtllm_blocks = _blocks(trtllm, FP8RowwiseLinearMethod)
+    assert trtllm_blocks and all(block.prims_ts_fp8 is None for block in trtllm_blocks)
+
+    # Fused QKV + QK-norm + RoPE and gate/up + SwiGLU (TRT-LLM out/down) match the TRT-LLM block.
+    block, trtllm_block = blocks[0], trtllm_blocks[0]
+    hidden, rope = _block_inputs(block.attn)
+    with torch.inference_mode():
+        actual = block.prims_ts_fp8(hidden, rope, None, None)
+        attended = trtllm_block.attn.attend(hidden, rope)
+        mlp = trtllm_block.ff(hidden.reshape(-1, hidden.shape[-1])).reshape_as(hidden)
+        expected = trtllm_block.attn.to_out[0](attended) + mlp
+        # One sequence's RoPE table broadcasts over a batch.
+        batched = block.prims_ts_fp8(hidden.expand(2, -1, -1).contiguous(), rope, None, None)
+        assert_cuda_graph_replays(lambda: block.prims_ts_fp8(hidden, rope, None, None))
+    assert_parity(actual, expected, relative_l2=0.03, cosine=0.999)
+    assert_parity(batched[1:], actual, relative_l2=1e-3, cosine=0.99999)
+
+    with torch.inference_mode():
+        image = transformer(**kwargs)["x_image"]
+        expected_image = reference(**kwargs)["x_image"]
+        trtllm_image = trtllm(**kwargs)["x_image"]
+    assert_parity(image, expected_image, **PARITY["fp8r"])
+    assert_parity(image, trtllm_image, relative_l2=0.05, cosine=0.998)
+
+
+@requires_prims_ts
+@pytest.mark.parametrize("variant", ["nvfp4", "fp8r"])
+def test_fused_blocks_compile_once(tmp_path, monkeypatch, variant):
+    """Per-layer checkpoint scales stay out of the traced graph: blocks share one compile."""
+    _assert_prims_ts_installed()
+    pipeline, _, _ = _variant_pipeline(tmp_path, monkeypatch, variant)
+    blocks = [
+        block
+        for block in pipeline.transformer.single_transformer_blocks
+        if (block.attn.prims_ts_qkv if variant == "nvfp4" else block.prims_ts_fp8) is not None
+    ]
+    assert len(blocks) >= 2
+    if variant == "nvfp4":
+        assert len({float(b.attn.to_q.weight_scale_2) for b in blocks}) > 1
+    hidden, rope = _block_inputs(blocks[0].attn)
+    mod = tuple(torch.randn_like(hidden) * 0.1 for _ in range(3))
+    from torch._dynamo.testing import CompileCounter
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    with torch.inference_mode():
+        for index, block in enumerate(blocks):
+            torch.compile(block, backend=counter)(hidden, rope, mod)
+            if index == 0:
+                first = counter.frame_count
+    assert counter.frame_count == first
+
+
+@pytest.mark.cpu_only
+def test_swiglu_repack_pairs_rows_and_block_scales() -> None:
+    """[gate; up] NVFP4 rows and their 128x4 scales become [up, gate] pairs, once."""
+    rows, reduction = 512, 256
+    torch.manual_seed(0)
+    layer = torch.nn.Module()
+    weight = torch.randint(0, 256, (rows, reduction // 2), dtype=torch.uint8)
+    scales = torch.randint(0, 127, (rows, reduction // 16), dtype=torch.uint8)
+    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ops.trtllm.block_scale_interleave(scales).reshape(-1), requires_grad=False
+    )
+    repack_swiglu_rows(layer)
+    half = rows // 2
+    expected_rows = torch.stack((weight[half:], weight[:half]), dim=1).reshape_as(weight)
+    expected_scales = torch.stack((scales[half:], scales[:half]), dim=1).reshape_as(scales)
+    assert torch.equal(layer.weight, expected_rows)
+    assert torch.equal(unswizzle_sf(layer.weight_scale, rows, reduction)[:rows], expected_scales)
+    repack_swiglu_rows(layer)  # idempotent
+    assert torch.equal(layer.weight, expected_rows)
+
+
+@requires_sm120
+def test_nvfp4_blocks_run_on_sm120_and_track_trtllm(tmp_path, monkeypatch):
+    pipeline, reference, kwargs = _variant_pipeline(tmp_path, monkeypatch, "nvfp4")
+    transformer = pipeline.transformer
+    blocks = _blocks(transformer, NVFP4LinearMethod)
+    assert blocks and all(block.sm120_nvfp4 is not None for block in blocks)
+    # The TRT-LLM projections read the packed Q/K/V buffer rather than own copies.
+    packed = blocks[0].sm120_nvfp4.qkv_weight.untyped_storage().data_ptr()
+    assert blocks[0].attn.to_k.weight.untyped_storage().data_ptr() == packed
+    # gate/up is repacked in place, so the TRT-LLM reference loads separately.
+    trtllm = _trtllm_transformer(tmp_path, monkeypatch, "nvfp4")
+    trtllm_blocks = _blocks(trtllm, NVFP4LinearMethod)
+    assert trtllm_blocks and all(block.sm120_nvfp4 is None for block in trtllm_blocks)
+
+    block, trtllm_block = blocks[0], trtllm_blocks[0]
+    hidden, rope = _block_inputs(block.attn)
+    with torch.inference_mode():
+        actual = block.sm120_nvfp4(hidden, rope, None, None)
+        attended = trtllm_block.attn.attend(hidden, rope)
+        mlp = trtllm_block.ff(hidden.reshape(-1, hidden.shape[-1])).reshape_as(hidden)
+        expected = trtllm_block.attn.to_out[0](attended) + mlp
+        batched = block.sm120_nvfp4(hidden.expand(2, -1, -1).contiguous(), rope, None, None)
+        assert_cuda_graph_replays(lambda: block.sm120_nvfp4(hidden, rope, None, None))
+    assert_parity(actual, expected, relative_l2=0.05, cosine=0.998)
+    assert_parity(batched[1:], actual, relative_l2=1e-3, cosine=0.99999)
+
+    with torch.inference_mode():
+        image = transformer(**kwargs)["x_image"]
+        expected_image = reference(**kwargs)["x_image"]
+    assert_parity(image, expected_image, **PARITY["nvfp4"])

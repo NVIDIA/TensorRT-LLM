@@ -7,7 +7,7 @@ import json
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pytest
 import torch
@@ -280,6 +280,27 @@ def assert_parity(
         "max_abs": (actual - expected).abs().max().item(),
     }
     assert stats["relative_l2"] <= relative_l2 and stats["cosine"] >= cosine, stats
+
+
+def assert_cuda_graph_replays(fn: Callable[[], Any]) -> Any:
+    """``fn`` captured in a CUDA graph and replayed gives exactly its eager output, returned."""
+    eager = fn()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fn()
+    graph.replay()
+    torch.cuda.synchronize()
+    for got, want in zip(
+        captured if isinstance(captured, tuple) else (captured,),
+        eager if isinstance(eager, tuple) else (eager,),
+    ):
+        assert torch.equal(got, want)
+    return eager
 
 
 # =============================================================================

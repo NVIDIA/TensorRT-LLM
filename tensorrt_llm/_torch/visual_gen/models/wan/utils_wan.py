@@ -24,31 +24,18 @@ import torch
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.visual_gen.kernels.blackwell import pertoken_adaln as _pertoken_adaln
 
-try:
-    from tensorrt_llm._torch.visual_gen.kernels.blackwell.pertoken_adaln import (
-        fused_pertoken_adaln as _fused_pertoken_adaln,
-    )
-    from tensorrt_llm._torch.visual_gen.kernels.blackwell.pertoken_adaln import (
-        fused_pertoken_adaln_residual as _fused_pertoken_adaln_residual,
-    )
+# The package exports None for the ops when CuTe DSL is unavailable.
+_fused_pertoken_adaln = _pertoken_adaln.fused_pertoken_adaln
+_fused_pertoken_adaln_residual = _pertoken_adaln.fused_pertoken_adaln_residual
+_PERTOKEN_ADALN_IMPORT_OK = _fused_pertoken_adaln is not None
 
-    _PERTOKEN_ADALN_IMPORT_OK = True
-except (ImportError, OSError):
-    _fused_pertoken_adaln = None
-    _fused_pertoken_adaln_residual = None
-    _PERTOKEN_ADALN_IMPORT_OK = False
-
-_PERTOKEN_ADALN_ALIGNMENT = 32
+_PERTOKEN_ADALN_ALIGNMENT = _pertoken_adaln.REQUIRED_ALIGNMENT
 
 
 def _pertoken_adaln_arch_ok(device: torch.device) -> bool:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return False
-    try:
-        return torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
-    except RuntimeError:
-        return False
+    return _pertoken_adaln.is_supported_device(device)
 
 
 class _PerTokenAdaLNContext(NamedTuple):
@@ -76,8 +63,7 @@ class WanPerTokenAdaLN:
         self._eligible = (
             _PERTOKEN_ADALN_IMPORT_OK
             and dtype == torch.bfloat16
-            and hidden_size % 256 == 0
-            and hidden_size <= 8192
+            and _pertoken_adaln.supports_hidden_size(hidden_size)
             and not competing_fusion
         )
         self._enabled = False

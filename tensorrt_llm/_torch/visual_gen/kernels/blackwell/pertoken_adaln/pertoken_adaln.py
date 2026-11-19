@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Fused per-token AdaLN modulate for WAN (temb.ndim == 4 path).
+# Fused per-token AdaLN modulate for WAN (temb.ndim == 4 path) and FLUX 3 (no table rows).
 #
 # Provenance: the row-per-CTA scaffold (two-pass mean/var warp+CTA reduce,
 # autovec 128-bit copies, symbolic-stride compile cache) is derived from
@@ -65,8 +65,13 @@ import cutlass.cute as cute
 import torch
 
 from .reduce import cta_reduce_sum, warp_reduce_sum
-
-WARP_SIZE = 32
+from .support import (
+    DEFAULT_VEC,
+    REQUIRED_ALIGNMENT,
+    SUPPORTED_CAPABILITIES,
+    WARP_SIZE,
+    supports_hidden_size,
+)
 
 TORCH_TO_CUTE_DTYPE = {
     torch.float16: cutlass.Float16,
@@ -75,17 +80,6 @@ TORCH_TO_CUTE_DTYPE = {
 }
 
 _COMPILE_CACHE = {}
-
-_REQUIRED_ALIGNMENT = 32
-
-# Elements per thread. 8 -> one LDG.128 per bf16 operand per thread,
-# num_warps = D/256 (12 warps at D=3072). 16 halves the CTA thread count
-# (more ILP, shorter reduce tree) at double the registers; it measures
-# within noise of 8 at the production shape, and vec=16 crashes the pinned
-# cutlass-dsl 4.5.0 compiler for the residual config (gate + fp32 [D]
-# weight/bias operands) — so the residual op hard-validates vec == 8, while
-# the plain op accepts 8 or 16 (both compile).
-DEFAULT_VEC = 8
 
 # CuTe DSL specialization requires the tensor-or-scalar-sentinel operands in
 # ``PerTokenAdaLN`` and its nested helpers to remain unannotated. Python union
@@ -368,8 +362,8 @@ def _validate_bsd(
     for i in range(t.ndim - 1):
         if t.stride(i) % D != 0:
             raise ValueError(f"{name}: stride({i})={t.stride(i)} not divisible by D={D}")
-    if t.data_ptr() % _REQUIRED_ALIGNMENT != 0:
-        raise ValueError(f"{name}: data pointer must be {_REQUIRED_ALIGNMENT}-byte aligned")
+    if t.data_ptr() % REQUIRED_ALIGNMENT != 0:
+        raise ValueError(f"{name}: data pointer must be {REQUIRED_ALIGNMENT}-byte aligned")
 
 
 def _validate_row(t: Optional[torch.Tensor], D: int, name: str, device: torch.device) -> None:
@@ -383,17 +377,17 @@ def _validate_row(t: Optional[torch.Tensor], D: int, name: str, device: torch.de
         raise ValueError(f"{name}: expected shape ({D},), got {tuple(t.shape)}")
     if t.stride(-1) != 1:
         raise ValueError(f"{name}: must be contiguous")
-    if t.data_ptr() % _REQUIRED_ALIGNMENT != 0:
-        raise ValueError(f"{name}: data pointer must be {_REQUIRED_ALIGNMENT}-byte aligned")
+    if t.data_ptr() % REQUIRED_ALIGNMENT != 0:
+        raise ValueError(f"{name}: data pointer must be {REQUIRED_ALIGNMENT}-byte aligned")
 
 
 def _check_d(D: int, vec: int) -> None:
     if vec not in (8, 16):
         raise ValueError(f"vec={vec} not supported: expected 8 or 16")
-    if D <= 0 or D % 256 != 0 or D > 8192:
-        raise ValueError(f"D={D} not supported: must be a multiple of 256 and <= 8192")
-    if D % (WARP_SIZE * vec) != 0:
-        raise ValueError(f"D={D} not divisible by {WARP_SIZE * vec} (vec={vec})")
+    if not supports_hidden_size(D, vec):
+        raise ValueError(
+            f"D={D} not supported: must be a multiple of 256 and of {WARP_SIZE * vec}, <= 8192"
+        )
 
 
 def _launch(
@@ -408,7 +402,7 @@ def _launch(
         hash_key = (device, vec, *PerTokenAdaLN.make_hash_key(*torch_tensors))
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+            if torch.cuda.get_device_capability(device) not in SUPPORTED_CAPABILITIES:
                 raise ValueError("fused per-token AdaLN requires an SM100 or SM103 GPU")
             kernel = PerTokenAdaLN(D, vec)
             fake_sig_args = [_to_fake_cute_arg(t) for t in torch_tensors]
@@ -426,8 +420,8 @@ def fused_pertoken_adaln(
     x: torch.Tensor,
     shift_chunk: torch.Tensor,
     scale_chunk: torch.Tensor,
-    table_shift: torch.Tensor,
-    table_scale: torch.Tensor,
+    table_shift: Optional[torch.Tensor],
+    table_scale: Optional[torch.Tensor],
     eps: float = 1e-6,
     vec: int = DEFAULT_VEC,
 ) -> torch.Tensor:
@@ -440,7 +434,8 @@ def fused_pertoken_adaln(
                                   views of a [B, S, 6, D] temb — strides
                                   (S*6*D, 6*D, 1)); stride(-1)==1, outer
                                   strides divisible by D
-      - table_shift, table_scale: [D] fp32 contiguous rows of scale_shift_table
+      - table_shift, table_scale: [D] fp32 contiguous rows of scale_shift_table, or None
+                                  for models without a table (as zero rows)
       - D: multiple of 256, <= 8192 (unpredicated LDG.128 vectorized loads)
     """
     if x.ndim != 3:
@@ -457,7 +452,20 @@ def fused_pertoken_adaln(
     y = torch.empty_like(x)
     # Scalar placeholders for absent operands (CuTe DSL TVM-FFI backend does
     # not accept None); they generate no code (const_expr isinstance checks).
-    torch_tensors = [y, 0, 0, x, 1, 1, 1, 0, shift_chunk, scale_chunk, table_shift, table_scale]
+    torch_tensors = [
+        y,
+        0,
+        0,
+        x,
+        1,
+        1,
+        1,
+        0,
+        shift_chunk,
+        scale_chunk,
+        0 if table_shift is None else table_shift,
+        0 if table_scale is None else table_scale,
+    ]
     _launch(torch_tensors, D, vec, eps, x.device)
     return y
 
@@ -467,8 +475,8 @@ def _fused_pertoken_adaln_fake(
     x: torch.Tensor,
     shift_chunk: torch.Tensor,
     scale_chunk: torch.Tensor,
-    table_shift: torch.Tensor,
-    table_scale: torch.Tensor,
+    table_shift: Optional[torch.Tensor],
+    table_scale: Optional[torch.Tensor],
     eps: float = 1e-6,
     vec: int = DEFAULT_VEC,
 ) -> torch.Tensor:

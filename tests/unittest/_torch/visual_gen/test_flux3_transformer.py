@@ -17,9 +17,13 @@ from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttenti
 from tensorrt_llm._torch.visual_gen.cache.cache_dit_enablers import enable_cache_dit_for_flux3
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import sol_attn_backend
+from tensorrt_llm._torch.visual_gen.kernels.blackwell import pertoken_adaln
 from tensorrt_llm._torch.visual_gen.models.flux3 import Flux3Transformer2DModel
 from tensorrt_llm._torch.visual_gen.models.flux3.packed import bounds, pack
-from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import Flux3Attention
+from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
+    Flux3Attention,
+    _Flux3Block,
+)
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     CacheDiTConfig,
@@ -532,3 +536,31 @@ def test_cache_dit_reuses_each_packed_sample_s_own_joint_residual(flow_map: bool
     for output in outputs:
         for start, end in bounds(SHAPES["i2i"][0]):
             assert_parity(output[start:end], expected[start:end], relative_l2=1e-2, cosine=0.9999)
+
+
+@requires_sm100
+@torch.inference_mode()
+def test_fused_adaln_matches_eager(monkeypatch):
+    """The CuTe DSL LayerNorm + per-token modulate kernel matches the eager expression."""
+    model, _, config = build(True, head_dim=128)  # hidden 256: kernel-eligible
+    blocks = [module for module in model.modules() if isinstance(module, _Flux3Block)]
+    assert blocks and all(block.fused_adaln for block in blocks)
+    samples = make_samples(config, *SHAPES["i2i"])
+    kwargs = packed_inputs(model, samples, TIMESTEPS)
+    targets = target_kwargs(True, TARGETS)
+    calls = []
+    kernel = pertoken_adaln.fused_pertoken_adaln
+
+    def counted(*args, **kwargs):
+        calls.append(args[0].shape)
+        return kernel(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pertoken_adaln, "fused_pertoken_adaln", counted)
+        fused = model(**kwargs, **targets)["x_image"]
+    # Every block normalized through the kernel, not a silent eager fallback.
+    assert len(calls) >= len(blocks)
+    for block in blocks:
+        block.fused_adaln = False
+    eager = model(**kwargs, **targets)["x_image"]
+    assert_parity(fused, eager, relative_l2=1e-2, cosine=0.9999)

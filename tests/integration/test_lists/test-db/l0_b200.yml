@@ -522,6 +522,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux3_example
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux3_fused_gemm_example[fp8r]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux3_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example

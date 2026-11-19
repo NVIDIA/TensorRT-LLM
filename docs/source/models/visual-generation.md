@@ -223,6 +223,7 @@ are not supported. See the
   Loading by Hugging Face ID downloads both variants. To download one, fetch
   `modular_model_index.json`, `transformer/config.json`, `text_encoder/*`, `vae/*` and
   `variants/<variant>/*`, then pass the local directory.
+- Without tensor parallelism (`tp_size` 1), `nvfp4` and `fp8r` checkpoints run fused GEMM kernels automatically on supported Blackwell GPUs.
 - SOL-Attn is recommended with `tau: 1.0` and `disabled_until_timestep: 0.96`.
 - The checkpoints ship only `modular_model_index.json`, so `trtllm-serve` needs
   `--visual_gen_args` or `--enable_visual_gen`.

@@ -21,7 +21,7 @@ import numpy as np
 import PIL.Image
 import pytest
 import torch
-from defs.common import venv_check_call
+from defs.common import venv_check_call, venv_check_output
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FeatureConfigState,
     _assert_feature_quantization_installed,
@@ -424,6 +424,49 @@ def test_flux3_example(_visual_gen_deps, llm_root, llm_venv):
         assert image.size == (1024, 1024), f"Unexpected FLUX 3 output size {image.size}"
         pixels = np.asarray(image.convert("RGB"), dtype=np.float32)
     assert pixels.std() > 5.0, "FLUX 3 example produced a blank image"
+
+
+@pytest.mark.parametrize("variant", ["fp8r", "nvfp4"])
+def test_flux3_fused_gemm_example(_visual_gen_deps, llm_root, llm_venv, variant):
+    """Run the FLUX 3 Klein example on a pre-quantized variant; its block GEMMs must fuse."""
+    model_path = get_checkpoint("flux-3-image-klein")
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", f"flux3_{variant}_fused_gemm"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, f"flux3_{variant}_output.png")
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux3.py")
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "flux3-fp4-1gpu.yaml")
+
+    output = venv_check_output(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--variant",
+            variant,
+            "--height",
+            "256",
+            "--width",
+            "256",
+            "--num_inference_steps",
+            "4",
+            "--seed",
+            "42",
+            "--output_path",
+            output_path,
+        ],
+        env={**os.environ, "TLLM_LOG_LEVEL": "INFO"},
+    )
+    log = output.decode() if isinstance(output, bytes) else output
+    assert "FLUX 3 fused GEMMs:" in log, f"FLUX 3 {variant} blocks fell back to TRT-LLM GEMMs"
+    with PIL.Image.open(output_path) as image:
+        assert image.size == (256, 256), f"Unexpected FLUX 3 output size {image.size}"
+        pixels = np.asarray(image.convert("RGB"), dtype=np.float32)
+    assert pixels.std() > 5.0, f"FLUX 3 {variant} example produced a blank image"
 
 
 def test_flux3_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp_path):
