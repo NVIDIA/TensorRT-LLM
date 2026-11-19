@@ -1696,34 +1696,26 @@ def strip_torch_compile_wrapper(name: str) -> str:
                     if part != _TORCH_COMPILE_WRAPPER_ATTR)
 
 
-def _get_load_weights_num_workers() -> Optional[int]:
-    """Return the per-rank module-loading worker limit, or None for the default.
+def _get_load_weights_num_workers() -> int:
+    """Return the per-rank number of module-loading workers.
 
-    Weight loading runs one ThreadPoolExecutor per rank, which without an
-    explicit limit defaults to as many as 32 workers (CPython's
-    ``min(32, cpu_count + 4)``; the count is the machine's, not the rank's
-    share of it). The limit is per rank, so four ranks on a node can have four
-    times that many module loads in flight. Each one holds its own host-side
-    working set while it stages and transforms a module's weights, and every
-    rank's is charged to the same host-memory cgroup -- which is how a large
-    checkpoint exhausts host memory while the GPUs are nowhere near full.
+    Loading a module's weights is Python bookkeeping and many small torch ops,
+    all under the GIL, and every torch op releases and re-takes it. Concurrent
+    loader threads therefore do not run in parallel: they hand the GIL to each
+    other on every op, which makes a pool of them slower than a single thread
+    for the same work. So weight loading uses one worker unless told otherwise.
 
-    ``TLLM_LOAD_WEIGHTS_NUM_WORKERS`` bounds that overlap. Unset or blank keeps
-    the executor default; a positive integer trades loading parallelism for
-    host-memory headroom; anything else raises, so a typo cannot look like it
+    ``TLLM_LOAD_WEIGHTS_NUM_WORKERS`` sets another count; unset or blank keeps
+    one; anything but a positive integer raises, so a typo cannot look like it
     took effect. ``TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL`` takes precedence
-    and skips the pool entirely -- this variable is the range in between.
-
-    Set it when ranks share a constrained cgroup. Tune it against node
-    ``memory.peak`` and the slowest rank's init time, not per-process RSS,
-    which does not see shared page cache. ``4`` measured well on a four-rank
-    node but is a starting point, not a default; retune per checkpoint and
-    topology.
+    and loads on the calling thread. More workers also multiply the host-side
+    working set of the module loads in flight, which every rank on a node
+    charges to the same host-memory cgroup.
     """
     env_name = "TLLM_LOAD_WEIGHTS_NUM_WORKERS"
     value = os.environ.get(env_name)
     if value is None or not value.strip():
-        return None
+        return 1
 
     try:
         num_workers = int(value)
