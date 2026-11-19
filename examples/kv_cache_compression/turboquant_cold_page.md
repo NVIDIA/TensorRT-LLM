@@ -344,7 +344,9 @@ it with NVFP4 cold pages at the same cold-tier quota.
 | 4 | 0.0094 | 0.0092 | 0.0086 | 0.0092 | 0.0092 | 0.0094 | 0.0091 |
 | NVFP4 | | 0.0091 | 0.0084 | 0.0014 | 0 | 0 | 0.51 |
 
-The per-vector least-squares scale makes TurboQuant slightly better than the paper's bound.
+The per-vector least-squares scale puts TurboQuant slightly below the paper's distortion on most
+inputs; the all-equal vector, a single direction and so a single sample of the error, lands up
+to 8% above it.
 
 KVCacheManagerV2 re-encodes a Page each time it offloads the Page again after an onboard. The
 same tool repeats the round trip on the outlier-channel input, each time re-encoding the decoded
@@ -356,8 +358,8 @@ Page:
 | NVFP4 | 0.0084 | 0.0084 | 0.0084 |
 
 The cold bytes settle after a few round trips and then repeat with period 1 or 2: most vectors
-reproduce their codes, and a few alternate between two codes (on GB300 every setting tested
-settled within 17 round trips; the unit tests check 32). The error stays where one round trip
+reproduce their codes, and a few alternate between two codes (the unit tests run 32 round trips
+and check that the last 8 repeat with period 1 or 2). The error stays where one round trip
 leaves it (within 1.5% with an FP8 KV cache, whose decoded values are rounded again). The paper's
 TurboQuant-prod is not offered because its
 error compounds instead; a prototype measured 0.55, 16.9, and 2.3e6 after 1, 4, and 16 round trips
@@ -398,7 +400,7 @@ writes it at 193 GB/s) and on the other socket (126 GB/s and 122 GB/s):
 
 Conventional K/V Pages are bound by the host link in both formats (96-100% of SOL), so
 TurboQuant takes about the NVFP4 time scaled by the cold-page size. MLA latents and DeepSeek-V4
-CSA rows need more decode work per byte, because every instance (256 to 512 values) is rotated
+CSA rows need more decode work per byte, because every instance (up to 512 values) is rotated
 back on tensor cores: on the faster link their decode takes 1.1-1.25x the NVFP4 time, while
 encode stays at or below it; on the slower link both are link bound and TurboQuant is faster.
 With `skip_rope_quantization` the GLM-5 latent is a single 512-value instance, whose encode takes

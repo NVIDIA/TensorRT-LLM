@@ -283,6 +283,8 @@ _COLD_PAGE_FORMAT_CASES = [
             False,
         ),
         (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits=2), True),
+        # model_dump() writes the float field as 4.0.
+        (generator.DISAGG_SCHEMA, _turboquant_cold_pages(turboquant_bits=4.0), True),
         (generator.SERVE_SCHEMA, _turboquant_cold_pages(turboquant_bits=2.5), False),
         (
             generator.DISAGG_SCHEMA,

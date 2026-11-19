@@ -345,7 +345,10 @@ for each quantized piece and in where it receives Page indices.
   including widths that are not a power of two, such as the 576-number MLA
   latent. With `true` the RoPE part is located by the same rules and the same
   `_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` as for NVFP4 and copied unchanged. The
-  codec refuses a piece whose length is not a multiple of 16 numbers.
+  codec refuses a piece that does not start and end on a multiple of 16 numbers,
+  that has 1024 numbers or more, that is wider than 512 numbers with a rest after
+  its 256-number instances that is not a power of two, or that splits into more
+  than four power-of-two pieces.
 - DeepSeek-V4 compressed (CSA) rows follow `skip_rope_quantization` as for
   NVFP4: the whole 512-number row is quantized, or with `true` the 448 NoPE
   numbers, and the 64 RoPE numbers are copied unchanged. The indexer cache is

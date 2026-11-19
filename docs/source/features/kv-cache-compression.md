@@ -363,7 +363,7 @@ kv_cache_compression_config:
 | `skip_rope_quantization` | `true`, `false` | `false` | Same as for NVFP4; see [Skipping RoPE Quantization](#skipping-rope-quantization) |
 
 A configuration fails when it is constructed if it sets `turboquant_*` fields
-with `quant: nvfp4`, sets `nvfp4_residual_dim` or `scale_checkpoint_path` with
+with `quant: nvfp4`, or sets `nvfp4_residual_dim` or `scale_checkpoint_path` with
 `quant: turboquant`. When the
 executor builds the KV cache, TensorRT-LLM also rejects TurboQuant on a GPU with
 compute capability below 8.0, with an FP8 active KV cache below compute
@@ -387,12 +387,13 @@ lossless buffer:   its hot size
 H: KV heads of the buffer (1 for an MLA latent)    T: tokens_per_block
 n: quantized values per vector                     r: values per vector in the hot cache
 b: turboquant_bits                                 e: bytes per hot value (2 for FP16/BF16, 1 for FP8)
-s: 1, or one per instance for n > 512
+s: BF16 scales per vector: 1, or the number of instances for n > 512 (3 for 576)
 ```
 
 Vectors with more than 512 quantized values, such as the 576-value MLA latent,
-are stored as several independent TurboQuant instances, each with its own
-rotation, codebook and scale, because decoding accumulates all output values of
+are stored as several independent TurboQuant instances, each rotated and
+quantized on its own and with its own scale (instances of the same width use the
+same rotation and codebook), because decoding accumulates all output values of
 an instance on chip: instances of 256 values plus the rest (576 = 256 + 256 +
 64, three BF16 scales). The per-vector side information stays within 64 bits.
 
@@ -420,7 +421,8 @@ and Conv state are preserved losslessly. See [Support](#support).
   newer (8.9 with an FP8 KV cache); NVFP4 cold pages need an SM100-family GPU.
 
 TurboQuant reaches the paper's distortion (normalized MSE 0.117, 0.034, and
-0.0094 at 2, 3, and 4 bits for head dimension 128) on every input structure tested, and
+0.0094 at 2, 3, and 4 bits for head dimension 128) on Gaussian input and stays within 8% of it on
+every structured input tested, and
 re-encoding a decoded Page settles within a few round trips without changing the error, so Pages
 that migrate repeatedly do not accumulate error.
 Encode and decode are bound by the host link for
@@ -482,7 +484,7 @@ structures and GPUs.[^general-requirements]
 | MLA Attention KV | Supported | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Preserved losslessly | Not supported |
-| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; NoPE uses NVFP4 and RoPE defaults to 2FP4, or keeps its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly | Supported[^deepseek-v4]; NoPE uses TurboQuant, and RoPE and the indexer cache are preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; NoPE uses NVFP4 and RoPE defaults to 2FP4, or keeps its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly | Supported[^deepseek-v4]; the whole 512-value row uses TurboQuant, or only the 448 NoPE values (RoPE kept at its original precision) when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly | Not supported |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Preserved losslessly | Not supported |
 
 [^general-requirements]: All methods currently require the PyTorch backend and

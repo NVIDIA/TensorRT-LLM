@@ -500,7 +500,7 @@ def test_deepseek_v4_csa_rows_follow_skip_rope_and_keep_the_indexer(bits, skip_r
     assert torch.equal(
         out[..., quantized:].view(torch.uint8), row[..., quantized:].view(torch.uint8)
     )
-    assert _nmse(row[..., :quantized], out[..., :quantized]) < 1.15 * PAPER_MSE[3]
+    assert _nmse(row[..., :quantized], out[..., :quantized]) < 1.15 * PAPER_MSE[bits]
     indexer = values[(1, "deepseek_v4_indexer_compress")].to(codec.dtype)
     assert torch.equal(
         restored[(1, "deepseek_v4_indexer_compress")].view(torch.uint8), indexer.view(torch.uint8)
