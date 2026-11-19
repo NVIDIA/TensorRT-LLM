@@ -1,11 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""What an engine's log says of its block reuse and of the pools it allocated."""
+"""What an engine's log says of its block reuse."""
 
 from __future__ import annotations
 
-import re
 from typing import Any, Mapping
 
 from .harness import workload_io
@@ -41,31 +40,6 @@ def reuse_disabled_detail(output: str, *, options: str | None) -> str | None:
 
 #: The harness's record of what one engine reused (``checks/harness/reuse_probe.py``).
 REUSE_MARKER = workload_io.REUSE_MARKER
-
-
-#: ``modeling_v2 newmodel: bound MambaHybridCacheManagerV2 #2: 4096 recurrent
-#: slots, ...`` -- what a target prints, once per rank, each time it binds a
-#: recurrent-state pool; the highest-numbered one is the pool the engine serves from.
-_BIND_LINE = re.compile(r"\bbound (\w+) #(\d+): (\d+) recurrent slots")
-
-
-#: ``[MemUsageChange] Allocated 29.11 GiB for max tokens in paged KV cache
-#: (524288).`` -- the C++ KV-cache manager, once per rank and pool, at INFO.
-_KV_ALLOCATED = re.compile(r"Allocated [0-9.]+ GiB for max tokens in paged KV cache \((\d+)\)")
-
-
-def parse_recurrent_slots(output: str) -> list[int]:
-    """The recurrent-state slots of the pool each rank serves from: its last bind line's."""
-    binds = [(int(n), int(slots)) for _, n, slots in _BIND_LINE.findall(output)]
-    if not binds:
-        return []
-    last = max(n for n, _ in binds)
-    return [slots for n, slots in binds if n == last]
-
-
-def parse_kv_allocations(output: str) -> list[int]:
-    """The max tokens of every paged KV-cache pool the C++ manager logged allocating."""
-    return [int(tokens) for tokens in _KV_ALLOCATED.findall(output)]
 
 
 def parse_reuse_records(output: str) -> list[dict[str, Any]]:
@@ -105,8 +79,6 @@ def reuse_failure(output: str, llm: Mapping[str, Any], *, options: str | None) -
 __all__ = [
     "REUSE_DISABLED_MARKER",
     "REUSE_MARKER",
-    "parse_kv_allocations",
-    "parse_recurrent_slots",
     "parse_reuse_records",
     "reuse_disabled_detail",
     "reuse_failure",
