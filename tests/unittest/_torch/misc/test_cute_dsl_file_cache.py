@@ -192,3 +192,31 @@ def test_kernel_cache_loads_stored_kernels(tmp_path):
     (reloaded,) = _finish(_start(script, cache))
     assert "LOADED" in reloaded[2], reloaded[2][-6000:]
     assert repaired[1] == reloaded[1] == cold[1]
+
+
+def test_kernel_cache_skips_requested_outputs(monkeypatch, tmp_path):
+    from tensorrt_llm._torch import cute_dsl_file_cache
+
+    for name in [k for k in os.environ if k.startswith("CUTE_DSL_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setattr(cute_dsl_file_cache, "_kernel_root", str(tmp_path))
+    monkeypatch.setattr(cute_dsl_file_cache, "_cute_identity", lambda: "identity")
+    cache = cute_dsl_file_cache.KernelCache("owner", __file__)
+
+    # Compile options that write files, spelled out or abbreviated, are never kept.
+    assert cache._paths(("--enable-tvm-ffi",)) is not None
+    for options in ("--keep-ptx", "--keep-cubin --dump-dir d", "--dump=d", "--flatten-locs=x.json"):
+        assert cache._paths((options,)) is None, options
+
+    # So are settings that ask for compile outputs or no caching, unless they are off.
+    for name, value in (
+        ("CUTE_DSL_KEEP", "ptx"),
+        ("CUTE_DSL_KEEP_PTX", "On"),
+        ("CUTE_DSL_NO_CACHE", "1"),
+    ):
+        monkeypatch.setenv(name, value)
+        assert cache._paths(("",)) is None, name
+        monkeypatch.delenv(name)
+    for value in ("0", "false", " OFF "):
+        monkeypatch.setenv("CUTE_DSL_DISABLE_FILE_CACHING", value)
+        assert cache._paths(("",)) is not None, value

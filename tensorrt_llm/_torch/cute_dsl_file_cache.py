@@ -26,6 +26,7 @@ import importlib.metadata
 import inspect
 import io
 import os
+import re
 import threading
 import time
 import uuid
@@ -45,13 +46,19 @@ _TVM_FFI_HOOK = "CutlassBaseDSL.compile_and_cache.<locals>.post_compile_hook"
 # CuTe DSL settings under which KernelCache neither loads nor stores: compile outputs (KEEP and
 # the deprecated KEEP_*, DUMP_DIR, PRINT_*, DRYRUN) or no caching.
 _DSL_ENV_NO_REUSE = ("KEEP", "DUMP_", "PRINT_", "DRYRUN", "NO_CACHE", "DISABLE_FILE_CACHING")
+# Values that leave a CuTe DSL boolean setting off.
+_DSL_ENV_OFF = frozenset({"", "0", "false", "no", "off"})
 # cute.compile options that write files beside the result; KernelCache keeps no key holding one.
+# The options parser also accepts any prefix of an option name.
 _OUTPUT_OPTIONS = (
-    "--keep-",
-    "--dump-dir",
-    "--remark-output",
-    "--flatten-locs-output-json-path",
+    "keep-ptx",
+    "keep-cubin",
+    "keep-sass",
+    "dump-dir",
+    "remark-output",
+    "flatten-locs-output-json-path",
 )
+_OPTION_NAME = re.compile(r"--([\w-]+)")
 
 _local = threading.local()
 _file_digests: dict[tuple[str, int, int], str] = {}
@@ -394,9 +401,15 @@ def install_cute_dsl_file_cache() -> None:
 def _dsl_env() -> str | None:
     """The ``CUTE_DSL_*`` settings, or None when one asks for compile outputs or no caching."""
     items = sorted((k, v) for k, v in os.environ.items() if k.startswith("CUTE_DSL_"))
-    if any(v not in ("", "0") and any(s in k for s in _DSL_ENV_NO_REUSE) for k, v in items):
-        return None
+    for k, v in items:
+        if v.strip().lower() not in _DSL_ENV_OFF and any(s in k for s in _DSL_ENV_NO_REUSE):
+            return None
     return repr(items)
+
+
+def _writes_files(text: str) -> bool:
+    """Whether ``text`` holds a compile option that writes files, in full or abbreviated."""
+    return any(o.startswith(n) for n in _OPTION_NAME.findall(text) for o in _OUTPUT_OPTIONS)
 
 
 def _source_digest(directory: str) -> str:
@@ -436,7 +449,7 @@ class KernelCache(dict):
         text = repr(key)
         if _kernel_root is None or env is None or " at 0x" in text:
             return None
-        if any(option in text for option in _OUTPUT_OPTIONS):
+        if _writes_files(text):
             return None
         try:
             identity = (
