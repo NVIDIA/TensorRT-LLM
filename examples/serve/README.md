@@ -14,3 +14,9 @@ The [Grafana setup example](grafana/README.md) renders and publishes role-aware
 Kubernetes inference dashboards, including KV-cache pressure, transfer and
 executor performance views. Start with an offline render and the neutral example
 configuration; Grafana/Prometheus deployment and inference settings remain separate.
+
+## Standalone checkpoint coordination
+
+The [experimental resident checkpoint coordinator](checkpoint/README.md) drives
+engine preparation, restore validation and traffic admission for one MPI rank.
+It requires a compatible engine and an independently authorized host adapter.
