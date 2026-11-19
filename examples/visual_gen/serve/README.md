@@ -312,9 +312,6 @@ trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-nano-1gpu.
 # Blackwell default: 4 B200/B300 GPUs (Super)
 trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-4gpu.yaml
 
-# 8 GPU (Super): trtllm-serve starts the configured workers
-trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-8gpu.yaml
-
 # 1 GPU text-to-image deployment: warms the 1024x1024 single-frame shape
 # instead of the omni video shape
 trtllm-serve nvidia/Cosmos3-Super-Text2Image-4Step --visual_gen_args ../configs/cosmos3-t2i-1gpu.yaml
