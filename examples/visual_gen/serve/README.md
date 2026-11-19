@@ -498,8 +498,11 @@ With the default `"response_format": "url"` the response carries a
 
 ### Notes
 
-- **A guardrail block surfaces as HTTP 500** (`Video generation failed` /
-  `Image generation failed`).
+- **Guardrail blocks** return HTTP 500 on the synchronous video and image
+  endpoints (`Video generation failed` or `Image generation failed`). For
+  async `POST /v1/videos`, submission returns HTTP 202. Poll
+  `GET /v1/videos/{video_id}` for `status: "failed"` with the error
+  `Video generation failed: output.video is None`.
 - **Distilled checkpoints** (`...-4Step`) fix their step count and guidance;
   simplest is to omit `num_inference_steps` and `guidance_scale`. A value that
   matches the checkpoint is accepted, a conflicting one returns HTTP 400 naming
