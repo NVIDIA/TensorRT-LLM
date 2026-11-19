@@ -840,10 +840,13 @@ def test_eager_rows_run_the_row_bucket_kernel_bitwise(
     call = _lowm_call(variant, m)
     eager = call()
     misses = compiled_mma.cache_info().misses
+    # A padded call under capture keeps its buffer to the capture, out of the staging cache.
+    monkeypatch.setattr(_mod, "_A_STAGING", {})
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = call()
     assert compiled_mma.cache_info().misses == misses
+    assert not _mod._A_STAGING
     graph.replay()
     torch.cuda.synchronize()
     with flashinfer_mxfp8_decode_graph_capture():

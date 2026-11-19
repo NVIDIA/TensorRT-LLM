@@ -1103,7 +1103,7 @@ def test_lowm_row_bucket_prewarm_always_meets_its_peers(
 class TestWarmupCleanup(unittest.TestCase):
     def test_lowm_row_bucket_prewarm_runs_between_the_autotuner_and_capture(self) -> None:
         """The low-M MMA row-bucket prewarm runs exactly once, after the eager warmup forwards (the
-        autotuner's are the last) and before the CUDA graphs are captured."""
+        autotuner's are the last) and before any CUDA graph is captured."""
         model_engine, resource_manager = self.enterContext(_warmup_and_resources())
         calls, _ = _run_warmup_tracked(model_engine, resource_manager)
 
@@ -1111,6 +1111,10 @@ class TestWarmupCleanup(unittest.TestCase):
         prewarm = calls.index("lowm_mma_row_buckets")
         self.assertLess(calls.index("autotuner"), prewarm, calls)
         self.assertLess(prewarm, calls.index("generation_cuda_graph"), calls)
+        captures = ("generation_cuda_graph", "additional_cuda_graph", "prefill_cuda_graph")
+        for i, name in enumerate(calls):
+            if name in captures:
+                self.assertLess(prewarm, i, calls)
 
     def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after
