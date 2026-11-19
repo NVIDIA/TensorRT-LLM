@@ -196,10 +196,11 @@ def _managed(args: argparse.Namespace) -> tuple[runner.ManagedServer, Optional[i
         "server_env_names": sorted({name for name, _ in args.server_env}),
     }
     batch, seq = config.get("max_batch_size"), config.get("max_seq_len")
+    runner.check_max_seq_len(seq)
     return (
         runner.ManagedServer(argv=tuple(argv), env=env, gpu_ids=gpus, settings=settings),
         batch if type(batch) is int and batch > 0 else None,
-        seq if type(seq) is int and seq > 0 else None,
+        seq,
     )
 
 

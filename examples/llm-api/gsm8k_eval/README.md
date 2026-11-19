@@ -69,8 +69,13 @@ Arguments:
 | `--min-correct N` | Also require at least N correct answers (a regression gate). |
 
 Invalid arguments, including a question count outside 1..1319, are rejected before any server is
-started or any request is sent. The full 1,319-question evaluation is a manual run; no CI
-configuration selects it.
+started or any request is sent. A known `max_seq_len` must exceed the 65,536-token
+output allowance; otherwise the run is refused before dataset loading or server startup.
+Managed mode checks the YAML's limit as well as any `--max-seq-len` override. This is
+only a lower-bound check: the endpoint owns tokenization and chat-template rendering,
+so the evaluator cannot determine the exact prompt length before a reply. Each reply's
+reported prompt-token count is still checked against the available context length.
+The full 1,319-question evaluation is a manual run; no CI configuration selects it.
 
 The `trtllm-serve disaggregated` router provides `/v1/models`, but may return HTTP 503
 until a context worker registers. Both endpoint and managed modes retry that response

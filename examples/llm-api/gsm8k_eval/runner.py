@@ -437,6 +437,15 @@ def _report(summary: Mapping[str, Any], timing: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def check_max_seq_len(value: Optional[int]) -> None:
+    """Reject a known context limit that leaves no room for the prompt."""
+    if value is not None and (type(value) is not int or value <= protocol.MAX_TOKENS):
+        raise EvaluationError(
+            f"max_seq_len must exceed the {protocol.MAX_TOKENS}-token output allowance "
+            f"to leave room for prompt tokens, got {value!r}"
+        )
+
+
 def run(
     *,
     dataset_dir: str | os.PathLike,
@@ -485,6 +494,7 @@ def run(
         raise EvaluationError(
             f"min_correct must be an integer in 0..{num_questions}, got {min_correct!r}"
         )
+    check_max_seq_len(max_seq_len)
     deadline = started + float(time_budget_s)
     try:
         manifest_sha256 = protocol.sha256_file(manifest_path)
