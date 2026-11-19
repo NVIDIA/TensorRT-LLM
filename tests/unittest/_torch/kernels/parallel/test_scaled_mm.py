@@ -180,7 +180,10 @@ def test_fp8_scaled_mm_epilogue(m, n, k, gelu, out_fp8):
                                    ref_codes.float(),
                                    rtol=0.125,
                                    atol=1e-3 * E4M3_MAX)
-        same = (out.view(torch.uint8) == ref_codes.view(torch.uint8)).float()
+        # Exact codes away from zero, where an e4m3 step exceeds the accumulation error.
+        large = (ref * d_scale).abs() > 4
+        same = (out.view(torch.uint8) == ref_codes.view(
+            torch.uint8))[large].float()
         assert same.mean().item(
         ) > 0.98, f"{same.mean().item():.4f} codes equal"
     result = out.float() / d_scale if out_fp8 else out.float()
