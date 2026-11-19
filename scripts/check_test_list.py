@@ -932,6 +932,35 @@ def install_python_dependencies(llm_src: str) -> None:
     )
 
 
+def _validate_test_db_condition(condition: dict, location: str) -> None:
+    for field in ("terms", "ranges", "wildcards"):
+        value = condition.get(field)
+        # The scheduler normalizes empty filters away.
+        if not value:
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"{location}.{field} must be a mapping")
+        if field == "ranges":
+            for term, limits in value.items():
+                if not isinstance(limits, dict):
+                    raise ValueError(
+                        f"{location}.ranges.{term} must be a mapping")
+
+    for field in ("match_any", "match_none"):
+        if field not in condition:
+            continue
+        value = condition[field]
+        if field == "match_none" and not value:
+            continue
+        if not isinstance(value, list):
+            raise ValueError(f"{location}.{field} must be a list of mappings")
+        for index, child in enumerate(value):
+            child_location = f"{location}.{field}[{index}]"
+            if not isinstance(child, dict):
+                raise ValueError(f"{child_location} must be a mapping")
+            _validate_test_db_condition(child, child_location)
+
+
 def list_test_db_names(test_db_path: str) -> list[str]:
     """Return every test entry in test-db/*.yml, across all stages and conditions.
 
@@ -941,23 +970,31 @@ def list_test_db_names(test_db_path: str) -> list[str]:
     Raises ValueError on input the test-db scheduler rejects: duplicate mapping
     keys, a missing or unsupported version, a context defined in more than one
     file, a context or block of the wrong type, or a block without a
-    'condition' mapping or a 'tests' list.
+    'condition' mapping or a 'tests' list, including malformed nested filters.
     """
     # Imported here so --validate runs without PyYAML (pre-commit uses system python).
     import yaml
 
     class _UniqueKeyLoader(yaml.SafeLoader):
 
-        def construct_mapping(self, node, deep=False):
-            seen = set()
-            for key_node, _ in node.value:
-                key = self.construct_object(key_node, deep=deep)
-                if key in seen:
-                    raise ValueError(
-                        f"duplicate key {key!r} at line {key_node.start_mark.line + 1}"
-                    )
-                seen.add(key)
-            return super().construct_mapping(node, deep=deep)
+        def __init__(self, stream) -> None:
+            super().__init__(stream)
+            self._checked_mappings = set()
+
+        def flatten_mapping(self, node: yaml.MappingNode) -> None:
+            # Check explicit keys before merges introduce legal overrides.
+            if node not in self._checked_mappings:
+                seen = set()
+                for key_node, _ in node.value:
+                    key = ("<<" if key_node.tag == "tag:yaml.org,2002:merge"
+                           else self.construct_object(key_node))
+                    if key in seen:
+                        raise ValueError(
+                            f"duplicate key {key!r} at line {key_node.start_mark.line + 1}"
+                        )
+                    seen.add(key)
+                self._checked_mappings.add(node)
+            super().flatten_mapping(node)
 
     names = set()
     context_files = {}
@@ -996,6 +1033,9 @@ def list_test_db_names(test_db_path: str) -> list[str]:
                     raise ValueError(
                         f"{path}: context {context!r} has a block whose 'condition' is not a mapping"
                     )
+                _validate_test_db_condition(
+                    block["condition"],
+                    f"{path}: context {context!r} condition")
                 if not isinstance(block.get("tests"), list):
                     raise ValueError(
                         f"{path}: context {context!r} has a block whose 'tests' is not a list"

@@ -609,6 +609,114 @@ def test_list_test_db_names_rejects_non_mapping_condition(mod, tmp_path, conditi
         mod.list_test_db_names(str(tmp_path))
 
 
+@pytest.mark.parametrize(
+    "condition, error",
+    [
+        ("{terms: [stage]}", "condition.terms must be a mapping"),
+        ("{wildcards: gpu}", "condition.wildcards must be a mapping"),
+        ("{ranges: [4]}", "condition.ranges must be a mapping"),
+        ("{ranges: {system_gpu_count: 4}}", "condition.ranges.system_gpu_count must be a mapping"),
+        ("{match_any: null}", "condition.match_any must be a list of mappings"),
+        (
+            "{match_any: {terms: {stage: pre_merge}}}",
+            "condition.match_any must be a list of mappings",
+        ),
+        ("{match_none: excluded}", "condition.match_none must be a list of mappings"),
+        ("{match_any: [null]}", "condition.match_any[0] must be a mapping"),
+        ("{match_none: [pre_merge]}", "condition.match_none[0] must be a mapping"),
+        (
+            "{match_any: [{ranges: {system_gpu_count: null}}]}",
+            "condition.match_any[0].ranges.system_gpu_count must be a mapping",
+        ),
+        (
+            "{match_none: [{match_any: null}]}",
+            "condition.match_none[0].match_any must be a list of mappings",
+        ),
+    ],
+)
+def test_list_test_db_names_rejects_malformed_nested_condition(mod, tmp_path, condition, error):
+    path = tmp_path / "l0_a.yml"
+    path.write_text(
+        f"version: 0.0.1\nl0_a:\n- condition: {condition}\n  tests:\n  - a.py::test_a\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=re.escape(f"{path}: context 'l0_a' {error}")):
+        mod.list_test_db_names(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "{terms: null, ranges: {}, wildcards: [], match_none: null}",
+        "{ranges: {system_gpu_count: {ge: 4, le: 8}}}",
+        "{match_any: [{terms: {stage: [pre_merge, post_merge]}}, {wildcards: {gpu: 'H*'}}]}",
+        "{match_none: [{terms: {stage: post_merge}}, {ranges: {system_gpu_count: {lt: 4}}}]}",
+    ],
+)
+def test_list_test_db_names_accepts_nested_conditions(mod, tmp_path, condition):
+    (tmp_path / "l0_a.yml").write_text(
+        f"version: 0.0.1\nl0_a:\n- condition: {condition}\n  tests:\n  - a.py::test_a\n",
+        encoding="utf-8",
+    )
+    assert mod.list_test_db_names(str(tmp_path)) == ["a.py::test_a"]
+
+
+def test_list_test_db_names_accepts_merge_overrides(mod, tmp_path):
+    (tmp_path / "l0_a.yml").write_text(
+        "version: 0.0.1\nl0_a:\n"
+        "- &base\n"
+        "  condition: &filters {terms: {stage: pre_merge}}\n"
+        "  tests:\n  - a.py::test_a\n"
+        "- &override\n"
+        "  <<: *base\n"
+        "  tests:\n  - b.py::test_b\n"
+        "- <<: [*override, *base]\n"
+        "- <<: *override\n"
+        "  condition:\n"
+        "    <<: *filters\n"
+        "    terms: {stage: post_merge}\n",
+        encoding="utf-8",
+    )
+    assert mod.list_test_db_names(str(tmp_path)) == ["a.py::test_a", "b.py::test_b"]
+
+
+@pytest.mark.parametrize("override", ["", "  tests:\n  - c.py::test_c\n"])
+def test_list_test_db_names_merge_precedence(mod, tmp_path, override):
+    (tmp_path / "l0_a.yml").write_text(
+        "version: 0.0.1\nl0_a:\n"
+        "- <<:\n"
+        "  - condition: {}\n    tests:\n    - a.py::test_a\n"
+        "  - tests:\n    - b.py::test_b\n" + override,
+        encoding="utf-8",
+    )
+    assert mod.list_test_db_names(str(tmp_path)) == ["c.py::test_c" if override else "a.py::test_a"]
+
+
+@pytest.mark.parametrize(
+    "block, duplicate",
+    [
+        (
+            "- <<: {condition: {}, tests: [], tests: []}\n",
+            "tests",
+        ),
+        (
+            "- <<: {condition: {}, tests: []}\n  tests: []\n  tests: []\n",
+            "tests",
+        ),
+        (
+            "- <<: {condition: {}}\n  <<: {tests: []}\n",
+            "<<",
+        ),
+    ],
+)
+def test_list_test_db_names_rejects_duplicate_explicit_keys_with_merge(
+    mod, tmp_path, block, duplicate
+):
+    (tmp_path / "l0_a.yml").write_text("version: 0.0.1\nl0_a:\n" + block, encoding="utf-8")
+    with pytest.raises(ValueError, match=re.escape(f"duplicate key {duplicate!r}")):
+        mod.list_test_db_names(str(tmp_path))
+
+
 # --------------------------------------------------------------------------
 # module-const soundness against in-place mutation / rebinding
 # --------------------------------------------------------------------------
