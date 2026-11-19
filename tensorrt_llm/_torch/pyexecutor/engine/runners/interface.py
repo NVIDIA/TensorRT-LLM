@@ -58,6 +58,11 @@ class ScheduledInputs:
     Keep borrowed data valid until GPU consumption completes. Spec enablement
     is independent of draft length; updates use outputs["runtime_draft_len"].
     Omitting that key preserves the input length without modifying this record.
+
+    ``inputs_staged`` lets a caller overlap forwards. A runner that reuses host
+    staging memory across calls records it on the forward's stream once the
+    stream has consumed that memory; the caller waits on it before the next
+    forward, which may then run while this one is still executing.
     """
 
     batch: ScheduledRequests
@@ -66,6 +71,7 @@ class ScheduledInputs:
     gather_context_logits: bool = False
     enable_spec_decode: bool = False
     runtime_draft_len: int = 0
+    inputs_staged: torch.cuda.Event | None = None
 
 
 @dataclass(frozen=True)

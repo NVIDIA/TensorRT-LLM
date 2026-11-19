@@ -63,6 +63,7 @@ __all__ = [
     "assert_weight_layout",
     "build_layer_descriptors",
     "derive_block",
+    "engram_table_is_mxfp4",
     "layout_for_role",
     "parse_quantization_layout",
     "quant_role_for_weight_key",
@@ -374,6 +375,17 @@ _EXPECTED_LAYOUT: Dict[str, DeepseekV41QuantLayout] = {
     ),
 }
 
+# Engram tables of a checkpoint with ``quantization_config.engram_embed_quant == "mxfp4"``: e2m1
+# pairs in uint8, element ``2k`` in byte ``k``'s low nibble, one e8m0 scale per 32 columns.
+_ENGRAM_EMBED_MXFP4 = DeepseekV41QuantLayout(
+    weight_dtype="mxfp4_e2m1",
+    storage_dtype="uint8",
+    scale_dtype="float8_e8m0",
+    element_block=(1, 32),
+    pack_factor=2,
+    packed_dim=1,
+)
+
 
 # Only the *routed* experts are MXFP4 — verified against the checkpoint: the
 # int8-packed tensors are exactly `{layers,mtp}.N.ffn.experts.M.w{1,2,3}.weight` and
@@ -466,7 +478,38 @@ def parse_quantization_layout(
         if expert_aliases_dense:
             layout[DeepseekV41QuantRole.EXPERT] = overridden
 
+    engram_quant = cfg.get("engram_embed_quant")
+    if engram_quant == "mxfp4":
+        block_size = cfg.get("engram_embed_block_size", 32)
+        scale_dtype = cfg.get("engram_embed_scale_dtype", "ue8m0")
+        if (block_size, scale_dtype) != (32, "ue8m0"):
+            raise ValueError(
+                "DeepSeek-V4.1 MXFP4 Engram tables need one ue8m0 scale per 32 columns, got "
+                f"engram_embed_block_size {block_size!r} and engram_embed_scale_dtype "
+                f"{scale_dtype!r}."
+            )
+        layout[DeepseekV41QuantRole.ENGRAM_EMBED] = _ENGRAM_EMBED_MXFP4
+    elif engram_quant is not None:
+        raise ValueError(
+            "DeepSeek-V4.1 expects quantization_config.engram_embed_quant 'mxfp4', or none for "
+            f"fp8 Engram tables, got {engram_quant!r}."
+        )
+
     return layout
+
+
+def engram_table_is_mxfp4(quantization_config: Optional[Dict[str, Any]], layer_id: int) -> bool:
+    """Whether Engram layer ``layer_id``'s table is MXFP4; tables of one checkpoint share a format."""
+    layout = layout_for_role(DeepseekV41QuantRole.ENGRAM_EMBED, quantization_config)
+    if layout.weight_dtype != _ENGRAM_EMBED_MXFP4.weight_dtype:
+        return False
+    layers = (quantization_config or {}).get("engram_embed_layers")
+    if layers is not None and layer_id not in layers:
+        raise ValueError(
+            f"Engram layer {layer_id} is not in quantization_config.engram_embed_layers {layers}; "
+            "checkpoints mixing MXFP4 and fp8 Engram tables are not supported."
+        )
+    return True
 
 
 _DECODER_BOUNDED_REPLAY_ENV = "TRTLLM_V41_DECODER_BOUNDED_REPLAY"
