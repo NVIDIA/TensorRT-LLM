@@ -553,8 +553,11 @@ def test_drain_reaps_killed_attached_frontends_off_the_event_loop() -> None:
             await asyncio.sleep(0.01)
 
     async def main() -> None:
-        await asyncio.gather(
-            _frontend_processes._drain_attached_frontends([child], None, lambda: True), tick()
+        await asyncio.wait_for(
+            asyncio.gather(
+                _frontend_processes._drain_attached_frontends([child], None, lambda: True), tick()
+            ),
+            timeout=10,
         )
 
     asyncio.run(main())
