@@ -631,6 +631,7 @@ def test_eager_decoder_layer_scope_consumes_mhc_activations(
 
     monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
     monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+    monkeypatch.setattr(torch.ops.trtllm, "has_requested_nccl_window_buffers", lambda: True)
     layers = torch.nn.ModuleList([Producer(), Consumer()])
     handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layers)
     try:
