@@ -251,9 +251,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._context_fork_hints: Dict[int, int] = {}
         self._snapshot_pruned_tokens_total = 0
         self._page_pruned_tokens_total = 0
-        # Prefix matched for every fresh lookup, against which
+        # Prefix matched for every admitted lookup, against which
         # _snapshot_pruned_tokens_total is judged; the iteration counters are
-        # reset by get_iteration_stats().
+        # reset by get_iteration_stats(). A lookup is kept per request until its
+        # first chunk is scheduled, since a refused admission is looked up again.
+        self._pending_prefix_loss: Dict[int, Tuple[int, int]] = {}
         self._prefix_matched_tokens_total = 0
         self._iter_prefix_matched_tokens = 0
         self._iter_prefix_snapshot_lost_tokens = 0
@@ -1318,6 +1320,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         super().prepare_resources(scheduled_batch)
         if self.local_num_mamba_layers == 0:
             return
+        for request in scheduled_batch.context_requests:
+            self._commit_prefix_loss(request.py_request_id)
         requests = scheduled_batch.context_requests + scheduled_batch.generation_requests
         num_contexts = len(scheduled_batch.context_requests)
         self._setup_state_indices(requests, num_contexts=num_contexts)
@@ -1473,6 +1477,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         self._branch_snapshot_points.pop(request.py_request_id, None)
         self._context_fork_hints.pop(request.py_request_id, None)
+        self._pending_prefix_loss.pop(request.py_request_id, None)
         # A freed request ends any steady decode run.
         self._steady_state_index_key = None
         super().free_resources(request, pin_on_release)
@@ -1759,7 +1764,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._context_fork_hints[req.py_request_id] = fork
 
     def _record_prefix_loss(self, req: LlmRequest, kv_cache: _KVCache) -> None:
-        """Count the attention-matched prefix and the part no snapshot covered.
+        """Keep the attention-matched prefix and the part no snapshot covered.
 
         A snapshot hit rate does not show this loss: a lookup that falls back to
         an older snapshot of the same prefix still counts as a hit.
@@ -1774,6 +1779,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
         matched = diagnostics._get_num_reusable_tokens_before_hybrid_pruning()
         lost = max(0, matched - kv_cache.num_committed_tokens)
+        self._pending_prefix_loss[req.py_request_id] = (matched, lost)
+
+    def _commit_prefix_loss(self, request_id: int) -> None:
+        """Count a request's last lookup once its first chunk is scheduled."""
+        pending = self._pending_prefix_loss.pop(request_id, None)
+        if pending is None:
+            return
+        matched, lost = pending
         self._prefix_matched_tokens_total += matched
         self._snapshot_pruned_tokens_total += lost
         self._iter_prefix_matched_tokens += matched
@@ -1784,7 +1797,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Warn once when missing snapshots cost a large share of prefix reuse.
 
         Judged on this rank's lookups only; with attention DP, other ranks'
-        loss is in the per-rank Prometheus counters.
+        loss reaches Prometheus only with TLLM_METRICS_ALL_RANKS=1.
         """
         matched = self._prefix_matched_tokens_total
         if (
@@ -1798,18 +1811,26 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
         self._snapshot_loss_warned = True
         # Prompts diverging between snapshot points never had a snapshot there;
-        # a larger pool only helps when snapshots were evicted.
-        if self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
-            divergence_hint = (
-                "a smaller 'kv_cache_config.mamba_state_config.periodic_snapshot_interval'"
-            )
-        else:
+        # a larger pool only helps when snapshots were evicted. per_conversation
+        # forces periodic snapshots off, so there is nothing to suggest for it.
+        interval_option = "'kv_cache_config.mamba_state_config.periodic_snapshot_interval'"
+        if not self.kv_cache_config.block_reuse_config.enable_branch_snapshot:
             divergence_hint = "'kv_cache_config.block_reuse_config.enable_branch_snapshot'"
+        elif self.block_reuse_policy == BlockReusePolicy.PER_CONVERSATION:
+            divergence_hint = None
+        elif self.kv_cache_config.mamba_state_config.periodic_snapshot_interval > 0:
+            divergence_hint = f"a smaller {interval_option}"
+        else:
+            divergence_hint = f"a positive {interval_option}"
+        divergence_advice = (
+            f" If prompts diverge between snapshot points, try {divergence_hint}."
+            if divergence_hint
+            else ""
+        )
         logger.warning(
             f"[MambaHybridCacheManagerV2] {share:.0%} of the prefix tokens matched in the "
             "attention cache on rank 0 were recomputed because no recurrent-state snapshot covered "
-            "them. If prompts diverge between snapshot points, try "
-            f"{divergence_hint}. If snapshots were evicted, give the recurrent-state "
+            f"them.{divergence_advice} If snapshots were evicted, give the recurrent-state "
             "pool a larger share of the cache with 'kv_cache_config.pool_ratio' or a "
             "smaller 'kv_cache_config.avg_seq_len'."
         )

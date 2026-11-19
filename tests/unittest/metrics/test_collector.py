@@ -1150,7 +1150,7 @@ class TestLogIterationStatsKvCacheIteration:
             == 10
         )
 
-    def test_prefix_snapshot_loss_counters(self):
+    def test_prefix_snapshot_loss_counters(self) -> None:
         collector = _make_kv_iter_collector()
         collector.log_iteration_stats(
             {"iterPrefixMatchedTokens": 20_000, "iterPrefixSnapshotLostTokens": 16_000}

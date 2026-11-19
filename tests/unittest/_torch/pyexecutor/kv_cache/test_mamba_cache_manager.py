@@ -5154,13 +5154,16 @@ def _branch_snapshot_manager(
         ),
     )
     mgr.is_estimating_kv_cache = False
+    mgr.mapping = SimpleNamespace(rank=0)
     mgr._branch_snapshot_points = {}
     mgr._context_fork_hints = {}
     mgr._snapshot_pruned_tokens_total = 0
     mgr._page_pruned_tokens_total = 0
+    mgr._pending_prefix_loss = {}
     mgr._prefix_matched_tokens_total = 0
     mgr._iter_prefix_matched_tokens = 0
     mgr._iter_prefix_snapshot_lost_tokens = 0
+    mgr._snapshot_loss_warned = False
     mgr._branch_snapshots_taken_total = 0
     mgr._branch_snapshots_skipped_total = {}
     return mgr
@@ -5522,6 +5525,7 @@ def test_branch_snapshot_counters_separate_snapshot_loss_from_page_loss():
     kv_cache = _fake_reuse_match(divergence=512, hybrid=320, reused=128)
 
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=1023)
+    mgr._commit_prefix_loss(request.py_request_id)
 
     # Matched in attention but pruned for want of a snapshot.
     assert mgr._snapshot_pruned_tokens_total == 320 - 128
@@ -5549,6 +5553,7 @@ def test_branch_snapshot_counters_accumulate_across_requests():
             _fake_reuse_match(divergence=512, hybrid=320, reused=128),
             num_lookup_tokens=1023,
         )
+        mgr._commit_prefix_loss(rid)
 
     assert mgr._branch_snapshots_taken_total == 0
     assert mgr._snapshot_pruned_tokens_total == 3 * (320 - 128)
@@ -6416,6 +6421,7 @@ def _v2_kda_replay_stub(num_slots=4, manager_cls=KimiK3HybridCacheManager, draft
     mgr._stream = None
     mgr._request_id_to_state_index = {}
     mgr._request_id_to_is_dummy = {}
+    mgr._pending_prefix_loss = {}
     mgr._kda_replay.seed_on_resume = set()
     mgr._kda_replay.acceptance_pending = set()
     mgr._kda_replay.unseeded_requests = set()
@@ -10326,7 +10332,7 @@ def test_v2_hybrid_mixed_precision_beside_private_mamba2_replay():
 
 
 @skip_no_cuda
-def test_v2_hybrid_iteration_stats_report_prefix_lost_to_missing_snapshot():
+def test_v2_hybrid_iteration_stats_report_prefix_lost_to_missing_snapshot() -> None:
     """Attention pages can match deeper than any recurrent-state snapshot; the gap is recomputed."""
     mgr = _build_v2_hybrid_with_mamba_layer(
         enable_block_reuse=True, additional_snapshot_offsets_from_end=[0], enable_stats=True

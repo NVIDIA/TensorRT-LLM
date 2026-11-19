@@ -3,15 +3,19 @@
 """Prefix tokens lost to missing recurrent-state snapshots, in the V2 iteration stats."""
 
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import kv_cache_stats
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig, MambaStateConfig
+
+_MIN_MATCHED = mamba_cache_manager_v2._SNAPSHOT_LOSS_MIN_MATCHED_TOKENS
 
 
 def _fake_kv_cache(matched: int, reused: int) -> SimpleNamespace:
@@ -23,10 +27,10 @@ def _fake_kv_cache(matched: int, reused: int) -> SimpleNamespace:
 
 
 def _fake_request(
-    is_dummy: bool = False, is_disagg_generation_init_state: bool = False
+    request_id: int = 1, is_dummy: bool = False, is_disagg_generation_init_state: bool = False
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        py_request_id=1,
+        py_request_id=request_id,
         prompt_len=1 << 21,
         context_current_position=0,
         # Like an attention DP or CUDA graph padding dummy, which is not a dummy_request.
@@ -37,17 +41,25 @@ def _fake_request(
     )
 
 
-def _manager(rank: int = 0, enable_branch_snapshot: bool = False) -> MambaHybridCacheManagerV2:
+def _manager(
+    rank: int = 0,
+    enable_branch_snapshot: bool = False,
+    periodic_snapshot_interval: int = 0,
+    policy: BlockReusePolicy = BlockReusePolicy.PER_REQUEST,
+) -> MambaHybridCacheManagerV2:
     """Bare manager carrying only what the loss accounting reads; no cache pools."""
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 1
     manager.is_estimating_kv_cache = False
     manager.mapping = SimpleNamespace(rank=rank)
     manager.kv_cache_config = KvCacheConfig(
-        block_reuse_config=BlockReuseConfig(enable_branch_snapshot=enable_branch_snapshot)
+        block_reuse_config=BlockReuseConfig(enable_branch_snapshot=enable_branch_snapshot),
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=periodic_snapshot_interval),
     )
+    manager.block_reuse_policy = policy
     manager._snapshot_pruned_tokens_total = 0
     manager._page_pruned_tokens_total = 0
+    manager._pending_prefix_loss = {}
     manager._prefix_matched_tokens_total = 0
     manager._iter_prefix_matched_tokens = 0
     manager._iter_prefix_snapshot_lost_tokens = 0
@@ -55,27 +67,61 @@ def _manager(rank: int = 0, enable_branch_snapshot: bool = False) -> MambaHybrid
     return manager
 
 
-def test_counts_loss_without_branch_snapshots():
+def _admit(
+    manager: MambaHybridCacheManagerV2,
+    matched: int,
+    reused: int,
+    request: Optional[SimpleNamespace] = None,
+) -> None:
+    """Look a request up and schedule its first chunk."""
+    request = request or _fake_request()
+    manager._record_prefix_loss(request, _fake_kv_cache(matched, reused))
+    manager._commit_prefix_loss(request.py_request_id)
+
+
+def test_counts_loss_without_branch_snapshots() -> None:
     manager = _manager()
     # Attention matched 20k tokens, the deepest snapshot was at 4k
-    manager._record_branch_snapshot_point(_fake_request(), _fake_kv_cache(20_000, 4_000), 20_000)
-    manager._record_branch_snapshot_point(_fake_request(), _fake_kv_cache(8_000, 8_000), 8_000)
+    first, second = _fake_request(1), _fake_request(2)
+    manager._record_branch_snapshot_point(first, _fake_kv_cache(20_000, 4_000), 20_000)
+    manager._record_branch_snapshot_point(second, _fake_kv_cache(8_000, 8_000), 8_000)
+    manager._commit_prefix_loss(first.py_request_id)
+    manager._commit_prefix_loss(second.py_request_id)
     assert manager._iter_prefix_matched_tokens == 28_000
     assert manager._iter_prefix_snapshot_lost_tokens == 16_000
     assert manager._snapshot_pruned_tokens_total == 16_000
-    # The attention page diagnostics stay off with the branch snapshot flag.
+    # The attention page diagnostics are counted only with enable_branch_snapshot, off here.
     assert manager._page_pruned_tokens_total == 0
 
 
-def test_skips_resumed_dummy_disagg_and_estimation_lookups():
+def test_counts_a_refused_admission_once() -> None:
     manager = _manager()
-    manager._record_branch_snapshot_point(_fake_request(), _fake_kv_cache(100, 0), None)
-    manager._record_branch_snapshot_point(_fake_request(is_dummy=True), _fake_kv_cache(100, 0), 100)
-    manager._record_branch_snapshot_point(
-        _fake_request(is_disagg_generation_init_state=True), _fake_kv_cache(100, 0), 100
-    )
+    request = _fake_request()
+    # Refused for budget or pages twice: each retry is a fresh lookup.
+    for _ in range(3):
+        manager._record_prefix_loss(request, _fake_kv_cache(24_000, 4_000))
+    assert manager._prefix_matched_tokens_total == 0
+    manager._commit_prefix_loss(request.py_request_id)
+    # Later chunks of the same request add nothing.
+    manager._commit_prefix_loss(request.py_request_id)
+    assert manager._prefix_matched_tokens_total == 24_000
+    assert manager._iter_prefix_matched_tokens == 24_000
+    assert manager._iter_prefix_snapshot_lost_tokens == 20_000
+
+
+def test_skips_resumed_dummy_disagg_and_estimation_lookups() -> None:
+    manager = _manager()
+    lookups = [
+        (_fake_request(1), None),
+        (_fake_request(2, is_dummy=True), 100),
+        (_fake_request(3, is_disagg_generation_init_state=True), 100),
+    ]
+    for request, num_lookup_tokens in lookups:
+        manager._record_branch_snapshot_point(request, _fake_kv_cache(100, 0), num_lookup_tokens)
     manager.is_estimating_kv_cache = True
-    manager._record_branch_snapshot_point(_fake_request(), _fake_kv_cache(100, 0), 100)
+    manager._record_branch_snapshot_point(_fake_request(4), _fake_kv_cache(100, 0), 100)
+    for request_id in (1, 2, 3, 4):
+        manager._commit_prefix_loss(request_id)
     assert manager._prefix_matched_tokens_total == 0
     assert manager._snapshot_pruned_tokens_total == 0
     assert manager._iter_prefix_matched_tokens == 0
@@ -83,35 +129,52 @@ def test_skips_resumed_dummy_disagg_and_estimation_lookups():
 
 
 @pytest.mark.parametrize(
-    ("enable_branch_snapshot", "hint"),
-    [(False, "enable_branch_snapshot"), (True, "periodic_snapshot_interval")],
+    ("enable_branch_snapshot", "periodic_snapshot_interval", "policy", "hint"),
+    [
+        (False, 0, BlockReusePolicy.PER_REQUEST, "try 'kv_cache_config.block_reuse_config"),
+        (True, 0, BlockReusePolicy.PER_REQUEST, "a positive 'kv_cache_config.mamba_state_config"),
+        (True, 64, BlockReusePolicy.PER_REQUEST, "a smaller 'kv_cache_config.mamba_state_config"),
+        (True, 0, BlockReusePolicy.PER_CONVERSATION, None),
+    ],
 )
 def test_warns_once_above_threshold_without_iteration_stats(
-    monkeypatch, enable_branch_snapshot, hint
-):
+    monkeypatch: pytest.MonkeyPatch,
+    enable_branch_snapshot: bool,
+    periodic_snapshot_interval: int,
+    policy: BlockReusePolicy,
+    hint: Optional[str],
+) -> None:
     warnings = []
     monkeypatch.setattr(mamba_cache_manager_v2.logger, "warning", warnings.append)
-    manager = _manager(enable_branch_snapshot=enable_branch_snapshot)
-    matched = mamba_cache_manager_v2._SNAPSHOT_LOSS_MIN_MATCHED_TOKENS
+    manager = _manager(
+        enable_branch_snapshot=enable_branch_snapshot,
+        periodic_snapshot_interval=periodic_snapshot_interval,
+        policy=policy,
+    )
     # No get_iteration_stats() call: the warning must not depend on stats being enabled.
-    manager._record_prefix_loss(_fake_request(), _fake_kv_cache(matched, matched // 2))
-    manager._record_prefix_loss(_fake_request(), _fake_kv_cache(matched, 0))
+    _admit(manager, _MIN_MATCHED, _MIN_MATCHED // 2, _fake_request(1))
+    _admit(manager, _MIN_MATCHED, 0, _fake_request(2))
     assert len(warnings) == 1
-    assert "50%" in warnings[0] and hint in warnings[0] and "pool_ratio" in warnings[0]
+    assert "50%" in warnings[0] and "pool_ratio" in warnings[0]
+    if hint is None:
+        assert "diverge" not in warnings[0]
+    else:
+        assert hint in warnings[0]
 
 
-def test_no_warning_below_threshold_or_on_other_ranks(monkeypatch):
+def test_no_warning_below_threshold_or_on_other_ranks(monkeypatch: pytest.MonkeyPatch) -> None:
     warnings = []
     monkeypatch.setattr(mamba_cache_manager_v2.logger, "warning", warnings.append)
-    matched = mamba_cache_manager_v2._SNAPSHOT_LOSS_MIN_MATCHED_TOKENS
-    small_loss = _manager()
-    small_loss._record_prefix_loss(_fake_request(), _fake_kv_cache(matched, matched - 1))
-    other_rank = _manager(rank=1)
-    other_rank._record_prefix_loss(_fake_request(), _fake_kv_cache(matched, 0))
+    _admit(_manager(), _MIN_MATCHED, _MIN_MATCHED - 1)
+    # Every matched token lost, but too few matched to judge.
+    _admit(_manager(), _MIN_MATCHED - 1, 0)
+    _admit(_manager(rank=1), _MIN_MATCHED, 0)
+    # Looked up but never scheduled.
+    _manager()._record_prefix_loss(_fake_request(), _fake_kv_cache(_MIN_MATCHED, 0))
     assert warnings == []
 
 
-def test_serialized_only_for_recurrent_models():
+def test_serialized_only_for_recurrent_models() -> None:
     report = kv_cache_stats.KVCacheV2IterationStatsReport(by_window_size={}, by_pool_group={})
     stats = {}
     kv_cache_stats.append_kv_cache_iteration_stats(stats, report)
