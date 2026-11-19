@@ -46,6 +46,9 @@ l0_gb300_multi_gpus:
   # FlashInfer's ring replay, NVFP4 KV at tep4 without block reuse -- and dep2 context and
   # generation engines on one node. tep4 over bf16 KV runs pre-merge (l0_gb300); mmmu runs in
   # QA (llm_function_core).
+  # GLM-5.3-Flash FP8 modeling_v2 target on a GB300 tray: GSM8K with MTP-3, its acceptance length and the metadata
+  # contract.
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/test_accuracy.py::TestModelingV2Glm53FlashFp8Sm10xTp4::test_gsm8k_mtp3
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_flashinfer_ring] TIMEOUT (60)
