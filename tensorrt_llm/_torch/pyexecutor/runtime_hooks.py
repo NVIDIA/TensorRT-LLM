@@ -327,6 +327,10 @@ class RuntimeHooks:
     # separate draft model's KV cache manager is resolved from the draft model and does not use it.
     # None keeps the resolved class.
     kv_cache_manager_cls: Optional[type] = None
+    # A subclass of the attention backend class the engine resolves for the model (``attn_backend`` and the model's
+    # sparse attention parameters); the engine uses this subclass instead, and with it the subclass's metadata class
+    # (resolve_attention_backend rejects a class that is not a subclass). None keeps the resolved class.
+    attention_backend_cls: Optional[type] = None
 
     @property
     def skips_unchanged_metadata_uploads(self) -> bool:

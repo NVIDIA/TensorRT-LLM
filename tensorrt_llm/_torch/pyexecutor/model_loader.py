@@ -46,7 +46,7 @@ from ..memory.monitor import names as monitor_names
 from ..mmap_utils import (page_cache_bytes, release_file_page_cache,
                           wait_for_page_migration_to_settle)
 from ..model_config import ModelConfig
-from ..modeling_v2 import modeling_v2_resolve_on_all_ranks
+from ..modeling_v2 import modeling_v2_resolve, modeling_v2_resolve_on_all_ranks
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints import memory_init, model_hooks
 from ..models.checkpoints.base_weight_mapper import BaseWeightMapper
@@ -1326,6 +1326,12 @@ class ModelLoader:
         if architectures:
             preference_cls = get_registered_model_class(
                 architectures[0]) or model_cls
+        if preference_cls is None:
+            # An architecture served only by modeling_v2 targets: the target
+            # supplies the model defaults and engine preferences.
+            preference_cls = model_cls = modeling_v2_resolve(config, llm_args)
+            if model_cls is not None:
+                _reject_unsupported_model_llm_args(llm_args, model_cls)
 
         _validate_encoder_attention_backend_support(preference_cls,
                                                     llm_args.multimodal_config)

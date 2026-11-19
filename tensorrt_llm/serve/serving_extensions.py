@@ -37,10 +37,17 @@ import importlib
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional
 
 if TYPE_CHECKING:
+    from xgrammar.structural_tag import StructuralTag
+
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+    from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 
 
-RequiredToolChoiceMode = Literal["template", "grammar"]
+# "template": the chat template asks for a tool call; "grammar": a mandatory
+# tool-call grammar enforces it; "prefer_grammar": the grammar when the request
+# can carry one (xgrammar, request-level tools, a rendered chat prompt),
+# otherwise the template.
+RequiredToolChoiceMode = Literal["template", "grammar", "prefer_grammar"]
 
 
 class OutputMode(enum.Enum):
@@ -62,6 +69,11 @@ class ServingExtension:
     # Part of the rendering fingerprint: bump it when a revision of the extension changes
     # the prompt it renders, so prepared requests from the older revision are refused.
     render_version: int = 1
+
+    # Chat-message parsing: keep an assistant tool call's arguments string verbatim when it is
+    # not valid JSON, and keep the ``tools`` a system message declares.
+    lenient_tool_call_arguments: bool = False
+    keeps_message_tools: bool = False
 
     def render_prompt(
         self, request: "ChatCompletionRequest", res: Any = None
@@ -126,6 +138,12 @@ class ServingExtension:
     def required_tool_choice_mode(self) -> Optional[RequiredToolChoiceMode]:
         """Return the required-tool policy; boolean permission selects template enforcement."""
         return "template" if self.allows_required_tool_choice() else None
+
+    def build_required_structural_tag(
+        self, parser: "BaseToolParser", tools: List[Any], *, thinking: bool
+    ) -> Optional["StructuralTag"]:
+        """Grammar that forces a tool call for ``tool_choice="required"``; the tool parser's by default."""
+        return parser.build_required_structural_tag(tools, thinking=thinking)
 
     def normalize_reasoning_effort(self, effort: str) -> Optional[str]:
         """Map a protocol-level effort onto what this model's template accepts.

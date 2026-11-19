@@ -33,3 +33,9 @@ l0_gb300_multi_nodes_node2_gpu8:
   # GLM-5.2 NVFP4 modeling_v2 sm_103 tp8 target, GSM8K under modeling_v2="require".
   # Measured 34 min on 2x4 GB300 (batch 1).
   - accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm103Tp8::test_gsm8k_tp8 TIMEOUT (90)
+  # Kimi K3.1 modeling_v2 sm_103 TEP target (TEP8), GSM8K, and DFlash2 w5 GSM8K plus its acceptance-length gate
+  # (two trays).
+  - accuracy/modeling_v2/kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep/test_accuracy.py::TestModelingV2KimiK31ProMxfp4Sm103Tep::test_gsm8k[tep8]
+  - accuracy/modeling_v2/kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep/test_accuracy.py::TestModelingV2KimiK31ProMxfp4Sm103Tep::test_gsm8k_dflash2[tep8]
+  # Kimi K3.1 modeling_v2 NVFP4 default target (TEP8, its validated recipe with DFlash2), GSM8K.
+  - accuracy/modeling_v2/kimi_k31/kimi_k31_pro_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2KimiK31ProNvfp4Sm10xDefault::test_gsm8k[tep8]

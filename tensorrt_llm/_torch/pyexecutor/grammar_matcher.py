@@ -76,6 +76,9 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
                 guided_decoding_config.tokenizer_str)
             vocab_type = metadata["vocab_type"]
             add_prefix_space = metadata["add_prefix_space"]
+        elif guided_decoding_config.vocab_type is not None:
+            vocab_type = xgrammar.VocabType[
+                guided_decoding_config.vocab_type.upper()]
 
         tokenizer_info = xgrammar.TokenizerInfo(
             guided_decoding_config.encoded_vocab,

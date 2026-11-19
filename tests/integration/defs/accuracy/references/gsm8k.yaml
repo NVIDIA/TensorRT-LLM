@@ -429,6 +429,23 @@ moonshotai/Kimi-K3:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 95.2
+moonshotai/Kimi-K3.1-Pro:
+  # The FP8-KV deployments of every K3.1 modeling_v2 gate of the MXFP4 checkpoint (test_gsm8k[tep8] / [dep16],
+  # FP8 index keys) share this key. Reference: 97.94 on GB300, the mean of DEP16 97.84 and TEP8 98.03 (greedy, with
+  # lossless speculation).
+  - kv_cache_quant_algo: FP8
+    accuracy: 97.94
+  # test_gsm8k_dflash2 of the sm_103 perf targets: DFlash2 with block verification, which keeps greedy
+  # decoding's output distribution, so held to the same accuracy.
+  - kv_cache_quant_algo: FP8
+    spec_dec_algo: DFlash
+    accuracy: 97.94
+nvidia/Kimi-K3.1-Pro-NVFP4:
+  # Mean of 19 CI-form greedy GSM8K runs of this checkpoint with DFlash2 on GB300 and Rubin (TEP8, DEP16): 97.566.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DFlash
+    accuracy: 97.57
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8

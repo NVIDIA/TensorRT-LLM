@@ -576,6 +576,46 @@ class TestOpenAIChatIntegration:
         assert response.status_code == 200, response.text
         assert rendered["generation"]["sampling_params"].guided_decoding is not None
 
+    def test_prefer_grammar_uses_the_grammar_when_the_server_can_build_it(
+        self, chat_client, monkeypatch
+    ):
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        client, _, rendered = chat_client
+        server = client.app.state.server
+        model_type = "prefer-grammar-test-model"
+        type(server.model_config).model_type = model_type
+        server.tool_parser = "qwen3_coder"
+        server.generator.args.reasoning_parser = "nemotron-v3"
+
+        async def render_prompt(**kwargs):
+            return "<|im_start|>assistant\n<think>\n"
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", render_prompt)
+
+        @register_serving_extension(model_types=(model_type,))
+        class PreferGrammarExtension(ServingExtension):
+            def required_tool_choice_mode(self):
+                return "prefer_grammar"
+
+        enforced = {}
+        try:
+            for backend in ("xgrammar", None):
+                server.generator.args.guided_decoding_backend = backend
+                response = client.post("/v1/chat/completions", json=self.required_body())
+                assert response.status_code == 200, response.text
+                postproc = server._create_chat_response.call_args.args[1].postproc_args
+                enforced[backend] = (
+                    rendered["generation"]["sampling_params"].guided_decoding is not None,
+                    postproc.tool_parser_grammar_constrained,
+                )
+        finally:
+            serving_extensions._BY_MODEL_TYPE.pop(model_type, None)
+
+        # With xgrammar a grammar enforces the call. Without it, where the "grammar" mode refuses
+        # the request (400), the chat template asks for the call.
+        assert enforced == {"xgrammar": (True, True), None: (False, False)}
+
     @pytest.mark.parametrize("thinking", [False, True])
     @pytest.mark.parametrize("workers", [0, 4])
     def test_required_attaches_mandatory_grammar(self, required_chat_client, thinking, workers):

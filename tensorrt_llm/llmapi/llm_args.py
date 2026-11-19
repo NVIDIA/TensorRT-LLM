@@ -1021,6 +1021,11 @@ class GuidedDecodingConfig(StrictBaseModel):
     tokenizer_str: Optional[str] = Field(
         default=None,
         description="The tokenizer string for guided decoding config.")
+    vocab_type: Optional[Literal["raw", "byte_fallback", "byte_level"]] = Field(
+        default=None,
+        description=
+        "How encoded_vocab spells tokens (xgrammar VocabType) when no "
+        "tokenizer_str is given to detect it from. Defaults to raw.")
     stop_token_ids: Optional[List[int]] = Field(
         default=None,
         description="The stop token ids for guided decoding config.")
@@ -4379,6 +4384,26 @@ def dspark_context_attention_window(model_dir: str,
     if is_mla_dspark_drafter(config):
         return None
     return dflash_context_attention_window(config)
+
+
+def _draft_checkpoint_config(speculative_model) -> Optional[dict]:
+    """The drafter checkpoint's ``config.json`` in TRT-LLM's form.
+
+    None when it is not a readable local file.
+    """
+    if speculative_model is None:
+        return None
+    draft_config_path = os.path.join(str(speculative_model), "config.json")
+    if not os.path.exists(draft_config_path):
+        return None
+    with open(draft_config_path) as f:
+        return translate_speculators_dspark_config(json.load(f))
+
+
+def _is_mla_dflash_drafter(draft_config: Optional[dict]) -> bool:
+    """Whether a drafter ``config.json`` declares an MLA DFlash drafter."""
+    return draft_config is not None and (draft_config.get("dflash_config")
+                                         or {}).get("attention_mode") == "mla"
 
 
 def is_lilicorr_checkpoint(architectures: Optional[List[str]],
@@ -9854,19 +9879,19 @@ class TorchLlmArgs(BaseLlmArgs):
                 # max_batch_size so the validator below raises with the
                 # actionable token-budget message.
 
-        draft_config = None
-        if spec_cfg.speculative_model is not None:
-            draft_config_path = os.path.join(str(spec_cfg.speculative_model),
-                                             "config.json")
-            if os.path.exists(draft_config_path):
-                with open(draft_config_path) as f:
-                    draft_config = translate_speculators_dspark_config(
-                        json.load(f))
+        draft_config = _draft_checkpoint_config(spec_cfg.speculative_model)
 
         arena_before_pool = self._kv_cache_estimation_runs()
-        if spec_cfg.skip_ctx_buffer_budget_check:
+        is_disagg = (self.cache_transceiver_config is not None
+                     and self.cache_transceiver_config.backend is not None)
+        managed_mla = (_is_mla_dflash_drafter(draft_config) and
+                       self.kv_cache_config.use_kv_cache_manager_v2 is not False
+                       and (is_disagg or self.context_parallel_size > 1))
+        if spec_cfg.skip_ctx_buffer_budget_check or managed_mla:
             # Opt out of the pooled-context buffer-fit check (the estimate is
-            # conservative); the token-budget check above still applies.
+            # conservative; an MLA drafter under a cache transceiver or helix
+            # keeps its context in the KV cache manager's pages, not in pooled
+            # buffers); the token-budget check above still applies.
             memory_budget_bytes = None
         elif memory_budget_bytes is None:
             kv_fraction = self.kv_cache_config.free_gpu_memory_fraction
@@ -9983,7 +10008,17 @@ class TorchLlmArgs(BaseLlmArgs):
                 # group-synchronized so the LM-head-TP group's collectives stay
                 # uniform -- see SpecMetadata.group_all_greedy_sample). Only
                 # context parallelism remains gated.
-                rs_parallel_active = self.context_parallel_size > 1
+                # The MLA DFlash2 worker uses the flattened Helix TP group
+                # for full-vocabulary candidate selection and verification;
+                # other DFlash drafters keep the context-parallel gate.
+                dflash_helix = (
+                    spec_mode.is_dflash() and self.cp_config is not None
+                    and self.cp_config.cp_type == CpType.HELIX
+                    and self.tensor_parallel_size == 1
+                    and not self.enable_attention_dp and _is_mla_dflash_drafter(
+                        _draft_checkpoint_config(
+                            self.speculative_config.speculative_model)))
+                rs_parallel_active = self.context_parallel_size > 1 and not dflash_helix
                 rs_guided_active = self.guided_decoding_backend is not None
                 rs_sa_active = getattr(self.speculative_config, "sa_config",
                                        None) is not None

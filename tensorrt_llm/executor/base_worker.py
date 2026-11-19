@@ -406,6 +406,20 @@ class BaseWorker(GenerationExecutor):
                     self._lora_adapter_identities.setdefault(
                         adapter_id, identity)
 
+    def _max_seq_len_counts_whole_sequence(self) -> bool:
+        """Whether max_seq_len bounds the whole sequence, not a rank's share.
+
+        Helix on KVCacheManagerV2 sizes the cache in global tokens; the other
+        context-parallel layouts hold up to max_seq_len tokens on each rank.
+        """
+        mapping = getattr(self, "mapping", None)
+        if mapping is None or not mapping.has_cp_helix():
+            return False
+        from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+            KVCacheManagerV2
+        return isinstance(getattr(self.engine, "kv_cache_manager", None),
+                          KVCacheManagerV2)
+
     def _enqueue_request(self,
                          request: GenerationRequest,
                          result_wait_queue=None) -> int:
@@ -499,27 +513,31 @@ class BaseWorker(GenerationExecutor):
                 else:
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
-            splited_prompt_len = int(prompt_len / cp_size)
+            if self._max_seq_len_counts_whole_sequence():
+                budgeted_prompt_len = prompt_len
+                max_context_length = max_seq_len
+            else:
+                # max_seq_len bounds the share of the prompt one CP rank holds.
+                budgeted_prompt_len = int(prompt_len / cp_size)
+                max_context_length = max_seq_len * cp_size
             if not self.engine.is_generation_model:
                 # The prompt runs in one forward and nothing is generated, so
                 # it may fill max_seq_len; max_tokens=1 has the request
                 # complete with that forward in every executor loop.
-                if prompt_len > max_seq_len * cp_size:
+                if prompt_len > max_context_length:
                     raise ValueError(
                         context_length_exceeded_message(
-                            max_context_length=max_seq_len * cp_size,
+                            max_context_length=max_context_length,
                             num_prompt_tokens=prompt_len))
                 return 1
-            default_max_tokens = max_seq_len - splited_prompt_len
+            default_max_tokens = max_seq_len - budgeted_prompt_len
             if default_max_tokens <= 0:
                 # Reject (never truncate): the prompt leaves no room for even
-                # one generated token. The message reports request-level
-                # totals, not per-CP-rank arithmetic: splited_prompt_len >=
-                # max_seq_len implies len(prompt_token_ids) >= max_seq_len *
-                # cp_size.
+                # one generated token. The message reports the request-level
+                # context limit, not the per-CP-rank arithmetic.
                 raise ValueError(
                     context_length_exceeded_message(
-                        max_context_length=max_seq_len * cp_size,
+                        max_context_length=max_context_length,
                         num_prompt_tokens=prompt_len))
 
             # default_max_tokens is the biggest available value

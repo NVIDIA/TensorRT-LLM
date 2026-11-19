@@ -140,6 +140,9 @@ l0_cpu:
   - unittest/_torch/pyexecutor
   - unittest/_torch/executor/test_handle_responses_fast_path.py
   - unittest/_torch/sampler/test_stop_criteria.py
+  # Kimi K3.1 family: pytest_ignore_collect keeps only the files marked cpu_only (routing, config, the DFlash
+  # context budget, the DSA metadata and the general target's multimodal and MLP construction tests).
+  - unittest/_torch/modeling_v2/models/kimi_k31
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
   - unittest/_torch/disaggregation

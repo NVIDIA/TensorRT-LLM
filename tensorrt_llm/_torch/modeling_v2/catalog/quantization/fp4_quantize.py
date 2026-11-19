@@ -45,7 +45,7 @@ class Fp4Quantize(OpWrapper):
     is something a consumer has to be told, not something its shape shows.
     """
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_107})
 
     # deepseek-r1 reaches this op from both layouts: the swizzled one feeding
     # nvfp4_gemm in the dense and shared-expert MLPs, the linear one feeding the
@@ -55,7 +55,10 @@ class Fp4Quantize(OpWrapper):
     # multiple of 128 it is shorter than the swizzled one; at a multiple of 128
     # the two are the same length and only the cells' byte order tells them
     # apart. glm-5.2 calls it only for its routed experts, past its own
-    # quantizer's 64 rows: linear scales at hidden 6144.
+    # quantizer's 64 rows: linear scales at hidden 6144. kimi-k3.1's NVFP4
+    # targets (the default on sm_103 and sm_107; dep16, helix8 and tep8 on
+    # sm_107) call it for their routed experts: linear scales at the latent
+    # width 3584.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode, hidden 7168, swizzled scales -- the dense MLP's input",

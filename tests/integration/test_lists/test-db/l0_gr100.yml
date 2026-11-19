@@ -275,3 +275,15 @@ l0_gr100:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[FP8_BLOCK_SCALES] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_quant_compile_smoke[NVFP4] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va-fp8-blockwise] TIMEOUT (30)
+  # The Kimi K3.1 family's unit tests on SM 10.7, one entry per directory: the family's ops and kernels and
+  # the three sm_107 NVFP4 targets. Tests of other architectures skip here, and so do the multi-rank tests
+  # (no CI stage runs several SM107 ranks yet).
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_nvfp4__sm_107__dep16
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_nvfp4__sm_107__helix8
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_nvfp4__sm_107__tep8
+  # The general target's MoE ops, its DFlash2 worker's select-and-accept, and its drafter arena.
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default/ops/moe
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default/test_modeling_v2_modeling_dflash_worker_ops.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default/test_modeling_v2_modeling_dflash_arena.py

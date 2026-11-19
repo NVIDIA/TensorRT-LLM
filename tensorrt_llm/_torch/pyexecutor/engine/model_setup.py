@@ -41,6 +41,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledMod
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
 from tensorrt_llm._torch.utils import set_torch_compiling
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.registry import InputProcessor, create_input_processor
@@ -509,7 +510,25 @@ def resolve_attention_backend(
         if sparse_attention_config is not None
         else None
     )
-    return get_attention_backend(llm_args.attn_backend, sparse_params=sparse_params)
+    backend = get_attention_backend(llm_args.attn_backend, sparse_params=sparse_params)
+    # A model may declare a subclass of that backend, and with it the subclass's metadata class
+    # (RuntimeHooks.attention_backend_cls); any other declared class is rejected.
+    declared = runtime_hooks_of(model).attention_backend_cls
+    if declared is None:
+        return backend
+    if not (isinstance(declared, type) and issubclass(declared, backend)):
+        declared_name = declared.__qualname__ if isinstance(declared, type) else repr(declared)
+        raise ValueError(
+            f"{type(model).__name__} declares the attention backend {declared_name} "
+            "(RuntimeHooks.attention_backend_cls), which is not a subclass of "
+            f"{backend.__qualname__}, the backend the engine resolved for this model and configuration."
+        )
+    logger.info_once(
+        f"Using the model-declared attention backend {declared.__qualname__} (a subclass of "
+        f"{backend.__qualname__})",
+        key=f"model_declared_attention_backend_{declared.__qualname__}",
+    )
+    return declared
 
 
 @dataclass(frozen=True)

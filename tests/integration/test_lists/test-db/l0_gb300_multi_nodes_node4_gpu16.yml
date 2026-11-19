@@ -22,3 +22,10 @@ l0_gb300_multi_nodes_node4_gpu16:
   - accuracy/test_kimi3.py::TestKimiK3::test_w4a16_mxfp4[sa] TIMEOUT (90)
   - test_e2e.py::test_multi_nodes_eval[MiniMax-M3-tp16-mmlu]
   - accuracy/test_kimi3.py::TestKimiK3::test_prims_ts TIMEOUT (90)
+  # Kimi K3.1 modeling_v2 sm_103 DEP target (DEP16): GSM8K, GPQA Diamond, and DFlash2 w5 GSM8K plus its
+  # acceptance-length gate.
+  - accuracy/modeling_v2/kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep/test_accuracy.py::TestModelingV2KimiK31ProMxfp4Sm103Dep::test_gsm8k[dep16] TIMEOUT (90)
+  - accuracy/modeling_v2/kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep/test_accuracy.py::TestModelingV2KimiK31ProMxfp4Sm103Dep::test_gpqa_diamond[dep16] TIMEOUT (180)
+  - accuracy/modeling_v2/kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep/test_accuracy.py::TestModelingV2KimiK31ProMxfp4Sm103Dep::test_gsm8k_dflash2[dep16] TIMEOUT (90)
+  # Kimi K3.1 modeling_v2 NVFP4 default target (DEP16, its validated recipe with DFlash2), GSM8K.
+  - accuracy/modeling_v2/kimi_k31/kimi_k31_pro_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2KimiK31ProNvfp4Sm10xDefault::test_gsm8k[dep16] TIMEOUT (90)

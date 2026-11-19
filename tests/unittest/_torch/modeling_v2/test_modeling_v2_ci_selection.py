@@ -116,19 +116,34 @@ _STOCK_PY_REFERENCE = re.compile(
     r"modeling_v2[./]models\b|torch\.ops\.mv2_|register_fake\(\s*f?[\"']mv2_"
 )
 _STOCK_CPP_INCLUDE = re.compile(r'#\s*include\s*"tensorrt_llm/modeling_v2/')
+# Stock files that import family modules: file -> (the names they import, why). A change to
+# such a module selects only its family's tests.
+_STOCK_FAMILY_IMPORTS = {
+    "tensorrt_llm/serve/extensions/__init__.py": (
+        {f"{_MODELS_PACKAGE}.kimi_k31", f"{_MODELS_PACKAGE}.kimi_k31.input_processor"},
+        "the serving-extension registry loads the family's extension in every process that "
+        "consults it, the disaggregated router and trtllm-render included, which build no model",
+    ),
+}
 
 
 def test_stock_code_does_not_reach_modeling_v2(repo: Path = _REPO):
     """Stock code reaches modeling_v2 only through the resolver.
 
     No family import, op call or fake registration in Python, and no modeling_v2
-    header in C++.
+    header in C++. The family imports of ``_STOCK_FAMILY_IMPORTS`` are the exception.
     """
     offenders = []
     for path in sorted((repo / "tensorrt_llm").rglob("*.py")):
         if path.is_relative_to(repo / _PY):
             continue
         text = path.read_text(errors="ignore")
+        allowed = _STOCK_FAMILY_IMPORTS.get(str(path.relative_to(repo)))
+        if allowed is not None:
+            reached = {m for m in _imports(path, repo) if m.startswith(f"{_MODELS_PACKAGE}.")}
+            if reached != allowed[0]:
+                offenders.append(f"{path.relative_to(repo)} imports {sorted(reached)}")
+            continue
         if _STOCK_PY_REFERENCE.search(text) or (
             "modeling_v2" in text
             and any(
@@ -367,6 +382,15 @@ _NO_CI_STAGE = {
     ),
 }
 
+# Target accuracy gates no CI stage or QA platform can run, by test-db path, with what they
+# wait for. No list may run them.
+_NO_PLATFORM = {
+    "accuracy/modeling_v2/kimi_k31/kimi_k31_pro_nvfp4__sm_107__helix8": (
+        "a DEP16 context server and a helix8 generation server on one host, 24 sm_107 GPUs; "
+        "no Rubin host has 24 GPUs, and the gate serves on localhost only"
+    ),
+}
+
 
 def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     """Every modeling_v2 test is in a list some job runs.
@@ -376,12 +400,16 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     deployments, run from the QA lists. Paths are in test-db form: unit tests relative
     to ``tests/``, accuracy tests relative to ``tests/integration/defs/``. Only paths
     are compared: the ``-m cpu_only`` and ``-m "not cpu_only"`` split between stages is
-    not checked. Unit tests under ``_NO_CI_STAGE`` are exempt until a stage can run them.
+    not checked. Unit tests under ``_NO_CI_STAGE`` and accuracy gates under
+    ``_NO_PLATFORM`` are exempt until a stage or platform can run them.
     """
     unit_root, accuracy_root = repo / "tests", repo / "tests/integration/defs"
     test_db = _test_db_entries(repo)
     any_list = test_db + _qa_entries(repo)
     unit_tests = [str(p.relative_to(unit_root)) for p in sorted((repo / _UNIT).rglob("test_*.py"))]
+    accuracy_tests = [
+        str(p.relative_to(accuracy_root)) for p in sorted((repo / _ACC).rglob("test_*.py"))
+    ]
     # An exemption outlives its reason once its tests move, vanish, or a list starts running them.
     stale = sorted(
         where
@@ -389,7 +417,13 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
         if not any(_at_or_under(t, where) for t in unit_tests)
         or any(_runs(e, t) for e in test_db for t in unit_tests if _at_or_under(t, where))
     )
-    assert not stale, f"_NO_CI_STAGE entries with no test or now listed: {stale}"
+    stale += sorted(
+        where
+        for where in _NO_PLATFORM
+        if not any(_at_or_under(t, where) for t in accuracy_tests)
+        or any(_runs(e, t) for e in any_list for t in accuracy_tests if _at_or_under(t, where))
+    )
+    assert not stale, f"_NO_CI_STAGE / _NO_PLATFORM entries with no test or now listed: {stale}"
     # Test-db path -> the test files that stand for it, and the entries that may run them.
     tests = {
         t: ([t], test_db)
@@ -399,11 +433,12 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     for family_dir in _families(repo):
         for d in _targets(family_dir):
             accuracy = repo / _ACC / family_dir.name / d.name
-            if accuracy.is_dir():
+            key = str(accuracy.relative_to(accuracy_root))
+            if accuracy.is_dir() and key not in _NO_PLATFORM:
                 files = [
                     str(p.relative_to(accuracy_root)) for p in sorted(accuracy.rglob("test_*.py"))
                 ]
-                tests[str(accuracy.relative_to(accuracy_root))] = (files, any_list)
+                tests[key] = (files, any_list)
     unreached = [
         path
         for path, (files, entries) in tests.items()

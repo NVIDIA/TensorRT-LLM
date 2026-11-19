@@ -731,6 +731,17 @@ def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
         raise TypeError(f"Unrecognized tokenizer {obj}")
 
 
+def _is_byte_level_vocab(tokenizer) -> bool:
+    """Whether vocabulary strings use the byte-to-unicode mapping (" " is "Ġ").
+
+    Some tiktoken tokenizers (e.g. Kimi's) expose their vocabulary that way,
+    like byte-level BPE tokenizers; xgrammar must then decode it as byte-level
+    or no grammar can match a space or a multi-byte character.
+    """
+    ids = tokenizer.encode(" ", add_special_tokens=False)
+    return bool(ids) and tokenizer.convert_ids_to_tokens(ids)[0] == "Ġ"
+
+
 def _xgrammar_tokenizer_info(tokenizer):
     # Reference: https://github.com/mlc-ai/xgrammar/blob/b9a16de54e1e0eff58da14c65750414cceaf1a6f/python/xgrammar/tokenizer_info.py#L133
     if isinstance(tokenizer, TokenizerBase):
@@ -760,8 +771,12 @@ def _xgrammar_tokenizer_info(tokenizer):
     elif ("vocab_file" in tokenizer.vocab_files_names
           and "tiktoken" in tokenizer.vocab_files_names["vocab_file"]):
         return {
-            "encoded_vocab": encoded_vocab,
-            "stop_token_ids": stop_token_ids
+            "encoded_vocab":
+            encoded_vocab,
+            "stop_token_ids":
+            stop_token_ids,
+            "vocab_type":
+            "byte_level" if _is_byte_level_vocab(tokenizer) else "raw",
         }
     else:
         raise ValueError(f"Unsupported tokenizer type: {type(tokenizer)}")

@@ -65,6 +65,18 @@ from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareR
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
 
 
+def _declares_message_tools(message) -> bool:
+    """Whether a chat message declares message-level tools.
+
+    Message-level tools ride on a system message's ``tools`` key, as
+    ``ChatCompletionRequest``'s tool_choice check and the serving extensions
+    that support them read them.
+    """
+    return (
+        isinstance(message, dict) and message.get("role") == "system" and bool(message.get("tools"))
+    )
+
+
 def _ctx_handoff_slots(response: UCompletionResponse) -> list:
     """The parts of a context response that carry the KV-cache handoff.
 
@@ -549,7 +561,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                 # Opt-in: drop conversation history so the gen worker doesn't
                 # re-parse the full conversation JSON (dominates its GIL at high
                 # concurrency). It uses prompt_token_ids and only reads the last
-                # message; tools are preserved. Config-gated because it's unsafe
+                # message and the tools. Request-level tools are preserved, and
+                # so are the system messages that declare message-level tools:
+                # the gen worker parses those tools' calls and checks
+                # tool_choice against them. Config-gated because it's unsafe
                 # for harmony/multimodal workers (model type is fixed per deploy).
                 if (
                     self._strip_gen_message_history
@@ -557,7 +572,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                     and request.messages
                     and len(request.messages) > 1
                 ):
-                    request.messages = request.messages[-1:]
+                    request.messages = [
+                        message
+                        for message in request.messages[:-1]
+                        if _declares_message_tools(message)
+                    ] + request.messages[-1:]
         else:
             # no ctx response, it's either a generation-only request or a generation-first disagg request
             request.disaggregated_params = DisaggregatedParams(
