@@ -340,6 +340,25 @@ def test_inkling2_text_config_keeps_layout_in_step_with_later_assignments():
     assert text.layer_types[:3] == ["sliding_attention", "full_attention", "sliding_attention"]
 
 
+@pytest.mark.parametrize("before, after", [(6, 12), (12, 6), (48, 2)])
+def test_inkling2_text_config_keeps_the_released_pattern_when_the_layer_count_changes(
+    before, after
+):
+    # Without local_layer_ids the release's pattern applies to any layer count: every sixth layer
+    # is global. Explicit local_layer_ids are kept as given (see the tests above).
+    expected = ["full_attention" if i % 6 == 5 else "sliding_attention" for i in range(after)]
+    text = Inkling2TextConfig(num_hidden_layers=before)
+    text.num_hidden_layers = after
+    assert text.local_layer_ids is None
+    assert text.layer_types == expected
+    assert text.global_layer_ids == [i for i in range(after) if i % 6 == 5]
+    # The same through from_dict's keyword override.
+    overridden = Inkling2TextConfig.from_dict(
+        {"num_hidden_layers": before}, num_hidden_layers=after
+    )
+    assert overridden.layer_types == expected
+
+
 def test_edge_text_config_keeps_legacy_torch_dtype():
     cfg = Cosmos3EdgeTextConfig(torch_dtype="float16")
     assert cfg.dtype == torch.float16
