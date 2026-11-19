@@ -85,9 +85,8 @@ def set_version(version: str, dry_run: bool = False) -> None:
             if not dry_run:
                 file.write_text(new_text)
     if (_ROOT / SCHEMA_DIR).is_dir():
-        if dry_run:
-            print(f"Would sync the version metadata in {SCHEMA_DIR}")
-        else:
+        print(f"{'Would sync' if dry_run else 'Syncing'} the version metadata in {SCHEMA_DIR}")
+        if not dry_run:
             # The generator reads the version from tensorrt_llm/version.py, written above.
             _sync_schemas(check=False)
 
