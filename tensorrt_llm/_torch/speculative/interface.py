@@ -2144,6 +2144,14 @@ class SpecWorkerBase(nn.Module, ABC):
             handler.commit_speculative_states(num_accepted_tokens,
                                               state_indices, num_contexts)
 
+    def prepare_managed_draft_cache(self, draft_model, spec_metadata,
+                                    attn_metadata, resource_manager) -> None:
+        """Runtime hook before each forward (eager, CUDA graph capture or replay) for a worker whose
+        drafter keeps its context KV in the target's KV cache manager; a no-op by default."""
+
+    def snapshot_managed_draft_history(self) -> None:
+        """Runtime hook after each non-warmup forward for such a worker; a no-op by default."""
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if "forward" in cls.__dict__:

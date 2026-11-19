@@ -1791,6 +1791,8 @@ def test_general_warmup_oom_restores_guided_batch_queue(callback_pending: bool) 
             get_last_tokens=lambda _: 1,
             py_draft_tokens=[],
             py_num_accepted_draft_tokens=0,
+            py_end_id=None,
+            py_stop_words_list=None,
         )
         return SimpleNamespace(
             all_requests=lambda: [request], num_context_requests=1, num_generation_requests=0

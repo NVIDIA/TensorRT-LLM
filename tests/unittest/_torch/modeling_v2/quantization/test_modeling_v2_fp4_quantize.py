@@ -86,6 +86,20 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(8192, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     ),
+    "kimi_k31/kimi_k31_pro_nvfp4__sm_10x__default": (
+        Cell(
+            why="k31 nvfp4 default decode: 1 row, latent MoE 3584, linear",
+            spec=dict(shape=(1, 3584), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="k31 nvfp4 default, 37 rows at 3584, linear: no row padding",
+            spec=dict(shape=(37, 3584), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="k31 nvfp4 default prefill, 8192 rows at 3584, linear",
+            spec=dict(shape=(8192, 3584), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

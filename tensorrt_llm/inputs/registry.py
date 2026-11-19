@@ -1298,8 +1298,14 @@ def create_input_processor(
                 .get(model_cls)
         except (RuntimeError, ConfigInputError,
                 UnsupportedError):  # unregistered model
-            logger.info("Unregistered model, using DefaultInputProcessor")
-            input_processor_cls = None
+            # An architecture served only by modeling_v2 has no zoo class to
+            # key the registry by; its family declares the processor.
+            from tensorrt_llm._torch.modeling_v2._router_index import \
+                modeling_v2_input_processor
+            model_cls = None
+            input_processor_cls = modeling_v2_input_processor(config)
+            if input_processor_cls is None:
+                logger.info("Unregistered model, using DefaultInputProcessor")
         if input_processor_cls is not None:
             if "vision_gpu_normalize" in kwargs:
                 kwargs["vision_gpu_normalize"] = kwargs[

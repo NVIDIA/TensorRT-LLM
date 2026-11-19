@@ -1,0 +1,1296 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Fused Kimi-K3 KDA ``[f_a | b] -> f_b`` decode projection (SM100/SM103/SM107).
+
+The TEP target runs it beside the recurrent verify (``kda_verify_rec``) for small verify batches (see
+``ops/ssm/kda_fab_proj``); the launcher is :func:`k31_kda_fab_proj` (end of this file).
+
+One launch computes, for ``x`` of ``1 <= M <= 16`` token rows,
+
+* ``bfa = bf16(x @ W_bfa^T)`` (``W_bfa`` = ``[f_a_proj; b_proj]`` rows, FP32 accumulation);
+* ``beta = bfa[:, 128 : 128 + H]``;
+* ``forget_gate = bf16(bfa[:, :128] @ W_fb^T)`` (FP32 accumulation),
+
+i.e. what a ``[f_a | b]`` GEMM, a slice copy and an ``f_b`` GEMM produce in three to five
+launches.
+
+The kernel runs on a second stream next to the KDA ``qkvg`` GEMM, which fills 96-120 SMs with
+~220 KB of shared memory each (clusters of 4-5 CTAs). It therefore uses 27 large CTAs that fit
+in the SMs the GEMM leaves free; more CTAs (or small ones that land between the GEMM's clusters)
+delay the GEMM.
+
+Design:
+
+* GEMM 1 (``mma.sync``). CTA ``(g, r, s)`` owns token group ``g`` (``8 * ntg``
+  tokens), row group ``r`` (``9 / R`` 16-row tiles of ``W_bfa``, rows past ``N1`` zero-filled by
+  TMA) and the ``s``-th slice of K in 64-wide chunks. One thread TMA-loads the CTA's whole weight
+  slice (before ``griddepcontrol.wait``) and activation slice up front, one mbarrier per chunk.
+  MMA warps tile the CTA's rows x tokens (``mt`` x ``nt`` m16n8k16 tiles each, rows on the MMA M
+  side) and split the chunks into ``kg`` groups, summed through shared memory in a fixed order.
+* Hand-off. Every CTA stores one FP32 partial tile ``[tokens, N1]`` into slots of a per-device
+  workspace that are filled with a sentinel (``0xffffffff``, which no FP32 operation produces);
+  consumers poll the data itself, so no fence, flag or counter sits between the producers' stores
+  and the consumers' loads. The workspace has two halves used by alternate launches. A control
+  warp per CTA takes a ticket from a packed 64-bit counter (high half: launch number, low half:
+  CTAs of the launch that have arrived; the last arrival moves it to the next launch), caches the
+  scalar parameters in shared memory, warms L2 with a share of ``W_fb``, and refills with the
+  sentinel its share of the region the previous launch dirtied in the other half.
+* Tail. The CTAs with the last ``T`` ranks (``T`` = tail work items) become workers. Worker
+  ``(tb, rb)`` TMA-loads its ``W_fb`` row block, polls the ``R * S`` partials of its tokens (in
+  register-sized batches with all loads of a batch in flight), sums them in split order, rounds
+  ``f_a`` to BF16 into shared memory (worker ``rb == 0`` also writes ``beta``) and computes its
+  forget-gate rows with ``mma.sync``. A worker only waits for CTAs with higher ranks or that
+  already run, so progress needs ``T + 1`` co-resident CTAs, not grid-wide co-residency.
+* Launches sharing a device's counter and workspace must not overlap (stream order; with PDL the
+  ticket and the refill happen after ``griddepcontrol.wait``).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import functools
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+import torch
+from cutlass import Float32, Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.runtime import make_ptr
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+#: Width of ``f_a`` (the ``W_fb`` reduction size).
+FA_DIM = 128
+#: Largest token count (two 8-token tiles).
+MAX_M = 16
+#: Largest ``[f_a | b]`` row count (nine 16-row MMA tiles).
+MAX_N1 = 144
+
+_K_CHUNK = 64
+_ROW_BYTES = _K_CHUNK * 2
+_M_TILE = 16
+_N_TILE = 8
+_N1_TILES = MAX_N1 // _M_TILE
+#: Partial floats a tail thread keeps in registers per polling round.
+_POLL_FLOATS = 128
+_SMEM_CAPACITY = utils.get_smem_capacity_in_bytes("sm_100")
+#: L2 eviction hint for the streamed weight (CacheHintSm90::EVICT_FIRST).
+_EVICT_FIRST = 0x12F0000000000000
+#: Partial-tile workspace per device: two halves used by alternate launches.
+_WS_HALF_BYTES = 4 << 20
+#: Device state words: packed ticket, then the dirtied bytes of each workspace half.
+_STATE_WORDS = 8
+_TICKET_WORD, _DIRTY_WORD = 0, 1
+#: The sentinel that marks an empty FP32 workspace word.
+_SENTINEL = -1
+
+# Shared-memory cache of scalar kernel parameters (constant-cache misses in the tail are slow).
+(_P_M, _P_BETA, _P_FG, _P_HALF, _P_RANK, _P_PREV, _P_OTHER) = range(7)
+_NUM_PARAMS = 8
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+@dataclasses.dataclass(frozen=True)
+class FabConfig:
+    """Tiling of one specialization.
+
+    Attributes:
+        ntg: GEMM-1 token tiles (of 8) per CTA.
+        r1: GEMM-1 row groups (1, 3 or 9).
+        s: GEMM-1 K splits.
+        mt: 16-row MMA tiles per warp (divides ``9 // r1``).
+        nt: 8-token MMA tiles per warp.
+        kg: K groups of warps (summed through shared memory).
+        ntb: Tail token tiles per worker (divides ``ntg``).
+        mtb: Tail ``W_fb`` 16-row tiles per worker.
+    """
+
+    ntg: int
+    r1: int
+    s: int
+    mt: int
+    nt: int
+    kg: int
+    ntb: int
+    mtb: int
+
+
+# ---------------------------------------------------------------------------
+# Inline PTX helpers
+# ---------------------------------------------------------------------------
+
+
+def _asm(res, operands, text, constraints, *, loc=None, ip=None):
+    return llvm.inline_asm(
+        res,
+        operands,
+        text,
+        constraints,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def _iv(value, *, loc=None, ip=None):
+    return Int32(value).ir_value(loc=loc, ip=ip)
+
+
+def _lv(value, *, loc=None, ip=None):
+    return Int64(value).ir_value(loc=loc, ip=ip)
+
+
+def _fv(value, *, loc=None, ip=None):
+    return Float32(value).ir_value(loc=loc, ip=ip)
+
+
+def _unpack(res, ty, cls, n, *, loc=None, ip=None):
+    return tuple(cls(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(n))
+
+
+@dsl_user_op
+def _ldsm_x4(addr, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_iv(addr, loc=loc, ip=ip)],
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _mma_bf16(a, b0, b1, c, *, loc=None, ip=None):
+    """``d[16x8] = a[16x16] @ b[16x8] + c`` (BF16 inputs, FP32 accumulate)."""
+    res = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [_iv(x, loc=loc, ip=ip) for x in (*a, b0, b1)] + [_fv(x, loc=loc, ip=ip) for x in c],
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _sts_f32(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
+        "st.shared.f32 [$0], $1;",
+        "r,f",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _lds_v4_f32(addr, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [_iv(addr, loc=loc, ip=ip)],
+        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,r",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _sts_bf16x4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
+    """Round four FP32 values to BF16 (nearest even) and store them as 8 bytes."""
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip)] + [_fv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
+        "{\n.reg .b32 lo, hi;\ncvt.rn.bf16x2.f32 lo, $2, $1;\ncvt.rn.bf16x2.f32 hi, $4, $3;\n"
+        "st.shared.v2.b32 [$0], {lo, hi};\n}",
+        "r,f,f,f,f",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _sts_b64(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
+        "st.shared.b64 [$0], $1;",
+        "r,l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _lds_b64(addr, *, loc=None, ip=None):
+    return Int64(
+        _asm(
+            T.i64(), [_iv(addr, loc=loc, ip=ip)], "ld.shared.b64 $0, [$1];", "=l,r", loc=loc, ip=ip
+        )
+    )
+
+
+@dsl_user_op
+def _ld_relaxed_v4_f32(addr, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [_lv(addr, loc=loc, ip=ip)],
+        "ld.relaxed.gpu.global.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _st_global_bf16(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
+        "{\n.reg .b16 h;\ncvt.rn.bf16.f32 h, $1;\nst.global.b16 [$0], h;\n}",
+        "l,f",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _atom_add_u64(addr, value, *, loc=None, ip=None):
+    return Int64(
+        _asm(
+            T.i64(),
+            [_lv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
+            "atom.relaxed.gpu.global.add.u64 $0, [$1], $2;",
+            "=l,l,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _red_add_u64(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
+        "red.relaxed.gpu.global.add.u64 [$0], $1;",
+        "l,l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_relaxed_u64(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
+        "st.relaxed.gpu.global.u64 [$0], $1;",
+        "l,l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_relaxed_v4_f32(addr, v0, v1, v2, v3, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip)] + [_fv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
+        "st.relaxed.gpu.global.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_sentinel_v4(addr, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip)],
+        "{\n.reg .b32 t;\nmov.b32 t, -1;\nst.global.v4.b32 [$0], {t, t, t, t};\n}",
+        "l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _all_valid4(v0, v1, v2, v3, *, loc=None, ip=None):
+    """1 if none of the four FP32 words is the empty-slot sentinel ``0xffffffff``."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_fv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
+            "{\n.reg .pred p;\n.reg .b32 t;\n"
+            "mov.b32 t, $1;\nsetp.ne.b32 p, t, -1;\n"
+            "mov.b32 t, $2;\nsetp.ne.and.b32 p, t, -1, p;\n"
+            "mov.b32 t, $3;\nsetp.ne.and.b32 p, t, -1, p;\n"
+            "mov.b32 t, $4;\nsetp.ne.and.b32 p, t, -1, p;\n"
+            "selp.u32 $0, 1, 0, p;\n}",
+            "=r,f,f,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_relaxed_u64(addr, *, loc=None, ip=None):
+    return Int64(
+        _asm(
+            T.i64(),
+            [_lv(addr, loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.u64 $0, [$1];",
+            "=l,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _min_s32(a, b, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(a, loc=loc, ip=ip), _iv(b, loc=loc, ip=ip)],
+            "min.s32 $0, $1, $2;",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fence_proxy_async_shared(*, loc=None, ip=None):
+    _asm(None, [], "fence.proxy.async.shared::cta;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _prefetch_l2(addr, nbytes, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _iv(nbytes, loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _griddepcontrol_wait(*, loc=None, ip=None):
+    _asm(None, [], "griddepcontrol.wait;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _griddepcontrol_launch_dependents(*, loc=None, ip=None):
+    _asm(None, [], "griddepcontrol.launch_dependents;", "", loc=loc, ip=ip)
+
+
+# ---------------------------------------------------------------------------
+# Kernel
+# ---------------------------------------------------------------------------
+
+
+class _FabTail:
+    """Control warp, hand-off and tail of the fused kernel (see the module docstring).
+
+    Subclasses set the geometry attributes (``num_ctas``, ``items``, ``tg``, ``threads``, ...),
+    run :meth:`control_warp` and :meth:`refill` on one warp, store their partial tiles into the
+    workspace half cached in shared memory and then run :meth:`tail` on the worker CTAs.
+    """
+
+    def _init_common(self, cfg, n_tiles, n1, n2, k, num_heads, use_pdl, geo):
+        self.cfg = cfg
+        self.n_tiles = n_tiles
+        self.n1 = n1
+        self.n2 = n2
+        self.k = k
+        self.num_heads = num_heads
+        self.use_pdl = use_pdl
+        # Bytes of W_fb (the tail's operand) the control warps warm in L2.
+        self.warm_bytes = n2 * FA_DIM * 2
+        for name, value in geo.items():
+            setattr(self, name, value)
+        self.dirty_bytes = self.groups * cfg.s * self.tg * n1 * 4
+        self.beta_units = _ceil_div(num_heads, 4)
+        # Tail units (4 consecutive rows of one token) a thread polls at once.
+        self.units_per_thread = _ceil_div(
+            cfg.ntb * _N_TILE * (FA_DIM // 4 + self.beta_units), self.threads
+        )
+
+    @cute.jit
+    def make_w2_tma(self, w2_ptr: cute.Pointer):
+        """TMA atom of ``W_fb`` boxes and their shared-memory layout (the tail's row block)."""
+        mW2 = cute.make_tensor(w2_ptr, cute.make_layout((self.n2, FA_DIM), stride=(FA_DIM, 1)))
+        atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
+        )
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            mW2,
+            cute.tile_to_shape(atom, (self.w2_box_rows, _K_CHUNK), order=(0, 1)),
+            (self.w2_box_rows, _K_CHUNK),
+        )
+        layout = cute.tile_to_shape(atom, (self.w2_box_rows, _K_CHUNK, self.w2_boxes), (0, 1, 2))
+        return tma_atom, tma_tensor, layout
+
+    @cute.jit
+    def control_warp(
+        self,
+        params: Int32,
+        bidx: Int32,
+        lane: Int32,
+        m: Int32,
+        w2_addr: Int64,
+        beta_addr: Int64,
+        fg_addr: Int64,
+        ws_addr: Int64,
+        state_addr: Int64,
+    ):
+        """Ticket, parameter cache (in shared memory) and ``W_fb`` L2 warm-up."""
+        if lane == 0:
+            if cutlass.const_expr(self.use_pdl):
+                _griddepcontrol_wait()
+            ticket = _atom_add_u64(state_addr + Int64(_TICKET_WORD * 8), Int64(1))
+            launch = ticket >> 32
+            rank = ticket & Int64(0xFFFFFFFF)
+            if rank == self.num_ctas - 1:
+                # Last arrival: clear the arrivals and advance the launch number in one add.
+                _red_add_u64(state_addr + Int64(_TICKET_WORD * 8), Int64((1 << 32) - self.num_ctas))
+            parity = launch & Int64(1)
+            prev = _ld_relaxed_u64(state_addr + Int64((_DIRTY_WORD + 1 - parity) * 8))
+            if rank == 0:
+                _st_relaxed_u64(
+                    state_addr + Int64((_DIRTY_WORD + parity) * 8), Int64(self.dirty_bytes)
+                )
+            cached = (
+                Int64(m),
+                beta_addr,
+                fg_addr,
+                ws_addr + parity * _WS_HALF_BYTES,
+                rank,
+                prev,
+                ws_addr + (Int64(1) - parity) * _WS_HALF_BYTES,
+            )
+            for i in cutlass.range_constexpr(len(cached)):
+                _sts_b64(params + i * 8, cached[i])
+            # Warm L2 with this CTA's share of W_fb for the tail.
+            total = self.warm_bytes
+            if cutlass.const_expr(total > 0):
+                share = _ceil_div(_ceil_div(total, self.num_ctas), 16) * 16
+                off = bidx * share
+                if off < total:
+                    nbytes = Int32(share)
+                    if off + share > total:
+                        nbytes = total - off
+                    _prefetch_l2(w2_addr + Int64(off), nbytes)
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def refill(self, params: Int32, lane: Int32):
+        """Refill this CTA's share of what the previous launch dirtied in the other half."""
+        prev = _lds_b64(params + _P_PREV * 8)
+        other = _lds_b64(params + _P_OTHER * 8)
+        rank = _lds_b64(params + _P_RANK * 8)
+        share = ((prev + self.num_ctas - 1) // self.num_ctas + 15) // 16 * 16
+        begin = rank * share
+        end = begin + share
+        if end > prev:
+            end = prev
+        off = begin + Int64(lane * 16)
+        while off < end:
+            _st_sentinel_v4(other + off)
+            off = off + 512
+
+    @cute.jit
+    def tail(
+        self,
+        region: Int32,
+        sW2: cute.Tensor,
+        w2_full,
+        tma_atom_w2: cute.CopyAtom,
+        mW2t: cute.Tensor,
+        params: Int32,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        worker: Int32,
+        m: Int32,
+        half: Int64,
+    ):
+        cfg = self.cfg
+        S = cfg.s
+        beta_addr = _lds_b64(params + _P_BETA * 8)
+        fg_addr = _lds_b64(params + _P_FG * 8)
+        tb = worker % self.token_blocks
+        rb = worker // self.token_blocks
+        blk_rows = cfg.mtb * _M_TILE
+        sw2 = region
+        sfa = sw2 + self.w2_smem_bytes
+        tb_rows = cfg.ntb * _N_TILE
+
+        # W_fb row block -> shared memory: TMA boxes of w2_box_rows x 64 columns (128B
+        # swizzle), rows past N2 zero-filled.
+        row0 = rb * blk_rows
+        if warp == 0:
+            # The block reuses shared memory last accessed through the generic proxy.
+            _fence_proxy_async_shared()
+            gW2 = cute.local_tile(mW2t, (self.w2_box_rows, _K_CHUNK), (None, None))
+            tW2s, tW2g = cpasync.tma_partition(
+                tma_atom_w2,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sW2, 0, 2),
+                cute.group_modes(gW2, 0, 2),
+            )
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(w2_full, self.w2_smem_bytes)
+            box0 = row0 // self.w2_box_rows
+            for b in cutlass.range_constexpr(self.w2_boxes):
+                cute.copy(
+                    tma_atom_w2,
+                    tW2g[(None, box0 + b // 2, b % 2)],
+                    tW2s[(None, b)],
+                    tma_bar_ptr=w2_full,
+                )
+
+        # f_a (and, for rb == 0, beta) of the block's tokens: poll the R * S partials of each
+        # 4-row unit until no slot holds the sentinel, then sum them in split order.
+        t0 = tb * tb_rows
+        g = t0 // self.tg
+        upt = FA_DIM // 4 + self.beta_units * Int32(rb == 0)
+        total = tb_rows * upt
+        slot_stride = self.tg * self.n1 * 4
+        U = self.units_per_thread
+        valid = []
+        srcs = []
+        for it in cutlass.range_constexpr(U):
+            idx = tidx + it * self.threads
+            tl = idx // upt
+            u = idx % upt
+            # Unit u covers rows [4 u, 4 u + 4): f_a for u < 32, beta (rows 128 + ...) after.
+            row = 4 * u
+            t = t0 + tl
+            valid.append(Int32(idx < total) * Int32(t < m))
+            srcs.append(half + Int64(((g * S * self.tg + t - g * self.tg) * self.n1 + row) * 4))
+        # Units are polled in batches of `batch` (all their loads in flight together) so the
+        # partials of a batch fit in registers.
+        batch = max(1, _POLL_FLOATS // (4 * S))
+        for b0 in cutlass.range_constexpr(0, U, batch):
+            nb = min(batch, U - b0)
+            parts = cute.make_rmem_tensor((nb * S * 4,), Float32)
+            ready = Int32(0)
+            while ready == 0:
+                ready = Int32(1)
+                for i in cutlass.range_constexpr(nb):
+                    if valid[b0 + i] != 0:
+                        for sp in cutlass.range_constexpr(S):
+                            v = _ld_relaxed_v4_f32(srcs[b0 + i] + Int64(sp * slot_stride))
+                            for e in cutlass.range_constexpr(4):
+                                parts[(i * S + sp) * 4 + e] = v[e]
+                            ready = ready & _all_valid4(*v)
+            for i in cutlass.range_constexpr(nb):
+                if valid[b0 + i] != 0:
+                    idx = tidx + (b0 + i) * self.threads
+                    tl = idx // upt
+                    u = idx % upt
+                    t = t0 + tl
+                    v = [parts[i * S * 4 + e] for e in range(4)]
+                    for sp in cutlass.range_constexpr(1, S):
+                        for e in cutlass.range_constexpr(4):
+                            v[e] = v[e] + parts[(i * S + sp) * 4 + e]
+                    if u < FA_DIM // 4:
+                        kc = u // 16
+                        unit = (u % 16) // 2
+                        dst = sfa + kc * (tb_rows * _ROW_BYTES) + tl * _ROW_BYTES
+                        dst = dst + ((unit ^ (tl & 7)) << 4) + (u % 2) * 8
+                        _sts_bf16x4(dst, *v)
+                    else:
+                        for e in cutlass.range_constexpr(4):
+                            h = 4 * (u - FA_DIM // 4) + e
+                            if h < self.num_heads:
+                                _st_global_bf16(
+                                    beta_addr + Int64((t * self.num_heads + h) * 2), v[e]
+                                )
+        cute.arch.mbarrier_wait(w2_full, 0)
+        cute.arch.barrier()
+
+        # forget_gate[block tokens, block rows] = f_a @ W_fb^T.
+        mat = lane >> 3
+        r = lane & 7
+        a_unit = mat >> 1
+        b_unit = mat & 1
+        ntb = cfg.ntb
+        b_rows = [
+            ((2 * p + (mat >> 1) * min(1, ntb - 1 - 2 * p)) * _N_TILE + r) * _ROW_BYTES
+            for p in range(_ceil_div(ntb, 2))
+        ]
+        # The block's f_a fragments are loaded once per warp; a warp's m-tiles (warp, warp +
+        # num_warps, ...) accumulate independently.
+        nk = FA_DIM // 16
+        bfrag = cute.make_rmem_tensor((nk * _ceil_div(ntb, 2) * 4,), Int32)
+        for kk in cutlass.range_constexpr(nk):
+            b_chunk = sfa + (kk // 4) * (tb_rows * _ROW_BYTES)
+            for p in cutlass.range_constexpr(_ceil_div(ntb, 2)):
+                b = _ldsm_x4(b_chunk + b_rows[p] + ((((kk % 4) * 2 + b_unit) ^ r) << 4))
+                for i in cutlass.range_constexpr(4):
+                    bfrag[(kk * _ceil_div(ntb, 2) + p) * 4 + i] = b[i]
+        mpw = _ceil_div(cfg.mtb, self.num_warps)
+        acc = cute.make_rmem_tensor((mpw * ntb * 4,), Float32)
+        acc.fill(0.0)
+        a_rows = []
+        for w in cutlass.range_constexpr(mpw):
+            # Warps past the block's last m-tile redo it (their results are not stored).
+            mi = _min_s32(warp + w * self.num_warps, cfg.mtb - 1)
+            row_l = mi * _M_TILE + (mat & 1) * 8 + r
+            a_rows.append(
+                sw2
+                + (row_l // self.w2_box_rows) * 2 * (self.w2_box_rows * _ROW_BYTES)
+                + (row_l % self.w2_box_rows) * _ROW_BYTES
+            )
+        for kk in cutlass.range_constexpr(nk):
+            for w in cutlass.range_constexpr(mpw):
+                a = _ldsm_x4(
+                    a_rows[w]
+                    + (kk // 4) * (self.w2_box_rows * _ROW_BYTES)
+                    + ((((kk % 4) * 2 + a_unit) ^ r) << 4)
+                )
+                for j in cutlass.range_constexpr(ntb):
+                    p = j // 2
+                    q = j % 2
+                    o = (w * ntb + j) * 4
+                    base = (kk * _ceil_div(ntb, 2) + p) * 4
+                    d = _mma_bf16(
+                        a,
+                        bfrag[base + 2 * q],
+                        bfrag[base + 2 * q + 1],
+                        (acc[o], acc[o + 1], acc[o + 2], acc[o + 3]),
+                    )
+                    for e in cutlass.range_constexpr(4):
+                        acc[o + e] = d[e]
+        for w in cutlass.range_constexpr(mpw):
+            mi = warp + w * self.num_warps
+            if mi < cfg.mtb:
+                for j in cutlass.range_constexpr(ntb):
+                    for e in cutlass.range_constexpr(4):
+                        tl = j * _N_TILE + 2 * (lane & 3) + (e & 1)
+                        row_l = mi * _M_TILE + (lane >> 2) + (e >> 1) * 8
+                        val = acc[(w * ntb + j) * 4 + e]
+                        if t0 + tl < m and row0 + row_l < self.n2:
+                            _st_global_bf16(
+                                fg_addr + Int64(((t0 + tl) * self.n2 + row0 + row_l) * 2), val
+                            )
+
+
+class K3KdaFabKernel(_FabTail):
+    """``beta``, ``forget_gate`` from ``x``, ``W_bfa`` and ``W_fb`` (see the module docstring).
+
+    Args:
+        cfg: Tiling.
+        n_tiles: Token tiles of 8 (``ceil(M / 8)``) of the specialization.
+        n1: Rows of ``W_bfa`` (``128 + H`` padded to a multiple of 8, at most 144).
+        n2: Rows of ``W_fb`` (a multiple of 16).
+        k: Hidden size (a multiple of 64).
+        num_heads: ``H``; ``beta`` is rows ``[128, 128 + H)`` of ``bfa``.
+        use_pdl: Launch with programmatic dependent launch.
+    """
+
+    def __init__(
+        self,
+        cfg: FabConfig,
+        n_tiles: int,
+        n1: int,
+        n2: int,
+        k: int,
+        num_heads: int,
+        use_pdl: bool,
+    ):
+        validate_config(cfg, n_tiles, n1, n2, k, num_heads)
+        self._init_common(
+            cfg,
+            n_tiles,
+            n1,
+            n2,
+            k,
+            num_heads,
+            use_pdl,
+            _geometry(cfg, n_tiles, n2, k),
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        w1_ptr: cute.Pointer,
+        x_ptr: cute.Pointer,
+        w2_ptr: cute.Pointer,
+        m: Int32,
+        w2_addr: Int64,
+        beta_addr: Int64,
+        fg_addr: Int64,
+        ws_addr: Int64,
+        state_addr: Int64,
+        stream: cuda.CUstream,
+    ):
+        mW = cute.make_tensor(w1_ptr, cute.make_layout((self.n1, self.k), stride=(self.k, 1)))
+        mX = cute.make_tensor(x_ptr, cute.make_layout((m, self.k), stride=(self.k, 1)))
+        atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
+        )
+        w_layout = cute.tile_to_shape(atom, (self.rows_cta, _K_CHUNK, self.max_chunks), (0, 1, 2))
+        x_layout = cute.tile_to_shape(atom, (self.tg, _K_CHUNK, self.max_chunks), (0, 1, 2))
+        tma_atom_w, tma_w = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            mW,
+            cute.tile_to_shape(atom, (self.rows_cta, _K_CHUNK), order=(0, 1)),
+            (self.rows_cta, _K_CHUNK),
+        )
+        tma_atom_x, tma_x = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            mX,
+            cute.tile_to_shape(atom, (self.tg, _K_CHUNK), order=(0, 1)),
+            (self.tg, _K_CHUNK),
+        )
+        tma_atom_w2, tma_w2, w2_layout = self.make_w2_tma(w2_ptr)
+
+        @cute.struct
+        class SharedStorage:
+            mbar: cute.struct.MemRange[cutlass.Int64, self.max_chunks]
+            w2_full: cute.struct.MemRange[cutlass.Int64, 1]
+            params: cute.struct.MemRange[cutlass.Int64, _NUM_PARAMS]
+            # The weight and activation chunk buffers; once the GEMM-1 MMAs are done, the same
+            # bytes hold the warp-partial reduction and then the tail's operands.
+            sW: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, self.sw_elems], 1024]
+            sX: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, self.sx_elems], 1024]
+
+        self.shared_storage = SharedStorage
+        self.kernel(
+            tma_atom_w,
+            tma_w,
+            tma_atom_x,
+            tma_x,
+            w_layout,
+            x_layout,
+            tma_atom_w2,
+            tma_w2,
+            w2_layout,
+            m,
+            w2_addr,
+            beta_addr,
+            fg_addr,
+            ws_addr,
+            state_addr,
+        ).launch(
+            grid=(self.num_ctas, 1, 1),
+            block=(self.threads, 1, 1),
+            smem=self.shared_storage.size_in_bytes(),
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tma_atom_w: cute.CopyAtom,
+        mWt: cute.Tensor,
+        tma_atom_x: cute.CopyAtom,
+        mXt: cute.Tensor,
+        w_layout: cute.ComposedLayout,
+        x_layout: cute.ComposedLayout,
+        tma_atom_w2: cute.CopyAtom,
+        mW2t: cute.Tensor,
+        w2_layout: cute.ComposedLayout,
+        m: Int32,
+        w2_addr: Int64,
+        beta_addr: Int64,
+        fg_addr: Int64,
+        ws_addr: Int64,
+        state_addr: Int64,
+    ):
+        cfg = self.cfg
+        S = cfg.s
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        group = bidx % self.groups
+        rest = bidx // self.groups
+        rgrp = rest % cfg.r1
+        split = rest // cfg.r1
+        base_chunks = self.num_k_chunks // S
+        rem_chunks = self.num_k_chunks % S
+        chunk_count = Int32(base_chunks)
+        chunk_start = split * base_chunks
+        if cutlass.const_expr(rem_chunks > 0):
+            if split < rem_chunks:
+                chunk_count = chunk_count + 1
+                chunk_start = chunk_start + split
+            else:
+                chunk_start = chunk_start + rem_chunks
+
+        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        mbar = storage.mbar.data_ptr()
+        params = storage.params.data_ptr().toint()
+        if warp == 0:
+            with cute.arch.elect_one():
+                for i in cutlass.range_constexpr(self.max_chunks):
+                    cute.arch.mbarrier_init(mbar + i, 1)
+                cute.arch.mbarrier_init(storage.w2_full.data_ptr(), 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.barrier()
+
+        # ---- GEMM-1 loads: the weight never depends on the previous grid. ----
+        if warp == 0:
+            if cutlass.const_expr(self.use_pdl):
+                _griddepcontrol_launch_dependents()
+            cpasync.prefetch_descriptor(tma_atom_w)
+            cpasync.prefetch_descriptor(tma_atom_x)
+            sW = storage.sW.get_tensor(w_layout.outer, swizzle=w_layout.inner)
+            sX = storage.sX.get_tensor(x_layout.outer, swizzle=x_layout.inner)
+            gW = cute.local_tile(mWt, (self.rows_cta, _K_CHUNK), (None, None))
+            gX = cute.local_tile(mXt, (self.tg, _K_CHUNK), (None, None))
+            tWs, tWg = cpasync.tma_partition(
+                tma_atom_w,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sW, 0, 2),
+                cute.group_modes(gW, 0, 2),
+            )
+            tXs, tXg = cpasync.tma_partition(
+                tma_atom_x,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sX, 0, 2),
+                cute.group_modes(gX, 0, 2),
+            )
+            for c in cutlass.range(chunk_count, unroll=1):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbar + c, self.w_chunk_bytes + self.x_chunk_bytes
+                    )
+                cute.copy(
+                    tma_atom_w,
+                    tWg[(None, rgrp, chunk_start + c)],
+                    tWs[(None, c)],
+                    tma_bar_ptr=mbar + c,
+                    cache_policy=Int64(_EVICT_FIRST),
+                )
+            if cutlass.const_expr(self.use_pdl):
+                _griddepcontrol_wait()
+            for c in cutlass.range(chunk_count, unroll=1):
+                cute.copy(
+                    tma_atom_x,
+                    tXg[(None, group, chunk_start + c)],
+                    tXs[(None, c)],
+                    tma_bar_ptr=mbar + c,
+                )
+
+        if warp == self.num_mma_warps:
+            self.control_warp(
+                params, bidx, lane, m, w2_addr, beta_addr, fg_addr, ws_addr, state_addr
+            )
+            self.refill(params, lane)
+        else:
+            self.gemm1(storage, mbar, warp, lane, chunk_count)
+
+        # ---- Warp partials were written to shared memory; sum them in K-group order and
+        # store the CTA's FP32 partial tile into the current workspace half. ----
+        if cutlass.const_expr(self.use_pdl):
+            _griddepcontrol_wait()
+        cute.arch.barrier()
+        m = Int32(_lds_b64(params + _P_M * 8))
+        half = _lds_b64(params + _P_HALF * 8)
+        red = storage.sW.data_ptr().toint()
+        units = self.rows_cta // 4
+        part_base = half + Int64((group * S + split) * self.tg * self.n1 * 4)
+        for o in cutlass.range(tidx, self.tg * units, self.threads, unroll=1):
+            token = o // units
+            u = o % units
+            row = rgrp * self.rows_cta + 4 * u
+            if group * self.tg + token < m and row < self.n1:
+                v = list(_lds_v4_f32(red + (token * self.red_stride + 4 * u) * 4))
+                for w in cutlass.range_constexpr(1, cfg.kg):
+                    v2 = _lds_v4_f32(red + ((w * self.tg + token) * self.red_stride + 4 * u) * 4)
+                    for e in cutlass.range_constexpr(4):
+                        v[e] = v[e] + v2[e]
+                _st_relaxed_v4_f32(part_base + Int64((token * self.n1 + row) * 4), *v)
+        cute.arch.barrier()
+
+        # ---- Tail: the last T ranks are workers. ----
+        worker = Int32(_lds_b64(params + _P_RANK * 8)) - (self.num_ctas - self.items)
+        sW2 = storage.sW.get_tensor(w2_layout.outer, swizzle=w2_layout.inner)
+        if worker >= 0:
+            self.tail(
+                red,
+                sW2,
+                storage.w2_full.data_ptr(),
+                tma_atom_w2,
+                mW2t,
+                params,
+                tidx,
+                warp,
+                lane,
+                worker,
+                m,
+                half,
+            )
+
+    @cute.jit
+    def gemm1(self, storage, mbar, warp: Int32, lane: Int32, chunk_count: Int32):
+        """GEMM-1 MMAs of one MMA warp; its partial tile goes to shared memory."""
+        cfg = self.cfg
+        mt = cfg.mt
+        nt = cfg.nt
+        wk = warp % cfg.kg
+        wmn = warp // cfg.kg
+        wn = wmn % self.warps_n
+        wm = wmn // self.warps_n
+        acc = cute.make_rmem_tensor((mt * nt * 4,), Float32)
+        acc.fill(0.0)
+        w_base = storage.sW.data_ptr().toint()
+        x_base = storage.sX.data_ptr().toint()
+        mat = lane >> 3
+        r = lane & 7
+        a_unit = mat >> 1
+        b_unit = mat & 1
+        a_rows = [((wm * mt + i) * _M_TILE + (mat & 1) * 8 + r) * _ROW_BYTES for i in range(mt)]
+        # Token tiles of this warp, clamped to the CTA's last tile (clamped tiles are not stored).
+        tiles = [_min_s32(wn * nt + j, cfg.ntg - 1) for j in range(nt)]
+        # ldmatrix.x4 row addresses of each tile pair (an odd last tile loads itself twice).
+        b_rows = []
+        for p in cutlass.range_constexpr(_ceil_div(nt, 2)):
+            second = tiles[min(2 * p + 1, nt - 1)]
+            tile = tiles[2 * p] + (mat >> 1) * (second - tiles[2 * p])
+            b_rows.append((tile * _N_TILE + r) * _ROW_BYTES)
+        for c in cutlass.range(wk, chunk_count, cfg.kg, unroll=1):
+            cute.arch.mbarrier_wait(mbar + c, 0)
+            a_chunk = w_base + c * self.w_chunk_bytes
+            x_chunk = x_base + c * self.x_chunk_bytes
+            for ks in cutlass.range_constexpr(_K_CHUNK // 16):
+                a = [
+                    _ldsm_x4(a_chunk + a_rows[i] + (((ks * 2 + a_unit) ^ r) << 4))
+                    for i in range(mt)
+                ]
+                for p in cutlass.range_constexpr(_ceil_div(nt, 2)):
+                    b = _ldsm_x4(x_chunk + b_rows[p] + (((ks * 2 + b_unit) ^ r) << 4))
+                    for q in cutlass.range_constexpr(min(2, nt - 2 * p)):
+                        j = 2 * p + q
+                        for i in cutlass.range_constexpr(mt):
+                            o = (i * nt + j) * 4
+                            d = _mma_bf16(
+                                a[i],
+                                b[2 * q],
+                                b[2 * q + 1],
+                                (acc[o], acc[o + 1], acc[o + 2], acc[o + 3]),
+                            )
+                            for e in cutlass.range_constexpr(4):
+                                acc[o + e] = d[e]
+        # All MMA warps must be done with the chunk buffers before they become the reduction
+        # buffer (named barrier over the MMA warps only).
+        cute.arch.barrier(barrier_id=1, number_of_threads=32 * self.num_mma_warps)
+        red = w_base
+        for j in cutlass.range_constexpr(nt):
+            if wn * nt + j < cfg.ntg:
+                for i in cutlass.range_constexpr(mt):
+                    for e in cutlass.range_constexpr(4):
+                        token = (wn * nt + j) * _N_TILE + 2 * (lane & 3) + (e & 1)
+                        row = (wm * mt + i) * _M_TILE + (lane >> 2) + (e >> 1) * 8
+                        _sts_f32(
+                            red + ((wk * self.tg + token) * self.red_stride + row) * 4,
+                            acc[(i * nt + j) * 4 + e],
+                        )
+
+
+# ---------------------------------------------------------------------------
+# Host side
+# ---------------------------------------------------------------------------
+
+
+def _geometry(cfg: FabConfig, n_tiles: int, n2: int, k: int) -> dict:
+    tg = cfg.ntg * _N_TILE
+    groups = _ceil_div(n_tiles, cfg.ntg)
+    num_k_chunks = k // _K_CHUNK
+    max_chunks = _ceil_div(num_k_chunks, cfg.s)
+    token_blocks = _ceil_div(n_tiles, cfg.ntb)
+    row_blocks = _ceil_div(n2 // _M_TILE, cfg.mtb)
+    w2_smem_bytes = cfg.mtb * _M_TILE * FA_DIM * 2
+    w2_box_rows = min(128, cfg.mtb * _M_TILE)
+    fa_smem_bytes = cfg.ntb * _N_TILE * FA_DIM * 2
+    geo = {
+        "tg": tg,
+        "groups": groups,
+        "num_k_chunks": num_k_chunks,
+        "max_chunks": max_chunks,
+        "token_blocks": token_blocks,
+        "row_blocks": row_blocks,
+        "items": token_blocks * row_blocks,
+        "num_ctas": groups * cfg.r1 * cfg.s,
+        "w2_smem_bytes": w2_smem_bytes,
+        "w2_box_rows": w2_box_rows,
+        "w2_boxes": (cfg.mtb * _M_TILE // w2_box_rows) * (FA_DIM // _K_CHUNK),
+        "workspace_bytes": groups * cfg.s * tg * MAX_N1 * 4,
+    }
+    mtc = _N1_TILES // cfg.r1
+    rows_cta = mtc * _M_TILE
+    warps_m = mtc // cfg.mt
+    warps_n = _ceil_div(cfg.ntg, cfg.nt)
+    num_mma_warps = warps_m * warps_n * cfg.kg
+    red_stride = rows_cta + 4
+    w_chunk_bytes = rows_cta * _ROW_BYTES
+    x_chunk_bytes = tg * _ROW_BYTES
+    red_bytes = cfg.kg * tg * red_stride * 4
+    sw_bytes = max_chunks * w_chunk_bytes
+    sx_bytes = max_chunks * x_chunk_bytes
+    alias_need = max(red_bytes, w2_smem_bytes + fa_smem_bytes)
+    sw_bytes = max(sw_bytes, _ceil_div(max(alias_need - sx_bytes, 0), 1024) * 1024)
+    geo.update(
+        mtc=mtc,
+        rows_cta=rows_cta,
+        warps_m=warps_m,
+        warps_n=warps_n,
+        num_mma_warps=num_mma_warps,
+        # One control warp (ticket, parameters, workspace refill) besides the MMA warps.
+        num_warps=num_mma_warps + 1,
+        threads=32 * (num_mma_warps + 1),
+        red_stride=red_stride,
+        w_chunk_bytes=w_chunk_bytes,
+        x_chunk_bytes=x_chunk_bytes,
+        sw_elems=sw_bytes // 2,
+        sx_elems=sx_bytes // 2,
+        smem_bytes=sw_bytes + sx_bytes + 8 * max_chunks + 8 * _NUM_PARAMS + 2048,
+    )
+    return geo
+
+
+def validate_config(cfg: FabConfig, n_tiles: int, n1: int, n2: int, k: int, num_heads: int) -> None:
+    """Raise ``ValueError`` if ``cfg`` cannot run the given problem."""
+    if not 1 <= n_tiles <= MAX_M // _N_TILE:
+        raise ValueError(f"n_tiles={n_tiles} must be in [1, {MAX_M // _N_TILE}]")
+    if n1 % 8 or not FA_DIM < n1 <= MAX_N1 or not 1 <= num_heads <= n1 - FA_DIM:
+        raise ValueError(f"N1={n1} / num_heads={num_heads} unsupported")
+    if n2 % _M_TILE or k % _K_CHUNK:
+        raise ValueError(f"N2={n2} must be a multiple of 16 and K={k} of 64")
+    if cfg.r1 not in (1, 3, 9) or (_N1_TILES // cfg.r1) % cfg.mt:
+        raise ValueError(f"r1={cfg.r1} / mt={cfg.mt} invalid")
+    elif cfg.ntg < 1 or cfg.nt < 1 or cfg.nt > cfg.ntg or cfg.kg < 1:
+        raise ValueError(f"invalid token tiling {cfg}")
+    if cfg.ntb < 1 or cfg.ntg % cfg.ntb or cfg.mtb < 1:
+        raise ValueError(f"invalid tail tiling {cfg}")
+    if not 1 <= cfg.s <= k // _K_CHUNK:
+        raise ValueError(f"s={cfg.s} invalid for K={k}")
+    geo = _geometry(cfg, n_tiles, n2, k)
+    if (cfg.mtb * _M_TILE) % min(128, cfg.mtb * _M_TILE):
+        raise ValueError(f"{cfg}: the W_fb block must be whole 128-row boxes")
+    if cfg.s * cfg.r1 > 32:
+        raise ValueError(f"{cfg}: more than 32 producer slots per token group")
+    if geo["num_warps"] > 16:
+        raise ValueError(f"{cfg} needs {geo['num_warps']} warps")
+    if geo["items"] > geo["num_ctas"]:
+        raise ValueError(f"{cfg}: {geo['items']} tail items > {geo['num_ctas']} CTAs")
+    if geo["smem_bytes"] > _SMEM_CAPACITY:
+        raise ValueError(f"{cfg} needs {geo['smem_bytes']} B of shared memory")
+    if geo["workspace_bytes"] > _WS_HALF_BYTES:
+        raise ValueError(f"{cfg} needs {geo['workspace_bytes']} B of workspace")
+
+
+def _base_config(n_tiles: int) -> FabConfig:
+    if n_tiles == 1:
+        return FabConfig(ntg=1, r1=3, s=9, mt=1, nt=1, kg=4, ntb=1, mtb=2)
+    return FabConfig(ntg=2, r1=3, s=9, mt=1, nt=2, kg=4, ntb=1, mtb=4)
+
+
+@functools.cache
+def default_config(n_tiles: int, n2: int = 768, k: int = 7168) -> FabConfig:
+    """Tiling for ``ceil(M / 8) = n_tiles``, tuned on GB300 next to the concurrent ``qkvg`` GEMM.
+
+    The concurrent ``qkvg`` GEMM (``k3_fp8w_lowm_gemm``, clusters of 4-5 CTAs) occupies 96-120 of
+    the 152 SMs; more than ~28 CTAs here break its single-wave cluster placement. So the grid is
+    27 CTAs with at most one tail item each.
+    Other shapes keep the tiling with at most ``k / 64`` K splits and enough ``W_fb`` rows per
+    tail item to cover ``n2`` with the CTAs available.
+    """
+    cfg = _base_config(n_tiles)
+    cfg = dataclasses.replace(cfg, s=min(cfg.s, k // _K_CHUNK))
+    geo = _geometry(cfg, n_tiles, n2, k)
+    row_blocks = max(1, geo["num_ctas"] // geo["token_blocks"])
+    mtb = max(cfg.mtb, _ceil_div(n2 // _M_TILE, row_blocks))
+    if mtb > 128 // _M_TILE:
+        mtb = _ceil_div(mtb, 128 // _M_TILE) * (128 // _M_TILE)
+    return dataclasses.replace(cfg, mtb=mtb)
+
+
+@functools.cache
+def _compiled(
+    cfg: FabConfig,
+    n_tiles: int,
+    n1: int,
+    n2: int,
+    k: int,
+    num_heads: int,
+    use_pdl: bool,
+):
+    kernel = K3KdaFabKernel(cfg, n_tiles, n1, n2, k, num_heads, use_pdl)
+    dummy = 1 << 20
+    ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
+    addr = Int64(dummy)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return cute.compile(
+        kernel, ptr, ptr, ptr, Int32(8 * n_tiles), addr, addr, addr, addr, addr, stream
+    )
+
+
+_STATE: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def _device_state(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-device ``(state words, sentinel-filled partial workspace)``.
+
+    Created outside CUDA graph capture (a capture would allocate it from the graph's private
+    pool); :func:`can_use_k3_kda_fab` rejects capturing callers until it exists.
+    """
+    index = _device_index(device)
+    state = _STATE.get(index)
+    if state is None:
+        words = torch.zeros(_STATE_WORDS, dtype=torch.int64, device=device)
+        ws = torch.full((2 * _WS_HALF_BYTES // 4,), _SENTINEL, dtype=torch.int32, device=device)
+        state = (words, ws)
+        _STATE[index] = state
+    return state
+
+
+@functools.cache
+def _is_supported_device(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3), (10, 7))
+
+
+def _check_inputs(x: torch.Tensor, w_bfa: torch.Tensor, w_fb: torch.Tensor, num_heads: int):
+    for name, t in (("x", x), ("w_bfa", w_bfa), ("w_fb", w_fb)):
+        if t.dtype != torch.bfloat16 or t.dim() != 2 or not t.is_contiguous():
+            raise ValueError(f"{name} must be a contiguous 2D bfloat16 tensor")
+        if not t.is_cuda or t.device != x.device or t.data_ptr() % 16:
+            raise ValueError(f"{name} must be a 16-byte aligned tensor on x's CUDA device")
+    m, k = x.shape
+    n1 = w_bfa.shape[0]
+    n2 = w_fb.shape[0]
+    if w_bfa.shape[1] != k or w_fb.shape[1] != FA_DIM:
+        raise ValueError(
+            f"shape mismatch: x {tuple(x.shape)}, w_bfa {tuple(w_bfa.shape)}, "
+            f"w_fb {tuple(w_fb.shape)}"
+        )
+    if not 1 <= m <= MAX_M:
+        raise ValueError(f"M={m} must be in [1, {MAX_M}]")
+    if n1 % 8 or not FA_DIM < n1 <= MAX_N1 or not 1 <= num_heads <= n1 - FA_DIM:
+        raise ValueError(f"N1={n1} / num_heads={num_heads} unsupported")
+    if n2 % _M_TILE or k % _K_CHUNK:
+        raise ValueError(f"N2={n2} must be a multiple of 16 and K={k} of 64")
+
+
+def run_k3_kda_fab(
+    x: torch.Tensor,
+    w_bfa: torch.Tensor,
+    w_fb: torch.Tensor,
+    num_heads: int,
+    beta: torch.Tensor,
+    forget_gate: torch.Tensor,
+    *,
+    use_pdl: bool = True,
+) -> None:
+    """Launch into ``beta`` (``bf16 [M, H]``) and ``forget_gate`` (``bf16 [M, N2]``)."""
+    m, k = x.shape
+    n_tiles = _ceil_div(m, _N_TILE)
+    cfg = default_config(n_tiles, w_fb.shape[0], k)
+    compiled = _compiled(cfg, n_tiles, w_bfa.shape[0], w_fb.shape[0], k, num_heads, use_pdl)
+    words, ws = _device_state(x.device)
+    compiled(
+        make_ptr(cutlass.BFloat16, w_bfa.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.BFloat16, w_fb.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        Int32(m),
+        Int64(w_fb.data_ptr()),
+        Int64(beta.data_ptr()),
+        Int64(forget_gate.data_ptr()),
+        Int64(ws.data_ptr()),
+        Int64(words.data_ptr()),
+        cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
+    )
+
+
+def k31_kda_fab_proj(
+    x: torch.Tensor, w_bfa: torch.Tensor, w_fb: torch.Tensor, num_heads: int, use_pdl: bool = True
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(beta, forget_gate)`` of the KDA ``[f_a | b] -> f_b`` projection in one launch.
+
+    Args:
+        x: ``bf16 [M, K]``, ``1 <= M <= 16``, ``K`` a multiple of 64.
+        w_bfa: ``bf16 [N1, K]``: ``f_a_proj`` rows ``[0, 128)``, ``b_proj`` rows
+            ``[128, 128 + num_heads)``, zero padding (``N1`` a multiple of 8, at most 144).
+        w_fb: ``bf16 [N2, 128]`` (``f_b_proj``), ``N2`` a multiple of 16.
+        num_heads: Rows of ``b_proj``.
+        use_pdl: Launch with programmatic dependent launch: the CTAs become resident and load the weights before
+            the previous grid completes. Without it the launch starts after the previous grid; the results are the
+            same bits either way.
+
+    Returns:
+        ``beta`` ``bf16 [M, num_heads]`` and ``forget_gate`` ``bf16 [M, N2]``, equal to
+        ``bfa = bf16(x @ w_bfa^T)``, ``bfa[:, 128:128 + num_heads]`` and
+        ``bf16(bfa[:, :128] @ w_fb^T)`` (FP32 accumulation).
+    """
+    _check_inputs(x, w_bfa, w_fb, num_heads)
+    beta = torch.empty((x.shape[0], num_heads), dtype=torch.bfloat16, device=x.device)
+    forget_gate = torch.empty((x.shape[0], w_fb.shape[0]), dtype=torch.bfloat16, device=x.device)
+    run_k3_kda_fab(x, w_bfa, w_fb, num_heads, beta, forget_gate, use_pdl=use_pdl)
+    return beta, forget_gate
+
+
+def can_use_k3_kda_fab(
+    x: torch.Tensor, w_bfa: torch.Tensor, w_fb: torch.Tensor, num_heads: int
+) -> bool:
+    """Whether :func:`k31_kda_fab_proj` accepts these inputs (non-raising check)."""
+    if not x.is_cuda or not _is_supported_device(x.device.index):
+        return False
+    if torch.cuda.is_current_stream_capturing() and _device_index(x.device) not in _STATE:
+        return False
+    try:
+        _check_inputs(x, w_bfa, w_fb, num_heads)
+        n_tiles = _ceil_div(x.shape[0], _N_TILE)
+        n2, k = w_fb.shape[0], x.shape[1]
+        validate_config(default_config(n_tiles, n2, k), n_tiles, w_bfa.shape[0], n2, k, num_heads)
+    except ValueError:
+        return False
+    return True
+
+
+__all__ = [
+    "FA_DIM",
+    "FabConfig",
+    "K3KdaFabKernel",
+    "MAX_M",
+    "MAX_N1",
+    "can_use_k3_kda_fab",
+    "default_config",
+    "k31_kda_fab_proj",
+    "run_k3_kda_fab",
+    "validate_config",
+]

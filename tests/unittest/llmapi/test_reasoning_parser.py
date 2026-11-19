@@ -1329,6 +1329,21 @@ def test_auto_detect_kimi_k3(tmp_path):
     assert result == "kimi_k3"
 
 
+@pytest.mark.parametrize("channel, thinking", [("think", True),
+                                               ("response", False)])
+def test_kimi_k31_reads_the_thinking_mode_off_the_prompt(
+        channel: str, thinking: bool):
+    """Kimi K3.1 reads the thinking mode off the rendered prompt.
+
+    Its template ends the generation prompt inside the think channel with
+    thinking on and inside the response channel with it off.
+    """
+    prompt = ("<|open|>user<|sep|>Hi.<|close|>user<|sep|>"
+              f"<|open|>assistant<|sep|><|open|>{channel}<|sep|>")
+    assert ReasoningParserFactory.resolve_prefilled_thinking(
+        "kimi_k31", prompt) is thinking
+
+
 _ARGS = "<arg_value>grep -c \"</think><tool_call>\" log</arg_value></tool_call>"
 _OFF = {"enable_thinking": False}
 

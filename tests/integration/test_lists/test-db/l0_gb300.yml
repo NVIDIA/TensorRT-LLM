@@ -122,6 +122,16 @@ l0_gb300:
   - unittest/_torch/modeling/test_musespark_open_boundary_fusion.py
   - unittest/_torch/modeling/test_musespark_open_cluster_boundary.py
   - unittest/_torch/modeling/test_musespark_open_finalize_local.py
+  # Kimi K3.1 modeling_v2 general target unit tests, with the vision tower against the engine tower and the KDA layer
+  # against the engine KDA mixer. The stage runs -m "not cpu_only"; the cpu_only ones run on l0_cpu.
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default
+  # Kimi K3.1 sm_103 perf target unit tests, with the kernels and ops only that target runs. Their multi-rank tests
+  # (gpu2 / gpu4, an MPI pool each) run post-merge on l0_gb300_multi_gpus.
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep -m "not gpu2 and not gpu4"
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep -m "not gpu2 and not gpu4"
+  # Kimi K3.1 family operations and borrowed kernels; multi-rank ones as above.
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops -m "not gpu2 and not gpu4"
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels -m "not gpu2 and not gpu4"
 - condition:
     ranges:
       system_gpu_count:

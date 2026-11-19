@@ -350,6 +350,37 @@ def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
     assert gen_request.conversation_params.conversation_id == "conv-chat"
 
 
+_WEATHER_TOOL = {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+
+
+def test_stripped_gen_request_keeps_message_level_tools():
+    """gen_strip_message_history keeps the system messages that declare tools.
+
+    The generation worker checks tool_choice="required" against the message-level
+    tools; without the declaring message it rejects the relayed request.
+    """
+    service = _make_service("context_first")
+    service._strip_gen_message_history = True
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "", "tools": [_WEATHER_TOOL]},
+            {"role": "assistant", "content": "Hello."},
+            {"role": "user", "content": "What is the weather in Paris?"},
+        ],
+        tool_choice="required",
+    )
+    ctx_response = _make_chat_response(finish_reason="length", prompt_token_ids=[101, 102, 103])
+
+    gen_request = service._get_gen_request(request, ctx_response, 42)
+
+    assert [message["role"] for message in gen_request.messages] == ["system", "user"]
+    assert gen_request.messages[0]["tools"] == [_WEATHER_TOOL]
+    relayed = ChatCompletionRequest.model_validate(gen_request.model_dump(exclude_unset=True))
+    assert relayed.tool_choice == "required"
+
+
 def test_get_ctx_request_preserves_conversation_params_on_wire():
     service = _make_service("context_first")
     request = CompletionRequest(

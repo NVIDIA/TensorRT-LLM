@@ -68,6 +68,36 @@ def routes(*architectures: str):
     return register
 
 
+# architectures[0] -> ``fn(config) -> input processor class``, filled by ``@input_processor_for``.
+_INPUT_PROCESSORS: Dict[str, Callable[..., Optional[type]]] = {}
+
+
+def input_processor_for(*architectures: str):
+    """Declare the input processor of these ``architectures[0]`` values, which no zoo class registers.
+
+    The decorated ``fn(config) -> Optional[type]`` returns the input processor class for the
+    checkpoint's config, or None for the default tokenizer path. The driver process builds the
+    input processor without building the model, so no target is routed for it.
+    """
+
+    def register(fn):
+        for arch in architectures:
+            _INPUT_PROCESSORS[arch] = fn
+        return fn
+
+    return register
+
+
+def modeling_v2_input_processor(config) -> Optional[type]:
+    """The input processor class the family of ``config.architectures[0]`` declares, or None."""
+    architectures = getattr(config, "architectures", None) or []
+    if not architectures:
+        return None
+    registered_routes()  # imports every family's routing module
+    fn = _INPUT_PROCESSORS.get(architectures[0])
+    return fn(config) if fn is not None else None
+
+
 def registered_routes() -> Dict[str, Callable[..., type]]:
     """architectures[0] -> ``route``, for every family ``models/__init__.py`` imports."""
     from . import models  # noqa: F401

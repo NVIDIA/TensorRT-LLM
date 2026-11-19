@@ -188,12 +188,13 @@ def is_kimi_linear(config):
     """True for Kimi K3 ("kimi_linear") hybrid KDA + MLA text models.
 
     Handles both the flattened text config (model_type "kimi_linear") and the
-    composite VLM config (model_type "kimi_k3" with a nested text_config).
+    composite VLM config (model_type "kimi_k3" or "kimi_k31" with a nested
+    text_config).
     """
     model_type = getattr(config, "model_type", None)
     if model_type == "kimi_linear":
         return getattr(config, "linear_attn_config", None) is not None
-    if model_type == "kimi_k3":
+    if model_type in ("kimi_k3", "kimi_k31"):
         text_config = getattr(config, "text_config", None)
         return text_config is not None and is_kimi_linear(text_config)
     return False
@@ -203,11 +204,11 @@ def unwrap_kimi_text_config(config):
     """Return the flattened Kimi text config.
 
     ``is_kimi_linear`` accepts both the flattened text config and the
-    composite "kimi_k3" config with a nested ``text_config``; consumers read
-    text-level fields (``linear_attn_config``, ``num_hidden_layers``, ...),
-    so they must unwrap the composite form first.
+    composite "kimi_k3" / "kimi_k31" config with a nested ``text_config``;
+    consumers read text-level fields (``linear_attn_config``,
+    ``num_hidden_layers``, ...), so they must unwrap the composite form first.
     """
-    if getattr(config, "model_type", None) == "kimi_k3":
+    if getattr(config, "model_type", None) in ("kimi_k3", "kimi_k31"):
         text_config = getattr(config, "text_config", None)
         if text_config is not None:
             return text_config
@@ -861,6 +862,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
     k3_dspark="K3DsparkConfig",
+    kimi_k31="KimiK31Config",
     laguna="LagunaConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 

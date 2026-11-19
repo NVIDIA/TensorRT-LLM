@@ -61,8 +61,8 @@ _SUPPORTED_REQUESTED_IO_POLICIES = (
 # Model families whose checkpoints are too large to materialize in host RAM;
 # their models stream rank-local slices out of the lazy mmapped handles. The
 # gate reads the raw config.json, so it names the checkpoint's own model_type.
-_LAZY_SAFETENSORS_MODEL_TYPES = ("kimi_k3", "kimi_linear", "glm5_next",
-                                 "glm5_next_text", "muse_spark")
+_LAZY_SAFETENSORS_MODEL_TYPES = ("kimi_k3", "kimi_k31", "kimi_linear",
+                                 "glm5_next", "glm5_next_text", "muse_spark")
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
 # via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.

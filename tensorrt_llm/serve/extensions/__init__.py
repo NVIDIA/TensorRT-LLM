@@ -25,6 +25,9 @@ Submodules may import ``openai_protocol`` (request/response types), which in
 turn imports the registry module. Nothing here may import ``openai_server``.
 """
 
+# A modeling_v2 family's extension, imported here so every process that consults the registry has it.
+from tensorrt_llm._torch.modeling_v2.models.kimi_k31 import input_processor as kimi_k31
+
 from . import deepseek_v41, gpt_oss, kimi_k3, musespark, nemotron
 
-__all__ = ["deepseek_v41", "gpt_oss", "kimi_k3", "musespark", "nemotron"]
+__all__ = ["deepseek_v41", "gpt_oss", "kimi_k3", "kimi_k31", "musespark", "nemotron"]

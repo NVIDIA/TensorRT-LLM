@@ -25,6 +25,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import apply_mm_placeholders
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.serving_extensions import get_serving_extension
 
 
 class VideoURL(TypedDict):
@@ -515,14 +516,17 @@ def parse_chat_messages_coroutines(
     else:
         content_format = ContentFormat.STRING
 
+    # How messages are parsed for this model (tool-call arguments kept
+    # verbatim, message-level tool declarations) is stated by its serving
+    # extension; the default extension keeps the strict parsing.
+    serving_extension = get_serving_extension(model_type)
     for msg in messages:
-        # kimi_k3's reference renderer keeps unparsable tool-call argument
-        # strings verbatim; other templates expect the strict dict contract.
         parsed_msg = parse_chat_message_content(
             msg,
             mm_data_tracker,
-            lenient_tool_call_arguments=(model_type == "kimi_k3"),
-            keep_message_tools=(model_type == "kimi_k3"))
+            lenient_tool_call_arguments=serving_extension.
+            lenient_tool_call_arguments,
+            keep_message_tools=serving_extension.keeps_message_tools)
         conversation.append(parsed_msg)
 
         # Track placeholders added for this message only.

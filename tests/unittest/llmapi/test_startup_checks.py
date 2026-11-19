@@ -200,6 +200,7 @@ def _arch_args(
     encode_only=False,
     model_kwargs=None,
     checkpoint_loader=None,
+    modeling_v2="off",
 ):
     return SimpleNamespace(
         checkpoint_format=checkpoint_format,
@@ -207,6 +208,7 @@ def _arch_args(
         encode_only=encode_only,
         model_kwargs=model_kwargs,
         checkpoint_loader=checkpoint_loader,
+        modeling_v2=modeling_v2,
     )
 
 
@@ -216,6 +218,7 @@ def _arch_args(
         (_arch_args(), ["FooBarForCausalLM"]),
         # model_kwargs overrides the checkpoint's architectures.
         (_arch_args(model_kwargs={"architectures": ["FooBarForCausalLM"]}), ["LlamaForCausalLM"]),
+        (_arch_args(modeling_v2="auto"), ["FooBarForCausalLM"]),
     ],
 )
 def test_unregistered_architecture_is_unsupported(args, architectures):

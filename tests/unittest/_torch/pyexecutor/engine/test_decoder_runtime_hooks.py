@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DecoderRunner and DecoderMetadata wiring of the step-loop hooks a model declares."""
+"""DecoderRunner and DecoderMetadata wiring of the step-loop hooks a model declares, and the attention backend it
+declares."""
 
 from types import SimpleNamespace
 
@@ -13,6 +14,8 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
     MiniMaxM3MsaSparseAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.pyexecutor.engine.model_setup import resolve_attention_backend
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
@@ -123,3 +126,24 @@ def test_an_msa_policy_reaches_the_metadata_and_the_cache():
     assert metadata.attn_metadata.msa_policy is policy
     assert manager.skip_unchanged_block_offsets is True
     assert manager.reuse_pool_views is False
+
+
+def test_a_declared_attention_backend_must_subclass_the_resolved_one():
+    """Without a declaration the engine keeps the backend it resolves; a declared subclass of it replaces it; any
+    other declared class is refused."""
+
+    def model(declared):
+        cls = type("Model", (), {"runtime_hooks": RuntimeHooks(attention_backend_cls=declared)})
+        instance = cls()
+        instance.model_config = SimpleNamespace(
+            sparse_attention_config=None, pretrained_config=None
+        )
+        return instance
+
+    llm_args = SimpleNamespace(attn_backend="TRTLLM")
+    resolved = get_attention_backend("TRTLLM", sparse_params=None)
+    subclass = type("Subclass", (resolved,), {})
+    assert resolve_attention_backend(model(None), llm_args) is resolved
+    assert resolve_attention_backend(model(subclass), llm_args) is subclass
+    with pytest.raises(ValueError, match="not a subclass of"):
+        resolve_attention_backend(model(TrtllmAttentionMetadata), llm_args)

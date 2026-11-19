@@ -15,6 +15,8 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.bindings.executor import FinishReason
@@ -31,8 +33,10 @@ from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.result import GenerationResult, LogProbsResult
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
-from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.executor.utils import (RequestError,
+                                         context_length_exceeded_message)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import LogprobParams, SamplingParams
 
 default_model_name = "Qwen3/Qwen3-0.6B"
@@ -356,6 +360,31 @@ def test_enqueue_request_wraps_lora_load_error():
     with pytest.raises(RequestError,
                        match="Failed to load LoRA adapter: bad adapter"):
         worker._enqueue_request(request)
+
+
+@pytest.mark.cpu_only
+def test_helix_prompt_without_generation_room_is_rejected():
+    """A Helix prompt on KVCacheManagerV2 counts whole against max_seq_len."""
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker._lora_manager = None
+    worker.max_seq_len = 1024
+    worker.mapping = Mapping(world_size=8,
+                             cp_size=8,
+                             cp_config={"cp_type": "HELIX"})
+    worker.engine = SimpleNamespace(
+        is_generation_model=True,
+        kv_cache_manager=Mock(spec=KVCacheManagerV2),
+        enqueue_request=Mock(return_value=1),
+    )
+    request = GenerationRequest(
+        prompt_token_ids=[1] * 1024,
+        sampling_params=SamplingParams(max_tokens=1)).set_id(3)
+
+    with pytest.raises(RequestError) as error:
+        worker._enqueue_request(request)
+
+    assert str(error.value) == context_length_exceeded_message(1024, 1024)
 
 
 def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):

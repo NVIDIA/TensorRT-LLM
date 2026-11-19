@@ -845,6 +845,16 @@ class DecoderRunner(ScheduledModelRunner):
                 # The warmup expert placement counts only the live rows (no attention-DP
                 # dummies or graph padding) and, with min_pos, rows far into their response.
                 moe_warmup_placement.set_live_rows(execution_requests, runtime_draft_len)
+            # A drafter that keeps its context KV in the target's KV cache manager binds this step's
+            # requests to their draft pages from host state, so outside CUDA graphs.
+            spec_worker = self._get_spec_worker() if spec_metadata is not None else None
+            if spec_worker is not None:
+                spec_worker.prepare_managed_draft_cache(
+                    getattr(self._model, "draft_model", None),
+                    spec_metadata,
+                    attn_metadata,
+                    resource_manager,
+                )
             if execution_promoted_context_ids:
                 self._inputs.record_promoted_iter_states(scheduled_requests)
             self._inputs.record_input_copy()
@@ -912,6 +922,14 @@ class DecoderRunner(ScheduledModelRunner):
                 outputs["context_logits_handled"] = True
             if captures_model_body:
                 return outputs
+
+            # The worker's post-forward hook: it queues this step's draft histories on the KV cache
+            # manager, which publishes them once the forward is done (for the KV rewind and the next
+            # step's binding). Warmup and dummy forwards are skipped.
+            if spec_worker is not None and not is_dummy:
+                graph_runner = self._graphs.cuda_graph_runner
+                if graph_runner is None or not graph_runner.is_warmup_only:
+                    spec_worker.snapshot_managed_draft_history()
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
