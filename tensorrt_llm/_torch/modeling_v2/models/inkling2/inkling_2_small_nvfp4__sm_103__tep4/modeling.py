@@ -95,7 +95,15 @@ class Inkling2SmallCore(DecoderModel):
         super().__init__(model_config)
         text = text_config_of(model_config.pretrained_config)
         checkpoint_dir = getattr(model_config.pretrained_config, "_name_or_path", None)
-        self.dims = InklingDims.from_config(text, read_hf_quant_config(checkpoint_dir))
+        hf_quant_config = read_hf_quant_config(checkpoint_dir)
+        if hf_quant_config is None:
+            # Without it every layer would read as BF16 experts, which this target does not serve.
+            raise ValueError(
+                f"Inkling2: found no hf_quant_config.json in {checkpoint_dir!r}, the directory the "
+                "config was loaded from (`_name_or_path`); this target reads each layer's expert "
+                "format from that file, so load the config from the checkpoint directory"
+            )
+        self.dims = InklingDims.from_config(text, hf_quant_config)
         self.shares = _weights.shares_of(self.dims, model_config.mapping)
         self.eps = self.dims.rms_norm_eps
         self.w = _weights.declare(self.shares)
@@ -131,7 +139,7 @@ class Inkling2SmallCore(DecoderModel):
         tile_request, tile_start = tile_plan(lengths, block_t, device)
         kv_lens = [c + n for c, n in zip(cached, lengths)]
         blocks = [-(-length // manager.tokens_per_block) for length in kv_lens]
-        page_tables = self._page_tables(manager, request_ids, blocks, device)
+        page_tables = self._page_tables(manager, request_ids, blocks, cached, device)
         return _Step(
             num_tokens=num_tokens,
             query_start=i32(bounds),
@@ -148,19 +156,21 @@ class Inkling2SmallCore(DecoderModel):
             ),
         )
 
-    def _page_tables(self, manager, request_ids, blocks, device) -> dict:
+    def _page_tables(self, manager, request_ids, blocks, cached, device) -> dict:
         """Each layer's page table `[R, W]` int32 (-1 past a request's pages).
 
         A layer's indices address its own `get_buffers` view. The manager gives the layers of one
         window the same indices; the first step checks that once, after which one table per window
-        is built and shared.
+        is built and shared. Every table is checked to have a live page for each block a request
+        reads this step (see `_check_live_pages`).
         """
 
         def build(layer):
             rows = manager.get_batch_cache_indices(
                 request_ids, layer_idx=layer, num_blocks_per_seq=blocks
             )
-            table = torch.full((len(rows), max(len(r) for r in rows)), -1, dtype=torch.int32)
+            # As wide as the longest read, so a row the manager returns short shows as -1.
+            table = torch.full((len(rows), max(blocks)), -1, dtype=torch.int32)
             for i, r in enumerate(rows):
                 table[i, : len(r)] = torch.tensor(r, dtype=torch.int32)
             return table
@@ -187,12 +197,39 @@ class Inkling2SmallCore(DecoderModel):
             tables = {layer: per_window[window[layer]] for layer in layers}
         else:
             tables = {layer: build(layer) for layer in layers}
-        # One upload per distinct table: the layers of a window share theirs.
+        # One check and one upload per distinct table: the layers of a window share theirs.
+        tokens_per_block = manager.tokens_per_block
+        read_end = torch.tensor(blocks)
+        sliding_start = torch.tensor(
+            [max(0, c - self.dims.sliding_window + 1) // tokens_per_block for c in cached]
+        )
         uploaded = {}
-        for t in tables.values():
+        for layer, t in tables.items():
             if id(t) not in uploaded:
+                start = torch.zeros_like(read_end) if window[layer] else sliding_start
+                self._check_live_pages(t, start, read_end, layer, request_ids)
                 uploaded[id(t)] = t.to(device, non_blocking=True)
         return {layer: uploaded[id(t)] for layer, t in tables.items()}
+
+    @staticmethod
+    def _check_live_pages(table, start, end, layer, request_ids) -> None:
+        """Fail if a block a request reads this step has no page (-1) in `table`.
+
+        Request `r` reads blocks `[start[r], end[r])`: from the window of its first new token on a
+        sliding layer (from block 0 on a global one) to its last token. `KVCacheManagerV2` keeps
+        a sliding layer's pages from `history + 1 - window` on, which covers that range, so a hole
+        there is a broken retention contract, reported here instead of read by the kernels.
+        """
+        blocks = torch.arange(table.shape[1])
+        read = (blocks[None, :] >= start[:, None]) & (blocks[None, :] < end[:, None])
+        holes = (table < 0) & read
+        if bool(holes.any()):
+            row, block = (int(i) for i in holes.nonzero()[0])
+            raise RuntimeError(
+                f"Inkling2: layer {layer}: request {request_ids[row]} reads KV cache block "
+                f"{block}, which has no page; the KV cache manager did not keep the window "
+                "the attention kernels read"
+            )
 
     # ------------------------------------------------------------------------------- forward
 
@@ -366,9 +403,13 @@ class ModelingV2Inkling2SmallNvfp4Sm103Tep4(
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
         text = text_config_of(cfg)
-        # config.json declares bf16 only in its text config; lm_head is built in this dtype.
+        # lm_head is built in the config's dtype, which `ModelConfig.from_pretrained` takes from
+        # the text config when config.json declares none at the top level.
         if getattr(cfg, "torch_dtype", None) is None:
-            cfg.torch_dtype = model_config.torch_dtype or torch.bfloat16
+            raise ValueError(
+                "Inkling2: the config declares no dtype (`torch_dtype`, or `dtype` in its text "
+                "config) to build lm_head in"
+            )
         super().__init__(
             Inkling2SmallCore(model_config),
             config=model_config,

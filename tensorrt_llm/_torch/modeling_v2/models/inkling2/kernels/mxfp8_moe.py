@@ -14,6 +14,12 @@ bounded by `T * top_k / BLOCK_M + E`). Then:
   added atomically into the fp32 output row of its token.
 
 `x^`, the MXFP8-rounded input, is computed once per call by the caller.
+
+Both activation roundings, `x^` (the caller's `mxfp8_quantize`) and `h^`, take the block scale
+`2^ceil(log2(amax / 448))`, as SGLang's Inkling 2 MoE does (`_mxfp8_block` in
+`sglang/kernels/ops/moe/inkling2_moe.py`), so that no value of a block saturates. The OCP MX rule
+`2^(floor(log2(amax)) - 8)` would instead clip a block whose `amax` lies in
+`(448 * 2^k, 512 * 2^k)`.
 """
 
 from __future__ import annotations

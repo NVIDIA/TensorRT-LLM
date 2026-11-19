@@ -90,8 +90,10 @@ class Inkling2KVCacheManager(KVCacheManagerV2):
         dims = InklingDims.from_config(text)
         tp = mapping.tp_size if mapping is not None else 1
         kv_width = dims.num_kv_heads * dims.head_dim // tp
-        # Requests paused by GEN preemption stay resident with their windows, beyond max_batch_size.
-        self.num_conv_slots = max_batch_size + self.gen_preemption_headroom + SPARE_SLOTS
+        # Every sequence the manager admits holds its windows: a retiring request keeps its slot
+        # one more iteration under the overlap scheduler, and a request paused by GEN preemption
+        # keeps its slot, so the base manager's own count sizes the pool.
+        self.num_conv_slots = self.max_admissible_sequences + SPARE_SLOTS
         widths = {"k": kv_width, "v": kv_width, "attn": dims.hidden_size, "mlp": dims.hidden_size}
         device = torch.device("cuda", torch.cuda.current_device())
         self._conv_state = [

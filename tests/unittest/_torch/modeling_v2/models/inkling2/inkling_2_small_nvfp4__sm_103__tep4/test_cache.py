@@ -10,7 +10,11 @@ import torch
 from tensorrt_llm._torch.modeling_v2.models.inkling2.inkling_2_small_nvfp4__sm_103__tep4 import (
     cache,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    _max_admissible_sequences,
+)
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -58,12 +62,27 @@ def _small_text_config() -> SimpleNamespace:
     )
 
 
-def test_conv_slots_cover_requests_paused_by_gen_preemption(monkeypatch):
-    """Paused requests stay resident with their windows: the pool holds them beyond the batch."""
+@pytest.mark.parametrize(
+    "disable_overlap_scheduler, admissible",
+    [(True, 23 + 9), (False, 2 * 23 + 9)],
+    ids=["overlap_off", "overlap_on"],
+)
+def test_conv_slots_cover_every_sequence_the_manager_admits(
+    monkeypatch, disable_overlap_scheduler, admissible
+):
+    """Paused requests (GEN preemption headroom 9) and, under the overlap scheduler, retiring ones
+    hold their windows too: the pool is the base manager's admission count plus the spares."""
+    mapping = Mapping(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4)
 
     def base_init(self, *args, **kwargs):
         self.enable_block_reuse = False
-        self.gen_preemption_headroom = 9
+        self.max_admissible_sequences = _max_admissible_sequences(
+            23,
+            mapping,
+            is_disagg=False,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            gen_preemption_headroom=9,
+        )
 
     monkeypatch.setattr(KVCacheManagerV2, "__init__", base_init)
     # The windows are allocated on the current CUDA device; a CPU stands in for it here.
@@ -74,20 +93,22 @@ def test_conv_slots_cover_requests_paused_by_gen_preemption(monkeypatch):
     )
     manager = cache.Inkling2KVCacheManager(
         pretrained_config=SimpleNamespace(text_config=_small_text_config()),
-        mapping=SimpleNamespace(tp_size=4),
+        mapping=mapping,
         max_batch_size=23,
     )
-    assert manager.num_conv_slots == 23 + 9 + cache.SPARE_SLOTS == 40
-    assert all(t.shape[0] == 40 for t in manager.conv_state(1).values())
+    slots_total = admissible + cache.SPARE_SLOTS
+    assert manager.num_conv_slots == slots_total
+    assert all(t.shape[0] == slots_total for t in manager.conv_state(1).values())
 
-    resident = [f"request-{i}" for i in range(23 + 9)]
+    resident = [f"request-{i}" for i in range(admissible)]
     slots = manager.conv_slots(resident).tolist()
-    assert len(set(slots)) == 32
+    assert len(set(slots)) == admissible
     # The earliest owners keep their slots while the rest are resident.
     assert manager.conv_slots(resident[:3]).tolist() == slots[:3]
     # The spare slots (CUDA-graph padding, warmup) are still there.
-    assert len(set(manager.conv_slots([f"spare-{i}" for i in range(8)]).tolist())) == 8
-    with pytest.raises(RuntimeError, match="all 40 short-convolution slots are in use"):
+    spares = manager.conv_slots([f"spare-{i}" for i in range(cache.SPARE_SLOTS)]).tolist()
+    assert len(set(spares)) == cache.SPARE_SLOTS
+    with pytest.raises(RuntimeError, match=f"all {slots_total} short-convolution slots are in use"):
         manager.conv_slots(["one-too-many"])
 
 

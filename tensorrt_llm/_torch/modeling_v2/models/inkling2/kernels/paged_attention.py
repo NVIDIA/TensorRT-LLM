@@ -19,6 +19,13 @@ query token `t` at position `p` and query head `h` (KV head `h // group`):
 in fp32, rounded once. `sigmoid(lse - sink)` is the probability mass the keys keep against one
 extra logit `sink` of zero value. A program covers `BLOCK_T` tokens of one request and the `group`
 query heads of one KV head, as `BLOCK_T * GROUP_PAD` rows of one tile.
+
+The kernels rely on the KV cache keeping every page they touch: `append_kv` writes only the step's
+new tokens, and `attention` reads only keys `p - window + 1 .. p` on a sliding layer (`0 .. p` on a
+global one). `KVCacheManagerV2` keeps a sliding layer's pages from `history + 1 - window` on, which
+covers that range, and the model checks each step's tables for it on the host. `attention` also
+masks a key whose page index is negative (a recycled page), so a broken contract cannot read
+before the pool.
 """
 
 from __future__ import annotations
@@ -150,6 +157,7 @@ def _attention_kernel(
         k_pos = block + tl.arange(0, BLOCK_N)
         key_ok = (k_pos >= lo) & (k_pos < hi)
         page = tl.load(pt_row + k_pos // PAGE_SIZE, mask=key_ok, other=0).to(tl.int64)
+        key_ok = key_ok & (page >= 0)
         slot_ptr = kv_base + page * stride_pool_page + (k_pos % PAGE_SIZE) * stride_pool_slot
         k = tl.load(slot_ptr[:, None] + offs_d[None, :], mask=key_ok[:, None], other=0.0)
         v = tl.load(
