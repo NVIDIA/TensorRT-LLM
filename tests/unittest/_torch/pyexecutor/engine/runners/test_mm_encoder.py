@@ -103,6 +103,7 @@ def test_mm_encoder_runner_forward_skips_metadata_only_and_missing_length_reques
 
 
 def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> None:
+    """The runner also marks its inputs staged once the towers have run."""
     requests = [
         SimpleNamespace(
             py_multimodal_data={
@@ -132,18 +133,22 @@ def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> Non
         ),
     ]
     embeddings = torch.arange(6).reshape(3, 2)
-    model = SimpleNamespace(extra_attrs={}, forward=Mock(return_value=[embeddings]))
+    calls = Mock()
+    calls.forward.return_value = [embeddings]
+    model = SimpleNamespace(extra_attrs={}, forward=calls.forward)
     runner = MultimodalEncoderRunner(model, encoder_cache_enabled=False, moe_load_balancer=None)
 
     for index, request in enumerate(requests):
         request.py_multimodal_params = MultimodalParams(multimodal_data=request.py_multimodal_data)
         request.get_num_tokens = Mock(return_value=index + 1)
     result = runner.forward(
-        ScheduledInputs(batch=SimpleNamespace(context_requests=requests)),
+        ScheduledInputs(
+            batch=SimpleNamespace(context_requests=requests), inputs_staged=calls.inputs_staged
+        ),
         resource_manager=SimpleNamespace(get_resource_manager=Mock(return_value=None)),
     )
 
-    model.forward.assert_called_once()
+    assert [name for name, _, _ in calls.mock_calls] == ["forward", "inputs_staged.record"]
     params = model.forward.call_args.args[0]
     assert [param.input_ids_start_offset for param in params] == [0, 1]
     assert result["mm_embedding_request_indices"] == [0, 1]

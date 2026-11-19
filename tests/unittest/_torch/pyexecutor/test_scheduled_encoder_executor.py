@@ -208,6 +208,24 @@ class _Harness:
         assert response.result.is_final
         return response.result
 
+    def complete_after_the_loop_takes_the_cancellation(self, request_id: int) -> None:
+        """Hold each launched batch's completion until the loop has taken this cancellation."""
+        executor = self.executor
+        taken = threading.Event()
+        receive, cancel_launched = executor._receive, executor._cancel_launched
+
+        def receive_and_report():
+            receive()
+            if request_id in executor._cancelled_after_launch:
+                taken.set()
+
+        def cancel_once_taken(flight):
+            assert taken.wait(timeout=30)
+            return cancel_launched(flight)
+
+        executor._receive = receive_and_report
+        executor._cancel_launched = cancel_once_taken
+
     def shutdown(self) -> None:
         if not self.closed:
             self.closed = True
@@ -356,8 +374,15 @@ def test_inadmissible_requests_fail_alone():
         assert h.runner.batches == [[fitting]]
 
 
-def test_a_multimodal_encoder_admits_multimodal_requests_and_fails_an_oversized_one_alone():
-    with _harness(completion="multimodal", max_seq_len=32, max_num_tokens=64) as h:
+@pytest.mark.parametrize(
+    ("max_seq_len", "max_num_tokens"), [(32, 64), (64, 32)], ids=["max_seq_len", "max_num_tokens"]
+)
+def test_a_multimodal_encoder_admits_multimodal_requests_and_fails_an_oversized_one_alone(
+    max_seq_len, max_num_tokens
+):
+    with _harness(
+        completion="multimodal", max_seq_len=max_seq_len, max_num_tokens=max_num_tokens
+    ) as h:
         too_long = h.submit(33, py_multimodal_data={"image": {}})
         fitting = h.submit(32, py_multimodal_data={"image": {}})
         h.executor.start_worker()
@@ -395,9 +420,8 @@ def test_cancelling_a_queued_request_finishes_it_once_as_cancelled(completion):
 def test_cancelling_a_launched_request_finishes_it_once_as_cancelled(completion):
     with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.hold()
-        # The launched forward is still running when the loop takes the cancellation.
-        h.runner.gpu_cycles = GPU_CYCLES
         launched, later = h.submit(), h.submit()
+        h.complete_after_the_loop_takes_the_cancellation(launched)
         h.executor.start_worker()
         assert h.runner.entered.wait(timeout=30)
 
@@ -473,7 +497,6 @@ def _cuda_memory_allocated() -> int:
 def test_a_launched_request_whose_result_is_not_delivered_frees_its_exports(cause):
     with _harness(completion="multimodal", max_batch_size=1) as h:
         h.runner.embedding_device = "cuda"
-        h.runner.gpu_cycles = GPU_CYCLES
         if cause == "failed":
 
             def fail_after_the_export(*args, **kwargs):
@@ -483,6 +506,8 @@ def test_a_launched_request_whose_result_is_not_delivered_frees_its_exports(caus
         allocated = _cuda_memory_allocated()
         h.runner.hold()
         launched = h.submit(py_multimodal_data={"image": {}})
+        if cause == "cancelled":
+            h.complete_after_the_loop_takes_the_cancellation(launched)
         h.executor.start_worker()
         assert h.runner.entered.wait(timeout=30)
         if cause == "cancelled":

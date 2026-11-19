@@ -672,11 +672,6 @@ def build_mm_encoder_runner(
     Yields:
         The runner with its loader, model config and resolved capacity.
     """
-    encoder_max_num_tokens = (
-        llm_args.encoder_max_num_tokens
-        if llm_args.encoder_max_num_tokens is not None
-        else llm_args.max_num_tokens
-    )
     with _load_encoder(
         llm_args,
         model_path=model_path,
@@ -684,6 +679,11 @@ def build_mm_encoder_runner(
         mapping=mapping,
         dist=dist,
     ) as loaded:
+        encoder_max_num_tokens = (
+            llm_args.encoder_max_num_tokens
+            if llm_args.encoder_max_num_tokens is not None
+            else loaded.max_num_tokens
+        )
         input_processor = create_engine_input_processor(model_path, llm_args)
         setup_mm_encoder_attn_metadata(loaded.model, input_processor, encoder_max_num_tokens, None)
         compiled = compile_model(
