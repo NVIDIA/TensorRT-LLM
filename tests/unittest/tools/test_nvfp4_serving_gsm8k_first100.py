@@ -677,7 +677,7 @@ def test_failed_append_does_not_complete_or_corrupt_previous_record(tmp_path, mo
     assert set(ledger.load().completed) == {p.id for p in problems}
 
 
-def test_managed_environment_values_are_private_and_rotation_resumes(tmp_path, monkeypatch, capsys):
+def test_managed_environment_values_are_private_and_rotation_resumes(tmp_path, monkeypatch, capfd):
     config = tmp_path / "config.yaml"
     config.write_text("max_batch_size: 1\nmax_seq_len: 69632\n")
     output = tmp_path / "results"
@@ -745,7 +745,7 @@ def test_managed_environment_values_are_private_and_rotation_resumes(tmp_path, m
     ]
     assert all(item["server_env_names"] == ["HF_TOKEN", "MODE"] for item in settings)
     assert all("server_env" not in item for item in settings)
-    captured = capsys.readouterr()
+    captured = capfd.readouterr()
     persisted = "".join(path.read_text() for path in output.iterdir()) + captured.out + captured.err
     for secret in (
         "fake-old-secret",
