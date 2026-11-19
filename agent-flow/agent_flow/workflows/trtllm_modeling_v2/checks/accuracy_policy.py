@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Accuracy floors and systematic-shift policy, independent of launch configuration."""
+"""Accuracy floors, independent of launch configuration."""
 
 from __future__ import annotations
 
@@ -23,12 +23,6 @@ FLOOR_RULES: tuple[str, ...] = (FLOOR_STATISTICAL, FLOOR_TOLERANCE)
 
 #: ``k`` in ``anchor - k * SE`` when the task does not state one.
 DEFAULT_FLOOR_K = 2.0
-
-
-#: A unit gated over fewer members than this gets no cross-member check: one
-#: member below the anchor by more than one SE happens about one time in six
-#: by chance alone.
-DEFAULT_SHIFT_MIN_MEMBERS = 2
 
 
 #: Questions in the split ``trtllm-eval`` scores for each benchmark it ships,
@@ -130,24 +124,16 @@ class FloorPolicy:
     rule: str = FLOOR_STATISTICAL
     k: float = DEFAULT_FLOOR_K
     tolerance: float = 0.0
-    shift_min_members: int = DEFAULT_SHIFT_MIN_MEMBERS
-    #: unit -> the reason a systematic shift on that unit is accepted.
-    acknowledged: Mapping[str, str] | None = None
 
 
 def resolve_floor_policy(accuracy: Mapping[str, Any]) -> FloorPolicy:
     """Read ``accuracy.floor`` (and ``accuracy.tolerance`` for the tolerance rule)."""
     block = accuracy.get("floor")
     block = block if isinstance(block, Mapping) else {}
-    acknowledged = block.get("acknowledge")
     return FloorPolicy(
         rule=str(block.get("rule") or FLOOR_STATISTICAL),
         k=float(block.get("k", DEFAULT_FLOOR_K)),
         tolerance=float(accuracy.get("tolerance") or 0.0),
-        shift_min_members=int(block.get("shift_min_members", DEFAULT_SHIFT_MIN_MEMBERS)),
-        acknowledged={str(k): str(v) for k, v in acknowledged.items()}
-        if isinstance(acknowledged, Mapping)
-        else {},
     )
 
 
@@ -168,76 +154,17 @@ def floor_for(
     return statistical_floor(reference, samples, policy.k)
 
 
-@dataclass(frozen=True)
-class ShiftFinding:
-    """Every member of a unit below the anchor by more than one SE."""
-
-    unit: str | None
-    reference: float
-    #: member -> (measured, SE)
-    members: Mapping[str, tuple[float, float]]
-    acknowledged: str | None = None
-
-    def describe(self) -> str:
-        """One line naming every member, its score and how many SE it sits below."""
-        shown = ", ".join(
-            f"{member} {measured:.2f} ({(measured - self.reference) / se:+.1f} SE)"
-            for member, (measured, se) in self.members.items()
-        )
-        head = (
-            f"systematic shift on `{self.unit}`: every member is below the anchor "
-            f"{self.reference:.2f} by more than 1 SE: {shown}"
-        )
-        if self.acknowledged:
-            return f"{head}. Acknowledged in task.yaml: {self.acknowledged}"
-        return (
-            f"{head}. Each member passed its own floor, but a shift every member shares "
-            f"is what a defect in shared code looks like. Delivery is blocked until it "
-            f"is explained or acknowledged under `accuracy.floor.acknowledge.{self.unit}`"
-        )
-
-
-def systematic_shift(
-    unit: str | None,
-    readings: Mapping[str, tuple[float, float, float]],
-    *,
-    min_members: int = DEFAULT_SHIFT_MIN_MEMBERS,
-    acknowledged: Mapping[str, str] | None = None,
-) -> ShiftFinding | None:
-    """A finding when every member scored more than one SE under its reference.
-
-    ``readings`` maps member -> ``(measured, reference, se)``. ``None`` when
-    fewer than ``min_members`` members were measured, or when any member is
-    within one SE of (or above) its reference.
-    """
-    if len(readings) < max(1, min_members):
-        return None
-    below = {
-        member: (measured, se)
-        for member, (measured, reference, se) in readings.items()
-        if se > 0 and measured < reference - se
-    }
-    if len(below) != len(readings):
-        return None
-    reference = sum(r for _, r, _ in readings.values()) / len(readings)
-    reason = (acknowledged or {}).get(str(unit)) if unit is not None else None
-    return ShiftFinding(unit=unit, reference=reference, members=below, acknowledged=reason)
-
-
 __all__ = [
     "DEFAULT_FLOOR_K",
-    "DEFAULT_SHIFT_MIN_MEMBERS",
     "FLOOR_RULES",
     "FLOOR_STATISTICAL",
     "FLOOR_TOLERANCE",
     "Floor",
     "FloorPolicy",
     "KNOWN_BENCHMARK_SAMPLES",
-    "ShiftFinding",
     "floor_for",
     "relative_floor",
     "resolve_floor_policy",
     "statistical_floor",
-    "systematic_shift",
     "tolerance_floor",
 ]

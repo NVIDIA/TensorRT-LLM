@@ -743,10 +743,10 @@ MX_GEMV_BF16_MAX_TOKENS: Dict[Tuple[int, int], int] = {
 }  # capacity: fixed: measured bf16-GEMV crossover per projection
 # MX-TAC (the TP2 target's, ported): the decode-graph MXFP8 projections the GEMVs do not serve (SHARED_DOWN at 17..32
 # rows, rows over DECODE_MAX_TOKENS or a bf16 activation over MX_GEMV_BF16_MAX_TOKENS, or a GEMV decline) take one fixed
-# decision instead of the AutoTuner's per-start, per-rank choice: FlashInfer's CuTe DSL quantize and CuTe DSL GEMM. All
-# of stock's candidates (quantize {TRT-LLM, CuTe DSL} x GEMM {CUTLASS, CuTe DSL}) give the same bits at the TP4
-# projections (gemm/test_modeling_v2_m3_pinned_gemm.py), so the pin is stock's output on every rank and start. Kill
-# constant: False returns these projections to the AutoTuner.
+# decision instead of the AutoTuner's per-start, per-rank choice: FlashInfer's CuTe DSL quantize and CuTe DSL GEMM.
+# The quantizers match bitwise; GEMM outputs from different tactics can differ
+# (gemm/test_modeling_v2_m3_mxfp8_pinned_gemm.py). A constant is rank-agreed and start-independent by construction.
+# False returns these projections to the AutoTuner.
 MX_TAC_TP4 = True
 # The tactics below are MXFP8QuantizeRunner.CUTE_DSL / FlashInferMXFP8GemmRunner.CUTE_DSL (0).
 MXFP8_DECODE_QUANT_TACTIC = 0  # capacity: fixed: a tactic id, not a size

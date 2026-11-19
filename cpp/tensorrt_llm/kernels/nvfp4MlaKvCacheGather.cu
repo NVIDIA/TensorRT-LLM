@@ -44,6 +44,16 @@ constexpr int32_t kMlaHeadDim = 576;
 constexpr int32_t kMlaResidualDim = 64;
 constexpr int32_t kMlaPackedHeadDim = kMlaHeadDim / 2;
 constexpr int32_t kMlaScalesPerToken = kMlaHeadDim / 16;
+// residual_dim == 2 * kMlaResidualDim selects the inline-scale record of FlashInfer PrimTS D576
+// "nvfp4.fp8rope": [E2M1 NoPE 256 B][E4M3 RoPE 64 B][E4M3 NoPE block scales 32 B] with scale block b
+// at byte 320 + 8 * (b % 4) + b / 4 and no scale pool.
+constexpr int32_t kMlaRecordResidualDim = 2 * kMlaResidualDim;
+constexpr int32_t kMlaRecordBytes = (kMlaHeadDim + kMlaRecordResidualDim) / 2;
+constexpr int32_t kMlaRecordNopeGroups = (kMlaHeadDim - kMlaResidualDim) / 16;
+constexpr int32_t kMlaRecordRopeOffset = kMlaRecordNopeGroups * 8;
+constexpr int32_t kMlaRecordScaleOffset = kMlaRecordRopeOffset + kMlaResidualDim;
+static_assert(kMlaRecordNopeGroups == kWarpSize, "One lane dequantizes one NoPE scaling group.");
+static_assert(kMlaRecordScaleOffset + kMlaRecordNopeGroups == kMlaRecordBytes);
 constexpr int32_t kMlaStagingBuffers = 3;
 constexpr size_t kWorkspaceAlignment = 256;
 
@@ -477,6 +487,43 @@ __device__ __forceinline__ void dequantizeRow(uint8_t const* __restrict__ dataPo
     }
 }
 
+// Expands one inline-scale record (kMlaRecordBytes) to a 576-wide E4M3 row. One warp per row.
+// The record's block scales and RoPE values are real-valued: no global scale applies.
+__device__ __forceinline__ void dequantizeRecordRow(uint8_t const* __restrict__ dataPool,
+    __nv_fp8_e4m3* __restrict__ output, int32_t globalIdx, int32_t outputIdx, int32_t lane)
+{
+    auto const* record = dataPool + static_cast<int64_t>(globalIdx) * kMlaRecordBytes;
+    auto* outputRow = output + static_cast<int64_t>(outputIdx) * kMlaHeadDim;
+    int32_t const group = lane;
+    uint2 const packed = *reinterpret_cast<uint2 const*>(record + static_cast<int64_t>(group) * 8);
+    __nv_fp8_e4m3 const scale
+        = reinterpret_cast<__nv_fp8_e4m3 const*>(record + kMlaRecordScaleOffset)[8 * (group % 4) + group / 4];
+    *reinterpret_cast<uint4*>(outputRow + static_cast<int64_t>(group) * 16)
+        = convertUnitScaledE2m1x16ToE4m3(packed, scale);
+    if (lane < kMlaResidualDim / 16)
+    {
+        *reinterpret_cast<uint4*>(outputRow + kMlaRecordNopeGroups * 16 + lane * 16)
+            = *reinterpret_cast<uint4 const*>(record + kMlaRecordRopeOffset + lane * 16);
+    }
+}
+
+__global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp4MlaRecordKvCacheGatherKernel(
+    uint8_t const* __restrict__ dataPool, int32_t const* __restrict__ globalIndices, __nv_fp8_e4m3* __restrict__ output,
+    int32_t* __restrict__ compactIndices, int64_t numPairs, int64_t numPoolTokens)
+{
+    int32_t const warp = threadIdx.x / kWarpSize;
+    int32_t const lane = threadIdx.x % kWarpSize;
+    int64_t const pairStride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
+    for (int64_t pair = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp; pair < numPairs; pair += pairStride)
+    {
+        int32_t const globalIdx = fetchGlobalIndex(globalIndices, compactIndices, pair, numPoolTokens, lane);
+        if (globalIdx >= 0)
+        {
+            dequantizeRecordRow(dataPool, output, globalIdx, static_cast<int32_t>(pair), lane);
+        }
+    }
+}
+
 template <int32_t kResidualDim, bool kCompactLayout>
 __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp4MlaKvCacheGatherKernel(
     uint8_t const* __restrict__ dataPool, __nv_fp8_e4m3 const* __restrict__ scalePool,
@@ -738,7 +785,14 @@ __global__ void markContextTopKKernel(int32_t const* __restrict__ localTopKIndic
     }
 }
 
-template <bool kMlaLayout>
+enum class MlaContextRowLayout
+{
+    kGeneric,
+    kResidual,
+    kRecord,
+};
+
+template <MlaContextRowLayout kLayout>
 __global__ void nvFp4MlaContextKvCacheGatherKernel(uint8_t const* __restrict__ dataPool,
     __nv_fp8_e4m3 const* __restrict__ scalePool, int32_t const* __restrict__ selectedFlags,
     int32_t const* __restrict__ selectedOffsets, int32_t const* __restrict__ selectedGlobalIndices,
@@ -749,6 +803,7 @@ __global__ void nvFp4MlaContextKvCacheGatherKernel(uint8_t const* __restrict__ d
     int32_t const lane = threadIdx.x % kWarpSize;
     float const dequantScale = globalDequantScale == nullptr ? 1.F : globalDequantScale[0];
     // Keep GLM row strides and scaling-group bounds constant through dequantization.
+    constexpr bool kMlaLayout = kLayout == MlaContextRowLayout::kResidual;
     int32_t const effectiveHeadDim = kMlaLayout ? kMlaHeadDim : headDim;
     int32_t const effectiveResidualDim = kMlaLayout ? kMlaResidualDim : residualDim;
     int64_t packedToken = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
@@ -778,7 +833,11 @@ __global__ void nvFp4MlaContextKvCacheGatherKernel(uint8_t const* __restrict__ d
         if (globalIdx >= 0 && static_cast<int64_t>(globalIdx) < numPoolTokens && outputIdx >= 0
             && outputIdx < outputCapacity)
         {
-            if (dequantScale == 1.F)
+            if constexpr (kLayout == MlaContextRowLayout::kRecord)
+            {
+                dequantizeRecordRow(dataPool, output, globalIdx, outputIdx, lane);
+            }
+            else if (dequantScale == 1.F)
             {
                 dequantizeRow<true>(dataPool, scalePool, output, globalIdx, outputIdx, effectiveHeadDim,
                     effectiveResidualDim, dequantScale, lane);
@@ -828,6 +887,11 @@ int32_t getPersistentBlockCount(int64_t workItems, int32_t blocksPerSm = kBlocks
 
 } // namespace
 
+bool isNvFp4MlaRecordLayout(int32_t headDim, int32_t residualDim)
+{
+    return headDim == kMlaHeadDim && residualDim == kMlaRecordResidualDim;
+}
+
 void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool, int32_t const* globalIndices,
     __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale, int32_t numRows, int32_t topK,
     int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream)
@@ -875,6 +939,12 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
             nvFp4MlaKvCacheGatherKernel<0, false><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
                 globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens);
         }
+    }
+    else if (isNvFp4MlaRecordLayout(headDim, residualDim))
+    {
+        int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
+        nvFp4MlaRecordKvCacheGatherKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
+            dataPool, globalIndices, output, compactIndices, numPairs, numPoolTokens);
     }
     else if (headDim == kMlaHeadDim && residualDim == kMlaResidualDim)
     {
@@ -973,9 +1043,9 @@ void invokeNvFp4MlaContextKvCacheGatherDirect(uint8_t const* dataPool, __nv_fp8_
         scanWorkspace, tokenScanWorkspaceSize, selectedFlags, selectedOffsets, maxKvTokens, stream));
 
     int32_t const gatherBlocks = getPersistentBlockCount(maxKvTokens);
-    nvFp4MlaContextKvCacheGatherKernel<false><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
-        selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, maxKvTokens, outputCapacity,
-        headDim, residualDim, numPoolTokens);
+    nvFp4MlaContextKvCacheGatherKernel<MlaContextRowLayout::kGeneric><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(
+        dataPool, scalePool, selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale,
+        maxKvTokens, outputCapacity, headDim, residualDim, numPoolTokens);
     TLLM_CUDA_CHECK(cudaGetLastError());
 
     remapContextGlobalTopKKernel<<<pairBlocks, kThreadsPerBlock, 0, stream>>>(localTopKIndices, queryReqIndices,
@@ -1043,15 +1113,23 @@ void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 c
     int32_t const gatherBlocks = getPersistentBlockCount(totalKvTokens);
     if (headDim == kMlaHeadDim && residualDim == kMlaResidualDim)
     {
-        nvFp4MlaContextKvCacheGatherKernel<true><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
-            selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, totalKvTokens,
-            outputCapacity, headDim, residualDim, numPoolTokens);
+        nvFp4MlaContextKvCacheGatherKernel<MlaContextRowLayout::kResidual>
+            <<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool, selectedFlags, selectedOffsets,
+                selectedGlobalIndices, output, globalDequantScale, totalKvTokens, outputCapacity, headDim, residualDim,
+                numPoolTokens);
+    }
+    else if (isNvFp4MlaRecordLayout(headDim, residualDim))
+    {
+        nvFp4MlaContextKvCacheGatherKernel<MlaContextRowLayout::kRecord><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(
+            dataPool, scalePool, selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale,
+            totalKvTokens, outputCapacity, headDim, residualDim, numPoolTokens);
     }
     else
     {
-        nvFp4MlaContextKvCacheGatherKernel<false><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
-            selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, totalKvTokens,
-            outputCapacity, headDim, residualDim, numPoolTokens);
+        nvFp4MlaContextKvCacheGatherKernel<MlaContextRowLayout::kGeneric>
+            <<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool, selectedFlags, selectedOffsets,
+                selectedGlobalIndices, output, globalDequantScale, totalKvTokens, outputCapacity, headDim, residualDim,
+                numPoolTokens);
     }
     TLLM_CUDA_CHECK(cudaGetLastError());
 

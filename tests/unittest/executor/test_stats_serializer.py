@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.iteration_stats import IterationStatsRecord
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -124,6 +125,96 @@ def _make_mock_kv_iter_stats(
 
 
 class TestStatsSerializer:
+    def test_native_json_is_not_decoded_for_transport(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tensorrt_llm._torch.pyexecutor import iteration_stats
+
+        native = _make_mock_iteration_stats()
+        record = IterationStatsRecord(native, attention_dp_rank=3, host_step_time_ms=12.5)
+        expected = record.to_dict()
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                iteration_stats.json,
+                "loads",
+                MagicMock(side_effect=AssertionError("native JSON was decoded")),
+            )
+            wire = BaseWorker._stats_serializer(record)
+        assert json.loads(wire) == expected
+
+    def test_named_record_preserves_all_wire_fields(self):
+        iter_stats = _make_mock_iteration_stats()
+        req_stats = MagicMock()
+        req_stats.to_json_str.return_value = json.dumps({"id": 42})
+        loop = {"kind": "loop", "per_iter": {"iter": 9, "globalRank": 4}}
+        record = IterationStatsRecord(
+            iteration_stats=iter_stats,
+            request_stats=[req_stats],
+            attention_dp_rank=3,
+            host_step_time_ms=12.5,
+            prev_device_step_time_ms=1.25,
+            scheduler_mode="overlap",
+            gpu_forward_time_ms=4.25,
+            mm_encoder_stats={"gpuTimesMS": [2.5]},
+            executor_loop=loop,
+        )
+        expected = {
+            **json.loads(iter_stats.to_json_str()),
+            "requestStats": [{"id": 42}],
+            "attentionDpRank": 3,
+            "hostStepTimeMS": 12.5,
+            "prevDeviceStepTimeMS": 1.25,
+            "schedulerMode": "overlap",
+            "gpuForwardTimeMS": 4.25,
+            "executorLoop": loop,
+            "multimodalEncoderStats": {"gpuTimesMS": [2.5]},
+        }
+        assert json.loads(BaseWorker._stats_serializer(record)) == expected
+        assert json.loads(BaseWorker._stats_serializer(tuple(record))) == expected
+
+    @pytest.mark.parametrize("field_count", range(2, 13))
+    def test_legacy_tuple_prefixes_and_future_trailing_fields(self, field_count):
+        iter_stats = _make_mock_iteration_stats()
+        loop = {"kind": "loop", "per_iter": {"iter": 9}}
+        legacy = (
+            iter_stats,
+            None,
+            None,
+            3,
+            12.5,
+            1.25,
+            "overlap",
+            4.25,
+            {"gpuTimesMS": [2.5]},
+            loop,
+            True,
+            "future field",
+        )[:field_count]
+        expected = {
+            **json.loads(iter_stats.to_json_str()),
+            "attentionDpRank": 3 if field_count >= 4 else 0,
+        }
+        for required_fields, key, value in (
+            (5, "hostStepTimeMS", 12.5),
+            (6, "prevDeviceStepTimeMS", 1.25),
+            (7, "schedulerMode", "overlap"),
+            (8, "gpuForwardTimeMS", 4.25),
+            (9, "multimodalEncoderStats", {"gpuTimesMS": [2.5]}),
+            (10, "executorLoop", loop),
+            (11, "isQueueSnapshot", True),
+        ):
+            if field_count >= required_fields:
+                expected[key] = value
+        assert json.loads(BaseWorker._stats_serializer(legacy)) == expected
+
+    def test_tagged_per_rank_dictionary_preserves_wire_fields(self):
+        stats = {
+            "iter": 9,
+            "rank": 3,
+            "kvCacheStats": {"maxNumBlocks": 10, "usedNumBlocks": 4},
+        }
+        assert json.loads(BaseWorker._stats_serializer(("per_rank_dict", stats))) == stats
+
     @pytest.mark.parametrize("times", [[], [0.0, 2.5]])
     def test_serializer_encoder_gpu_samples(self, times):
         iter_stats = _make_mock_iteration_stats()
@@ -132,6 +223,29 @@ class TestStatsSerializer:
         assert result["multimodalEncoderStats"]["gpuTimesMS"] == times
         legacy = json.loads(BaseWorker._stats_serializer(stats[:8]))
         assert "multimodalEncoderStats" not in legacy
+
+    def test_serializer_marks_queue_snapshots(self):
+        iter_stats = _make_mock_iteration_stats()
+        measured = IterationStatsRecord(
+            iter_stats,
+            host_step_time_ms=6.0,
+            prev_device_step_time_ms=4.0,
+            scheduler_mode="overlap",
+            gpu_forward_time_ms=2.0,
+        )
+        snapshot = measured._replace(
+            host_step_time_ms=0.0,
+            prev_device_step_time_ms=0.0,
+            gpu_forward_time_ms=0.0,
+            is_queue_snapshot=True,
+        )
+        assert json.loads(BaseWorker._stats_serializer(snapshot))["isQueueSnapshot"] is True
+        assert snapshot.to_dict()["isQueueSnapshot"] is True
+        assert "isQueueSnapshot" not in json.loads(BaseWorker._stats_serializer(measured))
+        # A tuple from before the marker existed is a measured record.
+        assert "isQueueSnapshot" not in json.loads(
+            BaseWorker._stats_serializer(tuple(measured)[:10])
+        )
 
     def test_serializer_without_kv_iter_stats(self):
         """Legacy 2-tuple and 3-tuple with None should produce same output."""
@@ -300,6 +414,27 @@ class TestStatsSerializer:
         assert "prevDeviceStepTimeMS" not in d
         assert d["schedulerMode"] == "overlap"
         assert d["gpuForwardTimeMS"] == 4.25
+
+    def test_loop_observation_keeps_its_identity_separate_from_the_batch(self):
+        iter_stats = _make_mock_iteration_stats()
+        loop = {
+            "kind": "loop",
+            "per_iter": {
+                "iter": 9,
+                "loopSequence": 12,
+                "globalRank": 4,
+                "numFetchedRequestsTotal": 17,
+            },
+        }
+        result = BaseWorker._stats_serializer(
+            (iter_stats, None, None, None, 12.5, None, "overlap", 4.25, None, loop)
+        )
+        data = json.loads(result)
+        assert data["executorLoop"] == loop
+        assert data["hostStepTimeMS"] == 12.5
+        assert data["executorLoop"]["per_iter"]["iter"] == 9
+        # Old tuple producers retain their original shape and do not gain fake loops.
+        assert "executorLoop" not in json.loads(BaseWorker._stats_serializer((iter_stats, None)))
 
     def test_serializer_with_v2_pool_group_stats(self):
         """KV cache manager V2 stats should include pool group breakdown."""

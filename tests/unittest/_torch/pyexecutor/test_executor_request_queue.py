@@ -11,6 +11,7 @@ import datetime
 import queue
 import threading
 import time
+import types
 from unittest.mock import Mock, patch
 
 import pytest
@@ -282,6 +283,92 @@ def test_get_from_request_queue_with_timeout(executor_queue):
 
     assert len(items) == 0
     assert elapsed < 0.2  # Should finish within timeout
+
+
+@pytest.fixture
+def idle_wait(executor_queue, monkeypatch):
+    """Replace the blocking queue wait and its clock with a scripted pair.
+
+    ``waits`` records every timeout the queue was asked to block for; an item
+    put in ``arrivals`` is returned by the wait instead of timing out.
+    """
+    from tensorrt_llm._torch.pyexecutor import executor_request_queue as module
+
+    state = types.SimpleNamespace(now=100.0, waits=[], arrivals=[])
+
+    def get(timeout=None):
+        # A wait that never ends must fail the test, not hang it.
+        assert len(state.waits) < 100, "the idle wait did not end"
+        state.waits.append(timeout)
+        if state.arrivals:
+            return state.arrivals.pop(0)
+        state.now += timeout
+        raise queue.Empty
+
+    monkeypatch.setattr(
+        module, "time",
+        types.SimpleNamespace(monotonic=lambda: state.now, time=time.time))
+    monkeypatch.setattr(executor_queue.request_queue, "get", get)
+    return state
+
+
+@pytest.mark.parametrize("tick_period,expected_waits",
+                         [(0.125, [0.125, 0.125, 0.125]),
+                          (0.25, [0.25, 0.125])])
+def test_get_from_request_queue_runs_idle_tick_between_waits(
+        executor_queue, idle_wait, tick_period, expected_waits):
+    """The idle callback slices the wait; the timeout still bounds it."""
+    idle_tick = Mock(return_value=tick_period)
+
+    items = executor_queue.get_from_request_queue(
+        datetime.timedelta(seconds=0.375), idle_tick=idle_tick)
+
+    assert items == []
+    assert idle_wait.waits == expected_waits
+    # It runs before every wait and once more when the timeout has elapsed.
+    assert idle_tick.call_count == len(expected_waits) + 1
+
+
+def test_get_from_request_queue_idle_tick_does_not_delay_requests(
+        executor_queue, idle_wait):
+    """A request ends an unbounded idle wait at once, whatever the tick period."""
+    item = RequestQueueItem(7, Mock())
+    idle_wait.arrivals.append(item)
+    idle_tick = Mock(return_value=30.0)
+
+    items = executor_queue.get_from_request_queue(None, idle_tick=idle_tick)
+
+    assert items == [item]
+    assert idle_wait.waits == [30.0]
+    idle_tick.assert_called_once()
+
+
+@pytest.mark.parametrize("timeout", [None, datetime.timedelta(0)])
+def test_get_from_request_queue_skips_idle_tick_without_a_wait(
+        executor_queue, timeout):
+    """Queued requests and non-blocking fetches never reach the idle callback."""
+    idle_tick = Mock(return_value=1.0)
+    item = RequestQueueItem(7, Mock())
+    if timeout is None:
+        executor_queue.request_queue.put(item)
+
+    items = executor_queue.get_from_request_queue(timeout, idle_tick=idle_tick)
+
+    assert items == ([item] if timeout is None else [])
+    idle_tick.assert_not_called()
+
+
+def test_get_from_request_queue_bounds_a_spinning_idle_tick(
+        executor_queue, idle_wait):
+    """A callback that asks for no wait cannot turn the wait into a busy loop."""
+    idle_tick = Mock(return_value=0.0)
+
+    items = executor_queue.get_from_request_queue(
+        datetime.timedelta(seconds=0.01), idle_tick=idle_tick)
+
+    assert items == []
+    assert len(idle_wait.waits) <= 11
+    assert min(idle_wait.waits) > 0
 
 
 def test_get_from_request_queue_async_behavior(executor_queue):

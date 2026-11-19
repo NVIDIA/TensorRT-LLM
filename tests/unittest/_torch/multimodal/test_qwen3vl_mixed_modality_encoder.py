@@ -12,6 +12,7 @@ disagg entrypoint) delegates to, so this suite covers both paths.
 
 from typing import Optional
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
@@ -24,6 +25,8 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemMetadata,
     MultimodalParams,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _encode_batched(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:

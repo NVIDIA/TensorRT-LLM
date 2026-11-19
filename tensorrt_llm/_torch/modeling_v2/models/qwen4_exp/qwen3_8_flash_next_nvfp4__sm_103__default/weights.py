@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Weight table and loader: Qwen3.8-Flash-Next-NVFP4 (hf-fc694b5_orig) / sm_103 / default.
+"""Weight table and loader: Qwen3.8-Flash-Next-NVFP4 / sm_103 / default.
+
+The n-gram table retains its stored FP8 or BF16 dtype. MTP experts retain native
+NVFP4 storage or the checkpoint's FP8 block-scale format.
 
 One `W` per weight role (shape, checkpoint source, the rank's cut, dtype, load-time
 transform); `Qwen4ExpDefaultWeights` unrolls the table into declaration, manifest and load.
@@ -32,7 +35,7 @@ scalars are derived in `modeling.py` after load.
   work in 128-row blocks), so each half is zero-extended to `expert_inter` = 256 rows (FC2
   to 256 columns) with zero codes and zero block scales before the relayout: SwiGLU of a
   zero row pair is zero and a zero FC2 column adds nothing, so the padding is exact.
-* **The MTP layer's FP8 block-scale experts** are split by expert over the whole TP
+* **The MTP layer's experts** are split by expert over the whole TP
   group at every member, `[128r, 128r + 128)`: the FP8 runner takes `H` and `I` in
   multiples of 128, which 640 / 4 is not.
 
@@ -70,8 +73,8 @@ Transforms:
   checkpoint row order. Under trtllm-gen a second copy of the window in the CuteDSL
   layout (`fc*_cd`) is declared when the core keeps it (`moe_prefill_copy`);
 * n-gram table: 128 row chunks concatenated into one `[rows, 160]` buffer (the hash
-  emits global row indices). It is replicated, and host-resident by default
-  (`_host_resident_empty`): one copy per rank.
+  emits global row indices). It is host-resident by default, one copy per rank, per server
+  or per node (`qwen4_exp/ple_host_table.py`).
 
 The n-gram table is not in the table: its height is a checkpoint fact, so `load`
 registers it with `torch.empty` (`_declare_ngram_table`) and adds its rows to the
@@ -79,8 +82,10 @@ manifest (`ngram_table_sources`).
 
 Not loaded: `mtp.*` when there is no `speculative_config`. With one, the MTP module is
 loaded at this rank's share, including the draft layer's own QSA indexer. MTP experts
-are plain row-major FP8 128x128: `[up ; gate]` concat, bf16 `weight_scale_inv` cast to
-fp32; `mtp_experts_to_nvfp4` requantizes a rank's window to NVFP4 after load.
+are either plain row-major FP8 128x128 (`[up ; gate]` concat, bf16
+`weight_scale_inv` cast to fp32) or native NVFP4 with per-16 block scales and
+per-tensor scalars. `mtp_experts_to_nvfp4` requantizes an FP8 window after load;
+native NVFP4 operands retain their checkpoint precision.
 
 `load(model, weights)` fills every declared parameter once and asserts coverage both
 ways: every parameter written, and every checkpoint key consumed (a key read through a
@@ -98,11 +103,14 @@ import torch
 from cuda.bindings import runtime as cudart
 from torch import nn
 
+from tensorrt_llm._torch.models.modeling_utils import moe_experts_quant_config
 from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.llmapi.utils import get_numa_aware_cpu_affinity
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .. import ple_host_table as _ple_host
 from .pool import attention_tp_size
 
 #: `layers=ALL_LAYERS`, the default: the weight is on every layer.
@@ -140,12 +148,14 @@ class W:
     `transform` runs on the cut tensor(s) before the copy, on the destination's
     device, with the dimension bundle: the kernels' relayouts, with no slicing of
     their own. `None` means the cut is already the declared shape.
+
+    `dtype` is a storage dtype or a callable of the dimension bundle.
     """
 
     name: str
     shape: Callable[[Any], tuple[int, ...]]
     src: str | Callable
-    dtype: torch.dtype | None = None
+    dtype: torch.dtype | Callable[[SimpleNamespace], torch.dtype] | None = None
     cut: Callable[[Any], Any] | None = None
     transform: Callable | None = None
     layers: object | None = ALL_LAYERS
@@ -219,7 +229,7 @@ class _RegisteredHostBuffer:
     device's random row gathers from 64 KiB pages run 2.5x (64 tokens) to 23x
     (1024 tokens) slower.
 
-    Not torch's pinned allocator: it rounds the 47.7 GiB table up to 64 GiB, and on
+    Not torch's pinned allocator: it rounds a 47.7 GiB FP8 table up to 64 GiB, and on
     GB300 the device's random row gathers from its pages run an order of magnitude
     slower than from registered pageable memory."""
 
@@ -272,13 +282,9 @@ def _host_resident_empty(
     is a view through a device address and owns nothing.
     """
     itemsize = torch.empty(0, dtype=dtype).element_size()
-    assert itemsize == 1, (
-        f"the host-resident allocation reinterprets a `|u1` buffer, so its "
-        f"element must be one byte; {dtype} is {itemsize}"
-    )
     assert device.type == "cuda", f"host offload needs a cuda device to map into; got {device}"
 
-    host = _RegisteredHostBuffer(rows * cols, device)
+    host = _RegisteredHostBuffer(rows * cols * itemsize, device)
     (device_pointer,) = CUASSERT(cudart.cudaHostGetDevicePointer(host.pointer, 0))
 
     # No public torch API builds a tensor over a pointer the caching allocator
@@ -286,7 +292,7 @@ def _host_resident_empty(
     # `|u1` because the protocol has no float8 typestr; reinterpreted below.
     interface = SimpleNamespace(
         __cuda_array_interface__={
-            "shape": (rows, cols),
+            "shape": (rows, cols * itemsize),
             "typestr": "|u1",
             "data": (int(device_pointer), False),
             "version": 3,
@@ -295,7 +301,7 @@ def _host_resident_empty(
     )
     table = torch.as_tensor(interface, device=device).view(dtype)
     # `torch.as_tensor` copies when it decides the buffer is not already on the
-    # requested device; a copy here would be a silent 48 GiB device allocation.
+    # requested device; a copy here would silently allocate the whole table on the device.
     assert table.data_ptr() == int(device_pointer), (
         "torch.as_tensor copied the host-mapped buffer instead of viewing it, "
         "so the table would be device-resident after all"
@@ -318,8 +324,8 @@ SF_VEC = 16
 # weight scales and along the activation row.
 FP8_BLOCK = 128
 
-#: The PLE n-gram table's storage: the checkpoint's FP8 per-tensor quantization, kept as
-#: stored (the gather dequantizes the rows it reads).
+#: The scaled PLE table's default storage. The loader also accepts unscaled BF16,
+#: retaining the stored dtype (the gather dequantizes the rows it reads).
 PLE_TABLE_DTYPE = torch.float8_e4m3fn
 
 #: The multiple a rank's stored routed-expert intermediate is padded up to. It is the
@@ -609,23 +615,30 @@ def _expert_fc2_s_cd(t: torch.Tensor, d) -> torch.Tensor:
 
 
 def _mtp_fc1_w(t: tuple[torch.Tensor, ...], d) -> torch.Tensor:
-    """(up, gate) e4m3 codes -> one draft expert's FC1 operand, `[up ; gate]` on
-    the row axis and nothing else. The FP8 block-scale runner reads the
-    checkpoint's plain row-major layout."""
+    """One draft expert's FC1: row-major FP8 or the packed NVFP4 runner layout."""
+    if d.mtp_nvfp4:
+        return _expert_fc1_w(t, _TRTLLM_GEN_LAYOUT)
     up, gate = t
     return torch.cat([up, gate], dim=0).contiguous()
 
 
 def _mtp_fc1_s(t: tuple[torch.Tensor, ...], d) -> torch.Tensor:
-    """(up, gate) 128x128 block scales -> one draft expert's FC1 scale operand:
-    the same `[up ; gate]` concatenation, cast bf16 -> fp32."""
+    """Draft FC1 scales: FP8 block-scale concatenation or NVFP4 row/scale relayout."""
+    if d.mtp_nvfp4:
+        return _expert_fc1_s(t, _TRTLLM_GEN_LAYOUT)
     up, gate = t
     return torch.cat([up, gate], dim=0).to(torch.float32).contiguous()
 
 
+def _mtp_fc2_w(tensor: torch.Tensor, dims: SimpleNamespace) -> torch.Tensor:
+    """Keep FP8 row-major weights or relayout packed NVFP4 draft weights."""
+    return _expert_fc2_w(tensor, _TRTLLM_GEN_LAYOUT) if dims.mtp_nvfp4 else tensor
+
+
 def _mtp_fc2_s(t: torch.Tensor, d) -> torch.Tensor:
-    """`down_proj.weight_scale_inv` -> the FC2 scale operand: a bf16 -> fp32
-    cast, no relayout."""
+    """Draft FC2 scales: FP8 inverse block scales or the NVFP4 runner layout."""
+    if d.mtp_nvfp4:
+        return _expert_fc2_s(t, _TRTLLM_GEN_LAYOUT)
     return t.to(torch.float32).contiguous()
 
 
@@ -722,6 +735,11 @@ def _mtp_only(d):
     return [d.num_layers] if d.mtp_enabled else []
 
 
+def _mtp_nvfp4_only(dims: SimpleNamespace) -> list[int]:
+    """The draft layer when its checkpoint experts are packed NVFP4."""
+    return _mtp_only(dims) if dims.mtp_nvfp4 else []
+
+
 # --- where the bytes come from ---
 
 
@@ -787,6 +805,20 @@ def _mtp_mlp(i):
     return f"{_MTP_LAYER}.mlp"
 
 
+def _mtp_scale_sources(*projections: str) -> Callable:
+    """Checkpoint scale sources for the draft experts' declared precision."""
+
+    def sources(dims: SimpleNamespace, layer: int | None) -> list[tuple]:
+        suffix = "weight_scale" if dims.mtp_nvfp4 else "weight_scale_inv"
+        return _experts(
+            _mtp_mlp,
+            *(f"{projection}.{suffix}" for projection in projections),
+            window=_mtp_window,
+        )(dims, layer)
+
+    return sources
+
+
 def _in_proj(d, i):
     """The Gated-DeltaNet input projections at this rank's heads, in the row order of
     the concatenated `in_proj_w` (and so the column order of its GEMM output):
@@ -824,7 +856,7 @@ _EXPERT_SCALARS = (
 #: rank outside its window leaves unread. The draft layer's FP8 experts carry
 #: `weight_scale_inv` in place of the NVFP4 `weight_scale`.
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
-_TRUNK_EXPERT_TENSORS = tuple(f"{p}.{s}" for p in _PROJECTIONS for s in ("weight", "weight_scale"))
+_NVFP4_EXPERT_TENSORS = tuple(f"{p}.{s}" for p in _PROJECTIONS for s in ("weight", "weight_scale"))
 _MTP_EXPERT_TENSORS = tuple(
     f"{p}.{s}" for p in _PROJECTIONS for s in ("weight", "weight_scale_inv")
 )
@@ -1371,8 +1403,8 @@ class Qwen4ExpDefaultWeights:
         #
         # Structurally one more decoder layer of this architecture with a two-branch
         # front end; every shape equals a trunk full-attention layer's (cut the same way)
-        # except the front end and the expert quantization (FP8 128x128 block scales, not
-        # NVFP4). Its keys carry no `{p}`: the module's prefix is not the trunk's.
+        # except the front end and, for FP8 exports, the experts' 128x128 block scales.
+        # Native NVFP4 experts use the trunk's layout. The module's prefix is not the trunk's.
         W(
             "mtp_pre_e_norm",
             shape=lambda d: (d.hidden,),
@@ -1416,12 +1448,16 @@ class Qwen4ExpDefaultWeights:
             src=f"{_MTP_LAYER}.mlp.gate.weight",
             layers=_mtp_only,
         ),
-        # e4m3 codes stored row-major with one fp32 scale per 128x128 weight block, the
-        # FC1 halves concatenated `[up ; gate]` on the row axis; this rank's window.
+        # This rank's expert window: row-major FP8 with fp32 128x128 scales, or native
+        # packed NVFP4 with e4m3 block scales and the trtllm-gen relayout.
         W(
             "mtp_fc1_w",
-            shape=lambda d: (d.mtp_local_experts, 2 * d.moe_inter, d.hidden),
-            dtype=f8,
+            shape=lambda d: (
+                d.mtp_local_experts,
+                2 * d.moe_inter,
+                d.hidden // (2 if d.mtp_nvfp4 else 1),
+            ),
+            dtype=lambda dims: u8 if dims.mtp_nvfp4 else f8,
             src=_experts(_mtp_mlp, "up_proj.weight", "gate_proj.weight", window=_mtp_window),
             transform=_mtp_fc1_w,
             layers=_mtp_only,
@@ -1430,39 +1466,48 @@ class Qwen4ExpDefaultWeights:
             "mtp_fc1_s",
             shape=lambda d: (
                 d.mtp_local_experts,
-                (2 * d.moe_inter) // FP8_BLOCK,
-                d.hidden // FP8_BLOCK,
+                (2 * d.moe_inter) // (1 if d.mtp_nvfp4 else FP8_BLOCK),
+                d.hidden // (SF_VEC if d.mtp_nvfp4 else FP8_BLOCK),
             ),
-            dtype=f32,
-            src=_experts(
-                _mtp_mlp,
-                "up_proj.weight_scale_inv",
-                "gate_proj.weight_scale_inv",
-                window=_mtp_window,
-            ),
+            dtype=lambda dims: u8 if dims.mtp_nvfp4 else f32,
+            src=_mtp_scale_sources("up_proj", "gate_proj"),
             transform=_mtp_fc1_s,
             layers=_mtp_only,
         ),
-        # FC2 needs no relayout at all: the checkpoint's `[hidden, I]` e4m3 block is
-        # exactly the operand.
+        # FP8 FC2 is already row-major; native NVFP4 FC2 uses the trtllm-gen shuffle.
         W(
             "mtp_fc2_w",
-            shape=lambda d: (d.mtp_local_experts, d.hidden, d.moe_inter),
-            dtype=f8,
+            shape=lambda d: (
+                d.mtp_local_experts,
+                d.hidden,
+                d.moe_inter // (2 if d.mtp_nvfp4 else 1),
+            ),
+            dtype=lambda dims: u8 if dims.mtp_nvfp4 else f8,
             src=_experts(_mtp_mlp, "down_proj.weight", window=_mtp_window),
+            transform=_mtp_fc2_w,
             layers=_mtp_only,
         ),
         W(
             "mtp_fc2_s",
             shape=lambda d: (
                 d.mtp_local_experts,
-                d.hidden // FP8_BLOCK,
-                d.moe_inter // FP8_BLOCK,
+                d.hidden // (1 if d.mtp_nvfp4 else FP8_BLOCK),
+                d.moe_inter // (SF_VEC if d.mtp_nvfp4 else FP8_BLOCK),
             ),
-            dtype=f32,
-            src=_experts(_mtp_mlp, "down_proj.weight_scale_inv", window=_mtp_window),
+            dtype=lambda dims: u8 if dims.mtp_nvfp4 else f32,
+            src=_mtp_scale_sources("down_proj"),
             transform=_mtp_fc2_s,
             layers=_mtp_only,
+        ),
+        *(
+            W(
+                f"mtp_{name}",
+                shape=lambda dims: (dims.num_experts,),
+                dtype=f32,
+                src=_experts(_mtp_mlp, suffix, window=_routing_space),
+                layers=_mtp_nvfp4_only,
+            )
+            for name, suffix in _EXPERT_SCALARS
         ),
         *_shared_expert("mtp_", _mtp_mlp, _mtp_only),
         # The module's own stack-final mixer, which is its `shared_head`.
@@ -1473,6 +1518,10 @@ class Qwen4ExpDefaultWeights:
         """This rank's dimension bundle, from the core's normalized text config, the
         composite's vision config (the core holds it as `vision_config` before it
         declares anything), the engine's `Mapping` and the core's engine choices."""
+        quant_config = (
+            moe_experts_quant_config(core.model_config, f"{_MTP_LAYER}.mlp.experts")
+            or core.model_config.quant_config
+        )
         return rank_dims(
             core.model_config.pretrained_config,
             core.vision_config,
@@ -1481,6 +1530,7 @@ class Qwen4ExpDefaultWeights:
             trunk_moe_backend=core.trunk_moe_backend,
             moe_prefill_copy=core.moe_prefill_copy,
             dtype=core.model_config.torch_dtype,
+            mtp_nvfp4=quant_config.quant_algo == QuantAlgo.NVFP4,
         )
 
     def expected_unconsumed(self, d: SimpleNamespace, keys) -> set:
@@ -1495,13 +1545,14 @@ class Qwen4ExpDefaultWeights:
         for i in range(d.num_layers):
             for e in range(d.num_experts):
                 if not start <= e < start + count:
-                    out.update(f"{_trunk_mlp(i)}.experts.{e}.{t}" for t in _TRUNK_EXPERT_TENSORS)
+                    out.update(f"{_trunk_mlp(i)}.experts.{e}.{t}" for t in _NVFP4_EXPERT_TENSORS)
         if not d.mtp_enabled:
             return out | {k for k in keys if k.startswith(f"{_MTP}.")}
         start, count = _mtp_window(d)
         for e in range(d.num_experts):
             if not start <= e < start + count:
-                out.update(f"{_mtp_mlp(None)}.experts.{e}.{t}" for t in _MTP_EXPERT_TENSORS)
+                tensors = _NVFP4_EXPERT_TENSORS if d.mtp_nvfp4 else _MTP_EXPERT_TENSORS
+                out.update(f"{_mtp_mlp(None)}.experts.{e}.{t}" for t in tensors)
         return out
 
     def declare(self, d: SimpleNamespace) -> nn.ParameterDict:
@@ -1512,7 +1563,7 @@ class Qwen4ExpDefaultWeights:
         """
         w = nn.ParameterDict()
         for entry in self.WEIGHTS:
-            dtype = entry.dtype or d.dtype
+            dtype = entry.dtype(d) if callable(entry.dtype) else entry.dtype or d.dtype
             for key, _, _ in self._targets(entry, d):
                 w[key] = nn.Parameter(
                     torch.empty(*entry.shape(d), dtype=dtype), requires_grad=False
@@ -1566,14 +1617,26 @@ class Qwen4ExpDefaultWeights:
     def load(self, model, weights) -> None:
         """Fill every declared parameter. The n-gram table is declared here first, each
         source is read through its cut, multi-key rows feed their transform several
-        tensors at once, and coverage is asserted in both directions."""
+        tensors at once, and coverage is asserted in both directions. Unscaled BF16
+        n-gram tables use a unit scale; FP8 tables load their checkpoint scale."""
         core = model.model
         d = self.dims(core)
         # The one load-time declaration, before the manifest is built: the table's
         # height comes from the shards, and the manifest addresses it by row range.
         rows_per_shard = _declare_ngram_table(core, d, weights)
+        try:
+            self._fill_declared(model, d, weights, rows_per_shard)
+        except BaseException:
+            _close_ngram_table(core)
+            raise
+
+    def _fill_declared(self, model, d: SimpleNamespace, weights, rows_per_shard: int) -> None:
+        core = model.model
         manifest = self.manifest(d)
         manifest["ple_table"] = ngram_table_sources(d, rows_per_shard)
+        if core.w["ple_table"].dtype == torch.bfloat16:
+            core.w["ple_tscale"].fill_(1)
+            manifest["ple_tscale"] = []
         consumed: set = set()
 
         def fill(param: nn.Parameter, ckpt_key, index, cut, transform) -> None:
@@ -1591,6 +1654,9 @@ class Qwen4ExpDefaultWeights:
             set(manifest.keys()) ^ set(core.w.keys()),
         )
         for param_key, sources in manifest.items():
+            if param_key == "ple_table" and core._ple_table_host is not None:
+                consumed |= _fill_ngram_table(core, d, weights, rows_per_shard)
+                continue
             for ckpt_key, index, cut, transform in sources:
                 fill(core.w[param_key], ckpt_key, index, cut, transform)
             if param_key.endswith(_RELEASE_AFTER):
@@ -1641,6 +1707,7 @@ def rank_dims(
     trunk_moe_backend: str,
     moe_prefill_copy: bool,
     dtype: torch.dtype,
+    mtp_nvfp4: bool = False,
 ) -> SimpleNamespace:
     """Every width the table declares at rank `mapping.rank`, and the shares behind them.
 
@@ -1652,6 +1719,7 @@ def rank_dims(
         trunk_moe_backend: the routed backend the trunk runs, which picks the expert layout.
         moe_prefill_copy: whether the core keeps the CuteDSL-layout copy of its window.
         dtype: the activation dtype, which every unquantized weight is declared in.
+        mtp_nvfp4: whether the checkpoint stores the draft experts as packed NVFP4.
     """
     hidden = cfg.hidden_size
     head_dim = cfg.head_dim
@@ -1743,6 +1811,7 @@ def rank_dims(
         expert_inter=expert_inter,
         mtp_local_experts=mtp_local_experts,
         mtp_expert_offset=mtp_local_experts * mapping.tp_rank,
+        mtp_nvfp4=mtp_nvfp4,
         moe_inter=moe_inter,
         shared_inter=cfg.shared_expert_intermediate_size,
         vocab=cfg.vocab_size,
@@ -1838,22 +1907,69 @@ def _declare_ngram_table(core, d: SimpleNamespace, weights) -> int:
         f"tile ple_embed_dim {d.ple_embed_dim}, i.e. {d.ple_head_dim}"
     )
     dtype = weights[keys[0]].dtype
-    assert dtype == d.ple_table_dtype, (
-        f"the n-gram table is stored {dtype}; this target declares "
-        f"{d.ple_table_dtype} and does not convert it"
+    assert dtype in (torch.bfloat16, d.ple_table_dtype), (
+        f"the n-gram table is stored {dtype}; expected torch.bfloat16 or {d.ple_table_dtype}"
     )
     device = core.w["embed"].device
     rows = d.ple_shards * rows_per_shard
     if core.ple_host_offload:
-        table, core._ple_table_host = _host_resident_empty(rows, head_dim, dtype, device)
+        mode = getattr(core, "ple_host_mode", _ple_host.RANK)
+        identity = None
+        if mode == _ple_host.NODE:
+            _, read = _ple_host.shard_rows(weights, keys, rows_per_shard, _read)
+            identity = _ple_host.table_identity(read, rows, head_dim, dtype, *keys)
+        mapping = getattr(core, "mapping", None)
+        core._ple_table_host = _ple_host.PleHostTable(
+            mode,
+            rows,
+            head_dim,
+            dtype,
+            device,
+            rank=mapping.tp_rank if mapping is not None else 0,
+            world=mapping.tp_size if mapping is not None else 1,
+            dp=getattr(core, "dp_size", 1),
+            private=_host_resident_empty,
+            identity=identity,
+        )
+        _bind_ngram_table(core)
     else:
         table = torch.empty(rows, head_dim, dtype=dtype, device=device)
         core._ple_table_host = None
+        core.w["ple_table"] = nn.Parameter(table, requires_grad=False)
+    core.ple_rows_per_shard = rows_per_shard
+    return rows_per_shard
+
+
+def _bind_ngram_table(core) -> None:
+    """`core.w["ple_table"]` as the host table's current view (a placeholder until a `node`
+    table is mapped). `nn.Parameter` (`_make_subclass`) shares storage rather than copying;
+    host offload depends on that, so it is asserted."""
+    host = core._ple_table_host
+    table = host.table
+    if table is None:
+        table = torch.empty(0, host.cols, dtype=host.dtype, device="meta")
     core.w["ple_table"] = nn.Parameter(table, requires_grad=False)
-    # `nn.Parameter` (`_make_subclass`) shares storage rather than copying; host offload
-    # depends on that, so it is asserted.
     assert core.w["ple_table"].data_ptr() == table.data_ptr(), (
         "wrapping the n-gram table in nn.Parameter moved its storage"
     )
-    core.ple_rows_per_shard = rows_per_shard
-    return rows_per_shard
+
+
+def _close_ngram_table(core) -> None:
+    """Release the host-resident n-gram table (in `node`, its chunks and the broker names other
+    processes of the host may wait on); `ple_table` becomes the placeholder."""
+    host = core._ple_table_host
+    if host is None:
+        return
+    host.close()
+    _bind_ngram_table(core)
+    core._ple_table_host = None
+
+
+def _fill_ngram_table(core, d: SimpleNamespace, weights, rows_per_shard: int) -> set:
+    """Fill this rank's rows of the host-resident n-gram table (`ple_host_table`); return the
+    shard keys."""
+    keys = ngram_shard_keys(d)
+    copy, read = _ple_host.shard_rows(weights, keys, rows_per_shard, _read)
+    core._ple_table_host.fill(copy, read)
+    _bind_ngram_table(core)
+    return set(keys)
