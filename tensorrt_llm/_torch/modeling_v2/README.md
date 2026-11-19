@@ -400,6 +400,9 @@ Put tests under `tests/`, in a directory that mirrors the code they test. CI
 picks tests by that mirror, so a test outside it may not run. Inside a target's
 test directory, the layout is up to the target.
 
+For MoE-specific tests and shared helpers, follow the
+[Staircase MoE test rules](../moe/fused_moe/MOE_DEVELOPER_GUIDE.md#staircase-moe-test-rules).
+
 | Tests | Location |
 |---|---|
 | Routing, loader and CI selection | `tests/unittest/_torch/modeling_v2/test_modeling_v2_*.py` |
