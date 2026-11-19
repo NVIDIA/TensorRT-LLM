@@ -102,22 +102,24 @@ def test_text_prompt_embeds_batched_with_image(llm: LLM, model_dir: str) -> None
 
 
 def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str) -> None:
-    # The mask indexes the ids before the image placeholder expands.
+    # The mask indexes the ids before the image placeholder expands. Swap two
+    # words around the image through embeddings only; the reference swaps the ids.
     table = _text_embedding_table(model_dir)
     image = _image_request(llm, model_dir)
     ids = llm.tokenizer.encode(image["prompt"], add_special_tokens=False)
     plain = {"prompt_token_ids": ids, "multi_modal_data": image["multi_modal_data"]}
-    expected = _run(llm, [plain])
     vision_ids = set(
         llm.tokenizer.convert_tokens_to_ids(["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"])
     )
-    mask = [t not in vision_ids and p % 2 == 0 for p, t in enumerate(ids)]
+    before, after = _swappable_positions(llm, ids, vision_ids)
+    swapped_ids = list(ids)
+    swapped_ids[before], swapped_ids[after] = ids[after], ids[before]
     request = {
         **plain,
-        "prompt_embeds": table[torch.tensor([t for t, m in zip(ids, mask) if m])],
-        "prompt_embeds_mask": mask,
+        "prompt_embeds": table[torch.tensor([ids[after], ids[before]])],
+        "prompt_embeds_mask": [p in (before, after) for p in range(len(ids))],
     }
-    assert _run(llm, [request]) == expected
+    assert _run(llm, [request]) == _run(llm, [{**plain, "prompt_token_ids": swapped_ids}])
 
     image_pos = ids.index(llm.tokenizer.convert_tokens_to_ids("<|image_pad|>"))
     on_image = [p == image_pos for p in range(len(ids))]
