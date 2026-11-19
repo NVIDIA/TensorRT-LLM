@@ -667,32 +667,23 @@ class DecoderModelForCausalLM(nn.Module,
     def prompt_embeds_unsupported_reason(self) -> Optional[str]:
         """Return why this model cannot take ``prompt_embeds``, or None if it can.
 
-        A prompt-embedding position has no token, like a multimodal position.
-        Models that read token ids after the input embedding treat it the way
-        they treat their own image positions (``prompt_embeds_model_inputs``)
-        or refuse here until they do.
+        Models that read token ids after the input embedding must treat an
+        embedding row like an image row (``prompt_embeds_model_inputs``) or refuse.
         """
         return None
 
     def embed_prompt_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Return the input embeddings ``forward`` computes from ``input_ids``.
 
-        The engine overwrites the rows of prompt-embedding positions and passes
-        the result as ``inputs_embeds``.
+        ``[N]`` int token ids on the model device -> ``[N, H]`` model-dtype
+        embeddings, including any scaling the embedding layer applies.
         """
         return self.model.embed_tokens(input_ids)
 
     def prompt_embeds_model_inputs(
             self, input_ids: torch.Tensor,
             embed_rows: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Return extra ``forward`` kwargs for a pass with prompt-embedding rows.
-
-        Args:
-            input_ids: ``[N]`` int32 CUDA token ids of the packed pass;
-                prompt-embedding rows hold placeholder ids.
-            embed_rows: ``[K]`` int64 CUDA indices into ``input_ids`` of the
-                rows replaced by supplied embeddings.
-        """
+        """Return extra ``forward`` kwargs; ``embed_rows`` ([K] int64) index ``input_ids`` ([N])."""
         return {}
 
     @staticmethod

@@ -1,12 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Precomputed prompt embeddings that replace the token embedding at chosen positions.
+"""Owned snapshots of precomputed prompt embeddings.
 
-A request carries ``prompt_token_ids`` of full length ``L`` plus ``K`` embedding
-rows and the ``K`` prompt positions they occupy. The engine looks up the token
-embedding of every position as usual and then overwrites the masked positions
-with the supplied rows, so the rows must equal the output of the model's input
-embedding module (after any scaling the module applies).
+The request contract is documented once, on ``TokensPrompt.prompt_embeds``.
 """
 
 import hashlib
@@ -24,7 +20,6 @@ PROMPT_EMBEDS_IDENTITY_VERSION = 1
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# Matches GenerationRequest.MAX_CACHE_SALT_LEN; the derived salt is far shorter.
 _SALT_PREFIX = f"prompt_embeds.v{PROMPT_EMBEDS_IDENTITY_VERSION}:"
 
 
@@ -33,17 +28,12 @@ class PromptEmbeds:
     """Owned prompt-embedding rows and the prompt positions they replace.
 
     Attributes:
-        embeds: ``[K, H]`` contiguous CPU tensor owned by this object, or None
-            when only the identity travels (generation-only disaggregated
-            workers never need the values).
-        positions: ``[K]`` int64 CPU tensor of strictly increasing prompt
-            positions.
+        embeds: ``[K, H]`` contiguous CPU tensor, or None when only the
+            identity travels (generation-only disaggregated requests).
+        positions: ``[K]`` int64 CPU tensor of strictly increasing positions.
         hidden_size: ``H``.
-        row_digests: ``K`` concatenated 32-byte SHA-256 digests, one per row,
-            over the identity version, dtype and row bytes. Block reuse keys
-            each embedding position by its row digest.
-        digest: Hex SHA-256 over the identity version, dtype, shape, positions
-            and row digests.
+        row_digests: ``K`` concatenated 32-byte SHA-256 digests, one per row.
+        digest: Hex SHA-256 over dtype, shape, positions and row digests.
     """
 
     embeds: Optional[torch.Tensor]
@@ -54,34 +44,22 @@ class PromptEmbeds:
 
     @property
     def num_rows(self) -> int:
-        """Number of prompt positions this request replaces."""
         return int(self.positions.numel())
 
     def chunk_rows(self, begin: int, end: int) -> Tuple[int, int]:
-        """Return the half-open row range whose positions fall in ``[begin, end)``.
-
-        Args:
-            begin: First prompt position of the chunk.
-            end: One past the last prompt position of the chunk.
-
-        Returns:
-            ``(lo, hi)`` indices into ``embeds`` and ``positions``.
-        """
+        """Return the row range ``(lo, hi)`` whose positions fall in ``[begin, end)``."""
         lo = int(torch.searchsorted(self.positions, begin, right=False))
         hi = int(torch.searchsorted(self.positions, end, right=False))
         return lo, hi
 
     def covers(self, position: int) -> bool:
-        """Return whether ``position`` takes a supplied embedding row."""
         lo, hi = self.chunk_rows(position, position + 1)
         return hi > lo
 
     def row_digest(self, row: int) -> bytes:
-        """Return the 32-byte digest of row ``row``."""
         return self.row_digests[row * _ROW_DIGEST_LEN : (row + 1) * _ROW_DIGEST_LEN]
 
     def identity_only(self) -> "PromptEmbeds":
-        """Return a copy that keeps the identity but drops the row values."""
         return PromptEmbeds(
             embeds=None,
             positions=self.positions,
@@ -95,7 +73,6 @@ _ROW_DIGEST_LEN = 32
 
 
 def _row_digests(embeds: torch.Tensor) -> bytes:
-    """Hash each row of an owned embedding snapshot."""
     prefix = f"prompt_embeds.v{PROMPT_EMBEDS_IDENTITY_VERSION}|{embeds.dtype}|{embeds.shape[1]}|"
     # Reinterpret as bytes so bfloat16 (no numpy dtype) hashes the same way.
     rows = embeds.view(torch.uint8).numpy()
@@ -108,7 +85,6 @@ def _row_digests(embeds: torch.Tensor) -> bytes:
 
 
 def _digest(embeds: torch.Tensor, positions: torch.Tensor, row_digests: bytes) -> str:
-    """Hash the canonical identity of an owned embedding snapshot."""
     h = hashlib.sha256()
     h.update(f"v{PROMPT_EMBEDS_IDENTITY_VERSION}|{embeds.dtype}|{tuple(embeds.shape)}|".encode())
     h.update(positions.numpy().tobytes())
@@ -117,7 +93,6 @@ def _digest(embeds: torch.Tensor, positions: torch.Tensor, row_digests: bytes) -
 
 
 def _as_mask(mask: Union[Sequence[bool], torch.Tensor], length: int) -> torch.Tensor:
-    """Validate a per-position mask and return it as a bool CPU tensor."""
     if isinstance(mask, torch.Tensor):
         if mask.dim() != 1:
             raise ValueError(f"prompt_embeds_mask must be 1-D, got shape {tuple(mask.shape)}")
@@ -143,20 +118,11 @@ def build_prompt_embeds(
     prompt_embeds_mask: Optional[Union[Sequence[bool], torch.Tensor]] = None,
     placeholder_token_id: int = 0,
 ) -> Tuple[List[int], PromptEmbeds]:
-    """Validate a prompt-embedding request and take an owned canonical snapshot.
-
-    Args:
-        prompt_token_ids: Full-length prompt ids, or None when every position is
-            an embedding (the prompt length is then ``K``).
-        prompt_embeds: ``[K, H]`` floating tensor of rows for the masked
-            positions, in mask order.
-        prompt_embeds_mask: Length-``L`` bools, True where a row replaces the
-            token embedding. Optional when ``K == L``.
-        placeholder_token_id: Token id used for every position when
-            ``prompt_token_ids`` is None.
+    """Validate a ``TokensPrompt``/``EmbedsPrompt`` request and snapshot its rows.
 
     Returns:
-        The prompt token ids to schedule and the snapshot.
+        The prompt token ids to schedule (``placeholder_token_id`` everywhere
+        when ``prompt_token_ids`` is None) and the owned snapshot.
     """
     if not isinstance(prompt_embeds, torch.Tensor):
         raise TypeError(f"prompt_embeds must be a torch.Tensor, got {type(prompt_embeds).__name__}")
@@ -204,8 +170,7 @@ def build_prompt_embeds(
                     f"selects {positions.numel()} positions"
                 )
 
-    # Owned contiguous CPU copy: later caller writes to its tensor must not
-    # change what is hashed or what the engine reads.
+    # Later caller writes must not change what is hashed or what the engine reads.
     embeds = prompt_embeds.detach().to("cpu", copy=True).contiguous()
     if not bool(torch.isfinite(embeds).all()):
         raise ValueError("prompt_embeds contains non-finite values")
@@ -221,12 +186,9 @@ def build_prompt_embeds(
 
 
 def prompt_embeds_cache_salt(user_salt: Optional[str], digest: str) -> str:
-    """Return the KV cache salt that scopes reuse to identical embeddings.
+    """Return the cache salt that scopes reuse to identical embeddings.
 
-    For KV cache managers that key blocks by token ids alone: requests with the
-    same ids, embeddings and user salt share KV blocks; any other request,
-    including a plain-token request with the same placeholder ids, never
-    matches.
+    Used where blocks are keyed by token ids alone (the V1 manager, KV connectors).
     """
     h = hashlib.sha256()
     h.update(digest.encode())
@@ -306,7 +268,6 @@ def remap_prompt_embeds(
 
 
 def _raise_unaligned() -> None:
-    """Raise the error for ids that processing changed outside placeholders."""
     raise ValueError(
         "prompt_token_ids did not survive multimodal processing unchanged "
         "outside the multimodal placeholders; use placeholder ids that "
@@ -318,17 +279,9 @@ def _raise_unaligned() -> None:
 def _align_gap(
     segment: Sequence[int], expanded_ids: Sequence[int], begin: int, end: int, framed: bool
 ) -> list[int]:
-    """Match ``segment`` in order within ``expanded_ids[begin:end]``.
+    """Return the expanded index of each ``segment`` token, matched in order in ``[begin, end)``.
 
-    Args:
-        segment: Original tokens between two placeholders.
-        expanded_ids: Expanded prompt ids.
-        begin: First expanded row after the previous item (or 0).
-        end: First row of the next item (or the prompt length).
-        framed: Whether an item follows, whose framing may precede its rows.
-
-    Returns:
-        The expanded index of each token of ``segment``.
+    ``framed``: an item starts at ``end`` and its framing may precede it.
     """
     mapping = []
     j = begin
@@ -354,11 +307,7 @@ def _align_gap(
 
 
 def multimodal_item_spans(multimodal_input: "MultimodalInput") -> list[tuple[int, int]]:
-    """Return each multimodal item's ``[first row, last row + 1)`` in prompt order.
-
-    Args:
-        multimodal_input: Multimodal layout of the request.
-    """
+    """Return each multimodal item's ``[first row, last row + 1)`` in prompt order."""
     offsets = multimodal_input.multimodal_item_run_cu_offsets
     if multimodal_input.multimodal_run_positions is not None and offsets is not None:
         starts = multimodal_input.multimodal_run_positions
@@ -382,12 +331,7 @@ def multimodal_item_spans(multimodal_input: "MultimodalInput") -> list[tuple[int
 
 
 def prompt_embeds_block_key(row_digest: bytes, placeholder_id: int) -> bytes:
-    """Return the 32-byte KV block key of one prompt-embedding position.
-
-    Args:
-        row_digest: Digest of the row (``PromptEmbeds.row_digest``).
-        placeholder_id: Token id scheduled at that position.
-    """
+    """Return the 32-byte KV block key of an embedding position (row and placeholder id)."""
     h = hashlib.sha256(b"prompt_embeds.key|")
     h.update(row_digest)
     h.update(int(placeholder_id).to_bytes(8, "little", signed=True))

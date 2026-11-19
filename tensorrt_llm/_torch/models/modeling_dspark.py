@@ -3939,7 +3939,6 @@ class K3DsparkForCausalLM(SpecDecOneEngineForCausalLM[K3DsparkModel, PretrainedC
     """
 
     def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Draft models never receive the request prompt."""
         return "it is a draft model"
 
     def __init__(self, model_config):
@@ -5345,7 +5344,6 @@ class MiniMaxDSparkBackbone(DecoderModelForCausalLM[MiniMaxDSparkModel, Pretrain
     (``config.architectures == ["DSparkMiniMaxDraftModel"]``)."""
 
     def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Draft models never receive the request prompt."""
         return "it is a draft model"
 
     def __init__(self, model_config: ModelConfig) -> None:

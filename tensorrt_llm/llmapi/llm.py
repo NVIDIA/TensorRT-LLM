@@ -916,15 +916,13 @@ class BaseLLM:
 
         if prompt_embeds is not None:
             if multimodal_params is not None:
-                # The mask indexes the ids before placeholder expansion.
                 multimodal_input = multimodal_params.multimodal_input
                 prompt_embeds = remap_prompt_embeds(
                     prompt_embeds, inputs["prompt_token_ids"], prompt_token_ids,
                     multimodal_item_spans(multimodal_input)
                     if multimodal_input is not None else [])
             if is_gen_only:
-                # The prompt's KV arrives from the context worker; only the
-                # identity that keys its blocks travels.
+                # The prompt's KV is transferred; only the identity travels.
                 prompt_embeds = prompt_embeds.identity_only()
 
         if (not self.args.mm_encoder_only and disaggregated_params is not None
@@ -992,11 +990,7 @@ class BaseLLM:
             self, inputs: Dict[str, Any]) -> Tuple[TokensPrompt, PromptEmbeds]:
         """Validate a prompt-embedding request and split off its rows.
 
-        Positions index ``prompt_token_ids``, so text prompts are rejected.
-        With ``multi_modal_data`` the mask indexes the ids before multimodal
-        placeholder expansion; ``generate_async`` moves the positions through
-        it. Execution-mode restrictions are enforced by the worker at
-        admission.
+        Execution-mode restrictions are enforced by the worker at admission.
         """
         if inputs.get("prompt_embeds") is None:
             raise ValueError("prompt_embeds_mask requires prompt_embeds.")

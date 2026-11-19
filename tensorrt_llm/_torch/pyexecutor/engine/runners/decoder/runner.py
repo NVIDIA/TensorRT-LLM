@@ -957,16 +957,10 @@ class DecoderRunner(ScheduledModelRunner):
     def _apply_prompt_embeds_overlay(
         self, inputs: dict[str, Any], dst_rows: torch.Tensor, src_rows: torch.Tensor
     ) -> dict[str, Any]:
-        """Replace the token embedding of prompt-embedding rows with the supplied rows.
+        """Overwrite ``input_ids`` rows ``dst_rows`` ([K] int64) with ``src_rows`` ([K, H]).
 
-        Runs after ``preprocess_inputs`` so the overlap scheduler's generation
-        tokens are already in ``input_ids``; the model then gets embeddings
-        instead of ids.
-
-        Args:
-            inputs: Model inputs with ``[N]`` CUDA ``input_ids``.
-            dst_rows: ``[K]`` int64 CUDA indices into ``input_ids``.
-            src_rows: ``[K, H]`` CUDA rows (float16, bfloat16 or float32).
+        Runs after ``preprocess_inputs`` so overlap-scheduler tokens are already in
+        ``input_ids``.
         """
         if getattr(self._model, "fuses_prompt_embeds", False):
             # Multimodal wrappers write the rows after fusing image rows.

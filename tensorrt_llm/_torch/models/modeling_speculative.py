@@ -1042,7 +1042,6 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
                                                 PretrainedConfig]):
 
     def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Draft models never receive the request prompt."""
         return "it is a draft model"
 
     def __init__(
@@ -1270,7 +1269,6 @@ class MistralLarge3DraftModel(DecoderModel):
 class MistralLarge3EagleForCausalLM(DecoderModelForCausalLM):
 
     def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Draft models never receive the request prompt."""
         return "it is a draft model"
 
     def __init__(

@@ -429,8 +429,7 @@ class MultimodalModelMixin:
     """Whether the model's production forward path uses the persistent encoder cache."""
 
     fuses_prompt_embeds: ClassVar[bool] = True
-    """Whether ``forward`` takes ``prompt_embeds_overlay`` and writes those rows after fusing
-    multimodal rows (the engine then keeps ``input_ids`` instead of passing embeddings)."""
+    """Whether ``forward`` takes ``prompt_embeds_overlay`` and applies it after multimodal fusion."""
 
     supports_mm_encoder_item_scheduling: ClassVar[bool] = False
     """Whether the model supports item-level MM encoder scheduling: it implements the item-encode
@@ -717,11 +716,7 @@ class MultimodalModelMixin:
         raise NotImplementedError
 
     def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Return why this model cannot take ``prompt_embeds``, or None if it can.
-
-        Wrappers opt in once the ids they pass to the language model (and any id-derived inputs
-        they build) treat a prompt-embedding row like the language model expects.
-        """
+        """Wrappers opt in once the ids they pass on handle prompt-embedding rows."""
         return "its multimodal wrapper does not handle prompt_embeds yet"
 
     @property

@@ -179,7 +179,6 @@ class GenerationRequest:
         self.scheduling_params = scheduling_params
         self.conversation_params = conversation_params
         self.kv_hints = snapshot_kv_hints(kv_hints)
-        # Owned rows and positions (tensorrt_llm.inputs.prompt_embeds).
         self.prompt_embeds = prompt_embeds
         if cache_salt is not None:
             if not isinstance(cache_salt, str):

@@ -1377,8 +1377,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
     def prompt_embeds_model_inputs(
         self, input_ids: torch.Tensor, embed_rows: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        """Per-layer embeddings read ids; embedding rows use ``pad_token_id``,
-        as image positions do in the multimodal wrapper."""
+        """Per-layer embeddings read ids; embedding rows use ``pad_token_id`` like image rows."""
         if not self.model.hidden_size_per_layer_input:
             return {}
         ple_input_ids = input_ids.clone()
@@ -1386,7 +1385,6 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         return {"ple_input_ids": ple_input_ids}
 
     def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Per-layer embeddings need a pad id for embedding rows."""
         if (
             self.model.hidden_size_per_layer_input
             and getattr(self.config, "pad_token_id", None) is None
@@ -1830,7 +1828,6 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
     shares_target_kv_cache = True
 
     def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Draft models never receive the request prompt."""
         return "it is a draft model"
 
     def __init__(self, model_config: ModelConfig):

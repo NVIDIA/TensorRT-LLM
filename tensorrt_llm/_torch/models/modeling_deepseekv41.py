@@ -3354,7 +3354,6 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
     weight_loader_cls = DeepseekV41WeightLoader
 
     def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Engram history would hash the placeholder ids of embedding rows."""
         return "Engram n-gram hashing has no ids for embedding rows"
 
     def __pp_init__(self) -> None:

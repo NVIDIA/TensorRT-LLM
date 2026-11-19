@@ -95,33 +95,24 @@ class TokensPrompt(TypedDict):
     prompt_embeds: NotRequired[torch.Tensor]
     """Precomputed ``[K, hidden_size]`` input embeddings for ``K`` prompt positions.
 
-    The dtype must be float16, bfloat16 or float32; the engine converts rows to
-    the model dtype. ``generate`` takes an owned CPU snapshot at submission, so
-    later writes to the caller's tensor have no effect. Each row replaces the
-    token embedding of one prompt position and must equal what the model's
-    input embedding module would produce there, including any scaling it
-    applies. The ids at those positions are placeholders: they still feed
-    repetition penalties, prompt logprobs and KV cache events. A KV block is
-    reused only by requests with identical ids and rows up to its end, so with
-    the V2 KV cache manager blocks before the first embedding row are shared
-    with plain-token prompts (other managers scope the whole prompt to
-    identical embeddings). Supported on
-    decoder models whose ``prompt_embeds_unsupported_reason`` returns None, on
-    the PyTorch backend, without speculative decoding, attention data parallelism or
-    context parallelism. With disaggregated serving the
-    generation-only request must carry the same ``prompt_embeds`` as the
-    context request (only its identity is used there) and the KV cache manager
-    must be V2.
+    This is the prompt_embeds contract. Rows (float16, bfloat16 or float32) must
+    equal what the model's input embedding module, including any scaling, would
+    produce; ``generate`` snapshots them at submission. The ids at those
+    positions are placeholders that still feed repetition penalties, prompt
+    logprobs and KV cache events. KV blocks are reused only across identical ids
+    and rows; with the V2 KV cache manager blocks before the first row are
+    shared with plain-token prompts. Requires the PyTorch backend and a decoder
+    model whose ``prompt_embeds_unsupported_reason`` returns None; speculative
+    decoding, attention data parallelism and context parallelism are rejected.
+    Disaggregated serving needs the V2 manager, and the generation-only request
+    must carry the same ``prompt_embeds`` as the context request.
     """
 
     prompt_embeds_mask: NotRequired[Union[List[bool], torch.Tensor]]
-    """Length-``len(prompt_token_ids)`` bools, True where a ``prompt_embeds`` row
-    replaces the token embedding; rows are consumed in position order. May be
-    omitted when ``prompt_embeds`` has one row per prompt token. With
-    ``multi_modal_data`` (models whose multimodal wrapper accepts
-    prompt_embeds) the mask is required and indexes ``prompt_token_ids`` before
-    multimodal placeholder expansion; it must not select a placeholder, and the
-    ids outside placeholders must survive processing unchanged.
+    """Length-``len(prompt_token_ids)`` bools, True where the next ``prompt_embeds``
+    row replaces the token embedding; optional when there is one row per token.
+    With ``multi_modal_data`` it is required and indexes ``prompt_token_ids``
+    before placeholder expansion; it must not select a placeholder.
     """
 
 
@@ -129,9 +120,7 @@ class EmbedsPrompt(TypedDict):
     """Schema for a prompt given entirely as precomputed input embeddings."""
 
     prompt_embeds: torch.Tensor
-    """``[L, hidden_size]`` input embeddings, one row per prompt position. See
-    ``TokensPrompt.prompt_embeds`` for the contract. Accepted by
-    ``LLM.generate`` and ``LLM.generate_async``."""
+    """``[L, hidden_size]``, one row per position; see ``TokensPrompt.prompt_embeds``."""
 
 
 PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt, EmbedsPrompt]

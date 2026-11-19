@@ -298,8 +298,7 @@ class HostLists:
     # draft_probs rows are one-hot'd after spec_metadata.prepare().
     padding_gen_slots: list[int] = field(default_factory=list)
     multimodal_params_list: list[MultimodalParams] = field(default_factory=list)
-    # Flattened input rows and CPU source rows of this pass's prompt-embedding
-    # positions, one entry per context request that has any in its chunk.
+    # Per context request with embedding rows in its chunk: input rows, CPU rows.
     prompt_embeds_dst_rows: list[torch.Tensor] = field(default_factory=list)
     prompt_embeds_src_rows: list[torch.Tensor] = field(default_factory=list)
     # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
@@ -1502,9 +1501,8 @@ class DecoderInputPreparer:
     ) -> None:
         """Record the prompt-embedding rows that fall in this chunk.
 
-        Rows are staged per chunk from the request's CPU copy, which lives
-        until the request finishes, so recomputed or replayed prefills
-        (including CED replay rows before the scheduled chunk) read them again.
+        Staged per chunk from the request's CPU copy, so recomputed or replayed
+        prefills (including CED replay rows) read them again.
         """
         prompt_embeds = request.py_prompt_embeds
         lo, hi = prompt_embeds.chunk_rows(begin, begin + num_tokens)

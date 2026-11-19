@@ -408,31 +408,20 @@ class BaseWorker(GenerationExecutor):
 
     def _effective_cache_salt(self,
                               request: GenerationRequest) -> Optional[str]:
-        """Return the cache salt the KV cache manager scopes reuse with.
-
-        KVCacheManagerV2 keys each embedding position by its row digest, so
-        blocks before the first embedding row stay shared with plain prompts.
-        Other managers key blocks by token ids alone, so the embedding identity
-        joins the salt and the whole prompt is scoped to identical embeddings.
-        """
+        """Fold the embedding identity into the salt unless block keys carry it."""
         if request.prompt_embeds is None or self._kv_cache_keys_prompt_embeds():
             return request.cache_salt
         return prompt_embeds_cache_salt(request.cache_salt,
                                         request.prompt_embeds.digest)
 
     def _kv_cache_keys_prompt_embeds(self) -> bool:
-        """Return whether every KV reuse path keys blocks by embedding rows.
-
-        KVCacheManagerV2 does; KV cache connectors (external stores) key blocks
-        by token ids and the cache salt.
-        """
+        """KVCacheManagerV2 keys blocks by rows; KV connectors key by ids and salt."""
         if self.llm_args is not None and getattr(
                 self.llm_args, "kv_connector_config", None) is not None:
             return False
         return self._uses_kv_cache_manager_v2()
 
     def _uses_kv_cache_manager_v2(self) -> bool:
-        """Return whether the engine's KV cache manager is KVCacheManagerV2."""
         from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
             KVCacheManagerV2
         return isinstance(getattr(self.engine, "kv_cache_manager", None),
@@ -441,8 +430,7 @@ class BaseWorker(GenerationExecutor):
     def _check_prompt_embeds(self, request: GenerationRequest) -> None:
         """Reject prompt embeddings this engine cannot place correctly.
 
-        Generation-only requests carry only the identity (the prompt's KV is
-        transferred) but pass the same deployment checks as context requests.
+        Generation-only requests carry only the identity but get the same checks.
         """
         prompt_embeds = request.prompt_embeds
         if prompt_embeds is None:

@@ -1146,8 +1146,7 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
     def prompt_embeds_model_inputs(
         self, input_ids: torch.Tensor, embed_rows: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        """Per-layer n-gram embeddings read ids; embedding rows use their
-        placeholder id, as image positions do in the multimodal wrapper."""
+        """Per-layer n-gram embeddings read ids; embedding rows use their placeholder id."""
         return {"orig_input_ids": input_ids}
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):

@@ -1259,11 +1259,7 @@ class GenerationResult(GenerationResultBase):
             self._release_prompt_embeds()
 
     def _release_prompt_embeds(self) -> None:
-        """Drop the client copy of prompt-embedding rows once the request is done.
-
-        The rows were sent before any response arrived; the result keeps only
-        their identity so a retained output does not pin the tensor.
-        """
+        """Keep only the identity once done, so a retained result does not pin the rows."""
         prompt_embeds = getattr(self._generation_request, "prompt_embeds", None)
         if (self._done and prompt_embeds is not None
                 and prompt_embeds.embeds is not None):

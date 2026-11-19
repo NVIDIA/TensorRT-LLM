@@ -1633,13 +1633,9 @@ def _augment_tokens_with_prompt_embeds(
     chunk_start: int,
     chunk_end: int,
 ) -> list[TokenIdExt]:
-    """Replace prompt-embedding positions in ``result`` with row-derived keys.
+    """Key the embedding positions of ``result`` (prompt ``[chunk_start, chunk_end)``).
 
-    ``result`` holds the keys of prompt positions ``[chunk_start, chunk_end)``.
-    Each embedding position is keyed by its row digest and its placeholder id
-    (some models still read the id), so a block matches only when every
-    embedding row and id in it is identical; the radix tree chains earlier
-    blocks.
+    The placeholder id stays in the key because some models still read it.
     """
     lo, hi = prompt_embeds.chunk_rows(chunk_start, chunk_end)
     for row in range(lo, hi):
@@ -8129,9 +8125,7 @@ class KVCacheManagerV2(BaseResourceManager):
         `tokens[start:end]` is materialized and returned. This avoids
         re-augmenting the full prompt on every chunk during chunked prefill.
 
-        Prompt-embedding positions (``req.py_prompt_embeds``) likewise become
-        their row digest, so blocks before the first embedding row stay shared
-        with plain-token prompts and later blocks match only identical rows.
+        Prompt-embedding positions are keyed by their row and placeholder id.
 
         For text-only requests this is a no-op.
         """
