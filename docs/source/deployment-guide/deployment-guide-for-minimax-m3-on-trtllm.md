@@ -56,8 +56,29 @@ The `MiniMax-M3-NVFP4` checkpoint uses MXFP8 base layers and NVFP4 routed expert
 (`MIXED_PRECISION`). Its name describes weight precision; set
 `kv_cache_config.dtype` explicitly to select FP8 or NVFP4 KV cache.
 
+The compressed-tensors NVFP4 MoE packaging of the MiniMax M3 architecture is
+also loaded as mixed MXFP8/NVFP4. Such a checkpoint declares
+`quant_method: mxfp8` together with `moe_quant_algo: NVFP4`,
+`moe_quant_format: nvfp4-pack-quantized` and `group_size: 16`, and stores each
+routed expert projection as `weight_packed`, `weight_scale`,
+`weight_global_scale` and `input_global_scale`. TensorRT LLM keeps the packed
+FP4 bytes and E4M3 block scales as stored and converts the global scales at
+load time: the stored `2688 / amax` multipliers become the reciprocal
+`weight_scale_2` and `input_scale` divisors of the NVFP4 MoE weight contract.
+A global scale that cannot be inverted (zero, as stored for an expert without
+calibration data, or negative or not finite) is set to 0 with a warning; a
+weight global scale of 0 zeroes that expert's output. The routed experts then
+run the standard static NVFP4 MoE recipe (static input scale, BF16 rounding
+after FC1, routing weights applied in the finalize) on any NVFP4-capable MoE
+backend; `moe_config.backend: CUTLASS` and `TRTLLM` are both qualified on this
+packaging.
+
 Use the checkpoint's chat template (`chat_template.jinja`) when launching the
 server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
+Evaluate a checkpoint in this packaging through the chat template as well, for
+example `trtllm-eval ... gsm8k --apply_chat_template --chat_template_kwargs
+'{"thinking_mode": "disabled"}'`; the raw eight-shot prompts of the `gsm8k`
+default bypass the template the model was trained with.
 
 ## Feature Support Notes
 

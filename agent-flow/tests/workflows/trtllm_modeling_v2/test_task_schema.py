@@ -13,6 +13,7 @@ import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
+from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.spec import derive, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
@@ -85,11 +86,11 @@ def test_source_restriction_is_not_a_supported_production_task_option(tmp_path):
     spec["source_embargo"] = []
     with pytest.raises(task_schema.TaskSchemaError, match="unknown key 'source_embargo'"):
         task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
-    from agent_flow.workflows.trtllm_modeling_v2.tune.schema import validate_perf_block
-
-    assert "perf.source_embargo: unknown key" in validate_perf_block(
-        {"perf": {"source_embargo": []}}
-    )
+    # The flow has no tuning stage: a perf block is refused with why.
+    del spec["source_embargo"]
+    spec["perf"] = {"enabled": True}
+    with pytest.raises(task_schema.TaskSchemaError, match="'perf' is not read: the flow has no"):
+        task_schema.load_and_validate_task_yaml(_write(tmp_path, spec))
 
 
 DISAGG_LAUNCHER = tree_anchors.ANCHORS["disagg_launcher"].hint
@@ -165,7 +166,7 @@ def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
     assert ci_waiver({**spec, "profile": "bringup"}) == "not owed by the bringup profile"
     # disagg where the goal puts it; its test lays its two engines out on dep4's node.
     assert spec["members"] == {"default": ["tp1", "dep4"], "disagg": ["dep4"]}
-    assert spec["coverage"] == {"accept": ["disagg@tp1"]}
+    assert "coverage" not in spec
     # The first KV dtype is every gate's; each other one a variant judged against core's score.
     assert "--kv_cache_dtype=fp8" not in spec["runtime"]["extra_flags"]
     assert spec["variants"]["kv_fp8"]["gates"] == ["accuracy"]
@@ -186,19 +187,45 @@ def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_i
     (checkpoint / "config.json").write_text(json.dumps(config))
     with pytest.raises(derive.DeriveError) as excinfo:
         cli._derive_spec(
-            checkpoint, _site(tmp_path), tmp_path / "ws", goal="multimodal tune", clean=False
+            checkpoint, _site(tmp_path), tmp_path / "ws", goal="multimodal", clean=False
         )
-    assert "accuracy.model_key" in str(excinfo.value) and "concurrency" not in str(excinfo.value)
+    assert "accuracy.model_key" in str(excinfo.value)
     spec = yaml.safe_load((tmp_path / "ws" / derive.SPEC_FILENAME).read_text())
-    # Concurrency is not asked: 1/32/128 by default, attention DP only at the high point, a
-    # global total its ranks share.
-    loads = {c["name"]: c["workload"]["concurrency"] for c in spec["perf"]["configs"]}
-    assert loads == {"tp1": [1, 32, 128], "tep4": [1, 32, 128], "dep4": [128]}
+    assert "perf" not in spec
     # The checkpoint's drafter is left out: the goal names its features and not it.
     assert spec["features"] == ["multimodal"]
     assert "features (left out)" in (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
     with pytest.raises(derive.DeriveError, match="kv= is named once"):
         derive.parse_goal("kv=fp8 kv=nvfp4")
+
+
+@pytest.mark.parametrize(
+    "block, entry",
+    [
+        ("acceptance", {"mpt": 2.5}),  # a misspelt unit: its floor would never be applied
+        ("acceptance", {"min_prompts": 32}),  # a key that is gone
+        ("boot", {"mpt": {"max_tokens": 64}}),
+        ("boot", {"default": {"max_tokens": 64}}),  # read under acceptance only
+    ],
+)
+def test_a_unit_entry_under_acceptance_or_boot_names_a_unit_of_the_spec(tmp_path, block, entry):
+    spec = _valid_spec(tmp_path)
+    spec["features"] = ["mtp"]
+    spec["accuracy"][block] = entry
+    with pytest.raises(task_schema.TaskSchemaError, match="names no unit or variant of this spec"):
+        load_and_validate_task_yaml(_write(tmp_path, spec))
+    spec["accuracy"][block] = (
+        {"mtp": next(iter(entry.values()))} if block == "boot" else {"mtp": 2.5}
+    )
+    load_and_validate_task_yaml(_write(tmp_path, spec))
+
+
+def test_a_spec_that_says_nothing_of_block_reuse_leaves_it_off(tmp_path):
+    spec = load_and_validate_task_yaml(_write(tmp_path, _valid_spec(tmp_path)))
+    assert spec["runtime"]["kv_cache_reuse"] is False
+    # So its core is gated as a derived spec's is: no boot beside its benchmark.
+    contract = contract_mod.compile_contract(spec, world_size=4)
+    assert [check.key for check in contract.checks] == ["core:accuracy[gsm8k]@tp1"]
 
 
 def test_core_keeps_reuse_and_chunking_off_and_each_named_one_is_its_own_variant(tmp_path):

@@ -21,6 +21,11 @@ class RankKvCacheStats(NamedTuple):
     reused_blocks: int
     missed_blocks: int
     cache_hit_rate: float
+    host_slab_bytes: int = 0
+    num_page_table_reuses: int = 0
+    num_page_table_row_updates: int = 0
+    num_page_table_full_builds: int = 0
+    page_table_full_build_ms: float = 0.0
 
     @classmethod
     def wire_size(cls) -> int:
@@ -36,7 +41,7 @@ class RankKvCacheStats(NamedTuple):
         """Restore a KV snapshot from its scalar wire fields.
 
         Args:
-            data: Eight block counters followed by the floating-point hit rate.
+            data: The snapshot's fields in declaration order.
 
         Returns:
             The immutable KV snapshot.
@@ -46,17 +51,73 @@ class RankKvCacheStats(NamedTuple):
         """
         if len(data) != cls.wire_size():
             raise ValueError(f"KV snapshot requires {cls.wire_size()} fields")
-        return cls(
-            int(data[0]),
-            int(data[1]),
-            int(data[2]),
-            int(data[3]),
-            int(data[4]),
-            int(data[5]),
-            int(data[6]),
-            int(data[7]),
-            float(data[8]),
-        )
+        return cls(*_typed_fields(cls, data, ("cache_hit_rate", "page_table_full_build_ms")))
+
+
+class RankSchedulingCounters(NamedTuple):
+    """A rank's scheduling counters since its previous record, named as InflightBatchingStats fields."""
+
+    num_skipped_forward_ctx_chunks: int = 0
+    num_dropped_ctx_chunks: int = 0
+    num_reverted_ctx_tokens: int = 0
+    num_deferred_gen_receives: int = 0
+    gen_receive_ready_wait_ms: float = 0.0
+    num_gen_init_cap_holds: int = 0
+    num_gen_init_transfer_budget_holds: int = 0
+    num_ctx_decoder_hold_passes: int = 0
+    num_ctx_decoder_held_requests: int = 0
+
+    @classmethod
+    def wire_size(cls) -> int:
+        return len(cls._fields)
+
+    @classmethod
+    def deserialize(cls, data: list[int | float]) -> RankSchedulingCounters:
+        """Restore the counters from their scalar wire fields; raises ValueError on a wrong size."""
+        if len(data) != cls.wire_size():
+            raise ValueError(f"Scheduling counters require {cls.wire_size()} fields")
+        return cls(*_typed_fields(cls, data, ("gen_receive_ready_wait_ms",)))
+
+
+def _typed_fields(cls, data: list[int | float], float_fields: tuple[str, ...]) -> list[int | float]:
+    return [
+        float(value) if name in float_fields else int(value)
+        for name, value in zip(cls._fields, data)
+    ]
+
+
+class RankSpecDecodingStats(NamedTuple):
+    """Immutable rank-local speculative-decoding counters for one iteration."""
+
+    num_draft_tokens: int
+    num_accepted_tokens: int
+    num_requests_with_draft_tokens: int
+
+    @classmethod
+    def wire_size(cls) -> int:
+        """Return the number of scalar fields in a speculative-decoding snapshot.
+
+        Returns:
+            Number of fields in the named tuple's wire schema.
+        """
+        return len(cls._fields)
+
+    @classmethod
+    def deserialize(cls, data: list[int | float]) -> RankSpecDecodingStats:
+        """Restore the counters from their scalar wire fields.
+
+        Args:
+            data: Draft tokens, accepted draft tokens and requests with draft tokens.
+
+        Returns:
+            The immutable speculative-decoding snapshot.
+
+        Raises:
+            ValueError: The snapshot has an unexpected number of fields.
+        """
+        if len(data) != cls.wire_size():
+            raise ValueError(f"Speculative-decoding snapshot requires {cls.wire_size()} fields")
+        return cls(int(data[0]), int(data[1]), int(data[2]))
 
 
 @dataclass
@@ -66,8 +127,15 @@ class RankIterStatsPayload:
     # Legacy scalar widths are independent of the optional snapshot fields.
     _ITER_STATS_FIELD_COUNT: ClassVar[int] = 9
     _KV_LOAD_FIELD_COUNT: ClassVar[int] = 3
-    _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -1
-    _SNAPSHOT_HEADER_SIZE: ClassVar[int] = 4
+    _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -3
+    _QUEUED_WIRE_VERSION: ClassVar[int] = -4
+    _QUEUED_FIELDS: ClassVar[tuple[str, ...]] = (
+        "num_queued_context_requests",
+        "num_queued_ctx_tokens",
+        "num_queued_gen_requests",
+        "num_queued_gen_kv_tokens",
+    )
+    _SNAPSHOT_HEADER_SIZE: ClassVar[int] = 6
 
     has_iter_stats: int = 0
     iter_stats_iter: int = -1
@@ -83,6 +151,15 @@ class RankIterStatsPayload:
     kv_load_timestamp_ns: int = 0
     kv_cache_stats: RankKvCacheStats | None = None
     cross_kv_cache_stats: RankKvCacheStats | None = None
+    specdec_stats: RankSpecDecodingStats | None = None
+    scheduling_counters: RankSchedulingCounters | None = None
+    num_queued_context_requests: int = 0
+    num_queued_ctx_tokens: int = 0
+    num_queued_gen_requests: int = 0
+    num_queued_gen_kv_tokens: int = 0
+    # Current activity is refreshed at each routing exchange, independently
+    # of the sampled iteration whose counters travel in this payload.
+    has_pending_work: bool = False
 
     def serialize(self, include_kv_cache_load: bool = False) -> list[int | float]:
         """Serialize to a flat list for allgather transport."""
@@ -105,19 +182,29 @@ class RankIterStatsPayload:
                     self.kv_load_timestamp_ns,
                 ]
             )
-        if self.kv_cache_stats is not None or self.cross_kv_cache_stats is not None:
+        snapshots = (
+            self.kv_cache_stats,
+            self.cross_kv_cache_stats,
+            self.specdec_stats,
+            self.scheduling_counters,
+        )
+        queued_values = [getattr(self, name) for name in self._QUEUED_FIELDS]
+        has_extended_stats = any(queued_values) or self.has_pending_work
+        if any(snapshot is not None for snapshot in snapshots) or has_extended_stats:
             # The negative version cannot be confused with has_iter_stats (0/1).
-            # Presence flags frame both snapshots and the independent load fields.
+            # Presence flags frame the snapshots and the independent load fields.
             values = [
-                self._SNAPSHOT_WIRE_VERSION,
+                self._QUEUED_WIRE_VERSION if has_extended_stats else self._SNAPSHOT_WIRE_VERSION,
                 int(include_kv_cache_load),
-                int(self.kv_cache_stats is not None),
-                int(self.cross_kv_cache_stats is not None),
+                *(int(snapshot is not None) for snapshot in snapshots),
                 *values,
             ]
-            for snapshot in (self.kv_cache_stats, self.cross_kv_cache_stats):
+            for snapshot in snapshots:
                 if snapshot is not None:
                     values.extend(snapshot)
+            if has_extended_stats:
+                values.extend(queued_values)
+                values.append(int(self.has_pending_work))
         return values
 
     @classmethod
@@ -135,15 +222,18 @@ class RankIterStatsPayload:
         """
         if (
             len(data) < cls._SNAPSHOT_HEADER_SIZE
-            or data[0] != cls._SNAPSHOT_WIRE_VERSION
+            or data[0] not in (cls._SNAPSHOT_WIRE_VERSION, cls._QUEUED_WIRE_VERSION)
             or any(flag not in (0, 1) for flag in data[1 : cls._SNAPSHOT_HEADER_SIZE])
         ):
-            raise ValueError("Invalid KV snapshot payload header")
+            raise ValueError("Invalid snapshot payload header")
         return (
             cls._SNAPSHOT_HEADER_SIZE
             + cls._ITER_STATS_FIELD_COUNT
             + int(data[1]) * cls._KV_LOAD_FIELD_COUNT
             + int(data[2] + data[3]) * RankKvCacheStats.wire_size()
+            + int(data[4]) * RankSpecDecodingStats.wire_size()
+            + int(data[5]) * RankSchedulingCounters.wire_size()
+            + (len(cls._QUEUED_FIELDS) + 1 if data[0] == cls._QUEUED_WIRE_VERSION else 0)
         )
 
     @classmethod
@@ -153,7 +243,7 @@ class RankIterStatsPayload:
         if values and values[0] < 0:
             expected_size = cls.snapshot_payload_size(values)
             if len(values) != expected_size:
-                raise ValueError(f"KV snapshot payload requires {expected_size} fields")
+                raise ValueError(f"Snapshot payload requires {expected_size} fields")
             scalar_end = (
                 cls._SNAPSHOT_HEADER_SIZE
                 + cls._ITER_STATS_FIELD_COUNT
@@ -170,6 +260,22 @@ class RankIterStatsPayload:
                 result.cross_kv_cache_stats = RankKvCacheStats.deserialize(
                     values[cursor : cursor + RankKvCacheStats.wire_size()]
                 )
+                cursor += RankKvCacheStats.wire_size()
+            if values[4]:
+                result.specdec_stats = RankSpecDecodingStats.deserialize(
+                    values[cursor : cursor + RankSpecDecodingStats.wire_size()]
+                )
+                cursor += RankSpecDecodingStats.wire_size()
+            if values[5]:
+                result.scheduling_counters = RankSchedulingCounters.deserialize(
+                    values[cursor : cursor + RankSchedulingCounters.wire_size()]
+                )
+                cursor += RankSchedulingCounters.wire_size()
+            if values[0] == cls._QUEUED_WIRE_VERSION:
+                queue_end = cursor + len(cls._QUEUED_FIELDS)
+                for name, value in zip(cls._QUEUED_FIELDS, values[cursor:queue_end]):
+                    setattr(result, name, int(value))
+                result.has_pending_work = bool(values[queue_end])
             return result
         scalar_field_count = cls._ITER_STATS_FIELD_COUNT + cls._KV_LOAD_FIELD_COUNT
         if len(values) > scalar_field_count:
@@ -188,6 +294,11 @@ class RankState:
     num_active_requests: int = 0
     num_active_tokens: int = 0
     num_retiring_requests: int = 0
+    num_pending_new_requests: int = 0
+    """Rank 0's snapshot of not-yet-fetched requests (request queue +
+    accumulated), piggybacked on the allgather so every rank can skip the
+    request-count probe broadcast (or the whole fetch) on the busy path.
+    Always 0 on non-zero ranks and when the fetch hint is disabled."""
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
     num_context_requests: int = 0
     num_generation_requests: int = 0
@@ -205,6 +316,7 @@ class RankState:
             self.num_active_requests,
             self.num_active_tokens,
             self.num_retiring_requests,
+            self.num_pending_new_requests,
             *self.iter_stats.serialize(include_kv_cache_load),
             self.num_context_requests,
             self.num_generation_requests,
@@ -216,7 +328,7 @@ class RankState:
     def deserialize(cls, data: list[int | float]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
-        prefix_field_count = 4
+        prefix_field_count = 5
         rank_state_fields = fields(cls)[:prefix_field_count]
         if not values:
             raise ValueError("RankState payload is missing required field rank")
@@ -225,7 +337,7 @@ class RankState:
                 values[prefix_field_count:]
             )
             if len(values) != prefix_field_count + stats_field_count + 4:
-                raise ValueError("KV snapshot rank state requires four trailing fields")
+                raise ValueError("Snapshot rank state requires four trailing fields")
         else:
             # Legacy messages have optional load telemetry and two or four tail
             # fields. Keep their framing independent of the Python dataclass size.
@@ -258,6 +370,7 @@ class RankState:
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
             num_retiring_requests=rank_values[3],
+            num_pending_new_requests=rank_values[4],
             iter_stats=RankIterStatsPayload.deserialize(values[prefix_field_count:stats_end]),
             num_context_requests=values[stats_end] if len(values) > stats_end else 0,
             num_generation_requests=values[stats_end + 1] if len(values) > stats_end + 1 else 0,

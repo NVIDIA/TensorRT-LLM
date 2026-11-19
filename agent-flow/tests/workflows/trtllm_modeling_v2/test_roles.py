@@ -42,7 +42,9 @@ from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
     TurnTimeout,
 )
 from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
+from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
+from agent_flow.workflows.trtllm_modeling_v2.run.execution import kernel_task
 from agent_flow.workflows.trtllm_modeling_v2.run.execution.handoff import (
     current_decision,
     decision_path,
@@ -119,8 +121,8 @@ def test_a_role_whose_model_the_spec_does_not_state_is_refused():
 
 @pytest.fixture
 def _quick_polls(monkeypatch):
-    """Background and side turns look again every 0.1s here, not every 5s."""
-    monkeypatch.setattr(slots, "_BACKGROUND_POLL_S", 0.1)
+    """Side turns look again every 0.1s here, not every 5s."""
+    monkeypatch.setattr(slots, "_SIDE_POLL_S", 0.1)
 
 
 class _Turns:
@@ -197,7 +199,6 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     shells: list[str] = []
     workflow = _workflow(
         tmp_path,
-        skip_substrate_gate=False,
         shell_runner=lambda command, env=None, timeout=0: shells.append(command),
     )
     log = get_logger().console
@@ -208,7 +209,7 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     assert "did not run the command" in journal
     assert "workflow does not change that policy" in journal
     assert not (tmp_path / "ws" / AGENT_PROBE_RECORD).exists()
-    # Nothing past it ran: not the substrate gate, not the survey.
+    # Nothing past it ran.
     assert shells == []
 
 
@@ -495,7 +496,7 @@ def test_decision_file_extra_keys_scope_and_role_endings() -> None:
 
 
 def test_workers_wait_for_results_and_write_decisions_before_ending() -> None:
-    for role in ("surveyor", "kernel_writer", "assembler", "tuner"):
+    for role in ("surveyor", "kernel_writer", "assembler"):
         text = getattr(prompts.DEFAULT_PROMPTS, role)
         assert WORKER_BASE in text
         assert "nothing wakes you after it" in text
@@ -521,7 +522,7 @@ def kernel_context() -> kernel.KernelContext:
         goal="certify norm",
         task_id="k4-rmsnorm",
         task_kind="kernel",
-        tags=("tune",),
+        tags=("investigate",),
         tier=4,
         landing="ops/norm/rmsnorm__r4",
         paths=("entry.py", "test.py"),
@@ -539,7 +540,7 @@ def test_kernel_device_assignment_respects_scheduler_and_device_zero(
     text = kernel.kernel_prompt(ctx)
     assert ("CUDA_VISIBLE_DEVICES=0" in text) is (environment == "local" and devices > 1)
     assert text.index(ctx.note) < text.index("## Your task")
-    assert text.index("## Tag `kernel`") < text.index("## Tag `tune`")
+    assert text.index("## Tag `kernel`") < text.index("## Tag `investigate`")
     assert "from .ops.norm.rmsnorm__r4 import rmsnorm" in text
     assert text.index("`entry.py`") < text.index("`test.py`")
     assert "The surface to certify: bf16" in text
@@ -566,7 +567,53 @@ def test_kernel_sourcing_and_landing_branches(
     assert ("Start the variant as a copy" in text) is (mode != "onboard")
 
 
-def test_survey_capture_variants_and_tune_identity_files(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("tests_directory", ["moe", "moe/ops"])
+@pytest.mark.parametrize("shared_landing", [False, True])
+def test_kernel_prompt_protects_shared_tests_in_task_checkout(
+    tmp_path: Path, tests_directory: str, shared_landing: bool
+) -> None:
+    name = "fp4_block_scale_moe_runner"
+    repo = tmp_path / "checkout"
+    source = f"{catalog_paths.CATALOG_DIR}/moe/{name}.py"
+    test = f"{catalog_paths.CATALOG_TESTS_DIR}/{tests_directory}/test_modeling_v2_{name}.py"
+    for relative in (source, test):
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Shared entry contract.\n", encoding="utf-8")
+
+    target = f"{catalog_paths.MODELING_V2_PACKAGE}/models/family/target"
+    ref = f"verify:moe/{name}"
+    item = catalog_paths.queue_item_from_ref(ref, "scope_probe")
+    assert item is not None
+    local_source = f"{target}/ops/moe/{name}__scope_probe.py"
+    task = Task(
+        id="scope_probe",
+        kind="kernel",
+        goal=f"Verify {name}",
+        ref=ref,
+        touches=[source if shared_landing else local_source],
+    )
+    execution = SimpleNamespace(
+        workflow=SimpleNamespace(
+            task_data={"trtllm_repo_path": str(repo), "arch": "sm_100"},
+            _preflight=SimpleNamespace(target_rel=target),
+            workspace=tmp_path / "run",
+            vocabulary_path=tmp_path / "run/vocabulary.yaml",
+        )
+    )
+    landing, paths = kernel_task._landing(execution, item, task)
+    text = kernel_task._kernel_writer_prompt(execution, item, task=task)
+    if shared_landing:
+        assert landing == item.target
+        assert paths == (source, test)
+        assert "Leave " not in text
+    else:
+        assert landing == item.variant
+        assert paths is not None and paths[0] == local_source
+        assert f"Leave `{source}` and `{test}`\nas they are:" in text
+
+
+def test_survey_capture_variants(monkeypatch) -> None:
     capture = check_config.CaptureList((1, 8), False, source="unit.yaml")
     monkeypatch.setattr(
         check_config,
@@ -577,28 +624,12 @@ def test_survey_capture_variants_and_tune_identity_files(tmp_path: Path, monkeyp
             check_config.LaunchCapture("disabled", "core", "disabled.yaml", None),
         ],
     )
-    identity = tmp_path / "identity.yaml"
-    identity.write_text("cuda_graph_config: null\n", encoding="utf-8")
-    missing = tmp_path / "missing.yaml"
-    text = survey.capture_lists_block(
-        {
-            "perf": {
-                "enabled": True,
-                "configs": [
-                    {"name": "identity", "identity_configs": [str(identity), str(missing)]},
-                    {"name": "derived", "workload": {"concurrency": [1, 8]}},
-                    {"name": "overlay", "llm_api_options": {"cuda_graph_config": None}},
-                ],
-            }
-        }
-    )
+    # Performance work is not the flow's: the survey plans no serving config.
+    text = survey.capture_lists_block({})
     assert "`core`: 2 batches [1, 8], unpadded" in text
     assert "variants same: their unit's list" in text
     assert "variant `disabled` (unit `core`): no CUDA graphs at any gate" in text
-    assert f"tune `identity`: no CUDA graphs, from {identity}" in text
-    assert f"{missing} (not readable here)" in text
-    assert "`capture_batch_sizes` up to concurrency 8" in text
-    assert "tune `overlay`: no CUDA graphs, from its `llm_api_options`" in text
+    assert "tune" not in text
 
 
 def test_all_template_resources_are_declared_as_package_data() -> None:
@@ -619,19 +650,3 @@ def test_all_template_resources_are_declared_as_package_data() -> None:
     for name in loaded:
         assert (resources / name).is_file()
         _render._ENVIRONMENT.get_template(name)
-
-
-@pytest.mark.parametrize("invalid", ["yaml", "capture"])
-def test_invalid_tune_configuration_is_reported_without_losing_other_configs(tmp_path, invalid):
-    if invalid == "yaml":
-        path = tmp_path / "invalid.yaml"
-        path.write_text("cuda_graph_config: [\n")
-        bad = {"name": "bad", "identity_configs": [str(path)]}
-    else:
-        bad = {"name": "bad", "llm_api_options": {"cuda_graph_config": "invalid"}}
-    text = survey.capture_lists_block(
-        {"perf": {"enabled": True, "configs": [bad, {"name": "good"}]}}
-    )
-    assert "tune `bad`: cannot be resolved" in text
-    assert "repair this configuration before measuring" in text
-    assert "tune `good`:" in text
