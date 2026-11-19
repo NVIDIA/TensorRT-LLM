@@ -128,6 +128,18 @@ Optionally, you may replace the native PyTorch modules with our implementations 
 
 For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.
 
+#### Multimodal Models
+
+A Modeling V2 vision-language model has the composite shape of a Modeling V1
+one: it holds the Modeling V2 language model as `llm` and the tower as
+`mm_encoder`, and `MultimodalModelMixin` runs it. Name it
+`ModelingV2<Target>ForConditionalGeneration` (never `...VLM` or `...Model`) and
+subclass `ModelingV2ForConditionalGeneration`, the shared base. Declare only
+what differs from the base; code that several targets would copy goes into the
+base. The language model target keeps its name, `ModelingV2<Target>`. See
+"Multimodal targets" in `tensorrt_llm/_torch/modeling_v2/README.md` for the
+template.
+
 ### Weight Loading
 
 The base class `DecoderModelForCausalLM` provides a `load_weights` method that loads the weights from the checkpoint file and assigns them to the corresponding layers in the model. However, if the default method does not work for `MyModelForCausalLM`, you need to implement your own `load_weights`:

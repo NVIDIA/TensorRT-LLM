@@ -81,7 +81,9 @@ double underscores between the three parts:
 The target class name contains the same three parts in CamelCase, for example
 `ModelingV2DeepseekR10528Nvfp4Sm10xDefault` in
 [`r1_0528_nvfp4__sm_10x__default`](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/).
-These names are conventions, not requirements.
+These names are conventions, not requirements. The one rule is for a
+vision-language model, whose class name ends with `ForConditionalGeneration`
+(see [Multimodal targets](#multimodal-targets)).
 
 A target can contain several execution paths. The DeepSeek R1 target, for
 example, has separate `PrefillTarget` and `DecodeTarget` classes and picks one
@@ -93,6 +95,7 @@ on each forward step. In this guide, "target" always means the whole directory.
 modeling_v2/
 ├── _router_index.py           # Route registration and target resolution
 ├── _native.py                 # Loads family native libraries
+├── multimodal.py              # Base class of vision-language targets
 ├── catalog/
 │   ├── _op.py                 # OpWrapper: the operation contract
 │   └── <category>/            # Operations used by more than one family
@@ -135,8 +138,10 @@ it uses only runtime interfaces, for example:
 
 * `DecoderModel`, `DecoderModelForCausalLM`, `ModelConfig` and `Mapping`.
 * `MultimodalModelMixin` and `MultimodalEncoderMixin`. A vision-language target
-  may inherit these. It does not subclass or call a Modeling V1 model, vision
-  tower, layer, attention backend or MoE.
+  inherits the first through `ModelingV2ForConditionalGeneration`
+  ([`multimodal.py`](multimodal.py)), and its tower the second. It does not
+  subclass or call a Modeling V1 model, vision tower, layer, attention backend
+  or MoE.
 * Attention and speculative metadata, and the KV cache managers.
 
 A target does not import, subclass or call Modeling V1 model code: the model
@@ -176,9 +181,10 @@ example that uses no Modeling V1 model code.
 
 A target plugs into TensorRT-LLM through the existing `DecoderModel` and
 `DecoderModelForCausalLM` interfaces. A language model target inherits these
-classes directly, not a Modeling V1 model class. A vision-language target is a
-composite `MultimodalModelMixin` model that holds such a language model target
-as `llm`. Either can override any of these steps:
+classes directly, not a Modeling V1 model class. A vision-language target
+subclasses `ModelingV2ForConditionalGeneration`, which holds such a language
+model target as `llm` (see [Multimodal targets](#multimodal-targets)). Either
+can override any of these steps:
 
 * **Constructor:** builds the model structure and parameters.
 * **`load_weights`:** loads checkpoint weights into the model. Put weight
@@ -196,6 +202,87 @@ classes are fine when they make the code clearer or faster. The
 [GPT-OSS target](models/gpt_oss/gpt_oss_120b__sm_10x__default/modeling.py) and
 its [weight loader](models/gpt_oss/gpt_oss_120b__sm_10x__default/weights.py)
 are a small example.
+
+## Multimodal targets
+
+A vision-language architecture routes to one of two kinds of target. The
+resolver checks every class a `route` returns: when the architecture's input
+processor takes media, the class must be one of these two (or an existing
+target that encodes media itself, see below), or startup fails.
+
+**A vision-language model** runs media through the shared multimodal runtime
+and has the composite shape of a Modeling V1 vision-language model: it holds a
+language model target as `llm` and the encoder tower as `mm_encoder`, and
+`MultimodalModelMixin` runs it. Subclass `ModelingV2ForConditionalGeneration`
+from [`multimodal.py`](multimodal.py). This shared base does the common work
+once: the config split, admission, encoder caching and the current chunk's rows
+(through `MultimodalModelMixin`), the compile scope, the weight split, and what
+the engine reads off the routed class and model. A target declares what
+differs:
+
+```python
+class ModelingV2MyTargetForConditionalGeneration(ModelingV2ForConditionalGeneration):
+    language_model_class = ModelingV2MyTarget   # the language model target
+    mm_encoder_class = MyTower                  # MyTower(vision_config, dtype)
+    mm_encoder_weight_prefix = "model.visual."  # the tower's checkpoint keys
+
+    def encode_multimodal_inputs(self, multimodal_params):
+        return torch.cat([encode(self.mm_encoder, p) for p in multimodal_params])
+```
+
+`route` returns this class. The tower is an `nn.Module` and
+`MultimodalEncoderMixin` that declares and loads its own weights. The base
+builds it as `mm_encoder_class(vision_config, dtype)`, from the composite
+config's `vision_config` at the activation dtype; for a tower built another
+way, override `build_mm_encoder` instead. By default
+the rows reach the language model fused into `inputs_embeds`. With
+`language_model_takes_rows = True`, `input_ids` stay as they are and the
+language model takes `multimodal_rows=(rows, mm_token_indices)`; the
+[qwen4_exp target](models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/modeling.py)
+does this because its PLE layer hashes `input_ids`. Override
+`validate_media_request` to refuse, at admission, media the tower cannot
+encode. To pass extra inputs to the language model, as V1 Qwen3-VL does for
+DeepStack, override `get_language_model_extra_forward_kwargs`.
+
+**A text-only target** serves the text half of the checkpoint. It defines
+`validate_multimodal_request_data` and raises when
+`tensorrt_llm.inputs.multimodal.has_media_or_embeddings` is true, so a request
+with media fails alone at admission instead of failing its batch in `forward`.
+M-RoPE positions alone, as a disaggregated generation request carries, are not
+media.
+
+**A target that encodes media itself** does not use the base. The qwen4_exp
+FP8 target encodes, in its own forward, only the frames of the current prefill
+chunk. It refuses at admission, in a `validate_request` of its own class (the
+resolver does not count an inherited one), what its tower cannot take, and it
+gets no shared encoder cache. The contract test lists such targets by name; a
+new target is not added to that list, and an entry that is no longer needed
+fails the test.
+
+With `disable_mm_encoder` the model builds no tower, loads no encoder weights
+and refuses media like a text-only target. With a tower, the breakable prefill
+CUDA graph runs when the language model takes the rows itself
+(`language_model_takes_rows`), as for the language model alone; with rows fused
+into `inputs_embeds` it is refused at startup. A model with a tower does not
+run its encoder on a side stream: the route declines
+`encoder_side_stream_max_ahead > 0`.
+
+**The rule for vision-language models:**
+
+* One shared base. Code that every V2 vision-language model needs lives in
+  `ModelingV2ForConditionalGeneration`. A target declares only what differs;
+  code that several targets would copy goes into the base.
+* One name. A V2 class that serves media is
+  `ModelingV2<Target>ForConditionalGeneration` and subclasses the base, never
+  `...VLM` or `...Model`. Its language model target stays `ModelingV2<Target>`.
+  A text-only target routed for a vision-language checkpoint keeps its name
+  until it serves media.
+
+`test_modeling_v2_contracts.py` checks both kinds of target from the source, and
+runs each text-only target's admission hook on media, embeddings and M-RoPE
+positions. For the name, it checks that a routed multimodal model subclasses the base and that
+its name ends with `ForConditionalGeneration`, and that no target class ends
+with `VLM`. Review checks the `ModelingV2<Target>` part.
 
 ## Routing
 
