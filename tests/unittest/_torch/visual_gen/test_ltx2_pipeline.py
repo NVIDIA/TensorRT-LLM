@@ -1213,7 +1213,9 @@ class TestLTX2TwoStageLoRAHelpers:
     """Test LTX-2 two-stage distilled LoRA helpers without model loading."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_quant_refinement_keeps_native_nvfp4_lora_bf16_path(self):
+    @pytest.mark.parametrize("use_cuda_graph", [False, True])
+    def test_quant_refinement_keeps_native_nvfp4_lora_bf16_path(self, use_cuda_graph):
+        from concurrent.futures import Future
         from unittest.mock import patch
 
         from test_common.visual_gen_quantization import (
@@ -1247,11 +1249,13 @@ class TestLTX2TwoStageLoRAHelpers:
             def post_load_weights(self):
                 self.proj.post_load_weights()
 
-        class Pipeline(BasePipeline):
-            _prepare_refinement_model = (
-                ltx2_two_stages.LTX2TwoStagesPipeline._prepare_refinement_model
-            )
+            def register_cuda_graph_extra_key_fns(self, runner):
+                pass
 
+            def forward(self, inputs):
+                return self.proj(inputs)
+
+        class Pipeline(BasePipeline):
             def _init_transformer(self):
                 self.transformer = Model(self.pipeline_config.model_configs["transformer"])
 
@@ -1265,7 +1269,7 @@ class TestLTX2TwoStageLoRAHelpers:
                 )
 
         config = DiffusionPipelineConfig(
-            cuda_graph=CudaGraphConfig(enable=False),
+            cuda_graph=CudaGraphConfig(enable=use_cuda_graph),
             model_configs={
                 "transformer": DiffusionModelConfig(
                     component_name="transformer",
@@ -1281,30 +1285,61 @@ class TestLTX2TwoStageLoRAHelpers:
         pipeline.load_transformer_quant_weights(weights)
         original = pipeline.transformer.proj.weight.detach().clone()
         original_method = pipeline.transformer.proj.quant_method
-        pipeline._distilled_lora_deltas = {"proj.weight": torch.full_like(weights, 0.125)}
+        future = Future()
+        future.set_result({"proj.weight": torch.full_like(weights, 0.125)})
         with patch.object(
             weight_loader,
             "quantize_nvfp4",
             side_effect=AssertionError("LoRA must keep merged BF16"),
         ):
-            pipeline.build_transformer_quant_stage("refinement", pipeline._prepare_refinement_model)
+            ltx2_two_stages.LTX2TwoStagesPipeline._load_two_stage_components(
+                pipeline, torch.device("cuda"), torch.bfloat16, "", "lora", future
+            )
+        pipeline._setup_transformer_quant_graphs()
         dispatcher = pipeline._transformer_quant_dispatchers["transformer"]
         inputs = torch.randn(1, 128, dtype=torch.bfloat16, device="cuda")
-        with torch.inference_mode(), observe_quantization_paths(dispatcher) as trace:
-            for _ in range(2):
-                with pipeline.transformer_quant_stage("refinement"):
-                    for step in range(2):
-                        pipeline._publish_denoise_step((step, 2))
-                        trace.step = step
-                        projection = pipeline.transformer.proj
-                        assert type(projection.quant_method) is UnquantizedLinearMethod
-                        assert projection.weight.dtype == torch.bfloat16
-                        assert projection.weight.shape == weights.shape
-                        projection(inputs)
-                    pipeline._publish_denoise_step(None)
-                assert pipeline.transformer.proj.quant_method is original_method
-                assert torch.equal(pipeline.transformer.proj.weight, original)
-        assert_quantization_routes(trace, {(step, "proj", "linear"): "bf16" for step in range(2)})
+        try:
+            with (
+                torch.inference_mode(),
+                observe_quantization_paths(dispatcher, device_only=use_cuda_graph) as trace,
+            ):
+                for _ in range(2):
+                    with pipeline.transformer_quant_stage("refinement"):
+                        pipeline._distilled_lora_weight_cache.bind_merged()
+                        try:
+                            for step in range(2):
+                                pipeline._publish_denoise_step((step, 2))
+                                trace.step = step
+                                projection = pipeline.transformer.proj
+                                assert type(projection.quant_method) is UnquantizedLinearMethod
+                                assert projection.weight.dtype == torch.bfloat16
+                                assert projection.weight.shape == weights.shape
+                                if use_cuda_graph:
+                                    for _ in range(4):
+                                        pipeline.transformer(inputs)
+                                    trace.reset()
+                                pipeline.transformer(inputs)
+                                if use_cuda_graph:
+                                    assert trace.device_counts.cpu().tolist() == [1, 0, 0, 0]
+                            pipeline._publish_denoise_step(None)
+                        finally:
+                            pipeline._distilled_lora_weight_cache.bind_original()
+                    assert pipeline.transformer.proj.quant_method is original_method
+                    assert torch.equal(pipeline.transformer.proj.weight, original)
+            if use_cuda_graph:
+                runners = [
+                    runner
+                    for name, runner in pipeline._cuda_graph_runners.items()
+                    if name.startswith("transformer_refinement_")
+                ]
+                assert len(runners) == 2 and all(runner.graphs for runner in runners)
+            else:
+                assert_quantization_routes(
+                    trace, {(step, "proj", "linear"): "bf16" for step in range(2)}
+                )
+        finally:
+            for runner in pipeline._cuda_graph_runners.values():
+                runner.clear()
 
     @pytest.mark.cpu_only
     @pytest.mark.parametrize("with_lora", [False, True])
@@ -1312,11 +1347,13 @@ class TestLTX2TwoStageLoRAHelpers:
         self, with_lora, tmp_path
     ):
         from concurrent.futures import Future
+        from unittest.mock import patch
 
         from safetensors.torch import save_file
         from test_common.visual_gen_quantization import ToyDiT
 
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+        from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
         from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
         from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
             bind_model_weights,
@@ -1327,6 +1364,7 @@ class TestLTX2TwoStageLoRAHelpers:
             def __init__(self, config):
                 super().__init__(block_count=1, model_config=config)
                 self._has_stage2 = True
+                self._sharder_s2 = SimpleNamespace(size=1)
                 self.topology = "base"
 
             def set_ulysses_topology(self, *, is_stage2):
@@ -1335,17 +1373,19 @@ class TestLTX2TwoStageLoRAHelpers:
             def prepare_text_cache(self):
                 return self.topology, id(self)
 
-        class Pipeline(BasePipeline):
-            _prepare_refinement_model = (
-                ltx2_two_stages.LTX2TwoStagesPipeline._prepare_refinement_model
-            )
-
+        class Pipeline(ltx2_two_stages.LTX2TwoStagesPipeline):
             def _init_transformer(self):
                 self.transformer = Model(self.pipeline_config.model_configs["transformer"])
 
-        pipeline = Pipeline(
+            def _get_per_channel_statistics(self):
+                return None
+
+        pipeline = object.__new__(Pipeline)
+        BasePipeline.__init__(
+            pipeline,
             DiffusionPipelineConfig(
                 cuda_graph=CudaGraphConfig(enable=False),
+                visual_gen_mapping=VisualGenMapping(world_size=1, rank=0),
                 model_configs={
                     "transformer": DiffusionModelConfig(
                         component_name="transformer",
@@ -1354,12 +1394,12 @@ class TestLTX2TwoStageLoRAHelpers:
                             quant_attention_config=QuantAttentionConfig(
                                 qk_dtype="nvfp4",
                                 v_dtype="fp8",
-                                ignore_steps=[0],
+                                ignore_steps=[0, 9],
                             ),
                         ),
                     )
                 },
-            )
+            ),
         )
         base_models = [model for _, model in pipeline.transformer_quant_models()]
         for model in base_models:
@@ -1393,22 +1433,58 @@ class TestLTX2TwoStageLoRAHelpers:
         refinement_models = [model for _, model in dispatcher.models("refinement")]
         assert len(refinement_models) == 2
         assert all(not model.training for model in refinement_models)
-        assert all(model.topology == "refinement" for model in refinement_models)
         assert all(model.topology == "base" for model in base_models)
-        for _ in range(2):
-            with pipeline.transformer_quant_stage("refinement"):
-                caches = pipeline.prepare_transformer_inputs("prepare_text_cache")
-                for step in range(2):
-                    pipeline._publish_denoise_step((step, 2))
-                    assert pipeline.resolve_transformer_inputs(caches) == (
-                        "refinement",
-                        id(pipeline.transformer),
-                    )
-                    weight = pipeline.transformer.blocks[0].linear.weight
-                    assert torch.equal(weight, original + delta if with_lora else original)
-                pipeline._publish_denoise_step(None)
-            assert torch.equal(pipeline.transformer.blocks[0].linear.weight, original)
+        stage1_weight = base_models[0].blocks[0].linear.weight
+        stage2_weight = refinement_models[0].blocks[0].linear.weight
+        assert stage1_weight is not stage2_weight
+        assert refinement_models[1].blocks[0].linear.weight is stage2_weight
+        assert (stage1_weight.data_ptr() == stage2_weight.data_ptr()) == (not with_lora)
+        cache = pipeline._distilled_lora_weight_cache
+        assert cache.applied_count == int(with_lora)
+        pipeline.scheduler = SimpleNamespace(timesteps=torch.arange(8))
+        pipeline.spatial_upsampler = torch.nn.Identity()
+        latents = torch.zeros(1, 1, 1, 1, 1)
+
+        def stage1(**kwargs):
             assert dispatcher.stage == "base"
+            assert all(model.topology == "base" for model in base_models)
+            assert torch.equal(stage1_weight, original)
+            return ltx2_two_stages.PipelineOutput(video=latents)
+
+        def stage2(**kwargs):
+            assert dispatcher.stage == "refinement"
+            assert cache._bound_state == "merged"
+            assert all(model.topology == "refinement" for model in refinement_models)
+            assert all(model.topology == "base" for model in base_models)
+            caches = pipeline.prepare_transformer_inputs("prepare_text_cache")
+            for _ in pipeline._profile_denoise_steps(range(3)):
+                assert pipeline.resolve_transformer_inputs(caches) == (
+                    "refinement",
+                    id(pipeline.transformer),
+                )
+                assert torch.equal(stage1_weight, original)
+                weight = pipeline.transformer.blocks[0].linear.weight
+                assert torch.equal(weight, original + delta if with_lora else original)
+            if fail:
+                raise RuntimeError("refinement failed")
+            return latents, None
+
+        with (
+            patch.object(ltx2_two_stages.LTX2Pipeline, "forward", side_effect=stage1),
+            patch.object(pipeline, "_refinement_denoise", side_effect=stage2),
+            patch.object(ltx2_two_stages, "upsample_video", return_value=latents),
+        ):
+            for fail in (False, True, False):
+                if fail:
+                    with pytest.raises(RuntimeError, match="refinement failed"):
+                        pipeline.forward(prompt="test", seed=0, output_type="latent")
+                else:
+                    pipeline.forward(prompt="test", seed=0, output_type="latent")
+                assert cache._bound_state == "original"
+                assert all(model.topology == "base" for model in refinement_models)
+                assert torch.equal(stage1_weight, original)
+                assert dispatcher.stage == "base" and dispatcher.step is None
+                assert pipeline._lora_cuda_graph_state == "original"
 
     def test_bf16_snapshot_gate_uses_preload_memory(self, monkeypatch):
         """Pre-load memory is the whole-pipeline budget and wins over current memory."""

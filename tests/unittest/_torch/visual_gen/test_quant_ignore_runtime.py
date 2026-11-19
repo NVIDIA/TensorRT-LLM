@@ -322,7 +322,8 @@ def test_variant_request_inputs_follow_the_selected_model():
 
 
 @pytest.mark.cpu_only
-def test_completed_linear_storage_is_shared_and_survives_offload():
+@pytest.mark.parametrize("share_parameters", [False, True])
+def test_completed_linear_storage_is_shared_and_survives_offload(share_parameters):
     config = DiffusionModelConfig(component_name="transformer")
 
     def model():
@@ -338,7 +339,8 @@ def test_completed_linear_storage_is_shared_and_survives_offload():
         "weight": {"meta": source.proj.weight.to("meta"), "param": source.proj.weight}
     }
     expected = source.proj.weight.detach().clone()
-    bind_model_weights(source, target)
+    bind_model_weights(source, target, share_parameters=share_parameters)
+    assert (source.proj.weight is target.proj.weight) == share_parameters
     assert target.proj.rebuild_tensor_metadata["weight"]["param"] is target.proj.weight
     assert (
         target.proj.rebuild_tensor_metadata["weight"]
@@ -365,6 +367,10 @@ def test_completed_linear_storage_is_shared_and_survives_offload():
             assert model.proj.rebuild_tensor_metadata["weight"]["param"] is model.proj.weight
         manager._rebind_to_cpu("transformer")
         manager.active_stage_name = None
+    if not share_parameters:
+        target.proj.weight.data = torch.empty_like(target.proj.weight)
+        assert source.proj.weight.data_ptr() != target.proj.weight.data_ptr()
+        assert torch.equal(source.proj.weight, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
