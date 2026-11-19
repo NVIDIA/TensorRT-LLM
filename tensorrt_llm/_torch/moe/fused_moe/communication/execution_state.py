@@ -15,25 +15,28 @@
 """The active-rank mask and abort state that the MoE all-to-all kernels read under Wide-EP fault tolerance.
 
 When a peer stops, ``request_abort`` releases the collectives that wait for it. Then, with the model
-idle, ``rearm`` returns the bound workspaces and layers to their first round, and ``install_mask``
-writes the new rank mask. Long waits on peers publish the round flag they wait for in the abort
-state (``waited_flags``). After each forward, ``check_incomplete_rounds`` marks the abort state
-cancelled if a peer may have overwritten rows that the forward's combines read.
+idle on every surviving rank, ``rearm`` returns the bound workspaces and layers to their first round,
+and ``install_mask`` writes the new rank mask (see ``rearm`` for the required order). Long waits on
+peers publish the round flag they wait for in the abort state (``waited_flags``). After each
+forward, ``check_incomplete_rounds`` marks the abort state cancelled if a peer may have overwritten
+rows that the forward's combines read.
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import confidential_compute_enabled, prefer_pinned
 from tensorrt_llm.bindings import internal as _tllm_internal
 
 from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
 
 _MASK_WORD_BITS = 64
 _ABORT_REQUESTED = 0
+_ABORT_STATUS = 1
 # The words ``requested`` and ``status``, then the round flag awaited from each peer.
 _ABORT_WORDS = slice(0, int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX))
 _WAITED_FLAGS = slice(int(_tllm_internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX), None)
@@ -65,6 +68,11 @@ class MoeExecutionState:
         self.ep_rank = ep_rank
         self._device = device
         # The kernels read the abort state at its host address, which must be pinned memory.
+        if confidential_compute_enabled():
+            raise RuntimeError(
+                "Wide-EP fault tolerance is not supported with Confidential Computing: the MoE "
+                "All-to-All kernels read their abort state in pinned host memory"
+            )
         self.abort = torch.zeros(
             int(_tllm_internal.thop.MOE_A2A_ABORT_STATE_WORDS),
             dtype=torch.int32,
@@ -73,17 +81,25 @@ class MoeExecutionState:
         if not self.abort.is_pinned():
             raise RuntimeError("The MoE All-to-All abort state requires pinned host memory")
         self._abort_words = self.abort.numpy()[_ABORT_WORDS]
+        # Orders the updates of ``requested`` by request_abort and rearm.
+        self._abort_lock = threading.Lock()
         self._workspaces: dict[object, tuple[Callable[[], None], Callable[[], None]]] = {}
-        self._layer_resets: list[Callable[[], None]] = []
+        self._layers: list[tuple[Callable[[], None], Callable[[], bool]]] = []
         snapshot = ep_group_health.snapshot()
         self._generation = snapshot.generation
         self.active_rank_mask = torch.tensor(
             _mask_words(snapshot.mask, ep_rank), dtype=torch.uint64, device=device
         )
 
-    def register_layer(self, reset_state: Callable[[], None]) -> None:
-        """Register the reset of a bound layer's dispatch/combine state machine."""
-        self._layer_resets.append(reset_state)
+    def register_layer(
+        self, reset_state: Callable[[], None], between_rounds: Callable[[], bool]
+    ) -> None:
+        """Register a bound layer's dispatch/combine state machine.
+
+        ``reset_state`` returns it to idle, and ``between_rounds`` returns whether it is idle, that
+        is, no dispatch of the layer waits for its combine.
+        """
+        self._layers.append((reset_state, between_rounds))
 
     def register_workspace(
         self,
@@ -99,8 +115,12 @@ class MoeExecutionState:
         self._workspaces.setdefault(workspace, (reset_workspace, check_incomplete_round))
 
     def request_abort(self) -> None:
-        """Make running and future collectives return without their peers. Safe from any thread."""
-        self._abort_words[_ABORT_REQUESTED] = 1
+        """Make running and future collectives return without their peers. Safe from any thread.
+
+        The request stays in effect until a :meth:`rearm` that starts after it.
+        """
+        with self._abort_lock:
+            self._abort_words[_ABORT_REQUESTED] += 1
 
     def aborted(self) -> bool:
         """Return whether an abort was requested or a collective aborted since the last :meth:`rearm`."""
@@ -129,28 +149,52 @@ class MoeExecutionState:
     def rearm(self) -> None:
         """Clear the abort state and return every bound workspace and layer to its first round.
 
-        Call only while the model is idle and before :meth:`install_mask`. The device is
-        synchronized before and after, so no queued collective sees a partial reset.
+        It resets this rank's row of each bound workspace without a barrier, so every surviving
+        rank recovers in this order: :meth:`request_abort` if a collective waits on a failed peer,
+        a device synchronization, a barrier over the surviving ranks, ``rearm``,
+        :meth:`install_mask`, then a barrier over the surviving ranks before its next collective.
+        The first barrier keeps a peer's aborted collectives from writing into the row after its
+        reset, the second keeps a peer's next collective from writing into it before. ``install_mask``
+        needs no barrier of its own: it writes only this rank's device mask, after a device
+        synchronization, and refuses a layer that is between its dispatch and its combine. The
+        device is synchronized before and after, so no queued collective sees a partial reset.
+
+        The abort requests made before ``rearm`` starts are cleared. A request made meanwhile
+        stays in effect, so :meth:`aborted` then holds and :meth:`install_mask` raises.
         """
+        with self._abort_lock:
+            handled_requests = int(self._abort_words[_ABORT_REQUESTED])
         torch.cuda.synchronize(self._device)
-        self.abort.zero_()
         for reset_workspace, _ in self._workspaces.values():
             reset_workspace()
-        for reset_state in self._layer_resets:
+        for reset_state, _ in self._layers:
             reset_state()
         torch.cuda.synchronize(self._device)
+        # The kernels write the status and waited flags, and none runs now.
+        self.abort[_ABORT_STATUS:].zero_()
+        with self._abort_lock:
+            self._abort_words[_ABORT_REQUESTED] -= handled_requests
 
     def install_mask(self) -> None:
         """Write the active ranks of the EP group health into the device mask.
 
         Call only while no all-to-all collective is queued or running, and after :meth:`rearm` if a
-        collective aborted. The device is synchronized first, so no collective reads a partly
-        written mask.
+        collective aborted (see :meth:`rearm` for the order across ranks). The device is
+        synchronized first, so no collective reads a partly written mask.
+
+        Raises:
+            RuntimeError: A bound layer dispatched without its combine, which would read the rows
+                of another mask, or the abort state is set.
         """
         snapshot = self.ep_group_health.snapshot()
         if snapshot.generation == self._generation:
             return
         words = _mask_words(snapshot.mask, self.ep_rank)
+        if not all(between_rounds() for _, between_rounds in self._layers):
+            raise RuntimeError(
+                "Install the MoE All-to-All rank mask only between rounds: a bound layer "
+                "dispatched without its combine"
+            )
         torch.cuda.synchronize(self._device)
         if self.aborted():
             raise RuntimeError(f"MoE All-to-All abort state is {self.abort[_ABORT_WORDS].tolist()}")

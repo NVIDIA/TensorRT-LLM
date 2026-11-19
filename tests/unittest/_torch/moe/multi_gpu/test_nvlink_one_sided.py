@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pickle
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -797,6 +798,25 @@ def test_nvlink_one_sided(case: Case, mpi_pools: dict[tuple[int, bool], MPIPoolE
 # CUDA graphs under an execution state
 # ============================================================================
 
+# Longer than the kernel timeouts the tests below set, so that a collective stuck on a peer fails on
+# the waiting rank first.
+_BARRIER_TIMEOUT_S = 120.0
+# Bounds a whole test, so that a worker stuck outside a barrier fails the test instead of the stage.
+_WORKER_TIMEOUT_S = 600.0
+
+
+def _bounded_barrier() -> None:
+    """Wait for every rank; raise instead of hanging when a peer never arrives."""
+    request = MPI.COMM_WORLD.Ibarrier()
+    deadline = time.monotonic() + _BARRIER_TIMEOUT_S
+    while not request.Test():
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"rank {MPI.COMM_WORLD.Get_rank()} waited {_BARRIER_TIMEOUT_S:.0f} s at a barrier "
+                "that a peer never reached"
+            )
+        time.sleep(0.01)
+
 
 def _run_graph_replay_worker(failed_rank: int) -> dict:
     """Capture one round trip with every rank active, then replay it without ``failed_rank``."""
@@ -854,7 +874,7 @@ def _run_graph_replay_worker(failed_rank: int) -> dict:
         set_inputs(everyone, 0)
         check(torch.equal(round_trip(), x), "eager round combined wrong")
         torch.cuda.synchronize()
-        MPI.COMM_WORLD.Barrier()
+        _bounded_barrier()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             output = round_trip()
@@ -862,7 +882,7 @@ def _run_graph_replay_worker(failed_rank: int) -> dict:
         graph.replay()
         torch.cuda.synchronize()
         check(torch.equal(output, x), "replay with every rank combined wrong")
-        MPI.COMM_WORLD.Barrier()
+        _bounded_barrier()
 
         # The failed rank replays nothing more; the others install the mask without it and
         # replay the graph captured before.
@@ -876,7 +896,7 @@ def _run_graph_replay_worker(failed_rank: int) -> dict:
                 graph.replay()
                 torch.cuda.synchronize()
                 check(torch.equal(output, x), f"replay {seed} without rank {failed_rank} wrong")
-        MPI.COMM_WORLD.Barrier()
+        _bounded_barrier()
         return {"rank": rank, "errors": errors, "sentinel_max_tokens": comm.sentinel_max_tokens}
     finally:
         comm.destroy()
@@ -889,8 +909,14 @@ def test_graph_replay_follows_installed_mask() -> None:
         pytest.skip(f"requires {ep_size} GPUs")
     # A replay that waited for the masked rank would end at this kernel timeout.
     executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "60"})
+    finished = False
     try:
-        results = list(executor.map(_run_graph_replay_worker, [failed_rank] * ep_size))
+        results = list(
+            executor.map(
+                _run_graph_replay_worker, [failed_rank] * ep_size, timeout=_WORKER_TIMEOUT_S
+            )
+        )
+        finished = True
         skipped = [r["skip"] for r in results if "skip" in r]
         if skipped:
             pytest.skip(skipped[0])
@@ -898,7 +924,8 @@ def test_graph_replay_follows_installed_mask() -> None:
         # The sentinel transport takes no active-rank mask, so every step takes the fence one.
         assert all(r["sentinel_max_tokens"] == 0 for r in results)
     finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+        # Waiting for a worker that failed or timed out could hang the test.
+        executor.shutdown(wait=finished, cancel_futures=True)
 
 
 # ============================================================================
@@ -909,8 +936,6 @@ def test_graph_replay_follows_installed_mask() -> None:
 def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round_flag: int) -> dict:
     """Abort a round from ``round_flag`` whose ``failed_rank`` stops before ``stop_before``."""
     # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
-    import time
-
     import torch
 
     from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
@@ -963,11 +988,11 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round
     try:
         state = MoeExecutionState(health, rank, torch.device("cuda"))
         comm.bind_execution_state(state)
-        MPI.COMM_WORLD.Barrier()
+        _bounded_barrier()
         x, combined = round_trip(everyone, 0)
         check(torch.equal(combined, x), "healthy round combined wrong")
         torch.cuda.synchronize()
-        MPI.COMM_WORLD.Barrier()
+        _bounded_barrier()
 
         # Round 1: the dispatch waits for flag value round_flag + 1 and the combine for
         # round_flag + 2, modulo 2**32. A wait publishes 1 for a flag value that wrapped to 0.
@@ -1010,12 +1035,12 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round
             own = torch.arange(capacity, device=x.device) % ep_size == rank
             expected[own] = x[own]
             check(torch.equal(combined, expected), "the incomplete round combined wrong")
-        MPI.COMM_WORLD.Barrier()
+        _bounded_barrier()
 
         health.mark_failed(failed_rank)
         if rank in active:
             state.rearm()
-        MPI.COMM_WORLD.Barrier()
+        _bounded_barrier()
         if rank in active:
             state.install_mask()
             for seed in (2, 3):
@@ -1023,7 +1048,7 @@ def _run_abort_stuck_collective_worker(failed_rank: int, stop_before: str, round
                 check(torch.equal(combined, x), f"round {seed} after the recovery combined wrong")
             torch.cuda.synchronize()
             check(not state.aborted(), "a round after the recovery aborted")
-        MPI.COMM_WORLD.Barrier()
+        _bounded_barrier()
         return {"rank": rank, "errors": errors}
     finally:
         comm.destroy()
@@ -1042,12 +1067,17 @@ def test_abort_releases_bound_collectives_waiting_on_a_stopped_rank(
     if torch.cuda.device_count() < ep_size:
         pytest.skip(f"requires {ep_size} GPUs")
     executor = MPIPoolExecutor(ep_size, env={"TRTLLM_MOE_COMM_TIMEOUT_SEC": "30"})
+    finished = False
     try:
         args = [(failed_rank, stop_before, round_flag)] * ep_size
-        results = list(executor.starmap(_run_abort_stuck_collective_worker, args))
+        results = list(
+            executor.starmap(_run_abort_stuck_collective_worker, args, timeout=_WORKER_TIMEOUT_S)
+        )
+        finished = True
         skipped = [r["skip"] for r in results if "skip" in r]
         if skipped:
             pytest.skip(skipped[0])
         assert [e for r in results for e in r["errors"]] == []
     finally:
-        executor.shutdown(wait=True, cancel_futures=True)
+        # Waiting for a worker that failed or timed out could hang the test.
+        executor.shutdown(wait=finished, cancel_futures=True)

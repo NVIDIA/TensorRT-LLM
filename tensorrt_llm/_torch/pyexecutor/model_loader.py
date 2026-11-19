@@ -1404,8 +1404,6 @@ class ModelLoader:
 
         validate_lm_head_output_dtype(model, self.llm_args.lm_head_output_dtype)
         if self.llm_args.enable_wide_ep_fault_tolerance:
-            # Imported here, so that a model without fault tolerance loads
-            # none of its modules.
             from .rank_failure_model_load import prepare_model
             prepare_model(model)
 

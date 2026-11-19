@@ -127,12 +127,9 @@ inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
 // Return the device address of a provided rank-mask tensor, which the kernels read when they run. On failure
 // (wrong dtype / device / shape), throw at the Python op boundary rather than launch.
 inline uint64_t const* resolveActiveRankMask(
-    torch::optional<torch::Tensor> const& maskTensor, int64_t epRank, torch::Tensor const& workspace)
+    torch::optional<torch::Tensor> const& maskTensor, torch::Tensor const& workspace)
 {
     using tensorrt_llm::kernels::moe_comm::kRankMaskWords;
-    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
-    TORCH_CHECK(
-        epRank >= 0 && epRank < kMaxRanks, "epRank must be in the range [0, ", kMaxRanks, ") for active_rank_mask");
     TORCH_CHECK(hasActiveRankMask(maskTensor), "active_rank_mask must be defined");
     torch::Tensor const& t = maskTensor.value();
     TORCH_CHECK(t.device() == workspace.device(), "active_rank_mask must be on the workspace device");
@@ -144,7 +141,7 @@ inline uint64_t const* resolveActiveRankMask(
 }
 
 // The kernels read the host abort state through unified virtual addressing, so the caller allocates it in pinned
-// memory.
+// memory. MoeExecutionState checks that once, when it allocates the abort state.
 inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torch::optional<torch::Tensor> const& abort)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2AAbortState;
@@ -153,11 +150,9 @@ inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torc
         return nullptr;
     }
     torch::Tensor const& t = abort.value();
-    constexpr int64_t kWords = sizeof(MoeA2AAbortState) / sizeof(int32_t);
-    TORCH_CHECK(
-        t.is_cpu() && t.scalar_type() == torch::kInt32 && t.dim() == 1 && t.numel() == kWords && t.is_contiguous(),
-        "abort_state must be a contiguous int32 CPU tensor of ", kWords, " elements");
-    TORCH_CHECK(t.is_pinned(), "abort_state must be in pinned memory, because the kernels read it at its host address");
+    TORCH_CHECK(t.is_cpu() && t.scalar_type() == torch::kInt32 && t.dim() == 1 && t.numel() == kAbortStateWords
+            && t.is_contiguous(),
+        "abort_state must be a contiguous int32 CPU tensor of ", kAbortStateWords, " elements");
     return static_cast<MoeA2AAbortState*>(t.data_ptr());
 }
 
@@ -704,8 +699,7 @@ void sentinelCombine(torch::Tensor const& payload, int64_t localNumTokens, torch
 //   - numExperts: Total number of routing slots (tokenSelectedExperts values are in [0, numExperts))
 //   - eplbStatsNumExperts: Number of experts used for EPLB stats (may be <= numExperts)
 //   - eplbLocalStats: [eplbStatsNumExperts] tensor containing local statistics for EPLB.
-//   - enableRankMask: Exchange only with the ranks set in activeRankMask. The workspace layout must be built with
-//   rank_mask=True.
+//   - enableRankMask: Exchange only with the ranks set in activeRankMask.
 //   - activeRankMask: [kRankMaskWords] uint64 tensor on the workspace device. The kernels read it at execution time,
 //   so a captured CUDA graph follows later updates. The kernels treat the local rank's bit as set.
 //   - useSentinel: run the sentinel transport; the payloads must be the hidden states, their scales (quantized
@@ -713,8 +707,8 @@ void sentinelCombine(torch::Tensor const& payload, int64_t localNumTokens, torch
 //   expertIdPayloadIndex / invalidTokenExpertId must be given. Received rows are then (source rank, token), not
 //   compacted, and rows of tokens not routed here carry invalidTokenExpertId.
 //   - abortState: (Optional) pinned int32 host tensor holding a MoeA2AAbortState, for enableRankMask without
-//   useSentinel. Long waits on peers publish the flag value they wait for in it. Setting its requested word stops the
-//   waits on peers.
+//   useSentinel, with a workspace layout built with rank_mask=True. Long waits on peers publish the flag value they
+//   wait for in it. Setting its requested word stops the waits on peers.
 //
 // Return values:
 //   - recvTensors: Vector of receive buffers (one tensor per payload), each [ep_size, runtimeMaxTokensPerRank,
@@ -973,7 +967,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.enable_rank_mask = enableRankMask;
     if (params.enable_rank_mask)
     {
-        params.active_rank_mask = resolveActiveRankMask(activeRankMask, epRank, workspace);
+        params.active_rank_mask = resolveActiveRankMask(activeRankMask, workspace);
     }
     else
     {
@@ -1161,7 +1155,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.enable_rank_mask = enableRankMask;
     if (params.enable_rank_mask)
     {
-        params.active_rank_mask = resolveActiveRankMask(activeRankMask, epRank, workspace);
+        params.active_rank_mask = resolveActiveRankMask(activeRankMask, workspace);
     }
     else
     {

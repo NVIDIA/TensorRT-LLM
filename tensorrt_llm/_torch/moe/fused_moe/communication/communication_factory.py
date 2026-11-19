@@ -45,6 +45,32 @@ from .nvlink_two_sided import NVLinkTwoSided
 if TYPE_CHECKING:
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
+# Settings of the removed all-to-all watchdog, which no MoE communication reads.
+_REMOVED_WATCHDOG_ENVS = (
+    "TRTLLM_ALLTOALL_WATCHDOG_TIMEOUT_S",
+    "TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S",
+)
+_FAULT_TOLERANCE_MODE_ENV = "TLLM_FAULT_TOLERANCE_MODE"
+
+
+def _warn_on_removed_fault_tolerance_envs() -> None:
+    """Warn once about each set variable of the earlier Wide-EP fault tolerance mode."""
+    for name in _REMOVED_WATCHDOG_ENVS:
+        if name in os.environ:
+            logger.warning_once(
+                f"{name} is no longer read: the all-to-all watchdog was removed. "
+                "Use enable_wide_ep_fault_tolerance for Wide-EP fault tolerance.",
+                key=f"removed_env_{name}",
+            )
+    if os.environ.get(_FAULT_TOLERANCE_MODE_ENV) == "1":
+        logger.warning_once(
+            f"{_FAULT_TOLERANCE_MODE_ENV}=1 no longer turns on Wide-EP fault tolerance for the "
+            "MoE layers; set enable_wide_ep_fault_tolerance=True. It only selects the MPI "
+            "signal-handler mode, which is deprecated and will be removed in a future release.",
+            key=f"removed_env_{_FAULT_TOLERANCE_MODE_ENV}",
+        )
+
+
 # Temporary NCCL-EP v0.1.0 limitation. The LL combine kernel derives its
 # warp-group count and dynamic-SMEM requirement here:
 # https://github.com/NVIDIA/nccl/blob/nccl-ep-v0.1.0/contrib/nccl_ep/device/low_latency.cu#L1990-L2025
@@ -142,6 +168,7 @@ class CommunicationFactory:
         # Backend constructors apply these budgets, and auto-selection below treats a constructor
         # error as "backend unavailable", so an invalid variable must fail here instead.
         get_moe_comm_timeout_budgets()
+        _warn_on_removed_fault_tolerance_envs()
 
         # Extract parameters from model_config
         mapping = model_config.mapping

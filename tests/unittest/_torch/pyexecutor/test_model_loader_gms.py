@@ -20,6 +20,7 @@ from tensorrt_llm._torch.models.checkpoints.mx import model_loading as mx_loadin
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassUnquantizedImpl
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
+from tensorrt_llm._torch.pyexecutor import rank_failure_model_load
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
@@ -354,6 +355,32 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
         backend.materialize_module.assert_called_once_with(model)
         # Readers map weights without a weight mapper.
         assert loader.weight_mapper is None
+
+
+def test_wide_ep_fault_tolerance_binds_moe_layers_before_weight_load(monkeypatch):
+    """Under Wide-EP fault tolerance, the loader binds the MoE layers before it loads weights."""
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    loader.llm_args.enable_wide_ep_fault_tolerance = True
+    monkeypatch.setattr(
+        rank_failure_model_load, "prepare_model", lambda model: events.append("prepare_model")
+    )
+    _install_gms_backend(monkeypatch, _build_gms_backend(is_rw=True, events=events))
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+    checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    assert events == [
+        "prepare_model",
+        "pool_enter",
+        "_apply",
+        "to",
+        "load_weights",
+        "post_load_weights",
+        "pool_exit",
+    ]
 
 
 @pytest.mark.parametrize(

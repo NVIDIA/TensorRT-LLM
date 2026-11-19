@@ -157,7 +157,8 @@ def test_checkpoint_prepare_timeout_fails_closed(monkeypatch) -> None:
 def test_checkpoint_prepare_rejects_remote_active_client() -> None:
     lifecycle, memory, _ = _make_lifecycle()
     memory.comm = _FakeComm(clients_idle_by_rank=[True, False])
-    lifecycle.register(_Client())
+    client = _Client()
+    lifecycle.register(client)
 
     with pytest.raises(RuntimeError, match=r"active MoE All-to-All phase on ranks \[1\]"):
         lifecycle.checkpoint_prepare()
