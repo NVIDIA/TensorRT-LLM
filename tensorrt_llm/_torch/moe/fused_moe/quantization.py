@@ -19,7 +19,8 @@ import os
 import threading
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import (Callable, Dict, Iterable, Iterator, List, NamedTuple,
+                    Optional, Tuple, Union)
 
 import torch
 import torch.nn.functional as F
@@ -7488,7 +7489,8 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         return grouped.transpose(dim, dim + 1).contiguous().view(sizes)
 
     @classmethod
-    def _slot_batches(cls, slots, slot_data: torch.Tensor):
+    def _slot_batches(cls, slots: Iterable[int],
+                      slot_data: torch.Tensor) -> Iterator[Tuple[int, int]]:
         """Contiguous ``[lo, hi)`` runs of ``slots`` within the batch budget."""
         per_slot_bytes = slot_data[0].numel() * slot_data.element_size()
         max_slots = max(1, cls.FINALIZE_BATCH_BYTES // max(1, per_slot_bytes))
