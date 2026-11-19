@@ -162,6 +162,8 @@ def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     assert set(assigned) == expected
     assert len(assigned) == len(expected)
     assert [plan.workers for plan in plans] == [1, 1, 1, 0]
+    issued = [plan.assigned_bytes for plan in plans[:3]]
+    assert max(issued) - min(issued) <= 4  # bytes balanced to within one chunk
 
     monkeypatch.setattr(read_ahead, "_WORKERS_PER_LOAD_GROUP", 64)
     monkeypatch.setattr(read_ahead, "_WORKERS_PER_RANK", 16)
