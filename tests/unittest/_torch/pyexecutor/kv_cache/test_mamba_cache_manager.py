@@ -6503,15 +6503,17 @@ def test_v2_kda_replay_suspend_leaves_the_replay_state_to_the_request(manager_cl
     assert _kda_replay_slot(mgr, 0) == (2, [1.0] * len(mgr._kda_replay._layer_replay_buffers()))
 
 
-@pytest.mark.parametrize("recorded_by", ["update_resources", "revert_allocate_generation"])
+@pytest.mark.parametrize(
+    "recorded_by", ["update_resources", "revert_allocate_generation", "keep_generation_allocation"]
+)
 @pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
     monkeypatch, recorded_by, manager_cls
 ):
     """With a host drafter, update_resources records the acceptance of a batch's verify in the request's replay
     state, which must happen before the request's pages can move. A suspend between the batch's prepare_resources and
-    its update_resources raises. Once update_resources has recorded it, or the batch is reverted without running, the
-    request suspends."""
+    its update_resources raises. Once update_resources has recorded it, or the batch is reverted or kept for a retry
+    without running, the request suspends."""
     mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
     if recorded_by == "update_resources":
         # update_resources records the acceptance with the CUDA kernel.
@@ -6520,8 +6522,13 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
         replay = mgr._kda_replay
         replay.prev_num_accepted_tokens = replay.prev_num_accepted_tokens.cuda()
     mgr.spec_config = SimpleNamespace(decoding_type="NGram")
-    for method in ("prepare_resources", "update_resources", "revert_allocate_generation"):
+    for method in ("prepare_resources", "update_resources"):
         monkeypatch.setattr(KVCacheManagerV2, method, MagicMock())
+    # The base skip paths unwind the step's per-request state first; their page bookkeeping is out of scope.
+    for method in ("revert_allocate_generation", "keep_generation_allocation"):
+        monkeypatch.setattr(
+            KVCacheManagerV2, method, lambda self, req: self._undo_generation_step(req)
+        )
     request = SimpleNamespace(
         py_request_id=1, is_dummy=False, py_draft_tokens=[11, 12], py_num_accepted_draft_tokens=2
     )
@@ -6537,7 +6544,7 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
         mgr.update_resources(batch)
         assert int(mgr._kda_replay.prev_num_accepted_tokens[0]) == 2
     else:
-        mgr.revert_allocate_generation(request)
+        getattr(mgr, recorded_by)(request)
     mgr.suspend_request(request)
     assert not mgr.kv_cache_map[1].is_active
 

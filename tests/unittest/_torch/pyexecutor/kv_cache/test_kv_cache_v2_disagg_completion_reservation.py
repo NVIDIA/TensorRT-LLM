@@ -96,6 +96,7 @@ def test_completion_reservation_counts_unallocated_pages_in_every_pool(
     manager = object.__new__(KVCacheManagerV2)
     manager._reserves_disagg_completion = True
     manager._disagg_completion_limits = dict(limits)
+    manager._completion_dummy_limits = {}
     manager._disagg_completion_pool_counts = {i: 1 for i in range(len(available))}
     manager.kv_cache_map = {
         i + 1: Mock(capacity=capacity, num_blocks=(capacity + 3) // 4)
@@ -117,6 +118,7 @@ def test_completion_reservation_rejects_a_bound_whose_cache_is_gone() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager._reserves_disagg_completion = True
     manager._disagg_completion_limits = {1: 100, 2: 3}
+    manager._completion_dummy_limits = {}
     manager._disagg_completion_pool_counts = {0: 1}
     manager.kv_cache_map = {2: Mock(num_blocks=0)}
     manager._get_storage_statistics = Mock(return_value=[SimpleNamespace(available=3)])
@@ -145,6 +147,7 @@ def test_generation_limit_counts_pool_variants_and_speculative_padding(
     assert limit == expected_blocks + int(enable_block_reuse)
 
     manager._disagg_completion_limits = {}
+    manager._completion_dummy_limits = {}
     manager._disagg_completion_pool_counts = {0: 2}
     manager.kv_cache_map = {1: Mock(capacity=0, num_blocks=0)}
     stats = SimpleNamespace(available=2 * limit - 1)
@@ -152,6 +155,22 @@ def test_generation_limit_counts_pool_variants_and_speculative_padding(
     assert not manager._can_reserve_disagg_completion(1, limit)
     stats.available = 2 * limit
     assert manager._can_reserve_disagg_completion(1, limit)
+
+
+@pytest.mark.cpu_only
+def test_admission_leaves_a_padding_forwards_pending_step() -> None:
+    """A generation dummy's next scheduled step is reserved like an admitted bound."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager._reserves_disagg_completion = True
+    manager._disagg_completion_limits = {}
+    # The dummy holds one block and its generation step reaches a second.
+    manager._completion_dummy_limits = {99: 2}
+    manager._disagg_completion_pool_counts = {0: 1}
+    manager.kv_cache_map = {99: Mock(num_blocks=1), 7: Mock(num_blocks=0)}
+    manager._get_storage_statistics = Mock(return_value=[SimpleNamespace(available=4)])
+
+    assert not manager._can_reserve_disagg_completion(7, 4)
+    assert manager._can_reserve_disagg_completion(7, 3)
 
 
 def _context_reservation_manager(available: int) -> KVCacheManagerV2:
@@ -165,6 +184,7 @@ def _context_reservation_manager(available: int) -> KVCacheManagerV2:
     manager.enable_block_reuse = False
     manager.is_draft = False
     manager._disagg_completion_limits = {}
+    manager._completion_dummy_limits = {}
     manager._disagg_completion_pool_counts = {0: 1}
     manager.kv_cache_map = {7: Mock(num_blocks=0)}
     manager._get_storage_statistics = Mock(return_value=[SimpleNamespace(available=available)])
@@ -201,6 +221,28 @@ def test_context_reservation_records_a_bound_once_it_fits() -> None:
     # A recorded bound is not checked again on later passes.
     manager._get_storage_statistics.return_value = [SimpleNamespace(available=0)]
     assert manager.reserve_context_completion(request)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_context_only_request", [True, False])
+def test_helix_context_reservation_sizes_off_the_full_prompt(
+    is_context_only_request: bool,
+) -> None:
+    """Under helix CP `prompt_len` is this rank's slice; the CP-scaled ledger needs the full prompt."""
+    manager = _context_reservation_manager(available=100)
+    manager._has_cp_helix = True
+    manager._ledger_tokens_per_block = 8  # 4 tokens per block on each of 2 CP ranks
+    request = _first_chunk(
+        prompt_len=8,
+        total_input_len_cp=16,
+        is_context_only_request=is_context_only_request,
+    )
+
+    assert manager.reserve_context_completion(request)
+    # 16 prompt tokens (20 with the output) + 1 base token in 8-token ledger blocks;
+    # sizing off the 8-token slice would reserve only 2.
+    assert manager._disagg_completion_limits == {7: 3}
+    assert manager._completion_blocks_required(request) == (2 if is_context_only_request else 3)
 
 
 @pytest.mark.cpu_only
@@ -1004,5 +1046,54 @@ def test_completion_capacity_excludes_retained_dummy_pages(context_only: bool) -
         manager.free_resources(small)
         manager.free_resources(dummy)
         assert manager.completion_capacity() == original
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("is_gen", [False, True])
+def test_padding_dummy_allocated_after_admission_keeps_the_admitted_bound(is_gen: bool) -> None:
+    """A padding cache allocated after admission cannot take an admitted request's growth.
+
+    The admitted request holds its prompt pages and reserves its decode growth
+    without pages, so the idle pool exactly covers that growth. A padding dummy
+    allocated then, by attention-DP padding or a lazy CUDA graph padding
+    request, is refused instead, and the admitted request still reaches its
+    last token. Once the request is gone, the dummy fits and records the
+    generation step it still takes.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    manager = _real_manager(
+        KvCacheConfig(**_GATE_DEFAULT_CONFIG, enable_disagg_completion_reservation=True),
+        kv_connector_manager=None,
+    )
+    try:
+        capacity = manager.completion_capacity()
+        assert capacity is not None and capacity > 3
+        tokens_per_block = manager.tokens_per_block
+        prompt_len = 2 * tokens_per_block
+        request = _gen_init_request(1, prompt_len, capacity * tokens_per_block - prompt_len)
+        assert manager.prepare_disagg_gen_init(request)
+        assert manager._disagg_completion_limits[1] == capacity
+        free_blocks = manager.get_kv_cache_stats().free_num_blocks
+
+        assert manager.add_dummy_requests([900], is_gen=is_gen) is None
+        assert 900 not in manager.kv_cache_map
+        assert 900 not in manager._completion_dummy_limits
+        assert manager.get_kv_cache_stats().free_num_blocks == free_blocks
+        # The admitted request still grows to its last output token.
+        assert manager.kv_cache_map[1].resize(capacity * tokens_per_block)
+        manager.free_resources(request)
+
+        dummies = manager.add_dummy_requests([900], is_gen=is_gen)
+        assert dummies is not None
+        dummy_cache = manager.kv_cache_map[900]
+        step_capacity = dummy_cache.capacity + int(is_gen)
+        assert manager._completion_dummy_limits[900] == max(
+            dummy_cache.num_blocks, -(-step_capacity // tokens_per_block)
+        )
+        manager.free_resources(dummies[0])
+        assert not manager._completion_dummy_limits
+        assert manager.completion_capacity() == capacity
     finally:
         manager.shutdown()

@@ -1730,7 +1730,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         rewind_context_after_cache_drop(req, self.tokens_per_block)
 
     def _reject_request(self, req: LlmRequest, message: str) -> None:
-        """Hand *req* to the executor to fail alone (``take_lost_kv_requests``); other requests keep scheduling."""
+        """Hand *req* to the executor to fail alone (``take_lost_kv_requests``); other requests keep scheduling.
+
+        Lock-step peers reject the same request: its completion capacity follows from the GPU quota, which
+        ``KVCacheManagerV2`` min-reduces across ranks at construction, and from padding allocations those peers make
+        alike. A failed remote cache level, by contrast, is seen by one rank only (``_on_lost_kv_cache``).
+        """
         logger.error(f"[V2Scheduler] Failing request {req.py_request_id}: {message}")
         if all(rejected is not req for rejected, _ in self._lost_kv_requests):
             self._lost_kv_requests = (*self._lost_kv_requests, (req, message))
@@ -2822,7 +2827,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         candidates count alongside generation ones because a disaggregated
         prefill server has no generation requests at all.
         """
-        if made_progress:
+        # A request queued to fail alone leaves the active list once the
+        # executor takes it, so this pass must return for that to happen.
+        if made_progress or self._lost_kv_requests:
             if self._stalled_schedules:
                 logger.debug(
                     f"[V2Scheduler] Stall cleared after {self._stalled_schedules} pass(es); "
