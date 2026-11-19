@@ -26,6 +26,7 @@ from tensorrt_llm._utils import (
     convert_to_torch_tensor,
     prefer_pinned,
 )
+from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
@@ -74,8 +75,10 @@ class Fp4MlaCacheLayout:
     views and page tables the FP4 MLA attention code reads.
 
     A manager that uses the layout keeps it as ``fp4_mla_layout`` and forwards
-    its layout hooks to it (``Fp4MlaLayoutHooks``); any other manager has
-    ``fp4_mla_layout = None``. ``Fp4MlaV2CacheLayoutPolicy.configure_manager``
+    its layout hooks to it (``Fp4MlaLayoutHooks``). A manager with the hooks
+    and no layout has ``fp4_mla_layout = None``; other managers have no such
+    attribute, so shared code reads it through ``fp4_mla_cache_layout``.
+    ``Fp4MlaV2CacheLayoutPolicy.configure_manager``
     creates the layout before the manager's base class is constructed, because
     that construction already runs the hooks.
     """
@@ -119,6 +122,8 @@ class Fp4MlaCacheLayout:
         self._fp4_mla_view_cache: dict[Any, Any] = {}
         self._fp8_context_scratch: Optional[Any] = None
         self._fp4_mla_q_buffers: Optional[dict[str, torch.Tensor]] = None
+        # Set once align_snapshot_points has logged a snapshot move.
+        self._snapshot_realignment_logged: bool = False
 
     @property
     def _manager(self) -> "KVCacheManagerV2":
@@ -541,6 +546,37 @@ class Fp4MlaCacheLayout:
             with torch.cuda.stream(stream):
                 v_scale_pool.zero_()
             stream.synchronize()
+
+    def virtual_layer_pool_roles(
+        self, layer_id: int
+    ) -> Optional[tuple[DataRole, Optional[DataRole]]]:
+        """Pool roles of a virtual layer this layout appended (an HP ring), else ``None``."""
+        if LayerId(layer_id) in self._hp_manager_layer_ids:
+            return Role.MLA_HP_TAIL, None
+        return None
+
+    def align_snapshot_points(self, request: "LlmRequest") -> None:
+        """Move a hybrid manager's recurrent-state snapshots onto full cache blocks.
+
+        The FP4 MLA cache quantizes the latent cache in 16-token tiles and
+        disables partial-block reuse, so a reused prefix always ends on a
+        cache block. A snapshot inside a block would restore the recurrent
+        state of a later token than the reused prefix ends at; one below the
+        first block can never be reused. Snapshot points also end the
+        context chunks, which keeps every non-final chunk tile-aligned.
+        """
+        block = self._manager.tokens_per_block
+        points = request.expect_snapshot_points
+        aligned = sorted({point // block * block for point in points if point >= block})
+        if aligned != sorted(set(points)) and not self._snapshot_realignment_logged:
+            self._snapshot_realignment_logged = True
+            logger.info(
+                "FP4 MLA moves Mamba snapshot points down to "
+                f"{block}-token cache blocks and drops points below the "
+                f"first block (logged once; request {request.py_request_id}: "
+                f"{sorted(set(points))} -> {aligned})."
+            )
+        request.expect_snapshot_points = aligned
 
     def _validate_fp4_mla_layer_groups(self) -> None:
         cache_groups = {

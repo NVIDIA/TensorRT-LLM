@@ -32,9 +32,9 @@ except ImportError:
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
-                                 global_mpi_size, is_trace_enabled, mpi_comm,
-                                 mpi_disabled, nvtx_range,
-                                 set_thread_local_mpi_comm, trace_func)
+                                 is_trace_enabled, mpi_comm, mpi_disabled,
+                                 nvtx_range, set_thread_local_mpi_comm,
+                                 trace_func)
 # yapf: disable
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
@@ -57,7 +57,7 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.metrics.perf import PerfMetricsCollector
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
@@ -107,7 +107,7 @@ from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import (HangDetector, all_ranks_crashed,
+from .hang_detector import (HangDetector, distributed_warmup_guard,
                             hard_kill_on_rank_crash, propagate_hard_kill,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
@@ -128,11 +128,12 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
-from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
-from .profiling import load_iteration_indexes as _load_iteration_indexes
+from .profiling import ProfileController, PyExecutorProfileManager
+from .request_delivery import ResponseChannel
 from .request_utils import (RequestBroadcaster,
                             derive_attention_dp_per_rank_request_cap,
-                            get_from_waiting_queue, merge_requests)
+                            drain_queued_items, get_from_waiting_queue,
+                            merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, is_context_only_kv_cache,
                                request_context)
@@ -450,6 +451,10 @@ _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 # minute, while cutting the collective rate by an order of magnitude.
 KV_POOL_REBALANCE_CHECK_INTERVAL = 10
 
+# How often an idle engine publishes an idle heartbeat when iteration stats
+# are enabled (see PyExecutor._plan_idle_heartbeat_wait).
+IDLE_HEARTBEAT_PERIOD_S = 1.0
+
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
     """Return whether an ACK is ready without blocking on recv."""
@@ -496,56 +501,6 @@ def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
     """Receive a sleep/wakeup ACK with a bounded nonblocking poll loop."""
     return _recv_sleep_wakeup_ack_until(comm, source,
                                         time.monotonic() + timeout_s)
-
-
-@contextmanager
-def _distributed_warmup_guard(dist: Distributed,
-                              mapping: Mapping) -> Iterator[None]:
-    """Arm the rank-crash watchdog when warmup fails on a subset of ranks.
-
-    Warmup runs from ``PyExecutor.__init__``, before the executor loop and so
-    before ``_event_loop_wrapper`` arms this watchdog itself. A rank that
-    raises here leaves every peer blocked in a warmup collective it will
-    never join, until that peer's own HangDetector times out.
-
-    The watchdog's grace period is what keeps the failure diagnosable: the
-    worker's setup/RPC error path reports the exception before the abort
-    tears the world down, and ``TLLM_RANK_CRASH_HARD_KILL_GRACE`` tunes it.
-
-    ``SystemExit`` / ``KeyboardInterrupt`` are excluded for the same reason
-    ``_event_loop_wrapper`` leaves them unarmed: they are teardown signals
-    the launcher is already acting on, and an MPI_Abort on top would turn a
-    clean Ctrl-C into exit 137.
-
-    A SYMMETRIC crash -- every rank raising out of warmup, e.g. an OOM every
-    rank hits at the same allocation -- arms no watchdog at all: the
-    ``all_ranks_crashed`` probe proves nobody is stranded in a collective, so
-    the error can propagate through the worker's setup/RPC path and the serve
-    front end can tear the world down cleanly. This matters because the kill
-    armed here (``error_delivered=None``) cannot be suppressed, and in the
-    launcher-spawned (mgmn) deployment the rank processes host a persistent
-    MPI task loop that legitimately outlives a failed engine.
-
-    Peer count spans the model communicator and ``MPI.COMM_WORLD``: DWDP
-    peers live only in the latter, while a TorchDist launch can have several
-    model ranks in a single-process MPI world. The symmetric-crash probe only
-    trusts a communicator that spans the whole peer count, so a DWDP mismatch
-    falls back to arming the watchdog.
-    """
-    try:
-        yield
-    except Exception:
-        if dist.world_size > 1 or mapping.dwdp_enabled:
-            world = max(dist.world_size, global_mpi_size())
-            if all_ranks_crashed(world):
-                logger.error(
-                    f"Warmup failed on all {world} ranks (symmetric crash): "
-                    "no peer is stranded in a collective, so the cross-rank "
-                    "hard kill is not armed and the error propagates to a "
-                    "clean shutdown.")
-            else:
-                start_rank_crash_kill_watchdog(world, error_delivered=None)
-        raise
 
 
 @dataclasses.dataclass
@@ -877,43 +832,20 @@ class PyExecutor:
 
         self.peft_cache_config = peft_cache_config
 
-        # Runtime-configurable profiling state. Populated by start_profile()
-        # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
-        # or API calls. When these are None/False the _profiler() context
-        # falls back to the environment-variable driven configuration.
-        self._runtime_profile_trace_path: Optional[str] = None
-        self._runtime_profile_activities: Optional[List[str]] = None
-        self._runtime_profile_cuda_only: bool = False
-        # Iteration markers added by the most recent runtime start_profile().
-        # Tracked so stop_profile() can cancel a start that has not fired
-        # yet (e.g. the caller stops before sending any requests) without
-        # leaking a pending profile window that would start later.
-        self._runtime_profile_pending_start_iter: Optional[int] = None
-        self._runtime_profile_pending_stop_iter: Optional[int] = None
-
-        # Mirrors the in-loop profile window state (maintained by
-        # ``_profiler()``) so external callers can query whether a profile
-        # is currently active. torch.profiler is not thread-safe so we do
-        # NOT call .stop() from other threads; ``stop_profile()`` schedules
-        # the iteration-scoped stop and (when triggered via an HTTP
-        # handler) the server tickles the executor loop so the stop fires
-        # even when the engine is otherwise idle.
-        #
-        # ``_profile_state_lock`` guards every read and write of
-        # ``_profile_enabled`` AND of the pending markers /
-        # ``_runtime_profile_*`` window fields above. Both the
-        # re-entrancy guard in ``start_profile()`` and the
-        # cancel-vs-schedule decision in ``apply_stop_config()`` depend
-        # on that combined state, and they race against the executor
-        # thread flipping the same fields inside ``profile_step``.
-        self._profile_state_lock = threading.Lock()
-        self._profile_enabled: bool = False
-
-        # The profile-state machine (start/stop scheduling, broadcast
-        # apply, per-iteration torch.profiler driver) lives in the
-        # ``PyExecutorProfileManager``. ``PyExecutor`` keeps the state
-        # fields above on ``self`` for backward-compat introspection;
-        # the manager operates on those fields via a weakref.
+        # Profile windows (runtime start_profile()/stop_profile() and the
+        # TLLM_PROFILE_START_STOP environment variable) live in the
+        # controller; the manager adds per-iteration timing and the
+        # iteration log around them.
+        self._profile_controller = ProfileController(
+            rank=self.global_rank,
+            current_iteration=lambda: self.iter_counter,
+            is_warmup=lambda: self.is_warmup,
+            broadcast_start=self._broadcast_profile_start,
+            broadcast_stop=self._broadcast_profile_stop,
+            pause_hang_detector=lambda:
+            (self.hang_detector.pause()
+             if self.hang_detector is not None else nullcontext()),
+        )
         self._perf_metrics = PerfMetricsCollector()
         self._profile_manager = PyExecutorProfileManager(self)
 
@@ -1004,14 +936,7 @@ class PyExecutor:
                                      disable_overlap_scheduler)
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
-        # profile config
-        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
-            PROFILE_START_STOP_ENV_VAR_NAME)
-        # Convert to mutable sets so start_profile()/stop_profile() can
-        # .add() runtime-configured iteration indices.
-        # _load_iteration_indexes returns frozensets.
-        self.profile_start_iters = set(_env_start_iters)
-        self.profile_stop_iters = set(_env_stop_iters)
+        self._profile_controller.reset_iterations()
 
         self._metrics = {}
         self._disagg_coordinator = None
@@ -1095,6 +1020,21 @@ class PyExecutor:
         # drain into the next emitted record, so sums over records stay exact.
         self._pending_num_new_active_requests = 0
         self._pending_num_completed_requests = 0
+        self._quiescent_stats_iter: Optional[int] = None
+        self._stats_has_pending_work = False
+        # Idle heartbeats: the monotonic time the next one is due on this
+        # rank, and the rows the latest one added to self.stats (a newer
+        # heartbeat replaces them, see _publish_idle_heartbeat).
+        self._next_idle_heartbeat_time = 0.0
+        self._idle_heartbeat_rows: List[Union[str, tuple]] = []
+        # The iteration whose idle wait was cut short to let a loop pass
+        # settle pending work (see _plan_idle_heartbeat_wait).
+        self._idle_recheck_iter: Optional[int] = None
+        # Queue snapshots of a busy engine: the queued counters last exported
+        # and the monotonic time an unchanged snapshot may be exported again
+        # (see _append_queue_snapshot).
+        self._queue_snapshot_counters: Optional[tuple] = None
+        self._next_queue_snapshot_time = 0.0
         # Requests finished by their first-token check in a sampled iteration,
         # waiting for their final requestStats entry; their completions are
         # already counted.
@@ -1183,11 +1123,7 @@ class PyExecutor:
             self._dspark_cost_profiler = DSparkCostProfiler.from_env(
                 rank=getattr(self.dist, "rank", 0) if self.dist else 0)
 
-        # response used data
-        self.response_lock = threading.Lock()
-        self.response_cv = threading.Condition(self.response_lock)
-        self.responses = {}
-        self.result_wait_queues = {}
+        self._response_channel = ResponseChannel()
         # If the event-loop thread (PyExecutor._event_loop_wrapper) raises
         # an exception (e.g. KV cache OOM), it is stashed here and read by
         # two local consumers so they can surface it instead of hanging:
@@ -1491,7 +1427,7 @@ class PyExecutor:
             # takes today's gathers whatever the previous instance's gate was.
             self._reset_adp_packed_sync_for_warmup()
             with torch.cuda.stream(self.execution_stream), \
-                    _distributed_warmup_guard(self.dist, self.dist.mapping):
+                    distributed_warmup_guard(self.dist, self.dist.mapping):
                 self.model_engine.warmup(self.resource_manager)
                 if self.draft_model_engine is not None:
                     self.draft_model_engine.warmup(self.resource_manager)
@@ -1504,7 +1440,7 @@ class PyExecutor:
                 # The model's actions after warmup and graph capture, on every
                 # rank (some are collective, so every rank reaches this point,
                 # and a rank-local failure arms the rank-crash watchdog).
-                with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                with distributed_warmup_guard(self.dist, self.dist.mapping):
                     self._executor_events.after_warmup()
             self.encoder_launch_executor = (ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="encoder-launch") if
@@ -1514,7 +1450,7 @@ class PyExecutor:
                 # CUDA graph capture inherits per-thread CUDA library state. Capture
                 # on the same single worker that owns every runtime encoder replay.
                 self.encoder_stream.wait_stream(self.execution_stream)
-                with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                with distributed_warmup_guard(self.dist, self.dist.mapping):
                     self.encoder_launch_executor.submit(
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
 
@@ -2574,9 +2510,7 @@ class PyExecutor:
         """
         req_ids = self.executor_request_queue.enqueue_requests(requests)
         if result_wait_queue is not None:
-            with self.response_cv:
-                for req_id in req_ids:
-                    self.result_wait_queues[req_id] = result_wait_queue
+            self._response_channel.register(req_ids, result_wait_queue)
         return req_ids
 
     @staticmethod
@@ -2772,8 +2706,7 @@ class PyExecutor:
         self.micro_batches = []
         self.pending_encoder_steps.clear()
         self.active_requests.clear()
-        self.responses.clear()
-        self.result_wait_queues.clear()
+        self._response_channel.clear()
         self._pending_transfer_responses.clear()
         self._pending_response_terminations.clear()
         self._merged_transfer_flush = None
@@ -3171,8 +3104,7 @@ class PyExecutor:
         """
         req_id = self.executor_request_queue.enqueue_request(request)
         if result_wait_queue is not None:
-            with self.response_cv:
-                self.result_wait_queues[req_id] = result_wait_queue
+            self._response_channel.register([req_id], result_wait_queue)
         return req_id
 
     def set_resource_governor_queue(self, queue):
@@ -3295,10 +3227,10 @@ class PyExecutor:
                 starts (relative to the current iteration counter).
             activities: Subset of ``["CPU", "GPU", "CUDA_PROFILER"]``.
 
-        See ``PyExecutorProfileManager.start_profile`` for the full
+        See ``ProfileController.start_profile`` for the full
         state-machine contract.
         """
-        return self._profile_manager.start_profile(
+        return self._profile_controller.start_profile(
             output_dir=output_dir,
             num_steps=num_steps,
             start_step=start_step,
@@ -3309,29 +3241,35 @@ class PyExecutor:
         """Schedule the in-progress runtime profiling to stop on the
         next executor iteration.
 
-        See ``PyExecutorProfileManager.stop_profile`` for details.
+        See ``ProfileController.stop_profile`` for details.
         """
-        return self._profile_manager.stop_profile()
+        return self._profile_controller.stop_profile()
+
+    def _broadcast_profile_start(self, config: Dict) -> None:
+        self.executor_request_queue.enqueue_profile_start_request(config)
+
+    def _broadcast_profile_stop(self) -> None:
+        self.executor_request_queue.enqueue_profile_stop_request()
 
     def _apply_profile_start_config(self, config: Dict) -> None:
         """Apply a broadcasted profile-start config on this rank.
 
-        Forwards to ``PyExecutorProfileManager.apply_start_config``.
+        Forwards to ``ProfileController.apply_start_config``.
         Kept on ``PyExecutor`` so ``_handle_special_queue_items`` and
         unit tests that patch this name continue to work unchanged.
         """
-        return self._profile_manager.apply_start_config(config)
+        return self._profile_controller.apply_start_config(config)
 
     def _apply_profile_stop_config(self) -> bool:
         """Apply a broadcasted profile-stop on this rank.
 
-        Forwards to ``PyExecutorProfileManager.apply_stop_config``.
+        Forwards to ``ProfileController.apply_stop_config``.
 
         Returns:
             ``True`` when a pending start was cancelled before it
             fired, ``False`` when a stop iteration was scheduled.
         """
-        return self._profile_manager.apply_stop_config()
+        return self._profile_controller.apply_stop_config()
 
     # _wake_executor_loop_for_profile was previously used to enqueue a
     # sentinel cancel-request to unblock the idle executor loop.  It is
@@ -3542,13 +3480,15 @@ class PyExecutor:
         return req_stats
 
     def _update_iter_stats(
-        self,
-        stats,
-        iter_latency_ms,
-        num_completed_requests,
-        scheduled_batch,
-        micro_batch_id,
-        scheduled_batch_stats: Optional[ScheduledBatchStats] = None
+            self,
+            stats,
+            iter_latency_ms,
+            num_completed_requests,
+            scheduled_batch,
+            micro_batch_id,
+            scheduled_batch_stats: Optional[ScheduledBatchStats] = None,
+            consume_deltas: bool = True,
+            current_batch: Optional[ScheduledRequests] = None
     ) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
         scheduled_batch_stats = (scheduled_batch_stats or ScheduledBatchStats())
@@ -3583,7 +3523,8 @@ class PyExecutor:
             kv_stats_to_save.reused_blocks = kv_stats.reused_blocks
             kv_stats_to_save.missed_blocks = kv_stats.missed_blocks
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
-            self._fill_kv_host_stats(kv_stats_to_save, kv_cache_manager)
+            self._fill_kv_host_stats(kv_stats_to_save, kv_cache_manager,
+                                     consume_deltas)
             stats.kv_cache_stats = kv_stats_to_save
 
             # Collect per-iteration stats (with deltas) at configured interval.
@@ -3594,13 +3535,17 @@ class PyExecutor:
             # sampled construction iterations reach this point, so a check on
             # the live counter could never match.
             # Guard: only fetch once per record iteration.
-            if (stats.iter % self._kv_iter_stats_interval == 0
-                    and self._last_kv_iter_stats_fetch_iter != stats.iter):
-                self._latest_kv_iter_stats = kv_cache_manager.get_iteration_stats(
-                )
-                self._last_kv_iter_stats_fetch_iter = stats.iter
-            else:
-                self._latest_kv_iter_stats = None
+            # Queue-only snapshots pass consume_deltas=False: the C++ delta
+            # fetch and the two cached fields below belong to measured
+            # iterations and must not be consumed or cleared here.
+            if consume_deltas:
+                if (stats.iter % self._kv_iter_stats_interval == 0
+                        and self._last_kv_iter_stats_fetch_iter != stats.iter):
+                    self._latest_kv_iter_stats = kv_cache_manager.get_iteration_stats(
+                    )
+                    self._last_kv_iter_stats_fetch_iter = stats.iter
+                else:
+                    self._latest_kv_iter_stats = None
 
         rank_metrics = {
             "rank": self.dist.rank,
@@ -3624,8 +3569,11 @@ class PyExecutor:
             }
             append_kv_cache_iteration_stats(rank_metrics,
                                             self._latest_kv_iter_stats)
-        self._perf_metrics.collect_rank(rank_metrics,
-                                        capture_iter=self.iter_counter)
+        # Queue-only snapshots keep the rank snapshot of the last measured
+        # iteration: a new one would carry that iteration's KV deltas again.
+        if consume_deltas:
+            self._perf_metrics.collect_rank(rank_metrics,
+                                            capture_iter=self.iter_counter)
 
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
@@ -3779,47 +3727,105 @@ class PyExecutor:
                 except RuntimeError:
                     pass
 
-        # Normal requests waiting in the executor_request_queue that have
-        # never been scheduled. Excludes non-normal control items
-        # (shutdown/cancel) and items with a missing payload. Each queued
-        # item is a RequestQueueItem wrapping an ExecutorRequest
-        # (tle::Request). Requests are routed by request_type:
-        #   - CONTEXT_AND_GENERATION (default) and CONTEXT_ONLY
-        #     (disagg-prefill side) -> queued-context counters.
-        #   - GENERATION_ONLY (disagg-decode side, awaiting KV transfer
-        #     before they can start decoding) -> queued-gen counters.
-        # On a non-disagg engine all items land in the context counters;
-        # on a disagg-decode engine all items land in the gen counters.
+        # The ingress and pre-admission queues contain ExecutorRequests;
+        # admitted requests waiting for a prefill slot are LlmRequests.
+        # Replicated pre-admission work belongs to rank 0, while each ADP
+        # rank contributes only its own admitted backlog to the stats fanout.
         num_queued_context_requests = 0
         num_queued_ctx_tokens = 0
         num_queued_gen_requests = 0
         num_queued_gen_kv_tokens = 0
-        for item in list(self.executor_request_queue.get_request_queue().queue):
-            if not item.is_normal_request:
+        seen_queued_ids = set()
+        canceled_ids = set(self.canceled_req_ids)
+        waiting_load = None
+        if not self.enable_attention_dp or self.dist.rank == 0:
+            # The waiting queue keeps incremental totals (only accepted normal
+            # requests enter it); only the ingress queue is scanned, and it is
+            # normally drained every iteration. Items fetched behind a control
+            # request stay parked on rank 0, unfiltered, until the first fetch
+            # after that request is handled, so they take the same scan.
+            request_queue = self.executor_request_queue.get_request_queue()
+            with request_queue.mutex:
+                intake_items = list(request_queue.queue)
+            intake_items.extend(self.request_accumulated)
+            canceled_ids.update(item.id for item in intake_items
+                                if item.is_canceled_request)
+            waiting_load = self.waiting_queue.queued_load
+            (num_queued_context_requests, num_queued_ctx_tokens,
+             num_queued_gen_requests,
+             num_queued_gen_kv_tokens) = waiting_load.totals(canceled_ids)
+            for item in intake_items:
+                if (not item.is_normal_request or item.request is None
+                        or item.id in seen_queued_ids or item.id in canceled_ids
+                        or item.id in waiting_load):
+                    continue
+                seen_queued_ids.add(item.id)
+                try:
+                    # input_token_ids would copy the whole prompt into a list.
+                    token_count = (item.request.num_input_tokens +
+                                   item.request.py_prompt_trimmed_prefix)
+                except (AttributeError, TypeError) as e:
+                    logger.warning(
+                        f"Excluding queued item {item.id} from queued counters: "
+                        f"num_input_tokens not readable ({type(e).__name__})")
+                    continue
+                if item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+                    num_queued_gen_requests += 1
+                    num_queued_gen_kv_tokens += token_count
+                else:
+                    num_queued_context_requests += 1
+                    num_queued_ctx_tokens += token_count
+
+        excluded_request_ids = {
+            req.py_request_id
+            for req in (scheduled_batch.context_requests +
+                        scheduled_batch.generation_requests + paused_requests)
+        }
+        if current_batch is not None:
+            # The overlap scheduler collects this record after the next batch
+            # entered its forward pass; that batch is scheduled, not queued.
+            excluded_request_ids.update(
+                req.py_request_id
+                for req in (current_batch.context_requests +
+                            current_batch.generation_requests +
+                            current_batch.paused_requests +
+                            current_batch.recompute_paused_requests))
+        for req in self.active_requests:
+            if (self._is_stats_dummy_request(req) or req.is_finished
+                    or req.py_request_id in excluded_request_ids
+                    or req.py_request_id in self.inflight_req_ids
+                    or req.py_request_id in seen_queued_ids
+                    or (waiting_load is not None
+                        and req.py_request_id in waiting_load)):
                 continue
-            if item.request is None:
+            cancel_id = (req.parent_request_id
+                         if req.is_child else req.py_request_id)
+            if cancel_id in canceled_ids:
                 continue
-            try:
-                # input_token_ids would copy the whole prompt into a list.
-                token_count = (item.request.num_input_tokens +
-                               item.request.py_prompt_trimmed_prefix)
-            except (AttributeError, TypeError) as e:
-                # Unusual request shape with no usable token payload;
-                # exclude from all queued counters so downstream consumers
-                # see consistent per-request averages. Not expected on the
-                # current API (ExecutorRequest construction requires a
-                # non-empty input_token_ids), logged so future API drift
-                # surfaces instead of being silently dropped.
-                logger.warning(f"Excluding queued item {item.id} from queued "
-                               f"counters: num_input_tokens not readable "
-                               f"({type(e).__name__})")
-                continue
-            if item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+            # A generation-first context request parked until its peer is
+            # ready has left the waiting queue and is not schedulable yet, but
+            # its prompt is still unscheduled prefill work.
+            # Native getters raise RuntimeError on a request whose C++ state
+            # was already released; skip it rather than fail stats collection.
+            if (req.is_context_init_state or req.state
+                    == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER):
+                try:
+                    remaining_tokens = max(0, req.context_remaining_length)
+                except RuntimeError:
+                    continue
+                if remaining_tokens:
+                    num_queued_context_requests += 1
+                    num_queued_ctx_tokens += remaining_tokens
+            elif req.is_disagg_generation_init_state:
+                try:
+                    gen_kv_tokens = req.get_num_tokens(0)
+                except RuntimeError:
+                    continue
                 num_queued_gen_requests += 1
-                num_queued_gen_kv_tokens += token_count
-            else:
-                num_queued_context_requests += 1
-                num_queued_ctx_tokens += token_count
+                num_queued_gen_kv_tokens += gen_kv_tokens
+
+        stats.num_queued_requests = (num_queued_context_requests +
+                                     num_queued_gen_requests)
 
         # Total KV context length summed across paused (preempted-decode)
         # requests — were decoding but got evicted back to the waiting
@@ -3840,16 +3846,27 @@ class PyExecutor:
         stats.inflight_batching_stats.num_queued_gen_requests = num_queued_gen_requests
         stats.inflight_batching_stats.num_queued_gen_kv_tokens = num_queued_gen_kv_tokens
         stats.inflight_batching_stats.num_paused_kv_tokens = num_paused_kv_tokens
-        self._take_scheduling_counters(stats.inflight_batching_stats)
+        if consume_deltas:
+            # A queue-only snapshot may never be exported, so the counters
+            # stay for the next measured record.
+            self._take_scheduling_counters(stats.inflight_batching_stats)
 
         return stats
 
-    def _fill_kv_host_stats(self, kv_stats: KvCacheStats,
-                            kv_cache_manager) -> None:
-        """Fill the host slab bytes and page-table counters of a V2 KV cache manager."""
+    def _fill_kv_host_stats(self,
+                            kv_stats: KvCacheStats,
+                            kv_cache_manager,
+                            consume_deltas: bool = True) -> None:
+        """Fill the host slab bytes and page-table counters of a V2 KV cache manager.
+
+        Reading the page-table counters resets them, so a queue-only snapshot
+        (``consume_deltas=False``) leaves them for the next measured record.
+        """
         if not self._is_kv_manager_v2:
             return
         kv_stats.host_slab_bytes = kv_cache_manager.host_slab_bytes()
+        if not consume_deltas:
+            return
         (kv_stats.num_page_table_reuses, kv_stats.num_page_table_row_updates,
          kv_stats.num_page_table_full_builds, kv_stats.page_table_full_build_ms
          ) = kv_cache_manager.take_page_table_stats()
@@ -3982,6 +3999,8 @@ class PyExecutor:
             self._pending_iter_stats_dict = local_dict
             return
 
+        # See _append_queue_snapshot.
+        self._queue_snapshot_counters = None
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -3997,6 +4016,19 @@ class PyExecutor:
                            or self.dist.pp_size > 1)
         return "overlap" if is_overlap_like else "non_overlap"
 
+    def _zero_duration_stats_row(self,
+                                 stats: IterationStats) -> IterationStatsRecord:
+        """The export record of a queue snapshot, a record taken without a
+        forward pass: it is marked as one and has no request stats, no KV
+        iteration stats, zero per-loop timings, no encoder observations and
+        no executor-loop observation."""
+        return IterationStatsRecord(iteration_stats=stats,
+                                    host_step_time_ms=0.0,
+                                    prev_device_step_time_ms=0.0,
+                                    scheduler_mode=self._stats_scheduler_mode(),
+                                    gpu_forward_time_ms=0.0,
+                                    is_queue_snapshot=True)
+
     def _take_mm_encoder_stats(self) -> Optional[dict]:
         """Completed rank-0 encoder calls, including side-stream prefetch.
 
@@ -4008,17 +4040,28 @@ class PyExecutor:
             "gpuTimesMS": encoder_gpu_times_ms
         } if encoder_gpu_times_ms else None
 
-    def _append_stats_rows(self, rows: List[str]) -> None:
-        """Append pre-serialized /metrics rows to the export buffer.
+    def _append_stats_rows(self,
+                           rows: Sequence[Union[str, tuple]],
+                           take_encoder_stats: bool = True) -> None:
+        """Append rows to the export buffer: pre-serialized /metrics rows, or
+        IterationStatsRecord entries.
 
-        The rows are rank 0's attention-DP fanout in rank order. Rank 0's
-        encoder calls go on its own row only, not on every rank's row.
+        Args:
+            rows: The rows to append.
+            take_encoder_stats: Whether the rows are rank 0's attention-DP
+                fanout in rank order, led by rank 0's own row. Rank 0's
+                encoder calls go on that row only, not on every rank's row.
+                Idle heartbeats and queue snapshots can be replaced or
+                dropped, so they leave the calls for the next such fanout.
         """
-        mm_encoder_stats = self._take_mm_encoder_stats()
-        if mm_encoder_stats is not None:
-            rank0_row = json.loads(rows[0])
-            rank0_row["multimodalEncoderStats"] = mm_encoder_stats
-            rows = [json.dumps(rank0_row), *rows[1:]]
+        if take_encoder_stats:
+            mm_encoder_stats = self._take_mm_encoder_stats()
+            if mm_encoder_stats is not None:
+                rank0_row = json.loads(rows[0])
+                rank0_row["multimodalEncoderStats"] = mm_encoder_stats
+                rows = [json.dumps(rank0_row), *rows[1:]]
+        # See _append_queue_snapshot.
+        self._queue_snapshot_counters = None
         with self.stats_lock:
             for row in rows:
                 if (not _stats_buffer_is_unbounded(self.max_stats_len)
@@ -4032,8 +4075,13 @@ class PyExecutor:
         active_requests: List[LlmRequest],
         batch_state: BatchState,
         micro_batch_id: int = 0,
+        current_batch: Optional[ScheduledRequests] = None,
     ):
-        """All ranks: build local stats; ADP queues them for later fanout."""
+        """All ranks: build local stats; ADP queues them for later fanout.
+
+        ``current_batch`` is the batch already in its forward pass when the
+        overlap scheduler collects ``batch_state``, if any.
+        """
         iter_end_time = time.time()
         # iterLatencyMS semantics differ by scheduler:
         # - Overlap / PP: batch_state.iter_start_time was captured at the top
@@ -4099,11 +4147,13 @@ class PyExecutor:
                 and self.enable_iter_perf_stats) else None
         self._pending_close_out_requests = []
 
-        stats = self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
+        stats = self._update_iter_stats(batch_state.iter_stats,
+                                        iter_latency_ms,
                                         num_completed_requests,
                                         batch_state.scheduled_requests,
                                         micro_batch_id,
-                                        batch_state.scheduled_batch_stats)
+                                        batch_state.scheduled_batch_stats,
+                                        current_batch=current_batch)
         if self.enable_attention_dp:
             self._adp_iter_stats.queue(
                 stats,
@@ -4149,6 +4199,11 @@ class PyExecutor:
                 iter_start_time=iter_start_time,
                 iter_stats=self._take_pending_new_active_requests(iter_stats),
                 iter_id=self.iter_counter))
+        if not self._has_close_outs_pending_iter_stats:
+            # The record just built reports this iteration's queues too. A
+            # queue snapshot of the same iteration would repeat them, and
+            # under attention DP replace the record before its fanout.
+            self._quiescent_stats_iter = self.iter_counter
 
     def _executor_loop_cleanup(self):
         # Responses held for the next GPU wait go out first.
@@ -4158,9 +4213,9 @@ class PyExecutor:
         # work below. If wait_on_pp_send_handles hangs (e.g. after a
         # crash leaves PP send handles in a bad state), the await loop
         # must not hang with it.
-        with self.response_cv:
+        with self._response_channel.response_cv:
             self.is_shutdown = True
-            self.response_cv.notify_all()
+            self._response_channel.response_cv.notify_all()
         # A request-intake thread waiting for a GPU wait parses now.
         self._intake_window.set()
         self.shutdown_event.set()
@@ -4667,6 +4722,7 @@ class PyExecutor:
                     # its record.
                     self._process_close_out_iter_stats(iter_stats,
                                                        iter_start_time)
+                    self._maybe_emit_quiescent_stats(engine_idle=False)
                     self.disagg.pace_idle()
 
                 # Stage 4: March forward in microbatch slots
@@ -6772,6 +6828,9 @@ class PyExecutor:
         # only peeks; finalize consumes once the states are aligned).
         iter_stats_payload = (self._adp_iter_stats.next_payload()
                               if self.enable_iter_perf_stats else None)
+        if self.enable_iter_perf_stats:
+            iter_stats_payload = self._with_pending_work_flag(
+                iter_stats_payload)
         num_pending_new_requests = 0
         if self._fetch_hint_enabled and self.dist.rank == 0:
             num_pending_new_requests = (
@@ -6961,7 +7020,7 @@ class PyExecutor:
         its offset from a single round trip, so a few milliseconds of added
         latency there skews every timestamp the server reports afterwards.
 
-        ``_profile_enabled`` is read without ``_profile_state_lock`` on
+        ``ProfileController.enabled`` is read without its lock on
         purpose: this is a per-iteration fast path, and the worst case is
         that a window that just opened or closed is reflected one
         iteration late in the trace. Taking the lock here would put a
@@ -6971,7 +7030,7 @@ class PyExecutor:
             A context manager -- ``nullcontext()`` when no profile window
             is active, otherwise a ``record_function`` for this iteration.
         """
-        if not self._profile_enabled:
+        if not self._profile_controller.enabled:
             return nullcontext()
         return torch.profiler.record_function(
             self._build_step_scope_label(scheduled_batch, phase))
@@ -7313,6 +7372,8 @@ class PyExecutor:
                 if sample_state is None:
                     self._process_close_out_iter_stats(iter_stats,
                                                        iter_start_time)
+                if not can_queue:
+                    self._maybe_emit_quiescent_stats(engine_idle=False)
                 # Same lockstep guarantee for iter-stats; no-op when
                 # TLLM_METRICS_ALL_RANKS=0.
                 self._flush_iter_stats_synced()
@@ -8543,6 +8604,8 @@ class PyExecutor:
                     self.kv_cache_manager.flush_deferred_closes()
 
                 if not can_queue:
+                    if self.previous_batch is None:
+                        self._maybe_emit_quiescent_stats(engine_idle=False)
                     self.disagg.pace_idle()
 
                 self._stage_mark('tail')
@@ -8588,8 +8651,10 @@ class PyExecutor:
             skip_kv_cache_manager=self._is_kv_manager_v2)
 
         if self.enable_iter_perf_stats:
-            self._process_iter_stats(finished_requests, self.active_requests,
-                                     self.previous_batch)
+            self._process_iter_stats(finished_requests,
+                                     self.active_requests,
+                                     self.previous_batch,
+                                     current_batch=current_batch)
 
         # The previous sample is now harvested. Requests absent from the
         # current forward must resume from their host tokens, not an unrelated
@@ -9097,6 +9162,7 @@ class PyExecutor:
                     and not control_pending)
         if use_hint and new_requests_hint == 0 and connector is None:
             return
+        idle_tick = None
         if idle:
             # The fetch below may block until a request arrives.
             self._flush_staged_responses()
@@ -9119,6 +9185,8 @@ class PyExecutor:
             if poll_timeout is not None:
                 timeout = (poll_timeout if timeout is None else min(
                     timeout, poll_timeout))
+            if self.enable_iter_perf_stats:
+                timeout, idle_tick = self._plan_idle_heartbeat_wait(timeout)
         else:
             timeout = datetime.timedelta(0)
 
@@ -9134,6 +9202,11 @@ class PyExecutor:
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
+            fetch_kwargs = {
+                "wait_for_batch": not (pending_retirement or self.is_shutdown)
+            }
+            if idle_tick is not None:
+                fetch_kwargs["idle_tick"] = idle_tick
             self._fetch_may_block = (timeout is None
                                      or timeout.total_seconds() > 0)
             try:
@@ -9142,9 +9215,7 @@ class PyExecutor:
                     # Retirement and shutdown must keep progressing without arrivals.
                     new_requests.extend(
                         self.executor_request_queue.get_from_request_queue(
-                            timeout,
-                            wait_for_batch=not (pending_retirement
-                                                or self.is_shutdown)))
+                            timeout, **fetch_kwargs))
             finally:
                 self._fetch_may_block = False
 
@@ -9194,6 +9265,244 @@ class PyExecutor:
         new_requests = self._handle_special_queue_items(new_requests)
 
         waiting_queue.add_requests(new_requests)
+        if (idle and not new_requests and not self.control_requests
+                and self.enable_iter_perf_stats):
+            pending_stats_work = (self._stats_has_pending_work
+                                  if self.enable_attention_dp else
+                                  self._has_pending_iteration_stats_work())
+            if not pending_stats_work:
+                self._maybe_emit_quiescent_stats(engine_idle=True)
+
+    def _with_pending_work_flag(
+            self,
+            payload: Optional[RankIterStatsPayload]) -> RankIterStatsPayload:
+        """Attach this rank's current pending-work flag to the ADP payload."""
+        if payload is None:
+            payload = RankIterStatsPayload()
+        payload.has_pending_work = self._has_pending_iteration_stats_work()
+        return payload
+
+    def _has_pending_iteration_stats_work(self) -> bool:
+        """Include native KV sends, outstanding model batches and completions
+        that wait for their record in idleness."""
+        transfers = self.async_transfer_manager
+        pending_batch = (not self._pp_ring_is_drained() if self.dist.pp_size > 1
+                         else self.previous_batch is not None)
+        return (pending_batch or bool(self.control_requests)
+                or self._has_close_outs_pending_iter_stats
+                or (transfers is not None
+                    and transfers.has_any_inflight_requests()))
+
+    def _plan_idle_heartbeat_wait(
+        self, timeout: Optional[datetime.timedelta]
+    ) -> Tuple[Optional[datetime.timedelta], Optional[Callable[[], float]]]:
+        """Choose how rank 0 waits on the request queue while the engine is idle.
+
+        An idle engine with iteration stats enabled publishes a heartbeat
+        every IDLE_HEARTBEAT_PERIOD_S. Returning from the queue wait to do so
+        would wake every rank through the request broadcast and run a full
+        executor loop pass (with its collectives) per heartbeat. Instead rank
+        0 stays parked on the queue for the caller's ``timeout`` and publishes
+        the heartbeats locally from an ``idle_tick`` callback, so the other
+        ranks stay parked in the broadcast probe.
+
+        Rank 0 can do that alone because "every rank is idle with no pending
+        work" only ends through a request or control item, and those only
+        enter through rank 0's queue. The cases that need a loop pass first
+        get a bounded wait and no callback:
+
+        - Some rank still has pending work, so the engine is not reportable
+          as idle yet. A loop pass is what harvests a pending model batch, so
+          one runs at once; if work is still pending after it (a native KV
+          send, a control request), the wait is one period.
+        - Attention DP exports one row per DP rank, and rank 0 only has the
+          peers' rows after an idle heartbeat went through the routing
+          exchange. Snapshots still queued behind the one this pass exported
+          drain one per pass, so those passes run at once. With nothing
+          queued, the wait ends when the next heartbeat is due: every rank
+          then queues a snapshot and the next pass fans it out. Later
+          heartbeats repeat those rows.
+
+        Args:
+            timeout: The idle wait chosen without regard to heartbeats.
+
+        Returns:
+            The timeout to use and the ``idle_tick`` callback, if any.
+        """
+        if self.dist.rank != 0:
+            # Only rank 0 waits on the queue.
+            return timeout, None
+
+        def at_most(wait: datetime.timedelta) -> datetime.timedelta:
+            return wait if timeout is None else min(timeout, wait)
+
+        period = datetime.timedelta(seconds=IDLE_HEARTBEAT_PERIOD_S)
+        immediately = datetime.timedelta(0)
+        pending_work = (self._stats_has_pending_work if self.enable_attention_dp
+                        else self._has_pending_iteration_stats_work())
+        if pending_work or self.control_requests:
+            if self._idle_recheck_iter != self.iter_counter - 1:
+                self._idle_recheck_iter = self.iter_counter
+                return immediately, None
+            return at_most(period), None
+        if not self.enable_attention_dp:
+            return timeout, self._idle_heartbeat_tick
+        adp_stats = self._adp_iter_stats
+        if adp_stats.next_payload() is not None:
+            # Ranks that are not aligned yet settle nothing; do not spin.
+            return (immediately if adp_stats.last_finalize_settled else
+                    at_most(period)), None
+        if adp_stats.last_idle_rank_states is not None:
+            # This pass fanned out an idle heartbeat: the peers' rows are
+            # current.
+            return timeout, self._idle_heartbeat_tick
+        due = datetime.timedelta(
+            seconds=max(0.0, self._next_idle_heartbeat_time - time.monotonic()))
+        return at_most(due), None
+
+    def _idle_heartbeat_tick(self) -> float:
+        """Publish an idle heartbeat if one is due.
+
+        Runs on rank 0 while it is parked on an empty request queue (see
+        _plan_idle_heartbeat_wait). It does no inter-rank communication.
+
+        Returns:
+            Seconds until the next heartbeat is due.
+        """
+        remaining = self._next_idle_heartbeat_time - time.monotonic()
+        if remaining > 0:
+            return remaining
+        stats = self._build_quiescent_stats()
+        if self.enable_attention_dp:
+            rows = self._adp_iter_stats.make_idle_heartbeat_rows(
+                stats, self._stats_scheduler_mode())
+        else:
+            rows = [self._zero_duration_stats_row(stats)]
+        self._publish_idle_heartbeat(rows)
+        self._next_idle_heartbeat_time = (time.monotonic() +
+                                          IDLE_HEARTBEAT_PERIOD_S)
+        return IDLE_HEARTBEAT_PERIOD_S
+
+    def _publish_idle_heartbeat(self, rows: Sequence[Union[str,
+                                                           tuple]]) -> None:
+        """Export idle-heartbeat rows in place of the previous heartbeat's.
+
+        An idle engine repeats the same snapshot every period. Only the newest
+        heartbeat is kept at the tail of the export buffer: the buffer is a
+        bounded FIFO, so appending each one would evict measured records that
+        a slow consumer has not read yet, and would grow without bound when
+        the buffer is unbounded. Rows a consumer already took are not touched.
+
+        Args:
+            rows: The heartbeat's export rows (see _append_stats_rows).
+        """
+        if not rows:
+            return
+        with self.stats_lock:
+            previous = self._idle_heartbeat_rows
+            count = len(previous)
+            if count and len(self.stats) >= count and all(
+                    kept is row
+                    for kept, row in zip(self.stats[-count:], previous)):
+                del self.stats[-count:]
+        self._append_stats_rows(rows, take_encoder_stats=False)
+        self._idle_heartbeat_rows = list(rows)
+
+    def _export_adp_fanout(self, rows: List[str]) -> None:
+        """Export the rows rank 0 fanned out for one attention-DP iteration."""
+        adp_stats = self._adp_iter_stats
+        if adp_stats.last_idle_rank_states is not None:
+            self._publish_idle_heartbeat(rows)
+        elif adp_stats.last_fanout_is_busy_queue_snapshot:
+            self._append_queue_snapshot(rows,
+                                        adp_stats.last_fanout_queued_counters)
+        elif rows:
+            # A queue snapshot can drop rank 0's row.
+            self._append_stats_rows(
+                rows, take_encoder_stats=adp_stats.last_fanout_has_rank0_row)
+
+    def _append_queue_snapshot(self, rows: Sequence[Union[str, tuple]],
+                               counters: tuple) -> None:
+        """Export a busy engine's queue snapshot.
+
+        Loops without a forward pass can spin far faster than a consumer
+        reads, and every pass takes a snapshot. One that repeats the queued
+        counters of the snapshot exported last, with no other row exported
+        since, is dropped until IDLE_HEARTBEAT_PERIOD_S has passed, so repeats
+        cannot evict measured records from the bounded export buffer. A
+        changed snapshot is always exported.
+
+        Args:
+            rows: The snapshot's export rows (see _append_stats_rows).
+            counters: The snapshot's queued counters; under attention DP
+                every rank's, in rank order, so that a backlog moving between
+                ranks is a change too.
+        """
+        if not rows:
+            return
+        now = time.monotonic()
+        if (counters == self._queue_snapshot_counters
+                and now < self._next_queue_snapshot_time):
+            return
+        self._append_stats_rows(rows, take_encoder_stats=False)
+        # Set after the append, which clears it: any other exported row makes
+        # the next snapshot the newest word on the queues again.
+        self._queue_snapshot_counters = counters
+        self._next_queue_snapshot_time = now + IDLE_HEARTBEAT_PERIOD_S
+
+    def _build_quiescent_stats(self) -> IterationStats:
+        """Snapshot the queues without inventing a completed forward pass."""
+        return self._update_iter_stats(self._get_init_iter_stats(0, 0.0),
+                                       0.0,
+                                       0,
+                                       ScheduledRequests(),
+                                       0,
+                                       consume_deltas=False)
+
+    def _maybe_emit_quiescent_stats(self, *, engine_idle: bool) -> None:
+        """Report queues without inventing a completed forward pass.
+
+        ``engine_idle`` must come from the all-rank live-work decision, never
+        from an empty local schedule. ADP retains the normal stats exchange
+        so older measured iterations are finalized before these snapshots.
+        """
+        if not self.enable_iter_perf_stats or self.is_shutdown:
+            return
+        if self._quiescent_stats_iter == self.iter_counter:
+            return
+        if not engine_idle and self.iter_counter % self.iter_perf_stats_interval:
+            return
+        self._quiescent_stats_iter = self.iter_counter
+        if (engine_idle and not self.enable_attention_dp
+                and time.monotonic() < self._next_idle_heartbeat_time):
+            # At most one idle heartbeat per period. This clock is rank-local,
+            # so it must not gate ADP snapshots, which every rank has to queue
+            # for the same iteration; rank 0 paces those through its idle wait
+            # (see _plan_idle_heartbeat_wait).
+            return
+        stats = self._build_quiescent_stats()
+        if engine_idle:
+            self._next_idle_heartbeat_time = (time.monotonic() +
+                                              IDLE_HEARTBEAT_PERIOD_S)
+        if self.enable_attention_dp:
+            self._adp_iter_stats.queue(stats,
+                                       is_rank0=self.dist.rank == 0,
+                                       kv_iter_stats=None,
+                                       host_step_time_ms=0.0,
+                                       prev_device_step_time_ms=0.0,
+                                       gpu_forward_time_ms=0.0,
+                                       is_queue_snapshot=True,
+                                       idle_heartbeat=engine_idle)
+        elif engine_idle:
+            self._publish_idle_heartbeat([self._zero_duration_stats_row(stats)])
+        else:
+            ifb = stats.inflight_batching_stats
+            if (ifb.num_queued_context_requests + ifb.num_queued_gen_requests):
+                self._append_queue_snapshot(
+                    [self._zero_duration_stats_row(stats)],
+                    tuple(
+                        getattr(ifb, name)
+                        for name in RankIterStatsPayload._QUEUED_FIELDS))
 
     def _get_request_admission_capacity(self) -> int:
         """Return the maximum number of distinct requests admitted at once."""
@@ -9380,17 +9689,21 @@ class PyExecutor:
             idle_wait_follows: Whether the fleet has no live or waiting request.
         """
         while True:
-            rows = self._adp_iter_stats.finalize(
-                all_rank_states,
-                is_rank0=self.dist.rank == 0,
-                scheduler_mode=self._stats_scheduler_mode())
-            if rows:
-                self._append_stats_rows(rows)
+            self._export_adp_fanout(
+                self._adp_iter_stats.finalize(
+                    all_rank_states,
+                    is_rank0=self.dist.rank == 0,
+                    scheduler_mode=self._stats_scheduler_mode()))
             if not (idle_wait_follows
                     and ADPIterStatsBuffer.rank0_sent_payload(all_rank_states)):
                 return
             all_rank_states = self.adp_router.gather_iter_stats(
                 self._adp_iter_stats.next_payload())
+            if not ADPIterStatsBuffer.rank0_sent_payload(all_rank_states):
+                # Nothing is left to fan out, and finalize() would only
+                # forget what the last fanout was: the idle wait is planned
+                # from it (see _plan_idle_heartbeat_wait).
+                return
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -9425,6 +9738,9 @@ class PyExecutor:
             if all_rank_states is None:
                 iter_stats_payload = (self._adp_iter_stats.next_payload()
                                       if self.enable_iter_perf_stats else None)
+                if self.enable_iter_perf_stats:
+                    iter_stats_payload = self._with_pending_work_flag(
+                        iter_stats_payload)
                 if load_sample:
                     if iter_stats_payload is None:
                         iter_stats_payload = RankIterStatsPayload()
@@ -9475,6 +9791,10 @@ class PyExecutor:
                                                    generation_ids)
             else:
                 connector_error = None
+            if self.enable_iter_perf_stats:
+                self._stats_has_pending_work = any(
+                    state.iter_stats.has_pending_work
+                    for state in all_rank_states)
             self._kv_connector_has_pending = any(s.num_connector_transfers
                                                  for s in all_rank_states)
             # Reuse the routing exchange to skip deadline/control voting when
@@ -9575,6 +9895,18 @@ class PyExecutor:
 
             new_requests = new_requests_cur_rank
 
+        if getattr(self, "_is_kv_manager_v2", False):
+            for req_item in new_requests:
+                if req_item.is_normal_request:
+                    request = req_item.request
+                    lora_config = getattr(request, "lora_config", None)
+                    req_item.locality_domain_id = (
+                        self.kv_cache_manager.pick_locality_domain(
+                            getattr(request, "input_token_ids", None),
+                            lora_config.task_id
+                            if lora_config is not None else None,
+                            getattr(request, "cache_salt", None)))
+
         # 7. Merge requests
         if self._kv_load_tracker.enabled and new_requests:
             self._kv_load_tracker.idle_sampled = False
@@ -9654,9 +9986,8 @@ class PyExecutor:
         # do not wait for a model batch or flush unrelated resource teardown.
         self._enqueue_responses(responses)
         if self.dist.rank == 0 or self.gather_all_responses:
-            with self.response_cv:
-                for req_id in handled_ids:
-                    self.result_wait_queues.pop(req_id, None)
+            for req_id in handled_ids:
+                self._response_channel.release(req_id)
 
     def _handle_special_queue_items(
             self,
@@ -10832,8 +11163,9 @@ class PyExecutor:
             # The dummy only needs a non-empty context request to enter the
             # context lifecycle and collectives. max_num_tokens is a batch-wide
             # scheduling limit; using it as one synthetic prompt performs a
-            # full max-sized prefill on every idle ADP rank. Helix raises this
-            # minimum to two tokens in the KV manager and capacity check.
+            # full max-sized prefill on every idle ADP rank. Under Helix the
+            # capacity check budgets two tokens for any dummy, while
+            # KVCacheManagerV2 raises only generation dummies to two.
             token_nums = [1]
 
         if not self._has_adp_dummy_kv_capacity(token_nums):
@@ -11884,7 +12216,6 @@ class PyExecutor:
                                batch_outputs.get("logits"),
                                beam_width,
                                num_context_logits_prefix_sum,
-                               self.sampler.is_generation_model(),
                                context_logits_handled=context_logits_handled)
 
                 HandleAdditionalOutputs()(scheduled_batch.context_requests,
@@ -12083,28 +12414,10 @@ class PyExecutor:
             # enters the same number of collectives (attention-DP /
             # gather-all modes use collective gathers internally).
             waiting_responses: List[Tuple[int, LlmResponse]] = []
-            while self.waiting_queue:
-                item = self.waiting_queue.pop_request()
+            for item in drain_queued_items(self.waiting_queue,
+                                           self.executor_request_queue):
                 if (self.gather_all_responses
                         or self.dist.rank == 0) and item.request is not None:
-                    waiting_responses.append(
-                        (item.id,
-                         LlmResponse(request_id=item.id,
-                                     error_msg=error_msg,
-                                     client_id=getattr(item.request,
-                                                       'client_id', None))))
-            # Also drain executor_request_queue so items already queued
-            # but not yet fetched by the main loop are not scheduled
-            # after the CUDA context is corrupted.  Safe to use empty()
-            # here because is_shutdown is True and the queue's active
-            # flag is about to be set False, so no new items arrive.
-            raw_queue = self.executor_request_queue.get_request_queue()
-            while not raw_queue.empty():
-                item = raw_queue.get_nowait()
-                if item.is_shutdown_request:
-                    continue
-                if ((self.gather_all_responses or self.dist.rank == 0)
-                        and item.request is not None):
                     waiting_responses.append(
                         (item.id,
                          LlmResponse(request_id=item.id,
@@ -12324,7 +12637,7 @@ class PyExecutor:
             request.py_encoder_output = None
             request.py_encoder_output_ready_event = None
         if self.gather_all_responses or self.dist.rank == 0:
-            self.result_wait_queues.pop(request.py_request_id, None)
+            self._response_channel.release(request.py_request_id)
 
     def _on_disagg_pp_termination(self, request: LlmRequest) -> None:
         """Finish a PP-synchronized termination and any deferred recompute."""
@@ -12893,36 +13206,21 @@ class PyExecutor:
         if self.dist.rank == 0 or self.gather_all_responses:
             # Look up the result queues now: a staged response is published after
             # its request may have terminated, which drops the request's queue.
-            routed = [(req_id, resp, self.result_wait_queues.get(req_id))
-                      for req_id, resp in responses]
+            routed = self._response_channel.route(responses)
             if self._stage_responses:
                 if not self._staged_responses:
                     self._staged_at = self._loop_iteration
                 self._staged_responses.extend(routed)
                 self._maybe_record_hang_diagnostic_phase("responses_staged")
                 return
-            self._publish_responses(routed)
+            self._response_channel.deliver(routed)
         self._maybe_record_hang_diagnostic_phase("responses_enqueued")
-
-    def _publish_responses(self,
-                           responses: Iterable[Tuple[int, LlmResponse,
-                                                     Optional["ActorHandle"]]]):
-        with self.response_cv:
-            for req_id, resp, result_wait_queue in responses:
-                if req_id in self.responses.keys():
-                    self.responses[req_id].append(resp)
-                else:
-                    self.responses.update({req_id: [resp]})
-                # (TODO: joyang) There are other types of responses, we need to sort out.
-                if type(resp) == LlmResponse and result_wait_queue is not None:
-                    result_wait_queue.put_response.remote(resp.client_id, resp)
-            self.response_cv.notify_all()
 
     def _flush_staged_responses(self):
         """Publish the staged responses in order, with one notify."""
         if self._staged_responses:
             staged, self._staged_responses = self._staged_responses, []
-            self._publish_responses(staged)
+            self._response_channel.deliver(staged)
 
     def _start_response_staging_iteration(self):
         """Top of an overlap-loop pass: whether this pass stages its responses, and
@@ -13261,54 +13559,19 @@ class PyExecutor:
     def _await_any_response(self,
                             timeout: Optional[float] = None
                             ) -> List[LlmResponse]:
-
-        def any_responses_ready():
-            return len(self.responses) > 0 or self.is_shutdown
-
-        responses = []
-        with self.response_cv:
-            self.response_cv.wait_for(any_responses_ready, timeout=timeout)
-            for req_id, response in self.responses.items():
-                responses += response
-            self.responses = {}
-
-        return responses
+        return self._response_channel.await_any(
+            timeout, is_shutdown=lambda: self.is_shutdown)
 
     def _await_single_response(
             self,
             id: int,
             timeout: Optional[float] = None) -> List[LlmResponse]:
-        with self.response_cv:
-
-            def key_has_response():
-                # Wake on shutdown too so that an event-loop crash
-                # cannot trap callers here forever (nvbug 6038228).
-                return id in self.responses or self.is_shutdown
-
-            self.response_cv.wait_for(key_has_response, timeout=timeout)
-            if id in self.responses:
-                return self.responses.pop(id)
-            if self.is_shutdown:
-                # The event-loop thread terminated before producing a
-                # response for this request. Re-raise the original
-                # exception (if any) so callers see a meaningful error
-                # instead of hanging here or hitting a KeyError below.
-                error = self._event_loop_error
-                if error is not None:
-                    # The caller is about to see the original exception, so
-                    # the crash is reportable without killing the world.
-                    self._event_loop_error_delivered.set()
-                    raise RuntimeError(
-                        f"Event loop terminated with error: {error}") from error
-                raise RuntimeError(
-                    f"Event loop shut down before a response was received "
-                    f"for request {id}.")
-            # Timed out without shutdown. Return [] to match the
-            # documented timeout contract used by _await_any_response and
-            # the other executor-API timeouts; the pre-fix code raised a
-            # bare KeyError on this path, which all known callers had to
-            # defend against anyway.
-            return []
+        return self._response_channel.await_single(
+            id,
+            timeout,
+            is_shutdown=lambda: self.is_shutdown,
+            read_error=lambda: self._event_loop_error,
+            mark_error_delivered=self._event_loop_error_delivered.set)
 
     def _terminate_requests(
             self, requests_to_terminate: Iterable[LlmRequest]) -> None:
@@ -13637,7 +13900,7 @@ class PyExecutor:
         # The same teardown an immediate recompute pause does (see
         # ``_resume_preempted_request``): free the execution resources, then
         # reset the request for a re-prefill. Terminating instead would pop
-        # the request's response routing (``result_wait_queues``) and release
+        # the request's response routing (its Ray result wait queue) and release
         # its multimodal inputs, neither of which a continuing request can lose.
         for request in requests_to_recompute:
             self._free_request_resources(request)

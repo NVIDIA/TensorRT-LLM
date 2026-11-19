@@ -7,7 +7,8 @@ packed-V cache and FP8 context scratch.
 
 Copied verbatim from ``tensorrt_llm/_torch/attention/backends/fp4_mla/`` (only the imports differ):
 the KV-cache-manager contract modules (config, layout, metadata, packed_plan, state) stay imported.
-``test_modeling_v2_k3_fp4_mla_copies.py`` checks each definition against its source.
+``test_modeling_v2_k3_fp4_mla_copies.py`` checks each definition against its source, except the
+definitions the family owns (listed there).
 """
 
 import copy
@@ -16,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
 import torch
 import triton
-import triton.language as tl
 
 # The FP4 MLA KV-cache layout contract shared with the KV cache manager (kept, not copied).
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
@@ -45,7 +45,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     fp4_mla_cache_layout,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
-    _ensure_workspace_tensor,
     _get_fp4_mla_global_scale,
     _get_fp4_mla_hp_pool_layout,
     _get_fp4_mla_kv_cache_tensors,
@@ -58,7 +57,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.metadata import (
     _fp4_mla_generation_hp_page_ids,
-    _fp4_mla_generation_num_blocks_device,
     _fp4_mla_generation_page_ids,
     _fp4_mla_uniform_generation_lengths,
     _materialize_fp4_mla_device_page_table_for_forward,
@@ -1015,7 +1013,6 @@ def scatter_fp4_mla_kv_cache(
                     "FP4 MLA V-packed layer view does not match its stable "
                     "full-pool base and page offset."
                 )
-    v_pack_num_valid = None
     if phase == "context":
         _materialize_fp4_mla_device_page_table_for_forward(metadata)
         hp_pool_updated = _scatter_fp4_mla_kv_cache_2d_context(
@@ -1070,10 +1067,6 @@ def scatter_fp4_mla_kv_cache(
         v_pack_page_ids = _fp4_mla_generation_page_ids(
             metadata, metadata.num_seqs - metadata.num_contexts
         )
-        if getattr(metadata, "is_cuda_graph", False):
-            # Frozen launch grids cannot follow the per-replay page count;
-            # the repack kernels stride over this device-side count instead.
-            v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
     cutedsl_repack_page_indptr = None
     cutedsl_repack_kv_lens = None
     cutedsl_repack_generation_lens = None
@@ -1122,18 +1115,6 @@ def scatter_fp4_mla_kv_cache(
         )
     if context_only_cache:
         return hp_pool_updated
-    _maybe_update_triton_v_packed_cache(
-        metadata,
-        layer_idx,
-        kv_cache,
-        v_pack_page_ids,
-        num_queries=num_tokens,
-        v_head_dim=v_head_dim,
-        page_size=metadata.page_size,
-        local_layer=local_layer,
-        v_sf=v_sf[local_layer],
-        num_valid_pages=v_pack_num_valid,
-    )
     if phase == "generation":
         metadata.fp4_mla_state.generation_cache_scattered = hp_pool_updated
     return hp_pool_updated
@@ -1273,12 +1254,6 @@ def load_fp4_mla_chunked_kv_cache(
     return compressed_kv, k_pe
 
 
-def _select_triton_block_v(num_queries: int, *, prefer_prepacked_v: bool = False) -> int:
-    if prefer_prepacked_v:
-        return 128
-    return 32 if num_queries <= 32 else 128
-
-
 def _v_packed_shape(
     kv_cache: torch.Tensor,
     v_head_dim: int,
@@ -1362,212 +1337,6 @@ def _repack_cutedsl_v_packed_cache(
         kv_lens=kv_lens,
         generation_lens=generation_lens,
         max_touched_pages=max_touched_pages,
-    )
-
-
-def _v_packed_cache_tag(
-    layer_idx: int,
-    kv_cache: torch.Tensor,
-    *,
-    v_head_dim: int,
-    page_size: int,
-    local_layer: Optional[int] = None,
-    v_sf: Optional[torch.Tensor] = None,
-    page_ids: Optional[torch.Tensor] = None,
-    block_v: int = 128,
-) -> tuple[Any, ...]:
-    v_sf_tag = (
-        None
-        if v_sf is None
-        else (
-            int(v_sf.data_ptr()),
-            str(v_sf.device),
-            str(v_sf.dtype),
-            tuple(int(dim) for dim in v_sf.shape),
-            tuple(int(stride) for stride in v_sf.stride()),
-        )
-    )
-    page_ids_tag = (
-        None
-        if page_ids is None
-        else (
-            int(page_ids.data_ptr()),
-            str(page_ids.device),
-            str(page_ids.dtype),
-            tuple(int(dim) for dim in page_ids.shape),
-            tuple(int(stride) for stride in page_ids.stride()),
-        )
-    )
-    return (
-        int(layer_idx),
-        None if local_layer is None else int(local_layer),
-        int(kv_cache.data_ptr()),
-        str(kv_cache.device),
-        str(kv_cache.dtype),
-        tuple(int(dim) for dim in kv_cache.shape),
-        tuple(int(stride) for stride in kv_cache.stride()),
-        int(v_head_dim),
-        int(page_size),
-        int(block_v),
-        v_sf_tag,
-        page_ids_tag,
-    )
-
-
-def _triton_prepack_v_enabled() -> bool:
-    return _fp4_mla_attention_backend() == "triton"
-
-
-def _triton_can_prepack_v(v_head_dim: int, page_size: int, block_v: int) -> bool:
-    return (
-        _triton_prepack_v_enabled()
-        and hasattr(tl, "make_tensor_descriptor")
-        and block_v in (32, 128)
-        and v_head_dim % block_v == 0
-        and page_size == FP4_MLA_TOKENS_PER_BLOCK
-    )
-
-
-def _triton_v_packed_attr(layer_idx: int) -> str:
-    """The V-packed buffer every layer shares (one layer's V is packed at a time)."""
-    del layer_idx
-    return "_fp4_mla_triton_attention_v_packed_buf"
-
-
-def _triton_shared_v_packed_valid_attr() -> str:
-    return "_fp4_mla_triton_attention_v_packed_valid_tag"
-
-
-def _triton_v_packed_cache_tag(
-    layer_idx: int,
-    kv_cache: torch.Tensor,
-    *,
-    v_head_dim: int,
-    page_size: int,
-    local_layer: Optional[int] = None,
-    v_sf: Optional[torch.Tensor] = None,
-    page_ids: Optional[torch.Tensor] = None,
-    block_v: int = 128,
-) -> tuple[Any, ...]:
-    return (
-        "triton",
-        _v_packed_cache_tag(
-            layer_idx,
-            kv_cache,
-            v_head_dim=v_head_dim,
-            page_size=page_size,
-            block_v=block_v,
-            local_layer=local_layer,
-            v_sf=v_sf,
-            page_ids=page_ids,
-        ),
-    )
-
-
-def _set_triton_v_packed_cache_valid(
-    metadata: Any,
-    layer_idx: int,
-    kv_cache: torch.Tensor,
-    *,
-    v_head_dim: int,
-    page_size: int,
-    local_layer: Optional[int] = None,
-    v_sf: Optional[torch.Tensor] = None,
-    page_ids: Optional[torch.Tensor] = None,
-    block_v: int = 128,
-) -> None:
-    valid_attr = _triton_shared_v_packed_valid_attr()
-    metadata.fp4_mla_state.v_packed_cache_tags[valid_attr] = _triton_v_packed_cache_tag(
-        layer_idx,
-        kv_cache,
-        v_head_dim=v_head_dim,
-        page_size=page_size,
-        block_v=block_v,
-        local_layer=local_layer,
-        v_sf=v_sf,
-        page_ids=page_ids,
-    )
-
-
-def _update_triton_v_packed_cache(
-    metadata: Any,
-    layer_idx: int,
-    kv_cache: torch.Tensor,
-    page_ids: torch.Tensor,
-    *,
-    v_head_dim: int,
-    page_size: int,
-    block_v: int,
-    local_layer: Optional[int] = None,
-    v_sf: Optional[torch.Tensor] = None,
-    num_valid_pages: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    if not _triton_can_prepack_v(v_head_dim, page_size, block_v):
-        return None
-    if page_ids.numel() == 0:
-        return None
-    from ._k3_fp4_mla_kernels import fp4_mla_repack_v_cache
-
-    def _tma_alloc(size: int, alignment: int, stream):
-        return torch.empty(size, device=kv_cache.device, dtype=torch.int8)
-
-    triton.set_allocator(_tma_alloc)
-    attr_name = _triton_v_packed_attr(layer_idx)
-    v_packed = _ensure_workspace_tensor(
-        metadata,
-        attr_name,
-        _v_packed_shape(kv_cache, v_head_dim, page_size, block_v),
-        dtype=torch.uint8,
-        device=kv_cache.device,
-    )
-    fp4_mla_repack_v_cache(
-        v_packed,
-        kv_cache,
-        page_ids,
-        v_head_dim=v_head_dim,
-        page_size=page_size,
-        block_v=block_v,
-        num_valid_pages=num_valid_pages,
-    )
-    _set_triton_v_packed_cache_valid(
-        metadata,
-        layer_idx,
-        kv_cache,
-        v_head_dim=v_head_dim,
-        page_size=page_size,
-        block_v=block_v,
-        local_layer=local_layer,
-        v_sf=v_sf,
-        page_ids=page_ids,
-    )
-    return v_packed
-
-
-def _maybe_update_triton_v_packed_cache(
-    metadata: Any,
-    layer_idx: int,
-    kv_cache: torch.Tensor,
-    page_ids: torch.Tensor,
-    *,
-    num_queries: int,
-    v_head_dim: int,
-    page_size: int,
-    local_layer: Optional[int] = None,
-    v_sf: Optional[torch.Tensor] = None,
-    num_valid_pages: Optional[torch.Tensor] = None,
-) -> None:
-    block_v = _select_triton_block_v(num_queries, prefer_prepacked_v=_triton_prepack_v_enabled())
-    _update_triton_v_packed_cache(
-        metadata,
-        layer_idx,
-        kv_cache,
-        page_ids,
-        v_head_dim=v_head_dim,
-        page_size=page_size,
-        block_v=block_v,
-        local_layer=local_layer,
-        v_sf=v_sf,
-        num_valid_pages=num_valid_pages,
     )
 
 

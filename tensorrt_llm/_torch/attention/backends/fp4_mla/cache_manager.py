@@ -4,7 +4,7 @@
 
 import math
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
@@ -54,6 +54,25 @@ def is_fp4_mla_context_only_cache(is_disagg: bool) -> bool:
     return bool(is_disagg) and os.getenv(_DISAGG_ROLE_ENV) == "context"
 
 
+def _require_fp4_mla_layout_hooks(manager_type: type) -> None:
+    """Refuse the FP4 MLA cache layout to a manager class that does not run its layout hooks.
+
+    The layout reaches the V2 manager through ``Fp4MlaLayoutHooks``. A class
+    without them, or one that overrides a hook ahead of them, would build only
+    some of the layout's pools.
+    """
+    shadowed = [
+        name
+        for name in Fp4MlaLayoutHooks.LAYOUT_HOOKS
+        if getattr(manager_type, name, None) is not getattr(Fp4MlaLayoutHooks, name)
+    ]
+    if shadowed:
+        raise NotImplementedError(
+            f"{manager_type.__name__} does not take {', '.join(shadowed)} from Fp4MlaLayoutHooks: "
+            "this manager cannot store an NVFP4 MLA latent cache."
+        )
+
+
 class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
     """FP4 MLA storage policy for a KV cache manager V2 lifecycle.
 
@@ -71,13 +90,16 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
     radix tree retains only the full-history FP4 pages.
 
     The layout itself is an ``Fp4MlaCacheLayout``, which ``configure_manager``
-    attaches to the manager as ``fp4_mla_layout``. Hybrid linear-attention
-    managers call ``configure_manager`` and ``finalize_manager`` on their own
-    instance, next to their SSM lifecycle. Such a manager keeps its own
-    disaggregation declarations and merges the layout's attention roles into
+    attaches to the manager as ``fp4_mla_layout``. The Kimi K3 hybrid
+    linear-attention manager selects this policy for its MLA latent cache
+    (``configure_manager``) and composes it with its SSM lifecycle: it lists
+    ``Fp4MlaLayoutHooks`` in its bases, and ``MambaHybridCacheManagerV2``
+    forwards the remaining attention-layout operations here, calling the
+    generic methods below with itself. Such a manager keeps its own
+    disaggregation declarations and merges the policy's attention roles into
     them (``DISAGG_ROLE_MAPPER_KINDS``, ``DISAGG_IGNORED_ROLES``,
-    ``_fp4_mla_disagg_global_layer_id``, ``_fp4_mla_disagg_role_layouts``), so
-    the recurrent-state roles keep their own transfer mappings.
+    ``disagg_global_layer_id``, ``disagg_role_layouts``), so the
+    recurrent-state roles keep their own transfer mappings.
     """
 
     DISAGG_ROLE_MAPPER_KINDS: dict[DataRole, MapperKind] = (
@@ -137,6 +159,7 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
         mapping: Optional[Mapping] = None,
     ):
         """Validate and install FP4 MLA layout state before V2 construction."""
+        _require_fp4_mla_layout_hooks(type(manager))
         if dtype != DataType.NVFP4 or kv_cache_type != CacheTypeCpp.SELFKONLY:
             raise ValueError("Fp4MlaKVCacheManagerV2 requires NVFP4 SELFKONLY cache storage.")
         if kv_cache_config is None or kv_cache_config.dtype not in ("auto", "nvfp4"):
@@ -213,6 +236,7 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
         layout._fp4_mla_hp_pool_size = HP_BLOCK_SIZE + max_rewind_len
         # From here on the manager's layout hooks (Fp4MlaLayoutHooks) run the layout.
         manager.fp4_mla_layout = layout
+        manager._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
         return kv_cache_config
 
     @staticmethod
@@ -220,12 +244,46 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
         """Validate allocated pools and initialize derived FP4 state."""
         manager.fp4_mla_layout.finalize()
 
+    # Attention-layout operations of a lifecycle manager that composes this
+    # policy (MambaHybridCacheManagerV2), which calls them with itself.
+
+    def virtual_layer_pool_roles(
+        self, layer_id: int
+    ) -> Optional[tuple[DataRole, Optional[DataRole]]]:
+        """Pool roles of a virtual layer this layout appended (an HP ring), else ``None``."""
+        return self.fp4_mla_layout.virtual_layer_pool_roles(layer_id)
+
+    def disagg_global_layer_id(self, internal_layer: int) -> Optional[int]:
+        """Transfer ID of an MLA cache or HP-ring layer.
+
+        Model layer ``L`` takes ``2 * L`` and ``2 * L + 1``, so a lifecycle
+        manager gives its other layers ``2 * L`` to keep the IDs collision-free.
+        """
+        return self.fp4_mla_layout._fp4_mla_disagg_global_layer_id(internal_layer)
+
+    def disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
+        """Transfer geometry of the HP ring."""
+        return self.fp4_mla_layout._fp4_mla_disagg_role_layouts()
+
+    def iter_physical_pool_views(self) -> Iterable[torch.Tensor]:
+        """Page-major views of each physical MLA pool."""
+        return self.fp4_mla_layout._iter_fp4_mla_physical_pool_views()
+
+    def align_snapshot_points(self, request: "LlmRequest") -> None:
+        """Move a hybrid manager's recurrent-state snapshots onto full cache blocks."""
+        self.fp4_mla_layout.align_snapshot_points(request)
+
     def _build_cache_config(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
         # The pure MLA manager resumes a reused prefix only on a block
         # boundary, where no HP ring content is needed, so its HP rings are
-        # private to the request. (A hybrid manager keeps the HP ring with its
-        # recurrent snapshots and applies the layout with ReusePolicy.REQUIRED.)
-        return self.fp4_mla_layout.apply_cache_config(config, hp_reuse_policy=ReusePolicy.PRIVATE)
+        # private to the request. A hybrid manager composing this policy keeps
+        # the HP ring with its recurrent snapshots.
+        hp_reuse_policy = (
+            ReusePolicy.PRIVATE
+            if isinstance(self, Fp4MlaV2CacheLayoutPolicy)
+            else ReusePolicy.REQUIRED
+        )
+        return self.fp4_mla_layout.apply_cache_config(config, hp_reuse_policy=hp_reuse_policy)
 
     @property
     def blocks_in_primary_pool(self) -> int:

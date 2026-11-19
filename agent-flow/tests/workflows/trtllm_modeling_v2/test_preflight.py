@@ -185,8 +185,8 @@ def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environme
         substrate_reuse,
     )
 
-    def inputs(perf=None, **environment):
-        task = _task(tmp_path, environment=environment, perf=perf or {})
+    def inputs(**environment):
+        task = _task(tmp_path, environment=environment)
         return substrate_inputs(task, resolve_environment(task, world_size=4))
 
     gates = {"name": "gates", "spool": "/s/gates", "env": {"A": "1"}, "setup": ["source /e.sh"]}
@@ -199,18 +199,18 @@ def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environme
         "sessions": [gates],
     }
     record = {"at": 0.0, "inputs": inputs(**block)}
-    perf = [
-        {**gates, "name": f"perf{n}", "spool": f"/s/perf{n}", "time_limit": "4h"} for n in (1, 2)
+    more = [
+        {**gates, "name": f"work{n}", "spool": f"/s/work{n}", "time_limit": "4h"} for n in (1, 2)
     ]
     resized = {**gates, "role": "gates", "nodes": 2, "gpus_per_node": 8, "handover_lead": "30m"}
-    grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *perf]}
-    assert substrate_reuse(record, inputs({"dev_spools": ["/s/perf2"]}, **grown), now=60.0)[0]
+    grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *more]}
+    assert substrate_reuse(record, inputs(**grown), now=60.0)[0]
     for changed in (
         {"container_image": "/images/other.sqsh"},
         {"mounts": ["/data:/data", "/models:/models"]},
         {"env": {"TMPDIR": _SCRATCH, "NCCL_DEBUG": "INFO"}},
         {"python": "/other/bin/python"},
-        {"sessions": [gates, {**gates, "name": "perf1", "setup": ["source /other.sh"]}]},
+        {"sessions": [gates, {**gates, "name": "work1", "setup": ["source /other.sh"]}]},
         # A field no list names counts too.
         {"gpu_memory_gib": 80},
     ):
