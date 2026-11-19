@@ -2456,6 +2456,7 @@ def test_pending_cancel_idle_hold_needs_the_consensus_vote(
 
     executor.canceled_req_ids = [9]
     executor.control_requests = []
+    executor.enable_iter_perf_stats = False
     executor._disable_mpi = False
     executor.request_accumulated = []
     executor.hang_detector = MagicMock()

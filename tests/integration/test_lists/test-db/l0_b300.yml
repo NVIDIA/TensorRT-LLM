@@ -237,7 +237,6 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_moe_routing.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_moe_routing.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_kimi_k3_noaux_tc_mxfp8_quant.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_route_b_moe.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_modeling_v2_rms_norm_gated_token_major.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/activation/test_modeling_v2_situ_and_mul.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3r_experts.py

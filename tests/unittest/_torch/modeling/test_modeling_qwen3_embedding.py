@@ -18,6 +18,10 @@ architecture is registered and classified as a non-generation (encoder/embedding
 model so it routes through the llm.encode() path.
 """
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 
 def test_qwen3_text_embedding_is_registered():
     # Importing the module triggers @register_auto_model.
