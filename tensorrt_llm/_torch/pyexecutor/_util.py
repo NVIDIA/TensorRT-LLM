@@ -5018,11 +5018,19 @@ def _create_kv_cache_manager(
                                          == torch.float16)
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         from ..modules.mamba.cache_manager import NemotronHybridCacheManager
+        from ..modules.mamba.exact_replay import exact_replay_requested
         if (mamba_params.mamba_chunk_size is not None and issubclass(
                 kv_cache_manager_cls, NemotronHybridCacheManager)):
-            # The FORCE_DETERMINISTIC replay state sizes its buffers by it.
+            # The deterministic replay state sizes its buffers by it.
             mamba_manager_extra_kwargs[
                 "mamba_chunk_size"] = mamba_params.mamba_chunk_size
+        elif (mamba_params.mamba_chunk_size is not None
+              and exact_replay_requested()):
+            logger.warning_once(
+                "Deterministic Mamba2 keeps the default prefill and decode "
+                f"kernels because {kv_cache_manager_cls.__name__} is not the "
+                "Python V2 hybrid cache manager.",
+                key="mamba2_exact_replay_manager")
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):

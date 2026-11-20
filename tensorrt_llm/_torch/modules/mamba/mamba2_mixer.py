@@ -316,7 +316,9 @@ class Mamba2Mixer(nn.Module):
         #
         # Results move by up to one bf16 ulp -- the layout change is bit-exact,
         # the accumulation order is not. Set TRTLLM_MAMBA_TOKEN_MAJOR_CONV=0 to
-        # fall back to the channel-major kernel plus transposes.
+        # fall back to the channel-major kernel plus transposes. The switch does
+        # not apply to the exact-replay path of the deterministic mode, which
+        # always uses the token-major kernel (see exact_replay.py).
         self._token_major_conv = os.environ.get("TRTLLM_MAMBA_TOKEN_MAJOR_CONV",
                                                 "1") == "1"
 
@@ -508,11 +510,12 @@ class Mamba2Mixer(nn.Module):
         conv_states = layer_cache.conv
         ssm_states = layer_cache.temporal
 
-        if (spec_metadata is None and zxbcdt.dtype == torch.bfloat16
-                and getattr(layer_cache, "replay_x", None) is not None):
-            # The cache manager bound the exact-replay state
-            # (FORCE_DETERMINISTIC): prefill and decode share the
-            # chunked-scan arithmetic from each slot's last chunk boundary.
+        if getattr(layer_cache, "replay_x", None) is not None:
+            # The cache manager bound the exact-replay state (deterministic
+            # Mamba2 kernels): prefill and decode share the chunked-scan
+            # arithmetic from each slot's last chunk boundary. The manager
+            # binds it only for a bfloat16 model without speculative decoding.
+            assert spec_metadata is None and zxbcdt.dtype == torch.bfloat16
             exact_replay_forward_core(self, zxbcdt, attn_metadata,
                                       mamba_metadata, layer_cache,
                                       preallocated_ssm_out)

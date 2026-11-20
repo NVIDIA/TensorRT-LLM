@@ -325,6 +325,31 @@ For hybrid Mamba models, `block_reuse_config.enable_branch_snapshot` also
 snapshots the recurrent state at the fork. The deprecated
 `mamba_state_config.enable_branch_snapshot` alias turns on the same option.
 
+### Deterministic Mamba2 State (Exact Replay)
+
+By default a Mamba2 layer computes a token with the chunked scan in prefill and
+with a single-token update in decode. The two agree mathematically but not bit
+for bit. With `FORCE_DETERMINISTIC=1`, or `FORCE_MAMBA_KERNEL_DETERMINISTIC=1`
+for the Mamba2 layers alone, decode replays the chunked scan, so a token gets
+the same bits in prefill, chunked prefill and decode.
+
+It takes effect when all of these hold; otherwise the manager logs the reason
+once and keeps the default kernels:
+
+- an SM100 or SM103 GPU and a bfloat16 Nemotron-H model;
+- `kv_cache_config.mamba_ssm_cache_dtype: float32`;
+- the Python V2 hybrid cache manager (`NemotronHybridCacheManager`);
+- no speculative decoding and no disaggregated serving.
+
+Each recurrent-state slot then also holds the inputs of its partial chunk:
+`chunk_size x (d_inner + num_heads + n_groups x d_state)` values per Mamba2
+layer in the model dtype (2.3 MiB per layer for Nemotron-H 8B, next to 4 MiB of
+FP32 state), and the pool is sized for it. A decode step scans its row's partial
+chunk instead of updating one token, which is slower per Mamba2 layer (for the
+Nemotron-H 8B geometry on GB200: 0.23 ms to 0.73 ms at batch 32 and 0.26 ms to
+2.89 ms at batch 128). Every row uses the token-major convolution kernel,
+whatever `TRTLLM_MAMBA_TOKEN_MAJOR_CONV` selects.
+
 ### KV Cache Salting for Secure Reuse
 
 KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.
