@@ -16,14 +16,19 @@ import ast
 import concurrent.futures
 import contextlib
 import copy
+import dis
 import enum
 import errno
 import fcntl
+import hashlib
+import importlib.util
 import inspect
 import itertools
 import json
 import os
+import sys
 import time
+import types
 import zlib
 from abc import ABC, abstractmethod
 from collections import Counter
@@ -343,6 +348,214 @@ class TunableRunner(ABC):
         another. None keeps the default cache key.
         """
         return None
+
+
+def _tracked(module: str) -> bool:
+    """Whether code of `module` counts toward a runner's fingerprint. This
+    module is left out: a change to the tuner is not a change to any kernel."""
+    return module.split(".")[0] == "tensorrt_llm" and module != __name__
+
+
+_CONSTANT_TYPES = (int, float, complex, str, bytes, bool, type(None), enum.Enum)
+_DEFINITIONS = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+@lru_cache(maxsize=None)
+def _source_index(path: str, stamp: Tuple[int, int]):
+    """A file's lines and the line spans of its classes, functions and
+    name assignments by qualified name (several when branches define one
+    name). `stamp` (mtime, size) keys the cache to the file's content."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    index: Dict[str, List[Tuple[int, int]]] = {}
+
+    def visit(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _DEFINITIONS):
+                name = prefix + child.name
+                start = min([child.lineno] +
+                            [d.lineno for d in child.decorator_list])
+                index.setdefault(name, []).append((start, child.end_lineno))
+                visit(
+                    child, name +
+                    ("." if isinstance(child, ast.ClassDef) else ".<locals>."))
+                continue
+            targets = (
+                child.targets if isinstance(child, ast.Assign) else
+                [child.target] if isinstance(child, ast.AnnAssign) else [])
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    index.setdefault(prefix + target.id, []).append(
+                        (child.lineno, child.end_lineno))
+            visit(child, prefix)
+
+    visit(ast.parse(text), "")
+    return text.splitlines(keepends=True), index
+
+
+def _definition_source(obj, qualname: Optional[str] = None) -> str:
+    """The source of a class or function (or of the assignment to `qualname`
+    in module `obj`), or of its whole file when the definition cannot be
+    found in it."""
+    try:
+        path = inspect.getsourcefile(obj)
+        st = os.stat(path)
+        lines, index = _source_index(path, (st.st_mtime_ns, st.st_size))
+    except (TypeError, OSError, SyntaxError, ValueError):
+        return ""
+    if qualname is not None:
+        return "".join("".join(lines[s - 1:e])
+                       for s, e in index.get(qualname, ()))
+    if inspect.ismodule(obj):
+        return "".join(lines)
+    spans = index.get(obj.__qualname__)
+    if spans:
+        return "".join("".join(lines[s - 1:e]) for s, e in spans)
+    try:
+        return inspect.getsource(obj)
+    except (OSError, TypeError):
+        return "".join(lines)
+
+
+def _attribute(obj, name: str):
+    """getattr, or None for an attribute that is missing or raises (a lazy
+    stand-in for an optional package can raise anything)."""
+    try:
+        return getattr(obj, name)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _resolve_import(name: str, package: str, level: int):
+    try:
+        if level:
+            name = importlib.util.resolve_name("." * level + name, package)
+        return importlib.import_module(name)
+    except Exception:  # noqa: BLE001 - what cannot load is not run either
+        return None
+
+
+def _code_refs(code: types.CodeType, globals_: Dict[str, Any]):
+    """(name, object) for what a code object, and the code nested in it, loads
+    by name: globals, attributes of global modules, and imports."""
+    instructions = list(dis.get_instructions(code))
+    package = globals_.get("__package__") or ""
+    module_name = globals_.get("__name__", "")
+    for i, ins in enumerate(instructions):
+        if ins.opname in ("LOAD_GLOBAL", "LOAD_NAME"):
+            if ins.argval not in globals_:
+                continue
+            name, obj = f"{module_name}.{ins.argval}", globals_[ins.argval]
+        elif ins.opname == "IMPORT_NAME":
+            level = instructions[i - 2].argval if i >= 2 else 0
+            obj = _resolve_import(ins.argval, package,
+                                  level if isinstance(level, int) else 0)
+            if obj is None:
+                continue
+            name, items = obj.__name__, []
+            for nxt in instructions[i + 1:]:
+                if nxt.opname == "IMPORT_FROM":
+                    attr = _attribute(obj, nxt.argval)
+                    if attr is None:
+                        attr = _resolve_import(f"{obj.__name__}.{nxt.argval}",
+                                               "", 0)
+                    items.append((f"{obj.__name__}.{nxt.argval}", attr))
+                elif not nxt.opname.startswith("STORE"):
+                    break
+            if items:
+                yield from ((n, a) for n, a in items if a is not None)
+                continue
+        else:
+            continue
+        # module.attr chains name the attribute, not the whole module.
+        for nxt in instructions[i + 1:]:
+            attr = (_attribute(obj, nxt.argval) if inspect.ismodule(obj)
+                    and nxt.opname in ("LOAD_ATTR", "LOAD_METHOD") else None)
+            if attr is None:
+                break
+            name, obj = f"{obj.__name__}.{nxt.argval}", attr
+        yield name, obj
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            yield from _code_refs(const, globals_)
+
+
+@lru_cache(maxsize=None)
+def _function_refs(fn) -> Tuple[Tuple[str, Any], ...]:
+    return tuple(_code_refs(fn.__code__, fn.__globals__))
+
+
+@lru_cache(maxsize=None)
+def _code_fingerprint(runner_cls: type) -> str:
+    """A digest of the source a runner's tactics depend on, in its cache keys.
+
+    It covers the definitions the runner reaches by name, at the granularity of
+    one class, function or constant: the runner and its TunableRunner bases,
+    and every tensorrt_llm class (with its bases) or function they use as a
+    class attribute, global, module attribute or import, followed through the
+    code of each. A TRT-LLM change thus re-tunes only the runners whose code
+    it touches; a module that cannot be narrowed counts whole.
+    """
+    owners = [
+        k for k in runner_cls.__mro__
+        if issubclass(k, TunableRunner) and k is not TunableRunner
+    ]
+    homes = {k.__module__ for k in owners}
+    sources: Dict[str, str] = {}
+    seen = set()
+    todo: List[Tuple[str, Any]] = [(f"{k.__module__}.{k.__qualname__}", k)
+                                   for k in owners]
+    while todo:
+        name, obj = todo.pop()
+        if isinstance(obj, (staticmethod, classmethod)):
+            obj = obj.__func__
+        if isinstance(obj, _CONSTANT_TYPES) or (
+                isinstance(obj, (tuple, frozenset))
+                and all(isinstance(v, _CONSTANT_TYPES) for v in obj)):
+            # A module global: its assignment, else its value. A class
+            # attribute is in its class's source already.
+            module, _, attr = name.rpartition(".")
+            if module in sys.modules and (_tracked(module) or module in homes):
+                sources[name] = (_definition_source(sys.modules[module], attr)
+                                 or repr(obj))
+            continue
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, property):
+            todo.extend((name, f) for f in (obj.fget, obj.fset, obj.fdel) if f)
+            continue
+        if isinstance(obj, (tuple, list)):
+            todo.extend((name, v) for v in obj)
+            continue
+        if callable(obj) and not inspect.isclass(obj):
+            try:
+                obj = inspect.unwrap(obj)
+            except Exception:  # noqa: BLE001
+                continue
+        module = (obj.__name__ if inspect.ismodule(obj) else _attribute(
+            obj, "__module__"))
+        if not isinstance(module, str) or not (_tracked(module)
+                                               or module in homes):
+            continue
+        if inspect.ismodule(obj):
+            sources[f"{module}:<module>"] = _definition_source(obj)
+        elif inspect.isclass(obj):
+            sources[f"{module}:{obj.__qualname__}"] = _definition_source(obj)
+            todo.extend((f"{module}.{obj.__qualname__}.{k}", v)
+                        for k, v in vars(obj).items())
+            todo.extend((f"{b.__module__}.{b.__qualname__}", b)
+                        for b in obj.__mro__[1:])
+        elif inspect.isfunction(obj):
+            sources[f"{module}:{obj.__qualname__}"] = _definition_source(obj)
+            try:
+                todo.extend(_function_refs(obj))
+            except Exception:  # noqa: BLE001 - a key must not fail tuning
+                continue
+    digest = hashlib.sha256()
+    for label in sorted(sources):
+        digest.update(f"{label}\0{sources[label]}\0".encode())
+    return digest.hexdigest()[:16]
 
 
 @contextlib.contextmanager
@@ -684,6 +897,7 @@ class AutoTunerProfilingCache:
                 tuning_config.tune_max_num_tokens,
                 apply_map_to_tuning_buckets,
             ),
+            _code_fingerprint(type(runner)),
         )
         tactic_space_key = runner.tactic_space_key()
         if tactic_space_key is not None:

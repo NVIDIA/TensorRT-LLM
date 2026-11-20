@@ -1944,12 +1944,82 @@ def test_tactic_space_key_extends_the_cache_key():
     cache = autotuner.AutoTuner().profiling_cache
     default = _tactic_space_cache_key(cache, _TacticSpaceRunner())
     assert default == ("test_tactic_space", "_TacticSpaceRunner", "()",
-                       ((16, 64), ))
+                       ((16, 64), ),
+                       autotuner._code_fingerprint(_TacticSpaceRunner))
     guided = _tactic_space_cache_key(cache, _TacticSpaceRunner(
         ("nvmmh", "x", 3)))
     assert guided == default + (("nvmmh", "x", 3), )
     assert _tactic_space_cache_key(cache, _TacticSpaceRunner(
         ("nvmmh", "x", 5))) != guided
+
+
+def test_code_fingerprint_follows_the_definitions_a_runner_uses(
+        tmp_path, monkeypatch):
+    import importlib.util
+    import textwrap
+
+    def load(name, text):
+        path = tmp_path / f"{name}.py"
+        path.write_text(textwrap.dedent(text))
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+        return module
+
+    def edit(name, old, new):
+        path = tmp_path / f"{name}.py"
+        path.write_text(path.read_text().replace(old, new))
+
+    # Modules named fp_* stand in for tensorrt_llm ones.
+    monkeypatch.setattr(autotuner, "_tracked",
+                        lambda module: module.startswith("fp_"))
+    load(
+        "fp_util", """
+        def used():
+            return 0
+
+
+        def unused():
+            return 0
+        """)
+    runners = load(
+        "fp_runners", """
+        import fp_util
+        from tensorrt_llm._torch.autotuner import TunableRunner
+
+
+        class Base(TunableRunner):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [0]
+
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return inputs[0]
+
+
+        class UsesUtil(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return fp_util.used()
+
+
+        class Other(Base):
+            pass
+        """)
+
+    def fingerprints():
+        autotuner._code_fingerprint.cache_clear()
+        return [
+            autotuner._code_fingerprint(runners.UsesUtil),
+            autotuner._code_fingerprint(runners.Other)
+        ]
+
+    before = fingerprints()
+    edit("fp_util", "def unused():\n    return 0",
+         "def unused():\n    return 42")
+    assert fingerprints() == before
+    edit("fp_util", "def used():\n    return 0", "def used():\n    return 42")
+    after = fingerprints()
+    assert after[0] != before[0] and after[1] == before[1]
 
 
 def test_search_cache_misses_across_tactic_spaces():
