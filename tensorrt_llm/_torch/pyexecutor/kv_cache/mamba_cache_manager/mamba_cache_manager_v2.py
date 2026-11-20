@@ -152,6 +152,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
 
+    # The buffer role through which the manager addresses a recurrent layer's
+    # state slots: their layer group, page index scale and page count. A
+    # subclass whose recurrent layers declare other buffers
+    # (`_get_recurrent_buffer_configs`) names one of them.
+    _state_anchor_role: DataRole = MambaRole.SSM_STATE
+
     # Mixed-precision high layers are appended like any attention layer group.
     _supports_mixed_precision_kv = True
     # Set per instance to the policy that lays out the attention layers when a
@@ -681,8 +687,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if not bytes_per_slot or not self.mamba_pp_layers:
             return 0
         layer_id = LayerId(self.layer_offsets[self.mamba_pp_layers[0]])
-        scale = cache.get_page_index_scale(layer_id, MambaRole.SSM_STATE)
-        pages = cache.get_page_index_upper_bound(layer_id, MambaRole.SSM_STATE)
+        scale = cache.get_page_index_scale(layer_id, self._state_anchor_role)
+        pages = cache.get_page_index_upper_bound(layer_id, self._state_anchor_role)
         return ((pages + scale - 1) // scale) * bytes_per_slot
 
     def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
@@ -716,14 +722,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return super()._get_pool_roles(pool_id)
         roles = [buffer.role for buffer in buffers]
         # A recurrent layer can span several groups when its buffers use
-        # different reuse policies. A group without SSM_STATE is described by
-        # one of its own roles.
-        return (MambaRole.SSM_STATE if MambaRole.SSM_STATE in roles else roles[0]), None
+        # different reuse policies. A group without the anchor role is
+        # described by one of its own roles.
+        anchor = self._state_anchor_role
+        return (anchor if anchor in roles else roles[0]), None
 
     @override
     def _get_layer_execution_group(self, layer_id: int) -> int:
         if self._is_local_mamba_layer(int(layer_id)):
-            return int(self.impl.get_buffer_group_id(LayerId(layer_id), MambaRole.SSM_STATE))
+            return int(self.impl.get_buffer_group_id(LayerId(layer_id), self._state_anchor_role))
         return super()._get_layer_execution_group(layer_id)
 
     def _max_resident_sequences(self) -> int:
@@ -1043,13 +1050,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if self.local_num_mamba_layers > 0:
             first_mamba_local_layer = self.layer_offsets[self.mamba_pp_layers[0]]
             self.ssm_layer_group_id = self.impl.get_buffer_group_id(
-                LayerId(first_mamba_local_layer), MambaRole.SSM_STATE
+                LayerId(first_mamba_local_layer), self._state_anchor_role
             )
             self._ssm_page_index_scale = self.impl.get_page_index_scale(
-                LayerId(first_mamba_local_layer), MambaRole.SSM_STATE
+                LayerId(first_mamba_local_layer), self._state_anchor_role
             )
             num_ssm_pages = self.impl.get_page_index_upper_bound(
-                LayerId(first_mamba_local_layer), MambaRole.SSM_STATE
+                LayerId(first_mamba_local_layer), self._state_anchor_role
             )
             num_ssm_slots = (
                 num_ssm_pages + self._ssm_page_index_scale - 1
@@ -1181,7 +1188,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layer_id = LayerId(local_layer_idx)
             if self._is_local_mamba_layer(local_layer_idx):
                 ssm_pages.append(
-                    self.impl.get_page_index_upper_bound(layer_id, MambaRole.SSM_STATE)
+                    self.impl.get_page_index_upper_bound(layer_id, self._state_anchor_role)
                     // self._ssm_page_index_scale
                 )
             else:
