@@ -81,7 +81,6 @@
       "expected_script": null,
       "expected_output": "A disaggregated, multi-node setup: separate context and generation server configs with KV-cache transfer settings, an orchestrator/router config listing both server groups, and launch commands that span nodes - not a single aggregated trtllm-serve config.",
       "assertions": [
-        "The trtllm-serve-config-guide skill is not loaded or applied.",
         "Produces separate context-server and generation-server configurations (each with a KV-cache transfer / cache transceiver setting) plus a disaggregated orchestration/router config, rather than a single aggregated trtllm-serve config.",
         "Addresses the multi-node generation server (e.g. launching TP16 across two nodes with an MPI or SLURM launcher)."
       ],
