@@ -290,7 +290,9 @@ model.
    the result of serializing a tensor via `torch.save`.
    `image_grid_thw` is the image's grid `[1, h, w]` from the model's image
    processor (here a 1920x1080 image for Qwen3-VL). Models that use mRoPE, such as
-   Qwen2.5-VL and Qwen3-VL, need it; LLaVA-NeXT ignores it.
+   Qwen2.5-VL and Qwen3-VL, need it; LLaVA-NeXT ignores it. If the embedding
+   comes from a TRT-LLM standalone encoder, its handle already has this grid
+   as `metadata["image_grid_thw"]`.
 
 **Video**
 
