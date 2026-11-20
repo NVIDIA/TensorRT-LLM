@@ -65,6 +65,11 @@ def _request(request_id: int, *, dummy: bool = False) -> MagicMock:
     req.total_input_len_cp = 8
     req.get_tokens.return_value = list(range(8))
     req.py_draft_tokens = []
+    req.py_per_pos_drafted = []
+    req.py_per_pos_accepted = []
+    req.py_total_draft_tokens = 0
+    req.py_total_accepted_draft_tokens = 0
+    req.py_disaggregated_params = None
     req.kv_cache_retention_config = None
     req.cache_salt = None
     return req
