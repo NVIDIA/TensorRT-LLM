@@ -2279,65 +2279,36 @@ def _fp8_block_scale_moe(num_experts: int,
 @_needs_trtllm_gen_moe
 def test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart(
         tmp_path, monkeypatch):
-    """A tactics file reused under another EP size, attention-DP mode or dummy distribution re-tunes
-    that configuration instead of serving it the first one's tactics; the first one still reuses its own."""
+    """A tactics file reused under another EP size, expert shard, attention-DP mode or dummy distribution
+    re-tunes that configuration instead of serving it another one's tactics; the first one still reuses its own."""
     tuner = AutoTuner.get()
     path = str(tmp_path / "tactics.json")
 
-    def profiled(num_experts=8, use_dp=False, distribution="random") -> int:
+    def profiled(num_experts=8,
+                 use_dp=False,
+                 distribution="random",
+                 local_expert_offset=0) -> int:
         monkeypatch.setenv("TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION",
                            distribution)
         tuner.clear_cache()
         tuner.reset_statistics()
         # One bucket per pass: the key is the one a full sweep writes.
         with autotune(cache_path=path, skip_dynamic_tuning_buckets=True):
-            _fp8_block_scale_moe(num_experts, use_dp=use_dp)
+            _fp8_block_scale_moe(num_experts,
+                                 local_expert_offset=local_expert_offset,
+                                 use_dp=use_dp)
         return tuner.stats.tuned_op_profiled_configs.get(_FP8_MOE_OP, 0)
 
     try:
         assert profiled() > 0
-        for other in (dict(num_experts=16), dict(use_dp=True),
-                      dict(distribution="balanced")):
+        for other in (dict(num_experts=16),
+                      dict(num_experts=16, local_expert_offset=8),
+                      dict(use_dp=True), dict(distribution="balanced")):
             assert profiled(**other) > 0, f"{other} took another's tactics"
         assert profiled() == 0, "the first configuration re-tuned"
     finally:
         tuner.clear_cache()
         tuner.reset_statistics()
-
-
-def _trtllm_gen_moe_shard_merge_worker(world_size):
-    """Tune this rank's expert shard, merge across ranks; returns (entries tuned, all kept)."""
-    rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    mapping = Mapping(world_size=world_size,
-                      rank=rank,
-                      tp_size=world_size,
-                      pp_size=1)
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
-    tuner.setup_distributed_state(mapping)
-    with autotune(skip_dynamic_tuning_buckets=True):
-        _fp8_block_scale_moe(num_experts=8 * world_size,
-                             local_expert_offset=8 * rank)
-    tuned = tuner.profiling_cache.get_specific_custom_op(_FP8_MOE_OP)
-    tuner.post_tune_merge_tactics()
-    merged = tuner.profiling_cache.get_specific_custom_op(_FP8_MOE_OP)
-    return len(tuned), all(merged[k] == v for k, v in tuned.items())
-
-
-@_needs_trtllm_gen_moe
-@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_trtllm_gen_moe_merge_keeps_each_shards_tactics(mpi_pool_executor):
-    """The cross-rank merge leaves each EP rank the tactics timed on its own expert shard."""
-    world_size = 2
-    results = list(
-        mpi_pool_executor.map(_trtllm_gen_moe_shard_merge_worker,
-                              *zip(*[(world_size, )] * world_size),
-                              timeout=300))
-    assert len(results) == world_size
-    for tuned, kept in results:
-        assert tuned > 0, "the shard tuned nothing"
-        assert kept, "the merge replaced a shard's tactics with another shard's"
 
 
 def test_post_tune_merge_tactics_min_time_and_subset_kept():

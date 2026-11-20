@@ -1317,8 +1317,6 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/misc/test_autotuner.py::test_rank_disagreeing_cache_does_not_deadlock]": 38.56555319148936,
    "unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart": 30.0,
    "test_unittests.py::test_unittests_v2[unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart]": 30.0,
-   "unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_merge_keeps_each_shards_tactics": 45.0,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_merge_keeps_each_shards_tactics]": 45.0,
    "unittest/_torch/misc/test_grammar_matcher.py": 22.059846153846152,
    "test_unittests.py::test_unittests_v2[unittest/_torch/misc/test_grammar_matcher.py]": 22.059846153846152,
    "unittest/_torch/misc/test_xgrammar_structural_tag.py": 22.13236842105263,
