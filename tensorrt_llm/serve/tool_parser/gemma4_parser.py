@@ -358,7 +358,8 @@ class Gemma4ToolParser(BaseToolParser):
         """Streaming incremental parsing for Gemma4 tool calls.
 
         Maintains state across chunks to handle tool calls that span
-        multiple streaming increments.
+        multiple streaming increments. A call's name is sent as soon as it is
+        known; its arguments are sent as one JSON object when the call ends.
         """
         self._buffer += new_text
         current_text = self._buffer
@@ -438,24 +439,8 @@ class Gemma4ToolParser(BaseToolParser):
                                 ]
                             )
 
-                # Stream raw argument text incrementally
-                if self._current_func_name is not None:
-                    prefix = BOT_TOKEN + CALL_PREFIX + self._current_func_name + "{"
-                    if current_text.startswith(prefix) and len(current_text) > len(prefix):
-                        args_so_far = current_text[len(prefix) :]
-                        already_sent = self.streamed_args_for_tool[self.current_tool_id]
-                        if len(args_so_far) > len(already_sent):
-                            diff = args_so_far[len(already_sent) :]
-                            self.streamed_args_for_tool[self.current_tool_id] += diff
-                            return StreamingParseResult(
-                                calls=[
-                                    ToolCallItem(
-                                        tool_index=self.current_tool_id,
-                                        parameters=diff,
-                                    )
-                                ]
-                            )
-
+                # The arguments are not JSON until the whole call is parsed, so
+                # they are sent once the end token arrives.
                 return StreamingParseResult()
 
             # Found end token - complete the tool call
@@ -504,6 +489,7 @@ class Gemma4ToolParser(BaseToolParser):
                                 parameters=args_json,
                             )
                         )
+                    self.streamed_args_for_tool[self.current_tool_id] = args_json
 
                     # Store for serving layer
                     try:
