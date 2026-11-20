@@ -56,7 +56,7 @@ def _validate_inputs(
 class FlashInferPrefill(OpWrapper):
     """FP16/BF16 prefill over [batch, rows, heads, dim] queries, keys and values.
 
-    qk_dtype and v_dtype select dynamic quantization; None uses the input precision.
+    qk_dtype and v_dtype select dynamic quantization. Omit both to use the input precision.
     Padding masks use True for visible keys. Returns output in the query layout
     and FP32 natural-log LSE in [batch, query heads, query rows].
     """

@@ -434,21 +434,20 @@ def test_visualgen_v2_selects_consumers(tmp_path, changed, expected):
     assert selected == set.union(*(entries[key] for key in expected))
 
 
-def test_h3_shared_quality_changes_select_v1_and_v2_entrypoints():
+def test_h3_v2_quality_changes_select_only_importing_l0_tests():
     index = YAMLIndex.load(REPO_ROOT / "tests/integration/test_lists/test-db")
     rule = CbtsTestsDefRule(index, {}, REPO_ROOT)
+    family = "visual_gen/minimax_h3_v2"
     result = rule.apply(
-        PRInputs(["tests/integration/defs/visual_gen/minimax_h3_quality_cases.py"], {})
+        PRInputs([f"tests/integration/defs/{family}/minimax_h3_quality_cases.py"], {})
     )
     assert result is not None and result.scope == "testdefonly"
     selected = {path for filters in result.block_filters.values() for path in filters}
-    assert {
-        "examples/visual_gen/test_minimax_h3_e2e.py",
-        "examples/visual_gen/test_visual_gen_multi_gpu.py",
-        "visual_gen/minimax_h3_v2/default_pipeline/test_loading.py",
-        "visual_gen/minimax_h3_v2/default_pipeline/test_parallel_quality.py",
-        "visual_gen/minimax_h3_v2/default_pipeline/test_quality.py",
-    } <= selected
+    assert selected == {
+        f"{family}/default_pipeline/test_loading.py",
+        f"{family}/default_pipeline/test_parallel_quality.py",
+        f"{family}/default_pipeline/test_quality.py",
+    }
 
 
 def _visualgen_selection(changed):

@@ -37,6 +37,10 @@ class CuteFMHA(OpWrapper):
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
         Cell("BF16 self-attention", dict(qk_dtype=None)),
+        Cell(
+            "skip a low-score KV tile and retain a near-threshold tile",
+            dict(qk_dtype=None, skip_softmax_threshold_scale_factor=4.0),
+        ),
         Cell("BF16 Q/K and E4M3 V", dict(qk_dtype="bf16")),
         Cell("Dynamic E4M3 Q/K/V", dict(qk_dtype="fp8")),
         Cell("MXFP8 Q/K and E4M3 V", dict(qk_dtype="mxfp8")),

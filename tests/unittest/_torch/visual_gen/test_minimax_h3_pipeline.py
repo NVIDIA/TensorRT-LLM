@@ -28,7 +28,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from diffusers import MiniMaxH3Scheduler
 from PIL import Image
-from test_common.visual_gen.h3_rollout import h3_modeling_v1 as h3_modeling_v1
 
 from tensorrt_llm._torch.attention.attention import _inherit_process_group_attrs
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
@@ -54,7 +53,7 @@ from tensorrt_llm.visual_gen.args import (
     VisualGenArgs,
 )
 
-pytestmark = [pytest.mark.cpu_only, pytest.mark.usefixtures("h3_modeling_v1")]
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("has_text_encoder", [False, True])

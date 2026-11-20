@@ -3,7 +3,7 @@
 
 import pytest
 
-from defs.visual_gen import minimax_h3_quality_cases as parallel
+from defs.visual_gen.minimax_h3_v2 import minimax_h3_quality_cases as parallel
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

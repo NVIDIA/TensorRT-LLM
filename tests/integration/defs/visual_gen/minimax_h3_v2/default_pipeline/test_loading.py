@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from defs.visual_gen import minimax_h3_quality_cases as release
+from defs.visual_gen.minimax_h3_v2 import minimax_h3_quality_cases as release
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

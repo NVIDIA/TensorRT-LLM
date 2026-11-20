@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MiniMax-H3 release, quality and parallelism checks for both modeling implementations."""
+"""Real-checkpoint release, quality and parallelism cases for MiniMax-H3 V2."""
 
 import os
 from collections.abc import Iterator
@@ -33,6 +33,9 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _multi_resolution_log_stft_distance,
 )
 from tensorrt_llm import VisualGen, VisualGenParams
+from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.default_pipeline.pipeline import (
+    MiniMaxH3Pipeline,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -219,6 +222,7 @@ def check_released_transformer_loads_and_runs() -> None:
     transformer = None
     output = None
     try:
+        assert type(pipeline) is MiniMaxH3Pipeline
         transformer = pipeline.transformer
         assert all(
             isinstance(block, torch._dynamo.OptimizedModule)
@@ -291,6 +295,7 @@ def check_released_transformer_dynamic_quant_compile_smoke(quant_algo: str) -> N
     transformer = None
     output = None
     try:
+        assert type(pipeline) is MiniMaxH3Pipeline
         transformer = pipeline.transformer
         assert transformer.model_config.quant_config.quant_algo == QuantAlgo(quant_algo)
         assert transformer.model_config.dynamic_weight_quant
@@ -359,6 +364,7 @@ def check_released_pipeline_smoke() -> None:
     output = None
     conditioned_output = None
     try:
+        assert type(pipeline) is MiniMaxH3Pipeline
         output = pipeline.forward(
             prompt="A red fox walking through snow",
             seed=MINIMAX_H3_SEED,
@@ -423,6 +429,7 @@ def check_public_visual_gen_api_smoke() -> None:
         ),
     )
     try:
+        assert visual_gen.default_params.num_inference_steps == 50
         output = visual_gen.generate(
             inputs="A red fox walking through snow",
             params=VisualGenParams(
@@ -457,8 +464,6 @@ def check_diffusers_lpips_and_audio_reference(
     quant_algo: str | None,
     tmp_path: Path,
     _full_cuda_memory_budget: None,
-    *,
-    expected_pipeline: type,
 ) -> None:
     """Gate both supported tasks against a fresh Diffusers reference."""
     checkpoint_path = _minimax_h3_checkpoint_path()
@@ -494,7 +499,7 @@ def check_diffusers_lpips_and_audio_reference(
         )
     ).load(skip_warmup=True)
     try:
-        assert type(pipeline) is expected_pipeline
+        assert type(pipeline) is MiniMaxH3Pipeline
         output = pipeline.forward(
             prompt=MINIMAX_H3_PROMPT,
             keyframes=keyframes,
@@ -561,6 +566,7 @@ def check_text_encoder_tp_lpips(tmp_path, monkeypatch, world_size):
         )
         engine = VisualGen(model=checkpoint, args=args)
         try:
+            assert engine.default_params.num_inference_steps == 50
             output = engine.generate(
                 inputs="A woman smiles and waves in a sunlit park, with birds chirping.",
                 params=VisualGenParams(
@@ -607,6 +613,7 @@ def check_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size, backend):
         )
         engine = VisualGen(model=args.model, args=args)
         try:
+            assert engine.default_params.num_inference_steps == 50
             output = engine.generate(
                 inputs=prompt,
                 params=VisualGenParams(
@@ -662,7 +669,7 @@ def check_tp2_example_lpips(tmp_path):
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires two CUDA GPUs")
     config_path = (
-        Path(__file__).resolve().parents[4] / "examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml"
+        Path(__file__).resolve().parents[5] / "examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml"
     )
     model = _minimax_h3_checkpoint_path()
     prompt = "A woman smiles and waves in a sunlit park, with birds chirping."
@@ -677,6 +684,7 @@ def check_tp2_example_lpips(tmp_path):
         args.parallel_config.tp_size = tp_size
         engine = VisualGen(model=model, args=args)
         try:
+            assert engine.default_params.num_inference_steps == 50
             output = engine.generate(
                 inputs=prompt,
                 params=VisualGenParams(

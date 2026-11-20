@@ -16,7 +16,11 @@ _BlockScaledQKMode = Literal["mxfp8", "nvfp4"]
 
 
 class FlashInferPrefillRunner:
-    """Own the prefill head geometry and the plans and workspaces shared by the caller."""
+    """Bind prefill geometry to caller-owned, per-stream plans and workspaces.
+
+    Give a captured graph a separate cache if subsequent eager requests on its
+    stream can replan the same geometry with a different padding mask.
+    """
 
     def __init__(
         self,

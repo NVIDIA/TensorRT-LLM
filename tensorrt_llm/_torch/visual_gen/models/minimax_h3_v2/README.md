@@ -76,6 +76,8 @@ For a proposed entry, write its reference using only the arguments at the call s
 | [CuTe FMHA](../../catalog/attention/cute_fmha.py) | Full attention on equal-head BSHD tensors, including quantization and a numerical skip-softmax threshold | Choose the recipe, resolve the threshold for the step and handle padding or dense fallback |
 | [Fine block-sparse attention](../../catalog/attention/block_sparse_attention.py) | Evaluate attention on explicit KV tile indices, counts and valid tile lengths | Construct text/video/audio routes and combine the result with coarse attention using the learned gate |
 
+FlashInfer uses *prefill* for attention over a sequence of query rows. H3 calls it for noncausal self-attention during denoising. Existing [LTX-2.3 FlashInfer deployments](../../../../../examples/visual_gen/configs/ltx23-t2v-fp8-1gpu.yaml) use the V1 backend.
+
 The [H3 attention component](components/dense_attention.py) adapts model inputs to these contracts. The [gated VSA computation](ops/vsa.py) serves both base checkpoints with gate weights and explicit VSA configuration and the FastH3 target.
 
 **H3 communication.** [H3 parallel code](parallel/ulysses.py) owns the V, Q, K projection order, streams and barriers. The [Ulysses ops](ops/ulysses.py) exchange Q/K/V or convert receive buffers to H3 attention layouts. Models can call the same native communication kernel with different schedules and layouts.

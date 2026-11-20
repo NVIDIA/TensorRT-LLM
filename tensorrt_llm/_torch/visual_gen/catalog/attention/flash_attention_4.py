@@ -124,7 +124,7 @@ class FlashAttention4(OpWrapper):
             dict(dtype=torch.float16, sq=11, sk=27, hq=4, hk=2, dim=64, lengths=None, causal=True),
         ),
         Cell(
-            "uncached BF16 prefill",
+            "unmasked BF16 prefill",
             dict(
                 dtype=torch.bfloat16, sq=17, sk=17, hq=2, hk=2, dim=64, lengths=None, causal=False
             ),

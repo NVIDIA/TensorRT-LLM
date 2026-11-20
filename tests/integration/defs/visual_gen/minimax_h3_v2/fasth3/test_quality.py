@@ -13,8 +13,8 @@ import torch
 from test_common.llm_data import get_checkpoint
 
 from defs.examples.visual_gen.visual_gen_test_utils import _multi_resolution_log_stft_distance
-from defs.visual_gen.minimax_h3_quality_cases import _mean_lpips_distance
 from defs.visual_gen.minimax_h3_v2.fasth3.quality_case import generate
+from defs.visual_gen.minimax_h3_v2.minimax_h3_quality_cases import _mean_lpips_distance
 
 
 @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL"])
