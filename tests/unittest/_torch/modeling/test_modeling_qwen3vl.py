@@ -1199,6 +1199,8 @@ def test_qwen_vl_encoder_runner_does_not_read_grid_from_gpu(encoder_cls):
     from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 
     data, lengths, expected, encoder, grid_devices = _qwen_vl_item_grid_case(encoder_cls)
+    # Like a real standalone encoder, so a forward that branches on it runs that branch.
+    encoder.model_config = SimpleNamespace(mm_encoder_only=True)
     request = SimpleNamespace(
         py_multimodal_data=data,
         py_multimodal_params=MultimodalParams(multimodal_data=data),
