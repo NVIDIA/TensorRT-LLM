@@ -1063,6 +1063,25 @@ async def test_cancel_handler_validates_routing_receipt(
 
 
 @pytest.mark.asyncio
+async def test_reserve_rejects_zero_pairing_id_before_worker_rpc(
+    context_worker: OpenAIServer,
+) -> None:
+    payload = context_cancellation_reservation_payload(0)
+    headers = build_context_cancellation_headers("secret", "reserve", payload)
+    reserve = Mock(return_value="unexpected-token")
+    context_worker.generator._executor.reserve_context_cancellation = reserve
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=context_worker.app), base_url="http://worker"
+    ) as client:
+        response = await client.post(
+            "/internal/context-cancellation/reserve", json=payload, headers=headers
+        )
+    assert response.status_code == 400
+    assert "disagg_request_id" in response.json()["error"]
+    reserve.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["authorization_id", "authorization_expires_at_ms"])
 async def test_reserve_authorization_fields_are_signed_before_worker_rpc(
     context_worker: OpenAIServer, field: str

@@ -69,7 +69,7 @@ class ContextCancellationReservations:
         """Reserve one context admission without allocating transfer resources.
 
         Args:
-            request_id: The immutable disaggregated pairing identity.
+            request_id: The immutable, nonzero uint64 disaggregated pairing identity.
             authorization_id: Signed 128-bit coordinator nonce shared by redeliveries.
             authorization_expires_at_ms: Signed UTC admission-authorization expiry.
 
@@ -80,8 +80,9 @@ class ContextCancellationReservations:
             ValueError: The request identity is invalid.
             RuntimeError: Pending admission or replay-accounting capacity is full.
         """
-        if type(request_id) is not int or not 0 <= request_id < 2**64:
-            raise ValueError("Context cancellation requires an integer request ID")
+        # The executor treats zero as an unset pairing ID and assigns a local ID.
+        if type(request_id) is not int or not 0 < request_id < 2**64:
+            raise ValueError("Context cancellation requires a positive uint64 integer request ID")
         if (
             not isinstance(authorization_id, str)
             or _AUTHORIZATION_ID_PATTERN.fullmatch(authorization_id) is None
