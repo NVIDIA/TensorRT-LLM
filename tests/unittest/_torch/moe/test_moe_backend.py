@@ -860,7 +860,9 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("decode_tuning", [False, True])
-def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
+def test_fp4_block_scale_moe_decode_tuning(
+    monkeypatch: pytest.MonkeyPatch, decode_tuning: bool
+) -> None:
     """Only a model that declares decode tuning gets the decode-step buckets and rank 0's tactic on every
     rank; otherwise every rank tunes on its own over the power-of-2 ladder."""
     from tensorrt_llm._torch.autotuner import DistributedTuningStrategy
@@ -882,13 +884,14 @@ def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
         assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [4, 8, 16, 128]
 
     # Only the declaring model's tuning cache key carries the flag, and with it do_finalize (finalized and
-    # un-finalized calls run different kernels).
+    # un-finalized calls run different kernels); the expert shard is keyed only where each rank tunes alone.
+    monkeypatch.delenv("TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION", raising=False)
     for do_finalize in (False, True):
         runner = FP4BlockScaleMoERunner(
             512, 10, None, None, 512, 0, 64, None, 1, do_finalize, 0, decode_tuning=decode_tuning
         )
-        assert runner.unique_id() == (10, 512, 64, 0) + (
-            (True, do_finalize) if decode_tuning else ()
+        assert runner.unique_id() == (10, 512, 64, 0, 512, False, "random") + (
+            (True, do_finalize) if decode_tuning else (0,)
         )
 
 

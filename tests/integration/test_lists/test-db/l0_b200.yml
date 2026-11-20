@@ -393,6 +393,8 @@ l0_b200:
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
+  - unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_tactics_file_keeps_routing_configurations_apart
+  - unittest/_torch/misc/test_autotuner.py::test_trtllm_gen_moe_merge_keeps_each_shards_tactics
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
   - unittest/_torch/modeling -k "modeling_llama"

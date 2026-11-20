@@ -69,6 +69,22 @@ _BALANCED = "balanced"
 _RANDOM = "random"
 
 
+def _dummy_distribution() -> str:
+    return os.environ.get(_MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV, _RANDOM).lower()
+
+
+def _dummy_routing_key(num_experts: int, local_expert_offset: int, use_dp: bool,
+                       tuning_config: TuningConfig) -> Tuple:
+    """Autotuner cache-key fields for the dummy routing a tactic is timed on (see the comment above).
+
+    The expert shard is keyed only where each rank tunes alone: ranks that share one rank's tactics need equal keys."""
+    key = (num_experts, use_dp, _dummy_distribution())
+    if (tuning_config.distributed_tuning_strategy ==
+            DistributedTuningStrategy.INDEPENDENT):
+        key += (local_expert_offset, )
+    return key
+
+
 def _select_explicit_fallback_tactic(
         valid_tactics: List[List[int]]) -> List[int]:
     if not valid_tactics:
@@ -143,8 +159,7 @@ def prepare_dummy_topk_and_hook(
         return routing_logits, topk_weights, topk_ids, base_tuning_config
 
     need_dummy_topk = (topk_weights is not None or topk_ids is not None)
-    autotune_distribution = os.environ.get(_MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV,
-                                           _RANDOM).lower()
+    autotune_distribution = _dummy_distribution()
     supported_distributions = {_BALANCED, _RANDOM}
     if autotune_distribution not in supported_distributions:
         raise ValueError(
@@ -492,12 +507,14 @@ class FP4BlockScaleMoERunner(TunableRunner):
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp,
             decode_tuning=decode_tuning)
+        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
+                                              use_dp, self.tuning_config)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
+    # that influence tactic validity and the dummy routing the tactics are timed on
     def unique_id(self):
         key = (self.top_k, self.intermediate_size, self.local_num_experts,
-               self.act_type)
+               self.act_type) + self.routing_key
         # Without decode tuning the key is the base tuple. With it, finalized and un-finalized calls run
         # different kernels (decode_moe.select), so they are tuned apart.
         return key + (True, self.do_finalize) if self.decode_tuning else key
@@ -1346,13 +1363,15 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
+        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
+                                              use_dp, self.tuning_config)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
-    # type does not matter
+    # that influence tactic validity and the dummy routing the tactics are timed on
     def unique_id(self):
         return (self.top_k, self.num_fused_shared_experts,
-                self.intermediate_size, self.local_num_experts, self.act_type)
+                self.intermediate_size, self.local_num_experts,
+                self.act_type) + self.routing_key
 
     def get_runner(self):
         instance_key = ()
@@ -1705,10 +1724,11 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
+        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
+                                              use_dp, self.tuning_config)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
-    # type does not matter
+    # that influence tactic validity and the dummy routing the tactics are timed on
     def unique_id(self):
         return (
             self.top_k,
@@ -1717,7 +1737,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        )
+        ) + self.routing_key
 
     def get_runner(self):
         instance_key = (self.act_type, True)
@@ -2046,10 +2066,11 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
+        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
+                                              use_dp, self.tuning_config)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
-    # type does not matter
+    # that influence tactic validity and the dummy routing the tactics are timed on
     def unique_id(self):
         return (
             self.top_k,
@@ -2058,7 +2079,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        )
+        ) + self.routing_key
 
     def get_runner(self):
         instance_key = (self.act_type, False)
@@ -2369,19 +2390,20 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
+        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
+                                              use_dp, self.tuning_config)
 
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
-    # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
-    # type does not matter
+    # that influence tactic validity and the dummy routing the tactics are timed on
     def unique_id(self):
-        return hash((
+        return (
             self.top_k,
             self.intermediate_size,
             self.valid_hidden_size,
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        ))
+        ) + self.routing_key
 
     def get_runner(self):
         instance_key = (self.act_type, )
@@ -2681,10 +2703,12 @@ class Bf16MoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
+        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
+                                              use_dp, self.tuning_config)
 
-    def unique_id(self) -> Tuple[int, int, int, int]:
+    def unique_id(self) -> Tuple:
         return (self.top_k, self.intermediate_size, self.local_num_experts,
-                self.act_type)
+                self.act_type) + self.routing_key
 
     def get_runner(self) -> torch.ScriptObject:
         instance_key = (self.act_type, )
@@ -2963,6 +2987,8 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             self.num_experts // self.local_num_experts,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
+        self.routing_key = _dummy_routing_key(num_experts, local_expert_offset,
+                                              use_dp, self.tuning_config)
 
     def unique_id(self):
         return (
@@ -2970,7 +2996,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             self.intermediate_size,
             self.local_num_experts,
             self.act_type,
-        )
+        ) + self.routing_key
 
     def get_runner(self):
         instance_key = (self.act_type, )
