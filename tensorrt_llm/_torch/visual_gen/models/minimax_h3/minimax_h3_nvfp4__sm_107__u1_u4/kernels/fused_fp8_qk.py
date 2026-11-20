@@ -427,11 +427,13 @@ def _launch_cast_g(
     amax_n,
     amax_stride,
     vfold_args=None,
+    cast_g_kernel=None,
 ):
     """One grouped Q / K cast launch (tensor ``i``); ``vfold_args`` = (V view, V amax slot, valid_len)
     folds V's amax into it."""
     v, vamax, valid_len = vfold_args if vfold_args is not None else (None, None, None)
-    _tensor_cast_g_kernel[grid](
+    selected_cast = _tensor_cast_g_kernel if cast_g_kernel is None else cast_g_kernel
+    selected_cast[grid](
         qkv[..., i * width : (i + 1) * width],
         weights[i],
         cos,
@@ -485,6 +487,7 @@ def _qk_norm_rope_fp8_split(
     packed_hl=0,
     qk_static=False,
     tensor_major=False,
+    cast_g_kernel=None,
 ):
     width = h * d
     grid = (rows,)
@@ -551,6 +554,7 @@ def _qk_norm_rope_fp8_split(
             1,
             1,
             vfold_args=(qkv[..., 2 * width : 3 * width], amax[2:3], valid_len),
+            cast_g_kernel=cast_g_kernel,
         )
     if not static and not vfold:
         for i in (2,) if qk_static else range(3):
@@ -605,7 +609,8 @@ def _qk_norm_rope_fp8_split(
         if vfold and i == 0:
             continue
         if v2 and i < 2:
-            _tensor_cast_g_kernel[grid](
+            selected_cast = _tensor_cast_g_kernel if cast_g_kernel is None else cast_g_kernel
+            selected_cast[grid](
                 qkv[..., i * width : (i + 1) * width],
                 weights[i],
                 cos,
@@ -679,6 +684,7 @@ def _qk_norm_rope_fp8_impl(
     layer_idx: int,
     valid_len: Optional[torch.Tensor],
     ulysses: int,
+    cast_g_kernel=None,
 ) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
     """Shared body of the two ops. ``ulysses == 0``: three ``[B, S, H * D]`` FP8 outputs.
     ``ulysses = U > 1``: one packed Ulysses send buffer ``[U, S, 3, H / U, D]`` (B must be 1)."""
@@ -732,6 +738,7 @@ def _qk_norm_rope_fp8_impl(
             packed_hl=hl,
             qk_static=qk_static,
             tensor_major=hl > 0 and RECV_INPLACE,
+            cast_g_kernel=cast_g_kernel,
         )
         if _AMAX_LOG is not None and not static:
             _record_descale(layer_idx, descale)
