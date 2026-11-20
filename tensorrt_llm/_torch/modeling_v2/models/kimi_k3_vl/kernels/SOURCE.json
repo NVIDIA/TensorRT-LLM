@@ -27,7 +27,7 @@
    "target_path": "kernels/k3_lamport_ar.py",
    "reused": "byte-identical to the family's file, which the target now imports"
   },
-  "kernels/k3r_comm/k3_latent_ar_norm_ull.py": {
+  "kernels/k3r_comm/k3_latent_ar_norm.py": {
    "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_latent_ar_norm.py@6904cd9672",
    "source_sha256": "f3c982e2da729a6635e26c043790d69843e853296622957e058290b82074f559",
    "import_edits": [
@@ -37,8 +37,9 @@
     "Bind grid dependency helpers from the shared route-tail module."
    ],
    "local_edits": [],
-   "sha256": "78dfc8004b96445674b9a6106ea5feecb67f3dc413c170a1addca4f6a4237558",
-   "target_path": "kernels/k3_latent_ar_norm.py"
+   "sha256": "77082d90892c984a5d47adb1238b7e921022ff867f6a974da781f29b8387b635",
+   "target_path": "kernels/k3_latent_ar_norm.py",
+   "reused": "Same executable definitions and normalized import bindings as the family file."
   },
   "kernels/k3r_common/k3_launch_attrs.py": {
    "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_launch_attrs.py@6904cd9672",
@@ -107,10 +108,11 @@
     "from .dspark_draft_gemm_push import ( SplitKArPushGemmKernel, _bmm_push, _make_layout_tensor, _swapped, ensure_cute_runtime, smem_bytes, validate_push_tactic, ) -> from ..k3r_spec.dspark_draft_gemm_push_ull import ( SplitKArPushGemmKernel, _bmm_push, _make_layout_tensor, _swapped, ensure_cute_runtime, smem_bytes, validate_push_tactic, )",
     "from .k3_lamport_ar import acc_bf16x2, pack_bf16x2, st_u32 -> from ..k3r_comm.k3_lamport_ar import acc_bf16x2, pack_bf16x2, st_u32",
     "from .k3_moe_tail1 import _lds_b32 -> from ..k3r_moe.k3_moe_tail1 import _lds_b32",
-    "from .k3_shared_persist import _div, _mul, _sigmoid, _tanh -> from ..k3r_moe.k3_shared_persist import _div, _mul, _sigmoid, _tanh"
+    "from .k3_shared_persist import _div, _mul, _sigmoid, _tanh -> from ..k3r_moe.k3_shared_persist import _div, _mul, _sigmoid, _tanh",
+    "Bind the shared dspark_draft_gemm_push kernel."
    ],
    "local_edits": [],
-   "sha256": "d1d6e0825ccd688223c9bd3da224b1d8e386506990e08666c08e0c7dd369a645",
+   "sha256": "5a63726b4d5b389488b6e38bd2f05ce1edf9de32e6f292b61aeb68127828a380",
    "target_path": "kernels/k3_dense0.py"
   },
   "kernels/k3r_gemm/k3_fp8w_lowm_gemm_ull.py": {
@@ -304,7 +306,7 @@
    "sha256": "fbc87a1376bba2f5235816247152fd9fa221cbba63bddf85e6674917d60034da",
    "target_path": "kernels/spec/dspark_draft3.py"
   },
-  "kernels/k3r_spec/dspark_draft_ar_ull.py": {
+  "kernels/k3r_spec/dspark_draft_ar.py": {
    "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/dspark_draft_ar.py@6904cd9672",
    "source_sha256": "17537395f31c13410ae0ba0a735f97006a5b61df74cad7a5c04d5252beba0c21",
    "import_edits": [
@@ -312,10 +314,11 @@
     "from .k3_latent_ar_norm import ( _asm, _bf16x2_f32, _cluster_sync_release_acquire, _fadd, _fmul, _fv, _iv, _lds_f32, _sq_bf16x2, _st_cluster_f32, _sts_f32, ) -> from ..k3r_comm.k3_latent_ar_norm_ull import ( _asm, _bf16x2_f32, _cluster_sync_release_acquire, _fadd, _fmul, _fv, _iv, _lds_f32, _sq_bf16x2, _st_cluster_f32, _sts_f32, )"
    ],
    "local_edits": [],
-   "sha256": "47dfb63cbc9eee51cf98765c5fa321da6525e9bdcaf86c7df4861a9f4e976d40",
-   "target_path": "kernels/dspark_draft_ar.py"
+   "sha256": "1aed2911058b8acf9b7f04b3ec630b6952d1ed200134fca3729fd504efae1a9a",
+   "target_path": "kernels/dspark_draft_ar.py",
+   "reused": "Same executable definitions and normalized import bindings as the family file."
   },
-  "kernels/k3r_spec/dspark_draft_gemm_push_ull.py": {
+  "kernels/k3r_spec/dspark_draft_gemm_push.py": {
    "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/dspark_draft_gemm_push.py@6904cd9672",
    "source_sha256": "2853ad8f5e7f3e59ec82c073862432047acd76aa2588b966b6b14709a3ede5b7",
    "import_edits": [
@@ -324,8 +327,9 @@
     "from .low_m_bf16_splitk import ( _AB_BUFFER_ALIGN_BYTES, _MAILBOX_ALIGN_BYTES, _MBARRIER_BYTES, _SMEM_CAPACITY_BYTES, _TMEM_POINTER_BYTES, OWNER_RANK, SplitKDenseGemmKernel, SplitKTactic, _align_up, _from_dlpack_dynamic, _smem_bytes, _store_shared_remote_v4, validate_tactic, ) -> from ..k3r_gemm.low_m_bf16_splitk import ( _AB_BUFFER_ALIGN_BYTES, _MAILBOX_ALIGN_BYTES, _MBARRIER_BYTES, _SMEM_CAPACITY_BYTES, _TMEM_POINTER_BYTES, OWNER_RANK, SplitKDenseGemmKernel, SplitKTactic, _align_up, _from_dlpack_dynamic, _smem_bytes, _store_shared_remote_v4, validate_tactic, )"
    ],
    "local_edits": [],
-   "sha256": "4c55748b8a4904047e30a21e7cf745779839a6a6c602a0c0efb8264d8afa2f19",
-   "target_path": "kernels/dspark_draft_gemm_push.py"
+   "sha256": "1cbab0994743f450100a8dbff30ae6b0513d8248c0bffc48656b260346eed823",
+   "target_path": "kernels/dspark_draft_gemm_push.py",
+   "reused": "Same executable definitions and normalized import bindings as the family file."
   },
   "kernels/k3r_spec/dspark_markov_greedy.py": {
    "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/dspark_markov_greedy.py@6904cd9672",
