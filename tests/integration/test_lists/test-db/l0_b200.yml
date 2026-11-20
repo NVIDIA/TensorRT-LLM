@@ -557,6 +557,7 @@ l0_b200:
   - unittest/_torch/visual_gen/models/minimax_h3_v2/components/test_trtllm_attention.py
   - unittest/_torch/visual_gen/models/minimax_h3_v2/components/test_lora.py
   - unittest/_torch/visual_gen/models/minimax_h3_v2/default_pipeline/ops/test_text_attention.py
+  - unittest/_torch/visual_gen/models/minimax_h3_v2/default_pipeline/ops/test_text_qk_norm_rope.py
   - unittest/_torch/visual_gen/models/minimax_h3_v2/ops/test_minimax_h3_vsa.py
   - unittest/_torch/visual_gen/models/minimax_h3_v2/ops/test_rope.py
   - unittest/_torch/visual_gen/models/minimax_h3_v2/kernels/test_minimax_h3_fused_rope.py

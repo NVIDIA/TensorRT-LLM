@@ -16,7 +16,6 @@ from transformers import AutoConfig
 
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import fused_qk_norm_rope
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
     flashinfer_fused_add_rmsnorm,
 )
@@ -28,6 +27,7 @@ from ..components.linear import Linear
 from ..packing import MINIMAX_H3_TEXT_ENCODER_LAYER
 from ..parallel.tp import shard_bounds
 from .ops.text_attention import text_causal_attention
+from .ops.text_qk_norm_rope import text_qk_norm_rope
 
 
 class _MiniMaxH3TextEncoderMapping(MpiTopology):
@@ -110,8 +110,9 @@ class _TextBlock(nn.Module):
         rope = (
             getattr(config, "rope_scaling", None) or getattr(config, "rope_parameters", None) or {}
         )
-        self.rope_scaling = _rope_scaling(config, rope, self.rotary_dim, self.theta)
-        self.sections = rope.get("mrope_section") if rope.get("mrope_interleaved") else None
+        self.rope_factor, self.rope_low, self.rope_high, self.rope_attention_factor = _rope_scaling(
+            config, rope, self.rotary_dim, self.theta
+        )
         self.q_width, self.kv_width = self.n_q * self.dim, self.n_kv * self.dim
         self.q_start = rank * self.q_width
         # When TP exceeds the KV head count, consecutive ranks share one KV head.
@@ -141,23 +142,21 @@ class _TextBlock(nn.Module):
 
     def forward(self, x, residual, positions, offsets, reduce):
         x, residual = _norm(x, residual, self.input_norm, self.eps)
-        qkv = fused_qk_norm_rope(
+        qkv = text_qk_norm_rope(
             self.qkv_proj(x),
-            self.n_q,
-            self.n_kv,
-            self.n_kv,
-            self.dim,
-            self.rotary_dim,
-            self.eps,
             self.q_norm,
             self.k_norm,
-            self.theta,
-            True,
             positions,
-            *self.rope_scaling,
-            use_mrope=self.sections is not None,
-            mrope_section1=self.sections[1] if self.sections is not None else 0,
-            mrope_section2=self.sections[2] if self.sections is not None else 0,
+            num_heads_q=self.n_q,
+            num_heads_kv=self.n_kv,
+            head_dim=self.dim,
+            rotary_dim=self.rotary_dim,
+            eps=self.eps,
+            base=self.theta,
+            factor=self.rope_factor,
+            low=self.rope_low,
+            high=self.rope_high,
+            attention_factor=self.rope_attention_factor,
         )
         q, k, v = (
             part.reshape(x.shape[0], heads, self.dim).contiguous()
@@ -276,8 +275,6 @@ class MiniMaxH3TensorParallelTextEncoder(nn.Module):
         seq_len = len(input_ids)
         offsets = torch.tensor([0, seq_len], device=self.device, dtype=torch.int32)
         positions = torch.arange(seq_len, device=self.device, dtype=torch.int32)
-        if self.layers and self.layers[0].sections is not None:
-            positions = positions.expand(3, -1).contiguous()
         residual = None
         for block in self.layers:
             x, residual = block(x, residual, positions, offsets, self.reduce)

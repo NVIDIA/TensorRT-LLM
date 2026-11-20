@@ -62,11 +62,13 @@ class FusedQkNormRope(OpWrapper):
     )
 
     note = """
-    gpt-oss uses RoPE with YaRN. qwen4_exp uses Gemma QK normalization.
-    The H3 TP text encoder uses plain-weight QK normalization and interleaved
-    mRoPE with identical text positions on all three axes.
-    Uncertified combinations include `is_neox=False`, YaRN with QK normalization,
-    and YaRN with mRoPE. Add a target cell before using one of these paths.
+    Certified by caller: gpt-oss runs `is_qk_norm=False` with YaRN; qwen4_exp
+    runs `is_qk_norm=True, use_gemma=True`, unscaled, with and without
+    interleaved mRoPE. Uncertified because no shipped target reaches them:
+    `is_qk_norm=True` with `use_gemma=False` (the plain-weight norm the op's
+    name advertises), `is_neox=False`, YaRN together with the norm or with
+    mRoPE. A target that wants one adds the cell rather than assuming the path
+    works because the argument exists.
 
     mRoPE preconditions. `position_ids` is a contiguous int32 `[3, T]`; the op
     rejects a strided view loudly, so an engine's `[3, 1, max_num_tokens]`

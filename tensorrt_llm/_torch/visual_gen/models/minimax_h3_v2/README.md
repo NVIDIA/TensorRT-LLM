@@ -48,7 +48,7 @@ Changing the fused RoPE tile size belongs in `kernels/`. Changing the rotation f
 
 ### Choose the sharing scope
 
-**Only fully model-independent operations belong in a catalog.** A new entry needs independent callers that use the same implementation unchanged. Express the computation in terms of tensors, layouts and explicit operation parameters. Model wrappers belong in their family or target, even when several models call the same native kernel. They own checkpoint interpretation, model-specific packing, masks, gates and collective scheduling.
+**Only fully model-independent operations belong in a catalog.** Count independent VisualGen families when choosing between target, family and VisualGen catalog ownership. A new catalog entry needs callers that use the same implementation unchanged. Express the computation in terms of tensors, layouts and explicit operation parameters. Model wrappers belong in their family or target, even when several models call the same native kernel. They own checkpoint interpretation, model-specific packing, masks, gates and collective scheduling.
 
 | Scope of the change | Place it here | H3 example |
 | --- | --- | --- |
@@ -87,6 +87,8 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 | [default_pipeline/ref2va.py](default_pipeline/ref2va.py) | Validate, normalize and order reference media for Ref2VA. |
 | [default_pipeline/text_encoder_tp.py](default_pipeline/text_encoder_tp.py) | Shard the Qwen3-VL text encoder and load its rank-local weights. |
 | [default_pipeline/ops/text_attention.py](default_pipeline/ops/text_attention.py) | Implement causal grouped-query attention for the TP text encoder. |
+| [default_pipeline/ops/text_qk_norm_rope.py](default_pipeline/ops/text_qk_norm_rope.py) | Define per-head Q/K normalization and rotation for the TP encoder's one-dimensional text positions. |
+| [default_pipeline/kernels/text_qk_norm_rope.py](default_pipeline/kernels/text_qk_norm_rope.py) | Apply text RoPE in place to the rank-local Q and K heads of a packed projection. |
 | [fasth3/pipeline.py](fasth3/pipeline.py) | Configure gated video sparse attention (VSA) and select the trained generation and warmup schedules. |
 | [fasth3/schedule.py](fasth3/schedule.py) | Convert trained DMD steps to video and audio scheduler timesteps and sigmas. |
 
