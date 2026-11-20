@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 import contextlib
+import io
 import os
 import re
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 import transformers
@@ -31,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -766,6 +770,7 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("image_format", ["pil", "np"])
 @pytest.mark.parametrize(
     "sizes, encoder_lengths, embedding_lengths",
     [
@@ -775,9 +780,16 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
     ],
 )
 def test_native_processed_images_preserve_item_sizes(
-    sizes: list[list[int]], encoder_lengths: list[int], embedding_lengths: list[int]
+    sizes: list[list[int]],
+    encoder_lengths: list[int],
+    embedding_lengths: list[int],
+    image_format: str,
 ) -> None:
-    """Keep unpadded per-image geometry through native processing and scheduling."""
+    """Keep unpadded per-image geometry through native processing and scheduling.
+
+    uint8 HWC arrays, the default image format, must reach the tokenizer as
+    the same encoded image as the PIL input.
+    """
     proc = _make_dummy_processor(processor_cls=MistralNativeInputProcessor)
     pixels = [
         torch.full((3, height, width), float(i + 1)) for i, (height, width) in enumerate(sizes)
@@ -800,23 +812,38 @@ def test_native_processed_images_preserve_item_sizes(
         ),
     )
 
+    sent_images = []
+
     def apply_chat_template(
-        *args: Any, return_tensors: str | None, **kwargs: Any
+        conversation: list[dict[str, Any]],
+        *args: Any,
+        return_tensors: str | None,
+        **kwargs: Any,
     ) -> transformers.BatchEncoding:
         assert return_tensors is None
+        sent_images.extend(item for item in conversation[0]["content"] if item["type"] == "image")
         return encoded
 
     tokenizer.transformers_tokenizer.apply_chat_template.side_effect = apply_chat_template
     proc._processor = modeling_mistral.MistralCommonImageProcessor(tokenizer, proc.dtype)
+    pil_images = [
+        Image.new("RGB", (width, height), (40 * (i + 1), 20, 200))
+        for i, (height, width) in enumerate(sizes)
+    ]
+    images = pil_images
+    if image_format == "np":
+        images = [np.asarray(image) for image in pil_images]
     input_ids, extra = proc.call_with_text_prompt(
-        {
-            "prompt": "Describe these images.",
-            "multi_modal_data": {"image": [Image.new("RGB", (w, h)) for h, w in sizes]},
-        },
+        {"prompt": "Describe these images.", "multi_modal_data": {"image": images}},
         tensorrt_llm.SamplingParams(),
     )
 
     assert input_ids == [1, 2, 3]
+    assert len(sent_images) == len(pil_images)
+    for item, pil_image in zip(sent_images, pil_images):
+        assert item["base64"] == encode_base64_image(pil_image)
+        sent = Image.open(io.BytesIO(base64.b64decode(item["base64"])))
+        assert sent.size == pil_image.size
     image = extra["multimodal_data"]["image"]
     assert image["image_sizes"] == sizes
     assert image["pixel_values"].shape == (

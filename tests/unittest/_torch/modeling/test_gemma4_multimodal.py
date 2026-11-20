@@ -91,6 +91,7 @@ from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MultimodalParams,
     MultimodalRuntimeData,
 )
+from tensorrt_llm.inputs.multimodal_data import VideoData  # noqa: E402
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig  # noqa: E402
 from tensorrt_llm.mapping import Mapping  # noqa: E402
 
@@ -592,6 +593,42 @@ def test_gemma4_vision_gpu_normalize_video_uint8(device, producer_dtype):
             _encode_normalization_buckets([bucket], modality="video").reshape(expected.shape).cpu()
         )
         assert torch.equal(actual, expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("gpu_normalize", [False, True], ids=["host_normalize", "gpu_normalize"])
+def test_gemma4_uint8_video_frames_match_float_frames(gpu_normalize):
+    """uint8 video frames, the loader default, give the same inputs as float `"pt"` frames."""
+    frames = np.random.default_rng(0).integers(0, 256, size=(4, 48, 96, 3), dtype=np.uint8)
+    # The loader's `"pt"` conversion of the same frames.
+    float_frames = list(
+        torch.from_numpy(frames.astype(np.float32) * np.float32(1.0 / 255.0)).permute(0, 3, 1, 2)
+    )
+    metadata = {"total_num_frames": 4, "fps": 2.0, "duration": 2.0, "frames_indices": [0, 1, 2, 3]}
+    results = []
+    for video_frames in (frames, float_frames):
+        processor = _make_normalization_processor(None)
+        processor._vision_gpu_normalize = gpu_normalize
+        processor._processor = SimpleNamespace(
+            video_processor=Gemma4VideoProcessor(max_soft_tokens=70)
+        )
+        prompts = []
+        processor._tokenizer = lambda text, **kwargs: (
+            prompts.append(text) or {"input_ids": torch.tensor([[1]])}
+        )
+        video = VideoData(frames=video_frames, metadata=dict(metadata))
+        inputs = {"prompt": "<|video|>", "multi_modal_data": {"video": [video]}}
+        _, extra = processor.call_with_text_prompt(inputs, None)
+        results.append((prompts, extra["multimodal_data"]["video"]))
+
+    (uint8_prompts, uint8_video), (float_prompts, float_video) = results
+    assert uint8_prompts == float_prompts
+    assert uint8_video.keys() == float_video.keys()
+    for key, value in uint8_video.items():
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(value, float_video[key]), key
+        else:
+            assert value == float_video[key], key
 
 
 # Mirror the engine's ``encoder_max_num_tokens`` runtime budget. The encoder

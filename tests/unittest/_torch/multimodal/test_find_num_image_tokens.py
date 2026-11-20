@@ -103,7 +103,7 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
         for image_idx, test_image in enumerate(example_images):
 
             # Get test image dimensions
-            test_image = load_image(test_image)
+            test_image = load_image(test_image, format="pt")
             image_height, image_width = test_image.shape[-2:]
 
             # Get actual embedding tensor for this image

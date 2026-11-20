@@ -14,7 +14,7 @@
 # limitations under the License.
 import json
 from functools import partial
-from typing import List, TextIO, Tuple
+from typing import List, Optional, TextIO, Tuple
 
 from transformers import PreTrainedTokenizer
 
@@ -78,7 +78,7 @@ def create_dataset_from_stream(
     model_dir: str = None,
     model_type: str = None,
     modality: str = None,
-    image_data_format: str = "pt",
+    image_data_format: Optional[str] = None,
     data_device: str = "cpu",
     max_input_seq_len_for_multimodal: int = 4096,
 ) -> Tuple[DatasetMetadata, List[InferenceRequest]]:

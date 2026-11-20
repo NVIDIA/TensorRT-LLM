@@ -398,13 +398,12 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         """Ask the loaders for PIL and for the model's own video sampling.
 
-        Format: the framework's default is `pt` (`ToTensor()` output, a
-        float32 CHW tensor in 0..1), while this model's preprocessing works on
-        PIL: `to_rgb` composites RGBA by image mode and `resize_lanczos`
-        calls `Image.resize`. Asking for PIL also skips a round-trip through
-        0..1 floats on every request. `_to_pil` still normalizes whatever
-        arrives, because a per-request `media_io_kwargs` override outranks
-        this.
+        Format: the framework's default is `np` (a uint8 HWC array), while
+        this model's preprocessing works on PIL: `to_rgb` composites RGBA by
+        image mode and `resize_lanczos` calls `Image.resize`. Asking for PIL
+        also skips a conversion to PIL on every request. `_to_pil` still
+        normalizes whatever arrives, because a per-request `media_io_kwargs`
+        override outranks this.
 
         Video sampling: `VideoMediaIO` defaults to `num_frames=10,
         fps=30`, 10 frames per video regardless of length, while this model

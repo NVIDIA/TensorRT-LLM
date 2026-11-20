@@ -2038,11 +2038,10 @@ class MiniMaxM3VLInputProcessor:
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         # uint8 HWC arrays for both modalities: the form the checkpoint's
-        # processors rescale themselves, at a quarter of the bytes of
-        # media_io's default "pt" float tensors (which ``_prepare_media``
-        # also accepts). trtllm-serve seeds its media_io defaults from this
-        # method, so no --media_io_kwargs flag is needed; an explicit flag
-        # still wins.
+        # processors rescale themselves, at a quarter of the bytes of "pt"
+        # float tensors (which ``_prepare_media`` also accepts). trtllm-serve
+        # seeds its media_io defaults from this method, so no
+        # --media_io_kwargs flag is needed; an explicit flag still wins.
         return {"image": {"format": "np"}, "video": {"format": "np"}}
 
     @staticmethod

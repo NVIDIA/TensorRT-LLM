@@ -26,7 +26,12 @@ from PIL import Image
 import tensorrt_llm.inputs.media_io as media_io_module
 import tensorrt_llm.inputs.utils as utils_module
 from tensorrt_llm.inputs.media_io import _close_aiohttp_session, _get_aiohttp_session
-from tensorrt_llm.inputs.utils import MultimodalDataTracker, async_load_audio, async_load_image
+from tensorrt_llm.inputs.utils import (
+    MultimodalDataTracker,
+    async_load_audio,
+    async_load_image,
+    load_image,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -81,6 +86,15 @@ class TestAsyncLoadImage:
         image_tensor = await async_load_image(url, format="pt")
         assert isinstance(image_tensor, torch.Tensor)
         assert image_tensor.shape[0] == 3  # C x H x W
+
+    @pytest.mark.asyncio
+    async def test_load_image_from_data_url_np(self):
+        url = _make_image_data_url()
+        image_array = await async_load_image(url, format="np")
+        assert isinstance(image_array, np.ndarray)
+        assert image_array.dtype == np.uint8
+        assert image_array.shape == (8, 8, 3)  # H x W x C
+        np.testing.assert_array_equal(load_image(url, format="np"), image_array)
 
     @pytest.mark.asyncio
     async def test_load_image_pil_input_passthrough(self):

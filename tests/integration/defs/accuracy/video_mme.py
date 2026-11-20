@@ -78,6 +78,7 @@ class _VideoInputContext(NamedTuple):
     processor: Any
     content_format: ContentFormat
     chat_template_kwargs: dict[str, Any]
+    video_load_kwargs: dict[str, Any]
 
 
 class VideoMME(Evaluator):
@@ -183,8 +184,12 @@ class VideoMME(Evaluator):
 
     def _make_input_context(self, llm: Any) -> _VideoInputContext:
         _, model_type = get_model_context(llm)
-        processor = getattr(getattr(llm, "input_processor", None), "processor", None)
+        input_processor = getattr(llm, "input_processor", None)
+        processor = getattr(input_processor, "processor", None)
         hf_chat_template = resolve_hf_chat_template(llm.tokenizer, processor, None, None)
+        # Decode frames in the format the model asks for, as trtllm-serve does.
+        preferred = getattr(input_processor, "get_preferred_media_io_kwargs", dict)()
+        video_format = preferred.get("video", {}).get("format")
         return _VideoInputContext(
             model_type=model_type,
             processor=processor,
@@ -192,6 +197,7 @@ class VideoMME(Evaluator):
             chat_template_kwargs=get_chat_template_kwargs(
                 processor or llm.tokenizer, self.chat_template_kwargs
             ),
+            video_load_kwargs={"format": video_format} if video_format else {},
         )
 
     def _make_input(
@@ -204,7 +210,9 @@ class VideoMME(Evaluator):
         mm_data_tracker = MultimodalDataTracker(input_context.model_type)
         video = video_cache.get(sample.video_path)
         if video is None:
-            video = load_video(sample.video_path, num_frames=self.num_frames)
+            video = load_video(
+                sample.video_path, num_frames=self.num_frames, **input_context.video_load_kwargs
+            )
             video_cache[sample.video_path] = video
 
         prompt_text = _format_video_qa_prompt(sample)
