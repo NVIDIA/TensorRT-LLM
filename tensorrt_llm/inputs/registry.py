@@ -1003,6 +1003,9 @@ class MultimodalPlaceholderRegistry:
             MULTIMODAL_MODEL_TYPE_TO_MODULE
         module_name = MULTIMODAL_MODEL_TYPE_TO_MODULE.get(model_type)
         if module_name is None:
+            # Not a model type of the zoo: a modeling_v2 family may register
+            # it (`register_architecture_input_processor`).
+            _import_modeling_v2_families()
             return
         full_name = f"tensorrt_llm._torch.models.{module_name}"
         try:
@@ -1027,6 +1030,7 @@ class MultimodalPlaceholderRegistry:
             MULTIMODAL_MODEL_TYPE_TO_MODULE
         for model_type in MULTIMODAL_MODEL_TYPE_TO_MODULE:
             self._ensure_provider_imported(model_type)
+        _import_modeling_v2_families()
 
     def remove_placeholder_metadata(self, model_type: str):
         self._ensure_provider_imported(model_type)
@@ -1139,6 +1143,10 @@ class InputProcessorRegistry:
     def __init__(self) -> None:
         self._input_processors_cls_by_model_type: Dict[
             Type[nn.Module], Type[InputProcessor]] = {}
+        # Processors of architectures no model class of the zoo implements,
+        # keyed by `config.architectures[0]`.
+        self._input_processors_cls_by_architecture: Dict[
+            str, Type[InputProcessor]] = {}
 
 
 INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
@@ -1214,6 +1222,57 @@ def register_input_processor(
         return model_cls
 
     return wrapper
+
+
+def register_architecture_input_processor(
+        architecture: str, model_type: str,
+        placeholder_metadata: MultimodalPlaceholderMetadata):
+    """Register the decorated input processor for an architecture by name.
+
+    This is for an architecture that no model class of the zoo implements,
+    such as one only a modeling_v2 target serves. `architecture` is the
+    checkpoint's `config.architectures[0]`; `create_input_processor` falls
+    back to these registrations when `get_model_architecture` finds no model
+    class for it. `model_type` and `placeholder_metadata` register the prompt
+    placeholders, as `register_input_processor` does.
+
+    A modeling_v2 family registers its processor when its routing module is
+    imported, which `registered_routes` does; the lookups here import every
+    family first.
+    """
+    if placeholder_metadata is None:
+        raise ValueError(
+            f"A valid placeholder_metadata must be provided but got {placeholder_metadata}"
+        )
+
+    def wrapper(processor_cls: Type[InputProcessor]) -> Type[InputProcessor]:
+        INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_architecture[
+            architecture] = processor_cls
+        MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+            model_type,
+            placeholder_metadata,
+            registrant_module=processor_cls.__module__)
+        processor_cls._registered_model_type = model_type
+        return processor_cls
+
+    return wrapper
+
+
+def _import_modeling_v2_families() -> None:
+    """Import every modeling_v2 family, which registers their processors."""
+    # Function-local: the families' processors import this module.
+    from tensorrt_llm._torch.modeling_v2._router_index import registered_routes
+    registered_routes()
+
+
+def _architecture_input_processor(
+        architecture: Optional[str]) -> Optional[Type[InputProcessor]]:
+    """The processor registered for `architecture` by name, or None."""
+    if architecture is None:
+        return None
+    _import_modeling_v2_families()
+    return INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_architecture.get(
+        architecture)
 
 
 def _warn_prompt_token_cache_ignored(processor_name: str) -> None:
@@ -1297,9 +1356,13 @@ def create_input_processor(
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
                 .get(model_cls)
         except (RuntimeError, ConfigInputError,
-                UnsupportedError):  # unregistered model
-            logger.info("Unregistered model, using DefaultInputProcessor")
-            input_processor_cls = None
+                UnsupportedError):  # no model class of the zoo
+            model_cls = None
+            architectures = getattr(config, "architectures", None)
+            input_processor_cls = _architecture_input_processor(
+                architectures[0] if architectures else None)
+            if input_processor_cls is None:
+                logger.info("Unregistered model, using DefaultInputProcessor")
         if input_processor_cls is not None:
             if "vision_gpu_normalize" in kwargs:
                 kwargs["vision_gpu_normalize"] = kwargs[
