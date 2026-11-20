@@ -23,15 +23,21 @@ When the receive buffers fit twice, a CTA instead lays its partials out per chan
 sends each block with one bulk copy that completes on the owner's barrier (same values).
 
 The launch can also take the query before its RoPE and rotate it in shared memory, bit for bit
-as a separate ``mla_rope_inplace`` launch does. An index-source layer's launch can export the
-cache slots its mapped main selections resolve to, which a later launch over the same
-selections, owner and visible lengths attends unmapped.
+as a separate ``mla_rope_inplace`` launch does. An index-source layer can export the cache slots
+its mapped main selections resolve to, which a later
+launch over the same selections, owner and visible lengths attends unmapped.
 
 Work that does not depend on the launch preceding this one on the stream happens before the
 programmatic dependent wait: the query and the SWA slots when ``inputs_ready`` promises they
 were final before that launch started, and the main rows (slots, page-table mapping, payload)
-when ``main_ready`` promises the same for them; with both, the whole main part runs before
-the wait and only the SWA rows the preceding cache write may have produced are left after it.
+when ``main_ready`` promises they are final when this launch starts; with both, the whole main
+part runs before the wait and only the SWA rows the preceding cache write may have produced are
+left after it. With ``main_ready`` alone the main rows are loaded before the wait and decoded
+after it, and the launch releases its own dependents only after the wait.
+
+For TP8 on SM107 with a 128-token SWA window and zero or 512 main keys, the key rows form the
+MMA's M dimension and the query heads form its N dimension. Each CTA computes one softmax
+over its keys and sends its partial outputs with ``st.async``.
 """
 
 import functools
@@ -132,6 +138,75 @@ def smem_layout(
         "total": total_bytes + extras,
         "dedicated": dedicated,
     }
+
+
+def _keys_as_m_smem_layout(keys: int) -> dict:
+    """Byte offsets of the keys-as-M attention's shared memory."""
+    prow = 2 * keys + 16
+    q = keys * _KEY_ROW
+    p = q + 8 * _KEY_ROW
+    red = pad_up(p + 8 * prow, 16)
+    fac = red + 2 * 8 * 8 * 4
+    recv = pad_up(fac + 8 * 9 * 4, 128)
+    block = 4 * 32 * 16 + 8 * 8
+    # Two mbarriers: the partial outputs', then the (max, sum) pairs'.
+    mbar = recv + 8 * block
+    total_bytes = mbar + 16
+    extras = keys * 12 + 16 * 20 + 6 * 128 + 64 * 4
+    return {
+        "sp": 0,
+        "q": q,
+        "p": p,
+        "prow": prow,
+        "red": red,
+        "fac": fac,
+        "recv": recv,
+        "block": block,
+        "ml_off": 0,
+        "out": 0,
+        "mbar": mbar,
+        "bulk": False,
+        "bytes": total_bytes,
+        "total": total_bytes + extras,
+        "dedicated": True,
+    }
+
+
+@functools.cache
+def _uses_keys_as_m(q_heads: int, swa_width: int, main_width: int, device_index: int) -> bool:
+    """Whether this SM107 launch uses the eight-head transposed MMA layout."""
+    return (
+        q_heads == 8
+        and swa_width == 128
+        and main_width in (0, 512)
+        and torch.cuda.get_device_capability(device_index) == (10, 7)
+    )
+
+
+# 58% (132 KB) shared-memory carveout: the keys-as-M CTA starts beside the projection GEMMs' CTAs.
+_ROOM_CARVEOUT = 58
+
+
+def _set_smem_carveout(compiled, percent: int) -> None:
+    """Set the preferred shared-memory carveout of every kernel of a compiled CuTe DSL function on
+    the current device (the DSL's launch option does not reach the loaded kernels)."""
+    import cuda.bindings.driver as cuda
+
+    err, device = cuda.cuCtxGetDevice()
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuCtxGetDevice failed: {err}")
+    library = cuda.CUlibrary(int(compiled.library))
+    for name in compiled.kernel_info:
+        err, kernel = cuda.cuLibraryGetKernel(library, name.encode())
+        if err == cuda.CUresult.CUDA_SUCCESS:
+            (err,) = cuda.cuKernelSetAttribute(
+                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                percent,
+                kernel,
+                device,
+            )
+        if err != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"setting the shared-memory carveout of {name} failed: {err}")
 
 
 def mma_heads(heads: int) -> int:
@@ -534,6 +609,57 @@ def _kernel_type():
         return words(out, 4, loc, ip)
 
     @dsl_user_op
+    def swa_decode4_x2(w: Int32, scale: Float32, *, loc=None, ip=None):
+        """``swa_decode4`` with its scale multiplies paired as ``mul.rn.f32x2`` (same products)."""
+        out = asm(
+            llvm.StructType.get_literal([T.i32()] * 2),
+            [Int32(w).ir_value(loc=loc, ip=ip), Float32(scale).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 lo, hi, x0, x1, x2, x3;\n\t.reg .b32 h0, h1;\n\t.reg .f32 f0, f1, f2, f3;\n\t"
+            ".reg .b64 s2, p0, p1;\n\t"
+            "mov.b32 {lo, hi}, $2;\n\tcvt.rn.f16x2.e4m3x2 h0, lo;\n\tcvt.rn.f16x2.e4m3x2 h1, hi;\n\t"
+            "mov.b32 {x0, x1}, h0;\n\tmov.b32 {x2, x3}, h1;\n\t"
+            "cvt.f32.f16 f0, x0;\n\tcvt.f32.f16 f1, x1;\n\tcvt.f32.f16 f2, x2;\n\tcvt.f32.f16 f3, x3;\n\t"
+            "mov.b64 s2, {$3, $3};\n\t"
+            "mov.b64 p0, {f0, f1};\n\tmul.rn.f32x2 p0, p0, s2;\n\tmov.b64 {f0, f1}, p0;\n\t"
+            "mov.b64 p1, {f2, f3};\n\tmul.rn.f32x2 p1, p1, s2;\n\tmov.b64 {f2, f3}, p1;\n\t"
+            "cvt.rn.bf16x2.f32 $0, f1, f0;\n\tcvt.rn.bf16x2.f32 $1, f3, f2;\n\t}",
+            "=r,=r,r,f",
+            side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+        return words(out, 2, loc, ip)
+
+    @dsl_user_op
+    def main_decode8_x2(w: Int32, scale: Float32, *, loc=None, ip=None):
+        """``main_decode8`` with its scale multiplies paired as ``mul.rn.f32x2`` (same products)."""
+        out = asm(
+            llvm.StructType.get_literal([T.i32()] * 4),
+            [Int32(w).ir_value(loc=loc, ip=ip), Float32(scale).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b8 b0, b1, b2, b3;\n\t.reg .b16 x0, x1, x2, x3, x4, x5, x6, x7;\n\t"
+            ".reg .b32 h0, h1, h2, h3;\n\t.reg .f32 f0, f1, f2, f3, f4, f5, f6, f7;\n\t"
+            ".reg .b64 s2, p0, p1, p2, p3;\n\t"
+            "mov.b32 {b0, b1, b2, b3}, $4;\n\t"
+            "cvt.rn.f16x2.e2m1x2 h0, b0;\n\tcvt.rn.f16x2.e2m1x2 h1, b1;\n\t"
+            "cvt.rn.f16x2.e2m1x2 h2, b2;\n\tcvt.rn.f16x2.e2m1x2 h3, b3;\n\t"
+            "mov.b32 {x0, x1}, h0;\n\tmov.b32 {x2, x3}, h1;\n\tmov.b32 {x4, x5}, h2;\n\tmov.b32 {x6, x7}, h3;\n\t"
+            "cvt.f32.f16 f0, x0;\n\tcvt.f32.f16 f1, x1;\n\tcvt.f32.f16 f2, x2;\n\tcvt.f32.f16 f3, x3;\n\t"
+            "cvt.f32.f16 f4, x4;\n\tcvt.f32.f16 f5, x5;\n\tcvt.f32.f16 f6, x6;\n\tcvt.f32.f16 f7, x7;\n\t"
+            "mov.b64 s2, {$5, $5};\n\t"
+            "mov.b64 p0, {f0, f1};\n\tmul.rn.f32x2 p0, p0, s2;\n\tmov.b64 {f0, f1}, p0;\n\t"
+            "mov.b64 p1, {f2, f3};\n\tmul.rn.f32x2 p1, p1, s2;\n\tmov.b64 {f2, f3}, p1;\n\t"
+            "mov.b64 p2, {f4, f5};\n\tmul.rn.f32x2 p2, p2, s2;\n\tmov.b64 {f4, f5}, p2;\n\t"
+            "mov.b64 p3, {f6, f7};\n\tmul.rn.f32x2 p3, p3, s2;\n\tmov.b64 {f6, f7}, p3;\n\t"
+            "cvt.rn.bf16x2.f32 $0, f1, f0;\n\tcvt.rn.bf16x2.f32 $1, f3, f2;\n\t"
+            "cvt.rn.bf16x2.f32 $2, f5, f4;\n\tcvt.rn.bf16x2.f32 $3, f7, f6;\n\t}",
+            "=r,=r,=r,=r,r,f",
+            side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+        return words(out, 4, loc, ip)
+
+    @dsl_user_op
     def bf16_pair(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Int32:
         return Int32(
             asm(
@@ -687,6 +813,20 @@ def _kernel_type():
         return floats(out, 2, loc, ip)
 
     @dsl_user_op
+    def st_shared_f32x4(
+        addr: Int32, a: Float32, b: Float32, c: Float32, d: Float32, *, loc=None, ip=None
+    ) -> None:
+        asm(
+            None,
+            [Int32(addr).ir_value(loc=loc, ip=ip)]
+            + [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+            "st.shared.v4.f32 [$0], {$1, $2, $3, $4};",
+            "r,f,f,f,f,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
     def ld_shared_f32x4(addr: Int32, *, loc=None, ip=None):
         out = asm(
             llvm.StructType.get_literal([T.f32()] * 4),
@@ -697,6 +837,114 @@ def _kernel_type():
             ip=ip,
         )
         return floats(out, 4, loc, ip)
+
+    # ------------------------------------------------------- keys-as-M attention (v2)
+
+    @dsl_user_op
+    def ldmatrix_x2(addr: Int32, *, loc=None, ip=None):
+        out = asm(
+            llvm.StructType.get_literal([T.i32()] * 2),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {$0, $1}, [$2];",
+            "=r,=r,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+        return words(out, 2, loc, ip)
+
+    @dsl_user_op
+    def shfl_idx8(v: Float32, k: int, *, loc=None, ip=None) -> Float32:
+        """Lane ``k`` of the caller's aligned group of 8 lanes."""
+        return Float32(
+            asm(
+                T.f32(),
+                [Float32(v).ir_value(loc=loc, ip=ip)],
+                "shfl.sync.idx.b32 $0, $1, " + str(k) + ", 0x181f, 0xffffffff;",
+                "=f,f",
+                loc=loc,
+                ip=ip,
+            )
+        )
+
+    @dsl_user_op
+    def st_async_f32x4(
+        addr: Int32,
+        mbar: Int32,
+        a: Float32,
+        b: Float32,
+        c: Float32,
+        d: Float32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> None:
+        asm(
+            None,
+            [Int32(addr).ir_value(loc=loc, ip=ip), Int32(mbar).ir_value(loc=loc, ip=ip)]
+            + [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+            "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [$0], {$2, $3, $4, $5}, [$1];",
+            "r,r,f,f,f,f,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def st_async_f32x2(
+        addr: Int32, mbar: Int32, a: Float32, b: Float32, *, loc=None, ip=None
+    ) -> None:
+        asm(
+            None,
+            [Int32(addr).ir_value(loc=loc, ip=ip), Int32(mbar).ir_value(loc=loc, ip=ip)]
+            + [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b)],
+            "st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [$0], {$2, $3}, [$1];",
+            "r,r,f,f,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def mbar_init_expect(mbar: Int32, tx_bytes: int, *, loc=None, ip=None) -> None:
+        """One-arrival mbarrier expecting ``tx_bytes`` (its own arrive done), released to the
+        cluster (a cluster barrier must follow before others complete bytes on it)."""
+        asm(
+            None,
+            [Int32(mbar).ir_value(loc=loc, ip=ip)],
+            "mbarrier.init.shared::cta.b64 [$0], 1;\n\t"
+            f"mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], {tx_bytes};\n\t"
+            "fence.mbarrier_init.release.cluster;",
+            "r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def mbar_wait0(mbar: Int32, *, loc=None, ip=None) -> None:
+        asm(
+            None,
+            [Int32(mbar).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .pred p;\n\t"
+            "WAIT${:uid}:\n\t"
+            "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$0], 0;\n\t"
+            "@!p bra WAIT${:uid};\n\t}",
+            "r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def cluster_wait_aligned(*, loc=None, ip=None) -> None:
+        asm(None, [], "barrier.cluster.wait.aligned;", "~{memory}", loc=loc, ip=ip)
+
+    @dsl_user_op
+    def st_global_b16(addr: Int64, w: Int32, *, loc=None, ip=None) -> None:
+        asm(
+            None,
+            [Int64(addr).ir_value(loc=loc, ip=ip), Int32(w).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 h;\n\tcvt.u16.u32 h, $1;\n\tst.global.b16 [$0], h;\n\t}",
+            "l,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
 
     # ------------------------------------------------- query RoPE, as mla_rope_inplace computes it
 
@@ -775,6 +1023,8 @@ def _kernel_type():
             q_rope: bool = False,
             bulk_exchange: bool = False,
             export_slots: bool = False,
+            keys_as_m: bool = False,
+            main_prewait: bool = False,
         ):
             self.q_heads = q_heads or heads
             self.heads = heads
@@ -793,19 +1043,25 @@ def _kernel_type():
             self.main_vec = main_vec
             self.inputs_ready = inputs_ready
             self.main_ready = main_ready and main_width > 0
+            self.keys_as_m = keys_as_m
             # The main part runs before the dependent wait when its rows and the query are final.
-            self.pre_main = self.main_ready and inputs_ready
+            self.pre_main = self.main_ready and inputs_ready and not keys_as_m
+            # Main rows final but the query not: they are loaded before the dependent wait.
+            self.main_prewait = main_prewait and use_pdl and self.main_ready and not self.pre_main
             self.use_pdl = use_pdl
             self.q_rope = q_rope
             self.export_slots = export_slots and mapped and main_width > 0
-            self.layout = smem_layout(
-                heads,
-                self.main_keys,
-                self.swa_keys,
-                cluster,
-                send_heads=min(self.q_heads, heads),
-                bulk=bulk_exchange,
-            )
+            if keys_as_m:
+                self.layout = _keys_as_m_smem_layout(self.keys)
+            else:
+                self.layout = smem_layout(
+                    heads,
+                    self.main_keys,
+                    self.swa_keys,
+                    cluster,
+                    send_heads=min(self.q_heads, heads),
+                    bulk=bulk_exchange,
+                )
             self.bulk = self.layout["bulk"]
 
         @cute.jit
@@ -993,6 +1249,44 @@ def _kernel_type():
             data = cute.make_rmem_tensor(cute.make_layout((per_warp, 4), stride=(4, 1)), Int32)
             scale_byte = cute.make_rmem_tensor(cute.make_layout((per_warp,)), Int32)
             kinds = cute.make_rmem_tensor(cute.make_layout((per_warp,)), Int32)
+            self._load_rows(
+                warp,
+                lane,
+                swa,
+                main,
+                swa_stride,
+                main_stride,
+                sSlot,
+                sKind,
+                first,
+                count,
+                want,
+                data,
+                scale_byte,
+                kinds,
+            )
+            self._store_rows(warp, lane, k_addr, first, count, want, data, scale_byte, kinds)
+
+        @cute.jit
+        def _load_rows(
+            self,
+            warp,
+            lane,
+            swa,
+            main,
+            swa_stride,
+            main_stride,
+            sSlot,
+            sKind,
+            first: cutlass.Constexpr,
+            count: cutlass.Constexpr,
+            want: cutlass.Constexpr,
+            data,
+            scale_byte,
+            kinds,
+        ):
+            """The global loads of ``_decode_rows`` into registers, for ``_store_rows``."""
+            per_warp: cutlass.Constexpr = ceil_div(count, 8)
             swa_base = Int64(swa.toint())
             main_base = Int64(main.toint())
             for i in cutlass.range_constexpr(per_warp):
@@ -1039,26 +1333,59 @@ def _kernel_type():
                     if const_expr(want & 4):
                         if kind == 0:
                             kinds[i] = Int32(0)
+
+        @cute.jit
+        def _store_rows(
+            self,
+            warp,
+            lane,
+            k_addr,
+            first: cutlass.Constexpr,
+            count: cutlass.Constexpr,
+            want: cutlass.Constexpr,
+            data,
+            scale_byte,
+            kinds,
+        ):
+            """The rows ``_load_rows`` loaded, decoded into their shared-memory rows."""
+            per_warp: cutlass.Constexpr = ceil_div(count, 8)
             for i in cutlass.range_constexpr(per_warp):
                 r = first + warp + 8 * i
                 dst = k_addr + r * _KEY_ROW + 32 * lane
-                if kinds[i] == 1:
-                    s = swa_scale(scale_byte[i])
-                    o0, o1 = swa_decode4(data[i, 0], s)
-                    o2, o3 = swa_decode4(data[i, 1], s)
-                    o4, o5 = swa_decode4(data[i, 2], s)
-                    o6, o7 = swa_decode4(data[i, 3], s)
-                    st_shared_v4(dst, o0, o1, o2, o3)
-                    st_shared_v4(dst + 16, o4, o5, o6, o7)
-                if kinds[i] == 2:
-                    s = e4m3_scale(scale_byte[i])
-                    o0, o1, o2, o3 = main_decode8(data[i, 0], s)
-                    o4, o5, o6, o7 = main_decode8(data[i, 1], s)
-                    st_shared_v4(dst, o0, o1, o2, o3)
-                    st_shared_v4(dst + 16, o4, o5, o6, o7)
-                if kinds[i] == 0:
-                    st_shared_v4(dst, Int32(0), Int32(0), Int32(0), Int32(0))
-                    st_shared_v4(dst + 16, Int32(0), Int32(0), Int32(0), Int32(0))
+                if const_expr(want & 1):
+                    if kinds[i] == 1:
+                        s = swa_scale(scale_byte[i])
+                        o0, o1 = self._swa4(data[i, 0], s)
+                        o2, o3 = self._swa4(data[i, 1], s)
+                        o4, o5 = self._swa4(data[i, 2], s)
+                        o6, o7 = self._swa4(data[i, 3], s)
+                        st_shared_v4(dst, o0, o1, o2, o3)
+                        st_shared_v4(dst + 16, o4, o5, o6, o7)
+                if const_expr(want & 2):
+                    if kinds[i] == 2:
+                        s = e4m3_scale(scale_byte[i])
+                        o0, o1, o2, o3 = self._main8(data[i, 0], s)
+                        o4, o5, o6, o7 = self._main8(data[i, 1], s)
+                        st_shared_v4(dst, o0, o1, o2, o3)
+                        st_shared_v4(dst + 16, o4, o5, o6, o7)
+                if const_expr(want & 4):
+                    if kinds[i] == 0:
+                        st_shared_v4(dst, Int32(0), Int32(0), Int32(0), Int32(0))
+                        st_shared_v4(dst + 16, Int32(0), Int32(0), Int32(0), Int32(0))
+
+        @cute.jit
+        def _main8(self, w, s):
+            if const_expr(self.keys_as_m):
+                return main_decode8_x2(w, s)
+            else:
+                return main_decode8(w, s)
+
+        @cute.jit
+        def _swa4(self, w, s):
+            if const_expr(self.keys_as_m):
+                return swa_decode4_x2(w, s)
+            else:
+                return swa_decode4(w, s)
 
         @cute.jit
         def _part(
@@ -1308,15 +1635,45 @@ def _kernel_type():
                 if tidx == 0:
                     mbarrier_init_tx(mbar_addr, Int32(cluster * block))
                 cluster_arrive_relaxed()
-            if const_expr(self.use_pdl):
+            if const_expr(self.keys_as_m):
+                # The partial outputs and the (max, sum) pairs complete on two mbarriers, initialized
+                # before any CTA stores (cluster barrier phase 1, waited before the push).
+                if tidx == 0:
+                    mbar_init_expect(mbar_addr, 8 * (block - 64))
+                    mbar_init_expect(mbar_addr + 8, 8 * 64)
+                cluster_arrive_relaxed()
+            if const_expr(self.use_pdl and not self.main_prewait):
                 griddepcontrol_launch_dependents()
 
             q_heads: cutlass.Constexpr = self.q_heads
             q_base = Int64(q.toint()) + Int64(row) * Int64(q_heads * HEAD_DIM * 2)
             q_chunks: cutlass.Constexpr = q_heads * HEAD_DIM // 8
-            if tidx < q_heads:
-                sSink[tidx] = ld_global_f32(Int64(sink.toint()) + Int64(4 * tidx)) * LOG2E
-            if const_expr(q_heads < heads):
+            # The sinks and the row's RoPE coefficients (its position is final long before this layer);
+            # through registers on the keys-as-M path, so their loads never hold up the key rows' resolve.
+            sink_v = Float32(0.0)
+            rope_pos = Int32(0)
+            rope_v = Float32(0.0)
+            if const_expr(self.keys_as_m):
+                if tidx < q_heads:
+                    sink_v = ld_global_f32(Int64(sink.toint()) + Int64(4 * tidx))
+                if const_expr(self.q_rope):
+                    if tidx < 64:
+                        rope_pos = ld_global_s32(Int64(q_positions.toint()) + Int64(row) * 4)
+            else:
+                if tidx < q_heads:
+                    sSink[tidx] = ld_global_f32(Int64(sink.toint()) + Int64(4 * tidx)) * LOG2E
+                if const_expr(self.q_rope):
+                    if tidx < 64:
+                        sRope[tidx] = ld_global_f32(
+                            Int64(q_cos_sin.toint())
+                            + Int64(ld_global_s32(Int64(q_positions.toint()) + Int64(row) * 4))
+                            * Int64(64 * 4)
+                            + Int64(4 * tidx)
+                        )
+            # Main rows resolved before the dependent wait: the coefficients load right after them.
+            rope_early: cutlass.Constexpr = self.pre_main or self.main_prewait
+            late_rope: cutlass.Constexpr = self.keys_as_m and self.q_rope
+            if const_expr(q_heads < heads and not self.keys_as_m):
                 # Padding heads: a zero query row (their outputs are not stored).
                 if tidx >= q_heads:
                     if tidx < heads:
@@ -1330,21 +1687,20 @@ def _kernel_type():
                         Int32(0),
                         Int32(0),
                     )
-            oacc0 = cute.make_rmem_tensor(cute.make_layout((o_tiles, 4), stride=(4, 1)), Float32)
-            oacc1 = cute.make_rmem_tensor(cute.make_layout((o_tiles, 4), stride=(4, 1)), Float32)
-            oacc0.fill(0.0)
-            oacc1.fill(0.0)
-            # The row's RoPE coefficients (its position is final long before this layer).
-            if const_expr(self.q_rope):
-                if tidx < 64:
-                    sRope[tidx] = ld_global_f32(
-                        Int64(q_cos_sin.toint())
-                        + Int64(ld_global_s32(Int64(q_positions.toint()) + Int64(row) * 4))
-                        * Int64(64 * 4)
-                        + Int64(4 * tidx)
-                    )
+            oacc0 = oacc1 = None
+            if const_expr(not self.keys_as_m):
+                oacc0 = cute.make_rmem_tensor(
+                    cute.make_layout((o_tiles, 4), stride=(4, 1)), Float32
+                )
+                oacc1 = cute.make_rmem_tensor(
+                    cute.make_layout((o_tiles, 4), stride=(4, 1)), Float32
+                )
+                oacc0.fill(0.0)
+                oacc1.fill(0.0)
 
             # ---- before the dependent wait: inputs final before the preceding launch ----
+            # The SWA slots are final whenever the main rows are promised before the query.
+            swa_first: cutlass.Constexpr = self.inputs_ready or self.main_prewait
             if const_expr(self.inputs_ready):
                 for i in cutlass.range_constexpr(q_chunks // _THREADS):
                     c = tidx + _THREADS * i
@@ -1372,11 +1728,39 @@ def _kernel_type():
                     max_positions,
                     swa_capacity,
                     main_capacity,
-                    self.inputs_ready,
+                    swa_first,
                     self.main_ready,
                     sSlot,
                     sKind,
                     slots_out,
+                )
+            if const_expr(late_rope and rope_early):
+                if tidx < 64:
+                    rope_v = ld_global_f32(
+                        Int64(q_cos_sin.toint()) + Int64(rope_pos) * (64 * 4) + Int64(4 * tidx)
+                    )
+            # main_prewait: the main rows are loaded before the dependent wait and decoded after it.
+            m_rows: cutlass.Constexpr = ceil_div(main_keys, 8) if self.main_prewait else 1
+            m_data = cute.make_rmem_tensor(cute.make_layout((m_rows, 4), stride=(4, 1)), Int32)
+            m_scale = cute.make_rmem_tensor(cute.make_layout((m_rows,)), Int32)
+            m_kinds = cute.make_rmem_tensor(cute.make_layout((m_rows,)), Int32)
+            if const_expr(self.main_prewait):
+                cute.arch.sync_threads()
+                self._load_rows(
+                    warp,
+                    lane,
+                    swa,
+                    main,
+                    swa_stride,
+                    main_stride,
+                    sSlot,
+                    sKind,
+                    0,
+                    main_keys,
+                    6,
+                    m_data,
+                    m_scale,
+                    m_kinds,
                 )
             if const_expr(self.pre_main):
                 cute.arch.sync_threads()
@@ -1394,6 +1778,8 @@ def _kernel_type():
                     main_keys,
                     6,
                 )
+                if const_expr(self.keys_as_m):
+                    self._store_coefs(tidx, sSink, sRope, sink_v, rope_v)
                 cp_async_wait_all()
                 cute.arch.sync_threads()
                 if const_expr(self.q_rope):
@@ -1418,6 +1804,9 @@ def _kernel_type():
 
             if const_expr(self.use_pdl):
                 griddepcontrol_wait()
+            if const_expr(self.main_prewait):
+                # Started under its producers: the next projection launches once they completed.
+                griddepcontrol_launch_dependents()
 
             # ---- after it: this layer's cache rows (and anything not promised ready) ----
             if const_expr(not self.inputs_ready):
@@ -1426,7 +1815,7 @@ def _kernel_type():
                     cp_async16(
                         q_addr + (c // 64) * _KEY_ROW + (c % 64) * 16, q_base + Int64(16 * c)
                     )
-            if const_expr((not self.inputs_ready) or (not self.main_ready)):
+            if const_expr((not swa_first) or (not self.main_ready)):
                 if tidx < keys:
                     self._resolve(
                         tidx,
@@ -1446,14 +1835,45 @@ def _kernel_type():
                         max_positions,
                         swa_capacity,
                         main_capacity,
-                        not self.inputs_ready,
+                        not swa_first,
                         not self.main_ready,
                         sSlot,
                         sKind,
                         slots_out,
                     )
+            if const_expr(late_rope and not rope_early):
+                if tidx < 64:
+                    rope_v = ld_global_f32(
+                        Int64(q_cos_sin.toint()) + Int64(rope_pos) * (64 * 4) + Int64(4 * tidx)
+                    )
             cute.arch.sync_threads()
-            if const_expr(self.pre_main):
+            if const_expr(self.main_prewait):
+                # This layer's SWA rows go out first; the main rows decode while they are in flight.
+                s_rows: cutlass.Constexpr = ceil_div(swa_keys, 8)
+                s_data = cute.make_rmem_tensor(cute.make_layout((s_rows, 4), stride=(4, 1)), Int32)
+                s_scale = cute.make_rmem_tensor(cute.make_layout((s_rows,)), Int32)
+                s_kinds = cute.make_rmem_tensor(cute.make_layout((s_rows,)), Int32)
+                self._load_rows(
+                    warp,
+                    lane,
+                    swa,
+                    main,
+                    swa_stride,
+                    main_stride,
+                    sSlot,
+                    sKind,
+                    main_keys,
+                    swa_keys,
+                    5,
+                    s_data,
+                    s_scale,
+                    s_kinds,
+                )
+                self._store_rows(warp, lane, k_addr, 0, main_keys, 6, m_data, m_scale, m_kinds)
+                self._store_rows(
+                    warp, lane, k_addr, main_keys, swa_keys, 5, s_data, s_scale, s_kinds
+                )
+            elif const_expr(self.pre_main):
                 self._decode_rows(
                     warp,
                     lane,
@@ -1483,166 +1903,460 @@ def _kernel_type():
                     keys,
                     7,
                 )
+            if const_expr(self.keys_as_m and not self.pre_main):
+                self._store_coefs(tidx, sSink, sRope, sink_v, rope_v)
             cp_async_wait_all()
             cute.arch.sync_threads()
             if const_expr(self.q_rope and not self.pre_main):
                 self._rope_query(tidx, q_addr, sRope)
                 cute.arch.sync_threads()
-            if const_expr((not self.pre_main) and main_keys > 0):
-                self._part(
+            if const_expr(self.keys_as_m):
+                self._keys_as_m_attention(
                     tidx,
                     warp,
                     lane,
-                    q_addr,
+                    rank,
+                    row,
                     k_addr,
-                    sp_addr,
-                    p_addr,
-                    sKind,
-                    sML,
-                    oacc0,
-                    scale_log2,
-                    0,
-                    main_keys,
-                    0,
-                )
-            if const_expr(swa_keys > 0):
-                self._part(
-                    tidx,
-                    warp,
-                    lane,
                     q_addr,
-                    k_addr,
-                    sp_addr,
-                    p_addr,
+                    base,
                     sKind,
-                    sML,
-                    oacc1,
+                    sSink,
+                    out,
                     scale_log2,
-                    main_keys,
-                    swa_keys,
-                    1,
                 )
-            cute.arch.sync_threads()
-
-            # ---- merge the parts, then send this CTA's partial to the channel owners ----
-            ht = warp % head_tiles
-            ds = warp // head_tiles
-            # This CTA's block in every destination's receive buffer.
-            send_base = recv_addr + rank * block
-            # Each thread holds fragment rows ``g`` and ``g + 8``; with 8 query heads the second are
-            # padding.
-            halves: cutlass.Constexpr = 1 if q_heads < heads else 2
-            for half in cutlass.range_constexpr(halves):
-                h = 16 * ht + g + 8 * half
-                f0 = Float32(0.0)
-                f1 = Float32(0.0)
-                if const_expr(main_keys > 0 and swa_keys > 0):
-                    mm0 = sML[2 * h]
-                    mm1 = sML[2 * heads + 2 * h]
-                    mtop = cute.arch.fmax(mm0, mm1)
-                    if mm0 != Float32(NEG_INF):
-                        f0 = exp2(mm0 - mtop)
-                    if mm1 != Float32(NEG_INF):
-                        f1 = exp2(mm1 - mtop)
-                elif const_expr(main_keys > 0):
-                    f0 = Float32(1.0)
-                else:
-                    f1 = Float32(1.0)
-                for n in cutlass.range_constexpr(o_tiles):
-                    d = ds * d_slice + 8 * n + 2 * t
-                    v0 = oacc0[n, 2 * half] * f0 + oacc1[n, 2 * half] * f1
-                    v1 = oacc0[n, 2 * half + 1] * f0 + oacc1[n, 2 * half + 1] * f1
-                    if const_expr(self.bulk):
-                        dest, offset = self._channel_owner(h, d)
-                        st_shared_f32x2(out_addr + dest * block + offset * 4, v0, v1)
-                    elif const_expr(lay["dedicated"]):
-                        dest, offset = self._channel_owner(h, d)
-                        st_cluster_f32x2(mapa(send_base + offset * 4, dest), v0, v1)
-                    else:
-                        oacc0[n, 2 * half] = v0
-                        oacc0[n, 2 * half + 1] = v1
-            # This CTA's (max, sum) per head over both parts, sent with its partial outputs.
-            ml_top = Float32(NEG_INF)
-            ml_total = Float32(0.0)
-            pm0 = Float32(NEG_INF)
-            pl0 = Float32(0.0)
-            pm1 = Float32(NEG_INF)
-            pl1 = Float32(0.0)
-            if tidx < q_heads:
-                if const_expr(main_keys > 0):
-                    pm0 = sML[2 * tidx]
-                    pl0 = sML[2 * tidx + 1]
+            else:
+                if const_expr((not self.pre_main) and main_keys > 0):
+                    self._part(
+                        tidx,
+                        warp,
+                        lane,
+                        q_addr,
+                        k_addr,
+                        sp_addr,
+                        p_addr,
+                        sKind,
+                        sML,
+                        oacc0,
+                        scale_log2,
+                        0,
+                        main_keys,
+                        0,
+                    )
                 if const_expr(swa_keys > 0):
-                    pm1 = sML[2 * heads + 2 * tidx]
-                    pl1 = sML[2 * heads + 2 * tidx + 1]
-                ml_top = cute.arch.fmax(pm0, pm1)
-                if pm0 != Float32(NEG_INF):
-                    ml_total = ml_total + pl0 * exp2(pm0 - ml_top)
-                if pm1 != Float32(NEG_INF):
-                    ml_total = ml_total + pl1 * exp2(pm1 - ml_top)
-                if const_expr(self.bulk):
-                    for dest in cutlass.range_constexpr(cluster):
-                        st_shared_f32x2(
-                            out_addr + dest * block + ml_off + tidx * 8, ml_top, ml_total
-                        )
-                elif const_expr(lay["dedicated"]):
-                    for dest in cutlass.range_constexpr(cluster):
-                        st_cluster_f32x2(
-                            mapa(send_base + ml_off + tidx * 8, dest), ml_top, ml_total
-                        )
-            if const_expr(not lay["dedicated"]):
-                # The receive buffer reuses the key rows: every CTA must be done with them.
-                cute.arch.cluster_arrive()
-                cute.arch.cluster_wait()
+                    self._part(
+                        tidx,
+                        warp,
+                        lane,
+                        q_addr,
+                        k_addr,
+                        sp_addr,
+                        p_addr,
+                        sKind,
+                        sML,
+                        oacc1,
+                        scale_log2,
+                        main_keys,
+                        swa_keys,
+                        1,
+                    )
+                cute.arch.sync_threads()
+
+                # ---- merge the parts, then send this CTA's partial to the channel owners ----
+                ht = warp % head_tiles
+                ds = warp // head_tiles
+                # This CTA's block in every destination's receive buffer.
+                send_base = recv_addr + rank * block
+                # Each thread holds fragment rows ``g`` and ``g + 8`` (padding at 8 query heads).
+                halves: cutlass.Constexpr = 1 if q_heads < heads else 2
                 for half in cutlass.range_constexpr(halves):
                     h = 16 * ht + g + 8 * half
+                    f0 = Float32(0.0)
+                    f1 = Float32(0.0)
+                    if const_expr(main_keys > 0 and swa_keys > 0):
+                        mm0 = sML[2 * h]
+                        mm1 = sML[2 * heads + 2 * h]
+                        mtop = cute.arch.fmax(mm0, mm1)
+                        if mm0 != Float32(NEG_INF):
+                            f0 = exp2(mm0 - mtop)
+                        if mm1 != Float32(NEG_INF):
+                            f1 = exp2(mm1 - mtop)
+                    elif const_expr(main_keys > 0):
+                        f0 = Float32(1.0)
+                    else:
+                        f1 = Float32(1.0)
                     for n in cutlass.range_constexpr(o_tiles):
                         d = ds * d_slice + 8 * n + 2 * t
-                        dest, offset = self._channel_owner(h, d)
-                        st_cluster_f32x2(
-                            mapa(send_base + offset * 4, dest),
-                            oacc0[n, 2 * half],
-                            oacc0[n, 2 * half + 1],
-                        )
+                        v0 = oacc0[n, 2 * half] * f0 + oacc1[n, 2 * half] * f1
+                        v1 = oacc0[n, 2 * half + 1] * f0 + oacc1[n, 2 * half + 1] * f1
+                        if const_expr(self.bulk):
+                            dest, offset = self._channel_owner(h, d)
+                            st_shared_f32x2(out_addr + dest * block + offset * 4, v0, v1)
+                        elif const_expr(lay["dedicated"]):
+                            dest, offset = self._channel_owner(h, d)
+                            st_cluster_f32x2(mapa(send_base + offset * 4, dest), v0, v1)
+                        else:
+                            oacc0[n, 2 * half] = v0
+                            oacc0[n, 2 * half + 1] = v1
+                # This CTA's (max, sum) per head over both parts, sent with its partial outputs.
+                ml_top = Float32(NEG_INF)
+                ml_total = Float32(0.0)
+                pm0 = Float32(NEG_INF)
+                pl0 = Float32(0.0)
+                pm1 = Float32(NEG_INF)
+                pl1 = Float32(0.0)
                 if tidx < q_heads:
-                    for dest in cutlass.range_constexpr(cluster):
-                        st_cluster_f32x2(
-                            mapa(send_base + ml_off + tidx * 8, dest), ml_top, ml_total
+                    if const_expr(main_keys > 0):
+                        pm0 = sML[2 * tidx]
+                        pl0 = sML[2 * tidx + 1]
+                    if const_expr(swa_keys > 0):
+                        pm1 = sML[2 * heads + 2 * tidx]
+                        pl1 = sML[2 * heads + 2 * tidx + 1]
+                    ml_top = cute.arch.fmax(pm0, pm1)
+                    if pm0 != Float32(NEG_INF):
+                        ml_total = ml_total + pl0 * exp2(pm0 - ml_top)
+                    if pm1 != Float32(NEG_INF):
+                        ml_total = ml_total + pl1 * exp2(pm1 - ml_top)
+                    if const_expr(self.bulk):
+                        for dest in cutlass.range_constexpr(cluster):
+                            st_shared_f32x2(
+                                out_addr + dest * block + ml_off + tidx * 8, ml_top, ml_total
+                            )
+                    elif const_expr(lay["dedicated"]):
+                        for dest in cutlass.range_constexpr(cluster):
+                            st_cluster_f32x2(
+                                mapa(send_base + ml_off + tidx * 8, dest), ml_top, ml_total
+                            )
+                if const_expr(not lay["dedicated"]):
+                    # The receive buffer reuses the key rows: every CTA must be done with them.
+                    cute.arch.cluster_arrive()
+                    cute.arch.cluster_wait()
+                    for half in cutlass.range_constexpr(halves):
+                        h = 16 * ht + g + 8 * half
+                        for n in cutlass.range_constexpr(o_tiles):
+                            d = ds * d_slice + 8 * n + 2 * t
+                            dest, offset = self._channel_owner(h, d)
+                            st_cluster_f32x2(
+                                mapa(send_base + offset * 4, dest),
+                                oacc0[n, 2 * half],
+                                oacc0[n, 2 * half + 1],
+                            )
+                    if tidx < q_heads:
+                        for dest in cutlass.range_constexpr(cluster):
+                            st_cluster_f32x2(
+                                mapa(send_base + ml_off + tidx * 8, dest), ml_top, ml_total
+                            )
+                if const_expr(self.bulk):
+                    # Each destination's block goes as one copy; every source's block is visible
+                    # once this CTA's barrier completes its bytes.
+                    fence_proxy_async_shared()
+                    cute.arch.sync_threads()
+                    cute.arch.cluster_wait()
+                    if tidx < cluster:
+                        bulk_copy_cluster(
+                            mapa(recv_addr + rank * block, tidx),
+                            out_addr + tidx * block,
+                            Int32(block),
+                            mapa(mbar_addr, tidx),
                         )
-            if const_expr(self.bulk):
-                # Each destination's block goes as one copy; every source's block is visible once
-                # this CTA's barrier completes its bytes.
-                fence_proxy_async_shared()
-                cute.arch.sync_threads()
-                cute.arch.cluster_wait()
-                if tidx < cluster:
-                    bulk_copy_cluster(
-                        mapa(recv_addr + rank * block, tidx),
-                        out_addr + tidx * block,
-                        Int32(block),
-                        mapa(mbar_addr, tidx),
-                    )
-                mbarrier_wait_parity(mbar_addr, Int32(0))
-                # The copies complete only on their destinations' barriers: no CTA may leave while
-                # a copy still reads its shared memory (the cluster wait at the end).
-                cluster_arrive_relaxed()
-            else:
-                # Every source's block (and its arrive's release) is visible after the wait.
-                cute.arch.cluster_arrive()
-                cute.arch.cluster_wait()
+                    mbarrier_wait_parity(mbar_addr, Int32(0))
+                    # The copies complete only on their destinations' barriers: no CTA may leave
+                    # while a copy still reads its shared memory (the cluster wait at the end).
+                    cluster_arrive_relaxed()
+                else:
+                    # Every source's block (and its arrive's release) is visible after the wait.
+                    cute.arch.cluster_arrive()
+                    cute.arch.cluster_wait()
 
-            # ---- this CTA's channels of every head: sum the sources with the sink ----
-            items: cutlass.Constexpr = q_heads * share // 4
-            out_base = Int64(out.toint()) + Int64(row) * Int64(q_heads * HEAD_DIM * 2)
-            for i in cutlass.range_constexpr(ceil_div(items, _THREADS)):
-                item = tidx + _THREADS * i
-                if item < items:
-                    h = item // (share // 4)
-                    dd = 4 * (item % (share // 4))
-                    w01, w23 = self._merge4(recv_addr, sSink, h, h * share + dd)
-                    st_global_v2(out_base + Int64((h * HEAD_DIM + rank * share + dd) * 2), w01, w23)
-            if const_expr(self.bulk):
-                cute.arch.cluster_wait()
+                # ---- this CTA's channels of every head: sum the sources with the sink ----
+                items: cutlass.Constexpr = q_heads * share // 4
+                out_base = Int64(out.toint()) + Int64(row) * Int64(q_heads * HEAD_DIM * 2)
+                for i in cutlass.range_constexpr(ceil_div(items, _THREADS)):
+                    item = tidx + _THREADS * i
+                    if item < items:
+                        h = item // (share // 4)
+                        dd = 4 * (item % (share // 4))
+                        w01, w23 = self._merge4(recv_addr, sSink, h, h * share + dd)
+                        st_global_v2(
+                            out_base + Int64((h * HEAD_DIM + rank * share + dd) * 2), w01, w23
+                        )
+                if const_expr(self.bulk):
+                    cute.arch.cluster_wait()
+
+        @cute.jit
+        def _store_coefs(self, tidx, sSink, sRope, sink_v, rope_v):
+            """The sinks (log2 units) and the query RoPE coefficients into shared memory."""
+            if tidx < self.q_heads:
+                sSink[tidx] = sink_v * LOG2E
+            if const_expr(self.q_rope):
+                if tidx < 64:
+                    sRope[tidx] = rope_v
+
+        @cute.jit
+        def _s_chain(self, acc, slot: cutlass.Constexpr, a_row, b_row, chain):
+            """Accumulator chain ``chain`` of a key tile's S^T (k steps ``chain + 4i``, in order)
+            into ``acc[slot]``."""
+            for i in cutlass.range_constexpr(HEAD_DIM // 64):
+                j = chain + 4 * i
+                qa0, qa1, qa2, qa3 = ldmatrix_x4(a_row + 32 * j, False)
+                qb0, qb1 = ldmatrix_x2(b_row + 32 * j)
+                r0, r1, r2, r3 = mma_bf16(
+                    qa0,
+                    qa1,
+                    qa2,
+                    qa3,
+                    qb0,
+                    qb1,
+                    acc[slot, 0],
+                    acc[slot, 1],
+                    acc[slot, 2],
+                    acc[slot, 3],
+                )
+                acc[slot, 0] = r0
+                acc[slot, 1] = r1
+                acc[slot, 2] = r2
+                acc[slot, 3] = r3
+
+        @cute.jit
+        def _keys_as_m_attention(
+            self,
+            tidx,
+            warp,
+            lane,
+            rank,
+            row,
+            k_addr,
+            q_addr,
+            base,
+            sKind,
+            sSink,
+            out,
+            scale_log2,
+        ):
+            """Keys-as-M attention of the 8 query heads over this CTA's key rows, then the merge."""
+            kt: cutlass.Constexpr = self.keys // 16
+            lay = self.layout
+            prow: cutlass.Constexpr = lay["prow"]
+            block: cutlass.Constexpr = lay["block"]
+            p_addr = base + lay["p"]
+            red_max = base + lay["red"]
+            red_sum = red_max + 8 * 8 * 4
+            recv_addr = base + lay["recv"]
+            g = lane // 4
+            t = lane % 4
+            key_lo = 16 * warp + g
+            key_hi = key_lo + 8
+            # ---- S^T for this warp's 16 key rows (four accumulator chains) ----
+            v0 = Float32(NEG_INF)
+            v1 = Float32(NEG_INF)
+            v2 = Float32(NEG_INF)
+            v3 = Float32(NEG_INF)
+            acc = cute.make_rmem_tensor(cute.make_layout((4, 4), stride=(4, 1)), Float32)
+            acc.fill(0.0)
+            a_lane = (lane % 16) * _KEY_ROW + 16 * (lane // 16)
+            b_row = q_addr + (lane % 8) * _KEY_ROW + 16 * ((lane // 8) % 2)
+            if const_expr(kt <= 2):
+                # Few tiles: chain c > 0 of tile t (v = 3t + c - 1) runs on warp (kt + v) % 8 and
+                # passes its partial through the query rows once every MMA has read them.
+                if warp < kt:
+                    self._s_chain(acc, 0, k_addr + 16 * warp * _KEY_ROW + a_lane, b_row, 0)
+                v = (warp + 8 - kt) % 8
+                if v < 3 * kt:
+                    self._s_chain(
+                        acc, 1, k_addr + 16 * (v // 3) * _KEY_ROW + a_lane, b_row, 1 + v % 3
+                    )
+                cute.arch.sync_threads()
+                if v < 3 * kt:
+                    st_shared_f32x4(
+                        q_addr + v * 512 + lane * 16, acc[1, 0], acc[1, 1], acc[1, 2], acc[1, 3]
+                    )
+                cute.arch.sync_threads()
+                if warp < kt:
+                    for c in cutlass.range_constexpr(1, 4):
+                        p0, p1, p2, p3 = ld_shared_f32x4(
+                            q_addr + (3 * warp + c - 1) * 512 + lane * 16
+                        )
+                        acc[c, 0] = p0
+                        acc[c, 1] = p1
+                        acc[c, 2] = p2
+                        acc[c, 3] = p3
+            elif warp < kt:
+                a_row = k_addr + 16 * warp * _KEY_ROW + a_lane
+                for j in cutlass.range_constexpr(HEAD_DIM // 16):
+                    qa0, qa1, qa2, qa3 = ldmatrix_x4(a_row + 32 * j, False)
+                    qb0, qb1 = ldmatrix_x2(b_row + 32 * j)
+                    c = j % 4
+                    r0, r1, r2, r3 = mma_bf16(
+                        qa0, qa1, qa2, qa3, qb0, qb1, acc[c, 0], acc[c, 1], acc[c, 2], acc[c, 3]
+                    )
+                    acc[c, 0] = r0
+                    acc[c, 1] = r1
+                    acc[c, 2] = r2
+                    acc[c, 3] = r3
+            if warp < kt:
+                v0 = ((acc[0, 0] + acc[1, 0]) + (acc[2, 0] + acc[3, 0])) * scale_log2
+                v1 = ((acc[0, 1] + acc[1, 1]) + (acc[2, 1] + acc[3, 1])) * scale_log2
+                v2 = ((acc[0, 2] + acc[1, 2]) + (acc[2, 2] + acc[3, 2])) * scale_log2
+                v3 = ((acc[0, 3] + acc[1, 3]) + (acc[2, 3] + acc[3, 3])) * scale_log2
+                if sKind[key_lo] == 0:
+                    v0 = Float32(NEG_INF)
+                    v1 = Float32(NEG_INF)
+                if sKind[key_hi] == 0:
+                    v2 = Float32(NEG_INF)
+                    v3 = Float32(NEG_INF)
+                wm_a = cute.arch.fmax(v0, v2)
+                wm_b = cute.arch.fmax(v1, v3)
+                for mask in (4, 8, 16):
+                    wm_a = shfl_max(wm_a, mask)
+                    wm_b = shfl_max(wm_b, mask)
+                if g == 0:
+                    st_shared_f32(red_max + (warp * 8 + 2 * t) * 4, wm_a)
+                    st_shared_f32(red_max + (warp * 8 + 2 * t + 1) * 4, wm_b)
+            cute.arch.sync_threads()
+            # ---- numerators against the CTA's maximum per head; BF16 probabilities ----
+            if warp < kt:
+                cm_a = Float32(NEG_INF)
+                cm_b = Float32(NEG_INF)
+                for w in cutlass.range_constexpr(kt):
+                    cm_a = cute.arch.fmax(cm_a, ld_shared_f32(red_max + (w * 8 + 2 * t) * 4))
+                    cm_b = cute.arch.fmax(cm_b, ld_shared_f32(red_max + (w * 8 + 2 * t + 1) * 4))
+                if cm_a == Float32(NEG_INF):
+                    cm_a = Float32(0.0)
+                if cm_b == Float32(NEG_INF):
+                    cm_b = Float32(0.0)
+                p0 = exp2(v0 - cm_a)
+                p1 = exp2(v1 - cm_b)
+                p2 = exp2(v2 - cm_a)
+                p3 = exp2(v3 - cm_b)
+                st_shared_b16(p_addr + (2 * t) * prow + 2 * key_lo, bf16_bits(p0))
+                st_shared_b16(p_addr + (2 * t + 1) * prow + 2 * key_lo, bf16_bits(p1))
+                st_shared_b16(p_addr + (2 * t) * prow + 2 * key_hi, bf16_bits(p2))
+                st_shared_b16(p_addr + (2 * t + 1) * prow + 2 * key_hi, bf16_bits(p3))
+                ps_a = p0 + p2
+                ps_b = p1 + p3
+                for mask in (4, 8, 16):
+                    ps_a = shfl_sum(ps_a, mask)
+                    ps_b = shfl_sum(ps_b, mask)
+                if g == 0:
+                    st_shared_f32(red_sum + (warp * 8 + 2 * t) * 4, ps_a)
+                    st_shared_f32(red_sum + (warp * 8 + 2 * t + 1) * 4, ps_b)
+            cute.arch.sync_threads()
+            # Every CTA's mbarrier is initialized (cluster barrier phase 1): this CTA's (max, sum) per
+            # head and then its partial outputs go out as soon as each is final.
+            mbar = base + lay["mbar"]
+            send = recv_addr + rank * block
+            cluster_wait_aligned()
+            if tidx < 8:
+                hm = Float32(NEG_INF)
+                hl = Float32(0.0)
+                for w in cutlass.range_constexpr(kt):
+                    hm = cute.arch.fmax(hm, ld_shared_f32(red_max + (w * 8 + tidx) * 4))
+                    hl = hl + ld_shared_f32(red_sum + (w * 8 + tidx) * 4)
+                for dest in cutlass.range_constexpr(8):
+                    st_async_f32x2(
+                        mapa(send + 4 * 32 * 16 + tidx * 8, dest), mapa(mbar + 8, dest), hm, hl
+                    )
+            # ---- O^T for channels 64w .. 64w + 63 over every key row, to their owner (rank w) ----
+            oc = cute.make_rmem_tensor(cute.make_layout((4, 4), stride=(4, 1)), Float32)
+            oc.fill(0.0)
+            pb = cute.make_rmem_tensor(cute.make_layout((kt, 2), stride=(2, 1)), Int32)
+            pb_row = p_addr + (lane % 8) * prow + 16 * ((lane // 8) % 2)
+            v_row = k_addr + (lane % 8 + 8 * (lane // 16)) * _KEY_ROW + 16 * ((lane // 8) % 2)
+            for ks in cutlass.range_constexpr(kt):
+                pb0, pb1 = ldmatrix_x2(pb_row + 32 * ks)
+                pb[ks, 0] = pb0
+                pb[ks, 1] = pb1
+            # In two halves of 32 channels: the first half's bytes travel under the second's MMAs.
+            for half in cutlass.range_constexpr(2):
+                for ks in cutlass.range_constexpr(kt):
+                    for i in cutlass.range_constexpr(2 * half, 2 * half + 2):
+                        pa0, pa1, pa2, pa3 = ldmatrix_x4(
+                            v_row + (16 * ks) * _KEY_ROW + 2 * (64 * warp + 16 * i), True
+                        )
+                        c0, c1, c2, c3 = mma_bf16(
+                            pa0,
+                            pa1,
+                            pa2,
+                            pa3,
+                            pb[ks, 0],
+                            pb[ks, 1],
+                            oc[i, 0],
+                            oc[i, 1],
+                            oc[i, 2],
+                            oc[i, 3],
+                        )
+                        oc[i, 0] = c0
+                        oc[i, 1] = c1
+                        oc[i, 2] = c2
+                        oc[i, 3] = c3
+                for i in cutlass.range_constexpr(2 * half, 2 * half + 2):
+                    st_async_f32x4(
+                        mapa(send + (i * 32 + lane) * 16, warp),
+                        mapa(mbar, warp),
+                        oc[i, 0],
+                        oc[i, 1],
+                        oc[i, 2],
+                        oc[i, 3],
+                    )
+            # Phase 2 (waited at the end): no CTA exits while another may still store into it.
+            cluster_arrive_relaxed()
+            # ---- per head: the sources' weights against the cluster maximum (with the sink) ----
+            mbar_wait0(mbar + 8)
+            fac = base + lay["fac"]
+            if tidx < 64:
+                # A head's 8 sources are one lane octet.
+                fh = tidx // 8
+                fs_src = tidx % 8
+                sink_h = sSink[fh]
+                rm, rl = ld_shared_f32x2(recv_addr + fs_src * block + 4 * 32 * 16 + fh * 8)
+                top = cute.arch.fmax(sink_h, rm)
+                for mask in (1, 2, 4):
+                    top = shfl_max(top, mask)
+                fs = Float32(0.0)
+                if rm != Float32(NEG_INF):
+                    fs = exp2(rm - top)
+                st_shared_f32(fac + (fh * 9 + fs_src) * 4, fs)
+                part = fs * rl
+                den = exp2(sink_h - top)
+                for k in cutlass.range_constexpr(8):
+                    den = den + shfl_idx8(part, k)
+                if fs_src == 0:
+                    st_shared_f32(fac + (fh * 9 + 8) * 4, Float32(1.0) / den)
+            cute.arch.sync_threads()
+            mbar_wait0(mbar)
+            # ---- this CTA's channels 64 rank .. 64 rank + 63 of every head ----
+            if tidx < 128:
+                ti = tidx // 32
+                ln = tidx % 32
+                gg = ln // 4
+                tt = ln % 4
+                ha = 2 * tt
+                hb = ha + 1
+                x0 = Float32(0.0)
+                x1 = Float32(0.0)
+                x2 = Float32(0.0)
+                x3 = Float32(0.0)
+                for src in cutlass.range_constexpr(8):
+                    fa = ld_shared_f32(fac + (ha * 9 + src) * 4)
+                    fb = ld_shared_f32(fac + (hb * 9 + src) * 4)
+                    y0, y1, y2, y3 = ld_shared_f32x4(recv_addr + src * block + (ti * 32 + ln) * 16)
+                    x0 = x0 + fa * y0
+                    x1 = x1 + fb * y1
+                    x2 = x2 + fa * y2
+                    x3 = x3 + fb * y3
+                inv_a = ld_shared_f32(fac + (ha * 9 + 8) * 4)
+                inv_b = ld_shared_f32(fac + (hb * 9 + 8) * 4)
+                ch = 64 * rank + 16 * ti + gg
+                w0 = bf16_bits(x0 * inv_a)
+                w1 = bf16_bits(x1 * inv_b)
+                w2 = bf16_bits(x2 * inv_a)
+                w3 = bf16_bits(x3 * inv_b)
+                out_row = Int64(out.toint()) + Int64(row) * Int64(8 * HEAD_DIM * 2)
+                st_global_b16(out_row + Int64((ha * HEAD_DIM + ch) * 2), w0)
+                st_global_b16(out_row + Int64((hb * HEAD_DIM + ch) * 2), w1)
+                st_global_b16(out_row + Int64((ha * HEAD_DIM + ch + 8) * 2), w2)
+                st_global_b16(out_row + Int64((hb * HEAD_DIM + ch + 8) * 2), w3)
+            cluster_wait_aligned()
 
         @cute.jit
         def _channel_owner(self, h, d):
@@ -1739,8 +2453,9 @@ def direct_sparse_decode(
     logical positions mapped in-kernel when ``main_mapping = (page_table, page_size,
     max_positions, requests, visible)`` is given (CSA2's owner page-table rules). ``sink [H]``
     FP32 logits, ``scale`` the softmax scale. Returns BF16 ``[T, H, 512]`` (``output`` if given).
-    ``inputs_ready`` / ``main_ready``: the query, SWA slots and page tables / the main
-    selections and rows were final before the launch preceding this one on the stream started.
+    ``inputs_ready``: the query, SWA slots and page tables were final before the launch preceding
+    this one on the stream started. ``main_ready``: the main selections and rows are final when
+    this launch starts (the launch preceding it releases it only after its own dependency wait).
 
     ``query_rope = (positions, cos_sin)``: ``q`` is the projected query before its interleaved RoPE
     (int32 positions ``[T]``, FP32 table of 32 cos then 32 sin per position), rotated in the
@@ -1848,6 +2563,8 @@ def direct_sparse_decode(
     ):
         raise ValueError("CSA2 direct decode slot export needs mapped main rows and int64 [T, Wm]")
     use_pdl = get_env_enable_pdl()
+    keys_as_m = _uses_keys_as_m(q_heads, swa_width, main_width, q.device.index)
+    main_prewait = keys_as_m and bool(main_ready) and not inputs_ready
     config = (
         heads,
         swa_width,
@@ -1865,6 +2582,8 @@ def direct_sparse_decode(
         q_rope,
         bool(bulk_exchange),
         slots_out is not None,
+        keys_as_m,
+        main_prewait,
     )
     key = (q.device.index, *config)
     swa_index_type = cutlass.Int64 if swa_index64 else cutlass.Int32
@@ -1909,7 +2628,10 @@ def direct_sparse_decode(
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm up CSA2 direct decode before CUDA Graph capture")
         kernel = _kernel_type()(*config)
-        compiled = _COMPILED[key] = cute.compile(kernel, *args)
+        compiled = cute.compile(kernel, *args)
+        if keys_as_m:
+            _set_smem_carveout(compiled, _ROOM_CARVEOUT)
+        _COMPILED[key] = compiled
     compiled(*args)
     return output
 

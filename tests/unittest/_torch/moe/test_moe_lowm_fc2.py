@@ -10,9 +10,13 @@ import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401  (registers torch.ops.trtllm)
-from tensorrt_llm._utils import is_blackwell_datacenter
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
 
-pytestmark = pytest.mark.skipif(not is_blackwell_datacenter(), reason="needs SM 10.0 / 10.3")
+_SM107 = get_sm_version() == 107
+pytestmark = pytest.mark.skipif(
+    not (is_blackwell_datacenter() or _SM107), reason="FC2 requires SM100, SM103 or SM107"
+)
+_datacenter_fc2 = pytest.mark.skipif(_SM107, reason="requires the SM100/SM103 K64 FC2 cubins")
 
 _TILE = 8
 
@@ -171,6 +175,7 @@ def test_fc2_cubin_selection_is_structural():
     assert not cute_fc2_reproduces({})
 
 
+@_datacenter_fc2
 def test_fc2_cubin_options_match_the_cubin_names():
     """Every FC2 cubin the runner offers reports the options its name encodes (tile, MMA shape, cluster, split-K,
     dtypes), so the options-based selection takes exactly the tile-8 M128 N8 K64 single-CTA cubins."""
@@ -221,6 +226,7 @@ def test_fc2_cubin_options_match_the_cubin_names():
     assert picked
 
 
+@_datacenter_fc2
 @pytest.mark.parametrize("kind", ["random", "signed_zeros", "full_sf"])
 @pytest.mark.parametrize(
     "m,shape",
@@ -244,6 +250,7 @@ def test_fc1_only_then_cute_fc2_is_bitwise(m, shape, kind):
         _assert_same_expert_rows(got, ref)
 
 
+@_datacenter_fc2
 def test_fc1_only_requires_unfinalized():
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import fc1_only_args
 
@@ -257,17 +264,30 @@ def test_fc1_only_requires_unfinalized():
         fc1_only_args(common)
 
 
-@pytest.mark.parametrize("decode_tuning", [True, False])
-def test_runner_forward_dispatch(decode_tuning, monkeypatch):
+@pytest.mark.parametrize(
+    "m,decode_tuning", [(16, True), (17, True)] if _SM107 else [(6, True), (6, False)]
+)
+def test_runner_forward_dispatch(m, decode_tuning, monkeypatch):
     """FP4BlockScaleMoERunner.forward with a tile-8 tactic: the CuTe FC2 where the model declares its decode kernels,
     the cubin otherwise; same bits either way."""
     from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
 
     runner = _runner()
-    m, shape = 6, _ALL_LOCAL
+    shape = _ALL_LOCAL._replace(local=192, local_picks=3) if _SM107 else _ALL_LOCAL
     ids, w, (xq, xsf, w13, w13s, clamp, w2, w2s, one, alpha2) = _inputs(m, shape, "random")
-    tactic = list(_bitwise_tactics(runner, m, shape)[0])
+    if _SM107:
+        configs = runner.get_valid_configs(shape.top_k, shape.hidden, shape.inter, shape.local, m)
+        tactics = [
+            [tile, config]
+            for tile, config in configs
+            if tile == _TILE
+            and runner.get_gemm2_kernel_name(tile, config) == decode_moe._SM107_FC2_CUBIN
+        ]
+        assert tactics, "the qualified SM107 FC2 cubin must be available"
+        tactic = tactics[0]
+    else:
+        tactic = list(_bitwise_tactics(runner, m, shape)[0])
     args = (
         shape.num_experts,
         shape.top_k,
@@ -307,7 +327,7 @@ def test_runner_forward_dispatch(decode_tuning, monkeypatch):
     monkeypatch.setattr(decode_moe, "run_cute_fc2", lambda *a: called.append(1) or orig(*a))
     got = FP4BlockScaleMoERunner(*args, decode_tuning=decode_tuning).forward(inputs, tactic=tactic)
     torch.cuda.synchronize()
-    assert bool(called) == decode_tuning
+    assert bool(called) == (decode_tuning and (not _SM107 or m <= 16))
     _assert_same_expert_rows(got, ref)
 
 

@@ -116,7 +116,12 @@ def _run(tp_size: int, fabric: bool) -> bool:
             assert markov_chain_supported(shard, w2_shard, w1, workspace)
             return markov_chain_fused(shard, w2_shard, w1, bonus, offset, VOCAB, workspace)
 
-        for batch in (1, 2, 4, 8):
+        sm107 = torch.cuda.get_device_capability() == (10, 7)
+        batches = (1, 2) if sm107 else (1, 2, 4, 8)
+        if sm107:
+            unsupported = torch.empty(3, BLOCK, local, dtype=torch.bfloat16, device="cuda")
+            assert not markov_chain_supported(unsupported, w2_shard, w1, workspace)
+        for batch in batches:
             for trial in range(3):
                 base, bonus = _make_inputs(batch, 100 * batch + trial, VOCAB)
                 got = fused(base, bonus).long()
@@ -125,7 +130,7 @@ def _run(tp_size: int, fabric: bool) -> bool:
                 )
 
         graphs = {}
-        for batch in (1, 2, 4, 8):
+        for batch in batches:
             shard = torch.zeros(batch, BLOCK, local, dtype=torch.bfloat16, device="cuda")
             bonus = torch.zeros(batch, dtype=torch.int64, device="cuda")
             x1 = torch.zeros(6 * batch, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -188,14 +193,20 @@ def _fabric_supported() -> bool:
     return platform.machine().lower() in ("aarch64", "arm64") and MnnvlMemory.supports_mnnvl()
 
 
+_SM107 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
+_TP_SIZE = 8 if _SM107 else 4
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.device_count() < 4
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="needs 4 SM100/SM103 GPUs",
+    or torch.cuda.device_count() < _TP_SIZE
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="requires TP4 on SM100/SM103 or TP8 on SM107",
 )
-@pytest.mark.parametrize("fabric", [False, True], ids=["ipc", "fabric"])
-@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+@pytest.mark.parametrize(
+    "fabric", [True] if _SM107 else [False, True], ids=lambda x: "fabric" if x else "ipc"
+)
+@pytest.mark.parametrize("mpi_pool_executor", [_TP_SIZE], indirect=True)
 def test_dspark_markov_chain_matches_reference(mpi_pool_executor, fabric):
     if fabric and not _fabric_supported():
         pytest.skip("needs fabric-mapped (MNNVL) memory")

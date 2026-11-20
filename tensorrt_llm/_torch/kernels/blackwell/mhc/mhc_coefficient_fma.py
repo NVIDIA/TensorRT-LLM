@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Split-boundary coefficients of up to 8 rows in one CUDA-core launch: BF16 x TF32 products are
-exact in FP32, so only the FP32 summation order differs from DeepGEMM's TF32 GEMM + bigfuse."""
+"""Split-boundary coefficients of up to 8 rows in one CUDA-core launch.
+
+Use TF32-rounded weights to match DeepGEMM's TF32 mixer, or the original FP32 weights to match
+an FP32 FMA mixer. With TF32 weights, BF16 products are exact in FP32; accumulation order can
+still differ from the reference backend.
+"""
 
 import contextlib
 import functools
@@ -604,7 +608,8 @@ def mhc_coefficients_fma(
     release_after_wait: bool = False,
 ):
     """``(pre, post, comb)`` of a boundary from its BF16 residual ``[M, 4 * hidden]`` (``M <= 8``);
-    ``weight`` is ``prepare_fma_weight``'s and ``counter`` ``fma_counter``'s. ``release_after_wait``
+    ``weight`` is FP32 with the reference mixer's precision (``prepare_fma_weight`` for TF32),
+    and ``counter`` is ``fma_counter``'s. ``release_after_wait``
     lets dependents launch from the dependency wait on, for consumers that read the coefficients
     after their own wait."""
     rows, k = residual.shape

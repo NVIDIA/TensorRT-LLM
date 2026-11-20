@@ -14,7 +14,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Trtl
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2ForwardState
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
 from tensorrt_llm._torch.modules.top_k import TopKImplementation
-from tensorrt_llm._utils import is_blackwell_datacenter
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ._utils import _plan_indexer
@@ -30,8 +30,8 @@ NBLK, SB, TOP_K = 2048, 8, 512
 
 @skip_pre_blackwell
 @pytest.mark.skipif(
-    not _sparse_kernels_available() or not is_blackwell_datacenter(),
-    reason="DeepGEMM sparse MQA and the fused select on SM100 / SM103",
+    not _sparse_kernels_available() or get_sm_version() not in (100, 103, 107),
+    reason="DeepGEMM sparse MQA and fused Reindex require SM100, SM103 or SM107",
 )
 @torch.inference_mode()
 def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
@@ -113,7 +113,7 @@ def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
                 patch.setattr(rs, "_FUSED_SELECT_MAX_ROWS", 0)
             metadata._csa2_forward_serial = getattr(metadata, "_csa2_forward_serial", 0) + 1
             source(state, 0, tokens)
-            return consumer(state, 0, tokens)
+            return consumer(state, 0, tokens).clone()
 
     def both():
         return forward(False), forward(True)
@@ -132,9 +132,15 @@ def test_indexer_consumer_fused_equals_two_launches(monkeypatch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         plain, fused = both()
-    for trial in range(3):
-        q.neg_() if trial % 2 else q.mul_(0.5)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(fused, plain), trial
-        assert int((plain >= 0).sum()) == tokens * TOP_K, trial
+    # Reused graph storage must read the new query, head weights and page mapping.
+    graph.replay()
+    previous = plain.clone()
+    q.neg_()
+    weights.copy_(torch.rand_like(weights))
+    table.copy_(table.roll(7, 1))
+    visible.clamp_max_(8192)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.equal(plain, previous)
+    assert torch.equal(fused, plain)
+    assert int((plain >= 0).sum()) == tokens * TOP_K

@@ -986,13 +986,13 @@ def reindex_select_applies(rows: int, width: int, top_k: int) -> bool:
         import cutlass  # noqa: F401
 
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
-        from tensorrt_llm._utils import is_blackwell_datacenter
+        from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
 
         from . import decode_select
 
         num_sms = ops._get_num_sms()
         ok = (
-            is_blackwell_datacenter()
+            (is_blackwell_datacenter() or get_sm_version() == 107)
             and reindex_select_supported(rows, width, top_k, num_sms)
             and width % 32 == 0
             and width <= decode_select._MAX_COLUMNS

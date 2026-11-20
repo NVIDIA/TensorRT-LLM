@@ -58,10 +58,18 @@ l0_gr100:
   # DeepSeek-V4.1 on SM107: query/prefill GEMMs, Top-K routing and packed schedules in CUDA graphs.
   - unittest/_torch/attention/sparse/csa2/test_query_projection.py
   - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_topk_opt_in_native_and_graph
+  - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_sm107_capped_gvr_masks_holes_during_graph_replay
   - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_packed_prefill_logits_schedule_matches_grid_stride
   - unittest/_torch/kernels/parallel/test_gvr_selfsampling_topk.py TIMEOUT (90)
   - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_prefill_linear_matches_reference
   - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_o_b_loaded_tactic_graph
+  - unittest/_torch/attention/sparse/csa2/test_block_select.py::test_block_select_matches_topk_decode
+  - unittest/_torch/attention/sparse/csa2/test_direct_decode.py::test_matches_fp32_reference
+  - unittest/_torch/attention/sparse/csa2/test_direct_decode.py::test_graph_replay_follows_new_inputs
+  - unittest/_torch/attention/sparse/csa2/test_reindex_select.py::test_indexer_consumer_fused_equals_two_launches
+  - unittest/_torch/modules/test_mhc.py::test_split_boundary_replicated_coefficients_one_launch
+  - unittest/_torch/modules/test_low_m_gemm.py::test_shared_expert_piece_stores_the_swiglu
+  - unittest/_torch/moe/test_moe_lowm_fc2.py::test_runner_forward_dispatch
   - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
   - unittest/_torch/kernels/parallel/test_nvfp4_quant.py
   - unittest/_torch/moe/kernels/parallel/test_triton_nvfp4_input_quant.py

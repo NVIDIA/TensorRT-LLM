@@ -26,6 +26,10 @@ entry carries the launch's tag (the launch epoch + 1, kept in the flag word and 
 kernel at the end of every launch, wrapping before 2^14 at a multiple of 3); a reader takes an
 entry only once it carries the current tag, and each launch zeroes (tag 0) the extent of the
 previous launch's slot.
+
+With ``packed`` every reduction compares one int64 key per candidate (``_okey`` of the value, then
+the inverted id), whose maximum is the candidate the comparisons above prefer, and an entry's low
+word carries that ordered value instead of the FP32 bits.
 """
 
 from __future__ import annotations
@@ -209,6 +213,54 @@ def _warp_prefer(v: Float32, i: Int32):
     return v, i
 
 
+@cute.jit
+def _okey(v: Float32) -> Int32:
+    """Int32 ordered as ``_prefer`` orders values: NaN highest, -0.0 equal to +0.0."""
+    bits = _f32_bits(v)
+    if bits == Int32(-2147483648):
+        bits = Int32(0)
+    if bits < Int32(0):
+        bits = bits ^ Int32(_ABS_MASK)
+    if _is_nan(v):
+        bits = Int32(_ABS_MASK)
+    return bits
+
+
+@cute.jit
+def _key(okey: Int32, index: Int32) -> Int64:
+    """The int64 whose maximum over candidates is ``_prefer``'s choice (smaller id on ties)."""
+    return (Int64(okey) << 32) | (Int64(0xFFFFFFFF) - Int64(index))
+
+
+@cute.jit
+def _key_index(key: Int64) -> Int32:
+    return Int32(Int64(0xFFFFFFFF) - (key & Int64(0xFFFFFFFF)))
+
+
+@cute.jit
+def _key_entry(key: Int64, tag: Int32) -> Int64:
+    """The exchange entry of a key: its ordered value in the low word."""
+    high = (Int64(tag) << _INDEX_BITS) | (Int64(_key_index(key)) & Int64(_INDEX_MASK))
+    return (high << 32) | ((key >> 32) & Int64(0xFFFFFFFF))
+
+
+@cute.jit
+def _entry_key(entry: Int64) -> Int64:
+    return _key(Int32(entry & Int64(0xFFFFFFFF)), Int32((entry >> 32) & Int64(_INDEX_MASK)))
+
+
+@cute.jit
+def _warp_max_key(key: Int64) -> Int64:
+    """Butterfly maximum of one key per lane; every lane ends with the warp's largest."""
+    for s in cutlass.range_constexpr(5):
+        hi = cute.arch.shuffle_sync_bfly(Int32(key >> 32), offset=16 >> s)
+        lo = cute.arch.shuffle_sync_bfly(Int32(key & Int64(0xFFFFFFFF)), offset=16 >> s)
+        other = (Int64(hi) << 32) | (Int64(lo) & Int64(0xFFFFFFFF))
+        if other > key:
+            key = other
+    return key
+
+
 class DSparkMarkovChainKernel:
     """``K`` Markov positions for ``B`` rows over a ``local_vocab`` shard, ``num_ctas`` CTAs.
 
@@ -219,6 +271,9 @@ class DSparkMarkovChainKernel:
       bonus  [B]                   int64  token preceding position 0
       out    [B, K]                int32  draft tokens (-1 when no candidate exists)
       ws     [nranks + 2]          int64  exchange buffers of every rank, flag words, layout words
+
+    With ``packed``, candidates reduce as int64 keys and position 0's latent rows load with the
+    base logits.
     """
 
     threads = 256
@@ -233,6 +288,7 @@ class DSparkMarkovChainKernel:
         vocab: int,
         nranks: int,
         num_ctas: int,
+        packed: bool = False,
     ):
         threads = self.threads
         if dim != 32 * VEC:
@@ -263,6 +319,7 @@ class DSparkMarkovChainKernel:
         self.local_bytes = pad_up(block * batch * num_ctas * 8, 16)
         rank_bytes = pad_up(block * batch * nranks * 8, 16)
         self.launch_slots = (self.local_bytes + rank_bytes) // 16
+        self.packed = packed
 
     def smem_bytes(self) -> int:
         w2 = self.rows_per_cta * self.row_stride * 2
@@ -270,7 +327,7 @@ class DSparkMarkovChainKernel:
         lat = self.batch * self.dim * 4
         red = 4 * self.num_warps * self.batch * 4 + self.batch * 4
         ranks = 2 * self.nranks * self.batch * 4
-        # Each of the 10 allocations may be padded to its 16-byte alignment.
+        # Each allocation (at most 10) may be padded to its 16-byte alignment.
         return w2 + base + lat + red + ranks + 10 * 16
 
     @cute.jit
@@ -351,27 +408,40 @@ class DSparkMarkovChainKernel:
         latf = smem.allocate_tensor(
             Float32, cute.make_layout((B, D), stride=(D, 1)), byte_alignment=16
         )
-        # Per-warp candidates of the CTA's rows (push) and of the rank's local entries (poll).
-        push_v = smem.allocate_tensor(
-            Float32, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
-        )
-        push_i = smem.allocate_tensor(
-            Int32, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
-        )
-        poll_v = smem.allocate_tensor(
-            Float32, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
-        )
-        poll_i = smem.allocate_tensor(
-            Int32, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
-        )
         tok = smem.allocate_tensor(Int32, cute.make_layout((B,)), byte_alignment=16)
-        # The ranks' winners of every row.
-        rank_v = smem.allocate_tensor(
-            Float32, cute.make_layout((NR, B), stride=(B, 1)), byte_alignment=16
-        )
-        rank_i = smem.allocate_tensor(
-            Int32, cute.make_layout((NR, B), stride=(B, 1)), byte_alignment=16
-        )
+        if cutlass.const_expr(self.packed):
+            # Per-warp keys of the CTA's rows (push) and of the rank's local entries (poll), and
+            # the ranks' winners of every row.
+            push_v = smem.allocate_tensor(
+                Int64, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
+            )
+            poll_v = smem.allocate_tensor(
+                Int64, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
+            )
+            rank_v = smem.allocate_tensor(
+                Int64, cute.make_layout((NR, B), stride=(B, 1)), byte_alignment=16
+            )
+        else:
+            # Per-warp candidates of the CTA's rows (push) and of the rank's local entries (poll).
+            push_v = smem.allocate_tensor(
+                Float32, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
+            )
+            push_i = smem.allocate_tensor(
+                Int32, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
+            )
+            poll_v = smem.allocate_tensor(
+                Float32, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
+            )
+            poll_i = smem.allocate_tensor(
+                Int32, cute.make_layout((NW, B), stride=(B, 1)), byte_alignment=16
+            )
+            # The ranks' winners of every row.
+            rank_v = smem.allocate_tensor(
+                Float32, cute.make_layout((NR, B), stride=(B, 1)), byte_alignment=16
+            )
+            rank_i = smem.allocate_tensor(
+                Int32, cute.make_layout((NR, B), stride=(B, 1)), byte_alignment=16
+            )
 
         gW2_v = cute.logical_divide(gW2, (None, VEC))
         gW1_v = cute.logical_divide(gW1, (None, VEC))
@@ -407,11 +477,19 @@ class DSparkMarkovChainKernel:
                             w2s_v[v // vecs_per_row, (None, v % vecs_per_row)],
                         )
 
+        if cutlass.const_expr(self.packed):
+            # The workspace table is written once, at allocation.
+            flag_addr = Int64(gWs[NR])
+            layout_addr = Int64(gWs[NR + 1])
+            own = Int64(gWs[rank])
+            peer = Int64(gWs[tidx % NR])
+
         # ---- exchange state of this launch (read before any CTA bumps the arrival counter) ----
         # ``flag`` is the launch epoch (0 .. _TAG_MOD - 1: slot ``flag % 3``, entry tag
         # ``flag + 1``), advanced by this kernel at the end of every launch.
-        flag_addr = Int64(gWs[NR])
-        layout_addr = Int64(gWs[NR + 1])
+        if cutlass.const_expr(not self.packed):
+            flag_addr = Int64(gWs[NR])
+            layout_addr = Int64(gWs[NR + 1])
         flag = _ld_volatile_s32(flag_addr + Int64(8))
         clear_size = _ld_volatile_s64(layout_addr)
         comm_size = _ld_volatile_s64(layout_addr + Int64(8))
@@ -425,6 +503,22 @@ class DSparkMarkovChainKernel:
             e = tidx + i * NT
             if e < bs_elems:
                 breg[i] = gBase[e // rows, row0 + e % rows]
+        vec = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)
+        lfa = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
+        lfb = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
+        if cutlass.const_expr(self.packed):
+            if tidx < B * vecs_per_row:
+                self._latent_row(
+                    gW1_v,
+                    latf_v,
+                    Int32(gBonus[tidx // vecs_per_row]),
+                    tidx,
+                    vec,
+                    lfa,
+                    lfb,
+                    copy_bf16,
+                    copy_f32,
+                )
         for i in cutlass.range_constexpr(bs_iters):
             e = tidx + i * NT
             if e < bs_elems:
@@ -432,7 +526,8 @@ class DSparkMarkovChainKernel:
 
         data_off = Int64(flag % 3) * comm_size
         clear_off = Int64((flag + 2) % 3) * comm_size
-        own = Int64(gWs[rank])
+        if cutlass.const_expr(not self.packed):
+            own = Int64(gWs[rank])
         cute.arch.sync_threads()
         if tidx == 0:
             _atomic_add_s32(flag_addr, Int32(1))
@@ -449,31 +544,18 @@ class DSparkMarkovChainKernel:
         prev = cute.make_rmem_tensor(cute.make_layout((B,)), Int32)
         for b in cutlass.range_constexpr(B):
             prev[b] = Int32(gBonus[b])
-        vec = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)
-        lfa = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
-        lfb = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
         wv = cute.make_rmem_tensor(cute.make_layout((VEC,)), BFloat16)
 
         for k in cutlass.range_constexpr(K):
             # ---- latent rows W1[prev] in FP32 (zeros for ids outside the vocabulary) ----
-            if tidx < B * vecs_per_row:
-                b = tidx // vecs_per_row
-                cv = tidx % vecs_per_row
-                t = Int32(-1)
-                for bb in cutlass.range_constexpr(B):
-                    if b == bb:
-                        t = prev[bb]
-                for i in cutlass.range_constexpr(VEC):
-                    vec[i] = BFloat16(0.0)
-                if t >= 0:
-                    if t < V:
-                        cute.copy(copy_bf16, gW1_v[t, (None, cv)], vec)
-                for i in cutlass.range_constexpr(4):
-                    lfa[i] = vec[i].to(Float32)
-                    lfb[i] = vec[4 + i].to(Float32)
-                cute.copy(copy_f32, lfa, latf_v[b, (None, 2 * cv)])
-                cute.copy(copy_f32, lfb, latf_v[b, (None, 2 * cv + 1)])
-            cute.arch.sync_threads()
+            if cutlass.const_expr(k > 0 or not self.packed):
+                if tidx < B * vecs_per_row:
+                    t = Int32(-1)
+                    for bb in cutlass.range_constexpr(B):
+                        if tidx // vecs_per_row == bb:
+                            t = prev[bb]
+                    self._latent_row(gW1_v, latf_v, t, tidx, vec, lfa, lfb, copy_bf16, copy_f32)
+                cute.arch.sync_threads()
 
             # ---- one row per thread: bias = bf16(W2[row] . latent), logit = base + bias ----
             cand_v = cute.make_rmem_tensor(cute.make_layout((B,)), Float32)
@@ -506,33 +588,58 @@ class DSparkMarkovChainKernel:
 
             # ---- CTA candidate per batch row ----
             for b in cutlass.range_constexpr(B):
-                wv_b, wi_b = _warp_prefer(cand_v[b], cand_i[b])
-                if lane == 0:
-                    push_v[warp, b] = wv_b
-                    push_i[warp, b] = wi_b
+                if cutlass.const_expr(self.packed):
+                    kb = _warp_max_key(_key(_okey(cand_v[b]), cand_i[b]))
+                    if lane == 0:
+                        push_v[warp, b] = kb
+                else:
+                    wv_b, wi_b = _warp_prefer(cand_v[b], cand_i[b])
+                    if lane == 0:
+                        push_v[warp, b] = wv_b
+                        push_i[warp, b] = wi_b
             cute.arch.sync_threads()
 
-            self._exchange(
-                k,
-                push_v,
-                push_i,
-                poll_v,
-                poll_i,
-                rank_v,
-                rank_i,
-                tok,
-                gOut,
-                gWs,
-                own,
-                data_off,
-                tag,
-                rank,
-                bid,
-                tidx,
-                warp,
-                lane,
-                neg_inf,
-            )
+            if cutlass.const_expr(self.packed):
+                self._exchange_packed(
+                    k,
+                    push_v,
+                    poll_v,
+                    rank_v,
+                    tok,
+                    gOut,
+                    own,
+                    peer,
+                    data_off,
+                    tag,
+                    rank,
+                    bid,
+                    tidx,
+                    warp,
+                    lane,
+                    neg_inf,
+                )
+            else:
+                self._exchange(
+                    k,
+                    push_v,
+                    push_i,
+                    poll_v,
+                    poll_i,
+                    rank_v,
+                    rank_i,
+                    tok,
+                    gOut,
+                    gWs,
+                    own,
+                    data_off,
+                    tag,
+                    rank,
+                    bid,
+                    tidx,
+                    warp,
+                    lane,
+                    neg_inf,
+                )
             for b in cutlass.range_constexpr(B):
                 prev[b] = tok[b]
 
@@ -545,6 +652,110 @@ class DSparkMarkovChainKernel:
                 _st_s32(flag_addr + Int64(8), (flag + 1) % _TAG_MOD)
                 _st_s64(layout_addr, Int64(self.launch_slots * VEC))
                 _st_s32(flag_addr, Int32(0))
+
+    @cute.jit
+    def _latent_row(self, gW1_v, latf_v, t, tidx, vec, lfa, lfb, copy_bf16, copy_f32) -> None:
+        """Thread ``tidx``'s 8 FP32 latent values of row ``tidx // (D / 8)``: W1[t], zeros for an id
+        outside the vocabulary."""
+        vecs_per_row: cutlass.Constexpr = self.dim // VEC
+        b = tidx // vecs_per_row
+        cv = tidx % vecs_per_row
+        for i in cutlass.range_constexpr(VEC):
+            vec[i] = BFloat16(0.0)
+        if t >= 0:
+            if t < self.vocab:
+                cute.copy(copy_bf16, gW1_v[t, (None, cv)], vec)
+        for i in cutlass.range_constexpr(4):
+            lfa[i] = vec[i].to(Float32)
+            lfb[i] = vec[4 + i].to(Float32)
+        cute.copy(copy_f32, lfa, latf_v[b, (None, 2 * cv)])
+        cute.copy(copy_f32, lfb, latf_v[b, (None, 2 * cv + 1)])
+
+    @cute.jit
+    def _exchange_packed(
+        self,
+        k,
+        push_k,
+        poll_k,
+        rank_k,
+        tok,
+        gOut,
+        own,
+        peer,
+        data_off,
+        tag,
+        rank,
+        bid,
+        tidx,
+        warp,
+        lane,
+        neg_inf,
+    ) -> None:
+        """``_exchange`` on int64 keys (``push_k``: the CTA's per-warp keys); ``peer`` is the buffer
+        of rank ``tidx % ranks``."""
+        B: cutlass.Constexpr = self.batch
+        NR: cutlass.Constexpr = self.nranks
+        NC: cutlass.Constexpr = self.num_ctas
+        NW: cutlass.Constexpr = self.num_warps
+        V: cutlass.Constexpr = self.vocab
+        rank_off = data_off + Int64(self.local_bytes)
+        # ---- this CTA's candidate of every row -> its slot (k, row, CTA) of this rank ----
+        if tidx < B:
+            ck = push_k[0, tidx]
+            for w in cutlass.range_constexpr(1, NW):
+                other = push_k[w, tidx]
+                if other > ck:
+                    ck = other
+            local_slot = Int64((k * B + tidx) * NC) + Int64(bid)
+            _st_relaxed_b64(own + data_off + local_slot * Int64(8), _key_entry(ck, tag), False)
+        # ---- CTA 0: this rank's winner of every row -> slot (k, row, rank) of every rank ----
+        if bid == 0:
+            for b in cutlass.range_constexpr(B):
+                lk = _key(_okey(neg_inf), Int32(V))
+                if tidx < NC:
+                    lk = _entry_key(
+                        _await_entry(
+                            own + data_off + (Int64((k * B + b) * NC) + Int64(tidx)) * Int64(8),
+                            tag,
+                            False,
+                        )
+                    )
+                lk = _warp_max_key(lk)
+                if lane == 0:
+                    poll_k[warp, b] = lk
+            cute.arch.sync_threads()
+            if tidx < B * NR:
+                row = tidx // NR
+                rk = poll_k[0, row]
+                for w in cutlass.range_constexpr(1, NW):
+                    other = poll_k[w, row]
+                    if other > rk:
+                        rk = other
+                rank_slot = Int64((k * B + row) * NR) + Int64(rank)
+                _st_relaxed_b64(peer + rank_off + rank_slot * Int64(8), _key_entry(rk, tag), True)
+        # ---- every CTA: the ranks' winners of every row ----
+        if tidx < B * NR:
+            row = tidx // NR
+            src = tidx % NR
+            rank_k[src, row] = _entry_key(
+                _await_entry(
+                    own + rank_off + (Int64((k * B + row) * NR) + Int64(src)) * Int64(8), tag, True
+                )
+            )
+        cute.arch.sync_threads()
+        if tidx < B:
+            tk = rank_k[0, tidx]
+            for r in cutlass.range_constexpr(1, NR):
+                other = rank_k[r, tidx]
+                if other > tk:
+                    tk = other
+            ti = _key_index(tk)
+            if ti >= V:
+                ti = Int32(-1)
+            tok[tidx] = ti
+            if bid == 0:
+                gOut[tidx, k] = ti
+        cute.arch.sync_threads()
 
     @cute.jit
     def _exchange(
@@ -569,8 +780,8 @@ class DSparkMarkovChainKernel:
         lane,
         neg_inf,
     ) -> None:
-        """Position ``k``'s winner of every row into ``tok`` (and ``gOut`` by CTA 0); ``push_v`` /
-        ``push_i`` hold the CTA's per-warp candidates."""
+        """Position ``k``'s winner of every row into ``tok`` (and ``gOut`` by CTA 0);
+        ``push_v`` / ``push_i`` hold the CTA's per-warp candidates."""
         B: cutlass.Constexpr = self.batch
         NR: cutlass.Constexpr = self.nranks
         NC: cutlass.Constexpr = self.num_ctas

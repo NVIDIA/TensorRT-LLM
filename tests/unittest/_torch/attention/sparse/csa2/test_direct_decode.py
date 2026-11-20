@@ -125,8 +125,9 @@ def _assert_close_to_fp32(actual, expected):
     )
 
 
-# 8 query heads per rank (TP8) run as a zero-padded 16-head MMA tile.
-@pytest.mark.parametrize("main_width,heads,rows", [(512, 8, 16), (512, 64, 6), (0, 64, 2)])
+@pytest.mark.parametrize(
+    "main_width,heads,rows", [(512, 8, 16), (0, 8, 2), (512, 64, 6), (0, 64, 2)]
+)
 @torch.inference_mode()
 def test_matches_fp32_reference(rows, heads, main_width):
     case = _case(rows, heads, 128, main_width, mapped=main_width > 0)

@@ -3028,34 +3028,43 @@ def test_split_boundary_small_coefficients_exact() -> None:
 @skip_pre_blackwell
 @requires_cuda
 def test_split_boundary_replicated_coefficients_one_launch() -> None:
-    """At <= 8 rows of a TP-replicated stream the one-launch coefficients match the split-K DeepGEMM +
-    bigfuse path up to the FP32 summation order and replay, released early into the next one."""
+    """Check mixer precision and coefficient reuse across a captured split boundary."""
     import tensorrt_llm._torch.modules.mhc.mhc_cuda as mhc_cuda
+    from tensorrt_llm._utils import get_sm_version
 
     rows = 6
     module = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=5)
     module.replicated = True
-    if mhc_cuda._get_dg_fn() is None or not module._fma_coefficients_ready(rows):
-        pytest.skip("needs DeepGEMM and SM100/SM103")
+    sm = get_sm_version()
+    if sm not in (100, 103, 107):
+        pytest.skip("FMA coefficients require SM100, SM103 or SM107")
+    if sm != 107 and mhc_cuda._get_dg_fn() is None:
+        pytest.skip("DeepGEMM is needed for the TF32 reference")
+    assert module._fma_coefficients_ready(rows)
     torch.manual_seed(rows)
     x, res, post, comb, pre, weight = _split_inputs(rows)
     expected = module.split_hc_lagged(x, res, post, comb, pre, weight, V41_RMS_NORM_EPS)
     residual = expected[0]
-    runner = mhc_cuda._get_pre_mapping_runner(
-        module.mult,
-        module.hidden_size,
-        module.norm_eps,
-        module.eps,
-        module.sinkhorn_eps,
-        module.post_mult_value,
-        module.sinkhorn_iters,
-    )
-    old_post, old_comb, _, old_pre = runner.forward(
-        [residual.reshape(rows, -1), module.fn, residual, module.scale, module.base],
-        tactic=("dg_splitk", 0, 0, 128),
-        pre_mix_ext=torch.ones(rows, module.mult, device="cuda"),
-        bigfuse_residual=torch.zeros(rows, module.mult, 8, dtype=torch.bfloat16, device="cuda"),
-    )
+    if sm == 107:
+        assert module._fma_weight is not None
+        assert module._fma_weight.data_ptr() == module.fn.data_ptr()
+        old_pre, old_post, old_comb = module.hc_coeffs(residual)
+    else:
+        runner = mhc_cuda._get_pre_mapping_runner(
+            module.mult,
+            module.hidden_size,
+            module.norm_eps,
+            module.eps,
+            module.sinkhorn_eps,
+            module.post_mult_value,
+            module.sinkhorn_iters,
+        )
+        old_post, old_comb, _, old_pre = runner.forward(
+            [residual.reshape(rows, -1), module.fn, residual, module.scale, module.base],
+            tactic=("dg_splitk", 0, 0, 128),
+            pre_mix_ext=torch.ones(rows, module.mult, device="cuda"),
+            bigfuse_residual=torch.zeros(rows, module.mult, 8, dtype=torch.bfloat16, device="cuda"),
+        )
     for got, old in zip(expected[1:4], (old_pre, old_post, old_comb)):
         torch.testing.assert_close(got, old.reshape(got.shape), rtol=1e-4, atol=1e-5)
 
@@ -3110,6 +3119,18 @@ def test_split_boundary_replicated_coefficients_one_launch() -> None:
     torch.cuda.synchronize()
     for got, want in zip(out, expected[:5] + expected_next[:5]):
         assert torch.equal(got, want)
+
+    if sm == 107:
+        # In-place weight writes must reach the captured full-precision mixer.
+        with torch.no_grad():
+            module.fn.mul_(-0.5)
+            module.cache_derived_state()
+        graph.replay()
+        torch.cuda.synchronize()
+        refreshed = module.hc_coeffs(out[0])
+        assert not torch.equal(out[1], expected[1])
+        for got, want in zip(out[1:4], refreshed):
+            torch.testing.assert_close(got, want.reshape(got.shape), rtol=1e-4, atol=1e-5)
 
 
 @skip_pre_blackwell

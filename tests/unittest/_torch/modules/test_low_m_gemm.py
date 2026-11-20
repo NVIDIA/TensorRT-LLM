@@ -26,7 +26,7 @@ from tensorrt_llm._torch.modules.low_m_gemm import (
     mxfp8_lowm_linear,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
-from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f
 
 # ---------------------------------------------------------------------------
 # Skip helpers — apply to tests that need hardware, not to mocked unit tests.
@@ -706,8 +706,8 @@ def test_fp8_lowm_index_query_matches_packed_rope_projection(m):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_blackwell_datacenter(),
-    reason="the shared expert stores the SwiGLU on SM100/SM103",
+    not torch.cuda.is_available() or not (is_blackwell_datacenter() or get_sm_version() == 107),
+    reason="the fused shared expert requires SM100, SM103 or SM107",
 )
 @torch.inference_mode()
 @pytest.mark.parametrize("m", [6])
@@ -734,8 +734,10 @@ def test_shared_expert_piece_stores_the_swiglu(m, monkeypatch):
         x[0] *= 16  # past the clamp limit
 
     def separate():
-        gate_up = mxfp8_lowm_linear(x, w13, s13)
-        return mxfp8_lowm_linear(swiglu_module.swiglu(gate_up, swiglu_limit=limit), w2, s2)
+        mma_options = (True, False) if get_sm_version() == 107 else None
+        gate_up = mxfp8_lowm_linear(x, w13, s13, mma_options=mma_options)
+        hidden = swiglu_module.swiglu(gate_up, swiglu_limit=limit)
+        return mxfp8_lowm_linear(hidden, w2, s2, mma_options=mma_options)
 
     def no_swiglu(*args, **kwargs):
         raise AssertionError("the shared expert launched the separate SwiGLU")

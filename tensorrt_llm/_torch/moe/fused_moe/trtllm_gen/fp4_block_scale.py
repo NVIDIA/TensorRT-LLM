@@ -186,7 +186,11 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         meta at that point, so a snapshot would carry no values.
         """
         super().cache_derived_state()
-        if self.decode_tuning and self.decode_engine_state is None:
+        if (
+            self.decode_tuning
+            and self.decode_fp4_persistent_engine
+            and self.decode_engine_state is None
+        ):
             from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
 
             self.decode_engine_state = new_state(self.w3_w1_weight.device)
@@ -206,7 +210,11 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         """Where the model declares the decode kernels (``decode_tuning``) of a pre-routed native call, the decode MoE
         engine (``decode_moe.ENGINE``) sizes a persistent grid it can shrink by up to
         ``decode_moe.ENGINE_SPARE_SMS`` SMs; 0 otherwise (the cubins' grids are fixed)."""
-        if not (self.decode_tuning and self.supports_prerouted_routing):
+        if not (
+            self.decode_tuning
+            and self.decode_fp4_persistent_engine
+            and self.supports_prerouted_routing
+        ):
             return 0
         from .decode_moe import ENGINE_SPARE_SMS
 
