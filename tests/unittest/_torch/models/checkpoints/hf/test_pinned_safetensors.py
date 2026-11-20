@@ -6,6 +6,7 @@ import os
 import struct
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pytest
 import torch
 from safetensors import safe_open
@@ -255,6 +256,9 @@ def _slice_shard(tmp_path, name):
 
 
 def _bits(tensor):
+    """Raw bytes of ``tensor``; empty tensors can keep non-unit strides, so they map to no bytes."""
+    if tensor.numel() == 0:
+        return torch.empty(0, dtype=torch.uint8)
     return tensor.contiguous().reshape(-1).view(torch.uint8)
 
 
@@ -264,6 +268,29 @@ def _assert_same_as_safe_open(got, expected):
     assert got.storage_offset() == 0
     assert got.untyped_storage().nbytes() == got.numel() * got.element_size()
     assert torch.equal(_bits(got), _bits(expected))
+
+
+def _has_step(index):
+    items = index if isinstance(index, tuple) else (index,)
+    return any(isinstance(i, slice) and i.step is not None for i in items)
+
+
+def _check_index(ours, ref, key, index):
+    """``ours`` must equal torch indexing of the full tensor, and ``safe_open``'s own slice
+    wherever the installed safetensors accepts the index and defines it the same way.
+
+    safetensors ignores slice steps and rejects Ellipsis, empty, out-of-range and zero-row
+    indexes, so the full tensor indexed by torch is the reference for those.
+    """
+    got = ours.get_slice(key)[index]
+    _assert_same_as_safe_open(got, ref.get_tensor(key)[index])
+    if _has_step(index):
+        return
+    try:
+        theirs = ref.get_slice(key)[index]
+    except Exception:  # not supported by the installed safetensors
+        return
+    _assert_same_as_safe_open(got, theirs)
 
 
 @pytest.mark.cpu_only
@@ -278,11 +305,16 @@ def test_get_slice_matches_safe_open_bit_for_bit(tmp_path, monkeypatch, name, in
         ours_slice, ref_slice = ours.get_slice("t"), ref.get_slice("t")
         assert ours_slice.get_shape() == ref_slice.get_shape()
         assert ours_slice.get_dtype() == ref_slice.get_dtype() == name
-        try:
-            expected = ref_slice[index]
-        except Exception as exc:  # the installed safetensors/torch cannot read this index
-            pytest.skip(f"safe_open cannot read {index!r}: {exc}")
-        _assert_same_as_safe_open(ours_slice[index], expected)
+        _check_index(ours, ref, "t", index)
+
+
+@pytest.mark.cpu_only
+def test_get_slice_accepts_numpy_integers(tmp_path):
+    path = _slice_shard(tmp_path, "I8")
+    with PinnedSafetensorsFile(path) as ours, safe_open(path, framework="pt", device="cpu") as ref:
+        full = ref.get_tensor("t")
+        got = ours.get_slice("t")[np.int64(3), np.int32(1) : np.int64(4)]
+        assert torch.equal(_bits(got), _bits(full[3, 1:4]))
 
 
 @pytest.mark.cpu_only
@@ -303,11 +335,7 @@ def test_get_slice_zero_dim_and_zero_size_tensors(tmp_path):
         for key, indexes in cases.items():
             assert ours.get_slice(key).get_shape() == ref.get_slice(key).get_shape()
             for index in indexes:
-                try:
-                    expected = ref.get_slice(key)[index]
-                except Exception as exc:  # the installed safetensors cannot read this index
-                    pytest.skip(f"safe_open cannot read {key} {index!r}: {exc}")
-                _assert_same_as_safe_open(ours.get_slice(key)[index], expected)
+                _check_index(ours, ref, key, index)
         with pytest.raises(IndexError):
             ours.get_slice("scalar")[0]
         with pytest.raises(IndexError):

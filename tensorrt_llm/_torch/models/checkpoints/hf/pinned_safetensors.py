@@ -19,6 +19,7 @@ callers opt in per loader.
 """
 
 import json
+import operator
 import os
 import struct
 
@@ -64,18 +65,23 @@ def _torch_dtype(key: str, dtype_name: str) -> torch.dtype:
     return dtype
 
 
-def _check_slice_bound(value: object, what: str) -> None:
-    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-        raise TypeError(f"unsupported slice {what} {value!r}: expected int or None")
+def _as_int(value: object, what: str) -> int:
+    """``operator.index(value)`` for integer-like values; bools and tensors are rejected."""
+    if isinstance(value, (bool, torch.Tensor)) or not hasattr(type(value), "__index__"):
+        raise TypeError(
+            f"unsupported {what} {type(value).__name__} ({value!r}): expected an integer"
+        )
+    return operator.index(value)
 
 
 def _normalize_index(index: object, ndim: int) -> tuple[int | slice, ...]:
     """Expand ``index`` to one ``int`` or ``slice`` per dimension.
 
-    Accepts an int, a slice, ``Ellipsis`` or a tuple of them; anything else
-    (lists, tensors, ``None``, bools) raises ``TypeError``.
+    Accepts an int (anything with ``__index__``, e.g. a NumPy integer), a slice
+    of ints, ``Ellipsis`` or a tuple of them; anything else (lists, tensors,
+    ``None``, bools) raises ``TypeError``.
     """
-    items = index if isinstance(index, tuple) else (index,)
+    items = list(index) if isinstance(index, tuple) else [index]
     ellipsis_at = None
     for pos, item in enumerate(items):
         if item is Ellipsis:
@@ -83,13 +89,23 @@ def _normalize_index(index: object, ndim: int) -> tuple[int | slice, ...]:
                 raise IndexError("an index can only have a single ellipsis ('...')")
             ellipsis_at = pos
         elif isinstance(item, slice):
-            for name in ("start", "stop", "step"):
-                _check_slice_bound(getattr(item, name), name)
-        elif isinstance(item, bool) or not isinstance(item, int):
+            items[pos] = slice(
+                *(
+                    None if bound is None else _as_int(bound, f"slice {name}")
+                    for name, bound in (
+                        ("start", item.start),
+                        ("stop", item.stop),
+                        ("step", item.step),
+                    )
+                )
+            )
+        elif isinstance(item, (bool, torch.Tensor)) or not hasattr(type(item), "__index__"):
             raise TypeError(
                 f"unsupported index type {type(item).__name__} ({item!r}): "
                 "only int, slice and Ellipsis are supported"
             )
+        else:
+            items[pos] = operator.index(item)
     given = len(items) - (ellipsis_at is not None)
     if given > ndim:
         raise IndexError(f"too many indices for a tensor of {ndim} dimensions: {given}")
@@ -105,6 +121,11 @@ class PinnedSafetensorsSlice:
     Valid only while the ``PinnedSafetensorsFile`` that made it is open; reads
     after ``__exit__`` raise ``ValueError``. ``get_shape`` and ``get_dtype`` come
     from the header and keep working.
+
+    Indexing follows PyTorch semantics, which differ from ``safe_open`` in edge
+    cases: a slice step is applied (``safe_open`` ignores it), out-of-range slice
+    bounds clamp (``safe_open`` raises), and an int index on a 0-dim tensor
+    raises ``IndexError``. For indexes both accept, results are bit-identical.
     """
 
     def __init__(self, file: "PinnedSafetensorsFile", key: str) -> None:
@@ -216,14 +237,13 @@ class PinnedSafetensorsFile:
 
     def _read_block(self, key: str, offset: int, nbytes: int) -> torch.Tensor:
         """``nbytes`` file bytes at ``offset`` in a new uint8 block (pinned when large)."""
+        fd = self._fd  # one snapshot, so a concurrent close cannot switch files mid-read
         pin = nbytes >= _PIN_MIN_BYTES and prefer_pinned()
         buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=pin)
         view = memoryview(buf.numpy()).cast("B")
         done = 0
         while done < nbytes:
-            n = os.preadv(
-                self._fd, [view[done : done + min(_READ_BYTES, nbytes - done)]], offset + done
-            )
+            n = os.preadv(fd, [view[done : done + min(_READ_BYTES, nbytes - done)]], offset + done)
             if n <= 0:
                 raise OSError(f"{self._path}: short read of {key!r} at byte {offset + done}")
             done += n
