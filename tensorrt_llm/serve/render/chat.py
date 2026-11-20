@@ -21,7 +21,8 @@ the multimodal encoder route and the standalone renderer. The pipeline is:
 1. :func:`prepare_chat_request`: model-extension preprocessing and tool dicts;
 2. template rendering with the server template, processor and extension rules;
 3. the forced named-tool prefix, when the caller supplies one;
-4. optional tokenization through the engine's own text tokenizer.
+4. optional tokenization: the tokenizer-native renderer's own ids when they are the
+   prompt, otherwise the engine's own text tokenizer.
 
 :func:`render_conversation` is steps 2-4 for a caller that already parsed the
 conversation (the chat route overlaps media loading with rendering).
@@ -39,9 +40,9 @@ from pydantic import ValidationError
 
 from tensorrt_llm.inputs.tokenization import tokenize_prompt
 from tensorrt_llm.inputs.utils import (
-    _has_python_chat_template,
     apply_chat_template,
     async_apply_chat_template,
+    uses_tokenizer_native_renderer,
 )
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
@@ -118,6 +119,32 @@ def _template_kwargs(
         chat_template_kwargs=chat_template_kwargs or {},
         injected_chat_template_kwargs=injected_chat_template_kwargs,
         enable_tokenize=enable_tokenize,
+    )
+
+
+def _prompt_is_native_ids(
+    res: RenderResources,
+    *,
+    chat_template: Optional[str],
+    forced_prefix: Optional[str],
+    add_special_tokens: bool,
+    truncate_prompt_tokens: Optional[int],
+) -> bool:
+    """Whether the prompt is the tokenizer-native renderer's own token ids.
+
+    Such a renderer (see ``uses_tokenizer_native_renderer``) tokenizes segment by segment: its
+    structural markers become control tokens and message content stays ordinary text, so a
+    control-token string inside user or tool text stays text. Encoding its rendered string
+    instead turns that string into a control token, or into an id past the vocabulary. Its ids
+    are the prompt only when nothing is appended to them, added around them or cut from them.
+    """
+    return (
+        forced_prefix is None
+        and not add_special_tokens
+        and truncate_prompt_tokens is None
+        and uses_tokenizer_native_renderer(
+            res.tokenizer, res.processor, chat_template or res.default_chat_template
+        )
     )
 
 
@@ -210,19 +237,24 @@ async def render_conversation(
     injected_chat_template_kwargs: Any = None,
     forced_prefix: Optional[str] = None,
     tokenize: bool = False,
+    prefer_native_ids: bool = False,
     add_special_tokens: bool = False,
     truncate_prompt_tokens: Optional[int] = None,
     encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
 ) -> RenderedPrompt:
-    """Render an already-parsed conversation without blocking the event loop."""
-    # A tokenizer-native template tokenizes segment by segment, so control-token strings inside
-    # user or tool text stay text. Encoding the finished string would turn them into special
-    # tokens, so keep the tokenizer's own ids when nothing is added after the template.
-    native_ids = (
-        tokenize
-        and forced_prefix is None
-        and truncate_prompt_tokens is None
-        and _has_python_chat_template(getattr(res.tokenizer, "tokenizer", res.tokenizer))
+    """Render an already-parsed conversation without blocking the event loop.
+
+    ``tokenize`` returns token ids. ``prefer_native_ids`` is for a caller whose engine tokenizes
+    the text itself (with ``add_special_tokens`` and ``truncate_prompt_tokens``): it returns the
+    tokenizer-native renderer's own ids when they are the prompt (see
+    :func:`_prompt_is_native_ids`), and the text otherwise.
+    """
+    native_ids = (tokenize or prefer_native_ids) and _prompt_is_native_ids(
+        res,
+        chat_template=chat_template,
+        forced_prefix=forced_prefix,
+        add_special_tokens=add_special_tokens,
+        truncate_prompt_tokens=truncate_prompt_tokens,
     )
     rendered = await async_apply_chat_template(
         **_template_kwargs(
@@ -397,6 +429,15 @@ def render_chat(
     # Nothing here loads media; close the coroutine instead of leaving it to be reported
     # as never awaited.
     mm_coroutine.close()
+    # The chat route executes the tokenizer-native renderer's own ids when they are the prompt
+    # (see ``render_conversation``), so these are the ids to count and route on as well.
+    native_ids = tokenize and _prompt_is_native_ids(
+        res,
+        chat_template=request.chat_template,
+        forced_prefix=None,
+        add_special_tokens=request.add_special_tokens,
+        truncate_prompt_tokens=request.truncate_prompt_tokens,
+    )
     rendered = apply_chat_template(
         **_template_kwargs(
             res,
@@ -408,7 +449,7 @@ def render_chat(
             chat_template=request.chat_template,
             chat_template_kwargs=request.chat_template_kwargs,
             injected_chat_template_kwargs=request.injected_chat_template_kwargs,
-            enable_tokenize=False,
+            enable_tokenize=native_ids,
         )
     )
     result = _finish(
@@ -483,6 +524,24 @@ def render_chat_for_length(
     return render_chat(text_only, plain, encode_rendered=encode_rendered)
 
 
+def prompt_tokens_excluded_from_usage(
+    request: "ChatCompletionRequest", res: RenderResources
+) -> int:
+    """Rendered prompt tokens the chat route leaves out of the reported prompt usage.
+
+    ``RenderResources.prompt_tokens_excluded_from_usage`` asked with how ``request`` is
+    rendered (kimi_k3: the trailing generation channel opener); the model still sees those
+    tokens. The chat route, its preparation context and count_tokens all ask here, so they
+    leave out the same tokens.
+    """
+    return res.prompt_tokens_excluded_from_usage(
+        add_generation_prompt=request.add_generation_prompt,
+        pre_tokenized=request.prompt_token_ids is not None
+        or request.prompt_token_ids_b64 is not None,
+        request_chat_template=request.chat_template,
+    )
+
+
 def preparation_context(
     request: "ChatCompletionRequest", res: RenderResources, rendered: RenderedPrompt
 ) -> Dict[str, Any]:
@@ -493,12 +552,7 @@ def preparation_context(
     with the ids (see ``PreparedContext``). ``request`` is the request as rendered, so it
     does not yet carry ``prompt_token_ids``.
     """
-    excluded = res.prompt_tokens_excluded_from_usage(
-        add_generation_prompt=request.add_generation_prompt,
-        pre_tokenized=request.prompt_token_ids is not None
-        or request.prompt_token_ids_b64 is not None,
-        request_chat_template=request.chat_template,
-    )
+    excluded = prompt_tokens_excluded_from_usage(request, res)
     thinking: Dict[str, bool] = {}
     if rendered.template_text and request.add_generation_prompt:
         # Deferred: the reasoning parsers module is only needed here.

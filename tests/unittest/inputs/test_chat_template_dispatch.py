@@ -365,6 +365,34 @@ class TestAsyncApplyChatTemplate:
 
 
 class TestPythonChatTemplate:
+    @pytest.mark.parametrize("model_type", ["kimi_k25", "kimi_linear"])
+    @pytest.mark.parametrize("template_source", ["tokenizer", "request"])
+    def test_jinja_override_preserves_tool_preprocessing(
+        self, template_source: str, model_type: str
+    ) -> None:
+        class ToolPreprocessingTokenizer(PreTrainedTokenizerBase):
+            def apply_chat_template(self, conversation, tools=None, **kwargs):
+                # Kimi-K2.5/K2.6 preprocess tools before delegating to the Jinja renderer.
+                kwargs["tools_ts_str"] = f"declare function {tools[0]['function']['name']}();"
+                return super().apply_chat_template(conversation, tools=tools, **kwargs)
+
+        template = "SELECTED:{{ tools_ts_str }}|{{ messages[0].content }}"
+        tokenizer = ToolPreprocessingTokenizer(
+            chat_template=template if template_source == "tokenizer" else "DEFAULT"
+        )
+        result = apply_chat_template(
+            model_type=model_type,
+            tokenizer=TransformersTokenizer(tokenizer),
+            processor=None,
+            conversation=[ConversationMessage(role="user", content="hello", media=[])],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            chat_template=template if template_source == "request" else None,
+        )
+
+        assert result == "SELECTED:declare function echo();|hello"
+
     @pytest.mark.parametrize(
         ("enable_tokenize", "expected"),
         [(False, "native-rendered"), (True, [1, 2, 3])],
@@ -440,6 +468,44 @@ class TestPythonChatTemplate:
         assert result == "jinja-rendered"
         _, captured_kwargs = inner_tokenizer.captured
         assert captured_kwargs["chat_template"] == template
+
+    def test_the_native_renderer_is_used_only_without_any_jinja_template(self):
+        from tensorrt_llm.inputs.utils import uses_tokenizer_native_renderer
+
+        class NativeTokenizer:
+            chat_template = None
+
+            def apply_chat_template(self, conversation, **kwargs):
+                return "native-rendered"
+
+        class OverrideWithJinjaTokenizer(NativeTokenizer):
+            # A Python override next to a Jinja template renders the Jinja template.
+            chat_template = "{{ messages }}"
+
+        class DefaultTokenizer:
+            chat_template = None
+            apply_chat_template = PreTrainedTokenizerBase.apply_chat_template
+
+        class JinjaTokenizer(DefaultTokenizer):
+            chat_template = "{{ messages }}"
+
+        class Processor:
+            chat_template = None
+
+        class JinjaProcessor:
+            chat_template = "{{ messages }}"
+
+        native = NativeTokenizer()
+        assert uses_tokenizer_native_renderer(native, None, None)
+        assert uses_tokenizer_native_renderer(TransformersTokenizer(native), Processor(), None)
+        assert not uses_tokenizer_native_renderer(native, None, "{{ messages }}")
+        assert not uses_tokenizer_native_renderer(native, JinjaProcessor(), None)
+        assert not uses_tokenizer_native_renderer(OverrideWithJinjaTokenizer(), None, None)
+        assert not uses_tokenizer_native_renderer(DefaultTokenizer(), None, None)
+        # The wrapper's own apply_chat_template only forwards to the tokenizer it wraps.
+        assert not uses_tokenizer_native_renderer(
+            TransformersTokenizer(JinjaTokenizer()), None, None
+        )
 
     def test_missing_template_still_errors_without_native_override(self):
         class DefaultTokenizer:
