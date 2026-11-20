@@ -405,6 +405,19 @@ def test_automatic_buckets_include_intermediate_token_capacities() -> None:
     assert [bucket.total_tokens for bucket in buckets if bucket.num_contexts == 1] == [
         256,
         512,
+        768,
+        1024,
+        1280,
+        1792,
+        2304,
+        3072,
+        3840,
+        4096,
+    ]
+    exact_fit = _BatchedFramesIOAdapter().capture_buckets(3, 4096, enable_padding=False)
+    assert [bucket.total_tokens for bucket in exact_fit if bucket.num_contexts == 1] == [
+        256,
+        512,
         1024,
         2048,
         4096,
@@ -425,7 +438,7 @@ def test_automatic_buckets_include_intermediate_token_capacities() -> None:
 def test_automatic_buckets_use_encoder_adapter_shape_rules() -> None:
     class AlignedAdapter(_BatchedFramesIOAdapter):
         def capture_buckets(
-            self, max_batch_size: int, max_num_tokens: int
+            self, max_batch_size: int, max_num_tokens: int, *, enable_padding: bool = True
         ) -> list[EncoderGraphKey]:
             return [EncoderGraphKey(8, 2)]
 
@@ -436,6 +449,24 @@ def test_automatic_buckets_use_encoder_adapter_shape_rules() -> None:
         config=MultimodalEncoderCudaGraphConfig(max_batch_size=2, max_num_tokens=12),
     )
     assert runner._buckets == [EncoderGraphKey(8, 2)]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable_padding,num_buckets", [(True, 82), (False, 43)])
+def test_automatic_packed_buckets_follow_padding_mode(enable_padding, num_buckets) -> None:
+    runner = MultimodalEncoderGraphRunner(
+        encoder_fn=_NeverInvokedEncoder(),
+        metadata_provider=_NoopMetadataProvider(),
+        input_specs={"x": EncoderGraphTensorSpec(shape=(4,), dtype=torch.float32)},
+        output_specs={"y": 0},
+        config=MultimodalEncoderCudaGraphConfig(
+            max_batch_size=8, max_num_tokens=16384, enable_padding=enable_padding
+        ),
+    )
+    assert len(runner._buckets) == num_buckets
+    if not enable_padding:
+        for tokens in (2048, 4096, 8192):
+            assert runner._select_bucket(1, tokens, [tokens]) == EncoderGraphKey(tokens, 1)
 
 
 @pytest.mark.cpu_only
@@ -1021,3 +1052,63 @@ def test_dummy_padding_isolates_real_tokens(cuda_device, make_cuda_runner):
     )
     captured_meta = runner._captured[captured_key].metadata
     assert captured_meta.seq_lens_cuda.tolist() == padded_seq_lengths
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "lengths,capacity,expected",
+    [
+        ([4092], 8192, True),
+        ([4096], 5120, True),
+        ([4096], 5121, False),
+        ([8192], 16384, False),
+        ([2048, 2048], 5120, True),
+        ([2048, 2048], 5121, False),
+    ],
+)
+def test_packed_padding_guard_preserves_small_calls_and_multi_context(lengths, capacity, expected):
+    runner = _make_logic_runner()
+    runner._buckets = [EncoderGraphKey(capacity, len(lengths))]
+    bucket = runner._select_bucket(len(lengths), sum(lengths), lengths)
+    assert (bucket is not None) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("lengths", [[4096], [2048, 2048]])
+def test_padding_guard_logs_once_without_consuming_missing_bucket_warning(lengths):
+    runner = _make_logic_runner(buckets=[EncoderGraphKey(8192, len(lengths))])
+    logger = encoder_graph_module.logger
+    with (
+        mock.patch.object(logger, "log") as log,
+        mock.patch.object(logger, "_appeared_keys", set()),
+    ):
+        for _ in range(2):
+            assert runner.maybe_run(seq_lengths=lengths, inputs={}) is None
+        log.assert_called_once_with(
+            logger.VERBOSE,
+            "Multimodal encoder CUDA graph padding guard: running eager because "
+            "padding 100.00% > 25%",
+        )
+        assert not runner._warned_no_bucket_match
+        assert runner.maybe_run(seq_lengths=[8193] * len(lengths), inputs={}) is None
+        assert log.call_count == 2
+        assert log.call_args.args[0] == logger.WARNING
+        assert "no configured bucket matches" in log.call_args.args[1]
+
+
+@pytest.mark.cpu_only
+def test_padding_guard_reason_in_replay_stats_and_off_without_padding():
+    logger = encoder_graph_module.logger
+    stats_runner = _make_logic_runner(buckets=[EncoderGraphKey(8192, 1)], enable_replay_stats=True)
+    exact_runner = _make_logic_runner(buckets=[EncoderGraphKey(8192, 1)], enable_padding=False)
+    with (
+        mock.patch.object(logger, "log") as log,
+        mock.patch.object(logger, "_appeared_keys", set()),
+    ):
+        assert stats_runner.maybe_run(seq_lengths=[4096], inputs={}) is None
+        infos = [call.args[1] for call in log.call_args_list if call.args[0] == logger.INFO]
+        assert len(infos) == 1 and "padding guard rejected" in infos[0]
+        log.reset_mock()
+        # Exact-fit replay has no padding to guard, so this is a real miss.
+        assert exact_runner.maybe_run(seq_lengths=[4096], inputs={}) is None
+        assert [call.args[0] for call in log.call_args_list] == [logger.WARNING]
