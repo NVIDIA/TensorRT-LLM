@@ -27,6 +27,8 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 |---|---|
 | `black-forest-labs/FLUX.1-dev` | Text-to-Image |
 | `black-forest-labs/FLUX.2-dev` | Text-to-Image |
+| `black-forest-labs/flux-3-image-klein-base` | Text-to-Image, Image-to-Image |
+| `black-forest-labs/flux-3-image-klein` | Text-to-Image, Image-to-Image |
 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
 | `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` | Text-to-Video (VSA) |
@@ -63,6 +65,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **FLUX.1** | Yes | Yes | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
 | **FLUX.2** | Yes | Yes | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
+| **FLUX 3 Klein Base** | Yes | Yes | No | Yes | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | No | Yes |
+| **FLUX 3 Klein** | Yes | Yes | No | Yes | No | No | No | Yes | No | Yes | Yes | Yes | No | No | Yes | No | Yes |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
 | **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes |
 | **Wan 2.2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
@@ -166,7 +170,7 @@ params.image_reference = [
 ]
 ```
 
-FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
+FLUX.2, FLUX 3 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
 
 The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
 
@@ -210,6 +214,26 @@ are not supported. See the
   Both backends preserve the trained compression gate and dense text/audio routes.
   CUTEDSL VSA requires supported Blackwell hardware and at most 4096 tiles;
   unsupported shapes fail explicitly rather than silently running dense attention.
+
+## FLUX 3 Notes
+
+- FLUX 3 encodes the prompt as given, without prompt upsampling. Write full scene captions, or
+  upsample offline with `black-forest-labs/flux-3-image-klein-pup`.
+- `pipeline_config.variant: nvfp4` or `fp8r` loads BFL's pre-quantized transformer weights.
+  Loading by Hugging Face ID downloads both variants. To download one, fetch
+  `modular_model_index.json`, `transformer/config.json`, `text_encoder/*`, `vae/*` and
+  `variants/<variant>/*`, then pass the local directory.
+- `nvfp4` and `fp8r` checkpoints run fused GEMM kernels automatically on supported Blackwell GPUs.
+  Under tensor parallelism a block fuses when each rank's weight shards fit the kernels and
+  otherwise keeps TRT-LLM's GEMMs (SM120 fuses at `tp_size` 1 only); at `TLLM_LOG_LEVEL=info`
+  the load log reports how many blocks are fused.
+  Set `TRTLLM_FLUX3_PRIMS_TS_AUTOTUNE=1` to autotune the fused `fp8r` GEMMs on SM100/SM103/SM107
+  in warmup's autotuning pass (`torch_compile_config.enable_autotune`); rank 0 tunes, every rank
+  uses its tactics, and they are cached under `TRTLLM_FLUX3_PRIMS_TS_CACHE_DIR`
+  (default `~/.cache/tensorrt_llm/flux3_prims_ts`).
+- SOL-Attn is recommended with `tau: 1.0` and `disabled_until_timestep: 0.96`.
+- The checkpoints ship only `modular_model_index.json`, so `trtllm-serve` needs
+  `--visual_gen_args` or `--enable_visual_gen`.
 
 ## Optimizations
 
@@ -440,7 +464,7 @@ CPU offloading stages move selected Wan, Cosmos3 T2V, and MiniMax-H3 pipeline co
 
 Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 
-- **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX uses embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to FLUX or the distilled FastWan 2.2 model.
+- **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX.1 and FLUX.2 use embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to them, to the distilled FLUX 3 Klein or to the distilled FastWan 2.2 model. FLUX 3 Klein Base uses it when `guidance_scale` is not 1.
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
     - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN, LTX-2 and MiniMax-H3 self-attention. MiniMax-H3 async is validated in BF16 only; FP8/NVFP4 combinations remain unvalidated.
 - **Parallel VAE** (`parallel_vae_size: N`): Parallelizes the final VAE decode (constraint: `parallel_vae_size ≤ world_size`). WAN/Cosmos3 shard along a spatial axis; LTX-2, LTX-2.3, and MiniMax-H3 distribute independent tiles.

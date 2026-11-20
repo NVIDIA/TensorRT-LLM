@@ -503,6 +503,9 @@ l0_b200:
   - unittest/_torch/visual_gen/test_flux_attention.py
   - unittest/_torch/visual_gen/test_flux_pipeline.py
   - unittest/_torch/visual_gen/test_flux2_image_conditioning.py
+  - unittest/_torch/visual_gen/test_flux3_pipeline.py
+  - unittest/_torch/visual_gen/test_flux3_quantization.py
+  - unittest/_torch/visual_gen/test_flux3_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
@@ -544,6 +547,9 @@ l0_b200:
   - visual_gen/test_dynamic_batching.py::test_dynamic_batching_http TIMEOUT (15)
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux3_example
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux3_fused_gemm_example[fp8r]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux3_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[nano-1gpu]

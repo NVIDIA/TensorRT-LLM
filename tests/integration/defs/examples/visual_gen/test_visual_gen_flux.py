@@ -17,9 +17,11 @@
 import os
 from dataclasses import dataclass
 
+import numpy as np
+import PIL.Image
 import pytest
 import torch
-from defs.common import venv_check_call
+from defs.common import venv_check_call, venv_check_output
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FeatureConfigState,
     _assert_feature_quantization_installed,
@@ -387,3 +389,122 @@ def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
         ],
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_flux3_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run the FLUX 3 Klein example with the supported single-GPU NVFP4 config."""
+    model_path = get_checkpoint("flux-3-image-klein")
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "flux3_example")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "flux3_output.png")
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux3.py")
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "flux3-fp4-1gpu.yaml")
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--num_inference_steps",
+            "4",
+            "--seed",
+            "42",
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    with PIL.Image.open(output_path) as image:
+        assert image.size == (1024, 1024), f"Unexpected FLUX 3 output size {image.size}"
+        pixels = np.asarray(image.convert("RGB"), dtype=np.float32)
+    assert pixels.std() > 5.0, "FLUX 3 example produced a blank image"
+
+
+@pytest.mark.parametrize("variant", ["fp8r", "nvfp4"])
+def test_flux3_fused_gemm_example(_visual_gen_deps, llm_root, llm_venv, variant):
+    """Run the FLUX 3 Klein example on a pre-quantized variant; its block GEMMs must fuse."""
+    model_path = get_checkpoint("flux-3-image-klein")
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", f"flux3_{variant}_fused_gemm"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, f"flux3_{variant}_output.png")
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux3.py")
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "flux3-fp4-1gpu.yaml")
+
+    output = venv_check_output(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--variant",
+            variant,
+            "--height",
+            "256",
+            "--width",
+            "256",
+            "--num_inference_steps",
+            "4",
+            "--seed",
+            "42",
+            "--output_path",
+            output_path,
+        ],
+        env={**os.environ, "TLLM_LOG_LEVEL": "INFO"},
+    )
+    log = output.decode() if isinstance(output, bytes) else output
+    assert "FLUX 3 fused GEMMs:" in log, f"FLUX 3 {variant} blocks fell back to TRT-LLM GEMMs"
+    with PIL.Image.open(output_path) as image:
+        assert image.size == (256, 256), f"Unexpected FLUX 3 output size {image.size}"
+        pixels = np.asarray(image.convert("RGB"), dtype=np.float32)
+    assert pixels.std() > 5.0, f"FLUX 3 {variant} example produced a blank image"
+
+
+def test_flux3_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp_path):
+    """Run the FLUX 3 Klein example with a reference image that is padded and cropped back."""
+    model_path = get_checkpoint("flux-3-image-klein")
+    # A 600 x 400 reference pads to a 608 x 400 canvas, and the output is cropped back to it.
+    pixels = np.random.default_rng(0).integers(0, 256, (400, 600, 3), dtype=np.uint8)
+    reference_path = tmp_path / "flux3_reference.png"
+    PIL.Image.fromarray(pixels).save(reference_path)
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "flux3_reference_image_example"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "flux3_reference_image_output.png")
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux3.py")
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "flux3-fp4-1gpu.yaml")
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--image",
+            str(reference_path),
+            "--num_inference_steps",
+            "4",
+            "--seed",
+            "42",
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    with PIL.Image.open(output_path) as image:
+        assert image.size == (600, 400), f"Unexpected FLUX 3 edit size {image.size}"
+        output = np.asarray(image.convert("RGB"), dtype=np.float32)
+    assert output.std() > 5.0, "FLUX 3 reference-image example produced a blank image"

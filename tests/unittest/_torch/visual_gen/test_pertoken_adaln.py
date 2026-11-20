@@ -86,6 +86,23 @@ def test_fused_pertoken_adaln_matches_reference(hidden_size: int) -> None:
     _assert_bf16_close(actual, expected)
 
 
+def test_fused_pertoken_adaln_without_tables() -> None:
+    """Omitted rows match explicit zero rows, including compiled strided modulation."""
+    x, temb, table = _make_inputs(3072)
+    shift, scale = temb[:, :, 0], temb[:, :, 1]
+    zero = torch.zeros_like(table[0])
+    expected = fused_pertoken_adaln(x, shift, scale, zero, zero, _EPS)
+
+    def forward(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return fused_pertoken_adaln(x, shift, scale, None, None, _EPS)
+
+    for actual in (
+        forward(x, shift, scale),
+        torch.compile(forward, fullgraph=True)(x, shift, scale),
+    ):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_fused_pertoken_adaln_residual_matches_norm2_reference() -> None:
     hidden_size = 768
     residual, temb, table = _make_inputs(hidden_size)
