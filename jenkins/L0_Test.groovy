@@ -8045,12 +8045,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
-        // GB300 accuracy post-merge aggregated (4 GPUs per node). One test list per topology,
-        // spelled out here rather than via buildStageConfigs: test_to_stage_mapping.py resolves
-        // stage <-> test by list name with a line-based parser, so a shared list or a helper's
-        // output breaks the mapping. For SingleNvlinkDomain see singleNvlinkDomainMode.
-        "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 1, 1, 8, 2],
-        "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 1, 16, 4],
+        // GB300 aggregated accuracy post-merge (4 GPUs per node).
+        "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 1, 3, 8, 2],
+        "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-2": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 2, 3, 8, 2],
+        "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-3": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 3, 3, 8, 2],
+        "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 3, 16, 4],
+        "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-2": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 2, 3, 16, 4],
+        "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-3": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 3, 3, 16, 4],
     ]
     // PerfSanity post-merge stages: -k_of_N build slots as for the GB300 single-node stages above. A
     // DeepSeek-V4-Pro e2e stage runs on the builds of the gen_only_no_context stage of its config.
