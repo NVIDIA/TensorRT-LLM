@@ -5,6 +5,7 @@
 
 import asyncio
 import gc
+import importlib.metadata
 import ipaddress
 import os
 import signal
@@ -20,6 +21,7 @@ import click
 import grpc
 import uvloop
 from grpc_health.v1 import health_pb2, health_pb2_grpc
+from packaging.version import Version
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
@@ -61,9 +63,34 @@ _SERVER_OPTIONS = [
     ("grpc.http2.max_pings_without_data", 0),
     ("grpc.http2.min_ping_interval_without_data_ms", 10000),
 ]
+# Honors grpc.so_reuseport (0.5.0) and streams responses with far less CPU (0.6.1).
+_PYGRPC_NATIVE_MIN_VERSION = "0.6.1"
 
 
 _format_bind_address = _format_host_port
+
+
+def _check_pygrpc_native() -> None:
+    """Fail before the engine loads if pygrpc-native is missing or too old."""
+    try:
+        installed = importlib.metadata.version("pygrpc-native")
+    except importlib.metadata.PackageNotFoundError:
+        installed = None
+    if installed is None or Version(installed) < Version(_PYGRPC_NATIVE_MIN_VERSION):
+        raise click.ClickException(
+            f"--openengine-grpc-server pygrpc-native requires "
+            f"pygrpc-native>={_PYGRPC_NATIVE_MIN_VERSION}, found {installed or 'none'}. "
+            'Install it with: pip install "tensorrt_llm[openengine-native]"'
+        )
+
+
+def _create_grpc_server(grpc_server: str, options: list[tuple[str, Any]]) -> Any:
+    """Build the grpc.aio server, or pygrpc-native's drop-in replacement for it."""
+    if grpc_server == "pygrpc-native":
+        import pygrpc_native.aio
+
+        return pygrpc_native.aio.server(options=options)
+    return grpc.aio.server(options=options)
 
 
 def _is_loopback(host: str) -> bool:
@@ -104,6 +131,7 @@ class OpenEngineServer:
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
         max_media_preparations: Concurrent media preparation requests. Defaults to
             TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT, or four when unset.
+        grpc_server: gRPC server implementation, "grpcio" or "pygrpc-native".
     """
 
     def __init__(
@@ -118,6 +146,7 @@ class OpenEngineServer:
         subagent_affinity_auth_key: str | None = None,
         max_media_preparations: int | None = None,
         metrics: OpenEngineMetrics | None = None,
+        grpc_server: str = "grpcio",
     ) -> None:
         if max_media_preparations is None:
             max_media_preparations = int(
@@ -139,7 +168,7 @@ class OpenEngineServer:
         self._fatal_engine_failure = False
         options = list(_SERVER_OPTIONS)
         options.append(("grpc.so_reuseport", 1 if frontend is not None else 0))
-        self._server = grpc.aio.server(options=options)
+        self._server = _create_grpc_server(grpc_server, options)
         self._input_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="openengine_input"
         )
@@ -183,7 +212,7 @@ class OpenEngineServer:
                 "The listener is unauthenticated and unencrypted: restrict it to a trusted "
                 "network or front it with an authenticating TLS proxy."
             )
-        # grpc.aio raises RuntimeError itself when the bind fails, naming the
+        # Both servers raise RuntimeError themselves when the bind fails, naming the
         # address, so there is no zero return to check for.
         try:
             bound_port = self._server.add_insecure_port(bind_address)
@@ -338,6 +367,7 @@ def launch_server(
     subagent_affinity_auth_key: str | None = None,
     metrics_host: str | None = None,
     metrics_port: int = 8001,
+    grpc_server: str = "grpcio",
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -351,8 +381,11 @@ def launch_server(
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
         metrics_host: HTTP bind address; defaults to the inference host.
         metrics_port: HTTP port when performance-metrics configuration enables Prometheus.
+        grpc_server: gRPC server implementation, "grpcio" or "pygrpc-native".
     """
     _warn_if_python_protobuf()
+    if grpc_server == "pygrpc-native":
+        _check_pygrpc_native()
 
     async def serve() -> None:
         logger.info("Initializing TensorRT-LLM OpenEngine server...")
@@ -549,6 +582,7 @@ def launch_server(
                 instance_id=instance_id,
                 subagent_affinity_auth_key=subagent_affinity_auth_key,
                 metrics=metrics,
+                grpc_server=grpc_server,
             )
             _disable_gc_if_requested()
             await server.start()
