@@ -1185,9 +1185,10 @@ class TestLogsprobsInBatchedSampling:
 
         # Raw logprobs of rows the sampler rewrites before sampling (embedding bias, bad words,
         # min_length), alone and mixed with requests it leaves alone.
-        assert 12 < vocab_size
         logit_rewrites = {
-            "embedding_bias": {"embedding_bias": ((12, -0.5),)},
+            "embedding_bias": {
+                "embedding_bias": tuple(enumerate(torch.linspace(-5.0, 5.0, vocab_size).tolist()))
+            },
             "bad_words": {"bad_token_ids": list(range(0, vocab_size, 2))},
             "min_length": {"end_id": 5, "min_tokens": 10},
         }
