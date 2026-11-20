@@ -1095,21 +1095,15 @@ def test_warmup_collects_only_enabled_layer_profiles(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(mod.PrimsTSSparseMlaFmha, "_is_fp8_cache", staticmethod(lambda _: True))
     monkeypatch.setattr(module, "supports_dsv4_epilogue_fusion", lambda layer: layer.fused)
-    monkeypatch.setattr(
-        mod, "_warmup_profiles", lambda profiles, meta, **kw: captured.extend(profiles)
-    )
-    mod.warmup_prims_ts_sparse_mla(
-        SimpleNamespace(modules=lambda: iter(layers)), metadata, max_total_draft_tokens=0
-    )
+    monkeypatch.setattr(mod, "_warmup_profiles", lambda profiles, meta: captured.extend(profiles))
+    mod.warmup_prims_ts_sparse_mla(SimpleNamespace(modules=lambda: iter(layers)), metadata)
     assert [(p.extra, p.q_dtype, p.has_sinks, p.fused_groups) for p in captured] == [
         (512, torch.float8_e4m3fn, True, 8),
         (512, torch.float8_e4m3fn, False, None),
     ]
     metadata.is_cuda_graph = True
     with pytest.raises(RuntimeError, match="outside graph capture"):
-        mod.warmup_prims_ts_sparse_mla(
-            SimpleNamespace(modules=lambda: iter(layers)), metadata, max_total_draft_tokens=0
-        )
+        mod.warmup_prims_ts_sparse_mla(SimpleNamespace(modules=lambda: iter(layers)), metadata)
 
 
 def test_warmup_combines_profiles_and_loads_largest_workspace_first(monkeypatch) -> None:
@@ -1177,13 +1171,11 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
         fmha_plan_caches={},
         max_num_tokens=256,
         max_num_requests=4,
-        max_total_draft_tokens=None,  # Fresh metadata before the first speculative forward.
+        max_total_draft_tokens=5,
         mapping=None,
         is_cuda_graph=False,
     )
-    mod._warmup_profiles(
-        [mod._WarmupProfile(lib, extra=512, **profile)], mtp, max_total_draft_tokens=5
-    )
+    mod._warmup_profiles([mod._WarmupProfile(lib, extra=512, **profile)], mtp)
     rows = [r for r, _ in planned]
     assert rows[0] == 4 * (1 + 5), rows
     assert rows == sorted(rows, reverse=True)
@@ -1208,7 +1200,6 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
     larger = SimpleNamespace(
         **{
             **vars(mtp),
-            "max_total_draft_tokens": 5,
             "max_num_requests": 32,
             "max_num_tokens": 183,
             "fmha_plan_caches": {},
