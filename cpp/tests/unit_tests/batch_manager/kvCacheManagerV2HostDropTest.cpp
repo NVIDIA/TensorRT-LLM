@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/page.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
@@ -255,6 +256,37 @@ TEST_F(HostDropTest, NoHostLevelMeansNoRing)
 {
     auto gpuOnly = std::make_shared<KvCacheManager>(makeConfig());
     EXPECT_THROW(gpuOnly->storage().setUpHostDropRing(1 << 20, true), std::exception);
+}
+
+TEST_F(HostDropTest, DrainWorksWithoutAContextAndLeavesTheCallersCurrent)
+{
+    auto& storage = mManager->storage();
+    (void) storage.setUpHostDropRing(/*ringBytes=*/0, /*preferKernel=*/false);
+    commitRound();
+    commitRound();
+    commitRound(); // the first round dropped into the ring
+
+    // A consumer thread starts with no current context: the drain makes the ring's current for its event queries,
+    // then gives the thread back the one it had.
+    std::vector<HostDropRingRecord> records;
+    CUcontext afterDrain = reinterpret_cast<CUcontext>(1);
+    CUresult status = CUDA_ERROR_UNKNOWN;
+    std::thread consumer(
+        [&]
+        {
+            records = drainAtLeast(2);
+            status = cuCtxGetCurrent(&afterDrain);
+        });
+    consumer.join();
+    ASSERT_EQ(status, CUDA_SUCCESS);
+    EXPECT_EQ(afterDrain, nullptr);
+    ASSERT_EQ(records.size(), 2U);
+    std::vector<int32_t> slots;
+    for (auto const& record : records)
+    {
+        slots.push_back(record.slot);
+    }
+    storage.releaseHostDropSlots(slots);
 }
 
 class HostDropRingTest : public HostDropTest, public ::testing::WithParamInterface<bool>

@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/storage/remoteMem.h"
 #include "kv_cache_manager_v2/utils/copyUtils.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -1144,13 +1145,19 @@ HostDropRingInfo StorageManager::setUpHostDropRing(
 
 std::vector<HostDropRingRecord> StorageManager::drainHostDrops(size_t maxRecords)
 {
-    if (mHostDropCtx != nullptr)
-    {
-        // The consumer may be a thread without a current context; event queries need one.
-        cuCtxSetCurrent(mHostDropCtx);
-    }
     std::vector<HostDropRingRecord> out;
     std::lock_guard<std::mutex> lock(mHostDropMutex);
+    if (mHostDropCtx == nullptr)
+    {
+        return out;
+    }
+    // Event queries need the ring's context, and the consumer's thread may have none or another one current. The
+    // scope restores the caller's context on every return path.
+    CudaContextScope const context(mHostDropCtx);
+    if (!context.usable())
+    {
+        return out;
+    }
     while (!mHostDropQueue.empty())
     {
         auto& batch = mHostDropQueue.front();
@@ -1230,6 +1237,7 @@ void StorageManager::_releaseHostDropResources() noexcept
         mHostDropCopier.reset();
         mHostDropRing.reset();
         mHostDropFree.clear();
+        mHostDropCtx = nullptr;
     }
     catch (...)
     {
