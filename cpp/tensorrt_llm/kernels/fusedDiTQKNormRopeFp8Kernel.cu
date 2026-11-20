@@ -495,6 +495,171 @@ __global__ void __launch_bounds__(128)
 #endif
 }
 
+// Register-staged variant of fusedDiTQKNormRopeFp8PipeKernel with the same per-row math and
+// thread mapping (bitwise-identical results). Each thread copies its Q/K/V vectors and its cos/sin
+// slice from the stage to registers before the row's only block barrier, so the stage is refilled
+// right after that barrier (kStages rows in flight during the math instead of kStages - 1); the
+// warp sums are double-buffered by row parity. MIN_BLOCKS keeps two blocks per SM.
+template <bool INTERLEAVE, int NCH>
+__global__ void __launch_bounds__(128, 2)
+    fusedDiTQKNormRopeFp8RegPipeKernel(__nv_bfloat16 const* qkv, __nv_fp8_e4m3* qOut, __nv_fp8_e4m3* kOut,
+        __nv_fp8_e4m3* vOut, float const* quantMul, int numHeads, float eps, __nv_bfloat16 const* qWeight,
+        __nv_bfloat16 const* kWeight, float const* cosEmb, float const* sinEmb, int numTokens, int cosSeqPerBatch)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap(); // The launcher selects this kernel only on SM90+.
+#else
+    constexpr int kWarpsPerRow = 4;
+    asm volatile("griddepcontrol.wait;");
+    int const tid = threadIdx.x;
+    int const rowWarp = tid >> 5;
+    int const rowLane = tid & 31;
+    int const n = numHeads * kHeadDim;
+    uint32_t const rowBytes = 3 * n * sizeof(__nv_bfloat16);
+    uint32_t const stageBytes = rowBytes + 2 * kHeadDim * sizeof(float);
+    extern __shared__ __align__(128) unsigned char ring[];
+    __shared__ __align__(8) uint64_t bars[kStages];
+    __shared__ float warpSums[2][2 * kWarpsPerRow];
+    int const stride = gridDim.x;
+    auto issue = [&](int st, int t)
+    {
+        unsigned char* dst = ring + st * stageBytes;
+        int const ct = (cosSeqPerBatch > 0) ? (t % cosSeqPerBatch) : t;
+        mbarExpectTx(&bars[st], stageBytes);
+        bulkLoad(dst, qkv + static_cast<int64_t>(t) * 3 * n, rowBytes, &bars[st]);
+        bulkLoad(dst + rowBytes, cosEmb + static_cast<int64_t>(ct) * kHeadDim, kHeadDim * sizeof(float), &bars[st]);
+        bulkLoad(dst + rowBytes + kHeadDim * sizeof(float), sinEmb + static_cast<int64_t>(ct) * kHeadDim,
+            kHeadDim * sizeof(float), &bars[st]);
+    };
+    if (tid == 0)
+    {
+#pragma unroll
+        for (int st = 0; st < kStages; st++)
+        {
+            mbarInit(&bars[st], 1);
+        }
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#pragma unroll
+        for (int st = 0; st < kStages; st++)
+        {
+            int const t = blockIdx.x + st * stride;
+            if (t < numTokens)
+            {
+                issue(st, t);
+            }
+        }
+    }
+    // The norm weights stay in registers across rows.
+    uint4 qW[NCH], kW[NCH];
+#pragma unroll
+    for (int chunk = 0; chunk < NCH; chunk++)
+    {
+        int const elemBase = chunk * 1024 + tid * 8;
+        if (elemBase >= n)
+        {
+            continue;
+        }
+        qW[chunk] = *reinterpret_cast<uint4 const*>(&qWeight[elemBase]);
+        kW[chunk] = *reinterpret_cast<uint4 const*>(&kWeight[elemBase]);
+    }
+    float const qMul = quantMul[0], kMul = quantMul[1], vMul = quantMul[2];
+    // Chunk starts are multiples of 1024, so every chunk of this thread uses the same cos/sin slice.
+    int const cosOff = (tid * 8) % kHeadDim;
+    __syncthreads();
+    int it = 0;
+    for (int tokenIdx = blockIdx.x; tokenIdx < numTokens; tokenIdx += stride, it++)
+    {
+        int const st = it % kStages;
+        int const parity = it & 1;
+        mbarWait(&bars[st], (it / kStages) & 1);
+        __nv_bfloat16 const* srow = reinterpret_cast<__nv_bfloat16 const*>(ring + st * stageBytes);
+        float const* scos = reinterpret_cast<float const*>(ring + st * stageBytes + rowBytes);
+        float const* ssin = scos + kHeadDim;
+        uint4 qv[NCH], kv[NCH], vv[NCH];
+#pragma unroll
+        for (int chunk = 0; chunk < NCH; chunk++)
+        {
+            int const elemBase = chunk * 1024 + tid * 8;
+            if (elemBase >= n)
+            {
+                continue;
+            }
+            qv[chunk] = *reinterpret_cast<uint4 const*>(&srow[elemBase]);
+            kv[chunk] = *reinterpret_cast<uint4 const*>(&srow[n + elemBase]);
+            vv[chunk] = *reinterpret_cast<uint4 const*>(&srow[2 * n + elemBase]);
+        }
+        float c[8], s[8];
+        loadFloat8(scos + cosOff, c);
+        loadFloat8(ssin + cosOff, s);
+        float qSum2 = 0.0F, kSum2 = 0.0F;
+#pragma unroll
+        for (int chunk = 0; chunk < NCH; chunk++)
+        {
+            int const elemBase = chunk * 1024 + tid * 8;
+            if (elemBase >= n)
+            {
+                continue;
+            }
+            float qf[8], kf[8];
+            unpackBf16x8(qv[chunk], qf);
+            unpackBf16x8(kv[chunk], kf);
+#pragma unroll
+            for (int i = 0; i < 8; i += 2)
+            {
+                qSum2 += qf[i] * qf[i] + qf[i + 1] * qf[i + 1];
+                kSum2 += kf[i] * kf[i] + kf[i + 1] * kf[i + 1];
+            }
+        }
+        qSum2 = warpReduceSum(qSum2);
+        kSum2 = warpReduceSum(kSum2);
+        if (rowLane == 0)
+        {
+            warpSums[parity][2 * rowWarp] = qSum2;
+            warpSums[parity][2 * rowWarp + 1] = kSum2;
+        }
+        __syncthreads();
+        // Every thread holds its slice of the stage in registers: refill the stage now.
+        if (tid == 0 && tokenIdx + kStages * stride < numTokens)
+        {
+            issue(st, tokenIdx + kStages * stride);
+        }
+        float qTotal = 0.0F, kTotal = 0.0F;
+#pragma unroll
+        for (int w = 0; w < kWarpsPerRow; w++)
+        {
+            qTotal += warpSums[parity][2 * w];
+            kTotal += warpSums[parity][2 * w + 1];
+        }
+        float const qRmsRcp = rsqrtf(qTotal / static_cast<float>(n) + eps);
+        float const kRmsRcp = rsqrtf(kTotal / static_cast<float>(n) + eps);
+        int64_t const outBase = static_cast<int64_t>(tokenIdx) * n;
+#pragma unroll
+        for (int chunk = 0; chunk < NCH; chunk++)
+        {
+            int const elemBase = chunk * 1024 + tid * 8;
+            if (elemBase >= n)
+            {
+                continue;
+            }
+            float w[8], e[8];
+            unpackBf16x8(qv[chunk], e);
+            unpackBf16x8(qW[chunk], w);
+            normRope8<INTERLEAVE>(e, w, c, s, qRmsRcp, rowLane);
+            storeFp8x8(e, qOut + outBase + elemBase, qMul);
+
+            unpackBf16x8(kv[chunk], e);
+            unpackBf16x8(kW[chunk], w);
+            normRope8<INTERLEAVE>(e, w, c, s, kRmsRcp, rowLane);
+            storeFp8x8(e, kOut + outBase + elemBase, kMul);
+
+            unpackBf16x8(vv[chunk], e);
+            storeFp8x8(e, vOut + outBase + elemBase, vMul);
+        }
+    }
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 // Per-block |V| maxima: one warp per token, kVUnroll loads in flight.
 constexpr int kVUnroll = 10;
 
@@ -628,12 +793,30 @@ size_t generalSmemBytes(int numHeads, bool perHeadCos)
         + kGeneralRows * 8 * sizeof(float);
 }
 
+// The register-staged kernel wins for rows of at least 4 chunks (32 heads and up), where the
+// smem-reading kernel waits on its stage refill; shorter rows run faster on that kernel.
+constexpr bool regPipeWins(int nch)
+{
+    return nch >= 4;
+}
+
 template <bool IL, int NCH>
 void launchPipe(int tokens, int numHeads, float eps, cudaStream_t stream, __nv_bfloat16 const* qkv, __nv_fp8_e4m3* q8,
     __nv_fp8_e4m3* k8, __nv_fp8_e4m3* v8, float const* quantMul, __nv_bfloat16 const* qw, __nv_bfloat16 const* kw,
     float const* cosp, float const* sinp, int cosSeqPerBatch)
 {
-    auto* kernel = fusedDiTQKNormRopeFp8PipeKernel<IL, NCH>;
+    // Only the kernel this row width runs is instantiated.
+    auto* kernel = []
+    {
+        if constexpr (regPipeWins(NCH))
+        {
+            return fusedDiTQKNormRopeFp8RegPipeKernel<IL, NCH>;
+        }
+        else
+        {
+            return fusedDiTQKNormRopeFp8PipeKernel<IL, NCH>;
+        }
+    }();
     size_t const smem = pipeSmemBytes(numHeads);
     int device = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));

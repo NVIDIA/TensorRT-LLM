@@ -23,10 +23,12 @@ Run with:
 import math
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from ._worker_pool import run_distributed
@@ -43,11 +45,25 @@ def _disable_mpi() -> Iterator[None]:
 with _disable_mpi():
     from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
     from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention, VanillaAttention
+    from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
     from tensorrt_llm._torch.visual_gen.attention.backends.interface import (
         AttentionBackend,
         AttentionTensorLayout,
     )
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import Attention2DAttention
+    from tensorrt_llm._torch.visual_gen.config import (
+        DiffusionModelConfig,
+        create_attention_metadata_state,
+    )
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanBlock
+    from tensorrt_llm._utils import get_sm_version
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+    from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
@@ -923,5 +939,273 @@ class TestUlyssesAttentionEdgeCases:
         run_test_in_distributed(world_size=4, test_fn=_logic_world_size_4, use_cuda=True)
 
 
+# =============================================================================
+# TRTLLM per-tensor FP8 attention (SM107): FP8 Q/K/V through the Ulysses
+# all-to-all, and Attention2D routed to cuDNN FP8.
+# =============================================================================
+
+FP8_HEAD_DIM = 128
+FP8_HEADS = 40
+FP8_RECIPE = QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8")
+
+
+def _run_fp8(world_size, fn, **kwargs):
+    """Run ``fn`` on ``world_size`` ranks; skips without SM107 or enough GPUs."""
+    if not torch.cuda.is_available() or get_sm_version() != 107:
+        pytest.skip("trtllm-gen dense FP8 attention serves the per-tensor FP8 recipe on SM107")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
+    run_distributed(world_size, fn, dist_backend="nccl", preload=("tensorrt_llm",), **kwargs)
+
+
+def _fp8_cosine(a, b):
+    """Cosine similarity of two tensors in fp32."""
+    return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def _fp8_config(backend, vgm=None, quant_attention_config=FP8_RECIPE):
+    """Model config for a Wan-sized attention layer with the FP8 recipe."""
+    config = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(
+            hidden_size=FP8_HEADS * FP8_HEAD_DIM,
+            num_attention_heads=FP8_HEADS,
+            attention_head_dim=FP8_HEAD_DIM,
+            eps=1e-6,
+        ),
+        attention=AttentionConfig(backend=backend, quant_attention_config=quant_attention_config),
+    )
+    if vgm is not None:
+        config.mapping = vgm.to_llm_mapping()
+        config.visual_gen_mapping = vgm
+    config.attention_metadata_state = create_attention_metadata_state()
+    return config
+
+
+def _fp8_wan_self_attention(config, enable_sequence_parallel, norm_gain=1.0):
+    """Wan self-attention with fused QKV, QK norm and RoPE and seeded weights."""
+    attn = Attention(
+        hidden_size=FP8_HEADS * FP8_HEAD_DIM,
+        num_attention_heads=FP8_HEADS,
+        qkv_mode=QKVMode.FUSE_QKV,
+        qk_norm=True,
+        qk_norm_mode="full",
+        fuse_qk_norm_rope=True,
+        config=config,
+        enable_sequence_parallel=enable_sequence_parallel,
+    ).cuda()
+    g = torch.Generator(device="cuda").manual_seed(7)
+    with torch.no_grad():
+        for name, p in attn.named_parameters():
+            if "norm" in name:
+                p.copy_(norm_gain * (1.0 + 0.1 * torch.randn(p.shape, device="cuda", generator=g)))
+            else:
+                p.copy_(0.02 * torch.randn(p.shape, device="cuda", generator=g))
+    return attn
+
+
+def _fp8_inputs(batch, seq):
+    """Seeded hidden states and Wan RoPE tables for ``seq`` tokens."""
+    g = torch.Generator(device="cuda").manual_seed(11)
+    hidden = torch.randn(
+        batch, seq, FP8_HEADS * FP8_HEAD_DIM, device="cuda", generator=g
+    ).bfloat16()
+    pos = torch.arange(seq, dtype=torch.float64)
+    inv = 1.0 / (10000 ** (torch.arange(0, FP8_HEAD_DIM, 2, dtype=torch.float64) / FP8_HEAD_DIM))
+    angles = torch.outer(pos, inv)
+    cos = angles.cos().repeat_interleave(2, dim=-1).float().view(1, seq, 1, FP8_HEAD_DIM).cuda()
+    sin = angles.sin().repeat_interleave(2, dim=-1).float().view(1, seq, 1, FP8_HEAD_DIM).cuda()
+    return hidden, cos, sin
+
+
+def _logic_ulysses_matches_single_gpu(rank, world_size, *, batch):
+    """Ulysses FP8 output and V scale match the single-GPU layer."""
+    seq = 1560 * world_size
+    shard = seq // world_size
+    rows = slice(rank * shard, (rank + 1) * shard)
+    vgm = VisualGenMapping(world_size=world_size, rank=rank, ulysses_size=world_size)
+    attn = _fp8_wan_self_attention(_fp8_config("TRTLLM", vgm), enable_sequence_parallel=True)
+    assert isinstance(attn.attn, UlyssesAttention)
+    assert attn._fp8_qkv_producer
+
+    hidden, cos, sin = _fp8_inputs(batch, seq)
+    local, local_cos, local_sin = hidden[:, rows], cos[:, rows], sin[:, rows]
+    with torch.no_grad():
+        out = attn(local.contiguous(), freqs=(local_cos, local_sin))
+
+        # One V scale on every rank: the group maximum.
+        qkv = attn.qkv_proj(local.contiguous()).view(batch * shard, -1)
+        amax = attn.attn.fp8_v_amax(qkv, FP8_HEADS, FP8_HEAD_DIM)
+        gathered = [torch.empty_like(amax) for _ in range(world_size)]
+        dist.all_gather(gathered, amax)
+        for other in gathered:
+            assert torch.equal(other, amax)
+
+        single = _fp8_wan_self_attention(_fp8_config("TRTLLM"), enable_sequence_parallel=False)
+        assert single._fp8_qkv_producer
+        single.load_state_dict(attn.state_dict())
+        ref = single(hidden, freqs=(cos, sin))[:, rows]
+        full_qkv = single.qkv_proj(hidden).view(batch * seq, -1)
+        assert torch.equal(amax, torch.ops.trtllm.dit_v_amax(full_qkv, FP8_HEADS, FP8_HEAD_DIM))
+
+    assert out.shape == ref.shape
+    assert _fp8_cosine(out, ref) > 0.9999, f"rank {rank}: cosine {_fp8_cosine(out, ref)}"
+
+
+def _logic_ulysses_cuda_graph(rank, world_size):
+    """Ulysses FP8 graph replays equal eager."""
+    batch, seq = 1, 1560 * world_size
+    shard = seq // world_size
+    rows = slice(rank * shard, (rank + 1) * shard)
+    vgm = VisualGenMapping(world_size=world_size, rank=rank, ulysses_size=world_size)
+    attn = _fp8_wan_self_attention(_fp8_config("TRTLLM", vgm), enable_sequence_parallel=True)
+    hidden, cos, sin = _fp8_inputs(batch, seq)
+    local = hidden[:, rows].contiguous()
+    freqs = (cos[:, rows].contiguous(), sin[:, rows].contiguous())
+    with torch.no_grad():
+        eager = attn(local, freqs=freqs)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            attn(local, freqs=freqs)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = attn(local, freqs=freqs)
+        for _ in range(10):
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(captured, eager), f"rank {rank}: replay differs from eager"
+
+
+def _logic_attn2d_runs_on_cudnn_fp8(rank, world_size):
+    """Attention2D keeps cuDNN FP8 and matches the BF16 single-GPU layer."""
+    batch, seq = 1, 1560 * world_size
+    shard = seq // world_size
+    rows = slice(rank * shard, (rank + 1) * shard)
+    vgm = VisualGenMapping(world_size=world_size, rank=rank, attn2d_row_size=2, attn2d_col_size=2)
+    # Peaked attention (QK norm gain 2): each rank's partial output differs from the others, so
+    # the result depends on merging the partials with the right LSE.
+    attn = _fp8_wan_self_attention(
+        _fp8_config("TRTLLM", vgm), enable_sequence_parallel=True, norm_gain=2.0
+    )
+    assert isinstance(attn.attn, Attention2DAttention)
+    assert isinstance(attn.attn.inner_backend, CuDNNAttention)
+    assert attn.attn.inner_backend.quant_dtype == "fp8"
+    assert not attn._fp8_qkv_producer
+
+    hidden, cos, sin = _fp8_inputs(batch, seq)
+    with torch.no_grad():
+        out = attn(hidden[:, rows].contiguous(), freqs=(cos[:, rows], sin[:, rows]))
+        single = _fp8_wan_self_attention(
+            _fp8_config("CUDNN", quant_attention_config=None), enable_sequence_parallel=False
+        )
+        single.load_state_dict(attn.state_dict())
+        ref = single(hidden, freqs=(cos, sin))[:, rows]
+    # BF16 single-GPU reference: single-GPU cuDNN FP8 reaches ~0.995 here and a mis-merged LSE ~0.85.
+    assert _fp8_cosine(out, ref) > 0.99, f"rank {rank}: cosine {_fp8_cosine(out, ref)}"
+
+
+def _fp8_wan_block(vgm, seed):
+    """A static-FP8 WanBlock (TRTLLM FP8 attention) with random weights, fusions planned."""
+    config = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(
+            num_attention_heads=FP8_HEADS,
+            attention_head_dim=FP8_HEAD_DIM,
+            ffn_dim=8192,
+            eps=1e-6,
+            cross_attn_norm=True,
+        ),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+        attention=AttentionConfig(backend="TRTLLM", quant_attention_config=FP8_RECIPE),
+    )
+    config.mapping = vgm.to_llm_mapping()
+    config.visual_gen_mapping = vgm
+    config.attention_metadata_state = create_attention_metadata_state()
+    block = WanBlock(config, _layer_idx=0).cuda()
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    input_scale, weight_scale = 8.0 / 448.0, 0.1 / 448.0
+    with torch.no_grad():
+        for module in block.modules():
+            if isinstance(module, Linear):
+                w = 0.02 * torch.randn(module.weight.shape, device="cuda", generator=g)
+                if module.weight.dtype == torch.float8_e4m3fn:
+                    module.weight.copy_((w / weight_scale).to(module.weight.dtype))
+                    module.weight_scale.fill_(weight_scale)
+                    module.input_scale.fill_(input_scale)
+                    module.inv_input_scale.fill_(1.0 / input_scale)
+                else:
+                    module.weight.copy_(w)
+                if module.bias is not None:
+                    module.bias.copy_(
+                        0.02 * torch.randn(module.bias.shape, device="cuda", generator=g)
+                    )
+        for name, p in block.named_parameters():
+            if "norm" in name and p.dtype != torch.float8_e4m3fn:
+                p.copy_(1.0 + 0.1 * torch.randn(p.shape, device="cuda", generator=g))
+        block.scale_shift_table.copy_(
+            0.1 * torch.randn(block.scale_shift_table.shape, device="cuda", generator=g)
+        )
+    for module in block.modules():
+        if isinstance(module, Linear):
+            module.post_load_weights()
+    assert block.plan_fp8_fusions()
+    return block
+
+
+def _logic_wan_block_ffn_residual_handoff(rank, world_size, *, layout):
+    """Two static-FP8 blocks on a sequence-parallel layout: the FFN residual of the first block,
+    applied in the second block's AdaLN1 pass, gives the same bits as its own residual pass."""
+    if layout == "ulysses":
+        vgm = VisualGenMapping(world_size=world_size, rank=rank, ulysses_size=world_size)
+        parallel_backend = UlyssesAttention
+    else:
+        vgm = VisualGenMapping(
+            world_size=world_size, rank=rank, attn2d_row_size=2, attn2d_col_size=2
+        )
+        parallel_backend = Attention2DAttention
+    first, second = _fp8_wan_block(vgm, seed=1), _fp8_wan_block(vgm, seed=2)
+    assert isinstance(first.attn1.attn, parallel_backend)
+
+    batch, seq = 2, 1560 * world_size
+    shard = seq // world_size
+    rows = slice(rank * shard, (rank + 1) * shard)
+    hidden, cos, sin = _fp8_inputs(batch, seq)
+    g = torch.Generator(device="cuda").manual_seed(3)
+    text = torch.randn(batch, 64, FP8_HEADS * FP8_HEAD_DIM, device="cuda", generator=g).bfloat16()
+    temb = (
+        0.1 * torch.randn(batch, 6, FP8_HEADS * FP8_HEAD_DIM, device="cuda", generator=g)
+    ).bfloat16()
+    x, cos, sin = hidden[:, rows].contiguous(), cos[:, rows], sin[:, rows]
+    with torch.no_grad():
+        reference = second(first(x, text, temb, cos, sin), text, temb, cos, sin)
+        x_pre, residual = first(x, text, temb, cos, sin, defer_ffn_residual=True)
+        handed_off = second(x_pre, text, temb, cos, sin, ffn_residual=residual)
+    assert torch.equal(handed_off, reference), f"rank {rank}: handoff differs"
+
+
+@pytest.mark.parametrize("world_size,batch", [(2, 1), (4, 2)])
+def test_ulysses_fp8_matches_single_gpu(world_size, batch):
+    """Ulysses FP8 attention matches one GPU."""
+    _run_fp8(world_size, _logic_ulysses_matches_single_gpu, batch=batch)
+
+
+def test_ulysses_fp8_cuda_graph_replay():
+    """Ulysses FP8 attention under CUDA graph replay."""
+    _run_fp8(2, _logic_ulysses_cuda_graph)
+
+
+def test_attn2d_fp8_runs_on_cudnn():
+    """Attention2D with the FP8 recipe on cuDNN FP8."""
+    _run_fp8(4, _logic_attn2d_runs_on_cudnn_fp8)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_wan_block_ffn_residual_handoff_ulysses():
+    _run_fp8(2, _logic_wan_block_ffn_residual_handoff, layout="ulysses")
+
+
+def test_wan_block_ffn_residual_handoff_attn2d():
+    _run_fp8(4, _logic_wan_block_ffn_residual_handoff, layout="attn2d")

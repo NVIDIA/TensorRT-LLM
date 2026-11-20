@@ -232,3 +232,33 @@ def test_fake_under_compile():
     eager = fn(q8, k8, v8)
     compiled = torch.compile(fn, fullgraph=True)(q8, k8, v8)
     torch.testing.assert_close(compiled, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, E4M3])
+def test_deferred_rescale(out_dtype):
+    """skip_correction_threshold = 1 defers the output rescale: the kernels apply it (the
+    result changes) and the attention stays as close to SDPA as with a rescale per row-max step."""
+    num_heads = 40
+    _require(num_heads, out_dtype, fp16_softmax=True)
+    if not torch.ops.trtllm.fmha_dense_fp8_is_supported(HEAD_DIM, num_heads, out_dtype, True, 1.0):
+        pytest.skip("no dense FP8 kernel with correction skipping for this configuration")
+    batch, seq_len = 1, 4680
+    q, k, v = _inputs(batch, seq_len, num_heads, seed=7)
+    qk_mul = math.sqrt(HEAD_DIM**-0.5 * LOG2E)
+    vs = v.abs().amax() / E4M3_MAX
+    q8, k8, v8 = _quant(q * qk_mul * 2, 1.0), _quant(k * qk_mul * 2, 1.0), _quant(v, vs)
+    out_scale = torch.tensor(4.0, device="cuda") if out_dtype == E4M3 else None
+    scale_out = (vs / out_scale if out_scale is not None else vs).reshape(1).float()
+    cu = _cu_seqlens(batch, seq_len)
+
+    def run(threshold):
+        out = torch.ops.trtllm.fmha_dense_fp8(
+            q8, k8, v8, cu, seq_len, None, scale_out, True, out_dtype, threshold
+        )
+        return out.float() * (out_scale if out_scale is not None else 1.0)
+
+    eager, deferred = run(0.0), run(1.0)
+    assert not torch.equal(eager, deferred)
+    ref = _reference(q8.float() / qk_mul, k8.float() / qk_mul, v8.float() * vs, batch, seq_len)
+    assert _cosine(deferred, ref) > _min_cosine(out_dtype)
+    assert abs(_cosine(deferred, ref) - _cosine(eager, ref)) < 1e-3

@@ -73,7 +73,7 @@ tk::TllmGenFmhaRunner& runnerFor(tk::Data_type dtypeOut, int device)
 
 // Shape-only parameters; callers fill the pointers and the stream before running.
 tk::TllmGenFmhaRunnerParams makeParams(int64_t batch, int64_t maxSeqLen, int64_t numTokens, int64_t numHeads,
-    int64_t headDim, bool fp16Softmax, int device)
+    int64_t headDim, bool fp16Softmax, double skipCorrectionThreshold, int device)
 {
     tk::TllmGenFmhaRunnerParams p{};
     p.mQkvLayout = tk::QkvLayout::SeparateQkv;
@@ -100,6 +100,8 @@ tk::TllmGenFmhaRunnerParams makeParams(int64_t batch, int64_t maxSeqLen, int64_t
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
     p.mMultiProcessorCount = smCount;
     p.mFp16Softmax = fp16Softmax;
+    // log2 of the row-max growth the kernels absorb before rescaling the output accumulator.
+    p.mSkipCorrThreshold = static_cast<float>(skipCorrectionThreshold);
     return p;
 }
 
@@ -111,10 +113,15 @@ tk::TllmGenFmhaRunnerParams makeParams(int64_t batch, int64_t maxSeqLen, int64_t
 // scale_out: fp32 [1] on device, v_descale for BF16 output or v_descale / out_scale for FP8 output.
 // With fp16_softmax the softmax scale must be folded into the Q/K quantization scales; the op runs
 // the kernels with a unit scaleSoftmaxLog2 of its own.
+// skip_correction_threshold: deferred output rescale; the kernels skip the accumulator correction
+// until the row max has grown by more than 2^threshold (0 rescales on every growth). A positive
+// value needs kernels built with correction skipping (see fmha_dense_fp8_is_supported).
 torch::Tensor fmha_dense_fp8(torch::Tensor const& q, torch::Tensor const& k, torch::Tensor const& v,
     torch::Tensor const& cu_seqlens, int64_t max_seqlen, c10::optional<torch::Tensor> const& scale_bmm1,
-    torch::Tensor const& scale_out, bool fp16_softmax, c10::ScalarType out_dtype)
+    torch::Tensor const& scale_out, bool fp16_softmax, c10::ScalarType out_dtype, double skip_correction_threshold)
 {
+    TORCH_CHECK(skip_correction_threshold >= 0.0 && skip_correction_threshold <= 8.0,
+        "fmha_dense_fp8: skip_correction_threshold must be in [0, 8]; got ", skip_correction_threshold);
     TORCH_CHECK(q.scalar_type() == c10::ScalarType::Float8_e4m3fn && k.scalar_type() == q.scalar_type()
             && v.scalar_type() == q.scalar_type(),
         "fmha_dense_fp8: q, k and v must be float8_e4m3fn");
@@ -148,7 +155,8 @@ torch::Tensor fmha_dense_fp8(torch::Tensor const& q, torch::Tensor const& k, tor
     auto out = torch::empty(q.sizes(), q.options().dtype(out_dtype));
 
     auto& runner = runnerFor(toFmhaOutType(out_dtype), device);
-    auto p = makeParams(batch, max_seqlen, q.size(0), q.size(1), q.size(2), fp16_softmax, device);
+    auto p = makeParams(
+        batch, max_seqlen, q.size(0), q.size(1), q.size(2), fp16_softmax, skip_correction_threshold, device);
     p.qPtr = q.data_ptr();
     p.kPtr = k.data_ptr();
     p.vPtr = v.data_ptr();
@@ -169,7 +177,8 @@ torch::Tensor fmha_dense_fp8(torch::Tensor const& q, torch::Tensor const& k, tor
 }
 
 // Whether a kernel exists for this head layout on the current device; never throws.
-bool fmha_dense_fp8_is_supported(int64_t head_dim, int64_t num_heads, c10::ScalarType out_dtype, bool fp16_softmax)
+bool fmha_dense_fp8_is_supported(
+    int64_t head_dim, int64_t num_heads, c10::ScalarType out_dtype, bool fp16_softmax, double skip_correction_threshold)
 {
     if (out_dtype != c10::ScalarType::BFloat16 && out_dtype != c10::ScalarType::Float8_e4m3fn)
     {
@@ -180,7 +189,8 @@ bool fmha_dense_fp8_is_supported(int64_t head_dim, int64_t num_heads, c10::Scala
         int const device = c10::cuda::current_device();
         auto& runner = runnerFor(toFmhaOutType(out_dtype), device);
         constexpr int64_t kProbeSeqLen = 128;
-        auto const p = makeParams(1, kProbeSeqLen, kProbeSeqLen, num_heads, head_dim, fp16_softmax, device);
+        auto const p = makeParams(
+            1, kProbeSeqLen, kProbeSeqLen, num_heads, head_dim, fp16_softmax, skip_correction_threshold, device);
         return runner.isSupported(p);
     }
     catch (std::exception const&)
@@ -198,8 +208,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fmha_dense_fp8(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens, int max_seqlen, Tensor? scale_bmm1, "
-        "Tensor scale_out, bool fp16_softmax, ScalarType out_dtype) -> Tensor");
-    m.def("fmha_dense_fp8_is_supported(int head_dim, int num_heads, ScalarType out_dtype, bool fp16_softmax) -> bool");
+        "Tensor scale_out, bool fp16_softmax, ScalarType out_dtype, float skip_correction_threshold=0.) -> Tensor");
+    m.def(
+        "fmha_dense_fp8_is_supported(int head_dim, int num_heads, ScalarType out_dtype, bool fp16_softmax, "
+        "float skip_correction_threshold=0.) -> bool");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
