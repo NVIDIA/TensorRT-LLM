@@ -867,8 +867,7 @@ def test_l0_deletes_checkpoints_with_each_locations_publishing_credential() -> N
 # The command that runs a stage's tests in the step beside the checkpoint watcher, by the function
 # that holds that step.
 _TESTS_BESIDE_THE_WATCHER = {
-    "runLLMTestlistOnPlatformImpl": '${pytestCommand.join(" ")}',
-    "rerunFailedTests": '${newTestCmdLine.join(" ")}',
+    "runLLMTestlistOnPlatformImpl": "python3 ${llmSrc}/jenkins/scripts/run_tests.py",
     "runLLMTestlistWithSbatch": "${trackCmd}",
 }
 
@@ -880,7 +879,7 @@ def test_l0_takes_checkpoints_from_a_watcher_beside_the_tests() -> None:
 
     # Blue Ocean cannot draw a parallel step nested in a test stage while the build runs, so the
     # watcher runs in the background of the step that runs the tests.
-    assert not re.search(r"^(def|void) (runWithCheckpoints|uploadCheckpoint)\(", code, re.M)
+    assert not re.search(r"\b(runWithCheckpoints|uploadCheckpoint)\(", code)
     assert "CHECKPOINT_UPLOADS" not in L0_TEST.read_text(encoding="utf-8")
     for function, tests in _TESTS_BESIDE_THE_WATCHER.items():
         body = _groovy_function_body(lines, function)
@@ -907,6 +906,8 @@ def test_l0_takes_checkpoints_from_a_watcher_beside_the_tests() -> None:
     stop = batch.index('touch "\\$PROGRESS_STOP_FILE"')
     busy = batch.index('while [ -e "\\$PROGRESS_STOP_FILE.busy" ]', stop)
     final_copy = batch.index("${scpXmlCmd} && break", busy)
+    assert busy < batch.index("${scpCollectionCmd}", busy) < final_copy
+    assert busy < batch.index("/results_isolated_*.xml", busy) < final_copy
     batch.index('touch "\\$PROGRESS_DONE_FILE"', final_copy)
     # Its checkpoints, like its final snapshot, wait for the job's results.xml, without which the
     # copy brings nothing back.
