@@ -175,9 +175,10 @@ class ScheduledEncoderExecutor:
     forwards are in flight, so the next batch is prepared and launched while the previous
     one runs, and a completion thread publishes each batch as soon as its forward finishes.
     A forward that fails on the device after its launch is not recoverable and ends the
-    loop like any other crash. Settings that only tune generation are ignored: the overlap
-    scheduler, chunked prefill, guided decoding, ``scheduler_config``, the waiting-queue
-    policy and the iteration-based batch waits. Iteration statistics and KV cache events
+    loop like any other crash. Requests wait in the queue that ``scheduler_config``'s
+    waiting-queue policy selects. Settings that only tune generation are ignored: the overlap
+    scheduler, chunked prefill, guided decoding, the rest of ``scheduler_config`` and the
+    iteration-based batch waits. Iteration statistics and KV cache events
     are always empty. With ``print_iter_log`` rank 0 logs one line per batch: its requests
     and prompt tokens, the requests still waiting when it launched, the host time from
     taking the batch to publishing it, and the GPU time of the forward.
@@ -236,14 +237,22 @@ class ScheduledEncoderExecutor:
         self._gc_gen0_threshold = llm_args.garbage_collection_gen0_threshold
 
         self._hang_detector = HangDetector(on_detected=self._on_hang_detected)
+        scheduler_config = llm_args.scheduler_config
+        # The wait cap ages requests by rank 0's arrival stamps on rank 0's clock, so that
+        # every rank pops the same order.
+        aging = scheduler_config.waiting_queue_max_wait_s is not None
         self._request_queue = ExecutorRequestQueue(
             dist,
             max_batch_size,
             enable_iter_perf_stats=False,
             batch_wait_timeout_ms=llm_args.batch_wait_timeout_ms,
+            stamp_admission_times=aging,
         )
-        self._broadcaster = RequestBroadcaster(dist, self._hang_detector)
-        self._waiting_queue = create_waiting_queue()
+        self._broadcaster = RequestBroadcaster(dist, self._hang_detector, sync_clock=aging)
+        self._waiting_queue = create_waiting_queue(
+            scheduler_config.waiting_queue_policy,
+            max_wait_s=scheduler_config.waiting_queue_max_wait_s,
+        )
         self._error_budget = ErrorBudget()
         self._perf_manager = PerfMetricsManager(enabled=llm_args.return_perf_metrics)
         self._iter_log = llm_args.print_iter_log and dist.rank == 0
@@ -417,7 +426,9 @@ class ScheduledEncoderExecutor:
         )
 
     def cancel_request(self, id: int) -> None:
-        """Cancel a request; it finishes as cancelled unless its result was already published.
+        """Cancel a request; it finishes as cancelled unless its batch's completion was settled.
+
+        The completion thread settles a batch in ``_cancel_launched``, just before publishing it.
 
         Args:
             id: The request id.
@@ -594,6 +605,8 @@ class ScheduledEncoderExecutor:
             with self._hang_detector.pause():
                 items = self._request_queue.get_from_request_queue(timeout)
         items = self._broadcaster.broadcast(items, prefer_cpu=idle)
+        if self._broadcaster.sync_clock:
+            self._waiting_queue.set_now(self._broadcaster.rank0_now)
 
         canceled_ids = set()
         rejected = []

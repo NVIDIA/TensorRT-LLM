@@ -33,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import (
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings.executor import FinishReason, OutputConfig, Request, SamplingConfig
 from tensorrt_llm.executor.utils import is_context_length_exceeded_message
+from tensorrt_llm.llmapi.llm_args import SchedulerConfig, WaitingQueuePolicy
 from tensorrt_llm.mapping import Mapping
 
 WAIT = timedelta(seconds=30)
@@ -148,6 +149,7 @@ class _Harness:
         max_num_tokens=64,
         max_seq_len=32,
         print_iter_log=False,
+        scheduler_config=None,
     ):
         self.multimodal = multimodal = completion == "multimodal"
         self.runner = _Runner(max_batch_size, multimodal)
@@ -163,6 +165,7 @@ class _Harness:
                 return_perf_metrics=False,
                 enable_iter_perf_stats=False,
                 print_iter_log=print_iter_log,
+                scheduler_config=scheduler_config or SchedulerConfig(),
             ),
             mapping=Mapping(),
             dist=SimpleNamespace(rank=0, world_size=1, has_pp=False, barrier=lambda: None),
@@ -394,6 +397,26 @@ def test_a_multimodal_encoder_admits_multimodal_requests_and_fails_an_oversized_
         assert h.runner.batches == [[fitting]]
 
 
+@pytest.mark.parametrize("max_wait_s", [None, 60.0], ids=["priority", "aging"])
+def test_a_priority_queue_admits_the_higher_priority_request_first(max_wait_s):
+    with _harness(
+        max_batch_size=1,
+        scheduler_config=SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.PRIORITY, waiting_queue_max_wait_s=max_wait_s
+        ),
+    ) as h:
+        h.runner.hold()
+        running = h.submit()
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+        low, high = h.submit(priority=0.1), h.submit(priority=0.9)
+        h.runner.release.set()
+
+        for request_id in (running, low, high):
+            h.result(request_id)
+        assert h.runner.batches == [[running], [high], [low]]
+
+
 def test_cancelling_a_queued_request_finishes_it_once_as_cancelled(completion):
     with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.hold()
@@ -532,6 +555,7 @@ def test_only_rank_0_of_a_multimodal_encoder_exports(monkeypatch, rank, exports)
             return_perf_metrics=False,
             enable_iter_perf_stats=False,
             print_iter_log=False,
+            scheduler_config=SchedulerConfig(),
         ),
         model_path="",
         checkpoint_loader=Mock(),

@@ -502,6 +502,8 @@ def _check_scheduled_encoder_support(llm_args: TorchLlmArgs,
         ("enable_resource_governor", llm_args.enable_resource_governor),
         ("sleep_config", llm_args.sleep_config is not None),
         ("orchestrator_type='ray'", llm_args.orchestrator_type == "ray"),
+        ("enable_client_io_during_gpu_wait",
+         llm_args.enable_client_io_during_gpu_wait),
     )
     settings = [name for name, used in checks if used]
     if settings:

@@ -49,6 +49,7 @@ def _encoder_args(**overrides):
         enable_resource_governor=False,
         sleep_config=None,
         orchestrator_type=None,
+        enable_client_io_during_gpu_wait=False,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -83,6 +84,7 @@ def test_scheduled_encoder_rejects_unsupported_parallelism(mapping, error):
         (dict(enable_resource_governor=True), "enable_resource_governor"),
         (dict(sleep_config=object()), "sleep_config"),
         (dict(orchestrator_type="ray"), "orchestrator_type='ray'"),
+        (dict(enable_client_io_during_gpu_wait=True), "enable_client_io_during_gpu_wait"),
     ],
 )
 def test_scheduled_encoder_rejects_settings_by_name(overrides, setting):
