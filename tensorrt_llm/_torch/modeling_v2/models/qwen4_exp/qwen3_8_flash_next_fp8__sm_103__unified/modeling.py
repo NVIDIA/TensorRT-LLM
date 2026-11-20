@@ -88,6 +88,7 @@ Integration facts this file depends on:
 from __future__ import annotations
 
 import contextlib
+import functools
 import math
 import os
 from typing import TYPE_CHECKING, NamedTuple
@@ -320,6 +321,7 @@ from .ops.moe.moe_prefill_grouped__prefill import (
     prefill_grouped_ready,
     warm_prefill_grouped,
 )
+from .ops.moe.moe_sp_routing_rows__prefill import pack_routing_rows, unpack_routing_rows
 from .ops.moe.moe_tpb_decode__decode import MAX_ROWS as _MOE_TPB_ROWS
 from .ops.moe.moe_tpb_decode__decode import BlockExperts as _BlockExperts
 from .ops.moe.moe_tpb_decode__decode import SharedBlocks as _TpbShared
@@ -645,6 +647,21 @@ _PREFILL_SPLIT_DEFAULT_TP = frozenset({2})
 #: Rows from which a prefill step runs sequence-parallel: a rank's share stays past the HC
 #: kernels' small-row paths, so each runs the configuration the whole step would.
 _SP_MIN_ROWS = 4096
+#: Opt-in switch (`weights.switch`): a two-rank sequence-parallel MoE block over the copy-engine
+#: exchange (`PrefillTarget._ce_exchange`) gathers its e4m3 codes and its
+#: `[scales | ids | weights]` rows on the copy engines straight into the exchange's receive
+#: buffers (`PrefillTarget._moe_ce_gather`), the codes' copy overlapping the router, instead of
+#: NCCL's two all-gathers on the main stream. The same bytes arrive either way. Read once, when
+#: the target is built; it does nothing where the pair has no copy-engine exchange.
+PREFILL_SP_MOE_CE_GATHER_ENV = "TRTLLM_PREFILL_SP_MOE_CE_GATHER"
+#: Receive-buffer bytes a step row keeps for the MoE block's `[scales | ids | weights]` row
+#: (`PREFILL_SP_MOE_CE_GATHER_ENV`), after the codes of every row.
+_MOE_CE_META_ROW_BYTES = 256
+#: Opt-in switch (`weights.switch`): a sequence-parallel MoE block packs its
+#: `[scales | ids | weights]` rows and unpacks the gathered ones in one launch each
+#: (`ops/moe/moe_sp_routing_rows__prefill`) instead of four and three slice copies. The same
+#: bytes either way. Read once, when the target is built.
+PREFILL_SP_MOE_FUSED_ROUTING_ROWS_ENV = "TRTLLM_PREFILL_SP_MOE_FUSED_ROUTING_ROWS"
 # cuBLASLt picks a bf16 projection's kernel by its exact row count up to this many rows, and
 # past them by the 8-row group the row count falls in (`_projection_warm_rows`).
 _KERNEL_CHOICE_EACH_ROW = 16
@@ -2978,26 +2995,45 @@ def _routed_experts_sp(
     """This rank's window partial `[T, hidden]` over every row of a sequence-parallel step.
 
     Each rank routes and e4m3-quantizes only its own rows (`pad_mask` sends padding rows to
-    `_NO_EXPERT`); two uniform gathers carry the codes and a `[scales | ids | weights]` row."""
+    `_NO_EXPERT`); two uniform gathers carry the codes and a `[scales | ids | weights]` row, or
+    `gather.moe_exchange` (`PrefillTarget._moe_ce_gather`) carries both where `_sp_split` set
+    it."""
     topk = core.topk
-    logits = cublas_mm(x_rows, router)
-    topk_ids, topk_w = renorm_moe_routing_op(logits, topk=topk, output_dtype=x_rows.dtype)
-    if pad_mask is not None:
-        topk_ids.masked_fill_(pad_mask, _NO_EXPERT)
+    # Codes first: under `PREFILL_SP_MOE_CE_GATHER_ENV` their gather overlaps the router.
     xq, xsf = fp8_quantize_1x128(x_rows, use_ue8m0=_MOE_USE_UE8M0)
     nb = xsf.shape[0]
     rows = x_rows.shape[0]
     # bf16 columns: nb fp32 scales, topk int32 ids, topk bf16 weights (the width stays even).
     c0, c1, c2 = 2 * nb, 2 * nb + 2 * topk, 2 * nb + 3 * topk
-    meta = torch.empty([rows, c2 + (c2 & 1)], dtype=torch.bfloat16, device=x_rows.device)
-    meta[:, :c0].view(torch.float32).copy_(xsf.t())
-    meta[:, c0:c1].view(torch.int32).copy_(topk_ids)
-    meta[:, c1:c2].copy_(topk_w)
-    codes = gather(xq.view(torch.bfloat16)).view(xq.dtype)
-    every = gather(meta)
-    scales = every[:, :c0].view(torch.float32).t()
-    ids = every[:, c0:c1].contiguous().view(torch.int32)
-    weights = every[:, c1:c2].contiguous()
+    # `PREFILL_SP_MOE_FUSED_ROUTING_ROWS_ENV`: one launch packs the rows, one unpacks them.
+    fused = getattr(gather, "fused_routing_rows", False)
+
+    def routing() -> torch.Tensor:
+        logits = cublas_mm(x_rows, router)
+        topk_ids, topk_w = renorm_moe_routing_op(logits, topk=topk, output_dtype=x_rows.dtype)
+        if fused:
+            return pack_routing_rows(xsf, topk_ids, topk_w, pad_mask, _NO_EXPERT)
+        if pad_mask is not None:
+            topk_ids.masked_fill_(pad_mask, _NO_EXPERT)
+        meta = torch.empty([rows, c2 + (c2 & 1)], dtype=torch.bfloat16, device=x_rows.device)
+        meta[:, :c0].view(torch.float32).copy_(xsf.t())
+        meta[:, c0:c1].view(torch.int32).copy_(topk_ids)
+        meta[:, c1:c2].copy_(topk_w)
+        return meta
+
+    exchange = getattr(gather, "moe_exchange", None)
+    if exchange is not None:
+        codes, every = exchange(xq, routing)
+    else:
+        meta = routing()
+        codes = gather(xq.view(torch.bfloat16)).view(xq.dtype)
+        every = gather(meta)
+    if fused:
+        scales, ids, weights = unpack_routing_rows(every, nb, topk)
+    else:
+        scales = every[:, :c0].view(torch.float32).t()
+        ids = every[:, c0:c1].contiguous().view(torch.int32)
+        weights = every[:, c1:c2].contiguous()
     total = codes.shape[0]
     step = getattr(core, "moe_max_rows", _MOE_MAX_ROWS)
     if after_first is not None and total <= step:
@@ -4195,6 +4231,10 @@ class PrefillTarget:
         self._block_sum = core.tp_sum
         # `(lo, hi, gather)` of a sequence-parallel forward, or None.
         self._sp_rows = None
+        # Whether `_routed_experts_sp` packs and unpacks its routing rows in one launch each.
+        self._sp_moe_fused_rows = split is not None and _weights.switch(
+            PREFILL_SP_MOE_FUSED_ROUTING_ROWS_ENV
+        )
         # Highest priority: in a CUDA graph a default-priority stream's gather waits for the
         # main stream's persistent GEMM, which holds every SM.
         self._comm_stream = None
@@ -4218,7 +4258,18 @@ class PrefillTarget:
             from .ops.comm.ce_exchange__sp_pair import CopyEngineExchange
 
             rows = -(-core.max_num_tokens // 2)
-            self._ce_exchange = CopyEngineExchange.create(core.mapping, rows * core.hidden * 2)
+            self._moe_ce_gather_on = _weights.switch(PREFILL_SP_MOE_CE_GATHER_ENV)
+            # The MoE gather (`_moe_ce_gather`) keeps every row's e4m3 codes (as many bytes as a
+            # share of bf16 rows) and then every row's routing row.
+            meta = core.max_num_tokens * _MOE_CE_META_ROW_BYTES if self._moe_ce_gather_on else 0
+            self._ce_exchange = CopyEngineExchange.create(
+                core.mapping, rows * core.hidden * 2 + meta
+            )
+            if self._moe_ce_gather_on and self._ce_exchange is not None and core.mapping.rank == 0:
+                print(
+                    f"{_LOG_PREFIX}: sequence-parallel MoE gathers on the copy engines",
+                    flush=True,
+                )
 
     def _sp_split(self, num_tokens: int):
         """`(lo, hi, gather, scatter)` of a sequence-parallel forward over `num_tokens`, or None.
@@ -4235,6 +4286,7 @@ class PrefillTarget:
         def gather(t: torch.Tensor) -> torch.Tensor:
             return allgather(t, None, group, process_group)
 
+        gather.fused_routing_rows = getattr(self, "_sp_moe_fused_rows", False)
         ce = getattr(self, "_ce_exchange", None) if world == 2 else None
 
         def scatter(t: torch.Tensor) -> torch.Tensor:
@@ -4265,8 +4317,47 @@ class PrefillTarget:
                 return t[lo:hi] + box.pop()
 
             scatter.split_finalize = (start, finish, peer_rows)
+            if getattr(self, "_moe_ce_gather_on", False):
+                gather.moe_exchange = functools.partial(self._moe_ce_gather, ce, lo)
 
         return rank * rows, (rank + 1) * rows, gather, scatter
+
+    def _moe_ce_gather(self, ce, lo: int, xq: torch.Tensor, routing) -> tuple:
+        """A two-rank SP MoE block's gathers on the copy engines (`PREFILL_SP_MOE_CE_GATHER_ENV`).
+
+        This rank's e4m3 codes `xq` `[rows, hidden]` (rows `[lo, lo + rows)` of the step) go to
+        their rows of the peer's receive buffer on the comm stream while `routing()` queues the
+        router on the main stream and returns this rank's `[rows, width]` bf16 routing rows,
+        which follow into the region after every row's codes; the main stream writes both into
+        the same rows of this rank's receive buffer. Returns `(codes, every)`: every row's codes
+        `[2 * rows, hidden]` and routing rows `[2 * rows, width]` in rank order, views of the
+        receive buffer (read before the next exchange, as `exchange`'s result)."""
+        rows, hidden = xq.shape
+        total = 2 * rows
+        main = torch.cuda.current_stream()
+        comm = self._comm_stream
+        self._comm_fork.record(main)
+        comm.wait_event(self._comm_fork)
+        with torch.cuda.stream(comm):
+            ce.begin_gather()
+            ce.put_gather(xq.view(torch.uint8), lo * hidden)
+        meta = routing()
+        width = meta.shape[1]
+        row_bytes = width * meta.element_size()
+        assert row_bytes <= _MOE_CE_META_ROW_BYTES, width
+        meta_at = -(-(total * hidden) // 256) * 256
+        self._comm_fork.record(main)
+        comm.wait_event(self._comm_fork)
+        with torch.cuda.stream(comm):
+            ce.put_gather(meta, meta_at + lo * row_bytes)
+            ce.end_gather()
+        codes = ce.received(0, total * hidden).view(xq.dtype).view(total, hidden)
+        every = ce.received(meta_at, total * row_bytes).view(meta.dtype).view(total, width)
+        codes[lo : lo + rows].copy_(xq)
+        every[lo : lo + rows].copy_(meta)
+        self._comm_join.record(comm)
+        main.wait_event(self._comm_join)
+        return codes, every
 
     def _block_rows(self, x: torch.Tensor) -> torch.Tensor:
         """A block's input over every row: `x`, or the gather of every rank's rows under SP."""

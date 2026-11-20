@@ -51,6 +51,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified.ops.moe.moe_front_router_quant__decode import (  # noqa: E501
     moe_front_router_quant,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified.ops.moe.moe_sp_routing_rows__prefill import (  # noqa: E501
+    pack_routing_rows,
+    unpack_routing_rows,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_103__unified.ops.moe.mtp_moe_combine_inject__decode import (  # noqa: E501
     mtp_moe_combine_inject,
 )
@@ -702,6 +706,81 @@ def test_prefill_grouped(case):
         _grouped_matches_the_reference(*map(int, case.split("-")))
 
 
+# ------------------------------------------------------ moe_sp_routing_rows__prefill ---
+
+
+def _same_bytes(got: torch.Tensor, want: torch.Tensor) -> bool:
+    """Same dtype, shape and bytes (ids and scales read as bf16 are not all numbers)."""
+    return (
+        got.dtype == want.dtype
+        and got.shape == want.shape
+        and torch.equal(got.contiguous().view(torch.uint8), want.contiguous().view(torch.uint8))
+    )
+
+
+def _check_pack_rows(cell):
+    """The packed rows are bytewise the slice copies, the padding rows' ids filled; a capture
+    replays on new rows."""
+    rows, nb, topk, padded = (cell.spec[k] for k in ("rows", "nb", "topk", "padded"))
+    assert (2 * nb + 3 * topk) % 2 == 0, "an odd width leaves its pad column unwritten"
+    g = torch.Generator(device=DEV).manual_seed(_seed(cell.why))
+
+    def operands():
+        xsf = torch.rand(nb, rows, device=DEV, generator=g)
+        ids = torch.randint(0, 512, (rows, topk), device=DEV, generator=g, dtype=torch.int32)
+        weights = torch.rand(rows, topk, device=DEV, generator=g).to(torch.bfloat16)
+        return xsf, ids, weights
+
+    mask = (torch.arange(rows, device=DEV) >= rows - padded)[:, None] if padded else None
+    ops = operands()
+    got = pack_routing_rows(*ops, mask, M._NO_EXPERT)
+    assert _same_bytes(got, pack_routing_rows.reference(*ops, mask, M._NO_EXPERT))
+    static = [t.clone() for t in ops]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = pack_routing_rows(*static, mask, M._NO_EXPERT)
+    new = operands()
+    for s, n in zip(static, new):
+        s.copy_(n)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _same_bytes(out, pack_routing_rows.reference(*new, mask, M._NO_EXPERT))
+
+
+def _check_unpack_rows(cell):
+    """The scales, ids and weights are bytewise the slice copies of the gathered rows, each
+    contiguous; a capture replays on new rows."""
+    rows, nb, topk = (cell.spec[k] for k in ("rows", "nb", "topk"))
+    width = 2 * nb + 3 * topk
+    assert width % 2 == 0, "an odd width carries a pad column"
+    g = torch.Generator(device=DEV).manual_seed(_seed(cell.why))
+
+    def operands():
+        # Any bytes: the op only moves them.
+        bits = torch.randint(
+            -(2**15), 2**15, (rows, width), device=DEV, generator=g, dtype=torch.int16
+        )
+        return bits.view(torch.bfloat16)
+
+    def check(got, every):
+        want = unpack_routing_rows.reference(every, nb, topk)
+        assert [tuple(t.shape) for t in got] == [(nb, rows), (rows, topk), (rows, topk)]
+        assert all(t.is_contiguous() for t in got)
+        assert all(_same_bytes(a, b) for a, b in zip(got, want))
+
+    every = operands()
+    check(unpack_routing_rows(every, nb, topk), every)
+    static = every.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = unpack_routing_rows(static, nb, topk)
+    new = operands()
+    static.copy_(new)
+    graph.replay()
+    torch.cuda.synchronize()
+    check(out, new)
+
+
 # ------------------------------------------------------------------ embed_rows__decode ---
 
 
@@ -1035,6 +1114,8 @@ _CELL_CHECKS = (
     (moe_front_router_quant, _check_front),
     (embed_rows, _check_embed_rows),
     (mtp_moe_combine_inject, _check_mtp_combine),
+    (pack_routing_rows, _check_pack_rows),
+    (unpack_routing_rows, _check_unpack_rows),
     (_tpb.moe_tpb_decode, _check_tpb),
 )
 CASES = [(entry, check, cell) for entry, check in _CELL_CHECKS for cell in entry.CELLS]

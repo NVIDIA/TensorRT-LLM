@@ -112,7 +112,9 @@ class CopyEngineExchange:
     """The pair's buffers and flags: `exchange(x)` -> the peer's `x` (`ce_exchange`, a view of
     this rank's receive buffer, same shape and dtype). `capacity` bytes a call at most. Built on
     the attention-TP group of a two-rank `mapping` (IPC memory inside a node); `create` returns
-    None where that does not hold. Owns this rank's buffer and its mapping of the peer's, and
+    None where that does not hold. `begin_gather` / `put_gather` / `end_gather` run the same
+    protocol around several copies at byte offsets, after which each receive buffer holds both
+    ranks' ranges (`received`). Owns this rank's buffer and its mapping of the peer's, and
     releases both when collected."""
 
     def __init__(self, local: int, peer: int, capacity: int):
@@ -155,6 +157,48 @@ class CopyEngineExchange:
     def exchange(self, x: torch.Tensor) -> torch.Tensor:
         """`ce_exchange(self, x)`."""
         return ce_exchange(self, x)
+
+    def begin_gather(self) -> None:
+        """Steps 1-2 of an all-gather into both receive buffers (`put_gather`, `end_gather`): this
+        rank's receive buffer is free and so is the peer's. On the caller's stream, which must
+        also run the `put_gather` calls and `end_gather` of this gather, in that order."""
+        d = self._driver
+        stream = d.CUstream(torch.cuda.current_stream().cuda_stream)
+        _write(d, stream, self._peer_ready, 1)
+        _wait(d, stream, self._my_ready, 1)
+        _write(d, stream, self._my_ready, 0)
+
+    def put_gather(self, x: torch.Tensor, offset: int) -> None:
+        """Copy `x` (contiguous) to byte `offset` of the peer's receive buffer over NVLink on the
+        copy engines. The caller writes the same range of its own receive buffer itself
+        (`received`), on any stream ordered before its next exchange or gather; the two ranks
+        put disjoint ranges, so after `end_gather` each receive buffer holds every rank's."""
+        assert x.is_contiguous() and x.is_cuda
+        nbytes = x.numel() * x.element_size()
+        assert 0 <= offset and offset + nbytes <= self.capacity, (offset, nbytes, self.capacity)
+        r = self._runtime
+        (err,) = r.cudaMemcpyAsync(
+            self._peer + offset,
+            x.data_ptr(),
+            nbytes,
+            r.cudaMemcpyKind.cudaMemcpyDefault,
+            r.cudaStream_t(torch.cuda.current_stream().cuda_stream),
+        )
+        assert err == r.cudaError_t.cudaSuccess, err
+
+    def end_gather(self) -> None:
+        """Steps 4-5 of the gather `begin_gather` opened: the peer's ranges are in this rank's
+        receive buffer (`received` reads them until the next exchange or gather)."""
+        d = self._driver
+        stream = d.CUstream(torch.cuda.current_stream().cuda_stream)
+        _write(d, stream, self._peer_data, 1)
+        _wait(d, stream, self._my_data, 1)
+        _write(d, stream, self._my_data, 0)
+
+    def received(self, offset: int, nbytes: int) -> torch.Tensor:
+        """Bytes `[offset, offset + nbytes)` of this rank's receive buffer (uint8)."""
+        assert 0 <= offset and offset + nbytes <= self.capacity, (offset, nbytes, self.capacity)
+        return self._recv[offset : offset + nbytes]
 
 
 def _write(driver, stream, addr: int, value: int) -> None:

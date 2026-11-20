@@ -4,7 +4,11 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
+import triton
+import triton.language as tl
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
@@ -19,6 +23,51 @@ AMAX_FLOOR = float(torch.tensor(1e-10, dtype=torch.bfloat16))
 #: The two divisions in the kernel are approximate (`--use_fast_math`), each
 #: within CUDA's documented 2 ulp; the returned scale is two deep.
 SCALE_ULP_GATE = 4
+
+
+#: Rows from which plain-scale calls run the Triton kernel below instead of the C++ op
+#: (TRTLLM_FP8_1X128_TRITON_MIN_ROWS; unset or 0 = never). Same bits as the C++ op.
+_TRITON_MIN_ROWS = int(os.environ.get("TRTLLM_FP8_1X128_TRITON_MIN_ROWS", "0") or 0)
+#: 1x128 groups a Triton program.
+_TRITON_BLOCK_G = 32
+
+
+@triton.jit
+def _fp8_quantize_1x128_kernel(
+    x_ptr, q_ptr, s_ptr, num_groups, rows, NB: tl.constexpr, BLOCK_G: tl.constexpr
+):
+    """`BLOCK_G` consecutive 1x128 groups of a row-major `[rows, NB * 128]` bf16 matrix: the
+    C++ vectorized kernel's arithmetic (bf16 amax floored at bf16(1e-10), IEEE `448 / amax`
+    and `1 / quant_scale`, e4m3 of the fp32 product, saturating), scales stored `[NB, rows]`."""
+    g = tl.program_id(0) * BLOCK_G + tl.arange(0, BLOCK_G)
+    live = g < num_groups
+    offs = g.to(tl.int64)[:, None] * 128 + tl.arange(0, 128)[None, :]
+    x = tl.load(x_ptr + offs, mask=live[:, None], other=0.0)
+    amax = tl.max(tl.abs(x), axis=1)
+    amax = tl.maximum(amax, tl.full([BLOCK_G], 1e-10, tl.float32).to(tl.bfloat16)).to(tl.float32)
+    quant_scale = tl.math.div_rn(tl.full([BLOCK_G], 448.0, tl.float32), amax)
+    dequant_scale = tl.math.div_rn(tl.full([BLOCK_G], 1.0, tl.float32), quant_scale)
+    tl.store(
+        q_ptr + offs,
+        (x.to(tl.float32) * quant_scale[:, None]).to(tl.float8e4nv),
+        mask=live[:, None],
+    )
+    row = g // NB
+    tl.store(s_ptr + (g - row * NB) * rows + row, dequant_scale, mask=live)
+
+
+def _fp8_quantize_1x128_triton(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`torch.ops.trtllm.fp8_quantize_1x128(input, False)` for a contiguous bf16 `[T, H]`,
+    `H % 128 == 0`: the same bits, the same shapes and the same padded data allocation."""
+    rows, width = input.shape
+    nb = width // 128
+    data = torch.empty(((rows + 3) // 4 * 4, width), dtype=torch.float8_e4m3fn, device=input.device)
+    scales = torch.empty((nb, rows), dtype=torch.float32, device=input.device)
+    groups = rows * nb
+    _fp8_quantize_1x128_kernel[(triton.cdiv(groups, _TRITON_BLOCK_G),)](
+        input, data, scales, groups, rows, NB=nb, BLOCK_G=_TRITON_BLOCK_G, num_warps=4
+    )
+    return data[:rows], scales
 
 
 def block_scales(input: torch.Tensor, use_ue8m0: bool) -> tuple[torch.Tensor, torch.Tensor]:
@@ -129,6 +178,12 @@ class Fp8Quantize1x128(OpWrapper):
     At the `capture` cells the replay is bitwise the eager call, and a second
     step's activations replay bitwise their own eager call.
 
+    With `TRTLLM_FP8_1X128_TRITON_MIN_ROWS=n`, plain-scale calls of at least n rows
+    (contiguous bf16, H % 128 == 0) run `_fp8_quantize_1x128_kernel` instead: the same
+    bits (IEEE divisions as the C++ kernel compiles them, the same e4m3 rounding), the
+    same returned shapes; 16384 x 2560 on GB300 41.7 -> 20.6 us (the C++ kernel spends
+    a 64-bit index division and two divisions per 8 elements a lane).
+
     Source: compiled-in C++, `torch.ops.trtllm.fp8_quantize_1x128` from
     `thop/fp8Quantize.cpp` (`fp8_1x128_cs` -> `launch_scale_1x128`). The
     launcher takes `scale_1x128_vec_kernel` when `can_vectorize_1x128` holds
@@ -165,6 +220,16 @@ class Fp8Quantize1x128(OpWrapper):
         input: torch.Tensor,
         use_ue8m0: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            _TRITON_MIN_ROWS
+            and not use_ue8m0
+            and input.dim() == 2
+            and input.shape[0] >= _TRITON_MIN_ROWS
+            and input.shape[1] % 128 == 0
+            and input.dtype == torch.bfloat16
+            and input.is_contiguous()
+        ):
+            return _fp8_quantize_1x128_triton(input)
         return torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0)
 
     def reference(
