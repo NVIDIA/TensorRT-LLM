@@ -3376,9 +3376,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         n = weight.size(1)
         return torch.empty(m, n, dtype=output_dtype, device=input.device)
 
-    # A build of the NVFP4 gather and finalize grouped GEMM fusions: one kernel's compile on GB300.
-    _GROUPED_GEMM_BUILD_S = 1.0
-
     class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
             TunableRunner):
         kernel_class = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
@@ -3532,9 +3529,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                               10, 0,
                                               helper.infer_shape_input5_rows)),
                         use_cold_l2_cache=True,
-                        build_strategy=BuildStrategy.PARALLEL,
-                        build_in_workers=True,
-                        build_seconds=_GROUPED_GEMM_BUILD_S)
+                        build_strategy=BuildStrategy.PARALLEL)
                     return self.__class__.tuning_config_cache[key]
                 self.__class__.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
@@ -3551,8 +3546,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cold_l2_cache=True,
                     build_strategy=BuildStrategy.PARALLEL,
-                    build_in_workers=True,
-                    build_seconds=_GROUPED_GEMM_BUILD_S,
                     # The dynamic dimension is input 0's (permuted) rows.
                     tune_max_num_tokens=helper.get_max_num_permuted_tokens(
                         self.weights_evict_first_max_tokens)
@@ -4454,9 +4447,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         constraint_specs=(ConstraintSpec(
                             2, 0, helper.infer_shape_input0_rows), ),
                         use_cold_l2_cache=True,
-                        build_strategy=BuildStrategy.PARALLEL,
-                        build_in_workers=True,
-                        build_seconds=_GROUPED_GEMM_BUILD_S)
+                        build_strategy=BuildStrategy.PARALLEL)
                     return self.__class__.tuning_config_cache[key]
                 helper = GatherGroupedGemmInputsHelper(
                     self.num_experts,
@@ -4486,8 +4477,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs_pre_hook=helper.inputs_pre_hook,
                     use_cold_l2_cache=True,
                     build_strategy=BuildStrategy.PARALLEL,
-                    build_in_workers=True,
-                    build_seconds=_GROUPED_GEMM_BUILD_S,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -13561,8 +13550,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                       stats_constraints),
                     inputs_pre_hook=self._tuning_inputs_pre_hook,
                     build_strategy=BuildStrategy.PARALLEL,
-                    build_in_workers=True,
-                    build_seconds=4.0,  # One kernel's compile on GB300.
                 )
             return cache[key]
 

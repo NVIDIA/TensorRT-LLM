@@ -3352,7 +3352,7 @@ def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path,
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(0, 0,
                                                                   (2, 4)), ),
                           build_strategy=BuildStrategy.PARALLEL,
-                          build_in_workers=workers_on)
+                          use_build_pool_in_warmup=workers_on)
     with tune_mode_workers.pass_scope(), autotune():
         tuner.choose_one("autotuner_test::build_across_ranks",
                          [TwoTacticRunner()], config,
@@ -3595,8 +3595,6 @@ def tune_mode_workers(monkeypatch):
         return env
 
     monkeypatch.setattr(build_pool, "_worker_env", worker_env)
-    # Every build goes to the workers, however short (the tests of that rule set it).
-    monkeypatch.setenv("TLLM_KERNEL_BUILDER_MIN_BUILD_S", "0")
     rank = build_pool.BuildPool(workers=2, enabled=True)
     monkeypatch.setattr(build_pool.BuildPool, "_instance", rank)
     yield rank
@@ -3610,7 +3608,7 @@ def tune_mode_workers(monkeypatch):
                          ids=["workers", "workers_off", "no_build_pass"])
 def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
         tune_mode_workers, tmp_path, monkeypatch, workers_on, in_build_pass):
-    """In tune mode inside a build pass, an op that sets ``build_in_workers`` has the rank's
+    """In tune mode inside a build pass, an op that sets ``use_build_pool_in_warmup`` has the rank's
     worker processes build every (profile, tactic) its profiling times, before it profiles;
     with the workers off (``TLLM_KERNEL_BUILDER=0``), or outside a build pass, none builds
     there."""
@@ -3622,7 +3620,7 @@ def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
     runner = targets.RecordingRunner(str(tmp_path))
     config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
-        build_in_workers=True,
+        use_build_pool_in_warmup=True,
     )
     x = torch.randn(4, 8, device="cuda")
     # The builds there are when the first tactic is timed.
@@ -3652,129 +3650,6 @@ def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
         assert tune_mode_workers._pool is None
     else:
         assert built == []
-    tuner.clear_cache()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("build_s, in_workers", [(0.0, False), (0.4, True)],
-                         ids=["short", "long"])
-def test_tune_mode_measures_a_build_before_the_workers_take_any(
-        tune_mode_workers, tmp_path, monkeypatch, build_s, in_workers):
-    """Until an op's builds are measured, tune mode builds one itself, timed; the workers
-    build the others only if it took TLLM_KERNEL_BUILDER_MIN_BUILD_S seconds. Builds too short
-    for the workers cost the inputs of the profile measured only."""
-    import autotuner_worker_targets as targets
-
-    tune_mode_workers.min_build_s = 0.2
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
-    runner = targets.RecordingRunner(str(tmp_path), build_s)
-    config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
-        build_in_workers=True,
-    )
-    x = torch.randn(4, 8, device="cuda")
-    made = []
-    tuning_tensors = AutoTuner._tuning_tensors
-
-    def record_inputs(self, profile, *args):
-        made.append(profile.get_opt_shapes())
-        return tuning_tensors(self, profile, *args)
-
-    monkeypatch.setattr(AutoTuner, "_tuning_tensors", record_inputs)
-    with tune_mode_workers.pass_scope(), autotune():
-        tuner.choose_one(f"test::measured_builds_{build_s}", [runner], config,
-                         [x])
-    # The measured profile's, then each profile's for the workers.
-    assert len(made) == (1 + 3 if in_workers else 1)
-    builders = {
-        name: (tmp_path / name).read_text().split()
-        for name in os.listdir(tmp_path)
-    }
-    here = str(os.getpid())
-    measured = [name for name, pids in builders.items() if pids[0] == here]
-    assert len(measured) == 1
-    if in_workers:
-        assert sorted(builders) == sorted(f"m{m}-t{t}" for m in (1, 2, 4)
-                                          for t in (0, 1))
-        assert all(pids[-1] != here for pids in builders.values())
-    else:
-        assert builders == {measured[0]: [here]}
-    tuner.clear_cache()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("start_fraction, measured", [(0.0, "m1-t0"),
-                                                      (0.5, "m2-t1")])
-def test_ranks_that_share_builds_measure_different_kernels(
-        tune_mode_workers, tmp_path, monkeypatch, start_fraction, measured):
-    """With shared builds, a rank measures a build from its own place in the profiles and
-    tactics (``jit_share.start_fraction``): the ranks measure different kernels, rather than
-    wait for one of them to build the same."""
-    import autotuner_worker_targets as targets
-
-    tune_mode_workers.min_build_s = 0.2
-    monkeypatch.setattr(jit_share, "enabled", lambda: True)
-    monkeypatch.setattr(jit_share, "start_fraction", lambda: start_fraction)
-    (tmp_path / "share").mkdir()
-    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path / "share"))
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
-    runner = targets.RecordingRunner(str(tmp_path))
-    config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
-        build_strategy=BuildStrategy.PARALLEL,
-        build_in_workers=True,
-    )
-    x = torch.randn(4, 8, device="cuda")
-    with tune_mode_workers.pass_scope(), autotune():
-        tuner.choose_one(f"test::shared_measure_{start_fraction}", [runner],
-                         config, [x])
-    # Too short for the workers: the measured build is the only one.
-    assert sorted(name for name in os.listdir(tmp_path)
-                  if name != "share") == [measured]
-    tuner.clear_cache()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("build_s, in_workers", [(0.1, False), (30.0, True)],
-                         ids=["short", "long"])
-def test_an_op_that_gives_its_build_time_is_not_measured(
-        tune_mode_workers, tmp_path, monkeypatch, build_s, in_workers):
-    """An op whose TuningConfig gives ``build_seconds`` builds nothing here to measure: the time
-    it gives decides whether the workers build every (profile, tactic). Builds left to the op
-    cost it no inputs before its profiling."""
-    import autotuner_worker_targets as targets
-
-    tune_mode_workers.min_build_s = 5.0
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
-    runner = targets.RecordingRunner(str(tmp_path))
-    config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
-        build_in_workers=True,
-        build_seconds=build_s,
-    )
-    x = torch.randn(4, 8, device="cuda")
-    made = []
-    tuning_tensors = AutoTuner._tuning_tensors
-
-    def record_inputs(self, profile, *args):
-        made.append(profile.get_opt_shapes())
-        return tuning_tensors(self, profile, *args)
-
-    monkeypatch.setattr(AutoTuner, "_tuning_tensors", record_inputs)
-    with tune_mode_workers.pass_scope(), autotune():
-        tuner.choose_one(f"test::expected_build_{build_s}", [runner], config,
-                         [x])
-    assert len(made) == (3 if in_workers else 0)
-    builders = {
-        name: (tmp_path / name).read_text().split()
-        for name in os.listdir(tmp_path)
-    }
-    assert all(str(os.getpid()) not in pids for pids in builders.values())
-    assert sorted(builders) == (sorted(f"m{m}-t{t}" for m in (1, 2, 4)
-                                       for t in (0, 1)) if in_workers else [])
     tuner.clear_cache()
 
 
@@ -3832,37 +3707,6 @@ def test_small_inputs_of_any_dtype_reach_a_worker_with_their_values(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_each_runner_of_an_op_is_measured_on_its_own(tune_mode_workers,
-                                                     tmp_path):
-    """A runner whose kernels ship prebuilt, timed first, does not keep a JIT
-    runner's long builds from the workers."""
-    import autotuner_worker_targets as targets
-
-    tune_mode_workers.min_build_s = 0.2
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
-    jit = targets.RecordingRunner(str(tmp_path), 0.4)
-    config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
-        build_in_workers=True,
-    )
-    x = torch.randn(4, 8, device="cuda")
-    with tune_mode_workers.pass_scope(), autotune():
-        tuner.choose_one("test::prebuilt_then_jit",
-                         [targets.PrebuiltRunner(), jit], config, [x])
-    builders = {
-        name: (tmp_path / name).read_text().split()
-        for name in os.listdir(tmp_path)
-    }
-    assert sorted(builders) == sorted(f"m{m}-t{t}" for m in (1, 2, 4)
-                                      for t in (0, 1))
-    here = str(os.getpid())
-    assert sum(pids[0] == here for pids in builders.values()) == 1
-    assert all(pids[-1] != here for pids in builders.values())
-    tuner.clear_cache()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_a_runner_that_builds_from_shapes_builds_on_meta_inputs_in_the_workers(
         tune_mode_workers, tmp_path):
     """A runner that ``builds_from_shapes`` builds every (profile, tactic) in the worker
@@ -3874,7 +3718,7 @@ def test_a_runner_that_builds_from_shapes_builds_on_meta_inputs_in_the_workers(
     runner = targets.FromShapesRunner(str(tmp_path))
     config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
-        build_in_workers=True,
+        use_build_pool_in_warmup=True,
     )
     x = torch.randn(4, 8, device="cuda")
     with tune_mode_workers.pass_scope(), autotune():

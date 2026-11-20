@@ -4,28 +4,24 @@
 module."""
 
 import os
-import time
 
 from tensorrt_llm._torch.autotuner import TunableRunner
 
 
 class RecordingRunner(TunableRunner):
-    """A runner whose build takes ``build_s`` seconds and records the process that built it, as a
-    line of the file in ``directory`` named for the rows and the tactic; its tactics double the
-    input."""
+    """A runner whose build records the process that built it, as a line of the file in
+    ``directory`` named for the rows and the tactic; its tactics double the input."""
 
-    def __init__(self, directory: str, build_s: float = 0.0):
+    def __init__(self, directory: str):
         self.directory = directory
-        self.build_s = build_s
 
     def unique_id(self):
-        return (self.directory, self.build_s)
+        return (self.directory,)
 
     def get_valid_tactics(self, inputs, profile, **kwargs):
         return [0, 1]
 
     def build(self, inputs, *, tactic=-1, **kwargs) -> None:
-        time.sleep(self.build_s)
         name = f"m{inputs[0].shape[0]}-t{tactic}"
         with open(os.path.join(self.directory, name), "a") as f:
             f.write(f"{os.getpid()}\n")
@@ -73,19 +69,3 @@ def record_made(path: str, specs) -> None:
     with open(path, "wb") as f:
         for spec in specs:
             f.write(_TensorSpec.make(spec).view(torch.uint8).cpu().numpy().tobytes())
-
-
-class PrebuiltRunner(TunableRunner):
-    """A runner whose kernel ships prebuilt (as cuBLAS's): its build does nothing."""
-
-    def unique_id(self):
-        return ()
-
-    def get_valid_tactics(self, inputs, profile, **kwargs):
-        return [0]
-
-    def build(self, inputs, *, tactic=-1, **kwargs) -> None:
-        """Nothing to build."""
-
-    def forward(self, inputs, tactic=-1, **kwargs):
-        return inputs[0] * 2

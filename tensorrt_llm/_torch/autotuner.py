@@ -177,14 +177,11 @@ class TuningConfig:
             bytes (evicting the operands, weights included, from L2) and each repeat is timed alone
             with %globaltimer stamps inside one CUDA graph; the median repeat is the tactic's time.
             For decode-sized GEMMs whose weights never stay in L2 between uses.
-        build_in_workers (bool): In a build pass (the memory-profiling warmup), tune mode first
-            builds every (profile, runner, tactic) on the rank's worker processes
-            (``TunableRunner.build``; tensorrt_llm._torch.build_pool), then profiles. The runners
-            and tactics must pickle and must not be collective. Only builds long enough to repay a
-            worker go there (``BuildPool.worth_a_worker``: measured on one build, or given by
-            ``build_seconds``); the others build as the op profiles.
-        build_seconds (Optional[float]): The expected time of one build of the op's runners, used
-            until builds are measured, in place of timing one (``build_in_workers``).
+        use_build_pool_in_warmup (bool): In the memory-profiling warmup (a build pass), tune mode
+            first builds every (profile, runner, tactic) on the rank's build-pool worker processes
+            (``TunableRunner.build``; tensorrt_llm._torch.build_pool), then profiles. For ops whose
+            builds are long enough to repay a worker. The runners and tactics must pickle and must
+            not be collective. Warmups without a build pass build as without it.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -197,8 +194,7 @@ class TuningConfig:
     parallel_jit_warmup: int = 0
     build_strategy: BuildStrategy = BuildStrategy.INDEPENDENT
     cold_l2_flush_bytes: int = 0
-    build_in_workers: bool = False
-    build_seconds: Optional[float] = None
+    use_build_pool_in_warmup: bool = False
 
 
 @dataclass(frozen=True)
@@ -274,7 +270,7 @@ class FakeTensor:
 class TunableRunner(ABC):
 
     # Whether ``build`` compiles from its inputs' shapes, strides and dtypes alone: in a worker
-    # process (``TuningConfig.build_in_workers``) it then gets meta tensors of them.
+    # process (``TuningConfig.use_build_pool_in_warmup``) it then gets meta tensors of them.
     builds_from_shapes: bool = False
 
     @abstractmethod
@@ -363,7 +359,7 @@ class TunableRunner(ABC):
         """Compile the kernels ``tactic`` runs on ``inputs``; the result is discarded.
 
         Tune mode calls it in the rank's worker processes before it profiles
-        (``TuningConfig.build_in_workers``). This default runs the tactic
+        (``TuningConfig.use_build_pool_in_warmup``). This default runs the tactic
         once, which compiles what a first call compiles. A runner that ships
         its kernels, or can compile without launching, overrides it; one whose
         build needs only the inputs' shapes sets ``builds_from_shapes``.
@@ -1695,31 +1691,11 @@ class AutoTuner:
             len(r.get_valid_tactics(tensors, first, **kwargs))
             for r in runners) == 1
 
-    def _measure_build(self, family: str, runner: TunableRunner,
-                       tensors: List[torch.Tensor], tactic: Any, prepare: bool,
-                       **kwargs) -> bool:
-        """For a runner whose builds (``family``) are not measured yet: build ``tactic`` on a
-        profile's ``tensors`` here, timed, and tell whether its builds take long enough for the
-        rank's workers (``BuildPool.worth_a_worker``)."""
-        pool = BuildPool.get()
-        t0 = time.perf_counter()
-        try:
-            if prepare:
-                runner(tensors, tactic=-1, do_preparation=True, **kwargs)
-            runner.build(tensors, tactic=tactic, **kwargs)
-            torch.cuda.synchronize()
-        except Exception as e:  # noqa: BLE001 - the profiling reports a tactic that fails
-            logger.debug(f"[Autotuner] {family}: measuring a build failed: "
-                         f"{type(e).__name__}: {e}")
-            return False
-        pool.record_build(family, time.perf_counter() - t0)
-        return pool.worth_a_worker(family)
-
     def _builds_in_pool(self, tuning_config: TuningConfig) -> bool:
         """Whether tune mode builds the op's kernels in the rank's worker processes before it
-        profiles: an op that sets ``build_in_workers``, whose runners are not collective (MERGE),
-        while the workers take builds (inside a build pass, ``TLLM_KERNEL_BUILDER`` on)."""
-        return (tuning_config.build_in_workers
+        profiles: an op that sets ``use_build_pool_in_warmup``, whose runners are not collective
+        (MERGE), while the workers take builds (inside a build pass, ``TLLM_KERNEL_BUILDER`` on)."""
+        return (tuning_config.use_build_pool_in_warmup
                 and tuning_config.distributed_tuning_strategy
                 != DistributedTuningStrategy.MERGE
                 and BuildPool.get().accepting())
@@ -1738,30 +1714,14 @@ class AutoTuner:
         (``TunableRunner.build_key``). With shared JIT builds the ranks claim the items, and
         each builds the ones it claims; the profiling waits for the others.
         Returns False, before claiming any item, when the runners cannot go to a worker (they
-        do not pickle) and when every runner's builds are too short for one
-        (:meth:`_measure_build`), and the caller builds as without workers; the decision takes
-        no inputs when the runners' build times are measured or given (``build_seconds``), and
-        one profile's otherwise. The items of a runner whose builds are too short, and an item
-        whose inputs cannot go to a worker, are left to the profiling.
+        do not pickle), and the caller builds as without the pool. An item whose inputs cannot
+        go to a worker is left to the profiling.
         """
         pool = BuildPool.get()
-        # Each runner's builds are measured, and go to the workers, on their own: a runner
-        # whose kernels ship prebuilt (cuBLAS) says nothing of a JIT runner's.
+        # A runner's builds are a family of their own: the pool learns each family's memory.
         families = [
             f"{custom_op}|{type(runner).__name__}" for runner in runners
         ]
-        expected_s = tuning_config.build_seconds
-        in_workers = {
-            r
-            for r in range(len(runners))
-            if pool.worth_a_worker(families[r], expected_s)
-        }
-        unmeasured = [
-            r for r in range(len(runners))
-            if pool.unmeasured(families[r], expected_s)
-        ]
-        if not in_workers and not unmeasured:
-            return False
         pending = [p for p in profiles if is_pending(p)]
         if not pending:
             return True
@@ -1781,27 +1741,6 @@ class AutoTuner:
             "do_preparation" in inspect.signature(r.forward).parameters
             for r in runners
         ]
-        # An unmeasured runner builds a tactic of a profile here, timed. The ranks that share
-        # the builds start at different profiles and tactics, so that they measure different
-        # kernels rather than wait for one of them to build the same.
-        offset = jit_share.start_fraction() if share_builds else 0.0
-        first = int(offset * len(pending))
-        for p in pending[first:] + pending[:first]:
-            if not unmeasured:
-                break
-            tensors = self._tuning_tensors(p, inputs, tuning_config)
-            for r in list(unmeasured):
-                tactics = runners[r].get_valid_tactics(tensors, p, **kwargs)
-                if not tactics:
-                    continue
-                unmeasured.remove(r)
-                tactic = tactics[int(offset * len(tactics))]
-                if self._measure_build(families[r], runners[r], tensors, tactic,
-                                       prepares[r], **kwargs):
-                    in_workers.add(r)
-            del tensors
-        if not in_workers:
-            return False
         items = []
         specs: Dict[int, List[Any]] = {}
         for i, p in enumerate(pending):
@@ -1823,8 +1762,6 @@ class AutoTuner:
         builds, claimed = [], []
         for k in order:
             i, r, tactic = items[k]
-            if r not in in_workers:
-                continue  # Its profiling builds it.
             runner = runners[r]
             key = repr(
                 (custom_op, type(runner).__name__, str(runner.unique_id()),

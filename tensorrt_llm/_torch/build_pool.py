@@ -11,8 +11,10 @@ separate processes, so every op's builds run there.
   (:func:`process_built` functions and the runners' shared ``kernel_cache`` dicts load it).
 * The workers live only inside a pass (:meth:`BuildPool.pass_scope`: the memory-profiling warmup)
   and exit when it ends, before the KV cache is sized.
-* A worker takes a build only when builds of its kind take ``TLLM_KERNEL_BUILDER_MIN_BUILD_S``
-  seconds (default 5) and the GPU has room for it; the others build in this process.
+* KernelBuilder sends an op's builds to the workers when builds of their kind take
+  ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds (default 5); the autotuner, for an op that sets
+  ``TuningConfig.use_build_pool_in_warmup``. A build starts only while the GPU has room for it;
+  the others build in this process.
 * With shared JIT builds (``tensorrt_llm._jit_share``) the ranks split the builds that have a
   :class:`Claim`, and share the store.
 
