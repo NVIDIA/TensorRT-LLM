@@ -162,6 +162,7 @@ class DisaggTransferCoordinator:
         # Intent contains no resources. Existing receive tables remain the sole
         # owners while an unpublished cancellation handoff must be retried.
         self._pending_gen_cancellation_intents: Dict[int, bool] = {}
+        self._any_rank_requested_cancel = False
         self._peer_failed_gen_cancellations: Set[int] = set()
         self._retiring_gen_receives: Dict[int, LlmRequest] = {}
         self._gen_termination_requested: Set[int] = set()
@@ -618,6 +619,7 @@ class DisaggTransferCoordinator:
         gather = self._dist.tp_cp_allgather if self._dist.cp_size > 1 else self._dist.tp_allgather
         peers = gather(payload, small_payload=True)
         all_cancel_ids = set().union(*(set(peer[0]) for peer in peers))
+        self._any_rank_requested_cancel = bool(all_cancel_ids)
         requests = {
             rid: client for _, active_ids, _, _ in peers for rid, client in active_ids.items()
         }
@@ -643,6 +645,18 @@ class DisaggTransferCoordinator:
         ]
         propagated = set(cancel_ids) | (all_cancel_ids & set(requests.values()))
         return aligned, propagated, complete
+
+    @property
+    def needs_post_poll_gen_cancellation(self) -> bool:
+        """Decide whether the executor must apply outcomes after the receive poll.
+
+        Returns:
+            True for group-capable receives with no replicated vote, or when
+            this iteration's first vote saw a cancel ID on any participant.
+        """
+        return self.supports_group_receive_cancellation and (
+            not self.requires_gen_cancellation_consensus or self._any_rank_requested_cancel
+        )
 
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""

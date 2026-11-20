@@ -55,6 +55,7 @@ def _harness(
 ) -> SimpleNamespace:
     """Run real coordinator/transfer-manager/reaper code with controlled engine effects."""
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._context_first_ownership = True
     transceiver._pending_rank_info_admissions = None
     transceiver._send_sessions = {} if session is None else {401: session}

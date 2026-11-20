@@ -168,6 +168,7 @@ class _ReceiveCase:
         self.handle = TaskHandle(self.session, self.session._kv_tasks[0], token_end=1)
         assert self.handle.poll() is None
         self.transceiver = object.__new__(KvCacheTransceiverV2)
+        self.transceiver._init_receive_cancellation_state()
         self.transceiver._fp4_mla_bridge_enabled = ownership
         self.transceiver.kv_transfer_timeout_ms = 1000
         self.transceiver._ever_had_recv_session = True

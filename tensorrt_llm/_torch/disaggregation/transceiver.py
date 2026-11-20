@@ -437,6 +437,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 "with use_kv_cache_manager_v2=False for a model that supports V1."
             )
         self._shutdown_lock = threading.Lock()
+        self._init_receive_cancellation_state()
         self._shutdown_complete = False
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
@@ -529,8 +530,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs = {}
         self._recv_reqs = {}
         self._cancelled_receive_fences: dict[int, _CancelledReceiveFence] = {}
-        self._cancelled_gen_receives: dict[int, _CancelledGenReceive] = {}
-        self._receive_cancellation_intents: dict[int, bool] = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
         try:
@@ -568,6 +567,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             and mapping.pp_size == 1
             and mapping.cp_size == 1
         )
+
+    def _init_receive_cancellation_state(self) -> None:
+        """Create fresh receive ownership and peer-intent tables for this rank."""
+        self._cancelled_gen_receives: dict[int, _CancelledGenReceive] = {}
+        self._receive_cancellation_intents: dict[int, bool] = {}
 
     def _init_gen_idle_poll(self, enabled: bool) -> None:
         """Set up the idle-poll skip of check_gen_transfer_status (called by _init_sync_policy).
@@ -822,7 +826,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Preflight may refuse closure while DMA remains active. Start the
         # bounded drain before that refusal, not only in worker.prepare_shutdown().
         self._transfer_worker.request_shutdown()
-        if getattr(self, "_cancelled_gen_receives", {}):
+        if self._cancelled_gen_receives:
             raise RuntimeError("Cancelled GEN receives still await group retirement")
         for rid in list(getattr(self, "_cancelled_receive_fences", {})):
             if not self._retire_cancelled_receive_fence(rid):
@@ -1128,7 +1132,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             locally_verified,
             local_session_count=(
                 len(self._recv_sessions)
-                + len(getattr(self, "_cancelled_gen_receives", {}))
+                + len(self._cancelled_gen_receives)
                 + deferred
                 + pending_admissions
                 if idle_skip
@@ -1439,7 +1443,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             rid in self._send_sessions
             or rid in self._recv_sessions
             or rid in getattr(self, "_cancelled_receive_fences", {})
-            or rid in getattr(self, "_cancelled_gen_receives", {})
+            or rid in self._cancelled_gen_receives
         )
 
     def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
@@ -1698,7 +1702,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 into.
         """
         if self.supports_group_receive_cancellation() and (
-            get_unique_rid(req) in getattr(self, "_cancelled_gen_receives", {})
+            get_unique_rid(req) in self._cancelled_gen_receives
             or req.py_kv_receive_cancel_outcome is not None
         ):
             return
@@ -1991,7 +1995,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if need_progress:
             self._poll_gen_sessions_for_poll_interval(wait_num)
 
-        cancelled_receives = getattr(self, "_cancelled_gen_receives", {})
+        cancelled_receives = self._cancelled_gen_receives
         sessions = self._recv_sessions
         if cancelled_receives:
             sessions = {
@@ -2175,7 +2179,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return (
             not self._recv_sessions
             and not getattr(self, "_cancelled_receive_fences", {})
-            and not getattr(self, "_cancelled_gen_receives", {})
+            and not self._cancelled_gen_receives
         )
 
     def _assert_disagg_history_declared(self, req: LlmRequest) -> None:
@@ -2232,7 +2236,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def take_receive_cancellation_intents(self) -> dict[int, bool]:
         """Hand peer intent to the coordinator without transferring resource ownership."""
-        intents = getattr(self, "_receive_cancellation_intents", {})
+        intents = self._receive_cancellation_intents
         self._receive_cancellation_intents = {}
         return intents
 
@@ -2280,9 +2284,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             admission = None
             if self._pending_rank_info_admissions is not None:
                 admission = self._pending_rank_info_admissions.pop(rid, None)
-            records = getattr(self, "_cancelled_gen_receives", None)
-            if records is None:
-                records = self._cancelled_gen_receives = {}
+            records = self._cancelled_gen_receives
             if rid not in records:
                 session = self._recv_sessions.get(rid)
                 records[rid] = _CancelledGenReceive(
@@ -2354,7 +2356,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         Returns:
             Per-request prior-failure and local-safe votes for the GEN rendezvous.
         """
-        records = getattr(self, "_cancelled_gen_receives", {})
+        records = self._cancelled_gen_receives
         local = {}
         for rid, record in records.items():
             session = self._recv_sessions.get(rid)
@@ -2387,10 +2389,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         Args:
             gathered: Every participant's logical-outcome and physical-safety votes.
         """
-        records = getattr(self, "_cancelled_gen_receives", {})
-        intents = getattr(self, "_receive_cancellation_intents", None)
-        if intents is None:
-            intents = self._receive_cancellation_intents = {}
+        records = self._cancelled_gen_receives
+        intents = self._receive_cancellation_intents
         for snapshot in gathered:
             for rid, vote in snapshot.items():
                 if rid not in records:
