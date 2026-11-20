@@ -28,6 +28,7 @@ from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoa
 from ...utils import Fp4QuantizedTensor
 from ..config import DiffusionModelConfig
 from ..modules.rms_norm import RMSNormTPAware
+from ..quantization.ops import FP8_E4M3_MAX
 from .backends.interface import AttentionBackend, AttentionTensorLayout
 from .backends.parallel import wrap_parallel_attention
 from .backends.utils import create_attention
@@ -60,6 +61,11 @@ def _needs_cudnn_fp8_fallback(attention_config: Optional["AttentionConfig"]) -> 
         return False
     dense_fp8 = FMHA_LIBS["trtllm_gen_dense_fp8"]
     return dense_fp8 in enabled and sm in dense_fp8.SUPPORTED_SMS
+
+
+# trtllm::fused_residual_norm_quant mode: RMSNorm + static FP8 quantization (the RMS_NORM member
+# of the Wan ResidualNormMode enum; tests check that they agree).
+RMS_NORM_MODE = 3
 
 
 class QKVMode(str, Enum):
@@ -389,6 +395,12 @@ class Attention(nn.Module):
         self._fp8_qk_mul = math.sqrt(LOG2E / math.sqrt(self.head_dim))
         # Dequant scale of to_out's FP8 input; the attention output stays BF16 while None.
         self._fp8_out_scale: Optional[torch.Tensor] = None
+        # Static-FP8 cross-attention (enable_fp8_cross_attention): fp32 norm_q weight, the static
+        # dequant scale of the e4m3 Q, and to_out's input dequant scale for an e4m3 output.
+        self._fp8_q_norm_weight: Optional[torch.Tensor] = None
+        self._fp8_q_descale: Optional[torch.Tensor] = None
+        self._fp8_q_inv_scale: Optional[torch.Tensor] = None
+        self._fp8_cross_out_scale: Optional[torch.Tensor] = None
 
     @staticmethod
     def _qualified_module_name(
@@ -680,6 +692,84 @@ class Attention(nn.Module):
         ):
             self._fp8_out_scale = to_out.input_scale
         return self._fp8_out_scale is not None
+
+    def enable_fp8_cross_attention(self, q_amax: Optional[float] = None) -> bool:
+        """Static-FP8 cross-attention: norm_q + e4m3 quantization of Q in one row kernel with a
+        static per-tensor scale, and an e4m3 output for a static-FP8 to_out. Call after weights
+        are loaded; returns whether it applies (a backend with static FP8 I/O, full-dim QK norm,
+        no TP and a row kernel for this width).
+
+        Without ``q_amax`` the Q scale needs no calibration: RMSNorm bounds every output element
+        by sqrt(width) * max|weight|, since each |x_i| is at most sqrt(width) times the row RMS,
+        and the scale maps that bound (plus a bf16 rounding margin) to the e4m3 maximum, so Q never
+        saturates. ``q_amax`` is a calibrated maximum of |norm_q(q)| (with its margin) that maps
+        to the e4m3 maximum instead; it is capped at the bound.
+        """
+        self.disable_fp8_cross_attention()
+        norm_q = getattr(self, "norm_q", None)
+        width = self.local_q_dim
+        if not (
+            self.qkv_mode == QKVMode.SEPARATE_QKV
+            and self.qk_norm
+            and self.qk_norm_mode == "full"
+            and self.tp_size == 1
+            and isinstance(norm_q, RMSNormTPAware)
+            and not norm_q.use_gemma
+            and norm_q.weight is not None
+            and norm_q.weight.dtype == torch.bfloat16
+            and norm_q.weight.numel() == width
+            and self.attn.accepts_static_fp8_io()
+            and torch.ops.trtllm.fused_residual_norm_quant_supported(width)
+        ):
+            return False
+        weight = norm_q.weight.detach().float().contiguous()
+        bound = math.sqrt(width) * weight.abs().max() * (1.0 + 2.0**-7)
+        if q_amax is not None:
+            if not q_amax > 0:
+                raise ValueError(f"{self.module_name}: calibrated Q amax must be positive")
+            bound = torch.clamp(bound, max=float(q_amax))
+        self._fp8_q_norm_weight = weight
+        self._fp8_q_descale = (bound / FP8_E4M3_MAX).reshape(1)
+        self._fp8_q_inv_scale = self._fp8_q_descale.reciprocal()
+        to_out = self.to_out[0]
+        if to_out.quant_method.supports_cublas_epilogues(to_out):
+            self._fp8_cross_out_scale = to_out.input_scale
+        return True
+
+    def disable_fp8_cross_attention(self) -> None:
+        """Back to the cross-attention without static FP8 Q or output."""
+        self._fp8_q_norm_weight = None
+        self._fp8_q_descale = None
+        self._fp8_q_inv_scale = None
+        self._fp8_cross_out_scale = None
+
+    def fp8_cross_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        """Cross-attention on the projections from ``get_qkv`` after ``enable_fp8_cross_attention``.
+
+        Returns [B, S, H*D], e4m3 for to_out when it is static FP8, else BF16.
+        """
+        _, q8 = torch.ops.trtllm.fused_residual_norm_quant(
+            q.reshape(-1, q.shape[-1]).contiguous(),
+            None,
+            None,
+            None,
+            RMS_NORM_MODE,
+            self._fp8_q_norm_weight,
+            None,
+            q.shape[1],
+            float(self.norm_q.variance_epsilon),
+            self._fp8_q_inv_scale,
+        )
+        return self._attn_impl(
+            q8.view(q.shape),
+            self.norm_k(k),
+            v,
+            q_descale=self._fp8_q_descale,
+            out_scale=self._fp8_cross_out_scale,
+            **kwargs,
+        )
 
     def apply_packed_qk_norm_rope_fp8(
         self,

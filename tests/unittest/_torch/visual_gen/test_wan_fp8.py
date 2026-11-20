@@ -160,6 +160,8 @@ def test_fused_block_matches_unfused(backend, quant_attention):
     assert block._fp8_block and block.ffn._use_fp8_gelu_fusion
     fp8_attention_out = block.attn1._fp8_qkv_producer
     assert (block.attn1._fp8_out_scale is not None) == fp8_attention_out
+    # Static-FP8 cross-attention where the cross-attention backend has static FP8 I/O (cuDNN FP8).
+    assert (block.attn2._fp8_q_descale is not None) == block.attn2.attn.accepts_static_fp8_io()
 
     # Batch 2 gives each batch its own modulation rows; the compile test covers batch 1.
     x, text, temb, cos, sin = _inputs(2, 1560)
@@ -554,6 +556,63 @@ def test_prequantized_path_defers_the_output_rescale():
     assert trtllm.accepts_fp8_qkv()
     lib = trtllm._prequantized_fp8_lib
     assert lib._prequantized_skip_correction == PREQUANTIZED_SKIP_CORRECTION_LOG2
+
+
+def _wan_cross_attention(backend, heads=12, quant=_TRTLLM_FP8):
+    attn = Attention(
+        hidden_size=heads * HEAD_DIM,
+        num_attention_heads=heads,
+        qkv_mode=QKVMode.SEPARATE_QKV,
+        qk_norm=True,
+        qk_norm_mode="full",
+        config=_model_config(backend, quant, heads),
+        enable_sequence_parallel=False,
+    ).cuda()
+    g = torch.Generator(device="cuda").manual_seed(9)
+    with torch.no_grad():
+        for name, p in attn.named_parameters():
+            if "norm" in name:
+                p.copy_(1.0 + 0.1 * torch.randn(p.shape, device="cuda", generator=g))
+            else:
+                p.copy_(0.02 * torch.randn(p.shape, device="cuda", generator=g))
+    return attn
+
+
+@_SM107_ONLY
+@pytest.mark.parametrize("heads", [24, 40])
+@pytest.mark.parametrize("calibrated", [False, True])
+def test_static_fp8_cross_attention(heads, calibrated):
+    """norm_q + static-scale e4m3 Q in one kernel feeding cuDNN FP8, against the per-call scale,
+    with the bound-derived scale or a calibrated maximum."""
+    attn = _wan_cross_attention("TRTLLM", heads)
+    assert isinstance(attn.attn, CuDNNAttention)
+    # Gaussian rows keep |norm_q(q)| near 8; a calibrated maximum of 16 leaves headroom.
+    q_amax = 16.0 if calibrated else None
+    assert attn.enable_fp8_cross_attention(q_amax)
+    width = heads * HEAD_DIM
+    bound = width**0.5 * attn.norm_q.weight.float().abs().max() * (1.0 + 2.0**-7)
+    expected = min(bound.item(), q_amax) if calibrated else bound.item()
+    torch.testing.assert_close(attn._fp8_q_descale.item(), expected / E4M3_MAX)
+
+    g = torch.Generator(device="cuda").manual_seed(4)
+    x = torch.randn(2, 1560, width, device="cuda", generator=g).bfloat16()
+    text = torch.randn(2, 512, width, device="cuda", generator=g).bfloat16()
+    with torch.no_grad():
+        q, k, v = attn.get_qkv(x, text)
+        static = attn.fp8_cross_attention(q, k, v)
+        qn, kn = attn.apply_qk_norm(q, k)
+        dynamic = attn._attn_impl(qn, kn, v)
+    assert static.shape == dynamic.shape
+    out = static.float() * attn._fp8_cross_out_scale if static.dtype == E4M3 else static
+    assert _cosine(out, dynamic) > 0.995
+
+
+@_FP8_GPU
+def test_static_fp8_cross_attention_needs_static_fp8_io():
+    # VANILLA (BF16) cross-attention has no static FP8 inputs or outputs.
+    attn = _wan_cross_attention("VANILLA", quant=None)
+    assert not attn.enable_fp8_cross_attention()
+    assert attn._fp8_q_descale is None
 
 
 # ---------------------------------------------------------------------------

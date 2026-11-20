@@ -143,6 +143,11 @@ class AttentionBackend(ABC):
     def support_fused_qkv(cls) -> bool:
         return False
 
+    def accepts_static_fp8_io(self) -> bool:
+        """Whether ``forward`` takes an e4m3 ``q`` with a static ``q_descale`` and writes e4m3
+        output with ``out_scale`` (the dequant scale of the consumer's input)."""
+        return False
+
     def accepts_fp8_qkv(self, fp8_output: bool = False) -> bool:
         """Whether ``forward_fp8`` serves per-tensor e4m3 Q/K/V with the softmax scale in Q/K.
 

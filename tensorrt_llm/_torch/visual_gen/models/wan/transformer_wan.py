@@ -516,7 +516,9 @@ class WanBlock(nn.Module):
             torch.empty(1, 6, hidden_size).normal_(std=hidden_size**-0.5)
         )
 
-    def plan_fp8_fusions(self, log: bool = False) -> bool:
+    def plan_fp8_fusions(
+        self, log: bool = False, cross_attention_q_amax: Optional[float] = None
+    ) -> bool:
         """Enable the static-FP8 fusions when every site supports them; returns whether it did.
 
         The sites: AdaLN1/LayerNorm2/AdaLN3 + FP8 quantization in one row kernel with the
@@ -528,6 +530,8 @@ class WanBlock(nn.Module):
         self._fp8_block = False
         ffn._use_fp8_gelu_fusion = False
         attn1._fp8_out_scale = None
+        attn2._fp8_q_descale = None
+        attn2._fp8_cross_out_scale = None
         for linear in (getattr(attn1, "qkv_proj", None), getattr(attn2, "to_q", None)):
             if linear is not None:
                 linear._fp8_fuse_bias = False
@@ -571,9 +575,13 @@ class WanBlock(nn.Module):
         linears["attn1.qkv_proj"].enable_fp8_bias_epilogue()
         linears["attn2.to_q"].enable_fp8_bias_epilogue()
         fp8_attention_out = attn1.enable_fp8_output()
+        fp8_cross_attention = attn2.enable_fp8_cross_attention(cross_attention_q_amax)
         self._fp8_block = True
         if log:
-            logger.info(f"Wan FP8 block fusions on; FP8 attention output: {fp8_attention_out}.")
+            logger.info(
+                f"Wan FP8 block fusions on; FP8 attention output: {fp8_attention_out}; "
+                f"static-FP8 cross-attention: {fp8_cross_attention}."
+            )
         return True
 
     def _fused_adaln_quant(self, x, scale_msa, shift_msa, temb, fp4_scale, eps):
@@ -760,16 +768,28 @@ class WanBlock(nn.Module):
         # Text cross-attention
         batch_size, seq_len = norm_x.shape[:2]
         q, k, v = self.attn2.get_qkv(norm_x, encoder_hidden_states_text)
-        q, k = self.attn2.apply_qk_norm(q, k)
-        attn2_output = self.attn2._attn_impl(
-            q,
-            k,
-            v,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            kv_seq_len=encoder_hidden_states_text.shape[1],
-            timestep=timestep,
-        )
+        if fp8_block and self.attn2._fp8_q_descale is not None:
+            # Static-FP8 Q (norm_q + quantization in one kernel); e4m3 output for to_out.
+            attn2_output = self.attn2.fp8_cross_attention(
+                q,
+                k,
+                v,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                kv_seq_len=encoder_hidden_states_text.shape[1],
+                timestep=timestep,
+            )
+        else:
+            q, k = self.attn2.apply_qk_norm(q, k)
+            attn2_output = self.attn2._attn_impl(
+                q,
+                k,
+                v,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                kv_seq_len=encoder_hidden_states_text.shape[1],
+                timestep=timestep,
+            )
 
         # I2V: image cross-attention
         if encoder_hidden_states_img is not None:
