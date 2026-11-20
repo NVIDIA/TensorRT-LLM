@@ -284,6 +284,7 @@ class ResidualNormMode(IntEnum):
     RESIDUAL_ONLY = 0
     LAYER_NORM = 1
     ADA_LAYER_NORM = 2
+    RMS_NORM = 3
 
 
 def residual_norm_quant(
@@ -303,7 +304,8 @@ def residual_norm_quant(
 
     RESIDUAL_ONLY returns (x + gate * (y + y_bias), None).
     LAYER_NORM: affine weight / bias [hidden]; ADA_LAYER_NORM: weight (scale) / bias (shift) of
-    shape [batch, hidden]. Returns (updated x or None without y, e4m3 normalized rows).
+    shape [batch, hidden]; RMS_NORM: weight [hidden] (bf16 values), no bias. Returns (updated x
+    or None without y, e4m3 normalized rows).
     """
     shape = x.shape
     hidden = shape[-1]

@@ -543,6 +543,19 @@ def test_dense_fp8_routing_follows_the_fmha_library(monkeypatch, sm, fmha_libs, 
     assert _needs_cudnn_fp8_fallback(config) is expected
 
 
+@_SM107_ONLY
+def test_prequantized_path_defers_the_output_rescale():
+    """The pre-quantized path runs with a deferred output rescale where the kernels support it."""
+    from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen_dense_fp8 import (
+        PREQUANTIZED_SKIP_CORRECTION_LOG2,
+    )
+
+    trtllm = _backend("TRTLLM", 40)
+    assert trtllm.accepts_fp8_qkv()
+    lib = trtllm._prequantized_fp8_lib
+    assert lib._prequantized_skip_correction == PREQUANTIZED_SKIP_CORRECTION_LOG2
+
+
 # ---------------------------------------------------------------------------
 # Wan pipeline_config key enable_fp8_block_fusions.
 # ---------------------------------------------------------------------------
