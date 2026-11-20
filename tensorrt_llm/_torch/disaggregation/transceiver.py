@@ -428,26 +428,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._context_first_ownership,
             cache_transceiver_config.kv_cache_bounce_size_mb,
         ) and (mapping.world_size == 1 or (ENABLE_MULTI_DEVICE and not mpi_disabled()))
-        self._agent_recovery = recovery_enabled
         if mapping.world_size > 1:
             validation_error = None
+            recovery_comm = None
             if recovery_enabled:
                 try:
-                    self._retirement_mpi_comm = _retirement_executor_comm(mapping)
+                    recovery_comm = _retirement_executor_comm(mapping, warn=False)
                 except ValueError as error:
                     validation_error = str(error)
             votes = dist.allgather((recovery_enabled, validation_error))
             errors = [error for _, error in votes if error is not None]
-            if errors or any(enabled != recovery_enabled for enabled, _ in votes):
+            if any(enabled != recovery_enabled for enabled, _ in votes):
                 raise ValueError(
-                    "NIXL recovery startup agreement failed: "
-                    + (errors[0] if errors else "inconsistent recovery profiles")
+                    "NIXL recovery startup agreement failed: inconsistent recovery profiles"
                 )
-            if recovery_enabled and mapping.rank == 0:
-                logger.warning(
-                    "NIXL recovery uses executor-scoped MPI retirement fail-stop; "
-                    "MPI/launcher termination may include other executors in the same job."
-                )
+            if errors:
+                recovery_enabled = False
+                if mapping.rank == 0:
+                    logger.info(f"NIXL agent recovery unavailable: {errors[0]}")
+            if recovery_enabled:
+                self._retirement_mpi_comm = recovery_comm
+                if mapping.rank == 0:
+                    logger.warning(
+                        "NIXL recovery uses executor-scoped MPI retirement fail-stop; "
+                        "MPI/launcher termination may include other executors in the same job."
+                    )
+        self._agent_recovery = recovery_enabled
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()

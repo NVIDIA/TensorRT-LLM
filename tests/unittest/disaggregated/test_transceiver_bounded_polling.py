@@ -875,7 +875,9 @@ def _make_cache_config(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-def _construct_worker_config(monkeypatch, cache_config, *, world_size=1) -> TransferWorkerConfig:
+def _construct_worker_config(
+    monkeypatch, cache_config, *, world_size=1, allgather=None
+) -> TransferWorkerConfig:
     """Build a KvCacheTransceiverV2 with all collectives/native setup mocked out.
 
     Returns the TransferWorkerConfig it wired.
@@ -924,7 +926,7 @@ def _construct_worker_config(monkeypatch, cache_config, *, world_size=1) -> Tran
 
     KvCacheTransceiverV2(
         mapping=mapping,
-        dist=Mock(allgather=Mock(side_effect=lambda value: [value] * world_size)),
+        dist=Mock(allgather=Mock(side_effect=allgather or (lambda value: [value] * world_size))),
         kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4, is_disagg=False),
         cache_transceiver_config=cache_config,
     )
@@ -947,6 +949,35 @@ def test_old_binding_disables_recovery_before_mpi_qualification(monkeypatch) -> 
     qualify.assert_not_called()
     assert config.recovery_fatal_callback is None
     assert not transfer.agent_recovery_supported(False, False, 0)
+
+
+@pytest.mark.parametrize("unqualified_rank", [None, 0, 1])
+def test_recovery_falls_back_when_rank_lacks_executor_mpi(monkeypatch, unqualified_rank) -> None:
+    from tensorrt_llm._torch.disaggregation import transceiver as module
+    from tensorrt_llm._torch.disaggregation.native import transfer
+
+    monkeypatch.setattr(transfer.NixlTransferAgent, "supports_handle_retirement", True)
+    monkeypatch.setattr(transfer, "use_pure_python_transfer_agent", lambda: False)
+    monkeypatch.setattr(module, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(module, "mpi_disabled", lambda: False)
+    communicator = Mock()
+    error = "MPI world differs from executor Mapping"
+    qualify = Mock(
+        return_value=communicator,
+        side_effect=ValueError(error) if unqualified_rank == 0 else None,
+    )
+    monkeypatch.setattr(module, "_retirement_executor_comm", qualify)
+
+    def allgather(vote):
+        return [vote, (True, error) if len(vote) == 2 and unqualified_rank == 1 else vote]
+
+    config = _construct_worker_config(
+        monkeypatch, _make_cache_config(), world_size=2, allgather=allgather
+    )
+    if unqualified_rank is None:
+        assert config.recovery_fatal_callback.__self__._retirement_mpi_comm is communicator
+    else:
+        assert config.recovery_fatal_callback is None
 
 
 @pytest.mark.parametrize("ownership_enabled", [False, True])
