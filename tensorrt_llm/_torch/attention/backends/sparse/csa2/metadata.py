@@ -18,7 +18,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
-from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.math_utils import ceil_div
 
 from .block_select import PUBLISH_BLOCK, block_select_supported
@@ -37,7 +37,7 @@ _BATCHED_DECODE_NEXT_N = range(2, 9)
 
 # Below this many decode requests DeepGEMM's two 3-row passes cost less than one split-row pass.
 _SPLIT_ROW_MIN_REQUESTS = 4
-# Decode batches block-select from the split-row scorer's block maxima (SM100/103) on the candidate
+# Decode batches block-select from the split-row scorer's block maxima (SM100/103/107) on the candidate
 # source above this many rows, where the selection also absorbs the candidate publication,
 BLOCK_SELECT_SOURCE_MIN_ROWS = 64
 # and on other FULL layers from this many, where it beats mask + Top-K + finalize.
@@ -50,7 +50,7 @@ def block_select_batch(rows: int, width: int, top_k: int, publish_k: int) -> boo
     return (
         rows > BLOCK_SELECT_SOURCE_MIN_ROWS
         and (publish_k > 0 or rows >= BLOCK_SELECT_FULL_MIN_ROWS)
-        and is_blackwell_datacenter()
+        and (is_blackwell_datacenter() or get_sm_version() == 107)
         and block_select_supported(width, top_k, publish_k)
     )
 

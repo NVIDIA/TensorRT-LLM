@@ -1712,14 +1712,26 @@ def full_tp_shared_expert_forward(
     from ..modules.swiglu import swiglu
 
     w13, s13, w2, s2 = weights
-    if is_blackwell_datacenter() and swiglu_out_supported(
+    sm107_fusion = (
+        get_sm_version() == 107
+        and 0 < x.shape[0] <= 16
+        and w13.shape == (640, 5120)
+        and w2.shape == (5120, 320)
+    )
+    mma_options = (True, False) if sm107_fusion and x.shape[0] <= 8 else None
+    if (is_blackwell_datacenter() or sm107_fusion) and swiglu_out_supported(
         x.shape[0], x.shape[1], w13, swiglu_limit
     ):
-        # Releases the down GEMM only after x's producer completed (no SwiGLU launch in between).
+        # Dependents wait before reading hidden; SM107 lets their weight loads start earlier.
         hidden = mxfp8_lowm_linear(
-            x, w13, s13, swiglu_out_limit=swiglu_limit, release_after_wait=True
+            x,
+            w13,
+            s13,
+            swiglu_out_limit=swiglu_limit,
+            release_after_wait=not sm107_fusion,
+            mma_options=mma_options,
         )
-        return mxfp8_lowm_linear(hidden, w2, s2)
+        return mxfp8_lowm_linear(hidden, w2, s2, mma_options=mma_options)
     gate_up = mxfp8_lowm_linear(x, w13, s13)
     return mxfp8_lowm_linear(swiglu(gate_up, swiglu_limit=swiglu_limit), w2, s2)
 

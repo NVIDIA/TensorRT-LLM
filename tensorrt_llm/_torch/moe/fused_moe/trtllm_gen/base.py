@@ -218,6 +218,7 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         # Declared by the model (MoEDecodeOptions): the FP4 block-scale op's decode tuning and kernels.
         decode = MoEDecodeOptions.of(model_config.extra_attrs)
         self.decode_tuning = decode.tuning
+        self.decode_fp4_persistent_engine = decode.fp4_persistent_engine
         self.decode_early_release_rows = decode.early_release_rows
 
         self.op_backend: MoEOpBackend = get_op_backend(self.provider)

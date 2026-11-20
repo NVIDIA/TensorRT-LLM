@@ -806,15 +806,15 @@ class CSA2Indexer(Indexer):
                 return fused_decode_select_(logits, valid, visible, output_indices, INDEX_PAGE_ROWS)
             tp_chain = self._tp_selection_chain(metadata)
             gvr_chain = (
-                tp_chain
+                (tp_chain or self._sm107_gvr_fold(metadata, logits, output_indices))
                 and gvr_prior_indices is None
                 and not self.top_k._gvr_emission_armed
                 and self._self_sampling_decode(logits.shape[0])
             )
             from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-            # The mask releases the Top-K behind it early only where that Top-K waits for it.
-            pdl = gvr_chain and get_env_enable_pdl()
+            # Keep the SM107 mask and Top-K serialized for short live prefixes.
+            pdl = gvr_chain and tp_chain and get_env_enable_pdl()
             if not masked:
                 mask_logits_(logits, valid, row_lengths=visible, pdl=pdl)
             if after_mask is not None:
@@ -890,6 +890,22 @@ class CSA2Indexer(Indexer):
 
         mapping = getattr(metadata, "mapping", None)
         return mapping is not None and not mapping.enable_attention_dp and is_blackwell_datacenter()
+
+    @staticmethod
+    def _sm107_gvr_fold(
+        metadata: CSA2TrtllmMetadata, logits: torch.Tensor, output_indices: torch.Tensor
+    ) -> bool:
+        """Whether the SM107 attention-TP shape uses capped GVR with a folded finalize."""
+        mapping = getattr(metadata, "mapping", None)
+        return bool(
+            get_sm_version() == 107
+            and mapping is not None
+            and mapping.tp_size == 8
+            and not mapping.enable_attention_dp
+            and 0 < logits.shape[0] <= 16
+            and logits.shape[1] > 131072
+            and output_indices.shape[1] == 512
+        )
 
     def _self_sampling_decode(self, count: int) -> bool:
         selector = self.top_k

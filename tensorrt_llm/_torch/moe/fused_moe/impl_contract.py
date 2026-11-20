@@ -78,6 +78,8 @@ class MoEDecodeOptions:
 
     # trtllm-gen FP4 op: decode-step tuning buckets and decode kernels (trtllm_gen.decode_moe.select).
     tuning: bool = False
+    # Permit the persistent NVFP4 engine alongside the FC1-only / CuTe FC2 path.
+    fp4_persistent_engine: bool = True
     # Rows from which the decode engine releases its dependents right after its own wait (0: never).
     early_release_rows: int = 0
     # CuTe DSL NVFP4 calls of up to this many rows load the FC2 weights evict-first (0: none).

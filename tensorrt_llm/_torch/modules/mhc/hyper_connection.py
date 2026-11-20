@@ -16,7 +16,7 @@ from torch import nn
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream, private_stream
 from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_container
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-from tensorrt_llm._utils import is_blackwell_datacenter
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
 
 
 @triton.jit
@@ -272,18 +272,28 @@ class mHC(nn.Module):
         # ``_tc_min_rows()`` rows), built on first use by ``coefficient_kernel_ready``.
         self._tc_weight: Optional[torch.Tensor] = None
         self._tc_counters: Optional[torch.Tensor] = None
-        # TF32-rounded weight and arrival ticket of the CUDA-core coefficient kernel, built lazily.
+        # Mixer weight and arrival ticket of the CUDA-core coefficient kernel, built lazily.
         self._fma_weight: Optional[torch.Tensor] = None
         self._fma_counter: Optional[torch.Tensor] = None
 
     @torch.no_grad()
+    def _prepare_fma_weight(self) -> torch.Tensor:
+        """Prepare the weight in the native small-row mixer's precision."""
+        if get_sm_version() == 107:
+            return self.fn.detach().contiguous()
+        from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_fma as fma
+
+        return fma.prepare_fma_weight(self.fn)
+
+    @torch.no_grad()
     def cache_derived_state(self) -> None:
         if self._fma_weight is not None:
-            from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_fma as fma
-
-            # In place: captured CUDA graphs keep the address; done before other streams read it.
-            self._fma_weight.copy_(fma.prepare_fma_weight(self.fn))
-            torch.cuda.current_stream().synchronize()
+            weight = self._prepare_fma_weight()
+            # SM107 can alias the full-precision parameter. Otherwise refresh the captured
+            # address in place before other streams read the copy.
+            if weight.data_ptr() != self._fma_weight.data_ptr():
+                self._fma_weight.copy_(weight)
+                torch.cuda.current_stream().synchronize()
         kernel = self.single_pass_boundary and _boundary_kernel(self.fn.device, self.hidden_size)
         if not kernel or self.mult != kernel.MULT:
             return
@@ -677,7 +687,9 @@ class mHC(nn.Module):
             self.replicated
             and 0 < num_tokens <= FMA_COEFF_MAX_ROWS
             and self.mult == 4
-            and is_blackwell_datacenter()
+            and (
+                is_blackwell_datacenter() or (get_sm_version() == 107 and self.hidden_size == 5120)
+            )
         ):
             return False
         from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_coefficient_fma as fma
@@ -690,7 +702,7 @@ class mHC(nn.Module):
                 num_tokens, self.hidden_size, self.sinkhorn_iters
             )
         if self._fma_weight is None:
-            self._fma_weight = fma.prepare_fma_weight(self.fn)
+            self._fma_weight = self._prepare_fma_weight()
             self._fma_counter = fma.fma_counter(self.fn.device)
             # Every row count compiles at this first eager call (warm-up), not in a later step.
             fma.compile_all(self.hidden_size, self.sinkhorn_iters)

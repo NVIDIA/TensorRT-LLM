@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm._utils import get_sm_version
 
 from .decode_front import max_num_tiles
 from .kernel_inputs import get_data_or_none, to_trtllm_gen_act_type
@@ -64,6 +65,15 @@ _CUTE_FC2_OPTIONS = {
 }
 
 
+# The K128 cubin is bitwise qualified for the DeepSeek-V4.1 NVFP4 FC2 shape on SM107.
+_SM107_FC2_CUBIN = (
+    "bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x256_s9_et128x8_m128x8x128"
+    "_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+)
+_SM107_FC2_WEIGHT_SHAPE = (192, 5120, 288)
+_SM107_FC2_MAX_TOKENS = 16
+
+
 def cute_fc2_reproduces(gemm2_kernel_options: Mapping[str, str]) -> bool:
     """Whether ``moe_lowm_fc2`` reproduces the FC2 cubin of these options (the runner's
     ``get_gemm2_kernel_options(tile, config)``) bit for bit."""
@@ -76,9 +86,9 @@ class DecodeKernel(enum.Enum):
     ENGINE = 2
 
 
-#: (act type, tile, config) -> whether ``moe_lowm_fc2`` reproduces that tactic's FC2 cubin. The C++ runners are
+#: (SM, act type, tile, config) -> whether ``moe_lowm_fc2`` reproduces that tactic's FC2 cubin. The C++ runners are
 #: shared per act type (``FP4BlockScaleMoERunner.get_runner``), so the key names the cubin.
-_FC2_REPRODUCED: Dict[Tuple[int, int, int], bool] = {}
+_FC2_REPRODUCED: Dict[Tuple[int, int, int, int], bool] = {}
 
 
 def _cute_fc2_fits(
@@ -96,16 +106,26 @@ def _cute_fc2_fits(
         return False
     if w2.shape[2] * 2 != intermediate_size:
         return False
-    key = (int(act_type), int(tactic[0]), int(tactic[1]))
+    sm = get_sm_version()
+    if sm == 107 and (
+        not 0 < x.shape[0] <= _SM107_FC2_MAX_TOKENS
+        or w2.shape != _SM107_FC2_WEIGHT_SHAPE
+        or args.output2_scale_scalar is None
+    ):
+        return False
+    tile, config = tactic
+    key = (sm, int(act_type), tile, config)
     reproduced = _FC2_REPRODUCED.get(key)
     if reproduced is None:
-        reproduced = _FC2_REPRODUCED[key] = cute_fc2_reproduces(
-            kernel_runner.get_gemm2_kernel_options(key[1], key[2])
-        )
+        if sm == 107:
+            reproduced = kernel_runner.get_gemm2_kernel_name(tile, config) == _SM107_FC2_CUBIN
+        else:
+            reproduced = cute_fc2_reproduces(kernel_runner.get_gemm2_kernel_options(tile, config))
+        _FC2_REPRODUCED[key] = reproduced
     # The CuTe FC2 stands in for the tuned tactic's FC2; the runner runs its fine-grained-sync pair instead (which
     # has no FC1-only entry) only where TLLM_USE_FINE_GRAINED_SYNC is set and such a cubin exists for this shape.
     return reproduced and not kernel_runner.uses_fine_grained_sync(
-        key[1], top_k, 2 * x.shape[1], intermediate_size, w2.shape[0], x.shape[0]
+        tile, top_k, 2 * x.shape[1], intermediate_size, w2.shape[0], x.shape[0]
     )
 
 
