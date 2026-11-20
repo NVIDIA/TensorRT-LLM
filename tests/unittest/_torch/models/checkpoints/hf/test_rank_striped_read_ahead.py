@@ -921,7 +921,7 @@ def test_mapping_and_materialization_failures_never_retry(tmp_path, monkeypatch)
     native_load = mock.Mock(side_effect=AssertionError("must not reload"))
     monkeypatch.setattr(loader, "_load_weights_native", native_load)
     monkeypatch.setattr(
-        loader, "_load_weights_in_parallel", mock.Mock(side_effect=RuntimeError("mapping failed"))
+        loader, "_map_safetensors_files", mock.Mock(side_effect=RuntimeError("mapping failed"))
     )
 
     with pytest.raises(RuntimeError, match="mapping failed"):

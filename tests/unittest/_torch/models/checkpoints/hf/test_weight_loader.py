@@ -113,7 +113,7 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
     loader = HfWeightLoader()
     with (
         mock.patch.object(
-            loader, "_load_weights_in_parallel", side_effect=MyError
+            loader, "_map_safetensors_files", side_effect=MyError
         ) as load_weights_in_parallel,
         mock.patch.object(loader, "prefetch_files") as prefetch_files,
         pytest.raises(MyError),
@@ -144,7 +144,7 @@ def test_weight_cache_reuses_raw_weights_with_fresh_consumable_wrapper(tmp_path,
     with (
         mock.patch.object(
             loader,
-            "_load_weights_in_parallel",
+            "_map_safetensors_files",
             return_value=ConsumableWeightsDict({"foo.weight": raw_weight}),
         ) as load_weights_in_parallel,
         mock.patch.object(loader, "prefetch_files"),
@@ -179,7 +179,7 @@ def test_weight_cache_evicts_before_load_on_miss(tmp_path, monkeypatch):
     with mock.patch.object(loader, "prefetch_files"):
         with mock.patch.object(
             loader,
-            "_load_weights_in_parallel",
+            "_map_safetensors_files",
             return_value=ConsumableWeightsDict({"foo.weight": object()}),
         ):
             loader.load_weights(str(dir_a), mapping=Mapping())
@@ -192,7 +192,7 @@ def test_weight_cache_evicts_before_load_on_miss(tmp_path, monkeypatch):
 
         with mock.patch.object(
             loader,
-            "_load_weights_in_parallel",
+            "_map_safetensors_files",
             side_effect=assert_room_freed_before_load,
         ):
             loader.load_weights(str(dir_b), mapping=Mapping())
@@ -221,7 +221,7 @@ def test_weight_cache_skips_checkpoint_larger_than_host_memory(tmp_path, monkeyp
     with mock.patch.object(loader, "prefetch_files"):
         with mock.patch.object(
             loader,
-            "_load_weights_in_parallel",
+            "_map_safetensors_files",
             return_value=ConsumableWeightsDict({"foo.weight": object()}),
         ):
             loader.load_weights(str(small_dir), mapping=Mapping())
@@ -234,7 +234,7 @@ def test_weight_cache_skips_checkpoint_larger_than_host_memory(tmp_path, monkeyp
         with (
             mock.patch.object(
                 loader,
-                "_load_weights_in_parallel",
+                "_map_safetensors_files",
                 side_effect=assert_room_freed_before_load,
             ) as load_weights_in_parallel,
             mock.patch.object(HfWeightLoader, "_fingerprint") as fingerprint,
@@ -259,7 +259,7 @@ def test_weight_cache_disabled_by_default(tmp_path, monkeypatch):
     with (
         mock.patch.object(
             loader,
-            "_load_weights_in_parallel",
+            "_map_safetensors_files",
             side_effect=[
                 ConsumableWeightsDict({"foo.weight": object()}),
                 ConsumableWeightsDict({"foo.weight": object()}),
@@ -293,7 +293,7 @@ def test_weight_cache_detects_inplace_mutation_and_reloads(tmp_path, monkeypatch
 
     with (
         mock.patch.object(
-            loader, "_load_weights_in_parallel", side_effect=fresh_weights
+            loader, "_map_safetensors_files", side_effect=fresh_weights
         ) as load_weights_in_parallel,
         mock.patch.object(loader, "prefetch_files"),
     ):
@@ -333,7 +333,7 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
     with (
         mock.patch.object(
             loader,
-            "_load_weights_in_parallel",
+            "_map_safetensors_files",
             return_value=ConsumableWeightsDict({"foo.weight": object()}),
         ),
         mock.patch.object(loader, "prefetch_files"),
@@ -379,7 +379,7 @@ def test_cache_skip_issues_the_miss_collectives(tmp_path, monkeypatch):
     with (
         mock.patch.object(
             loader,
-            "_load_weights_in_parallel",
+            "_map_safetensors_files",
             return_value=ConsumableWeightsDict({"foo.weight": object()}),
         ),
         mock.patch.object(loader, "prefetch_files"),

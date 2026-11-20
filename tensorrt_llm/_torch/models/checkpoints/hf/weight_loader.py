@@ -1289,7 +1289,10 @@ class HfWeightLoader(BaseWeightLoader):
         # One mapping per file and a view per tensor: load_file builds every
         # tensor separately, which costs tens of seconds per rank on
         # checkpoints with ~100k tensors.
-        file_size, header_bytes, header = _read_safetensors_header(file)
+        try:
+            file_size, header_bytes, header = _read_safetensors_header(file)
+        except ValueError:
+            return safetensors.torch.load_file(file)
         if not safetensors_layout_is_valid(header,
                                            file_size - 8 - header_bytes):
             return safetensors.torch.load_file(file)  # reports the bad layout
