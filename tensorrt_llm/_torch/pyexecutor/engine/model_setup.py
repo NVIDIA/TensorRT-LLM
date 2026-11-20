@@ -679,10 +679,16 @@ def build_mm_encoder_runner(
         mapping=mapping,
         dist=dist,
     ) as loaded:
-        encoder_max_num_tokens = (
-            llm_args.encoder_max_num_tokens
-            if llm_args.encoder_max_num_tokens is not None
-            else loaded.max_num_tokens
+        # The towers count patches, which a merged item needs more of than prompt tokens,
+        # so they keep the configured budget rather than the clamped one.
+        encoder_max_num_tokens = next(
+            budget
+            for budget in (
+                llm_args.encoder_max_num_tokens,
+                llm_args.max_num_tokens,
+                loaded.max_num_tokens,
+            )
+            if budget is not None
         )
         input_processor = create_engine_input_processor(model_path, llm_args)
         setup_mm_encoder_attn_metadata(loaded.model, input_processor, encoder_max_num_tokens, None)

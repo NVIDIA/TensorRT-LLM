@@ -464,6 +464,47 @@ def test_cancelling_a_launched_request_with_two_sequences_delivers_both_and_ends
             assert response.result.finish_reasons == [FinishReason.CANCELLED]
 
 
+def test_a_cancellation_sent_while_the_loop_waits_for_a_slot_still_cancels_a_launched_request(
+    completion,
+):
+    with _harness(completion=completion, max_batch_size=1) as h:
+        slots, waiting = h.executor._slots, threading.Event()
+
+        class Slots:
+            def acquire(self):
+                if not slots.acquire(blocking=False):
+                    waiting.set()
+                    slots.acquire()
+
+            def release(self):
+                slots.release()
+
+        h.executor._slots = Slots()
+        sent = threading.Event()
+        cancel_launched = h.executor._cancel_launched
+
+        def cancel_once_sent(flight):
+            assert sent.wait(timeout=30)
+            return cancel_launched(flight)
+
+        h.executor._cancel_launched = cancel_once_sent
+        first, second, third = h.submit(), h.submit(), h.submit()
+        h.executor.start_worker()
+        # Two batches are in flight, and the loop waits in the third launch, not in _receive.
+        assert waiting.wait(timeout=30)
+
+        h.executor.cancel_request(first)
+        sent.set()
+
+        (cancelled,) = h.responses(first)
+        assert cancelled.result.finish_reasons == [FinishReason.CANCELLED]
+        assert cancelled.result.mm_embedding_handles is None
+        assert cancelled.result.context_logits is None
+        h.result(second)
+        h.result(third)
+        assert h.runner.batches == [[first], [second], [third]]
+
+
 @pytest.mark.parametrize("rank, exports", [(0, True), (1, False)], ids=["rank_0", "tp_follower"])
 def test_only_rank_0_of_a_multimodal_encoder_exports(monkeypatch, rank, exports):
     """A follower's responses reach no client, so its exports would pin each batch's memory."""

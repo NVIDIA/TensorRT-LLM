@@ -252,10 +252,12 @@ class ScheduledEncoderExecutor:
         self._last_staged: torch.cuda.Event | None = None
         self._completion_thread: threading.Thread | None = None
         self._completion_error: BaseException | None = None
-        # Ids of the launched, unpublished requests, and of those among them cancelled since.
+        # Ids of the launched, unpublished requests, and of those among them cancelled since;
+        # and ids whose cancellation was sent but not yet taken by the loop.
         self._cancel_lock = threading.Lock()
         self._launched_ids: set[int] = set()
         self._cancelled_after_launch: set[int] = set()
+        self._cancel_sent: set[int] = set()
         self._response_channel = ResponseChannel()
         self._iter_counter = 0
         self._profiler = ProfileController(
@@ -420,6 +422,10 @@ class ScheduledEncoderExecutor:
         Args:
             id: The request id.
         """
+        # A launched batch may complete before the loop takes the queued cancellation;
+        # rank 0, which publishes, checks this record then.
+        with self._cancel_lock:
+            self._cancel_sent.add(id)
         self._request_queue.enqueue_cancel_request(id)
 
     def start_profile(
@@ -616,6 +622,7 @@ class ScheduledEncoderExecutor:
         if canceled_ids:
             with self._cancel_lock:
                 self._cancelled_after_launch.update(canceled_ids & self._launched_ids)
+                self._cancel_sent -= canceled_ids
             self._cancel_waiting(canceled_ids)
 
     @nvtx_range("_check_admissible")
@@ -762,7 +769,7 @@ class ScheduledEncoderExecutor:
         request_ids = {request.py_request_id for request in flight.requests if not request.is_child}
         with self._cancel_lock:
             self._launched_ids -= request_ids
-            cancelled_ids = self._cancelled_after_launch & request_ids
+            cancelled_ids = (self._cancelled_after_launch | self._cancel_sent) & request_ids
             self._cancelled_after_launch -= cancelled_ids
         if not cancelled_ids:
             return
