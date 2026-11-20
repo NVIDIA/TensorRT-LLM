@@ -16,7 +16,7 @@ import pytest
 
 from tensorrt_llm import _jit_share
 from tensorrt_llm._torch import build_pool
-from tensorrt_llm._torch.build_pool import Build, BuildPool, BuildResult
+from tensorrt_llm._torch.build_pool import Build, BuildPool, BuildResult, Claim
 
 pytestmark = pytest.mark.cpu_only
 
@@ -368,6 +368,30 @@ def test_the_threads_take_builds_beside_the_caller_and_join_waits_for_them(pool)
     assert threading.get_ident() not in {ident for _, ident in ran}
     # Outside a pass there are no threads: the caller builds where it is.
     assert pool.threads is None
+
+
+def test_the_threads_make_a_claimed_build_only_when_no_other_rank_claimed_it(pool, tmp_path):
+    def claim(name):
+        base = str(tmp_path / name)
+        return Claim(base + ".claim", base + ".done", base + ".failed")
+
+    mine, made, theirs, fails = (claim(name) for name in ("mine", "made", "theirs", "fails"))
+    open(made.done, "w").close()  # Another rank made it.
+    open(theirs.claim, "w").close()  # Another rank is making it.
+    ran = []
+    with pool.pass_scope():
+        lane = pool.threads
+        builds = [
+            lane.submit(functools.partial(ran.append, c), "f", claim=c)
+            for c in (mine, made, theirs)
+        ]
+        builds.append(lane.submit(targets.fail, "f", claim=fails))
+        assert lane.join() == {"built": 1, "present": 1, "claimed": 1, "failed": 1}
+    assert ran == [mine]
+    assert [build.status for build in builds] == ["built", "present", "claimed", "failed"]
+    # The ranks waiting for the builds this rank claimed learn how they ended.
+    assert os.path.exists(mine.done) and not os.path.exists(mine.failed)
+    assert os.path.exists(fails.failed) and not os.path.exists(fails.done)
 
 
 def test_thread_builds_that_do_not_fit_together_run_one_at_a_time(pool, gpu, tmp_path):

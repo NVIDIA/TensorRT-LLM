@@ -63,6 +63,7 @@ __all__ = [
     "BuildResult",
     "BuildStrategy",
     "Claim",
+    "ThreadBuild",
     "process_built",
 ]
 
@@ -1026,10 +1027,16 @@ class _Pool:
             self._owner._settle(task, BuildResult(REFUSED, 0.0, "no worker process is left"))
 
 
-class _LaneBuild(NamedTuple):
+@dataclasses.dataclass(eq=False)
+class ThreadBuild:
+    """A build queued on the pass's threads (``BuildPool.threads.submit``). ``status`` says how
+    it ended, as a :class:`BuildResult`'s does: ``"refused"`` until a thread takes it."""
+
     function: Callable[[], Any]
     family: Optional[str]
     need_bytes: int
+    claim: Optional[Claim] = None
+    status: str = REFUSED
 
 
 class _ThreadLane:
@@ -1039,13 +1046,14 @@ class _ThreadLane:
     and synchronizes that stream alone, so that they go on beside the rank's other work. A build
     starts only while the GPU has room for the ``need_bytes`` it says it allocates (the pass's
     :class:`_Admission`); the threads never empty the allocator's cache, which synchronizes the
-    device: the pass's end does. A build that raises fails alone, and its caller builds it."""
+    device: the pass's end does. A build that raises fails alone, and its caller builds it. A build
+    with a :class:`Claim` is made only when no other rank claimed it first, as on a worker."""
 
     def __init__(self, owner: BuildPool, admission: _Admission, max_threads: int):
         self._owner = owner
         self._admission = admission
         self._max = max(1, max_threads)
-        self._queue: "queue.Queue[Optional[_LaneBuild]]" = queue.Queue()
+        self._queue: "queue.Queue[Optional[ThreadBuild]]" = queue.Queue()
         self._cond = threading.Condition()
         self._threads: List[threading.Thread] = []
         self._pending = 0
@@ -1054,14 +1062,19 @@ class _ThreadLane:
         self._seconds = 0.0
 
     def submit(
-        self, function: Callable[[], Any], family: Optional[str] = None, need_bytes: int = 0
-    ) -> bool:
-        """Queue ``function()``, which allocates at most ``need_bytes`` of GPU memory at once;
-        False when the threads have stopped, and the caller builds it."""
+        self,
+        function: Callable[[], Any],
+        family: Optional[str] = None,
+        need_bytes: int = 0,
+        claim: Optional[Claim] = None,
+    ) -> Optional[ThreadBuild]:
+        """Queue ``function()``, which allocates at most ``need_bytes`` of GPU memory at once, and
+        return the queued build; None when the threads have stopped, and the caller builds it.
+        With a ``claim``, it is made only when no other rank claimed it first."""
         with self._cond:
             if self._stopping:
                 self._counts[REFUSED] += 1
-                return False
+                return None
             self._pending += 1
             if len(self._threads) < min(self._max, self._pending):
                 thread = threading.Thread(
@@ -1072,8 +1085,9 @@ class _ThreadLane:
                 self._threads.append(thread)
                 thread.start()
             # Queued under the lock, so that a stop() refuses it or a thread serves it.
-            self._queue.put(_LaneBuild(function, family, need_bytes))
-        return True
+            build = ThreadBuild(function, family, need_bytes, claim)
+            self._queue.put(build)
+        return build
 
     def join(self) -> Dict[str, int]:
         """Wait until every build queued has ended; how many ended each way."""
@@ -1089,9 +1103,12 @@ class _ThreadLane:
     def report(self) -> str:
         with self._cond:
             counts, seconds, threads = dict(self._counts), self._seconds, len(self._threads)
+        elsewhere = counts.get(PRESENT, 0) + counts.get(CLAIMED, 0)
         return (
             f"{threads} build threads: {counts.get(BUILT, 0)} builds in {seconds:.1f}s, "
-            f"{counts.get(FAILED, 0)} failed, {counts.get(REFUSED, 0)} left to the caller"
+            f"{counts.get(FAILED, 0)} failed, "
+            + (f"{elsewhere} built by other ranks, " if elsewhere else "")
+            + f"{counts.get(REFUSED, 0)} left to the caller"
         )
 
     def stop(self) -> None:
@@ -1130,31 +1147,43 @@ class _ThreadLane:
             if self._admission.admit(key, item.family, item.need_bytes, in_process=True):
                 t0 = time.perf_counter()
                 try:
-                    if stream is None:
-                        item.function()
-                    else:
-                        import torch
-
-                        with torch.cuda.stream(stream):
-                            item.function()
-                        stream.synchronize()
-                    status = BUILT
-                except Exception as e:  # noqa: BLE001 - a build that fails here fails alone
-                    status = FAILED
-                    logger.debug(
-                        f"[BuildPool] {item.family}: a build on a thread failed: "
-                        f"{type(e).__name__}: {e}"
-                    )
+                    status = self._make(item, stream)
                 finally:
                     self._admission.release(key)
                 seconds = time.perf_counter() - t0
                 if status == BUILT and item.family is not None:
                     self._owner.record_build(item.family, seconds)
+            item.status = status
             with self._cond:
                 self._counts[status] += 1
                 self._seconds += seconds
                 self._pending -= 1
                 self._cond.notify_all()
+
+    @staticmethod
+    def _make(item: ThreadBuild, stream: Any) -> str:
+        """Make ``item`` on this thread, unless another rank made it or is making it; how it
+        ended, which a claim records for the other ranks."""
+        elsewhere = _claim_build(item.claim)
+        if elsewhere is not None:
+            return elsewhere
+        try:
+            if stream is None:
+                item.function()
+            else:
+                import torch
+
+                with torch.cuda.stream(stream):
+                    item.function()
+                stream.synchronize()
+        except Exception as e:  # noqa: BLE001 - a build that fails here fails alone
+            _end_claim(item.claim, e)
+            logger.debug(
+                f"[BuildPool] {item.family}: a build on a thread failed: {type(e).__name__}: {e}"
+            )
+            return FAILED
+        _end_claim(item.claim)
+        return BUILT
 
 
 def _tail(stream: IO[bytes]) -> str:
@@ -1263,33 +1292,53 @@ def _touch(path: str) -> None:
         pass  # The other ranks then wait for the build until their wait runs out.
 
 
-def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
-    """In a worker process: make one build; with a ``claim``, only when no other rank's worker
-    claimed it first."""
+def _claim_build(claim: Optional[Claim]) -> Optional[str]:
+    """None when this process makes the build of ``claim``: it claimed it, or there is no claim;
+    else ``"present"`` or ``"claimed"``, for a build another rank made or is making."""
     from tensorrt_llm import _jit_share
 
-    if claim is not None:
-        if os.path.exists(claim.done):
-            return (PRESENT, 0.0, "")
-        try:
-            claimed = _jit_share._claim(claim.claim)
-        except OSError:
-            claimed = True  # The directory takes no claims: build it here.
-        if not claimed:
-            return (PRESENT if os.path.exists(claim.done) else CLAIMED, 0.0, "")
+    if claim is None:
+        return None
+    if os.path.exists(claim.done):
+        return PRESENT
+    try:
+        if _jit_share._claim(claim.claim):
+            return None
+    except OSError:
+        return None  # The directory takes no claims: build it here.
+    return PRESENT if os.path.exists(claim.done) else CLAIMED
+
+
+def _end_claim(claim: Optional[Claim], error: Optional[Exception] = None) -> None:
+    """Mark for the other ranks that the build this process claimed ended, or failed with
+    ``error``."""
+    from tensorrt_llm import _jit_share
+
+    if claim is None:
+        return
+    if error is not None:
+        _jit_share._mark_failed(claim.failed, f"{type(error).__name__}: {error}")
+    elif not os.path.exists(claim.done):
+        _touch(claim.done)
+
+
+def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
+    """In a worker process: make one build; with a ``claim``, only when no other rank claimed it
+    first."""
+    elsewhere = _claim_build(claim)
+    if elsewhere is not None:
+        return (elsewhere, 0.0, "")
     t0 = time.perf_counter()
     try:
         value = _resolve(function)(*args)
     except Exception as e:  # noqa: BLE001 - reported to the rank, which builds it itself
-        if claim is not None:
-            _jit_share._mark_failed(claim.failed, f"{type(e).__name__}: {e}")
+        _end_claim(claim, e)
         detail = traceback.format_exc()[-_STDERR_TAIL:]
         seconds = time.perf_counter() - t0
         return (FAILED, seconds, f"{type(e).__name__}: {e}\n{detail}", _release_gpu_memory())
     seconds = time.perf_counter() - t0
     peak = _release_gpu_memory()
-    if claim is not None and not os.path.exists(claim.done):
-        _touch(claim.done)
+    _end_claim(claim)
     return (BUILT, seconds, "", peak, value)
 
 

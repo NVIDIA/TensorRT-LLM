@@ -68,6 +68,7 @@ from .build_pool import (
     BuildResult,
     BuildStrategy,
     Claim,
+    ThreadBuild,
     _resolve,
 )
 
@@ -116,7 +117,8 @@ class BuildConfig:
             decides whether workers take them (``BuildPool.worth_a_worker``).
         thread_safe: The op's builds run outside the GIL and may run on several threads of this
             process at once, allocating no GPU memory: in a rehearsal, those too short for a
-            worker run on the pass's threads (``BuildPool.threads``) instead of being the op's.
+            worker run on the pass's threads (``BuildPool.threads``), split with the other ranks
+            as ``strategy`` says, instead of being the op's.
     """
 
     dynamic_specs: Tuple[DynamicSpec, ...] = ()
@@ -141,7 +143,7 @@ class _OpStats:
     signatures: int = 0
     list_s: float = 0.0
     # Builds made by this rank's workers, failed there, made by other ranks, left to the op,
-    # queued on the pass's threads.
+    # queued on the pass's threads (less those other ranks made).
     built: int = 0
     failed: int = 0
     elsewhere: int = 0
@@ -327,11 +329,11 @@ class KernelBuilder:
         not asked for before on the rank's worker processes, in parallel, and return once they
         are built; in a rehearsal, queue them and return at once (:meth:`join` waits for them).
 
-        With the SHARED strategy, a build another rank's worker started first is that rank's:
-        this one waits for the builds it left to other ranks, at most ``TLLM_JIT_SHARE_WAIT_S``
-        seconds in all. A build no worker takes, one too short for a worker
-        (``BuildPool.worth_a_worker``), and one that fails are left to the op, which builds them
-        on first use.
+        With the SHARED strategy, a build another rank started first, on a worker or a thread, is
+        that rank's: this one waits for the builds it left to other ranks, at most
+        ``TLLM_JIT_SHARE_WAIT_S`` seconds in all. A build no worker takes, one too short for a
+        worker (``BuildPool.worth_a_worker``) that the pass's threads do not take, and one that
+        fails are left to the op, which builds them on first use.
         """
         if not self.active():
             return
@@ -364,17 +366,47 @@ class KernelBuilder:
         self, op: str, builds: Sequence[Tuple[Hashable, BuildTask, BuildConfig]]
     ) -> None:
         """Builds too short for a worker: in a rehearsal, those of a thread-safe op run on the
-        pass's threads; the others are the op's."""
+        pass's threads, which split the SHARED ones with the other ranks as workers do; the others
+        are the op's."""
         lane = BuildPool.get().threads if self.rehearsing() else None
-        queued = 0
+        queued, shared = 0, []
         if lane is not None:
-            for _, task, config in builds:
-                if config.thread_safe and lane.submit(functools.partial(_run_task, task), op):
+            for key, task, config in self._rotated(list(builds)):
+                if not config.thread_safe:
+                    continue
+                claim = self._claim(op, key, config)
+                build = lane.submit(functools.partial(_run_task, task), op, claim=claim)
+                if build is not None:
                     queued += 1
+                    if claim is not None:
+                        shared.append(build)
         with self._lock:
             stats = self._op_stats(op)
             stats.threads += queued
             stats.inline += len(builds) - queued
+            if shared:
+                self._pending.append(functools.partial(self._settle_threads, op, shared))
+
+    def _settle_threads(self, op: str, builds: List[ThreadBuild]) -> None:
+        """Once the pass's threads have run ``builds`` (SHARED ones), wait for those that other
+        ranks are making, and count the ones other ranks made."""
+        BuildPool.get().join_threads()
+        claimed = [build.claim for build in builds if build.status == CLAIMED]
+        if claimed:
+            with _jit_share.wait_until(time.time() + _jit_share.wait_seconds()):
+                late = sum(not _jit_share._wait(c.done, c.failed) for c in claimed)
+        else:
+            late = 0
+        elsewhere = sum(build.status in (PRESENT, CLAIMED) for build in builds)
+        with self._lock:
+            stats = self._op_stats(op)
+            stats.threads -= elsewhere
+            stats.elsewhere += elsewhere
+        if elsewhere:
+            logger.info(
+                f"[KernelBuilder] {op}: {elsewhere} of {len(builds)} kernels queued on build "
+                f"threads built by other ranks ({late} not in time)"
+            )
 
     def _settle(self, op: str, jobs: List[Build], batch: BuildBatch, t0: float) -> None:
         """Wait for ``batch`` and for the builds it found other ranks making, and count them."""

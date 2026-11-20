@@ -429,3 +429,36 @@ def test_a_rank_stops_waiting_for_a_build_that_failed_elsewhere(
         timer.join()
     # The op builds it on first use.
     assert not (tmp_path / "x").exists()
+
+
+def test_in_a_rehearsal_the_threads_split_shared_builds_with_the_other_ranks(
+    builder, shared, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TLLM_JIT_SHARE_WAIT_S", "60")
+    pool = BuildPool.get()
+    pool.min_build_s = 5.0
+    config = BuildConfig(
+        strategy=BuildStrategy.SHARED,
+        share_scope=lambda: "here",
+        build_seconds=0.1,
+        thread_safe=True,
+    )
+    made = _claimed_elsewhere("made")
+    open(made.done, "w").close()  # Another rank made it.
+    theirs = _claimed_elsewhere("theirs")  # Another rank is making it.
+    builds = [(key, *_record(tmp_path / key, 1, config)) for key in ("mine", "made", "theirs")]
+    with pool.pass_scope(overlapped=True):
+        with builder.rehearsal():
+            builder.build("op", builds)
+        # The threads made only the build no other rank had claimed.
+        assert pool.threads.join() == {"built": 1, "present": 1, "claimed": 1}
+        timer = threading.Timer(0.5, lambda: open(theirs.done, "w").close())
+        timer.start()
+        builder.join()
+        # The join went on once the other rank's build had ended.
+        assert os.path.exists(theirs.done)
+    timer.join()
+    assert int((tmp_path / "mine").read_text().split()[1]) == os.getpid()
+    assert not (tmp_path / "made").exists() and not (tmp_path / "theirs").exists()
+    assert os.path.exists(kernel_builder._claim_files("op", "mine", "here").done)
+    assert (builder.stats("op").threads, builder.stats("op").elsewhere) == (1, 2)
