@@ -111,7 +111,7 @@ from .helix_a2a_fused import (
     _unpack,
     record_bytes,
 )
-from ..k3r_gemm.k3_fp8w_lowm_gemm_ull import (
+from ..k3r_gemm.k3_fp8w_lowm_gemm import (
     _bf16x2_inv_scale,
     _gate_mul_bf16x8,
     _quant_bf16x8_to_e4m3,

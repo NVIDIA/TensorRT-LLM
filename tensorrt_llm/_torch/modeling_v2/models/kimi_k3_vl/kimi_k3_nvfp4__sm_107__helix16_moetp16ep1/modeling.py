@@ -224,9 +224,7 @@ from ..ops.common.k3_ull_features import PROFILE, K3Features
 from ..ops.common.k3_ull_features import active as _features
 from ..ops.common.k3_ull_runtime import make_runtime_hooks
 from ..ops.common.sm107_launch import USE_PDL, log_constants
-from ..ops.gemm.k3_fp8w_lowm_gemm_push_ull import (
-    k3_fp8w_lowm_gemm_push as k3_fp8w_lowm_gemm_push_op,
-)
+from ..ops.gemm.k3_fp8w_lowm_gemm_push import k3_fp8w_lowm_gemm_push as k3_fp8w_lowm_gemm_push_op
 from ..ops.gemm.k3_fp8w_lowm_gemm_ull import k3_fp8w_lowm_gemm as k3_fp8w_lowm_gemm_op
 from ..ops.gemm.k3_fp8w_lowm_mxfp8_gemm_ull import (
     k3_fp8w_lowm_mxfp8_gemm as k3_fp8w_lowm_mxfp8_gemm_op,
@@ -234,8 +232,8 @@ from ..ops.gemm.k3_fp8w_lowm_mxfp8_gemm_ull import (
 from ..ops.gemm.k3_fp8w_lowm_mxfp8_push_ull import (
     k3_fp8w_lowm_mxfp8_push as k3_fp8w_lowm_mxfp8_push_op,
 )
-from ..ops.gemm.k3_fp8w_mid_gemm_push_ull import k3_fp8w_mid_gemm_push as k3_fp8w_mid_gemm_push_op
-from ..ops.gemm.k3_fp8w_mid_gemm_ull import k3_fp8w_mid_gemm as k3_fp8w_mid_gemm_op
+from ..ops.gemm.k3_fp8w_mid_gemm import k3_fp8w_mid_gemm as k3_fp8w_mid_gemm_op
+from ..ops.gemm.k3_fp8w_mid_gemm_push import k3_fp8w_mid_gemm_push as k3_fp8w_mid_gemm_push_op
 from ..ops.gemm.k3_mxfp8_gemm_ull import k3_mxfp8_gemm as k3_mxfp8_gemm_op
 from ..ops.norm.attn_res_fwd_ull import attn_res_fwd
 from ..ops.norm.k3_attn_res_norm_ull import k3_attn_res_norm
@@ -3894,7 +3892,7 @@ def _k3_lowm_gemm_can_run(
     allow_partial_n_tile: bool = False,
 ) -> bool:
     """Whether the K3 low-M GEMM (``ops.gemm.k3_fp8w_lowm_gemm``) serves this projection."""
-    from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+    from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
     return k3_fp8w_lowm_gemm.can_run(
         x, weight, weight_scale, allow_partial_n_tile=allow_partial_n_tile
@@ -3996,7 +3994,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             return False
         if self.lowm_weight_scale is None:
             return True
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
         return num_rows > k3_fp8w_lowm_gemm.bf16_over_prequantized_max_m(
             self.out_features, self.in_features
@@ -4120,7 +4118,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             # A row view of the KDA fused q/k/v/g weight; the fused module serves forward.
             return False
         self.transform_weights()
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
         n, k = self.weight.shape
         if n % k3_fp8w_lowm_gemm.N_ALIGN or k % 128:
@@ -4180,7 +4178,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             or tuple(push.output.shape) != (x_flat.shape[0], self.out_features)
         ):
             return None
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
         tactic = k3_fp8w_lowm_gemm.ar_push_tactic(
             x_flat.shape[0], self.out_features, self.in_features, gated=gated
@@ -4204,7 +4202,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             return False
         if tuple(push.output.shape) != (num_rows, self.out_features):
             return False
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
         tactic = k3_fp8w_lowm_gemm.mid_ar_push_tactic(num_rows, self.out_features, self.in_features)
         return tactic is not None and tactic.mma_n <= 128
@@ -4221,7 +4219,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         m, k = activation.shape
         if k != self.in_features or tuple(push.output.shape) != (m, self.out_features):
             return None
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
         tactic = k3_fp8w_lowm_gemm.mid_ar_push_tactic(m, self.out_features, k)
         if tactic is None or tactic.mma_n > 128:
@@ -4334,7 +4332,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             return False
         if self.weight.shape[0] % 128 and not self.fp8w_lowm_partial_n_tile:
             return False
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
         limit = k3_fp8w_lowm_gemm.low_m_max_for(*self.weight.shape)
         if self.lowm_weight_scale is not None:
@@ -4368,7 +4366,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         n, k = self.weight.shape
         if n % 128 and not self.fp8w_lowm_partial_n_tile:
             return None
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
         if (
             not k3_fp8w_lowm_gemm.low_m_max_for(n, k)
@@ -4418,7 +4416,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         (``k3_fp8w_lowm_mxfp8.staged_matches_mid_m``)."""
         if not _K3_FP8W_LOWM_GEMM or self.lowm_weight_scale is None:
             return False
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
         from ..kernels.k3r_gemm import k3_fp8w_lowm_mxfp8_ull as k3_fp8w_lowm_mxfp8
 
         n, k = self.weight.shape
@@ -4454,7 +4452,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         x_flat = x.reshape(-1, x.shape[-1])
         if xs.dim() == 1 and self.takes_mid_mxfp8_input(x_flat.shape[0]):
             # The producer stored the scales in the mid-M GEMM's layout.
-            from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+            from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
             m = x_flat.shape[0]
             tactic, _ = k3_fp8w_lowm_gemm.mid_prequant_plan(m, self.out_features, self.in_features)
@@ -4516,7 +4514,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         scale = self._lowm_forward_scale(x)
         if scale is None:
             return False
-        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+        from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
         return k3_fp8w_lowm_gemm.can_run_gated(
             x,
@@ -4532,7 +4530,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         x_flat = x.reshape(-1, x.shape[-1])
         scale = self._lowm_forward_scale(x_flat)
         if scale is not None:
-            from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm
+            from ..kernels.k3r_gemm import k3_fp8w_lowm_gemm
 
             if x_flat.shape[0] <= k3_fp8w_lowm_gemm.low_m_max_for(
                 self.out_features, self.in_features
