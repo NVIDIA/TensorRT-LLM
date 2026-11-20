@@ -17,7 +17,8 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
-                    Literal, NoReturn, Optional, Sequence, Set, Tuple, Union)
+                    Literal, NoReturn, Optional, Sequence, Set, Tuple, Union,
+                    cast)
 
 import torch
 from strenum import StrEnum
@@ -852,6 +853,14 @@ class PyExecutor:
 
         self.model_engine = model_engine
         self._uses_torch_compile = model_engine.uses_torch_compile
+
+        model = self.model_engine.model
+        if model is not None and hasattr(model, "lm_head"):
+            self._num_embeddings: int | None = cast(
+                int, model.lm_head.num_embeddings)
+        else:
+            self._num_embeddings = None
+
         hooks = runtime_hooks_of(model_engine.model)
         self._execution_stream_loop_armed = hooks.loop_on_execution_stream
         self._executor_events = hooks.executor_events
@@ -8685,16 +8694,16 @@ class PyExecutor:
         )
 
     def _validate_token_id_range(self, request: LlmRequest) -> None:
-        model = self.model_engine.model
-        if not hasattr(model, "lm_head"):
+        if self._num_embeddings is None:
             return
 
-        num_embeddings = model.lm_head.num_embeddings
         end_id = request.py_end_id
-        if end_id is not None and (end_id < -1 or end_id >= num_embeddings):
+        if end_id is not None and (end_id < -1
+                                   or end_id >= self._num_embeddings):
             raise ValueError(f"EndId ({end_id}) is not within acceptable range "
-                             f"[-1, {num_embeddings}).")
+                             f"[-1, {self._num_embeddings}).")
 
+        model = self.model_engine.model
         if isinstance(model, DecoderModelForCausalLM):
             # Only skip token-range checks for Llama4 when the request has
             # multimodal data. Probed via sys.modules so this module does not
@@ -8720,9 +8729,9 @@ class PyExecutor:
             # Recorded when a trimmed prompt was restored; spares a full scan.
             token_bound = request.py_prompt_token_bound
             if token_bound is not None:
-                if token_bound >= num_embeddings:
+                if token_bound >= self._num_embeddings:
                     raise ValueError("Token ID out of range")
-            elif not request.check_token_id_range(num_embeddings):
+            elif not request.check_token_id_range(self._num_embeddings):
                 raise ValueError("Token ID out of range")
 
     def _warn_if_kv_block_budget_unchecked(self) -> None:
@@ -8772,6 +8781,18 @@ class PyExecutor:
                     f"(prompt_len={request.orig_prompt_len}, "
                     f"max_new_tokens={request.max_new_tokens}, "
                     f"beam_width={request.py_beam_width}).")
+
+    def _validate_embedding_bias(self, request: LlmRequest) -> None:
+        if self._num_embeddings is None:
+            return
+
+        embedding_bias = request.py_embedding_bias
+        if embedding_bias is not None:
+            for idx, val in embedding_bias:
+                if idx < 0 or idx >= self._num_embeddings:
+                    raise ValueError(
+                        f"Embedding bias index must be in [0, {self._num_embeddings - 1}]"
+                    )
 
     def _validate_encoder_output_len(self, request: LlmRequest) -> None:
         """Reject an encoder input that no iteration can serve.
@@ -8907,6 +8928,8 @@ class PyExecutor:
         request.py_csa2_remote_tail_split = split
 
     def _validate_request(self, request: LlmRequest) -> None:
+        request.raise_if_validation_failed()
+
         if getattr(self, "_decode_only",
                    False) and not request.is_generation_only_request:
             raise ValueError(
@@ -9012,6 +9035,8 @@ class PyExecutor:
 
         # Check token ID ranges
         self._validate_token_id_range(request)
+
+        self._validate_embedding_bias(request)
 
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
@@ -9909,14 +9934,17 @@ class PyExecutor:
         # 7. Merge requests
         if self._kv_load_tracker.enabled and new_requests:
             self._kv_load_tracker.idle_sampled = False
-        return merge_requests(new_requests,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits(),
-                              is_disagg=self.kv_cache_transceiver is not None,
-                              track_unique_tokens=self.track_unique_tokens)
+        return merge_requests(
+            new_requests,
+            cp_config=self.dist.cp_config,
+            cp_rank=self.dist.cp_rank,
+            cp_size=self.dist.cp_size,
+            exclude_last_generation_logits=self.
+            _should_exclude_last_generation_logits(),
+            is_disagg=self.kv_cache_transceiver is not None,
+            track_unique_tokens=self.track_unique_tokens,
+            vocab_size=self._num_embeddings,
+        )
 
     def _cancel_queued_context_requests(self,
                                         waiting_queue: WaitingQueue) -> None:
