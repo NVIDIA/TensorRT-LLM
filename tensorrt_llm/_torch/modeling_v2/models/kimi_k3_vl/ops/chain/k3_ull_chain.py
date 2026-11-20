@@ -1012,7 +1012,7 @@ class NvScratch:
 
 
 class NvExperts:
-    """One layer's NVFP4 routed experts behind ``PersistentExperts``' interface (module docstring).
+    """One layer's NVFP4 routed experts.
 
     ``packed``: ``_chain_weights.pack_routed_experts_tp16(..., publish=True)``; ``scratch``: the
     shared :class:`NvScratch`. ``prepare`` compiles outside CUDA graph captures; ``run`` only
@@ -1057,13 +1057,14 @@ class NvExperts:
             self.direct_sf = self.rt.to_cute(self.direct[1])
         return self.direct[0], self.direct_sf
 
-    def prepare(self, batch, buffers, out, publish=(), planned=False, twoshot=False, early=False):
-        """``PersistentExperts.prepare``: ``buffers`` (MR8's scratch) is not used, the NVFP4
-        layers share :class:`NvScratch`; ``planned``: the routing kernel writes the image / plan
-        (else ``run`` writes it from x first). Row counts outside ``rows`` are compiled at their
-        first ``run``; two-shot ones raise there."""
+    def prepare(self, batch, out, publish=(), planned=False, twoshot=False):
+        """Compile a row shape, or record it for compilation on the first run.
+
+        With ``planned`` the routing kernel writes the shared :class:`NvScratch` image or plan.
+        Otherwise ``run`` writes it from its input before launching the experts.
+        """
         if self.rows is not None and batch not in self.rows:
-            self.deferred[batch] = (batch, buffers, out, publish, planned, twoshot)
+            self.deferred[batch] = (batch, out, publish, planned, twoshot)
             return
         self._prepare(batch, out, publish, planned, twoshot)
 
@@ -1114,8 +1115,7 @@ class NvExperts:
 
         b = x.shape[0]
         if b not in self.prepared and b in self.deferred:
-            batch, _, out, publish, planned, twoshot = self.deferred.pop(b)
-            self._prepare(batch, out, publish, planned, twoshot)
+            self._prepare(*self.deferred.pop(b))
         p = self.prepared[b]
         if p["writer"] is not None:
             write, plan = p["writer"]
@@ -1516,9 +1516,7 @@ class K3UllChain:
         owner = (group, self.device, self.tp, self.rank)
         fronts = {i: weights.layers[i].moe.front for i in plan.indices}
         self.prefetch_controller = k.prefetch.PrefetchController(ds, decoders, fronts)
-        state = self.moe_state = k.moe_prepared.MoEScratch(
-            self.tp, self.device, ds.tuned, owner=owner
-        )
+        state = self.moe_state = k.moe_prepared.MoEScratch(self.tp, self.device, ds.tuned)
         mailbox = k.oproj.OprojMailbox(*owner)
         self.tail_box = k.tail_runtime.MoeTailBox(*owner)
         twoshot = k.twoshot.TwoShot(*owner)
@@ -1550,8 +1548,7 @@ class K3UllChain:
                 tail_op, moe.latent_norm, moe.latent_up, ds.tuned, (self.tail_box, ordinal, count)
             )
             self.feed_forward[i] = k.moe_prepared.PreparedMoE(
-                front, experts, tail, state, prefetch=self.prefetch_controller, layer_idx=i,
-                module=decoder.mlp,
+                front, experts, tail, state, prefetch=self.prefetch_controller, layer_idx=i
             )  # fmt: skip
         # A tail followed by a layer whose input projection preloads its weights before its PDL
         # wait (a KdaHead; at q > 1 the MLA layer's tensor-memory in-projection) releases that

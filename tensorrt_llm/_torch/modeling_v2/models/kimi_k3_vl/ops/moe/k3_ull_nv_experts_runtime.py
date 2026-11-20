@@ -2,19 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Host side of the NVFP4 TP16 Rubin experts (``nv_experts.RubinNvExpertsKernel``).
 
-* :func:`scratch`: the experts' workspace (vLLM's ``experts_runtime.scratch`` layout: images,
+* :func:`scratch`: the experts' workspace (images,
   partials, counters, route mailbox, staged rows, grouped hidden images, peer slots, generations;
   the hidden images of both kernels armed with 0x88, everything else with 0xFF), the latent image
   plan of 8-row calls (``nv_experts.IMAGE_BYTES``) and the grouped plan of 9-64-row calls
   (``nv_experts.PLAN_BYTES``).
 * :func:`route_mailbox`: the route mailbox words (int32) the routing kernel writes in polled mode
   (128 ids, then the image count, which reaches ``2 * 8 - 1`` when the image is complete).
-* :class:`NvRubinExperts`: one layer's packed weights (``weights.pack_routed_experts_tp16``) and
-  the compiled kernels: ``RubinNvExpertsKernel`` at 8 rows (:meth:`NvRubinExperts.prepare`,
-  :meth:`NvRubinExperts.run`), ``RubinNvGroupedExpertsKernel`` at 9-64 rows
-  (:meth:`NvRubinExperts.prepare_grouped`, :meth:`NvRubinExperts.run_grouped`; the same weights).
-
-Like ``nv_experts`` this module imports no TensorRT-LLM code.
 """
 
 import functools
@@ -189,57 +183,3 @@ def write_image(latent, plan, x_gsf):
         cutlass.Float32(float(x_gsf)),
         _host.stream(latent.device),
     )
-
-
-class NvRubinExperts:
-    """One MoE layer's routed experts (packed weights) on ``RubinNvExpertsKernel``.
-
-    ``packed``: :func:`weights.pack_routed_experts_tp16`'s dict; ``beta`` / ``linear_beta``: the
-    SiTU constants; ``grid``: the persistent grid (default every SM; the whole grid must be
-    co-resident)."""
-
-    def __init__(self, packed, *, beta, linear_beta, grid=None, slots=None):
-        self.w13, self.w13_sf = packed["w13"], packed["w13_sf"]
-        self.w2, self.w2_sf = packed["w2"], packed["w2_sf"]
-        self.alphas = packed["alphas"]
-        self.experts = self.w13.shape[0]
-        self.device = self.w13.device
-        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
-        self.grid = grid or sms
-        self.slots = slots or slots_for(self.device)
-        self.scalars = tuple(map(cutlass.Float32, (beta * linear_beta, 1 / beta, 1 / linear_beta)))
-        self.views = tuple(to_cute(t) for t in (self.alphas, self.w13_sf, self.w2_sf))
-        self.addresses = (cutlass.Int64(self.w13.data_ptr()), cutlass.Int64(self.w2.data_ptr()))
-
-    def prepare(self, publish=False, polled=False, static=True, fast=True, stamp=0):
-        moe, code = compile_experts(
-            self.experts, self.grid, self.slots, self.device.index, publish, polled, static, fast,
-            stamp,
-        )  # fmt: skip
-        _host.check_residency(code, self.device.index, self.grid, 384, "Kimi K3 NVFP4 experts")
-        return moe, code
-
-    def prepare_grouped(self, batch, publish=False, static=True):
-        """``RubinNvGroupedExpertsKernel`` for ``batch`` (9-64) rows."""
-        moe, code = compile_grouped(
-            self.experts, batch, self.grid, self.slots, self.device.index, publish, static
-        )
-        _host.check_residency(code, self.device.index, self.grid, 384, "Kimi K3 NVFP4 experts")
-        return moe, code
-
-    def run_grouped(self, code, buffers, ids, output, batch, box=()):
-        """Launch the grouped kernel for ``batch`` rows: ``buffers["rows"]`` holds the grouped plan
-        (the routing kernel's, or :func:`write_plan`), ``ids`` int32 [batch * 16], ``output``: BF16
-        rows [batch * 16, 3584] (publish False) or the routing weights BF16 [batch * 16]."""
-        args = (to_cute(buffers["rows"]), to_cute(ids), self.views[0], *self.views[1:])
-        args += (to_cute(buffers["workspace"]), to_cute(output), cutlass.Int32(batch))
-        code(*args, *self.scalars, *box, *self.addresses, _host.stream(self.device))
-
-    def run(self, code, buffers, ids, output, box=(), batch=BATCH):
-        """Launch for ``batch`` <= 8 token rows (the image's rows past it are never used): ``ids``
-        int32 [8 * 16] (rows < ``batch``; read after the dependency wait unless polled),
-        ``output``: BF16 rows [8 * 16, 3584] (publish False) or the routing weights BF16 [8 * 16];
-        ``box``: the publish box (cute scalars)."""
-        args = (to_cute(buffers["plan"]), to_cute(ids), self.views[0], *self.views[1:])
-        args += (to_cute(buffers["workspace"]), to_cute(output), cutlass.Int32(batch))
-        code(*args, *self.scalars, *box, *self.addresses, _host.stream(self.device))
