@@ -1643,7 +1643,7 @@ repos:
         - PyYAML
         pass_filenames: false
         files: >-
-          ^(\.claude/skills/[^/]+/SKILL\.md|\.claude/agents/.*\.md|scripts/check_skill_naming_convention\.py)$
+          ^(\.claude/skills/[^/]+/SKILL\.md|skills/[^/]+/SKILL\.md|\.claude/agents/.*\.md|scripts/check_skill_naming_convention\.py)$
     -   id:  type-check
         name: Record advisory Pyrefly type-check report
         entry: scripts/run_pyrefly.sh

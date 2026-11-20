@@ -1,0 +1,91 @@
+{
+  "skill_name": "trtllm-serve-config-guide",
+  "evals": [
+    {
+      "id": "tscg-exact-match-throughput-profile",
+      "prompt": "Generate the trtllm-serve config for openai/gpt-oss-120b on 8x H200 SXM: ISL 1024, OSL 1024, concurrency 64, TP 8, objective Max Throughput. A trimmed TensorRT-LLM checkout (configs and a few docs only) is at /workspace/input/trtllm-mini/. There is no GPU, network or TensorRT-LLM install in this sandbox; do not install anything.",
+      "expected_skill": "trtllm-serve-config-guide",
+      "expected_script": null,
+      "expected_output": "Exact database match: two recipes exist for (gpt-oss-120b, H200_SXM, 8 GPUs, 1024/1024, conc 64); the profile: throughput one (1k1k_tp8_conc64_throughput.yaml) is chosen to preserve Max Throughput and emitted unchanged. Response is Config -> Source -> Launch command (trtllm-serve openai/gpt-oss-120b ... --config <yaml>), with trust_remote_code called out as a trust boundary and max_num_tokens 20000 confirmed to exceed ISL + template overhead.",
+      "assertions": [
+        "Uses the exact database match for (gpt-oss-120b, H200_SXM, 8 GPUs, ISL 1024, OSL 1024, concurrency 64) and, of the two recipes for that key, picks the `profile: throughput` one (`examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc64_throughput.yaml`) to preserve the Max Throughput objective, not the latency-profile file.",
+        "Emits that config's fields unchanged (e.g. `enable_attention_dp: true` with its attention_dp_config, `moe_config.backend: TRITON`, tensor_parallel_size 8, moe_expert_parallel_size 8, max_num_tokens 20000, max_seq_len 2068, free_gpu_memory_fraction 0.8) without hand-tuned edits or added fields such as a speculative_config.",
+        "Structures the response as Config, then Source (the database file path), then Launch command, with a launch command of the form `trtllm-serve openai/gpt-oss-120b ... --config <that yaml>`.",
+        "Calls out `trust_remote_code: true` as a trust boundary.",
+        "Confirms that max_num_tokens (20000) covers ISL 1024 plus chat-template overhead."
+      ],
+      "files": [
+        "files/trtllm-mini"
+      ]
+    },
+    {
+      "id": "tscg-r1-mtp-nearest-config",
+      "prompt": "Generate a trtllm-serve config for deepseek-ai/DeepSeek-R1-0528 on 8x B200: ISL 1024, OSL 1024, concurrency 192, TP 8, objective Max Throughput. Use the trimmed TensorRT-LLM checkout at /workspace/input/trtllm-mini/. There is no GPU, network or TensorRT-LLM install in this sandbox; do not install anything.",
+      "expected_skill": "trtllm-serve-config-guide",
+      "expected_script": null,
+      "expected_output": "No exact match for concurrency 192; starts from a neighboring checked-in B200 1k/1k database recipe (conc 128 or conc 256), chosen with the Max Throughput objective in mind. The MTP speculative_config is copied verbatim from that one source (max_draft_len 3 from conc 128 or 1 from conc 256, never an interpolated value), max_batch_size comes from the source rather than the concurrency, and the answer is Config -> Source used as starting point -> a single What to benchmark list, with trust_remote_code called out.",
+      "assertions": [
+        "Finds no exact database match for concurrency 192 and uses a neighboring checked-in DeepSeek-R1-0528 B200 1k/1k database config (concurrency 128 or 256) as the starting point, naming its path.",
+        "Explicitly takes the Max Throughput objective into account when choosing between the neighboring recipes (e.g. why the attention-DP conc-256 recipe, or the conc-128 recipe, fits).",
+        "Copies the MTP `speculative_config` block verbatim from that single source file (`decoding_type: MTP` with that file's `max_draft_len` - 3 for conc 128, 1 for conc 256), never an interpolated value such as `max_draft_len: 2` or a value mixed in from the other file.",
+        "Keeps max_batch_size from the chosen source config instead of deriving it from the requested concurrency (does not set it to 192).",
+        "Uses the interpolated response format: Config, then Source used as starting point, then a single 'What to benchmark' list of knobs to sweep.",
+        "Calls out `trust_remote_code: true` as a trust boundary."
+      ],
+      "files": [
+        "files/trtllm-mini"
+      ]
+    },
+    {
+      "id": "tscg-curated-objective-mismatch",
+      "prompt": "Generate a trtllm-serve config for nvidia/Llama-3.3-70B-Instruct-FP8 on 4x H100 SXM: ISL 2048, OSL 256, concurrency 4, TP 4, objective Min Latency. A trimmed TensorRT-LLM checkout is at /workspace/input/trtllm-mini/. There is no GPU, network or TensorRT-LLM install in this sandbox; do not install anything.",
+      "expected_skill": "trtllm-serve-config-guide",
+      "expected_script": null,
+      "expected_output": "No database entry exists, so the curated llama-3.3-70b.yaml is the starting point, and the response calls out that it is labeled Max Throughput, conflicting with Min Latency. Interpolated fields: tensor_parallel_size 4, max_num_tokens raised above 2048 (ISL 2048 + template overhead), max_seq_len ~ISL+OSL+overhead (2304 < x <= ~2560); legacy TensorRT-engine numbers are ignored. Ends with one What to benchmark list and calls out trust_remote_code.",
+      "assertions": [
+        "Finds no database entry for this model and uses the curated `examples/configs/curated/llama-3.3-70b.yaml` as the starting point, naming it as the source used as starting point.",
+        "Explicitly calls out that the only checked-in Llama-3.3-70B config is labeled Max Throughput, which conflicts with the requested Min Latency objective.",
+        "Sets max_num_tokens above 2048 so a 2048-token prompt plus chat-template overhead is not rejected (the curated value of 2048 is insufficient for ISL 2048).",
+        "Sets max_seq_len to ISL + OSL + a chat-template allowance: greater than 2304 and no more than about 2560.",
+        "Does not use the values from docs/source/legacy/ (max_batch_size 96, max_num_tokens 12288, free-memory fraction 0.95), treating TensorRT engine-build numbers as not transferable to PyTorch-backend serving.",
+        "Ends with a single 'What to benchmark' list of knobs to sweep rather than per-field unverified tags, and calls out `trust_remote_code: true` as a trust boundary."
+      ],
+      "files": [
+        "files/trtllm-mini"
+      ]
+    },
+    {
+      "id": "tscg-kv-capacity-interpolation",
+      "prompt": "Generate a trtllm-serve config for Qwen/Qwen3-32B (dense, BF16) on 2x H100 SXM 80GB (nvidia-smi reports 81,559 MiB per GPU), TP 2, ISL 8192, OSL 1024, concurrency 64, objective Balanced. Will concurrency 64 fit in KV cache? The model's Hugging Face config is at /workspace/input/qwen3-32b-hf/config.json (BF16 weights are about 65.5 GB in total) and a trimmed TensorRT-LLM checkout is at /workspace/input/trtllm-mini/. No GPU, network or TensorRT-LLM install in this sandbox; do not install anything.",
+      "expected_skill": "trtllm-serve-config-guide",
+      "expected_script": null,
+      "expected_output": "No checked-in config exists for Qwen3-32B, so the config is interpolated and marked unverified. GQA KV per token per GPU = 2 x 64 x (8/2) x 128 x 2 B = 131,072 B, ~1.125 GiB per 9,216-token request; with the 0.90 HBM factor and ~32.75 GB of weights per GPU, roughly 32-37 requests fit, so concurrency 64 does not fit with BF16 KV (options: FP8 KV, TP 4, lower concurrency). max_num_tokens > 8192, max_seq_len ~9,216 + template overhead (not 40,960), single What to benchmark list.",
+      "assertions": [
+        "Finds no checked-in database or curated config for Qwen3-32B in the trimmed checkout and therefore treats the result as interpolated/unverified (the Qwen3-30B-A3B MoE recipes are a different model).",
+        "Computes the per-token KV size per GPU with the GQA formula: 2 x 64 layers x (8 KV heads / TP 2) x 128 head_dim x 2 bytes = 131,072 bytes (128 KiB), i.e. about 1.125 GiB per 9,216-token request per GPU.",
+        "Estimates the maximum concurrent requests with the 0.90 HBM factor at roughly 32-37, concludes that concurrency 64 does not fit with BF16 KV at full ISL+OSL, names options to close the gap (e.g. FP8 KV cache, TP 4, or lower concurrency), and marks the formula-derived numbers as unverified.",
+        "Sets max_num_tokens above 8192 (ISL plus chat-template overhead) rather than the 8192 default.",
+        "Sets max_seq_len to ISL + OSL + a chat-template allowance (greater than 9216 and at most about 10,240), not the 40,960 max_position_embeddings.",
+        "Uses the interpolated response format with a single 'What to benchmark' list of knobs to sweep rather than per-field unverified tags."
+      ],
+      "files": [
+        "files/trtllm-mini",
+        "files/qwen3-32b-hf"
+      ]
+    },
+    {
+      "id": "tscg-negative",
+      "prompt": "Set up disaggregated serving for DeepSeek-R1-0528 across three B200 nodes with TensorRT-LLM: one node runs context (prefill) servers and the other two nodes run a single TP16 generation server, with KV-cache transfer over NIXL. Give me the context-server config, the generation-server config, the disaggregated orchestrator config, and the launch commands.",
+      "expected_skill": null,
+      "should_trigger": false,
+      "expected_script": null,
+      "expected_output": "A disaggregated, multi-node setup: separate context and generation server configs with KV-cache transfer settings, an orchestrator/router config listing both server groups, and launch commands that span nodes - not a single aggregated trtllm-serve config.",
+      "assertions": [
+        "The trtllm-serve-config-guide skill is not loaded or applied.",
+        "Produces separate context-server and generation-server configurations (each with a KV-cache transfer / cache transceiver setting) plus a disaggregated orchestration/router config, rather than a single aggregated trtllm-serve config.",
+        "Addresses the multi-node generation server (e.g. launching TP16 across two nodes with an MPI or SLURM launcher)."
+      ],
+      "files": []
+    }
+  ]
+}
