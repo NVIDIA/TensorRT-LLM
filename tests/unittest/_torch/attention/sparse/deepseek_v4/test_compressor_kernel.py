@@ -1761,6 +1761,7 @@ def test_chunked_prefill(compress_ratio, head_dim, overlap, batch_size, start_po
     assert ref_out is not None, "Reference should produce output"
 
     # ---- Kernel call 1: initial prefill (sp=0, kv_len=start_pos_val) ----
+    cu_outputs_1 = None
     actual_num_out_1 = start_pos_val // ratio
     kv_comp_1 = torch.empty(0, head_dim, device=device, dtype=torch.bfloat16)
 

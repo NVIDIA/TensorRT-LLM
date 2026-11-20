@@ -81,7 +81,7 @@ def createKubernetesPodConfig(image, arch = "amd64")
         """.stripIndent(),
     ]
 
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "runPerfSanityTriage"])
 }
 
 pipeline {

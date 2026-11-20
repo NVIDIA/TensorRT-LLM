@@ -18,6 +18,7 @@ pytestmark = pytest.mark.cpu_only
 def test_all_padding_families_preserve_real_slot_ownership(monkeypatch, physical_k):
     # Exercise the real initialization and host prepare methods. This deliberately
     # does not validate device copies, graph replay, or target KV-cache contents.
+    dummy = None
     original_zeros = torch.zeros
     original_empty = torch.empty
     original_full = torch.full
@@ -49,7 +50,7 @@ def test_all_padding_families_preserve_real_slot_ownership(monkeypatch, physical
         num_stages=1,
         _attn_params={"window_size": 4, "head_dim": 2},
     )
-    DSv4DSparkWorker._lazy_init(worker, draft, SimpleNamespace(max_num_requests=4))
+    DSv4DSparkWorker._lazy_init(worker, draft, SimpleNamespace(max_num_requests=4, num_seq_slots=4))
     meta = SimpleNamespace(
         _dspark_worker=worker, batch_indices_cuda=torch.empty(4, dtype=torch.int32)
     )

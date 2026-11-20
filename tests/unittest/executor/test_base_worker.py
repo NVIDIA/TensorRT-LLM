@@ -40,6 +40,37 @@ model_path = llm_models_root() / default_model_name
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("return_metrics", [False, True, None],
+                         ids=["opt_out", "opt_in", "untracked"])
+def test_response_metrics_are_deserialized_only_when_requested(
+        monkeypatch: pytest.MonkeyPatch, return_metrics: bool | None) -> None:
+    metrics = {"latency": 0.125}
+    deserialize = Mock(return_value=SimpleNamespace(
+        request_perf_metrics=metrics))
+    response = SimpleNamespace(client_id=7,
+                               result=SimpleNamespace(is_final=False,
+                                                      _result=None,
+                                                      get_result=deserialize))
+    results = {} if return_metrics is None else {
+        7:
+        SimpleNamespace(sampling_params=SimpleNamespace(
+            return_perf_metrics=return_metrics))
+    }
+    monkeypatch.setattr("tensorrt_llm.executor.result._build_perf_metrics_dict",
+                        lambda value: value)
+
+    wrapped = base_worker._maybe_wrap_response(
+        SimpleNamespace(_results=results), response)
+
+    if return_metrics is False:
+        assert wrapped is response
+        deserialize.assert_not_called()
+    else:
+        assert wrapped.request_perf_metrics is metrics
+        deserialize.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("drop_context_logits", [False, True])
 @pytest.mark.parametrize("simple", [False, True])

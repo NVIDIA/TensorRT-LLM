@@ -32,7 +32,6 @@ import fcntl
 import os
 import subprocess
 import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -86,43 +85,6 @@ def resolve_commit(repo: str | Path, rev: str = "HEAD") -> str | None:
     """The full commit ``rev`` names in ``repo``; ``None`` when it names none or git cannot say."""
     answer = git_output(repo, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}") or ""
     return answer.strip() or None
-
-
-def read_files_at(
-    repo: str | Path, commit: str, paths: Sequence[str], timeout: float = 120
-) -> dict[str, str] | None:
-    """The text of each of ``paths`` at ``commit``, read in one ``git cat-file --batch``.
-
-    A path ``commit`` does not hold is left out. ``None`` when git cannot answer.
-    """
-    if not paths:
-        return {}
-    request = "".join(f"{commit}:{path}\n" for path in paths).encode()
-    try:
-        done = subprocess.run(
-            ["git", "--no-optional-locks", "-C", str(repo), "cat-file", "--batch"],
-            input=request,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if done.returncode != 0:
-        return None
-    out, texts, at = done.stdout, {}, 0
-    for path in paths:
-        end = out.find(b"\n", at)
-        if end < 0:
-            return None
-        header, at = out[at:end], end + 1
-        if header.endswith(b" missing"):
-            continue
-        _, kind, size = header.rsplit(b" ", 2)
-        if kind == b"blob":
-            texts[path] = out[at : at + int(size)].decode("utf-8", "replace")
-        at += int(size) + 1
-    return texts
 
 
 #: The optional task.yaml block that configures the policy; every key has a default.
@@ -494,9 +456,8 @@ def native_artifacts(repo: str | Path) -> list[str]:
 def repo_lock(repo: Path):
     """Serialize worktree creation on one repository.
 
-    Concurrent `git worktree add` on one repository (a campaign stacking a candidate
-    while a tuner request opens another) fails with `Could not reset index file to
-    revision 'HEAD'`.
+    Concurrent `git worktree add` on one repository (two tasks opening their worktrees at
+    once) fails with `Could not reset index file to revision 'HEAD'`.
     """
     path = Path(git_checked(repo, "rev-parse", "--git-common-dir"))
     if not path.is_absolute():
@@ -507,29 +468,6 @@ def repo_lock(repo: Path):
             yield
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
-
-
-def add_worktree(repo: Path, tree: Path, *args: str) -> None:
-    """`git worktree add` under the repo lock, retried once after cleaning up a failed attempt.
-
-    Only the registration holds the lock (``--no-checkout``); the checkout, the slow part, runs
-    outside it against the worktree's own index, so several candidates check out at once.
-    """
-    with repo_lock(repo):
-        for attempt in (1, 2):
-            out = subprocess.run(
-                ["git", "-C", str(repo), "worktree", "add", "--no-checkout", *args],
-                capture_output=True,
-                text=True,
-            )
-            if out.returncode == 0:
-                break
-            git_checked(repo, "worktree", "remove", "--force", str(tree), check=False)
-            git_checked(repo, "worktree", "prune", check=False)
-            if attempt == 2:
-                raise RuntimeError(f"git worktree add {' '.join(args)}: {out.stderr.strip()}")
-            time.sleep(5)
-    git_checked(tree, "reset", "--hard", "-q")
 
 
 def link_native(repo: Path, tree: Path) -> None:
@@ -545,7 +483,6 @@ __all__ = [
     "repo_lock",
     "native_artifacts",
     "link_native",
-    "add_worktree",
     "COMMIT_POLICY_FIELD",
     "COMMIT_POLICY_KEYS",
     "CommitFinding",
@@ -563,7 +500,6 @@ __all__ = [
     "git_checked",
     "git_output",
     "is_sandbox_placeholder",
-    "read_files_at",
     "resolve_base",
     "resolve_commit",
     "resolve_commit_identity",

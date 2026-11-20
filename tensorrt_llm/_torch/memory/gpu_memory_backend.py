@@ -24,11 +24,12 @@ is delegated to the GMS library's stable public Python primitives.
 
 Design notes:
 - We deliberately avoid the upstream `setup_gms()` monkey-patch entry
-  point. TRT-LLM owns the integration policy in `ModelLoader`; this
+  point. TRT-LLM owns the integration policy in
+  `models/checkpoints/gms/model_loading.py`; this
   backend is a thin adapter over the GMS library's primitive API.
 - The protocol has a single point of contact per concern, so when the
   upstream GMS Python API drifts, only the methods on `GMSBackend`
-  need to change — the call sites in `model_loader.py` are stable.
+  need to change — the call sites in `gms/model_loading.py` are stable.
 
 Operating modes:
 - **RW (Read-Write)**: First worker loads weights via the normal
@@ -120,8 +121,9 @@ class GMSBackend:
     This adapter calls the GMS library's stable per-call primitives
     (`GMSClientMemoryManager` + the helpers in
     `gpu_memory_service.client.torch.allocator` and `.module`) and
-    composes them into the methods TRT-LLM's `ModelLoader` invokes for
-    the `LoadFormat.GMS` branch. We intentionally do **not** use the
+    composes them into the methods that TRT-LLM's GMS loading code
+    (`models/checkpoints/gms/model_loading.py`) invokes for
+    `LoadFormat.GMS`. We intentionally do **not** use the
     upstream `setup_gms()` monkey-patch — TRT-LLM owns the integration
     policy and we keep the dependency surface narrow and explicit.
     """
@@ -347,9 +349,8 @@ class GMSBackend:
         registered tensor to live in the GMS pool, so we copy any stray
         CUDA params into freshly created GMS mappings of the same size.
 
-        Mirrors `gpu_memory_service.integrations.trtllm.model_loader.
-        _move_untracked_params` so behavior matches the upstream
-        reference integration.
+        Copies each untracked storage once and preserves each parameter's
+        dtype, shape, strides, and storage offset within that mapping.
 
         Args:
             model: The `nn.Module` to scan for stray CUDA parameters.
@@ -358,6 +359,8 @@ class GMSBackend:
 
         Raises:
             RuntimeError: If `connect()` has not been called yet.
+            ValueError: If an untracked CUDA parameter has zero-byte storage,
+                lazy conjugate/negative state, or exceeds a reused mapping.
         """
         # TODO(GMS-API): Clean up once the stable GMS API becomes available.
         if self._client is None:
@@ -368,50 +371,51 @@ class GMSBackend:
 
         gms_client = self._client
         device_index = self._device_index
-        # Map original storage base ptr -> new GMS base_va. Serves two roles:
-        #   1. Dedups create_mapping() / copy_() calls when multiple tensors
-        #      share a storage (e.g. tied embeddings, sliced fused params).
-        #   2. Lets us rebind every view of a shared storage to the SAME
-        #      GMS mapping, so all tied/aliased parameters end up backed
-        #      by the GMS pool. Without this, only the first encountered
-        #      view was rebound; subsequent views still pointed at the
-        #      original non-GMS storage and were missed by finalize_write.
-        storage_to_gms_va: dict[int, int] = {}
+        # One mapping per migrated storage preserves both shared storage
+        # identity and bytes outside the first parameter's view.
+        storage_to_gms: dict[int, torch.UntypedStorage] = {}
 
-        # No torch.no_grad() guard: `tensor.data = X` bypasses autograd by
-        # definition (it's a data-attribute assignment, not an autograd-tracked
-        # operation), and `replacement.copy_(tensor)` is an in-place op on a
-        # freshly created tensor with no autograd history. Model loading also
-        # runs outside any grad-enabled context.
-        for _name, tensor, tensor_type in _iter_module_tensors(model):
+        for name, tensor, tensor_type in _iter_module_tensors(model):
             if tensor_type != "parameter" or tensor is None or not tensor.is_cuda:
                 continue
 
-            # GMS tracks whole storage allocations, so use the storage
-            # base pointer instead of a tensor view's offset pointer.
-            storage_base_ptr = tensor.untyped_storage().data_ptr()
+            storage = tensor.untyped_storage()
+            storage_base_ptr = storage.data_ptr()
             if _ptr_in_gms(gms_client, int(storage_base_ptr)):
                 continue
 
-            base_va = storage_to_gms_va.get(storage_base_ptr)
-            first_for_this_storage = base_va is None
-            if first_for_this_storage:
-                nbytes = _storage_nbytes(tensor)
-                base_va = gms_client.create_mapping(size=nbytes, tag=self._tag)
-                storage_to_gms_va[storage_base_ptr] = base_va
+            if tensor.is_conj() or tensor.is_neg():
+                raise ValueError(
+                    f"GMS cannot register CUDA parameter {name!r} with lazy conjugate/negative state"
+                )
 
-            replacement = _tensor_from_pointer(
-                int(base_va),
-                list(tensor.shape),
-                list(tensor.stride()),
-                tensor.dtype,
-                device_index,
+            mapped_storage = storage_to_gms.get(storage_base_ptr)
+            if mapped_storage is None:
+                nbytes = _storage_nbytes(tensor)
+                if nbytes == 0:
+                    raise ValueError(
+                        f"GMS cannot register CUDA parameter {name!r} with zero-byte storage"
+                    )
+                base_va = gms_client.create_mapping(size=nbytes, tag=self._tag)
+                mapped_storage = _tensor_from_pointer(
+                    int(base_va), [nbytes], [1], torch.uint8, device_index
+                ).untyped_storage()
+                mapped_storage.copy_(storage)
+                storage_to_gms[storage_base_ptr] = mapped_storage
+            elif storage.nbytes() > mapped_storage.nbytes():
+                raise ValueError(
+                    f"GMS cannot migrate CUDA parameter {name!r}: storage size "
+                    f"{storage.nbytes()} exceeds the shared mapping size {mapped_storage.nbytes()}"
+                )
+
+            # set_ interprets the offset and strides in the parameter's dtype,
+            # while keeping the whole shared storage available for other views.
+            replacement = torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
+                mapped_storage,
+                tensor.storage_offset(),
+                tensor.shape,
+                tensor.stride(),
             )
-            # Copy original bytes exactly once per storage; subsequent
-            # views of the same storage just rebind onto the same GMS
-            # mapping without recopying.
-            if first_for_this_storage:
-                replacement.copy_(tensor)
             tensor.data = replacement
 
     def finalize_write(self, model: nn.Module) -> int:

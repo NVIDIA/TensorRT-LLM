@@ -77,7 +77,7 @@ def createKubernetesPodConfig(image)
         """.stripIndent(),
     ]
 
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "PruneSlurmOutputs"])
 }
 
 // Clusters CI submits to with the default svc_tensorrt credentials; partitions

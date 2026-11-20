@@ -16,12 +16,15 @@ context_servers:
   speculative_config:
     decoding_type: MTP
     max_draft_len: 1
+    # The target's tactic does not reach the MTP layer, whose experts are
+    # BF16; pin it to TRTLLM-Gen as well.
+    moe_tactic: trtllm_gen
   kv_cache_config:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.8
     dtype: fp8
   moe_config:
-    backend: TRTLLM
+    tactic: trtllm_gen
     # Chunk the MoE forward at half of max_num_tokens, mirroring the non-MTP
     # config: the ctx sizing here is identical (16640 tokens, 0.8 KV fraction,
     # TRTLLM-Gen FP4 MoE), so a full-size chunk carries the same 7-8 GiB
@@ -47,12 +50,13 @@ generation_servers:
   speculative_config:
     decoding_type: MTP
     max_draft_len: 1
+    moe_tactic: trtllm_gen
   kv_cache_config:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.8
     dtype: fp8
   moe_config:
-    backend: TRTLLM
+    tactic: trtllm_gen
   cuda_graph_config:
     enable_padding: true
     batch_sizes:

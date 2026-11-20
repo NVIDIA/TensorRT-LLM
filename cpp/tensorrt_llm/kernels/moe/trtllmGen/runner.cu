@@ -140,6 +140,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::Sigmoid;
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::SumNormalize;
         routingData.mNormTopkProb = true;
+        // Matches the Python reference's sum + 1e-20: an all-underflow token gets 0 weights, not NaN.
+        routingData.mSumEpsilon = 1e-20f;
 
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
         routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
@@ -478,11 +480,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType,
     bool useFineGrained)
-    : mDtypeAct(dtypeAct)
-    , mDtypeWeights(dtypeWeights)
-    , mTileTokensDim(tileTokensDim)
+    : mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, useFineGrained)))
+          getOptions(dtypeAct, dtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, useFineGrained)))
     , mActType(actType)
 {
 }
@@ -495,14 +495,6 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
     void* bmm1Workspace, bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
     int32_t validHiddenSize, int32_t validIntermediateSize)
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
-    {
-        // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
-        // FIXME: enforce valid hidden dim to be multiple of 512 due to unhandled OOB read in routeAct. Please keep this
-        // in sync with
-        // tensorrt_llm/_torch/moe/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     int32_t intermediateSizeFactor = (is_gated_activation ? 2 : 1);
@@ -528,30 +520,22 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
-    {
-        // Keep in sync with run(): the kernel is launched with the 512-rounded valid hidden size.
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     return mRunner.getDefaultValidConfigIndex(numTokens, is_gated_activation ? 2 * intermediateSize : intermediateSize,
-        hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize,
-        validHiddenSize);
+        hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, numTokens,
+        is_gated_activation ? 2 * validIntermediateSize : validIntermediateSize, validHiddenSize);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
-    {
-        validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens,
         is_gated_activation ? 2 * intermediateSize : intermediateSize, hiddenSize, {}, numTokens, numExperts,
-        maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize, validHiddenSize);
+        maxNumCgasInBatchDim, numTokens, is_gated_activation ? 2 * validIntermediateSize : validIntermediateSize,
+        validHiddenSize);
 
     return isValid;
 }
@@ -595,10 +579,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype d
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, bool useDeepSeekFp8,
     int tileTokensDim, bool useFineGrained)
-    : mDtypeAct(dtypeAct)
-    , mDtypeWeights(dtypeWeights)
-    , mDtypeOut(dtypeOut)
-    , mTileTokensDim(tileTokensDim)
+    : mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8, useFineGrained)))
 {
@@ -611,11 +592,6 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
     void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize,
     int32_t validIntermediateSize)
 {
-    if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
-    {
-        // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
-        validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
-    }
     auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     mRunner.run(numTokens, hiddenSize, intermediateSize, numTokens, validHiddenSize, validIntermediateSize, {},
         numTokens, numExperts, maxNumCgasInBatchDim, permutedHiddenState, permutedHiddenStateScale, weights,
@@ -645,7 +621,6 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-
     auto const maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens, hiddenSize, intermediateSize, {}, numTokens,
@@ -662,6 +637,11 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const
 std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
 {
     return mRunner.getKernelNameFromConfigIndex(configIndex);
+}
+
+std::map<std::string, std::string> Runner::getKernelOptionsFromConfigIndex(int32_t configIndex) const
+{
+    return mRunner.getKernelOptionsFromConfigIndex(configIndex);
 }
 
 } // namespace Gemm2
@@ -823,6 +803,20 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
     return std::distance(mPassingConfigs.begin(), it);
 }
 
+std::string Runner::getGemm2KernelName(int64_t configIndex) const
+{
+    TLLM_CHECK_WITH_INFO(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+        "Invalid MoE config index %ld.", static_cast<long>(configIndex));
+    return mGemm2.getKernelNameFromConfigIndex(static_cast<int32_t>(mPassingConfigs[configIndex].gemm2Config));
+}
+
+std::map<std::string, std::string> Runner::getGemm2KernelOptions(int64_t configIndex) const
+{
+    TLLM_CHECK_WITH_INFO(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+        "Invalid MoE config index %ld.", static_cast<long>(configIndex));
+    return mGemm2.getKernelOptionsFromConfigIndex(static_cast<int32_t>(mPassingConfigs[configIndex].gemm2Config));
+}
+
 void Runner::run(
     MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex)
 {
@@ -851,6 +845,7 @@ void Runner::run(
         args.valid_intermediate_size.value_or(args.intermediate_size));
 
     // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
+    TLLM_CHECK_WITH_INFO(!args.skip_gemm2 || !args.do_finalize, "skip_gemm2 requires do_finalize == false.");
     void* gemm2_input = workspace.gemm1_output;
     void* gemm2_input_scale = workspace.gemm1_output_scale;
     // We do activation only for DeepSeek FP8, as cubins do not have fused activation.
@@ -860,6 +855,11 @@ void Runner::run(
         moe::dev::activation::run(activationData, stream);
         gemm2_input = workspace.activation_output;
         gemm2_input_scale = workspace.activation_output_scale;
+    }
+
+    if (args.skip_gemm2)
+    {
+        return;
     }
 
     // Run gemm2

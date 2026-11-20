@@ -166,6 +166,7 @@ def test_argmax_performance(N):
         torch.cuda.synchronize()
 
         # CuTE graph
+        out = None
         g1 = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g1):
             for _ in range(num_iters):

@@ -88,11 +88,13 @@ def test_set_spec_metadata_all_rank_counts_for_one_model() -> None:
         [8, 9],
         [2, 3],
         [1, 2],
+        [3, 0],
     )
 
     assert spec_metadata.all_rank_num_tokens == [8, 9]
     assert spec_metadata.all_rank_num_seqs == [2, 3]
     assert spec_metadata.all_rank_num_gens == [1, 2]
+    assert spec_metadata.all_rank_draft_lens == [3, 0]
     assert spec_metadata.subseq_all_rank_num_tokens == [2, 3]
 
 
@@ -104,6 +106,7 @@ def test_forward_selects_current_speculative_rows(
     logits = torch.arange(24).reshape(6, 4)
     metadata = object.__new__(DSparkSpecMetadata) if dspark else SimpleNamespace()
     runner = object.__new__(DecoderRunner)
+    runner._model = None
     runner._config = SimpleNamespace(without_logits=False)
     runner._inputs = SimpleNamespace(preprocess_inputs=lambda inputs, **kwargs: inputs)
     runner.sample_in_graph_callable = None

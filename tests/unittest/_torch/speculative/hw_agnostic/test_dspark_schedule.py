@@ -11,6 +11,8 @@ from tensorrt_llm._torch.speculative.dspark_schedule import (
     schedule_verify_lens_topk,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 BLOCK = 7
 
 

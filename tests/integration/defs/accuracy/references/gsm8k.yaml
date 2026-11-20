@@ -154,6 +154,14 @@ deepseek-ai/DeepSeek-V4.1-Flash:
     accuracy: 93.3283
     threshold: 91.0
     num_samples: 1319
+  # DeepSeek-V4.1-Flash-1017-NVFP4: NVFP4 routed experts and MXFP4 Engram tables, same floor.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DSpark
+    extra_acc_spec: engram_quant=mxfp4
+    accuracy: 95.6785
+    threshold: 91.0
+    num_samples: 1319
 deepseek-ai/DeepSeek-V4-Flash-Base:
   # Base (pretrained, non-instruct) checkpoint, so GSM8K lands well below the
   # instruct DeepSeek-V4-Flash above. GSM8K measurements from
@@ -295,8 +303,13 @@ Qwen/Qwen3.5-397B-A17B:
     spec_dec_algo: MTP
     accuracy: 95.0
 Qwen/Qwen3.8-27B:
+  # DFlash is lossless, so the run without it shares the reference.
+  - accuracy: 89.8408
   - spec_dec_algo: DFlash
     accuracy: 89.8408
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 90.068
 Qwen/Qwen3.8-2.4T-A95B:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.80
@@ -310,9 +323,20 @@ Qwen/Qwen3.8-2.4T-A95B:
     accuracy: 93.80
 Qwen/Qwen3.8-Flash-Next:
   - accuracy: 95.72
+  # Block FP8 without speculative decoding, under the protocol of the FP8 MTP row (chat
+  # template, thinking with a short-reasoning system prompt, 512 output tokens), measured on
+  # the built-in implementation: TEP4 on GB300, TRTLLM MoE, bf16 Mamba SSM cache.
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 95.34
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 95.11
+  # FP8 KV cache over the checkpoint's bf16 KV, measured on the modeling_v2 FP8 target: TEP4 on
+  # GB300, MTP draft length 3, the breakable prefill graph, bf16 Mamba SSM cache.
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 95.15
   - quant_algo: MIXED_PRECISION
     accuracy: 96.36
   - quant_algo: MIXED_PRECISION
@@ -379,6 +403,19 @@ moonshotai/Kimi-K3:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: NVFP4
     accuracy: 95.4
+  # The same NVFP4 KV with DSpark, which verifies against the target: the
+  # disaggregated SM107 modeling_v2 targets
+  # (accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__*/test_accuracy.py).
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    spec_dec_algo: DSpark
+    accuracy: 95.4
+  # Same requant with FP8 KV cache on aggregated Helix TP4 x CP2
+  # (TestKimiK3::test_gsm8k_nvfp4_tp4_helix2[fp8]). Measured 96.59 on all
+  # 1,319 samples on GB300; 95.2 keeps margin for run-to-run variation.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 95.2
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8
@@ -550,6 +587,11 @@ nvidia/Nemotron-3-Nano:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 65.428
+nvidia/Nemotron-3-Nano-4B:
+  - accuracy: 84.80
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 83.28
 nvidia/Nemotron-3.5-Lightning:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
