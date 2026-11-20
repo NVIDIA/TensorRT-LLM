@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.visual_gen.quantization.ops import (
+from tensorrt_llm._torch.visual_gen.catalog.quantization.fp8_weight_quantize import (
     quantize_fp8_blockwise,
     quantize_fp8_per_tensor,
-    quantize_nvfp4,
 )
+from tensorrt_llm._torch.visual_gen.catalog.quantization.nvfp4_weight_quantize import quantize_nvfp4
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils import fp4_utils
 

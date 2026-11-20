@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import struct
 
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,12 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
+
+from .skip_softmax_threshold import (
+    H3SkipSoftmax,
+    dense_prefix,
+    resolve_skip_softmax_threshold_scale_factor,
+)
 
 
 def _cute_output(q, k, v, scale, *, recipe=None, threshold=None):
@@ -65,13 +72,13 @@ class H3DenseAttention:
                 plan_cache=config.attention_metadata_state,
             )
         elif backend == "CUTEDSL" and getattr(sparse_params, "algorithm", None) == "sol_attn":
-            from ....catalog.attention._cute_fmha_kernel import is_cute_fmha_supported
+            from ....catalog.attention.cute_fmha import is_cute_fmha_supported
             from ..kernels.sol_attention import run_sol_attn_bthd
 
             self.sol = run_sol_attn_bthd
             self.sol_params = sparse_params
             self.sparse_params = None
-            self.sol_dense_layer = layer_idx in sparse_params.dense_layers
+            self.sol_dense_layer = layer_idx in (sparse_params.dense_layers or ())
             self.cute_dense_available = is_cute_fmha_supported()
 
     @staticmethod
@@ -80,19 +87,10 @@ class H3DenseAttention:
 
     @torch.compiler.disable
     def _sol_dense_by_step(self, timestep):
-        from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import (
-            graph_phase_for_timestep,
-        )
-
         phase = resolved_extra_key("sparse_attn_phase")
         if phase is not None:
             return phase == 0
-        return (
-            graph_phase_for_timestep(
-                timestep, disabled_until_timestep=self.sol_params.disabled_until_timestep
-            )
-            == 0
-        )
+        return dense_prefix(timestep, self.sol_params.disabled_until_timestep)
 
     def forward(self, q, k, v, *, key_padding_mask=None, timestep=None, **kwargs):
         if self.sol is not None:
@@ -154,8 +152,6 @@ class H3DenseAttention:
         if key_padding_mask is not None:
             raise NotImplementedError(f"{self.backend} requires an unpadded H3 sequence")
         if self.backend == "CUTEDSL":
-            from .skip_softmax_threshold import resolve_skip_softmax_threshold_scale_factor
-
             threshold = resolve_skip_softmax_threshold_scale_factor(
                 None, self.sparse_params, timestep
             )
@@ -177,11 +173,17 @@ def create_h3_attention(config, *, num_heads, head_dim, layer_idx, module_name):
                 if prefix and not module_name.startswith(prefix + ".")
                 else module_name
             )
-            params = sparse.to_sparse_params(
-                module_name=qualified, pretrained_config=config.pretrained_config
-            )
+            params = H3SkipSoftmax.from_config(sparse, qualified, config.pretrained_config)
         elif isinstance(sparse, SolAttentionConfig):
-            params = sparse.to_sparse_params()
+            try:
+                tau = struct.unpack("=f", struct.pack("=f", sparse.tau))[0]
+            except (OverflowError, ValueError, struct.error) as error:
+                raise ValueError("SOL tau must be representable as float32") from error
+            if not math.isfinite(tau):
+                raise ValueError("SOL tau must be finite")
+            params = sparse.model_copy(
+                update={"tau": tau, "dense_layers": list(sparse.dense_layers or ())}
+            )
     if backend == "TRTLLM":
         from .trtllm_attention import H3TrtllmAttention
 

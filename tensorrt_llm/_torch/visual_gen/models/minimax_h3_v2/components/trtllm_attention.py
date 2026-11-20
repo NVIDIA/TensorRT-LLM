@@ -13,14 +13,17 @@ from tensorrt_llm._torch.attention.backends.interface import PredefinedAttention
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseBackendForwardArgs,
-    SparseParams,
 )
-from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SolAttentionConfig
 
-from ..ops.uncached_attention import ContextBuffers, uncached_attention
+from ....catalog.attention.trtllm_context_attention import (
+    TrtllmContextWorkspace,
+    trtllm_context_attention,
+)
+from .skip_softmax_threshold import H3SkipSoftmax, dense_prefix
 from .trtllm_attention_prims import H3PrimTS
 
 
@@ -48,7 +51,7 @@ class H3TrtllmAttention:
         quant_config: QuantConfig | None = None,
         dtype: torch.dtype | None = None,
         attention_config: AttentionConfig | None = None,
-        sparse_params: SparseParams | None = None,
+        sparse_params: SolAttentionConfig | H3SkipSoftmax | None = None,
     ):
         if attention_metadata_state is None:
             raise ValueError("TRTLLM attention requires model-scoped attention metadata state.")
@@ -59,8 +62,8 @@ class H3TrtllmAttention:
         self.quant_mode = int(quant_config.layer_quant_mode) if quant_config is not None else 0
         self.recipe = attention_config.quant_attention_config if attention_config else None
         self.sparse = sparse_params
-        self.sol = sparse_params is not None and sparse_params.algorithm == "sol_attn"
-        self.skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
+        self.sol = isinstance(sparse_params, SolAttentionConfig)
+        self.skip_softmax = isinstance(sparse_params, H3SkipSoftmax)
         self.state = attention_metadata_state
         self.prims = H3PrimTS(self.recipe, attention_metadata_state)
         self.skip_stats = None
@@ -74,21 +77,24 @@ class H3TrtllmAttention:
         return self.recipe is None and not self.sol
 
     @torch.compiler.disable
-    def _skip_params(self, timestep):
-        return self.sparse.scheduler.get_runtime_params(timestep=timestep)
+    def _skip_threshold(self, timestep):
+        assert isinstance(self.sparse, H3SkipSoftmax)
+        return (
+            0.0
+            if dense_prefix(timestep, self.sparse.disabled_until_timestep)
+            else self.sparse.threshold
+        )
 
     @torch.compiler.disable
     def _sol_routes(self, q, k, v, timestep):
-        from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol import predictor
+        from ....catalog.attention.sol_predictor import SOL_BLOCK_SIZE, sol_predictor
 
-        if self.layer_idx in self.sparse.dense_layers:
+        assert isinstance(self.sparse, SolAttentionConfig)
+        if self.layer_idx in (self.sparse.dense_layers or ()):
             return None
-        phase = graph_phase_for_timestep(
-            timestep, disabled_until_timestep=self.sparse.disabled_until_timestep
-        )
-        if phase == 0:
+        if dense_prefix(timestep, self.sparse.disabled_until_timestep):
             return None
-        pred = predictor.predict(
+        bits, keys, values = sol_predictor(
             q,
             k,
             v,
@@ -97,40 +103,42 @@ class H3TrtllmAttention:
             thresh_type=self.sparse.thresh_type,
         )
         return BlockSparseForwardInputs(
-            q_block_size=predictor.BLOCK_SIZE,
-            kv_block_size=predictor.BLOCK_SIZE,
-            exact_block_bits=pred.exact_block_bits,
-            k_summary=pred.k_summary,
-            v_summary=pred.v_summary,
+            q_block_size=SOL_BLOCK_SIZE,
+            kv_block_size=SOL_BLOCK_SIZE,
+            exact_block_bits=bits,
+            k_summary=keys,
+            v_summary=values,
         )
 
     @torch.compiler.disable
-    def _thop(self, q, k, v, batch, length, sparse):
+    def _thop(self, q, k, v, batch, length, threshold):
         if not self.prims.fallback_enabled:
             raise RuntimeError("Uncached H3 context attention requires the fallback FMHA library.")
         cache = self.state.setdefault("h3_thop", {})
         key = (q.device, batch, length)
         if key not in cache:
-            cache[key] = ContextBuffers.for_shape(batch, length, q.device)
+            cache[key] = TrtllmContextWorkspace(batch, length, q.device)
         if self.skip_stats is None or self.skip_stats.device != q.device:
             self.skip_stats = q.new_zeros((2,), dtype=torch.uint32)
         if self.print_stats:
             self.skip_stats.zero_()
-        out = uncached_attention(
-            q,
-            k,
-            v,
+        recipe = self.recipe
+        packed_heads = self.num_heads + (2 * self.num_kv_heads if k is None else 0)
+        out = trtllm_context_attention(
+            q.view(batch, length, packed_heads, self.head_dim),
+            k.view(batch, length, self.num_kv_heads, self.head_dim) if k is not None else None,
+            v.view(batch, length, self.num_kv_heads, self.head_dim) if v is not None else None,
             cache[key],
             self.skip_stats,
-            length=length,
             num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
             layer_idx=self.layer_idx,
             quant_mode=self.quant_mode,
-            prefill_threshold=sparse.threshold_scale_factor_prefill if sparse else None,
-            decode_threshold=sparse.threshold_scale_factor_decode if sparse else None,
-            recipe=self.recipe,
+            skip_threshold=threshold,
+            sage_block_sizes=(recipe.q_block_size, recipe.k_block_size, recipe.v_block_size)
+            if recipe
+            else (0, 0, 0),
+            sage_qk_int8=recipe is not None and recipe.qk_dtype == "int8",
+            sage_smooth_k=recipe is not None and recipe.smooth_k,
         )
         if self.print_stats:
             total, skipped = self.skip_stats.tolist()
@@ -138,7 +146,7 @@ class H3TrtllmAttention:
                 print(
                     f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped}/{total} = {skipped / total:.2f}%"
                 )
-        return out.view(batch, length, -1)
+        return out.flatten(2)
 
     def forward(
         self,
@@ -182,7 +190,7 @@ class H3TrtllmAttention:
                     timestep=timestep,
                 )
                 return F.pad(out, (0, 0, 0, seq_len - valid_seq_len))
-        sparse = self._skip_params(timestep) if self.skip_softmax else None
+        threshold = self._skip_threshold(timestep) if self.skip_softmax else None
         routes = sparse_backend_args.block_sparse_inputs if sparse_backend_args else None
         if self.sol or routes is not None or self.recipe is not None:
             if k is None or v is None:
@@ -197,13 +205,7 @@ class H3TrtllmAttention:
                     v,
                     routes,
                     skip_softmax=self.skip_softmax,
-                    skip_threshold_active=bool(
-                        sparse
-                        and (
-                            sparse.threshold_scale_factor_prefill
-                            or sparse.threshold_scale_factor_decode
-                        )
-                    ),
+                    skip_threshold_active=bool(threshold),
                 )
                 if out is not None:
                     return out.flatten(2)
@@ -218,7 +220,7 @@ class H3TrtllmAttention:
                     v.flatten(0, 1).flatten(1),
                     batch_size,
                     seq_len,
-                    sparse,
+                    threshold,
                 )
         qkv = q.reshape(batch_size * seq_len, -1) if k is None else _pack(q, k, v)
-        return self._thop(qkv, None, None, batch_size, seq_len, sparse)
+        return self._thop(qkv, None, None, batch_size, seq_len, threshold)

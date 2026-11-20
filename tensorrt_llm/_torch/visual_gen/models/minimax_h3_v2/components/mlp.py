@@ -4,13 +4,13 @@
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.modules.gate_up_swiglu_quack import (
+from tensorrt_llm._utils import get_sm_version
+
+from ....catalog.gemm.gate_up_swiglu_quack import (
     gate_up_swiglu_quack_available,
     gate_up_swiglu_quack_bf16,
     gate_up_swiglu_quack_shape_ok,
 )
-from tensorrt_llm._utils import get_sm_version
-
 from ..ops.activation import swiglu
 from .linear import Linear, projection_shard_bounds
 

@@ -13,9 +13,10 @@ from ._cute_fmha_kernel import (
     _quantize_fp8,
     cute_dsl_fmha_fwd,
     cutlass,
+    is_cute_fmha_supported,
 )
 
-__all__ = ["cute_fmha"]
+__all__ = ["cute_fmha", "is_cute_fmha_supported"]
 
 
 def _smooth_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -263,9 +263,11 @@ l0_cpu:
   - unittest/_torch/visual_gen/models/minimax_h3_v2/test_routing.py
   - unittest/_torch/visual_gen/models/minimax_h3_v2/ops/test_minimax_h3_vsa.py
   - unittest/_torch/visual_gen/models/minimax_h3_v2/components/test_skip_softmax_threshold.py
+  - unittest/_torch/visual_gen/models/minimax_h3_v2/components/test_prims_selection.py
   - unittest/_torch/visual_gen/catalog/attention/test_cute_fmha.py
   - unittest/_torch/visual_gen/catalog/attention/test_flash_attention_4.py
   - unittest/_torch/visual_gen/catalog/attention/test_flashinfer_prefill.py
+  - unittest/_torch/visual_gen/catalog/attention/test_trtllm_context_attention.py
   - unittest/_torch/visual_gen/models/minimax_h3_v2/components/test_tiled_vae.py
   - unittest/_torch/visual_gen/models/minimax_h3_v2/test_minimax_h3_scheduler_packing.py
   - unittest/_torch/visual_gen/test_model_loader.py

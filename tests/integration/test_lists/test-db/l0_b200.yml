@@ -463,6 +463,13 @@ l0_b200:
   - unittest/_torch/visual_gen/catalog/attention/test_cute_fmha.py
   - unittest/_torch/visual_gen/catalog/attention/test_flash_attention_4.py
   - unittest/_torch/visual_gen/catalog/attention/test_flashinfer_prefill.py
+  - unittest/_torch/visual_gen/catalog/attention/test_prims_dense_attention.py
+  - unittest/_torch/visual_gen/catalog/attention/test_prims_routed_attention.py
+  - unittest/_torch/visual_gen/catalog/attention/test_sol_predictor.py
+  - unittest/_torch/visual_gen/catalog/attention/test_trtllm_context_attention.py
+  - unittest/_torch/visual_gen/catalog/gemm/test_gate_up_swiglu_quack.py
+  - unittest/_torch/visual_gen/catalog/quantization/test_fp8_weight_quantize.py
+  - unittest/_torch/visual_gen/catalog/quantization/test_nvfp4_weight_quantize.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_attention.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_kernels.py
   - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py
