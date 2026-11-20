@@ -177,12 +177,13 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
                 req.state,
             )
             status_key = (direction, status_id)
-            for old in list(self._records_by_status.get(status_key, {}).values()):
+            indexed = self._records_by_status.get(status_key, {})
+            for old in list(indexed.values()):
                 if old.admission_uncertain:
                     # Numeric status cannot distinguish the uncertain older generation.
                     # Discard only its observation, without terminal or release claims.
                     self._discard(old)
-            if direction == "send":
+            if direction == "send" and not indexed:
                 self._transceiver.start_send_terminal_outcome_observation(req)
             self._records[record.key] = record
             self._records_by_status.setdefault(status_key, {})[record.key] = record
@@ -228,7 +229,7 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
                     self._records_by_status.pop(status_key, None)
             self._receive_state_records.pop(record.key, None)
             req = record.get_request()
-            if record.direction == "send" and req is not None:
+            if record.direction == "send" and req is not None and not indexed:
                 try:
                     self._transceiver.stop_send_terminal_outcome_observation(req)
                 except _OBSERVATION_ERRORS as error:
@@ -284,6 +285,11 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         if ownership is False:
             self._finish(record, "failed")
         elif ownership is None:
+            indexed = self._records_by_status.get((record.direction, record.status_id), {})
+            if any(other is not record for other in indexed.values()):
+                # A numeric terminal ID cannot distinguish this failed admission.
+                self._discard(record)
+                return
             record.admission_uncertain = True
             # Keep no strong failed-request owner when native admission is unknown.
             # Native owners/callers still determine release and request lifetime.
@@ -508,10 +514,34 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return self._transceiver.prepare_shutdown()
 
     def shutdown(self) -> None:
-        """Shut down the resource owner before cancelling its remaining
-        observations.
-        """
+        """Preserve ready outcomes and settle only authoritatively retired transfers."""
+        outcomes: dict[int, SendTerminalOutcome] = {}
+        if self._records:
+            try:
+                outcomes = self._transceiver.get_send_terminal_outcomes()
+            except _OBSERVATION_ERRORS as error:
+                _profiler.warn_profiler_failure(
+                    "trtllm::kv_transfer", "kv", "shutdown send outcomes", error
+                )
         result = self._transceiver.shutdown()
         for record in list(self._records.values()):
-            self._finish(record, "cancelled")
+            outcome = outcomes.get(record.status_id) if record.direction == "send" else None
+            if outcome is None:
+                req = record.get_request()
+                try:
+                    owned = (
+                        self._transceiver.transfer_resource_ownership(req)
+                        if req is not None
+                        else None
+                    )
+                except _OBSERVATION_ERRORS as error:
+                    _profiler.warn_profiler_failure(
+                        "trtllm::kv_transfer", "kv", "shutdown ownership", error
+                    )
+                    owned = None
+                if owned is not False:
+                    self._discard(record)
+                    continue
+                outcome = "cancelled"
+            self._finish(record, outcome)
         return result
