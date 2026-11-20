@@ -441,6 +441,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                                     multimodal_data,
                                                     mm_item_order)
         if metadata is not None:
+            item_grids = {}
             for modality in ("image", "video"):
                 modality_data = multimodal_data.get(modality)
                 grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
@@ -449,6 +450,20 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     metadata.input_partitions[
                         modality] = _qwen_vision_input_partitions(
                             multimodal_data, modality, metadata)
+                    item_grids[modality] = [{
+                        grid_key: grid
+                    } for grid in modality_data[grid_key].tolist()]
+            if item_grids:
+                # Each item's grid, in prompt order. The standalone encoder
+                # returns it with the item's embedding: a prefill worker that
+                # gets the embedding without this encoder's mRoPE positions
+                # (for example from an embedding cache) needs the grid to
+                # build them. It is read here, on the host, because that
+                # encoder moves the grids to the GPU before its forward.
+                multimodal_data["multimodal_embedding_metadata"] = [
+                    item_grids[modality][index]
+                    for modality, index in metadata.item_refs
+                ]
         return metadata
 
     # ------------------------------------------------------------------
@@ -1609,10 +1624,6 @@ class Qwen2VisionModelBase(nn.Module):
     @nvtx_range("Qwen2VisionModelBase forward()")
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]):
-        # The aggregated model also calls this forward. Only the standalone
-        # encoder returns embedding handles.
-        if self.model_config.mm_encoder_only:
-            _set_item_grid_metadata(multimodal_params)
 
         mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(
             multimodal_params)
@@ -2331,26 +2342,6 @@ def _qwen_vision_input_partitions(
         grid_key: _QWEN_VISION_BATCHED_FIELD,
         "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
     }
-
-
-def _set_item_grid_metadata(multimodal_params: List[MultimodalParams]) -> None:
-    """Put each item's grid on its embedding handle, in prompt order.
-
-    A prefill worker that gets these embeddings without this encoder's mRoPE
-    positions (for example from an embedding cache) needs the grid to build
-    them.
-    """
-    for param in multimodal_params:
-        item_refs, _ = param.get_item_layout()
-        data = param.multimodal_data
-        grids = {}
-        metadata = []
-        for modality, index in item_refs:
-            key = f"{modality}_grid_thw"
-            if modality not in grids:
-                grids[modality] = data[modality][key].tolist()
-            metadata.append({key: grids[modality][index]})
-        data["multimodal_embedding_metadata"] = metadata
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):

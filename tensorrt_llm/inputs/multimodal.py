@@ -1616,6 +1616,7 @@ def find_mm_token_lengths(
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_metadata",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     "special_token_offsets",
     "layout_metadata",

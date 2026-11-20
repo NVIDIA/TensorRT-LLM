@@ -1113,65 +1113,123 @@ def test_qwen_vl_embeddings_on_model_without_support_raise(model):
         )
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("mm_encoder_only", [True, False], ids=["encoder", "aggregated"])
-@pytest.mark.parametrize(
+_QWEN_VL_ENCODERS = pytest.mark.parametrize(
     "encoder_cls",
     [modeling_qwen2vl.Qwen2VisionModelBase, Qwen3VisionModelBase, Cosmos3EdgeVisionEncoder],
     ids=["qwen2.5", "qwen3", "cosmos3_edge"],
 )
-def test_qwen_vl_encoder_puts_item_grid_on_embedding_handles(encoder_cls, mm_encoder_only):
-    """The standalone encoder gives each item its grid, in prompt order.
 
-    A caller that caches encoder outputs passes this grid back with the
-    embedding, as {"mm_embeddings": tensor, "image_grid_thw": [t, h, w]}.
+
+def _qwen_vl_item_grid_case(encoder_cls):
+    """Return one request's processed data, a stub encoder and the expected grids.
+
+    The input processor puts each item's grid on its embedding handle, in
+    prompt order, and the encoder returns rows in the same order.
     """
     # A landscape and a portrait image, so a swapped h and w shows.
-    data = {
-        "image": {
-            "pixel_values": torch.zeros(48, 4),
-            "image_grid_thw": torch.tensor([[1, 4, 6], [1, 6, 4]]),
-        }
-    }
-    item_refs = [("image", 0), ("image", 1)]
-    lengths = [6, 6]
     expected = [{"image_grid_thw": [1, 4, 6]}, {"image_grid_thw": [1, 6, 4]}]
+    prompt = [11, 12, 13, 11, 12, 13]
+    model = "qwen2.5"
     if encoder_cls is not modeling_qwen2vl.Qwen2VisionModelBase:
         # Qwen3-VL encodes images and videos in one call. The video comes first in the prompt.
-        data["video"] = {
-            "pixel_values_videos": torch.zeros(32, 4),
-            "video_grid_thw": torch.tensor([[2, 4, 4]]),
-        }
-        item_refs.insert(0, ("video", 0))
-        lengths.insert(0, 8)
         expected.insert(0, {"video_grid_thw": [2, 4, 4]})
-    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
-        item_refs, output_embedding_lengths=lengths
-    )
+        prompt = [11, 14, 13] + prompt
+        model = "qwen3"
+    data = {}
+    for modality, pixel_key in (("image", "pixel_values"), ("video", "pixel_values_videos")):
+        grid_key = f"{modality}_grid_thw"
+        grids = [item[grid_key] for item in expected if grid_key in item]
+        if grids:
+            # Each patch holds its item's grid, so a row shows which item it comes from.
+            pixels = [
+                torch.tensor(grid, dtype=torch.float32).expand(int(np.prod(grid)), 3)
+                for grid in grids
+            ]
+            data[modality] = {pixel_key: torch.cat(pixels), grid_key: torch.tensor(grids)}
+    processor, _ = _make_qwen_vl_embedding_processor(model, prompt)
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = processor.get_mm_item_metadata(prompt, data)
+    lengths = [int(np.prod(grid)) // 4 for item in expected for grid in item.values()]
+
+    grid_devices = []
 
     def vit(pixel_values, grid_thw):
-        # One row per 2x2 merged patch, like the real encoder. Each row holds
-        # its item's grid, so the test can see which item a row comes from.
-        return torch.cat([grid.float().expand(int(grid.prod()) // 4, 3) for grid in grid_thw])
+        # One row per 2x2 merged patch, like the real encoder. It does not read the grid.
+        grid_devices.append(grid_thw.device.type)
+        return pixel_values[::4]
 
     # Skip the real vision tower; forward only needs the config and the ViT call.
     encoder = encoder_cls.__new__(encoder_cls)
     torch.nn.Module.__init__(encoder)
-    encoder.model_config = SimpleNamespace(mm_encoder_only=mm_encoder_only)
+    encoder.model_config = SimpleNamespace(mm_encoder_only=True)
     encoder.visual = vit
     encoder.encode_batched = vit
-    param = MultimodalParams(multimodal_data=data)
-    embeddings = encoder.forward([param])
+    return data, lengths, expected, encoder, grid_devices
 
-    assert sum(embedding.shape[0] for embedding in embeddings) == sum(lengths)
-    # Rows come in prompt order, like the metadata: each item's rows hold its own grid.
-    for rows, item in zip(torch.cat(embeddings).split(lengths), expected, strict=True):
+
+def _assert_rows_hold_item_grids(embedding, lengths, expected):
+    """Rows come in prompt order, like the metadata: each item's rows hold its own grid."""
+    assert embedding.shape[0] == sum(lengths)
+    for rows, item in zip(embedding.split(lengths), expected, strict=True):
         (grid,) = item.values()
         assert torch.equal(rows, torch.tensor(grid, dtype=rows.dtype).expand_as(rows))
-    if mm_encoder_only:
-        assert param.multimodal_data["multimodal_embedding_metadata"] == expected
-    else:
-        assert "multimodal_embedding_metadata" not in param.multimodal_data
+
+
+@pytest.mark.cpu_only
+@_QWEN_VL_ENCODERS
+def test_qwen_vl_encoder_puts_item_grid_on_embedding_handles(encoder_cls):
+    """Each item gets its grid, in prompt order, with its embedding rows.
+
+    A caller that caches encoder outputs passes this grid back with the
+    embedding, as {"mm_embeddings": tensor, "image_grid_thw": [t, h, w]}.
+    """
+    data, lengths, expected, encoder, _ = _qwen_vl_item_grid_case(encoder_cls)
+    assert data["multimodal_embedding_metadata"] == expected
+    _assert_rows_hold_item_grids(
+        torch.cat(encoder.forward([MultimodalParams(multimodal_data=data)])), lengths, expected
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_QWEN_VL_ENCODERS
+def test_qwen_vl_encoder_runner_does_not_read_grid_from_gpu(encoder_cls):
+    """The standalone runner moves every tensor to the GPU, grids too.
+
+    Its forward must still return each item's grid without a device sync.
+    """
+    from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
+    from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
+
+    data, lengths, expected, encoder, grid_devices = _qwen_vl_item_grid_case(encoder_cls)
+    request = SimpleNamespace(
+        py_multimodal_data=data,
+        py_multimodal_params=MultimodalParams(multimodal_data=data),
+        multimodal_lengths=None,
+        get_num_tokens=lambda _: sum(lengths),
+    )
+
+    def forward(multimodal_params):
+        # Any device-to-host copy, like tolist() on a CUDA tensor, raises here.
+        previous_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            return encoder.forward(multimodal_params)
+        finally:
+            torch.cuda.set_sync_debug_mode(previous_mode)
+
+    runner = MultimodalEncoderRunner(
+        SimpleNamespace(extra_attrs={}, forward=forward),
+        encoder_cache_enabled=False,
+        moe_load_balancer=None,
+    )
+    result = runner.forward(
+        ScheduledInputs(batch=SimpleNamespace(context_requests=[request])),
+        resource_manager=SimpleNamespace(get_resource_manager=lambda _: None),
+    )
+
+    assert set(grid_devices) == {"cuda"}
+    assert result["mm_embedding_metadata"] == [expected]
+    (embedding,) = result["mm_embeddings"]
+    _assert_rows_hold_item_grids(embedding.cpu(), lengths, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -2277,7 +2335,6 @@ def test_normalization_transport_item_selection(declared: bool, modality: str) -
     from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
     from tensorrt_llm.inputs.multimodal import (
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-        MultimodalItemMetadata,
         MultimodalItemPartition,
     )
 
@@ -2428,7 +2485,6 @@ def test_normalization_transport_partial_encoder_cache() -> None:
     from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
     from tensorrt_llm.inputs.multimodal import (
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-        MultimodalItemMetadata,
         MultimodalItemPartition,
     )
 

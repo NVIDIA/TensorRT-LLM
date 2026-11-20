@@ -74,7 +74,6 @@ from .modeling_qwen2vl import (
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
     _qwen_vision_item_partitions,
-    _set_item_grid_metadata,
 )
 from .modeling_utils import (
     ModelConfig,
@@ -1614,10 +1613,6 @@ class Qwen3VisionModelBase(nn.Module):
         modality-batched ViT the aggregated path uses and applies the
         per-request `item_metadata.item_refs` reorder before returning.
         """
-        # The aggregated model also calls this forward. Only the standalone
-        # encoder returns embedding handles.
-        if self.model_config.mm_encoder_only:
-            _set_item_grid_metadata(multimodal_params)
         return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 
