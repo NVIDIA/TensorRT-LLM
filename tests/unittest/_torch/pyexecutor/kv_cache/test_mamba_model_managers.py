@@ -2637,7 +2637,9 @@ def test_fp4_mla_route_rejects_a_hybrid_family_other_than_kimi_k3():
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
-    with pytest.raises(ValueError, match="only on Kimi K3"):
+    with pytest.raises(
+        ValueError, match="NemotronHybridCacheManager does not compose the FP4 MLA cache layout"
+    ):
         get_kv_cache_manager_cls(
             _hybrid_fp4_mla_model_config(config),
             KvCacheConfig(use_kv_cache_manager_v2=True, enable_kv_pool_rebalance=False),

@@ -1037,8 +1037,22 @@ def test_cache_manager_routing_guards(route, monkeypatch):
         assert get_kv_cache_manager_cls(config, kv) is Glm5NextCacheManager
         assert get_kv_cache_manager_cls(config, kv, True, transceiver) is Glm5NextCacheManager
     else:
-        with pytest.raises(ValueError, match="glm5_next"):
+        with pytest.raises(ValueError, match="Glm5NextVLM .* KV cache manager V2"):
             get_kv_cache_manager_cls(config, kv, True, transceiver)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model_cls", [Glm5NextForCausalLM, Glm5NextVLM])
+def test_explicit_kv_cache_manager_v1_is_rejected_at_load(model_cls):
+    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import _resolve_kv_cache_manager_v2_auto
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model", kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False)
+    )
+    with pytest.raises(ValueError, match=f"{model_cls.__name__} requires KV cache manager v2"):
+        _resolve_kv_cache_manager_v2_auto(args, model_cls, _config())
 
 
 @pytest.mark.cpu_only

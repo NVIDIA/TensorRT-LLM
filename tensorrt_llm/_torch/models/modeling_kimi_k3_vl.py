@@ -484,6 +484,12 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
             text_config, quant_config=quant_config
         )
 
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the text backbone's cache manager class."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return KimiLinearForCausalLM.get_recurrent_kv_cache_manager_cls(text_config)
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],

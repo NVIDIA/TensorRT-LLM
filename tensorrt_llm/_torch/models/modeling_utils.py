@@ -901,6 +901,37 @@ class DecoderModelForCausalLM(nn.Module,
         return None
 
     @classmethod
+    def requires_kv_cache_manager_v2(cls,
+                                     pretrained_config: Any = None) -> bool:
+        """Return whether KV cache manager V2 is the model's only supported route.
+
+        Such a model is never demoted to V1: an explicit
+        ``kv_cache_config.use_kv_cache_manager_v2=False`` and a route that
+        cannot keep V2 are rejected.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config.
+        """
+        return False
+
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(
+            cls, pretrained_config: Any) -> Optional[type]:
+        """Return the V2 cache manager class of the model's recurrent family.
+
+        An architecture that overrides :meth:`get_recurrent_state_spec`
+        overrides this too. A VLM wrapper forwards to the class of its
+        language model.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config.
+
+        Returns:
+            ``None`` for an architecture without recurrent layers.
+        """
+        return None
+
+    @classmethod
     def get_recurrent_state_spec(
         cls,
         pretrained_config: Any,
@@ -1408,6 +1439,21 @@ def declares_recurrent_state(pretrained_config: Any) -> bool:
     no recurrent state, or when no class can be found.
     """
     return resolve_recurrent_state_spec(pretrained_config) is not None
+
+
+def resolve_recurrent_kv_cache_manager_cls(
+        pretrained_config: Any) -> Optional[type]:
+    """Return the V2 cache manager class of the recurrent family of a config.
+
+    The model class that :func:`resolve_model_class` finds declares it.
+    ``None`` means that class has no recurrent family, or that no class can
+    be found.
+    """
+    model_cls = resolve_model_class(pretrained_config)
+    get_cls = getattr(model_cls, 'get_recurrent_kv_cache_manager_cls', None)
+    if get_cls is None:
+        return None
+    return get_cls(pretrained_config)
 
 
 def is_model_arch_known(model_arch: str) -> bool:
