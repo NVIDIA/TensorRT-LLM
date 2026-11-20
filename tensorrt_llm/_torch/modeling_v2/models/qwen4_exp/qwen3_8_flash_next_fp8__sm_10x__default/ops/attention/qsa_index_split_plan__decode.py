@@ -36,7 +36,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Requests compared at once in the ranking (a `[BLOCK, CHUNK]` tile).
 _CHUNK = 32
@@ -126,7 +127,7 @@ class IndexSplitPlan(OpWrapper):
 
     Bitwise `reference`."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="tep2 HT verify step: 64 requests x 3 rows, rank 1, 3 padding requests at the tail",
              spec=_spec(64, 3, 2, 1, "padded")),

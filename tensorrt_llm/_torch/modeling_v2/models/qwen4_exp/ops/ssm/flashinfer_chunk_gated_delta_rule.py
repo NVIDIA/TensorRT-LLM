@@ -27,7 +27,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modules.fla.flashinfer_chunk import (
     chunk_gated_delta_rule as _fi_chunk_gated_delta_rule,
 )
@@ -293,7 +294,7 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     itself when given).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: geometry (H, HV, K, V); seqlens; `slots`-row pool with `indices`
     # (or _engine_slots); pool_dtype (fp32); output (None | "buffer" | "slice", a prefix

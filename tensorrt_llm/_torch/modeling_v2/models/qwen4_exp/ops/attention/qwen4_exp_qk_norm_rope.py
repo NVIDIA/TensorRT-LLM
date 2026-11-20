@@ -27,7 +27,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 @triton.jit
@@ -973,7 +974,7 @@ class Qwen4ExpQkNormRope(OpWrapper):
     store may run before or after this call.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # Four cells, one per compiled launch the forward reaches: the Triton kernel's 1-, 2-
     # and 8-head launches (by decode batch size) and the CuTe kernel (prefill).

@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Largest finite e4m3 magnitude.
 E4M3_MAX = 448.0
@@ -67,7 +68,7 @@ class Fp8Quantize1x128(OpWrapper):
     family) the compaction into `[NB, T]` are inside; no GEMM is fused.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: tokens, hidden, use_ue8m0, capture (False: eager; True: replayed from a captured
     # CUDA graph over two steps' activations).

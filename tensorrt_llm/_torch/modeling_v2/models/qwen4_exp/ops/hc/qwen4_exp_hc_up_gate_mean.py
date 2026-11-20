@@ -33,7 +33,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Programmatic dependent launch (sm_90+), off with TRTLLM_ENABLE_PDL=0.
 _PDL = get_env_enable_pdl()
@@ -898,7 +899,7 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     up)` followed by a separate gate-and-mean pass).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows, hc_count (4), hidden (2560), rank (320); bf16 only.
     CELLS: tuple[Cell, ...] = (

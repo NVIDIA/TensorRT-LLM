@@ -17,7 +17,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 @triton.jit
@@ -63,7 +64,7 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     `inject` is `None` exactly when `with_inject` is False.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16),
     # capture (False: eager; True: replayed from a captured CUDA graph over two steps' logits).

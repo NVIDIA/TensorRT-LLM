@@ -9,7 +9,8 @@ from typing import NamedTuple
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's block budget: `indexer_budget` 2048 tokens over
 #: `indexer_compress_ratio` 4. The op's own default, 2048, is the *token* budget.
@@ -82,7 +83,7 @@ class QsaTopkSelect(OpWrapper):
     encodes in `row_ends`, and the block-to-token expansion are outside.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # The target calls this with `index_topk = 512` over the `[rows, 2080]`
     # score matrix `qsa_paged_index_scores` returns with

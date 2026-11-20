@@ -27,7 +27,8 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 from flashinfer.gemm.kernels import dense_bf16_gemm_warp_splitk as _fw
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 from ..gemm import low_m_bf16_mm__decode as _lowm
 
@@ -634,7 +635,7 @@ class GdnInProjConv(OpWrapper):
     `causal_conv1d_token_major` over `proj`'s q|k|v columns.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = _cells()
 
     note = """

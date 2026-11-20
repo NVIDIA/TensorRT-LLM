@@ -30,7 +30,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.jit_variants import (
     compile_only,
     first_time,
@@ -466,7 +467,7 @@ class PleGateConvInjectNorm(OpWrapper):
     caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: lengths (rows per sequence), pool_slots (default num_seqs + 2),
     # max_rows (max(lengths)), carries (None -> the argument is None),

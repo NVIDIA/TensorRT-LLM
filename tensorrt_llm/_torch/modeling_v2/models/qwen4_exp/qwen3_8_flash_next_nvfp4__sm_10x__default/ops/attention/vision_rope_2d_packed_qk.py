@@ -58,7 +58,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's tower: 1152 / 16 heads = a 72-wide head, spatial_merge_size 2, theta 1e4
 #: (`model.visual.blocks.N.attn.qkv.weight` is [3456, 1152], so a qkv row is 3 * 16 * 72).
@@ -145,7 +146,7 @@ class VisionRope2dPackedQk(OpWrapper):
     q / k / v and the attention are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: grid -- `grid_thw` rows (frames, height, width) in patch units, from which
     # the test builds the caller's angle table the way the target does; grid_dtype --

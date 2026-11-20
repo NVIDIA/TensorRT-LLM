@@ -33,7 +33,8 @@ from cutlass.cute.runtime import from_dlpack
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices as _expand,
 )
@@ -1339,7 +1340,7 @@ class QsaTopkExpandDecode(OpWrapper):
     Fusion boundary: the selection and the expansion. Scoring is the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # `width` is the score table's column count (and row stride): a compile key, and the
     # thread count (`_threads`: 640 at 2560, 576 at 2304, 1024 at 4096).

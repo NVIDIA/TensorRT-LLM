@@ -11,7 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Elements a program widens per loop step.
 _CHUNK = 4096
@@ -97,7 +98,7 @@ class QsaFp8PagesToBf16(OpWrapper):
     `offsets` is the exclusive prefix sum of `counts`. Returns `(k_out, v_out, table)`.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="one request, one page", spec=_spec((17,))),

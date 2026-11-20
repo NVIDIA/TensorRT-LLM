@@ -11,7 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: One index-K row: 128 bf16 a token (one 128-wide head).
 ROW = 128
@@ -97,7 +98,7 @@ class SpecRollbackBegin(OpWrapper):
     Nothing but the outputs is written. Run it before any layer of the step writes a plane.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = _cells()
 
     note = """

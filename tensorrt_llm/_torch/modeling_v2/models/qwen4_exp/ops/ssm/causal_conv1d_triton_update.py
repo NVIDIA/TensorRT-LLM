@@ -17,7 +17,8 @@ from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
     causal_conv1d_update as _causal_conv1d_triton_update,
 )
@@ -112,7 +113,7 @@ class CausalConv1dTritonUpdate(OpWrapper):
     in place and not returned.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec keys: dim, x_row_stride (default 16480), batch, seqlen, pool_slots,
     # pool_layers (the pool the last layer's view of a page this many layers

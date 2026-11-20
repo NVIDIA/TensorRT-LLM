@@ -14,7 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Requests a program of `draft_continue_select` covers.
 SEQ_BLOCK = 256
@@ -110,7 +111,7 @@ class DraftContinueSelect(OpWrapper):
 
     Bitwise `_draft_continue_rows` followed by four `index_select`s."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="tep2 HT draft-extend step: 192 requests (the largest batch)", spec=_select_spec(192, 3)),
         Cell(why="two programs: 300 requests, 4 rows each", spec=_select_spec(300, 4)),
@@ -156,7 +157,7 @@ class DraftRowsGather(OpWrapper):
 
     Bitwise `index_select(operands[k], 0, index)`."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="tep2 HT draft-extend step at 64 requests: index query, QKV, gate, residual, inject",

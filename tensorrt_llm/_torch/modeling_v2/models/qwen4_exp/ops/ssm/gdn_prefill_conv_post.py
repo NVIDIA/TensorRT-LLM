@@ -24,7 +24,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from triton.language.extra.cuda import libdevice
 
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's linear-attention geometry at tp1.
 NUM_K_HEADS, HEAD_K_DIM, NUM_V_HEADS, HEAD_V_DIM = 16, 128, 48, 128
@@ -832,7 +833,7 @@ class GdnPrefillConvPost(OpWrapper):
     every sequence whose slot is not `pad_slot_id`; nothing else is written.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: lengths; slots (pool rows used, None -> _engine_slots); pool_slots;
     # initial; layout "in_proj" (x and a/b column views of one [T, 16480]

@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: The hyper-connection residual: hc_count 4 streams of hidden 2560, row stride 10240.
 _STREAM = dict(row_width=10240, dtype=torch.bfloat16, eps=1e-6)
@@ -26,7 +27,7 @@ class FlashinferGemmaRmsnorm(OpWrapper):
     plain-`w` form is `flashinfer_rmsnorm`.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # The target's grouped norm is one call per 2560-wide stream of the
     # 10240-wide residual, each a column slice at row stride 10240 -- that, not

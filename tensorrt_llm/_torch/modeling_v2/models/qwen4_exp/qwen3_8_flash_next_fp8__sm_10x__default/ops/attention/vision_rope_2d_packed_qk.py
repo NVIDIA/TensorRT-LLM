@@ -42,7 +42,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's bf16 tower: 1152 / 16 heads = a 72-wide head, a qkv row of 3 * 16 * 72.
 NUM_HEADS = 16
@@ -119,7 +120,7 @@ class VisionRope2dPackedQk(OpWrapper):
     never touched). `cos` / `sin` are fp32 `[T, half]`: the height angles, then the width angles.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: grid -- `grid_thw` rows the test builds the angle table from; grid_dtype -- its
     # host dtype; dtype -- the qkv dtype. Heads 16 x 72, merge 2, theta 1e4 throughout.

@@ -18,8 +18,9 @@ from typing import Tuple
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean import (
     _BLOCK_H,
     hc_up_gate_mean_fp4,
@@ -47,7 +48,7 @@ class Qwen4ExpHcUpGateMeanFp4(OpWrapper):
     of the mean.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows; hc_count 4, hidden 2560, rank 320 (the checkpoint); bf16 only. Under
     # attention TP (tp4, tep4) every rank mixes the full 4 x 2560 residual of every row,

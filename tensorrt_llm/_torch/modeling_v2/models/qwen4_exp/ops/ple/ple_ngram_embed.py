@@ -30,7 +30,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.embedding.ngram_hash import ngram_hash
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.jit_variants import warm_variants
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ngram_token_history import (
@@ -339,7 +340,7 @@ class PleNgramEmbed(OpWrapper):
     publish. The key/value projections that consume the result are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: lengths (rows per sequence), pool_slots (default num_seqs + 2),
     # carries (None -> the argument is None), max_rows (default max(lengths)),

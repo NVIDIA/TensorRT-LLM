@@ -10,7 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Values per e4m3 block scale, and e2m1 values per stored byte.
 _SF_VEC = 16
@@ -395,7 +396,7 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
     of K are the caller's; the QSA index plane is not touched.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(

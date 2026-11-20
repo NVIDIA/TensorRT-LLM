@@ -20,7 +20,8 @@ import math
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: The block MLP's `linear_fc1` is `[4304, 1152]`: one width, nothing split.
 INTERMEDIATE_SIZE = 4304
@@ -38,7 +39,7 @@ class GeluTanh(OpWrapper):
     merger's); which one a module wants is a property of the checkpoint.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: shape, dtype; `dist` "uniform" over [lo, hi] (default) or "fc1" (a
     # unit-normal hidden state through an fc1 at the checkpoint's measured

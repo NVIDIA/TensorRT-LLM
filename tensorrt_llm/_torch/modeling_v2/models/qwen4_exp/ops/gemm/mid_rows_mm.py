@@ -53,7 +53,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Rows one launch takes: the largest MMA N.
 MAX_ROWS = 256
@@ -1267,7 +1268,7 @@ class MidRowsMm(OpWrapper):
 
     Fusion boundary: activation quantization + GEMM (two launches) / the GEMM (one)."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         _mm_cell("GDN in_proj, STP con32 (32 rows), e4m3", 16480, 2560, 32, "tensor"),
@@ -1344,7 +1345,7 @@ class Fp8RowQuant(OpWrapper):
     AMAX_FLOOR) / 448` and `q = e4m3_satfinite(x * (448 / max))` -- bitwise torch's cast of
     `x * (448 / max)`. One warp a row, one launch; releases its dependents at its start."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="in-projection input, 37 rows", spec=dict(m=37, k=2560)),

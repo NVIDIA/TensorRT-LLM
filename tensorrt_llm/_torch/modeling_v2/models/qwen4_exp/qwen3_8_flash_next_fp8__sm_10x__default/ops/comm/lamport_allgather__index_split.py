@@ -27,7 +27,8 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
 SLOTS = 3
@@ -194,7 +195,7 @@ class LamportAllgather(OpWrapper):
     row `dst_rows[j]` instead (`out[dst_rows] = gathered`), in the same launch. `lam` comes from
     `build`."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"tep{world}: a served step of {requests} requests, 12 trunk calls at "

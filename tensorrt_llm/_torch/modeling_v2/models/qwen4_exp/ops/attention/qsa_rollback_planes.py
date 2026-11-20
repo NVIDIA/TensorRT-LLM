@@ -17,7 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's index plane row: one index KV head of 128 bf16.
 ROW = 128
@@ -87,7 +88,7 @@ class QsaRollbackGather(OpWrapper):
     Fusion boundary: the gather of all planes; the slots (`pages`, `within`) are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     # Both halves are certified at the same cells: the target's at tp1, and its MTP verify
     # rows at `max_batch_size` 128 over a tep4 rank's pool.
     CELLS: tuple[Cell, ...] = (
@@ -170,7 +171,7 @@ class QsaRollbackRestore(OpWrapper):
     Fusion boundary: the restore of all planes; `rejected` is the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     # Both halves are certified at the same cells: the target's at tp1, and its MTP verify
     # rows at `max_batch_size` 128 over a tep4 rank's pool.
     CELLS: tuple[Cell, ...] = (

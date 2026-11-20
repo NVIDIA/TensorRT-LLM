@@ -27,7 +27,8 @@ from typing import Sequence
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm.logger import logger
 
 #: Bytes kept for the two flags after the data region (one 128-byte line each).
@@ -182,7 +183,7 @@ class CeExchange(OpWrapper):
     the caller's stream: a view of this rank's receive buffer, same shape and dtype, valid until
     the next exchange. Both ranks call it identically."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = tuple(
         Cell(why=f"sp2: {why}", spec=dict(world=2, rows=rows, width=width, dtype=dtype))
         for dtype, width, what in (

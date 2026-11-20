@@ -22,7 +22,8 @@ import math
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: `merger.linear_fc1` is `[4608, 4608]`: spatial merge 2 over a 1152-wide tower.
 MERGER_WIDTH = 4608
@@ -40,7 +41,7 @@ class GeluErf(OpWrapper):
     MLPs' `hidden_act`); both appear in this one tower.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: shape, dtype; `dist` "uniform" over [lo, hi] (default) or "merger"
     # (a tower hidden state scaled by the merger norm's measured gamma, grouped

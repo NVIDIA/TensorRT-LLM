@@ -14,7 +14,8 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
 #: Columns per activation scale.
@@ -162,7 +163,7 @@ class MoeFrontRouterQuant(OpWrapper):
       reads).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = _router_cells()
 
     note = """
