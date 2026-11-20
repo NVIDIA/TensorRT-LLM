@@ -488,6 +488,11 @@ def _check_ratio2_module_partial_groups(
         (10, 7),
     ):
         pytest.skip("CSA2 PrimTS requires SM100, SM103 or SM107")
+    if implementation == "trtllm":
+        from tensorrt_llm._utils import is_sm_100f
+
+        if not is_sm_100f():
+            pytest.skip("CSA2 trtllm-gen requires an SM100-family GPU")
 
     from tensorrt_llm._torch.attention.backends.interface import (
         PositionalEmbeddingParams,
@@ -2105,6 +2110,7 @@ def replay_module_factory(monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm._utils import is_sm_100f
     from tensorrt_llm.bindings import DataType, SamplingConfig
     from tensorrt_llm.bindings.internal.batch_manager import CacheType
     from tensorrt_llm.functional import PositionEmbeddingType
@@ -2112,8 +2118,10 @@ def replay_module_factory(monkeypatch):
     from tensorrt_llm.mapping import Mapping
 
     # The replay checks compare with a BF16 reference of the native provider's attention;
-    # PrimTS's E4M3 attention has its own accuracy tests.
-    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "trtllm")
+    # PrimTS's E4M3 attention has its own accuracy tests. Only SM100-family GPUs default to
+    # PrimTS; the others keep their default provider.
+    if is_sm_100f():
+        monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "trtllm")
     resources = []
 
     def create(ratio, input_length=8):
