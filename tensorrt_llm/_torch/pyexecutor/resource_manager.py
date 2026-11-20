@@ -19,7 +19,7 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
 
@@ -456,6 +456,7 @@ class KVCacheManager(BaseResourceManager):
         # head_dim=512).
         pool_configurations: Optional[List[PoolConfiguration]] = None,
         enable_chunked_prefill: bool = False,
+        disable_overlap_scheduler: bool = False,
         **kwargs,
     ) -> None:
         logger.warning_once(
@@ -619,12 +620,13 @@ class KVCacheManager(BaseResourceManager):
             draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
             self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens,
                                                 draft_loop_tokens)
+        draft_lookahead = 0
         if self.is_draft:
             from ..speculative.dflash import dflash_block_kv_lookahead
 
             # A DFlash-family drafter stores its noise block past its draft tokens.
-            self._kv_reserve_draft_tokens += dflash_block_kv_lookahead(
-                spec_config)
+            draft_lookahead = dflash_block_kv_lookahead(spec_config)
+            self._kv_reserve_draft_tokens += draft_lookahead
 
         # Resolve the per-layer window vector and clamp the pool windows to
         # the same max_seq_len bound, so their window keys agree.
@@ -783,6 +785,25 @@ class KVCacheManager(BaseResourceManager):
                     dtype=pc.dtype,
                 ) for pc in self.pool_configurations
             ]
+
+        if draft_lookahead:
+            # Native offset rows must also cover the noise block of each
+            # in-flight step. Keep full windows full under the larger bound.
+            full_window = self.max_seq_len
+            self.max_seq_len += draft_lookahead * (
+                1 if disable_overlap_scheduler else 2)
+            if full_window in blocks_per_window:
+                blocks_per_window[self.max_seq_len] = blocks_per_window.pop(
+                    full_window)
+                self.max_attention_window_vec = [
+                    self.max_seq_len if w == full_window else w
+                    for w in self.max_attention_window_vec
+                ]
+                self.pool_configurations = [
+                    replace(pc, window_size=self.max_seq_len)
+                    if pc.window_size == full_window else pc
+                    for pc in self.pool_configurations
+                ]
 
         # Hybrid linear-attention managers intentionally carry two windows
         # (the RECURRENT_STATES sentinel window plus the full attention

@@ -4932,6 +4932,9 @@ def _create_kv_cache_manager(
             "kv_cache_config.kv_events_config is set but streaming KV event "
             "publishing requires KV cache manager V2; events will not be "
             f"published for {kv_cache_manager_cls.__name__}.")
+    if is_draft and issubclass(kv_cache_manager_cls, KVCacheManager):
+        manager_extra_kwargs[
+            "disable_overlap_scheduler"] = disable_overlap_scheduler
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

@@ -24,8 +24,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
-    _get_minimum_blocks_per_window, _merge_kv_cache_pool_pointers,
+    KVCacheManager, PeftCacheManager, PoolConfiguration, ResourceManager,
+    ResourceManagerType, _get_minimum_blocks_per_window,
+    _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo,
     scan_kv_buffer_for_invalid_values)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -37,7 +38,9 @@ from tensorrt_llm.bindings.internal.batch_manager import (
     LinearCacheType, PeftTaskNotCachedException)
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import (DFlashDecodingConfig,
+                                          DSparkDecodingConfig, KvCacheConfig,
+                                          PeftCacheConfig)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
                                                 KV_CACHE_HASH_ALGO_V1,
@@ -1415,11 +1418,8 @@ class TestKVCacheManagerPrepreparedDummies(unittest.TestCase):
         self.assertEqual(other_manager.impl.add_sequence_batch.call_count, 1)
 
 
-@pytest.mark.cpu_only
-def test_v1_deprecation_warning_is_emitted_once(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    from tensorrt_llm.logger import logger
-
+@pytest.fixture
+def v1_cpp_constructor(monkeypatch):
     impl = MagicMock()
     impl.get_block_pool_pointers.return_value = torch.empty(0)
     impl.get_block_scale_pool_pointers.return_value = torch.empty(0)
@@ -1427,13 +1427,67 @@ def test_v1_deprecation_warning_is_emitted_once(
     impl.num_pools = 1
     impl.max_blocks_per_seq = 1
     constructor = MagicMock(return_value=impl)
-    emitted = MagicMock()
-    monkeypatch.setattr(logger, "_appeared_keys", set())
-    monkeypatch.setattr(logger, "log", emitted)
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerCpp",
         constructor)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (1 << 30, 2 << 30))
+    return constructor
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("limit", [62, 63, 64, 65])
+@pytest.mark.parametrize("disable_overlap", [False, True])
+@pytest.mark.parametrize("spec_type",
+                         [DFlashDecodingConfig, DSparkDecodingConfig])
+def test_v1_draft_block_table_at_sequence_limit(v1_cpp_constructor, limit,
+                                                disable_overlap, spec_type):
+    page = 32
+    steps = 1 if disable_overlap else 2
+    spec = spec_type(max_draft_len=7)
+    pools = [PoolConfiguration(w, 128, DataType.HALF) for w in (16, limit)]
+    for is_draft in (False, True):
+        manager = KVCacheManager(
+            KvCacheConfig(max_tokens=1024, max_attention_window=[16, limit]),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=2,
+            layer_mask=[True, True],
+            num_kv_heads=1,
+            head_dim=128,
+            tokens_per_block=page,
+            max_seq_len=limit,
+            max_batch_size=1,
+            mapping=Mapping(),
+            spec_config=spec,
+            is_draft=is_draft,
+            disable_overlap_scheduler=disable_overlap,
+            pool_configurations=pools,
+            is_estimating_kv_cache=True,
+            execution_stream=SimpleNamespace(cuda_stream=0))
+        try:
+            native = v1_cpp_constructor.call_args.kwargs
+            capacity = native["max_sequence_length"]
+            assert capacity == limit + (2 * steps if is_draft else 0)
+            assert native["max_attention_window_vec"] == [16, capacity]
+            assert set(native["blocks_per_window"]) == {16, capacity}
+            assert [p.window_size
+                    for p in native["pool_configurations"]] == [16, capacity]
+            assert [p.window_size for p in pools] == [16, limit]
+            # Full acceptance peaks at M-1 plus the extra reservations.
+            peak = limit - 1 + steps * (manager._kv_reserve_draft_tokens -
+                                        spec.max_draft_len)
+            assert (peak - 1) // page < (capacity + page - 1) // page
+        finally:
+            manager.shutdown()
+
+
+@pytest.mark.cpu_only
+def test_v1_deprecation_warning_is_emitted_once(monkeypatch: pytest.MonkeyPatch,
+                                                v1_cpp_constructor) -> None:
+    from tensorrt_llm.logger import logger
+
+    emitted = MagicMock()
+    monkeypatch.setattr(logger, "_appeared_keys", set())
+    monkeypatch.setattr(logger, "log", emitted)
 
     for _ in range(2):
         manager = KVCacheManager(
@@ -1458,7 +1512,7 @@ def test_v1_deprecation_warning_is_emitted_once(
         and "KV cache manager V1 (KVCacheManager) is deprecated" in call.args[1]
     ]
     assert len(warnings) == 1
-    assert constructor.call_count == 2
+    assert v1_cpp_constructor.call_count == 2
 
 
 @pytest.mark.cpu_only
