@@ -356,7 +356,11 @@ def test_weight_load_matches_stock(drafters, name):
             _assert_bitwise(new_params[key], old_params[key], key)
     for key in ("model.norm.weight", "fc.weight", "hidden_norm.weight"):
         _assert_bitwise(new_params[key], old_params[key], key)
-    for attr in ("markov_w1", "markov_w2", "confidence_proj_weight", "confidence_proj_bias"):
+    # The stock drafter loads the confidence projection into its confidence head, in fp32.
+    stock_proj = old.confidence_head.proj
+    _assert_bitwise(new.confidence_proj_weight.float(), stock_proj.weight, "confidence_proj.weight")
+    _assert_bitwise(new.confidence_proj_bias.float(), stock_proj.bias, "confidence_proj.bias")
+    for attr in ("markov_w1", "markov_w2"):
         _assert_bitwise(getattr(new, attr), getattr(old, attr), attr)
     _assert_bitwise(new.mask_token_embedding, old.mask_token_embedding, "mask_token_embedding")
     assert new.hidden_norm.eps == old.hidden_norm.eps

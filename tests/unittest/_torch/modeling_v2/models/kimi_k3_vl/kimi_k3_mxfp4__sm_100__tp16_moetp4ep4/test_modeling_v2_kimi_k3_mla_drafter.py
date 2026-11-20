@@ -209,7 +209,13 @@ def test_weight_load_matches_main(pair):
         "hidden_norm.weight",
     ):
         _assert_bitwise(new[key], old[key], key)
-    for attr in ("markov_w1", "markov_w2", "confidence_proj_weight", "confidence_proj_bias"):
+    # The built-in drafter loads the confidence projection into its confidence head, in fp32.
+    main_proj = pair.old.confidence_head.proj
+    _assert_bitwise(
+        pair.new.confidence_proj_weight.float(), main_proj.weight, "confidence_proj.weight"
+    )
+    _assert_bitwise(pair.new.confidence_proj_bias.float(), main_proj.bias, "confidence_proj.bias")
+    for attr in ("markov_w1", "markov_w2"):
         _assert_bitwise(getattr(pair.new, attr), getattr(pair.old, attr), attr)
     assert pair.new.hidden_norm.eps == pair.old.hidden_norm.eps
     for field in (
