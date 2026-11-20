@@ -123,6 +123,7 @@
 /tensorrt_llm/commands/__init__.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/commands/serve.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/commands/utils.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/commands/serve_cli @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/grpc @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/grpc/openengine @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-dynamo-devs
