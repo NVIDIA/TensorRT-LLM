@@ -137,6 +137,7 @@ async def encode(
         await owner._media_admission.acquire()
         lease = _PreparationLease(owner._media_admission)
         publication = _PreprocessingWork(partial(_discard_publication, owner))
+        is_published = False
         try:
             reference = await lease.run(
                 owner._input_executor,
@@ -153,12 +154,16 @@ async def encode(
                 request_id=request.request_id, encoded_media=portable_reference(reference)
             )
             publication.transfer()
+            is_published = True
             if metrics is not None:
                 metrics.complete_encoding()
             return response
         finally:
-            publication.abandon()
-            lease.close()
+            try:
+                if not is_published:
+                    await owner._run_encoder_cleanup(asyncio.to_thread(publication.abandon))
+            finally:
+                lease.close()
     except (DuplicateRequestError, InvalidRequestIdError, CoordinationError) as error:
         status = (
             grpc.StatusCode.UNAVAILABLE

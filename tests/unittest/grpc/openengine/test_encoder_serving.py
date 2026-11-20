@@ -567,6 +567,76 @@ async def test_cancel_during_publish_reclaims_the_completed_cache(
 
 
 @pytest.mark.asyncio
+async def test_abandoned_publication_keeps_rpc_loop_live_and_cleanup_tracked(
+    encoder_inference, monkeypatch, tmp_path
+):
+    inference, _, _ = encoder_inference
+    cache = inference._encoder_cache
+    context = FakeServicerContext()
+    publish, discard = cache.publish, cache.discard
+    loop = asyncio.get_running_loop()
+    held, unlock, unlocked = threading.Event(), threading.Event(), threading.Event()
+    entered = asyncio.Event()
+    discarded = []
+    available = inference._media_admission._value
+
+    def hold_publication_lock():
+        with cache._lock():
+            held.set()
+            unlock.wait(5)
+        unlocked.set()
+
+    holder = threading.Thread(target=hold_publication_lock)
+
+    def cancelled_publication(*args):
+        reference = publish(*args)
+        holder.start()
+        assert held.wait(2)
+        context.is_cancelled = True
+        return reference
+
+    def blocked_discard(reference):
+        loop.call_soon_threadsafe(entered.set)
+        result = discard(reference)
+        discarded.append(result)
+        return result
+
+    monkeypatch.setattr(cache, "publish", cancelled_publication)
+    monkeypatch.setattr(cache, "discard", blocked_discard)
+    rpc = asyncio.create_task(inference.Encode(encode_request(), context))
+    drain = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert not unlocked.is_set(), "discard blocked the RPC event loop"
+        assert not rpc.done()
+        for _ in range(2):
+            rpc.cancel()
+            await asyncio.sleep(0)
+        drain = asyncio.create_task(inference.drain_encoder_cleanup())
+        await asyncio.sleep(0)
+        assert not drain.done(), "shutdown must retain pending publication cleanup"
+        assert inference._encoder_cleanup_tasks
+        unlock.set()
+        await asyncio.wait_for(drain, 2)
+        await asyncio.gather(rpc, return_exceptions=True)
+        assert discarded == [True]
+        assert not list(tmp_path.glob("*.safetensors"))
+        assert not inference._encoder_cleanup_tasks
+        assert inference.active_request_count() == 0
+        assert inference._media_admission._value == available
+        assert not inference._encoder_cleanup_failed
+    finally:
+        unlock.set()
+        await asyncio.gather(rpc, return_exceptions=True)
+        if drain is not None:
+            await drain
+        await inference.drain_encoder_cleanup()
+        if holder.ident is not None:
+            holder.join(timeout=2)
+            assert not holder.is_alive()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("input_kind", ["missing", "prompt", "tokens"])
 async def test_unary_encode_validates_native_context_and_records_no_token_usage(
     encoder_inference, input_kind
