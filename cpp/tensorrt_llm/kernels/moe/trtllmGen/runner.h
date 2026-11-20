@@ -230,8 +230,6 @@ public:
         cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1);
 
 private:
-    batchedGemm::trtllm::gen::Dtype mDtypeAct;
-    batchedGemm::trtllm::gen::Dtype mDtypeWeights;
     int32_t mTileTokensDim;
     ActType mActType;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
@@ -271,9 +269,6 @@ public:
         int32_t validIntermediateSize = -1);
 
 private:
-    batchedGemm::trtllm::gen::Dtype mDtypeAct;
-    batchedGemm::trtllm::gen::Dtype mDtypeWeights;
-    batchedGemm::trtllm::gen::Dtype mDtypeOut;
     int32_t mTileTokensDim;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
