@@ -514,6 +514,7 @@ def test_zero_duration_row_does_not_repeat_the_latest_kv_iteration_stats():
     fake = types.SimpleNamespace(
         enable_attention_dp=False,
         enable_iter_perf_stats=True,
+        _fmha_step_stats_enabled=False,
         disable_overlap_scheduler=True,
         dist=types.SimpleNamespace(pp_size=1, tp_size=1),
         max_stats_len=1000,
