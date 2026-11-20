@@ -3,6 +3,8 @@
 
 # Developing MiniMax-H3 with Modeling V2
 
+Modeling V2 lets contributors change and test one deployment independently. A **target** owns the pipeline for a checkpoint or deployment configuration. Its **model family** owns routing and the H3 behavior its targets share. See the [LLM Modeling V2 guide](../../../modeling_v2/README.md).
+
 **Develop new H3 features, kernels and deployment targets in `minimax_h3_v2/`.** The [V1 family](../minimax_h3/) remains the default during rollout and provides the reference for validating V2. Keep V1 changes scoped to fixes that must reach that implementation. Both versions use the existing VisualGen API, CLI and checkpoint identifiers.
 
 ## Run a target
@@ -24,13 +26,17 @@ The [family registry](pipeline_registry.py) selects a V2 target before transform
 
 ## When to split a target
 
-Start in the target that supports the checkpoint. Keep a scenario there when existing operations and configuration express it clearly. For example, base H3 uses the same functional target for BF16, FP8, block-scaled FP8 and NVFP4. Changing the projection implementation for one precision can be confined to that projection.
+Start in the checkpoint’s **functional target** (the V2 pipeline used when no deployment specialization matches). Base H3 uses `default_pipeline/` for BF16, FP8, block-scaled FP8 and NVFP4. FastH3 uses `fasth3/`. Keep a change in that target when it fits an existing component, such as a projection for one precision.
 
 Split out a sibling target when the differences need to evolve and be tested together. FastH3 illustrates this boundary. Its learned gate changes how trunk attention is built and its trained DMD schedule changes denoising. For a deployment such as NVFP4 on a fixed four-way Ulysses layout, ask whether changing its weight packing would also require changes to projection order and collectives. If those pieces must move together and would spread deployment-specific branches across the functional pipeline, give that path its own target.
 
-Choose the boundary case by case. A target can specialize only the transformer and denoising loop while reusing encoding and decoding. Include an encoder or decoder when its inputs, layout or execution order also diverge. For a deployment specialization, use `<checkpoint-and-quantization>__<sm>__<parallel>/`. In `route(config, checkpoint_dir)`, check the specialization's effective precision, device capabilities, topology and required features and return its imported pipeline class by name so CI can identify the target. On a mismatch, return the functional target for the same checkpoint. A check deferred to the constructor can fail after selection. Test both the match and fallback through [`AutoPipeline.resolve_class`](../../pipeline_registry.py). The selected pipeline handles per-request and per-step decisions.
+A target can specialize the transformer and denoising loop while reusing family-owned encoding and decoding. Include an encoder or decoder in the target when its inputs, layout or execution order also diverge.
 
-Wire a specialization during construction. For example, [FastH3](fasth3/pipeline.py) passes `attention_cls=MiniMaxH3VSAAttention` to the [family transformer](components/transformer.py), which instantiates that class in its trunk blocks. A target with a different attention implementation can pass its own `target/components/attention.py` class at that same point. If its communication schedule also changes, that class imports `target/components/ulysses_attention.py`. Add `target/ops/` or `target/kernels/` only for computations or kernels the target owns. A target reuses family implementations through ordinary imports.
+Keep sibling targets independent. A target can import family code, catalog ops and runtime interfaces. To reuse the base target’s TP text encoder in a second target, move the shared encoder code into the family and import it from both. A direct import from `default_pipeline/` would leave the second target untested when the encoder changes because change-based CI selects only the modified target’s tests.
+
+Name a deployment specialization `<checkpoint-and-quantization>__<sm>__<parallel>/`. Check its effective precision, device capabilities, topology and required features in [`route(config, checkpoint_dir)`](pipeline_registry.py). Return the imported pipeline class directly so CI can identify the target. On a mismatch, return the functional target for the same checkpoint. Test both paths through [`AutoPipeline.resolve_class`](../../pipeline_registry.py). The selected pipeline handles per-request and per-step decisions.
+
+Wire a specialization during construction. For example, [FastH3](fasth3/pipeline.py) passes `attention_cls=MiniMaxH3VSAAttention` to the [family transformer](components/transformer.py), which instantiates that class in its trunk blocks. A target with a different attention implementation can pass its own `target/components/attention.py` class at that same point. If its communication schedule also changes, that class imports `target/components/ulysses_attention.py`. Add `target/ops/` or `target/kernels/` only for computations or kernels the target owns.
 
 ## Where to put code
 
@@ -62,8 +68,10 @@ Use the `trtllm::minimax_h3_v2_` prefix for H3 V2 Python-registered Triton ops s
 | --- | --- | --- |
 | Target (`models/<family>/<target>/`) | The [router](pipeline_registry.py) selects this implementation for a checkpoint or deployment. Keep code specific to that target in its directory. | Base H3's TP text encoder or FastH3's trained schedule. |
 | Model family (`models/<family>/`) | The family owns H3 routing and common model behavior. Put code shared by sibling targets here so each can import it independently. | Joint token packing, DiT blocks and gated VSA attention. |
-| [VisualGen V2 catalog](../../catalog/) (`catalog/<category>/`) | Another V2 family could call the same op with the same tensor semantics, reference and supported configurations. The first V2 consumer may introduce it. V1 callers keep their existing backend paths. | Fine attention over explicit KV tile indices, counts and valid lengths. |
+| [VisualGen V2 catalog](../../catalog/) (`catalog/<category>/`) | Own a model-independent op with a reference and tests for its supported configurations. | Fine attention over explicit KV tile indices, counts and valid lengths. |
 | Existing runtime or library | Call its existing interface directly when the contract fits. | H3 [projections](components/linear.py) use the LLM V2 GEMM ops and [normalization](components/norm.py) uses `flashinfer_rmsnorm`. |
+
+The [LLM V2 catalog](../../../modeling_v2/README.md#code-layout) holds ops used by multiple families. VisualGen allows the first V2 consumer to introduce an op if another family could use its contract unchanged. Write its reference using only the explicit call arguments, including any buffers the op updates. Keep checkpoint-, layer- and timestep-specific decisions in the model that supplies those arguments.
 
 ```text
 FastH3 with CUTEDSL VSA
@@ -93,10 +101,10 @@ Change H3's tile selection or coarse/fine merge in the [family VSA op](ops/vsa.p
 | Change which rows or heads a rank receives, or how its receive buffers are laid out | The [H3 QKV ops](ops/ulysses_qkv.py) specify the exchange and local rearrangement. Each has an independent tensor reference. |
 
 ```text
-Base H3 / H3UlyssesAttention
-  sync   exchange projected Q/K/V -------------------+
-                                                     +-> local attention -> output all-to-all
-  async  project/push V, Q, K -> wait -> unscatter --+
+Base H3 / H3UlyssesAttention (family component)
+  sync   exchange projected Q/K/V ------------------------------+
+                                                                +-> local attention -> output all-to-all
+  async  project/push V, Q, K -> wait -> restore Q/K/V layout --+
 ```
 
 The [sequence sharder](components/sequence_sharder.py) pads, shards and gathers DiT and refiner rows. The [tiled VAE](components/tiled_vae.py) distributes video decode tiles. Base H3 uses these parallel paths. FastH3 runs on one GPU. The V1 [token-sharded TP layout](../../parallel/token_sharded_tp.py) is a separate feature used by Wan.
@@ -111,8 +119,6 @@ Use **one testable tensor computation, collective or explicit state update** as 
 | [Reduce-scatter](../../../modeling_v2/catalog/comm/reducescatter.py) | Reduce contributions and return the local slice for an explicit group. The implementation can dispatch by communicator. | Share the collective when layouts agree. Each family decides where it runs and what work overlaps it. |
 | [MLA RoPE and KV append](../../../modeling_v2/catalog/attention/mla_rope_append_paged_kv_assign_q.py) | Rotate new tokens and write specified rows to an explicit KV pool. The reference describes the resulting buffer contents. | Several steps can be one operation when independent callers need the same outputs and mutations. |
 
-For a proposed entry, write its reference using only the arguments at the call site. Expose the numerical inputs and any observable buffer mutations. If reuse requires the caller's checkpoint, layer identity, token packing or denoising step, keep that decision in the model.
-
 | VisualGen V2 entry | Catalog computes | H3 supplies or owns |
 | --- | --- | --- |
 | [FA4](../../catalog/attention/flash_attention_4.py) | Attention output and logsumexp from Q/K/V, scale, causal mode and optional valid KV lengths | Convert trailing-padding masks to prefix lengths and restore the model's output dtype |
@@ -124,9 +130,13 @@ FlashInfer uses *prefill* for attention over a sequence of query rows. H3 calls 
 
 The [H3 attention component](components/dense_attention.py) adapts model inputs to these contracts. The [gated VSA computation](ops/vsa.py) serves both base checkpoints with gate weights and explicit VSA configuration and the FastH3 target.
 
-Use the public operation or runner exported by the catalog entry. For example, H3 creates `FlashInferPrefillRunner` from [flashinfer_prefill.py](../../catalog/attention/flashinfer_prefill.py) and supplies the per-model plan cache. The [FA4 entry](../../catalog/attention/flash_attention_4.py) owns compatibility with the provider's `_flash_attn_fwd` binding. Keep mask conversion, layer selection and denoising policy with the model. Use the [Modeling V2 operation contract](../../../modeling_v2/README.md#writing-operations) for new entries.
+### Backend dependencies
 
-H3 keeps backend-specific adapters in the model. [Uncached attention](ops/uncached_attention.py) calls `FallbackFmha.attention`. [H3 PrimTS](components/trtllm_attention_prims.py) calls `_validate_block_sparse_static_profile`. The [TRTLLM SOL adapter](components/trtllm_attention.py) calls the [VisualGen SOL predictor](../../attention/backends/sparse/sol/predictor.py), and the [CuTe SOL path](components/dense_attention.py) checks availability through `_cute_fmha_kernel`. Treat these as implementation dependencies. New consumers should use an exported kernel or runner interface, or introduce a model-independent operation with a reference. See the [LLM V2 dependency rule](../../../modeling_v2/README.md#modeling-v1-code).
+For new H3 code, use an exported catalog op or runner, or a supported kernel-library interface. For example, H3 creates `FlashInferPrefillRunner` from the [FlashInfer catalog entry](../../catalog/attention/flashinfer_prefill.py) and supplies the per-model plan cache. The [FA4 entry](../../catalog/attention/flash_attention_4.py) handles compatibility with the provider’s private `_flash_attn_fwd` binding.
+
+When an interface is missing, define the computation and its reference at the narrowest scope that needs it. Model-specific mask conversion, layer selection and denoising policy stay in H3. See the [Modeling V2 operation contract](../../../modeling_v2/README.md#writing-operations).
+
+H3 retains some private attention-backend dependencies as pilot exceptions to the [LLM V2 dependency rule](../../../modeling_v2/README.md#modeling-v1-code). For example, [uncached attention](ops/uncached_attention.py) calls `FallbackFmha.attention` and the [TRTLLM SOL adapter](components/trtllm_attention.py) uses the [VisualGen V1 SOL predictor](../../attention/backends/sparse/sol/predictor.py). Keep these calls local to their existing adapters.
 
 ## Test a change
 
