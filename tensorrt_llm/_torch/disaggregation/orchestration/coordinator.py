@@ -286,7 +286,7 @@ class DisaggTransferCoordinator:
         if self.inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
-        else:
+        elif getattr(self._dist, "pp_size", 1) == 1:
             self._retire_legacy_timed_out_gen_transfers()
 
     def _retire_legacy_timed_out_gen_transfers(self) -> None:
@@ -564,6 +564,28 @@ class DisaggTransferCoordinator:
             and uses_async_gen_transfer()
             and self._transceiver.supports_idle_request_cancellation() is not True
         )
+
+    def agree_pp_handoff_stops(
+        self, cancellations: Set[int], timeouts: Set[int], ready: Set[int]
+    ) -> Tuple[Set[int], Set[int], Set[int]]:
+        """Agree on stop reasons and intersect retirement votes across a PP replica.
+
+        Called before scheduling even by stages with no local deadline or abort.
+        Attention-DP lanes own independent requests.
+        """
+        vote = (cancellations, timeouts, ready)
+        if self._enable_attention_dp:
+            local = self._dist.cp_allgather(vote) if self._dist.cp_size > 1 else [vote]
+            votes = [v for stage in self._dist.pp_allgather(local) for v in stage]
+        else:
+            votes = self._dist.allgather(vote)
+        aborted = set().union(*(v[0] for v in votes))
+        expired = set().union(*(v[1] for v in votes)) - aborted
+        drained = set.intersection(*(v[2] for v in votes))
+        # A timeout vote does not certify the connector checks for a client abort.
+        # Let any such stage retry with the agreed stop reason.
+        drained -= aborted - set.intersection(*(v[0] for v in votes))
+        return aborted, expired, drained
 
     def align_gen_cancellation(
         self, ready: List[LlmRequest], active: List[LlmRequest], cancel_ids: List[int]
@@ -1537,6 +1559,8 @@ class DisaggTransferCoordinator:
     def _is_error_cleanup_blocked(self, request: LlmRequest) -> bool:
         """Whether a failed request must wait: the cancel path owns it, or a
         transfer owner still holds its context blocks."""
+        if getattr(request, "py_pp_handoff_stop", None) in ("cancel", "timeout"):
+            return True
         if self._vote_id(request) in self._registry.canceled_request_ids():
             return True
         return (

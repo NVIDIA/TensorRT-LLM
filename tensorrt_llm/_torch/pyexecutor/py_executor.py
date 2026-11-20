@@ -16,8 +16,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
-                    Literal, NoReturn, Optional, Sequence, Set, Tuple, Union)
+from typing import (TYPE_CHECKING, AbstractSet, Callable, Dict, Iterable,
+                    Iterator, List, Literal, NoReturn, Optional, Sequence, Set,
+                    Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -4263,7 +4264,9 @@ class PyExecutor:
         return (self.dist.is_first_pp_rank and self.dist.tp_size > 1
                 and self.enable_attention_dp)
 
-    def _pp_schedule_and_propagate(self, microbatch_id: int):
+    def _pp_schedule_and_propagate(
+        self, microbatch_id: int,
+        held_handoffs: AbstractSet[int] = frozenset()):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
 
         scheduled_batch = None
@@ -4271,7 +4274,7 @@ class PyExecutor:
         wait_for_disagg_gen_transfer_progress = False
         if self._pp_rank_schedules():
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-            )
+                held_handoffs)
             fitting_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
                 self.disagg.admit(fitting_disagg_gen_init_requests))
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
@@ -4393,8 +4396,11 @@ class PyExecutor:
                 self.disagg.prepare_context_schedulable(new_requests)
                 self.disagg.poll_gen_transfers()
                 self._activate_completed_remote_tails()
+                self.disagg.check_transfer_timeouts()
+                held_handoffs = self._cancel_pending_gen_receives(
+                    pipeline_parallel=True)
                 self._sweep_transfer_held_failures()
-                self._finish_gen_requests_ended_by_first_token()
+                self._finish_gen_requests_ended_by_first_token(held_handoffs)
 
                 iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
 
@@ -4402,7 +4408,8 @@ class PyExecutor:
 
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 (scheduled_batch, fitting_disagg_gen_init_requests, _,
-                 _) = self._pp_schedule_and_propagate(microbatch_id)
+                 _) = self._pp_schedule_and_propagate(microbatch_id,
+                                                      held_handoffs)
                 if not self._pp_rank_schedules():
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
@@ -4412,7 +4419,8 @@ class PyExecutor:
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
-                        self.active_requests, self.inflight_req_ids)
+                        self._requests_excluding(held_handoffs),
+                        self.inflight_req_ids)
                     local_disagg_candidates = getattr(
                         local_scheduler_output,
                         "fitting_disagg_gen_init_requests", [])
@@ -5109,6 +5117,7 @@ class PyExecutor:
             self._progress_recompute_pause_termination_if_idle(
                 executed_batch_num)
             return
+        self.disagg.handle_timeouts_synced()
         self._flush_pending_transfer_responses()
         if self._disagg_pp_termination_handler is not None:
             self._disagg_pp_termination_handler.terminate_pending_requests()
@@ -10503,8 +10512,17 @@ class PyExecutor:
             return encoder_requests[:i]
         return encoder_requests
 
+    def _requests_excluding(self,
+                            excluded_ids: AbstractSet[int]) -> List[LlmRequest]:
+        if not excluded_ids:
+            return self.active_requests
+        return [
+            req for req in self.active_requests
+            if req.py_request_id not in excluded_ids
+        ]
+
     @nvtx_range("_schedule")
-    def _schedule(self):
+    def _schedule(self, held_handoffs: AbstractSet[int] = frozenset()):
         self._maybe_record_hang_diagnostic_phase("scheduling",
                                                  forward_completion="clear")
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
@@ -10512,10 +10530,9 @@ class PyExecutor:
                 self.active_requests)
 
         cancelled_model_ids = self._cancelled_disagg_model_request_ids()
-        scheduling_requests = [
-            request for request in self.active_requests
-            if request.py_request_id not in cancelled_model_ids
-        ] if cancelled_model_ids else self.active_requests
+        if held_handoffs:
+            cancelled_model_ids = cancelled_model_ids | held_handoffs
+        scheduling_requests = self._requests_excluding(cancelled_model_ids)
         if any(request.py_request_id in cancelled_model_ids
                and request.lora_task_id is not None
                for request in self.active_requests) or any(
@@ -11464,7 +11481,8 @@ class PyExecutor:
             max_seq_len=None if helix else self.sampler.max_seq_len,
             stop_word_history=stop_word_history)
 
-    def _finish_gen_requests_ended_by_first_token(self) -> None:
+    def _finish_gen_requests_ended_by_first_token(
+        self, held_handoffs: AbstractSet[int] = frozenset()) -> None:
         """Finish received generation requests that their first token ends.
 
         The context server samples the first token of a context-only request
@@ -11489,8 +11507,8 @@ class PyExecutor:
             return
         candidates = [
             req for req in self.active_requests
-            if req.is_disagg_generation_transmission_complete
-            and not req.py_first_token_checked
+            if req.is_disagg_generation_transmission_complete and not req.
+            py_first_token_checked and req.py_request_id not in held_handoffs
         ]
         if not candidates:
             return
@@ -11601,7 +11619,10 @@ class PyExecutor:
                 or request.is_disagg_generation_transmission_in_progress
                 or request.is_disagg_generation_transmission_complete)
 
-    def _cancel_pending_gen_receives(self) -> None:
+    def _cancel_pending_gen_receives(self,
+                                     *,
+                                     pipeline_parallel: bool = False
+                                     ) -> set[int]:
         """Apply aborts and expired transfer deadlines to requests awaiting handoff.
 
         Such a request is not schedulable, so neither a forward nor the
@@ -11612,28 +11633,55 @@ class PyExecutor:
         reports its destination safe to free and is retried on the next
         iteration until then. An agreed receive completion supersedes a local
         timeout observation. With in-flight cancellation enabled the
-        coordinator owns this instead.
+        coordinator owns timeout retirement instead. PP stages hold a stopped
+        request out of scheduling until every owner agrees it can retire.
         """
-        if (self.kv_cache_transceiver is None
-                or self.disagg.inflight_cancel_active()):
-            return
+        if self.kv_cache_transceiver is None:
+            return set()
+        inflight_cancel = self.disagg.inflight_cancel_active()
+        if inflight_cancel and not pipeline_parallel:
+            return set()
         canceled_ids = set(self.canceled_req_ids)
         cancelled, timed_out = [], []
+        cancel_votes, timeout_votes = set(), set()
         for request in self.active_requests:
-            if not self._awaits_gen_handoff(request):
+            rid = request.py_request_id
+            prior = getattr(request, "py_pp_handoff_stop", None)
+            already_stopping = prior in ("cancel", "timeout")
+            if not already_stopping and not self._awaits_gen_handoff(request):
                 continue
-            req_id = (request.parent_request_id
-                      if request.is_child else request.py_request_id)
-            if req_id in canceled_ids:
+            client_id = request.parent_request_id if request.is_child else rid
+            if client_id in canceled_ids or prior == "cancel":
+                cancel_votes.add(rid)
                 if self._try_cancel_request(request):
                     cancelled.append(request)
-            elif (request.py_kv_transfer_timed_out
-                  and request.is_disagg_generation_transmission_in_progress):
+            elif not inflight_cancel and (
+                    prior == "timeout" or
+                (request.py_kv_transfer_timed_out
+                 and request.is_disagg_generation_transmission_in_progress)):
+                timeout_votes.add(rid)
                 if self.disagg.request_cancellation(request):
-                    # The receive is abandoned; leaving the in-transmission
-                    # state lets the failure release the request at once.
-                    request.state = LlmRequestState.DISAGG_TRANS_ERROR
                     timed_out.append(request)
+
+        held = set()
+        if pipeline_parallel:
+            ready = {req.py_request_id for req in cancelled + timed_out}
+            aborted, expired, drained = self.disagg.agree_pp_handoff_stops(
+                cancel_votes, timeout_votes, ready)
+            stopping = aborted | expired
+            held = stopping - drained
+            cancelled, timed_out = [], []
+            for req in self.active_requests:
+                rid = req.py_request_id
+                if rid not in stopping:
+                    continue
+                if rid in held:
+                    req.py_pp_handoff_stop = "cancel" if rid in aborted else "timeout"
+                else:
+                    req.py_pp_handoff_stop = None
+                    (cancelled if rid in aborted else timed_out).append(req)
+        for request in timed_out:
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
         for request in cancelled:
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
@@ -11668,6 +11716,7 @@ class PyExecutor:
                 if req_id not in done_ids or req_id in still_active
             ]
         self.disagg.fail_timed_out(timed_out)
+        return held
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
@@ -13165,8 +13214,10 @@ class PyExecutor:
             if req_id not in canceled_req_ids_set:
                 continue
 
-            if (getattr(request, "is_generation_only_request", False)
-                    and consensus):
+            if (getattr(request, "py_pp_handoff_stop",
+                        None) in ("cancel", "timeout")
+                    or (getattr(request, "is_generation_only_request", False)
+                        and consensus)):
                 still_pending_canceled_ids.append(req_id)
                 continue
 
@@ -13505,6 +13556,11 @@ class PyExecutor:
                 new_active_requests.append(request)
                 continue
 
+            if getattr(request, "py_pp_handoff_stop",
+                       None) in ("cancel", "timeout"):
+                new_active_requests.append(request)
+                continue
+
             # Check if a generation request needs cleanup due to KV cache transfer timeout.
             if request.py_kv_transfer_timed_out:
                 if self.disagg.inflight_cancel_active():
@@ -13519,7 +13575,7 @@ class PyExecutor:
                         timed_out_requests.append(request)
                     continue
 
-                if request.is_disagg_generation_transmission_complete:
+                if request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
                     # Handoff owns the completed receive, including when it
                     # waits another iteration for a runnable batch.
                     request.py_kv_transfer_timed_out = False
@@ -13534,6 +13590,11 @@ class PyExecutor:
                     new_active_requests.append(request)
                     continue
 
+                if (self._dist_size(getattr(self, "dist", None), "pp_size") > 1
+                        and self._awaits_gen_handoff(request)):
+                    # A stage-local clock cannot retire a replicated PP request here.
+                    new_active_requests.append(request)
+                    continue
                 is_cancelled = self.disagg.request_cancellation(request)
                 if is_cancelled:
                     if self._awaits_gen_handoff(request):

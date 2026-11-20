@@ -2689,7 +2689,8 @@ def test_each_pp_rank_schedules_once_per_iteration(
     executor.kv_cache_manager = Mock()
     executor.scheduler = Mock()
 
-    def schedule_and_propagate(microbatch_id):
+    def schedule_and_propagate(microbatch_id, held_handoffs):
+        assert not held_handoffs
         if executor._pp_rank_schedules():
             # PyExecutor._schedule runs the scheduler.
             executor.scheduler.schedule_request(executor.active_requests, executor.inflight_req_ids)

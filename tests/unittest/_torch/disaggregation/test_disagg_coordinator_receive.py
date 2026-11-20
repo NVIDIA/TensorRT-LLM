@@ -636,10 +636,12 @@ def test_completed_tp_receive_wins_over_one_ranks_timeout() -> None:
     requests = [_GenRequest(1, py_kv_transfer_timed_out=(i == 0)) for i in range(2)]
     for rank, req in zip(ranks, requests):
         rank.active.append(req)
+
     def handoff(i):
         coordinator = ranks[i].coordinator
         coordinator.poll_gen_transfers()
         assert coordinator.try_finish_gen_receive(requests[i])
+
     group.run(handoff)
     for rank, req in zip(ranks, requests):
         assert req.state == LlmRequestState.GENERATION_IN_PROGRESS
@@ -915,6 +917,53 @@ def _closing_executor(
     executor._pending_response_terminations = []
     executor._first_token_timer = None
     return executor
+
+
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+def test_pp_handoff_waits_for_every_stage_before_retiring(stop: str) -> None:
+    group = FakeDistGroup(world_size=2, tp_size=1)
+
+    def run_stage(rank):
+        dist = group.rank(rank)
+        dist.pp_size = 2
+        h = CoordinatorHarness(dist=dist)
+        req = _ClosingRequest(
+            7, state=_RECEIVING, is_disagg_generation_transmission_in_progress=True
+        )
+        other = _ClosingRequest(8, max_new_tokens=12)
+        executor = _closing_executor(h.coordinator, [req, other])
+        req.finish_by_reason = Mock()
+        # Stage zero expires locally. An abort on the other stage, when present,
+        # takes precedence and must pass each stage's own cancellation checks.
+        req.py_kv_transfer_timed_out = rank == 0
+        if stop == "cancel" and rank == 1:
+            executor.canceled_req_ids.append(req.py_request_id)
+        safe = rank == (1 if stop == "cancel" else 0)
+        h.transceiver.cancel_request = lambda request: rank == 0 or safe
+        executor._try_cancel_request = lambda request: safe
+        for _ in range(2):
+            held = executor._cancel_pending_gen_receives(pipeline_parallel=True)
+            assert held == {7}
+            assert executor._requests_excluding(held) == [other]
+            assert not h.effects.failed and not executor._pending_response_terminations
+            # A terminal context token becoming available in the meantime
+            # cannot cause a second finish while the receive is held.
+            req.state = _COMPLETE
+            executor._finish_gen_requests_ended_by_first_token(held)
+            assert req.new_tokens == []
+        safe = True
+        assert not executor._cancel_pending_gen_receives(pipeline_parallel=True)
+        assert executor.active_requests == [other]
+        assert not executor._cancel_pending_gen_receives(pipeline_parallel=True)
+        if stop == "cancel":
+            req.finish_by_reason.assert_called_once_with(FinishReason.CANCELLED)
+            assert executor._pending_response_terminations == [req]
+            assert not h.effects.failed
+        else:
+            assert len(h.effects.failed) == 1
+            assert not executor._pending_response_terminations
+
+    group.run(run_stage)
 
 
 def test_close_out_ends_a_single_token_request_at_its_first_token() -> None:
