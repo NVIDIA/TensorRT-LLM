@@ -3899,6 +3899,7 @@ class RxSession(RxSessionBase):
             raise
         self._exception: Optional[Exception] = None
         self._closed = False
+        self._aux_wait_timed_out = False
         self._terminal_status: Optional[SessionStatus] = None
         # When this failed receive started waiting on its remaining writers, and whether that
         # wait has run out (see failed_receive_awaits_writers).
@@ -4555,7 +4556,7 @@ class RxSession(RxSessionBase):
     def resources_drained(self) -> bool:
         if not self._enforce_physical_ownership:
             with self.lock:
-                if self.status != SessionStatus.ERROR:
+                if self._aux_wait_timed_out or self.status != SessionStatus.ERROR:
                     return self._legacy_destinations_drained()
                 return not any(task.status == TaskStatus.TRANSFERRING for task in self._kv_tasks)
         retirement = getattr(self, "_retirement", None)
@@ -4684,7 +4685,7 @@ class RxSession(RxSessionBase):
         return False
 
     def _failed_wait_result(self) -> Optional[WaitResult]:
-        if not self._enforce_physical_ownership:
+        if not self._enforce_physical_ownership and not self._aux_wait_timed_out:
             return None if self.failed_receive_awaits_writers() else WaitResult.FAILED
         return WaitResult.FAILED if self.resources_drained() else None
 
@@ -4698,8 +4699,8 @@ class RxSession(RxSessionBase):
 
         With blocking=False (default): polls non-blockingly; returns None if
         any KV task or aux is not yet done — caller should re-poll next cycle.
-        With blocking=True: waits up to _timeout_s for each task.
-        Returns WaitResult.COMPLETED on full success, WaitResult.FAILED on error/timeout.
+        With blocking=True: waits up to _timeout_s for each KV task and for auxiliary data.
+        A timed-out auxiliary receive stays failed and returns None until its writers drain.
         """
         if self.status == SessionStatus.CANCELLED and not self._enforce_physical_ownership:
             return WaitResult.FAILED if self.resources_drained() else None
@@ -4724,6 +4725,11 @@ class RxSession(RxSessionBase):
                 if task.status == TaskStatus.ERROR:
                     return self._failed_wait_result()
         if self._need_aux:
+            deadline = (
+                time.monotonic() + self._timeout_s
+                if blocking and self._timeout_s is not None
+                else None
+            )
             while True:
                 status = self.status
                 if status == SessionStatus.TRANSFERRED:
@@ -4736,7 +4742,28 @@ class RxSession(RxSessionBase):
                     return self._failed_wait_result()
                 if not blocking:
                     return None  # KV done, aux still in flight; re-poll next cycle
-                time.sleep(0.001)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        with self.lock:
+                            # A result or cancellation can win just before we take the lock.
+                            if self.status in (
+                                SessionStatus.TRANSFERRED,
+                                SessionStatus.ERROR,
+                                SessionStatus.CANCELLED,
+                            ):
+                                continue
+                            self._exception = TimeoutError(
+                                f"Timed out waiting for auxiliary transfer for request {self.request_id}"
+                            )
+                            self._logical_outcomes.fail(self._exception)
+                            self._terminal_status = SessionStatus.ERROR
+                            self._aux_wait_timed_out = True
+                        self.notify_cancel()
+                        return self._failed_wait_result()
+                    time.sleep(min(remaining, 0.001))
+                else:
+                    time.sleep(0.001)
         return self._failed_wait_result() if self.has_failed() else self._completed_wait_result()
 
     def close(self) -> bool:
@@ -4768,9 +4795,8 @@ class RxSession(RxSessionBase):
                 if self._closed:
                     return True
                 if (
-                    self._terminal_status == SessionStatus.CANCELLED
-                    and not self._legacy_destinations_drained()
-                ):
+                    self._terminal_status == SessionStatus.CANCELLED or self._aux_wait_timed_out
+                ) and not self._legacy_destinations_drained():
                     return False
                 self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:

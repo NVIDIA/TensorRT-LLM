@@ -19,6 +19,7 @@ The transport, request registry, executor effects, and one-slot allocation pools
 are controlled CPU substitutes; these tests do not qualify GPU/NIXL deployments.
 """
 
+import time
 from types import SimpleNamespace
 from typing import Literal
 from unittest.mock import Mock, call
@@ -27,7 +28,7 @@ import pytest
 
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm._torch.disaggregation.base import TokenRange
-from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, KVRecvTask, RxSession
@@ -111,7 +112,9 @@ def _profile(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> tuple[SimpleName
 
 
 class _ReceiveCase:
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, bridge_enabled: bool) -> None:
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, *, bridge_enabled: bool, context_first: bool = False
+    ) -> None:
         mapping, ownership = _profile(monkeypatch, bridge_enabled)
         monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
         self.now = 10.0
@@ -129,7 +132,11 @@ class _ReceiveCase:
             py_kv_transfer_timed_out=False,
             py_disaggregated_params=DisaggregatedParams(
                 disagg_request_id=_OLD_REQUEST,
-                schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+                schedule_style=(
+                    DisaggScheduleStyle.CONTEXT_FIRST
+                    if context_first
+                    else DisaggScheduleStyle.GENERATION_FIRST
+                ),
             ),
             state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
         )
@@ -151,6 +158,7 @@ class _ReceiveCase:
             params=self.request.py_disaggregated_params,
             receiver=self.receiver,
             aux_buffer=self.aux,
+            need_aux=context_first,
         )
         self.session.receive(
             Chunk(
@@ -305,3 +313,39 @@ def test_cancelled_receive_retains_destinations_until_all_accessors_settle(
         case.assert_cancelled()
     assert case.cleanup_count == case.kv.release_count == case.aux.slot.release_count == 1
     assert case.kv.data == case.aux.slot.data == _SENTINEL
+
+
+@pytest.mark.parametrize("bridge_enabled", [False, True])
+@pytest.mark.parametrize("aux_on_time", [False, True])
+def test_blocking_aux_deadline(monkeypatch, bridge_enabled, aux_on_time):
+    case = _ReceiveCase(
+        monkeypatch, bridge_enabled=bridge_enabled, context_first=not bridge_enabled
+    )
+    case.complete("kv")
+    session = case.session
+    session._timeout_s = 0.002
+    deadline = case.now + session._timeout_s
+
+    def advance(seconds):
+        assert seconds > 0 and case.now < deadline, "AUX wait exceeded the deadline"
+        case.now += seconds
+        if aux_on_time:
+            case.complete("aux")
+
+    monkeypatch.setattr(time, "sleep", advance)
+    assert session.wait_complete(blocking=False) is None
+    if aux_on_time:
+        assert session.wait_complete(blocking=True) is WaitResult.COMPLETED
+        case.receiver.send_cancel_to_senders.assert_not_called()
+    else:
+        assert session.wait_complete(blocking=True) is None  # writer still owns the slot
+        assert case.now == pytest.approx(deadline)
+        assert session.status is SessionStatus.ERROR
+        assert isinstance(session._exception, TimeoutError)
+        case.receiver.send_cancel_to_senders.assert_called_once()
+        assert not session.close()
+        assert case.aux.slot.release_count == 0
+        case.complete("aux")
+        assert session.wait_complete() is WaitResult.FAILED
+    assert session.close()
+    assert case.aux.slot.release_count == 1
