@@ -1082,11 +1082,13 @@ def test_decode_prewarm_failure_still_reaches_barrier() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "cp_size,gather,attention_dp,spec_decode,max_rows",
+    "cp_size,gather,attention_dp,spec_mode,max_rows",
     [
-        (1, "tp_allgather", False, False, 8),
-        (2, "tp_cp_allgather", True, False, 16),
-        (1, "tp_allgather", False, True, None),
+        (1, "tp_allgather", False, None, 8),
+        (2, "tp_cp_allgather", True, None, 16),
+        (1, "tp_allgather", False, "DSPARK", None),
+        (1, "tp_allgather", False, "NGRAM", 8),
+        (1, "tp_allgather", False, "USER_PROVIDED", 8),
     ],
 )
 @pytest.mark.parametrize("fails", [False, True])
@@ -1094,17 +1096,26 @@ def test_lowm_row_bucket_prewarm_always_meets_its_peers(
     cp_size: int,
     gather: str,
     attention_dp: bool,
-    spec_decode: bool,
+    spec_mode: str | None,
     max_rows: int | None,
     fails: bool,
 ) -> None:
-    """Without speculative decoding a rank prewarms the buckets up to a step's most rows (its
-    tokens, gathered over the TP group under attention DP); with it, every bucket, since a drafter
-    can project more rows than its target verifies. The rank meets its TP (TP x CP) peers whether
-    its prewarm compiled nothing or failed; a failure is a warning, since it only defers the
-    compiles to their first calls."""
+    """Without a neural drafter a rank prewarms the buckets up to a step's most rows (its tokens,
+    gathered over the TP group under attention DP); lookup drafts add no projection. With a neural
+    drafter, every bucket, since it can project more rows than its target verifies. The rank meets
+    its TP (TP x CP) peers whether its prewarm compiled nothing or failed; a failure is a warning,
+    since it only defers the compiles to their first calls."""
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+    spec_config = (
+        None
+        if spec_mode is None
+        else SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode[spec_mode])
+    )
     owner = SimpleNamespace(
-        _config=SimpleNamespace(max_num_tokens=8, is_spec_decode=spec_decode),
+        _config=SimpleNamespace(
+            max_num_tokens=8, spec_config=spec_config, is_spec_decode=spec_config is not None
+        ),
         mapping=SimpleNamespace(cp_size=cp_size, tp_size=2, enable_attention_dp=attention_dp),
         dist=Mock(),
     )
