@@ -475,7 +475,7 @@ public:
         }
     }
 
-    struct RejectedAgentRequest
+    struct RejectedRequest
     {
     };
 
@@ -487,9 +487,9 @@ public:
             {
                 return recvRequestInfoOnce();
             }
-            catch (RejectedAgentRequest const&)
+            catch (RejectedRequest const&)
             {
-                // Keep serving other peers after a malformed agent request.
+                // Keep serving other peers after a malformed request frame.
             }
         }
         return std::nullopt;
@@ -521,7 +521,34 @@ public:
             serializedInfo.resize(infoSize);
             connection->recv(DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
             std::istringstream iss(serializedInfo);
-            info = RequestInfo::deserialize(iss);
+            try
+            {
+                info = RequestInfo::deserialize(iss);
+            }
+            catch (std::exception const&)
+            {
+                static std::atomic<uint64_t> rejectedFrames{0};
+                auto const count = ++rejectedFrames;
+                bool const logRejection = count <= 8 || (count & (count - 1)) == 0;
+                if (logRejection)
+                {
+                    TLLM_LOG_WARNING("Rejecting malformed cache transfer request frame (%lu bytes, occurrence %lu)",
+                        infoSize, count);
+                }
+                try
+                {
+                    bool const ready = false;
+                    connection->send(DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, &ready, sizeof(ready));
+                }
+                catch (std::exception const&)
+                {
+                    if (logRejection)
+                    {
+                        TLLM_LOG_WARNING("Failed to send cache transfer frame rejection");
+                    }
+                }
+                throw RejectedRequest{};
+            }
         }
 
         auto requestId = info.getRequestId();
@@ -581,7 +608,7 @@ public:
             {
                 TLLM_LOG_WARNING("Failed to send rejection for agent cache transfer request id %lu", requestId);
             }
-            throw RejectedAgentRequest{};
+            throw RejectedRequest{};
         }
     }
 
