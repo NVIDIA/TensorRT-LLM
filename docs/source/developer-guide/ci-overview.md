@@ -33,8 +33,6 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 
 Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](source:.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, the **post-merge pipeline** runs the same `jenkins/L0_MergeRequest.groovy` as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with `Post-Merge` in its name, except that a stage whose name ends in `-k_of_N` runs only on the post-merge builds whose `BUILD_NUMBER % N == k % N`. In both pipelines, the test stages run in child jobs defined by `jenkins/L0_Test.groovy`, which maps each stage name to a test list: a top-level key of a test-db YAML file (usually the file's own name; a file may hold several lists).
 
-For a pull request from outside the NVIDIA GitHub organization, the comment must name the reviewed commit with `--commit`, for example `/bot run --commit <full 40-character SHA>`. The CI starts only if that commit is still the latest commit of the pull request, so it never runs code that was pushed after the review. The option is also accepted for other pull requests.
-
 `stage` tags live in the YAML files under `tests/integration/test_lists/test-db/`. Searching those files for `stage: pre_merge` shows exactly which tests the merge-request pipeline covers.
 
 ### C++ license checks

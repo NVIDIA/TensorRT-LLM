@@ -46,9 +46,9 @@ jobs:
             "Run `/bot [-h|--help]` to print this help message.\n\n" +
             "See details below for each supported subcommand.\n\n" +
             "<details>\n\n" +
-            "`run  [--commit SHA --reuse-test (optional)pipeline-id --disable-fail-fast --skip-test --stage-list \"A10-PyTorch-1, xxx\" --gpu-type \"A30, H100_PCIe\" --test-backend \"pytorch, cpp\" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage \"H100_PCIe-TensorRT-Post-Merge-1, xxx\" --detailed-log --debug(experimental) --high-priority]`\n\n" +
+            "`run  [--commit FULL_SHA --reuse-test (optional)pipeline-id --disable-fail-fast --skip-test --stage-list \"A10-PyTorch-1, xxx\" --gpu-type \"A30, H100_PCIe\" --test-backend \"pytorch, cpp\" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage \"H100_PCIe-TensorRT-Post-Merge-1, xxx\" --detailed-log --debug(experimental) --high-priority]`\n\n" +
             "Launch build/test pipelines. All previously running jobs will be killed.\n\n" +
-            "`--commit SHA ` *(OPTIONAL)* : Full 40-character SHA of the commit to run on. **Required for pull requests from outside the NVIDIA GitHub organization.** The command is rejected if this is not the latest commit of the pull request, so CI never runs code that was pushed after the review. Also accepted by `skip` and `reuse-pipeline`.\n\n" +
+            "`--commit FULL_SHA ` *(OPTIONAL)* : Full 40-character SHA of the commit to run on. **Required for pull requests from outside the NVIDIA GitHub organization.** Also accepted by `skip` and `reuse-pipeline`.\n\n" +
             "`--reuse-test (optional)pipeline-id ` *(OPTIONAL)* : Allow the new pipeline to reuse build artifacts and skip successful test stages from a specified pipeline or the last pipeline if no pipeline-id is indicated. If the Git commit ID has changed, this option will be always ignored. The DEFAULT behavior of the bot is to reuse build artifacts and successful test results from the last pipeline.\n\n" +
             "`--disable-reuse-test ` *(OPTIONAL)* : Explicitly prevent the pipeline from reusing build artifacts and skipping successful test stages from a previous pipeline. Ensure that all builds and tests are run regardless of previous successes.\n\n" +
             "`--disable-fail-fast ` *(OPTIONAL)* : Disable fail fast on build/tests/infra failures.\n\n" +
@@ -68,11 +68,11 @@ jobs:
             "`kill  `\n\n" +
             "Kill all running builds associated with pull request.\n\n" +
             "### skip\n\n" +
-            "`skip --comment COMMENT [--commit SHA]`\n\n" +
-            "Skip testing for latest commit on pull request. `--comment \"Reason for skipping build/test\"` is required. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break. `--commit SHA` is required for pull requests from outside the NVIDIA GitHub organization, see `run`.\n\n" +
+            "`skip --comment COMMENT [--commit FULL_SHA]`\n\n" +
+            "Skip testing for latest commit on pull request. `--comment \"Reason for skipping build/test\"` is required. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break. `--commit FULL_SHA` is required for pull requests from outside the NVIDIA GitHub organization.\n\n" +
             "### reuse-pipeline\n\n" +
-            "`reuse-pipeline [--commit SHA]`\n\n" +
-            "Reuse a previous pipeline to validate current commit. This action will also kill all currently running builds associated with the pull request. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break. `--commit SHA` is required for pull requests from outside the NVIDIA GitHub organization, see `run`.\n\n" +
+            "`reuse-pipeline [--commit FULL_SHA]`\n\n" +
+            "Reuse a previous pipeline to validate current commit. This action will also kill all currently running builds associated with the pull request. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break. `--commit FULL_SHA` is required for pull requests from outside the NVIDIA GitHub organization.\n\n" +
             "</details>";
 
             github.rest.issues.createComment({
