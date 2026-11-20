@@ -45,6 +45,7 @@ from tensorrt_llm.llmapi import (
     SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
     TorchCompileConfig)
 # isort: on
+from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (check_device_contain, llm_models_root,
@@ -59,7 +60,8 @@ from ..deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT, evaluate_gsm8k
 from .accuracy_core import (
     GSM8K, MMLU, CnnDailymail, GPQADiamond, GSM8KInferenceX, JsonModeEval,
     QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS, LlmapiAccuracyTestHarness, LongBenchV1,
-    LongBenchV2, assert_acceptance_length, assert_acceptance_length_for_llm,
+    LongBenchV2, acceptance_length_from_iteration_stats,
+    assert_acceptance_length, assert_acceptance_length_for_llm,
     assert_guided_decoding_regex, assert_kv_cache_reuse_for_llm,
     compute_acceptance_length)
 
@@ -2599,11 +2601,36 @@ _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
     "in the form #### <answer>, using the simplest numeric form without units "
     "or trailing zeros.")
 
+
+def _adaptive_eplb_decode_burst(llm):
+    # Unscored decode-only burst: every rank's batch at once, no refill, full
+    # output budget; the evaluation reads its own stats.
+    batch = llm.args.tensor_parallel_size * llm.args.max_batch_size
+    llm.generate(
+        load_dataset(GSM8K.DATASET_DIR, "main",
+                     split="test")["question"][:batch],
+        SamplingParams(max_tokens=GSM8K.MAX_OUTPUT_LEN, ignore_eos=True))
+    llm.get_stats(timeout=2)
+
+
+def _assert_adaptive_eplb_installed(test_name, stats):
+    # The balancer reports its counters in the iteration statistics: the run
+    # must have installed a layout.
+    installs = max(
+        (s.get("moeLoadBalancerStats") or {}).get("installs", 0) for s in stats)
+    print(f"[EPLB] {test_name} installs = {installs}")
+    assert installs > 0, "adaptive EPLB installed no layout"
+
+
 MEGAMOE_CUTEDSL_TACTIC = "cutedsl.mega_moe"
 
 
-def _gsm8k_dep4_megamoe_cutedsl(model_name, model_path, extra_evaluator_kwargs,
-                                spec_config, acceptance_key):
+def _gsm8k_dep4_megamoe_cutedsl(model_name,
+                                model_path,
+                                extra_evaluator_kwargs,
+                                spec_config,
+                                acceptance_key,
+                                load_balancer=None):
     """Run GSM8K on a DeepSeek-V4-Pro NVFP4 export, MegaMoE CuTe DSL DEP4.
 
     One node. DEP4 doubles the per-rank model footprint relative to DEP8, so
@@ -2611,7 +2638,10 @@ def _gsm8k_dep4_megamoe_cutedsl(model_name, model_path, extra_evaluator_kwargs,
     warmup OOM. The acceptance length is gated as well as the score: a drafter
     regression costs speed only, which the score cannot see. The target is
     pinned by ``MEGAMOE_CUTEDSL_TACTIC``; a target tactic does not reach the
-    drafter, so ``spec_config`` carries the drafter's own selection.
+    drafter, so ``spec_config`` carries the drafter's own selection. With
+    ``load_balancer`` (adaptive EPLB) an unscored decode burst runs first and
+    the run must install a layout; a replica is a copy of its expert, so the
+    balanced run keeps the same baselines.
     """
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.5)
@@ -2623,7 +2653,8 @@ def _gsm8k_dep4_megamoe_cutedsl(model_name, model_path, extra_evaluator_kwargs,
              tensor_parallel_size=4,
              moe_expert_parallel_size=4,
              enable_attention_dp=True,
-             moe_config=MoeConfig(tactic=MEGAMOE_CUTEDSL_TACTIC),
+             moe_config=MoeConfig(tactic=MEGAMOE_CUTEDSL_TACTIC,
+                                  load_balancer=load_balancer),
              max_batch_size=64,
              cuda_graph_config=CudaGraphConfig(max_batch_size=64),
              max_seq_len=4096,
@@ -2641,12 +2672,17 @@ def _gsm8k_dep4_megamoe_cutedsl(model_name, model_path, extra_evaluator_kwargs,
             kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
             spec_dec_algo=llm.args.speculative_config.decoding_type)
         assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+        if load_balancer is not None:
+            _adaptive_eplb_decode_burst(llm)
         with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
             task.evaluate(llm, prepared_evaluator=evaluator)
-        acceptance_length = compute_acceptance_length(llm)
+        stats = llm.get_stats(timeout=2)
+        acceptance_length = acceptance_length_from_iteration_stats(stats)
         print(f"[AL] {acceptance_key} "
               f"acceptance_length = {acceptance_length:.3f}")
         assert_acceptance_length(acceptance_key, acceptance_length)
+        if load_balancer is not None:
+            _assert_adaptive_eplb_installed(acceptance_key, stats)
 
 
 @pytest.mark.timeout(14400)
@@ -2695,6 +2731,22 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
             self.MODEL_NAME, self.NVFP4_MODEL_PATH, self.EXTRA_EVALUATOR_KWARGS,
             MTPDecodingConfig(max_draft_len=3, moe_backend="AUTO"),
             "TestDeepSeekV4Pro::test_gsm8k_dep4_megamoe_cutedsl_mtp")
+
+    # Adaptive EPLB prices its installs with the MoE backend's decode time
+    # model, calibrated on the GPUs during the CUDA graph warmup.
+    @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_gsm8k_dep4_megamoe_cutedsl_mtp_adaptive_eplb(self):
+        # The same run with adaptive EPLB on the body. The MTP layer takes
+        # TRTLLM-Gen from moe_backend="AUTO", which does not support adaptive
+        # EPLB, so that layer runs as plain EP outside the balancer.
+        with open(f"{self.NVFP4_MODEL_PATH}/config.json") as f:
+            num_experts = json.load(f)["n_routed_experts"]
+        _gsm8k_dep4_megamoe_cutedsl(
+            self.MODEL_NAME, self.NVFP4_MODEL_PATH, self.EXTRA_EVALUATOR_KWARGS,
+            MTPDecodingConfig(max_draft_len=3, moe_backend="AUTO"),
+            "TestDeepSeekV4Pro::test_gsm8k_dep4_megamoe_cutedsl_mtp",
+            MoeAdaptiveLoadBalancerConfig(num_slots=num_experts + 4 * 4))
 
 
 @pytest.mark.timeout(14400)
@@ -2820,6 +2872,24 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                                  speculative_model=self.NVFP4_MODEL_PATH,
                                  moe_tactic=MEGAMOE_CUTEDSL_TACTIC),
             "TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl")
+
+    # Adaptive EPLB prices its installs with the MoE backend's decode time
+    # model, calibrated on the GPUs during the CUDA graph warmup.
+    @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_gsm8k_dep4_megamoe_cutedsl_adaptive_eplb(self):
+        # The same run with adaptive EPLB replicating hot experts while the
+        # requests decode: four slots per rank beyond the experts it homes,
+        # half of them for replicas and half free for the next install.
+        with open(f"{self.NVFP4_MODEL_PATH}/config.json") as f:
+            num_experts = json.load(f)["n_routed_experts"]
+        _gsm8k_dep4_megamoe_cutedsl(
+            self.MODEL_NAME, self.NVFP4_MODEL_PATH, self.EXTRA_EVALUATOR_KWARGS,
+            DSparkDecodingConfig(max_draft_len=5,
+                                 speculative_model=self.NVFP4_MODEL_PATH,
+                                 moe_tactic=MEGAMOE_CUTEDSL_TACTIC),
+            "TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl",
+            MoeAdaptiveLoadBalancerConfig(num_slots=num_experts + 4 * 4))
 
 
 @pytest.mark.timeout(14400)

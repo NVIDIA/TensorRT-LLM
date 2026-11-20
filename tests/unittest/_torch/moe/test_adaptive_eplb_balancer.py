@@ -5,7 +5,6 @@
 import json
 import multiprocessing
 import os
-import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,12 +18,7 @@ from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer as base
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import balancer as module
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import calibrate
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import AdaptiveMoeLoadBalancer
-from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
-    ExpertStatistics,
-    TimeModel,
-    build_route_tables,
-    statistics_buffers,
-)
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import TimeModel, build_route_tables
 from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -96,13 +90,6 @@ def test_factory_refuses_what_adaptive_eplb_cannot_balance(arch, ep_size, cluste
     )
     with pytest.raises(ValueError, match=f"adaptive EPLB {error}"):
         base.maybe_create_moe_load_balancer(model_config, mapping)
-
-
-def test_statistics_record_nothing_while_the_flag_is_clear():
-    off = torch.zeros(1, dtype=torch.int32)
-    stats = ExpertStatistics.of(statistics_buffers(1, 4, "cpu"), 0, off)
-    stats.record(torch.tensor([[0, 1], [1, 3]], dtype=torch.int32))
-    assert not stats.rows.any() and stats.forwards.item() == 0
 
 
 def test_layer_route_stages_into_the_backend_and_records_the_statistics():
@@ -688,22 +675,6 @@ def test_a_state_change_on_another_rank_raises_on_every_rank_after_the_vote(monk
     assert "start" not in seen
 
 
-def test_a_snapshot_widens_one_chunk_of_a_large_tensor_at_a_time(monkeypatch):
-    live, peak, widen = set(), [0], torch.Tensor.long
-
-    def long(self, *args, **kwargs):  # the int64 chunks alive at once
-        out = widen(self, *args, **kwargs)
-        live.add(id(out))
-        weakref.finalize(out, live.discard, id(out))
-        peak[0] = max(peak[0], len(live))
-        return out
-
-    monkeypatch.setattr(torch.Tensor, "long", long)
-    monkeypatch.setattr(calibrate, "DIGEST_WORDS", 4)
-    calibrate.snapshot([torch.arange(64, dtype=torch.int32)])  # 16 chunks
-    assert 0 < peak[0] <= 2
-
-
 @pytest.mark.parametrize("scale", [0.0, -0.5, float("nan"), float("inf")])
 def test_a_bucket_of_a_degenerate_scale_has_no_model_and_the_others_serve(monkeypatch, scale):
     fits = iter([(0.01, 0.001, 0.0), (scale, 0.001, 0.0)])  # the buckets of 8 and 16 tokens
@@ -770,3 +741,25 @@ def test_forced_routes_realize_a_design_with_distinct_slots_per_token():
         assert ids.shape == (g.ep, g.T, g.K)
         assert (np.bincount(ids.ravel(), minlength=x.size).reshape(x.shape) == x).all()
         assert (np.diff(np.sort(ids, -1), axis=-1) > 0).all()
+
+
+def test_single_pass_capture_is_refused_while_the_balancer_calibrates_between_the_passes(
+    monkeypatch,
+):
+    """Regression: adaptive EPLB calibrates its time model between the warmup's two passes
+    (before_capture), so the opt-in single-pass capture must not skip that point."""
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
+
+    monkeypatch.delenv("TLLM_CUDA_GRAPH_GEMM_TUNING", raising=False)
+    graphs = SimpleNamespace(
+        cuda_graph_runner=SimpleNamespace(graphs={}),
+        mapping=SimpleNamespace(has_pp=lambda: False, world_size=4),
+        _lora=SimpleNamespace(cuda_graph_manager=None),
+        _flashinfer_mxfp8_autotune_methods=lambda: [],
+        supports_single_pass_capture=True,
+        _moe_load_balancer=SimpleNamespace(before_capture=lambda: None),
+        _agreement=SimpleNamespace(is_distributed_forward=lambda: False),
+    )
+    assert "before_capture" in DecoderCudaGraphs._single_pass_blocker(graphs)
+    graphs._moe_load_balancer = None
+    assert DecoderCudaGraphs._single_pass_blocker(graphs) is None

@@ -4,6 +4,7 @@
 byte as torch copies, fills and ``fp4_quantize.into`` do: routes in rows ``[0, n)`` (only the live
 rows of a live-row word), -1 and 0 after them."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,42 @@ def _garbage(shape, dtype, generator, device):
     nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
     raw = torch.randint(0, 256, (nbytes,), dtype=torch.uint8, generator=generator)
     return raw.view(dtype).view(shape).to(device)
+
+
+def _cuda_last_error() -> int:
+    """cudaPeekAtLastError of the CUDA runtime this process loaded (0: none pending), without clearing it."""
+    import ctypes
+
+    path = next(
+        line.split()[-1]
+        for line in open("/proc/self/maps")
+        if "libcudart.so" in line and line.split()[-1].startswith("/")
+    )
+    return int(ctypes.CDLL(path).cudaPeekAtLastError())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_stage_routes_first_launch_of_the_process_leaves_no_error(record_property):
+    """The first route staging of the process, of a launch without rows (an empty grid of routes, a full bucket of
+    -1 and 0): no CUDA error is pending before it, none after it, and it stages what torch fills. Records where an
+    error first shows (before / after) for a run that fails."""
+    torch.zeros(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
+    before = _cuda_last_error()
+    ids = torch.empty((0, TOP_K), dtype=torch.int32, device="cuda")
+    weights = torch.empty((0, TOP_K), device="cuda")
+    ids_out = torch.full((ROWS, TOP_K), 7, dtype=torch.int64, device="cuda")
+    weights_out = torch.full((ROWS, TOP_K), 7.0, device="cuda")
+    error = None
+    try:
+        torch.ops.trtllm.megamoe_stage_routes(ids, weights, ids_out, weights_out)
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised by the assertion below
+        error = repr(exc)
+    after = _cuda_last_error()
+    record_property("first_stage_routes_launch", f"before={before} after={after} error={error}")
+    assert before == 0 and error is None and after == 0, (before, error, after)
+    assert (ids_out == -1).all() and (weights_out == 0).all()
 
 
 @pytest.mark.parametrize("device", _DEVICES)
@@ -182,7 +219,7 @@ def test_bf16_inputs_stage_in_one_launch_as_in_two(rows, bucket, monkeypatch):
     monkeypatch.setattr(live_rows, "current_word", lambda device: word)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        MegaMoECuteDsl._stage_bf16_inputs(moe, x, ids, weights)
+        MegaMoECuteDsl._stage_bf16_inputs(moe, x, ids, weights, None)
     for value in (live_rows.NO_ROWS, live_rows.ALL_ROWS):
         word.fill_(value)
         x.copy_(torch.randn(rows, 7168, generator=gen) * 3)
@@ -318,6 +355,338 @@ def test_stage_inputs_one_launch_against_two_large_buckets(bucket):
         quantize_blocks
         == reference_blocks
         >= torch.cuda.get_device_properties(0).multi_processor_count
+    )
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The adaptive route of the one-round dispatch router (adaptive_eplb_router_reference.py): the router's own device code
+# (_OneRoundRouter._adaptive_counted_rows / _adaptive_pick), launched one warp per token row as the router launches it,
+# against the module's plain-integer definition, bit for bit; and the kernels a build without the route compiles.
+# ---------------------------------------------------------------------------------------------------------------------
+
+_requires_cute_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="needs a Blackwell GPU",
+)
+_AR_WORLD, _AR_SLOTS, _AR_EXPERTS, _AR_TOP_K = 32, 512, 384, 6
+
+
+def _router_route_module():
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parent / "adaptive_eplb_router_reference.py"
+    spec = importlib.util.spec_from_file_location("router_route", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _route_table(rng, zero_one):
+    """A packed route table row of 384 experts in 512 slots of 32 GPUs: every expert at home, the 128
+    spare slots holding replicas, a share vector with some 0/1 copies (policy.build_route_tables)."""
+    from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
+        ExpertGeometry,
+        build_route_tables,
+    )
+
+    geometry = ExpertGeometry(_AR_EXPERTS, _AR_SLOTS, _AR_WORLD)
+    layout = geometry.home_layout().tolist()
+    free = [s for s, e in enumerate(layout) if e < 0]
+    rng.shuffle(free)
+    hot = rng.sample(range(_AR_EXPERTS), 40)
+    for slot in free[:96]:
+        layout[slot] = rng.choice(hot)
+    shares = [rng.random() for _ in range(_AR_SLOTS)]
+    by_expert = {}
+    for slot, e in enumerate(layout):
+        if e >= 0:
+            by_expert.setdefault(e, []).append(slot)
+    for slots in by_expert.values():
+        if len(slots) > 1 and rng.random() < zero_one:
+            keep = rng.randrange(len(slots))
+            for k, slot in enumerate(slots):
+                shares[slot] = 1.0 if k == keep else 0.0
+    return build_route_tables(layout, shares, _AR_EXPERTS, _AR_SLOTS).packed()
+
+
+def _compile_router_probe(rows, staged=False):
+    """``staged``: the probe's CTA first stages the route table in shared memory, as the router's push does."""
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.utils
+    from cutlass.cutlass_dsl import Int32, Int64
+
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain.one_round_router import (
+        _OneRoundRouter,
+    )
+
+    router = _OneRoundRouter(
+        ProblemDesc(
+            {
+                "world_size": _AR_WORLD,
+                "expert_count": _AR_SLOTS,
+                "topk": _AR_TOP_K,
+                "max_tokens_per_rank": rows,
+                "hidden_size": 7168,
+                "quant_kind": "nvfp4",
+                "apply_topk_at_fc1": True,
+            }
+        ),
+        ImplDesc(
+            {
+                "token_padding_block": 64,
+                "one_round_cta_count": 512 // _AR_WORLD,
+                "adaptive_route_experts": _AR_EXPERTS,
+            }
+        ),
+    )
+    warps = 4
+
+    class Probe:
+        @cute.kernel
+        def kernel(
+            self,
+            ids: cute.Tensor,
+            out: cute.Tensor,
+            tables: Int64,
+            stat_rows: Int64,
+            forwards: Int64,
+            enabled: Int64,
+            word: Int64,
+            num_tokens: Int32,
+            first: Int32,
+            ep_rank: Int32,
+        ):
+            thread_idx, _, _ = cute.arch.thread_idx()
+            cta_idx, _, _ = cute.arch.block_idx()
+            warp = thread_idx // Int32(32)
+            lane = thread_idx % Int32(32)
+            adaptive = (tables, stat_rows, forwards, enabled, word, num_tokens, first)
+            table = None
+            if cutlass.const_expr(staged):
+                workspace = router.router_smem_workspace
+                storage = cutlass.utils.SmemAllocator().allocate(workspace.storage_class())
+                table = workspace.tensor(
+                    router.smem_adaptive_table_region, storage.buffer.data_ptr()
+                )
+                entries = router._adaptive_table_load(tables, thread_idx, warps * 32)
+                router._adaptive_table_store(entries, table, thread_idx, warps * 32)
+                cute.arch.sync_threads()
+            counted = router._adaptive_counted_rows(adaptive, cta_idx, thread_idx)
+            token = cta_idx * Int32(warps) + warp
+            if token < Int32(rows):
+                if lane < Int32(_AR_TOP_K):
+                    raw = ids[token, lane]
+                    slot = Int32(-1)
+                    if cutlass.Uint64(raw) < cutlass.Uint64(_AR_EXPERTS):
+                        slot = router._adaptive_pick(
+                            adaptive, counted, Int32(raw), token, ep_rank, table
+                        )
+                    out[token, lane] = slot
+
+        @cute.jit
+        def __call__(
+            self,
+            ids: cute.Tensor,
+            out: cute.Tensor,
+            tables: Int64,
+            stat_rows: Int64,
+            forwards: Int64,
+            enabled: Int64,
+            word: Int64,
+            num_tokens: Int32,
+            first: Int32,
+            ep_rank: Int32,
+            stream,
+        ):
+            self.kernel(
+                ids, out, tables, stat_rows, forwards, enabled, word, num_tokens, first, ep_rank
+            ).launch(
+                grid=[(rows + warps - 1) // warps, 1, 1], block=[warps * 32, 1, 1], stream=stream
+            )
+
+    fake = cute.runtime.make_fake_compact_tensor
+    return cute.compile(
+        Probe(),
+        fake(cutlass.Int64, (rows, _AR_TOP_K), stride_order=(1, 0)),
+        fake(cutlass.Int32, (rows, _AR_TOP_K), stride_order=(1, 0)),
+        *(Int64(0),) * 5,
+        Int32(0),
+        Int32(1),
+        Int32(0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+@_requires_cute_gpu
+@pytest.mark.parametrize("staged", [False, True], ids=["global", "staged"])
+@pytest.mark.parametrize("rows", [8, 32, 64, 256])
+def test_router_adaptive_route_is_bitwise_its_definition(rows, staged):
+    """Slots and statistics of the router's adaptive route equal the reference's, with replicated experts,
+    0/1 shares, invalid ids, padding rows past the forward's rows, live-row words and the recording flag; with
+    the table read from global memory and from the copy the router stages in shared memory."""
+    import random
+
+    from _torch.moe import adaptive_eplb_reference as reference
+
+    rr = _router_route_module()
+    rng = random.Random(rows)
+    compiled = _compile_router_probe(rows, staged)
+    device = torch.device("cuda")
+    for case in range(12):
+        packed = _route_table(rng, zero_one=0.4 if case % 2 else 0.0)
+        table = torch.tensor(packed, dtype=torch.int32, device=device)
+        num_tokens = rng.randint(1, rows)
+        ids = [[rng.randrange(_AR_EXPERTS) for _ in range(_AR_TOP_K)] for _ in range(rows)]
+        for t in range(rows):
+            if t >= num_tokens:
+                ids[t] = [-1] * _AR_TOP_K
+            elif rng.random() < 0.1:
+                ids[t][rng.randrange(_AR_TOP_K)] = rng.choice([-1, _AR_EXPERTS, _AR_SLOTS + 3])
+        requests = rng.choice([0, 1, 2, 4, num_tokens])
+        real = rng.randint(0, requests) if requests else 0
+        word = None if case % 3 == 0 else (requests << 16) | real
+        enabled = case % 4 != 3
+        first = case % 5 != 4
+        ep_rank = rng.randrange(_AR_WORLD)
+
+        stat_rows = torch.zeros(_AR_EXPERTS, dtype=torch.float32, device=device)
+        forwards = torch.zeros(1, dtype=torch.int64, device=device)
+        flag = torch.tensor([1 if enabled else 0], dtype=torch.int32, device=device)
+        word_t = torch.tensor(
+            [0x7FFFFFFF if word is None else word], dtype=torch.int32, device=device
+        )
+        out = torch.full((rows, _AR_TOP_K), -7, dtype=torch.int32, device=device)
+        ids_t = torch.tensor(ids, dtype=torch.int64, device=device)
+        compiled(
+            ids_t,
+            out,
+            table.data_ptr(),
+            stat_rows.data_ptr(),
+            forwards.data_ptr(),
+            flag.data_ptr(),
+            word_t.data_ptr(),
+            num_tokens,
+            1 if first else 0,
+            ep_rank,
+        )
+        torch.cuda.synchronize()
+
+        want_slots = rr.slots_of(ids, ep_rank, packed, _AR_EXPERTS, _AR_SLOTS)
+        # The statistics are those the staged route records over the forward's rows (a word that
+        # keeps every row reads as 0x7FFF real of 0x7FFF requests).
+        want_rows, want_forwards = torch.zeros(_AR_EXPERTS), torch.zeros(1, dtype=torch.int64)
+        reference.record(
+            torch.tensor(ids[:num_tokens]),
+            want_rows,
+            want_forwards,
+            torch.tensor([int(enabled)]),
+            first,
+            word_t.cpu(),
+        )
+        assert out.cpu().tolist() == want_slots, (rows, case)
+        assert stat_rows.cpu().tolist() == want_rows.tolist(), (rows, case)
+        assert forwards.item() == want_forwards.item(), (rows, case)
+
+
+def _kernel_ptx_digests(adaptive_route_experts, out_dir, tokens=32):
+    """Build and compile the DeepSeek-V4 EP32 MegaMoE kernel of a 32-token bucket in a fresh interpreter with its
+    PTX and cubins kept: {file: sha256 of the PTX without source locations, of the cubin}, and the resource usage."""
+    import json
+    import subprocess
+    import sys
+
+    script = f"""
+import hashlib, json, os, pathlib, re, subprocess, torch
+from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+kwargs = dict(world_size=32, local_rank=0, num_topk=6, num_experts_per_rank=16, hidden_size=7168,
+              intermediate_size_per_partition=3072, expand_intermediate_size_per_partition=6144,
+              max_tokens_per_rank={tokens}, output_dtype=torch.bfloat16, apply_topk_in_fc1=True, swiglu_alpha=None,
+              swiglu_beta=None, gate_up_clamp=None, situ_beta=None, situ_linear_beta=None, in_kernel_fc2_reduce=False,
+              combine_format="16e2m1xbf16", tactic_autotune=False, helper_expert_count=0)
+if {adaptive_route_experts}:
+    kwargs["adaptive_route_experts"] = {adaptive_route_experts}
+# The kernel builder reads the device's limits through the driver: it needs this process's CUDA context.
+torch.cuda.set_device(0)
+torch.zeros(1, device="cuda")
+out = pathlib.Path({str(out_dir)!r})
+out.mkdir(parents=True, exist_ok=True)
+import cutlass.cute as cute
+_compile = cute.compile
+class _KeepCode:
+    # cute.compile with the DSL's keep-PTX / keep-cubin dump of every kernel it builds into `out`.
+    keep = " --keep-ptx --keep-cubin --dump-dir " + str(out)
+    def _with(self, fn):
+        return lambda *a, **k: fn(*a, **dict(k, options=(k.get("options", "") + self.keep).strip()))
+    def __getitem__(self, item):
+        return self._with(_compile[item])
+    def __call__(self, *a, **k):
+        return self._with(_compile)(*a, **k)
+cute.compile = _KeepCode()
+runner = op._megamoe_get_runner(**kwargs)
+tactic = op._default_megamoe_tactic_for_key(runner._tactic_lookup_key(), num_tokens={tokens})
+kernel = runner._build_kernel_once(tactic)
+kernel.aot_compile()
+digests = {{}}
+for f in sorted(out.rglob("*")):
+    if f.suffix == ".ptx":
+        text = "\\n".join(l for l in f.read_text().splitlines() if not re.match(r"\\s*(\\.loc|\\.file|//)", l))
+        digests[f.name] = ["ptx", hashlib.sha256(text.encode()).hexdigest()]
+    elif f.suffix == ".cubin":
+        try:
+            dump = ["cuobjdump", "--dump-resource-usage", str(f)]
+            usage = subprocess.run(dump, capture_output=True, text=True).stdout
+        except OSError as error:
+            usage = f"cuobjdump: {{error}}"
+        digests[f.name] = ["cubin", hashlib.sha256(f.read_bytes()).hexdigest(), usage]
+print("DIGESTS " + json.dumps(digests))
+"""
+    # Without the variables of the MPI job pytest may run in: the child imports tensorrt_llm, which
+    # initializes MPI, and would join that job as its parent.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))
+    }
+    env.update(CUTE_DSL_KEEP_PTX="1", CUTE_DSL_KEEP_CUBIN="1", CUTE_DSL_DUMP_DIR=str(out_dir))
+    done = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=1800
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    line = next(x for x in done.stdout.splitlines() if x.startswith("DIGESTS "))
+    return json.loads(line[len("DIGESTS ") :])
+
+
+@_requires_cute_gpu
+@pytest.mark.parametrize("tokens", [32, 1024])
+def test_megamoe_kernels_without_the_adaptive_route_record_their_ptx(
+    tmp_path, record_property, tokens
+):
+    """Records the digests of the no-EPLB EP32 build's kernels of a 32-token bucket (the one-round router) and a
+    1024-token bucket (the metadata-push router), PTX without source locations and cubin, as JUnit properties, so
+    two runs (a base and a change) can compare them; this test does not compare them. The adaptive build's
+    resource usage is recorded beside them."""
+    import json
+
+    digests = _kernel_ptx_digests(0, tmp_path / "base", tokens)
+    kept = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
+    assert any(kind == "ptx" for kind, *_ in digests.values()), (
+        f"the compile kept no PTX: {kept[:20]}"
+    )
+    record_property(
+        "no_eplb_kernel_digests", json.dumps({k: v[:2] for k, v in digests.items()}, sort_keys=True)
+    )
+    record_property(
+        "no_eplb_resource_usage",
+        json.dumps({k: v[2] for k, v in digests.items() if v[0] == "cubin"}),
+    )
+    adaptive = _kernel_ptx_digests(_AR_EXPERTS, tmp_path / "adaptive", tokens)
+    record_property(
+        "adaptive_resource_usage",
+        json.dumps({k: v[2] for k, v in adaptive.items() if v[0] == "cubin"}),
     )
 
 
