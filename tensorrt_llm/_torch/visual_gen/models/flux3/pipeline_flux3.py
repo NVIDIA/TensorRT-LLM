@@ -573,9 +573,17 @@ class Flux3Pipeline(BasePipeline):
         """
         reference = PIL.Image.new("RGB", (width, height), (128, 128, 128))
         references, _, _ = self._prepare_references([reference], height, width)
-        self._warmup_reference_keys.add(self._reference_cache_key(height, width, references))
+        images = [None]
+        try:
+            self._check_token_counts({"reference": references.num_tokens})
+        except ValueError:
+            # Ulysses cannot split this refit reference, so a same-size edit is rejected anyway.
+            pass
+        else:
+            self._warmup_reference_keys.add(self._reference_cache_key(height, width, references))
+            images.append(references)
         prompts = [self._warmup_prompt(window) for window in WARMUP_TEXT_WINDOWS]
-        for image in (None, references):
+        for image in images:
             for prompt in prompts:
                 self.forward(
                     prompt,
