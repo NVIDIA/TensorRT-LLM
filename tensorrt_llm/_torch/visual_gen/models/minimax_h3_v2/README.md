@@ -47,8 +47,8 @@ Choose the **role** from the behavior you are changing and the **owner** from th
 | Role | What belongs here |
 | --- | --- |
 | Pipeline | How a request moves through conditioning, denoising steps and decoding. The [family pipeline](pipeline.py) runs the joint audio/video loop. |
-| Component | A model block that composes ops and owns weights or execution state when needed. [H3 attention](components/attention.py) owns the projections and decides when to fuse Q/K normalization and RoPE. |
-| Operation | A callable with an independently testable contract. Its reference defines the outputs and any buffer updates for the given inputs. An implementation can combine multiple tensor computations and collectives. The caller passes any required execution state explicitly. |
+| Component | Defines how part of the model runs. It owns the weights or execution state it needs and chooses when to call its ops. For example, the [TP text encoder block](default_pipeline/text_encoder_tp.py) owns the QKV and output projections and calls causal attention between them. |
+| Operation | Specifies what a call computes given explicit inputs, including any weights or execution state supplied by the caller. Its reference defines the outputs and observable buffer updates, even when the implementation combines several computations or collectives. For example, [text causal attention](default_pipeline/ops/text_attention.py) takes projected Q/K/V and prompt offsets and returns the attention output. |
 | Kernel | The device implementation of an op, including launch geometry, tiling, memory access and fusion. An op can dispatch to one or more kernels or an existing library primitive. |
 
 ```text
@@ -61,6 +61,19 @@ H3 family       DiT attention    -->  DiT Q/K norm + RoPE  --> Triton DiT kernel
 Changing which channels the DiT rotates changes the [family op](ops/rope.py) and its reference tests. Changing the tile size for the same result belongs in the [kernel](kernels/fused_rope.py). The TP text encoder has its [own op](default_pipeline/ops/text_qk_norm_rope.py) and [kernel](default_pipeline/kernels/text_qk_norm_rope.py) for one-dimensional text positions.
 
 Use the `trtllm::minimax_h3_v2_` prefix for H3 V2 Python-registered Triton ops so V1 and V2 can coexist in the process-wide dispatcher. For a new C++/CUDA kernel, follow the [native code guide](../../../../../cpp/tensorrt_llm/modeling_v2/README.md) for namespaces and registration. [CMake discovery](../../../../../cpp/tensorrt_llm/modeling_v2/CMakeLists.txt) scans `_torch/modeling_v2/models/`. A family library under `_torch/visual_gen/models/` also needs build discovery and loading from the VisualGen path.
+
+#### When to extract an op
+
+Extract a component method when both conditions hold.
+
+1. **Can you write a reference from the call arguments alone?** Specify the expected outputs and any mutations using the inputs, their layouts and any state the caller supplies. The reference should be usable independently of the enclosing model block.
+2. **Does the behavior need an independent implementation or test?** Typical reasons include introducing a custom kernel, checking a fast path and fallback against the same reference, or reusing the exact contract across callers. A custom kernel can justify extraction with a single caller.
+
+[`ulysses_qkv_all_to_all`](ops/ulysses_qkv.py) is a family op. Packing Q/K/V for one all-to-all and exchanging the three tensors separately must produce the same heads in the same layout on each rank. The [op tests](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/ops/test_ulysses_qkv.py) check both paths against that reference.
+
+[`H3SequenceSharder.gather`](components/sequence_sharder.py) stays a component method. The refiner and DiT call it to gather rank-local rows and trim padding. A fused gather-and-trim kernel would justify extracting an op and using the current implementation as its reference.
+
+Choose the [sharing scope](#choose-the-sharing-scope) separately. H3-specific ops belong with the target or family that uses them.
 
 ### Choose the sharing scope
 
@@ -98,7 +111,7 @@ Change H3's tile selection or coarse/fine merge in the [family VSA op](ops/vsa.p
 | --- | --- |
 | Change which projection channels a TP rank owns or when it sums partial results | [Linear](components/linear.py) owns projection shard bounds, quantization alignment and row-parallel output reduction. [MLP](components/mlp.py) uses the same bounds for gate/up and down. [Attention](components/attention.py) assigns complete Ulysses head groups to each TP rank. |
 | Change when transfers run relative to Q/K/V projections and local attention | The [Ulysses component](components/ulysses_attention.py) holds the process group and coordinates both execution paths. |
-| Change which rows or heads a rank receives, or how its receive buffers are laid out | The [H3 QKV ops](ops/ulysses_qkv.py) own these contracts. For example, `ulysses_qkv_all_to_all` returns the same per-rank heads and layout whether it packs Q/K/V for one all-to-all or exchanges the three tensors separately. |
+| Change which rows or heads a rank receives, or how its receive buffers are laid out | The [H3 QKV ops](ops/ulysses_qkv.py) define and test the exchange and receive-layout contracts. |
 
 ```text
 Base H3 / H3UlyssesAttention (family component)
