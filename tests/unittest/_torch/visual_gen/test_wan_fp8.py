@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Wan FP8 paths: TRTLLM per-tensor FP8 attention on the trtllm-gen dense FP8 library (SM107),
-static-FP8 WanBlock fusions against the unfused block, and the enable_fp8_block_fusions knob (CPU).
+static-FP8 WanBlock fusions against the unfused block (with the FFN residual handoff, the
+static-FP8 cross-attention and the output-head modulation), and the enable_fp8_block_fusions knob
+and its load-time plans (CPU).
 """
 
 import json
@@ -33,6 +35,7 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
     WanBlock,
+    WanFfnResidual,
     WanTransformer3DModel,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -249,6 +252,99 @@ def test_row_parallel_linear_without_reduction_produces_partial_output():
     assert linear.produces_partial_output()
     with pytest.raises(ValueError, match="tensor-parallel"):
         linear.forward_without_bias(torch.zeros(4, 128, dtype=torch.bfloat16))
+
+
+def _bitwise(a, b):
+    assert a.dtype == b.dtype and torch.equal(a, b)
+
+
+@_FP8_GPU
+@pytest.mark.parametrize(
+    "backend,quant_attention",
+    [
+        ("VANILLA", None),
+        pytest.param(
+            "TRTLLM",
+            _TRTLLM_FP8,
+            marks=_SM107_ONLY,
+        ),
+    ],
+)
+@pytest.mark.parametrize("batch", [1, 2])
+def test_ffn_residual_handoff_is_bitwise(backend, quant_attention, batch):
+    """The FFN residual applied in the next block's AdaLN1 pass equals its own residual pass."""
+    config = _config(backend, quant_attention)
+    first, second = _block(config), _block(config)
+    assert first.plan_fp8_fusions() and second.plan_fp8_fusions()
+    x, text, temb, cos, sin = _inputs(batch, 1560)
+    with torch.no_grad():
+        reference = second(first(x, text, temb, cos, sin), text, temb, cos, sin)
+        x_pre, residual = first(x, text, temb, cos, sin, defer_ffn_residual=True)
+        assert isinstance(residual, WanFfnResidual)
+        handed_off = second(x_pre, text, temb, cos, sin, ffn_residual=residual)
+    _bitwise(handed_off, reference)
+
+
+@_FP8_GPU
+def test_ffn_residual_reaches_a_block_off_the_fp8_path():
+    """A block that does not take the static-FP8 path (per-token temb) applies the residual first."""
+    config = _config("VANILLA", None)
+    first, second = _block(config), _block(config)
+    assert first.plan_fp8_fusions() and second.plan_fp8_fusions()
+    x, text, temb, cos, sin = _inputs(1, 256)
+    temb_per_token = temb[:, None].expand(1, 256, 6, HIDDEN).contiguous()
+    assert not second.takes_fp8_block_path(temb_per_token, x.shape[0])
+    with torch.no_grad():
+        x_pre, residual = first(x, text, temb, cos, sin, defer_ffn_residual=True)
+        x_full = first(x, text, temb, cos, sin)
+        handed_off = second(x_pre, text, temb_per_token, cos, sin, ffn_residual=residual)
+        reference = second(x_full, text, temb_per_token, cos, sin)
+    _bitwise(handed_off, reference)
+
+
+@_FP8_GPU
+def test_ffn_residual_handoff_compiles():
+    config = _config("VANILLA", None)
+    first, second = _block(config), _block(config)
+    assert first.plan_fp8_fusions() and second.plan_fp8_fusions()
+    x, text, temb, cos, sin = _inputs(1, 1560)
+
+    def two_blocks(first_block, second_block, x):
+        x_pre, residual = first_block(x, text, temb, cos, sin, defer_ffn_residual=True)
+        return second_block(x_pre, text, temb, cos, sin, ffn_residual=residual)
+
+    with torch.no_grad():
+        eager = two_blocks(first, second, x)
+        compiled = two_blocks(
+            torch.compile(first, fullgraph=True), torch.compile(second, fullgraph=True), x
+        )
+    assert _cosine(compiled, eager) > 0.999
+
+
+@_FP8_GPU
+def test_unplanned_block_does_not_defer():
+    block = _block(_config("VANILLA", None, fp8=False))
+    assert not block.plan_fp8_fusions()
+    x, text, temb, cos, sin = _inputs(1, 256)
+    with torch.no_grad():
+        out = block(x, text, temb, cos, sin, defer_ffn_residual=True)
+    assert isinstance(out, torch.Tensor)
+
+
+@_FP8_GPU
+@pytest.mark.parametrize("batch", [1, 2])
+def test_output_modulation_kernel_matches_eager(batch):
+    """The output head's one-pass modulation on the model's chunked [B, 1, D] scale and shift."""
+    model = WanTransformer3DModel.__new__(WanTransformer3DModel)
+    g = torch.Generator(device="cuda").manual_seed(5)
+    x = torch.randn(batch, 3120, HIDDEN, device="cuda", generator=g).bfloat16()
+    table = torch.randn(1, 2, HIDDEN, device="cuda", generator=g) * 0.1
+    temb = (torch.randn(batch, HIDDEN, device="cuda", generator=g) * 0.1).bfloat16()
+    shift, scale = (table + temb.unsqueeze(1)).chunk(2, dim=1)
+    assert not scale.reshape(batch, -1).is_contiguous() or batch == 1
+    assert model._modulation_kernel_applies(x, scale, shift, torch.bfloat16)
+    fused = model._modulate_output(x, scale, shift, torch.bfloat16)
+    _bitwise(fused, (x * (1 + scale) + shift).to(torch.bfloat16))
 
 
 # ---------------------------------------------------------------------------
@@ -648,11 +744,14 @@ def test_block_fusions_default_off_and_override_reaches_the_model_config(
     """enable_fp8_block_fusions defaults off and an override reaches the model config."""
     default_args = VisualGenArgs(model=wan_checkpoint)
     loader = PipelineLoader(default_args, device="cpu")
-    assert loader._resolve_pipeline_config(wan_checkpoint) == {"enable_fp8_block_fusions": False}
+    assert loader._resolve_pipeline_config(wan_checkpoint) == {
+        "enable_fp8_block_fusions": False,
+        "fp8_cross_attention_q_amax": "",
+    }
 
     args = VisualGenArgs(model=wan_checkpoint, pipeline_config={"enable_fp8_block_fusions": True})
     resolved = PipelineLoader(args, device="cpu")._resolve_pipeline_config(wan_checkpoint)
-    assert resolved == {"enable_fp8_block_fusions": True}
+    assert resolved == {"enable_fp8_block_fusions": True, "fp8_cross_attention_q_amax": ""}
 
     config = DiffusionPipelineConfig.from_pretrained(
         wan_checkpoint, args=args, pipeline_config=resolved, device="cpu"
@@ -670,14 +769,8 @@ def test_block_fusions_key_takes_a_bool_only(wan_checkpoint: str) -> None:
         PipelineLoader(args, device="cpu")._resolve_pipeline_config(wan_checkpoint)
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("enabled", [False, True])
-def test_post_load_weights_plans_block_fusions_only_when_enabled(monkeypatch, enabled) -> None:
-    """post_load_weights plans block fusions only when enabled."""
-    planned = []
-    monkeypatch.setattr(
-        WanBlock, "plan_fp8_fusions", lambda self, log=False: planned.append(self) or False
-    )
+def _tiny_model(enabled: bool, num_layers: int = 2) -> WanTransformer3DModel:
+    """A small Wan transformer on CPU with the block-fusion key set."""
     heads, head_dim = 2, 128
     config = DiffusionModelConfig(
         pretrained_config=SimpleNamespace(
@@ -688,7 +781,7 @@ def test_post_load_weights_plans_block_fusions_only_when_enabled(monkeypatch, en
             freq_dim=256,
             in_channels=16,
             num_attention_heads=heads,
-            num_layers=2,
+            num_layers=num_layers,
             out_channels=16,
             patch_size=[1, 2, 2],
             qk_norm="rms_norm_across_heads",
@@ -701,6 +794,120 @@ def test_post_load_weights_plans_block_fusions_only_when_enabled(monkeypatch, en
         skip_create_weights_in_init=False,
     )
     config.extra_attrs["enable_fp8_block_fusions"] = enabled
-    model = WanTransformer3DModel(model_config=config)
+    return WanTransformer3DModel(model_config=config)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+def test_post_load_weights_plans_block_fusions_only_when_enabled(monkeypatch, enabled) -> None:
+    """post_load_weights plans block fusions only when enabled."""
+    planned = []
+    monkeypatch.setattr(
+        WanBlock,
+        "plan_fp8_fusions",
+        lambda self, log=False, cross_attention_q_amax=None: planned.append(self) or False,
+    )
+    model = _tiny_model(enabled)
     model.post_load_weights()
     assert len(planned) == (2 if enabled else 0)
+
+
+def _plan(monkeypatch, model, planned_blocks):
+    def plan(self, log=False, cross_attention_q_amax=None):
+        self._fp8_block = self in planned_blocks
+        return self._fp8_block
+
+    monkeypatch.setattr(WanBlock, "plan_fp8_fusions", plan)
+    model.post_load_weights()
+
+
+@pytest.mark.cpu_only
+def test_ffn_residual_handoff_between_consecutive_planned_blocks(monkeypatch) -> None:
+    model = _tiny_model(True, num_layers=4)
+    blocks = list(model.blocks)
+    _plan(monkeypatch, model, {blocks[0], blocks[1], blocks[3]})
+
+    hidden = model.config.hidden_size
+    per_batch_temb = torch.zeros(1, 6, hidden)
+    per_token_temb = torch.zeros(1, 8, 6, hidden)
+    assert model._ffn_residual_handoff(per_batch_temb, 1) == [True, False, False, False]
+    assert model._ffn_residual_handoff(per_token_temb, 1) == [False] * 4
+    # A temb with another batch than x keeps every block on its own residual pass.
+    assert model._ffn_residual_handoff(per_batch_temb, 2) == [False] * 4
+
+
+@pytest.mark.cpu_only
+def test_ffn_residual_handoff_follows_compiled_blocks_only(monkeypatch) -> None:
+    model = _tiny_model(True)
+    _plan(monkeypatch, model, set(model.blocks))
+    temb = torch.zeros(1, 6, model.config.hidden_size)
+
+    class Compiled(torch.nn.Module):
+        def __init__(self, block):
+            super().__init__()
+            self._orig_mod = block
+
+    class Wrapper(torch.nn.Module):
+        pass
+
+    blocks = list(model.blocks)
+    model.blocks = torch.nn.ModuleList([Compiled(b) for b in blocks])
+    assert model._ffn_residual_handoff(temb, 1) == [True, False]
+    model.blocks = torch.nn.ModuleList([Wrapper(), Compiled(blocks[1])])
+    assert model._ffn_residual_handoff(temb, 1) == [False, False]
+
+
+@pytest.mark.cpu_only
+def test_output_modulation_kernel_rule() -> None:
+    """The output head takes the one-pass kernel for CUDA bf16 x with per-batch fp32 rows."""
+    model = _tiny_model(False)
+    hidden = model.config.hidden_size
+    x = torch.zeros(2, 8, hidden, dtype=torch.bfloat16)
+    per_batch = torch.zeros(2, 1, hidden)
+    # CPU tensors and per-token modulation keep the eager ops.
+    assert not model._modulation_kernel_applies(x, per_batch, per_batch, torch.bfloat16)
+    if torch.cuda.is_available():
+        xc, pc = x.cuda(), per_batch.cuda()
+        assert model._modulation_kernel_applies(xc, pc, pc, torch.bfloat16)
+        per_token = torch.zeros(2, 8, hidden, device="cuda")
+        assert not model._modulation_kernel_applies(xc, per_token, per_token, torch.bfloat16)
+        assert not model._modulation_kernel_applies(xc, pc.bfloat16(), pc, torch.bfloat16)
+
+
+@pytest.mark.cpu_only
+def test_rms_norm_mode_matches_the_wan_enum() -> None:
+    """Attention's RMSNorm row-kernel mode is the RMS_NORM member of ResidualNormMode."""
+    from tensorrt_llm._torch.visual_gen.attention import attention
+    from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import ResidualNormMode
+
+    assert attention.RMS_NORM_MODE == ResidualNormMode.RMS_NORM
+
+
+@pytest.mark.cpu_only
+def test_cross_attention_q_amax_file(tmp_path, monkeypatch) -> None:
+    """The calibrated Q maxima (times their margin) reach each planned block by module name; a
+    missing layer and an empty path leave the bound-derived scale."""
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
+        load_cross_attention_q_amax,
+    )
+
+    assert load_cross_attention_q_amax("") == {}
+    path = tmp_path / "q_amax.json"
+    path.write_text(json.dumps({"margin": 1.5, "amax": {"blocks.0.attn2": 4.0}}))
+    assert load_cross_attention_q_amax(str(path)) == {"blocks.0.attn2": 6.0}
+
+    seen = {}
+
+    def plan(self, log=False, cross_attention_q_amax=None):
+        seen[self.attn2.module_name] = cross_attention_q_amax
+        return False
+
+    monkeypatch.setattr(WanBlock, "plan_fp8_fusions", plan)
+    model = _tiny_model(True)
+    model.model_config.extra_attrs["fp8_cross_attention_q_amax"] = str(path)
+    model.post_load_weights()
+    assert seen == {"blocks.0.attn2": 6.0, "blocks.1.attn2": None}
+
+    path.write_text(json.dumps({"margin": 0.5, "amax": {}}))
+    with pytest.raises(ValueError, match="margin"):
+        load_cross_attention_q_amax(str(path))
