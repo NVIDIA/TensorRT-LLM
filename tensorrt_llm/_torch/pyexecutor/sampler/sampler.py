@@ -14,13 +14,13 @@
 """Sampler orchestration: the entry points the executor drives each step.
 
 Holds the :class:`Sampler` ABC and its ``SampleState`` types, the trivial
-early-stop samplers (:class:`EarlyStopSampler` for non-generation models,
-:class:`EarlyStopWithMMResult` for the multimodal-encoder-only engine), and
-:class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no
-sampling logic of its own beyond batching and orchestration: each feature
-(beam search, penalties, token bans, top-p decay, finish reasons, log-probs,
-seeds) lives in its own module and is held here as a handler, driven through
-``setup_sampler_step`` / ``sample_async`` / ``update_requests``.
+early-stop sampler (:class:`EarlyStopWithMMResult` for the
+multimodal-encoder-only engine), and :class:`TorchSampler` -- the PyTorch
+sampling path. ``TorchSampler`` owns no sampling logic of its own beyond
+batching and orchestration: each feature (beam search, penalties, token bans,
+top-p decay, finish reasons, log-probs, seeds) lives in its own module and is
+held here as a handler, driven through ``setup_sampler_step`` /
+``sample_async`` / ``update_requests``.
 """
 
 import sys
@@ -317,55 +317,6 @@ def _validate_single_forward_request(request: LlmRequest, max_num_tokens: Option
                 max_context_length=max_num_tokens, num_prompt_tokens=request.prompt_len
             )
         )
-
-
-class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensors]]):
-    """
-    Use for skipping decoding step for non generation model,
-    such as encoder-only model (e.g., BERT) or reward models that only need context phase.
-
-    Args:
-        max_num_tokens: The engine's token budget. A request runs whole in one
-            forward, so a prompt longer than this is rejected; None skips the check.
-    """
-
-    SampleState: TypeAlias = SampleState[SampleStateTensors, SampleStateTensors]
-
-    def __init__(self, max_num_tokens: Optional[int] = None) -> None:
-        self.max_num_tokens = max_num_tokens
-
-    @override
-    def validate_request(self, request: LlmRequest) -> None:
-        _validate_single_forward_request(request, self.max_num_tokens)
-
-    @override
-    def sample_async(
-        self,
-        scheduled_requests: ScheduledRequests,
-        model_outputs: dict[str, Any],
-        num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> SampleState:
-        host = SampleStateTensors(new_tokens=torch.empty(0))
-        assert not scheduled_requests.generation_requests
-        return self.SampleState(requests=scheduled_requests.context_requests, host=host)
-
-    @override
-    def update_requests(
-        self,
-        state: SampleState,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
-        assert isinstance(state, SampleState)
-        requests = state.requests
-        for idx, request in enumerate(requests):
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            # NOTE: This is a hack: set finish reason manually and set the beam 0
-            request.set_finished_reason(FinishReason.LENGTH, 0)
-
-    @override
-    def is_generation_model(self) -> bool:
-        return False
 
 
 @dataclass(kw_only=True)
@@ -2832,6 +2783,32 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return_log_probs = self._log_probs._return_log_probs(sampling_requests)
         if return_log_probs:
             self._log_probs._prepare_log_probs(sampling_requests)
+        # Raw logprobs come from the model's logits, but the embedding bias,
+        # penalties and token bans below rewrite logits_cuda in place. Keep a
+        # copy of the rows of the requests that ask for raw logprobs and use one
+        # of them, and put those rows back before the logprobs are read.
+        # Multi-beam requests are skipped, as in the raw-logit extraction of
+        # _sample_batched_by_strategy: their logprobs come from the beam history.
+        raw_rows_index_cuda: Optional[torch.Tensor] = None
+        raw_rows_cuda: Optional[torch.Tensor] = None
+        if return_log_probs:
+            raw_rows = [
+                row
+                for request, offset, num_tokens in zip(
+                    sampling_requests,
+                    sampling_requests_metadata.req_offsets.tolist(),
+                    sampling_requests_metadata.req_num_generated_tokens.tolist(),
+                )
+                if self._slot_params.need_raw_logprobs[cast(int, request.py_seq_slot)]
+                and not (self._use_beam_search and request.py_beam_width != 1)
+                and self._request_rewrites_logits(request)
+                for row in range(offset, offset + num_tokens)
+            ]
+            if raw_rows:
+                raw_rows_index_cuda = torch.tensor(
+                    raw_rows, dtype=torch.int64, pin_memory=prefer_pinned()
+                ).to(logits_cuda.device, non_blocking=True)
+                raw_rows_cuda = logits_cuda.index_select(0, raw_rows_index_cuda)
 
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in sampling_requests],
@@ -2983,6 +2960,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         if return_log_probs:
+            if raw_rows_cuda is not None:
+                logits_cuda.index_copy_(0, raw_rows_index_cuda, raw_rows_cuda)
             self._log_probs._process_logprobs(
                 batched_sampling_result,
                 logits_cuda=logits_cuda,

@@ -19,9 +19,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
+from torch.distributed.constants import default_pg_timeout
 
 from tensorrt_llm._torch.distributed.initialization import init_torch_distributed
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.visual_gen.batching import (
+    BatchInfo,
+    DynamicBatchScheduler,
+    split_batch_output,
+)
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
@@ -373,6 +379,7 @@ class DiffusionRequest:
     # Set only while the request is in flight on the rank0 -> N-rank hop; see
     # ``DiffusionExecutor._broadcast_request``.
     ref_sizes: Optional[List[int]] = field(default=None, repr=False)
+    batch_info: Optional[BatchInfo] = None
 
     def refs_to_shm(self) -> None:
         """Move reference payloads into shared memory, in place (producer side).
@@ -603,10 +610,27 @@ class DiffusionExecutor:
 
     def serve_forever(self):
         """Main execution loop."""
+        config = self.visual_gen_args.batching_config
+        scheduler = DynamicBatchScheduler(
+            max_batch_size=config.max_batch_size,
+            max_queue_delay_ms=config.max_queue_delay_ms,
+        )
+        batching_enabled = (
+            self.pipeline.supports_dynamic_batching and self.visual_gen_args.cache_config is None
+        )
+        if config.max_batch_size > 1 and not batching_enabled:
+            logger.warning(
+                "Dynamic batching is inactive: the pipeline must support request batching "
+                "and cache_config must be unset. Requests will run independently."
+            )
         while True:
             req = None
             if self.rank == 0:
-                req = self.requests_ipc.get()
+                req = scheduler.next_request(
+                    self.requests_ipc.get,
+                    self.requests_ipc.poll,
+                    enabled=batching_enabled,
+                )
                 if req is not None:
                     req.refs_from_shm()
                 logger.info(f"Worker {self.device_id}: Request available")
@@ -624,6 +648,11 @@ class DiffusionExecutor:
                 break
 
             logger.info(f"Worker {self.device_id}: Processing request {req.request_id}")
+            if req.batch_info is not None:
+                logger.info(
+                    f"Dynamic batch: requests={req.batch_info.request_ids}, "
+                    f"images={sum(req.batch_info.sample_counts)}"
+                )
             self.process_request(req)
 
     def _merge_defaults(self, req: DiffusionRequest):
@@ -662,7 +691,9 @@ class DiffusionExecutor:
                     params.extra_params[key] = spec.default
 
     def process_request(self, req: DiffusionRequest):
-        """Process a single request."""
+        """Run one pipeline call and respond to every original request."""
+        request_ids = req.batch_info.request_ids if req.batch_info else (req.request_id,)
+        pending_request_ids = deque(request_ids)
         log_cuda_memory = _cuda_memory_logging_enabled()
         if log_cuda_memory:
             self._reset_cuda_peak_memory_stats()
@@ -692,29 +723,41 @@ class DiffusionExecutor:
             generation = time.perf_counter() - generation_start  # seconds
 
             if self.rank == 0:
+                outputs = split_batch_output(output, req.batch_info) if req.batch_info else [output]
                 # CUDA IPC handles are invalid within the producing process, so
                 # a same-process client takes the media via in-process handoff.
-                output.to_handle(local=self.in_client_process)
-                self.response_queue.put(
-                    DiffusionResponse(
-                        request_id=req.request_id,
-                        output=output,
-                        generation=generation,
-                    )
-                )
+                for request_id, request_output in zip(request_ids, outputs, strict=True):
+                    try:
+                        request_output.to_handle(local=self.in_client_process)
+                    except Exception as e:
+                        logger.error(f"Worker {self.device_id}: Output handoff failed: {e}")
+                        response = DiffusionResponse(
+                            request_id=request_id,
+                            error_msg=str(e),
+                            error_type=self.pipeline.classify_request_failure(e),
+                        )
+                    else:
+                        response = DiffusionResponse(
+                            request_id=request_id,
+                            output=request_output,
+                            generation=generation,
+                        )
+                    self.response_queue.put(response)
+                    pending_request_ids.popleft()
         except Exception as e:
             if log_cuda_memory:
                 self._log_cuda_peak_memory(req.request_id)
             logger.error(f"Worker {self.device_id}: Error: {e}")
             logger.error(traceback.format_exc())
             if self.rank == 0:
-                self.response_queue.put(
-                    DiffusionResponse(
-                        request_id=req.request_id,
-                        error_msg=str(e),
-                        error_type=self.pipeline.classify_request_failure(e),
+                for request_id in pending_request_ids:
+                    self.response_queue.put(
+                        DiffusionResponse(
+                            request_id=request_id,
+                            error_msg=str(e),
+                            error_type=self.pipeline.classify_request_failure(e),
+                        )
                     )
-                )
 
     def _reset_cuda_peak_memory_stats(self) -> None:
         """Reset CUDA peak memory stats for this worker if CUDA is available."""
@@ -761,12 +804,16 @@ def run_diffusion_worker(
     local_rank: Optional[int] = None,
     in_client_process: bool = False,
     parent_pid: Optional[int] = None,
+    use_client_store: bool = False,
 ):
     """Entry point for worker process.
 
     ``in_client_process``: True only when this worker runs inside the client
     process. Declared by the launch site — never derive it from the
     environment here, the env writes below make every worker look external.
+
+    ``use_client_store``: Connect to a coordinator-owned TCPStore at
+    ``master_addr:master_port`` that stays alive until this worker exits.
     """
     # This native watchdog starts before CUDA, distributed, or model
     # initialization and does not depend on the Python GIL. It follows the
@@ -816,9 +863,15 @@ def run_diffusion_worker(
                     f"performance."
                 )
 
+        store = (
+            dist.TCPStore(master_addr, master_port, is_master=False, timeout=default_pg_timeout)
+            if use_client_store
+            else None
+        )
         init_torch_distributed(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
-            init_method="env://",
+            store=store,
+            init_method=None if store is not None else "env://",
             world_size=world_size,
             rank=rank,
             device_id=torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else None,
@@ -887,96 +940,107 @@ class DiffusionRemoteClient:
     ):
         self.args = args
         self.n_workers = args.parallel_config.n_workers
+        self._rendezvous_store: dist.TCPStore | None = None
 
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
 
-        if ext is None:
-            # Single-node: coordinator spawns all workers locally
-            # Setup distributed env
-            self.master_addr = "127.0.0.1"
-            self.master_port = find_free_port()
+        try:
+            if ext is None:
+                # Single-node: coordinator spawns all workers locally
+                # Setup distributed env
+                self.master_addr = "127.0.0.1"
+                # Bind before drawing ZMQ ports so they cannot reuse the rendezvous port.
+                self._rendezvous_store = dist.TCPStore(
+                    self.master_addr,
+                    0,
+                    is_master=True,
+                    wait_for_workers=False,
+                    timeout=default_pg_timeout,
+                )
+                self.master_port = self._rendezvous_store.port
 
-            # Setup IPC addresses
-            self.host_ip = get_ip_address()
-            req_port, resp_port = find_free_port(), find_free_port()
+                # Setup IPC addresses
+                self.host_ip = get_ip_address()
+                req_port, resp_port = find_free_port(), find_free_port()
 
-            self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
-            self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
-            self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
-            self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
+                self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
+                self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+                self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
+                self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
 
-        else:
-            # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
-            rank, local_rank, world_size, master_addr, master_port = ext
-            req_port = find_free_port()
-            resp_port = find_free_port()
-            self.master_addr = master_addr
-            self.master_port = master_port
-            self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
-            self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
-            self.req_addr_connect = f"tcp://{master_addr}:{req_port}"
-            self.resp_addr_connect = f"tcp://{master_addr}:{resp_port}"
+            else:
+                # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
+                rank, local_rank, world_size, master_addr, master_port = ext
+                req_port = find_free_port()
+                resp_port = find_free_port()
+                self.master_addr = master_addr
+                self.master_port = master_port
+                self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
+                self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+                self.req_addr_connect = f"tcp://{master_addr}:{req_port}"
+                self.resp_addr_connect = f"tcp://{master_addr}:{resp_port}"
 
-        # Generate shared HMAC keys for IPC authentication
-        self.req_hmac_key = os.urandom(32)
-        self.resp_hmac_key = os.urandom(32)
+            # Generate shared HMAC keys for IPC authentication
+            self.req_hmac_key = os.urandom(32)
+            self.resp_hmac_key = os.urandom(32)
 
-        # IPC setup
-        self.requests_ipc = None
-        self.responses_ipc = None
-        self.pending_requests = queue.Queue()
-        self.completed_responses: Dict[int, DiffusionResponse] = {}
-        # Request ids the caller has given up on (e.g., aresult timed out).
-        # _store_response drops late-arriving responses for these ids so a
-        # full PipelineOutput tensor does not pin in completed_responses for
-        # the process lifetime.
-        self._abandoned_request_ids: Set[int] = set()
-        # Iteration-stats tracker — populated on lifecycle events (enqueue,
-        # request started, response received) and drained by
-        # ``get_iteration_stats`` for the /metrics HTTP endpoint.  Mirrors
-        # the LLM iteration-stats producer but with a visual-gen-shaped
-        # payload.
-        self._iter_stats = _IterationStatsTracker()
+            # IPC setup
+            self.requests_ipc = None
+            self.responses_ipc = None
+            self.pending_requests = queue.Queue()
+            self.completed_responses: Dict[int, DiffusionResponse] = {}
+            # Request ids the caller has given up on (e.g., aresult timed out).
+            # _store_response drops late-arriving responses for these ids so a
+            # full PipelineOutput tensor does not pin in completed_responses for
+            # the process lifetime.
+            self._abandoned_request_ids: Set[int] = set()
+            # Iteration-stats tracker — populated on lifecycle events (enqueue,
+            # request started, response received) and drained by
+            # ``get_iteration_stats`` for the /metrics HTTP endpoint.  Mirrors
+            # the LLM iteration-stats producer but with a visual-gen-shaped
+            # payload.
+            self._iter_stats = _IterationStatsTracker()
 
-        # We'll create asyncio primitives in the background thread's event loop
-        self._event_loop = None
-        self.response_event = None
-        self.lock = None
-        self.shutdown_event = _Event()
-        self.event_loop_ready = _Event()
-        self._shutdown_lock = threading.Lock()
-        self._shutdown_started = False
-        self._shutdown_complete = _Event()
-        self._shutdown_error: Optional[BaseException] = None
-        self._shutdown_thread: Optional[threading.Thread] = None
-        self.worker_processes: List[mp.Process] = []
-        self._worker_spawner: Optional[_WorkerProcessSpawner] = None
-        self._ext_worker_thread: Optional[threading.Thread] = None
-        self._monitor_worker_liveness = False
-        self._worker_failure: Optional[str] = None
-        self._request_to_send: Optional[DiffusionRequest] = None
+            # We'll create asyncio primitives in the background thread's event loop
+            self._event_loop = None
+            self.response_event = None
+            self.lock = None
+            self.shutdown_event = _Event()
+            self.event_loop_ready = _Event()
+            self._shutdown_lock = threading.Lock()
+            self._shutdown_started = False
+            self._shutdown_complete = _Event()
+            self._shutdown_error: Optional[BaseException] = None
+            self._shutdown_thread: Optional[threading.Thread] = None
+            self.worker_processes: List[mp.Process] = []
+            self._worker_spawner: Optional[_WorkerProcessSpawner] = None
+            self._ext_worker_thread: Optional[threading.Thread] = None
+            self._monitor_worker_liveness = False
+            self._worker_failure: Optional[str] = None
+            self._request_to_send: Optional[DiffusionRequest] = None
 
-        # Start background thread (it will create its own event loop)
-        self.background_thread = _Thread(target=self._serve_forever_thread, daemon=True)
-        self.background_thread.start()
+            self.background_thread = _Thread(target=self._serve_forever_thread, daemon=True)
 
-        # Wait for the background thread to initialize the event loop
-        self.event_loop_ready.wait()
+            # Pipeline metadata — populated by _wait_ready from the READY signal.
+            self.default_generation_params: Dict = {}
+            self.extra_param_specs: Dict = {}
+            self.supports_image_edit: bool = False
+            self.ref_slot_specs: Dict = {}
 
-        # Pipeline metadata — populated by _wait_ready from the READY signal.
-        self.default_generation_params: Dict = {}
-        self.extra_param_specs: Dict = {}
-        self.supports_image_edit: bool = False
-        self.ref_slot_specs: Dict = {}
-
-        # --- Launch workers ---
-        # multiprocessing installs its own timeout-less child joins at import
-        # time. atexit is LIFO, so this callback must be registered afterward
-        # and before startup can block or fail.
-        _register_atexit(DiffusionRemoteClient._atexit_shutdown, weakref.ref(self))
+            # --- Launch workers ---
+            # multiprocessing installs its own timeout-less child joins at import
+            # time. atexit is LIFO, so this callback must be registered afterward
+            # and before startup can block or fail.
+            _register_atexit(DiffusionRemoteClient._atexit_shutdown, weakref.ref(self))
+        except BaseException:
+            self._rendezvous_store = None
+            raise
 
         try:
+            self.background_thread.start()
+            self.event_loop_ready.wait()
+
             if ext is None:
                 logger.info(f"DiffusionClient: Launching {self.n_workers} workers")
                 ctx = _get_mp_context("spawn")
@@ -997,6 +1061,7 @@ class DiffusionRemoteClient:
                             "log_level": logger.level,
                             "local_rank": rank,
                             "parent_pid": parent_pid,
+                            "use_client_store": True,
                         },
                     )
                     self.worker_processes.append(p)
@@ -1195,27 +1260,29 @@ class DiffusionRemoteClient:
         except RuntimeError as e:
             logger.warning(f"DiffusionClient: Failed to release request {request.request_id}: {e}")
 
-    def _process_requests(self):
-        """Process pending requests."""
+    def _process_requests(self, max_requests: int = 1):
+        """Send a bounded burst before polling responses so queued peers can batch."""
         req = None
         try:
-            if self._request_to_send is None:
-                req = self.pending_requests.get(timeout=POLL_TIMEOUT)
-                if req is None:
-                    try:
-                        self._send_shutdown()
-                    finally:
-                        self.shutdown_event.set()
-                    return
-                self._request_to_send = req
+            for index in range(max_requests):
+                if self._request_to_send is None:
+                    req = self.pending_requests.get(timeout=POLL_TIMEOUT if index == 0 else 0)
+                    if req is None:
+                        try:
+                            self._send_shutdown()
+                        finally:
+                            self.shutdown_event.set()
+                        return
+                    self._request_to_send = req
 
-            req = self._request_to_send
-            logger.info(f"DiffusionClient: Sending request {req.request_id}")
-            self.requests_ipc.put_nowait(req)
-            self._request_to_send = None
-            # Once the request has been handed to the workers it becomes the
-            # in-flight ("active") request from the client's perspective.
-            self._iter_stats.record_request_started(req.request_id, self.pending_requests.qsize())
+                req = self._request_to_send
+                logger.info(f"DiffusionClient: Sending request {req.request_id}")
+                self.requests_ipc.put_nowait(req)
+                self._request_to_send = None
+                # The client tracks requests handed to workers as in flight.
+                self._iter_stats.record_request_started(
+                    req.request_id, self.pending_requests.qsize()
+                )
         except queue.Empty:
             pass
         except zmq.Again:
@@ -1230,10 +1297,12 @@ class DiffusionRemoteClient:
             logger.error(f"DiffusionClient: Error sending request: {e}")
             logger.error(traceback.format_exc())
 
-    def _process_responses(self):
-        """Poll and process responses."""
+    def _process_responses(self, max_responses: int = 1):
+        """Poll once, then drain a bounded burst of already-ready responses."""
         try:
-            if self.responses_ipc.poll(timeout=POLL_TIMEOUT):
+            for index in range(max_responses):
+                if not self.responses_ipc.poll(timeout=POLL_TIMEOUT if index == 0 else 0):
+                    break
                 response = self.responses_ipc.get()
                 if isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
@@ -1346,8 +1415,8 @@ class DiffusionRemoteClient:
             if worker_failure is not None:
                 self._abort_worker_group(worker_failure)
             if self._worker_failure is None:
-                self._process_requests()
-                self._process_responses()
+                self._process_requests(max_requests=self.args.batching_config.max_batch_size)
+                self._process_responses(max_responses=self.args.batching_config.max_batch_size)
             await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
 
         self._cleanup_ipc()
@@ -1485,11 +1554,14 @@ class DiffusionRemoteClient:
 
             self.pending_requests.put(None)
 
-            self.background_thread.join(timeout=THREAD_TIMEOUT)
+            if not self.background_thread.is_alive():
+                self.event_loop_ready.wait(timeout=THREAD_TIMEOUT)
             if self.background_thread.is_alive():
-                logger.warning("DiffusionClient: Force stopping background thread")
-                self.shutdown_event.set()
-                self.background_thread.join(timeout=1.0)
+                self.background_thread.join(timeout=THREAD_TIMEOUT)
+                if self.background_thread.is_alive():
+                    logger.warning("DiffusionClient: Force stopping background thread")
+                    self.shutdown_event.set()
+                    self.background_thread.join(timeout=1.0)
         except BaseException as e:
             shutdown_error = e
             logger.error(f"DiffusionClient: Error stopping coordinator thread: {e}")
@@ -1518,6 +1590,7 @@ class DiffusionRemoteClient:
                 shutdown_error = e
             logger.error(f"DiffusionClient: Error stopping workers: {e}")
         finally:
+            self._rendezvous_store = None
             self._shutdown_error = shutdown_error
             self._shutdown_complete.set()
 

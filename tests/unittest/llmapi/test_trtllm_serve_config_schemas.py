@@ -295,6 +295,25 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": 7}}}, True),
         (generator.DISAGG_SCHEMA, {"context_servers": {"watermark_config": {"key": -1}}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_batch_size": 4, "max_queue_delay_ms": 5}},
+            True,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_size": 0}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_size": True}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_queue_delay_ms": -1}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_queue_delay_ms": 3_000_000_000}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"batching_config": {"max_queue_delay_ms": 2_147_483_647}},
+            True,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"batching_config": {"max_batch_szie": 4}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 1}}, True),
@@ -588,6 +607,90 @@ def test_branch_snapshot_field_types(
     schemas: dict[str, dict], filename: str, section: str, value: bool | str, valid: bool
 ) -> None:
     config = {"kv_cache_config": {section: {"enable_branch_snapshot": value}}}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        (None, True),
+        (0, True),
+        (-1, True),
+        (4096, True),
+        (-2, False),
+        ("4096", False),
+        (1.5, False),
+    ],
+)
+def test_dspark_context_recompute_tail_type(
+    schemas: dict[str, dict], filename: str, value: object, valid: bool
+) -> None:
+    config = {
+        "speculative_config": {
+            "decoding_type": "DSpark",
+            "max_draft_len": 7,
+            "speculative_model": "/path/to/drafter",
+            "context_recompute_tail": value,
+        }
+    }
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    "decoding",
+    [
+        {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
+        {"decoding_type": "Eagle3", "max_draft_len": 3, "speculative_model": "/path/to/eagle3"},
+        {"decoding_type": "DSpark", "max_draft_len": 7, "speculative_model": "/path/to/drafter"},
+    ],
+    ids=["MTP", "Eagle3", "DSpark"],
+)
+@pytest.mark.parametrize(
+    ("field", "value", "valid"),
+    [
+        ("rejection_sample_method", "standard", True),
+        ("rejection_sample_method", "block", True),
+        ("rejection_sample_method", "blocks", False),
+        ("rejection_sample_method", "Block", False),
+    ],
+)
+def test_rejection_sampling_option_values(
+    schemas: dict[str, dict],
+    filename: str,
+    decoding: dict,
+    field: str,
+    value: object,
+    valid: bool,
+) -> None:
+    config = {"speculative_config": {**decoding, "use_rejection_sampling": True, field: value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("yes", False)])
+def test_dspark_ancestral_draft_sampling_values(
+    schemas: dict[str, dict], filename: str, value: bool | str, valid: bool
+) -> None:
+    config = {
+        "speculative_config": {
+            "decoding_type": "DSpark",
+            "max_draft_len": 7,
+            "speculative_model": "/path/to/drafter",
+            "use_rejection_sampling": True,
+            "use_ancestral_draft_sampling": value,
+        }
+    }
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
 
