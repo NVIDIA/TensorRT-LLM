@@ -325,13 +325,14 @@
    "target_path": "kernels/dspark_markov_greedy.py",
    "reused": "byte-identical to the family's file, which the target now imports"
   },
-  "kernels/k3r_spec/dspark_mla_rope_ull.py": {
+  "kernels/k3r_spec/dspark_mla_rope.py": {
    "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/dspark_mla_rope.py@6904cd9672",
    "source_sha256": "628519fc24f77a47993f537402b549f08078bb69d40e02b9ea386b77a93c01f2",
    "import_edits": [],
    "local_edits": [],
-   "sha256": "628519fc24f77a47993f537402b549f08078bb69d40e02b9ea386b77a93c01f2",
-   "target_path": "kernels/dspark_mla_rope.py"
+   "sha256": "906cf58512930fa8dde6475f83e07c2770c1568bfb299dcef9ebb6c38b9fc1a0",
+   "target_path": "kernels/dspark_mla_rope.py",
+   "reused": "same executable definitions and imports as the family file, which the target now imports"
   },
   "kernels/k3r_spec/dspark_ull2.py": {
    "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/dspark_ull2.py@6904cd9672",

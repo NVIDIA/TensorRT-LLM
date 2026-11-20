@@ -240,7 +240,7 @@ from ..ops.gemm.k3_mxfp8_gemm_ull import k3_mxfp8_gemm as k3_mxfp8_gemm_op
 from ..ops.norm.attn_res_fwd_ull import attn_res_fwd
 from ..ops.norm.k3_attn_res_norm_ull import k3_attn_res_norm
 from ..ops.spec.k3_draft_embed_ull import k3_draft_embed
-from ..ops.spec.k3_dspark_mla_ctx_norm_rope_ull import k3_dspark_mla_ctx_norm_rope
+from ..ops.spec.k3_dspark_mla_ctx_norm_rope import k3_dspark_mla_ctx_norm_rope
 
 
 def _resolve_kimi_situ_betas(cfg: Any) -> tuple[float, float]:
