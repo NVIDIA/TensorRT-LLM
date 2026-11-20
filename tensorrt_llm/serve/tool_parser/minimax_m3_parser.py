@@ -216,6 +216,19 @@ class MiniMaxM3ToolParser(BaseToolParser):
         self._buffer = ""
         return result
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Parse whatever the buffer still holds when the stream ends.
+
+        That is text held back because it ends like the start of the
+        opener (an answer ending in ``]``), or a tool-call block the stream
+        stopped before its closer. It is read as :meth:`detect_and_parse`
+        reads a whole response, so both paths return the same content.
+        """
+        text, self._buffer = self._buffer, ""
+        if not text:
+            return StreamingParseResult()
+        return self.detect_and_parse(text, tools)
+
     def supports_structural_tag(self) -> bool:
         """Structural-tag-driven decoding is not implemented for M3 yet."""
         return False
