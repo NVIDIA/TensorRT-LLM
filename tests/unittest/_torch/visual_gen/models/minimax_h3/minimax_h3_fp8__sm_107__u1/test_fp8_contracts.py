@@ -4,11 +4,15 @@
 
 import ast
 import copy
+import fnmatch
+import logging
 import os
+import re
 import sys
 import unittest
+from functools import lru_cache
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 from typing import Callable, Optional, Type
 from unittest.mock import patch
 
@@ -26,14 +30,23 @@ def _routing_namespace():
     tree = ast.parse((MODEL / "scenarios.py").read_text())
     names = {
         "NoScenario",
+        "_transformer_quant_config",
         "_transformer_quant_algo",
         "_transformer_layer_quant",
         "_ulysses_size",
         "route_fp8_sm_107_u1",
+        "route_nvfp4_sm_107_u1_u4",
         "resolve_scenario",
     }
     body = [
-        n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names
+        n
+        for n in tree.body
+        if (isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names)
+        or (
+            isinstance(n, ast.AnnAssign)
+            and isinstance(n.target, ast.Name)
+            and n.target.id == "ROUTES"
+        )
     ]
     namespace = {
         "__package__": "_h3_fp8_cpu_contracts",
@@ -41,7 +54,8 @@ def _routing_namespace():
         "Type": Type,
         "Callable": Callable,
         "os": os,
-        "QuantAlgo": SimpleNamespace(FP8="FP8"),
+        "QuantAlgo": SimpleNamespace(FP8="FP8", NVFP4="NVFP4"),
+        "logger": logging.getLogger(__name__),
         "_MODES": ("off", "auto", "require"),
         "_device_capability": lambda: (10, 7),
         "_device_multiprocessors": lambda: 212,
@@ -53,15 +67,66 @@ def _routing_namespace():
     return namespace
 
 
+@lru_cache(maxsize=1)
+def _checkpoint_exclusion_matcher():
+    """Use the real QuantConfig matcher without importing GPU runtime bindings."""
+    path = REPO / "tensorrt_llm/models/modeling_utils.py"
+    tree = ast.parse(path.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "QuantConfig")
+    method = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "is_module_excluded_from_quantization"
+    )
+    namespace = {"fnmatch": fnmatch, "re": re}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace[method.name]
+
+
+def _quant_config():
+    config = SimpleNamespace(quant_algo="FP8", exclude_modules=None)
+    config.is_module_excluded_from_quantization = MethodType(
+        _checkpoint_exclusion_matcher(), config
+    )
+    return config
+
+
+def _uniform_ignore_patterns():
+    return [
+        "audio_proj_in",
+        "audio_proj_out",
+        "context_embedder",
+        "norm_out*",
+        "proj_in",
+        "proj_out",
+        "time_embedder*",
+        "token_refiner*",
+    ] + [f"transformer_blocks.{i}.adaln_proj*" for i in range(50)]
+
+
+def _earlytop8_ignore_patterns():
+    # A ModelOpt FP8 export may keep whole blocks in BF16 through its ignore list.
+    return _uniform_ignore_patterns() + [
+        "transformer_blocks.1.*",
+        "transformer_blocks.16*",
+        "transformer_blocks.32*",
+        "transformer_blocks.34*",
+        "transformer_blocks.35*",
+        "transformer_blocks.36*",
+        "transformer_blocks.37*",
+        "transformer_blocks.42*",
+    ]
+
+
 def _config():
     return SimpleNamespace(
         model_configs={
             "transformer": SimpleNamespace(
-                quant_config=SimpleNamespace(quant_algo="FP8"),
+                quant_config=_quant_config(),
                 quant_config_dict=None,
             )
         },
-        quant_config=SimpleNamespace(quant_algo="FP8"),
+        quant_config=_quant_config(),
         quant_config_dict=None,
         dynamic_weight_quant=False,
         force_dynamic_quantization=False,
@@ -159,6 +224,80 @@ class RoutingContracts(unittest.TestCase):
         with patch.dict(sys.modules, {module + ".config": config, module + ".pipeline": pipeline}):
             self.assertIs(namespace["route_fp8_sm_107_u1"](_config()), expected)
         self.assertEqual(calls, ["selected"])
+
+    def test_uniform_non_main_exclusions_still_select_fp8(self):
+        cfg = _config()
+        cfg.model_configs["transformer"].quant_config.exclude_modules = _uniform_ignore_patterns()
+        namespace = _routing_namespace()
+        module = "_h3_fp8_cpu_contracts.minimax_h3_fp8__sm_107__u1"
+        config = ModuleType(module + ".config")
+        config.select = lambda: None
+        pipeline = ModuleType(module + ".pipeline")
+        expected = type("Pipeline", (), {})
+        pipeline.MiniMaxH3Fp8Sm107U1Pipeline = expected
+        cfg.extra_attrs["visual_gen_scenario"] = "auto"
+        with patch.dict(sys.modules, {module + ".config": config, module + ".pipeline": pipeline}):
+            self.assertIs(namespace["resolve_scenario"](object, cfg), expected)
+
+    def test_ignore_based_earlytop8_rejects_before_selection(self):
+        cfg = _config()
+        quant = cfg.model_configs["transformer"].quant_config
+        quant.exclude_modules = _earlytop8_ignore_patterns()
+        roles = ("attn.qkv_proj", "attn.to_out.0", "ff.gate_up_proj", "ff.down_proj")
+        excluded = [
+            f"transformer_blocks.{i}.{role}"
+            for i in range(50)
+            for role in roles
+            if quant.is_module_excluded_from_quantization(f"transformer_blocks.{i}.{role}")
+        ]
+        self.assertEqual(len(excluded), 32)
+        self.assertIsNone(cfg.model_configs["transformer"].quant_config_dict)
+        namespace = _routing_namespace()
+        with self.assertRaisesRegex(namespace["NoScenario"], "excluded"):
+            namespace["route_fp8_sm_107_u1"](cfg)
+        with self.assertRaisesRegex(RuntimeError, "excluded"):
+            namespace["resolve_scenario"](object, cfg)
+
+    def test_auto_and_off_keep_family_for_unsupported_cases(self):
+        cases = [
+            (_earlytop8_ignore_patterns(), (10, 7), 212, 1),
+            (_earlytop8_ignore_patterns(), (10, 3), 152, 1),
+            (_earlytop8_ignore_patterns(), (10, 7), 212, 4),
+            (_uniform_ignore_patterns(), (10, 3), 152, 1),
+            (_uniform_ignore_patterns(), (10, 7), 212, 4),
+        ]
+        for mode in ("auto", "off"):
+            for ignored, capability, count, ulysses in cases:
+                with self.subTest(mode=mode, capability=capability, ulysses=ulysses):
+                    cfg = _config()
+                    cfg.model_configs["transformer"].quant_config.exclude_modules = ignored
+                    cfg.visual_gen_mapping.ulysses_size = ulysses
+                    cfg.extra_attrs["visual_gen_scenario"] = mode
+                    namespace = _routing_namespace()
+                    namespace["_device_capability"] = lambda: capability
+                    namespace["_device_multiprocessors"] = lambda: count
+                    self.assertIs(namespace["resolve_scenario"](object, cfg), object)
+
+    def test_parent_glob_regex_and_global_exclusions_are_honored(self):
+        patterns = [
+            "transformer_blocks.1",
+            "transformer_blocks.1.*",
+            "transformer_blocks.1*",
+            r"re:transformer_blocks\.1\..*",
+            r"re:transformer_blocks\.1",
+            "transformer_blocks.*.ff.down_proj",
+        ]
+        for pattern in patterns:
+            for use_global in (False, True):
+                with self.subTest(pattern=pattern, global_config=use_global):
+                    cfg = _config()
+                    if use_global:
+                        cfg.model_configs["transformer"].quant_config = None
+                        cfg.quant_config.exclude_modules = [pattern]
+                    else:
+                        cfg.model_configs["transformer"].quant_config.exclude_modules = [pattern]
+                    cfg.extra_attrs["visual_gen_scenario"] = "auto"
+                    self.assertIs(_routing_namespace()["resolve_scenario"](object, cfg), object)
 
     def test_off_does_not_call_any_route(self):
         namespace = _routing_namespace()

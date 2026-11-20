@@ -43,6 +43,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 if TYPE_CHECKING:
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
     from ...config import DiffusionPipelineConfig
     from ...pipeline import BasePipeline
 
@@ -65,12 +67,16 @@ def _device_multiprocessors() -> Optional[int]:
     return int(torch.cuda.get_device_properties(0).multi_processor_count)
 
 
-def _transformer_quant_algo(config: "DiffusionPipelineConfig") -> Optional[QuantAlgo]:
+def _transformer_quant_config(config: "DiffusionPipelineConfig") -> "QuantConfig":
     model_config = config.model_configs.get("transformer")
     quant_config = getattr(model_config, "quant_config", None) if model_config is not None else None
     if quant_config is None:
         quant_config = config.quant_config
-    return getattr(quant_config, "quant_algo", None)
+    return quant_config
+
+
+def _transformer_quant_algo(config: "DiffusionPipelineConfig") -> Optional[QuantAlgo]:
+    return getattr(_transformer_quant_config(config), "quant_algo", None)
 
 
 def _transformer_layer_quant(config: "DiffusionPipelineConfig") -> Optional[dict]:
@@ -171,6 +177,15 @@ def route_fp8_sm_107_u1(config: "DiffusionPipelineConfig") -> Type["BasePipeline
         or config.force_dynamic_quantization
     ):
         raise NoScenario("the static-FP8 fusion needs a uniform pre-quantized FP8 checkpoint")
+    quant_config = _transformer_quant_config(config)
+    for block_index in range(50):
+        for projection in ("attn.qkv_proj", "attn.to_out.0", "ff.gate_up_proj", "ff.down_proj"):
+            name = f"transformer_blocks.{block_index}.{projection}"
+            if quant_config.is_module_excluded_from_quantization(name):
+                raise NoScenario(
+                    "the static-FP8 fusion needs all 200 main Linears quantized; "
+                    f"{name} is excluded from quantization"
+                )
     qac = getattr(config.attention, "quant_attention_config", None)
     if (
         str(config.attention.backend).upper() != "CUDNN"
