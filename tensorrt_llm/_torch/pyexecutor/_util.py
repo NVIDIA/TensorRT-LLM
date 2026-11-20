@@ -4866,8 +4866,6 @@ def _create_kv_cache_manager(
             "kv_cache_config.kv_events_config is set but streaming KV event "
             "publishing requires KV cache manager V2; events will not be "
             f"published for {kv_cache_manager_cls.__name__}.")
-    if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-        manager_extra_kwargs["is_disagg"] = is_disagg
 
     if config_utils.is_glm5_next(config) or is_kimi_linear(config):
         # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on
@@ -4919,6 +4917,8 @@ def _create_kv_cache_manager(
                 and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
                 and getattr(backbone, "kda_draft_records", False)):
             kda_extra_kwargs["kda_draft_records"] = True
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            kda_extra_kwargs["is_disagg"] = is_disagg
         if (not is_glm5_next and issubclass(kv_cache_manager_cls,
                                             MambaHybridCacheManagerV2)):
             # The V2 manager reads the MLA geometry and the per-layer KV
@@ -5042,6 +5042,7 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            mamba_manager_extra_kwargs["is_disagg"] = is_disagg
             # The manager tells its draft layers apart by the model's layer count.
             mamba_manager_extra_kwargs["pretrained_config"] = config
         kv_cache_manager = kv_cache_manager_cls(
@@ -5103,6 +5104,7 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            mamba_manager_extra_kwargs["is_disagg"] = is_disagg
             # The manager tells its draft layers apart by the model's layer count.
             mamba_manager_extra_kwargs["pretrained_config"] = config
         if (issubclass(kv_cache_manager_cls,
