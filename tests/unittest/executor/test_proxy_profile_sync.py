@@ -45,7 +45,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 # These tests deliberately keep a real single-thread
 # ``_profile_control_executor`` alive for the whole test body -- pinning
-# every profile ZMQ op to one owner thread is precisely what they assert.
+# each profile socket to one owner thread is precisely what they assert.
 # ``pytest-threadleak`` samples threads around the *call* phase, so a
 # function-scoped fixture finalizer necessarily runs too late to satisfy
 # it. The ``bare_proxy`` teardown below still drains the executor, so the
@@ -487,20 +487,20 @@ def test_profile_ack_wait_fails_promptly_after_worker_death():
 def test_profile_control_pinned_to_single_owner_thread(bare_proxy, tmp_path):
     """Regression test for QiJune's review §2.
 
-    All ZMQ socket operations triggered by ``start_profile`` /
-    ``stop_profile`` must run on the same single owner thread, even
-    though the public API is invoked from many different caller
-    threads (``asyncio.to_thread`` does not pin to one worker).
+    Each ZMQ socket used by ``start_profile`` / ``stop_profile`` must be
+    operated by one owner thread, even though the public API is invoked
+    from many different caller threads (``asyncio.to_thread`` does not
+    pin to one worker).
 
     We capture the ``threading.current_thread()`` identity inside both
     the ``request_queue.put`` and ``profile_ack_queue.get`` mocks, and
     invoke the proxy from several caller threads in sequence. After
     the round-trip we assert:
 
-      * Every queue operation observed exactly one owner thread.
-      * That owner thread is *not* any of the caller threads — it is
-        the dedicated ``proxy_profile_control`` worker created by
-        ``_profile_control_executor``.
+      * Each socket observed exactly one owner thread.
+      * The command socket's owner is the ``proxy_request_sender`` thread
+        and the ack socket's owner is the ``proxy_profile_control`` worker
+        created by ``_profile_control_executor``; neither is a caller thread.
     """
     proxy = bare_proxy
 
@@ -557,9 +557,10 @@ def test_profile_control_pinned_to_single_owner_thread(bare_proxy, tmp_path):
 # Strengthened regression tests for QiJune's PR review §2.
 #
 # pyzmq sockets are not thread-safe — concurrent access from multiple threads
-# (even one writer + one reader) is undefined behavior in libzmq. The fix
-# routes ALL profile-control ZMQ ops through ``_profile_control_executor``
-# (max_workers=1) so the FastAPI thread-pool worker never touches the socket.
+# (even one writer + one reader) is undefined behavior in libzmq. Profile
+# requests are written by the command sender's owner thread and acks are read
+# on ``_profile_control_executor`` (max_workers=1), so the FastAPI thread-pool
+# worker never touches either socket.
 # These tests pin that contract under stress.
 # --------------------------------------------------------------------------- #
 
@@ -597,9 +598,9 @@ def test_profile_ops_serialized_under_concurrent_callers(bare_proxy, tmp_path):
     Mirrors what FastAPI would do under load: many request handlers each
     schedule a /start_profile or /stop_profile via ``asyncio.to_thread``
     simultaneously. If the proxy ever directly touched ZMQ sockets from
-    those threads we would see ``peak_concurrency > 1``. The fix routes
-    every op through ``_profile_control_executor`` (max_workers=1), so
-    peak concurrency MUST stay at 1.
+    those threads we would see ``peak_concurrency > 1``. Profile calls run
+    on ``_profile_control_executor`` (max_workers=1) and command writes on
+    the command sender's owner thread, so peak concurrency MUST stay at 1.
     """
     proxy = bare_proxy
     recorder = _ThreadSafetyRecorder()
@@ -658,13 +659,14 @@ def test_profile_ops_serialized_under_concurrent_callers(bare_proxy, tmp_path):
 
 
 def test_profile_control_thread_name_is_stable_across_calls(bare_proxy, tmp_path):
-    """The same single owner thread serves *every* call, not just one.
+    """The same owner threads serve *every* call, not just one.
 
     A pool with ``max_workers=1`` reuses its worker thread across submitted
-    callables, so even with thousands of calls we should only ever see one
-    owner thread name. This guards against an accidental future change to
-    ``max_workers > 1`` (which would still pass under serialized tests but
-    break the contract under concurrency).
+    callables, so even with thousands of calls we should see exactly two
+    owner threads: the command sender's and the profile-control worker.
+    This guards against an accidental future change to ``max_workers > 1``
+    (which would still pass under serialized tests but break the contract
+    under concurrency).
     """
     proxy = bare_proxy
     seen_owners = []

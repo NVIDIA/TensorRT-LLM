@@ -37,6 +37,7 @@ _HEARTBEAT_INTERVAL = 0.5
 # regardless, because the helper notices its worker's exit directly. A helper
 # that dies itself sends no report, so only the lease detects it.
 _HEARTBEAT_TIMEOUT = 15.0
+# Longest the receiver waits for a report before it checks the leases again.
 _RECEIVE_WAIT = 0.1
 # Upper bound on one authenticated report frame; real reports are far smaller.
 _MAX_REPORT_BYTES = 4096
@@ -263,6 +264,7 @@ class RemoteWorkerProcessMonitor:
             is_server=True,
             socket_type=zmq.PULL,
             name="remote_worker_process_watch",
+            # Several queued reports per rank while the receiver is paused.
             receive_hwm=max(64, world_size * 4),
             ipv6=ipv6,
             # libzmq drops a connection that announces a larger frame before
@@ -379,6 +381,8 @@ class RemoteWorkerProcessMonitor:
                 first_wait = (
                     _RECEIVE_WAIT if now - waited_from > _RECEIVE_WAIT + _HEARTBEAT_INTERVAL else 0
                 )
+                # At least the receive HWM, so one pass empties a normal
+                # backlog; bounded so the lease check below still runs.
                 for index in range(max(64, self._world_size * 64)):
                     if self._stopped.is_set() or not self._queue.poll(
                         first_wait if index == 0 else 0
@@ -574,6 +578,8 @@ def _watch_process() -> int:
         channel.setsockopt(zmq.SNDHWM, 4)
         channel.setsockopt(zmq.SNDTIMEO, 100)
         channel.connect(config["address"])
+        # Give up before the worker's _START_TIMEOUT wait for "ready" ends, so
+        # this helper's exit, not that timeout, ends the worker's wait.
         deadline = time.monotonic() + _START_TIMEOUT - 1
         ready = False
         while True:

@@ -15,12 +15,14 @@
 """Offline tests for Responses storage and replay, and the endpoint up to preprocessing."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from openai.types.responses import ResponseFunctionToolCall
 
+from tensorrt_llm.executor.utils import EngineDeadError, EngineUnavailableError
 from tensorrt_llm.serve.openai_protocol import DisaggregatedParams, ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     ConversationHistoryStore,
@@ -316,6 +318,33 @@ def test_protected_disagg_fields_are_checked_before_anything_is_rendered(monkeyp
 
     assert response.status_code == 400
     assert captured == {}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [EngineDeadError(RuntimeError("rank 1 lost")), EngineUnavailableError("command queue is full")],
+)
+def test_engine_admission_failure_returns_service_unavailable(monkeypatch, error):
+    """A dead or unavailable engine is a 503 with the engine's message, not a 400."""
+    import tensorrt_llm.serve.openai_server as server_module
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    server, raw_request, _ = _server_up_to_preprocess(monkeypatch)
+
+    async def preprocess(**_kwargs):
+        return [1, 2, 3], SamplingParams()
+
+    monkeypatch.setattr(server_module, "responses_api_request_preprocess", preprocess)
+    monkeypatch.setattr(server, "_responses_prompt_tokens_excluded_from_usage", lambda _: 0)
+    server.generator.generate_async = Mock(side_effect=error)
+    response = asyncio.run(
+        server.openai_responses(ResponsesRequest(model="test-model", input="hi"), raw_request)
+    )
+
+    assert response.status_code == 503
+    body = json.loads(response.body)
+    assert body["type"] == "ServiceUnavailableError"
+    assert body["message"] == str(error)
 
 
 @pytest.mark.parametrize(

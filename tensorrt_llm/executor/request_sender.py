@@ -169,6 +169,10 @@ class _RequestSender:
     CONNECT_TIMEOUT = 5.0
     # Bound on queuing the stop sentinel in an orderly close.
     SENTINEL_TIMEOUT = 1.0
+    # close() timeout that covers the owner's worst orderly close: final writes
+    # waiting for the first connection, the stop sentinel, then the context
+    # termination that waits for the socket's linger.
+    CLOSE_TIMEOUT = CONNECT_TIMEOUT + SENTINEL_TIMEOUT + CLOSE_LINGER_MS / 1000
 
     @classmethod
     def send_hwm(cls, batching: bool) -> int:

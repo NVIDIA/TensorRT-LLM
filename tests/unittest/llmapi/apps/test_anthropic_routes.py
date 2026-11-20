@@ -27,6 +27,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
+from tensorrt_llm.executor.utils import EngineDeadError, EngineUnavailableError
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
@@ -467,13 +468,15 @@ class _ModelConfig:
     vocab_size = 1024
 
 
-def _streaming_chat_server(monkeypatch, generation):
-    """A server whose real ``openai_chat`` streams ``generation``.
+def _streaming_chat_server(monkeypatch, generation=None, *, generate_async=None):
+    """A server that runs the real chat handlers on a stubbed engine.
 
-    The server is built with ``object.__new__``; prompt rendering and the
-    engine are stubbed, and the engine's output is already post-processed into
-    SSE frames.
+    The server is built with ``object.__new__``, and prompt rendering is
+    stubbed. ``generate_async`` stands in for the engine; by default it returns
+    ``generation``, whose output is already post-processed into SSE frames.
     """
+    if generate_async is None:
+        generate_async = Mock(return_value=generation)
 
     async def render(**kwargs):
         return "rendered prompt"
@@ -499,7 +502,7 @@ def _streaming_chat_server(monkeypatch, generation):
             guided_decoding_backend=None,
             num_postprocess_workers=1,
         ),
-        generate_async=Mock(return_value=generation),
+        generate_async=generate_async,
     )
     server.await_disconnected = AsyncMock()
     server._extract_metrics = AsyncMock()
@@ -627,6 +630,25 @@ def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
 
     server_logger.error.assert_called_once()
     assert "engine failed" in server_logger.error.call_args.args[0]
+
+
+@pytest.mark.parametrize("route", ["openai_chat", "openai_mm_encoder"])
+@pytest.mark.parametrize(
+    "error",
+    [EngineDeadError(RuntimeError("rank 1 lost")), EngineUnavailableError("command queue is full")],
+)
+def test_engine_admission_failure_returns_service_unavailable(monkeypatch, route, error):
+    """A dead or unavailable engine is a 503 with the engine's message, not a 400."""
+    server = _streaming_chat_server(monkeypatch, generate_async=Mock(side_effect=error))
+    request = ChatCompletionRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
+    raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+
+    response = asyncio.run(getattr(server, route)(request, raw_request))
+
+    assert response.status_code == 503
+    body = json.loads(response.body)
+    assert body["type"] == "ServiceUnavailableError"
+    assert body["message"] == str(error)
 
 
 @pytest.fixture

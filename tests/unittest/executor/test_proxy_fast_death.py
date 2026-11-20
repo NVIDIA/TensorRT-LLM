@@ -15,9 +15,13 @@
 """EngineDeadError, the pending-result broadcast, and queue-step fast-fail (no GPU)."""
 
 import asyncio
+import os
 import queue as _queue
+import signal
+import socket
 import threading
 import time as _time
+import weakref
 from concurrent.futures import Future as _Future
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -227,7 +231,7 @@ class _DeadAfterRegistrationMonitor:
     def register(self, identities):
         self.identities = identities
 
-    def find_dead_worker(self):
+    def find_dead_worker(self, *, include_remote):
         return self.identities[0] if self.identities else None
 
     def close(self):
@@ -620,7 +624,7 @@ def test_error_monitor_tears_down_when_a_request_records_the_error_first():
     # and aborts pending requests.
     proxy = _serving_proxy()
     proxy._check_remote_worker_death = lambda: False
-    proxy._check_mpi_workers = lambda include_remote=False: False
+    proxy._check_mpi_workers = lambda *, include_remote: False
     torn_down = threading.Event()
 
     def pre_shutdown():
@@ -635,6 +639,86 @@ def test_error_monitor_tears_down_when_a_request_records_the_error_first():
     assert torn_down.wait(2), "the error monitor exited without pre_shutdown"
     monitor.join(2)
     assert not monitor.is_alive()
+
+
+@pytest.mark.timeout(30, method="thread")
+def test_error_monitor_fails_the_engine_when_a_remote_rank_is_lost(monkeypatch):
+    """The real error monitor turns remote supervision loss into engine death.
+
+    No MPI future or forwarded worker error reports the loss, so only the
+    monitor's remote supervision check can record it.
+    """
+    from tensorrt_llm.executor import remote_worker_process_monitor as remote
+    from tensorrt_llm.executor.worker_process_monitor import WorkerProcessMonitor
+
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH", "1")
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_TIMEOUT", "1.5")
+    proxy = _serving_proxy()
+    proxy.mpi_session = SimpleNamespace()  # forwards no worker errors
+    proxy._worker_process_monitor = WorkerProcessMonitor()
+    pending = _FakeResult()
+    proxy._results = {1: pending}
+    endpoint = proxy._worker_process_monitor.start_remote(1, proxy._shutdown_event)
+    watch = remote.WorkerProcessWatch(endpoint, 0)
+    monitor = threading.Thread(target=proxy._error_monitor_loop, daemon=True)
+    try:
+        assert proxy._worker_process_monitor.wait_remote_ready()
+        monitor.start()
+        assert proxy.check_health()
+        # The rank's reports stop, as when its node is lost.
+        os.kill(watch._process.pid, signal.SIGKILL)
+        monitor.join(10)
+        assert not monitor.is_alive(), "the error monitor did not record the lost rank"
+    finally:
+        proxy._worker_process_monitor.close()
+        watch.close()
+
+    assert f"rank 0 (pid {os.getpid()}) lost process liveness" in str(proxy._fatal_error)
+    dead = pending.queue.get_nowait()
+    assert isinstance(dead, EngineDeadError) and dead.root_cause is proxy._fatal_error
+    assert not proxy.check_health()
+
+
+@pytest.mark.timeout(20, method="thread")
+def test_command_connection_loss_after_ready_fails_the_engine():
+    """Losing rank 0's command connection after READY makes the engine dead.
+
+    The sender reports the loss through the proxy's failure callback: pending
+    requests fail with EngineDeadError, health turns false and the error
+    monitor records the loss as the fatal error.
+    """
+    proxy = _serving_proxy()
+    proxy._command_failure_lock = threading.Lock()
+    proxy._command_failure = None
+    proxy.mpi_session = SimpleNamespace()
+    proxy._worker_process_monitor = SimpleNamespace(find_dead_worker=lambda *, include_remote: None)
+    pending = _FakeResult()
+    proxy._results = {1: pending}
+    peer = IpcQueue(None, is_server=True, socket_type=zmq.PULL)
+    commands = IpcQueue(peer.address, is_server=False, socket_type=zmq.PUSH)
+    proxy._request_sender = proxy_module._create_request_sender(
+        commands, proxy._error_queue, weakref.WeakMethod(proxy._handle_command_failure)
+    )
+    monitor = threading.Thread(target=proxy._error_monitor_loop, daemon=True)
+    monitor.start()
+    try:
+        proxy._send_request(CancellingRequest(1))
+        assert peer.get(timeout=2)
+        assert proxy.check_health()
+        peer.close()
+        monitor.join(10)
+        assert not monitor.is_alive(), "the error monitor did not record the lost connection"
+    finally:
+        proxy._request_sender.close(timeout=2)
+        peer.close()
+
+    assert isinstance(proxy._fatal_error, ConnectionError)
+    dead = pending.queue.get_nowait()
+    assert isinstance(dead, EngineDeadError) and dead.root_cause is proxy._fatal_error
+    assert not proxy.check_health()
+    with pytest.raises(EngineDeadError):
+        proxy._send_request(CancellingRequest(2))
 
 
 @pytest.mark.parametrize("error", [EngineUnavailableError("queue full"), "bad request"])
@@ -1160,6 +1244,42 @@ def test_early_command_disconnect_aborts_before_marking_dead(tmp_path, loss_at):
             proxy.result_queue.close()
         if proxy.worker_init_status_queue is not status_queue:
             proxy.worker_init_status_queue.close()
+
+
+@pytest.mark.timeout(20, method="thread")
+def test_failed_worker_submit_releases_the_process_watch_port(monkeypatch):
+    """A worker submit that raises frees a fixed process-watch port at once.
+
+    The constructor raises, so nothing shuts the proxy down before garbage
+    collection, and a retry in the same process binds the same port.
+    """
+    from tensorrt_llm.executor.worker_process_monitor import WorkerProcessMonitor
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH", "1")
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_PORT", str(port))
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+    proxy.model_world_size = 1
+    proxy._shutdown_event = threading.Event()
+    proxy._worker_process_monitor = WorkerProcessMonitor()
+    proxy._request_sender = _Mock()
+    proxy.mpi_session = _Mock(spec=RemoteMpiCommSessionClient)
+    # RemoteMpiCommSessionClient.submit pickles its arguments synchronously.
+    proxy.mpi_session.submit.side_effect = TypeError("cannot pickle 'module' object")
+    retry = WorkerProcessMonitor()
+    try:
+        with pytest.raises(TypeError, match="cannot pickle"):
+            proxy._start_executor_workers({})
+        assert not proxy.workers_started
+        assert retry.start_remote(1, threading.Event()).address.endswith(f":{port}")
+        proxy._request_sender.close.assert_called_once()
+    finally:
+        retry.close()
+        proxy._worker_process_monitor.close()
 
 
 def test_remote_supervision_failure_after_ready_preserves_startup_error():

@@ -324,13 +324,14 @@ class GenerationExecutorProxy(GenerationExecutor):
                 return True
         return False
 
-    def _check_mpi_workers(self, *, include_remote: bool = False) -> bool:
+    def _check_mpi_workers(self, *, include_remote: bool) -> bool:
         """Check MPI futures, then OS process handles and remote supervision.
 
         A worker's MPI future carries its actual failure, so it takes
         precedence over a liveness loss reported at the same time. Only the
-        error monitor consumes remote supervision, after forwarded worker
-        errors, so a health check cannot record the generic loss first.
+        error monitor passes ``include_remote=True``: it checks forwarded
+        worker errors first, so a health check cannot record the generic
+        loss before the actual failure.
 
         Args:
             include_remote: Whether to check remote process supervision.
@@ -374,6 +375,14 @@ class GenerationExecutorProxy(GenerationExecutor):
                 break
         return drained
 
+    def _command_sender_available(self) -> bool:
+        """Whether commands can still reach rank 0.
+
+        False once the command sender failed, for example after the command
+        connection was lost; True before the sender exists.
+        """
+        return self._request_sender is None or self._request_sender.available
+
     def check_health(self) -> bool:
         """Check executor health including MPI worker liveness.
 
@@ -381,6 +390,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         ``super().check_health()`` so that fatal queue items trigger
         ``pre_shutdown()`` (non-blocking) rather than ``shutdown()``
         (which blocks on ``f.result()`` for surviving MPI workers).
+
+        Unhealthy once a fatal error is recorded, shutdown has begun, a
+        worker future or local worker process has exited, or the command
+        sender has failed. Remote process supervision loss is recorded by
+        the error monitor, which this check then reports.
 
         Returns:
             True if the executor and all MPI workers are healthy.
@@ -390,13 +404,12 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if self._drain_error_queue():
             return (self._fatal_error is None and not self.doing_shutdown
-                    and (self._request_sender is None
-                         or self._request_sender.available))
+                    and self._command_sender_available())
 
-        if self._check_mpi_workers():
+        if self._check_mpi_workers(include_remote=False):
             return False
 
-        return self._request_sender is None or self._request_sender.available
+        return self._command_sender_available()
 
     def _set_fatal_error(self, error: BaseException) -> None:
         """Record the fatal error, then unblock every pending request.
@@ -491,10 +504,12 @@ class GenerationExecutorProxy(GenerationExecutor):
     def _handle_worker_death(self, error: BaseException) -> None:
         """Fail pending requests and queue terminal worker errors for cleanup.
 
-        Used by MPI worker-death callbacks and cancellation transport failures.
-        The monitor records the fatal error and drives pre_shutdown, while the
-        immediate EngineDeadError broadcast fails requests without waiting for
-        the next poll tick.
+        Used by MPI worker-death callbacks, forwarded remote worker errors,
+        and every command-sender failure once the workers are ready (an
+        attached frontend's sender reports here directly). The monitor records
+        the fatal error and drives pre_shutdown, while the immediate
+        EngineDeadError broadcast fails requests without waiting for the next
+        poll tick.
         """
         self._error_queue.put_nowait(error)
         self._mark_engine_dead(error)
@@ -709,8 +724,16 @@ class GenerationExecutorProxy(GenerationExecutor):
     def abort_request(self, request_id: int) -> None:
         """Abort a request by sending a cancelling request to the request queue.
 
+        A no-op once the engine is dead, for an unknown request, or when the
+        cancellation is refused because shutdown has begun (shutdown cancels
+        or stops the remaining requests itself).
+
         Args:
             request_id (int): The id of the request to abort.
+
+        Raises:
+            EngineUnavailableError: The command sender refused the cancellation
+                outside shutdown.
         """
         if self._engine_dead or self._fatal_error is not None:
             return
@@ -1030,7 +1053,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                 return error
         if self._command_failure is not None:
             return self._command_failure
-        dead_worker = self._worker_process_monitor.find_dead_worker()
+        dead_worker = self._worker_process_monitor.find_dead_worker(
+            include_remote=True)
         if dead_worker is None:
             return None
         failure = self._worker_process_monitor.remote_failure
@@ -1089,17 +1113,24 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         with _StartupTimer("worker_submit_to_ready") as startup_timer:
             with startup_timer.phase("worker_submit"):
-                self.mpi_futures = self.mpi_session.submit(
-                    worker_main,
-                    **mpi_worker_kwargs,
-                    worker_cls=self.worker_cls,
-                    tracer_init_kwargs=tracer_init_kwargs,
-                    _torch_external_model_modules=export_external_model_modules(
-                    ),
-                    ready_signal=GenerationExecutorProxy.READY_SIGNAL,
-                    worker_process_identities_signal=
-                    worker_process_identities_signal,
-                )
+                try:
+                    self.mpi_futures = self.mpi_session.submit(
+                        worker_main,
+                        **mpi_worker_kwargs,
+                        worker_cls=self.worker_cls,
+                        tracer_init_kwargs=tracer_init_kwargs,
+                        _torch_external_model_modules=
+                        export_external_model_modules(),
+                        ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+                        worker_process_identities_signal=
+                        worker_process_identities_signal,
+                    )
+                except BaseException:
+                    # The constructor raises, so no caller owns this proxy.
+                    # Release the process-watch listener now rather than at
+                    # garbage collection: a retry may bind the same fixed port.
+                    self._release_unstarted_resources()
+                    raise
 
             self.workers_started = True
 
@@ -1276,7 +1307,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         """
         if self._request_sender is None:
             return
-        error = self._request_sender.close(timeout=7.0,
+        error = self._request_sender.close(timeout=_RequestSender.CLOSE_TIMEOUT,
                                            send_sentinel=send_sentinel,
                                            cancel_ids=cancel_ids,
                                            wait=wait)
@@ -1303,13 +1334,17 @@ class GenerationExecutorProxy(GenerationExecutor):
             shutil.rmtree(ipc_dir, ignore_errors=True)
             self._multi_frontend_ipc_dir = None
 
+    def _release_unstarted_resources(self) -> None:
+        """Release what the proxy holds before any worker was submitted."""
+        monitor = getattr(self, '_worker_process_monitor', None)
+        if monitor is not None:
+            monitor.close()
+        self._close_request_sender()
+        self._cleanup_multi_frontend_ipc_dir()
+
     def shutdown(self):
         if not self.workers_started:
-            monitor = getattr(self, '_worker_process_monitor', None)
-            if monitor is not None:
-                monitor.close()
-            self._close_request_sender()
-            self._cleanup_multi_frontend_ipc_dir()
+            self._release_unstarted_resources()
             return
 
         if not self.doing_shutdown:
@@ -1417,6 +1452,16 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         Returns a "future" GenerationResult which can be waited.
         Forwards the request to the workers through the request queue.
+
+        When the command queue is full, a caller without a running event loop
+        or inside a blocking ``generate()`` call waits for capacity; any other
+        event-loop caller is rejected.
+
+        Raises:
+            EngineDeadError: The engine is dead, including when death is
+                recorded while the request is admitted.
+            EngineUnavailableError: Shutdown has begun, or the command queue
+                is full and the caller does not wait for capacity.
         """
 
         # Sticky fast-fail: don't accept new work once the engine is known dead.
@@ -1823,19 +1868,19 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
 
         An attached frontend owns no workers, so there is no process or
         MPI-future liveness to poll: it is healthy while no fatal error
-        has been recorded and shutdown has not begun. Engine death
-        reaches it through the per-lane result socket / dispatch-thread
-        error path, which records the fatal error checked here.
+        has been recorded, shutdown has not begun and its command sender
+        works. Engine death reaches it through the per-lane result socket /
+        dispatch-thread error path, which records the fatal error checked
+        here.
         """
         if self.doing_shutdown or self._fatal_error is not None:
             return False
 
         if self._drain_error_queue():
             return (self._fatal_error is None and not self.doing_shutdown
-                    and (self._request_sender is None
-                         or self._request_sender.available))
+                    and self._command_sender_available())
 
-        return self._request_sender is None or self._request_sender.available
+        return self._command_sender_available()
 
     def _start_fatal_teardown(self) -> None:
         # An attached frontend has no error monitor, and its pre_shutdown
@@ -1856,7 +1901,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
 
     def shutdown(self):
         self.pre_shutdown()
-        # Send the cancels queued by pre_shutdown before the lane goes idle.
+        # pre_shutdown does not wait; wait (bounded) for the sender to write
+        # the cancels it queued.
         self._close_request_sender()
         if self.rpc_client is not None:
             self.rpc_client.close()

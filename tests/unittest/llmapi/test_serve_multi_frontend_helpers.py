@@ -265,7 +265,7 @@ def test_watchdog_ignores_health_answers_that_are_not_engine_verdicts(
 @pytest.mark.parametrize("failure", ["engine", "batcher"])
 def test_watchdog_uses_launcher_health_without_transport_grace(tmp_path, monkeypatch, failure):
     proxy = bare_proxy(
-        _check_mpi_workers=lambda: False,
+        _check_mpi_workers=lambda *, include_remote: False,
         _request_sender=SimpleNamespace(
             available=True, fail=lambda _: None, close=lambda **_: None
         ),
