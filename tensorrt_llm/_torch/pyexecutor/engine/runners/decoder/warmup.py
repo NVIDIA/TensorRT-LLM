@@ -582,6 +582,11 @@ class DecoderWarmup:
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        # Every background TRTLLM-Gen FMHA sweep was queued by the attention
+        # warmup above; finish and verify them before the first graph-shape
+        # forward, so no compile (or wait on one) lands inside a forward that
+        # runs MoE all-to-alls.
+        self._drain_and_verify_trtllm_gen_fmha_jit_warmup()
         with self._warmup_timer.phase("cuda_graph_capture"):
             # KV-cache estimation always uses both passes, so the KV-cache size ignores the switch.
             self._graphs.warmup_and_capture(
@@ -647,6 +652,55 @@ class DecoderWarmup:
         maybe_bolt_clear_counters()
 
         return self._freeze_eager_workspace_floor()
+
+    def _drain_and_verify_trtllm_gen_fmha_jit_warmup(self) -> None:
+        """Wait for the background TRTLLM-Gen FMHA JIT warmup and verify it.
+
+        Blocks until every background compilation sweep has finished, then
+        re-runs each finished sweep once on this thread: a cache-hit loop when
+        the background pass compiled every kernel, and the place where any
+        kernel it missed (or a sweep whose background task failed) is compiled
+        instead of on the first real request. Runs whether or not CUDA graphs
+        are enabled, so configurations without graphs still finish
+        verification before readiness. The drain is a no-op unless async
+        warmup is enabled (``TRTLLM_GEN_FMHA_ASYNC_WARMUP=1``); the rank sync
+        after it runs whenever the forward group is reachable.
+        """
+        attention_backend = getattr(self._config, "attention_backend", None)
+        if attention_backend is None or not issubclass(
+            attention_backend.Metadata, TrtllmAttentionMetadata
+        ):
+            return
+        enabled = bool(torch.ops.trtllm.trtllm_gen_fmha_async_jit_warmup_enabled())
+        if enabled:
+            with self._warmup_timer.phase("attention_jit_drain_and_verify"):
+                num_verified = torch.ops.trtllm.trtllm_gen_fmha_jit_warmup_drain_and_verify()
+                if num_verified:
+                    logger.info(
+                        f"TRTLLM-Gen FMHA JIT warmup: verified {num_verified} "
+                        "background warmup sweep(s) before CUDA graph capture."
+                    )
+        # Each rank only waited for its own compilation. The graph-shape
+        # warmup and capture forwards that follow run MoE all-to-alls, the
+        # capture pass under the serving timeouts, so a rank that enters
+        # one while a peer is still compiling could spend that timeout
+        # waiting. Meet the peers here first. The flag is read from each
+        # process's environment, so the sync does not depend on it: a rank
+        # with the flag unset still joins instead of leaving its peers
+        # waiting here. Under DWDP the forward group is not reachable through
+        # ``self.dist`` and there is no sync: a rank can then enter the
+        # graph-shape warmup pass while a DWDP peer is still compiling and
+        # wait for it inside that pass, under the warmup timeouts; the
+        # capture pass starts only once that pass has completed on every rank.
+        allgather = self._agreement.allgather()
+        if allgather is None:
+            return
+        flags = allgather(int(enabled))
+        if any(flags) and not all(flags):
+            logger.warning(
+                "TRTLLM_GEN_FMHA_ASYNC_WARMUP is set on some ranks but not on others "
+                f"(per rank: {flags}); set it the same way on every rank."
+            )
 
     def _freeze_eager_workspace_floor(self) -> EagerWorkspaceReclaimer | None:
         if not self._eager_workspace_reclaimable:
@@ -1141,7 +1195,10 @@ class DecoderWarmup:
     def _run_attention_warmup(
         self, resource_manager: ResourceManager, can_run_general_warmup: bool = True
     ) -> None:
-        if not issubclass(self._config.attention_backend.Metadata, TrtllmAttentionMetadata):
+        attention_backend = getattr(self._config, "attention_backend", None)
+        if attention_backend is None or not issubclass(
+            attention_backend.Metadata, TrtllmAttentionMetadata
+        ):
             return
 
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")

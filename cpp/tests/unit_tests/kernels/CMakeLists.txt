@@ -257,6 +257,39 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;attention-mask;gpu")
 add_tllm_gtest(
+  fmhaJitWarmupTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaJitWarmupTest.cpp
+  LINK_LIBRARIES
+  tllm::common_logging
+  Threads::Threads
+  LABELS
+  "unit;kernels;fmha-jit-warmup;host")
+add_tllm_gtest(
+  fmhaJitWarmupFingerprintTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaJitWarmupFingerprintTest.cpp
+  FULL_STACK
+  LINK_LIBRARIES
+  Threads::Threads
+  LABELS
+  "unit;kernels;fmha-jit-warmup;full-stack;gpu")
+add_tllm_gtest(
+  fmhaJitWarmupProcessExitTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaJitWarmupProcessExitTest.cpp
+  FULL_STACK
+  LINK_LIBRARIES
+  Threads::Threads
+  LABELS
+  "unit;kernels;fmha-jit-warmup;full-stack;gpu")
+add_tllm_gtest(
   fmhaDsv4EpilogueFusionTest
   OWNER
   kernel
