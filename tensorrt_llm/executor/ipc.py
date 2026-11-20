@@ -68,6 +68,8 @@ class ZeroMqQueue:
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
             name (str, optional): The name of the queue. Defaults to None.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
+            send_hwm (int, optional): ZMQ_SNDHWM in messages. None leaves the send queue unlimited.
+            receive_hwm (int, optional): ZMQ_RCVHWM in messages. None leaves the receive queue unlimited.
             ipv6 (bool): Enable IPv6 before binding or connecting. Defaults to False.
             socket_options (dict, optional): Extra ZMQ socket options applied
                 before binding or connecting. Some options, such as
@@ -249,20 +251,7 @@ class ZeroMqQueue:
         self.setup_lazily()
         self._check_thread_safety()
         with nvtx_range_debug("send", color="blue", category="IPC"):
-            flags = 0
-            if timeout is not None:
-                if timeout == 0:
-                    # ZMQ_EVENTS processes pending pipe updates like a
-                    # zero-timeout zmq_poll but does not release the GIL, so
-                    # callers holding a lock do not make others wait for it.
-                    writable = self.socket.getsockopt(zmq.EVENTS) & zmq.POLLOUT
-                else:
-                    writable = self.socket.poll(int(timeout * 1000),
-                                                zmq.POLLOUT)
-                if not writable:
-                    raise zmq.Again()
-                # A peer can disappear after poll reports writability.
-                flags = zmq.NOBLOCK
+            flags = self._wait_writable(timeout)
             if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
                 # Need manual serialization for encryption or ROUTER multipart
                 data = self._prepare_data(obj)
@@ -270,6 +259,57 @@ class ZeroMqQueue:
             else:
                 # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj, flags=flags)
+
+    def sign_pickled(self, pickled: bytes) -> bytes:
+        """Return the message that sends an object the caller already pickled.
+
+        get() on the receiving queue returns the object, as if put() had sent
+        it. Signing does not use the socket, so a caller can sign outside the
+        lock that serializes its socket use and send the message later with
+        put_signed().
+        """
+        return self._sign_data(pickled)
+
+    def put_signed(self,
+                   message: bytes,
+                   *,
+                   timeout: Optional[float] = None) -> None:
+        """Send a message returned by sign_pickled().
+
+        Args:
+            message: Message to send.
+            timeout: Maximum wait in seconds, or None to wait indefinitely.
+
+        Raises:
+            ValueError: If timeout is negative.
+            zmq.Again: If the message cannot be sent within timeout.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be nonnegative")
+        self.setup_lazily()
+        self._check_thread_safety()
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            self._send_data(message, flags=self._wait_writable(timeout))
+
+    def _wait_writable(self, timeout: Optional[float]) -> int:
+        """Wait up to timeout for a writable peer; return the send flags.
+
+        Raises:
+            zmq.Again: If the socket is not writable within timeout.
+        """
+        if timeout is None:
+            return 0
+        if timeout == 0:
+            # ZMQ_EVENTS processes pending pipe updates like a zero-timeout
+            # zmq_poll but does not release the GIL, so callers holding a
+            # lock do not make others wait for it.
+            writable = self.socket.getsockopt(zmq.EVENTS) & zmq.POLLOUT
+        else:
+            writable = self.socket.poll(int(timeout * 1000), zmq.POLLOUT)
+        if not writable:
+            raise zmq.Again()
+        # A peer can disappear after poll reports writability.
+        return zmq.NOBLOCK
 
     def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
         """Send an object without waiting for a writable peer.

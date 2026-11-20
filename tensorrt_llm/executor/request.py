@@ -345,9 +345,6 @@ class CancellingRequest:
         self.id = id
 
 
-_COMMAND_QUEUE_HWM = 16
-
-
 class StartProfileRequest:
     """Request the IPC worker to start runtime profiling.
 

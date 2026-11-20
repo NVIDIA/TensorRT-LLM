@@ -21,7 +21,6 @@ attached-frontend proxy lifecycle over real ipc:// sockets.
 
 import asyncio
 import os
-import pickle
 import queue
 import tempfile
 import threading
@@ -323,7 +322,7 @@ class TestClassicFrontendProxyEndToEnd:
             result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
             assert get_frontend_id(result.request_id) == 1
             assert worker_ingress.poll(5)
-            received = pickle.loads(worker_ingress.get()[0])
+            received = worker_ingress.get()
             assert isinstance(received, GenerationRequest)
             assert received.id == result.request_id
 
@@ -331,7 +330,7 @@ class TestClassicFrontendProxyEndToEnd:
             # must NOT emit the None engine-shutdown sentinel.
             proxy.shutdown()
             assert worker_ingress.poll(5)
-            cancel = pickle.loads(worker_ingress.get()[0])
+            cancel = worker_ingress.get()
             assert isinstance(cancel, CancellingRequest)
             assert cancel.id == result.request_id
             assert not worker_ingress.poll(1), (
@@ -378,7 +377,7 @@ class TestClassicFrontendProxyEndToEnd:
             proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
             result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
             assert worker_ingress.poll(5)
-            assert isinstance(pickle.loads(worker_ingress.get()[0]), GenerationRequest)
+            assert isinstance(worker_ingress.get(), GenerationRequest)
 
             # A frontend-local failure drained on the event loop.
             proxy._error_queue.put(RuntimeError("dispatch thread failed"))
@@ -391,7 +390,7 @@ class TestClassicFrontendProxyEndToEnd:
             assert time.monotonic() - started < 1.0, "the drain waited for shutdown writes"
 
             assert worker_ingress.poll(5), "in-flight request was never cancelled"
-            cancel = pickle.loads(worker_ingress.get()[0])
+            cancel = worker_ingress.get()
             assert isinstance(cancel, CancellingRequest) and cancel.id == result.request_id
             proxy.shutdown()
             assert not worker_ingress.poll(1), "an attached frontend sent the stop sentinel"

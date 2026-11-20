@@ -24,9 +24,11 @@ import subprocess  # nosec B404
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
+from typing import Any, TypeVar
 
 _HEARTBEAT_INTERVAL = 0.5
 # Default lease. TCP retransmission backoff (0.2, 0.4, 0.8, 1.6, 3.2 s, ...)
@@ -510,11 +512,16 @@ class WorkerProcessWatch:
                     pass
 
 
-def supervise_worker_process(function):
+_T = TypeVar("_T")
+
+
+def supervise_worker_process(function: Callable[..., _T]) -> Callable[..., _T]:
     """Keep remote MPI worker supervision alive for the complete worker call."""
 
     @wraps(function)
-    def supervised(*args, _process_watch=None, **kwargs):
+    def supervised(
+        *args: Any, _process_watch: ProcessWatchEndpoint | None = None, **kwargs: Any
+    ) -> _T:
         if _process_watch is None:
             return function(*args, **kwargs)
         from .._errors import RuntimeInitError

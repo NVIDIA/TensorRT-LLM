@@ -112,7 +112,7 @@ def test_cancellation_preserves_live_worker_shutdown(state: str) -> None:
         proxy.abort_request(42)
         if state in ("healthy", "graceful"):
             assert peer.poll(timeout=1)
-            cancel = __import__("pickle").loads(peer.get()[0])
+            cancel = peer.get()
             assert isinstance(cancel, CancellingRequest)
             assert cancel.id == 42
         else:

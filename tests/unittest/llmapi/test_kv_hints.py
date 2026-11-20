@@ -380,9 +380,9 @@ def test_proxy_batching_preserves_hint_snapshots() -> None:
     error_queue = queue.Queue()
     with closing(IpcQueue(is_server=True)) as receiver:
         request_queue = IpcQueue(
-            receiver.address, is_server=False, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES
+            receiver.address, is_server=False, send_hwm=_RequestSender.send_hwm(batching=True)
         )
-        sender = _RequestSender(request_queue, error_queue)
+        sender = _RequestSender(request_queue, error_queue, batching=True)
         proxy = bare_proxy(_request_sender=sender)
         try:
             proxy._send_request(request)

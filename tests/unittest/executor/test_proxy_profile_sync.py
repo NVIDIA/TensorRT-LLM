@@ -55,8 +55,9 @@ pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 @pytest.mark.threadleak(enabled=True)
 @pytest.mark.timeout(15, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
 @pytest.mark.parametrize("outcome", ["success", "rejected", "failed"])
-def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
+def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome, direct_send):
     address = (f"ipc://{tmp_path}/commands", b"k" * 32)
     entered = threading.Event()
     release = threading.Event()
@@ -101,6 +102,8 @@ def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
             errors,
             batching=False,
             connect_timeout=0.5,
+            stop_workers_on_failure=False,
+            direct_send=direct_send,
         )
         for _ in range(2)
     ]
@@ -115,7 +118,7 @@ def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
             request = GenerationRequest([1] * (512 * 1024), SamplingParams())
             request.set_id(request_id)
             senders[1].send(pickle.dumps(request))
-        senders[1].send(pickle.dumps(CancellingRequest(7)), control=True)
+        senders[1].send(pickle.dumps(CancellingRequest(7)), cancellation_id=7)
         assert cancelled.wait(2)
         assert received == list(range(64))
         assert errors.empty()
@@ -171,8 +174,8 @@ def test_invalid_profile_start_is_acknowledged_and_ingress_continues():
     assert received == [3]
 
 
-@pytest.fixture
-def bare_proxy():
+@pytest.fixture(params=[True, False], ids=["direct", "owner"])
+def bare_proxy(request):
     """Build a minimal ``GenerationExecutorProxy`` for testing.
 
     Provides only the queues the profile handlers touch. Avoids the
@@ -181,7 +184,10 @@ def bare_proxy():
 
     Also wires a real single-thread ``_profile_control_executor`` —
     this matches the production setup, where the shared command sender
-    owns writes and the profile-control executor owns profile replies.
+    owns the request socket and the profile-control executor owns profile
+    replies. With ``direct``, as in production, the profile-control thread
+    writes its own commands under the sender's lock; with ``owner``, as with
+    ``TLLM_LLMAPI_ZMQ_DEBUG=1``, the sender thread writes them.
     """
     # The profile handlers reject control once ``pre_shutdown()`` sets
     # ``doing_shutdown``.
@@ -198,16 +204,19 @@ def bare_proxy():
         def setup_lazily(self):
             pass
 
-        def put(self, message, **kwargs):
-            if message is not None:
-                for payload in message:
-                    proxy.request_queue.put(pickle.loads(payload))
-                    delivered.put(None)
+        def sign_pickled(self, pickled):
+            return pickled
+
+        def put_signed(self, message, **kwargs):
+            command = pickle.loads(message)
+            if command is not None:
+                proxy.request_queue.put(command)
+                delivered.put(None)
 
         def close(self):
             pass
 
-    proxy._request_sender = _RequestSender(Commands(), queue.Queue(), batching=False)
+    proxy._request_sender = _RequestSender(Commands(), queue.Queue(), direct_send=request.param)
     original_wait = proxy._wait_profile_ack
 
     def wait_for_delivered_ack(kind, timeout):
@@ -229,6 +238,13 @@ def bare_proxy():
         executor.shutdown(wait=True)
         proxy._profile_control_executor = None
     proxy._request_sender.close(timeout=5)
+
+
+def _command_writer(proxy):
+    """Name (prefix) of the thread that writes profile commands to the socket."""
+    if proxy._request_sender._direct_send:
+        return "proxy_profile_control"
+    return "proxy_request_sender"
 
 
 def test_stop_profile_blocks_until_worker_acks(bare_proxy):
@@ -532,7 +548,7 @@ def test_profile_control_pinned_to_single_owner_thread(bare_proxy, tmp_path):
 
     owners = {op: {th for kind, th in seen_threads if kind == op} for op in ("put", "get")}
     assert all(len(threads) == 1 for threads in owners.values())
-    assert next(iter(owners["put"])).name == "proxy_request_sender"
+    assert next(iter(owners["put"])).name.startswith(_command_writer(proxy))
     assert next(iter(owners["get"])).name.startswith("proxy_profile_control")
     assert not set(caller_threads).intersection(owners["put"] | owners["get"])
 
@@ -637,7 +653,7 @@ def test_profile_ops_serialized_under_concurrent_callers(bare_proxy, tmp_path):
 
     owners = {op: {th for kind, th in recorder.events if kind == op} for op in ("put", "get")}
     assert all(len(threads) == 1 for threads in owners.values())
-    assert next(iter(owners["put"])).name == "proxy_request_sender"
+    assert next(iter(owners["put"])).name.startswith(_command_writer(proxy))
     assert next(iter(owners["get"])).name.startswith("proxy_profile_control")
 
 
@@ -679,7 +695,8 @@ def test_profile_control_thread_name_is_stable_across_calls(bare_proxy, tmp_path
     assert len(seen_owners) == 4 * n_calls
 
     owner_set = set(seen_owners)
-    assert len(owner_set) == 2, (
+    # The profile-control thread reads acks, and with direct sends also writes.
+    assert len(owner_set) == (1 if proxy._request_sender._direct_send else 2), (
         f"Owner thread changed across calls: "
         f"{sorted(t.name for t in owner_set)}. "
         f"max_workers may have been bumped > 1."

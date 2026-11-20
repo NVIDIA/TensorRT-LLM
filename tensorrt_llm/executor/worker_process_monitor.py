@@ -22,7 +22,10 @@ import os
 import select
 import socket
 import threading
-from typing import Dict, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional
+
+if TYPE_CHECKING:
+    from .remote_worker_process_monitor import ProcessWatchEndpoint
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +109,9 @@ class WorkerProcessMonitor:
         self._local_pid_namespace = _read_pid_namespace(os.getpid())
         self._remote = None
 
-    def start_remote(self, world_size: int, wake: threading.Event):
+    def start_remote(
+        self, world_size: int, wake: threading.Event
+    ) -> Optional[ProcessWatchEndpoint]:
         """Watch remote ranks when TRTLLM_WORKER_WATCH=1 opts in.
 
         Supervision needs worker-to-proxy TCP connectivity that MPI alone does

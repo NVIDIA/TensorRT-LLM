@@ -30,16 +30,20 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _RecordingQueue:
-    """Request-queue stand-in that records each message; the first put can block.
+    """Request-queue stand-in that records each message as rank 0 decodes it.
 
-    Like ``ZeroMqQueue`` with ``TLLM_LLMAPI_ZMQ_DEBUG=1``, it rejects a write from
-    any thread other than the first one that wrote, so the production factory
-    keeps every write on the sender thread.
+    With ``block_first_put``, the first message stays in flight until
+    ``release_first_put`` is set: an owner-thread write blocks for that time,
+    and with ``direct`` later writes find the socket unwritable instead.
+    Without ``direct``, like ``ZeroMqQueue`` with ``TLLM_LLMAPI_ZMQ_DEBUG=1``,
+    it rejects a write from any thread other than the first one that wrote, so
+    the production factory keeps every write on the sender thread.
     """
 
     _zmq_debug_enabled = True
 
-    def __init__(self, block_first_put: bool = False):
+    def __init__(self, block_first_put: bool = False, *, direct: bool = False):
+        self.direct = direct
         self.messages = []
         self.socket = stub_command_socket(self._check_writer)
         self.writer = None
@@ -49,6 +53,8 @@ class _RecordingQueue:
             self.release_first_put.set()
 
     def _check_writer(self):
+        if self.direct:
+            return
         if self.writer is None:
             self.writer = threading.get_ident()
         elif self.writer != threading.get_ident():
@@ -57,16 +63,19 @@ class _RecordingQueue:
     def setup_lazily(self):
         self._check_writer()
 
-    def put(self, msg, *, timeout=None):
+    def sign_pickled(self, pickled):
+        return pickled
+
+    def put_signed(self, message, *, timeout=None):
         self._check_writer()
-        if not self.messages:
+        if self.direct:
+            if self.messages and not self.release_first_put.wait(timeout):
+                raise zmq.Again()
+        elif not self.messages:
             self.first_put_started.set()
             self.release_first_put.wait(timeout=10)
-        self.messages.append(msg)
-
-    def put_noblock(self, msg, *, retry=1, wait_time=0.001):
-        self._check_writer()
-        self.messages.append(msg)
+        self.messages.append(pickle.loads(message))
+        self.first_put_started.set()
 
     def close(self):
         self._check_writer()
@@ -197,25 +206,28 @@ def test_batching_is_opt_in(monkeypatch, setting):
     sender.send(pickle.dumps("c"))
     q.release_first_put.set()
     sender.close(timeout=10)
-    expected = (
-        [_payloads("a"), _payloads("b", "c")]
-        if batching
-        else [_payloads("a"), _payloads("b"), _payloads("c")]
-    )
+    expected = ["a", _payloads("b", "c")] if batching else ["a", "b", "c"]
     assert q.messages == expected
 
 
-def test_lone_request_is_sent_as_one_payload_list():
+def _owner_sender(request_queue, error_queue=None, **kwargs):
+    """Create a sender that writes only on its owner thread and coalesces bursts."""
+    kwargs.setdefault("batching", True)
+    error_queue = queue.Queue() if error_queue is None else error_queue
+    return _RequestSender(request_queue, error_queue, direct_send=False, **kwargs)
+
+
+def test_lone_request_is_sent_as_itself():
     request_queue = _RecordingQueue()
-    sender = _RequestSender(request_queue, queue.Queue())
+    sender = _owner_sender(request_queue)
     sender.send(pickle.dumps("a"))
     sender.close(timeout=10)
-    assert request_queue.messages == [_payloads("a")]
+    assert request_queue.messages == ["a"]
 
 
 def test_burst_is_sent_as_one_list_in_order():
     request_queue = _RecordingQueue(block_first_put=True)
-    sender = _RequestSender(request_queue, queue.Queue())
+    sender = _owner_sender(request_queue)
     sender.send(pickle.dumps(0))
     assert request_queue.first_put_started.wait(timeout=10)
     # Everything queued while the first send is in flight goes out as one list.
@@ -223,12 +235,12 @@ def test_burst_is_sent_as_one_list_in_order():
         sender.send(pickle.dumps(item))
     request_queue.release_first_put.set()
     sender.close(timeout=10)
-    assert request_queue.messages == [_payloads(0), _payloads(1, 2, 3, 4, 5)]
+    assert request_queue.messages == [0, _payloads(1, 2, 3, 4, 5)]
 
 
 def test_close_flushes_queued_requests_and_drops_later_ones():
     request_queue = _RecordingQueue(block_first_put=True)
-    sender = _RequestSender(request_queue, queue.Queue())
+    sender = _owner_sender(request_queue)
     sender.send(pickle.dumps("first"))
     assert request_queue.first_put_started.wait(timeout=10)
     sender.send(pickle.dumps("queued"))
@@ -237,25 +249,25 @@ def test_close_flushes_queued_requests_and_drops_later_ones():
     request_queue.release_first_put.set()
     closer.join(timeout=10)
     assert not closer.is_alive()
-    assert request_queue.messages == [_payloads("first"), _payloads("queued")]
+    assert request_queue.messages == ["first", "queued"]
     with pytest.raises(EngineUnavailableError):
         sender.send(pickle.dumps("late"))
-    assert request_queue.messages == [_payloads("first"), _payloads("queued")]
+    assert request_queue.messages == ["first", "queued"]
 
 
 def test_close_is_idempotent():
     request_queue = _RecordingQueue()
-    sender = _RequestSender(request_queue, queue.Queue())
+    sender = _owner_sender(request_queue)
     sender.send(pickle.dumps("a"))
     sender.close(timeout=10)
     assert not sender._thread.is_alive()
     sender.close(timeout=10)
-    assert request_queue.messages == [_payloads("a")]
+    assert request_queue.messages == ["a"]
 
 
 def test_sender_thread_sends_the_sentinel_after_the_queued_requests():
     request_queue = _RecordingQueue(block_first_put=True)
-    sender = _RequestSender(request_queue, queue.Queue())
+    sender = _owner_sender(request_queue)
     sender.send(pickle.dumps("first"))
     assert request_queue.first_put_started.wait(timeout=10)
     sender.send(pickle.dumps("queued"))
@@ -267,13 +279,13 @@ def test_sender_thread_sends_the_sentinel_after_the_queued_requests():
     request_queue.release_first_put.set()
     closer.join(timeout=10)
     assert result == [None]
-    # A bare None after the payload lists, written by the sender thread.
-    assert request_queue.messages == [_payloads("first"), _payloads("queued"), None]
+    # The sentinel follows the queued commands, written by the sender thread.
+    assert request_queue.messages == ["first", "queued", None]
 
 
 def test_shutdown_without_requests_still_uses_the_socket_owner():
     q = _RecordingQueue()
-    sender = _RequestSender(q, queue.Queue())
+    sender = _owner_sender(q)
     assert sender.close(timeout=10, send_sentinel=True) is None
     assert q.messages == [None]
     assert q.writer != threading.get_ident()
@@ -281,7 +293,7 @@ def test_shutdown_without_requests_still_uses_the_socket_owner():
 
 def test_close_during_interpreter_finalization_does_not_join():
     request_queue = _RecordingQueue(block_first_put=True)
-    sender = _RequestSender(request_queue, queue.Queue())
+    sender = _owner_sender(request_queue)
     sender.send(pickle.dumps("first"))
     assert request_queue.first_put_started.wait(timeout=10)
     sender.send(pickle.dumps("queued"))
@@ -295,14 +307,14 @@ def test_close_during_interpreter_finalization_does_not_join():
     request_queue.release_first_put.set()
     sender.close(timeout=10)
     assert not sender._thread.is_alive()
-    assert request_queue.messages == [_payloads("first"), _payloads("queued")]
+    assert request_queue.messages == ["first", "queued"]
 
 
 def test_pre_shutdown_flushes_batched_requests_before_the_sentinel():
     request_queue = _RecordingQueue(block_first_put=True)
     proxy = _bare_proxy()
     proxy.request_queue = request_queue
-    proxy._request_sender = _RequestSender(request_queue, queue.Queue())
+    proxy._request_sender = _owner_sender(request_queue)
     proxy._send_request("first")
     assert request_queue.first_put_started.wait(timeout=10)
     proxy._send_request("queued")
@@ -313,7 +325,7 @@ def test_pre_shutdown_flushes_batched_requests_before_the_sentinel():
     assert not shutdown.is_alive()
     proxy.workers_started = False
     # The sender thread wrote everything, the sentinel included.
-    assert request_queue.messages == [_payloads("first"), _payloads("queued"), None]
+    assert request_queue.messages == ["first", "queued", None]
     assert request_queue.writer != shutdown.ident
 
 
@@ -322,7 +334,7 @@ def test_pre_shutdown_sends_the_sentinel_itself_if_nothing_else_wrote(batching):
     request_queue = _RecordingQueue()
     proxy = _bare_proxy()
     proxy.request_queue = request_queue
-    proxy._request_sender = _RequestSender(request_queue, queue.Queue(), batching=batching)
+    proxy._request_sender = _owner_sender(request_queue, batching=batching)
 
     shutdown = _pre_shutdown(proxy)
     shutdown.join(timeout=10)
@@ -349,9 +361,9 @@ def test_transport_error_reaches_error_queue(monkeypatch, late_close):
     class _FailingQueue(_RecordingQueue):
         attempts = 0
 
-        def put(self, msg, *, timeout=None):
-            if msg is None:
-                return super().put(msg, timeout=timeout)
+        def put_signed(self, message, *, timeout=None):
+            if pickle.loads(message) is None:
+                return super().put_signed(message, timeout=timeout)
             self._check_writer()
             self.attempts += 1
             self.first_put_started.set()
@@ -384,12 +396,13 @@ def test_transport_error_reaches_error_queue(monkeypatch, late_close):
         finish_failure.set()
         closer.join(timeout=10)
         assert not closer.is_alive()
-        assert responsibility == [None]
         assert request_queue.attempts == 1
         assert request_queue.messages == [None]
         error = error_queue.get_nowait()
         assert isinstance(error, RuntimeError)
         assert str(error) == "socket closed"
+        # close() returns the failure that stopped the sender.
+        assert responsibility == [error]
     finally:
         request_queue.release_first_put.set()
         finish_failure.set()
@@ -425,14 +438,10 @@ def test_worker_unpacks_batched_requests_in_order():
         def get(self):
             return self._messages.pop(0)
 
-    request_queue = _ListQueue(
-        [_payloads("a"), _payloads("b", "c"), _payloads("d"), None, "after sentinel"]
-    )
+    # A batch is a list of pickled payloads; a lone command arrives already
+    # unpickled by the queue.
+    request_queue = _ListQueue(["a", _payloads("b", "c"), "d", None, "after sentinel"])
     assert list(_incoming_requests(request_queue)) == ["a", "b", "c", "d"]
-
-    # Every command message is a list; anything else is not a command.
-    with pytest.raises(TypeError, match="Expected a list of pickled commands"):
-        list(_incoming_requests(_ListQueue([_payloads("a"), pickle.dumps("b")])))
 
 
 @pytest.mark.timeout(30, method="thread")
@@ -474,7 +483,7 @@ def test_established_disconnect_fails_while_idle_without_replay(tmp_path, transp
     replacement = None
     try:
         sender.send(pickle.dumps("accepted"))
-        assert peer.get(timeout=2) == _payloads("accepted")
+        assert peer.get(timeout=2) == "accepted"
         # No subsequent send or Again may be needed to discover missing tail data.
         peer.close()
         assert isinstance(errors.get(timeout=2), ConnectionError)
@@ -504,7 +513,7 @@ def test_stop_sentinel_after_engine_failure_survives_commands_in_flight(tmp_path
             peer.address,
             is_server=False,
             socket_type=zmq.PUSH,
-            send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES,
+            send_hwm=_RequestSender.send_hwm(batching=False),
         )
         received, stop = [], threading.Event()
 
@@ -543,32 +552,46 @@ def test_stop_sentinel_after_engine_failure_survives_commands_in_flight(tmp_path
             peer.close()
 
 
-@pytest.mark.timeout(12, method="thread")
-def test_control_capacity_is_reserved_when_admission_is_full():
-    q = _RecordingQueue(block_first_put=True)
-    sender = _RequestSender(q, queue.Queue())
+def _sender_behind_a_blocked_write(direct_send, error_queue=None):
+    """Return a sender whose first command stays in flight until released.
+
+    The owner-thread mode writes one command per message, like direct mode.
+    """
+    q = _RecordingQueue(block_first_put=True, direct=direct_send)
+    error_queue = queue.Queue() if error_queue is None else error_queue
+    sender = _RequestSender(q, error_queue, batching=not direct_send, direct_send=direct_send)
     sender.MAX_BATCH_SIZE = 1
+    return q, sender
+
+
+@pytest.mark.timeout(12, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
+def test_control_commands_and_cancellations_bypass_a_full_request_queue(direct_send):
+    q, sender = _sender_behind_a_blocked_write(direct_send)
     sender.MAX_PENDING_REQUESTS = 1
-    sender.MAX_PENDING_CONTROLS = 1
     try:
         sender.send(pickle.dumps("in-flight"))
         assert q.first_put_started.wait(3)
         sender.send(pickle.dumps("queued"))
         with pytest.raises(EngineUnavailableError):
             sender.send(pickle.dumps("overload"))
-        sender.send(pickle.dumps("cancel"), control=True)
-        with pytest.raises(EngineUnavailableError):
-            sender.send(pickle.dumps("extra-cancel"), control=True)
+        # Control commands have no queue budget of their own; their callers
+        # already send one at a time.
+        sender.send(pickle.dumps("start-profile"), control=True)
+        sender.send(pickle.dumps("stop-profile"), control=True)
+        sender.send(pickle.dumps("cancel"), cancellation_id=7)
+        # A second cancellation of a still-queued id is a duplicate.
+        sender.send(pickle.dumps("cancel-again"), cancellation_id=7)
     finally:
         q.release_first_put.set()
         sender.close(timeout=3, send_sentinel=True)
-    assert q.messages == [_payloads("in-flight"), _payloads("queued"), _payloads("cancel"), None]
+    assert q.messages == ["in-flight", "queued", "start-profile", "stop-profile", "cancel", None]
 
 
 @pytest.mark.timeout(12, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
 @pytest.mark.parametrize("local_final", [False, True])
-def test_proxy_retains_cancellations_when_control_queue_is_full(local_final):
-    q = _RecordingQueue(block_first_put=True)
+def test_proxy_retains_cancellations_when_the_request_queue_is_full(local_final, direct_send):
     proxy = _bare_proxy()
     unrelated = SimpleNamespace(queue=queue.Queue())
     proxy._results = {
@@ -576,14 +599,13 @@ def test_proxy_retains_cancellations_when_control_queue_is_full(local_final):
         43: SimpleNamespace(queue=queue.Queue()),
         44: unrelated,
     }
-    sender = _RequestSender(q, proxy._error_queue)
-    sender.MAX_PENDING_CONTROLS = 1
-    sender.MAX_BATCH_SIZE = 1
+    q, sender = _sender_behind_a_blocked_write(direct_send, proxy._error_queue)
+    sender.MAX_PENDING_REQUESTS = 1
     proxy._request_sender = sender
     try:
         sender.send(pickle.dumps("in-flight"))
         assert q.first_put_started.wait(3)
-        sender.send(pickle.dumps("queued-control"), control=True)
+        sender.send(pickle.dumps("queued"))
         if local_final:
             from tensorrt_llm.executor.postproc_worker import PostprocWorker
 
@@ -601,27 +623,26 @@ def test_proxy_retains_cancellations_when_control_queue_is_full(local_final):
     finally:
         q.release_first_put.set()
         sender.close(timeout=3)
-    delivered = [pickle.loads(message[0]) for message in q.messages[2:]]
+    delivered = q.messages[2:]
     assert [request.id for request in delivered] == [42, 43]
     assert all(isinstance(request, CancellingRequest) for request in delivered)
 
 
 @pytest.mark.timeout(12, method="thread")
-def test_shutdown_cancels_survive_full_control_queue():
-    q = _RecordingQueue(block_first_put=True)
-    sender = _RequestSender(q, queue.Queue())
-    sender.MAX_PENDING_CONTROLS = 1
-    sender.MAX_BATCH_SIZE = 1
+@pytest.mark.parametrize("direct_send", [False, True])
+def test_shutdown_cancels_survive_a_full_request_queue(direct_send):
+    q, sender = _sender_behind_a_blocked_write(direct_send)
+    sender.MAX_PENDING_REQUESTS = 1
     sender.send(pickle.dumps("in-flight"))
     assert q.first_put_started.wait(3)
-    sender.send(pickle.dumps("queued-control"), control=True)
+    sender.send(pickle.dumps("queued"))
     closed = threading.Thread(target=lambda: sender.close(timeout=3, cancel_ids=(7, 8)))
     closed.start()
     q.release_first_put.set()
     closed.join(timeout=4)
     assert not closed.is_alive()
-    assert q.messages[:2] == [_payloads("in-flight"), _payloads("queued-control")]
-    cancels = [pickle.loads(message[0]) for message in q.messages[2:]]
+    assert q.messages[:2] == ["in-flight", "queued"]
+    cancels = q.messages[2:]
     assert all(isinstance(request, CancellingRequest) for request in cancels)
     assert [request.id for request in cancels] == [7, 8]
     assert None not in q.messages
@@ -633,9 +654,9 @@ def test_connected_stall_longer_than_the_connect_timeout_keeps_accepted_work(dir
     blocked = threading.Event()
 
     class ObservedQueue(IpcQueue):
-        def put(self, message, **kwargs):
+        def put_signed(self, message, **kwargs):
             try:
-                return super().put(message, **kwargs)
+                return super().put_signed(message, **kwargs)
             except zmq.Again:
                 blocked.set()
                 raise
@@ -667,9 +688,7 @@ def test_connected_stall_longer_than_the_connect_timeout_keeps_accepted_work(dir
         sender.send(pickle.dumps((count, data)))
         received = []
         for _ in range(count + 1):
-            message = peer.get(timeout=10)
-            assert len(message) == 1
-            request_id, contents = pickle.loads(message[0])
+            request_id, contents = peer.get(timeout=10)
             assert contents == data
             received.append(request_id)
         assert received == list(range(count + 1))
@@ -682,11 +701,12 @@ def test_connected_stall_longer_than_the_connect_timeout_keeps_accepted_work(dir
 
 
 @pytest.mark.timeout(10, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
 @pytest.mark.parametrize("stop", ["capacity", "close", "failure"])
-def test_capacity_wait_unblocks_on_progress_or_shutdown(stop):
-    commands = _RecordingQueue(block_first_put=True)
+def test_capacity_wait_unblocks_on_progress_or_shutdown(stop, direct_send):
+    commands = _RecordingQueue(block_first_put=True, direct=direct_send)
     errors = queue.Queue()
-    sender = _RequestSender(commands, errors, batching=False)
+    sender = _RequestSender(commands, errors, batching=False, direct_send=direct_send)
     sender.MAX_PENDING_REQUESTS = 1
     outcomes = queue.Queue()
     entered = threading.Event()
@@ -730,11 +750,7 @@ def test_capacity_wait_unblocks_on_progress_or_shutdown(stop):
         sender.close(timeout=2)
     assert not waiter.is_alive()
     if stop == "capacity":
-        assert commands.messages == [
-            _payloads("in-flight"),
-            _payloads("queued"),
-            _payloads("waiting"),
-        ]
+        assert commands.messages == ["in-flight", "queued", "waiting"]
 
 
 @pytest.mark.parametrize(
@@ -772,9 +788,9 @@ class _ObservedQueue(IpcQueue):
         self.writers = set()
         self.owner_blocked = threading.Event()
 
-    def put(self, message, **kwargs):
+    def put_signed(self, message, **kwargs):
         try:
-            super().put(message, **kwargs)
+            super().put_signed(message, **kwargs)
         except zmq.Again:
             if threading.current_thread().name == "proxy_request_sender":
                 self.owner_blocked.set()
@@ -858,7 +874,7 @@ def test_unbatched_admission_does_not_wait_for_the_sender_thread():
     # Callers write unbatched commands themselves. A busy event loop can deny
     # the sender thread the GIL, and a connected, idle worker must still
     # receive every command without admission filling up.
-    commands = _ObservedQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = _ObservedQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=False))
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=False, direct_send=True)
     sender.MAX_PENDING_REQUESTS = 4
@@ -868,7 +884,7 @@ def test_unbatched_admission_does_not_wait_for_the_sender_thread():
     try:
         for item in range(count):
             sender.send(pickle.dumps(item))
-        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(count)] == list(range(count))
+        assert [peer.get(timeout=2) for _ in range(count)] == list(range(count))
         assert commands.writers == {threading.current_thread().name}
         assert sender._pending_requests == 0
         assert errors.empty()
@@ -901,7 +917,7 @@ def test_admission_after_an_unwritable_socket_does_not_wait_for_the_sender_threa
         count = 4 * sender.MAX_PENDING_REQUESTS
         for item in range(1, count):
             sender.send(pickle.dumps(item))
-        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(count)] == list(range(count))
+        assert [peer.get(timeout=2) for _ in range(count)] == list(range(count))
         assert errors.empty()
     finally:
         if resume is not None:
@@ -916,14 +932,14 @@ def test_peer_loss_seen_by_a_caller_stops_admission_without_the_sender_thread():
     # A caller that observes the command peer's loss stops admission and
     # reports the sender unavailable, without waiting for the possibly
     # descheduled sender thread to record the failure.
-    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=False))
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=False, direct_send=True)
     peer = _command_peer(commands)
     resume = None
     try:
         sender.send(pickle.dumps("before"))
-        assert peer.get(timeout=2) == _payloads("before")
+        assert peer.get(timeout=2) == "before"
         resume = _deschedule_owner(sender)
         _close_quietly(peer)
         accepted = 0
@@ -945,26 +961,53 @@ def test_peer_loss_seen_by_a_caller_stops_admission_without_the_sender_thread():
         _close_quietly(peer)
 
 
+class _FailingSendQueue(IpcQueue):
+    """Real command socket whose writes fail once connected, as on a broken socket."""
+
+    def _send_data(self, data, flags=0, routing_id=None):
+        raise zmq.ZMQError(zmq.ENOTSUP)
+
+
 @pytest.mark.timeout(10, method="thread")
 def test_direct_transport_error_is_recorded_by_the_sender_thread():
-    class _FailingQueue(IpcQueue):
-        def put(self, message, **kwargs):
-            if message is not None:
-                raise RuntimeError("socket closed")
-            return super().put(message, **kwargs)
-
-    commands = _FailingQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = _FailingSendQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=False))
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=False, direct_send=True)
     peer = _command_peer(commands)
     try:
-        # The caller's failed write is retried and reported by the sender thread.
+        # The caller's failed write is reported by the sender thread.
         sender.send(pickle.dumps("rejected"))
         error = errors.get(timeout=2)
-        assert isinstance(error, RuntimeError) and str(error) == "socket closed"
+        assert isinstance(error, zmq.ZMQError) and error.errno == zmq.ENOTSUP
         with pytest.raises(EngineDeadError):
             sender.send(pickle.dumps("after-failure"))
     finally:
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(10, method="thread")
+def test_a_failed_backlog_write_is_not_reported_as_a_full_queue():
+    # With batching, a caller that finds admission full writes the backlog. If
+    # that write fails, the request fails as engine death, not as a retryable
+    # "queue is full" from a sender that can no longer write.
+    commands = _FailingSendQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=True))
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=True, direct_send=True)
+    sender.MAX_PENDING_REQUESTS = 2
+    peer = _command_peer(commands)
+    resume = _deschedule_owner(sender)
+    try:
+        for item in range(sender.MAX_PENDING_REQUESTS):
+            sender.send(pickle.dumps(item))
+        with pytest.raises(EngineDeadError) as raised:
+            sender.send(pickle.dumps("over-the-limit"))
+        assert isinstance(raised.value.root_cause, zmq.ZMQError)
+        assert not sender.available
+        resume.set()
+        assert isinstance(errors.get(timeout=2), zmq.ZMQError)
+    finally:
+        resume.set()
         sender.close(timeout=2)
         _close_quietly(peer)
 
@@ -974,7 +1017,7 @@ def test_busy_event_loop_does_not_fill_unbatched_admission():
     # The serving shape: a coroutine that keeps the loop busy and yields
     # between submissions denies the sender thread the GIL. No submission may
     # be rejected.
-    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=False))
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=False, direct_send=True)
     sender.MAX_PENDING_REQUESTS = 64
@@ -996,7 +1039,7 @@ def test_busy_event_loop_does_not_fill_unbatched_admission():
 
     try:
         assert asyncio.run(submit()) == 0
-        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(count)] == list(range(count))
+        assert [peer.get(timeout=2) for _ in range(count)] == list(range(count))
         assert errors.empty()
     finally:
         sender.close(timeout=2)
@@ -1008,7 +1051,7 @@ def test_full_batched_admission_writes_the_backlog_without_the_sender_thread():
     # With TRTLLM_PROXY_BATCH_REQUESTS=1, a caller that finds admission full
     # writes the backlog itself, so a sender thread denied the GIL by a busy
     # event loop does not make admission reject requests.
-    commands = _ObservedQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = _ObservedQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=True))
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=True, direct_send=True)
     sender.MAX_PENDING_REQUESTS = 4
@@ -1054,17 +1097,221 @@ def test_a_written_command_does_not_wake_the_sender_thread():
 
     try:
         sender.send(pickle.dumps("connect"))
-        assert peer.get(timeout=2) == _payloads("connect")
+        assert peer.get(timeout=2) == "connect"
         sender._cond.notify_all = recording_notify_all
         for item in range(32):
             sender.send(pickle.dumps(item))
-        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(32)] == list(range(32))
+        assert [peer.get(timeout=2) for _ in range(32)] == list(range(32))
         assert notified == []
         assert errors.empty()
     finally:
         sender._cond.notify_all = notify_all
         sender.close(timeout=2)
         _close_quietly(peer)
+
+
+def _commands(message):
+    """Return the commands in one message, whether sent alone or as a batch."""
+    return (
+        [pickle.loads(payload) for payload in message] if isinstance(message, list) else [message]
+    )
+
+
+@pytest.mark.timeout(20, method="thread")
+@pytest.mark.parametrize("batching", [True, False])
+def test_serializing_a_message_does_not_hold_up_other_callers(batching):
+    # The writer pickles and signs a message without holding the lock that
+    # every send() takes, so with large prompts other callers do not wait for
+    # a whole batch's serialization.
+    signing, release = threading.Event(), threading.Event()
+    held = {}
+
+    class _SlowSigningQueue(IpcQueue):
+        def _sign_data(self, data):
+            if threading.current_thread() is held.get("thread"):
+                signing.set()
+                assert release.wait(10)
+            return super()._sign_data(data)
+
+    commands = _SlowSigningQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching))
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=batching, direct_send=True)
+    peer = _command_peer(commands)
+    first = threading.Thread(target=sender.send, args=(pickle.dumps(0),), name="first-caller")
+    later = threading.Thread(
+        target=lambda: [sender.send(pickle.dumps(item)) for item in range(1, 5)]
+    )
+    try:
+        # With batching the sender thread writes; otherwise the first caller.
+        held["thread"] = sender._thread if batching else first
+        first.start()
+        assert signing.wait(5)
+        later.start()
+        later.join(timeout=2)
+        assert not later.is_alive(), "send() waited for another thread's serialization"
+        release.set()
+        first.join(timeout=5)
+        received = []
+        while len(received) < 5:
+            received += _commands(peer.get(timeout=2))
+        assert received == list(range(5))
+        assert errors.empty()
+    finally:
+        release.set()
+        for thread in (first, later):
+            if thread.is_alive():
+                thread.join(timeout=5)
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(10, method="thread")
+def test_lone_command_is_pickled_once():
+    # A lone command goes out as its own signed payload, so it is pickled once
+    # on the proxy and unpickled once on rank 0.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=False))
+    sender = _RequestSender(commands, queue.Queue(), batching=False, direct_send=True)
+    peer = _command_peer(commands)
+    payload = pickle.dumps({"prompt_token_ids": list(range(64))})
+    try:
+        sender.send(payload)
+        assert peer.socket.poll(2000, zmq.POLLIN)
+        # The message is the payload and its 32-byte HMAC, nothing more.
+        assert peer.socket.recv()[:-32] == payload
+    finally:
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(15, method="thread")
+def test_sender_thread_is_woken_once_per_queued_burst():
+    # send() wakes the sender thread only when the queue turns non-empty; the
+    # thread retries queued work on its own after that.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=True))
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=True, direct_send=True)
+    peer = _command_peer(commands)
+    resume = _deschedule_owner(sender)
+    wake = sender._owner_wake
+    wakes = []
+
+    class _CountingWake:
+        def set(self):
+            wakes.append(threading.current_thread().name)
+            wake.set()
+
+        def __getattr__(self, name):
+            return getattr(wake, name)
+
+    sender._owner_wake = _CountingWake()
+    try:
+        for item in range(10):
+            sender.send(pickle.dumps(item))
+        assert len(wakes) == 1
+        resume.set()
+        received = []
+        while len(received) < 10:
+            received += _commands(peer.get(timeout=2))
+        assert received == list(range(10))
+        assert errors.empty()
+    finally:
+        sender._owner_wake = wake
+        resume.set()
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.parametrize("batching", [None, "1"])
+def test_unbatched_command_socket_buffers_as_many_commands_as_admission(monkeypatch, batching):
+    # Unbatched, every command is one message, so the socket buffers as many
+    # as admission queues and a burst does not wait for the sender thread.
+    if batching is None:
+        monkeypatch.delenv("TRTLLM_PROXY_BATCH_REQUESTS", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", batching)
+    proxy, _ = _single_frontend_lanes()
+    try:
+        expected = (
+            _RequestSender.BATCHED_SEND_HWM if batching else _RequestSender.MAX_PENDING_REQUESTS
+        )
+        assert proxy.request_queue.socket.getsockopt(zmq.SNDHWM) == expected
+    finally:
+        proxy._request_sender.close(timeout=2)
+        proxy.result_queue.close()
+        proxy.worker_init_status_queue.close()
+
+
+def test_constructor_defaults_match_the_production_sender(monkeypatch):
+    monkeypatch.delenv("TRTLLM_PROXY_BATCH_REQUESTS", raising=False)
+    senders = []
+    try:
+        for create in (_RequestSender, _create_request_sender):
+            commands = IpcQueue(is_server=True)
+            senders.append(create(commands, queue.Queue()))
+        flags = [
+            (sender._batching, sender._direct_send, sender._stop_workers_on_failure)
+            for sender in senders
+        ]
+        assert flags == [(False, True, True), (False, True, True)]
+    finally:
+        for sender in senders:
+            sender.close(timeout=2)
+
+
+@pytest.mark.timeout(15, method="thread")
+def test_peer_loss_during_close_ends_final_writes_without_a_failure():
+    # When rank 0 disconnects during close, queued commands are dropped at
+    # once rather than retried until the close deadline, and no engine failure
+    # is reported.
+    peer = IpcQueue(is_server=True, socket_type=zmq.PULL, receive_hwm=1)
+    peer.socket.setsockopt(zmq.RCVBUF, 256 * 1024)
+    commands = IpcQueue(peer.address, is_server=False, socket_type=zmq.PUSH, send_hwm=1)
+    commands.socket.setsockopt(zmq.SNDBUF, 256 * 1024)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    data = b"x" * (1024 * 1024)
+    try:
+        deadline = time.monotonic() + 5
+        while not sender._pending:
+            assert time.monotonic() < deadline, "the command socket never filled"
+            sender.send(pickle.dumps(data))
+        sender.close(timeout=7.0, wait=False)
+        _close_quietly(peer)
+        started = time.monotonic()
+        assert sender.close(timeout=7.0) is None
+        assert time.monotonic() - started < 3
+        assert not sender._thread.is_alive()
+        assert errors.empty()
+    finally:
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(15, method="thread")
+def test_failed_shutdown_write_marks_the_engine_dead_without_raising():
+    # A stop sentinel that cannot be queued at shutdown marks the engine dead
+    # but is not raised from shutdown().
+    q = _RecordingQueue(block_first_put=True, direct=True)
+    proxy = _bare_proxy()
+    proxy._engine_dead = False
+    proxy._results = {}
+    proxy._error_queue = queue.Queue()
+    proxy._request_sender = _RequestSender(q, proxy._error_queue)
+    try:
+        proxy._request_sender.send(pickle.dumps("in-flight"))
+        assert q.first_put_started.wait(3)
+        proxy.workers_started = True
+        started = time.monotonic()
+        # Rank 0 has stopped reading, so the sentinel cannot be queued.
+        proxy._close_request_sender(send_sentinel=True)
+        assert time.monotonic() - started < 5
+        assert proxy._error_queue.empty()
+        assert proxy._engine_dead
+    finally:
+        proxy.workers_started = False
+        q.release_first_put.set()
+        proxy._request_sender.close(timeout=2)
+    assert q.messages == ["in-flight"]
 
 
 class _PollRecordingSocket:
@@ -1094,7 +1341,7 @@ def test_sends_and_idle_checks_do_not_poll_under_the_sender_lock():
     # zmq_poll releases the GIL even with a zero timeout, so neither callers
     # nor the idle sender thread poll a socket while holding the sender lock.
     # Otherwise every caller waits for that thread to get the GIL back.
-    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=False))
     holder = {}
     polls = []
     commands.socket = _PollRecordingSocket(commands.socket, holder, polls)
@@ -1106,7 +1353,7 @@ def test_sends_and_idle_checks_do_not_poll_under_the_sender_lock():
     try:
         for item in range(32):
             sender.send(pickle.dumps(item))
-        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(32)] == list(range(32))
+        assert [peer.get(timeout=2) for _ in range(32)] == list(range(32))
         _wait_for_owner_checks(checks, 3)
         assert polls == []
         assert sender.available
@@ -1122,13 +1369,13 @@ def test_sender_thread_stays_off_the_lock_while_callers_check_the_connection():
     # thread checks it at most once per IDLE_CHECK_INTERVAL. Its checks take
     # the lock, and with another CPU-bound thread a caller that arrives during
     # one waits for GIL handoffs.
-    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=False))
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=False, direct_send=True)
     peer = _command_peer(commands)
     try:
         sender.send(pickle.dumps("connect"))
-        assert peer.get(timeout=2) == _payloads("connect")
+        assert peer.get(timeout=2) == "connect"
         owner_checks = _record_owner_checks(sender)
         started = time.monotonic()
         count = 0
@@ -1138,8 +1385,8 @@ def test_sender_thread_stays_off_the_lock_while_callers_check_the_connection():
             time.sleep(0.002)
         active = len(owner_checks)
         active_window = time.monotonic() - started
-        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(count)] == list(range(count))
-        # Checking every SEND_TIMEOUT would give about ten checks in 0.5 s.
+        assert [peer.get(timeout=2) for _ in range(count)] == list(range(count))
+        # Checking every POLL_INTERVAL would give about ten checks in 0.5 s.
         assert active <= active_window / sender.IDLE_CHECK_INTERVAL + 1
         # An idle connection is still checked, so its loss is still detected.
         _wait_for_owner_checks(owner_checks, 2)
@@ -1169,20 +1416,20 @@ def _probe(port, kind):
 def test_unrelated_connection_to_command_port_does_not_fail_the_engine(kind, direct_send):
     # A local connect/close on the loopback command port that is not the
     # command peer does not fail a healthy engine.
-    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=False))
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=False, direct_send=direct_send)
     peer = _command_peer(commands)
     try:
         sender.send(pickle.dumps("before"))
-        assert peer.get(timeout=2) == _payloads("before")
+        assert peer.get(timeout=2) == "before"
         _probe(int(commands.address[0].rsplit(":", 1)[1]), kind)
         # Let the idle sender thread process the probe's connection events.
         time.sleep(3 * sender.IDLE_CHECK_INTERVAL)
         assert errors.empty()
         assert sender.available
         sender.send(pickle.dumps("after"))
-        assert peer.get(timeout=2) == _payloads("after")
+        assert peer.get(timeout=2) == "after"
         # Losing the command peer itself remains terminal.
         _close_quietly(peer)
         assert isinstance(errors.get(timeout=2), ConnectionError)
@@ -1198,7 +1445,7 @@ def test_unrelated_connection_to_command_port_does_not_fail_the_engine(kind, dir
 def test_probe_overlapping_the_worker_handshake_does_not_fail_the_engine(direct_send):
     # A TLS probe produces no handshake failure event. Its close, after the
     # worker's handshake completes, is not the command peer's loss.
-    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.send_hwm(batching=False))
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=False, direct_send=direct_send)
     port = int(commands.address[0].rsplit(":", 1)[1])
@@ -1208,7 +1455,7 @@ def test_probe_overlapping_the_worker_handshake_does_not_fail_the_engine(direct_
         time.sleep(0.2)
         peer = _command_peer(commands)
         sender.send(pickle.dumps("before"))
-        assert peer.get(timeout=2) == _payloads("before")
+        assert peer.get(timeout=2) == "before"
         probe.sendall(bytes.fromhex("16030100c4010000c00303") + b"\x00" * 190)
         time.sleep(0.05)
         probe.close()
@@ -1216,7 +1463,7 @@ def test_probe_overlapping_the_worker_handshake_does_not_fail_the_engine(direct_
         assert errors.empty()
         assert sender.available
         sender.send(pickle.dumps("after"))
-        assert peer.get(timeout=2) == _payloads("after")
+        assert peer.get(timeout=2) == "after"
         _close_quietly(peer)
         assert isinstance(errors.get(timeout=2), ConnectionError)
     finally:
@@ -1264,7 +1511,7 @@ def test_local_probe_before_the_worker_attaches_does_not_take_a_lane(lane, paylo
         if lane == "request":
             proxy._request_sender.send(pickle.dumps("first"))
             assert worker.poll(3), "a non-ZMTP probe took the command lane"
-            assert worker.get() == _payloads("first")
+            assert worker.get() == "first"
             assert proxy._request_sender.available and proxy._error_queue.empty()
         else:
             worker.put("result")

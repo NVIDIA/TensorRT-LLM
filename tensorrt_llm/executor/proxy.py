@@ -111,6 +111,16 @@ def _check_collective_rpc_guard(
             "this shim only reaches rank-0.")
 
 
+def _batch_requests() -> bool:
+    """Whether TRTLLM_PROXY_BATCH_REQUESTS=1 asks to coalesce command bursts."""
+    return os.getenv("TRTLLM_PROXY_BATCH_REQUESTS", "0") == "1"
+
+
+def _command_send_hwm() -> int:
+    """Return the send high-water mark for a command socket."""
+    return _RequestSender.send_hwm(_batch_requests())
+
+
 def _create_request_sender(
         request_queue: IpcQueue,
         error_queue: Queue,
@@ -126,7 +136,7 @@ def _create_request_sender(
     return _RequestSender(
         request_queue,
         error_queue,
-        batching=os.getenv("TRTLLM_PROXY_BATCH_REQUESTS", "0") == "1",
+        batching=_batch_requests(),
         on_failure=on_failure,
         stop_workers_on_failure=stop_workers_on_failure,
         direct_send=not getattr(request_queue, "_zmq_debug_enabled", False))
@@ -589,12 +599,11 @@ class GenerationExecutorProxy(GenerationExecutor):
             frontend_result_addrs = [(multi_frontend_result_addr(ipc_dir,
                                                                  i), hmac_key)
                                      for i in range(self._num_frontends)]
-            self.request_queue = IpcQueue(
-                request_addr,
-                is_server=False,
-                socket_type=zmq.PUSH,
-                name="proxy_request_queue",
-                send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+            self.request_queue = IpcQueue(request_addr,
+                                          is_server=False,
+                                          socket_type=zmq.PUSH,
+                                          name="proxy_request_queue",
+                                          send_hwm=_command_send_hwm())
             self._request_sender = _create_request_sender(
                 self.request_queue, self._error_queue,
                 weakref.WeakMethod(self._handle_command_failure))
@@ -608,7 +617,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.request_queue = IpcQueue(
                 is_server=True,
                 name="proxy_request_queue",
-                send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES,
+                send_hwm=_command_send_hwm(),
                 socket_options=self._LOOPBACK_LANE_OPTIONS)
             self._request_sender = _create_request_sender(
                 self.request_queue, self._error_queue,
@@ -1250,21 +1259,29 @@ class GenerationExecutorProxy(GenerationExecutor):
             and submission_waits_for_capacity(),
             cancellation_id=request.id
             if isinstance(request, CancellingRequest) else None,
-            control=isinstance(
-                request,
-                (CancellingRequest, StartProfileRequest, StopProfileRequest)))
+            control=isinstance(request,
+                               (StartProfileRequest, StopProfileRequest)))
 
     def _close_request_sender(self,
                               send_sentinel: bool = False,
                               *,
                               cancel_ids: tuple[int, ...] = (),
                               wait: bool = True) -> None:
-        """Request bounded shutdown from the command socket's owner."""
-        if self._request_sender is not None:
-            self._request_sender.close(timeout=7.0,
-                                       send_sentinel=send_sentinel,
-                                       cancel_ids=cancel_ids,
-                                       wait=wait)
+        """Request bounded shutdown from the command socket's owner.
+
+        A failure of the final writes is logged by the sender, not raised from
+        shutdown. For a launcher it still marks the engine dead, so teardown
+        does not wait for workers that may never have received the stop
+        sentinel.
+        """
+        if self._request_sender is None:
+            return
+        error = self._request_sender.close(timeout=7.0,
+                                           send_sentinel=send_sentinel,
+                                           cancel_ids=cancel_ids,
+                                           wait=wait)
+        if error is not None and self.workers_started:
+            self._mark_engine_dead(error)
 
     def _get_next_client_id(self) -> int:
         client_id = super()._get_next_client_id()
@@ -1774,7 +1791,7 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             is_server=False,
             socket_type=zmq.PUSH,
             name=f"frontend_{frontend_id}_request_queue",
-            send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+            send_hwm=_command_send_hwm())
         self._request_sender = _create_request_sender(
             self.request_queue,
             self._error_queue,
@@ -1831,7 +1848,7 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         self.doing_shutdown = True
         # Abort this frontend's in-flight requests so the engine frees their
         # slots. The owner sends these in bounded batches after draining its
-        # queue, so a full control queue cannot silently discard cleanup.
+        # queue, so a full request queue cannot silently discard cleanup.
         # Never send the None engine-shutdown sentinel: only the launcher
         # frontend owns the engine lifecycle. check_health runs this on the
         # event loop, so do not wait for the cancels here; shutdown() joins.

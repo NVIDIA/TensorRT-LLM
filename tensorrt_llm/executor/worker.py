@@ -372,14 +372,16 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                 self.engine.wait_shutdown()
 
 
-def _incoming_requests(request_queue: IpcQueue,
-                       poll_control: Optional[Callable[[], bool]] = None):
+def _incoming_requests(
+        request_queue: IpcQueue,
+        poll_control: Optional[Callable[[], bool]] = None) -> Iterator[object]:
     """Yield the proxy's requests until its shutdown sentinel arrives.
 
-    Every command message is a list of pickled requests; with
-    TRTLLM_PROXY_BATCH_REQUESTS=1 one list carries a burst of requests.
-    ``request_queue.get()`` has already authenticated that message, and with
-    it every payload inside. Any other message is rejected.
+    A lone request arrives as itself, already unpickled by
+    ``request_queue.get()``. With TRTLLM_PROXY_BATCH_REQUESTS=1 the proxy
+    sends a burst of requests as one list of pickled requests.
+    ``request_queue.get()`` has already authenticated each message, and with
+    it every payload inside.
 
     ``poll_control`` returns True while a profile operation is pending. The
     loop then waits for a command in short polls and calls it between them,
@@ -392,11 +394,11 @@ def _incoming_requests(request_queue: IpcQueue,
                 continue
         if (msg := request_queue.get()) is None:
             return
-        if not isinstance(msg, list):
-            raise TypeError(f"Expected a list of pickled commands, got "
-                            f"{type(msg).__name__}")
-        for payload in msg:
-            yield pickle.loads(payload)  # nosec B301
+        if isinstance(msg, list):
+            for payload in msg:
+                yield pickle.loads(payload)  # nosec B301
+        else:
+            yield msg
 
 
 def _dispatch_requests(worker: GenerationExecutorWorker,
