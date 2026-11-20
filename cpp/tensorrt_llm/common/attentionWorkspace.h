@@ -238,6 +238,8 @@ class AttentionWorkspaceManager
 {
 public:
     //! Size padded Q/K/V and score buffers, sequence metadata, and packed-token metadata.
+    //! Q/K/V and score buffers use padded counts because padding removal can make the packed token count smaller
+    //! than batch size times the maximum context query length.
     [[nodiscard]] static AttentionContextWorkspaceSizes buildUnfusedContextSizes(
         AttentionUnfusedContextWorkspaceParams const& params) noexcept;
 
