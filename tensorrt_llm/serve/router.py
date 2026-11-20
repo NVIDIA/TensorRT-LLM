@@ -469,7 +469,10 @@ class Router(ABC):
             async with self.session.get(f"{url}/server_info",
                                         timeout=timeout) as response:
                 response.raise_for_status()
-                return await response.json()
+                info = await response.json()
+                if not isinstance(info, dict):
+                    raise ValueError("/server_info must return a JSON object")
+                return info
         except Exception as e:
             logger.warning(
                 f"Error fetching server info for server {server}: {e}")
@@ -1791,14 +1794,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         await self._finish(req_id, success)
 
     def _on_servers_updated(self, old_servers, new_servers):
-        new_state = {}
-        for server in new_servers:
-            new_state[server] = (self._server_state.get(server)
-                                 or self._create_server_state(server))
-        for server, state in self._server_state.items():
-            if server not in new_state:
+        # Unpublished state can belong to a concurrent admission awaiting /server_info.
+        # Only a departure from the published set retires this worker's poll.
+        for server in set(old_servers) - set(new_servers):
+            state = self._server_state.pop(server, None)
+            if state is not None:
                 state.request_poll_stop()
-        self._server_state = new_state
+        for server in new_servers:
+            if server not in self._server_state:
+                self._server_state[server] = self._create_server_state(server)
 
 
 class _BlockHashTrie:

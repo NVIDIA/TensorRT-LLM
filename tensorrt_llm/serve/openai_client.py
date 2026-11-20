@@ -429,7 +429,11 @@ class OpenAIHttpClient(OpenAIClient):
                     timeout=min(5.0, max(0.0, deadline - asyncio.get_running_loop().time())),
                 )
                 break
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                asyncio.TimeoutError,
+            ):
                 if attempt == 1:
                     raise
             except aiohttp.ClientResponseError as error:

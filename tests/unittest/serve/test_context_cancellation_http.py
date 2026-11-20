@@ -781,6 +781,11 @@ async def test_adapted_response_closes_protected_source_before_first_read_or_fai
         ([aiohttp.ClientResponseError(None, (), status=409)], 1, False),
         ([ValueError("invalid receipt")], 1, False),
         ([asyncio.TimeoutError(), asyncio.TimeoutError()], 2, False),
+        (
+            [aiohttp.ClientPayloadError("truncated"), aiohttp.ClientPayloadError("truncated")],
+            2,
+            False,
+        ),
     ],
     ids=[
         "timeout_retry",
@@ -789,6 +794,7 @@ async def test_adapted_response_closes_protected_source_before_first_read_or_fai
         "rejected",
         "invalid_receipt",
         "exhausted",
+        "truncated_replies_exhausted",
     ],
 )
 async def test_context_cancel_redelivery_is_bounded_and_idempotent(
@@ -1349,6 +1355,47 @@ async def test_reserve_redelivery_reuses_recorded_authorization_after_lost_reply
     assert deliveries[0] == deliveries[1]
     assert tokens == [token, token]
     assert list(owner._pending) == [token]
+
+
+@pytest.mark.asyncio
+async def test_truncated_control_replies_redeliver_only_the_original_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial 200 response can hide an accepted reserve or cancel."""
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", Mock())
+    deliveries = []
+
+    async def control(request: web.Request) -> web.Response:
+        action = request.match_info["action"]
+        deliveries.append((action, await request.json()))
+        if len(deliveries) in (1, 3):
+            response = web.Response(
+                body=b"{", content_type="application/json", headers={"Content-Length": "32"}
+            )
+            response.force_close()
+            return response
+        return web.json_response(
+            {"token": "opaque"} if action == "reserve" else {"status": "queued"}
+        )
+
+    app = web.Application()
+    app.router.add_post("/internal/context-cancellation/{action:reserve|cancel}", control)
+    async with TestServer(app) as http, aiohttp.ClientSession() as session:
+        client = OpenAIHttpClient(
+            Mock(spec=Router),
+            ServerRole.CONTEXT,
+            session=session,
+            internal_disagg_auth_key="secret",
+        )
+        cancellation = _ContextCancellation(client)
+        assert await cancellation.reserve(str(http.make_url("/")), 42) == "opaque"
+        await cancellation.cancel()
+
+    assert [action for action, _ in deliveries] == ["reserve", "reserve", "cancel", "cancel"]
+    assert deliveries[0] == deliveries[1]
+    assert deliveries[2][1] == deliveries[3][1] == {"token": "opaque"}
+    assert cancellation._token is None
 
 
 @pytest.mark.asyncio
