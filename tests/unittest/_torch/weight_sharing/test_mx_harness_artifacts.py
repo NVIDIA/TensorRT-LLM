@@ -171,6 +171,26 @@ def test_timing_report_and_archive_survive_a_failed_run(
     assert (destination / "receiver-transfer-logs" / "rank0.log").is_file()
 
 
+def test_archive_keeps_earlier_attempts_of_the_same_case(tmp_path: Path) -> None:
+    layout = _failed_run(tmp_path / "run")
+    root = tmp_path / "output" / "model_express"
+
+    first = archive_run_artifacts(tmp_path / "output", "llama-bf16-tp1", layout)
+    layout.log("receiver").write_text("second attempt\n", encoding="utf-8")
+    second = archive_run_artifacts(tmp_path / "output", "llama-bf16-tp1", layout)
+    third = archive_run_artifacts(tmp_path / "output", "llama-bf16-tp1", layout)
+
+    assert (first, second, third) == (
+        root / "llama-bf16-tp1",
+        root / "llama-bf16-tp1.attempt-2",
+        root / "llama-bf16-tp1.attempt-3",
+    )
+    assert (first / "receiver.log").read_text(encoding="utf-8") == (
+        "MX E2E worker exited with status 1\n"
+    )
+    assert (second / "receiver.log").read_text(encoding="utf-8") == "second attempt\n"
+
+
 def test_archive_is_skipped_without_an_output_dir(tmp_path: Path) -> None:
     layout = _failed_run(tmp_path / "run")
 
@@ -229,6 +249,34 @@ def test_mx_role_manifests_still_reject_a_preloaded_donor(tmp_path: Path) -> Non
 
     with pytest.raises(AssertionError, match="donor must load from disk"):
         assert_weight_manifests(_case(), manifests, roles=MX_ROLES)
+
+
+def test_final_tier_failure_names_the_role_that_disagrees(tmp_path: Path) -> None:
+    _write_mx_manifests(tmp_path)
+    baseline = _TwoTensorModule()
+    with torch.no_grad():
+        baseline.weight[1, 2] += 1
+    context = {
+        "family": "final",
+        "role": "baseline",
+        "rank": 0,
+        "checkpoint_format": "HF",
+        "world_size": 1,
+    }
+    write_weight_manifest(
+        build_weight_manifest(baseline, context=context),
+        tmp_path / manifest_file_name("final", "baseline", 0),
+    )
+    manifests = collect_weight_manifests(tmp_path, _case())
+
+    with pytest.raises(pytest.fail.Exception) as failure:
+        assert_weight_manifests(_case(), manifests)
+
+    message = str(failure.value)
+    assert "Weight manifests differ: baseline@final rank0 vs donor@final rank0" in message
+    assert "1 of 1 1 MiB chunks differ (bytes 0-32)" in message
+    summary = message.split("roles that disagree with the others on rank 0:\n")[1]
+    assert summary == "  weight: baseline differs from donor and receiver"
 
 
 def test_manifest_roles_must_include_both_mx_roles(tmp_path: Path) -> None:

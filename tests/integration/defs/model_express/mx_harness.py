@@ -25,6 +25,7 @@ launching, transfer evidence, and weight-manifest comparison.
 
 from __future__ import annotations
 
+import fnmatch
 import functools
 import json
 import os
@@ -34,6 +35,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -834,6 +836,7 @@ def _assert_manifests_equal(
     *,
     kinds: Sequence[str] = ("param", "buffer"),
     exempt_patterns: Sequence[str] = (),
+    note: str = "",
 ) -> None:
     diff = compare_weight_manifests(expected, actual, kinds=kinds, exempt_patterns=exempt_patterns)
     if diff.exempted_digest_diffs:
@@ -842,7 +845,47 @@ def _assert_manifests_equal(
             f"{list(diff.exempted_digest_diffs)}"
         )
     if not diff.is_empty:
-        pytest.fail(diff.describe(expected_label, actual_label))
+        pytest.fail(diff.describe(expected_label, actual_label) + note)
+
+
+def _final_tier_disagreement(
+    manifests: Mapping[ManifestKey, WeightManifest],
+    roles: Sequence[str],
+    rank: int,
+    exempt_patterns: Sequence[str],
+    *,
+    limit: int = 20,
+) -> str:
+    """Name, per tensor, the final-tier roles whose digest differs from the others' agreed one.
+
+    With three roles, one role that disagrees with the two others identifies the
+    load that produced different bytes. Returns an empty string when fewer than
+    three roles ran or every non-exempt tensor agrees.
+    """
+    if len(roles) < 3:
+        return ""
+    entries = {role: manifests[("final", role, rank)].entries_by_fqn() for role in roles}
+    lines: list[str] = []
+    for fqn in sorted(set().union(*(by_fqn.keys() for by_fqn in entries.values()))):
+        if any(fnmatch.fnmatchcase(fqn, pattern) for pattern in exempt_patterns):
+            continue
+        digests = {
+            role: entries[role][fqn].sha256 if fqn in entries[role] else None for role in roles
+        }
+        agreed, votes = Counter(digests.values()).most_common(1)[0]
+        if votes == len(roles):
+            continue
+        if votes * 2 > len(roles):
+            others = " and ".join(role for role in roles if digests[role] == agreed)
+            deviating = ", ".join(role for role in roles if digests[role] != agreed)
+            lines.append(f"  {fqn}: {deviating} differs from {others}")
+        else:
+            lines.append(f"  {fqn}: no two roles agree")
+    if not lines:
+        return ""
+    if len(lines) > limit:
+        lines = [*lines[:limit], f"  ... and {len(lines) - limit} more"]
+    return f"\n roles that disagree with the others on rank {rank}:\n" + "\n".join(lines)
 
 
 def assert_weight_manifests(
@@ -890,6 +933,9 @@ def assert_weight_manifests(
             f"receiver@receive rank{rank}",
             kinds=TRANSFER_TIER_KINDS,
         )
+        disagreement = _final_tier_disagreement(
+            manifests, roles, rank, case.final_manifest_exempt_patterns
+        )
         for expected_role, actual_role in final_pairs:
             _assert_manifests_equal(
                 manifests[("final", expected_role, rank)],
@@ -897,6 +943,7 @@ def assert_weight_manifests(
                 f"{expected_role}@final rank{rank}",
                 f"{actual_role}@final rank{rank}",
                 exempt_patterns=case.final_manifest_exempt_patterns,
+                note=disagreement,
             )
 
 
@@ -1056,11 +1103,21 @@ def report_timings(
 def archive_run_artifacts(
     output_dir: str | Path | None, case_id: str, layout: MxRunLayout
 ) -> Path | None:
-    """Copy payloads, logs, manifests, and timing into the CI-archived output directory."""
+    """Copy payloads, logs, manifests, and timing into the CI-archived output directory.
+
+    A case archived again into the same output directory, as when CI reruns a
+    failed test, goes to `<case_id>.attempt-<n>`, so the earlier attempt's
+    artifacts are kept.
+    """
     if not output_dir:
         return None
-    destination = Path(output_dir) / "model_express" / case_id
-    destination.mkdir(parents=True, exist_ok=True)
+    root = Path(output_dir) / "model_express"
+    destination = root / case_id
+    attempt = 1
+    while destination.exists():
+        attempt += 1
+        destination = root / f"{case_id}.attempt-{attempt}"
+    destination.mkdir(parents=True)
     for pattern in ("*.json", "*.log"):
         for path in layout.root.glob(pattern):
             if path.is_file():

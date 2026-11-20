@@ -40,6 +40,13 @@ Canonical bytes of a tensor are defined as
 covers the logical (row-major) element bytes; physical layout is compared via
 the recorded metadata instead. `ModelLoader.reload` is intentionally not
 covered: incremental weight updates own their own lifecycle.
+
+Each entry also records a checksum per `WEIGHT_MANIFEST_CHUNK_BYTES` chunk of
+the canonical bytes, computed on the device that holds the tensor. Comparison
+stays byte-exact on the digests; the checksums only explain a digest
+difference: the report names the byte ranges whose chunks differ, and when
+every chunk agrees, the device bytes were equal and only the host copy that was
+hashed differed.
 """
 
 from __future__ import annotations
@@ -62,7 +69,8 @@ from torch import nn
 
 from tensorrt_llm.logger import logger
 
-WEIGHT_MANIFEST_FORMAT_VERSION = 1
+WEIGHT_MANIFEST_FORMAT_VERSION = 2
+WEIGHT_MANIFEST_CHUNK_BYTES = 1 << 20
 WEIGHT_MANIFEST_DIR_ENV = "MX_WEIGHT_MANIFEST_DIR"
 WEIGHT_MANIFEST_ROLE_ENV = "MX_WEIGHT_MANIFEST_ROLE"
 WEIGHT_MANIFEST_FAMILIES = ("final", "transfer")
@@ -78,11 +86,20 @@ SKIP_REASON_NON_STRIDED = "non_strided_layout"
 
 _ROLE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _METADATA_FIELDS = ("kind", "dtype", "shape", "stride", "storage_offset", "nbytes")
+# The weighted byte sums of a chunk stay below 2**63 up to this chunk size, so
+# they are exact and do not depend on the reduction order.
+_MAX_CHUNK_BYTES = 1 << 27
+# Chunks reduced per kernel launch; bounds the int64 working set of a reduction.
+_CHUNKS_PER_REDUCTION = 16
 
 
 @dataclass(frozen=True)
 class WeightManifestEntry:
-    """One hashed tensor: identity, layout metadata, and its byte digest."""
+    """One hashed tensor: identity, layout metadata, its byte digest, and chunk checksums.
+
+    `chunk_checksums` holds one checksum per `chunk_bytes` chunk of the canonical
+    bytes (see `chunk_checksums`); both are empty or zero for an empty tensor.
+    """
 
     fqn: str
     kind: str
@@ -92,6 +109,8 @@ class WeightManifestEntry:
     storage_offset: int
     nbytes: int
     sha256: str
+    chunk_bytes: int = 0
+    chunk_checksums: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -103,6 +122,8 @@ class WeightManifestEntry:
             "storage_offset": self.storage_offset,
             "nbytes": self.nbytes,
             "sha256": self.sha256,
+            "chunk_bytes": self.chunk_bytes,
+            "chunk_checksums": list(self.chunk_checksums),
         }
 
     @classmethod
@@ -116,6 +137,8 @@ class WeightManifestEntry:
             storage_offset=int(payload["storage_offset"]),
             nbytes=int(payload["nbytes"]),
             sha256=str(payload["sha256"]),
+            chunk_bytes=int(payload.get("chunk_bytes", 0)),
+            chunk_checksums=tuple(str(value) for value in payload.get("chunk_checksums", ())),
         )
 
 
@@ -285,6 +308,15 @@ class WeightManifestDiff:
             actual_digest = actual.sha256[:12] if actual else "-"
             return f"  {fqn} {dtype} {shape} expected={expected_digest} actual={actual_digest}"
 
+        def digest_line(fqn: str) -> str:
+            line = entry_line(fqn)
+            expected = self.expected_entries.get(fqn)
+            actual = self.actual_entries.get(fqn)
+            if expected is None or actual is None:
+                return line
+            location = describe_chunk_differences(expected, actual)
+            return f"{line}; {location}" if location else line
+
         if self.is_empty:
             return f"Weight manifests are identical: {expected_label} vs {actual_label}"
 
@@ -321,8 +353,8 @@ class WeightManifestDiff:
             self.metadata_diffs,
             lambda item: f"  {item[0]} {item[1]}: expected={item[2]!r} actual={item[3]!r}",
         )
-        section("digest differs", self.digest_diffs, entry_line)
-        section("digest differs (exempted)", self.exempted_digest_diffs, entry_line)
+        section("digest differs", self.digest_diffs, digest_line)
+        section("digest differs (exempted)", self.exempted_digest_diffs, digest_line)
 
         def skipped_summary(item: SkippedTensor) -> str:
             return f"{item.kind} {item.reason} {item.dtype} {list(item.shape)}"
@@ -372,6 +404,86 @@ def canonical_tensor_bytes(tensor: torch.Tensor) -> torch.Tensor:
     return flat.view(torch.uint8)
 
 
+def chunk_checksums(
+    tensor: torch.Tensor, chunk_bytes: int = WEIGHT_MANIFEST_CHUNK_BYTES
+) -> tuple[str, ...]:
+    """Return one checksum per `chunk_bytes` chunk of a tensor's canonical bytes.
+
+    The checksum of a chunk is the sum of `byte * (offset + 1)` over its bytes,
+    with offsets counted from the chunk start, as 16 hexadecimal digits; the last
+    chunk may be shorter. It is computed on the device that holds the tensor, so
+    for a CUDA tensor it describes device memory, independently of the host copy
+    that the SHA-256 digest reads. The sums are exact, so equal bytes give equal
+    checksums on every device.
+    """
+    if not 0 < chunk_bytes <= _MAX_CHUNK_BYTES:
+        raise ValueError(f"chunk_bytes must be in (0, {_MAX_CHUNK_BYTES}], got {chunk_bytes}")
+    flat = tensor.detach().reshape(-1).contiguous()
+    if flat.numel() == 0:
+        return ()
+    raw = flat.view(torch.uint8)
+    total = raw.numel()
+    full_chunks = total // chunk_bytes
+    weights = torch.arange(1, min(chunk_bytes, total) + 1, dtype=torch.int64, device=raw.device)
+    sums: list[torch.Tensor] = []
+    for first in range(0, full_chunks, _CHUNKS_PER_REDUCTION):
+        count = min(_CHUNKS_PER_REDUCTION, full_chunks - first)
+        block = raw[first * chunk_bytes : (first + count) * chunk_bytes].view(count, chunk_bytes)
+        sums.append((block.to(torch.int64) * weights).sum(dim=1))
+    tail = raw[full_chunks * chunk_bytes :]
+    if tail.numel():
+        sums.append((tail.to(torch.int64) * weights[: tail.numel()]).sum().reshape(1))
+    return tuple(f"{value:016x}" for value in torch.cat(sums).cpu().tolist())
+
+
+def _format_size(nbytes: int) -> str:
+    for unit, scale in (("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if nbytes % scale == 0:
+            return f"{nbytes // scale} {unit}"
+    return f"{nbytes} bytes"
+
+
+def describe_chunk_differences(
+    expected: WeightManifestEntry, actual: WeightManifestEntry, *, limit: int = 4
+) -> str:
+    """Say where two entries' bytes differ according to their chunk checksums.
+
+    Returns the merged byte ranges of the differing chunks, a note that every
+    chunk agrees (so only the hashed host copies differ), or an empty string
+    when the entries carry no comparable checksums.
+    """
+    if (
+        not expected.chunk_checksums
+        or expected.chunk_bytes != actual.chunk_bytes
+        or len(expected.chunk_checksums) != len(actual.chunk_checksums)
+    ):
+        return ""
+    differing = [
+        index
+        for index, (left, right) in enumerate(zip(expected.chunk_checksums, actual.chunk_checksums))
+        if left != right
+    ]
+    if not differing:
+        return "every device chunk checksum agrees, so only the hashed host copies differ"
+    ranges: list[list[int]] = []
+    for index in differing:
+        if ranges and index == ranges[-1][1] + 1:
+            ranges[-1][1] = index
+        else:
+            ranges.append([index, index])
+    size = expected.chunk_bytes
+    spans = [
+        f"bytes {first * size}-{min((last + 1) * size, expected.nbytes)}"
+        for first, last in ranges[:limit]
+    ]
+    if len(ranges) > limit:
+        spans.append(f"{len(ranges) - limit} more ranges")
+    return (
+        f"{len(differing)} of {len(expected.chunk_checksums)} {_format_size(size)} chunks "
+        f"differ ({', '.join(spans)})"
+    )
+
+
 def _canonical_json_digest(obj: Any) -> str:
     """SHA-256 of the canonical JSON encoding (same recipe as `SourceIdentity`)."""
     payload = json.dumps(obj, sort_keys=True, default=str, separators=(",", ":"))
@@ -406,14 +518,18 @@ def _iter_named_tensors(model: nn.Module) -> list[tuple[str, str, torch.Tensor]]
 
 
 def build_weight_manifest(
-    model: nn.Module, *, context: Optional[Mapping[str, Any]] = None
+    model: nn.Module,
+    *,
+    context: Optional[Mapping[str, Any]] = None,
+    chunk_bytes: int = WEIGHT_MANIFEST_CHUNK_BYTES,
 ) -> WeightManifest:
     """Hash every registered tensor of `model` into a `WeightManifest`.
 
     Every CUDA device that holds a tensor is synchronized before any byte is
     read, and the device-to-host copies are blocking, so asynchronous loading,
     transform, or P2P writes are complete and visible. Peak extra host memory
-    is one tensor's canonical bytes.
+    is one tensor's canonical bytes. Each entry also gets the device-side
+    checksums of its `chunk_bytes` chunks.
     """
     started = time.perf_counter()
     entries: list[WeightManifestEntry] = []
@@ -437,6 +553,7 @@ def build_weight_manifest(
                 skipped.append(SkippedTensor(fqn, kind, SKIP_REASON_NON_STRIDED, dtype, shape))
                 continue
 
+            checksums = chunk_checksums(tensor, chunk_bytes)
             digest, nbytes = _tensor_digest(tensor)
             bytes_hashed += nbytes
             entries.append(
@@ -449,6 +566,8 @@ def build_weight_manifest(
                     storage_offset=int(tensor.storage_offset()),
                     nbytes=nbytes,
                     sha256=digest,
+                    chunk_bytes=chunk_bytes if checksums else 0,
+                    chunk_checksums=checksums,
                 )
             )
             storage = tensor.untyped_storage()
@@ -714,6 +833,7 @@ __all__ = [
     "PARAM_KIND",
     "SKIP_REASON_META_DEVICE",
     "SKIP_REASON_NON_STRIDED",
+    "WEIGHT_MANIFEST_CHUNK_BYTES",
     "WEIGHT_MANIFEST_DIR_ENV",
     "WEIGHT_MANIFEST_FAMILIES",
     "WEIGHT_MANIFEST_FILE_PATTERN",
@@ -727,7 +847,9 @@ __all__ = [
     "WeightManifestWriteResult",
     "build_weight_manifest",
     "canonical_tensor_bytes",
+    "chunk_checksums",
     "compare_weight_manifests",
+    "describe_chunk_differences",
     "load_weight_manifest",
     "manifest_file_name",
     "maybe_write_weight_manifest",

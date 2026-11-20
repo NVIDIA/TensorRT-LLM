@@ -495,6 +495,117 @@ def test_describe_lists_first_differences_and_avoids_failure_markers():
 
 
 # --------------------------------------------------------------------------- #
+# Chunk checksums: where two tensors' bytes differ
+# --------------------------------------------------------------------------- #
+
+
+def _reference_chunk_checksums(tensor: torch.Tensor, chunk_bytes: int) -> tuple[str, ...]:
+    """The documented checksum formula, evaluated in plain Python."""
+    raw = canonical_tensor_bytes(tensor).tolist()
+    return tuple(
+        f"{sum(byte * (offset + 1) for offset, byte in enumerate(raw[start : start + chunk_bytes])):016x}"
+        for start in range(0, len(raw), chunk_bytes)
+    )
+
+
+class _KiBWeightModule(nn.Module):
+    """A float32 parameter of `numel` elements plus a one-element buffer."""
+
+    def __init__(self, numel: int = 1024) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.arange(numel, dtype=torch.float32) / numel)
+        self.register_buffer("scale", torch.tensor([0.5], dtype=torch.float32))
+
+
+@pytest.mark.cpu_only
+def test_chunk_checksums_follow_the_documented_formula():
+    # Non-contiguous: the checksums cover the logical bytes, like the digest.
+    tensor = torch.arange(1000, dtype=torch.int16).reshape(10, 100)[:, ::2]
+    checksums = weight_manifest_mod.chunk_checksums(tensor, 256)
+
+    assert checksums == _reference_chunk_checksums(tensor, 256)
+    assert len(checksums) == 4  # 1000 bytes: three full chunks and a 232-byte tail
+    assert weight_manifest_mod.chunk_checksums(torch.empty(0), 256) == ()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("chunk_bytes", [0, (1 << 27) + 1])
+def test_chunk_checksums_reject_chunk_sizes_without_exact_sums(chunk_bytes: int):
+    with pytest.raises(ValueError, match="chunk_bytes"):
+        weight_manifest_mod.chunk_checksums(torch.ones(4), chunk_bytes)
+
+
+@pytest.mark.cpu_only
+def test_manifest_records_chunk_checksums_and_round_trips_them(tmp_path: Path):
+    manifest = build_weight_manifest(_KiBWeightModule(), chunk_bytes=1024)
+    entries = manifest.entries_by_fqn()
+
+    assert entries["weight"].chunk_bytes == 1024
+    assert len(entries["weight"].chunk_checksums) == 4
+    assert len(entries["scale"].chunk_checksums) == 1
+    assert manifest.manifest_format_version == WEIGHT_MANIFEST_FORMAT_VERSION
+
+    path = tmp_path / manifest_file_name("final", "baseline", 0)
+    write_weight_manifest(manifest, path)
+    assert load_weight_manifest(path).entries == manifest.entries
+
+
+@pytest.mark.cpu_only
+def test_describe_locates_a_flipped_byte_to_its_chunk():
+    module = _KiBWeightModule()
+    before = build_weight_manifest(module, chunk_bytes=1024)
+    _flip_bit(module.weight, byte_index=2048 + 5, bit=3)
+    after = build_weight_manifest(module, chunk_bytes=1024)
+
+    report = compare_weight_manifests(before, after).describe("baseline", "donor")
+
+    assert "1 of 4 1 KiB chunks differ (bytes 2048-3072)" in report
+    lowered = report.lower()
+    assert not any(marker in lowered for marker in _FAILURE_MARKERS)
+
+
+@pytest.mark.cpu_only
+def test_describe_merges_adjacent_chunks_and_ends_at_the_tensor_size():
+    # 1000 float32 elements: 4000 bytes, so the last 1 KiB chunk holds 928 bytes.
+    module = _KiBWeightModule(numel=1000)
+    before = build_weight_manifest(module, chunk_bytes=1024)
+    for byte_index in (100, 2100, 3990):
+        _flip_bit(module.weight, byte_index=byte_index, bit=0)
+    after = build_weight_manifest(module, chunk_bytes=1024)
+
+    report = compare_weight_manifests(before, after).describe("baseline", "donor")
+
+    assert "3 of 4 1 KiB chunks differ (bytes 0-1024, bytes 2048-4000)" in report
+
+
+@pytest.mark.cpu_only
+def test_describe_says_when_only_the_hashed_host_copies_differ():
+    expected = build_weight_manifest(_KiBWeightModule(), chunk_bytes=1024)
+    weight = dataclasses.replace(expected.entries_by_fqn()["weight"], sha256="0" * 64)
+    actual = dataclasses.replace(
+        expected,
+        entries=tuple(weight if entry.fqn == "weight" else entry for entry in expected.entries),
+    )
+
+    report = compare_weight_manifests(expected, actual).describe("baseline", "donor")
+
+    assert "every device chunk checksum agrees, so only the hashed host copies differ" in report
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_chunk_checksums_are_equal_on_cuda_and_on_cpu():
+    generator = torch.Generator().manual_seed(0)
+    # 41,500 bytes: two full reductions of 16 chunks, one of 8, and a tail.
+    tensor = torch.randint(0, 256, (41_500,), dtype=torch.uint8, generator=generator)
+    expected = _reference_chunk_checksums(tensor, 1024)
+
+    assert weight_manifest_mod.chunk_checksums(tensor, 1024) == expected
+    assert weight_manifest_mod.chunk_checksums(tensor.cuda(), 1024) == expected
+    module = _KiBWeightModule().cuda()
+    assert build_weight_manifest(module).entries == build_weight_manifest(module.cpu()).entries
+
+
+# --------------------------------------------------------------------------- #
 # Serialization and file naming
 # --------------------------------------------------------------------------- #
 
