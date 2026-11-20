@@ -38,6 +38,7 @@ from ...infra.compute.environment import RunEnvironment, resolve_environment, sc
 from ...infra.compute.sessions import GATE_ROLES, sessions_from_task
 from ...infra.git import git_output
 from ...operators.coverage import MODELING_V2_PACKAGE
+from ...spec import verify as verify_mod
 from ...spec.derive import hybrid_marker
 from ...spec.task_schema import (
     assembly_units,
@@ -505,6 +506,38 @@ def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list
     return notes
 
 
+def check_user_tests(task_data: Mapping[str, Any]) -> list[str]:
+    """Every test of the spec's own (``verify.tests``) is defined in the tree before the run starts.
+
+    Read off the tree's sources (``spec.verify.defined``): its file, class and
+    function. Nothing is imported, collected or run; a parametrization is not
+    looked at, and a node that selects nothing fails when it runs.
+    """
+    notes: list[str] = []
+    repo = str(task_data.get("trtllm_repo_path") or "")
+    missing: list[str] = []
+    for test in verify_mod.user_tests(task_data):
+        for node in test.nodes:
+            probe = node.replace(verify_mod.MEMBER_PLACEHOLDER, "").replace(
+                verify_mod.FEATURE_PLACEHOLDER, test.feature
+            )
+            there, said = verify_mod.defined(repo, probe)
+            where = f"`{test.feature}.{test.name}`"
+            if there is False:
+                missing.append(f"{where}: {said}")
+            elif there is None:
+                notes.append(f"test {where} ({test.stage}): unchecked, {said}")
+            else:
+                notes.append(f"test {where} ({test.stage}): {said}")
+    if missing:
+        raise SpecInconsistencyError(
+            "tests the spec declares (verify.tests) are not defined in the tree: "
+            + "; ".join(missing)
+            + ". A test of the spec's own is in the tree before the run starts."
+        )
+    return notes
+
+
 def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
     """The native test's per-node device request fits the allocation geometry."""
     spec = disagg_checks.DisaggSpec.from_task(task_data)
@@ -546,8 +579,9 @@ def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
     The spool admits a job only where it can finish before its allocation ends, so a
     gate whose limit is longer than a whole allocation is never admitted: it would wait
     for ever. The benchmark's limit is ``accuracy.timeout`` (default four hours), the
-    disaggregated test's ``accuracy.disagg.timeout``, and a boot's or the acceptance gate's
-    the longest ``timeout`` ``accuracy.boot`` or ``accuracy.acceptance`` declares.
+    disaggregated test's ``accuracy.disagg.timeout``, a boot's or the acceptance gate's
+    the longest ``timeout`` ``accuracy.boot`` or ``accuracy.acceptance`` declares, and
+    a test of the spec's own its ``timeout`` (per pytest node).
     """
     sessions = [s for s in sessions_from_task(task_data) if s.role in GATE_ROLES and s.time_limit_s]
     if not sessions:
@@ -570,6 +604,8 @@ def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
         ]
         if declared:
             limits[f"accuracy.{block}.timeout"] = max(declared)
+    for test in verify_mod.user_tests(task_data):
+        limits[f"verify.tests.{test.feature}.{test.name}.timeout"] = int(test.timeout)
     over = {key: limit for key, limit in limits.items() if limit > budget}
     if over:
         raise PreflightError(
@@ -876,6 +912,7 @@ def run_preflight(
     notes.extend(check_variant_anchors(task_data, world_size))
     notes.extend(check_launch_settings(task_data))
     notes.extend(check_disagg_placement(task_data))
+    notes.extend(check_user_tests(task_data))
     notes.extend(check_gate_budgets(task_data))
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))
@@ -1000,6 +1037,7 @@ __all__ = [
     "check_capture_lists",
     "check_disagg_placement",
     "check_gate_budgets",
+    "check_user_tests",
     "check_variant_anchors",
     "check_kv_cache_configs",
     "check_speculation_support",

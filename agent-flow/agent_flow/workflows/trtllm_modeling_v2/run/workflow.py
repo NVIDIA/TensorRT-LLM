@@ -55,6 +55,7 @@ from ..infra.compute.environment import RunEnvironment
 from ..infra.compute.rebuild import LIBRARY_PATTERNS
 from ..infra.files import write_text_atomic
 from ..infra.git import CommitPolicy, git_output
+from ..spec import verify as verify_mod
 from ..spec.task_schema import load_and_validate_task_yaml
 from . import orchestrator as orchestrator_mod
 from .execution.handoff import current_decision
@@ -1076,13 +1077,19 @@ def gate_inputs(task_data: Mapping[str, Any], repo: str | Path) -> frozenset[str
     when the spec names none, and every file inside the checkout that a
     gate-facing block of the spec names (:data:`GATE_INPUT_BLOCKS`): an
     options file, a prompts file, an image, a script in a command, and the
-    accuracy anchor tables.
+    accuracy anchor tables; and the file of each test of the spec's own
+    (``verify.tests``), which its gate runs.
     """
     root = Path(repo)
     keep = {boot_checks.DEFAULT_BOOT_IMAGE}
     for block in GATE_INPUT_BLOCKS:
         for word in _path_words(task_data.get(block)):
             path = _in_checkout(word, root)
+            if path is not None:
+                keep.add(path)
+    for test in verify_mod.user_tests(task_data):
+        for node in test.nodes:
+            path = _in_checkout(node.partition("::")[0], root)
             if path is not None:
                 keep.add(path)
     return frozenset(keep)

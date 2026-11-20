@@ -158,8 +158,8 @@ def test_one_check_of_any_kind_covers_a_feature_and_a_bare_one_is_named():
     task = {"features": ["mtp"], "variants": {"kv_fp8": {"llm_api_options": {}}}}
     contract = c.Contract(
         checks=(
-            c.Check("core", "accuracy[gsm8k]", "tp4", c.TIER_INNER),
-            c.Check("mtp", "boot", "tp1", c.TIER_INNER),
+            c.Check("core", "accuracy[gsm8k]", "tp4", c.STAGE_LANDING),
+            c.Check("mtp", "boot", "tp1", c.STAGE_LANDING),
         )
     )
     coverage = requirements.feature_checks(task, contract)

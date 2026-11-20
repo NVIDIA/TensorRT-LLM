@@ -27,7 +27,10 @@ work and write.
   once your branch lands, passed before or not, and a check that fails comes
   back to the planner. Without an answer, the planner's run. A check nobody
   names keeps its verdict, and one that has never passed still runs before
-  delivery. Run a gate yourself to debug.
+  delivery. A check at the `delivery` stage you name runs once the work is
+  done, not on your landing. The spec's own tests (`test[<name>]`) are checks
+  like the others: the contract's notes say what each proves. Run a gate
+  yourself to debug.
 - **The workflow's checks are the reference, not the only checks.** Start
   from `trtllm-modeling-v2 gate` and the checks it runs: they use the
   settings the verdicts use. When they do not fit what the user asked for (a

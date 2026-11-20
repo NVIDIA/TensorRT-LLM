@@ -407,7 +407,7 @@ def test_a_check_measures_one_commit_while_integrations_move_the_checkout(
     workflow.environment = RunEnvironment(kind="local", python="/py", world_size=1)
     workflow._snapshots = snapshots_mod.Snapshots(repo, workflow.workspace / "snapshots")
     marker = workflow._target_marker()
-    check = contract_mod.Check("core", "boot", "tp1", contract_mod.TIER_INNER)
+    check = contract_mod.Check("core", "boot", "tp1", contract_mod.STAGE_LANDING)
 
     result = CheckRunner(workflow)._run_contract_check(check, None)
     status = contract_mod.ContractStatus.load(workflow.workspace)

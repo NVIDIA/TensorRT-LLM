@@ -28,9 +28,9 @@ from agent_flow.workflows.trtllm_modeling_v2.run.workspace.integration import Ta
 
 _orchestrator_CONTRACT = c.Contract(
     checks=(
-        c.Check("core", "boot", "tp1", c.TIER_INNER),
-        c.Check("core", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
-        c.Check("core", "serve", "tp1", c.TIER_DELIVERY),
+        c.Check("core", "boot", "tp1", c.STAGE_LANDING),
+        c.Check("core", "accuracy[gsm8k]", "tp1", c.STAGE_LANDING),
+        c.Check("core", "serve", "tp1", c.STAGE_DELIVERY),
     )
 )
 
@@ -121,10 +121,10 @@ def test_a_failed_check_wakes_the_planner_with_the_evidence(tmp_path):
 
 _STANDING = c.Contract(
     checks=(
-        c.Check("core", "boot", "tp1", c.TIER_INNER),
-        c.Check("core", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
-        c.Check("mtp", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
-        c.Check("mtp", "acceptance", "tp1", c.TIER_PROOF),
+        c.Check("core", "boot", "tp1", c.STAGE_LANDING),
+        c.Check("core", "accuracy[gsm8k]", "tp1", c.STAGE_LANDING),
+        c.Check("mtp", "accuracy[gsm8k]", "tp1", c.STAGE_LANDING),
+        c.Check("mtp", "acceptance", "tp1", c.STAGE_LANDING),
     ),
     confirm="mtp:accuracy[gsm8k]@tp1",
 )
@@ -193,7 +193,7 @@ def test_the_final_tree_is_confirmed_by_one_check_when_none_ran_on_it(tmp_path):
 
 
 def test_a_check_that_only_shows_the_engine_answering_does_not_confirm_the_final_tree(tmp_path):
-    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    serve = c.Check("core", "serve", "tp1", c.STAGE_DELIVERY)
     contract = c.Contract(checks=(*_STANDING.checks[:2], serve), confirm=_CORE[1])
     plan = _plan_once(
         _task("core", "assemble", [*_CORE, serve.key]),
@@ -211,7 +211,7 @@ def test_a_check_that_only_shows_the_engine_answering_does_not_confirm_the_final
 def test_a_delivery_check_runs_again_only_when_a_task_that_claims_it_lands(
     tmp_path, claims, served_on
 ):
-    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    serve = c.Check("core", "serve", "tp1", c.STAGE_DELIVERY)
     contract = c.Contract(checks=(_STANDING.checks[1], serve), confirm=_CORE[1])
     repaired = []
 
@@ -301,7 +301,7 @@ def test_the_worker_names_the_checks_its_landing_runs():
 
 
 def test_a_check_task_owes_the_delivery_checks_it_names(tmp_path):
-    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    serve = c.Check("core", "serve", "tp1", c.STAGE_DELIVERY)
     contract = c.Contract(checks=(_STANDING.checks[1], serve), confirm=_CORE[1])
     status = c.ContractStatus.load(tmp_path)
     orchestrator = GraphOrchestrator(_moving_target(_plan_once()), contract, status, tmp_path)
@@ -312,7 +312,7 @@ def test_a_check_task_owes_the_delivery_checks_it_names(tmp_path):
 
 
 def test_a_claim_that_lands_while_its_check_runs_stays_owed(tmp_path):
-    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    serve = c.Check("core", "serve", "tp1", c.STAGE_DELIVERY)
     state = {"tree": 1, "land": ""}  # land: where a task lands and claims the serve
     runs = []
 
@@ -513,7 +513,7 @@ def test_an_owed_check_that_passed_on_this_tree_is_owed_no_more(tmp_path):
 def _three_benchmarks():
     """Three units' benchmarks at tp1, as a spec with one `accuracy` block for every unit owes."""
     checks = tuple(
-        c.Check(unit, "accuracy[gsm8k]", "tp1", c.TIER_INNER)
+        c.Check(unit, "accuracy[gsm8k]", "tp1", c.STAGE_LANDING)
         for unit in ("core", "multimodal", "mtp")
     )
     return c.Contract(checks=checks, confirm=checks[-1].key)
@@ -764,8 +764,8 @@ def test_an_attempt_whose_worktree_was_never_prepared_does_not_spend_a_worker_ru
 
 _CONCURRENT_CONTRACT = c.Contract(
     checks=(
-        c.Check("core", "boot", "tp1", c.TIER_INNER),
-        c.Check("core", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
+        c.Check("core", "boot", "tp1", c.STAGE_LANDING),
+        c.Check("core", "accuracy[gsm8k]", "tp1", c.STAGE_LANDING),
     )
 )
 

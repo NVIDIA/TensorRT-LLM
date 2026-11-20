@@ -64,6 +64,26 @@ features: []
 # run, or per unit and variant over `default`. A switch the spec sets itself keeps its value.
 # profile: {default: standard, multimodal: smoke}
 
+# Tests of the spec's own, beside the flow's checks, by the feature each proves (core, a feature
+# or a variant). Each is a pytest node of the tree, judged by its JUnit report (a skip fails it),
+# at a stage: `landing` (the default, when a landing names it) or `delivery` (once the work is
+# done). `members` makes it a whole-model test, run once per member with that member's
+# configuration (`MV2FLOW_LLM_OPTIONS`, `MV2FLOW_MODEL`, `MV2FLOW_FEATURE`, `MV2FLOW_MEMBER`);
+# `devices` (default 1) runs it once. Its checks are `<feature>:test[<name>]@<member>`.
+# verify:
+#   tests:
+#     core:
+#       e2e:
+#         purpose: GSM8K, a long-context subset and the reuse panel on one engine
+#         pytest: tests/integration/defs/accuracy/modeling_v2/<family>/<target>/test_accuracy.py::TestX::test_e2e
+#         members: [tep4]
+#         stage: delivery
+#       moe_routing:
+#         purpose: the router picks the experts the HF reference picks, on 64 prompts
+#         pytest: tests/unittest/_torch/modeling_v2/test_moe_routing.py
+#         devices: 1
+#         timeout: 1800
+
 # REQUIRED: the checkout the target is built in.
 trtllm_repo_path: /path/to/TensorRT-LLM
 
