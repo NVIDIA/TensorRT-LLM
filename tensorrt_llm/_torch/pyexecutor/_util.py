@@ -53,6 +53,11 @@ from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..distributed.communicator import Distributed, ReduceOp
 from ..hostfunc import set_low_latency_dispatch
+from ..memory.monitor import names as monitor_names
+from ..memory.monitor import providers as monitor_providers
+from ..memory.monitor import startup as monitor_startup
+from ..memory.monitor.providers.kv_cache import \
+    KvCacheProvider as MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..modules.dwdp.dense.manager import DenseDwdpManager
@@ -86,9 +91,9 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import ModelEngine
 from .py_executor import PyExecutor, PyExecutorResources
-from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+from .resource_manager import (BaseResourceManager, KVCacheCompressionManager,
+                               KVCacheManager, PeftCacheManager,
+                               ResourceManager, ResourceManagerType)
 from .runtime_hooks import runtime_hooks_of
 from .sampler import TorchSampler
 from .sampler.penalties import PenaltyStore
@@ -191,6 +196,20 @@ def _has_variable_kv_cache_geometry(model_config: ModelConfig) -> bool:
     layer_specs = _get_kv_cache_layer_specs(model_config)
     return bool(layer_specs) and len({(spec.head_dim, spec.num_kv_heads)
                                       for spec in layer_specs}) > 1
+
+
+def _register_kv_cache_monitor_providers(
+        main: Optional[BaseResourceManager],
+        draft: Optional[BaseResourceManager],
+        cross: Optional[BaseResourceManager]) -> None:
+    """Hand each distinct KV cache pool to the memory monitor."""
+    seen = []
+    for role, manager in (("main", main), ("draft", draft), ("cross", cross)):
+        if manager is None or any(manager is other for other in seen):
+            continue
+        seen.append(manager)
+        monitor_providers.register_provider(
+            MonitorKvCacheProvider(manager, role))
 
 
 def _non_hybrid_kv_cache_manager_cls(model_config: ModelConfig,
@@ -2390,6 +2409,9 @@ class KvCacheCreator:
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
+        # Memory taken out of the KV cache budget for workspaces the
+        # profiling run does not allocate.
+        kv_budget_reserves = 0
         if getattr(self._sparse_attention_config, "algorithm",
                    None) == "deepseek_v4":
             workspace_memory = get_indexer_mqa_logits_workspace_bytes(
@@ -2399,6 +2421,7 @@ class KvCacheCreator:
                 budget_before, workspace_memory)
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
+                kv_budget_reserves += workspace_reserve
                 logger.info(
                     f"Reserving {workspace_reserve / (GB):.2f} GiB for the DeepSeek-V4 Indexer MQA "
                     f"logits workspace (workspace cap {workspace_memory / (GB):.2f} GiB): KV cache "
@@ -2512,6 +2535,7 @@ class KvCacheCreator:
         if w_bytes_per_token > 0 and kv_len_cap:
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
+                kv_budget_reserves += workspace_reserve
                 floor_description = (
                     f", staging floor {min_workspace_tokens} tokens less "
                     f"{profiled_tokens} tokens already in the measured peak"
@@ -2540,6 +2564,15 @@ class KvCacheCreator:
                     f"Raising the configured cap to {min_workspace_tokens} tokens would resolve to "
                     f"{cap_at_floor} tokens and reserve "
                     f"{additional_reserve} additional bytes on this rank.")
+
+        # The memory monitor compares later usage against this plan, which
+        # needs a measured peak. The profiled peak still holds the temporary
+        # sizing KV pool, which the final KV cache replaces, so it is taken
+        # out of the non-KV peak; the workspace reserves are added to it.
+        if py_executor is not None and not self._skip_est:
+            monitor_startup.record_memory_plan(
+                peak_memory - allocated_bytes + kv_budget_reserves,
+                activation_bytes)
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
@@ -4485,6 +4518,16 @@ class KvCacheCreator:
         if not estimating_kv_cache and kv_cache_manager is not None:
             kv_cache_manager.fp8_ctx_mla_kv_len_cap = self._fp8_ctx_mla_kv_len_cap
 
+        # Each pool is a separate allocation, usually the largest in the
+        # process, so the memory monitor is handed the managers here, where
+        # they are built. They are dropped from it before they are shut down
+        # (PyExecutor._shutdown_resource_managers, teardown_managers). A draft
+        # model that shares the target's manager is skipped so the pool is
+        # not counted twice. Providers hold the managers weakly.
+        _register_kv_cache_monitor_providers(kv_cache_manager,
+                                             draft_kv_cache_manager,
+                                             cross_kv_cache_manager)
+
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
@@ -4556,6 +4599,14 @@ class KvCacheCreator:
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""
+        # The memory monitor stops reporting the pools being released. A
+        # manager may outlive its shutdown, and V1 keeps reporting the bytes
+        # it allocated.
+        for manager_type in (ResourceManagerType.KV_CACHE_MANAGER,
+                             ResourceManagerType.DRAFT_KV_CACHE_MANAGER,
+                             ResourceManagerType.CROSS_KV_CACHE_MANAGER):
+            monitor_providers.unregister_providers_of(
+                resources.get(manager_type))
         compression_manager = resources.pop(
             ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, None)
         if compression_manager is not None:
@@ -5852,9 +5903,13 @@ def create_py_executor_resources(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
-    kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+    # Disaggregated serving's KV transfer buffers are allocated in C++ with
+    # no size exposed to Python; the memory monitor names them by measuring.
+    with monitor_startup.region(monitor_names.REGION_KV_TRANSFER_BUFFERS,
+                                per_executor=True):
+        kv_cache_transceiver = create_kv_cache_transceiver(
+            mapping, dist, kv_cache_manager, attention_type,
+            cache_transceiver_config, mamba_cache_manager)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
