@@ -98,7 +98,7 @@ methods:
         annotation: Optional[tensorrt_llm.sampling_params.GuidedDecodingParams]
         default: null
       embedding_bias:
-        annotation: Optional[torch.Tensor]
+        annotation: Optional[Union[tensorrt_llm.sampling_params.EmbeddingBias, torch.Tensor, List[float]]]
         default: null
       # Tokenizer behavior
       ignore_eos:

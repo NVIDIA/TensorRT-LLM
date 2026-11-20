@@ -183,6 +183,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/norm TIMEOUT (30)
   - unittest/_torch/modeling_v2/quantization TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4 TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4 TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default TIMEOUT (30)
@@ -299,6 +300,10 @@ l0_b300:
       stage: post_merge
       backend: pytorch
   tests:
+  # Kimi K3 routing shape (896 experts, top_k 16). Single-GPU, random weights.
+  # Same sm100f routing kernel as the B200 entry; this is the SM103 run.
+  # Too heavy for pre_merge, and it does not need the 4-GPU stage.
+  - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   # ---- moved to post-merge (MoE CI optimization) ----
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"

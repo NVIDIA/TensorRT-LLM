@@ -17,11 +17,22 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_dspark_worker_hooks.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_switches.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_modeling_v2_spec_tail_contracts.py
+  # MiniMax-M3 family code shared with MiniMax-M3.1-Flash: the CuTe DSL object cache, the draft prob1 worker and
+  # the MSA backend's host logic.
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_cute_aot.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/kernels/m3ll/prob1
+  - unittest/_torch/modeling_v2/models/minimax_m3/msa
   # MiniMax-M3 Rubin target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_drafter_fullctx_cells.py
   # MiniMax-M3 target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_tp4_drift.py
+  # MiniMax-M3.1-Flash Rubin dep, tp2ctx and dep2ctx targets: their device-free (cpu_only) tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2ctx
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep2ctx
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
@@ -102,6 +113,11 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_modeling_v2_mtp_draft_moe.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_small_batch_mtp.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
+  # The GLM-5.3-Flash target's admission check and guided-decoding refusal, on fake requests,
+  # and its step metadata's hooks (cpu_only, so the GPU stage's entry for the target's
+  # directory deselects them).
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_modeling_v2_glm5_next_validate_request.py
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_modeling_v2_glm5_next_step_metadata.py
   # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
@@ -200,6 +216,9 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
   - unittest/_torch/models/test_minimax_m3.py
+  # MiniMax-M3.1-Flash sm_107 tp8 target: its device-free (cpu_only) tests; the stage's -m cpu_only collects
+  # only them. The comm tests run 2 to 8 ranks.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/*
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py::test_sparse_moe_keeps_shared_expert_tokens_unpadded
   # MiniMax-M3 VL input processor and wrapper forward; the CPU stage's -m cpu_only
   # leaves the checkpoint-backed tests out.
@@ -252,6 +271,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_attention_importable.py
   - unittest/_torch/visual_gen/test_cache_dit.py
+  - unittest/_torch/visual_gen/test_cosmos3_parameter_resolver.py
   - unittest/_torch/visual_gen/test_dynamic_batching.py
   - unittest/_torch/visual_gen/test_cuda_graph_cache.py
   - unittest/_torch/visual_gen/test_executor_lifecycle.py
@@ -314,6 +334,7 @@ l0_cpu:
   - unittest/executor/test_event_loop_error_broadcast.py
   - unittest/executor/test_forward_error_survival.py
   - unittest/executor/test_rpc_worker_mixin.py
+  - unittest/executor/test_rpc_response_registration.py
   - unittest/executor/test_sleep_collective_rpc_guards.py
   - unittest/executor/test_shutdown_retry_contracts.py
   - unittest/executor/test_rpc_proxy_submit_order.py
