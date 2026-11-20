@@ -80,9 +80,9 @@
    ],
    "local_edits": [
     "the internal CuTe DSL scheduling hints removed: 15 dsl_hints.cfence() / dsl_hints.warp_switch() calls (three of them the only statement of an `if is_compute_warp:` block, dropped with it) and the module docstring's paragraph on them; the public nvidia-cutlass-dsl provides none of the hints, so they emitted nothing",
-    "The family shares the FP4 decode. An absent KV-ready flag supplies no runtime pointer; a present flag enables the ULL acquire and proxy fence."
+    "Share the FP4 decode while preserving both launch signatures. Helix16 binds its KV-ready operand when polling is disabled, and Helix8 omits it."
    ],
-   "sha256": "c635b820a15d5389d26ac7c4d2d476c7fe805001f00a5051ad3392995c94c845",
+   "sha256": "fe2ad02ad5bfb496577687da62f263d98e1683b3792af29edda0267e33ffb211",
    "target_path": "kernels/fp4_mla_mufu16.py"
   },
   "kernels/k3r_fp4_mla/fp4_mla_packed_reduce.py": {

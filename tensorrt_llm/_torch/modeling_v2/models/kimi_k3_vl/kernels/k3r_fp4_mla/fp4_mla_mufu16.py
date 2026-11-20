@@ -1139,7 +1139,7 @@ def fused_fp4_mla_decode_ctm(
         cute.make_layout((1,), stride=(1,)),
     )
     kv_ready_tensor = None
-    if cutlass.const_expr(kv_ready_wait):
+    if cutlass.const_expr(kv_ready_ptr is not None):
         kv_ready_tensor = cute.make_tensor(
             cute.recast_ptr(kv_ready_ptr, dtype=cutlass.Int32),
             cute.make_layout((1,), stride=(1,)),
@@ -8186,6 +8186,7 @@ def _compile_fused(
         split_partial_dtype,
         pdl_wait,
         kv_ready_wait,
+        kv_ready_data_ptr is not None,
     )
     cached = _FUSED_COMPILE_CACHE.get(cache_key)
     if cached is not None:
@@ -8294,6 +8295,7 @@ def run_trtllm_fp4_mla_decode_page_native(
     launch_dependents: bool = False,
     pdl_wait: bool = False,
     kv_ready: torch.Tensor | None = None,
+    kv_ready_operand: bool = False,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
@@ -8726,7 +8728,12 @@ def run_trtllm_fp4_mla_decode_page_native(
     page_indptr_data_ptr = paged_kv_indptr_decode.data_ptr()
     q_global_scale_data_ptr = q_global_scale.data_ptr()
     kv_global_scale_data_ptr = kv_global_scale.data_ptr()
-    kv_ready_data_ptr = kv_ready.data_ptr() if kv_ready is not None else None
+    kv_ready_data_ptr = None
+    if kv_ready is not None:
+        kv_ready_data_ptr = kv_ready.data_ptr()
+    elif kv_ready_operand:
+        # The inactive operand preserves the packed ULL kernel's launch signature.
+        kv_ready_data_ptr = valid_k_data_ptr
     kv_page_stride_bytes = cache_layout.stride_page
     ksf_page_stride_bytes = int(sf_cache.stride(0))
     vsf_page_stride_bytes = int(v_sf.stride(0))
@@ -8948,6 +8955,7 @@ def run_trtllm_fp4_mla_decode_packed(
     launch_dependents: bool = False,
     pdl_wait: bool = False,
     kv_ready: torch.Tensor | None = None,
+    kv_ready_operand: bool = False,
 ) -> None:
     """Packed decode: ``q_fp4``/``q_sf`` hold ``num_requests`` entries of
     ``physical_m`` rows ([query token, head] pairs, 128-padded), ``output`` is
@@ -8968,7 +8976,8 @@ def run_trtllm_fp4_mla_decode_packed(
     caller guarantees that only the query is written by that previous kernel. ``kv_ready`` (one
     int32, ``SUPPORTS_KV_READY``): the KV tiles that may hold the last ``query_len`` keys of a
     request are loaded only once it reads nonzero, so the grid appending those keys may still be
-    running when this one starts; the caller orders everything else."""
+    running when this one starts; the caller orders everything else. ``kv_ready_operand``
+    retains the ULL pointer argument even when polling is disabled."""
     valid_m, physical_m = packed_query_rows(num_heads, query_len)
     if num_requests <= 0 or num_splits <= 0:
         raise ValueError("packed decode needs positive request and split counts")
@@ -9029,6 +9038,7 @@ def run_trtllm_fp4_mla_decode_packed(
         launch_dependents=launch_dependents,
         pdl_wait=pdl_wait,
         kv_ready=kv_ready,
+        kv_ready_operand=kv_ready_operand,
     )
 
 

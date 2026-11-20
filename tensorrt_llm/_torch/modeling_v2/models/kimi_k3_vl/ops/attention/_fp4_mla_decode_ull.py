@@ -641,6 +641,7 @@ def _run_packed_decode(
         **common,
         launch_dependents=launch_dependents,
         pdl_wait=use_pdl_wait and step.metadata_launches == metadata_launches,
+        kv_ready_operand=True,
     )
     reduce.reduce_packed_splits(
         partial,
