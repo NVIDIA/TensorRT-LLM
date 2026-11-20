@@ -27,7 +27,6 @@ import numpy as np
 import pytest
 import torch
 from test_common.host_cache_manager import make_host_cache_manager
-from test_common.host_executor import make_host_executor
 from test_common.interface_checks import mock_target, verify_instance
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
@@ -8833,10 +8832,12 @@ class TestVetoedContextChunk:
         """Another attention-DP rank had nothing to run, so this batch is skipped."""
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor._is_kv_manager_v2 = True
         executor.kv_cache_manager = manager
         executor.enable_joint_kv_cache_reuse = False
+        executor._num_skipped_forward_ctx_chunks = 0
+        executor._num_reverted_ctx_tokens = 0
         batch = ScheduledRequests()
         for request in output.context_requests:
             batch.append_context_request(request)

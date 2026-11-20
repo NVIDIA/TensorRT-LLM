@@ -134,8 +134,9 @@ def test_guard_refuses_misaligned_residuals(index) -> None:
     shape = inputs[index].shape
     shifted = torch.empty(inputs[index].numel() + 1, dtype=torch.bfloat16, device="cuda")[1:]
     inputs[index] = shifted.view(shape).copy_(inputs[index])
+    layer_residual, block_residual, res_weight, rms_weight = inputs
     with pytest.raises(AssertionError, match="16-byte aligned"):
-        k3_attn_res_fwd.is_valid(*inputs, RMS_EPS)
+        k3_attn_res_fwd.is_valid(layer_residual, block_residual, res_weight, rms_weight, RMS_EPS)
 
 
 def test_cuda_graph_replay_matches_eager() -> None:
