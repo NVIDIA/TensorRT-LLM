@@ -1763,6 +1763,17 @@ class Sender(SenderBase):
             return
         aux_task = session.aux_task
         assert aux_task is not None, f"aux_task is None for session {write_meta.unique_rid}"
+        recovery = not owned and getattr(self, "_recover_agent", None) is not None
+        claim_result = owned or recovery
+        if recovery:
+            with session.lock:
+                peer = write_meta.peer_rank
+                if (
+                    peer in session._reported_aux_peer_ranks
+                    or peer in session._direct_aux_started_peer_ranks
+                ):
+                    return
+                session._direct_aux_started_peer_ranks.add(peer)
         timer = aux_task._perf_timer
         if timer:
             timer.record_push_end(write_meta.peer_rank)
@@ -1782,7 +1793,7 @@ class Sender(SenderBase):
                 # An admitted operation normally makes this worker the only
                 # eligible claimant. Keep the claim at the send boundary so
                 # duplicate dispatch cannot publish contradictory evidence.
-                if not owned or session._claim_aux_terminal_result(write_meta.peer_rank):
+                if not claim_result or session._claim_aux_terminal_result(write_meta.peer_rank):
                     self._get_result_dealer(write_meta.peer_endpoint).send(
                         _make_aux_result_msg(
                             self._instance_rank,
@@ -1822,7 +1833,7 @@ class Sender(SenderBase):
         # An admitted operation normally makes this worker the only eligible
         # claimant. Keep the claim at the send boundary so future cleanup-path
         # changes cannot publish contradictory evidence.
-        if not owned or session._claim_aux_terminal_result(write_meta.peer_rank):
+        if not claim_result or session._claim_aux_terminal_result(write_meta.peer_rank):
             if agent_result == AgentResult.IN_DOUBT:
                 self._retain_in_doubt_transfer(
                     write_meta,
@@ -2534,10 +2545,15 @@ class Sender(SenderBase):
             else:
                 with self._sessions_lock:
                     session = self._get_session(info.unique_rid)
-                if session is not None and not session._claim_aux_terminal_result(
-                    info.instance_rank
-                ):
-                    return
+                if session is not None:
+                    if (
+                        not session._enforce_physical_ownership
+                        and getattr(self, "_recover_agent", None) is not None
+                    ):
+                        if not session._claim_unsubmitted_aux_failure(info):
+                            return
+                    elif not session._claim_aux_terminal_result(info.instance_rank):
+                        return
                 message = _make_aux_result_msg(
                     self._instance_rank,
                     info.unique_rid,
@@ -2741,6 +2757,7 @@ class TxSession(TxSessionBase):
         self.kv_tasks = []
         self.aux_task = None
         self._reported_aux_peer_ranks: set[int] = set()
+        self._direct_aux_started_peer_ranks: set[int] = set()
         self._has_last_slice = False
         self.lock = threading.Lock()
         self._logical_outcomes = _LogicalOutcomes(self._retirement)
@@ -2948,14 +2965,22 @@ class TxSession(TxSessionBase):
     def _claim_unsubmitted_aux_failures_locked(
         self, req_infos: Iterable[RecvReqInfo]
     ) -> list[RecvReqInfo]:
-        if not self._enforce_physical_ownership or not self._need_aux:
+        if not self._need_aux or (
+            not self._enforce_physical_ownership
+            and getattr(self._sender, "_recover_agent", None) is None
+        ):
             return []
         claimed = []
         for info in req_infos:
             peer_rank = info.instance_rank
-            if self.aux_task is not None and self.aux_task.has_started_physical_operation(
-                peer_rank
-            ):
+            if self._enforce_physical_ownership:
+                started = (
+                    self.aux_task is not None
+                    and self.aux_task.has_started_physical_operation(peer_rank)
+                )
+            else:
+                started = peer_rank in self._direct_aux_started_peer_ranks
+            if started:
                 continue
             if not self._claim_aux_terminal_result_locked(peer_rank):
                 continue
@@ -3712,7 +3737,8 @@ class Receiver(ReceiverBase):
             rank: secrets.token_bytes(_KV_RESULT_REPORT_TOKEN_BYTES) for rank in peer_overlap.ranks
         }
         if not session._enforce_physical_ownership:
-            session.mark_transferring(task.slice_id)
+            if not session.mark_transferring(task.slice_id):
+                return
             # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
             session._sender_endpoints.update(sender_endpoints)
             for rank in peer_overlap.ranks:
@@ -4001,7 +4027,7 @@ class Receiver(ReceiverBase):
         if session is not None:
             if message[2:] == [b"FAILED"]:
                 # Failure intent is not proof that the published writers have retired.
-                session._logical_outcomes.fail(RuntimeError("CTX transfer agent unavailable"))
+                session.record_recovery_failure(RuntimeError("CTX transfer agent unavailable"))
             if session._enforce_physical_ownership:
                 session.cancel_local(by_peer=True)
             else:
@@ -4143,6 +4169,9 @@ class RxSession(RxSessionBase):
         self.kv_cache_size_bytes: int = 0
         self._kv_tasks: list[KVRecvTask] = []
         self._aux_count = 0
+        self._aux_expected_writers = 0
+        self._aux_writer_reports: set[int] = set()
+        self._recovery_failed = False
         self._aux_status: TaskStatus = TaskStatus.INIT
         self._publication_may_have_escaped = False
         self._aux_physical_owner: Optional[_ReceiveOperationOwner] = None
@@ -4369,17 +4398,23 @@ class RxSession(RxSessionBase):
                 self._aux_physical_owner.finish_publication()
             return True
 
-    def mark_transferring(self, slice_id: int, writer_cohort: Optional[set[int]] = None) -> None:
+    def mark_transferring(self, slice_id: int, writer_cohort: Optional[set[int]] = None) -> bool:
         if not self._enforce_physical_ownership:
             with self.lock:
-                self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
-            return
+                if self._closed or self._terminal_status is not None:
+                    return False
+                task = self._kv_tasks[slice_id]
+                if self._need_aux and slice_id == 0:
+                    self._aux_expected_writers = task.expected_transfers
+                task.status = TaskStatus.TRANSFERRING
+            return True
         if writer_cohort is None:
             raise ValueError("ownership-mode publication requires an explicit writer cohort")
         if not self.try_begin_transfer(slice_id, set(), writer_cohort):
             raise RuntimeError(
                 f"RxSession {self.disagg_request_id} became terminal before publication"
             )
+        return True
 
     def receive(self, chunk: Chunk, expected_write_bytes: Optional[int] = None) -> None:
         if self.transfer_start_time is None:
@@ -4676,6 +4711,12 @@ class RxSession(RxSessionBase):
                     raise
                 if not accepted:
                     return
+            elif status in (AgentResult.SUCCESS, AgentResult.FAILED):
+                if peer_rank in self._aux_writer_reports:
+                    return
+                if task._kv_result_report_tokens and peer_rank not in task._kv_result_report_tokens:
+                    return
+                self._aux_writer_reports.add(peer_rank)
             if status == AgentResult.SUCCESS:
                 self._aux_count += 1
 
@@ -4753,6 +4794,25 @@ class RxSession(RxSessionBase):
         kv_drained = all(task.resources_drained for task in self._kv_tasks)
         aux_drained = self._aux_physical_owner is None or self._aux_physical_owner.resources_drained
         return kv_drained and aux_drained
+
+    def record_recovery_failure(self, error: Exception) -> None:
+        """Latch failure before drain cancellation can claim the outcome."""
+        with self.lock:
+            self._logical_outcomes.fail(error)
+            self._recovery_failed = self._logical_outcomes.failed
+
+    @property
+    def recovery_failed(self) -> bool:
+        return getattr(self, "_recovery_failed", False)
+
+    @property
+    def committed_failure(self) -> bool:
+        return self._logical_outcomes.failed
+
+    def _recovery_aux_awaits_writers(self) -> bool:
+        # The first slice publishes the session-level AUX slot. A timeout
+        # cannot establish that those writers have stopped accessing it.
+        return self.recovery_failed and len(self._aux_writer_reports) < self._aux_expected_writers
 
     def cancel_local(self, by_peer: bool = False) -> bool:
         """Commit cancellation under the same lock used for publication."""
@@ -4853,6 +4913,8 @@ class RxSession(RxSessionBase):
         """
         if self._enforce_physical_ownership or not self._logical_outcomes.failed:
             return False
+        if self._recovery_aux_awaits_writers():
+            return True
         if self._writer_wait_expired:
             return False
         if not any(task.reports_outstanding for task in self._kv_tasks):
@@ -4951,9 +5013,12 @@ class RxSession(RxSessionBase):
                     return False
                 self._closed = True
         else:
-            if getattr(self, "_closed", False):
-                return True
-            self._closed = True
+            with self.lock:
+                if getattr(self, "_closed", False):
+                    return True
+                if self._recovery_aux_awaits_writers():
+                    return False
+                self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:
             self._aux_buffer.free_slot(self.aux_slot)
             self.aux_slot = None

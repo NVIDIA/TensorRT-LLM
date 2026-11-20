@@ -1127,7 +1127,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         pending = self.__dict__.setdefault(f"_{side}_failure_intents", set())
         pending.intersection_update(sessions)
         pending.update(
-            rid for rid, session in sessions.items() if session.status == SessionStatus.ERROR
+            rid
+            for rid, session in sessions.items()
+            if session.status == SessionStatus.ERROR
+            or (isinstance(session, RxSession) and session.committed_failure)
         )
         if not self._local_agent_ready():
             pending.update(
@@ -1146,13 +1149,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if isinstance(session, (TxSession, RxSession)):
                 if getattr(session, "_failure_cancel_notified", False):
                     continue
-                session._logical_outcomes.fail(RuntimeError("KV transfer agent unavailable"))
+                error = RuntimeError("KV transfer agent unavailable")
                 try:
                     if isinstance(session, TxSession):
+                        session._logical_outcomes.fail(error)
                         session.cancel_local(by_peer=True)
                         session._sender.send_cancel_to_receivers(rid, failure=True)
-                    elif not session.cancel(by_peer=True):
-                        session.notify_cancel()
+                    else:
+                        session.record_recovery_failure(error)
+                        if not session.cancel(by_peer=True):
+                            session.notify_cancel()
                     session._failure_cancel_notified = True
                 except RuntimeError as error:
                     logger.warning(f"Transfer {rid} failure cancellation will retry: {error}")
@@ -2128,7 +2134,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
                 # server timeout).  Return the req objects so the caller can
                 # distinguish the two cases and set the appropriate state.
-                cancelled.append(rid)
+                if isinstance(session, RxSession) and session.recovery_failed:
+                    failed.append(rid)
+                else:
+                    cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 req = self._recv_reqs[rid]
                 if session.transfer_end_time is not None:
@@ -2462,9 +2471,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 session.notify_cancel()
             else:
                 session.cancel()
-            if session.has_transferring_tasks():
+            if isinstance(session, RxSession) and (
+                session.recovery_failed
+                or (getattr(self, "_agent_recovery", False) and session.committed_failure)
+            ):
+                # Let the outcome vote retire this failed receive on every rank.
                 has_transferring = True
-            elif session.close() is False:
+            elif session.has_transferring_tasks() or session.close() is False:
                 has_transferring = True
             else:
                 # The bridge has a stable, rank-local receive outcome. Keep

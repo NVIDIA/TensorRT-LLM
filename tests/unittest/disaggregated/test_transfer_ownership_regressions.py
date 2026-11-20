@@ -1782,7 +1782,8 @@ def test_bridge_rejection_releases_only_without_physical_owner(
 
 
 @pytest.mark.cpu_only
-def test_terminal_sender_settles_known_unsubmitted_aux_peer_once() -> None:
+@pytest.mark.parametrize("owned", [True, False])
+def test_terminal_sender_settles_known_unsubmitted_aux_peer_once(owned: bool) -> None:
     rid = 104
     active_info = transfer_mod.RecvReqInfo(
         sender_req_id=18,
@@ -1815,7 +1816,10 @@ def test_terminal_sender_settles_known_unsubmitted_aux_peer_once() -> None:
     session._base_args = SimpleNamespace(params=params)
     session.request_id = rid
     session._sender = sender
-    session._enforce_physical_ownership = True
+    session._enforce_physical_ownership = owned
+    if not owned:
+        sender._recover_agent = Mock()
+    session._direct_aux_started_peer_ranks = set() if owned else {active_info.instance_rank}
     session._need_aux = True
     session._reported_aux_peer_ranks = set()
     session._logical_outcomes = transfer_mod._LogicalOutcomes()
@@ -1826,7 +1830,8 @@ def test_terminal_sender_settles_known_unsubmitted_aux_peer_once() -> None:
     session._closed = False
     session.aux_task = transfer_mod.AuxSendTask(params, slot=0)
     session.aux_task.bind_logical_outcomes(session._logical_outcomes)
-    assert session.aux_task.begin_physical_operation(active_info.instance_rank)
+    if owned:
+        assert session.aux_task.begin_physical_operation(active_info.instance_rank)
 
     session.set_exception("request failed before auxiliary submission")
     session.set_exception("duplicate terminal notification")
@@ -1835,12 +1840,13 @@ def test_terminal_sender_settles_known_unsubmitted_aux_peer_once() -> None:
         AgentResult.FAILED,
     )
 
-    assert session.aux_task.has_started_physical_operation(active_info.instance_rank)
-    assert not session.aux_task.has_started_physical_operation(unsubmitted_info.instance_rank)
     assert session._reported_aux_peer_ranks == {unsubmitted_info.instance_rank}
-    assert not session.aux_task.resources_drained
-    session.aux_task.retire_unsubmitted_physical_operation(active_info.instance_rank)
-    assert session.aux_task.resources_drained
+    if owned:
+        assert session.aux_task.has_started_physical_operation(active_info.instance_rank)
+        assert not session.aux_task.has_started_physical_operation(unsubmitted_info.instance_rank)
+        assert not session.aux_task.resources_drained
+        session.aux_task.retire_unsubmitted_physical_operation(active_info.instance_rank)
+        assert session.aux_task.resources_drained
 
 
 @pytest.mark.cpu_only
@@ -2096,12 +2102,13 @@ def test_recovery_cancel_before_writer_result_retains_gen_pages(monkeypatch) -> 
         if rank == 3:
             assert gen.check_gen_transfer_status(0) == ([], [], [])
             assert gen._recv_sessions[rid] is rx
-    assert gen.check_gen_transfer_status(0) == ([], [], [request])
+    assert gen.check_gen_transfer_status(0) == ([], [rid], [])
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert rid not in receiver._sessions and rid not in gen._recv_sessions
 
 
 def _two_writer_receive_failed_by_one(
-    rid: int, timeout_s: float | None = None, *, first_result: bool = True
+    rid: int, timeout_s: float | None = None, *, first_result: bool = True, aux_buffer=None
 ):
     """A two-writer receive, optionally after context rank 3 answered FAILED.
 
@@ -2117,8 +2124,15 @@ def _two_writer_receive_failed_by_one(
     receiver._shutdown = False
     session = RxSession(
         request_id=rid,
-        params=DisaggregatedParams(disagg_request_id=rid),
+        params=(
+            DisaggregatedParams(disagg_request_id=rid)
+            if aux_buffer is None
+            else DisaggregatedParams(
+                disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+            )
+        ),
         receiver=receiver,
+        aux_buffer=aux_buffer,
         timeout_s=timeout_s,
     )
 
@@ -2170,6 +2184,69 @@ def _two_writer_receive_failed_by_one(
     transceiver._recv_reqs = {rid: request}
     assert session.status == (SessionStatus.ERROR if first_result else SessionStatus.TRANSFERRING)
     return receiver, session, transceiver, request
+
+
+@pytest.mark.cpu_only
+def test_recovery_failure_retains_aux_slot_after_kv_settles(monkeypatch) -> None:
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    aux = transfer_mod.AuxBuffer(max_slot_num=1, beam_width=1, max_draft_len=1)
+    rid = 120
+    receiver, session, gen, request = _two_writer_receive_failed_by_one(
+        rid, first_result=False, aux_buffer=aux
+    )
+    gen._agent_recovery = True
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    request.is_child = request.is_context_only_request = False
+    request.is_generation_only_request = True
+    request.finish_by_reason = Mock()
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = gen
+    executor.active_requests = [request]
+    executor.waiting_queue = Mock()
+    executor.canceled_req_ids = [rid]
+    executor._try_cancel_request = gen.cancel_request
+    executor._handle_errors = Mock()
+    for peer in (3, 4):
+        receiver._process_kv_agent_result(
+            b"ctx",
+            transfer_mod._make_kv_result_msg(
+                peer,
+                rid,
+                0,
+                True,
+                AgentResult.SUCCESS,
+                kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+            ),
+        )
+    receiver._process_aux_agent_result(
+        b"ctx", transfer_mod._make_aux_result_msg(3, rid, AgentResult.SUCCESS)
+    )
+    receiver._handle_cancel_session([MessageType.CANCEL_SESSION, b"120", b"FAILED"])
+    executor._handle_canceled_requests()
+    executor.disagg.reap_gen_receives(0)
+    assert executor.canceled_req_ids == [rid]
+    assert not session.close()
+    with pytest.raises(ValueError, match="No free auxiliary buffer slots"):
+        aux.alloc_slot()
+
+    receiver._process_aux_agent_result(
+        b"ctx", transfer_mod._make_aux_result_msg(4, rid, AgentResult.FAILED)
+    )
+    executor._handle_canceled_requests()
+    executor.disagg.reap_gen_receives(0)
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    executor._handle_canceled_requests()
+    assert executor.canceled_req_ids == []
+    executor.disagg.reap_gen_receives(0)
+    request.finish_by_reason.assert_not_called()
+    executor._handle_errors.assert_called_once_with(
+        error_msg="Error in kv cache transfer for generation requests",
+        requests=[request],
+        charge_budget=False,
+    )
+    assert aux.alloc_slot().id == 0
 
 
 @pytest.mark.cpu_only

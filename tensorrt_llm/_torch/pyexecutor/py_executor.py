@@ -13229,10 +13229,7 @@ class PyExecutor:
         for request in aligned:
             if (request.state == LlmRequestState.DISAGG_TRANS_ERROR
                     and request.is_generation_only_request
-                    and self.kv_cache_transceiver is not None
-                    and getattr(self, "kv_connector_manager", None) is None
-                    and self.kv_cache_transceiver.
-                    supports_idle_request_cancellation(request) is True):
+                    and self.kv_cache_transceiver is not None):
                 # Drop the pending cancel so synchronized error cleanup
                 # can report the committed failure without rewriting it.
                 continue
