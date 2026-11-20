@@ -258,7 +258,11 @@ class _ContextCancellation:
                 error = failure
                 if failure.status < 500:
                     break
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as failure:
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                asyncio.TimeoutError,
+            ) as failure:
                 error = failure
             except (aiohttp.ClientError, ValueError) as failure:
                 error = failure

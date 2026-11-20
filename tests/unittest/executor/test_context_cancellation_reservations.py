@@ -3,8 +3,8 @@
 
 import secrets
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event, Lock, current_thread
-from unittest.mock import Mock
+from threading import Event, Lock
+from unittest.mock import DEFAULT, Mock
 
 import pytest
 
@@ -12,6 +12,22 @@ from tensorrt_llm.executor import context_cancellation
 from tensorrt_llm.executor.context_cancellation import ContextCancellationReservations
 
 pytestmark = pytest.mark.cpu_only
+
+
+class _ObservedLock:
+    """Expose a failed acquisition attempt while retaining real mutual exclusion."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self.contended = Event()
+
+    def __enter__(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+
+    def __exit__(self, *args: object) -> None:
+        self._lock.release()
 
 
 def _reserve(owner: ContextCancellationReservations, request_id: int) -> str:
@@ -48,34 +64,15 @@ def test_consumed_token_routes_after_result_without_retaining_binding() -> None:
         owner.submit(token, 17, Mock())
 
 
-def test_cancel_cannot_overtake_consumed_submit() -> None:
+def test_cancel_cannot_overtake_consumed_submit(monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise the real lock; cancellation cannot precede its queued request."""
     owner = ContextCancellationReservations()
     token = _reserve(owner, 17)
     submitting = Event()
     finish_submit = Event()
-    cancelling = Event()
     order = []
-
-    class ObservedLock:
-        """Expose real contention, not merely cancellation-thread readiness."""
-
-        def __init__(self) -> None:
-            self.lock = Lock()
-            self.holder = None
-
-        def __enter__(self) -> None:
-            if submitting.is_set() and self.holder is not current_thread():
-                assert self.lock.locked()
-                cancelling.set()
-            self.lock.acquire()
-            self.holder = current_thread()
-
-        def __exit__(self, *args: object) -> None:
-            self.holder = None
-            self.lock.release()
-
-    owner._lock = ObservedLock()
+    lock = _ObservedLock()
+    monkeypatch.setattr(owner, "_lock", lock)
 
     def submit() -> int:
         """Hold the real admission callback at the executor boundary."""
@@ -93,7 +90,7 @@ def test_cancel_cannot_overtake_consumed_submit() -> None:
         try:
             assert submitting.wait(5)
             cancellation = pool.submit(cancel)
-            assert cancelling.wait(5)
+            assert lock.contended.wait(5)
             assert order == []
         finally:
             finish_submit.set()
@@ -339,17 +336,30 @@ def test_shared_reserve_authorization_is_idempotent_only_while_pending(
     monkeypatch.setattr(context_cancellation.time, "time_ns", lambda: 1_000_000_000_000)
     owner = ContextCancellationReservations()
     nonce, expiry = "a" * 32, 1_120_000
-    ready = Barrier(2)
+    issuing, finish_issue = Event(), Event()
+    lock = _ObservedLock()
+    monkeypatch.setattr(owner, "_lock", lock)
 
-    def deliver() -> str:
-        """Align independent frontend deliveries before the worker admission lock."""
-        ready.wait(timeout=5)
-        return owner.reserve(17, nonce, expiry)
+    def pause_issuer(*args: object) -> object:
+        """Pause issuance until the redelivery contends for the same admission lock."""
+        issuing.set()
+        assert finish_issue.wait(5)
+        return DEFAULT  # Delegate to the real signer.
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        # Two RPC/frontend lanes enter the same real worker lock concurrently.
-        deliveries = [pool.submit(deliver) for _ in range(2)]
-        first, second = [result.result(timeout=5) for result in deliveries]
+    signer = Mock(wraps=context_cancellation.hmac)
+    signer.new.side_effect = pause_issuer
+    with monkeypatch.context() as m, ThreadPoolExecutor(max_workers=2) as pool:
+        m.setattr(context_cancellation, "hmac", signer)
+        first_delivery = pool.submit(owner.reserve, 17, nonce, expiry)
+        try:
+            assert issuing.wait(5)
+            redelivery = pool.submit(owner.reserve, 17, nonce, expiry)
+            assert lock.contended.wait(5)
+        finally:
+            finish_issue.set()
+        first = first_delivery.result(timeout=5)
+        second = redelivery.result(timeout=5)
+        signer.new.assert_called_once()
     assert first == second
     assert list(owner._pending) == [first]
     assert len(owner._authorizations) == 1

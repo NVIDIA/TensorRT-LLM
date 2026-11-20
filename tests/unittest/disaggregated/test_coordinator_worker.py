@@ -1326,6 +1326,77 @@ async def test_protected_metadata_can_recover_after_empty_discovery() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [[], None], ids=["array", "null"])
+async def test_protected_metadata_skips_malformed_server_info(malformed: object) -> None:
+    """A bad response excludes only its worker; a later valid probe can admit it."""
+    servers = ["ctx-a:8000", "ctx-b:8000"]
+    metadata = {f"trtllm/{server}": {"url": server, "server_role": "context"} for server in servers}
+    router = RoundRobinRouter(
+        ServerRole.CONTEXT, metadata_server=metadata, require_context_cancellation=True
+    )
+    router.check_servers_health = AsyncMock(return_value=servers)
+    valid = {"supports_logical_context_cancellation": True}
+    json_response = AsyncMock(side_effect=[malformed, valid, valid])
+    manager = AsyncMock()
+    manager.__aenter__.return_value = Mock(json=json_response)
+    router._session = Mock(get=Mock(return_value=manager), close=AsyncMock())
+    try:
+        await router.refresh_protected_context_servers()
+        assert router.prepared_servers == {servers[1]}
+        assert router.servers == [servers[1]]
+        await router.refresh_protected_context_servers()
+        assert router.prepared_servers == set(servers)
+        assert set(router.servers) == set(servers)
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove_peer", [False, True], ids=["peer-joins", "peer-leaves"])
+async def test_protected_kv_admission_survives_peer_update(remove_peer: bool) -> None:
+    """Publishing or removing a peer must not discard a worker's pending hash state."""
+    router = KvCacheAwareRouter(
+        ServerRole.CONTEXT, tokens_per_block=4, require_context_cancellation=True
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def info(server: str, timeout: float) -> dict[str, bool | str]:
+        if server == "pending":
+            entered.set()
+            await release.wait()
+        return {
+            "supports_logical_context_cancellation": True,
+            "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2,
+        }
+
+    router._fetch_server_info = AsyncMock(side_effect=info)
+    if remove_peer:
+        assert await router.add_server("peer")
+    pending = asyncio.create_task(router.add_server("pending"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert "pending" not in router.servers
+        if remove_peer:
+            await asyncio.wait_for(router.remove_server("peer"), timeout=5)
+        else:
+            assert await asyncio.wait_for(router.add_server("peer"), timeout=5)
+        assert "pending" not in router.servers
+        release.set()
+        assert await asyncio.wait_for(pending, timeout=5)
+        expected = {"pending"} if remove_peer else {"pending", "peer"}
+        assert set(router.servers) == router.prepared_servers == expected
+        assert router.routing_key_config() == {
+            "tokens_per_block": 4,
+            "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2,
+        }
+    finally:
+        release.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await router.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delegated", [False, True])
 async def test_protected_replacement_keeps_original_load_owner(delegated: bool) -> None:
     """Completion of old work cannot decrement the replacement worker's load."""

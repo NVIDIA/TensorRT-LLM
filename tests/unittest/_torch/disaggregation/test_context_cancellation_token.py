@@ -289,12 +289,19 @@ def test_token_cancel_receipt_means_queue_only(
     engine.disagg.request_logical_context_cancellation.assert_not_called()
 
 
-def test_normal_numeric_cancel_and_token_namespace_remain_distinct() -> None:
-    """A token cancellation cannot leak its sentinel into ordinary pending IDs."""
+def test_queue_distinguishes_numeric_cancel_token_cancel_and_benchmark_vote() -> None:
+    """A benchmark vote is not a cancellation, and only numeric cancels expose pending IDs."""
     engine = _executor()
+    queue = engine.executor_request_queue
     engine.cancel_request(11)
     engine.cancel_context_request("11")
-    assert engine.executor_request_queue.pending_cancellation_ids() == {11}
+    queue.enqueue_benchmark_stage_vote_request()
+    assert queue.pending_cancellation_ids() == {11}
+    numeric, token, vote = queue.get_from_request_queue(datetime.timedelta(0), wait_for_batch=False)
+    assert numeric.is_canceled_request and numeric.id == 11
+    assert token.is_canceled_request and token.cancel_context_token == "11"
+    assert not token.is_benchmark_stage_vote_request
+    assert vote.is_benchmark_stage_vote_request and not vote.is_canceled_request
 
 
 @pytest.mark.parametrize(
