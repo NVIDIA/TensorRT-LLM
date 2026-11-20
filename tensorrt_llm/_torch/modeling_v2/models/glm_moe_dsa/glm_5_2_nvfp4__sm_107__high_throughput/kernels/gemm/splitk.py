@@ -1813,6 +1813,11 @@ class SplitKDenseGemmKernel:
 
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        # Phase 0 (this warp's first arrival plus the epilogue's) must be complete
+        # before this warp arrives again: otherwise the parity-1 wait below names
+        # the phase before phase 0, returns at once, and the dealloc races the
+        # epilogue's tcgen05.ld.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
@@ -2006,7 +2011,10 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                # The peers' st.async complete-tx releases at cluster scope; the
+                # mailbox reads below need a cluster-scope acquire, not the CTA-scope
+                # one of cute.arch.mbarrier_wait.
+                _wait_parity_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     if cutlass.const_expr(self.mailbox_interleaved):
                         for vec in cutlass.range_constexpr(values_per_thread // 4):
