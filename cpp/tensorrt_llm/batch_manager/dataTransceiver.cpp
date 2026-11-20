@@ -238,11 +238,7 @@ using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 namespace
 {
 
-int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
-{
-    constexpr int32_t kDATA_TAG{43};
-    return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
-}
+constexpr uint64_t kMaxSerializedRequestInfoBytes = 64ULL * 1024 * 1024;
 
 std::filesystem::path getTransferOutputPath(char const* tag, std::string const& instanceId = "")
 {
@@ -479,7 +475,27 @@ public:
         }
     }
 
+    struct RejectedAgentRequest
+    {
+    };
+
     [[nodiscard]] std::optional<RequestInfo> recvRequestInfo()
+    {
+        while (!mTerminate)
+        {
+            try
+            {
+                return recvRequestInfoOnce();
+            }
+            catch (RejectedAgentRequest const&)
+            {
+                // Keep serving other peers after a malformed agent request.
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<RequestInfo> recvRequestInfoOnce()
     {
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         bool isAgent = agentConnectionManager != nullptr;
@@ -499,6 +515,8 @@ public:
             TLLM_CHECK(id == TransceiverTag::Id::REQUEST_SEND);
             std::uint64_t infoSize{0};
             connection->recv(DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
+            TLLM_CHECK_WITH_INFO(infoSize <= kMaxSerializedRequestInfoBytes,
+                "Serialized cache transfer request exceeds the maximum size");
             std::string serializedInfo;
             serializedInfo.resize(infoSize);
             connection->recv(DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
@@ -507,42 +525,64 @@ public:
         }
 
         auto requestId = info.getRequestId();
-        mCacheTransferLayer.validateSupport(info.getTransState());
-
-        auto allCounterparts = mCacheTransferLayer.computeCounterparts(
-            mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
-
-        auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx();
-        int peerIdx = std::distance(
-            allCounterparts.begin(), std::find(allCounterparts.begin(), allCounterparts.end(), peerSelfIdx));
-
-        TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
-            "Peer rank %d not found in expected counterparts", peerSelfIdx);
-        std::shared_ptr<std::atomic<bool>> cancelFlag;
-        if (common::getEnvDisaggEnableInflightCancel())
+        try
         {
-            cancelFlag = getOrCreateInFlightCancelFlag(requestId);
-        }
-        {
-            std::unique_lock<std::mutex> lk(mMtxForMap);
-            auto it = mRequestToSession.find(requestId);
-            if (it == mRequestToSession.end())
+            mCacheTransferLayer.validateSupport(info.getTransState());
+
+            auto allCounterparts = mCacheTransferLayer.computeCounterparts(
+                mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
+
+            auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx();
+            int peerIdx = std::distance(
+                allCounterparts.begin(), std::find(allCounterparts.begin(), allCounterparts.end(), peerSelfIdx));
+
+            TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
+                "Peer rank %d not found in expected counterparts", peerSelfIdx);
+            std::shared_ptr<std::atomic<bool>> cancelFlag;
+            if (common::getEnvDisaggEnableInflightCancel())
             {
-                auto session = cancelFlag != nullptr
-                    ? TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                        DataContext{tagFromRequestId(requestId), *cancelFlag}, allCounterparts, mSelfState,
-                        info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                        !common::getEnvKVCacheTimeOutputPath().empty())
-                    : TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                        DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
-                        info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                        !common::getEnvKVCacheTimeOutputPath().empty());
-                session.setTime(TransferSession::kTimeRequestInfo);
-                it = mRequestToSession.emplace(requestId, std::move(session)).first;
+                cancelFlag = getOrCreateInFlightCancelFlag(requestId);
             }
-            it->second.setConnection(peerIdx, connection);
+            {
+                std::unique_lock<std::mutex> lk(mMtxForMap);
+                auto it = mRequestToSession.find(requestId);
+                if (it == mRequestToSession.end())
+                {
+                    auto session = cancelFlag != nullptr
+                        ? TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
+                            DataContext{tagFromRequestId(requestId), *cancelFlag}, allCounterparts, mSelfState,
+                            info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(),
+                            nullptr, !common::getEnvKVCacheTimeOutputPath().empty())
+                        : TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
+                            DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
+                            info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(),
+                            nullptr, !common::getEnvKVCacheTimeOutputPath().empty());
+                    session.setTime(TransferSession::kTimeRequestInfo);
+                    it = mRequestToSession.emplace(requestId, std::move(session)).first;
+                }
+                it->second.setConnection(peerIdx, connection);
+            }
+            return info;
         }
-        return info;
+        catch (std::exception const&)
+        {
+            if (!isAgent)
+            {
+                throw;
+            }
+            TLLM_LOG_WARNING("Rejecting invalid agent cache transfer request id %lu", requestId);
+            try
+            {
+                auto const* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
+                TLLM_CHECK(agentConnection != nullptr);
+                agentConnection->sendReadySignal(DataContext{tagFromRequestId(requestId)}, false);
+            }
+            catch (std::exception const&)
+            {
+                TLLM_LOG_WARNING("Failed to send rejection for agent cache transfer request id %lu", requestId);
+            }
+            throw RejectedAgentRequest{};
+        }
     }
 
     void sendSync(LlmRequest const& llmRequest)

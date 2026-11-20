@@ -32,6 +32,10 @@
 namespace tensorrt_llm::executor::kv_cache
 {
 
+inline constexpr size_t kMaxSerializedAgentDescBytes = 64ULL * 1024 * 1024;
+// Notifications may carry a full agent descriptor as metadata plus request fields.
+inline constexpr size_t kMaxSerializedAgentNotificationBytes = kMaxSerializedAgentDescBytes + 1024 * 1024;
+
 enum class MemoryType : uint8_t
 {
     kDRAM,

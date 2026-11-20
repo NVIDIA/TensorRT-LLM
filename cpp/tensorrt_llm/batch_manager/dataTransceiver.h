@@ -41,6 +41,12 @@
 namespace tensorrt_llm::batch_manager
 {
 
+inline int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
+{
+    constexpr int32_t kDataTag{43};
+    return ((requestId & 0xFFF) << 8) | (kDataTag & 0xFF);
+}
+
 namespace kv_cache_manager
 {
 class BaseCacheFormatter;

@@ -259,6 +259,16 @@ TEST_P(AgentCommTest, MalformedNotificationRecovery)
     std::ostringstream invalidRequestStream;
     NotificationInfo::serialize(NotificationInfo{invalidRequest}, invalidRequestStream);
     sender.getAgent()->notifySyncMessage(receiverName, invalidRequestStream.str());
+    constexpr uint64_t kRejectedRequestId = kRequestId + 1;
+    tensorrt_llm::batch_manager::RequestInfo rejectedRequest{kRejectedRequestId, state};
+    RequestAndBufferInfo invalidPayload{senderName, sender.getAgent()->getLocalConnectionInfo(), rejectedRequest, {},
+        sender.getAgent()->getLocalAgentDesc().getBackendAgentDesc(), 0, {}};
+    std::ostringstream invalidPayloadStream;
+    NotificationInfo::serialize(NotificationInfo{invalidPayload}, invalidPayloadStream);
+    sender.getAgent()->notifySyncMessage(receiverName, invalidPayloadStream.str());
+    constexpr uint64_t kInvalidIndexRequestId = kRequestId + 2;
+    tensorrt_llm::batch_manager::RequestInfo invalidIndexRequest{kInvalidIndexRequestId, state};
+    agentConnection->sendRequestAndBufferInfo(invalidIndexRequest, {std::optional<size_t>{0}}, 10000);
     agentConnection->sendRequestAndBufferInfo(request, {std::optional<size_t>{0}}, 0);
     tensorrt_llm::batch_manager::RequestInfo received;
     auto requestFuture = std::async(std::launch::async,
@@ -272,6 +282,32 @@ TEST_P(AgentCommTest, MalformedNotificationRecovery)
     ASSERT_EQ(requestStatus, std::future_status::ready);
     ASSERT_NE(requestFuture.get(), nullptr);
     EXPECT_EQ(received.getRequestId(), kRequestId);
+
+    terminate.store(false);
+    auto rejectionFuture = std::async(std::launch::async,
+        [&]()
+        {
+            TLLM_CUDA_CHECK(cudaSetDevice(0));
+            return agentConnection->recvReadySignalWithStatus(
+                DataContext{tensorrt_llm::batch_manager::tagFromRequestId(kRejectedRequestId), terminate});
+        });
+    auto const rejectionStatus = rejectionFuture.wait_for(kTimeout);
+    terminate.store(true);
+    ASSERT_EQ(rejectionStatus, std::future_status::ready);
+    ASSERT_EQ(rejectionFuture.get(), std::optional<bool>{false});
+
+    terminate.store(false);
+    auto invalidIndexFuture = std::async(std::launch::async,
+        [&]()
+        {
+            TLLM_CUDA_CHECK(cudaSetDevice(0));
+            return agentConnection->recvReadySignalWithStatus(
+                DataContext{tensorrt_llm::batch_manager::tagFromRequestId(kInvalidIndexRequestId), terminate});
+        });
+    auto const invalidIndexStatus = invalidIndexFuture.wait_for(kTimeout);
+    terminate.store(true);
+    ASSERT_EQ(invalidIndexStatus, std::future_status::ready);
+    ASSERT_EQ(invalidIndexFuture.get(), std::optional<bool>{false});
 
     // Exercise the separate waitForNotification loop with another malformed-then-valid pair.
     sender.getAgent()->notifySyncMessage(receiverName, "x");

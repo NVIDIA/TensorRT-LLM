@@ -32,7 +32,6 @@ namespace tensorrt_llm::executor::kv_cache
 
 namespace
 {
-constexpr size_t kMaxSerializedAgentDescBytes = 64ULL * 1024 * 1024;
 } // namespace
 
 void promoteHostLibraryToGlobalScope()

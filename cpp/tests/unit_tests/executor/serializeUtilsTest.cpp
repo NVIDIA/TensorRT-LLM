@@ -107,7 +107,8 @@ TEST(SerializeUtilsTest, RejectMalformedAgentDescLengths)
     auto const largeDesc = AgentDesc::deserialize(AgentDesc{largeBackend}.serialize());
     EXPECT_EQ(largeDesc.getBackendAgentDesc(), largeBackend);
 
-    EXPECT_THROW(AgentDesc::deserialize(std::string(64 * kMiB + 1, '\0')), tensorrt_llm::common::TllmException);
+    EXPECT_THROW(AgentDesc::deserialize(std::string(texec::kv_cache::kMaxSerializedAgentDescBytes + 1, '\0')),
+        tensorrt_llm::common::TllmException);
 
     for (auto const count : {size_t{1} << 32, std::numeric_limits<size_t>::max()})
     {

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -75,7 +76,26 @@ auto computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectio
 namespace
 {
 
-constexpr size_t kMaxSerializedNotificationBytes = 64ULL * 1024 * 1024;
+void logDroppedNotification(char const* category, std::exception const& e, uint64_t requestId = 0)
+{
+    static std::atomic<uint64_t> count{0};
+    auto const n = ++count;
+    if (n > 8 && (n & (n - 1)) != 0)
+    {
+        return;
+    }
+    auto const* message = e.what();
+    std::string reason;
+    constexpr size_t kMaxReasonBytes = 160;
+    auto const length = strnlen(message, kMaxReasonBytes);
+    reason.reserve(length);
+    for (size_t i = 0; i < length; ++i)
+    {
+        auto const ch = static_cast<unsigned char>(message[i]);
+        reason.push_back(ch >= 0x20 && ch <= 0x7e ? static_cast<char>(ch) : '?');
+    }
+    TLLM_LOG_WARNING("Dropping %s (request id %lu, occurrence %lu): %s", category, requestId, n, reason.c_str());
+}
 
 bool isValidBufferKind(uint8_t kind)
 {
@@ -540,14 +560,14 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                 std::optional<NotificationInfo> notificationStorage;
                 try
                 {
-                    TLLM_CHECK_WITH_INFO(notifIt->size() <= kMaxSerializedNotificationBytes,
+                    TLLM_CHECK_WITH_INFO(notifIt->size() <= kMaxSerializedAgentNotificationBytes,
                         "Serialized agent notification exceeds the maximum size");
                     std::stringstream ss(*notifIt);
                     notificationStorage.emplace(NotificationInfo::deserialize(ss));
                 }
                 catch (std::exception const& e)
                 {
-                    TLLM_LOG_WARNING("Dropping malformed agent notification: %s", e.what());
+                    logDroppedNotification("malformed agent notification", e);
                     notifIt = notifs.erase(notifIt);
                     continue;
                 }
@@ -565,6 +585,10 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     auto const& remoteAgentName = requestAndBufferInfo.mAgentName;
                     auto const& bufferKindsRef = requestAndBufferInfo.mBufferKinds;
 
+                    AgentConnection* connection = nullptr;
+                    bool trustedIdentity = false;
+                    bool connectAttempted = false;
+
                     try
                     {
                         TLLM_CHECK_WITH_INFO(agent == remoteAgentName,
@@ -577,6 +601,16 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                                 "AgentConnectionManager received mismatched connection info for agent '%s'",
                                 remoteAgentName.c_str());
                         }
+                        else
+                        {
+                            std::scoped_lock remoteInfoLock(mRemoteConnectionInfoMutex);
+                            auto const remoteInfoIt = mRemoteConnectionInfo.find(remoteAgentName);
+                            TLLM_CHECK_WITH_INFO(
+                                remoteInfoIt == mRemoteConnectionInfo.end() || remoteInfoIt->second == address,
+                                "AgentConnectionManager received mismatched connection info for dynamic agent '%s'",
+                                remoteAgentName.c_str());
+                        }
+                        trustedIdentity = true;
                         TLLM_CHECK_WITH_INFO(connectionIdx >= 0,
                             "AgentConnectionManager received negative connection index for agent '%s'",
                             remoteAgentName.c_str());
@@ -623,89 +657,132 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                                 "AgentConnectionManager received mismatched connection info for dynamic agent '%s'",
                                 remoteAgentName.c_str());
                         }
+                        requestInfo = requestAndBufferInfo.mRequestInfo;
+                        auto const& peerCacheState = requestInfo.getTransState().getCacheState().value();
+                        auto const peerSelfIdx = requestInfo.getTransState().getCommState()->getSelfIdx();
+                        for (auto const kind : bufferKindsRef)
+                        {
+                            switch (static_cast<batch_manager::BufferKind>(kind))
+                            {
+                            case batch_manager::BufferKind::kKV:
+                                validateConnectionIdx(connectionIdx,
+                                    targetIRanks(mCacheState, peerCacheState, peerSelfIdx), "KV", remoteAgentName);
+                                break;
+                            case batch_manager::BufferKind::kKV_INDEXER:
+                                validateConnectionIdx(connectionIdx,
+                                    targetIRanksForIndexerKCache(mCacheState, peerCacheState, peerSelfIdx), "IndexerK",
+                                    remoteAgentName);
+                                break;
+                            case batch_manager::BufferKind::kRNN:
+                                validateConnectionIdx(connectionIdx,
+                                    targetIRanksForRnn(mCacheState, peerCacheState, peerSelfIdx), "RNN",
+                                    remoteAgentName);
+                                break;
+                            }
+                        }
+                        TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
+                        connectAttempted = true;
+                        connection = connect(remoteAgentName, address, metadataOpt, true);
+                        TLLM_CHECK_WITH_INFO(
+                            m_Agent->checkRemoteDescs(remoteAgentName, MemoryDescs{MemoryType::kVRAM, bufferDescsRef}),
+                            "AgentConnectionManager received unregistered destination descriptors from agent '%s'",
+                            remoteAgentName.c_str());
+                        auto bufferDescs = std::move(requestAndBufferInfo.mBufferDescs);
+                        auto bufferKinds = std::move(requestAndBufferInfo.mBufferKinds);
+
+                        std::optional<std::pair<size_t, size_t>> kvOffsetRatio;
+                        std::optional<std::pair<size_t, size_t>> indexerOffsetRatio;
+                        std::optional<std::pair<size_t, size_t>> rnnOffsetRatio;
+                        std::vector<std::pair<size_t, size_t>> offsetRatios;
+                        offsetRatios.reserve(bufferDescs.size());
+
+                        for (size_t bi = 0; bi < bufferDescs.size(); bi++)
+                        {
+                            auto kind = static_cast<batch_manager::BufferKind>(bufferKinds[bi]);
+                            switch (kind)
+                            {
+                            case batch_manager::BufferKind::kKV:
+                            {
+                                if (!kvOffsetRatio)
+                                {
+                                    auto kvTargetInfo
+                                        = targetIRanks(mCacheState, requestInfo.getTransState().getCacheState().value(),
+                                            requestInfo.getTransState().getCommState()->getSelfIdx());
+                                    validateConnectionIdx(connectionIdx, kvTargetInfo, "KV", remoteAgentName);
+                                    kvOffsetRatio = computeSendOffsetRatio(kvTargetInfo, connectionIdx);
+                                }
+                                offsetRatios.push_back(*kvOffsetRatio);
+                                break;
+                            }
+                            case batch_manager::BufferKind::kKV_INDEXER:
+                            {
+                                if (!indexerOffsetRatio)
+                                {
+                                    // The indexer K cache pass runs in "indexer layer space": with a
+                                    // masked indexer pool (per-layer indexer mask) the receiver
+                                    // slices its recv buffer at indexer-layer prefix offsets, so the
+                                    // write offset must use the indexer layer counts (identical to
+                                    // the attention counts for dense models).
+                                    auto indexerTargetInfo = targetIRanksForIndexerKCache(mCacheState,
+                                        requestInfo.getTransState().getCacheState().value(),
+                                        requestInfo.getTransState().getCommState()->getSelfIdx());
+                                    validateConnectionIdx(
+                                        connectionIdx, indexerTargetInfo, "IndexerK", remoteAgentName);
+                                    indexerOffsetRatio = computeSendOffsetRatio(indexerTargetInfo, connectionIdx);
+                                }
+                                offsetRatios.push_back(*indexerOffsetRatio);
+                                break;
+                            }
+                            case batch_manager::BufferKind::kRNN:
+                            {
+                                if (!rnnOffsetRatio)
+                                {
+                                    auto rnnTargetInfo = targetIRanksForRnn(mCacheState,
+                                        requestInfo.getTransState().getCacheState().value(),
+                                        requestInfo.getTransState().getCommState()->getSelfIdx());
+                                    validateConnectionIdx(connectionIdx, rnnTargetInfo, "RNN", remoteAgentName);
+                                    size_t rnnOffsetLayer = 0;
+                                    for (int ri = 0; ri < connectionIdx; ri++)
+                                    {
+                                        rnnOffsetLayer += rnnTargetInfo.getPeerPPDomainLayerNum(ri);
+                                    }
+                                    size_t rnnSendLayer = rnnTargetInfo.getPeerPPDomainLayerNum(connectionIdx);
+                                    rnnOffsetRatio = std::make_pair(rnnOffsetLayer, rnnSendLayer);
+                                }
+                                offsetRatios.push_back(*rnnOffsetRatio);
+                                break;
+                            }
+                            }
+                        }
+                        connection->setSenderState(
+                            std::move(bufferDescs), connectionIdx, std::move(offsetRatios), std::move(bufferKinds));
                     }
                     catch (std::exception const& e)
                     {
-                        TLLM_LOG_WARNING("Dropping invalid agent request: %s", e.what());
+                        auto const requestId = requestAndBufferInfo.mRequestInfo.getRequestId();
+                        logDroppedNotification("invalid agent request", e, requestId);
+                        if (trustedIdentity)
+                        {
+                            try
+                            {
+                                if (connection == nullptr && !connectAttempted)
+                                {
+                                    connection = connect(remoteAgentName, address, metadataOpt, true);
+                                }
+                                if (connection != nullptr)
+                                {
+                                    connection->sendReadySignal(
+                                        DataContext{batch_manager::tagFromRequestId(requestId)}, false);
+                                }
+                            }
+                            catch (std::exception const& nackError)
+                            {
+                                logDroppedNotification("agent request rejection signal", nackError, requestId);
+                            }
+                        }
                         notifIt = notifs.erase(notifIt);
                         continue;
                     }
-
-                    requestInfo = requestAndBufferInfo.mRequestInfo;
-                    TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
-                    auto connection = connect(remoteAgentName, address, metadataOpt, true);
-                    TLLM_CHECK_WITH_INFO(
-                        m_Agent->checkRemoteDescs(remoteAgentName, MemoryDescs{MemoryType::kVRAM, bufferDescsRef}),
-                        "AgentConnectionManager received unregistered destination descriptors from agent '%s'",
-                        remoteAgentName.c_str());
-                    auto bufferDescs = std::move(requestAndBufferInfo.mBufferDescs);
-                    auto bufferKinds = std::move(requestAndBufferInfo.mBufferKinds);
-
-                    std::optional<std::pair<size_t, size_t>> kvOffsetRatio;
-                    std::optional<std::pair<size_t, size_t>> indexerOffsetRatio;
-                    std::optional<std::pair<size_t, size_t>> rnnOffsetRatio;
-                    std::vector<std::pair<size_t, size_t>> offsetRatios;
-                    offsetRatios.reserve(bufferDescs.size());
-
-                    for (size_t bi = 0; bi < bufferDescs.size(); bi++)
-                    {
-                        auto kind = static_cast<batch_manager::BufferKind>(bufferKinds[bi]);
-                        switch (kind)
-                        {
-                        case batch_manager::BufferKind::kKV:
-                        {
-                            if (!kvOffsetRatio)
-                            {
-                                auto kvTargetInfo
-                                    = targetIRanks(mCacheState, requestInfo.getTransState().getCacheState().value(),
-                                        requestInfo.getTransState().getCommState()->getSelfIdx());
-                                validateConnectionIdx(connectionIdx, kvTargetInfo, "KV", remoteAgentName);
-                                kvOffsetRatio = computeSendOffsetRatio(kvTargetInfo, connectionIdx);
-                            }
-                            offsetRatios.push_back(*kvOffsetRatio);
-                            break;
-                        }
-                        case batch_manager::BufferKind::kKV_INDEXER:
-                        {
-                            if (!indexerOffsetRatio)
-                            {
-                                // The indexer K cache pass runs in "indexer layer space": with a
-                                // masked indexer pool (per-layer indexer mask) the receiver
-                                // slices its recv buffer at indexer-layer prefix offsets, so the
-                                // write offset must use the indexer layer counts (identical to
-                                // the attention counts for dense models).
-                                auto indexerTargetInfo = targetIRanksForIndexerKCache(mCacheState,
-                                    requestInfo.getTransState().getCacheState().value(),
-                                    requestInfo.getTransState().getCommState()->getSelfIdx());
-                                validateConnectionIdx(connectionIdx, indexerTargetInfo, "IndexerK", remoteAgentName);
-                                indexerOffsetRatio = computeSendOffsetRatio(indexerTargetInfo, connectionIdx);
-                            }
-                            offsetRatios.push_back(*indexerOffsetRatio);
-                            break;
-                        }
-                        case batch_manager::BufferKind::kRNN:
-                        {
-                            if (!rnnOffsetRatio)
-                            {
-                                auto rnnTargetInfo = targetIRanksForRnn(mCacheState,
-                                    requestInfo.getTransState().getCacheState().value(),
-                                    requestInfo.getTransState().getCommState()->getSelfIdx());
-                                validateConnectionIdx(connectionIdx, rnnTargetInfo, "RNN", remoteAgentName);
-                                size_t rnnOffsetLayer = 0;
-                                for (int ri = 0; ri < connectionIdx; ri++)
-                                {
-                                    rnnOffsetLayer += rnnTargetInfo.getPeerPPDomainLayerNum(ri);
-                                }
-                                size_t rnnSendLayer = rnnTargetInfo.getPeerPPDomainLayerNum(connectionIdx);
-                                rnnOffsetRatio = std::make_pair(rnnOffsetLayer, rnnSendLayer);
-                            }
-                            offsetRatios.push_back(*rnnOffsetRatio);
-                            break;
-                        }
-                        }
-                    }
-                    connection->setSenderState(
-                        std::move(bufferDescs), connectionIdx, std::move(offsetRatios), std::move(bufferKinds));
                     notifIt = notifs.erase(notifIt);
                     if (notifs.empty())
                     {
@@ -874,14 +951,14 @@ bool AgentConnectionManager::waitForNotification(
                 std::optional<NotificationInfo> notificationStorage;
                 try
                 {
-                    TLLM_CHECK_WITH_INFO(notifIt->size() <= kMaxSerializedNotificationBytes,
+                    TLLM_CHECK_WITH_INFO(notifIt->size() <= kMaxSerializedAgentNotificationBytes,
                         "Serialized agent notification exceeds the maximum size");
                     std::stringstream ss(*notifIt);
                     notificationStorage.emplace(NotificationInfo::deserialize(ss));
                 }
                 catch (std::exception const& e)
                 {
-                    TLLM_LOG_WARNING("Dropping malformed agent notification: %s", e.what());
+                    logDroppedNotification("malformed agent notification", e);
                     notifIt = notifs.erase(notifIt);
                     continue;
                 }
