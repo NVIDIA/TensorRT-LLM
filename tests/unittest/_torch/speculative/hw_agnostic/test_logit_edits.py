@@ -238,6 +238,66 @@ def test_new_slot_occupant_drops_the_previous_edits():
     assert torch.equal(logits, torch.zeros((1, VOCAB)))
 
 
+class _FailingUpload:
+    """Stands in for a device table whose row upload raises (a CUDA OOM, say)."""
+
+    def index_copy_(self, *args: object) -> None:
+        raise RuntimeError("upload failed")
+
+
+def _fail_next_ban_upload(state: LogitEditState, request: _Request) -> None:
+    """Observe ``request`` with the bad-words upload failing, after the bias upload."""
+    ban_valid = state.ban_valid
+    state.ban_valid = _FailingUpload()
+    try:
+        with pytest.raises(RuntimeError, match="upload failed"):
+            state.observe([request])
+    finally:
+        state.ban_valid = ban_valid
+
+
+def _edited_row(state: LogitEditState, slot: int) -> torch.Tensor:
+    logits = torch.zeros((1, VOCAB))
+    row_slots = torch.tensor([slot])
+    logit_edits.apply_embedding_bias(logits, state, row_slots)
+    logit_edits.apply_bad_words(logits, state, row_slots, *_no_drafts(1))
+    return logits
+
+
+def test_failed_upload_does_not_leave_the_previous_edits_to_the_next_occupant():
+    """The step of a failed upload fails, but the executor keeps serving: the slot must
+    not be recorded as neutral while its device rows still hold the previous edits."""
+    state = _state()
+    state.observe([_Request(1, [3], bias=_bias({2: 5.0}), bad_words=[[7]])])
+    _fail_next_ban_upload(state, _Request(1, [3]))
+
+    state.observe([_Request(1, [3])])
+
+    assert torch.equal(_edited_row(state, 1), torch.zeros((1, VOCAB)))
+
+
+def test_partly_uploaded_edits_do_not_reach_the_next_occupant():
+    """The bias rows of a request are on the device when its bad-words upload raises."""
+    state = _state()
+    _fail_next_ban_upload(state, _Request(1, [3], bias=_bias({2: 5.0}), bad_words=[[7]]))
+
+    state.observe([_Request(1, [3])])
+
+    assert torch.equal(_edited_row(state, 1), torch.zeros((1, VOCAB)))
+
+
+def test_request_is_reloaded_after_its_upload_failed():
+    state = _state()
+    request = _Request(1, [3], bias=_bias({2: 5.0}), bad_words=[[7]])
+    _fail_next_ban_upload(state, request)
+
+    state.observe([request])
+
+    row = _edited_row(state, 1)
+    assert row[0, 2].item() == 5.0
+    assert _banned(row) == [[7]]
+
+
 def test_same_occupant_is_loaded_once():
     state = _state()
     request = _Request(1, [3, 4], bad_words=[[3, 4, 9]])
@@ -328,21 +388,22 @@ def test_worker_edits_a_copy_in_bias_penalty_ban_order(monkeypatch):
     assert edited[0, 2].item() == 1.0
 
 
-def test_worker_leaves_vocab_sharded_logits_unedited():
+@pytest.mark.parametrize("width", [VOCAB // 2, VOCAB + 3], ids=["narrower", "wider"])
+def test_worker_rejects_logits_the_tables_were_not_sized_for(width: int):
+    """Admission accepts the edits on this deploy, so logits the token tables cannot index
+    (an LM head wider than the model config's vocabulary) must not be decoded without them."""
     state = _state()
     state.observe([_Request(1, [3], bias=_bias({2: 1.0}), bad_words=[[7]])])
     metadata = _spec_metadata(state, [1])
-    shard = torch.zeros((1, VOCAB // 2))
 
-    edited = _make_worker()._edit_target_logits(
-        shard,
-        torch.empty((0, 2), dtype=torch.int32),
-        num_contexts=1,
-        batch_size=1,
-        spec_metadata=metadata,
-    )
-
-    assert torch.equal(edited, shard)
+    with pytest.raises(ValueError, match="enable_penalty"):
+        _make_worker()._edit_target_logits(
+            torch.zeros((1, width)),
+            torch.empty((0, 2), dtype=torch.int32),
+            num_contexts=1,
+            batch_size=1,
+            spec_metadata=metadata,
+        )
 
 
 def test_no_draft_step_applies_the_edits_and_advances_the_tail():
