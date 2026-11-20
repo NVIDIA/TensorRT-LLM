@@ -1082,7 +1082,12 @@ def test_qwen_vl_embeddings_without_image_grid_raise(model, as_dict):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("grid", [[1, 6, 6], [1, 3, 8], [4, 6]])
+@pytest.mark.parametrize(
+    "grid",
+    # The last two pass a row check alone: an image has t == 1, and
+    # [1, 4.9, 6.9] truncated to integers is [1, 4, 6].
+    [[1, 6, 6], [1, 3, 8], [4, 6], [2, 2, 6], [1, 4.9, 6.9]],
+)
 def test_qwen_vl_embeddings_with_wrong_image_grid_raise(grid):
     processor, width = _make_qwen_vl_embedding_processor("qwen3", [7, 12, 8])
     with pytest.raises(ValueError, match="does not match image embedding 0"):

@@ -1318,16 +1318,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     "each image as {'mm_embeddings': tensor, "
                     "'image_grid_thw': [t, h, w]}, with the grid from the "
                     "model's image processor.")
-            grid = torch.as_tensor(grid, dtype=torch.long).flatten().tolist()
+            grid = torch.as_tensor(grid).flatten().tolist()
             rows = image_embedding.shape[0]
-            if (len(grid) != 3 or min(grid) <= 0 or grid[1] % merge_size
+            # An image has t == 1. Floats are rejected, not truncated.
+            if (len(grid) != 3 or any(type(size) is not int for size in grid)
+                    or grid[0] != 1 or min(grid) <= 0 or grid[1] % merge_size
                     or grid[2] % merge_size
                     or math.prod(grid) != rows * merge_size**2):
                 raise ValueError(
                     f"image_grid_thw {grid} does not match image embedding "
-                    f"{index}: t * h * w / {merge_size}**2 must equal its "
-                    f"{rows} rows, and h and w must be multiples of "
-                    f"{merge_size}.")
+                    f"{index}: it must be 3 integers [1, h, w] (t is 1 for "
+                    f"an image), h and w must be multiples of {merge_size}, "
+                    f"and h * w / {merge_size}**2 must equal its {rows} rows.")
             image_grid_thw.append(grid)
 
         build_disagg_prefill_multimodal_inputs = getattr(
