@@ -581,8 +581,19 @@ def _indexer_splitk_kernel(
             # surfaces later as a TMEM dealloc error.
             # owned_count is CTA-uniform, so every lane of every warp waits
             # together here and the warp re-converges before the collective.
-            while not prims.mbarrier_try_wait_parity(recv_mbar, 0, time_limit=10_000_000):
+            # The peers' st.async complete-tx releases at cluster scope; a CTA-scope
+            # acquire does not order the recv_ptr reads below after it. A relaxed
+            # cluster-scope wait followed by an acquire fence restricted to shared::cluster
+            # orders them without the L1 invalidation an acquire-qualified try_wait incurs.
+            while not prims.mbarrier_try_wait_parity(
+                recv_mbar,
+                0,
+                time_limit=10_000_000,
+                scope=prims.MBarrierScope.CLUSTER,
+                order=prims.MemOrder.RELAXED,
+            ):
                 pass
+            prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
             for chunk in cutlass.range_constexpr(SPLITK_NCHUNK):
                 owner: cutlass.Constexpr[int] = chunk % SPLITK_K_PARTS
                 owned_slot: cutlass.Constexpr[int] = chunk // SPLITK_K_PARTS
