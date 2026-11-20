@@ -47,7 +47,6 @@ LLM_ROOT = "llm"
 
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
-URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
 
 // The primary location a parent pipeline passed in globalVars, which this job uses instead of its
@@ -66,63 +65,18 @@ def llmArtifactsPrimary()
     return primary
 }
 
-// The locations of outputs under llm-artifacts/. repo serves reads, lists, and uploads; localRepo
+// The locations of outputs under llm-artifacts/, from the shared library, which also maps legacy
+// paths to them (trtllm_utils.llmArtifacts*). repo serves reads, lists, and uploads; localRepo
 // is the local repository that deletes go to, since urm's virtual repository refuses them; and
 // credential is the identity that publishes to and deletes from the location.
-LLM_ARTIFACTS_LOCATIONS = [
-    aws: [root: "https://artifactory.nvidia.com/artifactory", repo: "sw-tensorrt-llm-generic-local",
-          localRepo: "sw-tensorrt-llm-generic-local", credential: "aws-artifactory-credentials"],
-    urm: [root: "https://urm.nvidia.com/artifactory", repo: "sw-tensorrt-generic",
-          localRepo: "sw-tensorrt-generic-local", credential: "urm-artifactory-creds"],
-]
-
-def llmArtifactsLayoutPath(String legacyPath)
-{
-    def layoutPath = legacyPath.replaceFirst(/^sw-tensorrt-generic(-local)?\//, "")
-    if (!layoutPath.startsWith("llm-artifacts/")) {
-        error("Not an llm-artifacts path: ${legacyPath}")
-    }
-    return layoutPath
-}
-
-def llmArtifactsRepoPath(String location, String legacyPath)
-{
-    return "${LLM_ARTIFACTS_LOCATIONS[location].repo}/${llmArtifactsLayoutPath(legacyPath)}"
-}
-
-def llmArtifactsUrl(String location, String legacyPath)
-{
-    return "${LLM_ARTIFACTS_LOCATIONS[location].root}/${llmArtifactsRepoPath(location, legacyPath)}"
-}
-
-def llmArtifactsLocalRepoPath(String location, String legacyPath)
-{
-    return "${LLM_ARTIFACTS_LOCATIONS[location].localRepo}/${llmArtifactsLayoutPath(legacyPath)}"
-}
-
-// The host name of a location, as a netrc machine entry and curl name it.
-def llmArtifactsHost(String location)
-{
-    return LLM_ARTIFACTS_LOCATIONS[location].root.replaceFirst(/^[a-z]+:\/\//, "").replaceFirst(/[:\/].*$/, "")
-}
-
-// The link to an output that people open in a browser. artifactory.nvidia.com answers a direct
-// link from a browser with a password prompt, so its links open the native browser, which signs
-// people in with the company sign-in; urm serves direct links.
-def llmArtifactsBrowseUrl(String location, String legacyPath)
-{
-    if (location == "aws") {
-        return "https://${llmArtifactsHost('aws')}/ui/native/${llmArtifactsRepoPath('aws', legacyPath)}"
-    }
-    return llmArtifactsUrl(location, legacyPath)
-}
+LLM_ARTIFACTS_LOCATIONS = trtllm_utils.llmArtifactsLocations()
 
 // Describes a failed Artifactory request. status is the HTTP status, or "000" when no response
 // arrived. A 401 or 403 names the credential that was sent, if any, and the permission that the
 // request needs ("read", "deploy", or "delete").
 def artifactoryFailureMessage(String location, String path, String status, boolean sentCredentials, String permission)
 {
-    def host = llmArtifactsHost(location)
+    def host = trtllm_utils.llmArtifactsHost(location)
     if (status in ["401", "403"]) {
         if (!sentCredentials) {
             return "${host} rejected the anonymous request for ${path} (HTTP ${status})."
@@ -138,26 +92,11 @@ def artifactoryFailureMessage(String location, String path, String status, boole
     return "${host} answered HTTP status ${status} for ${path}."
 }
 
-// Where test results go. While urm is in service, everything under test-results/ is published to
-// urm, the required copy, and replicated to aws whenever aws is the primary location; during a
-// rollback to urm there is no replica. rerun_reports/ and cbts-coverage/ go to the primary alone.
-// This function alone decides the targets of a test-results/ output: the locations in upload
-// order, where a failed upload to the required one fails a step as it always has, and a failed
-// upload to a replica marks only the stage unstable. jenkins/scripts/fetch_build_artifact.sh
-// relies on urm coming first: while urm is the primary, it asks urm alone about test results.
-def testResultTargets(String primary)
-{
-    if (primary == "aws") {
-        return [[location: "urm", replica: false], [location: "aws", replica: true]]
-    }
-    return [[location: "urm", replica: false]]
-}
-
 // The upload target of a folder of this run's outputs, such as "test-results", on a location.
 def testResultsDirTarget(String location, String directory)
 {
     if (location == "aws") {
-        return "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/${directory}/"
+        return "${trtllm_utils.llmArtifactsRepoPath('aws', UPLOAD_PATH)}/${directory}/"
     }
     return "${UPLOAD_PATH}/${directory}/"
 }
@@ -178,7 +117,7 @@ def attemptPrimary(String stageName, String postTag)
 
 def attemptTargets(String stageName, String postTag)
 {
-    return testResultTargets(attemptPrimary(stageName, postTag))
+    return trtllm_utils.llmArtifactsTargets(attemptPrimary(stageName, postTag))
 }
 
 // Stage attempts, by stageName + postTag, whose checkpoints deleteProgressArtifact has deleted.
@@ -188,6 +127,12 @@ CHECKPOINT_DELETED = [] as Set
 // dispatcher pod deletes their checkpoints once the agent's block returns, and only then, so that
 // an attempt that stopped before its final upload keeps its checkpoints as its only result.
 CHECKPOINT_DELETES_ON_DISPATCHER = [] as Set
+
+// Stage attempts, by stageName + postTag, whose tests run code from the wheel being checked: the
+// sanity tests of the "Run LLMAPI Test" step. No Artifactory credential may be in their container
+// once that code has run, so their checkpoint watcher gets none: it prepares its snapshots and
+// uploads no checkpoint, and the attempt's results reach Artifactory in its final archive alone.
+CHECKPOINT_NETRC_WITHHELD = [] as Set
 
 // Marks the current stage UNSTABLE and leaves the build result alone: an UNSTABLE test job counts
 // as infra-incomplete to the parent pipeline, so a lost replica or a failed read must not set it.
@@ -199,39 +144,10 @@ def markStageUnstable(String reason)
 }
 
 // Uploads filePattern to a folder of this run's outputs, such as "test-results", on each of
-// targets in order (see testResultTargets). The required target's upload fails the step when
-// requiredFailureFails, and then no replica is tried; otherwise its failure is logged. A replica's
-// failure is logged with the link to the required copy, when that upload succeeded, and marks the
-// stage unstable. Returns the locations that received the file.
+// targets (see trtllm_utils.uploadToTargets). Returns the locations that received the file.
 def uploadTestResult(String filePattern, String directory, List targets, boolean requiredFailureFails = true)
 {
-    def name = filePattern.tokenize("/")[-1]
-    def required = targets.find { !it.replica }
-    def uploaded = []
-    for (target in targets) {
-        try {
-            trtllm_utils.uploadArtifacts(filePattern, testResultsDirTarget(target.location, directory), target.location)
-            uploaded << target.location
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            if (!target.replica && requiredFailureFails) {
-                throw e
-            }
-            if (target.replica) {
-                def requiredCopy = "the ${required.location} upload failed too"
-                if (required.location in uploaded) {
-                    requiredCopy = "${required.location} copy: " +
-                        llmArtifactsUrl(required.location, "${UPLOAD_PATH}/${directory}/${name}")
-                }
-                echo "[test-results] replica upload of ${name} to ${llmArtifactsHost(target.location)} failed; ${requiredCopy}"
-                markStageUnstable("Replica upload of ${name} to ${llmArtifactsHost(target.location)} failed: ${e}")
-            } else {
-                echo "[test-results] upload of ${name} to ${target.location} failed (non-fatal): ${e}"
-            }
-        }
-    }
-    return uploaded
+    return trtllm_utils.uploadToTargets(filePattern, "${UPLOAD_PATH}/${directory}/", targets, requiredFailureFails)
 }
 
 // "Setup Environment" stashes jenkins/scripts/fetch_build_artifact.sh from the run's commit under
@@ -243,6 +159,7 @@ FETCH_BUILD_ARTIFACT_STASH = "fetch-build-artifact"
 // that they match.
 FETCH_ABSENT = 2
 FETCH_TRANSFER_FAILED = 4
+FETCH_SECONDARY_FAILED = 5
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -265,8 +182,9 @@ ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 // Read-only artifactory pull credentials
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 // Credential with which the read helper reads from artifactory.nvidia.com: the publishing
-// credential, the one the pipelines publish build artifacts and test results with.
-LLM_ARTIFACTS_CREDENTIALS_ID = "aws-artifactory-credentials"
+// credential, the one the pipelines publish build artifacts and test results with and that
+// trtllm_utils.writeArtifactoryNetrc puts in the helper's netrc.
+LLM_ARTIFACTS_CREDENTIALS_ID = LLM_ARTIFACTS_LOCATIONS.aws.credential
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.09-py3"
@@ -583,6 +501,8 @@ def timeoutEvidenceFile(String stageName) {
 def clearTimeoutEvidence(String stageName) {
     try {
         sh "rm -f '${timeoutEvidenceFile(stageName)}' || true"
+        // Created by the agent so it stays the owner; the pytest plugin only appends to it.
+        writeFile(file: timeoutEvidenceFile(stageName), text: "")
     } catch (InterruptedException interruptedError) {
         throw interruptedError
     } catch (Exception cleanupError) {
@@ -598,13 +518,23 @@ def retainUnfinishedTimeoutEvidence(String stageName, String llmSrc) {
 
     String unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
     String helper = "${llmSrc}/jenkins/scripts/pytest_timeout_evidence.py"
-    int status = sh(
-        script: "python3 '${helper}' --evidence-file '${evidenceFile}' " +
-            "--unfinished-test-file '${unfinishedTestFile}'",
-        returnStatus: true,
-    )
-    if (status != 0) {
-        echo "Ignorable warning: could not scope timeout evidence before rerunning ${stageName}"
+    try {
+        sh(
+            script: "python3 '${helper}' --evidence-file '${evidenceFile}' " +
+                "--unfinished-test-file '${unfinishedTestFile}'",
+        )
+    } catch (InterruptedException interruptedError) {
+        throw interruptedError
+    } catch (hudson.AbortException scopeError) {
+        boolean ignorable =
+            (scopeError.message ==~ /script returned exit code -?\d+/) &&
+            FailureClassifier.flattenThrowable(scopeError).size() == 1 &&
+            (FailureClassifier.classify(scopeError, InfraFailure.K8S) instanceof UserFailure)
+        if (!ignorable) {
+            throw scopeError
+        }
+        echo "Ignorable warning: could not scope timeout evidence before rerunning ${stageName}: ${scopeError.message}"
+        return
     }
 }
 
@@ -1165,7 +1095,7 @@ bash "${args.prepareBodyPathNode}"
 def deliverFatBuilderNetrc(pipeline, def remote, String netrcPathNode) {
     def netrcPathLocal = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
     try {
-        writeArtifactoryNetrc(pipeline, netrcPathLocal)
+        trtllm_utils.writeArtifactoryNetrc(netrcPathLocal)
         // scp -p keeps the netrc's 600 mode on the node.
         Utils.copyFileToRemoteHost(pipeline, remote, netrcPathLocal, netrcPathNode)
     } finally {
@@ -1393,7 +1323,8 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     try {
         echo "[SLURM-FINALIZER] ${entry.id}: reconciling orphaned SLURM resources off-pod " +
              "(job=${entry.slurmJobId ?: entry.jobUID}, node=${entry.nodeName ?: 'n/a'})."
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, {
+        def stageName = entry.id.toString().replaceFirst(/\/slurm\/[^\/]+$/, "")
+        launchKubernetesStagePod(pipeline, podSpec, containerName, stageName, [reportFailure: false], {
             if (entry.usedSbatch) {
                 cleanUpSlurmResources(pipeline, cluster, entry.clusterName, entry.jobUID)
             } else {
@@ -2293,42 +2224,6 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-// Writes a netrc for artifactory.nvidia.com with LLM_ARTIFACTS_CREDENTIALS_ID, readable only by its
-// owner. The shell's printf builtin moves the secret from the bound variables into the file, so it
-// never appears on a command line or in the trace. Callers remove the file in a finally block.
-def writeArtifactoryNetrc(pipeline, String netrcPath)
-{
-    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: LLM_ARTIFACTS_CREDENTIALS_ID,
-            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
-        pipeline.withEnv(["ARTIFACTORY_NETRC=${netrcPath}"]) {
-            pipeline.sh(label: "Write Artifactory netrc", script: '''
-                set +x
-                umask 077
-                printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
-            ''')
-        }
-    }
-}
-
-// Adds an entry for a location to the netrc at netrcPath, with the identity that publishes to and
-// deletes from that location, so that one file can hold an entry for each host. Only the file's
-// owner can read it, and the shell's printf builtin moves the secret from the bound variables into
-// it, so it never appears on a command line or in the trace. Callers remove the file in a finally
-// block.
-def addArtifactoryNetrcEntry(pipeline, String netrcPath, String location)
-{
-    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: LLM_ARTIFACTS_LOCATIONS[location].credential,
-            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
-        pipeline.withEnv(["ARTIFACTORY_NETRC=${netrcPath}", "ARTIFACTORY_HOST=${llmArtifactsHost(location)}"]) {
-            pipeline.sh(label: "Add an Artifactory netrc entry", script: '''
-                set +x
-                umask 077
-                printf 'machine %s login %s password %s\\n' "$ARTIFACTORY_HOST" "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" >> "$ARTIFACTORY_NETRC"
-            ''')
-        }
-    }
-}
-
 // Returns the path of the read helper, jenkins/scripts/fetch_build_artifact.sh from the run's
 // commit, in the node's temporary directory, which workspace resets and package extraction leave
 // alone. Unstashes it there the first time.
@@ -2358,19 +2253,29 @@ def readHelperPath(pipeline)
 // "properties" writes the properties JSON to dest and returns the helper's exit status instead of
 // failing: 0 when found, otherwise one of the exit codes the helper names, such as FETCH_ABSENT
 // when neither location has properties for it.
-def fetchBuildArtifact(pipeline, String artifactPath, String dest, String mode = "download")
+//
+// secondaryOptional, for "download-status" only, is for a file whose copy on the secondary
+// location is not required: when the primary lacks the file and the secondary cannot answer, the
+// helper's status is FETCH_SECONDARY_FAILED instead of a failure.
+def fetchBuildArtifact(pipeline, String artifactPath, String dest, String mode = "download", boolean secondaryOptional = false)
 {
     if (!(mode in ["download", "download-status", "exists", "properties"])) {
         pipeline.error("fetchBuildArtifact: unknown mode '${mode}'")
     }
+    if (secondaryOptional && mode != "download-status") {
+        pipeline.error("fetchBuildArtifact: secondaryOptional needs mode 'download-status', not '${mode}'")
+    }
     def primary = llmArtifactsPrimary()
     def helper = readHelperPath(pipeline)
     def helperOption = mode in ["exists", "properties"] ? " --${mode}" : ""
+    if (secondaryOptional) {
+        helperOption += " --secondary-optional"
+    }
     def command = "bash '${helper}'${helperOption} '${artifactPath}'" + (mode == "exists" ? "" : " '${dest}'")
     def netrcPath = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
     def statusPath = "${pipeline.pwd(tmp: true)}/fetch-status-${UUID.randomUUID().toString()}"
     try {
-        writeArtifactoryNetrc(pipeline, netrcPath)
+        trtllm_utils.writeArtifactoryNetrc(netrcPath)
         return pipeline.withEnv([
             "LLM_ARTIFACTS_PRIMARY=${primary}",
             "ARTIFACTORY_NETRC=${netrcPath}",
@@ -2415,6 +2320,107 @@ def fetchBuildArtifact(pipeline, String artifactPath, String dest, String mode =
     } finally {
         pipeline.sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}' '${statusPath}'")
     }
+}
+
+// Reads artifactPath to dest as fetchBuildArtifact does in "download" or "download-status" mode,
+// unless the caller hands over prefetched: the reads that it made earlier with
+// prefetchBuildArtifact, as a map from an artifact path to [status: the read helper's exit status,
+// file: the local copy when the status is 0]. With a map, nothing is read and no credential is
+// bound here: dest is copied from the map's file, and a path that the map lacks counts as
+// FETCH_ABSENT.
+def fetchOrUsePrefetched(pipeline, Map prefetched, String artifactPath, String dest, String mode = "download", boolean secondaryOptional = false)
+{
+    if (prefetched == null) {
+        return fetchBuildArtifact(pipeline, artifactPath, dest, mode, secondaryOptional)
+    }
+    if (!(mode in ["download", "download-status"])) {
+        pipeline.error("fetchOrUsePrefetched: unsupported mode '${mode}'")
+    }
+    def entry = prefetched[artifactPath.toString()]
+    def status = entry == null ? FETCH_ABSENT : entry.status
+    if (status == 0) {
+        pipeline.sh(label: "Use the earlier read of ${artifactPath}", script: "cp '${entry.file}' '${dest}'")
+    }
+    if (mode == "download-status") {
+        return status
+    }
+    if (status != 0) {
+        pipeline.error("${artifactPath} could not be read earlier in this step " +
+            "(fetch_build_artifact.sh exit status ${status}); its message above says why.")
+    }
+    return null
+}
+
+// Tells whether e, a FlowInterruptedException, is the expiry of the caller's own timeout step: one
+// of limitMinutes that the caller entered at startMs, a System.currentTimeMillis() value, or null
+// when it entered none. The expiry of a timeout step that encloses the caller's carries the same
+// cause, so the two are told apart by time: the caller's step cannot expire before its limit has
+// passed. From then on, an enclosing step that expires as well counts as the caller's; it still
+// fails the steps that run under it a minute after its own expiry.
+def ownTimeoutExpired(e, startMs, int limitMinutes)
+{
+    if (startMs == null || System.currentTimeMillis() - startMs < limitMinutes * 60000L) {
+        return false
+    }
+    return e.causes.any { it.class.simpleName == 'ExceededTimeout' }
+}
+
+// Reads artifactPath into dir with the read helper and records the outcome in prefetched, for
+// fetchOrUsePrefetched. A read that runs out of timeoutMinutes, when given, or that fails outside
+// the helper is recorded as FETCH_TRANSFER_FAILED. An abort propagates, and so does the expiry of
+// a timeout that encloses the read.
+def prefetchBuildArtifact(pipeline, Map prefetched, String artifactPath, String dir, boolean secondaryOptional = false, int timeoutMinutes = 0)
+{
+    def file = "${dir}/${prefetched.size()}-${artifactPath.tokenize('/').last()}"
+    def status = FETCH_TRANSFER_FAILED
+    // The time at which the read's timeout step is entered; a read without a limit enters none.
+    def startMs = null
+    try {
+        if (timeoutMinutes > 0) {
+            startMs = System.currentTimeMillis()
+            pipeline.timeout(time: timeoutMinutes, unit: 'MINUTES') {
+                status = fetchBuildArtifact(pipeline, artifactPath, file, "download-status", secondaryOptional)
+            }
+        } else {
+            status = fetchBuildArtifact(pipeline, artifactPath, file, "download-status", secondaryOptional)
+        }
+    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+        // Running out of timeoutMinutes is recorded like any failed read; user aborts, upstream
+        // pipeline interruptions and the expiry of an enclosing timeout must keep propagating.
+        if (!ownTimeoutExpired(e, startMs, timeoutMinutes)) {
+            throw e
+        }
+        pipeline.echo "Reading ${artifactPath} timed out after ${timeoutMinutes} min"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo "Reading ${artifactPath} failed (${e.class.simpleName}: ${e.message})"
+    }
+    prefetched[artifactPath.toString()] = [status: status, file: file]
+    return status
+}
+
+// Makes the reads that runLLMTestlistOnPlatformImpl makes for stageName's tests besides the
+// package, so that a step can make them before code from a wheel runs on the node: the merged
+// waives, the CBTS test-db archive when CBTS narrowed the run, and the archives of the stage's
+// earlier attempts when postTag names a retry. Returns them for fetchOrUsePrefetched.
+def prefetchTestlistReads(pipeline, String stageName, String postTag, String dir)
+{
+    def prefetched = [:]
+    pipeline.sh "mkdir -p '${dir}'"
+    prefetchBuildArtifact(pipeline, prefetched, "${ARTIFACT_PATH}/waive_list/waives.txt", dir)
+    def cbts = testFilter[(CBTS_RESULT)]
+    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_test_db_artifact_path) {
+        prefetchBuildArtifact(pipeline, prefetched, "${cbts.cbts_test_db_artifact_path}", dir, false, 10)
+    }
+    if (testFilter[(REUSE_TEST)] != false) {
+        priorAttemptTags(postTag).each { priorTag ->
+            prefetchBuildArtifact(pipeline, prefetched,
+                "${UPLOAD_PATH}/test-results/results-${stageName}${priorTag}.tar.gz", dir,
+                llmArtifactsPrimary() == "aws")
+        }
+    }
+    return prefetched
 }
 
 def cppTestArtifactPath(String config, String stageName)
@@ -2783,7 +2789,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // requeues, after the first run deleted it has no netrc, and its download fails.
                 def artifactoryNetrcPathLocal = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
                 try {
-                    writeArtifactoryNetrc(pipeline, artifactoryNetrcPathLocal)
+                    trtllm_utils.writeArtifactoryNetrc(artifactoryNetrcPathLocal)
                     // scp -p keeps the netrc's 600 mode on the node.
                     Utils.copyFileToRemoteHost(
                         pipeline,
@@ -3399,7 +3405,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // gone). Deregistered when cleanup actually runs.
                 registerSlurmResource(stageName, [clusterName: partition.clusterName, jobUID: jobUID, slurmJobId: slurmJobId, usedSbatch: true])
 
-                def fullOutputLink = llmArtifactsBrowseUrl(attemptPrimary(stageName, postTag),
+                def fullOutputLink = trtllm_utils.llmArtifactsBrowseUrl(attemptPrimary(stageName, postTag),
                     "${UPLOAD_PATH}/test-results/results-${stageName}${postTag}.tar.gz")
                 def scriptTrack = """#!/bin/bash
                     set -xEeuo pipefail
@@ -3550,6 +3556,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
                 def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
                 def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
+                def timeoutLogCmd = Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(
+                    "grep -aF -e 'TRTLLM_PYTEST_TIMEOUT ' -e 'TRTLLM_PYTEST_ATTEMPT ' -- '${slurmJobLogPath}' || true"))
                 def watcher = prepareCheckpointWatcher(pipeline, stageName, postTag)
                 try {
                     withEnv(watcher.env + [
@@ -3588,11 +3596,26 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             # and perf folders for the final snapshot. The watcher first finishes any
                             # checkpoint under way and then starts no other, so that the copy and a
                             # checkpoint never write the results at the same time. The copies are
-                            # best-effort, and each logs its own failure.
-                            touch "\$PROGRESS_STOP_FILE"
-                            while [ -e "\$PROGRESS_STOP_FILE.busy" ] && kill -0 \$WATCHER_PID 2>/dev/null; do
-                                sleep 1
-                            done
+                            # best-effort, and each logs its own failure. If the stop file cannot
+                            # be created, the watcher cannot be asked to pause, so a signal ends
+                            # it here: its final snapshot then comes before the copies. A watcher
+                            # that cannot remove the mark of its checkpoint ends on its own, and
+                            # takes no final snapshot beside the copies either. A final snapshot
+                            # from before the copies has no timeout results.
+                            watcher_ended=0
+                            if touch "\$PROGRESS_STOP_FILE"; then
+                                while [ -e "\$PROGRESS_STOP_FILE.busy" ] && kill -0 \$WATCHER_PID 2>/dev/null; do
+                                    sleep 1
+                                done
+                                if ! kill -0 \$WATCHER_PID 2>/dev/null; then
+                                    wait \$WATCHER_PID
+                                    watcher_ended=1
+                                fi
+                            else
+                                kill -s USR1 \$WATCHER_PID 2>/dev/null
+                                wait \$WATCHER_PID
+                                watcher_ended=1
+                            fi
                             mkdir -p '${WORKSPACE}/${stageName}'
                             ${sshRefreshCacheCmd}
                             for _attempt in 1 2 3; do
@@ -3617,8 +3640,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                 done
                                 [ "\$_perf_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp perf \$perf_folder failed after 3 attempts"
                             done < <(eval '${sshListPerfCmd}' 2>/dev/null || true)
-                            touch "\$PROGRESS_DONE_FILE"
-                            wait \$WATCHER_PID
+                            # Give the final snapshot this job's timeout markers.
+                            [ -f "\$TIMEOUT_EVIDENCE_FILE" ] && ${timeoutLogCmd} >> "\$TIMEOUT_EVIDENCE_FILE"
+                            # A signal stands in for a done file that cannot be created. A watcher
+                            # that ended above gets no signal: its PID may belong to another
+                            # process by now. The step has waited for it already.
+                            if [ "\$watcher_ended" -eq 0 ]; then
+                                touch "\$PROGRESS_DONE_FILE" || kill -s USR1 \$WATCHER_PID 2>/dev/null
+                                wait \$WATCHER_PID
+                            fi
                             exit \$rc
                         """
                     }
@@ -3852,6 +3882,9 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
+  // Capture the outer node before entering a nested SLURM compute agent.
+  String dispatcherNodeName = env.NODE_NAME
+
   // Per-stage override of the SLURM infra-retry budget (from opts.infraRetryMax,
   // threaded via the dispatcher's retryContext). Lets resource-scarce pools cap
   // or disable stage-level retries (0 = no retry). Null falls back to the global.
@@ -3877,6 +3910,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
     // Shared by result suppression and the retry decision for this attempt only.
     Map slurmRetryContext = [
       scope: InfraFailure.SLURM,
+      dispatcherNodeName: dispatcherNodeName,
       stageName: stageName,
       attempt: attempt,
       backoffMs: 60L * 1000L,
@@ -3921,15 +3955,6 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
       // User abort / pipeline timeout -- never retry
       throw e
     } catch (Exception e) {
-      // If the K8s dispatcher pod this stage runs inside died mid-run, every
-      // retry attempt would execute on that same dead pod and fail immediately,
-      // and the in-pod cleanup can no longer reach the SLURM controller. Stop
-      // retrying in place and propagate so the pod-level wrapper reconciles the
-      // orphaned SLURM job / Jenkins node off-pod (fail closed).
-      if (isDispatcherPodFailure(e)) {
-        echo "[INFRA-RETRY] ${stageName}: dispatcher pod died mid-run; not retrying on the dead pod (${e.toString()}). Failing closed for off-pod reconciliation."
-        throw e
-      }
       // classifyFailure() handles FlowInterruptedException + exit-code-143 +
       // typed throws + originating-step evidence and cause-chain fallback, returning one of
       // PipelineInterruption / InfraFailure / UserFailure. Scope=SLURM
@@ -3941,6 +3966,13 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
         // exception matches no catalog pattern lands here and would
         // otherwise decline the retry with no log output at all.
         echo "[INFRA-RETRY] ${stageName}: SLURM attempt failed with no infra pattern matched (classified as user failure); not retrying. Exception: ${e.toString()}"
+        throw e
+      }
+
+      // A compute-agent failure does not imply the outer dispatcher died.
+      // Only retry in place when that dispatcher is still online.
+      if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+        echo "[INFRA-RETRY] ${stageName}: dispatcher is offline or unknown; not retrying in place. Failing closed for off-pod reconciliation."
         throw e
       }
 
@@ -3965,6 +3997,12 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
       echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
 
       sleep(60)
+      // The dispatcher may have gone offline during cooldown.
+      if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+        echo "[INFRA-RETRY] ${stageName}: dispatcher is offline or unknown after cooldown; " +
+             "not starting another SLURM attempt."
+        throw e
+      }
     }
   }
 }
@@ -4309,7 +4347,10 @@ boolean hasBudgetForInfraRetry(def pipeline, String stageName, String scope, Inf
 
 def classifyFailure(def pipeline, Throwable error, String scope, Map retryContext=null)
 {
-    if (error instanceof TrtllmCiException) return FailureClassifier.classify(error, scope)
+    // Interruptions carry their own reasons; do not collect step logs while cancelling.
+    if (error instanceof TrtllmCiException || FailureClassifier.hasInterruption(error)) {
+        return FailureClassifier.classify(error, scope)
+    }
 
     // Reuse evidence only when it was collected for this exact error and classification scope.
     boolean cachedForFailure = retryContext?.failureEvidence != null &&
@@ -4333,11 +4374,12 @@ def preservePrimaryFailure(Throwable primaryError, Closure actions)
 {
     try {
         actions()
-    } catch (InterruptedException e) {
-        throw e
     } catch (Exception e) {
         // Post-processing failures must not replace the failure that triggered them.
-        if (primaryError == null || FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption) throw e
+        // K8s node removal is secondary; control and unknown interruptions still win.
+        if (primaryError == null || FailureClassifier.classify(e, InfraFailure.K8S) instanceof PipelineInterruption) throw e
+        // Keep agent loss on the primary so outer handlers do not retry on a dead dispatcher.
+        FailureClassifier.attachAgentLoss(primaryError, e)
         echo "[INFRA-RETRY] Secondary failure while handling ${primaryError}:\n${Utils.getStackTrace(e)}"
     }
 }
@@ -4352,9 +4394,17 @@ boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error,
     if (!(classified instanceof InfraFailure)) {
         return false
     }
+    if (scope == InfraFailure.SLURM) {
+        String dispatcherNodeName = retryContext.dispatcherNodeName
+        if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+            return false
+        }
+    }
     Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
     int attempt = parsedAttempt != null ? parsedAttempt as int : 1
-    int effectiveMax = retryMaxForFailure(scope, classified, retryContext.infraRetryMax as Integer)
+    int effectiveMax = retryContext.launchOnly ?
+        resolveInfraRetryMax(scope, retryContext.infraRetryMax as Integer) :
+        retryMaxForFailure(scope, classified, retryContext.infraRetryMax as Integer)
     Long parsedBackoffMs = trtllm_utils.parseCiBudgetLong(retryContext.backoffMs)
     long backoffMs = parsedBackoffMs != null ? parsedBackoffMs : 60L * 1000L
     return hasBudgetForInfraRetry(pipeline, retryContext.stageName ?: "Unknown", scope, classified, attempt, effectiveMax, backoffMs, logDecision)
@@ -4582,7 +4632,7 @@ def getHostNodeName() {
 // deferCheckpointDelete leaves the delete of the attempt's checkpoints to the caller, which runs
 // it where no test runs: a Slurm agent stage deletes them from its dispatcher pod. Otherwise the
 // delete runs in the pod's jnlp container.
-def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean deferCheckpointDelete=false)
+def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean deferCheckpointDelete=false, boolean collectTimeoutResult=true)
 {
     checkStageName([stageName])
     // Resolve the attempt's primary location as it starts; every write and delete of its outputs
@@ -4637,7 +4687,7 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else {
+                } else if (collectTimeoutResult) {
                     // Regenerate authoritatively after all regular, rerun, and
                     // isolated test work; an earlier snapshot may be stale.
                     generateTimeoutTestResultXml(pipeline, stageName)
@@ -4968,15 +5018,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                     imagePullPolicy: Always
         """
     }
-    // CPU test pods mount the model scratch from 10.117.145.14, which can't be accessed from ipp6/ipp9 DC.
-    // Pods placed there stay in ContainerCreating. Build stage pods do not mount the model scratch,
-    // so they can still use these nodes.
-    def scratchUnreachableNodeAffinity = type == "cpu" ? '''
-                              - key: "region"
-                                operator: NotIn
-                                values:
-                                - "ipp6"
-                                - "ipp9"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -4992,6 +5033,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                     path: /vol/scratch1/scratch.svc_tensorrt_blossom
         """
     }
+    // Any kubernetes-cpu stage mounting this NFS must be covered by cpu-model-scratch-nfs in
+    // trtllm-jenkins-shared-lib/resources/trtllm/ci/excluded_nodes.yaml.
     def llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
@@ -5030,7 +5073,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                                 values:
                                 - "core"
                                 - "qa_only"
-${scratchUnreachableNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
@@ -5143,7 +5185,7 @@ def runLLMDocBuild(pipeline, config, versionOverride="")
 
     echo "Upload built html."
     sh "tar -czvf doc-html-preview.tar.gz  ${LLM_ROOT}/docs/build/html"
-    uploadTestResult("doc-html-preview.tar.gz", "test-results", testResultTargets(llmArtifactsPrimary()))
+    uploadTestResult("doc-html-preview.tar.gz", "test-results", trtllm_utils.llmArtifactsTargets(llmArtifactsPrimary()))
 }
 
 def runLLMAgentFlowTest(pipeline, stageName)
@@ -5382,7 +5424,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     return makoArgs
 }
 
-def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null, String clusterName=null) {
+def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null, String clusterName=null, Map prefetched=null) {
     def makoOpts = preDefinedMakoOpts
 
     if (!makoOpts) {
@@ -5426,23 +5468,51 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         ? readProperties(file: ciVersionsPath)
         : [TRT_TEST_DB_VERSION: "1.8.5+bc6df7"]
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==${ciVersions.TRT_TEST_DB_VERSION}"
-    // CBTS Layer 3: download the pre-built cbts_test_db/ tarball that the
-    // orchestrator uploaded to Artifactory (see getCbtsResult in
-    // L0_MergeRequest.groovy). This avoids re-running main.py locally and
+    // CBTS Layer 3: read the pre-built cbts_test_db/ tarball that the
+    // orchestrator published (see getCbtsResult in L0_MergeRequest.groovy)
+    // through the read helper, or take it from the reads that the caller made
+    // earlier (prefetched). This avoids re-running main.py locally and
     // avoids passing large PR-diff payloads as Jenkins parameters (env vars).
-    // If the download or extraction fails we swallow the error: the override
+    // If the read or the extraction fails or runs out of time, the override
     // directory will be absent below, the overrideYaml check will fail, and
-    // renderTestDB falls back to the source test-db.
+    // renderTestDB falls back to the source test-db. An abort propagates, and
+    // so does the expiry of a timeout that encloses the read.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null && cbts.test_db_dir_override && cbts.cbts_test_db_artifact_path) {
+        // Always re-fetch: a reused workspace may hold a stale cbts_test_db/ shadowing this build's YAMLs.
+        def cbtsArchive = "${pipeline.pwd(tmp: true)}/cbts_test_db-${UUID.randomUUID().toString()}.tar.gz"
+        // The read's time limit, and the time at which its timeout step is entered.
+        def readMinutes = 10
+        def readStartMs = null
         try {
-            // Always re-fetch: a reused workspace may hold a stale cbts_test_db/ shadowing this build's YAMLs.
-            def artifactUrl = "${URM_ARTIFACTORY_BASE}/${cbts.cbts_test_db_artifact_path}"
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${artifactUrl}' -O /tmp/cbts_test_db.tar.gz && tar xzf /tmp/cbts_test_db.tar.gz -C ${llmSrc}")
-            echo "CBTS Layer 3: extracted cbts_test_db from artifact"
+            def status = null
+            readStartMs = System.currentTimeMillis()
+            timeout(time: readMinutes, unit: 'MINUTES') {
+                status = fetchOrUsePrefetched(pipeline, prefetched, "${cbts.cbts_test_db_artifact_path}", cbtsArchive, "download-status")
+            }
+            if (status == 0) {
+                sh "tar xzf '${cbtsArchive}' -C ${llmSrc}"
+                echo "CBTS Layer 3: extracted cbts_test_db from artifact"
+            } else {
+                echo "CBTS Layer 3: artifact read failed (fetch_build_artifact.sh exited ${status}, " +
+                     "see its message above); falling back to source test-db"
+            }
+        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+            // Running out of the read's own time falls back like any failed read; user
+            // aborts, upstream pipeline interruptions and the expiry of an enclosing
+            // timeout must keep propagating.
+            if (ownTimeoutExpired(e, readStartMs, readMinutes)) {
+                echo "CBTS Layer 3: artifact read timed out after ${readMinutes} min; falling back to source test-db"
+            } else {
+                throw e
+            }
+        } catch (InterruptedException e) {
+            throw e
         } catch (Exception e) {
-            echo "CBTS Layer 3: artifact download failed " +
+            echo "CBTS Layer 3: artifact read failed " +
                  "(${e.class.simpleName}: ${e.message}); falling back to source test-db"
+        } finally {
+            sh "rm -f '${cbtsArchive}'"
         }
     }
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
@@ -5660,6 +5730,8 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
             def watcher = prepareCheckpointWatcher(pipeline, stageName, postTag)
             try {
                 withEnv(watcher.env + [
+                    "TIMEOUT_XML_SCRIPT=${llmSrc}/jenkins/scripts/generate_timeout_xml.py",
+                    "TIMEOUT_INPUT_FINAL=1",
                     "PROGRESS_DONE_FILE=${WORKSPACE}/.rerun${times}-done-${stageName}",
                     "LABEL_PREFIX=rerun${times} checkpoint",
                     "FINAL_LABEL=rerun${times} final snapshot",
@@ -5674,7 +5746,9 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
                         cd ${llmSrc}/tests/integration/defs && \\
                         ${newTestCmdLine.join(" ")}
                         rc=\$?
-                        touch "\$PROGRESS_DONE_FILE"
+                        # As in the first run: a signal stands in for a done file that cannot
+                        # be created.
+                        touch "\$PROGRESS_DONE_FILE" || kill -s USR1 \$WATCHER_PID 2>/dev/null
                         wait \$WATCHER_PID
                         exit \$rc
                     """)
@@ -5834,7 +5908,7 @@ def generateRerunReport(stageName, llmSrc, String postTag) {
             "${testResultsDirTarget(primary, 'rerun_reports')}${stageName}_rerun_results.html",
             primary
         )
-        echo "Test rerun report: ${llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html")}"
+        echo "Test rerun report: ${trtllm_utils.llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html")}"
     }
 
     // Remove isolation results since they are merged into results.xml
@@ -5843,9 +5917,9 @@ def generateRerunReport(stageName, llmSrc, String postTag) {
     echo "Rerun report generation completed for stage: ${stageName}"
 }
 
-def mergeWaivesTxt(pipeline, llmSrc, stageName) {
+def mergeWaivesTxt(pipeline, llmSrc, stageName, Map prefetched=null) {
     try {
-        fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/waive_list/waives.txt", "waives.txt")
+        fetchOrUsePrefetched(pipeline, prefetched, "${ARTIFACT_PATH}/waive_list/waives.txt", "waives.txt")
         if (!fileExists("waives.txt")) {
             error "There is no merged waives.txt file, use the default waives.txt."
         }
@@ -5889,8 +5963,11 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
  *                    "-SubJob-RunTest-attempt-2" for a retried sub-job).
  *                    Used by priorAttemptTags() to enumerate earlier
  *                    attempts in this build.
+ * @param prefetched  The earlier attempts' tarballs as the caller read them
+ *                    before (see fetchOrUsePrefetched), or null to read them
+ *                    here.
  */
-def reusePassedTestResults(pipeline, llmSrc, stageName, waivesTxt, String postTag = "") {
+def reusePassedTestResults(pipeline, llmSrc, stageName, waivesTxt, String postTag = "", Map prefetched = null) {
     try {
         def reusedTests = []
         def workDir = "${WORKSPACE}/${stageName}"
@@ -5921,17 +5998,22 @@ def reusePassedTestResults(pipeline, llmSrc, stageName, waivesTxt, String postTa
                 def tarName = "results-${stageName}${priorTag}.tar.gz"
                 def priorDir = "${workDir}/prior${priorTag.replace('-', '_')}"
                 // FETCH_ABSENT is expected when an attempt died before its finally
-                // block uploaded a tarball. Any other failure to read or unpack
-                // the tarball skips only this attempt and marks the stage
-                // unstable, so that it is visible without dropping the reuse
-                // found elsewhere.
+                // block uploaded a tarball. While aws is the primary, urm holds only
+                // a replica, so FETCH_SECONDARY_FAILED (aws lacks the tarball and urm
+                // could not answer) skips this attempt and marks nothing. Any other
+                // failure to read or unpack the tarball skips only this attempt and
+                // marks the stage unstable, so that it is visible without dropping
+                // the reuse found elsewhere.
                 def failure = null
                 try {
                     sh "mkdir -p ${priorDir}"
-                    def status = fetchBuildArtifact(pipeline, "${UPLOAD_PATH}/test-results/${tarName}",
-                        "${priorDir}/${tarName}", "download-status")
+                    def status = fetchOrUsePrefetched(pipeline, prefetched, "${UPLOAD_PATH}/test-results/${tarName}",
+                        "${priorDir}/${tarName}", "download-status", llmArtifactsPrimary() == "aws")
                     if (status == FETCH_ABSENT) {
                         echo "Prior attempt artifact ${tarName} not present; skipping"
+                    } else if (status == FETCH_SECONDARY_FAILED) {
+                        echo "Prior attempt artifact ${tarName} is not on aws, and urm could not answer " +
+                            "(see the message of fetch_build_artifact.sh above); skipping"
                     } else if (status != 0) {
                         failure = "fetch_build_artifact.sh exited ${status}, see its message above"
                     } else {
@@ -6014,38 +6096,56 @@ def checkpointFileName(String stageName, String postTag)
 // entry for each of the attempt's targets into a new private directory of the current node and
 // container, for the watcher to read and remove before the tests start. Returns that directory, for
 // the caller to remove with removeCheckpointNetrc in a finally block, and the watcher's variables.
-// When the netrc cannot be written, the failure is logged, and the watcher prepares its checkpoints
-// without uploading them.
+// A location whose entry cannot be written is logged and left out of the watcher's targets, so
+// that it does not keep the checkpoints from the other location. When no entry can be written, or
+// the attempt is in CHECKPOINT_NETRC_WITHHELD, there is no netrc, and the watcher prepares its
+// checkpoints without uploading them.
 def prepareCheckpointWatcher(pipeline, String stageName, String postTag)
 {
     def progressTar = checkpointFileName(stageName, postTag)
-    def locations = attemptTargets(stageName, postTag).collect { it.location }
-    def targets = []
     def watcherEnv = [
         "STAGE_NAME=${stageName}",
         "POST_TAG=${postTag}",
         "PROGRESS_TAR=${progressTar}",
         "PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC}",
+        "TIMEOUT_EVIDENCE_FILE=${timeoutEvidenceFile(stageName)}",
     ]
-    for (location in locations) {
-        String path = testResultsDirTarget(location, "test-results") + progressTar
-        targets << "${location}=${LLM_ARTIFACTS_LOCATIONS[location].root}/${path}"
-        // The watcher puts the status of a 401 or 403 in place of HTTPSTATUS.
-        def rejected = artifactoryFailureMessage(location, path, "401", true, "deploy").toString()
-            .replace("(HTTP 401)", "(HTTP HTTPSTATUS)")
-        watcherEnv << "CHECKPOINT_REJECTED_${location}=${rejected}"
+    if ((stageName + postTag) in CHECKPOINT_NETRC_WITHHELD) {
+        pipeline.echo("[PROGRESS-UPLOAD] ${stageName}: no checkpoint is uploaded in this step, whose " +
+            "tests run without an Artifactory credential")
+        return [netrcDir: "", env: watcherEnv]
     }
-    watcherEnv << "CHECKPOINT_TARGETS=${targets.join(' ')}"
-
+    def locations = attemptTargets(stageName, postTag).collect { it.location }
+    def targets = []
     def netrcDir = ""
     try {
         netrcDir = pipeline.sh(label: "Create a directory for the checkpoint netrc", returnStdout: true,
             script: "mktemp -d /tmp/checkpoint-netrc.XXXXXX").trim()
         def netrcPath = "${netrcDir}/netrc"
         for (location in locations) {
-            addArtifactoryNetrcEntry(pipeline, netrcPath, location)
+            try {
+                trtllm_utils.writeArtifactoryNetrc(netrcPath, location, true)
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo("[PROGRESS-UPLOAD] ${stageName}: no checkpoint is uploaded to ${location} in " +
+                    "this step, since its netrc entry could not be written: ${e}")
+                continue
+            }
+            String path = testResultsDirTarget(location, "test-results") + progressTar
+            targets << "${location}=${LLM_ARTIFACTS_LOCATIONS[location].root}/${path}"
+            // The watcher puts the status of a 401 or 403 in place of HTTPSTATUS.
+            def rejected = artifactoryFailureMessage(location, path, "401", true, "deploy").toString()
+                .replace("(HTTP 401)", "(HTTP HTTPSTATUS)")
+            watcherEnv << "CHECKPOINT_REJECTED_${location}=${rejected}"
         }
-        watcherEnv << "CHECKPOINT_NETRC_FILE=${netrcPath}"
+        if (targets) {
+            watcherEnv << "CHECKPOINT_TARGETS=${targets.join(' ')}"
+            watcherEnv << "CHECKPOINT_NETRC_FILE=${netrcPath}"
+        } else {
+            removeCheckpointNetrc(pipeline, netrcDir)
+            netrcDir = ""
+        }
     } catch (InterruptedException e) {
         removeCheckpointNetrc(pipeline, netrcDir)
         throw e
@@ -6118,11 +6218,12 @@ def artifactoryRequestStatus(pipeline, String method, String url, String netrcPa
 // checkpoint watcher reached that location, since the watcher keeps its record in the stage's
 // workspace; a location without the checkpoint answers 404. The attempt calls it once its final
 // archive is uploaded. It runs where no test runs: in the container named containerName (a pod
-// stage's jnlp container), or in the current one on a Slurm stage's dispatcher pod. The netrc holds
-// an entry for each location, in a temporary directory of that container outside the workspace,
-// which a pod's test container mounts too. A failed delete is logged and never fails or marks the
-// stage; a checkpoint left behind goes with the rest of the build's outputs. A second call for the
-// same attempt does nothing.
+// stage's jnlp container), or in the current one on a Slurm stage's dispatcher pod. Each location
+// has a netrc of its own, in a temporary directory of that container outside the workspace, which
+// a pod's test container mounts too, and its delete stands on its own: a failure for one location,
+// such as its credential not binding, leaves the other's delete to go ahead. A failed delete is
+// logged and never fails or marks the stage; a checkpoint left behind goes with the rest of the
+// build's outputs. A second call for the same attempt does nothing.
 def deleteProgressArtifact(pipeline, String stageName, String postTag, String containerName = "")
 {
     if (!CHECKPOINT_DELETED.add(stageName + postTag)) {
@@ -6135,21 +6236,25 @@ def deleteProgressArtifact(pipeline, String stageName, String postTag, String co
         try {
             netrcDir = pipeline.sh(label: "Create a directory for the Artifactory netrc", returnStdout: true,
                 script: "mktemp -d /tmp/checkpoint-delete.XXXXXX").trim()
-            def netrcPath = "${netrcDir}/netrc"
             for (location in locations) {
-                addArtifactoryNetrcEntry(pipeline, netrcPath, location)
-            }
-            for (location in locations) {
-                def deletePath = llmArtifactsLocalRepoPath(location, checkpointPath)
-                def status = artifactoryRequestStatus(pipeline, "DELETE",
-                    "${LLM_ARTIFACTS_LOCATIONS[location].root}/${deletePath}", netrcPath)
-                if (status in ["200", "204"]) {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: deleted the checkpoint on ${location}: ${deletePath}"
-                } else if (status == "404") {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: no checkpoint on ${location}"
-                } else {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: checkpoint delete on ${location} failed (non-fatal): " +
-                        artifactoryFailureMessage(location, deletePath, status, true, "delete")
+                try {
+                    def netrcPath = "${netrcDir}/netrc-${location}"
+                    trtllm_utils.writeArtifactoryNetrc(netrcPath, location)
+                    def deletePath = trtllm_utils.llmArtifactsLocalRepoPath(location, checkpointPath)
+                    def status = artifactoryRequestStatus(pipeline, "DELETE",
+                        "${LLM_ARTIFACTS_LOCATIONS[location].root}/${deletePath}", netrcPath)
+                    if (status in ["200", "204"]) {
+                        echo "[PROGRESS-UPLOAD] ${stageName}: deleted the checkpoint on ${location}: ${deletePath}"
+                    } else if (status == "404") {
+                        echo "[PROGRESS-UPLOAD] ${stageName}: no checkpoint on ${location}"
+                    } else {
+                        echo "[PROGRESS-UPLOAD] ${stageName}: checkpoint delete on ${location} failed (non-fatal): " +
+                            artifactoryFailureMessage(location, deletePath, status, true, "delete")
+                    }
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    echo "[PROGRESS-UPLOAD] ${stageName}: checkpoint delete on ${location} failed (non-fatal): ${e}"
                 }
             }
         } finally {
@@ -6255,7 +6360,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map retryContext=null)
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map retryContext=null, String prefetchedPackage="", Map prefetchedReads=null)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -6313,6 +6418,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             sh "ln -sfn /tmp/TensorRT-LLM ${llmPath}/TensorRT-LLM"
             // Resolve to real path so pytest --rootdir doesn't produce ../../../ node IDs.
             llmSrc = sh(script: "realpath ${llmPath}/TensorRT-LLM/src", returnStdout: true).trim()
+        } else if (prefetchedPackage) {
+            // The caller read the package before code from a wheel ran on this node, while the
+            // read's credential could still be bound. Only a path passed in is used, so a package
+            // left behind in a reused workspace is never picked up.
+            sh "cd ${llmPath} && tar -zxf '${prefetchedPackage}'"
         } else {
             def llmTarArtifactPath = boltedTarArtifactPath(pipeline, config, tarName)
             timeout(time: 30, unit: 'MINUTES') {
@@ -6450,7 +6560,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             clusterDurationsArgs = ["--durations-path=${clusterDurationsPath}"]
         }
 
-        def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
+        def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations, prefetchedReads)
         def waivesFilePath = infraDryRun
             ? "${llmSrc}/infra_dry_run_waives.txt"
             : "${llmSrc}/tests/integration/test_lists/waives.txt"
@@ -6459,11 +6569,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             sh ": > ${waivesFilePath}"
         } else {
             // Download and Merge waives.txt
-            mergeWaivesTxt(pipeline, llmSrc, stageName)
+            mergeWaivesTxt(pipeline, llmSrc, stageName, prefetchedReads)
 
             // Add passed test list from previous pipeline run to the waives.txt
             if (testFilter[(REUSE_TEST)] != false) {
-                reusePassedTestResults(pipeline, llmSrc, stageName, waivesFilePath, postTag)
+                reusePassedTestResults(pipeline, llmSrc, stageName, waivesFilePath, postTag, prefetchedReads)
             }
         }
 
@@ -6581,7 +6691,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                         cd '${llmSrc}/tests/integration/defs'
                                         ${pytestCommand.join(" ")}
                                         rc=\$?
-                                        touch "\$PROGRESS_DONE_FILE"
+                                        # The watcher exits only once it learns that the tests
+                                        # have ended. If the done file cannot be created, a
+                                        # signal tells it instead.
+                                        touch "\$PROGRESS_DONE_FILE" || kill -s USR1 \$WATCHER_PID 2>/dev/null
                                         wait \$WATCHER_PID
                                         exit \$rc
                                     """)
@@ -6723,7 +6836,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false, String prefetchedPackage="", Map prefetchedReads=null)
 {
     cacheErrorAndUploadResult(pipeline, stageName, {
         // PMIx builds a singleton ID, singleton.{hostname}.{pid}, that must fit a
@@ -6738,7 +6851,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
             "PMIX_HOSTNAME=mpi-node0",
         ]
         withEnv(testEnv) {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext, prefetchedPackage, prefetchedReads)
         }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
@@ -6780,12 +6893,13 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
 }
 
 
-def checkPipInstall(pipeline, wheel_path)
+// Checks the wheel in wheelFile, a file on this node: check_pip_install.py installs it and runs the
+// quickstart from it, and downloads no wheel.
+def checkPipInstall(pipeline, String wheelFile)
 {
-    def wheelArtifactLinks = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: """
         cd ${LLM_ROOT}/tests/unittest && \
-        python3 check_pip_install.py --wheel_path ${wheelArtifactLinks}
+        python3 check_pip_install.py --wheel_path '${wheelFile}'
         """)
 }
 
@@ -6802,9 +6916,12 @@ def pythonVersionFromCpver(cpver)
 }
 
 
-def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
+// Hands Kitmaker the wheel's direct address on primary, the location that holds the wheel's
+// required copy. The address carries no credential, query token, or signature: Kitmaker fetches
+// the public-version wheel itself, with its own identity on either location.
+def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to, String primary)
 {
-    def wheelUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
+    def wheelUrl = trtllm_utils.llmArtifactsUrl(primary, "${UPLOAD_PATH}/${wheel_path}")
     def releaseScriptsDir = "release-scripts"
 
     echo "Running Kitmaker wheel dry run for ${wheelUrl} with publish target ${publish_to}"
@@ -6916,26 +7033,52 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, String boltP
             fi
         """
         // Exit codes (apply_latest.sh): 3 = no promoted bundle for branch/triple,
-        // 2 = apply error, 0 = applied. Only 3 is worth trying the next branch for;
-        // an apply error means the bundle IS there and did not take, which retrying
-        // against a different branch would only paper over.
+        // 4 = the profile store could not be read, 2 = apply error, 0 = applied.
+        // Only 3 is worth trying the next branch for. An unreadable store says
+        // nothing about what is promoted, and an apply error means the bundle IS
+        // there and did not take, which retrying against a different branch would
+        // only paper over.
         def rc = 3
         def appliedFrom = null
-        for (b in branches) {
-            rc = sh(returnStatus: true, script: """
-                export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
-                export BOLT_PROFILE_REF='${boltProfileRef}'
-                # Quoted: the branch comes from job env and the wheel name from a
-                # directory listing, so an unquoted expansion would let a shell
-                # metacharacter in either run before apply_latest.sh starts.
-                bash tensorrt_llm/scripts/bolt/internal/apply_latest.sh \
-                     '${b}' '${cpu_arch}' '${wheel}' '${wheel}.bolted'
-            """)
-            if (rc != 3) {
-                appliedFrom = b
-                break
+        // apply_latest.sh reads the bundle through the read helper, which takes the
+        // location and the credential from the environment. The script removes the
+        // netrc once it has a bundle and before it applies it
+        // (ARTIFACTORY_NETRC_REMOVE_AFTER_READ), so only the reads run while the
+        // credential is on the node; a branch without a bundle leaves the netrc for
+        // the next one. The unpacked LLVM release is not on PATH for the reads: the
+        // script adds it after the netrc is gone. The removal below is for every
+        // other end.
+        def netrcPath = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+        try {
+            trtllm_utils.writeArtifactoryNetrc(netrcPath)
+            withEnv([
+                "LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}",
+                "ARTIFACTORY_NETRC=${netrcPath}",
+                "ARTIFACTORY_NETRC_REMOVE_AFTER_READ=1",
+                "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+            ]) {
+                for (b in branches) {
+                    rc = sh(returnStatus: true, script: """
+                        export BOLT_PROFILE_REF='${boltProfileRef}'
+                        # Quoted: the branch comes from job env and the wheel name from a
+                        # directory listing, so an unquoted expansion would let a shell
+                        # metacharacter in either run before apply_latest.sh starts.
+                        bash tensorrt_llm/scripts/bolt/internal/apply_latest.sh \
+                             '${b}' '${cpu_arch}' '${wheel}' '${wheel}.bolted'
+                    """)
+                    if (rc != 3) {
+                        appliedFrom = b
+                        break
+                    }
+                    echo "[bolt-wheel] no promoted bundle for ${b}/${cpu_arch}; trying next candidate branch"
+                }
             }
-            echo "[bolt-wheel] no promoted bundle for ${b}/${cpu_arch}; trying next candidate branch"
+        } finally {
+            sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}'")
+        }
+        if (rc == 4) {
+            error("[bolt-wheel] the BOLT profile store could not be read for ${appliedFrom}/${cpu_arch} " +
+                  "(apply_latest.sh's message above says why); refusing to upload an unoptimized release wheel")
         }
         if (rc == 3 && boltProfileRef) {
             error("[bolt-wheel] pinned BOLT bundle ${boltProfileRef} (${cpu_arch}) not found under any of " +
@@ -6970,6 +7113,11 @@ def runLLMBuild(
     boltProfileBranch="",
     kitmakerDryRun=false)
 {
+    // One resolution for the whole call keeps its wheels, attribution reports, and dry-run address
+    // on one location if CI rolls back to urm while it runs.
+    def primary = llmArtifactsPrimary()
+    def targets = trtllm_utils.llmArtifactsTargets(primary)
+
     sh "pwd && ls -alh"
     sh "env | sort"
     sh "ccache -sv"
@@ -7035,9 +7183,10 @@ def runLLMBuild(
     def builtWheelUploadPath =
         is_dlfw ? "${rootWheelUploadPath}dlfw/" : rootWheelUploadPath
     echo "uploading ${wheelName} to ${builtWheelUploadPath}"
-    trtllm_utils.uploadArtifacts(
+    trtllm_utils.uploadToTargets(
         "tensorrt_llm/build/${wheelName}",
-        "${UPLOAD_PATH}/${builtWheelUploadPath}")
+        "${UPLOAD_PATH}/${builtWheelUploadPath}",
+        targets, true)
 
     def uploadedWheelPath = "${builtWheelUploadPath}${wheelName}"
     def wheelPath = uploadedWheelPath
@@ -7063,9 +7212,10 @@ def runLLMBuild(
         ).trim()
         def localWheelName = localWheelPath.tokenize('/').last()
         echo "uploading ${localWheelName} to ${rootWheelUploadPath}"
-        trtllm_utils.uploadArtifacts(
+        trtllm_utils.uploadToTargets(
             localWheelPath,
-            "${UPLOAD_PATH}/${rootWheelUploadPath}")
+            "${UPLOAD_PATH}/${rootWheelUploadPath}",
+            targets, true)
         wheelPath = "${rootWheelUploadPath}${localWheelName}"
     }
 
@@ -7076,7 +7226,7 @@ def runLLMBuild(
         echo "Skipping Kitmaker wheel dry run outside post-merge"
     } else {
         def kitmakerPython = "tensorrt_llm/.venv-${pythonVersionFromCpver(cpver)}/bin/python3"
-        kitmakerDryRunMetadata = runKitmakerWheelDryRun(pipeline, uploadedWheelPath, kitmakerPython, KITMAKER_PUBLISH_TO)
+        kitmakerDryRunMetadata = runKitmakerWheelDryRun(pipeline, uploadedWheelPath, kitmakerPython, KITMAKER_PUBLISH_TO, primary)
     }
 
     if (reinstall_dependencies) {
@@ -7095,7 +7245,7 @@ def runLLMBuild(
     def wheelBase = wheelName.replace('.whl', '')
     for (f in ["missing_files.json", "import_payload.json", "file_mappings.json"]) {
         if (fileExists("${attrDir}/${f}")) {
-            trtllm_utils.uploadArtifacts("${attrDir}/${f}", "${UPLOAD_PATH}/${cpu_arch}/attribution/${wheel_path}${wheelBase}/")
+            trtllm_utils.uploadToTargets("${attrDir}/${f}", "${UPLOAD_PATH}/${cpu_arch}/attribution/${wheel_path}${wheelBase}/", targets, true)
         }
     }
     checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
@@ -7117,7 +7267,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
     sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
 
     sh "pwd && ls -alh"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${whlUrl}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${whlUrl}' -O '${wheel_path.tokenize('/').last()}'")
 
     if (reinstall_dependencies) {
         // Test installation in the new environment
@@ -7133,12 +7283,13 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
 
     def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${pkgUrl}' -O '${linuxPkgName}'")
     sh "tar -zvxf ${linuxPkgName}"
 
     // TODO: The steps below drove the removed TensorRT engine flow (trtllm-build / examples/run.py).
     // When re-enabling this sanity check, use PyTorch backend test samples instead
-    // (e.g. examples/llm-api/quickstart_example.py).
+    // (e.g. examples/llm-api/quickstart_example.py), and read the wheel and the package with
+    // fetchBuildArtifact in place of the two wget calls above.
     // trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core/gpt && python3 ../../../generate_checkpoint_config.py --architecture GPTForCausalLM --dtype float16'")
     // trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core//gpt && trtllm-build --model_config config.json --log_level verbose'")
     // trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core/gpt && python3 ../../../run.py --max_output_len 4 --end_id -1'")
@@ -7235,11 +7386,40 @@ def runInEnrootOnNode(label, partitionTimeout)
     }
 }
 
+def launchKubernetesStagePod(pipeline, podSpec, containerName, String stageName, Map opts = [:], Closure runner)
+{
+    def stagePodSpec
+    try {
+        stagePodSpec = ciNodePolicy.apply(podSpec, [pipeline: "L0_Test", stage: stageName])
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "[NODE-EXCLUSION] ${stageName}: failed to apply node policy: ${e.toString()}"
+        if (opts.reportFailure != false) {
+            // Report before launch from an isolated parent-agent directory; no test tracker exists yet.
+            def resultStage = stageName.replaceAll(/[^-+\w\[\]]/, "_")
+            def postTag = opts.postTag ?: ""
+            preservePrimaryFailure(e) {
+                try {
+                    dir("node-policy-${resultStage}${postTag}") {
+                        cacheErrorAndUploadResult(pipeline, resultStage, { throw e }, {}, true,
+                            postTag, opts.isFinalAttempt != false, opts.retryContext, false, false)
+                    }
+                } catch (Exception reportError) {
+                    if (!reportError.is(e)) throw reportError
+                }
+            }
+        }
+        throw e
+    }
+    trtllm_utils.launchKubernetesPodWithPlacement(pipeline, stagePodSpec, containerName, opts.placementContext, runner)
+}
+
 def runInKubernetes(pipeline, podSpec, containerName)
 {
     return {
         stageName, runner -> stage(stageName) {
-            trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName) {
+            launchKubernetesStagePod(pipeline, podSpec, containerName, stageName) {
                 echoNodeAndGpuInfo(pipeline, stageName)
                 runner()
             }
@@ -7286,7 +7466,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
     if (testFilter[(DEBUG_MODE)]) {
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
+        launchKubernetesStagePod(pipeline, podSpec, containerName, stageName, { runner("", true, null) })
         return
     }
 
@@ -7319,14 +7499,18 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                     // launch a fresh cleanup pod if this pod dies mid-run.
                     registerSlurmResource(stageName, [podSpec: attemptPodSpec, containerName: containerName])
                 }
-                trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, {
+                launchKubernetesStagePod(pipeline, attemptPodSpec, containerName, stageName,
+                    [placementContext: attemptPlacementContext, postTag: "-node-policy-launch-${launchAttempt}",
+                     isFinalAttempt: launchAttempt > K8S_INFRA_RETRY_MAX,
+                     retryContext: [scope: InfraFailure.K8S, stageName: stageName, attempt: launchAttempt,
+                         backoffMs: 60L * 1000L, infraRetryMax: K8S_INFRA_RETRY_MAX, launchOnly: true]], {
                     attemptPlacementContext.runnerStarted = true
                     runner("", true, null)
                 })
                 return
-            } catch (InterruptedException e) {
-                throw e
             } catch (Exception e) {
+                def c = classifyFailure(pipeline, e, InfraFailure.K8S)
+                if (c instanceof PipelineInterruption) throw e
                 // Once the runner has started, this is an execution failure the
                 // inner retry owns -- honor singleAttempt and do not re-run. But if
                 // the dispatcher pod itself died mid-run, its in-pod cleanup could not
@@ -7334,16 +7518,14 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                 // back on the parent context here, so reconcile them from a fresh
                 // cleanup pod before failing closed.
                 if (attemptPlacementContext.runnerStarted) {
-                    if (slurmDispatcher && isDispatcherPodFailure(e)) {
+                    if (slurmDispatcher && isDispatcherPodFailure(c)) {
                         // Pass this attempt's pod spec explicitly so the finalizer
                         // never depends on the registry entry's podSpec surviving a
                         // prior attempt's deregister.
                         finalizeOrphanedSlurmResource(pipeline, stageName, attemptPodSpec)
                     }
-                    throw e
+                    throw (c instanceof InfraFailure ? c : e)
                 }
-                def c = classifyFailure(pipeline, e, InfraFailure.K8S)
-                if (c instanceof PipelineInterruption) throw e
                 if (!(c instanceof InfraFailure)) {
                     // UserFailure -> don't retry, but leave a trace: a pod/agent
                     // launch exception missing from PATTERN_CATALOG (e.g. a
@@ -7419,14 +7601,14 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? Math.min(1, k8sInfraRetryMax) : k8sInfraRetryMax
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
             def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
-            trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, { runner(attemptTag, isFinalAttempt, retryContext) })
+            launchKubernetesStagePod(pipeline, attemptPodSpec, containerName, stageName,
+                [placementContext: attemptPlacementContext, postTag: attemptTag,
+                 isFinalAttempt: isFinalAttempt, retryContext: retryContext],
+                { runner(attemptTag, isFinalAttempt, retryContext) })
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
             }
             return
-        } catch (InterruptedException e) {
-            // User abort / pipeline timeout -- never retry
-            throw e
         } catch (Exception e) {
             // classifyFailure() handles FlowInterruptedException + exit-code-143 +
             // typed throws + originating-step evidence and cause-chain fallback, returning one of
@@ -7660,6 +7842,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // PerfSanity post-merge tests
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2_of_4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
         "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1],
+        // Single-GPU Rubin PerfSanity post-merge test: a Rubin copy of the B200 Qwen3.8-Flash-Next case, on the same builds
+        "GR100-PyTorch-PerfSanity-Post-Merge-1_of_4": ["auto:gr100-x1", "l0_gr100_perf_sanity", 1, 1],
     ]
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
@@ -8109,7 +8293,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         if (values[5] != DLFW_IMAGE) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb -O cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             // Match the CUDA the DLFW base image builds the wheel with.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")
@@ -8123,6 +8307,34 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             // The internal mirror proxies https://download.pytorch.org/whl/cu132.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cuda-thirteen-two-remote/simple")
                         }
+
+                        // Read the wheel, the packaged build, and whatever else the sanity tests
+                        // read by name through the read helper before the wheel is installed. The
+                        // helper removes its netrc after each read, the tests take these files
+                        // instead of reading again, and their checkpoint watcher gets no netrc
+                        // (CHECKPOINT_NETRC_WITHHELD), so no Artifactory credential is in this
+                        // container once code from the wheel runs. The node's temporary directory
+                        // is outside the checkout and outside the workspace that the sanity tests
+                        // clear.
+                        def config = VANILLA_CONFIG
+                        if (cpu_arch == AARCH64_TRIPLE) {
+                            config = LINUX_AARCH64_CONFIG
+                        }
+                        def readDir = "${pwd(tmp: true)}/llmapi-read-${UUID.randomUUID().toString()}"
+                        sh "mkdir -p '${readDir}/wheel' '${readDir}/package'"
+                        def wheelFile = "${readDir}/wheel/${wheelPath.tokenize('/').last()}"
+                        // A wheel of about 2 GiB takes about 11 minutes at 3 MB/s.
+                        timeout(time: 40, unit: 'MINUTES') {
+                            fetchBuildArtifact(pipeline, "${UPLOAD_PATH}/${wheelPath}", wheelFile)
+                        }
+                        def packageName = BUILD_CONFIGS[config][TARNAME]
+                        def packageFile = "${readDir}/package/${packageName}"
+                        def packageArtifactPath = boltedTarArtifactPath(pipeline, config, packageName)
+                        timeout(time: 30, unit: 'MINUTES') {
+                            fetchBuildArtifact(pipeline, packageArtifactPath, packageFile)
+                        }
+                        def sanityPostTag = "-SubJob-RunTest" + attemptTag
+                        def sanityReads = prefetchTestlistReads(pipeline, toStageName(values[1], key), sanityPostTag, "${readDir}/reads")
 
                         // A stock image, so nothing here went through Dockerfile.multi or
                         // install_base.sh: what a singleton MPI_Comm_spawn needs has to be
@@ -8144,7 +8356,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             sh "env | sort"
                             trtllm_utils.llmRetry(1, "checkPipInstall", {
                                 timeout(time: 30, unit: 'MINUTES') {
-                                    checkPipInstall(pipeline, wheelPath)
+                                    checkPipInstall(pipeline, wheelFile)
                                 }
                             })
                         }
@@ -8164,13 +8376,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         libEnv += ["LD_LIBRARY_PATH+trtllm_ucx=${trtllmLibsDir}/ucx"]
                         libEnv += ["LD_LIBRARY_PATH+trtllm_libs=${trtllmLibsDir}"]
 
-                        def config = VANILLA_CONFIG
-                        if (cpu_arch == AARCH64_TRIPLE) {
-                            config = LINUX_AARCH64_CONFIG
-                        }
+                        // The sanity tests run code from the wheel, so their checkpoint watcher
+                        // uploads nothing. Their final archive goes through the Jenkins
+                        // Artifactory plugin, which keeps its credential in the agent process.
+                        CHECKPOINT_NETRC_WITHHELD << (toStageName(values[1], key) + sanityPostTag)
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, toStageName(values[1], key), 1, 1, true, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, toStageName(values[1], key), 1, 1, true, sanityPostTag, isFinalAttempt, retryContext, false, packageFile, sanityReads)
                         }
                     })
                 }
@@ -8482,7 +8694,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
         } else {
             stage(values.name) {
                 def imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                launchKubernetesStagePod(pipeline, imageSanitySpec, "trt-llm", values.name, {
                     sh "env | sort"
                     def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
                     runLLMBuild(pipeline, cpuArch, false, "imageTest/")
@@ -8497,7 +8709,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
 
 pipeline {
     agent {
-        kubernetes createKubernetesPodConfig("", "agent")
+        kubernetes ciNodePolicy.apply(createKubernetesPodConfig("", "agent"), [pipeline: "L0_Test"])
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/

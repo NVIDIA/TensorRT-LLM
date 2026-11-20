@@ -118,6 +118,7 @@ class RPCClient:
                                           socket_type=socket_type,
                                           name="rpc_client")
         self._pending_futures = {}
+        self._sending_tasks: set[asyncio.Task[Any]] = set()
         # map request_id to the queue for streaming responses
         self._streaming_queues: Dict[str, AsyncQueue] = {}
         self._streaming_queues_lock = threading.RLock(
@@ -177,7 +178,15 @@ class RPCClient:
         if self._loop and self._loop.is_running():
             try:
 
-                async def cancel_reader_task():
+                async def cancel_reader_task() -> None:
+                    with self._call_lock:
+                        sending = [
+                            task for task in self._sending_tasks
+                            if task.get_loop() is asyncio.get_running_loop()
+                        ]
+                    for task in sending:
+                        task.cancel()
+                    await asyncio.gather(*sending, return_exceptions=True)
                     pending = [
                         future for future, loop in tuple(
                             self._pending_futures.values())
@@ -483,38 +492,54 @@ class RPCClient:
                              kwargs=kwargs,
                              need_response=need_response,
                              timeout=timeout)
-        await self._client_socket.put_async(request)
-        logger_debug(f"[client] RPC Client sent request: {request}")
-
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        assert task is not None
+        future = None
         with self._call_lock:
             if self._closed:
                 raise RPCCancelled("RPC client closed")
-            if not need_response:
-                return None
-            loop = asyncio.get_running_loop()
-            future = loop.create_future()
-            self._pending_futures[request_id] = (future, loop)
+            # Sending can yield to the response reader. Publish the receiver
+            # before the request can reach the server.
+            if need_response:
+                future = loop.create_future()
+                self._pending_futures[request_id] = (future, loop)
+            self._sending_tasks.add(task)
 
         try:
-            # If timeout, the remote call should return a timeout error timely,
-            # so we add 1 second to the timeout to ensure the client can get
-            # that result.
-            if timeout is None:
-                res = await future
-            else:
-                # Add 1 second to the timeout to ensure the client can get
-                res = await asyncio.wait_for(future, timeout)
-            return res
-        except RPCCancelled:
-            self._server_stopped = True
-            raise
-        except asyncio.TimeoutError:
-            raise RPCTimeout(
-                f"Request '{method_name}' timed out after {timeout}s")
-        except Exception as e:
-            raise e
+            try:
+                await self._client_socket.put_async(request)
+            except asyncio.CancelledError:
+                if self._closed:
+                    raise RPCCancelled("RPC client closed") from None
+                raise
+            finally:
+                with self._call_lock:
+                    self._sending_tasks.discard(task)
+            logger_debug(f"[client] RPC Client sent request: {request}")
+            with self._call_lock:
+                if self._closed:
+                    raise RPCCancelled("RPC client closed")
+            if not need_response:
+                return None
+            assert future is not None
+            try:
+                if timeout is None:
+                    return await future
+                return await asyncio.wait_for(future, timeout)
+            except RPCCancelled:
+                self._server_stopped = True
+                raise
+            except asyncio.TimeoutError:
+                raise RPCTimeout(
+                    f"Request '{method_name}' timed out after {timeout}s")
         finally:
             self._pending_futures.pop(request_id, None)
+            if future is not None:
+                future.cancel()
+                if not future.cancelled():
+                    # A remote error may arrive before a failed or cancelled send.
+                    future.exception()
 
     def _ensure_event_loop(self):
         """Create and start the background event loop.

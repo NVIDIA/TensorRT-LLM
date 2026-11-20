@@ -145,12 +145,16 @@ class FusedMoEQuantScalesMXFP8(NamedTuple):
 
 def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
         dst_w3_w1_weight: torch.Tensor,
-        cache_permute_indices: Dict[tuple[tuple[int, int, int], str],
-                                    torch.Tensor],
+        cache_permute_indices: Dict[tuple, torch.Tensor],
         epilogue_tile_m: int,
         num_elts_per_sf: Union[None, int] = None,
         is_gated_act_gemm: bool = True) -> torch.Tensor:
-    key = (dst_w3_w1_weight.shape, "w31", int(num_elts_per_sf or -1))
+    # The gated flag is part of the key. The quant methods keep one cache per
+    # class, so a gated layer and a non-gated one with the same w3/w1 shape
+    # would otherwise share an entry, and the second would get the row order
+    # of the first.
+    gated = bool(is_gated_act_gemm)
+    key = (dst_w3_w1_weight.shape, "w31", int(num_elts_per_sf or -1), gated)
 
     if key not in cache_permute_indices:
         # Get permute indices and chain them together
@@ -887,8 +891,9 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
     block_k = 64
     use_shuffled_weight = True
     weight_layout = TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K
-    _cache_permute_indices: Dict[tuple[tuple[int, ...], str, int],
-                                 torch.Tensor] = {}
+    # One cache for the class, shared by every layer, keyed by shape (and, for
+    # w3/w1, by the gated flag).
+    _cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
     def create_weights(self, module: torch.nn.Module):
         super().create_weights(module)
@@ -910,8 +915,7 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
             self._cache_permute_indices,
             epilogue_tile_m=128)
 
-    def _convert_to_block_major_k_layout(
-            self, input_tensor: torch.Tensor) -> torch.Tensor:
+    def _block_major_k_view(self, input_tensor: torch.Tensor) -> torch.Tensor:
         if input_tensor.dim() != 2:
             raise ValueError(
                 f"input_tensor must be 2D for BlockMajorK conversion, got shape={tuple(input_tensor.shape)}"
@@ -922,44 +926,227 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
                 f"K dimension ({k}) must be divisible by block_k ({self.block_k}) for BlockMajorK layout."
             )
         return input_tensor.view(m, k // self.block_k,
-                                 self.block_k).permute(1, 0, 2).contiguous()
+                                 self.block_k).permute(1, 0, 2)
 
-    def _prepare_bf16_weight_for_trtllm_gen(
-            self, weight: torch.Tensor,
-            permute_indices: torch.Tensor) -> torch.Tensor:
-        shuffled_weight = weight[permute_indices.to(weight.device)].contiguous()
-        if self.weight_layout == TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K:
-            return self._convert_to_block_major_k_layout(shuffled_weight)
-        raise ValueError(
-            f"Unsupported TRTLLM-Gen BF16 weight_layout={self.weight_layout}")
+    def _kernel_layout_view(self, weight: torch.Tensor,
+                            permute_indices: torch.Tensor) -> torch.Tensor:
+        """One expert's ``[M, K]`` weight in the kernel layout, as a view.
+
+        Rows are shuffled by ``permute_indices``, then split into BlockMajorK
+        (``[K / 64, M, 64]``).
+        """
+        if self.weight_layout != TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K:
+            raise ValueError(
+                f"Unsupported TRTLLM-Gen BF16 weight_layout={self.weight_layout}"
+            )
+        return self._block_major_k_view(weight[permute_indices.to(
+            weight.device)])
+
+    def _w3_w1_to_kernel_layout(self, module: torch.nn.Module,
+                                expert: torch.Tensor) -> torch.Tensor:
+        """One expert's w3/w1 ``[M, K]`` in the kernel layout, as a view.
+
+        The single definition of that layout for the first load, an in-place
+        refit and the online-EPLB host copies, which must all hold the same
+        bytes. A gated activation also reorders the rows for its fused GEMM.
+        The permute indices are cached per shape, so a call per expert costs a
+        lookup.
+        """
+        permute_indices = self._get_w3_w1_permute_indices(
+            expert, is_gated_act_gemm=module.is_gated_activation)
+        return self._kernel_layout_view(expert, permute_indices)
+
+    def _w2_to_kernel_layout(self, expert: torch.Tensor) -> torch.Tensor:
+        """One expert's w2 ``[M, K]`` in the kernel layout, as a view. The w2
+        counterpart of ``_w3_w1_to_kernel_layout``."""
+        return self._kernel_layout_view(expert,
+                                        self._get_w2_permute_indices(expert))
+
+    def _use_inplace_refit(self, module: torch.nn.Module) -> bool:
+        """Whether a weight reload can write each expert straight into the
+        kernel-layout tensors the layer already holds.
+
+        The kernel layout of an expert depends on that expert alone, so it can
+        be converted as soon as its tensors arrive. Two cases are not updated
+        in place. A layer that is not in the kernel layout yet (no experts on
+        this rank, or not finalized yet) has no converted tensors, so the
+        reload writes its creation-layout tensors and finalize converts them.
+        A gated activation interleaves the w3 and w1 rows of an expert, which
+        a partial reload may deliver in different calls, so a gated layer is
+        re-created in the creation layout, a second copy of the routed experts
+        until finalize.
+        """
+        metadata = module.rebuild_tensor_metadata
+        if "w3_w1_weight" not in metadata or "w2_weight" not in metadata:
+            return False
+        if module.is_gated_activation:
+            logger.info_once(
+                "BF16 TRTLLM-Gen MoE weight reload re-creates the routed "
+                "experts of a gated layer in the creation layout (a second "
+                "copy until finalize): a gated activation interleaves w3 and w1 "
+                "of an expert, which a reload may deliver in different calls.",
+                key="bf16_trtllm_gen_refit_recreate_gated")
+            return False
+        return True
+
+    def pre_reload_weights(self, module: torch.nn.Module) -> None:
+        """Prepare the expert weights for a reload.
+
+        When ``_use_inplace_refit`` allows it, the kernel-layout tensors
+        (``[experts, K / 64, M, 64]``) stay registered: CUDA graphs captured
+        their addresses, and ``load_expert_*`` overwrite one expert slot at a
+        time, so an expert the reload does not deliver keeps its weights.
+        Otherwise the base class re-creates, in its creation shape, every
+        tensor that ``rebuild_tensor_metadata`` lists (the expert stacks of a
+        converted gated layer; none for a layer not converted yet), and
+        ``process_weights_after_loading`` converts the layer again. Experts a
+        reload does not deliver into a re-created stack are left
+        uninitialized.
+        """
+        if not self._use_inplace_refit(module):
+            super().pre_reload_weights(module)
+            return
+        for param_name in ("w3_w1_weight", "w2_weight"):
+            module.register_parameter(
+                param_name, module.rebuild_tensor_metadata[param_name]['param'])
+
+    def _empty_expert_in_creation_layout(self, module: torch.nn.Module,
+                                         param_name: str,
+                                         device: torch.device) -> torch.Tensor:
+        meta = module.rebuild_tensor_metadata[param_name]['meta']
+        return torch.empty(meta.shape[1:], dtype=meta.dtype, device=device)
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor | None,
+                                 w3_weight: torch.Tensor | None,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False) -> None:
+        if dst_w3_w1_weight.dim() == 2:
+            # Creation layout [M, K]: the first load, or a re-created layer.
+            super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                             dst_w3_w1_weight,
+                                             allow_partial_loading)
+            return
+        # Kernel-layout slot [K / 64, M, 64], kept by pre_reload_weights.
+        if module.is_gated_activation and ((w1_weight is None) != (w3_weight
+                                                                   is None)):
+            # The slot interleaves both halves, so one half alone cannot be
+            # written; pre_reload_weights re-creates a gated layer instead.
+            raise ValueError(
+                "A gated BF16 TRTLLM-Gen MoE layer in the kernel layout needs "
+                "w1 and w3 of an expert in one load; call pre_reload_weights() "
+                "before a partial reload")
+        if w1_weight is None:
+            if not allow_partial_loading:
+                raise ValueError(
+                    "w1_weight is missing for an expert of a BF16 TRTLLM-Gen "
+                    "MoE layer, and allow_partial_loading is not set")
+            return
+        expert = self._empty_expert_in_creation_layout(module, "w3_w1_weight",
+                                                       dst_w3_w1_weight.device)
+        super().load_expert_w3_w1_weight(module, w1_weight, w3_weight, expert,
+                                         allow_partial_loading)
+        dst_w3_w1_weight.copy_(self._w3_w1_to_kernel_layout(module, expert))
+
+    def load_expert_w2_weight(self,
+                              module: torch.nn.Module,
+                              w2_weight: torch.Tensor | None,
+                              dst_w2_weight: torch.Tensor,
+                              allow_partial_loading: bool = False) -> None:
+        if dst_w2_weight.dim() == 2:
+            # Creation layout [M, K]: the first load, or a re-created layer.
+            super().load_expert_w2_weight(module, w2_weight, dst_w2_weight,
+                                          allow_partial_loading)
+            return
+        # Kernel-layout slot [K / 64, M, 64], kept by pre_reload_weights.
+        if w2_weight is None:
+            if not allow_partial_loading:
+                raise ValueError(
+                    "w2_weight is missing for an expert of a BF16 TRTLLM-Gen "
+                    "MoE layer, and allow_partial_loading is not set")
+            return
+        expert = self._empty_expert_in_creation_layout(module, "w2_weight",
+                                                       dst_w2_weight.device)
+        super().load_expert_w2_weight(module, w2_weight, expert,
+                                      allow_partial_loading)
+        dst_w2_weight.copy_(self._w2_to_kernel_layout(expert))
+
+    def _transform_expert_stacks_for_trtllm_gen(
+            self, module: torch.nn.Module, w3_w1: torch.Tensor,
+            w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rewrite stacked expert weights into shuffled BlockMajorK.
+
+        Each expert goes through the per-expert conversion an in-place refit
+        uses (``_w3_w1_to_kernel_layout`` / ``_w2_to_kernel_layout``), so the
+        two cannot drift apart. An empty stack (a rank that stages no shared
+        experts) is returned unchanged.
+        """
+        if w3_w1.shape[0] == 0 or w2.shape[0] == 0:
+            return w3_w1, w2
+
+        # The module's slots live on its GPU; transform there rather than on
+        # whatever the current CUDA device happens to be.
+        compute_device = module.w3_w1_weight.device
+
+        def transform(weights: torch.Tensor,
+                      to_kernel_layout: Callable) -> torch.Tensor:
+            # One expert at a time on the GPU: the gather is far cheaper there,
+            # while a host-resident stack never needs a device-sized allocation
+            # of its own. Each expert returns to the stack's original device.
+            return torch.stack([
+                to_kernel_layout(expert.to(compute_device)).contiguous().to(
+                    weights.device) for expert in weights
+            ])
+
+        def w3_w1_to_kernel_layout(expert: torch.Tensor) -> torch.Tensor:
+            return self._w3_w1_to_kernel_layout(module, expert)
+
+        return (transform(w3_w1, w3_w1_to_kernel_layout),
+                transform(w2, self._w2_to_kernel_layout))
 
     def process_weights_after_loading(self, module: torch.nn.Module):
+        if module.w3_w1_weight.dim() == 4:
+            # Already in the kernel layout [experts, K / 64, M, 64], from an
+            # earlier conversion or an in-place reload that wrote each
+            # delivered expert as it arrived; converting again would shuffle
+            # the rows twice.
+            return
         if module.w3_w1_weight.numel() == 0 or module.w2_weight.numel() == 0:
             module._trtllm_gen_layout_transform_pending = False
             return
 
-        w3_w1_permute_indices = self._get_w3_w1_permute_indices(
-            module.w3_w1_weight.data[0],
-            is_gated_act_gemm=getattr(module, "is_gated_activation", True))
-        w2_permute_indices = self._get_w2_permute_indices(
-            module.w2_weight.data[0])
-
-        processed_w3_w1 = torch.stack([
-            self._prepare_bf16_weight_for_trtllm_gen(expert,
-                                                     w3_w1_permute_indices)
-            for expert in module.w3_w1_weight.data
-        ])
-        processed_w2 = torch.stack([
-            self._prepare_bf16_weight_for_trtllm_gen(expert, w2_permute_indices)
-            for expert in module.w2_weight.data
-        ])
-
+        processed_w3_w1, processed_w2 = self._transform_expert_stacks_for_trtllm_gen(
+            module, module.w3_w1_weight.data, module.w2_weight.data)
         replace_parameter_and_save_metadata(module, "w3_w1_weight",
                                             processed_w3_w1,
                                             module.rebuild_tensor_metadata)
         replace_parameter_and_save_metadata(module, "w2_weight", processed_w2,
                                             module.rebuild_tensor_metadata)
         module._trtllm_gen_layout_transform_pending = False
+
+    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
+        """Put the online-EPLB host copies in the same layout as the slots.
+
+        A migration copies an expert's host copy into a slot byte for byte, so
+        both must hold the same layout. The host copies are staged in the
+        layout the slots had when ``load_weights`` ran, the checkpoint's MajorK
+        on a first load, and ``process_weights_after_loading`` has rewritten
+        the slots into shuffled BlockMajorK since. Like that device transform,
+        this goes by rank: a stack of BlockMajorK experts is 4-D, a stack of
+        MajorK experts 3-D, so the host copies are never converted twice.
+        """
+        if module.w3_w1_weight.dim() != 4:
+            # The device transform skips empty weights, so the slots are still
+            # MajorK and the host copies must stay MajorK as well.
+            return
+        if module.local_shared_w3_w1_tensors.dim() == 4:
+            # Already BlockMajorK, like the slots.
+            return
+        (module.local_shared_w3_w1_tensors, module.local_shared_w2_tensors) = (
+            self._transform_expert_stacks_for_trtllm_gen(
+                module, module.local_shared_w3_w1_tensors,
+                module.local_shared_w2_tensors))
 
     def transform_weights(self, module: torch.nn.Module) -> None:
         if getattr(module, "_trtllm_gen_layout_transform_pending", False):

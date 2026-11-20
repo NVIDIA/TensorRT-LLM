@@ -23,7 +23,9 @@ from pytest_timeout_evidence import load_timeout_evidence
 _FALLBACK_TEST_TIME_SECONDS = 1.0
 
 
-def parse_xml_classname_name_file_from_testname(testname, stage_name):
+def parse_xml_classname_name_file_from_testname(
+    testname: str, stage_name: str
+) -> tuple[str, str, str]:
     """Parse XML attributes from a test name.
 
     Args:
@@ -43,31 +45,31 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
     if testname.startswith(stage_name + "/"):
         testname = testname[len(stage_name) + 1 :]
 
+    # Parameter IDs can contain "::", which is not a node separator there.
+    node_path, bracket, parameters = testname.partition("[")
+    parts = node_path.split("::")
+
     # Get file name
     if testname.startswith("unittest/"):
         file = "test_unittests.py"
     else:
-        file = testname.split("::")[0]
+        file = parts[0]
 
     # Get test name
     if testname.startswith("unittest/"):
         name = "test_unittests_v2[" + testname + "]"
     else:
-        name = testname.split("::")[-1]
+        name = parts[-1] + bracket + parameters
 
     # Get class name
     if testname.startswith("unittest/"):
         classname = stage_name + ".test_unittests"
-    elif len(testname.split("::")) == 3:
+    elif len(parts) == 3:
         classname = (
-            stage_name
-            + "."
-            + testname.split("::")[0].replace(".py", "").replace("/", ".")
-            + "."
-            + testname.split("::")[1]
+            stage_name + "." + parts[0].replace(".py", "").replace("/", ".") + "." + parts[1]
         )
     else:
-        classname = stage_name + "." + testname.split("::")[0].replace(".py", "").replace("/", ".")
+        classname = stage_name + "." + parts[0].replace(".py", "").replace("/", ".")
         if testname.startswith("accuracy/"):
             classname = ""
 
@@ -168,7 +170,7 @@ def main():
             timeoutTests = list(dict.fromkeys(line.strip() for line in f if line.strip()))
     except IOError as e:
         print(f"Error reading {full_path}: {e}")
-        return
+        sys.exit(1)
 
     if not timeoutTests:
         print(f"No timeout tests found in {full_path}, skipping timeout XML generation")

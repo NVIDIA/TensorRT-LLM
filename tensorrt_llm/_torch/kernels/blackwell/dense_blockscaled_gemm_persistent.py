@@ -185,6 +185,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         q_fp8_amax: bool = False,
         q_fp8_only: bool = False,
         split_k: int = 1,
+        use_sm107_mma: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -224,8 +225,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 slice reduce-adds its partial into C through TMA, so callers
                 must zero C before every launch. Fused epilogues require
                 ``split_k=1``.
+            use_sm107_mma (bool): Use SM107 K64 MXFP8 instructions, keeping the
+                K128 pipeline stage and query epilogue unchanged.
         """
 
+        if use_sm107_mma and (not q_rope_fusion or sf_vec_size != 32):
+            raise ValueError("SM107 MMA requires an MXFP8 query projection")
+        self.use_sm107_mma = use_sm107_mma
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -308,6 +314,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         k_block_end = (k_block_cnt * (split_idx + 1)) // self.split_k
         return k_block_begin, k_block_end - k_block_begin
 
+    def _make_tiled_mma(self, shape, cta_group):
+        if self.use_sm107_mma:
+            import cutlass.utils.rubin_helpers as sm107_utils
+
+            return sm107_utils.make_blockscaled_trivial_tiled_mma(
+                self.a_dtype, self.b_dtype, self.a_major_mode,
+                self.b_major_mode, self.sf_dtype, self.sf_vec_size, cta_group,
+                shape)
+        return sm100_utils.make_blockscaled_trivial_tiled_mma(
+            self.a_dtype, self.a_major_mode, self.b_major_mode, self.sf_dtype,
+            self.sf_vec_size, cta_group, shape[:2])
+
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
 
@@ -323,7 +341,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         - Computing tensor memory allocation columns
         """
         # Compute mma instruction shapes
-        mma_inst_bits_k = 256
+        mma_inst_bits_k = 512 if self.use_sm107_mma else 256
         # (MMA_Tile_Shape_M, MMA_Tile_Shape_N, MMA_Inst_Shape_K)
         self.mma_inst_shape_mnk = (
             self.mma_tiler[0],
@@ -337,28 +355,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_inst_shape_mnk[2],
         )
 
-        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            self.cta_group,
-            self.mma_inst_shape_mnk[:2],
-        )
+        tiled_mma = self._make_tiled_mma(self.mma_inst_shape_mnk,
+                                         self.cta_group)
 
-        tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            cute.nvgpu.tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_mnk_sfb[:2],
-        )
+        tiled_mma_sfb = self._make_tiled_mma(self.mma_inst_shape_mnk_sfb,
+                                             cute.nvgpu.tcgen05.CtaGroup.ONE)
 
         # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = 4
+        mma_inst_tile_k = 2 if self.use_sm107_mma else 4
         self.mma_tiler = (
             self.mma_inst_shape_mnk[0],
             self.mma_inst_shape_mnk[1],
@@ -497,11 +501,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             raise ValueError(
                 "The swapped indexer-Q transform-warp schedule requires at "
                 "least two accumulator stages")
+        # Scale storage covers the same K stage with either instruction width.
+        sf_inst_tile_k = 4
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] //
-                                  sf_atom_mn) * mma_inst_tile_k
+                                  sf_atom_mn) * sf_inst_tile_k
         self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] //
-                                  sf_atom_mn) * mma_inst_tile_k
+                                  sf_atom_mn) * sf_inst_tile_k
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[
             1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[
@@ -610,25 +616,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             b_tensor.shape, self.sf_vec_size)
         sfb_tensor = cute.make_tensor(sfb_tensor.iterator, sfb_layout)
 
-        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            self.cta_group,
-            self.mma_inst_shape_mnk[:2],
-        )
+        tiled_mma = self._make_tiled_mma(self.mma_inst_shape_mnk,
+                                         self.cta_group)
 
-        tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            cute.nvgpu.tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_mnk_sfb[:2],
-        )
+        tiled_mma_sfb = self._make_tiled_mma(self.mma_inst_shape_mnk_sfb,
+                                             cute.nvgpu.tcgen05.CtaGroup.ONE)
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         # Setup TMA load for A

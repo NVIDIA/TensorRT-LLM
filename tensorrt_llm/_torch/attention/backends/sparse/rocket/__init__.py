@@ -4,12 +4,13 @@
 """RocketKV sparse attention backend package."""
 
 from .backend import RocketTrtllmAttention, RocketVanillaAttention
-from .cache_manager import RocketKVCacheManager
+from .cache_manager import RocketKVCacheManager, RocketKVCacheManagerV2
 from .metadata import RocketTrtllmAttentionMetadata, RocketVanillaAttentionMetadata
 from .params import RocketKVMetadataParams, RocketKVParams
 
 __all__ = [
     "RocketKVCacheManager",
+    "RocketKVCacheManagerV2",
     "RocketKVMetadataParams",
     "RocketKVParams",
     "RocketTrtllmAttention",

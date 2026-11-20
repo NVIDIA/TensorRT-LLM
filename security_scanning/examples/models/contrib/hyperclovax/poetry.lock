@@ -121,14 +121,14 @@ all = ["cuda-toolkit (==13.*)", "cuda-toolkit[cufile] (==13.*) ; sys_platform ==
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.9.0"
+version = "1.9.1"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "platform_system == \"Linux\""
 files = [
-    {file = "cuda_pathfinder-1.9.0-py3-none-any.whl", hash = "sha256:622df7440f7702f36b7a02a1699aa0b084fe04034d9939188fee9b16d0c36366"},
+    {file = "cuda_pathfinder-1.9.1-py3-none-any.whl", hash = "sha256:b743c132f90ad2d1e71d43fd28f31ebcde518f943e50fd44aca62b2a80d5230d"},
 ]
 
 [[package]]
@@ -207,14 +207,14 @@ numpy = ">=1.14.0"
 
 [[package]]
 name = "filelock"
-version = "4.2.10"
+version = "4.2.12"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 files = [
-    {file = "filelock-4.2.10-py3-none-any.whl", hash = "sha256:9479aaeb4db20b5a53e3da28493edd24720b66b8a0b84030aa56ccdf243d6857"},
-    {file = "filelock-4.2.10.tar.gz", hash = "sha256:fcc3c0cb8bfe7f4b3bb0e231c04b15dbad068cb3c2515f343d8fde4dce93bd5d"},
+    {file = "filelock-4.2.12-py3-none-any.whl", hash = "sha256:21decfec02f116ed4c954433cdb31f28c3b346b784543177b6d7059da2702ee9"},
+    {file = "filelock-4.2.12.tar.gz", hash = "sha256:7e7da24d3ac39268b0f156e56870001de44886318f092f9d851e692f7114d6dd"},
 ]
 
 [[package]]
@@ -303,15 +303,15 @@ tests = ["pytest"]
 
 [[package]]
 name = "httpcore2"
-version = "2.16.0"
+version = "2.16.2"
 description = "A minimal low-level HTTP client."
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "sys_platform != \"emscripten\""
 files = [
-    {file = "httpcore2-2.16.0-py3-none-any.whl", hash = "sha256:5c4358319f2602d984ad93182c9fee5160f22e9da7babdda870a5e7c4e2dc34f"},
-    {file = "httpcore2-2.16.0.tar.gz", hash = "sha256:c72cd0413563b17e1cd8354677dff887466f8ec2551679759e93126534428643"},
+    {file = "httpcore2-2.16.2-py3-none-any.whl", hash = "sha256:16051ae2a42f776007543f32de9349a317b23d2cbb4e1456b4bac0e88b87419a"},
+    {file = "httpcore2-2.16.2.tar.gz", hash = "sha256:6c519d0f7b44f7269fa9bbb4d2763db395a4a2370f046d8e8e0a4b38227815d2"},
 ]
 
 [package.dependencies]
@@ -326,19 +326,19 @@ trio = ["trio (>=0.34.0,<1.0)"]
 
 [[package]]
 name = "httpx2"
-version = "2.16.0"
+version = "2.16.2"
 description = "The next generation HTTP client."
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 files = [
-    {file = "httpx2-2.16.0-py3-none-any.whl", hash = "sha256:fd2c5d7909e8d86fe92d53020c310ca0e4e431b838c207c5754b9bbf0308d49a"},
-    {file = "httpx2-2.16.0.tar.gz", hash = "sha256:0d54c98128e8f2ff7fbbde0fca8c359e5f032edeaaaac443cdb7f31f685bcd7f"},
+    {file = "httpx2-2.16.2-py3-none-any.whl", hash = "sha256:f05c13aade4c45dbf1c9060647a1058f0acad62398fad96e741269edb33d46f5"},
+    {file = "httpx2-2.16.2.tar.gz", hash = "sha256:748b615678f07d8e3b183efe81ad13b655ca88bfc56ce4589219b2d442860574"},
 ]
 
 [package.dependencies]
 anyio = {version = ">=4.10", markers = "sys_platform != \"emscripten\""}
-httpcore2 = {version = "2.16.0", markers = "sys_platform != \"emscripten\""}
+httpcore2 = {version = "2.16.2", markers = "sys_platform != \"emscripten\""}
 httpx2-jsfetch = {version = "*", markers = "sys_platform == \"emscripten\" and python_version >= \"3.12\""}
 idna = ">=3.18"
 truststore = {version = ">=0.10", markers = "sys_platform != \"emscripten\""}
@@ -731,17 +731,15 @@ nvidia-cuda-nvrtc = "*"
 
 [[package]]
 name = "nvidia-cublas"
-version = "13.10.0.20"
+version = "13.10.1.6"
 description = "CUBLAS native runtime libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
 markers = "platform_system == \"Linux\""
 files = [
-    {file = "nvidia_cublas-13.10.0.20-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:dcc6d63884c53d07e267ce7e6feac17b2538cebaafec5db865736c3e28e4dc84"},
-    {file = "nvidia_cublas-13.10.0.20-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:c5f3418c0a845232a8cabc58f6fa52cfae7d8bd3680d94c3907aca710fd48d70"},
-    {file = "nvidia_cublas-13.10.0.20-py3-none-win_amd64.whl", hash = "sha256:c310b749eea855b88fafb906de08d6819b87216c6711640771764fea5dcd8546"},
-    {file = "nvidia_cublas-13.10.0.20-py3-none-win_arm64.whl", hash = "sha256:05929d6a64af9edce1951ff82a514d630fc1a2369bcfe1ab195f5e85266dbfed"},
+    {file = "nvidia_cublas-13.10.1.6-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:0f26cf49a81377fd96f519e28fd56c5f638a2581f303d531f60e633fb222e1ea"},
+    {file = "nvidia_cublas-13.10.1.6-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:0052e19ce6afed797ee445c60463de2460e950d9bb16ceac1ddd2141f611fbc1"},
 ]
 
 [package.dependencies]
