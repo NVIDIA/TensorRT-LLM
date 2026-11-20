@@ -182,6 +182,14 @@ def test_chat_ids_are_the_servers_and_are_forwarded(router, same_server, fields)
     assert request.prompt_token_ids == expected
 
 
+def test_a_truncated_chat_forwards_its_last_ids(router, same_server):
+    """The router forwards the ids the server would keep under truncate_prompt_tokens."""
+    expected = _servers_chat_ids(router, _MESSAGES)
+    request = ChatCompletionRequest(model="m", messages=_MESSAGES, truncate_prompt_tokens=2)
+    assert router._routing_key_sync(request)["num_tokens"] == 2
+    assert request.prompt_token_ids == expected[-2:]
+
+
 def test_chat_ids_are_not_forwarded_to_a_server_that_renders_differently(router, checkpoint):
     """A server whose tokenizer file differs renders differently; it renders for itself."""
     other, other_format = (
@@ -224,6 +232,17 @@ def test_a_chat_mistral_common_rejects_routes_on_no_ids(router, same_server):
     assert key["num_tokens"] == 0
     assert key["conv_key"] is not None  # conversation affinity still applies
     assert request.prompt_token_ids is None
+
+
+def test_a_render_error_that_is_no_rejection_is_raised(router, monkeypatch):
+    """Only a chat the renderer rejects routes on no ids; any other error surfaces."""
+
+    def broken(*args, **kwargs):
+        raise ValueError("a rendering bug")
+
+    monkeypatch.setattr(MistralTokenizer, "render_chat", broken)
+    with pytest.raises(ValueError, match="a rendering bug"):
+        router._routing_key_sync(ChatCompletionRequest(model="m", messages=_MESSAGES))
 
 
 def test_responses_request_routes_on_the_chat_ids(router):

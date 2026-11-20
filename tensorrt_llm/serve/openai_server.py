@@ -2570,6 +2570,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         injected_chat_template_kwargs=request.
                         injected_chat_template_kwargs,
                         forced_prefix=forced_tool_begin_prefix,
+                        truncate_prompt_tokens=request.truncate_prompt_tokens,
                     )
                 if rendered.text is None:
                     if forced_tool_begin_prefix is not None:

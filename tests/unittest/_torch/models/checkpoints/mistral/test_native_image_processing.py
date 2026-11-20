@@ -104,8 +104,11 @@ def test_an_unknown_type_is_refused():
 
 
 @pytest.mark.parametrize("encoding", ["JPEG", "PNG"])
-def test_the_preferred_loader_hands_over_the_pil_image_used_as_loaded(encoding):
-    """The media loader format the processor asks for yields a PIL image, used as loaded."""
+def test_the_preferred_loader_keeps_the_pixels_of_a_pil_decode(encoding: str) -> None:
+    """The media loader format the processor asks for yields an array of Pillow's pixels.
+
+    mistral-common decodes an image with Pillow; the loaders decode a JPEG with torchvision.
+    """
     from tensorrt_llm._torch.models.modeling_mistral import MistralNativeInputProcessor
     from tensorrt_llm.inputs.media_io import ImageMediaIO
 
@@ -113,10 +116,11 @@ def test_the_preferred_loader_hands_over_the_pil_image_used_as_loaded(encoding):
         MistralNativeInputProcessor
     ).get_preferred_media_io_kwargs()
     buffer = BytesIO()
-    _rgb(3).save(buffer, encoding)
+    _rgb(3, (480, 640)).save(buffer, encoding)
     loaded = ImageMediaIO.create(preferred.get("image"), None).load_bytes(buffer.getvalue())
-    assert isinstance(loaded, Image.Image)
-    assert _to_pil(loaded) is loaded
+    assert isinstance(loaded, np.ndarray) and loaded.dtype == np.uint8
+    pillow = np.asarray(Image.open(BytesIO(buffer.getvalue())).convert("RGB"))
+    assert np.array_equal(np.asarray(_to_pil(loaded)), pillow)
 
 
 @pytest.fixture(scope="module")
@@ -145,15 +149,17 @@ def _assert_grids(native_processor, payload, images):
         assert torch.equal(payload["pixel_values"][index, :, :h, :w], single["pixel_values"][0])
 
 
-@pytest.mark.parametrize("form", [lambda image: image, ToTensor()], ids=["pil", "pt"])
+@pytest.mark.parametrize(
+    "form", [lambda image: image, np.asarray, ToTensor()], ids=["pil", "np", "pt"]
+)
 @pytest.mark.parametrize("name", ["merlion.png", "excel_table_test.jpg"])
 def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(
     native_processor, name, form, monkeypatch
 ):
     """Nothing lies between the loaded image and mistral-common's resize and normalize.
 
-    The server loads PIL images; other callers may pass ``pt`` tensors. No image is
-    serialized on the way.
+    The server loads ``np`` arrays; other callers may pass PIL images or ``pt`` tensors. No
+    image is serialized on the way.
     """
     from mistral_common.protocol.instruct.chunk import ImageChunk
 
@@ -187,8 +193,15 @@ def test_pil_image_size_is_the_size_of_the_pil_image(image, size):
     assert _to_pil(image).size == size
 
 
-def test_a_served_chat_keeps_roles_image_order_and_control_tokens(native_processor):
+@pytest.mark.parametrize("served", [True, False], ids=["server_loader", "default_loader"])
+def test_a_served_chat_keeps_roles_image_order_and_control_tokens(native_processor, served):
+    """A chat renders and processes to the reference ids and grids.
+
+    The server loads images in the format the processor prefers (``np`` arrays); a caller
+    without that configuration gets the loaders' default (``pt`` tensors).
+    """
     from tensorrt_llm.inputs.content_format import ContentFormat
+    from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
     from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
     from tensorrt_llm.inputs.utils import async_apply_chat_template_with_mm
     from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
@@ -206,8 +219,13 @@ def test_a_served_chat_keeps_roles_image_order_and_control_tokens(native_process
     expected = native_processor.tokenizer.apply_chat_template(
         messages, tokenize=True, return_dict=False, add_generation_prompt=True
     )
+    server_config = (
+        MultimodalServerConfig(media_io_kwargs=native_processor.get_preferred_media_io_kwargs())
+        if served
+        else None
+    )
     conversation, media, counts, _ = parse_chat_messages_coroutines(
-        messages, native_processor.config
+        messages, native_processor.config, multimodal_server_config=server_config
     )
     assert counts == [{}, {"[IMG]": 2}, {}, {"[IMG]": 1}]
     ids, (mm_data, _) = asyncio.run(
@@ -222,6 +240,8 @@ def test_a_served_chat_keeps_roles_image_order_and_control_tokens(native_process
         )
     )
     assert ids == expected
+    loaded_type = np.ndarray if served else torch.Tensor
+    assert all(isinstance(image, loaded_type) for image in mm_data["image"])
     actual_ids, extra = native_processor(
         {"prompt_token_ids": ids, "multi_modal_data": mm_data}, None
     )
@@ -272,6 +292,33 @@ def test_token_ids_carry_whole_image_grids_without_reencoding(native_processor):
             process(invalid)
     with pytest.raises(ValueError, match="sizes and order"):
         process(actual, list(reversed(images)))
+
+
+def test_the_default_loader_places_images_at_the_prompts_markers(native_processor):
+    """As the input processor places a text prompt's images, one per [IMG] marker."""
+    from tensorrt_llm.inputs.utils import default_multimodal_input_loader
+
+    images = [_rgb(52, (56, 84)), _rgb(53, (112, 56))]
+    prompt = "Before [IMG] between [IMG] after"
+
+    def load(prompt):
+        return default_multimodal_input_loader(
+            tokenizer=None,
+            model_dir=native_processor.model_path,
+            model_type="mistral_common",
+            modality="multiple_image",
+            prompts=[prompt],
+            media=[_image_url(image) for image in images],
+        )
+
+    (inputs,) = load(prompt)
+    expected, _ = native_processor({"prompt": prompt, "multi_modal_data": {"image": images}}, None)
+    assert inputs["prompt_token_ids"] == expected
+    ids, extra = native_processor(inputs, None)
+    assert ids == expected
+    _assert_grids(native_processor, extra["multimodal_data"]["image"], images)
+    with pytest.raises(ValueError, match="1 \\[IMG\\] placeholders for 2 images"):
+        load("Only [IMG] one")
 
 
 def test_the_default_loader_returns_native_token_ids(native_processor):

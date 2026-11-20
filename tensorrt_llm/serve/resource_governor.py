@@ -21,7 +21,7 @@ LLM/Proxy/Worker chain.
 
 import traceback
 from http import HTTPStatus
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import FastAPI
 from starlette.responses import JSONResponse, Response
@@ -34,11 +34,32 @@ from tensorrt_llm.serve.chat_utils import (
     resolve_top_level_model_type,
 )
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     KVCacheTruncateRequest,
     KVCacheTruncateTokensRequest,
     ensure_request_chat_template_allowed,
 )
 from tensorrt_llm.serve.render import RenderResources, render_conversation_with_media
+
+
+def _chat_template_kwargs(request: KVCacheTruncateRequest, extension: Any) -> Dict[str, Any]:
+    """The chat-template kwargs the chat route renders ``request``'s messages with.
+
+    The chat route lets the model's serving extension derive kwargs from request-level
+    fields (a Mistral-native checkpoint's reasoning effort, for one); the cache to truncate
+    holds the prompt rendered with them.
+    """
+    fields: Dict[str, Any] = {
+        "model": request.model,
+        "messages": request.messages or request.messages_to_retain,
+        "chat_template": request.chat_template,
+        "chat_template_kwargs": request.chat_template_kwargs,
+    }
+    if request.reasoning_effort is not None:
+        fields["reasoning_effort"] = request.reasoning_effort
+    chat_request = ChatCompletionRequest(**fields)
+    extension.apply_chat_extensions(chat_request)
+    return chat_request.chat_template_kwargs or {}
 
 
 class ResourceGovernor:
@@ -166,7 +187,7 @@ class ResourceGovernor:
                 if request.tools is None
                 else [extension.serialize_tool(tool) for tool in request.tools]
             )
-            chat_template_kwargs = request.chat_template_kwargs or {}
+            chat_template_kwargs = _chat_template_kwargs(request, extension)
 
             messages_to_retain = (
                 await self._convert_messages(

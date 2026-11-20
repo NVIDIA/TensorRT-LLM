@@ -41,10 +41,12 @@ from .. import LLM as PyTorchLLM
 from ..inputs import (ConversationMessage, MultimodalDataTracker,
                       add_multimodal_placeholders, convert_image_mode)
 from ..inputs.content_format import ContentFormat
+from ..inputs.model_config import resolve_top_level_model_type
 from ..inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
-from ..inputs.utils import NATIVE_MISTRAL_MODEL_TYPES, _resolve_content_format
+from ..inputs.utils import _resolve_content_format
 from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
-from ..inputs.utils import interleave_mm_placeholders, resolve_hf_chat_template
+from ..inputs.utils import (interleave_mm_placeholders,
+                            renders_from_loaded_media, resolve_hf_chat_template)
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -613,7 +615,19 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             self.model_type)
 
     def _get_model_type(self, llm: PyTorchLLM) -> str:
-        """Extract model type from the model configuration."""
+        """The model type of the loaded model.
+
+        Read from the configuration the input processor was loaded with, which
+        follows the checkpoint format: a Mistral-native checkpoint is
+        ``mistral_common`` whether or not it ships a Hugging Face config.json.
+        The checkpoint's config.json otherwise.
+        """
+        processor_config = getattr(getattr(llm, "input_processor", None),
+                                   "config", None)
+        if processor_config is not None:
+            model_type = resolve_top_level_model_type(processor_config)
+            if model_type:
+                return model_type
         config_path = os.path.join(llm._hf_model_dir, 'config.json')
 
         if not os.path.exists(config_path):
@@ -645,7 +659,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
         Adapted from: https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L225
         """
-        if self.model_type in NATIVE_MISTRAL_MODEL_TYPES:
+        if renders_from_loaded_media(self.model_type):
             # lm-eval supplies image pixels only in generate_until, and
             # mistral-common sizes each image's tokens from its pixels. Its
             # cached context is a string, so keep the structured chat there
@@ -752,7 +766,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
         The image placeholders take the images in order, across the conversation;
         placeholders past the last image (``is_force_single_image``) are dropped,
-        and images past the last placeholder follow the last message's text.
+        and images past the last placeholder follow the last user message's text.
         """
         deferred = json.loads(prompt)
         conversation, counts = [], []
@@ -775,12 +789,19 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                                     content_parts=content_parts))
             counts.append(sum(isinstance(part, dict) for part in content_parts))
         if conversation and placed < len(images):
+            # mistral-common takes images in user messages only, so they do
+            # not join an assistant generation prefix.
+            target = next((index for index in reversed(range(len(conversation)))
+                           if conversation[index]["role"] == "user"),
+                          len(conversation) - 1)
             for index in range(placed, len(images)):
-                conversation[-1]["content_parts"].append({
-                    "type": "image",
-                    "media_index": index
+                conversation[target]["content_parts"].append({
+                    "type":
+                    "image",
+                    "media_index":
+                    index
                 })
-            counts[-1] += len(images) - placed
+            counts[target] += len(images) - placed
         return trtllm_apply_chat_template(
             model_type=self.model_type,
             tokenizer=self.llm.tokenizer,
@@ -834,7 +855,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                     convert_image_mode(img, "RGB")
                     for img in media_data["visual"]
                 ]
-            if self.model_type in NATIVE_MISTRAL_MODEL_TYPES:
+            if renders_from_loaded_media(self.model_type):
                 prompt = self._render_native_mistral_chat(prompt, images)
             prompt = prompt_inputs(prompt)
             prompt["multi_modal_data"] = {"image": images}

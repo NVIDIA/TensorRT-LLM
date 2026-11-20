@@ -119,6 +119,17 @@ def get_safetensors_metadata(model_name_or_path, consolidated: bool = False):
         else (SAFETENSORS_SINGLE_FILE, SAFETENSORS_INDEX_FILE)
     )
     if os.path.isdir(model_name_or_path):
+        # A consolidated checkpoint may come as shards without an index, which the
+        # runtime finds by name.
+        unindexed_shards = (
+            sorted(
+                name
+                for name in os.listdir(model_name_or_path)
+                if "consolidated" in name and name.endswith(".safetensors")
+            )
+            if consolidated
+            else []
+        )
         if os.path.exists(os.path.join(model_name_or_path, single_file)):
             file_metadata = parse_safetensors_file_metadata(
                 model_path=model_name_or_path, filename=single_file
@@ -156,6 +167,23 @@ def get_safetensors_metadata(model_name_or_path, consolidated: bool = False):
                 metadata=index.get("metadata", None),
                 sharded=True,
                 weight_map=weight_map,
+                files_metadata=files_metadata,
+            )
+        elif unindexed_shards:
+            files_metadata = {
+                filename: parse_safetensors_file_metadata(
+                    model_path=model_name_or_path, filename=filename
+                )
+                for filename in unindexed_shards
+            }
+            return SafetensorsRepoMetadata(
+                metadata=None,
+                sharded=True,
+                weight_map={
+                    tensor_name: filename
+                    for filename, file_metadata in files_metadata.items()
+                    for tensor_name in file_metadata.tensors.keys()
+                },
                 files_metadata=files_metadata,
             )
         else:

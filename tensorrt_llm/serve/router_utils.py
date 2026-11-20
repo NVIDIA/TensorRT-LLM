@@ -27,6 +27,7 @@ from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBloc
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.inputs.prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
+from tensorrt_llm.inputs.utils import ChatRejectedError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import kv_cache_hash
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -334,26 +335,26 @@ class BlockHashMixin:
         """Routing ids from :func:`render_chat_for_length`; never forwarded to a worker.
 
         A request the request model rejects, or Harmony cannot convert, gets no ids. One the chat
-        template rejects raises, except for a Mistral-native checkpoint: mistral-common's
-        rejection also gets no ids, and the worker answers the request. So do the chats of a
-        Mistral-native directory read without the servers' checkpoint format, which this
-        router cannot render.
+        template rejects raises; one the model's own renderer rejects (``ChatRejectedError``:
+        mistral-common, for a Mistral-native checkpoint) gets no ids, and the worker answers it.
+        So do the chats of a Mistral-native directory read without the servers' checkpoint
+        format, which this router cannot render.
         """
+        resources = self._render_resources(request.model)
+        if request.model in self.__dict__.get("_mistral_native_dirs", ()):
+            logger.debug(
+                "Router cannot render the chats of a Mistral-native directory without its "
+                "checkpoint format; routing on no ids."
+            )
+            return []
         try:
             return render_chat_for_length(
                 request,
-                self._render_resources(request.model),
+                resources,
                 encode_rendered=self._make_encode_rendered(request),
             ).token_ids
-        except (UnsupportedRenderError, HarmonyConversionError) as error:
+        except (UnsupportedRenderError, HarmonyConversionError, ChatRejectedError) as error:
             logger.debug(f"Router has no length for the request ({error}); routing on no ids.")
-            return []
-        except ValueError as error:
-            if not self._mistral_native and request.model not in self.__dict__.get(
-                "_mistral_native_dirs", ()
-            ):
-                raise
-            logger.debug(f"Router could not render the request ({error}); routing on no ids.")
             return []
 
     def _render_key(self, model: str) -> str:

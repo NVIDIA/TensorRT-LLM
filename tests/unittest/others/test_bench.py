@@ -596,20 +596,25 @@ def _weights(*shapes):
 
 
 def _mistral_native_checkpoint(path, *, weights="consolidated", hf_config=False):
-    """Write params.json and, by `weights`, consolidated, sharded consolidated or no weights."""
+    """Write params.json and, by `weights`, its weights.
+
+    `weights` is "consolidated", "sharded" (consolidated shards and their index),
+    "unindexed_shards" or None.
+    """
     path.mkdir()
     (path / "params.json").write_text(json.dumps(_MISTRAL_NATIVE_PARAMS))
     if weights == "consolidated":
         save_file(_weights((1024, 256), (256,)), path / "consolidated.safetensors")
-    elif weights == "sharded":
+    elif weights in ("sharded", "unindexed_shards"):
         weight_map = {}
         for shard, (name, tensor) in enumerate(_weights((1024, 256), (256,)).items(), 1):
             file_name = f"consolidated-{shard:05d}-of-00002.safetensors"
             save_file({name: tensor}, path / file_name)
             weight_map[name] = file_name
-        (path / "consolidated.safetensors.index.json").write_text(
-            json.dumps({"weight_map": weight_map})
-        )
+        if weights == "sharded":
+            (path / "consolidated.safetensors.index.json").write_text(
+                json.dumps({"weight_map": weight_map})
+            )
     if hf_config:
         (path / "config.json").write_text(json.dumps(_HF_CONFIG))
         save_file(_weights((1024, 128)), path / "model.safetensors")
@@ -667,7 +672,7 @@ def _tune(tmp_path, checkpoint, checkpoint_format="mistral"):
 
 
 @pytest.mark.parametrize("hf_config", [False, True], ids=["native_only", "with_config_json"])
-@pytest.mark.parametrize("weights", ["consolidated", "sharded"])
+@pytest.mark.parametrize("weights", ["consolidated", "sharded", "unindexed_shards"])
 @pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
 def test_tuning_reads_a_mistral_native_checkpoint_from_its_native_files(
     tmp_path, checkpoint_format, weights, hf_config
@@ -687,6 +692,67 @@ def test_tuning_reads_a_mistral_native_checkpoint_from_its_native_files(
     assert model_config.param_count == 1024 * 256 + 256
     assert model_config.checkpoint_size_in_gb == (1024 * 256 + 256) * 2 / 1024**3
     assert quant_config.quant_algo is None
+
+
+def test_an_image_dataset_of_a_mistral_native_checkpoint_renders_with_its_tekken_file(tmp_path):
+    """An image dataset renders with the Tekken file, without --custom_tokenizer.
+
+    trtllm-bench reads a Mistral-native checkpoint's tokenizer through mistral-common, as its
+    input processor does, though the directory ships a Hugging Face tokenizer too; each image
+    goes at its [IMG] marker.
+    """
+    import base64
+    import io
+    import shutil
+
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+    from PIL import Image
+    from test_common.llm_data import llm_models_root
+    from test_common.mistral_tekken import TEKKEN_CHECKPOINT_FILES, write_hf_tokenizer
+
+    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
+
+    pytest.importorskip("cv2")  # mistral-common's image encoder resizes with OpenCV
+    root = llm_models_root()
+    tekken = None if root is None else root / TEKKEN_CHECKPOINT_FILES["v15"]
+    if tekken is None or not tekken.is_file():
+        pytest.skip("needs a Tekken file with an image encoder under LLM_MODELS_ROOT")
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    shutil.copy(tekken, checkpoint / "tekken.json")
+    write_hf_tokenizer(checkpoint)
+    (checkpoint / "config.json").write_text(json.dumps({"model_type": "mistral3"}))
+    image_path = tmp_path / "red.png"
+    Image.new("RGB", (64, 48), (200, 30, 30)).save(image_path)
+
+    assert not isinstance(initialize_tokenizer(str(checkpoint)), MistralTokenizer)
+    tokenizer = initialize_tokenizer(str(checkpoint), checkpoint_format="mistral")
+    assert isinstance(tokenizer, MistralTokenizer)
+    line = {
+        "task_id": 0,
+        "prompt": "Describe [IMG] briefly.",
+        "media_paths": [str(image_path)],
+        "output_tokens": 4,
+    }
+    _, requests = create_dataset_from_stream(
+        tokenizer,
+        io.StringIO(json.dumps(line) + "\n"),
+        model_dir=str(checkpoint),
+        model_type="mistral_common",
+        modality="image",
+    )
+    buffer = io.BytesIO()
+    Image.open(image_path).save(buffer, "PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    content = [
+        {"type": "text", "text": "Describe "},
+        {"type": "image_url", "image_url": {"url": url}},
+        {"type": "text", "text": " briefly."},
+    ]
+    expected = tokenizer.mistral.encode_chat_completion(
+        ChatCompletionRequest.from_openai(messages=[{"role": "user", "content": content}])
+    ).tokens
+    assert requests[0].prompt["prompt_token_ids"] == expected
 
 
 def test_tuning_reads_config_json_when_the_native_files_cannot_be_read(tmp_path):

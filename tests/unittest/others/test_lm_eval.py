@@ -1982,6 +1982,79 @@ def test_native_mistral_eval_continues_a_gen_prefix():
     assert wrapper._render_native_mistral_chat(deferred, []) == expected
 
 
+def test_native_mistral_eval_puts_leftover_images_in_the_user_turn():
+    """Images past the last placeholder join the last user message.
+
+    mistral-common takes images in user messages only, so they cannot join an assistant
+    gen_prefix.
+    """
+    import base64
+    import io
+
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+    from PIL import Image
+    from test_common.mistral_tekken import load_tekken
+
+    pytest.importorskip("cv2")  # mistral-common's image encoder resizes with OpenCV
+    tokenizer = load_tekken("v15")  # the bundled Tekken file has no image encoder
+    image = Image.new("RGB", (64, 48))
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    wrapper = _make_multimodal_wrapper(model_type="mistral_common")
+    wrapper.llm.tokenizer = tokenizer
+    wrapper.chat_template_kwargs = {"reasoning_effort": "none"}
+    history = [
+        {"role": "user", "content": "What is this?"},
+        {"role": "assistant", "content": "The answer is"},
+    ]
+    deferred = wrapper.apply_chat_template(history, add_generation_prompt=False)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": url}},
+            ],
+        },
+        history[1],
+    ]
+    expected = tokenizer.mistral.encode_chat_completion(
+        ChatCompletionRequest.from_openai(
+            messages=messages, continue_final_message=True, reasoning_effort="none"
+        )
+    ).tokens
+    assert wrapper._render_native_mistral_chat(deferred, [image]) == expected
+
+
+@pytest.mark.parametrize("with_config_json", [False, True], ids=["native_only", "dual_format"])
+def test_the_multimodal_wrapper_reads_the_loaded_model_type(tmp_path, with_config_json):
+    """Without a model_type, the wrapper takes the type the input processor was loaded with.
+
+    The trtllm-eval MMMU commands pass none. A Mistral-native checkpoint then needs no
+    config.json, and its Hugging Face config.json does not make it an HF model.
+    """
+    import json
+    from types import SimpleNamespace
+
+    if with_config_json:
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "mistral3"}))
+    llm = MagicMock()
+    llm._hf_model_dir = str(tmp_path)
+    llm.input_processor.config = SimpleNamespace(model_type="mistral_common")
+    wrapper = MultimodalLmEvalWrapper(llm, sampling_params=None, streaming=False)
+    assert wrapper.model_type == "mistral_common"
+
+    # A processor without a configuration leaves the type to config.json.
+    llm.input_processor.config = None
+    if with_config_json:
+        wrapper = MultimodalLmEvalWrapper(llm, sampling_params=None, streaming=False)
+        assert wrapper.model_type == "mistral3"
+    else:
+        with pytest.raises(FileNotFoundError):
+            MultimodalLmEvalWrapper(llm, sampling_params=None, streaming=False)
+
+
 @pytest.mark.parametrize("prompt", [None, "[INST]Q[/INST]"])
 def test_dump_inference_results_keeps_token_id_prompts(tmp_path, prompt):
     """A token-id prompt dumps the ids the engine received; a text prompt is re-encoded."""

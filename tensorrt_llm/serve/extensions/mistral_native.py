@@ -16,8 +16,9 @@
 
 The Mistral-native format (``checkpoint_format`` ``mistral`` or ``mistral_large_3``)
 renders chats with mistral-common, not a Jinja template. mistral-common takes the
-reasoning effort and the response format as model settings (Tekken v15 and later),
-and counts each image's tokens from the decoded image.
+reasoning effort and the response format as model settings, which the prompt states
+when the tokenizer file declares them (Tekken v15 declares a reasoning effort), and
+counts each image's tokens from the decoded image.
 """
 
 from typing import Any
@@ -40,10 +41,6 @@ def _reasoning_effort(value: Any) -> Any:
 class MistralNativeServingExtension(ServingExtension):
     """Chat-request rules for the mistral-common renderer."""
 
-    def render_needs_media(self) -> bool:
-        """mistral-common derives each image's token count from the decoded image."""
-        return True
-
     def apply_chat_extensions(self, request: ChatCompletionRequest) -> None:
         """Validate the template controls and resolve the model settings.
 
@@ -54,8 +51,8 @@ class MistralNativeServingExtension(ServingExtension):
         ``chat_template_kwargs`` is accepted as well, and the two must agree when both
         are given. Unset, the checkpoint's default effort applies; a checkpoint that
         declares no efforts rejects one. A ``json_object`` or ``json_schema`` response
-        format is passed on as well, for the renderer to state in the prompt; it
-        constrains decoding either way.
+        format is passed on as well, for the prompt to state where the tokenizer file
+        declares that setting; it constrains decoding either way.
         """
         kwargs = dict(request.chat_template_kwargs or {})
         if request.chat_template is not None or kwargs.get("chat_template") is not None:

@@ -6,8 +6,8 @@ import base64
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import (TYPE_CHECKING, Any, Collection, Coroutine, Dict, List,
-                    NamedTuple, Optional, Tuple, TypedDict, Union)
+from typing import (Any, Collection, Coroutine, Dict, List, NamedTuple,
+                    Optional, Tuple, TypedDict, Union)
 from urllib.parse import urlparse
 
 import numpy as np
@@ -42,10 +42,6 @@ from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import \
-        MistralTokenizer
 
 logger = logging.get_logger(__name__)
 
@@ -674,6 +670,27 @@ def resolve_hf_chat_template(
 NATIVE_MISTRAL_MODEL_TYPES = frozenset(("mistral_common", ))
 
 
+def renders_from_loaded_media(model_type: Optional[str]) -> bool:
+    """Whether the chat renderer of `model_type` needs the media loaded first.
+
+    Other renderers render the chat while the media loads. mistral-common
+    derives each image's token count from the decoded image, so it is handed
+    the loaded `mm_data`, and cannot take precomputed multimodal embeddings.
+    """
+    return model_type in NATIVE_MISTRAL_MODEL_TYPES
+
+
+class ChatRejectedError(ValueError):
+    """The model's own chat renderer rejected the chat as an invalid request.
+
+    Raised for the chats mistral-common renders (Mistral-native checkpoints),
+    for example with a reasoning effort the tokenizer file does not declare. A
+    distinct type so that a caller that only needs the chat's length (the
+    KV-cache-aware router) can leave the request to the server, without
+    treating every ValueError raised during rendering the same way.
+    """
+
+
 class _RenderDispatch(NamedTuple):
     """The renderer `apply_chat_template` uses for a set of inputs.
 
@@ -810,162 +827,11 @@ def _build_openai_content(
     return content_list
 
 
-# The `chat_template_kwargs` keys mistral-common's chat encoder reads. It has
-# no Jinja template, so other keys have nothing to apply to.
-_NATIVE_MISTRAL_CHAT_KWARGS = frozenset(
-    ("continue_final_message", "reasoning_effort", "response_format"))
-
-
-def _native_mistral_response_format(response_format):
-    """An OpenAI `response_format` as mistral-common's, or None if it renders nothing.
-
-    `json_object` and a named `json_schema` render into the prompt's model
-    settings; other formats only constrain decoding. mistral-common renders
-    response formats from 1.13.0 on, which needs Python 3.11; with an older
-    release a response format only constrains decoding.
-    """
-    if not isinstance(response_format, dict):
-        return None
-    kind = response_format.get("type")
-    named = response_format.get("json_schema")
-    if kind not in ("json_object", "json_schema") or (
-            kind == "json_schema" and
-        (not isinstance(named, dict) or named.get("schema") is None
-         or not named.get("name"))):
-        return None
-    from mistral_common.protocol.instruct import request as mistral_request
-    if not hasattr(mistral_request, "JsonSchema"):
-        logger.warning_once(
-            "mistral-common renders response formats from 1.13.0 on (Python "
-            "3.11 or later); the prompt leaves the response format out, and it "
-            "only constrains decoding.")
-        return None
-    ResponseFormat = mistral_request.ResponseFormat
-    ResponseFormats = mistral_request.ResponseFormats
-    JsonSchema = mistral_request.JsonSchema
-    if kind == "json_object":
-        return ResponseFormat(type=ResponseFormats.json_object)
-    return ResponseFormat(type=ResponseFormats.json_schema,
-                          json_schema=JsonSchema(name=named["name"],
-                                                 schema=named["schema"],
-                                                 strict=bool(
-                                                     named.get("strict"))))
-
-
-# The URL of each image part in the messages `_native_mistral_messages` builds;
-# `_encode_native_mistral_chat` puts an image of the loaded image's size there.
-_NATIVE_MISTRAL_IMAGE_SLOT = "trtllm-loaded-image"
-
-
-def _encode_native_mistral_chat(tokenizer: "MistralTokenizer",
-                                messages: list[dict[str, Any]],
-                                image_sizes: list[tuple[int, int]], *,
-                                tools: Optional[list[dict[str, Any]]],
-                                continue_final_message: bool,
-                                reasoning_effort: Optional[str],
-                                response_format: Optional[Any]) -> list[int]:
-    """Token ids of a chat, encoded by mistral-common.
-
-    The image parts are slots that take, in order, a blank image of each
-    `image_sizes` entry (width, height): mistral-common makes an image's token
-    grid from its size alone, and the tokenizer's `grid_only_mistral` makes
-    the grid without processing pixels, which the input processor does.
-    `response_format` is mistral-common's, or None.
-    """
-    from mistral_common.protocol.instruct.chunk import ImageChunk, ImageURLChunk
-    from mistral_common.protocol.instruct.request import ChatCompletionRequest
-
-    # mistral-common before 1.13.0 has no response formats.
-    request_kwargs = ({} if response_format is None else {
-        "response_format": response_format
-    })
-    request = ChatCompletionRequest.from_openai(
-        messages=messages,
-        tools=tools,
-        continue_final_message=continue_final_message,
-        reasoning_effort=reasoning_effort,
-        **request_kwargs)
-    filled = 0
-    for message in request.messages:
-        content = getattr(message, "content", None)
-        if not isinstance(content, list):
-            continue
-        chunks = []
-        for chunk in content:
-            if isinstance(chunk, ImageURLChunk) and chunk.get_url(
-            ) == _NATIVE_MISTRAL_IMAGE_SLOT:
-                chunk = ImageChunk(image=Image.new("1", image_sizes[filled]))
-                filled += 1
-            chunks.append(chunk)
-        message.content = chunks
-    if filled != len(image_sizes):
-        raise ValueError(f"The chat has {filled} image slots for "
-                         f"{len(image_sizes)} images.")
-    return tokenizer.grid_only_mistral.encode_chat_completion(request).tokens
-
-
-def _native_mistral_tools(tools):
-    """OpenAI tool dicts in the form mistral-common validates: no null `strict`."""
-    if tools is None:
-        return None
-    normalized = []
-    for tool in tools:
-        function = tool.get("function")
-        if isinstance(function, dict) and function.get("strict", False) is None:
-            function = {
-                key: value
-                for key, value in function.items() if key != "strict"
-            }
-            tool = {**tool, "function": function}
-        normalized.append(tool)
-    return normalized
-
-
-def _validate_native_mistral_chat_args(messages, add_generation_prompt,
-                                       continue_final_message):
-    """Reject generation-prompt flags that contradict the final message."""
-    if add_generation_prompt and continue_final_message:
-        raise ValueError("Cannot set both `add_generation_prompt` and "
-                         "`continue_final_message` to True.")
-    last_role = messages[-1].get("role") if messages else None
-    if add_generation_prompt and last_role == "assistant":
-        raise ValueError(
-            "Cannot set `add_generation_prompt` to True when the last message "
-            "is from the assistant. Consider using `continue_final_message` "
-            "instead.")
-    if continue_final_message and last_role != "assistant":
-        raise ValueError("Cannot set `continue_final_message` to True when "
-                         "the last message is not from the assistant.")
-
-
-def _native_mistral_messages(
+def _openai_chat_messages(
     conversation: list[ConversationMessage],
     mm_placeholder_counts: list[dict[str, int]],
-    mm_data: Optional[Dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
-    """The chat as OpenAI messages, each image part in its place, and the image sizes.
-
-    Each image part is a slot (see `_encode_native_mistral_chat`); the sizes,
-    (width, height) in the order of the slots, are those of the loaded images.
-    """
-    from tensorrt_llm._torch.models.modeling_mistral import \
-        MistralCommonImageProcessor
-
-    mm_data = mm_data or {}
-    if set(mm_data) - {"image"}:
-        raise ValueError(
-            "Mistral-native checkpoints currently support image inputs only")
-    images = MistralCommonImageProcessor.image_list(mm_data.get("image"))
-    num_placeholders = sum(
-        sum(counts.values()) for counts in mm_placeholder_counts)
-    if num_placeholders != len(images):
-        # mistral-common sizes each image's tokens from the decoded image, so
-        # the images must be loaded before the chat is rendered.
-        raise ValueError(
-            f"The chat has {num_placeholders} images, but {len(images)} were "
-            "loaded for rendering; this route does not take images for "
-            "Mistral-native checkpoints.")
-    image_sizes = []
+) -> list[dict[str, Any]]:
+    """The conversation as OpenAI messages, each media part in its place."""
     messages = []
     for conv, counts in zip(conversation, mm_placeholder_counts):
         message = {
@@ -974,22 +840,9 @@ def _native_mistral_messages(
             if key not in ("media", "content_parts")
         }
         if counts or conv.get("content_parts"):
-            content = _build_openai_content(conv, counts)
-            for index, part in enumerate(content):
-                if part["type"] == "text":
-                    continue
-                content[index] = {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": _NATIVE_MISTRAL_IMAGE_SLOT
-                    }
-                }
-                image_sizes.append(
-                    MistralCommonImageProcessor.pil_image_size(
-                        images[len(image_sizes)]))
-            message["content"] = content
+            message["content"] = _build_openai_content(conv, counts)
         messages.append(message)
-    return messages, image_sizes
+    return messages
 
 
 def apply_chat_template(
@@ -1028,48 +881,25 @@ def apply_chat_template(
                                         tools=tools)
 
     if dispatch.kind == "mistral_native":
-        from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import \
-            MistralTokenizer
-        if isinstance(tokenizer, TransformersTokenizer) and not isinstance(
-                tokenizer, MistralTokenizer):
-            raise ValueError(
-                "The Mistral-native format renders chats with "
-                "mistral-common's MistralTokenizer, not an HF tokenizer "
-                f"({type(tokenizer).__name__})")
-        messages, image_sizes = _native_mistral_messages(
-            conversation, mm_placeholder_counts, mm_data)
-        requested = chat_template_kwargs or {}
-        continue_final_message = bool(
-            requested.get("continue_final_message", False))
-        _validate_native_mistral_chat_args(messages, add_generation_prompt,
-                                           continue_final_message)
-        ignored = sorted(set(requested) - _NATIVE_MISTRAL_CHAT_KWARGS)
-        if documents is not None:
-            ignored.append("documents")
-        if ignored:
-            logger.warning_once(
-                f"Mistral-native checkpoints render chats with mistral-common, which "
-                f"does not use {ignored}; ignoring them.")
         from mistral_common.exceptions import MistralCommonException
 
-        response_format = _native_mistral_response_format(
-            requested.get("response_format"))
-        # mistral-common validates the request against the checkpoint (for
-        # example a reasoning effort its tekken.json does not declare); its
-        # errors are invalid requests. add_generation_prompt only selects the
-        # validation above: the encoder always opens the assistant turn after
-        # a final user or tool message.
+        from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import \
+            MistralTokenizer
+        if not isinstance(tokenizer, MistralTokenizer):
+            raise ValueError("The Mistral-native format renders chats with "
+                             "mistral-common's MistralTokenizer, not "
+                             f"{type(tokenizer).__name__}")
         try:
-            return _encode_native_mistral_chat(
-                tokenizer,
-                messages,
-                image_sizes,
-                tools=_native_mistral_tools(tools),
-                continue_final_message=continue_final_message,
-                reasoning_effort=requested.get("reasoning_effort"),
-                response_format=response_format)
+            return tokenizer.render_chat(
+                _openai_chat_messages(conversation, mm_placeholder_counts),
+                mm_data,
+                add_generation_prompt=add_generation_prompt,
+                tools=tools,
+                documents=documents,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs)
         except MistralCommonException as error:
-            raise ValueError(str(error)) from error
+            raise ChatRejectedError(str(error)) from error
 
     if dispatch.kind == "deepseek_v41":
         # The native renderer deep-copies messages; omit pending media coroutines
@@ -1186,7 +1016,7 @@ async def async_apply_chat_template(
 
 async def async_apply_chat_template_with_mm(mm_coroutines, **kwargs):
     """Resolve native image geometry before encoding its chat token stream."""
-    if kwargs["model_type"] in NATIVE_MISTRAL_MODEL_TYPES:
+    if renders_from_loaded_media(kwargs["model_type"]):
         mm_data, mm_embeddings = await mm_coroutines
         if mm_embeddings:
             raise ValueError(
@@ -1494,12 +1324,33 @@ def default_multimodal_input_loader(
                 conv["content"] = add_multimodal_placeholders(
                     model_type, conv["content"], mm_placeholder_counts)
         native_mm_data = None
-        if model_type in NATIVE_MISTRAL_MODEL_TYPES:
+        if renders_from_loaded_media(model_type):
             if is_embedding:
                 raise ValueError(
                     "Native Mistral chat requires images, not external embeddings"
                 )
             native_mm_data, _ = mm_data_tracker.retrieve_all_sync()
+            # As the input processor does for a text prompt, the images go
+            # where the prompt has their placeholders, one per image, or
+            # after it when it has none.
+            for placeholder, count in mm_placeholder_counts.items():
+                if placeholder in conv["content"]:
+                    parts = conv["content"].split(placeholder)
+                    if len(parts) != count + 1:
+                        raise ValueError(
+                            f"The prompt has {len(parts) - 1} {placeholder} "
+                            f"placeholders for {count} images.")
+                    content_parts = []
+                    for index, part in enumerate(parts):
+                        if part:
+                            content_parts.append(part)
+                        if index < count:
+                            content_parts.append({
+                                "type": "image",
+                                "media_index": index
+                            })
+                    conv["content"] = "".join(parts)
+                    conv["content_parts"] = content_parts
         prompt = apply_chat_template(
             model_type=model_type,
             tokenizer=tokenizer,

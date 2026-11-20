@@ -31,7 +31,8 @@ import pytest
 from PIL import Image
 from test_common.mistral_tekken import load_tekken
 
-from tensorrt_llm.inputs.utils import apply_chat_template
+from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
+from tensorrt_llm.inputs.utils import ChatRejectedError, apply_chat_template
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 from tensorrt_llm.serve.render import render_conversation_with_media
@@ -54,12 +55,12 @@ _CITY_FORMAT = {
 }
 
 
-class _RecordingTokenizer:
+class _RecordingTokenizer(MistralTokenizer):
     """Records each mistral-common request the renderer encodes."""
 
     def __init__(self):
         self.calls = []
-        self.grid_only_mistral = SimpleNamespace(encode_chat_completion=self._encode)
+        self._grid_only_mistral = SimpleNamespace(encode_chat_completion=self._encode)
 
     def _encode(self, request):
         self.calls.append(request)
@@ -82,7 +83,13 @@ def _config(model_type=_MODEL_TYPE):
     return type("Config", (), {"model_type": model_type})()
 
 
-def test_the_renderer_gets_only_what_mistral_common_reads():
+def test_the_renderer_gets_only_what_mistral_common_reads(monkeypatch):
+    from tensorrt_llm._torch.models.checkpoints.mistral import tokenizer as tokenizer_module
+
+    warnings = []
+    monkeypatch.setattr(
+        tokenizer_module.logger, "warning_once", lambda message, key: warnings.append(message)
+    )
     tools = [
         {"type": "function", "function": {"name": "a", "description": None, "strict": None}},
         {"type": "function", "function": {"name": "b", "strict": True}},
@@ -95,9 +102,15 @@ def test_the_renderer_gets_only_what_mistral_common_reads():
         tools=tools,
         chat_template_kwargs={"reasoning_effort": "high", "enable_thinking": False, "foo": 1},
         documents=[{"title": "t", "text": "x"}],
+        # A server --chat_template reaches the renderer as this.
+        chat_template="{{ messages }}",
     )
     _render(tokenizer, _HI)
     request, unset = tokenizer.calls
+    # What mistral-common does not read is named, not dropped silently.
+    assert len(warnings) == 1
+    for ignored in ("enable_thinking", "foo", "documents", "chat_template"):
+        assert repr(ignored) in warnings[0]
     # A null `strict` is dropped: mistral-common refuses it.
     assert [tool.function.name for tool in request.tools] == ["a", "b"]
     assert str(getattr(request.reasoning_effort, "value", request.reasoning_effort)) == "high"
@@ -130,7 +143,8 @@ def test_generation_flags_must_agree_with_the_final_message(
         # mistral-common continues the final assistant message as a prefix.
         assert tokenizer.calls[0].messages[-1].prefix is True
         return
-    with pytest.raises(ValueError, match=match):
+    # An invalid request, as when mistral-common itself rejects the chat.
+    with pytest.raises(ChatRejectedError, match=match):
         _render(tokenizer, messages, **kwargs)
     assert tokenizer.calls == []
 
@@ -248,6 +262,7 @@ def _request_ids(tokenizer, request):
             documents=request.documents,
             chat_template_kwargs=request.chat_template_kwargs or {},
             injected_chat_template_kwargs=request.injected_chat_template_kwargs,
+            truncate_prompt_tokens=request.truncate_prompt_tokens,
         )
     )
     assert rendered.text is None
@@ -429,14 +444,55 @@ def _anthropic_route(tokenizer, effort):
 def test_a_reasoning_effort_is_checked_against_the_checkpoint(tokenizer, route, effort):
     """Every route passes the effort to mistral-common.
 
-    One the checkpoint declares renders; any other is a ValueError, which every route answers
-    with HTTP 400.
+    One the checkpoint declares renders; any other is a rejected chat (a ValueError), which
+    every route answers with HTTP 400.
     """
     if effort in _declared_efforts(tokenizer):
         assert route(tokenizer, effort) == _mistral_ids(tokenizer, _HI, reasoning_effort=effort)
         return
-    with pytest.raises(ValueError, match="reasoning_effort"):
+    with pytest.raises(ChatRejectedError, match="reasoning_effort"):
         route(tokenizer, effort)
+
+
+def test_kv_cache_truncation_renders_the_chat_routes_prefix(tokenizer):
+    """The message-based KV-cache truncation renders the prefix the cache holds.
+
+    It applies the request's reasoning effort as the chat route does.
+    """
+    from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
+    from tensorrt_llm.serve.resource_governor import _chat_template_kwargs
+
+    efforts = _declared_efforts(tokenizer)
+    if not efforts:
+        pytest.skip("this Tekken file declares no reasoning effort")
+    effort = efforts[-1]
+    request = KVCacheTruncateRequest(model="m", messages=_HI, reasoning_effort=effort)
+    kwargs = _chat_template_kwargs(request, get_serving_extension(_MODEL_TYPE))
+    assert kwargs == {"reasoning_effort": effort}
+    truncated = _server_ids(tokenizer, messages=_HI, chat_template_kwargs=kwargs)
+    assert truncated == _server_ids(tokenizer, messages=_HI, reasoning_effort=effort)
+
+
+def test_a_developer_message_renders_as_a_system_message(tokenizer):
+    """mistral-common converts a developer message only from 1.13.1 on."""
+    system = [{"role": "system", "content": "Be brief."}, *_HI]
+    developer = [{**system[0], "role": "developer"}, *_HI]
+    expected = _mistral_ids(tokenizer, system)
+    assert _render(tokenizer, developer) == _render(tokenizer, system) == expected
+
+
+def test_truncation_keeps_the_last_ids_of_a_chat_without_images(tokenizer):
+    """The chat route keeps the last truncate_prompt_tokens of the ids it renders.
+
+    The engine truncates a text prompt that way; a truncation that would cut image tokens is
+    refused.
+    """
+    full = _server_ids(tokenizer, messages=_HI)
+    assert len(full) > 1
+    assert _server_ids(tokenizer, messages=_HI, truncate_prompt_tokens=1) == full[-1:]
+    assert _server_ids(tokenizer, messages=_HI, truncate_prompt_tokens=len(full)) == full
+    with pytest.raises(ValueError, match="carries media"):
+        _server_ids(tokenizer, messages=_IMAGES, truncate_prompt_tokens=1)
 
 
 @pytest.mark.parametrize(

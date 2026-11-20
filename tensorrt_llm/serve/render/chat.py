@@ -42,6 +42,7 @@ from tensorrt_llm.inputs.utils import (
     _has_python_chat_template,
     apply_chat_template,
     async_apply_chat_template,
+    renders_from_loaded_media,
 )
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
@@ -176,8 +177,12 @@ def _finish(
     encode_rendered: Optional[Callable[[str, Any], List[int]]],
 ) -> RenderedPrompt:
     if not isinstance(rendered, str):
-        # A native renderer that tokenizes for itself returns ids.
-        return RenderedPrompt(token_ids=list(rendered))
+        # A native renderer that tokenizes for itself returns ids; truncation keeps their
+        # last ``truncate_prompt_tokens``, as it does a text prompt's.
+        token_ids = list(rendered)
+        if truncate_prompt_tokens is not None:
+            token_ids = token_ids[-truncate_prompt_tokens:]
+        return RenderedPrompt(token_ids=token_ids)
     template_text = rendered
     prefix_applied = False
     if forced_prefix is not None:
@@ -222,7 +227,9 @@ async def render_conversation(
     """Render an already-parsed conversation without blocking the event loop.
 
     ``mm_data`` is the loaded media, for a renderer that needs it (see
-    ``ServingExtension.render_needs_media``); others render without it.
+    ``renders_from_loaded_media``); others render without it. Such a renderer returns
+    token ids, which ``truncate_prompt_tokens`` truncates even when ``tokenize`` is off; a
+    truncation that would cut the media's tokens raises ``ValueError``.
     """
     # A tokenizer-native template tokenizes segment by segment, so control-token strings inside
     # user or tool text stay text. Encoding the finished string would turn them into special
@@ -248,6 +255,16 @@ async def render_conversation(
             mm_data=mm_data,
         )
     )
+    if (
+        truncate_prompt_tokens is not None
+        and not isinstance(rendered, str)
+        and len(rendered) > truncate_prompt_tokens
+        and any(mm_data.values() if mm_data else ())
+    ):
+        raise ValueError(
+            f"truncate_prompt_tokens={truncate_prompt_tokens} would cut a prompt of "
+            f"{len(rendered)} tokens that carries media; its media tokens cannot be truncated."
+        )
     if tokenize:
         # Tokenization is CPU work that scales with the prompt; keep it off the loop.
         return await asyncio.to_thread(
@@ -278,11 +295,11 @@ async def render_conversation_with_media(
 
     Returns ``(rendered, (mm_data, mm_embeddings))``. Rendering overlaps the media
     loading, unless the model's renderer needs the loaded media (see
-    ``ServingExtension.render_needs_media``); it then renders afterwards, from the
+    ``renders_from_loaded_media``); it then renders afterwards, from the
     loaded media, which rules out precomputed embeddings. ``render_kwargs`` are
     those of :func:`render_conversation`.
     """
-    if not res.extension.render_needs_media():
+    if not renders_from_loaded_media(res.model_type):
         rendered, media = await asyncio.gather(
             render_conversation(res, **render_kwargs), mm_coroutines
         )
