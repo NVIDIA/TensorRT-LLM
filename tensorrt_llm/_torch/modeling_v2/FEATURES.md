@@ -15,12 +15,9 @@ hold, and records what every routed target does with them today.
 Features fall into three kinds, by what goes wrong when a target does not serve
 one:
 
-- **Basic** features are the ones every model in Modeling V1 serves (see the
-  Model-Feature Support Matrix in
-  [supported models](../../../docs/source/models/supported-models.md)). A user
-  expects them to work, so every target serves them by default; a target that
-  does not is the exception and says so, and turning the feature on for it is an
-  error.
+- **Basic** features are the foundational features every target is expected to
+  serve, so a target serves them by default. A target that does not is the
+  exception and says so, and turning the feature on for it is an error.
 - **Advanced functional** features change what the engine computes. A target
   that ignores one returns wrong results, so only a target that declares it is
   built; otherwise `auto` falls back to Modeling V1.
