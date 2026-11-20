@@ -10,6 +10,7 @@ from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as sha
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     _LOCKED_KERNEL_KWARGS,
     _SF_PADDING_BLOCK,
+    MegaMoeKernelProperties,
     Sm100MegaMoENvfp4Runner,
     _launch_cluster_configuration,
     _unpack_tactic,
@@ -271,7 +272,7 @@ class RubinDeferredMegaMoERunner(RubinMegaMoERunner):
     defer_topk_reduce = True
 
 
-def query_rubin_kernel_properties(**kwargs):
+def query_rubin_kernel_properties(**kwargs) -> MegaMoeKernelProperties:
     if kwargs["max_tokens_per_rank"] not in GEN_TOKEN_BUCKETS:
         return shared.query_megamoe_kernel_properties(**kwargs)
     kwargs = dict(kwargs)
@@ -280,7 +281,12 @@ def query_rubin_kernel_properties(**kwargs):
     if tactic is None:
         tactic = runner._default_tactic(runner.max_tokens_per_rank)
     kernel, _ = runner._resolve_kernel_descriptor(tactic, allow_fallback=True)
-    return int(kernel.get_workspace_sizes()[1]), True
+    # The generation-phase kernels read their inputs in place and do not mask invalid routes.
+    return MegaMoeKernelProperties(
+        shared_workspace_bytes=int(kernel.get_workspace_sizes()[1]),
+        supports_direct_inputs=True,
+        masks_invalid_routes=False,
+    )
 
 
 def runner_kernel(runner):

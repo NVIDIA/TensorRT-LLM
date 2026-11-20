@@ -222,7 +222,7 @@ def test_unsupported_configuration_fails_closed(env, field, value, ep_size) -> N
 def test_layout_reaches_query_and_provider(env, monkeypatch) -> None:
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op_module
 
-    query = Mock(return_value=(128, True))
+    query = Mock(return_value=op_module.MegaMoeKernelProperties(128, True, False))
     provider = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(op_module, "query_megamoe_kernel_properties", query, raising=False)
     monkeypatch.setattr(op_module, "get_megamoe_symm_provider", provider, raising=False)

@@ -182,6 +182,10 @@ l0_dgx_b200:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=ALLGATHER-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_MXFP4_FP8-routing=Renormalize]
   # GPT-OSS MXFP4/FP8 reference checks for DEP/DeepEP and TTP (aligned and padded shards).
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_FP8 and 1.702 and bfloat16 and Renormalize and ((DEP and DEEPEP and not DEEPEPLOWLATENCY and e60_k4_h2048_i1408) or (TTP and NVLINK_ONE_SIDED and (e8_k1_h512_i512 or e60_k4_h2048_i1408)))"
+  # Both MegaMoE backends under online EPLB: where each issues the statistic-allreduce wait.
+  - unittest/_torch/moe/test_megamoe_before_launch.py::test_online_eplb_statistic_wait_order
+  # MegaMoE CuteDSL on four ranks drops padding rows under every combine format.
+  - unittest/_torch/moe/test_megamoe_live_rows_gpu.py::test_megamoe_cutedsl_drops_padding_rows
 - condition:
     ranges:
       system_gpu_count:

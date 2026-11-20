@@ -295,39 +295,36 @@ class TestMoeGate:
 
     @pytest.mark.parametrize("is_hash", [False, True])
     def test_gate_forward_without_tokens_launches_nothing(self, is_hash):
-        """No tokens launch no kernel: no launch error is reported, now or by a later call."""
+        """Regression: gate_forward launched an empty grid on an empty batch, leaving a launch
+        error pending for the next op that checks its launches."""
+
+        def pending_launch_error():
+            # An op that checks its launches (route staging of one row) reports and clears it.
+            ids = torch.zeros(1, TOPK, dtype=torch.int32, device="cuda")
+            weights = torch.zeros(1, TOPK, device="cuda")
+            try:
+                torch.ops.trtllm.megamoe_stage_routes(ids, weights, ids.clone(), weights.clone())
+            except RuntimeError as error:
+                return repr(error)
+            return None
+
+        pending_launch_error()  # clear an error an earlier test may have left
         empty_ids = torch.empty(0, dtype=torch.int32, device="cuda")
         bias = torch.empty(0 if is_hash else N_EXPERTS, dtype=torch.float32, device="cuda")
         tid2eid = torch.zeros(16, TOPK, dtype=torch.int32, device="cuda") if is_hash else empty_ids
-        out_weights = torch.empty(0, TOPK, dtype=torch.float32, device="cuda")
-        out_indices = torch.empty(0, TOPK, dtype=torch.int32, device="cuda")
         torch.ops.trtllm.gate_forward(
             torch.empty(0, N_EXPERTS, dtype=torch.float32, device="cuda"),
             bias,
             empty_ids,
             tid2eid,
-            out_weights,
-            out_indices,
+            torch.empty(0, TOPK, dtype=torch.float32, device="cuda"),
+            torch.empty(0, TOPK, dtype=torch.int32, device="cuda"),
             TOPK,
             1.0,
             is_hash,
         )
-        # A call with tokens checks its launch, which reports an error left by the call above.
-        scores = torch.randn(4, N_EXPERTS, dtype=torch.float32, device="cuda")
-        weights = torch.empty(4, TOPK, dtype=torch.float32, device="cuda")
-        indices = torch.empty(4, TOPK, dtype=torch.int32, device="cuda")
-        torch.ops.trtllm.gate_forward(
-            scores,
-            torch.randn(N_EXPERTS, dtype=torch.float32, device="cuda"),
-            empty_ids,
-            empty_ids,
-            weights,
-            indices,
-            TOPK,
-            1.0,
-            False,
-        )
         torch.cuda.synchronize()
+        assert pending_launch_error() is None
 
     @pytest.mark.parametrize("batch_size", [32, 128, 256, 1024])
     def test_gate_forward_performance(self, batch_size):

@@ -14,6 +14,7 @@
 # limitations under the License.
 """Shared MoE test utilities."""
 
+import importlib
 import logging
 import os
 import time
@@ -1710,3 +1711,23 @@ def refit_moe_in_buckets(model: torch.nn.Module, buckets: list[dict[str, torch.T
     for bucket in buckets:
         model.load_weights([dict(bucket)], allow_partial_loading=True)
     finalize_moe_refit(model)
+
+
+def count_separate_staging(patch: pytest.MonkeyPatch, staged: list) -> None:
+    """Record in ``staged`` every separate staging launch (not the DSV4 fused route+quant)."""
+    stage = MegaMoECuteDsl._stage_inputs
+    patch.setattr(
+        MegaMoECuteDsl,
+        "_stage_inputs",
+        lambda *a, **k: staged.append("_stage_inputs") or stage(*a, **k),
+    )
+    # Not the module's torch.ops: the worker is pickled by value, and that namespace does not pickle.
+    trtllm_ops = importlib.import_module("torch").ops.trtllm
+    for name in ("megamoe_stage_inputs", "megamoe_stage_routes"):
+        if hasattr(trtllm_ops, name):
+            staging_op = getattr(trtllm_ops, name)
+            patch.setattr(
+                trtllm_ops,
+                name,
+                lambda *a, _op=staging_op, _name=name, **k: staged.append(_name) or _op(*a, **k),
+            )

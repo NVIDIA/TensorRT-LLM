@@ -22,6 +22,7 @@ from typing import Optional
 import cloudpickle
 import pytest
 import torch
+from _torch.moe.moe_test_utils import count_separate_staging
 from _torch.moe.quantize_utils import NVFP4QuantizeUtil
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
@@ -30,7 +31,6 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import SwigluActivation, create_moe
 from tensorrt_llm._torch.moe.fused_moe import moe_warmup_placement as mwp
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_cute_dsl
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -294,12 +294,7 @@ def _run_placement(gens: int, draft_len: int) -> None:
                     out.copy_(_forward(moe, balancer, x, logits))
                 graphs.append((graph, out))
         staging, separate_counts = [], []
-        stage = mega_moe_cute_dsl.stage_megamoe_inputs
-        patch.setattr(
-            mega_moe_cute_dsl,
-            "stage_megamoe_inputs",
-            lambda *a, **k: staging.append(1) or stage(*a, **k),
-        )
+        count_separate_staging(patch, staging)
         patch.setattr(mwp, "count_routing", lambda *a, **k: separate_counts.append(1))
         moved = [0] * len(layers)
         # Step 1 plans under a min_round_gain no plan meets: it moves nothing but halves the
@@ -367,7 +362,9 @@ def _run_placement(gens: int, draft_len: int) -> None:
             None if torch.equal(controller._hist, frozen_counts) else "counted after the freeze"
         )
         patch.undo()
-        _assert_on_all_ranks(f"re-staged launches: {len(staging)}" if staging else None)
+        _assert_on_all_ranks(
+            f"re-staged launches: {len(staging)} by {sorted(set(staging))}" if staging else None
+        )
         _assert_on_all_ranks(
             f"separate count launches: {len(separate_counts)}" if separate_counts else None
         )
