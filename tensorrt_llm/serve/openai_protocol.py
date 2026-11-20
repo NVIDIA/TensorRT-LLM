@@ -372,7 +372,7 @@ class DisaggregatedParams(OpenAIBaseModel):
 
 
 class ContextCancellationReservationRequest(OpenAIBaseModel):
-    disagg_request_id: int = Field(ge=0, strict=True)
+    disagg_request_id: int = Field(gt=0, strict=True)
     authorization_id: str = Field(min_length=32,
                                   max_length=32,
                                   pattern=r"^[0-9a-f]{32}$")

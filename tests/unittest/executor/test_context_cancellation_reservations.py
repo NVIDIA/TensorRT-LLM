@@ -166,16 +166,16 @@ def test_full_reservations_reject_new_work_without_evicting_live_tokens(
     now = [100.0]
     monkeypatch.setattr(context_cancellation.time, "monotonic", lambda: now[0])
     owner = ContextCancellationReservations()
-    tokens = [_reserve(owner, index) for index in range(1024)]
+    tokens = [_reserve(owner, request_id) for request_id in range(1, 1025)]
     with pytest.raises(RuntimeError, match="reservations are full"):
-        _reserve(owner, 1024)
+        _reserve(owner, 1025)
     assert owner.cancel(tokens[0], Mock()) == "not_submitted"
-    _reserve(owner, 1024)
-    now[0] = 161.0
     _reserve(owner, 1025)
+    now[0] = 161.0
+    _reserve(owner, 1026)
     assert len(owner._pending) == 1
     with pytest.raises(ValueError, match="admission is closed"):
-        owner.submit(tokens[1], 1, Mock())
+        owner.submit(tokens[1], 2, Mock())
 
 
 @pytest.mark.parametrize(
@@ -305,19 +305,22 @@ def test_submission_requires_exact_integer_identity(request_id: object) -> None:
         owner.submit(token, request_id, Mock())
 
 
-@pytest.mark.parametrize("request_id", [-1, True, "17", None, 2**64, 10**500])
+@pytest.mark.parametrize("request_id", [-1, 0, True, "17", None, 2**64, 10**500])
 def test_invalid_reservation_identity(request_id: object) -> None:
-    """Reject identities outside the immutable integer request namespace."""
+    """Invalid identities cannot change pending admissions or replay accounting."""
     owner = ContextCancellationReservations()
+    _reserve(owner, 17)
+    pending, authorizations = owner._pending.copy(), owner._authorizations.copy()
     with pytest.raises(ValueError, match="integer request ID"):
         _reserve(owner, request_id)
-    assert not owner._pending and not owner._authorizations
+    assert owner._pending == pending
+    assert owner._authorizations == authorizations
 
 
-def test_largest_native_request_identity_has_usable_token() -> None:
-    """The largest native uint64 identity remains valid at every token boundary."""
+@pytest.mark.parametrize("request_id", [1, 2**64 - 1], ids=["minimum", "maximum"])
+def test_native_request_identity_bounds_have_usable_tokens(request_id: int) -> None:
+    """Both ends of the positive uint64 range survive reserve, submit, and cancel."""
     owner = ContextCancellationReservations()
-    request_id = 2**64 - 1
     token = _reserve(owner, request_id)
     assert len(token) <= 512
     assert owner.submit(token, request_id, lambda: request_id) == request_id
