@@ -667,10 +667,10 @@ def test_prepare_sampling_params_explicit_end_id_tokenizes_bad_words_only():
     assert sampling_params._get_stop_words() == []
 
 
-@pytest.mark.parametrize(
-    "words", [{"stop": "STOP"}, {"stop": ""}, {"bad": "BAD"}, {"bad": ""}, {"bad": ["BAD"]}]
-)
+@pytest.mark.parametrize("words", [{"stop": "STOP"}, {"bad": "BAD"}, {"bad": ""}, {"bad": ["BAD"]}])
 def test_prepare_sampling_params_explicit_end_id_strings_without_tokenizer_are_rejected(words):
+    # An empty stop string is rejected by SamplingParams itself; see
+    # test_sampling_params_rejects_empty_stop_string.
     with pytest.raises(ValueError, match="tokenizer is required"):
         _prepare_sampling_params(SamplingParams(end_id=7, **words), None)
 
