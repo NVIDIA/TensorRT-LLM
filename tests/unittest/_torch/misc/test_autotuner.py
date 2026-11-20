@@ -1970,11 +1970,14 @@ class Base(TunableRunner):
 def fp_modules(tmp_path, monkeypatch):
     """Modules written to tmp_path; those named fp_* stand in for tensorrt_llm
     ones, and fp_base holds a TunableRunner base."""
-    import importlib.util
     import textwrap
+    import types
 
     monkeypatch.setattr(autotuner, "_tracked",
                         lambda module: module.startswith("fp_"))
+    # Rewritten sources must never run from a stale .pyc (one written within
+    # the same second for a source of the same size).
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
     # The modules are written after this process started; only
     # test_code_fingerprint_marks_sources_edited_after_start wants that seen.
     monkeypatch.setattr(autotuner, "_EPOCH_NS", float("inf"))
@@ -1985,11 +1988,12 @@ def fp_modules(tmp_path, monkeypatch):
 
     def load(name, text):
         write(name, text)
-        spec = importlib.util.spec_from_file_location(name,
-                                                      tmp_path / f"{name}.py")
-        module = importlib.util.module_from_spec(spec)
+        path = tmp_path / f"{name}.py"
+        module = types.ModuleType(name)
+        module.__file__ = str(path)
         monkeypatch.setitem(sys.modules, name, module)
-        spec.loader.exec_module(module)
+        # Compiled from the source just written, never from bytecode.
+        exec(compile(path.read_text(), str(path), "exec"), module.__dict__)
         return module
 
     def edit(name, old, new):
@@ -2278,7 +2282,11 @@ def test_code_fingerprint_follows_which_definition_a_name_binds(fp_modules):
         def alternate():
             return 1
         """)
-    runner_source = """
+    fp_modules.load("fp_impl_a", "def run():\n    return 0\n")
+    fp_modules.load("fp_impl_b", "def run():\n    return 1\n")
+    # Each runner source, and the swap of the two definitions its names bind.
+    cases = [
+        ("""
         from fp_base import Base
         from fp_impls import primary as first, alternate as second
 
@@ -2286,15 +2294,78 @@ def test_code_fingerprint_follows_which_definition_a_name_binds(fp_modules):
         class Runner(Base):
             def forward(self, inputs, tactic=-1, **kwargs):
                 return (first if tactic == 0 else second)()
-        """
-    [before] = fp_modules.fingerprints(
-        fp_modules.load("fp_runners", runner_source).Runner)
-    assert fp_modules.fingerprints(
-        fp_modules.load("fp_runners", runner_source).Runner) == [before]
-    swapped = runner_source.replace("primary as first, alternate as second",
-                                    "alternate as first, primary as second")
-    assert fp_modules.fingerprints(
-        fp_modules.load("fp_runners", swapped).Runner) != [before]
+        """, "primary as first, alternate as second",
+         "alternate as first, primary as second"),
+        ("""
+        from fp_base import Base
+        import fp_impl_a as first, fp_impl_b as second
+
+
+        class Runner(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return first.run() if tactic == 0 else second.run()
+        """, "fp_impl_a as first, fp_impl_b as second",
+         "fp_impl_b as first, fp_impl_a as second"),
+    ]
+    for source, bindings, swapped_bindings in cases:
+        [before] = fp_modules.fingerprints(
+            fp_modules.load("fp_runners", source).Runner)
+        assert fp_modules.fingerprints(
+            fp_modules.load("fp_runners", source).Runner) == [before]
+        swapped = source.replace(bindings, swapped_bindings)
+        assert fp_modules.fingerprints(
+            fp_modules.load("fp_runners", swapped).Runner) != [before]
+
+
+def test_code_fingerprint_follows_modules_imported_in_a_function(fp_modules):
+    fp_modules.load("fp_helpers", "def helper():\n    return 0\n")
+    (fp_modules.root / "fp_moe").mkdir()
+    fp_modules.write("fp_moe/__init__", "")
+    fp_modules.write(
+        "fp_moe/decode", """
+        from fp_helpers import helper
+
+
+        def select():
+            return helper()
+
+
+        def unused():
+            return 0
+        """)
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        def run_with(module):
+            return module.select()
+
+
+        class UsesAttribute(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                from fp_moe import decode
+                return decode.select()
+
+
+        class PassesModule(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                from fp_moe import decode
+                return run_with(decode)
+        """)
+    classes = (runners.UsesAttribute, runners.PassesModule)
+
+    before = fp_modules.fingerprints(*classes)
+    # What the module's code uses counts, in another file too.
+    fp_modules.edit("fp_helpers", "return 0", "return 42")
+    after_helper = fp_modules.fingerprints(*classes)
+    assert _changed(before, after_helper) == [True, True]
+    # A module used only through its attributes counts by those; one passed
+    # on as a whole counts whole.
+    fp_modules.edit("fp_moe/decode", "def unused():\n    return 0",
+                    "def unused():\n    return 42")
+    after_unused = fp_modules.fingerprints(*classes)
+    assert _changed(after_helper, after_unused) == [False, True]
 
 
 def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
@@ -2333,21 +2404,28 @@ def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
         class UsesNativeOp(Base):
             def forward(self, inputs, tactic=-1, **kwargs):
                 return torch.ops.fp_test.native_{op}(inputs[0])
+
+
+        class UsesNativeClass(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                runner = torch.classes.fp_test.Runner_{op}()
+                return list(range(runner.get_num_configs()))
         """)
     build = {"id": "a"}
     monkeypatch.setattr(autotuner, "_native_build_id", lambda: build["id"])
-    classes = (runners.UsesPythonOp, runners.UsesNativeOp)
+    classes = (runners.UsesPythonOp, runners.UsesNativeOp,
+               runners.UsesNativeClass)
 
     before = fp_modules.fingerprints(*classes)
     fp_modules.edit("fp_ops", "return x.clone()", "return x.clone() + 0")
     after_edit = fp_modules.fingerprints(*classes)
-    assert _changed(before, after_edit) == [True, False]
+    assert _changed(before, after_edit) == [True, False, False]
     fp_modules.edit("fp_ops", "x.mul(1)", "x.mul(10)")
     after_kernel_edit = fp_modules.fingerprints(*classes)
-    assert _changed(after_edit, after_kernel_edit) == [True, False]
+    assert _changed(after_edit, after_kernel_edit) == [True, False, False]
     build["id"] = "b"
     after_rebuild = fp_modules.fingerprints(*classes)
-    assert _changed(after_kernel_edit, after_rebuild) == [False, True]
+    assert _changed(after_kernel_edit, after_rebuild) == [False, True, True]
 
 
 def test_code_fingerprint_marks_sources_edited_after_start(

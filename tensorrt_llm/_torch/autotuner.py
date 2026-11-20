@@ -371,6 +371,9 @@ _CLASS_METADATA = frozenset(
      "__orig_bases__", "__parameters__", "__qualname__",
      "__static_attributes__", "__weakref__"))
 _OPERATOR_TYPES = (torch._ops.OpOverload, torch._ops.OpOverloadPacket)
+_SCRIPT_CLASS = getattr(torch._C, "ScriptClass", ())
+# torch.ops / torch.classes namespaces that torch itself registers.
+_TORCH_NAMESPACES = ("aten", "prim", "prims")
 # A source file changed after this may no longer hold the code this process
 # runs.
 _EPOCH_NS = time.time_ns()
@@ -392,6 +395,12 @@ class _SourceIndex(NamedTuple):
     loads: Dict[str, Tuple[str, ...]]
     # name -> (level, module, attr) of each module-level `from` import.
     imports: Dict[str, Tuple[int, str, str]]
+
+
+class _Alias(NamedTuple):
+    """The module a global name refers to, when code reaches past the name
+    into the module's attributes."""
+    module: str
 
 
 class _External(NamedTuple):
@@ -563,27 +572,42 @@ def _attribute(obj, name: str, default=None):
         return default
 
 
+def _torch_namespace(module_name: str) -> Optional[str]:
+    """The namespace a torch.ops or torch.classes namespace module stands for
+    (torch names the latter `torch.classes<namespace>`), or None."""
+    for prefix in ("torch.ops.", "torch.classes"):
+        if module_name.startswith(prefix) and len(module_name) > len(prefix):
+            return module_name[len(prefix):].lstrip(".").partition(".")[0]
+    return None
+
+
 def _narrowable(module, attr: str) -> bool:
     """Whether to look `attr` up on `module`. Only tracked modules, and the
-    torch.ops chain that leads to an operator: a module elsewhere may import
-    on attribute access (PEP 562), and counts by its package anyway."""
+    torch.ops and torch.classes chains that lead to native code: a module
+    elsewhere may import on attribute access (PEP 562), and counts by its
+    package anyway."""
     name = getattr(module, "__name__", "")
     if not isinstance(name, str):
         return False
-    return (_tracked(name) or (name == "torch" and attr == "ops")
-            or name == "torch.ops" or name.startswith("torch.ops."))
+    return (_tracked(name) or (name == "torch" and attr in ("ops", "classes"))
+            or name in ("torch.ops", "torch.classes")
+            or _torch_namespace(name) is not None)
 
 
-def _narrow(name: str, obj, attrs) -> Tuple[str, Any]:
-    """module.attr chains name the attribute, not the whole module."""
+def _narrow(name: str, obj, attrs):
+    """(name, object) for a chain of attributes: module.attr chains name the
+    attribute, not the whole module. A module reached under another name
+    (`import a as first`) also yields that binding, as an _Alias."""
     for attr in attrs:
         if not inspect.ismodule(obj) or not _narrowable(obj, attr):
             break
         value = _attribute(obj, attr, _MISSING)
         if value is _MISSING:
             break
+        if name != obj.__name__:
+            yield name, _Alias(obj.__name__)
         name, obj = f"{obj.__name__}.{attr}", value
-    return name, obj
+    yield name, obj
 
 
 def _resolve_loads(names, globals_: Dict[str, Any]):
@@ -592,7 +616,7 @@ def _resolve_loads(names, globals_: Dict[str, Any]):
     for dotted in names:
         head, *attrs = dotted.split(".")
         if head in globals_:
-            yield _narrow(f"{module_name}.{head}", globals_[head], attrs)
+            yield from _narrow(f"{module_name}.{head}", globals_[head], attrs)
 
 
 def _load_module(name: str):
@@ -609,63 +633,111 @@ def _load_module(name: str):
 
 
 def _import_refs(name: str, package: str, level: int, fromlist, following):
-    """(name, object) for what an import statement binds. A module outside
-    the tracked code counts by its package: it is neither imported nor
-    looked into."""
+    """(local, name, object) for what an import statement binds (local is the
+    variable it stores to, when one follows). A module outside the tracked
+    code counts by its package: it is neither imported nor looked into."""
     try:
         target = (importlib.util.resolve_name("." * level +
                                               name, package) if level else name)
     except (ImportError, ValueError):
         return
     if not _tracked(target):
-        yield target, _External(target)
+        yield None, target, _External(target)
         return
     module = _load_module(target)
     if module is None:
         return
     if fromlist is None:
-        # `import a.b` binds `a` and `import a.b as c` binds `a.b` (through
-        # IMPORT_FROM on `a`); either way the code reaches `a.b`.
-        yield target, module
+        # `import a.b` binds `a`; `import a.b as c` binds `a.b`, reached
+        # through IMPORT_FROM on `a`.
+        aliased = False
+        for ins in following:
+            if ins.opname == "IMPORT_FROM":
+                aliased = True
+            elif ins.opname.startswith("STORE"):
+                if aliased:
+                    yield ins.argval, target, module
+                else:
+                    top = target.partition(".")[0]
+                    yield ins.argval, top, sys.modules.get(top, module)
+                return
+            elif ins.opname not in ("SWAP", "POP_TOP"):
+                break
+        yield None, target, module
         return
+    attr = None
     for ins in following:
         if ins.opname == "IMPORT_FROM":
-            value = _attribute(module, ins.argval, _MISSING)
+            attr = ins.argval
+            value = _attribute(module, attr, _MISSING)
             if value is _MISSING:
-                value = _load_module(f"{target}.{ins.argval}")
+                value = _load_module(f"{target}.{attr}")
                 if value is None:
-                    continue
-            yield f"{target}.{ins.argval}", value
+                    attr = None
+        elif ins.opname.startswith("STORE") and attr is not None:
+            yield ins.argval, f"{target}.{attr}", value
+            attr = None
         elif not ins.opname.startswith("STORE"):
             break
 
 
-def _code_refs(code: types.CodeType, globals_: Dict[str, Any]):
+def _loaded_locals(ins) -> Tuple[str, ...]:
+    """The local or cell variables an instruction loads, in order."""
+    if ins.opname == "STORE_FAST_LOAD_FAST":
+        return (ins.argval[1], )
+    if ins.opname.startswith(("LOAD_FAST", "LOAD_DEREF")):
+        return ins.argval if isinstance(ins.argval, tuple) else (ins.argval, )
+    return ()
+
+
+def _code_refs(code: types.CodeType, globals_: Dict[str, Any], outer=None):
     """(name, object) for what a code object, and the code nested in it, loads
-    by name: globals, attributes of global modules, and imports."""
+    by name: globals, attributes of global modules, imports, and attributes
+    of the modules it imports into local variables (or that `outer`, the
+    enclosing code's, holds)."""
     instructions = list(dis.get_instructions(code))
     package = globals_.get("__package__") or ""
     module_name = globals_.get("__name__", "")
+
+    def attrs_after(i):
+        attrs = []
+        for nxt in instructions[i + 1:]:
+            if nxt.opname not in ("LOAD_ATTR", "LOAD_METHOD"):
+                break
+            attrs.append(nxt.argval)
+        return attrs
+
+    modules: Dict[str, Tuple[str, Any]] = dict(outer or {})
+    for i, ins in enumerate(instructions):
+        if ins.opname != "IMPORT_NAME":
+            continue
+        level = instructions[i - 2].argval if i >= 2 else 0
+        fromlist = instructions[i - 1].argval if i >= 1 else None
+        for local, name, obj in _import_refs(
+                ins.argval, package, level if isinstance(level, int) else 0,
+                fromlist, instructions[i + 1:]):
+            if local is not None and inspect.ismodule(obj):
+                # Counted where it is used, through the attributes used.
+                modules[local] = (name, obj)
+            else:
+                yield name, obj
     for i, ins in enumerate(instructions):
         if ins.opname in ("LOAD_GLOBAL", "LOAD_NAME"):
-            if ins.argval not in globals_:
-                continue
-            attrs = []
-            for nxt in instructions[i + 1:]:
-                if nxt.opname not in ("LOAD_ATTR", "LOAD_METHOD"):
-                    break
-                attrs.append(nxt.argval)
-            yield _narrow(f"{module_name}.{ins.argval}", globals_[ins.argval],
-                          attrs)
-        elif ins.opname == "IMPORT_NAME":
-            level = instructions[i - 2].argval if i >= 2 else 0
-            fromlist = instructions[i - 1].argval if i >= 1 else None
-            yield from _import_refs(ins.argval, package,
-                                    level if isinstance(level, int) else 0,
-                                    fromlist, instructions[i + 1:])
+            if ins.argval in globals_:
+                yield from _narrow(f"{module_name}.{ins.argval}",
+                                   globals_[ins.argval], attrs_after(i))
+            continue
+        loaded = _loaded_locals(ins)
+        for k, local in enumerate(loaded):
+            if local in modules:
+                name, module = modules[local]
+                # Only the last variable an instruction loads can be followed
+                # by its attributes; any other use counts the whole module.
+                last = k == len(loaded) - 1
+                yield from _narrow(name, module, attrs_after(i) if last else [])
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
-            yield from _code_refs(const, globals_)
+            yield from _code_refs(const, globals_, modules)
 
 
 def _closure_functions(fn) -> List[Callable]:
@@ -859,6 +931,12 @@ class _FingerprintWalk:
         if isinstance(obj, _External):
             self.add_package(obj.module)
             return
+        if isinstance(obj, _Alias):
+            self.bind(name, obj.module)
+            return
+        if isinstance(obj, _SCRIPT_CLASS):
+            self.native = True  # A torch.classes class, registered in C++.
+            return
         if isinstance(obj, (staticmethod, classmethod)):
             obj = obj.__func__
         if isinstance(obj, property):
@@ -878,9 +956,19 @@ class _FingerprintWalk:
                 obj = inspect.unwrap(obj)
             except ValueError:
                 pass  # A cycle of __wrapped__: keep the outermost callable.
-        if inspect.ismodule(obj) or inspect.isclass(obj) or inspect.isfunction(
-                obj):
-            if not inspect.ismodule(obj) and isinstance(obj.__module__, str):
+        if inspect.ismodule(obj):
+            self.bind(name, obj.__name__)
+            namespace = _torch_namespace(obj.__name__)
+            if namespace is None:
+                self.visit_definition(obj)
+            elif namespace in _TORCH_NAMESPACES:
+                self.packages.add("torch")
+            else:
+                # A namespace of native operators or classes, reached when
+                # the operator or class itself is not (yet) registered.
+                self.native = True
+        elif inspect.isclass(obj) or inspect.isfunction(obj):
+            if isinstance(obj.__module__, str):
                 self.bind(name, f"{obj.__module__}.{obj.__qualname__}")
             self.visit_definition(obj)
         else:
@@ -912,7 +1000,7 @@ class _FingerprintWalk:
                             or {}).values():
                 self.todo.extend(
                     (qualname, f) for f in _closure_functions(wrapper))
-        elif qualname.partition("::")[0] in ("aten", "prim", "prims"):
+        elif qualname.partition("::")[0] in _TORCH_NAMESPACES:
             self.packages.add("torch")
         else:
             self.native = True
@@ -932,7 +1020,11 @@ class _FingerprintWalk:
             self.native = self.native or _is_extension(obj)
             return
         if inspect.ismodule(obj):
+            # Counted whole: with every definition of its own, and what those
+            # use (the names it imports count where its code uses them).
             self.sources[f"{module}:<module>"] = index.digest
+            self.todo.extend((f"{module}.{k}", v) for k, v in vars(obj).items()
+                             if k in index.spans)
             return
         self.sources[f"{module}:{obj.__qualname__}"] = _definition_digest(
             obj, index)
