@@ -73,8 +73,7 @@ _BATCHED_CANDIDATE_KEYS = 4 << 20  # 4M
 _CANDIDATE_CLUSTER_TOPK_MAX_ROWS = 64
 # CTAs per row of the attention-TP chain's self-sampling GVR: one 4-CTA cluster.
 _GVR_ROW_CTAS = 4
-# The self-sampling GVR decode engine runs one CTA per row. On the candidate source, whose rows
-# are twice as long, larger decode batches select with the exact radix Top-K.
+# Existing CSA2 candidate-source decode cutoff: larger batches keep exact radix Top-K.
 _DECODE_GVR_SOURCE_MAX_ROWS = 256
 # Candidate consumers' decode batches above this many rows rank 8-column groups first.
 _CONSUMER_BLOCK_TOPK_MIN_ROWS = 64
@@ -180,7 +179,9 @@ class CSA2Indexer(Indexer):
             sm_version=sm,
         )
         prefill_self_sampling = use_self_sampling_gvr(**self_sampling_kwargs, is_prefill=True)
-        decode_self_sampling = use_self_sampling_gvr(**self_sampling_kwargs, is_prefill=False)
+        decode_self_sampling = use_self_sampling_gvr(
+            **self_sampling_kwargs, is_prefill=False, sm107_decode=True
+        )
         if prefill_self_sampling:
             # The self-sampling engine is exact, so prefill uses it without heuristic decode.
             prefill = TopKImplementation.CUTE_DSL_GVR
@@ -435,7 +436,7 @@ class CSA2Indexer(Indexer):
             or not _HAS_SPARSE_MQA_LOGITS
             or self.head_dim != 128
             or heads not in (8, 16, 32, 64)
-            or get_sm_version() not in (100, 103)
+            or get_sm_version() not in (100, 103, 107)
         ):
             return None
         if torch.cuda.is_current_stream_capturing():

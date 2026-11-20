@@ -19,7 +19,7 @@ speculative decoding runs:
 
 The checkpoint's quantization picks the targets that can apply: the two above
 serve the NVFP4 checkpoint, and ``glm_5_3_flash_fp8__sm_10x__tp4`` serves the
-block-FP8 (``FP8_BLOCK_SCALES``) checkpoint on sm_100 with tensor parallelism 4
+block-FP8 (``FP8_BLOCK_SCALES``) checkpoint on sm_100 or sm_103 with tensor parallelism 4
 (see ``_fp8_refused``).
 
 The checkpoint declares the vision-language wrapper, and the language model's
@@ -65,9 +65,9 @@ _SHAPE_FIELDS = (
     "linear_num_heads",
 )
 
-# The GPU architecture the block-FP8 target has run on: sm_100 (B200, GB200). It reads
-# the same config shape as the NVFP4 targets, and the geometry below.
-_FP8_SM = (10, 0)
+# The GPU architectures the block-FP8 target has run on: sm_100 (B200, GB200) and sm_103
+# (B300, GB300). It reads the same config shape as the NVFP4 targets, and the geometry below.
+_FP8_SMS = ((10, 0), (10, 3))
 
 # What the block-FP8 target's kernels compile in beyond that shape: the experts each token
 # routes to, the experts' intermediate size (512 per rank in the decode MoE kernel) and the
@@ -325,7 +325,8 @@ def fp8_model_refused(model_config: ModelConfig, compute_capability: Tuple[int, 
     kda = None if linear is None else {name: _field(linear, name) for name in _FP8_KDA}
     tied = text_config is not None and bool(_field(text_config, "tie_word_embeddings"))
     refused = {
-        f"compute capability {compute_capability} (only sm_100)": compute_capability != _FP8_SM,
+        f"compute capability {compute_capability} (only sm_100 or sm_103)": compute_capability
+        not in _FP8_SMS,
         f"text_config shape {shape} (only {_SHAPE})": shape != _SHAPE,
         f"text_config geometry {geometry} (only {_FP8_GEOMETRY})": geometry != _FP8_GEOMETRY,
         f"MoE routing {routing} (only {FP8_MOE_ROUTING})": routing != FP8_MOE_ROUTING,
@@ -359,7 +360,7 @@ def _fp8_refused(
 ) -> list[str]:
     """What the block-FP8 target does not run for this deployment; empty when it is admitted.
 
-    The target serves GLM-5.3-Flash's block-FP8 release, text only, on sm_100 with tp4:
+    The target serves GLM-5.3-Flash's block-FP8 release, text only, on sm_100 or sm_103 with tp4:
     tensor-parallel attention over the 4 ranks of one node and the routed experts split by
     intermediate, a weight layout, which is why it selects a target rather than a runtime branch
     (:func:`fp8_model_refused`). Its sparse attention reads an FP8 latent cache. Its MoE kernels

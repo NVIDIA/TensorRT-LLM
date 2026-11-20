@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
     from .args import (
         AttentionConfig,
+        BatchingConfig,
         CacheConfig,
         CacheDiTConfig,
         CompilationConfig,
@@ -79,6 +80,7 @@ _LAZY_ATTRS = {
     "ExtraParamSchema": "tensorrt_llm.visual_gen.visual_gen",
     "VisualGenArgs": "tensorrt_llm.visual_gen.args",
     "AttentionConfig": "tensorrt_llm.visual_gen.args",
+    "BatchingConfig": "tensorrt_llm.visual_gen.args",
     "CacheConfig": "tensorrt_llm.visual_gen.args",
     "CacheDiTConfig": "tensorrt_llm.visual_gen.args",
     "CompilationConfig": "tensorrt_llm.visual_gen.args",
@@ -170,6 +172,7 @@ __all__ = [
     "SessionEnded",
     "SessionLeaseExpired",
     # Cross-cutting sub-configs
+    "BatchingConfig",
     "CompilationConfig",
     "CudaGraphConfig",
     "CpuOffloadConfig",

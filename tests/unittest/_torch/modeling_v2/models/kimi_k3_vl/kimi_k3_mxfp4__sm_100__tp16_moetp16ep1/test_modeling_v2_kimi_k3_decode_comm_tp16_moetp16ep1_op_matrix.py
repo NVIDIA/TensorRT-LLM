@@ -22,7 +22,7 @@ import torch
 assert torch.cuda.is_available(), "the Kimi K3 target's decode collectives require CUDA devices"
 
 if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-    # The target is certified on sm_100 (GB200) only, as are the catalog entries it calls.
+    # Runs on sm_100 and sm_103, the architectures the K3 decode kernels are certified on; others skip.
     pytest.skip("K3 decode-path kernels require SM100 or SM103", allow_module_level=True)
 
 if torch.cuda.device_count() < _rank_job.WORLD_SIZE:

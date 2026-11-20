@@ -1135,13 +1135,13 @@ class DecoderInputPreparer:
 
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
-            # Prefill CUDA graphs can also capture guided decoding.
+            # Prefill CUDA graphs capture only the decoder body; guided decoding runs after it.
+            # _skip_inactive raises if a capture ever records guided work while inactive.
             self.guided_decoder.add_batch(
                 scheduled_requests,
                 new_tokens=new_tokens_device,
                 runtime_draft_len=runtime_draft_len,
-                is_cuda_graph=maybe_graph
-                or self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED,
+                is_cuda_graph=maybe_graph,
             )
 
         spec_config = self._config.spec_config if enable_spec_decode else None

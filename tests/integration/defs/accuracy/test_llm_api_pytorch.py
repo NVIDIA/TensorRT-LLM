@@ -1482,10 +1482,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @parametrize_with_ids("mtp_nextn",
-                          [0, pytest.param(2, marks=skip_pre_hopper)])
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+    def _evaluate_guided_decoding(self, backend: str, mtp_nextn: int, mocker,
+                                  **llm_kwargs):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
@@ -1498,10 +1496,25 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   cuda_graph_config=cuda_graph_config,
                   enable_chunked_prefill=True,
                   max_num_tokens=256,
-                  speculative_config=mtp_config)
+                  speculative_config=mtp_config,
+                  **llm_kwargs)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
+        self._evaluate_guided_decoding(backend, mtp_nextn, mocker)
+
+    @skip_pre_hopper
+    def test_guided_decoding_breakable_prefill_cuda_graph(self, mocker):
+        self._evaluate_guided_decoding(
+            "xgrammar",
+            2,
+            mocker,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("mtp_nextn",
@@ -2785,6 +2798,59 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             assert_acceptance_length(
                 "TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl",
                 acceptance_length)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device_memory(140000)
+@skip_pre_blackwell
+class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
+    # V4-Flash with its embedded DSpark drafter and NVFP4 routed experts.
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-nvfp4-DSpark"
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_gsm8k_dep4_confidence_scheduling(self, tmp_path: Path) -> None:
+        """Confidence-scheduled DSpark verification keeps GSM8K accuracy on DEP4."""
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64]
+        # Compact verify windows cost less than native K+1 rows, as in a measured table.
+        cost_table = tmp_path / "dspark_costs.json"
+        cost_table.write_text(
+            json.dumps({
+                "schema_version": 3,
+                "costs": {
+                    "5": {
+                        str(g): {
+                            "token_counts": [0, 3 * g, 4 * g, 5 * g],
+                            "step_time_ms": [10.0, 8.5, 9.0, 9.5],
+                        }
+                        for g in batch_sizes
+                    }
+                },
+            }))
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model=self.MODEL_PATH,
+            enable_confidence_scheduling=True,
+            confidence_cost_table_path=str(cost_table))
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
+                 max_batch_size=64,
+                 cuda_graph_config=CudaGraphConfig(batch_sizes=batch_sizes,
+                                                   enable_padding=True),
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=KvCacheConfig(enable_block_reuse=False,
+                                               free_gpu_memory_fraction=0.5),
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                task.evaluate(llm)
 
 
 @pytest.mark.timeout(14400)

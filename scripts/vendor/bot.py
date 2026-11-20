@@ -241,6 +241,7 @@ class Monitor:
         settings = {
             "consumer_repo": gh.consumer_repo,
             "vendor": gh.vendor_name,
+            "lock": gh.lock,
             "upstream_repo": gh.upstream_repo,
             "base_branch": gh.base_branch,
             "upstream_branch": gh.upstream_branch,
@@ -251,6 +252,9 @@ class Monitor:
             "repo": str(args.repo),
         }
         saved = store.get("settings")
+        if saved is not None:
+            # Saved settings without a lock refer to the repository lock.
+            saved = {"lock": promote._LOCK, **saved}
         migration_from = args.migrate_canonical_branch_from
         if saved is not None and saved != settings:
             changed = {
@@ -465,7 +469,7 @@ class Monitor:
                 cached = self.store.get(key, {})
                 if cached.get("head") != head:
                     relevant = any(
-                        item["filename"] == promote._LOCK
+                        item["filename"] == self.gh.lock
                         for item in _pages(self.gh, f"{self.prefix}/pulls/{number}/files")
                     )
                     cached = {"head": head, "relevant": relevant}
@@ -777,8 +781,12 @@ class Monitor:
 
     def _inputs(self, pr: dict) -> tuple[manage.Vendor, manage.Vendor] | None:
         for change in _pages(self.gh, f"{self.prefix}/pulls/{pr['number']}/files"):
-            if change["filename"] == promote._LOCK and change.get("status") in ("added", "removed"):
-                return None  # Creating/removing the entire lock is not a source update.
+            # Creating, moving, or removing the entire lock is not a source update.
+            if change.get("status") in ("added", "removed", "renamed") and self.gh.lock in (
+                change["filename"],
+                change.get("previous_filename"),
+            ):
+                return None
         if pr.get("merged"):
             revision = promote._sha(pr["merge_commit_sha"])
             commit = self.gh.get(f"{self.prefix}/commits/{revision}")
@@ -800,7 +808,7 @@ class Monitor:
         except (manage.VendorError, ValueError) as error:
             raise Diagnostic(
                 f"Invalid lock entry at `vendors.{name}`: {field(_summary(error))}.",
-                f"Correct that entry in `{promote._LOCK}` with `scripts/vendor/manage.py`, "
+                f"Correct that entry in `{self.gh.lock}` with `scripts/vendor/manage.py`, "
                 "regenerate the vendored snapshot if its source changed, and push the PR. "
                 "Editing the PR description will not fix a lock-file error.",
             ) from error
@@ -844,7 +852,7 @@ class Monitor:
                 raise Diagnostic(
                     f"Temporary source reference adds no new vendor commit: "
                     f"{field(reviewed.commit)} is already pinned on {field(self.gh.base_branch)}.",
-                    f"In `{promote._LOCK}` at `vendors.{name}`, restore `url` to "
+                    f"In `{self.gh.lock}` at `vendors.{name}`, restore `url` to "
                     f"{field(previous.url)} and `branch` to {field(previous.branch)}. "
                     "Change only these source-reference fields; keep the commit and other lock "
                     "fields, vendored files, and patch unchanged. No upstream-PR metadata or "
@@ -976,7 +984,10 @@ class Monitor:
             cache = self.args.workdir / "sources.git"
             if upstream_proof is None:
                 entry = metadata.parse(
-                    pr.get("body") or "", self.gh.vendor_name, self.gh.upstream_repo
+                    pr.get("body") or "",
+                    self.gh.vendor_name,
+                    self.gh.upstream_repo,
+                    lock=self.gh.lock,
                 )
                 # Until provenance is committed, decisions follow current remote
                 # inputs, not whichever upstream heads a previous process cached.
@@ -1022,6 +1033,24 @@ class Monitor:
             }
         self._publish(arguments, plan)
 
+    def _check_vendor_lock(self) -> None:
+        """Fail the poll unless the vendor is in the configured lock on the base branch."""
+        self.progress.operation("checking_vendor_lock")
+        revision = promote._main_sha(self.gh)
+        try:
+            vendors = promote._lock_vendors_at(self.gh, self.gh.consumer_repo, revision)
+        except Diagnostic as error:
+            raise RuntimeError(f"Base vendor lock is invalid: {error}") from error
+        if self.gh.vendor_name not in vendors:
+            raise ValueError(
+                f"Vendor {self.gh.vendor_name!r} is not in {self.gh.lock} on "
+                f"{self.gh.base_branch}. Check --vendor and --lock; a monitor started before "
+                "the vendor's lock entry merged recovers once it merges. If the vendor moved to "
+                "another lock, promotions pending from this lock can no longer complete: close "
+                "them and start a new workdir with --lock naming the new lock, or stop this "
+                "monitor if the vendor was removed."
+            )
+
     def poll(self) -> None:
         """Process candidates serially; preserve failures for safe later retries."""
         started = time.monotonic()
@@ -1033,6 +1062,7 @@ class Monitor:
         _LOG.info("Poll started")
         completed = False
         try:
+            self._check_vendor_lock()
             candidates = self._discover()
             self.progress.count("tracked", len(candidates))
             for number in candidates:
@@ -1160,6 +1190,7 @@ def _serve(args: argparse.Namespace) -> None:
                         args.upstream_repo,
                         args.base_branch,
                         args.upstream_branch,
+                        lock=args.lock,
                     )
                     monitor = Monitor(args, gh, store, progress)
                     store.put("process", {"pid": os.getpid(), "publish": args.publish})
@@ -1274,6 +1305,7 @@ def _status(workdir: Path) -> dict:
             canonical_repo=state.get("settings", {}).get("canonical_repo"),
             canonical_branch=state.get("settings", {}).get("canonical_branch"),
             base_branch=state.get("settings", {}).get("base_branch"),
+            lock=state["settings"].get("lock", promote._LOCK) if "settings" in state else None,
             refresh_branches=refresh_branches,
             migration=state.get("migration"),
         )
@@ -1291,6 +1323,12 @@ def _parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="Monitor in foreground, or detach with --daemon.")
     run.add_argument("--workdir", type=Path, required=True)
     run.add_argument("--vendor", required=True)
+    run.add_argument(
+        "--lock",
+        default=promote._LOCK,
+        help="Vendor lock that defines --vendor, relative to the consumer repository root "
+        f"(default: {promote._LOCK}).",
+    )
     run.add_argument("--upstream-repo", required=True)
     run.add_argument("--canonical-repo", required=True)
     run.add_argument("--canonical-branch", required=True)
@@ -1378,6 +1416,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--base-branch must be main or release/<name>.")
         if not manage._NAME_PATTERN.fullmatch(args.vendor):
             raise ValueError("Invalid vendor key.")
+        args.lock = manage._lock_location(args.lock, "--lock")
         for name in (args.consumer_repo, args.upstream_repo, args.canonical_repo, args.fork):
             promote._repo_name(f"https://github.com/{name}")
         for branch in (args.canonical_branch, args.base_branch, args.upstream_branch):
