@@ -454,6 +454,11 @@ void gate_forward(void* scores_in, // [batch_size, nExperts] - pre-computed from
     auto* weights = static_cast<float*>(out_weights);
     auto* indices = static_cast<int*>(out_indices);
 
+    if (batch_size == 0)
+    {
+        // No tokens: an empty grid is not a valid launch.
+        return;
+    }
     switch (n_experts)
     {
     case 256:
