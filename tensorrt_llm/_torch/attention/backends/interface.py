@@ -85,6 +85,13 @@ class GraphVariant(NamedTuple):
     Ranks that must replay the same graph take the largest value among their
     own, so a graph of a larger value has to be valid for a step of a smaller
     one.
+
+    A value may change only what a rank computes for its own rows, such as
+    the attention kernel it launches. It must not change the work the ranks
+    share inside a graph (what they exchange, or the shapes they exchange it
+    in). A runner that reuses a graph shape agreed elsewhere replays without
+    exchanging the values (``DSparkCUDAGraphRunner._agree_graph_shape``), so
+    its ranks may replay graphs of different values in the same step.
     """
     name: str
     # Values the graphs of a shape (batch size, draft length) are captured
