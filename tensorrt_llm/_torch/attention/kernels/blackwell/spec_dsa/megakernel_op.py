@@ -133,7 +133,18 @@ _CONFIGS: dict[int, dict] = {
 # that hold the dense end of the sequence, and with it the heavy candidate publication, differ from row to row) and two
 # dedicated CTAs compute the thresholds (tcta: no stream CTA with an empty range blocks in the threshold wait).
 _FP4_SHARED = dict(team4=True, nteams=4, rs24_dry=False, b1l_upub=3, drot=37, tcta=2)
-_FP4_OVERRIDES = {b: _FP4_SHARED for b in range(5, 33)}
+# FP4 spec, 1 to 4 rows (the stream is shorter than the FP8 one, the fixed costs of the start and of the row
+# boundaries decide): the K tiles' TMA descriptors are prefetched at entry and the row lengths are loaded before the
+# barrier setup (early / tearly) at one row; from two rows on the next row's descriptor is loaded one row ahead (dpf)
+# and the split ranges rotate over the stream CTAs from row to row (drot), as the shared-team sets from five rows on
+# already do.
+_FP4_SMALL = {
+    1: dict(early=True, tearly=True),
+    2: dict(dpf=True, drot=37),
+    3: dict(dpf=True, drot=37),
+    4: dict(dpf=True, drot=37),
+}
+_FP4_OVERRIDES = {**_FP4_SMALL, **{b: _FP4_SHARED for b in range(5, 33)}}
 
 # The knob sets of the megakernel per spec (kernel_key) and batch size: the base knobs plus the set of the batch size
 # (and, for the FP4 spec, its overrides).

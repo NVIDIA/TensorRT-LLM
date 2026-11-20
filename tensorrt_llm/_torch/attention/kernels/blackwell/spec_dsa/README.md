@@ -34,6 +34,8 @@ differ between models live and how to add a model.
   5 CTAs serve a row (up to 26 rows, the clusters of 5 that fit one wave at one CTA per SM):
   every CTA runs the attention of its KV tiles with a local softmax maximum, the partial outputs are combined through
   distributed shared memory. Plain stream-ordered launch (the production top-K kernel never triggers a dependent launch).
+  Against the production FP4 chain (1M-token captures, B200) the fastest path per batch size is the megakernel up to 8 rows,
+  the tail attention from 9 to 26 rows and the large-batch kernels above.
 
 | Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Large batch |
 | --- | --- | --- | --- | --- | --- | --- |

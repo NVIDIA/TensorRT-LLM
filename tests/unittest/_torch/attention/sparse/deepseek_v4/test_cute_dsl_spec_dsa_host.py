@@ -382,9 +382,20 @@ def test_megakernel_knob_tables():
     assert sorted(fp8) == list(range(1, 48)) and sorted(fp4) == list(range(1, 21))
     # the FP8 sets have none of the FP4 knobs (the generated code of the FP8 kernels is the first version's)
     assert all("tcta" not in k and "drot" not in k for k in fp8.values())
-    # one to four rows: the same sets for both specs; from five rows the FP4 sets add the shared-team knobs
+    # one to four rows: the FP8 sets plus the FP4 start / row-boundary knobs of ``_FP4_SMALL``; from five rows the FP4
+    # sets add the shared-team knobs
     for b in range(1, 5):
-        assert fp4[b] == fp8[b], b
+        small = megakernel_op._FP4_SMALL.get(b, {})
+        assert {x: v for x, v in fp4[b].items() if x not in small} == {
+            x: v for x, v in fp8[b].items() if x not in small
+        }, b
+        assert all(fp4[b][x] == v for x, v in small.items()), b
+    assert megakernel_op._FP4_SMALL == {
+        1: {"early": True, "tearly": True},
+        2: {"dpf": True, "drot": 37},
+        3: {"dpf": True, "drot": 37},
+        4: {"dpf": True, "drot": 37},
+    }
     for b in range(5, 21):
         k = fp4[b]
         assert (k["team4"], k["nteams"], k["tcta"], k["b1l_upub"], k["rs24_dry"]) == (

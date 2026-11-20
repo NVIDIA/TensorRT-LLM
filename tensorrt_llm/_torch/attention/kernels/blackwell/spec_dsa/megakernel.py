@@ -2997,6 +2997,10 @@ class SpecDsaMegakernel:
                 w_cache = cute.make_rmem_tensor((self.num_w_in_reg,), self.epi_dtype)
                 for w_j in cutlass.range_constexpr(self.num_w_in_reg):
                     w_cache[w_j] = sW[w_j, q_stage_local]
+                if cutlass.const_expr(self.fp4):
+                    # jw = pos // wst as umulhi(pos, magic): exact for pos < 2^18, 8 <= wst < 2^14
+                    # (the ladder's wst <= 920)
+                    wmag = Uint64(Uint32(4294967295) // Uint32(wst) + Uint32(1))
                 L.bar(6, 288)
                 gen = self._gen_from(Uint64(gen_slot[0]), Uint64(gen_slot[1]), Uint64(gen_slot[2]))
                 if tidx == 0:
@@ -3056,7 +3060,10 @@ class SpecDsaMegakernel:
                             if cutlass.const_expr(self.debug):
                                 if pos < n:
                                     mDbg[pos] = val
-                            jw = pos // wst
+                            if cutlass.const_expr(self.fp4):
+                                jw = Int32((Uint64(pos) * wmag) >> Uint64(32))
+                            else:
+                                jw = pos // wst
                             if pos - jw * wst < Int32(8):
                                 if jw < SMP:
                                     st_rlx_u64(
@@ -3135,7 +3142,10 @@ class SpecDsaMegakernel:
                             if cutlass.const_expr(self.debug):
                                 if pos < n:
                                     mDbg[pos] = val
-                            jw = pos // wst
+                            if cutlass.const_expr(self.fp4):
+                                jw = Int32((Uint64(pos) * wmag) >> Uint64(32))
+                            else:
+                                jw = pos // wst
                             if pos - jw * wst < Int32(8):
                                 if jw < SMP:
                                     st_rlx_u64(
@@ -3795,6 +3805,10 @@ class SpecDsaMegakernel:
                     t_lo = s0 * Int32(SPLIT_TOK)
                     nwin0 = (nwin + Int32(1)) // Int32(2)
                     nwin1 = nwin // Int32(2)
+                    if cutlass.const_expr(self.fp4):
+                        # jw = pos // wst as umulhi(pos, magic): exact for pos < 2^18, 8 <= wst < 2^14
+                        # (the ladder's wst <= 920)
+                        wmag = Uint64(Uint32(4294967295) // Uint32(wst) + Uint32(1))
                     ws_r_ = ws + Int64(r_) * Int64(rs_["ws"] * 8)
                     q_pipeline.consumer_wait(q_cons_state)
                     q_stage_local = q_cons_state.index
@@ -3888,7 +3902,10 @@ class SpecDsaMegakernel:
                                 if cutlass.const_expr(self.debug):
                                     if pos < n:
                                         mDbg[pos] = val
-                                jw = pos // wst
+                                if cutlass.const_expr(self.fp4):
+                                    jw = Int32((Uint64(pos) * wmag) >> Uint64(32))
+                                else:
+                                    jw = pos // wst
                                 if pos - jw * wst < Int32(8):
                                     if jw < SMP:
                                         st_rlx_u64(
@@ -3953,7 +3970,10 @@ class SpecDsaMegakernel:
                                 if cutlass.const_expr(self.debug):
                                     if pos < n:
                                         mDbg[pos] = val
-                                jw = pos // wst
+                                if cutlass.const_expr(self.fp4):
+                                    jw = Int32((Uint64(pos) * wmag) >> Uint64(32))
+                                else:
+                                    jw = pos // wst
                                 if pos - jw * wst < Int32(8):
                                     if jw < SMP:
                                         st_rlx_u64(
