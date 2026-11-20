@@ -56,7 +56,7 @@ before they are classified.
 
 | Feature | Turned on by | Status | Targets that do not serve it today |
 |---|---|---|---|
-| `DecodeCudaGraph` | `cuda_graph_config` | in code | none |
+| `DecodeCudaGraph` | `cuda_graph_config` | in code | none. Serving it includes running the dummy rows that `cuda_graph_config.enable_padding` adds to a batch; a `PrefillTarget` serves it without doing anything, since the graph captures only steps without context rows. |
 | `ChunkedPrefill` | `enable_chunked_prefill` | in code | none |
 | `OverlapScheduler` | `disable_overlap_scheduler=False` | in code | none (GLM-5.2 sm103 tp8 fast paths fall back without it) |
 | `KvCacheBlockReuse` | `kv_cache_config.enable_block_reuse` | in code | Kimi K3 tp16 (both): asserted off at the first forward; should declare `unsupported` |
@@ -65,7 +65,7 @@ before they are classified.
 
 | Feature | Turned on by | Status | Today |
 |---|---|---|---|
-| `SpeculativeDecoding` | `speculative_config` | planned | Every target serves one mode, checked in `route`: one-model MTP-Eagle (DeepSeek R1, Qwen3.8-Flash-Next, the four GLM-5.2 targets, GLM-5.3-Flash mtp_fused), one-model Eagle3 (MiniMax-M3), SA/DFlash/DSpark (Kimi K3 moetp4ep4), MTP or SA (GLM-5.3-Flash default), none (GPT-OSS, Kimi K3 moetp16ep1). Dynamic trees, `draft_len_schedule` and two-model drafting are refused everywhere; GLM-5.2 sm103 tp8 requires MTP. The feature would carry the mode, linearity and draft length so targets state these limits with `when`. |
+| `SpeculativeDecoding` | `speculative_config` | planned | Every target serves one mode, checked in `route`: one-model MTP-Eagle (DeepSeek R1, Qwen3.8-Flash-Next, the four GLM-5.2 targets, GLM-5.3-Flash mtp_fused), one-model Eagle3 (MiniMax-M3), SA/DFlash/DSpark (Kimi K3 moetp4ep4), MTP or SA (GLM-5.3-Flash default), none (GPT-OSS, Kimi K3 moetp16ep1). Dynamic trees, `draft_len_schedule` and two-model drafting are refused everywhere; GLM-5.2 sm103 tp8 requires MTP. The feature would carry the `SpeculativeDecodingMode` (`speculative_config.spec_dec_mode`), linearity and draft length so targets state these limits with `when`. |
 | `LoRA` | `enable_lora` / `lora_config` | planned | No target serves it. Qwen3.8-Flash-Next asserts and MiniMax-M3 raises at runtime; DeepSeek R1, GPT-OSS and GLM-5.2 sm103 tep4 ignore `lora_params` without a check. |
 | `BeamSearch` | `max_beam_width > 1` | planned | No target serves it. Qwen3.8-Flash-Next asserts width 1; DeepSeek R1 and GLM-5.2 sm103 tep4 assume width 1 without a check. |
 | `ReturnRoutedExperts` | `enable_return_routed_experts` | to verify | |
@@ -86,7 +86,7 @@ before they are classified.
 | `MoeLoadBalancer` | `moe_config.load_balancer` | planned | Qwen3.8-Flash-Next (with expert parallelism) and GLM-5.2 sm107 high_throughput refuse it because it would do nothing; a warning fits. |
 | `MoeTactic` | `moe_config.tactic`, `speculative_config.moe_tactic` | planned | Refused today unless the target lists `moe_impls_honored` / `draft_moe_impls_honored`; only GLM-5.2 sm107 low_latency and Kimi K3 list trunk ids. |
 | `MoeBackend` | `moe_config.backend` | to verify | Qwen3.8-Flash-Next and GLM-5.2 sm107 high_throughput restrict it. |
-| `CudaGraphPadding`, `CudaGraphSamplingVariants`, `InGraphSampling` | `cuda_graph_config.enable_padding`, `cuda_graph_config.sampling_variants`, `enable_in_graph_sampling` | to verify | |
+| `CudaGraphSamplingVariants`, `InGraphSampling` | `cuda_graph_config.sampling_variants`, `enable_in_graph_sampling` | to verify | |
 | `AttentionDpBalance` | `attention_dp_config` | to verify | |
 | `UserBuffers`, `CuteDslBlockscaling`, `MinLatency` | `torch_compile_config.enable_userbuffers`, `use_cute_dsl_blockscaling_mm/bmm`, `enable_min_latency` | to verify | |
 | `AllReduceStrategy` | `allreduce_strategy` | to verify | Kimi K3 asserts AUTO or MNNVL; decide whether that limit is functional or perf. |
@@ -100,8 +100,10 @@ numerics a checkpoint is served with. `route` keeps checking them.
   attention DP, `enable_lm_head_tp_in_adp`, MoE TP×EP.
 - Numerics: KV cache dtype, `mamba_ssm_cache_dtype`, model dtype, quantization
   format, `sparse_attention_config`.
-- Settings the engine handles without the model: scheduler policy,
-  `batch_wait_*`, `stream_interval`, statistics, tokenizer.
+
+The engine settings the model never sees (scheduler policy, `batch_wait_*`,
+`stream_interval`, statistics, tokenizer) are neither features nor checked in
+`route`.
 
 ## Known gaps
 
