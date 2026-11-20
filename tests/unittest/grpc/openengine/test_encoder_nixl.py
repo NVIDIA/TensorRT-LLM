@@ -11,13 +11,15 @@ import grpc
 import pytest
 import torch
 from conftest import AbortError, FakeServicerContext
+from test_control import _inference, _servicer
 from utils.native_encoder import _cache as _native_cache
 from utils.native_encoder import _receive, _receiver, _writes, model, native_result, request
 
 from tensorrt_llm._torch.disaggregation import encoder_nixl as transport
 from tensorrt_llm._torch.disaggregation.encoder_output import EncodedMediaRef
 from tensorrt_llm.grpc.openengine import encoder_nixl as rpc
-from tensorrt_llm.grpc.openengine.bindings import encoder_transfer_pb2
+from tensorrt_llm.grpc.openengine.bindings import encoder_transfer_pb2, encoding_pb2
+from tensorrt_llm.grpc.openengine.encoder import portable_reference
 from tensorrt_llm.grpc.openengine.encoder_transfer import EncoderTransferServicer
 from tensorrt_llm.grpc.openengine.errors import (
     ENCODER_TRANSFER_REJECTED_METADATA,
@@ -80,49 +82,6 @@ def pair(monkeypatch):
             cache.close()
 
 
-@pytest.mark.skipif(
-    os.environ.get("TRTLLM_TEST_NIXL_ENCODER") != "1",
-    reason="opt-in native NIXL/UCX runtime test",
-)
-def test_native_nixl_over_real_grpc_loopback():
-    from concurrent.futures import ThreadPoolExecutor
-
-    import grpc
-
-    from tensorrt_llm.grpc.openengine.bindings import (
-        encoder_transfer_pb2,
-        encoder_transfer_pb2_grpc,
-    )
-
-    server = grpc.server(ThreadPoolExecutor(max_workers=2))
-    port = server.add_insecure_port("127.0.0.1:0")
-    producer = transport.NixlEncoderCache(
-        f"127.0.0.1:{port}", "a" * 40, device="cpu", request_transfer=rpc.request_transfer
-    )
-    consumer = transport.NixlEncoderCache(
-        "", "a" * 40, device="cpu", request_transfer=rpc.request_transfer
-    )
-
-    class Service(encoder_transfer_pb2_grpc.EncoderTransferServicer):
-        def Transfer(self, req, context):
-            producer.transfer(EncodedMediaRef(req.reference), req.destination)
-            return encoder_transfer_pb2.TransferEncoderCacheResponse()
-
-    encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
-    server.start()
-    try:
-        llm, seen = model()
-        output, expected = native_result()
-        ref = producer.publish(output, request(), llm)
-        consumer.prepare(ref, request(), llm, None)
-        assert all(torch.equal(a, b) for a, b in zip(seen["tensors"], expected))
-        assert producer._used == consumer._used == 0
-    finally:
-        server.stop(0).wait()
-        consumer.close()
-        producer.close()
-
-
 def _native_encoder_producer(pipe):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -151,6 +110,7 @@ def _native_encoder_producer(pipe):
         ref = producer.publish(native_result()[0], request(), llm)
         pipe.send((os.getpid(), ref.opaque_state))
         assert pipe.recv() == "stop"
+        assert producer._used == 0
     finally:
         server.stop(0).wait()
         producer.close()
@@ -184,7 +144,9 @@ def test_native_nixl_between_separate_processes():
             torch.arange(6, dtype=torch.int64).reshape(3, 1, 2),
             torch.tensor([[1]]),
         ]
+        assert len(seen["tensors"]) == len(expected)
         assert all(torch.equal(a, b) for a, b in zip(seen["tensors"], expected))
+        assert consumer._used == 0
         assert seen["metadata"] == {"image_grid_thw": [1, 2, 2]}
         parent.send("stop")
         process.join(20)
@@ -322,3 +284,27 @@ async def test_transfer_rejection_marker_requires_proven_prewrite_failure(reject
         grpc.StatusCode.INVALID_ARGUMENT if rejected else grpc.StatusCode.UNAVAILABLE
     )
     assert context.trailing_metadata == ((ENCODER_TRANSFER_REJECTED_METADATA,) if rejected else ())
+
+
+@pytest.mark.asyncio
+async def test_release_rejects_deeply_nested_reference_without_changing_exports(pair):
+    producer, _ = pair
+    llm, _ = model()
+    reference = producer.publish(native_result()[0], request(), llm)
+    reserved = producer._used
+    inference = _inference()
+    inference.encoder_role = "encode"
+    inference._encoder_cache = producer
+    malformed = EncodedMediaRef(
+        opaque_state=b"[" * 10000 + b"0" + b"]" * 10000,
+    )
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await _servicer(inference=inference).ReleaseEncodedMedia(
+            encoding_pb2.ReleaseEncodedMediaRequest(encoded_media=portable_reference(malformed)),
+            context,
+        )
+    assert context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+    assert producer._used == reserved and len(producer._exports) == 1
+    assert not producer._claims and not producer.failed
+    assert producer.discard(reference)

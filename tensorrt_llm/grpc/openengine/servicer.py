@@ -40,7 +40,13 @@ from .encoder import (
     native_reference,
     validate_encoder,
 )
-from .errors import AbortFailedError, MediaUnavailableError, UnsupportedFeatureError
+from .errors import (
+    AbortFailedError,
+    EncoderCapacityError,
+    EncoderUnavailableError,
+    MediaUnavailableError,
+    UnsupportedFeatureError,
+)
 from .formatting import _engine_error_response, _stop_texts
 from .metrics import OpenEngineMetrics, RequestMetrics
 from .preparation import _decode_preparation, _prepared_decode_from_request
@@ -192,7 +198,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         self._media_admission = asyncio.Semaphore(max_media_preparations)
         self._llm = llm
         cache_directory = os.environ.get("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR")
-        self._encoder_cache = EncoderCache(cache_directory) if cache_directory else None
+        self._encoder_cache = None
         encoder_transport = os.environ.get("TRTLLM_OPENENGINE_ENCODER_TRANSFER", "")
         if encoder_transport not in ("", "nixl"):
             raise ValueError("unsupported encoder transfer backend")
@@ -204,6 +210,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 os.environ.get("TRTLLM_OPENENGINE_ENCODER_MODEL_REVISION", ""),
                 request_transfer=request_transfer,
             )
+        elif cache_directory:
+            self._encoder_cache = EncoderCache(cache_directory)
         self.encoder_role = encoder_role(llm, self._encoder_cache)
         if encoder_transport == "nixl" and (
             not self.encoder_role
@@ -214,6 +222,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 "NIXL encoder serving requires a supported role and a producer endpoint"
             )
         if getattr(llm.args, "mm_encoder_only", False) and self.encoder_role != "encode":
+            if self._encoder_cache is not None:
+                self._encoder_cache.close()
             raise ValueError(
                 "encoder-only serving requires a shared cache, native MM disaggregation, and TP1"
             )
@@ -599,7 +609,13 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     return
                 try:
                     inputs = mapping_task.result()
-                except (UnsupportedFeatureError, MediaUnavailableError, ValueError):
+                except (
+                    UnsupportedFeatureError,
+                    EncoderCapacityError,
+                    EncoderUnavailableError,
+                    MediaUnavailableError,
+                    ValueError,
+                ):
                     raise
                 except Exception as error:
                     # Unexpected preparation failures are worker errors, not bad inputs.
@@ -616,6 +632,12 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 local_request.clear_mapping(mapping_task)
         except UnsupportedFeatureError as error:
             await context.abort(grpc.StatusCode.UNIMPLEMENTED, str(error))
+            return
+        except EncoderCapacityError as error:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
+            return
+        except EncoderUnavailableError as error:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
             return
         except MediaUnavailableError as error:
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))

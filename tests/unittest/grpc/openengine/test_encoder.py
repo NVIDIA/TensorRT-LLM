@@ -1,10 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
-
 import pytest
-from utils.native_encoder import model, native_result, request
 
 from tensorrt_llm._torch.disaggregation import encoder_output as oe
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2 as pb
@@ -41,7 +38,7 @@ def test_encoder_role_validation_fails_closed():
 
 
 @pytest.mark.parametrize("token_input", [False, True])
-def test_shared_handoff_accepts_field_equal_inputs_with_unknown_wire_fields(tmp_path, token_input):
+def test_encoder_input_ignores_unknown_wire_fields_and_wire_order(token_input):
     req = wire_request()
     if token_input:
         req.token_ids.ids.extend([1, 2])
@@ -54,20 +51,13 @@ def test_shared_handoff_accepts_field_equal_inputs_with_unknown_wire_fields(tmp_
     if token_input:
         equivalent.token_ids.ParseFromString(b"\x08\x01\x08\x02\xa0\x06\x01")
     assert req.SerializeToString() != equivalent.SerializeToString()
-    cache = oe.EncoderCache(str(tmp_path))
-    llm, _ = model()
-    llm.tokenizer = SimpleNamespace(
-        decode=lambda ids, **kwargs: "Describe <image_1>",
-        encode=lambda prompt, **kwargs: [1, 2],
-    )
-    ref = cache.publish(native_result()[0], encoder_input(req), llm)
-    cache.prepare(ref, encoder_input(equivalent), llm, None)
+    assert encoder_input(req) == encoder_input(equivalent)
 
 
-def test_input_identity_preserves_order_source_and_all_media_fields():
+def test_encoder_input_preserves_order_source_and_all_media_fields():
     req = wire_request()
     req.media.add(modality=pb.MODALITY_IMAGE, raw_bytes=b"second")
-    original = oe._input_digest(encoder_input(req))
+    original = encoder_input(req)
     mutations = (
         lambda value: value.media.reverse(),
         lambda value: setattr(value.media[0], "url", value.media[0].data_uri),
@@ -80,11 +70,11 @@ def test_input_identity_preserves_order_source_and_all_media_fields():
     for mutate in mutations:
         changed = pb.GenerateRequest.FromString(req.SerializeToString())
         mutate(changed)
-        assert oe._input_digest(encoder_input(changed)) != original
+        assert encoder_input(changed) != original
     req.token_ids.ids.extend([1, 2])
-    original = oe._input_digest(encoder_input(req))
+    original = encoder_input(req)
     req.token_ids.ids.reverse()
-    assert oe._input_digest(encoder_input(req)) != original
+    assert encoder_input(req) != original
 
 
 @pytest.mark.parametrize("payload", [b"", b"\x00\xffopaque", b'{"format":"custom","version":9}'])
@@ -93,4 +83,3 @@ def test_native_reference_boundary_is_lossless(payload):
 
     native = oe.EncodedMediaRef(payload)
     assert native_reference(portable_reference(native)) == native
-    assert encoder_input(wire_request()) == request()

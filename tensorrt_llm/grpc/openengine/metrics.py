@@ -153,6 +153,16 @@ class RequestMetrics:
             self._outcome = RpcOutcome.CANCELLED
         elif status == grpc.StatusCode.DEADLINE_EXCEEDED:
             self._outcome = RpcOutcome.TIMEOUT
+        elif status == grpc.StatusCode.UNAVAILABLE:
+            self._outcome = RpcOutcome.UNAVAILABLE
+        elif status in (
+            grpc.StatusCode.INVALID_ARGUMENT,
+            grpc.StatusCode.UNIMPLEMENTED,
+            grpc.StatusCode.ALREADY_EXISTS,
+            grpc.StatusCode.FAILED_PRECONDITION,
+            grpc.StatusCode.RESOURCE_EXHAUSTED,
+        ):
+            self._outcome = RpcOutcome.REJECTED
         self._finished = True
         self._metrics.record_outcome(self._phase, self._outcome.value)
 

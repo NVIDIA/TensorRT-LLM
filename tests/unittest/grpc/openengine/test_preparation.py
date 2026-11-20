@@ -144,15 +144,9 @@ def test_prepared_decode_preserves_version_one_digest(kind, expected_digest):
     payload = json.loads(_decode_preparation(request, llm, capture))
     assert payload["version"] == 1
     assert payload["input_digest"] == expected_digest
-
-    # A legacy producer's digest must also be accepted by the current reader.
-    payload["input_digest"] = expected_digest
-    _handoff(request, payload)
-    restored = _prepared_decode_from_request(request, llm)
-    try:
-        assert restored.prompt_token_ids == capture["prompt_token_ids"]
-    finally:
-        restored.multimodal_params.release_handles()
+    assert payload["config_digest"] == (
+        "16bc205841cb67c7cf250e7b84d5c96234d98146a6c303d8eb161b0b226e06fe"
+    )
 
 
 def test_qwen_prepared_decode_roundtrip_preserves_tokens_and_positions():

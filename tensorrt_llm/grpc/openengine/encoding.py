@@ -15,7 +15,12 @@ from tensorrt_llm.sampling_params import SamplingParams
 from .bindings import encoding_pb2, generation_pb2
 from .coordinator import CoordinationError, DuplicateRequestError, InvalidRequestIdError
 from .encoder import encoder_input, portable_reference, release_encoder_result
-from .errors import MediaUnavailableError, UnsupportedFeatureError
+from .errors import (
+    EncoderCapacityError,
+    EncoderUnavailableError,
+    MediaUnavailableError,
+    UnsupportedFeatureError,
+)
 from .metrics import RequestMetrics
 from .request_mapping import (
     _load_prepared_input,
@@ -165,11 +170,17 @@ async def encode(
         await context.abort(status, str(error))
     except UnsupportedFeatureError as error:
         await context.abort(grpc.StatusCode.UNIMPLEMENTED, str(error))
+    except EncoderCapacityError as error:
+        await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
+    except EncoderUnavailableError as error:
+        await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
     except MediaUnavailableError as error:
         await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
     except ValueError as error:
         await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
     except RuntimeError as error:
+        if context.code() not in (None, grpc.StatusCode.OK):
+            raise
         if metrics is not None:
             metrics.engine_failed()
         await context.abort(grpc.StatusCode.INTERNAL, str(error))
@@ -214,6 +225,8 @@ async def _reclaim(owner, handle, completed):
         except asyncio.TimeoutError:
             owner._encoder_cleanup_failed = True
         except Exception:
+            # Native abort completion can raise after installing its final exports.
+            # Reclaim those handles below even when completion reports an error.
             pass
         finally:
             if not await asyncio.to_thread(release_encoder_result, handle):

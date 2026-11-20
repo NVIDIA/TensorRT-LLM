@@ -3,7 +3,11 @@
 
 """Errors the OpenEngine adapter raises across its modules."""
 
-from tensorrt_llm._torch.disaggregation.encoder_output import EncoderTransferRejected
+from tensorrt_llm._torch.disaggregation.encoder_output import (
+    EncoderCapacityError,
+    EncoderTransferRejected,
+    EncoderUnavailableError,
+)
 
 
 class UnsupportedFeatureError(ValueError):
@@ -28,7 +32,9 @@ class AbortFailedError(RuntimeError):
 __all__ = [
     "AbortFailedError",
     "ENCODER_TRANSFER_REJECTED_METADATA",
+    "EncoderCapacityError",
     "EncoderTransferRejected",
+    "EncoderUnavailableError",
     "MediaUnavailableError",
     "UnsupportedFeatureError",
 ]

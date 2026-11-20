@@ -157,6 +157,8 @@ def verify_openengine_distribution() -> None:
             )
 
     proto_names = (
+        "encoded_media",
+        "encoding",
         "error",
         "generation",
         "kv",

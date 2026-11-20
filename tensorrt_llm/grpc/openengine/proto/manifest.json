@@ -18,11 +18,11 @@
     "grpcio": "1.73.1"
   },
   "draft_extensions": [
-    "native-encoded-media (local unary Encode and release proposal)"
+    "native-encoded-media (unmerged unary Encode and release proposal)"
   ],
   "source": {
     "url": "https://github.com/ai-dynamo/openengine.git",
     "commit": "59f1d5a7062629cf8c47031391a67a716b80b1ff",
-    "publication": "local-only contract checkpoint for EPD validation; not pushed or published"
+    "publication": "Proposed contract in ai-dynamo/openengine#35; upstream merge pending"
   }
 }

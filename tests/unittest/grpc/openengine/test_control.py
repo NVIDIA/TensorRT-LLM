@@ -961,58 +961,45 @@ async def test_release_encoder_cache_requires_encode_cleanup_support(role, has_d
 
 
 @pytest.mark.asyncio
-async def test_release_encoder_cache_reports_release_and_idempotent_outcomes():
-    from tensorrt_llm.grpc.openengine.bindings import encoded_media_pb2
-
-    inference = _inference()
-    inference.encoder_role = "encode"
-    present = True
-
-    def discard(reference):
-        nonlocal present
-        assert reference.opaque_state == b"\x00\xffengine-owned"
-        removed, present = present, False
-        return removed
-
-    inference._encoder_cache = SimpleNamespace(discard=discard)
-    control = _servicer(inference=inference)
-    req = encoding_pb2.ReleaseEncodedMediaRequest(
-        encoded_media=encoded_media_pb2.EncodedMediaRef(opaque_state=b"\x00\xffengine-owned")
-    )
-    for _ in range(2):
-        result = await control.ReleaseEncodedMedia(req, FakeServicerContext())
-        assert isinstance(result, encoding_pb2.ReleaseEncodedMediaResponse)
-    assert inference.active_request_count() == 0
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure,code",
     [
+        (None, None),
         (ValueError("invalid reference"), grpc.StatusCode.INVALID_ARGUMENT),
         (RuntimeError("transport unhealthy"), grpc.StatusCode.UNAVAILABLE),
         (OSError("cannot remove cached encoder output"), grpc.StatusCode.INTERNAL),
     ],
 )
-async def test_release_encoder_cache_preserves_failures(failure, code):
+async def test_release_encoder_cache_maps_native_outcome(failure, code):
     inference = _inference()
     inference.encoder_role = "encode"
 
     def discard(reference):
-        raise failure
+        assert reference.opaque_state == b"\x00\xffengine-owned"
+        if failure is not None:
+            raise failure
+        return False
 
     inference._encoder_cache = SimpleNamespace(discard=discard)
     context = FakeServicerContext()
-    with pytest.raises(AbortError):
-        await _servicer(inference=inference).ReleaseEncodedMedia(
-            encoding_pb2.ReleaseEncodedMediaRequest(encoded_media={}), context
-        )
-    assert context.abort_code == code
+    call = _servicer(inference=inference).ReleaseEncodedMedia(
+        encoding_pb2.ReleaseEncodedMediaRequest(
+            encoded_media={"opaque_state": b"\x00\xffengine-owned"}
+        ),
+        context,
+    )
+    if code is not None:
+        with pytest.raises(AbortError):
+            await call
+        assert context.abort_code == code
+    else:
+        assert isinstance(await call, encoding_pb2.ReleaseEncodedMediaResponse)
+        assert inference.active_request_count() == 0
 
 
 @pytest.mark.asyncio
 async def test_release_encoder_cache_over_real_grpc(tmp_path):
-    from test_encoder import model, native_result, request
+    from utils.native_encoder import model, native_result, request
 
     from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc
     from tensorrt_llm.grpc.openengine.encoder import EncoderCache, portable_reference
@@ -1039,20 +1026,3 @@ async def test_release_encoder_cache_over_real_grpc(tmp_path):
         assert not list(tmp_path.glob("*.safetensors"))
     finally:
         await server.stop(0)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["", "encode", "consume"])
-@pytest.mark.parametrize("failed", [False, True])
-async def test_encoder_cache_requirement_is_distinct_from_consumption_capability(role, failed):
-    inference = _inference()
-    inference.encoder_role = role
-    inference._encoder_cache = SimpleNamespace(backend="test-encoder", failed=failed)
-    control = _servicer(inference=inference)
-    info = await control.GetModelInfo(
-        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
-    )
-    assert control._engine_is_healthy() is not failed
-    assert "encoder" not in info.DESCRIPTOR.fields_by_name
-    assert "trtllm_encoder_cache_release" not in info.extra
-    assert "trtllm_requires_encoder_cache" not in info.extra

@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 from conftest import AbortError, FakeServicerContext
 from test_control import MODEL, _inference, _servicer
-from test_encoder import model, native_result
 from test_encoder import wire_request as request
+from utils.native_encoder import model, native_result
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
@@ -17,6 +17,11 @@ from tensorrt_llm.grpc.openengine import encoding, servicer
 from tensorrt_llm.grpc.openengine.bindings import encoding_pb2, lifecycle_pb2, model_pb2, server_pb2
 from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer
+from tensorrt_llm.grpc.openengine.errors import (
+    EncoderCapacityError,
+    EncoderUnavailableError,
+    MediaUnavailableError,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -30,6 +35,47 @@ def encode_request():
 
 async def prepared_encode(*args):
     return SimpleNamespace(multimodal_params=None)
+
+
+@pytest.fixture
+def encoder_inference(tmp_path, monkeypatch):
+    llm, _ = model()
+    llm.args = SimpleNamespace(mm_encoder_only=True, guided_decoding_backend=None)
+    result, _source_tensors = native_result()
+
+    class Handle:
+        error = None
+        finished = True
+        disaggregated_params = result.disaggregated_params
+
+        async def __aiter__(self):
+            yield self
+
+        async def aresult(self):
+            return self
+
+        def abort(self):
+            pass
+
+    handle = Handle()
+
+    def generate(inputs, sampling_params):
+        assert sampling_params.max_tokens == 1
+        return handle
+
+    llm.generate_async = generate
+    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(encoding, "_prepare", prepared_encode)
+    inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
+    outcomes = []
+    inference._metrics = SimpleNamespace(
+        record_outcome=lambda *outcome: outcomes.append(outcome),
+        record_result=lambda *_: pytest.fail("Encode has no generation-token accounting"),
+    )
+    try:
+        yield inference, handle, outcomes
+    finally:
+        assert encoding.release_encoder_result(handle)
 
 
 @pytest.mark.asyncio
@@ -277,37 +323,14 @@ async def test_prefill_cancel_waits_for_late_exports_only_for_multimodal_inputs(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_encode_reclaims_native_exports(tmp_path, monkeypatch):
-    llm, _ = model()
-    result, _ = native_result()
-    llm.args = SimpleNamespace(mm_encoder_only=True, guided_decoding_backend=None)
-    llm.tokenizer = None
-
-    class Handle:
-        disaggregated_params = result.disaggregated_params
-        finished = True
-        error = None
-        aborted = False
-
-        async def __aiter__(self):
-            yield self
-
-        async def aresult(self):
-            return self
-
-        def abort(self):
-            self.aborted = True
-
-    handle = Handle()
-    llm.generate_async = lambda **kwargs: handle
-    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr(encoding, "_prepare", prepared_encode)
+async def test_cancelled_encode_reclaims_native_exports(encoder_inference, tmp_path):
+    inference, handle, outcomes = encoder_inference
     context = FakeServicerContext()
     context.is_cancelled = True
-    req = encode_request()
-    inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
     with pytest.raises(AbortError):
-        await inference.Encode(req, context)
+        await inference.Encode(encode_request(), context)
+    assert context.abort_code == encoding.grpc.StatusCode.CANCELLED
+    assert outcomes == [("encode", "cancelled")]
     assert handle.disaggregated_params.multimodal_embedding_handles is None
     assert handle.disaggregated_params.mrope_position_ids_handle is None
     assert not list(tmp_path.glob("*.safetensors"))
@@ -316,15 +339,19 @@ async def test_cancelled_encode_reclaims_native_exports(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role", ["", "encode", "consume"])
-async def test_encoder_discovery_uses_existing_engine_role_only(role):
+@pytest.mark.parametrize("failed", [False, True])
+async def test_encoder_discovery_uses_existing_engine_role_only(role, failed):
     inference = _inference()
     inference.encoder_role = role
+    inference._encoder_cache = SimpleNamespace(failed=failed)
     inference._media_capabilities = MediaCapabilities({"image": "<image_{}>"})
     control = _servicer(inference=inference)
     info = await control.GetModelInfo(
         model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
     )
-    assert "encoder" not in info.DESCRIPTOR.fields_by_name
+    assert control._engine_is_healthy() is not failed
+    assert "trtllm_encoder_cache_release" not in info.extra
+    assert "trtllm_requires_encoder_cache" not in info.extra
     server = await control.GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
     assert server.engine_role == (
         server_pb2.ENGINE_ROLE_ENCODER if role == "encode" else server_pb2.ENGINE_ROLE_UNSPECIFIED
@@ -446,13 +473,6 @@ async def test_encode_export_release_failure_withdraws_readiness(
 
 
 @pytest.mark.asyncio
-async def test_uncertain_encoder_transport_withdraws_health():
-    inference = _inference()
-    inference._encoder_cache = SimpleNamespace(failed=True)
-    assert not _servicer(inference=inference)._engine_is_healthy()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "cancel_path", ["rpc", "request_id", "all_requests", "reservation", "discard_failure"]
 )
@@ -549,34 +569,9 @@ async def test_cancel_during_publish_reclaims_the_completed_cache(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("input_kind", ["missing", "prompt", "tokens"])
 async def test_unary_encode_validates_native_context_and_records_no_token_usage(
-    tmp_path, monkeypatch, input_kind
+    encoder_inference, input_kind
 ):
-    llm, _ = model()
-    llm.args = SimpleNamespace(mm_encoder_only=True, guided_decoding_backend=None)
-    result, _ = native_result()
-
-    class Handle:
-        error = None
-        finished = True
-        disaggregated_params = result.disaggregated_params
-
-        async def __aiter__(self):
-            yield self
-
-    class FakeEncoderGenerate:
-        def __call__(self, inputs, sampling_params):
-            assert sampling_params.max_tokens == 1
-            return Handle()
-
-    llm.generate_async = FakeEncoderGenerate()
-    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr(encoding, "_prepare", prepared_encode)
-    inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
-    outcomes = []
-    inference._metrics = SimpleNamespace(
-        record_outcome=lambda *outcome: outcomes.append(outcome),
-        record_result=lambda *_: pytest.fail("Encode has no generation-token accounting"),
-    )
+    inference, _, outcomes = encoder_inference
     req = encode_request()
     if input_kind == "missing":
         req.ClearField("prompt")
@@ -592,10 +587,135 @@ async def test_unary_encode_validates_native_context_and_records_no_token_usage(
         response = await inference.Encode(req, context)
         assert response.request_id == req.request_id
         assert response.encoded_media.opaque_state
-        assert "usage" not in response.DESCRIPTOR.fields_by_name
         assert outcomes == [("encode", "completed")]
         from tensorrt_llm.grpc.openengine.encoder import native_reference
 
         assert inference._encoder_cache.discard(native_reference(response.encoded_media))
     await inference.drain_encoder_cleanup()
     assert not inference.active_request_count()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure, status, outcome",
+    [
+        (
+            EncoderCapacityError("full"),
+            encoding.grpc.StatusCode.RESOURCE_EXHAUSTED,
+            "rejected",
+        ),
+        (
+            EncoderUnavailableError("closed"),
+            encoding.grpc.StatusCode.UNAVAILABLE,
+            "unavailable",
+        ),
+        (
+            MediaUnavailableError("fetch failed"),
+            encoding.grpc.StatusCode.UNAVAILABLE,
+            "unavailable",
+        ),
+        (
+            ValueError("published output exceeds limit"),
+            encoding.grpc.StatusCode.INVALID_ARGUMENT,
+            "rejected",
+        ),
+        (
+            RuntimeError("unexpected engine fault"),
+            encoding.grpc.StatusCode.INTERNAL,
+            "engine_error",
+        ),
+    ],
+)
+async def test_encode_publication_errors_preserve_status_and_metrics(
+    encoder_inference, monkeypatch, failure, status, outcome
+):
+    inference, _, outcomes = encoder_inference
+
+    def publish(*args):
+        raise failure
+
+    monkeypatch.setattr(inference._encoder_cache, "publish", publish)
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await inference.Encode(encode_request(), context)
+    assert context.abort_code == status, context.abort_details
+    assert outcomes == [("encode", outcome)]
+    await inference.drain_encoder_cleanup()
+    assert inference.active_request_count() == 0
+    assert not inference._encoder_cleanup_failed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure, status, outcome",
+    [
+        (
+            EncoderCapacityError("full"),
+            encoding.grpc.StatusCode.RESOURCE_EXHAUSTED,
+            "rejected",
+        ),
+        (
+            EncoderUnavailableError("closed"),
+            encoding.grpc.StatusCode.UNAVAILABLE,
+            "unavailable",
+        ),
+        (
+            RuntimeError("unexpected import fault"),
+            encoding.grpc.StatusCode.INTERNAL,
+            "engine_error",
+        ),
+    ],
+)
+async def test_consumer_import_errors_preserve_status_and_metrics(
+    tmp_path, monkeypatch, failure, status, outcome
+):
+    llm, _ = model()
+    llm.args = SimpleNamespace(disable_mm_encoder=True, guided_decoding_backend=None)
+    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", str(tmp_path))
+    inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
+    assert inference.encoder_role == "consume"
+    inference._media_capabilities = MediaCapabilities({"image": "<image_{}>"})
+    outcomes = []
+    inference._metrics = SimpleNamespace(record_outcome=lambda *value: outcomes.append(value))
+
+    def prepare(*args):
+        raise failure
+
+    monkeypatch.setattr(inference._encoder_cache, "prepare", prepare)
+    req = request()
+    req.encoded_media.opaque_state = b"native-owned-reference"
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        async for _ in inference.Generate(req, context):
+            pytest.fail("import failure must not generate output")
+    assert context.abort_code == status, context.abort_details
+    assert outcomes == [("aggregated", outcome)]
+    await inference.drain_encoder_cleanup()
+    assert inference.active_request_count() == 0
+
+
+@pytest.mark.parametrize("invalid_role", [False, True])
+def test_nixl_transport_does_not_construct_unused_shared_cache(monkeypatch, invalid_role):
+    from tensorrt_llm.grpc.openengine import encoder_nixl
+
+    llm, _ = model()
+    llm.args = SimpleNamespace(
+        mm_encoder_only=True,
+        guided_decoding_backend=None,
+        tensor_parallel_size=2 if invalid_role else 1,
+    )
+    closed = []
+    cache = SimpleNamespace(endpoint="encoder.example:30001", close=lambda: closed.append(True))
+    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", "/unused-shared-cache")
+    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_TRANSFER", "nixl")
+    monkeypatch.setattr(encoder_nixl, "NixlEncoderCache", lambda *args, **kwargs: cache)
+    monkeypatch.setattr(servicer, "EncoderCache", lambda *args: pytest.fail("unused shared cache"))
+    if invalid_role:
+        with pytest.raises(ValueError, match="supported role"):
+            servicer.OpenEngineInferenceServicer(llm, "qwen")
+        assert closed == [True]
+    else:
+        inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
+        assert inference._encoder_cache is cache
+        assert inference.encoder_role == "encode"
+        assert not closed
