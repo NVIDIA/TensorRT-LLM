@@ -1296,13 +1296,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          pp_size, ep_size, torch_compile, mtp_nextn,
                          moe_tactic):
         # Only ep4 has moe_tp_size == 1 and dp_size > 1, which is the layout
-        # that can select NVLinkOneSided. Fail here instead of reporting a
+        # that can select NVLinkOneSided. Skip here instead of reporting a
         # pass for a layout that never reads the flag.
         if low_precision_combine and not (attention_dp and tp_size == ep_size
                                           and pp_size == 1):
-            pytest.fail(
-                "use_low_precision_moe_combine requires ep4 "
-                "(moe_tp_size == 1 and dp_size > 1)")
+            pytest.skip("use_low_precision_moe_combine requires ep4 "
+                        "(moe_tp_size == 1 and dp_size > 1)")
         skip_unless_moe_tactic_runs_here(moe_tactic)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
