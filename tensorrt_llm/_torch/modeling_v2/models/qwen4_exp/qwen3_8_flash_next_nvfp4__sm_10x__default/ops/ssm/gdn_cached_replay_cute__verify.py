@@ -3,7 +3,8 @@
 """GDN cached-replay verify step on warp tensor cores (CuTe DSL), a drop-in for the Triton
 `_cached_replay_kernel` (`fused_recurrent_gated_delta_rule_cached_replay_update`) at this
 checkpoint's geometry (K=V=128, history 16, bf16 checkpoint state, T=1..8 new tokens), over
-H q/k heads and HV = 3 H value heads: a whole layer's 16 / 48, or a tp4/tep4 rank's 4 / 12.
+H q/k heads and HV = 3 H value heads: a whole layer's 16 / 48, a tp2/tep2 rank's 8 / 24, or a
+tp4/tep4 rank's 4 / 12.
 
 Tier 5 (CuTe DSL written for this checkpoint); the head counts are compile-time parameters of
 `_Replay` (`h`, `hv`).
@@ -53,15 +54,16 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T as _ty
 from cutlass.cutlass_dsl import dsl_user_op
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 K, V, HIST = 128, 128, 16
 #: Value heads a q/k head serves. The q/k and value head counts themselves are compile-time
 #: parameters (`_Replay(h=..., hv=...)`, from the call's shapes): `GEOMETRIES`.
 GRP = 3
 #: `(q/k heads, value heads)` the kernel is compiled for: a whole layer (an attention-DP
-#: rank's), and a tp4/tep4 rank's quarter.
-GEOMETRIES = ((16, 48), (4, 12))
+#: rank's), a tp2/tep2 rank's half, and a tp4/tep4 rank's quarter.
+GEOMETRIES = ((16, 48), (8, 24), (4, 12))
 TILES = GRP * (V // 16)  # m-tiles of one (request, q/k head)
 PU = 272  # shared row pitch (bytes) of 128-element bf16 rows read by ldmatrix (conflict-free)
 PK = 320  # shared row pitch of the history keys read as permuted 16-byte fragments
@@ -2033,11 +2035,33 @@ def cached_replay_update(
 
 #: A tp4/tep4 rank's GDN heads: 16 key / 48 value split four ways.
 RANK_K_HEADS, RANK_V_HEADS = 4, 12
+#: A tp2/tep2 rank's GDN heads: the same 16 / 48 split two ways.
+TWO_RANK_K_HEADS, TWO_RANK_V_HEADS = 8, 24
 #: A tp1 or dep4 rank's GDN heads: the whole layer's.
 ONE_RANK_K_HEADS, ONE_RANK_V_HEADS = 16, 48
 #: The stock tep4 engine's recurrent-state slots a rank (bf16 state), and the GDN layers whose
 #: states share one slot page in the stock manager: the slot stride is 36 layers' states.
 TEP4_SLOTS, PAGE_LAYERS = 1874, 36
+#: The same page's slots at a tp2/tep2 rank's slot stride.
+TEP2_SLOTS = 937
+
+
+def _tep2_cell(why, path, n, t, **spec) -> Cell:
+    return Cell(
+        why=f"tep2 {why}",
+        spec=dict(
+            path=path,
+            n=n,
+            t=t,
+            state_dtype=torch.bfloat16,
+            H=TWO_RANK_K_HEADS,
+            HV=TWO_RANK_V_HEADS,
+            history_size=HIST,
+            slots=TEP2_SLOTS,
+            page_layers=PAGE_LAYERS,
+            **spec,
+        ),
+    )
 
 
 def _tep4_cell(why, path, n, t, **spec) -> Cell:
@@ -2086,13 +2110,14 @@ class GdnCachedReplayCute(OpWrapper):
     all-layer commit does), exactly as the Triton entry.
 
     The q/k and value head counts are compile-time parameters taken from the call's shapes
-    (`GEOMETRIES`: a whole layer's 16 / 48 and a tp4/tep4 rank's 4 / 12), and `g` / `beta` may
-    be strided column views of the input projection (any row stride, unit head stride).
+    (`GEOMETRIES`: a whole layer's 16 / 48, a tp2/tep2 rank's 8 / 24 and a tp4/tep4 rank's
+    4 / 12), and `g` / `beta` may be strided column views of the input projection (any row
+    stride, unit head stride).
 
     Fusion boundary: as the Triton entry's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: the Triton entry's test harness (`_Bench`) spec -- path, n sequences x t
     # tokens, consecutive steps with random acceptance, start, accept, dup, H / HV, pool slots,
@@ -2144,6 +2169,22 @@ class GdnCachedReplayCute(OpWrapper):
             strided_gates=True,
         ),
         _tep4_cell("all_layer n=128 T=4: a large partitioned batch", "all_layer", 128, 4, steps=4),
+        _tep2_cell(
+            "small n=4 T=4: a 16-row verify, in-kernel commit",
+            "small",
+            4,
+            4,
+            steps=6,
+            strided_gates=True,
+        ),
+        _tep2_cell(
+            "all_layer n=32 T=4: a 128-row verify, all-layer commit",
+            "all_layer",
+            32,
+            4,
+            steps=4,
+            strided_gates=True,
+        ),
         _whole_layer_cell(
             "small n=1 T=3: MTP2 verify at con1 (the tp1 AgentX engines), in-kernel commit",
             "small",
@@ -2182,12 +2223,12 @@ class GdnCachedReplayCute(OpWrapper):
 
     note = """
     Call site: `_gdn_verify` (`DecodeTarget._gdn_block` / `PrefillTarget._gdn_block` of a verify
-    step) over the bf16 recurrent pool, at a tp4/tep4 rank's 4 / 12 heads (tp1 and dep4: the
-    whole layer's 16 / 48): q/k/v from the conv's fresh contiguous `[N*T, 2560]` rows
-    (`packed_qkv`; 10240 at 16 / 48), `g` / `beta` the input projection's raw
+    step) over the bf16 recurrent pool, at a tp4/tep4 rank's 4 / 12 heads, a tp2/tep2 rank's
+    8 / 24 (tp1 and dep4: the whole layer's 16 / 48): q/k/v from the conv's fresh contiguous
+    `[N*T, 2560]` rows (`packed_qkv`; 10240 at 16 / 48), `g` / `beta` the input projection's raw
     a / b columns read through its row stride (no copies), `A_log` / `dt_bias` fp32, the
     layer's view of the stock manager's bf16 state page (slot stride 36 layers' states), the
-    history buffers `[slots, 2, 16, 12|4, 128]` / `[slots, 2, 12, 16]` (addressed by the
+    history buffers `[slots, 2, 16, 24|12|4, 128]` / `[slots, 2, 12, 16]` (addressed by the
     manager's replay slots, `replay_indices`, when it keeps the history in slots of its own;
     the work items then carry the replay slot as a fifth field), and work items +
     `use_all_layer_commit` exactly when the Triton entry gets them (N >= 16 with the manager's
@@ -2206,7 +2247,9 @@ class GdnCachedReplayCute(OpWrapper):
     warm histories with random acceptance): the in-kernel commit at N = 1, 2, 4 and T = 2, 4,
     8 (T = 8 with full acceptance appending to the history's end, then wrapping), CUDA-graph
     padding rows sharing one slot, and the all-layer commit at N = 16 and 128 (T = 4); g / beta
-    as column views of a `[N*T, 4120]` projection. Against the Triton entry's bands (fractions
+    as column views of a `[N*T, 4120]` projection. At 8 / 24 heads (tp2/tep2) the in-kernel
+    commit at N = 4 and the all-layer commit at N = 32, both T = 4.
+    Against the Triton entry's bands (fractions
     of each gate): output elements <= 0.50 of 4 bf16 ulps of their token block, relative RMS
     <= 0.71 of 1.5 ulps, bf16 checkpoint <= 0.68 of 2 ulps of its head's absmax, `old_u` <=
     0.50 of 4 ulps, `old_G` <= 0.06 -- the Triton entry's own margins (0.52 / 0.64 / 0.84 /

@@ -33,7 +33,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa import (
     qsa_paged_sparse_gqa as _per_row_entry,
 )
@@ -538,7 +539,7 @@ def _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_ind
         raise ValueError("a row's query heads per KV head must fit the 128-row tile")
     if not _cute_eligible(q, k_cache, v_cache):
         raise ValueError(
-            "the row-tile pass needs SM103, head_dim 256, unit-stride heads (q's heads packed) "
+            "the row-tile pass needs SM103/SM107, head_dim 256, unit-stride heads (q's heads packed) "
             "and 16-byte-aligned rows"
         )
 
@@ -711,14 +712,14 @@ class QsaSparseGqaRowtile(OpWrapper):
     programmatically dependent on the lone pass, whose rows are disjoint, so
     the two overlap. That pass is `qsa_rowtile_attention_cute` (tcgen05 MMAs,
     S / P / O in tensor memory, a cp.async gather of the K/V rows, a TMA store
-    of O), so the entry serves SM103, bf16 q and K/V and D = 256.
+    of O), so the entry serves SM103/SM107, bf16 q and K/V and D = 256.
 
     Fusion boundary: as `qsa_paged_sparse_gqa` -- the block-table gather,
     scale, online softmax and P.V are inside; deciding what to attend to,
     appending K/V and q's projection, norm, RoPE and gate are not.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(

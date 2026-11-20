@@ -19,11 +19,11 @@
 # modeling_v2 README.
 add_modeling_v2_family(qwen4_exp)
 
-# The FP8 target routes on SM103 only (its kernels need only SM90+ features).
+# The FP8 target serves SM103 and SM107 (its kernels need only SM90+ features).
 # The hyper-connection all-reduce uses the stock all-reduce's IPC workspace,
 # which exists only in multi-device builds.
 add_modeling_v2_target(
   qwen4_exp qwen3_8_flash_next_fp8__sm_10x__default
-  ARCHS 103a
+  ARCHS 103a 107a
   SOURCES *.cu *.cpp
   REQUIRES MULTI_DEVICE)

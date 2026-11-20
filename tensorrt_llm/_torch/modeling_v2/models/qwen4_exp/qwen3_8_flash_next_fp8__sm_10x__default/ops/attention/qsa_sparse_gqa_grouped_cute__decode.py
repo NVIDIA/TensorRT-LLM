@@ -40,7 +40,8 @@ from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 
 from .qsa_sparse_gqa_splitk_cute__decode import (
     MAX_SPLITS,
@@ -2374,7 +2375,7 @@ def _compile_plan(pkey: tuple, plan_kw: dict, plan_args: tuple):
 
 def takes_grouped(q, k_cache, selected_tokens, rows_per_request) -> bool:
     """Whether `sparse_gqa_grouped` serves this call (on shapes only, so a per-capture constant):
-    an e4m3 pool on SM103, 2..4 rows a request, `MIN_GROUPS` groups, a shared-memory plan."""
+    an e4m3 pool on SM103/SM107, 2..4 rows a request, `MIN_GROUPS` groups, a shared-memory plan."""
     if q.dim() != 3 or k_cache.dim() != 4 or k_cache.dtype != torch.float8_e4m3fn:
         return False
     rows, num_q_heads, head_dim = q.shape
@@ -2385,7 +2386,7 @@ def takes_grouped(q, k_cache, selected_tokens, rows_per_request) -> bool:
         return False
     if k_cache.stride(3) != 1 or k_cache.stride(2) != HEAD_DIM:
         return False
-    if torch.cuda.get_device_capability(q.device) != (10, 3):
+    if not archs.fast_path("qsa_grouped_decode", torch.cuda.get_device_capability(q.device)):
         return False
     group = num_q_heads // k_cache.shape[1]
     return _layout(rpr, group, selected_tokens.shape[1], 1) is not None
@@ -2687,7 +2688,7 @@ class QsaSparseGqaGroupedCute(OpWrapper):
     result is `bf16(attn) * sigmoid(gate)` rounded once more to bf16.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = archs.SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -2740,7 +2741,7 @@ class QsaSparseGqaGroupedCute(OpWrapper):
     Source: this target's CuTe DSL kernels (`_GroupedKernel`, `_RowMergeKernel`, `_BalPlanKernel`),
     `cute.compile`d per (T, splits, launch mode); every reachable plan of a geometry is compiled on
     its first call. Called by `modeling._sparse_gqa` for verify / draft-extend rows over an e4m3
-    pool with `rows_per_request` > 1 where `serves` (an e4m3 pool on SM103, 2..4 rows a request,
+    pool with `rows_per_request` > 1 where `serves` (an e4m3 pool on SM103/SM107, 2..4 rows a request,
     at least `MIN_GROUPS` groups, T x q heads a KV head <= 128); the per-row
     `qsa_sparse_gqa_splitk_cute` otherwise. Graph-capturable (the row count is a runtime value).
 

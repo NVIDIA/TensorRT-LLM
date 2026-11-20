@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """ModelingV2 target: Qwen3.8-Flash-Next-FP8 (hf-236dfdf_orig) / sm_10x / default.
 
-One target for every layout `routing.py` admits for this checkpoint in one node (`_FP8_LAYOUTS`):
+One target for every layout `routing.py` admits (`_LAYOUTS`, and dep<world size> across nodes):
 tp1; tp2, tep2 (attention TP2) and dep2 (attention DP) at two ranks; tp4, tep4 (attention TP4)
 and dep4 (attention DP) at four. The core holds this rank's share of the weights, the derived
 operands and the per-manager pool views; `PrefillTarget` (any batch with context rows) and
@@ -120,6 +120,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, al
 from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.graph.eager_on_graph import eager_on_graph
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmoid_mul_inplace import (
     fused_sigmoid_mul_inplace,
 )
@@ -346,9 +347,6 @@ from .ops.ssm.gdn_in_proj_conv__verify import fused_tactic as _gdn_in_proj_conv_
 from .ops.ssm.gdn_in_proj_conv__verify import gdn_in_proj_conv
 from .ops.ssm.gdn_inforward_tail import gdn_inforward_conv_swap, gdn_inforward_tail
 
-# The certified GPU architecture, checked again because a direct instantiation bypasses routing.
-_SM = (10, 3)
-
 # `moe_config.backend` requests served by the trunk's routed experts (`fp8_block_scale_moe_runner`).
 _TRUNK_MOE_BACKENDS = ("AUTO", "TRTLLM")
 
@@ -500,6 +498,8 @@ _GDN_REPLAY_HT_LAUNCH = (
     (80, get_env_enable_pdl(), None),
     (1 << 30, False, dict(tpc=8, warps=4, pf=0, minb=5, early_acc=True)),
 )
+#: Where `_GDN_REPLAY_HT_LAUNCH` was measured; on sm_107 its `pf=0, minb=5` rows fail at launch.
+_GDN_REPLAY_HT_GPUS = frozenset({archs.SM_103})
 #: Requests up to which a tp2/tep2 HT verify batch folds the conv into the CuTe replay
 #: (`conv_fold=`, bitwise `causal_conv1d_token_major`); the replay writes the per-row windows and
 #: the acceptance promote advances the pool window from them.
@@ -909,8 +909,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
         mapping = model_config.mapping
-        assert torch.cuda.get_device_capability() == _SM, (
-            f"target certified on sm_{_SM[0]}{_SM[1]}, running on "
+        assert archs.served(torch.cuda.get_device_capability()), (
+            f"target serves {archs.served_names()}, running on "
             f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}"
         )
         assert getattr(cfg, "model_type", None) == "qwen4_exp_text", (
@@ -2124,7 +2124,11 @@ def _gdn_verify_folds_conv(core, n: int) -> bool:
 def _gdn_replay_launch(core, n: int) -> tuple:
     """Return `(pdl, mapping)` for the CuTe cached replay over `n` requests."""
     heads = (core.num_k_heads, core.num_v_heads)
-    if heads == _GDN_REPLAY_HT_GEOMETRY and n >= _GDN_REPLAY_HT_MIN_REQUESTS:
+    if (
+        heads == _GDN_REPLAY_HT_GEOMETRY
+        and n >= _GDN_REPLAY_HT_MIN_REQUESTS
+        and torch.cuda.get_device_capability() in _GDN_REPLAY_HT_GPUS
+    ):
         for bound, pdl, mapping in _GDN_REPLAY_HT_LAUNCH:
             if n <= bound:
                 return pdl, mapping
@@ -6868,7 +6872,11 @@ def _text_settings(text) -> dict:
 class ModelingV2Qwen38FlashNextFp8Sm10xDefault(
     DecoderModelForCausalLM[Qwen4ExpDefaultModelingV2, PretrainedConfig]
 ):
-    """Qwen3.8-Flash-Next-FP8 at tp1, tp2, tep2, dep2, tp4, tep4 or dep4 on sm_103."""
+    """Qwen3.8-Flash-Next-FP8 at tp1, tp2, tep2, dep2, tp4, tep4, dep4, or dep<world size>
+    across nodes."""
+
+    # Keeps a requested NVFP4 KV pool, which the engine otherwise turns into FP8 on sm_107.
+    supports_nvfp4_kv_cache = True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
@@ -6879,7 +6887,7 @@ class ModelingV2Qwen38FlashNextFp8Sm10xDefault(
     def check_deployment(model_config: ModelConfig, llm_args: TorchLlmArgs, layout: str) -> None:
         """Raise `NoTarget` for a checkpoint or engine choice this target does not run.
 
-        `route` calls it once the GPU, `layout` (routing's `_FP8_LAYOUTS`) and draft path match,
+        `route` calls it once the GPU, `layout` (routing's `_LAYOUTS`) and draft path match,
         so `auto` falls back to the built-in implementation instead of failing later."""
         cfg = model_config.pretrained_config
         text = getattr(cfg, "text_config", None)

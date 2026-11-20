@@ -9,7 +9,8 @@ One target for the layouts `routing.py` admits in one node: one rank (tp1, every
 expert); at four ranks tp4 (attention TP4, routed experts split by intermediate), tep4
 (attention TP4, experts EP4) and dep4 (attention DP, experts EP4); at two ranks dep2 (attention
 DP, experts EP2), the layout of both disaggregated-serving engines, which is dep4 at half the
-group. The core holds the static
+group, tp2 (attention TP2, every expert split by intermediate) and tep2 (attention TP2, experts
+EP2); across nodes dep<world size>. The core holds the static
 structure (this rank's share of the weights, derived operands, per-manager pool views);
 `PrefillTarget` (any batch with context rows) and `DecodeTarget` (generation only) run a step
 over it, passing every argument to every op at the call site.
@@ -174,6 +175,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner impo
     MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS,
 )
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmoid_mul_inplace import (
     fused_sigmoid_mul_inplace,
 )
@@ -450,10 +452,6 @@ from .ops.ssm.gdn_cached_replay_cute__verify import precompile as gdn_replay_pre
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-# The GPU architecture this target is certified for; a direct instantiation could
-# bypass routing.
-_SM = (10, 3)
 
 # `moe_config.backend` request -> the routed-expert backend the trunk runs.
 _TRUNK_MOE_BACKENDS = {"AUTO": "TRTLLM", "TRTLLM": "TRTLLM", "CUTEDSL": "CUTEDSL"}
@@ -1044,8 +1042,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         mapping = model_config.mapping
         # One rank holds the whole model (tp1), which takes forms of its own (module docstring).
         self.one_rank = mapping.world_size == 1
-        assert torch.cuda.get_device_capability() == _SM, (
-            f"target certified on sm_{_SM[0]}{_SM[1]}, running on "
+        assert archs.served(torch.cuda.get_device_capability()), (
+            f"target serves {archs.served_names()}, running on "
             f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}"
         )
         assert getattr(cfg, "model_type", None) == "qwen4_exp_text", (
@@ -1192,9 +1190,16 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             f"max_draft_len={self.max_verify_rows - 1} with moe_config.backend=CUTEDSL: the "
             f"CuteDSL expert pipeline is certified at max_draft_len up to {_CUTEDSL_MAX_DRAFT_LEN}"
         )
+        # Without the CuTe DSL MoE every launch runs on trtllm-gen.
+        cute_dsl_moe = archs.fast_path("cute_dsl_moe", torch.cuda.get_device_capability())
+        assert self.trunk_moe_backend != "CUTEDSL" or cute_dsl_moe, (
+            "moe_config.backend=CUTEDSL: the CuTe DSL MoE does not run on "
+            f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}; "
+            "use moe_config.backend=TRTLLM"
+        )
         # At one rank the CuteDSL-layout copy of the experts for prefill-sized launches
         # (`_moe_prefill_copy`); `weights.py` declares it from this.
-        self.moe_prefill_copy = _moe_prefill_copy(
+        self.moe_prefill_copy = cute_dsl_moe and _moe_prefill_copy(
             self.one_rank, self.trunk_moe_backend, model_config.max_num_tokens
         )
         # Cached native NVFP4 operands or the one-rank FP8 conversion, built once because
@@ -6818,7 +6823,8 @@ def _text_settings(text) -> dict:
 class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
     DecoderModelForCausalLM[Qwen4ExpDefaultModelingV2, PretrainedConfig]
 ):
-    """Qwen3.8-Flash-Next-NVFP4 at tp1, tp4, tep4, dep4 or dep2 on sm_103."""
+    """Qwen3.8-Flash-Next-NVFP4 at tp1, tp2, tep2, dep2, tp4, tep4, dep4, or dep<world size>
+    across nodes."""
 
     # At tp1 one-engine speculative decoding takes the engine's fast paths (greedy and
     # temperature-only sampling CUDA graph variants, the overlap loop on the execution stream,
@@ -6826,6 +6832,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
     # decode-step prepare), validated there; off at every other layout.
     spec_decode_fast_paths: bool = False
     runtime_hooks: RuntimeHooks | None = None
+    # Keeps a requested NVFP4 KV pool, which the engine otherwise turns into FP8 on sm_107.
+    supports_nvfp4_kv_cache = True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
@@ -6837,11 +6845,10 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
     def check_deployment(model_config: ModelConfig, llm_args: TorchLlmArgs, layout: str) -> None:
         """Raise `NoTarget` for a checkpoint or an engine choice this target does not run.
 
-        `route` calls it once the GPU, the parallel layout (`layout`, a key of routing's
-        `_LAYOUTS`) and the draft path match, before it returns this class. Where the
-        constructor, the bind or the first forward would refuse the deployment, or a same-shape
-        checkpoint would compute something else, `auto` then falls back to the built-in
-        implementation.
+        `route` calls it once the GPU, the parallel layout (`layout`: routing's `layout`) and the
+        draft path match, before it returns this class. Where the constructor, the bind or the
+        first forward would refuse the deployment, or a same-shape checkpoint would compute
+        something else, `auto` then falls back to the built-in implementation.
         """
         cfg = model_config.pretrained_config
         text = getattr(cfg, "text_config", None)
