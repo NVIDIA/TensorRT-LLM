@@ -15,6 +15,7 @@ import os
 import sys
 import unittest
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -154,6 +155,58 @@ class TestHostResplit(unittest.TestCase):
             self.assertGreater(arena.check_cached(self), 0)
         finally:
             arena.close()
+
+    def test_resplit_with_suspended_cache_sharing_an_active_prefix(self):
+        """A SUSPENDED cache that holds prefix pages an ACTIVE cache locks on the GPU.
+
+        Those pages are hot, locked and not scheduled for eviction, so they are not host pages the
+        re-split must keep. Listing them as persistent host pages made adjust() throw "Persistent page
+        cache level or pool group mismatch" (Gemma-3-27B serving, doc 40, 2026-11-20).
+        """
+        arena = _build()
+        holder_id, sharer_id = 4000, 4001
+        holder = sharer = None
+        try:
+            _fill(arena)
+            tokens = base._tokens(holder_id)
+            holder = arena.add_request(holder_id, commit=True)
+            holder_idx = arena.indices(holder)
+            # Same prompt: the sharer reuses the holder's committed blocks and locks the same pages.
+            sharer = arena.mgr.create_kv_cache(input_tokens=tokens, id=sharer_id)
+            arena.bufs[sharer_id] = {
+                lc: np.full(base.BLOCKS_PER_REQUEST, -2, dtype=np.int32)
+                for lc in arena.lcs.values()
+            }
+            arena.bind_bufs(sharer_id, sharer)
+            self.assertTrue(sharer.resume(arena.stream))
+            self.assertTrue(sharer.resize(len(tokens)))
+            sharer_idx = arena.indices(sharer)
+            shared = sum(
+                1
+                for lc in holder_idx
+                for a, b in zip(holder_idx[lc], sharer_idx[lc])
+                if a == b and a != kvm.BAD_PAGE_INDEX
+            )
+            self.assertGreater(shared, 0, "the sharer reused no page of the holder")
+            torch.cuda.synchronize()
+            holder.suspend()  # holds pages the ACTIVE sharer still locks on the GPU
+
+            self._resplit_with_live_requests(arena, [0.8, 0.2])
+            self.assertEqual(
+                arena.indices(sharer), sharer_idx, "a page the active sharer locks moved"
+            )
+
+            # The suspended holder comes back with its data.
+            self.assertTrue(holder.resume(arena.stream))
+            arena.bind_bufs(holder_id, holder)
+            arena.live[holder_id] = (holder, tokens)
+            arena.check_live(self)
+        finally:
+            if sharer is not None:
+                sharer.close()
+            if holder is not None and holder_id not in arena.live:
+                holder.close()
+            arena.close()  # closes the live requests
 
 
 if __name__ == "__main__":

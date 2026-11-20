@@ -1624,9 +1624,12 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLa
                     {
                         continue;
                     }
-                    if (active && pg->status() == PageStatus::LOCKED)
+                    if (pg->status() == PageStatus::LOCKED)
                     {
-                        // Held here but locked by another active cache: relocated with the locked pages.
+                        // Held here but locked by an ACTIVE cache (a shared prefix; possible whenever adjust()
+                        // runs without suspending everyone, also for a SUSPENDED holder): a hot page, never
+                        // scheduled for eviction, so not a last-level page to keep. Relocated, if at all, with
+                        // the locked pages.
                         continue;
                     }
                     // Mirrors Python assertions for invariant checking.
