@@ -382,22 +382,26 @@ changes:
 
 | Layer | File |
 |-------|------|
-| Selection and identity: what a resolution can get wrong (see the Identity Tests row under [Canonical Examples](#canonical-examples)) | `test_moe_impl.py` |
+| Selection and identity: what a resolution can get wrong (see the Identity Tests row under [Canonical Examples](#canonical-examples)) | `test_moe_impl_identity.py` |
 | The generated catalog in the MoE performance guide | `test_moe_impl_catalog.py` |
-| Backends: `run_moe`, `can_implement`, weight loading, numerics | `test_moe_backend.py` |
-| `ConfigurableMoE` integration (Backend × Comm × EPLB) | `test_moe_module.py` |
+| Implementations: `run_moe`, `can_implement`, weight loading, numerics | `test_moe_impl.py` |
+| `ConfigurableMoE` integration (Impl × Comm × EPLB) | `test_moe_module.py` |
 | Communication strategies | `test_moe_comm.py` |
 | Routing | `test_moe_routing.py` |
 | Load balancer | `test_moe_load_balancer.py` |
 | CuteDSL MoE ops, including the MXFP8 fused FC12 op against an fp32 reference | `kernels/parallel/test_cute_dsl_moe.py` |
 | Multi-GPU EP and all-to-all | `multi_gpu/` |
 
-Backend, quantization and skip matrices are shared, in `moe_test_utils.py` and
-`quantize_utils.py`. A feature with its own suite gets a file named after it
-beside these (`test_per_layer_dynamic_eplb.py`,
-`test_cute_dsl_b12x_moe_backend.py`, `test_mxfp8_moe_partial_refit.py`). `test_fused_moe.py` holds legacy tests
-being replaced: do not add tests there. A test that needs no GPU carries the
-`cpu_only` mark, which is what the CPU stage collects; `tests/AGENTS.md` says
+Implementation matrices use full registered `provider.technique.kernel_name.quant`
+IDs and verify the constructed implementation. `moe_test_utils.py` and
+`quantize_utils.py` share input preparation and skip policies. Implementation-specific
+tests live in `impls/test_<provider>_<technique>_<kernel_name>.py`,
+with quantization variants in the same file; retain the existing CI execution mode.
+Shared implementation contracts live in `test_moe_impl.py`. A feature with its own
+suite keeps a file such as `test_per_layer_dynamic_eplb.py` or
+`test_mxfp8_moe_partial_refit.py` beside the framework.
+`test_fused_moe.py` holds legacy tests being replaced: do not add tests there.
+A test that needs no GPU carries the `cpu_only` mark, which is what the CPU stage collects; `tests/AGENTS.md` says
 which CI list runs a test.
 
 Before merge, the DGX stages run `test_moe_multi_gpu_premerge` instead of the
@@ -1432,9 +1436,9 @@ When adding new components, use these reference implementations:
 | New Quantization Method | `quantization.py` → `FP8QDQFusedMoEMethod` | Subclass `FusedMoEMethod`, implement quant/dequant ops |
 | New Communication Strategy | `communication/nvlink_one_sided.py` (`NVLinkOneSided`) | Subclass `Communication`, implement `prepare_dispatch`, `dispatch`, `combine`; also implement `CheckpointableCommunication` when native workspace mappings must follow executor sleep/wakeup |
 | New Scheduler | `moe_scheduler.py` (`ExternalCommMoEScheduler` / `FusedCommMoEScheduler`) | Subclass `MoEScheduler`, implement `forward`; add new `MoESchedulerKind` value and wire into `create_moe_scheduler` factory |
-| Backend Tests | `test_moe_backend.py` | Follow existing parametrize patterns |
-| Identity Tests | `test_moe_impl.py` | Test what selection can get wrong: the backend literal or a pinned id reaches the intended leaf, a leaf declines what its kernel does not run, a pin fails rather than degrades, and a leaf refuses a layer whose format moved after it was picked. Do not restate a declaration (an id string, a support set, a family's membership) across tests; a family with several leaves pins its leaves' declarations once, in one hand-written table (`test_cutlass_leaf_declarations`, `test_cutedsl_leaf_declarations`). Tests that merely *use* the class belong in `test_moe_backend.py` |
-| Integration Tests | `test_moe_module.py` | Test Backend × Communication × EPLB combinations |
+| Implementation Tests | `test_moe_impl.py` | Follow existing parametrize patterns |
+| Identity Tests | `test_moe_impl_identity.py` | Test what selection can get wrong: the backend literal or a pinned id reaches the intended leaf, a leaf declines what its kernel does not run, a pin fails rather than degrades, and a leaf refuses a layer whose format moved after it was picked. Do not restate a declaration (an id string, a support set, a family's membership) across tests; a family with several leaves pins its leaves' declarations once, in one hand-written table (`test_cutlass_leaf_declarations`, `test_cutedsl_leaf_declarations`). Tests that merely *use* the class belong in `test_moe_impl.py` |
+| Integration Tests | `test_moe_module.py` | Test Impl × Communication × EPLB combinations |
 
 **Note on backend inheritance:** new execution units inherit `MoEImplBase` (in
 `impl_base.py`), never `MoE` and never another implementation for its
@@ -1539,7 +1543,7 @@ their real class name.
 - **Do NOT add communication logic inside backends** — Communication belongs in `communication/`, backends do pure computation (exception: `FUSED_COMM` backends own the SymmBuffer collective inside their fused kernel)
 - **Do NOT add forward-execution policy inside backends** — chunking, EPLB hook ordering, dispatch/combine sequencing belong in `MoEScheduler`
 - **Do NOT modify old `XXFusedMoE` files for new features** — Use ConfigurableMoE + Backend + Scheduler architecture
-- **Do NOT add new tests to `test_fused_moe.py` or `test_moe.py`** — Use `test_moe_backend.py` and `test_moe_module.py`
+- **Do NOT add new tests to `test_fused_moe.py` or `test_moe.py`** — Use `test_moe_impl.py` and `test_moe_module.py`
 - **Do NOT skip `can_implement()` checks** — Every backend must declare what it supports; an unsupported combination returns `MoEEligibility.no(MoERejectReason.<CODE>, detail)`, never a bare `False` and never a free-form string a test would have to pattern-match
 - **Do NOT probe the machine inside `can_implement()`** — No `get_sm_version()`, no `import` as a presence test, no `os.environ`. Read `d.env`; add the probe to `impl_environment.py` if it does not exist yet
 - **Do NOT gate an activation on a class name** — No `isinstance`, no `moe_cls in [...]`, no ad-hoc `swiglu_gptoss_style` branch in a factory. A backend states what its kernels execute in `activation_support`; `_reject_unsupported_activation` reads that declaration for every candidate, and `materialize_activation_params` enforces it again at construction

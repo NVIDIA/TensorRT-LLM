@@ -29,7 +29,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, RenormalizeMoeRoutingMethod
+from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
     MoEActivation,
@@ -39,41 +39,20 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     activation_constant_names,
 )
-from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
-    TrtllmCutedslFusedFc12Mxfp8Impl,
-    cutedsl_grouped_gemm_leaf,
-    find_cutedsl_grouped_gemm_leaf,
-)
-from tensorrt_llm._torch.moe.fused_moe.cutlass import (
-    cutlass_leaf,
-    cutlass_leaves_in_resolution_order,
-    find_cutlass_leaf,
-)
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
-    FlashinferCutedslNvfp4Impl,
-    FlashinferCutedslW4a16Nvfp4Impl,
-)
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import find_marlin_leaf, marlin_leaf
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
-    find_trtllm_gen_leaf,
-    trtllm_gen_leaf,
-)
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
     canonical_activation,
     canonical_quant,
-    identity_quant_of,
     normalize_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.impl_identity import MOE_IMPL_REGISTRY, MoEImplId
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import (
     is_megamoe_cute_dsl_runtime_available,
 )
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import IMPL_PRIORITY, backend_family_of
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -81,10 +60,10 @@ G_LOGGER = logging.getLogger(__name__)
 
 
 # ============================================================================
-# MoE Backend Types
+# MoE test policy groups
 # ============================================================================
-class MoeBackendType(str, Enum):
-    """Enum for MoE backend types."""
+class MoeTestFamily(str, Enum):
+    """Groups sharing test input preparation and CI policy, not impl selectors."""
 
     CUTLASS = "CUTLASS"
     TRTLLM = "TRTLLM"
@@ -99,100 +78,44 @@ class MoeBackendType(str, Enum):
     MARLIN = "MARLIN"
 
 
-def get_backend_class(
-    backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
-) -> type[MoE]:
-    """Get the MoE backend class for a given backend type.
-
-    Raises when the family publishes no leaf for the format. Callers enumerating
-    combinations to decide what is worth running want ``find_backend_classes``.
-    """
-    backend_class = find_backend_class(backend_type, quant_algo)
-    if backend_class is None:
-        # Reuse the family's raising lookup for its message, which lists what
-        # *is* registered rather than only naming what is missing.
-        raising_lookup = {
-            MoeBackendType.CUTLASS: cutlass_leaf,
-            MoeBackendType.TRTLLM: trtllm_gen_leaf,
-            MoeBackendType.MARLIN: marlin_leaf,
-            MoeBackendType.CUTEDSL: cutedsl_grouped_gemm_leaf,
-        }.get(backend_type)
-        if raising_lookup is None:
-            raise ValueError(
-                f"{backend_type.value} has no implementation serving quant_algo={quant_algo} here"
-            )
-        return raising_lookup(quant_algo)
-    return backend_class
+def get_impl_class(impl_id: str) -> type[MoE]:
+    """Look up an exact registered test implementation; never select a fallback."""
+    identity = MoEImplId.parse(impl_id)
+    impl_cls = MOE_IMPL_REGISTRY.lookup(identity)
+    if impl_cls is None:
+        raise ValueError(f"Unregistered MoE test implementation: {impl_id}")
+    return impl_cls
 
 
-def find_backend_class(
-    backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
-) -> type[MoE] | None:
-    """The MoE backend class, or ``None`` if the family has no leaf for the format.
-
-    ``CUTLASS``, ``TRTLLM``, ``MARLIN``, ``CUTEDSL`` and ``CUTE_DSL_B12X`` are
-    not one class each but sets of leaves keyed by quant, so each needs
-    ``quant_algo``. CUTLASS publishes ``fp8_block_scales`` twice, once per SM
-    family, so for that format the leaf is the one this device runs.
-    TRTLLM-Gen has one leaf per format, the unquantized one included.
-
-    Absence is returned rather than raised so that a parameter generator can
-    tell it apart from a real failure: catching the exception instead would let
-    a leaf that got unregistered read as a combination nobody meant to run, and
-    the sweep would go green by shrinking.
-    """
-    if backend_type is MoeBackendType.CUTLASS:
-        return find_cutlass_leaf(quant_algo)
-    if backend_type is MoeBackendType.TRTLLM:
-        return find_trtllm_gen_leaf(quant_algo)
-    if backend_type is MoeBackendType.MARLIN:
-        return find_marlin_leaf(quant_algo)
-    if backend_type is MoeBackendType.CUTEDSL:
-        # The literal's family: a grouped-GEMM leaf per format, plus the fused
-        # FC12 leaf, the only CuteDSL leaf serving MXFP8.
-        if canonical_quant(quant_algo) == canonical_quant(QuantAlgo.MXFP8):
-            return TrtllmCutedslFusedFc12Mxfp8Impl
-        return find_cutedsl_grouped_gemm_leaf(quant_algo)
-    if backend_type is MoeBackendType.CUTE_DSL_B12X:
-        # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
-        # W4A16_NVFP4 never leaves the b12x kernel. Compared as identities
-        # spell the format, as the leaves' can_implement sees it.
-        quant = normalize_quant(canonical_quant(quant_algo))
-        return next(
-            (
-                leaf
-                for leaf in (FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl)
-                if identity_quant_of(leaf) == quant
-            ),
-            None,
-        )
-
-    backend_class_map = {
-        MoeBackendType.CUTEDSL_FC12: CuteDslFc12FusedMoE,
-        MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
-        MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
-        MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
-        MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
-    }
-    return backend_class_map[backend_type]
+def impl_test_family(impl_id: str) -> MoeTestFamily:
+    """Return the input/skip policy group of an already pinned implementation."""
+    impl_cls = get_impl_class(impl_id)
+    if impl_cls.descriptor.identity.kernel_name == "b12x":
+        return MoeTestFamily.CUTE_DSL_B12X
+    return MoeTestFamily(backend_family_of(impl_cls))
 
 
-def find_backend_classes(
-    backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
-) -> tuple[type[MoE], ...]:
-    """The classes a resolution walk would try, in its order; empty if none.
+def get_test_impl_ids(families: list[MoeTestFamily]) -> list[str]:
+    """Enumerate registered identities within the suite's existing policy groups."""
+    return [
+        cls.descriptor.impl_id
+        for cls in IMPL_PRIORITY
+        if getattr(cls, "descriptor", None) is not None
+        and impl_test_family(cls.descriptor.impl_id) in families
+    ]
 
-    A tuple and not one class because CUTLASS publishes ``fp8_block_scales``
-    twice, as the SM90 and SM120 leaves, and resolution asks each. A caller
-    asking whether a case is *supported* has to ask the same way, or it skips
-    cases the layer under test goes on to serve.
 
-    :func:`find_backend_class` stays for callers that want to name one class.
-    """
-    if backend_type is MoeBackendType.CUTLASS:
-        return cutlass_leaves_in_resolution_order(quant_algo)
-    cls = find_backend_class(backend_type, quant_algo)
-    return () if cls is None else (cls,)
+def get_test_impl_id(family: MoeTestFamily, quant_algo: QuantAlgo | None) -> str:
+    """Pin the single identity of a focused test's family and quantization."""
+    quant = normalize_quant(canonical_quant(quant_algo))
+    matches = [
+        impl_id
+        for impl_id in get_test_impl_ids([family])
+        if MoEImplId.parse(impl_id).quant == quant
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Test must name one exact impl for {family}/{quant}: {matches}")
+    return matches[0]
 
 
 # ============================================================================
@@ -268,7 +191,7 @@ def _is_fp4_fp8_standalone_gemm_available() -> bool:
 
 
 def should_skip_trtllm(
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     quant_algo: Optional[QuantAlgo],
     model_config: "MoeModelConfig",
     routing_method_cls=None,
@@ -302,7 +225,7 @@ def should_skip_trtllm(
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type != MoeBackendType.TRTLLM:
+    if backend_type != MoeTestFamily.TRTLLM:
         return None
 
     # Routing method compatibility check (used by test_moe_module.py)
@@ -447,7 +370,7 @@ def should_skip_trtllm(
             )
         # Keep unvalidated NVFP4 seq=8 configurations skipped, except for
         # the restored Relu2 case below. This exemption assumes the single-GPU
-        # generators in test_moe_backend.py; multi-GPU sweeps use SwiGLU.
+        # generators in test_moe_impl.py; multi-GPU sweeps use SwiGLU.
         is_restored_relu2_seq8_case = (
             model_config == MoeModelConfig(60, 4, 2048, 1408)
             and dtype == torch.bfloat16
@@ -530,7 +453,7 @@ def should_skip_trtllm(
 
 
 def should_skip_cutedsl(
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     quant_algo: Optional[QuantAlgo],
     model_config: "MoeModelConfig" = None,
     comm_method: Optional[str] = None,
@@ -543,7 +466,7 @@ def should_skip_cutedsl(
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type not in (MoeBackendType.CUTEDSL, MoeBackendType.CUTEDSL_FC12):
+    if backend_type not in (MoeTestFamily.CUTEDSL, MoeTestFamily.CUTEDSL_FC12):
         return None
 
     if model_config is None:
@@ -626,7 +549,7 @@ def should_skip_cutedsl(
 
 
 def should_skip_cutlass(
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     comm_method: Optional[str] = None,
     quant_algo: Optional[QuantAlgo] = None,
     model_config: "MoeModelConfig" = None,
@@ -640,7 +563,7 @@ def should_skip_cutlass(
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type != MoeBackendType.CUTLASS:
+    if backend_type != MoeTestFamily.CUTLASS:
         return None
 
     # W4A16_MXFP4 is the SM90 member of the MXFP4 family, and the family is the
@@ -695,7 +618,7 @@ def should_skip_cutlass(
 
 
 def should_skip_deepgemm(
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     comm_method: Optional[str] = None,
     quant_algo: Optional[QuantAlgo] = None,
     model_config: "MoeModelConfig" = None,
@@ -707,7 +630,7 @@ def should_skip_deepgemm(
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type != MoeBackendType.DEEPGEMM:
+    if backend_type != MoeTestFamily.DEEPGEMM:
         return None
 
     # TP per-shard alignment: FP8_BLOCK_SCALES requires 128-aligned per-shard
@@ -728,7 +651,7 @@ def should_skip_deepgemm(
 
 
 def should_skip_densegemm(
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     quant_algo: Optional[QuantAlgo] = None,
     model_config: "MoeModelConfig" = None,
     comm_method: Optional[str] = None,
@@ -751,7 +674,7 @@ def should_skip_densegemm(
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type != MoeBackendType.DENSEGEMM:
+    if backend_type != MoeTestFamily.DENSEGEMM:
         return None
 
     # DenseGEMM only supports NVFP4
@@ -804,7 +727,7 @@ def should_skip_densegemm(
 
 
 def should_skip_megamoe_deepgemm(
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     quant_algo: Optional[QuantAlgo] = None,
     dtype: Optional[torch.dtype] = None,
     model_config: "MoeModelConfig" = None,
@@ -819,7 +742,7 @@ def should_skip_megamoe_deepgemm(
     backends share the FUSED_COMM contract but have different quant/shape
     constraints (W4A8_MXFP4_MXFP8 + 512-aligned vs NVFP4 + 32-aligned).
     """
-    if backend_type != MoeBackendType.MEGAMOE_DEEPGEMM:
+    if backend_type != MoeTestFamily.MEGAMOE_DEEPGEMM:
         return None
 
     if not torch.cuda.is_available():
@@ -857,13 +780,13 @@ def should_skip_megamoe_deepgemm(
 
 
 def should_skip_cute_dsl_b12x(
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     comm_method: Optional[str] = None,
     moe_tp_size: int = 1,
     parallel_mode: Optional[str] = None,
 ) -> Optional[str]:
     """Check multi-rank constraints omitted from the capability query."""
-    if backend_type != MoeBackendType.CUTE_DSL_B12X:
+    if backend_type != MoeTestFamily.CUTE_DSL_B12X:
         return None
 
     if comm_method is not None or parallel_mode is not None:
@@ -877,7 +800,7 @@ def should_skip_cute_dsl_b12x(
 
 
 def should_skip_megamoe_cutedsl(
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     quant_algo: Optional[QuantAlgo] = None,
     dtype: Optional[torch.dtype] = None,
     model_config: "MoeModelConfig" = None,
@@ -900,7 +823,7 @@ def should_skip_megamoe_cutedsl(
     kernel's already-global routed output. TP modes shard intermediate, which
     would break the per-slot weight layout.
     """
-    if backend_type != MoeBackendType.MEGAMOE_CUTEDSL:
+    if backend_type != MoeTestFamily.MEGAMOE_CUTEDSL:
         return None
 
     if not torch.cuda.is_available():
@@ -1050,7 +973,7 @@ def should_skip_routing_method(
 
 
 def supports_autotuner_capture(
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     _quant_algo: Optional[QuantAlgo],
 ) -> bool:
     """
@@ -1068,11 +991,11 @@ def supports_autotuner_capture(
     # autotuner capture (fused kernels own dispatch+combine, b12x has its own
     # dispatch/replay state).
     if backend_type in (
-        MoeBackendType.DEEPGEMM,
-        MoeBackendType.MEGAMOE_DEEPGEMM,
-        MoeBackendType.MEGAMOE_CUTEDSL,
-        MoeBackendType.CUTE_DSL_B12X,
-        MoeBackendType.MARLIN,
+        MoeTestFamily.DEEPGEMM,
+        MoeTestFamily.MEGAMOE_DEEPGEMM,
+        MoeTestFamily.MEGAMOE_CUTEDSL,
+        MoeTestFamily.CUTE_DSL_B12X,
+        MoeTestFamily.MARLIN,
     ):
         return False
 
@@ -1122,7 +1045,7 @@ def build_test_activation(
 
 
 def get_quick_skip_reason(
-    backend_type: MoeBackendType,
+    impl_id: str,
     quant_algo: Optional[QuantAlgo],
     dtype: torch.dtype,
     model_config: "MoeModelConfig",
@@ -1147,18 +1070,9 @@ def get_quick_skip_reason(
     trtllm_logger.setLevel(_logging.ERROR)
 
     try:
-        # Every candidate a run would try, in resolution's order, because
-        # resolution falls through to the next leaf publishing the format when
-        # one rejects. Asking a single pre-picked class would skip cases the
-        # layer under test goes on to serve.
-        candidates = find_backend_classes(backend_type, quant_algo)
-        if not candidates:
-            # No leaf of this family publishes the format. Asked as a query,
-            # so any other failure in the lookup still raises instead of being
-            # reported as a skip.
-            quant = normalize_quant(canonical_quant(quant_algo))
-            return f"no {backend_type.value} implementation for quant={quant}"
-        is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
+        impl_cls = get_impl_class(impl_id)
+        backend_type = impl_test_family(impl_id)
+        is_minimax_megamoe = backend_type == MoeTestFamily.MEGAMOE_CUTEDSL and swiglu_gptoss_style
         # Eligibility reads *which* constants an activation carries, not just
         # its kind: a backend declaring ``limit=UNSUPPORTED`` serves unclamped
         # SwiGLU and rejects clamped SwiGLU, and both are
@@ -1211,15 +1125,9 @@ def get_quick_skip_reason(
             num_slots=0 if model_config is None else model_config.num_experts,
             env=collect_moe_environment(),
         )
-        reason = None
-        for backend_cls in candidates:
-            verdict = backend_cls.can_implement(problem, deployment)
-            if verdict.eligible:
-                reason = None
-                break
-            reason = f"{verdict.reject_reason.value}: {verdict.detail}"
-        if reason is not None:
-            return reason
+        verdict = impl_cls.can_implement(problem, deployment)
+        if not verdict.eligible:
+            return f"{verdict.reject_reason.value}: {verdict.detail}"
 
         # Chain skip checks: routing method, then per-backend constraints
         skip_checks = [
@@ -1273,7 +1181,7 @@ def get_quick_skip_reason(
 
         # DEEPGEMM/DENSEGEMM: float16 reference module constraint
         if (
-            backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.DENSEGEMM)
+            backend_type in (MoeTestFamily.DEEPGEMM, MoeTestFamily.DENSEGEMM)
             and dtype == torch.float16
         ):
             return f"{backend_type.value} reference module requires bfloat16 input"
@@ -1292,7 +1200,7 @@ def get_quick_skip_reason(
                     QuantAlgo.W4A8_MXFP4_FP8,
                     QuantAlgo.W4A8_MXFP4_MXFP8,
                 }
-                is_trtllm_backend = backend_type == MoeBackendType.TRTLLM
+                is_trtllm_backend = backend_type == MoeTestFamily.TRTLLM
                 if not (is_trtllm_backend and is_mxfp4_variant):
                     return (
                         f"Non-128-aligned sizes (h={hidden_size}, i={intermediate_size}) "
@@ -1352,7 +1260,7 @@ def replay_tactics_and_check(
     run_moe_fn: Callable[[], torch.Tensor],
     check_accuracy_fn: Callable[[torch.Tensor, torch.Tensor], None],
     ref_output: torch.Tensor,
-    backend_type: MoeBackendType,
+    backend_type: MoeTestFamily,
     quant_algo: Optional[QuantAlgo],
     fail_fast: bool = False,
 ) -> None:
@@ -1426,7 +1334,7 @@ _CI_ROUTING_METHODS = {"Renormalize", "DeepSeekV3"}
 
 
 def should_skip_to_accelerate_ci(
-    backend_type: "MoeBackendType",
+    backend_type: "MoeTestFamily",
     quant_algo: Optional[QuantAlgo],
     model_config: "MoeModelConfig",
     routing_method_cls=None,
@@ -1478,8 +1386,8 @@ def should_skip_to_accelerate_ci(
     # Keep TRTLLM BF16, and CuteDSL BF16 with locality domain for the dedicated
     # locality domain backend matrix.
     keeps_unquantized_bf16_coverage = dtype == torch.bfloat16 and (
-        backend_type == MoeBackendType.TRTLLM
-        or (backend_type == MoeBackendType.CUTEDSL and enable_locality_domains)
+        backend_type == MoeTestFamily.TRTLLM
+        or (backend_type == MoeTestFamily.CUTEDSL and enable_locality_domains)
     )
     if (
         quant_algo is None
@@ -1489,7 +1397,7 @@ def should_skip_to_accelerate_ci(
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
     # --- Rule 0a: MARLIN backend only runs NVFP4 on Ada/Hopper (SM89-SM99) ---
-    if backend_type == MoeBackendType.MARLIN:
+    if backend_type == MoeTestFamily.MARLIN:
         from tensorrt_llm._torch.utils import is_nvfp4_marlin_supported_sm
         from tensorrt_llm._utils import get_sm_version
 
@@ -1541,7 +1449,7 @@ def should_skip_to_accelerate_ci(
         routing_name = routing_method_cls.__name__.replace("MoeRoutingMethod", "")
         if routing_name not in _CI_ROUTING_METHODS:
             allows_full_routing = (
-                backend_type == MoeBackendType.CUTLASS or backend_type == MoeBackendType.TRTLLM
+                backend_type == MoeTestFamily.CUTLASS or backend_type == MoeTestFamily.TRTLLM
             ) and quant_algo == QuantAlgo.NVFP4
             if not allows_full_routing:
                 return (
@@ -1577,7 +1485,7 @@ def iter_base_test_configs(
     model_configs: list[MoeModelConfig],
     seq_lens: list[int],
     dtypes: list[torch.dtype],
-    backend_types: list[MoeBackendType],
+    impl_ids: list[str],
     quant_algos: list[QuantAlgo | None],
     routing_methods: list[type] | None = None,
     *,
@@ -1590,7 +1498,7 @@ def iter_base_test_configs(
         MoeModelConfig,
         int,
         torch.dtype,
-        MoeBackendType,
+        str,
         QuantAlgo | None,
         type,
         str | None,
@@ -1600,7 +1508,7 @@ def iter_base_test_configs(
     """
     Iterate over base test configurations using itertools.product.
 
-    This is shared by test_moe_backend.py and test_moe_module.py.
+    This is shared by test_moe_impl.py and test_moe_module.py.
     When routing_methods is None, defaults to [RenormalizeMoeRoutingMethod].
 
     Args:
@@ -1608,28 +1516,34 @@ def iter_base_test_configs(
         model_configs: List of MoeModelConfig
         seq_lens: List of sequence lengths
         dtypes: List of data types
-        backend_types: List of backend types
+        impl_ids: Full registered implementation IDs
         quant_algos: List of quantization algorithms
         routing_methods: List of routing method classes (default: [RenormalizeMoeRoutingMethod])
         activation_type: Activation kind for eligibility and accuracy skip checks.
 
     Yields:
         Tuple of (swiglu_alpha, swiglu_beta, swiglu_limit, model_config, seq_len,
-                  dtype, backend_type, quant_algo, routing_method_cls, skip_reason, base_test_id)
+                  dtype, impl_id, quant_algo, routing_method_cls, skip_reason, base_test_id)
     """
     if routing_methods is None:
         routing_methods = [RenormalizeMoeRoutingMethod]
 
+    impl_quant_pairs = [
+        (impl_id, quant_algo)
+        for impl_id in impl_ids
+        for quant_algo in quant_algos
+        if MoEImplId.parse(impl_id).quant == normalize_quant(canonical_quant(quant_algo))
+    ]
     for (
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
-    ), model_config, seq_len, dtype, backend_type, quant_algo, routing_method_cls in product(
-        swiglu_combos, model_configs, seq_lens, dtypes, backend_types, quant_algos, routing_methods
+    ), model_config, seq_len, dtype, (impl_id, quant_algo), routing_method_cls in product(
+        swiglu_combos, model_configs, seq_lens, dtypes, impl_quant_pairs, routing_methods
     ):
         swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
         skip_reason = get_quick_skip_reason(
-            backend_type,
+            impl_id,
             quant_algo,
             dtype,
             model_config,
@@ -1646,7 +1560,7 @@ def iter_base_test_configs(
         )
         base_test_id = (
             f"{swiglu_id}{model_config}-seq={seq_len}-dtype={dtype}-"
-            f"backend={backend_type.value}-quant={quant_algo}-routing={routing_name}"
+            f"impl={impl_id}-quant={quant_algo}-routing={routing_name}"
         )
         yield (
             swiglu_alpha,
@@ -1655,7 +1569,7 @@ def iter_base_test_configs(
             model_config,
             seq_len,
             dtype,
-            backend_type,
+            impl_id,
             quant_algo,
             routing_method_cls,
             skip_reason,

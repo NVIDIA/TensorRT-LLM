@@ -151,8 +151,8 @@ l0_gr100:
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_moe_rubin
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_mxfp8_chunked_forward_with_aux_stream
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache
-  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_mxfp8_fused_fc12_accuracy_ab
-  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and MXFP8 and not locality_domain"
+  - unittest/_torch/moe/test_moe_impl.py::test_cutedsl_mxfp8_fused_fc12_accuracy_ab
+  - unittest/_torch/moe/test_moe_impl.py::test_moe_impl -k "trtllm.cutedsl.fused_fc12.mxfp8 and not locality_domain"
   - unittest/_torch/moe/test_mxfp8_moe_partial_refit.py
   - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py::test_auto_prefill_stays_finite_on_repeated_token_with_mixed_decay
@@ -177,14 +177,14 @@ l0_gr100:
   - unittest/_torch/moe/test_moe_sorted_routing.py::test_shared_expert_runs_beside_fc12_on_reserved_sms[64]
   # The Rubin fused FC1+FC2 kernel at tile 256 runs its 2-CTA scheduler handoff only on SM107.
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_nvfp4_fc12_fused_rubin_matches_two_op_path
-  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4_PLUS-routing=Renormalize]
-  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4_PLUS-routing=Renormalize]
-  - unittest/_torch/moe/test_moe_backend.py::test_fc1_prologue_wait_preserves_exhaustion
-  - unittest/_torch/moe/test_moe_backend.py::test_fc1_prologue_wait_keeps_a_longer_stream_open
+  - unittest/_torch/moe/test_moe_impl.py::test_moe_impl[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-impl=trtllm.cutedsl.grouped_gemm.nvfp4_plus-quant=NVFP4_PLUS-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_impl.py::test_moe_impl[e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-impl=trtllm.cutedsl.grouped_gemm.nvfp4_plus-quant=NVFP4_PLUS-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_impl.py::test_fc1_prologue_wait_preserves_exhaustion
+  - unittest/_torch/moe/test_moe_impl.py::test_fc1_prologue_wait_keeps_a_longer_stream_open
   # Single-GPU MEGAMOE_CUTEDSL on SM107.
-  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=MEGAMOE_CUTEDSL-quant=NVFP4-routing=Renormalize]
-  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=MEGAMOE_CUTEDSL-quant=NVFP4-routing=Renormalize]
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e256_k6_h4096_i2048-seq=1-dtype=torch.bfloat16-backend=MEGAMOE_CUTEDSL-quant=NVFP4-routing=DeepSeekV3]
+  - unittest/_torch/moe/test_moe_impl.py::test_moe_impl[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-impl=trtllm.cutedsl.mega_moe.nvfp4-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_impl.py::test_moe_impl[e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-impl=trtllm.cutedsl.mega_moe.nvfp4-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e256_k6_h4096_i2048-seq=1-dtype=torch.bfloat16-impl=trtllm.cutedsl.mega_moe.nvfp4-quant=NVFP4-routing=DeepSeekV3]
   # CuTe DSL GEMM/BMM kernels and their nvMatmulHeuristics-guided tactics.
   - unittest/_torch/kernels/parallel/test_cute_dsl_bf16_dense.py
   - unittest/_torch/kernels/parallel/test_fp4_linear.py::test_nvfp4_gemm_cutedsl

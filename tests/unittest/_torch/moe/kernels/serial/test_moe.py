@@ -19,7 +19,7 @@ from typing import Tuple, TypedDict
 import pytest
 import torch
 import torch.nn.functional as F
-from _torch.moe.moe_test_utils import MoeBackendType, replay_tactics_and_check
+from _torch.moe.moe_test_utils import MoeTestFamily, replay_tactics_and_check
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
@@ -31,7 +31,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
     shuffle_matrix_sf_a)
 
 # NOTE: Some tests in this file are deprecated and skipped. They are now covered by the
-# unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
+# unified MoE test framework in tests/unittest/_torch/moe/test_moe_impl.py
 # and test_moe_module.py. Add new MoE tests there instead of here.
 
 
@@ -941,7 +941,7 @@ def are_groups_valid(top_k_groups, n_groups):
 
 @pytest.mark.skip(
     reason=
-    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_impl.py and test_moe_module.py. Add new tests there."
 )
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
@@ -1079,7 +1079,7 @@ class TestMoeFP8:
 
 @pytest.mark.skip(
     reason=
-    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_impl.py and test_moe_module.py. Add new tests there."
 )
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
@@ -2032,7 +2032,7 @@ class TestMoeFp4:
 
 @pytest.mark.skip(
     reason=
-    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_impl.py and test_moe_module.py. Add new tests there."
 )
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
@@ -2732,14 +2732,14 @@ def _run_moe_mxe2m1_weights(
             run_moe_fn=run_moe,
             check_accuracy_fn=check_output,
             ref_output=output_dequant_reference,
-            backend_type=MoeBackendType.TRTLLM,
+            backend_type=MoeTestFamily.TRTLLM,
             quant_algo=QuantAlgo.W4A8_MXFP4_FP8,
         )
 
 
 @pytest.mark.skip(
     reason=
-    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_impl.py and test_moe_module.py. Add new tests there."
 )
 @pytest.mark.skipif(
     getSMVersion() != 100,
