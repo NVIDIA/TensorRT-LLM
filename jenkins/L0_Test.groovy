@@ -282,6 +282,8 @@ SLURM_JOB_LOG_EVIDENCE_QUERY_IDS = [
     "gpu-lost",
     "gpu-ecc-uncorrectable",
     "nvlink-fabric-failure",
+    "ffmpeg-apt-install-failed",
+    "shared-fs-transport-shutdown",
 ]
 
 PYTEST_TIMEOUT_EVIDENCE_QUERIES = [
@@ -3366,11 +3368,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         [[id: "slurm-sbatch-final-failure", anyOf: [sbatchFailureMarker]]]
                     )
                     if (diagnosticEvidence.collectionStatus == "MATCHED") {
-                        def finalFailure = new Exception(
-                            "SLURM job submission failed for ${stageName}: ${diagnosticEvidence.matchedMessage}",
-                            submitEx
-                        )
-                        throw FailureClassifier.classify(finalFailure, InfraFailure.SLURM)
+                        throw FailureClassifier.classify(submitEx, InfraFailure.SLURM, diagnosticEvidence)
                     }
                     throw submitEx
                 }
