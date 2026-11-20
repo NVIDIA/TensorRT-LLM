@@ -17,6 +17,7 @@
 Records rejected candidates; falls back when the requested backend cannot serve.
 """
 
+import dataclasses
 import itertools
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Collection, Dict, FrozenSet, List, Optional, Tuple, Union
@@ -990,6 +991,15 @@ def resolve_moe_impl(
                 )
             )
             continue
+        if deployment.eplb_mode == "adaptive" and not candidate.capabilities.supports_adaptive_eplb:
+            rejected.append(
+                MoERejection(
+                    _legacy_backend_name(candidate),
+                    MoERejectReason.EPLB_UNSUPPORTED,
+                    f"{candidate.__name__} does not support adaptive EPLB",
+                )
+            )
+            continue
         if deployment.eplb_enabled and not candidate.capabilities.supports_eplb:
             rejected.append(
                 MoERejection(
@@ -1047,6 +1057,34 @@ def resolve_moe_impl(
         env_fingerprint=deployment.env.fingerprint(),
         requested_impls=frozenset(_legacy_backend_name(impl_cls) for impl_cls in requested_impls),
     )
+
+    if winner_cls is None and deployment.eplb_mode == "adaptive":
+        # No implementation that serves this layer supports adaptive EPLB:
+        # the layer runs as plain EP outside the balancer instead, the
+        # balancer covering the other layers (``create_moe`` builds it so).
+        plain = resolve_moe_impl(
+            model_config,
+            problem=problem,
+            deployment=dataclasses.replace(
+                deployment,
+                eplb_enabled=False,
+                eplb_mode="disabled",
+                num_slots=problem.num_experts,
+            ),
+            layer_idx=layer_idx,
+            allow_degradation=allow_degradation,
+            impl_id=impl_id,
+        )
+        if plain.winner is not None:
+            reason = (
+                "no implementation that serves it supports adaptive EPLB "
+                f"({report.describe_rejections()})"
+            )
+            logger.info(
+                f"MoE layer{location} runs {plain.winner} as plain EP, outside the "
+                f"adaptive EPLB balancer: {reason}"
+            )
+            return dataclasses.replace(plain, load_balancer_off=reason)
 
     if report.degraded and not allow_degradation:
         raise UnsupportedError(

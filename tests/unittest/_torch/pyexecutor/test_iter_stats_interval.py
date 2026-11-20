@@ -59,6 +59,7 @@ def _build_fake_self(interval: int, *, enabled: bool = True):
     # _get_init_iter_stats: no spec-decode resource manager / spec config.
     fake.resource_manager.resource_managers.get.return_value = None
     fake.model_engine.spec_config = None
+    fake._moe_load_balancer = None
     fake._get_new_active_requests_queue_latency.return_value = 0.0
     fake.perf_manager.try_compute_gpu_elapsed_time_ms.return_value = None
 

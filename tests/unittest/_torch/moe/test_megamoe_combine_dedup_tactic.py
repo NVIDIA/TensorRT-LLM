@@ -220,6 +220,25 @@ def test_query_and_runner_build_the_same_dedup_kernel(
     assert runner._tactic_cache_key(_DEDUP) != runner._tactic_cache_key(plain)
 
 
+def test_runner_passes_an_adaptive_route_only_when_it_has_one(
+    op: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the runner passed adaptive_route_experts=0 to the kernel builder and the
+    properties query did not, so the two built the same kernel from different arguments."""
+    calls = []
+    original = op._construct_megamoe_kernel
+    monkeypatch.setattr(
+        op, "_construct_megamoe_kernel", lambda **kw: calls.append(kw["common"]) or original(**kw)
+    )
+    for experts in (0, 3):
+        op.Sm100MegaMoENvfp4Runner(**_problem(), adaptive_route_experts=experts)._build_kernel_once(
+            _DEDUP
+        )
+    assert "adaptive_route_experts" not in calls[0]
+    assert calls[1].pop("adaptive_route_experts") == 3
+    assert calls[0] == calls[1]
+
+
 @pytest.mark.parametrize("sm_version, capacity", [(107, 256), (100, 8192)])
 def test_dedup_never_reaches_a_kernel_without_the_option(
     op: types.ModuleType, sm_version: int, capacity: int

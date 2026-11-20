@@ -960,6 +960,49 @@ def _register_fake():
     ) -> None:
         return None
 
+    @torch.library.register_fake("trtllm::adaptive_eplb_route_into")
+    def _(
+        ids: torch.Tensor,
+        counts: torch.Tensor,
+        starts: torch.Tensor,
+        slots: torch.Tensor,
+        cumulative_shares: torch.Tensor,
+        ep_rank: int,
+        out: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
+        weights_out: Optional[torch.Tensor] = None,
+        rows: Optional[torch.Tensor] = None,
+        forwards: Optional[torch.Tensor] = None,
+        enabled: Optional[torch.Tensor] = None,
+        first: bool = True,
+        live_row_word: Optional[torch.Tensor] = None,
+        x: Optional[torch.Tensor] = None,
+        x_global_scale: Optional[torch.Tensor] = None,
+        x_fp4: Optional[torch.Tensor] = None,
+        x_sf: Optional[torch.Tensor] = None,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::adaptive_eplb_record")
+    def _(
+        ids: torch.Tensor,
+        rows: torch.Tensor,
+        forwards: torch.Tensor,
+        enabled: torch.Tensor,
+        first: bool = True,
+        live_row_word: Optional[torch.Tensor] = None,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::adaptive_eplb_solve_shares")
+    def _(
+        load_rows: torch.Tensor,
+        layout: torch.Tensor,
+        ep_size: int,
+        costs: Optional[List[float]] = None,
+    ) -> torch.Tensor:
+        return layout.new_empty(layout.shape, dtype=torch.float64)
+
     @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
     def _(
         workspace: torch.Tensor,
