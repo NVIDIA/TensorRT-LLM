@@ -3,7 +3,7 @@
 """FP4 MLA decode path selection: ``2x`` packed (default) | ``4x`` four-CTA-cluster | ``twostream`` (4x arm + 2x arm).
 
 The decision is host arithmetic on static shapes plus the KV length, so it is the same in the eager warm-up, at
-CUDA-graph capture and (through the graph that was captured) at replay.  Measured basis (hecate0358/0369, Rubin
+CUDA-graph capture and (through the graph that was captured) at replay.  Measured basis (two nodes, Rubin
 212 SMs, 128 heads, graph replays, 2026-11-02; see the two-stream planner for the item cost model):
 
 ======================================  ==========  ===========  ===================  ===================
@@ -21,8 +21,8 @@ B128/q4, KV 4K                          101         102          102            
 
 Graph-replay medians throughout (the 2x kernel's first replays at 8K are faster, 158 us cold, which is the only
 sense in which 2x "wins" there); on the main tree's slower 2x packed kernel (#20576) the 8K row read 190 / 191 /
-192 and 4K 106 / 107 / 107 on 2026-11-02 (hecate0358) and 182 / 178 / 178 and 110 / 116 / 116 on 2026-11-03
-(hecate0341, the first matrix below): with the 4x kernel of that date B128 at 8K was a tie within the node-to-node
+192 and 4K 106 / 107 / 107 on 2026-11-02 and 182 / 178 / 178 and 110 / 116 / 116 on 2026-11-03 on another node
+(the first matrix below): with the 4x kernel of that date B128 at 8K was a tie within the node-to-node
 spread either way, which is where the many-wave floor was put.  The 4x and two-stream columns of the table above
 are that kernel's; the kernel of 2026-11-10 is faster and the many-wave tie sits at 4K (second matrix below).
 
@@ -43,7 +43,7 @@ B128 (5.6)                 0.86x   0.88x   0.95x   1.02x   1.14x   1.15x   8K
 B256 (11.1)                        0.88x   0.95x   1.09x           1.19x   8K
 =========================  ======  ======  ======  ======  ======  ======  ==========
 
-Re-validated on 2026-11-10 (hecate0087) for the 4x kernel of that date: shared memory laid out by sub-bank, the
+Re-validated on 2026-11-10 for the 4x kernel of that date: shared memory laid out by sub-bank, the
 four-bank V ring and the K128 QK tail make the 4x and two-stream cells 2-14 % faster, the 2x kernel is unchanged.
 Same shapes, graph-replay medians; ratio = 2x / the 4x paths with the floor forced to 0
 (``TRTLLM_FP4_MLA_4X_MIN_KV=0``); ``*`` marks a cell under its floor, where the dispatcher keeps 2x:
@@ -78,7 +78,8 @@ the device, today the shared memory a block may use), and every call then stays 
 runner on such a device keys its decode graphs by no KV regime, as it does for Helix.
 
 KV length used for the decision: ``live_max_kv``, the ceiling of the KV regime a CUDA graph runner keys its decode
-graphs by (``set_decode_kv_regime`` on the graph's attention metadata stores it in ``Fp4MlaState.kv_regime_max_kv``),
+graphs by (the ``kv_regime`` graph variant, which the graph's attention metadata stores in
+``Fp4MlaState.kv_regime_max_kv``),
 an upper bound of the step's longest live KV; without one, eager steps included, the page-table capacity.  The
 kernels themselves are always compiled and planned for the capacity.
 
@@ -101,7 +102,7 @@ Environment:
 from __future__ import annotations
 
 import os
-from typing import Callable, NamedTuple, Optional, Sequence
+from typing import Callable, NamedTuple, Optional
 
 from .fp4_mla_twostream import LANES_4X, ROWS_PER_4X_ITEM, TwoStreamPlan, plan_two_stream
 
@@ -119,8 +120,9 @@ PATH_TWO_STREAM = "twostream"
 PATHS = (PATH_2X, PATH_4X, PATH_TWO_STREAM)
 
 # KV regimes a graph runner can key its decode graphs by (tokens): ``kv_regimes_for_batch`` lists the regimes worth
-# a graph for one batch shape, ``kv_regime_for_step`` maps a step's longest live KV onto them; the page-table
-# capacity itself is always the last regime, the grid adds optional points between a batch's floor and the capacity.
+# a graph for one batch shape, and a step's longest live KV maps onto the smallest one covering it
+# (``graph_resolvers.select_kv_regime_ceiling``); the page-table capacity itself is always the last regime, the
+# grid adds optional points between a batch's floor and the capacity.
 KV_REGIME_GRID_ENV = "TRTLLM_FP4_MLA_KV_REGIME_GRID"
 DEFAULT_KV_REGIME_GRID: tuple[int, ...] = ()
 
@@ -301,18 +303,6 @@ def _plan_flip_ceilings(
             regime_gain = max(regime_gain, gain(current))
         previous = current
     return flips
-
-
-def kv_regime_for_step(max_kv_len: int, ceilings: Sequence[int]) -> int:
-    """Regime of a step whose longest live KV is ``max_kv_len``: the smallest ceiling covering it.
-
-    Shorter steps share the first regime; a step beyond the list (never, when ``ceilings`` ends with the
-    capacity) gets the last one, the graph of the capacity.
-    """
-    for ceiling in ceilings:
-        if max_kv_len <= ceiling:
-            return int(ceiling)
-    return int(ceilings[-1])
 
 
 def choose_decode_strategy(

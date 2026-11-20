@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from contextlib import nullcontext
-from typing import Dict, Optional, cast
+from typing import Any, Callable, Dict, Optional, cast
 
 import torch
 from torch import nn
@@ -228,6 +228,174 @@ def fp8_block_scaling_bmm_out(
             torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
+
+
+def _uses_dense_fp4_mla(mla: "MLA") -> bool:
+    """Whether the layer runs dense FP4 MLA: an NVFP4 KV cache, no sparse attention.
+
+    The layer's generation attention op is built with the same sparse
+    parameters and quantization config, so it takes its FP4 MLA branch
+    (``uses_fp4_mla_attention``) exactly when this holds.
+    """
+    return bool(
+        mla.sparse_params is None
+        and mla.mqa.support_fp4_kv_cache()
+        and mla.quant_config is not None
+        and mla.quant_config.layer_quant_mode.has_fp4_kv_cache()
+    )
+
+
+def _expand_mla_context_kv(
+    mla: "MLA",
+    compressed_kv: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Up-project compressed KV to per-head K and V with one wide GEMM.
+
+    Returns K as [tokens, heads * qk_head_dim], the projected K without RoPE
+    followed by ``k_pe`` repeated for every head, and V as
+    [tokens, heads * v_head_dim], a view of the projection's output. The FP4
+    chunked prefill expands its partitions this way; ``MLA._expand_context_kv``
+    is the expansion of the FP8/BF16 paths.
+    """
+    kv = mla._project_context_kv(compressed_kv)
+    k_nope, v = kv.split(
+        [
+            mla.num_context_heads * mla.qk_nope_head_dim,
+            mla.num_context_heads * mla.v_head_dim,
+        ],
+        -1,
+    )
+    k_nope = k_nope.view(-1, mla.num_context_heads, mla.qk_nope_head_dim)
+    k_pe = k_pe.view(-1, 1, mla.qk_rope_head_dim)
+    k = maybe_compiled_cat(
+        (k_nope, k_pe.expand(-1, mla.num_context_heads, -1)),
+        dim=-1,
+    )
+    return k.view(-1, mla.num_context_heads * mla.qk_head_dim), v
+
+
+def _run_mla_chunked_prefill_partitions(
+    mla: "MLA",
+    trtllm_attention: "TrtllmAttention",
+    q: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    current_k_pe: torch.Tensor,
+    attn_metadata: "TrtllmAttentionMetadata",
+    output: torch.Tensor,
+    *,
+    run_partition: Callable[
+        [torch.Tensor, torch.Tensor, AttentionForwardArgs, Optional[int], Optional[int]],
+        torch.Tensor,
+    ],
+    expand_kv: Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+    include_helix_plan: bool = False,
+) -> torch.Tensor:
+    """Attend the current chunk to its cached prefix, one KV partition at a time.
+
+    The cached prefix is read back in ``chunked_loop_num`` partitions, each
+    attended without a mask, and the current chunk's own KV comes last under
+    the causal mask. ``expand_kv(compressed_kv, k_pe)`` up-projects a
+    partition's latent KV to per-head K and V, and ``run_partition(k, v,
+    forward_args, loop_idx, cached_kv_tokens)`` attends it and returns its
+    output. ``loop_idx`` and ``cached_kv_tokens``, the tokens the partition
+    read back, are None for the current chunk. Every partition's output and
+    softmax statistics are merged into ``output``, which is returned.
+    """
+    chunked_loop_num = attn_metadata.chunked_loop_num
+    # Per query token and head: the softmax statistics the merge combines.
+    mla.softmax_stats_tensor = torch.empty(
+        (attn_metadata.num_ctx_tokens, mla.num_context_heads, 2),
+        dtype=torch.float,
+        device=q.device,
+    )
+    mla.temp_softmax_stats_tensor = torch.empty_like(mla.softmax_stats_tensor)
+    attn_output = output
+    temp_attn_output = q.new_empty(
+        (q.size(0), mla.num_context_heads * mla.v_head_dim),
+        dtype=q.dtype,
+    )
+
+    def make_partition_forward_args(
+        attention_mask: PredefinedAttentionMask,
+    ) -> AttentionForwardArgs:
+        # latent_cache must be None to differentiate from the normal context
+        # phase, so the attention op neither applies RoPE nor appends KV.
+        return AttentionForwardArgs(
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=None,
+            out_scale=mla.out_scale,
+            attention_mask=attention_mask,
+            softmax_stats_tensor=mla.temp_softmax_stats_tensor,
+            chunked_prefill_buffer_batch_size=(
+                attn_metadata.runtime_features.chunked_prefill_buffer_batch_size
+            ),
+            output=temp_attn_output,
+        )
+
+    helix_chunk_plans = getattr(attn_metadata, "helix_mla_chunk_plans", None)
+    for loop_idx in range(chunked_loop_num):
+        total_chunked_tokens = int(
+            attn_metadata.host_cu_chunked_seq_len[loop_idx, attn_metadata.num_contexts]
+        )
+        load_kwargs: dict[str, Any] = {
+            "metadata": attn_metadata,
+            "num_ctx_cached_tokens": total_chunked_tokens,
+            "cu_chunked_seq_len": attn_metadata.cu_chunked_seq_len[loop_idx],
+            "chunked_global_offset": attn_metadata.chunked_global_offset[loop_idx],
+            "chunked_max_seq_len": int(attn_metadata.max_chunk_len_per_loop[loop_idx]),
+            "out_dtype": q.dtype,
+        }
+        if include_helix_plan:
+            load_kwargs["helix_plan"] = (
+                helix_chunk_plans[loop_idx] if helix_chunk_plans is not None else None
+            )
+        chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
+            **load_kwargs
+        )
+        chunked_k, chunked_v = expand_kv(chunked_compressed_kv, chunked_k_pe)
+        # Release the activation memory before the attention call.
+        chunked_compressed_kv = None
+        chunked_k_pe = None
+
+        temp_attn_output = run_partition(
+            chunked_k,
+            chunked_v,
+            make_partition_forward_args(PredefinedAttentionMask.FULL),
+            loop_idx,
+            total_chunked_tokens,
+        )
+        chunked_k = None
+        chunked_v = None
+        trtllm_attention.merge_attention_for_mla(
+            attn_output,
+            temp_attn_output,
+            mla.softmax_stats_tensor,
+            mla.temp_softmax_stats_tensor,
+            attn_metadata.merge_op_tensor[loop_idx],
+            attn_metadata,
+        )
+
+    # Last, the KV of the current chunk itself.
+    current_k, current_v = expand_kv(compressed_kv, current_k_pe)
+    temp_attn_output = run_partition(
+        current_k,
+        current_v,
+        make_partition_forward_args(PredefinedAttentionMask.CAUSAL),
+        None,
+        None,
+    )
+    current_k = None
+    current_v = None
+    trtllm_attention.merge_attention_for_mla(
+        attn_output,
+        temp_attn_output,
+        mla.softmax_stats_tensor,
+        mla.temp_softmax_stats_tensor,
+        attn_metadata.merge_op_tensor[chunked_loop_num],
+        attn_metadata,
+    )
+    return attn_output
 
 
 class MLA(nn.Module):
@@ -750,12 +918,7 @@ class MLA(nn.Module):
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales()
         )
         mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
-        if (
-            self.sparse_params is None
-            and self.mqa.support_fp4_kv_cache()
-            and self.quant_config is not None
-            and self.quant_config.layer_quant_mode.has_fp4_kv_cache()
-        ):
+        if _uses_dense_fp4_mla(self):
             # The absorption weights follow kv_b_proj: BF16, or FP8 with
             # 128x128 block scales. Generation has a BMM for each that writes
             # into the same fused Q slice, and the context path expands KV
@@ -1406,113 +1569,41 @@ class MLA(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
         )[:, self.kv_lora_rank :]
 
-        self.softmax_stats_tensor = torch.empty(
-            (attn_metadata.num_ctx_tokens, self.num_context_heads, 2),
-            dtype=torch.float,
-            device=q.device,
-        )
-        self.temp_softmax_stats_tensor = torch.empty_like(self.softmax_stats_tensor)
-        attn_output = output
-        temp_attn_output = q.new_empty(
-            (q.size(0), self.num_context_heads * self.v_head_dim),
-        )
-
-        def expand_kv(
-            partition_compressed_kv: torch.Tensor,
-            partition_k_pe: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            partition_kv = self._project_context_kv(partition_compressed_kv)
-            partition_k_nope, partition_v = partition_kv.split(
-                [
-                    self.num_context_heads * self.qk_nope_head_dim,
-                    self.num_context_heads * self.v_head_dim,
-                ],
-                -1,
-            )
-            partition_k_nope = partition_k_nope.view(
-                -1,
-                self.num_context_heads,
-                self.qk_nope_head_dim,
-            )
-            partition_k_pe = partition_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            partition_k = maybe_compiled_cat(
-                (
-                    partition_k_nope,
-                    partition_k_pe.expand(-1, self.num_context_heads, -1),
-                ),
-                dim=-1,
-            )
-            return (
-                partition_k.view(-1, self.num_context_heads * self.qk_head_dim),
-                partition_v,
-            )
-
-        def partition_forward_args(attention_mask) -> AttentionForwardArgs:
-            return AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=self.out_scale,
-                attention_mask=attention_mask,
-                softmax_stats_tensor=self.temp_softmax_stats_tensor,
-                chunked_prefill_buffer_batch_size=(
-                    attn_metadata.runtime_features.chunked_prefill_buffer_batch_size
-                ),
-                output=temp_attn_output,
-            )
-
-        for loop_idx in range(attn_metadata.chunked_loop_num):
-            total_chunked_tokens = int(
-                attn_metadata.host_cu_chunked_seq_len[
-                    loop_idx,
-                    attn_metadata.num_contexts,
-                ]
-            )
-            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
-                metadata=attn_metadata,
-                num_ctx_cached_tokens=total_chunked_tokens,
-                cu_chunked_seq_len=attn_metadata.cu_chunked_seq_len[loop_idx],
-                chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
-                chunked_max_seq_len=int(attn_metadata.max_chunk_len_per_loop[loop_idx]),
-                out_dtype=q.dtype,
-            )
-            chunked_k, chunked_v = expand_kv(chunked_compressed_kv, chunked_k_pe)
-            temp_attn_output = trtllm_attention.forward_fp4_mla_context_partition(
+        def run_fp4_partition(
+            partition_k: torch.Tensor,
+            partition_v: torch.Tensor,
+            forward_args: AttentionForwardArgs,
+            loop_idx: Optional[int],
+            cached_kv_tokens: Optional[int],
+        ) -> torch.Tensor:
+            del cached_kv_tokens
+            if loop_idx is None:
+                kv_lens_cuda = attn_metadata.prompt_lens_cuda_runtime
+                kv_lens_cpu = attn_metadata.prompt_lens_cpu_runtime
+            else:
+                kv_lens_cuda = attn_metadata.chunked_seq_len[loop_idx]
+                kv_lens_cpu = attn_metadata.host_chunked_seq_len[loop_idx]
+            return trtllm_attention.forward_fp4_mla_context_partition(
                 q,
-                chunked_k,
-                chunked_v,
+                partition_k,
+                partition_v,
                 attn_metadata,
-                partition_forward_args(PredefinedAttentionMask.FULL),
-                kv_lens_cuda=attn_metadata.chunked_seq_len[loop_idx],
-                kv_lens_cpu=attn_metadata.host_chunked_seq_len[loop_idx],
-            )
-            trtllm_attention.merge_attention_for_mla(
-                attn_output,
-                temp_attn_output,
-                self.softmax_stats_tensor,
-                self.temp_softmax_stats_tensor,
-                attn_metadata.merge_op_tensor[loop_idx],
-                attn_metadata,
+                forward_args,
+                kv_lens_cuda=kv_lens_cuda,
+                kv_lens_cpu=kv_lens_cpu,
             )
 
-        current_k, current_v = expand_kv(compressed_kv, current_k_pe)
-        temp_attn_output = trtllm_attention.forward_fp4_mla_context_partition(
+        return _run_mla_chunked_prefill_partitions(
+            self,
+            trtllm_attention,
             q,
-            current_k,
-            current_v,
+            compressed_kv,
+            current_k_pe,
             attn_metadata,
-            partition_forward_args(PredefinedAttentionMask.CAUSAL),
-            kv_lens_cuda=attn_metadata.prompt_lens_cuda_runtime,
-            kv_lens_cpu=attn_metadata.prompt_lens_cpu_runtime,
+            output,
+            run_partition=run_fp4_partition,
+            expand_kv=functools.partial(_expand_mla_context_kv, self),
         )
-        trtllm_attention.merge_attention_for_mla(
-            attn_output,
-            temp_attn_output,
-            self.softmax_stats_tensor,
-            self.temp_softmax_stats_tensor,
-            attn_metadata.merge_op_tensor[attn_metadata.chunked_loop_num],
-            attn_metadata,
-        )
-        return attn_output
 
     def forward_context_with_chunked_prefill(
         self,
@@ -1525,27 +1616,9 @@ class MLA(nn.Module):
         trtllm_attention = cast(TrtllmAttention, self.mha)
         # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
         trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
-
-        # determine the number of loop
-        # currently we assume that the chunk size is the same as the max_num_tokens
-        chunked_loop_num = attn_metadata.chunked_loop_num
-
-        # [total_token_q, num_heads, 2] -> [total_token_q, num_heads] float2
-        self.softmax_stats_tensor = torch.empty(
-            (attn_metadata.num_ctx_tokens, self.num_context_heads, 2),
-            dtype=torch.float,
-            device="cuda",
-        )
-        self.temp_softmax_stats_tensor = torch.empty(
-            (attn_metadata.num_ctx_tokens, self.num_context_heads, 2),
-            dtype=torch.float,
-            device="cuda",
-        )
-
-        attn_output = output
-        temp_attn_output = q.new_empty(
-            (q.size(0), self.num_context_heads * self.v_head_dim), dtype=q.dtype
-        )
+        current_k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim])[
+            :, self.kv_lora_rank :
+        ]
 
         # use fake cached_cu_seq_len for chunked loop
         origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
@@ -1554,111 +1627,52 @@ class MLA(nn.Module):
         # a 0-d view would alias it and make the restore a no-op.
         origin_ctx_total_kv_len = attn_metadata.host_total_kv_lens[0].item()
 
-        for loop_idx in range(chunked_loop_num):
-            # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
-            # fetch `loop_idx` chunk from kv cache
-            temp_cu_chunked_seq_len = attn_metadata.cu_chunked_seq_len[loop_idx]
-            total_ctx_chunked_tokens = attn_metadata.host_cu_chunked_seq_len[
-                loop_idx, attn_metadata.num_contexts
-            ]
-            chunked_global_offset = attn_metadata.chunked_global_offset[loop_idx]
-            chunked_max_seq_len = attn_metadata.max_chunk_len_per_loop[loop_idx]
-            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
-                metadata=attn_metadata,
-                num_ctx_cached_tokens=total_ctx_chunked_tokens,
-                cu_chunked_seq_len=temp_cu_chunked_seq_len,
-                chunked_global_offset=chunked_global_offset,
-                chunked_max_seq_len=chunked_max_seq_len,
-                out_dtype=q.dtype,
-                helix_plan=(
-                    attn_metadata.helix_mla_chunk_plans[loop_idx]
-                    if attn_metadata.helix_mla_chunk_plans is not None
-                    else None
-                ),
-            )
-
-            chunked_k, chunked_v = self._expand_context_kv(chunked_compressed_kv, chunked_k_pe)
-            chunked_compressed_kv = None
-            chunked_k_pe = None
-
-            # copy chunked_seq_len to replace kv_lens_runtime
-            attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[loop_idx]
-            attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[loop_idx]
-            attn_metadata.host_total_kv_lens[0] = total_ctx_chunked_tokens
-
-            # do not apply mask for attention within loop
-            # latent_cache must be None to differentiate from normal context phase,
-            # so that we can skip applying RoPE and appending KV cache inside attention op
-            temp_attn_output = self.mha.forward(
+        def run_default_partition(
+            partition_k: torch.Tensor,
+            partition_v: torch.Tensor,
+            forward_args: AttentionForwardArgs,
+            loop_idx: Optional[int],
+            cached_kv_tokens: Optional[int],
+        ) -> torch.Tensor:
+            # The attention op reads the partition's KV lengths from the
+            # metadata: the current chunk's own lengths, or the cached chunk's.
+            if loop_idx is None:
+                attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
+                attn_metadata.kv_lens_cuda_runtime = attn_metadata.prompt_lens_cuda_runtime
+                total_kv_tokens = int(
+                    attn_metadata.prompt_lens_cpu_runtime[: attn_metadata.num_contexts].sum().item()
+                )
+            else:
+                attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[loop_idx]
+                attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[loop_idx]
+                total_kv_tokens = cached_kv_tokens
+            attn_metadata.host_total_kv_lens[0] = total_kv_tokens
+            return self.mha.forward(
                 q,
-                chunked_k,
-                chunked_v,
+                partition_k,
+                partition_v,
                 attn_metadata,
-                forward_args=AttentionForwardArgs(
-                    attention_input_type=AttentionInputType.context_only,
-                    latent_cache=None,
-                    out_scale=self.out_scale,
-                    attention_mask=PredefinedAttentionMask.FULL,
-                    softmax_stats_tensor=self.temp_softmax_stats_tensor,
-                    chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.chunked_prefill_buffer_batch_size,
-                    output=temp_attn_output,
-                ),
-            )
-            # merge attn result
-            temp_merge_op = attn_metadata.merge_op_tensor[loop_idx]
-            trtllm_attention.merge_attention_for_mla(
-                attn_output,
-                temp_attn_output,
-                self.softmax_stats_tensor,
-                self.temp_softmax_stats_tensor,
-                temp_merge_op,
-                attn_metadata,
+                forward_args=forward_args,
             )
 
-        # The current chunk's cache already contains rotated K positions.
-        _, k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim]).split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], -1
-        )
-        k, v = self._expand_context_kv(compressed_kv, k_pe)
-
-        # copy q_lens to replace kv_lens_runtime
-        attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
-        attn_metadata.kv_lens_cuda_runtime = attn_metadata.prompt_lens_cuda_runtime
-        attn_metadata.host_total_kv_lens[0] = (
-            attn_metadata.prompt_lens_cpu_runtime[: attn_metadata.num_contexts].sum().item()
-        )
-
-        # latent_cache must be None to differentiate from normal context phase,
-        # so that we can skip applying RoPE and appending KV cache inside attention op
-        temp_attn_output = self.mha.forward(
-            q,
-            k,
-            v,
-            attn_metadata,
-            forward_args=AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=self.out_scale,
-                softmax_stats_tensor=self.temp_softmax_stats_tensor,
-                chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.chunked_prefill_buffer_batch_size,
-                output=temp_attn_output,
-            ),
-        )
-        temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
-        trtllm_attention.merge_attention_for_mla(
-            attn_output,
-            temp_attn_output,
-            self.softmax_stats_tensor,
-            self.temp_softmax_stats_tensor,
-            temp_merge_op,
-            attn_metadata,
-        )
-        # copy back kv_lens_runtime and kv_lens_cuda_runtime
-        attn_metadata.kv_lens_runtime = origin_kv_lens_runtime
-        attn_metadata.kv_lens_cuda_runtime = origin_kv_lens_cuda_runtime
-        attn_metadata.host_total_kv_lens[0] = origin_ctx_total_kv_len
-
-        return attn_output
+        try:
+            return _run_mla_chunked_prefill_partitions(
+                self,
+                trtllm_attention,
+                q,
+                compressed_kv,
+                current_k_pe,
+                attn_metadata,
+                output,
+                run_partition=run_default_partition,
+                expand_kv=self._expand_context_kv,
+                include_helix_plan=True,
+            )
+        finally:
+            # copy back kv_lens_runtime and kv_lens_cuda_runtime
+            attn_metadata.kv_lens_runtime = origin_kv_lens_runtime
+            attn_metadata.kv_lens_cuda_runtime = origin_kv_lens_cuda_runtime
+            attn_metadata.host_total_kv_lens[0] = origin_ctx_total_kv_len
 
     @staticmethod
     @functools.cache
@@ -1919,6 +1933,13 @@ class MLA(nn.Module):
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
         num_seqs = attn_metadata.num_seqs
 
+        fp4_mla = _uses_dense_fp4_mla(self)
+        if fp4_mla and latent_cache is None:
+            raise RuntimeError(
+                "FP4 MLA generation requires a latent cache for fused "
+                "Q quantization, RoPE, and cache update."
+            )
+
         # The rope kernel writes seqQOffset[batch_idx + 1] for every
         # batch_idx < batch_size, and CUB-scans total_s_len / seq_len entries
         # into seqKVOffsets (mlaKernels.cu:579, :650). `batch_size` there is the
@@ -1927,31 +1948,38 @@ class MLA(nn.Module):
         # token-major presentation a row is a token, so size these by the token
         # count. Uniform verification keeps the established request-major
         # allocation rather than scaling these temporary buffers by K.
-        cu_seqlens_rows = (
-            max(num_seqs, num_tokens) + 1
-            if getattr(attn_metadata, "is_ragged_verify", False)
-            else num_seqs + 1
-        )
-        cu_q_seqlens = torch.empty(cu_seqlens_rows, dtype=torch.int32, device=q.device)
-        cu_kv_seqlens = torch.empty(cu_seqlens_rows, dtype=torch.int32, device=q.device)
-        fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
-        use_fp8_mla = getattr(self.mqa, "has_fp8_kv_cache", False) or getattr(
-            self.mqa, "has_fp4_kv_cache", False
-        )
-
+        # Dense FP4 MLA produces its prequantized Q and cache state in
+        # scatter_fp4_mla_kv_cache and consumes none of the FP8 scheduler or Q
+        # staging buffers below.
+        cu_q_seqlens = None
+        cu_kv_seqlens = None
+        fmha_scheduler_counter = None
         mla_bmm1_scale = None
         mla_bmm2_scale = None
         quant_q_buffer = None
-        if use_fp8_mla:
-            mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
-            mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
-            quant_q_buffer = torch.empty(
-                num_tokens,
-                self.num_heads_tp,
-                (self.kv_lora_rank + self.qk_rope_head_dim),
-                dtype=torch.uint8,
-                device=q.device,
+        use_fp8_mla = False
+        if not fp4_mla:
+            cu_seqlens_rows = (
+                max(num_seqs, num_tokens) + 1
+                if getattr(attn_metadata, "is_ragged_verify", False)
+                else num_seqs + 1
             )
+            cu_q_seqlens = torch.empty(cu_seqlens_rows, dtype=torch.int32, device=q.device)
+            cu_kv_seqlens = torch.empty(cu_seqlens_rows, dtype=torch.int32, device=q.device)
+            fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
+            use_fp8_mla = getattr(self.mqa, "has_fp8_kv_cache", False) or getattr(
+                self.mqa, "has_fp4_kv_cache", False
+            )
+            if use_fp8_mla:
+                mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
+                mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
+                quant_q_buffer = torch.empty(
+                    num_tokens,
+                    self.num_heads_tp,
+                    (self.kv_lora_rank + self.qk_rope_head_dim),
+                    dtype=torch.uint8,
+                    device=q.device,
+                )
 
         if hasattr(self, "k_b_proj_trans"):
             fused_q = torch.empty(
@@ -1964,17 +1992,6 @@ class MLA(nn.Module):
                 device=q.device,
             )
 
-            fp4_mla = (
-                self.sparse_params is None
-                and self.mqa.support_fp4_kv_cache()
-                and self.quant_config is not None
-                and self.quant_config.layer_quant_mode.has_fp4_kv_cache()
-            )
-            if fp4_mla and latent_cache is None:
-                raise RuntimeError(
-                    "FP4 MLA generation requires a latent cache for fused "
-                    "Q quantization, RoPE, and cache update."
-                )
             fuse_fp4_q_quant = fp4_mla
             fp4_rope_kwargs = {"fuse_fp4_q_quant": True} if fuse_fp4_q_quant else {}
 

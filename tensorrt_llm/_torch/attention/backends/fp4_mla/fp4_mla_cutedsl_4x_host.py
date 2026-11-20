@@ -21,23 +21,23 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import math
-import os
 import sys
 import threading
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from .call_cache import LruCache, class_defines_callables
+from .config import _env_flag_not_disabled as _env_flag
+from .config import _env_int
+
 __all__ = [
     "EnvelopeGeometry",
     "FULL_ONLY_MAX_PAIRS",
     "SUPPORTED_QUERY_LENS",
     "COMPILE_OPTIONS",
-    "KERNEL_ARGV_FLAGS",
-    "check_kernel_argv",
     "kernel_module",
     "validate_envelope",
     "zero_queries",
@@ -120,20 +120,6 @@ MIN_PAIRS_DERIVED = -1  # default: the 2x two-piece-plan rule above
 Q2_MIN_PAIRS = 20
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return default
-    return value.strip().lower() not in ("0", "false", "off", "no")
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return default
-    return int(value)
-
-
 def split_enabled() -> bool:
     """Whether the plan-driven split mode may be used (``TRTLLM_FP4_MLA_4X_SPLIT``, default on)."""
     return _env_flag(SPLIT_ENV, True)
@@ -161,9 +147,6 @@ def use_split_mode(*, num_heads: int, query_len: int, num_requests: int, max_kv_
 INT32_MAX = 2147483647
 LOG2_E = 1.4426950408889634  # X79:395
 COMPILE_OPTIONS = "--opt-level 2 --ptxas-options '--uumn'"  # X79:10093
-# The kernel module reads sys.argv at import (X79:318-356 via :380 SF_VEC_SIZE and :406 lazy-anchor threshold):
-# a driver whose argv happens to carry these flags would silently reconfigure the kernel (hazard H-E2).
-KERNEL_ARGV_FLAGS = ("--sf-vec-size", "--lazy-anchor-threshold-log2")
 
 _HERE = Path(__file__).resolve().parent
 KERNEL_FILE = _HERE / "fp4_mla_cutedsl_4x.py"
@@ -194,18 +177,6 @@ class EnvelopeError(ValueError):
     """Raised when a call is outside the fair envelope or violates the mufu16 input contract."""
 
 
-def check_kernel_argv(argv: list[str] | None = None) -> None:
-    """Reject argv that the kernel module would consume at import time (X79:318-356, 380, 406)."""
-    args = sys.argv[1:] if argv is None else list(argv)
-    for arg in args:
-        for flag in KERNEL_ARGV_FLAGS:
-            if arg == flag or arg.startswith(flag + "="):
-                raise EnvelopeError(
-                    f"sys.argv carries {flag!r}, which the kernel module reads at import time "
-                    f"(X79:318-356); the 4x host refuses to run with kernel-tuning flags in argv (H-E2)"
-                )
-
-
 _KERNEL_LOCK = threading.Lock()
 _KERNEL: Any = None
 
@@ -216,7 +187,6 @@ def kernel_module():
     with _KERNEL_LOCK:
         if _KERNEL is not None:
             return _KERNEL
-        check_kernel_argv()
         module = sys.modules.get(KERNEL_MODULE_NAME)
         if module is None:
             if not KERNEL_FILE.is_file():
@@ -390,7 +360,6 @@ def validate_envelope(
     tensors; never do that under CUDA-graph capture).  ``require_cuda`` also requires a device that can host the
     kernel (``device_unsupported_reason``, cached per device).  ``max_pairs`` overrides FULL_ONLY_MAX_PAIRS and
     exists ONLY for the two-wave control experiment (TEST MATRIX "B26/Q4 CONTROL (b)")."""
-    check_kernel_argv()
     # --- scalars -------------------------------------------------------------------------------------------------
     if type(query_len_per_seq) is not int or query_len_per_seq not in SUPPORTED_QUERY_LENS:
         raise EnvelopeError(
@@ -787,11 +756,10 @@ def zero_queries(kv_lens: list[int] | torch.Tensor, query_len_per_seq: int) -> l
 
 
 # --- compile / launch ------------------------------------------------------------------------------------------------
-_COMPILE_CACHE: dict[tuple, Any] = {}
-_EXECUTOR_CACHE: OrderedDict[tuple, Any] = OrderedDict()
-_PREPARED_CACHE: OrderedDict[tuple, Any] = OrderedDict()
-_CACHE_LOCK = threading.Lock()
 _CACHE_CAPACITY = 256  # X79:9934-9935
+_COMPILE_CACHE: dict[tuple, Any] = {}
+_EXECUTOR_CACHE: LruCache[Any] = LruCache(_CACHE_CAPACITY)
+_PREPARED_CACHE: LruCache[Any] = LruCache(_CACHE_CAPACITY)
 _VALIDATED_BINDINGS: set[tuple] = set()
 _HEADER_SCRATCH: dict[torch.device, torch.Tensor] = {}
 _SCRATCH_FILL = 1  # if the kernel implementer kept the header[576] gate (X79:8845-8847), a positive word passes it
@@ -860,8 +828,11 @@ def _make_wrapper_ptrs(addresses: list[int], output_dtype: torch.dtype) -> tuple
 
 
 def _current_cu_stream():
-    """Plain caller-stream handle (rig cute_dsl_utils.py:19-21); deliberately WITHOUT x79's
-    DKG_MLA_EXPLICIT_STREAM side effect (X79:637-643 calls torch.cuda.set_stream)."""
+    """The caller's stream, for launch ordering and CUDA graph capture.
+
+    Same as ``cute_dsl_utils._current_cu_stream``, with the CUDA bindings imported on use: the host-side checks of
+    this module also run where they are not installed.
+    """
     import cuda.bindings.driver as cuda
 
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1148,31 +1119,6 @@ def compile_variant(
         return _compile(geom, ptrs, _current_cu_stream(), enable_mxi_imlp)
 
 
-def _class_defines_callables(value: object, *names: str) -> bool:  # X79:9954-9956
-    value_type = type(value)
-    return all(callable(getattr(value_type, name, None)) for name in names)
-
-
-def _cache_get(cache: OrderedDict, key):
-    with _CACHE_LOCK:
-        v = cache.get(key)
-        if v is not None:
-            cache.move_to_end(key)
-        return v
-
-
-def _cache_put(cache: OrderedDict, key, value):
-    with _CACHE_LOCK:
-        existing = cache.get(key)
-        if existing is not None:
-            cache.move_to_end(key)
-            return existing
-        cache[key] = value
-        if len(cache) > _CACHE_CAPACITY:
-            cache.popitem(last=False)
-        return value
-
-
 def run_fp4_mla_decode_4x_full(
     q_fp4: torch.Tensor,
     q_sf: torch.Tensor,
@@ -1352,7 +1298,7 @@ def run_fp4_mla_decode_4x_full(
         compiled = _compile(
             geom, _make_wrapper_ptrs(addresses, output.dtype), stream, enable_mxi_imlp
         )
-    supports_prepared = _class_defines_callables(
+    supports_prepared = class_defines_callables(
         compiled, "to", "generate_execution_args", "run_compiled_program"
     )
     prepared_key = (
@@ -1381,7 +1327,7 @@ def run_fp4_mla_decode_4x_full(
         geom.used_tasks,
     )
     if supports_prepared:
-        prepared = _cache_get(_PREPARED_CACHE, prepared_key)
+        prepared = _PREPARED_CACHE.get(prepared_key)
         if prepared is not None:
             prepared.run()
             return prepared.geometry
@@ -1409,22 +1355,21 @@ def run_fp4_mla_decode_4x_full(
         compiled(*runtime_args)
         return geom
     executor_key = (id(compiled), device_index, int(current_context))
-    executor = _cache_get(_EXECUTOR_CACHE, executor_key)
+    executor = _EXECUTOR_CACHE.get(executor_key)
     if executor is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "FP4 MLA CUDA Graph capture requires an eager warmup for the compiled kernel, device, and CUDA context."
             )
         candidate = compiled.to(device_index)  # X79:10539
-        if not _class_defines_callables(
+        if not class_defines_callables(
             candidate, "generate_execution_args", "run_compiled_program"
         ):
             compiled(*runtime_args)
             return geom
-        executor = _cache_put(_EXECUTOR_CACHE, executor_key, candidate)
+        executor = _EXECUTOR_CACHE.put(executor_key, candidate)
     execution_args, adapted_args = executor.generate_execution_args(*runtime_args)  # X79:10546
-    prepared = _cache_put(
-        _PREPARED_CACHE,
+    prepared = _PREPARED_CACHE.put(
         prepared_key,
         _PreparedCall(executor, runtime_args, execution_args, adapted_args, geom),
     )

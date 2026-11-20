@@ -19,6 +19,7 @@ from .config import (
     _ceil_div,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
+    has_fp4_mla_cache_layout,
 )
 from .fp4_mla_kernels import _fp4_mla_rebuild_v_scale_from_k_scale_kernel
 from .layout import get_fp4_mla_v_scale_pool_size
@@ -34,15 +35,15 @@ def _v_packed_shape(
 
 
 def _get_fp4_mla_v_packed_pool(metadata: Any, local_layer: int) -> Optional[torch.Tensor]:
-    return metadata.kv_cache_manager.get_mla_v_packed_pool(local_layer)
+    return metadata.kv_cache_manager.fp4_mla_layout.get_mla_v_packed_pool(local_layer)
 
 
 def _get_fp4_mla_v_packed_pool_base(metadata: Any) -> Optional[torch.Tensor]:
-    return metadata.kv_cache_manager.get_mla_v_packed_pool_base()
+    return metadata.kv_cache_manager.fp4_mla_layout.get_mla_v_packed_pool_base()
 
 
 def _get_fp4_mla_v_scale_pool_base(metadata: Any) -> Optional[torch.Tensor]:
-    return metadata.kv_cache_manager.get_mla_v_scale_pool_base()
+    return metadata.kv_cache_manager.fp4_mla_layout.get_mla_v_scale_pool_base()
 
 
 def _get_cutedsl_persistent_v_packed_cache(
@@ -272,10 +273,10 @@ def rebuild_fp4_mla_disagg_imported_cache(
         kv_cache_manager is None
         or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4
         or getattr(kv_cache_manager, "kv_factor", None) != 1
-        or getattr(kv_cache_manager, "mla_v_scale_head_dim", None) is None
-        or not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None))
+        or not has_fp4_mla_cache_layout(kv_cache_manager)
     ):
         return False
+    cache_layout = kv_cache_manager.fp4_mla_layout
     if len(request_ids) != len(prompt_lens):
         raise ValueError(
             "FP4 MLA disaggregated import needs one prompt_len per request, got "
@@ -309,9 +310,7 @@ def rebuild_fp4_mla_disagg_imported_cache(
             "FP4 MLA disaggregated import cannot map local to global layers: "
             f"{len(pp_layers)} PP layers for {num_local_layers} local layers."
         )
-    fp4_local_layers = list(
-        getattr(kv_cache_manager, "_fp4_mla_compact_to_local", range(num_local_layers))
-    )
+    fp4_local_layers = list(cache_layout._fp4_mla_compact_to_local)
     if not fp4_local_layers:
         raise RuntimeError("FP4 MLA disaggregated import found no local MLA layers.")
     if any(local_layer < 0 or local_layer >= num_local_layers for local_layer in fp4_local_layers):
@@ -339,15 +338,15 @@ def rebuild_fp4_mla_disagg_imported_cache(
             )
         prompt_block_ids.append([int(block_id) for block_id in block_ids[:num_prompt_pages]])
 
-    kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_pool_bases()
-    v_scale_pool = kv_cache_manager.get_mla_v_scale_pool_base()
+    kv_cache, sf_cache = cache_layout.get_fp4_mla_cache_pool_bases()
+    v_scale_pool = cache_layout.get_mla_v_scale_pool_base()
     if not isinstance(v_scale_pool, torch.Tensor):
         raise RuntimeError("FP4 MLA disaggregated import requires the manager V-scale pool.")
     page_ids, page_valid_tokens = _stage_fp4_mla_import_page_metadata(
         prompt_block_ids,
         [prompt_len for _, prompt_len in imports],
         [
-            int(kv_cache_manager.get_mla_v_scale_page_offset(compact_layer))
+            int(cache_layout.get_mla_v_scale_page_offset(compact_layer))
             for compact_layer in range(len(fp4_local_layers))
         ],
         page_size=page_size,
@@ -362,19 +361,19 @@ def rebuild_fp4_mla_disagg_imported_cache(
         page_ids,
         page_valid_tokens,
         local_layer=0,
-        v_head_dim=int(kv_cache_manager.mla_v_scale_head_dim),
+        v_head_dim=int(cache_layout.mla_v_scale_head_dim),
         page_size=page_size,
     )
     if (
         _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
         and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
     ):
-        v_head_dim = getattr(kv_cache_manager, "mla_v_head_dim", None)
+        v_head_dim = cache_layout.mla_v_head_dim
         if v_head_dim is None:
             raise RuntimeError(
                 "CuTeDSL FP4 MLA disaggregated import requires a persistent V head dimension."
             )
-        v_packed = kv_cache_manager.get_mla_v_packed_pool_base()
+        v_packed = cache_layout.get_mla_v_packed_pool_base()
         if not isinstance(v_packed, torch.Tensor):
             raise RuntimeError(
                 "CuTeDSL FP4 MLA disaggregated import requires the persistent V-packed pool."

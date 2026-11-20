@@ -20,8 +20,8 @@ import os
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
-                    List, Optional, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet,
+                    Iterator, List, Optional, Tuple)
 
 import numpy as np
 import torch
@@ -61,14 +61,16 @@ from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
 from .fmha.registry import is_fmha_lib_enabled
-from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, fp4_mla_cache_layout,
+                      has_fp4_mla_cache_layout, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        AttentionRuntimeFeatures, KVCacheParams, MLAParams,
-                        PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams, merge_attention_forward_args)
+                        AttentionRuntimeFeatures, GraphVariant, KVCacheParams,
+                        MLAParams, PositionalEmbeddingParams,
+                        PredefinedAttentionMask, RopeParams,
+                        merge_attention_forward_args)
 from .mixed_precision_rows import store_mixed_precision_low_rows
 from .sparse.hooks import has_sparse_mla_hooks, prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
@@ -737,9 +739,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=prefer_pinned(),
                 )
 
-        if callable(
-                getattr(self.kv_cache_manager, "get_fp4_mla_page_table_spec",
-                        None)):
+        if has_fp4_mla_cache_layout(self.kv_cache_manager):
             self.fp4_mla_state = Fp4MlaState.create(self, buffers)
 
         # Allocate static buffers for helix parallelism support.
@@ -857,27 +857,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if state is not None:
             state.update_for_spec_dec(self)
 
-    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
-        # The FP4 MLA decode dispatcher chooses 2x | 4x | two-stream on it.
+    def set_decode_graph_variant(self, name: str, value: Optional[int]) -> None:
+        # Only the FP4 MLA decode serves graph variants.
         state = self.fp4_mla_state
-        if state is not None:
-            state.kv_regime_max_kv = kv_regime
+        if state is None:
+            return super().set_decode_graph_variant(name, value)
+        state.set_decode_graph_variant(name, value)
 
-    @property
-    def decode_kv_regime(self) -> Optional[int]:
+    def decode_graph_variant(self, name: str) -> Optional[int]:
         state = self.fp4_mla_state
-        return None if state is None else state.kv_regime_max_kv
-
-    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
-        # The FP4 MLA packed decode launches its split budget only when True.
-        state = self.fp4_mla_state
-        if state is not None:
-            state.packed_split = packed_split
-
-    @property
-    def decode_packed_split(self) -> Optional[bool]:
-        state = self.fp4_mla_state
-        return None if state is None else state.packed_split
+        return None if state is None else state.decode_graph_variant(name)
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
@@ -3595,12 +3584,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         local_layer_idx = self.get_local_layer_idx(metadata)
         if metadata.kv_cache_manager is None:
             return local_layer_idx
-        to_compact = getattr(metadata.kv_cache_manager,
-                             "_fp4_mla_compact_layer_idx", None)
-        if not callable(to_compact):
+        layout = fp4_mla_cache_layout(metadata.kv_cache_manager)
+        if layout is None:
             raise RuntimeError(
                 "FP4 MLA requires a cache manager with compact layer mapping.")
-        return to_compact(local_layer_idx)
+        return layout._fp4_mla_compact_layer_idx(local_layer_idx)
 
     def use_nvfp4_output(
         self,
@@ -4647,6 +4635,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def support_fp4_kv_cache(cls) -> bool:
         return True
 
+    @classmethod
+    def decode_graph_variants(
+            cls, *, kv_cache_manager: Any, model: torch.nn.Module,
+            mapping: "Mapping",
+            sm_count_fn: Callable[[], int]) -> List[GraphVariant]:
+        # Only the FP4 MLA decode declares graph variants. Any other KV cache
+        # gets none, before a switch is read or the device probed.
+        from .fp4_mla import graph_resolvers
+
+        return graph_resolvers.resolve_fp4_mla_graph_variants(
+            kv_cache_manager=kv_cache_manager,
+            model=model,
+            mapping=mapping,
+            sm_count_fn=sm_count_fn)
+
     def has_cached_kv_for_mla_context(
         self,
         metadata: TrtllmAttentionMetadata,
@@ -4972,12 +4975,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q_pe: Optional[torch.Tensor],
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
-        cu_q_seqlens: torch.Tensor,
-        cu_kv_seqlens: torch.Tensor,
-        fmha_scheduler_counter: torch.Tensor,
-        mla_bmm1_scale: torch.Tensor,
-        mla_bmm2_scale: torch.Tensor,
-        quant_q_buffer: torch.Tensor,
+        cu_q_seqlens: Optional[torch.Tensor] = None,
+        cu_kv_seqlens: Optional[torch.Tensor] = None,
+        fmha_scheduler_counter: Optional[torch.Tensor] = None,
+        mla_bmm1_scale: Optional[torch.Tensor] = None,
+        mla_bmm2_scale: Optional[torch.Tensor] = None,
+        quant_q_buffer: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
         kv_norm_weight: Optional[torch.Tensor] = None,
         kv_norm_eps: float = 1e-6,
@@ -5034,6 +5037,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 fuse_q_quant=fuse_fp4_q_quant,
             )
             return
+
+        assert cu_q_seqlens is not None
+        assert cu_kv_seqlens is not None
+        assert fmha_scheduler_counter is not None
 
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
@@ -5098,7 +5105,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         fmha_scheduler_counter: torch.Tensor,
         mla_bmm1_scale: Optional[torch.Tensor],
         mla_bmm2_scale: Optional[torch.Tensor],
-        quant_q_buffer: torch.Tensor,
+        quant_q_buffer: Optional[torch.Tensor],
         out_scale: Optional[torch.Tensor],
         helix_tensor_params: List[Optional[torch.Tensor]],
         kv_norm_weight: Optional[torch.Tensor],

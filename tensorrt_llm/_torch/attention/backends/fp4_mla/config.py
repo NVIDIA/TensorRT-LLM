@@ -6,11 +6,15 @@ import functools
 import importlib.util
 import inspect
 import os
-from typing import Any, Literal, Optional
+import threading
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from .cache_layout import Fp4MlaCacheLayout
 
 HP_BLOCK_SIZE: int = 16
 
@@ -84,6 +88,14 @@ _FP8_CONTEXT_SUPPORTED_SMS = frozenset((90, 100, 103, 107, 120))
 FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV = "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE"
 
 
+FP4_MLA_FOLD_Q_ENV = "TRTLLM_FP4_MLA_FOLD_Q"
+FP4_MLA_BLOCK_V_ENV = "TRTLLM_FP4_MLA_BLOCK_V"
+FP4_MLA_PAGE_STATS_NUM_WARPS_ENV = "TRTLLM_FP4_MLA_PAGE_STATS_NUM_WARPS"
+FP4_MLA_PV_NUM_WARPS_ENV = "TRTLLM_FP4_MLA_PV_NUM_WARPS"
+FP4_MLA_LAZY_ANCHOR_LOG2_ENV = "TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2"
+CUTEDSL_VERBOSE_COMPILE_ENV = "TRTLLM_CUTEDSL_VERBOSE_COMPILE"
+
+
 _FP4_MLA_CUTEDSL_BACKEND = "cutedsl"
 
 
@@ -126,9 +138,9 @@ _FP4_MLA_MAX_REDUCE_GROUPS = 64
 
 def _env_enabled_default(name: str, default: bool) -> bool:
     value = os.getenv(name)
-    if value is None or value == "":
+    if value is None or value.strip() == "":
         return default
-    return value.lower() in (
+    return value.strip().lower() in (
         "1",
         "true",
         "yes",
@@ -136,8 +148,41 @@ def _env_enabled_default(name: str, default: bool) -> bool:
     )
 
 
+def _env_flag_not_disabled(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def fp4_mla_cache_layout(kv_cache_manager: object) -> Optional["Fp4MlaCacheLayout"]:
+    """The FP4 MLA cache layout a KV cache manager holds; None for a manager without one."""
+    return getattr(kv_cache_manager, "fp4_mla_layout", None)
+
+
+def has_fp4_mla_cache_layout(kv_cache_manager: object) -> bool:
+    """Whether ``kv_cache_manager`` stores its MLA latent cache in the FP4 MLA layout."""
+    return fp4_mla_cache_layout(kv_cache_manager) is not None
+
+
 def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
     return _env_enabled_default(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, False)
+
+
+def _cutedsl_verbose_compile_enabled() -> bool:
+    """Whether a CuTe DSL compilation leaves the PyIR status lines on stdout."""
+    return _env_enabled_default(CUTEDSL_VERBOSE_COMPILE_ENV, False)
+
+
+# Held by a CuTe DSL compilation of the FP4 MLA kernels: it switches the DSL's
+# process-wide PyIR frontend and may filter sys.stdout while it runs, and both
+# are restored correctly only when compilations do not overlap.
+_CUTEDSL_COMPILE_LOCK = threading.RLock()
 
 
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
@@ -194,11 +239,33 @@ def _fp4_mla_packed_rows_per_seq(num_heads: int, query_len: int) -> int:
     return rows if rows <= _FP4_MLA_PACKED_MAX_M else 0
 
 
-def _env_int(name: str) -> Optional[int]:
+def _fp4_mla_fold_q_enabled() -> bool:
+    return os.environ.get(FP4_MLA_FOLD_Q_ENV, "1") != "0"
+
+
+def _fp4_mla_split_kv_override() -> str:
+    return os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
+
+
+def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
     value = os.environ.get(name)
-    if value is None or value == "":
-        return None
+    if value is None or value.strip() == "":
+        return default
     return int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
+
+
+def resolve_fp4_mla_lazy_anchor_rebase_log2(default: float) -> float:
+    threshold = _env_float(FP4_MLA_LAZY_ANCHOR_LOG2_ENV, default)
+    if not 0.0 <= threshold <= 8.0:
+        raise ValueError(f"{FP4_MLA_LAZY_ANCHOR_LOG2_ENV} must be in [0, 8], got {threshold}")
+    return threshold
 
 
 def _fp4_mla_attention_backend() -> str:

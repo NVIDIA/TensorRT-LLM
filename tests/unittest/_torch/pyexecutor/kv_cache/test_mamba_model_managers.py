@@ -53,6 +53,7 @@ from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     Qwen4ExpHybridCacheManager,
     Qwen4ExpPLECacheParams,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_layout_hooks import Fp4MlaLayoutHooks
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
@@ -86,8 +87,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ],
 )
 def test_model_managers_inherit_the_common_lifecycle(manager_cls):
-    # The GDN managers also mix in the in-forward snapshot API.
-    bases = tuple(base for base in manager_cls.__bases__ if base is not InforwardSnapshotHost)
+    # The GDN managers also mix in the in-forward snapshot API, and Kimi K3
+    # the hooks that run its FP4 MLA cache layout.
+    mixins = (InforwardSnapshotHost, Fp4MlaLayoutHooks)
+    bases = tuple(base for base in manager_cls.__bases__ if base not in mixins)
     assert bases == (MambaHybridCacheManagerV2,)
     for method in (
         "try_commit_blocks",

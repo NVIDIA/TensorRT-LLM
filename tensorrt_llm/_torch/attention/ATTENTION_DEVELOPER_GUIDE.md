@@ -377,10 +377,13 @@ metadata and cache behavior.
 All backend metadata types inherit from `AttentionMetadata`. The base contract
 includes sequence-length and request-level state, KV-cache manager and
 parameters, runtime feature flags, and optional CUDA-graph buffer management.
-A CUDA graph runner that keys its decode graphs by KV regime hands the
-regime ceiling to the graph's metadata through `set_decode_kv_regime`; only a
-backend whose decode path depends on the KV length keeps it (the FP4 MLA
-2x | 4x | two-stream dispatcher), the default ignores it.
+A backend may declare graph variants (`GraphVariant`), further dimensions its
+decode CUDA graphs are keyed by, by overriding
+`AttentionBackend.decode_graph_variants`; the graph runner hands the value a
+graph serves to the graph's metadata through `set_decode_graph_variant`, which
+raises for a variant the metadata does not serve. Only the FP4 MLA decode
+declares any (the KV regime its 2x | 4x | two-stream dispatcher decides on,
+and the packed split decision), through `TrtllmAttention`.
 Sparse metadata subtypes consume only `SparseMetadataParams`, not
 backend-owned `SparseParams`.
 
@@ -677,7 +680,15 @@ The FMHA package is split by role:
   composes the policy with the recurrent-state lifecycle and forwards the
   attention-layout operations to it: the policy owns the MLA layers' roles,
   HP-ring virtual layers and snapshot-point alignment, and the hybrid
-  manager keeps the SSM, convolution, and KDA replay state. No other hybrid
+  manager keeps the SSM, convolution, and KDA replay state. The layout
+  itself is an `Fp4MlaCacheLayout` object that the manager holds as
+  `fp4_mla_layout`. A manager class that takes the layout lists
+  `Fp4MlaLayoutHooks` ahead of `KVCacheManagerV2` in its bases, or
+  `configure_manager` raises `NotImplementedError`. New FP4 MLA state and
+  operations belong on the layout: an operation the hybrid manager calls
+  gets a forwarder on the policy, and a V2 manager hook the layout takes
+  over gets a forwarder in `Fp4MlaLayoutHooks` and an entry in its
+  `LAYOUT_HOOKS`. No other hybrid
   linear-attention family has an FP4 MLA layout, so `get_kv_cache_manager_cls`
   rejects one with an NVFP4 MLA cache. For disaggregated
   serving the hybrid manager owns the transfer declarations and merges the

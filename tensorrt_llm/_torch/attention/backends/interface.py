@@ -7,8 +7,9 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Generic, List, Literal,
+                    NamedTuple, Optional, Protocol, Sequence, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from typing_extensions import Self
@@ -69,6 +70,44 @@ class AttentionInputType(IntEnum):
     mixed = 0  # contains both context and generation
     context_only = 1
     generation_only = 2
+
+
+class GraphVariant(NamedTuple):
+    """One more dimension the decode graphs are keyed by, declared by the attention backend.
+
+    The backend lists its variants in ``AttentionBackend.decode_graph_variants``.
+    A decode step has one integer value of the variant, and graphs captured
+    for different values are different graphs. The runner does not know what
+    a value means: it captures the values a graph shape can take, keys every
+    step by its value, and tells the attention metadata of a graph which
+    value the graph serves (``AttentionMetadata.set_decode_graph_variant``).
+
+    Ranks that must replay the same graph take the largest value among their
+    own, so a graph of a larger value has to be valid for a step of a smaller
+    one.
+
+    A value may change only what a rank computes for its own rows, such as
+    the attention kernel it launches. It must not change the work the ranks
+    share inside a graph (what they exchange, or the shapes they exchange it
+    in). A runner that reuses a graph shape agreed elsewhere replays without
+    exchanging the values (``DSparkCUDAGraphRunner._agree_graph_shape``), so
+    its ranks may replay graphs of different values in the same step.
+    """
+    name: str
+    # Values the graphs of a shape (batch size, draft length) are captured
+    # for, ascending. A shape with one value is keyed by it without measuring
+    # the step.
+    values: Callable[[int, int], Tuple[int, ...]]
+    # A step's value, from its shape and the KV length each of its rows reads.
+    of_step: Callable[[int, int, List[int]], int]
+    # The value a step replays when no graph of its own value was captured,
+    # from that value and the ones captured for the step's shape.
+    replayable: Callable[[int, Sequence[int]], int]
+    # (warm-up length, value) of the capture passes of a shape, from the
+    # warm-up lengths of the capture and the shape's values. None captures
+    # every value at every length. Only the first variant may set it.
+    capture_passes: Optional[Callable[[Sequence[int], Tuple[int, ...]],
+                                      List[Tuple[int, int]]]] = None
 
 
 @dataclass(kw_only=True)
@@ -592,39 +631,28 @@ class AttentionMetadata:
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
-    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
-        """Bound the KV length the decode kernels choose their path on.
+    def set_decode_graph_variant(self, name: str, value: Optional[int]) -> None:
+        """Fix a decode graph variant for the CUDA graph this metadata serves.
 
-        A CUDA graph runner that keys its decode graphs by KV regime passes
-        the regime ceiling of the graph this metadata serves, an upper bound
-        of the longest KV a replay reads.
-
-        Args:
-            kv_regime: The regime ceiling in tokens; None restores the
-                page-table capacity. Backends whose decode path does not
-                depend on the KV length ignore it.
-        """
-
-    @property
-    def decode_kv_regime(self) -> Optional[int]:
-        """The KV regime set by ``set_decode_kv_regime``; None when unset or ignored."""
-        return None
-
-    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
-        """Fix whether the decode launches its KV split budget.
-
-        A CUDA graph runner that keys its decode graphs by the split
-        decision passes the decision of the graph this metadata serves.
+        A CUDA graph runner that keys its decode graphs by a variant the
+        backend declared (``AttentionBackend.decode_graph_variants``) passes
+        the value of the graph this metadata serves, so the decode captured in
+        the graph behaves as that value says instead of deciding on each call.
 
         Args:
-            packed_split: True launches the split budget, False one task
-                per request; None restores the per-call decision. Backends
-                without a split decode ignore it.
-        """
+            name: The variant's name.
+            value: Its value for this graph; None restores the per-call
+                decision.
 
-    @property
-    def decode_packed_split(self) -> Optional[bool]:
-        """The decision set by ``set_decode_packed_split``; None when unset or ignored."""
+        Raises:
+            ValueError: This metadata serves no variant of that name. The base
+                metadata serves none, as its backend declares none.
+        """
+        raise ValueError(
+            f"{type(self).__name__} serves no decode graph variant {name!r}.")
+
+    def decode_graph_variant(self, name: str) -> Optional[int]:
+        """The value set by ``set_decode_graph_variant``; None when unset."""
         return None
 
     def prepare_for_spec_dec(self, *fields) -> None:
@@ -1331,6 +1359,27 @@ class AttentionBackend(Generic[TMetadata]):
     def support_fp4_kv_cache(cls) -> bool:
         """Whether the backend can execute attention with an FP4 KV cache."""
         return False
+
+    @classmethod
+    def decode_graph_variants(
+            cls, *, kv_cache_manager: Any, model: torch.nn.Module,
+            mapping: Mapping, sm_count_fn: Callable[[],
+                                                    int]) -> List[GraphVariant]:
+        """Graph variants the decode CUDA graphs of this backend are keyed by, besides their shape.
+
+        The decoder graph runner asks once, at capture, when the KV cache
+        exists, and keys the graphs by what it gets. The backend's metadata
+        has to serve every variant returned here
+        (``AttentionMetadata.set_decode_graph_variant``). Default: none.
+
+        Args:
+            kv_cache_manager: The KV cache manager of the decode.
+            model: The model whose decode the graphs capture.
+            mapping: The parallel layout of this rank.
+            sm_count_fn: Streaming multiprocessors of the device the graphs
+                replay on, read only when a variant depends on it.
+        """
+        return []
 
     @classmethod
     def support_multi_item_scoring(cls) -> bool:

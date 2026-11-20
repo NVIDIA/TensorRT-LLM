@@ -101,7 +101,7 @@ through hooks that name no family:
 
 | State | Owner | Hooks of `MambaHybridCacheManagerV2` |
 |---|---|---|
-| FP4 MLA latent-cache layout | `KimiK3HybridCacheManager` selects `Fp4MlaV2CacheLayoutPolicy` for an NVFP4 MLA cache | `_configure_attention_cache_layout()` installs `_attention_cache_layout_policy`, to which the manager forwards attention-layout operations; `_estimate_attention_cache_cost()` gives the cost estimate its pages and rings |
+| FP4 MLA latent-cache layout | `KimiK3HybridCacheManager` selects `Fp4MlaV2CacheLayoutPolicy` for an NVFP4 MLA cache | `_configure_attention_cache_layout()` installs `_attention_cache_layout_policy`, to which the manager forwards attention-layout operations; `_estimate_attention_cache_cost()` gives the cost estimate its pages and rings. The layout is the manager's `fp4_mla_layout` object, which the V2 manager hooks reach through `Fp4MlaLayoutHooks` in the manager's bases |
 | A standalone drafter's KV layers | `KimiK3HybridCacheManager` (`accepts_appended_draft_layers`) | `_append_layers()` extends the layer masks, `_bind_appended_layers()` maps them to local layers |
 | GDN in-forward snapshots | `Qwen35HybridCacheManager` owns `InforwardSnapshots` (`modules/fla/inforward_snapshot.py`); `GDNMambaMetadata` plans the split | `_setup_model_state()`, `prepare_resources()`, `shutdown()`; the executor and scheduler read `inforward_snapshot_rows` (0 on `KVCacheManagerV2`) |
 | GDN mixer state (iteration context, state-reset gate, aligned decode slots) | `GDNMambaMetadata` | `prepare()`, `prepare_steady_gen_step()` |

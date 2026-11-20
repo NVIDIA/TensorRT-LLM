@@ -388,8 +388,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert quant_config.quant_mode.has_fp4_kv_cache()
             manager = executor.kv_cache_manager
             assert isinstance(manager, Fp4MlaKVCacheManagerV2)
-            assert manager.get_mla_v_scale_pool().numel() > 0
-            assert manager.get_fp4_mla_hp_pool().numel() > 0
+            assert manager.fp4_mla_layout.get_mla_v_scale_pool().numel() > 0
+            assert manager.fp4_mla_layout.get_fp4_mla_hp_pool().numel() > 0
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             mla_layers = [

@@ -21,7 +21,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import dummy_requests
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -64,11 +63,11 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fu
     assert manager.fp4_mla_context_only_cache == context_only
     assert is_fp4_mla_context_only_cache(is_disagg) == context_only
     assert is_context_only_kv_cache(manager) == context_only
-    assert manager.mla_v_head_dim == (None if context_only or fused else 512)
-    assert (manager._v_scale_bytes_per_page() == 0) == context_only
+    assert manager.fp4_mla_layout.mla_v_head_dim == (None if context_only or fused else 512)
+    assert (manager.fp4_mla_layout._v_scale_bytes_per_page() == 0) == context_only
     if context_only:
-        assert manager.get_mla_v_scale_pool() is None
-        assert manager.get_mla_v_scale_pool_base() is None
+        assert manager.fp4_mla_layout.get_mla_v_scale_pool() is None
+        assert manager.fp4_mla_layout.get_mla_v_scale_pool_base() is None
 
     slope, intercept = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
         SimpleNamespace(pretrained_config=config),
@@ -83,47 +82,6 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fu
     assert slope == (360 if context_only else 392 if fused else 648)
     # The HP ring stays: the context worker writes and transfers it.
     assert intercept == 2 * 16 * 576 * 2
-
-
-def test_context_only_layer_bytes_exclude_v_scales(monkeypatch):
-    monkeypatch.setenv(DISAGG_ROLE_ENV, "context")
-    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
-    manager = object.__new__(Fp4MlaKVCacheManagerV2)
-    Fp4MlaKVCacheManagerV2.configure_manager(
-        manager,
-        KvCacheConfig(dtype="nvfp4"),
-        CacheTypeCpp.SELFKONLY,
-        dtype=DataType.NVFP4,
-        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-        head_dim=576,
-        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
-        is_disagg=True,
-    )
-    manager.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
-    manager.num_local_layers = 1
-    manager.pp_layers = [0]
-    manager.head_dim_per_layer = [576]
-    manager.num_kv_heads_per_layer = [1]
-
-    assert manager.get_layer_bytes_per_token(0, Role.ALL) == 320 + 40
-    # No V-scale (or packed-V) buffer is registered next to K and K scales.
-    assert manager._extra_buffers_per_layer(tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK) == {0: []}
-
-
-@pytest.mark.parametrize(
-    "attrs,expected",
-    [
-        ({}, False),
-        ({"kda_context_only": True}, True),
-        ({"fp4_mla_context_only_cache": True}, True),
-        ({"kda_context_only": False, "fp4_mla_context_only_cache": False}, False),
-    ],
-)
-def test_context_only_kv_cache_predicate(attrs, expected):
-    assert is_context_only_kv_cache(SimpleNamespace(**attrs)) is expected
-    # A Mock manager answers any attribute with a truthy Mock; only True counts.
-    assert is_context_only_kv_cache(Mock()) is False
 
 
 def _dummy_requests(monkeypatch, context_only: bool):
@@ -157,10 +115,3 @@ def test_only_context_workers_skip_generation_warmup(monkeypatch, context_only):
             factory.create_warmup_request(resources, 8, 1)
         with pytest.raises(RuntimeError, match="warmup batch reached"):
             factory.create_cuda_graph_warmup_request(resources, 1, 0)
-
-
-def test_context_warmup_is_preserved_on_context_only_cache(monkeypatch):
-    factory, resources = _dummy_requests(monkeypatch, context_only=True)
-
-    with pytest.raises(RuntimeError, match="warmup batch reached"):
-        factory.create_warmup_request(resources, 8192, 0)

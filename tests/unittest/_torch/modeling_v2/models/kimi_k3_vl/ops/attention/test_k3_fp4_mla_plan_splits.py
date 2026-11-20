@@ -56,6 +56,7 @@ def _metadata(num_requests, is_cuda_graph=True):
         page_table_stride=3904,
         generation_kv_lens=torch.zeros(num_requests, dtype=torch.int32),
         workspaces={"_fp4_mla_packed_plan": torch.empty(1 << 16, dtype=torch.int32)},
+        packed_split=None,
     )
     return SimpleNamespace(page_size=128, is_cuda_graph=is_cuda_graph, fp4_mla_state=state)
 

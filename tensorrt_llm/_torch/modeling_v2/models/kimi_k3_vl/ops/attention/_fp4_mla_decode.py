@@ -41,6 +41,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_kernel_module,
     _fp4_mla_packed_rows_per_seq,
+    fp4_mla_cache_layout,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.layout import (
     _ensure_workspace_tensor,
@@ -845,7 +846,8 @@ def run_decode(
     core_v_packed = _get_fp4_mla_v_packed_pool_base(metadata)
     if core_v_packed is None:
         raise RuntimeError("Persistent FP4 MLA V packing requires a stable full-pool base.")
-    get_v_page_offset = getattr(metadata.kv_cache_manager, "get_mla_v_packed_page_offset", None)
+    cache_layout = fp4_mla_cache_layout(metadata.kv_cache_manager)
+    get_v_page_offset = getattr(cache_layout, "get_mla_v_packed_page_offset", None)
     v_page_offset = (
         int(get_v_page_offset(local_layer))
         if callable(get_v_page_offset)
@@ -875,7 +877,7 @@ def run_decode(
             "tensor with the configured page stride."
         )
     core_v_sf = v_sf_pool_base.view(torch.float8_e4m3fn)
-    get_v_sf_page_offset = getattr(metadata.kv_cache_manager, "get_mla_v_scale_page_offset", None)
+    get_v_sf_page_offset = getattr(cache_layout, "get_mla_v_scale_page_offset", None)
     v_sf_page_offset = (
         int(get_v_sf_page_offset(local_layer))
         if callable(get_v_sf_page_offset)

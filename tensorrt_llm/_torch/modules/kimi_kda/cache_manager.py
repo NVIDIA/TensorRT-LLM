@@ -18,6 +18,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_layout_hooks import Fp4MlaLayoutHooks
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
     KVCacheLayerSpec,
@@ -1068,21 +1069,19 @@ def _insert_draft_pool_ratio(
     return ratio
 
 
-class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
+class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
     """KDA/MLA cache layout and K3-only replay lifecycle handling.
 
     With an NVFP4 KV cache the MLA latent cache takes the FP4 MLA V2 layout
-    (``Fp4MlaV2CacheLayoutPolicy``), and a standalone drafter (DSpark) can
-    keep its context KV layers in this manager after the target layers.
+    (``Fp4MlaV2CacheLayoutPolicy``), which the ``Fp4MlaLayoutHooks`` base runs,
+    and a standalone drafter (DSpark) can keep its context KV layers in this
+    manager after the target layers.
     """
 
     kda_context_only = False
     _kda_replay_region: KDAReplayRegion | None = None
     # Draft-owned attention layers kept after the target layers (layer_specs).
     _draft_layer_specs: tuple[KVCacheLayerSpec, ...] = ()
-    # Set per instance by the FP4 MLA layout on a disaggregated context
-    # worker, which keeps no generation-only V scales or packed V.
-    fp4_mla_context_only_cache = False
 
     @classmethod
     @override
@@ -1210,9 +1209,10 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if not _uses_fp4_mla_cache_layout(dtype, kv_cache_type, pretrained_config):
             return kv_cache_config
         # NVFP4 MLA latent cache: compose the FP4 MLA V2 layout (K, K scales,
-        # V scales, BF16 HP ring) with the recurrent-state lifecycle. The base
-        # manager forwards attention-layout operations to the policy; SSM
-        # operations stay on this manager.
+        # V scales, BF16 HP ring) with the recurrent-state lifecycle. The
+        # policy attaches the layout as fp4_mla_layout, which the layout hooks
+        # run; the base manager forwards its other attention-layout operations
+        # to the policy, and SSM operations stay on this manager.
         from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
             Fp4MlaV2CacheLayoutPolicy,
         )

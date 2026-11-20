@@ -45,6 +45,9 @@ if TYPE_CHECKING:
 
     from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 
+from ..attention.backends.fp4_mla.config import \
+    FP4_BLOCK_SIZE as FP4_MLA_QUANTIZATION_TILE_SIZE
+from ..attention.backends.fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
@@ -82,9 +85,6 @@ _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
-FP4_MLA_TOKENS_PER_BLOCK = 128
-# NVFP4 MLA quantizes the latent cache in 16-token tiles.
-FP4_MLA_QUANTIZATION_TILE_SIZE = 16
 
 
 def _validate_fp4_mla_chunk_unit(

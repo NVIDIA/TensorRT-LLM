@@ -19,6 +19,11 @@ if TYPE_CHECKING:
     from .fp4_mla_context import _Fp8MlaContextScratch
 
 
+# Names of the graph variants the FP4 MLA decode graphs can be keyed by (graph_resolvers).
+KV_REGIME_VARIANT = "kv_regime"
+PACKED_SPLIT_VARIANT = "packed_split"
+
+
 @dataclass
 class Fp4MlaState:
     """State shared by RoPE/cache append and all FP4 FMHAs in one batch.
@@ -51,13 +56,13 @@ class Fp4MlaState:
     generation_lengths_serial: int = 0
     plan_4x_key: tuple | None = None
     # Ceiling (tokens) of the KV regime this CUDA graph metadata serves, an upper bound of its steps' longest live KV,
-    # set through set_decode_kv_regime by a graph runner that keys its decode graphs by KV regime
+    # set as the KV_REGIME_VARIANT graph variant by a graph runner that keys its decode graphs by KV regime
     # (fp4_mla_dispatch.kv_regimes_for_batch). None (eager metadata, graphs without regimes): decide on the
     # page-table capacity.
     kv_regime_max_kv: int | None = None
-    # Split decision of the packed decode this CUDA graph metadata serves, set through set_decode_packed_split by a
-    # graph runner that keys its decode graphs by it (packed_plan.packed_split_variants): True launches the split
-    # budget, False one task per request. None (eager metadata, graphs without it): decide per call
+    # Split decision of the packed decode this CUDA graph metadata serves, set as the PACKED_SPLIT_VARIANT graph
+    # variant by a graph runner that keys its decode graphs by it (packed_plan.packed_split_variants): True launches
+    # the split budget, False one task per request. None (eager metadata, graphs without it): decide per call
     # (packed_plan._on_demand_split_count).
     packed_split: bool | None = None
     generation_cache_scattered: bool = False
@@ -97,17 +102,35 @@ class Fp4MlaState:
             raise RuntimeError("FP4 MLA paged_kv_indptr is not allocated.")
         return self._paged_kv_indptr[: self.num_sequences + 1]
 
+    def set_decode_graph_variant(self, name: str, value: int | None) -> None:
+        """Take the value of a decode graph variant from the CUDA graph runner (graph_resolvers)."""
+        if name == KV_REGIME_VARIANT:
+            self.kv_regime_max_kv = value
+        elif name == PACKED_SPLIT_VARIANT:
+            self.packed_split = None if value is None else bool(value)
+        else:
+            raise ValueError(f"The FP4 MLA decode serves no graph variant {name!r}.")
+
+    def decode_graph_variant(self, name: str) -> int | None:
+        """The value last set for a decode graph variant; None when unset or unknown."""
+        if name == KV_REGIME_VARIANT:
+            return self.kv_regime_max_kv
+        if name == PACKED_SPLIT_VARIANT:
+            return None if self.packed_split is None else int(self.packed_split)
+        return None
+
     @classmethod
     def create(cls, metadata: TrtllmAttentionMetadata, buffers: Buffers | None) -> Fp4MlaState:
         manager = metadata.kv_cache_manager
-        hp_ring_size = manager.fp4_mla_hp_pool_size
+        layout = manager.fp4_mla_layout
+        hp_ring_size = layout.fp4_mla_hp_pool_size
         if hp_ring_size < HP_BLOCK_SIZE:
             raise RuntimeError(
                 "FP4 MLA high-precision ring must retain at least one "
                 f"{HP_BLOCK_SIZE}-token quantization tile, got {hp_ring_size} slots."
             )
-        hp_pool = manager.get_fp4_mla_hp_pool()
-        fp4_layers = manager._fp4_mla_compact_to_local
+        hp_pool = layout.get_fp4_mla_hp_pool()
+        fp4_layers = layout._fp4_mla_compact_to_local
         if (
             not isinstance(hp_pool, torch.Tensor)
             or hp_pool.dtype != torch.bfloat16
@@ -134,7 +157,7 @@ class Fp4MlaState:
                 capture_graph=metadata.is_cuda_graph,
             )
 
-        state = cls(hp_pool=hp_pool, v_scale_pool=manager.get_mla_v_scale_pool())
+        state = cls(hp_pool=hp_pool, v_scale_pool=layout.get_mla_v_scale_pool())
         tokens = (metadata.max_num_tokens,)
         sequences = (metadata.max_num_sequences,)
         indptr = (metadata.max_num_sequences + 1,)

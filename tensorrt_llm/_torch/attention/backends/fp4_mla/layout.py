@@ -17,6 +17,7 @@ from .config import (
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
     _ceil_div,
+    fp4_mla_cache_layout,
 )
 
 # FP4 MLA scale-layout helpers
@@ -70,7 +71,7 @@ def get_fp4_mla_v_scale_pool_view(
     v_head_dim: int,
 ) -> torch.Tensor:
     """View the auxiliary MLA V-scale pool in Triton's block-scaled layout."""
-    pool = getattr(metadata.fp4_mla_state, "v_scale_pool", None)
+    pool = metadata.fp4_mla_state.v_scale_pool
     if pool is None:
         raise RuntimeError("FP4 MLA V scale pool is not allocated.")
 
@@ -101,7 +102,7 @@ def get_fp4_mla_v_scale_pool_view(
 
 
 def _get_fp4_mla_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
-    global_scale = getattr(metadata.fp4_mla_state, "kv_global_scale", None)
+    global_scale = metadata.fp4_mla_state.kv_global_scale
     if (
         not isinstance(global_scale, torch.Tensor)
         or global_scale.device != device
@@ -113,7 +114,7 @@ def _get_fp4_mla_global_scale(metadata: Any, device: torch.device) -> torch.Tens
 
 
 def _get_fp4_mla_q_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
-    global_scale = getattr(metadata.fp4_mla_state, "q_global_scale", None)
+    global_scale = metadata.fp4_mla_state.q_global_scale
     if (
         not isinstance(global_scale, torch.Tensor)
         or global_scale.device != device
@@ -127,7 +128,7 @@ def _get_fp4_mla_q_global_scale(metadata: Any, device: torch.device) -> torch.Te
 def _get_fp4_mla_kv_cache_tensors(
     metadata: Any, layer_idx: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return metadata.kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
+    return metadata.kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(layer_idx)
 
 
 def _get_fp4_mla_hp_pool_layout(
@@ -135,10 +136,10 @@ def _get_fp4_mla_hp_pool_layout(
     pool: torch.Tensor,
 ) -> tuple[int, int]:
     """Return the manager-owned HP ring size and per-token head dimension."""
-    manager = getattr(metadata, "kv_cache_manager", None)
-    if manager is None or not hasattr(manager, "fp4_mla_hp_pool_size"):
+    cache_layout = fp4_mla_cache_layout(getattr(metadata, "kv_cache_manager", None))
+    if cache_layout is None:
         raise ValueError("FP4 MLA requires a V2 manager-owned HP ring.")
-    hp_pool_size = manager.fp4_mla_hp_pool_size
+    hp_pool_size = cache_layout.fp4_mla_hp_pool_size
     if (
         hp_pool_size < HP_BLOCK_SIZE
         or pool.ndim != 4
