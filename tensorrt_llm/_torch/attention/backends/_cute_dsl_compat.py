@@ -50,18 +50,23 @@ class JitSpecCuteDsl(_FlashInferJitSpecCuteDsl):
         # object. Keep its inode alive across the lookup to detect replacement
         # without writing a lock file on cache hits.
         try:
-            with self.meta_path.open() as marker:
-                try:
-                    metadata = json.load(marker)
-                except (UnicodeDecodeError, json.JSONDecodeError):
+            marker = self.meta_path.open()
+        except OSError:
+            return None
+        with marker:
+            try:
+                if json.load(marker) != self.expected_meta or not self.object_path.is_file():
                     return None
-                if metadata != self.expected_meta or not self.object_path.is_file():
-                    return None
-                value = self._load_from_disk() if load else True
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return None
+
+            value = self._load_from_disk() if load else True
+
+            try:
                 if os.path.samestat(os.fstat(marker.fileno()), self.meta_path.stat()):
                     return value
-        except (FileNotFoundError, NotADirectoryError):
-            return None
+            except OSError:
+                return None
         return None
 
     @property
