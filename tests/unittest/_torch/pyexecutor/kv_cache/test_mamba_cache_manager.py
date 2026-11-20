@@ -784,6 +784,26 @@ def test_hybrid_cache_manager_factory_honors_v2_setting(
     assert get_kv_cache_manager_cls(_hybrid_model_config(), kv_cache_config) is expected
 
 
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_hybrid_cache_manager_factory_rejects_confidence_scheduling_on_v1(
+    monkeypatch, enable_block_reuse
+):
+    """Only the V2 hybrid managers hold state for a ragged graph's second padding dummy."""
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    model_config = _kimi_model_config()
+    model_config.spec_config = SimpleNamespace(enable_confidence_scheduling=True)
+
+    with pytest.raises(ValueError, match="confidence scheduling.*use_kv_cache_manager_v2=True"):
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(enable_block_reuse=enable_block_reuse, use_kv_cache_manager_v2=False),
+        )
+
+    v2_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+    assert get_kv_cache_manager_cls(model_config, v2_config) is KimiK3HybridCacheManager
+
+
 @pytest.mark.parametrize(
     ("use_v2", "num_mamba_layers", "variable_geometry", "expected"),
     [

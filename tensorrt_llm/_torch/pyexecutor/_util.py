@@ -396,6 +396,15 @@ def get_kv_cache_manager_cls(
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
 
+        # A confidence-scheduled CUDA graph pads with a second dummy request.
+        # Only the V2 hybrid managers reserve a recurrent-state slot for it; a
+        # V1 manager would give it a real request's state block.
+        if not use_v2 and getattr(model_config.spec_config,
+                                  "enable_confidence_scheduling", False):
+            raise ValueError("DSpark confidence scheduling with hybrid Mamba / "
+                             "linear-attention models requires "
+                             "kv_cache_config.use_kv_cache_manager_v2=True.")
+
         if config_utils.is_glm5_next(config):
             # glm5_next indexer state is a V2 extra buffer: reject any knob
             # that would select a non-V2 manager.
