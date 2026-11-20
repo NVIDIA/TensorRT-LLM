@@ -23,6 +23,7 @@ Tests that merely *use* an implementation, such as weight loading, staged hooks,
 or numerical parity across backends, belong in ``test_moe_backend.py``.
 """
 
+import contextlib
 import dataclasses
 import importlib
 from types import SimpleNamespace
@@ -138,6 +139,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     TrtllmTrtllmGenBf16Impl,
     TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
     TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
     find_trtllm_gen_leaf,
 )
@@ -465,6 +467,36 @@ def test_per_layer_dynamic_eplb_filters_backends_by_declared_capability():
     assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
 
 
+def test_adaptive_eplb_filters_backends_by_declared_capability(monkeypatch):
+    """Only backends that declare adaptive EPLB resolve under it, on any GPU: one without a
+    calibrated decode time model keeps the backend, and adaptive EPLB stays off at start-up."""
+    assert TrtllmCutedslMegaMoeNvfp4Impl.capabilities.supports_adaptive_eplb
+    assert not DeepgemmCudaW4a8Mxfp4Mxfp8Impl.capabilities.supports_adaptive_eplb
+    deployment = dataclasses.replace(
+        _megamoe_cutedsl_deployment(),
+        eplb_enabled=True,
+        eplb_mode="adaptive",
+    )
+    rejected = resolve_moe_impl(
+        _deepgemm_model_config(QuantAlgo.W4A8_MXFP4_MXFP8),
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=deployment,
+        impl_id="deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8",
+    )
+    assert rejected.winner is None
+    assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    for device in ("NVIDIA GB300", "NVIDIA A100-SXM4-80GB"):
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args, name=device: name)
+        accepted = resolve_moe_impl(
+            _megamoe_cutedsl_model_config(),
+            problem=_megamoe_cutedsl_problem(),
+            deployment=deployment,
+            impl_id=_MEGAMOE_CUTEDSL_IMPL_ID,
+        )
+        assert impl_class_for(accepted) is TrtllmCutedslMegaMoeNvfp4Impl
+
+
 def test_pinned_megamoe_cutedsl_identity_fails_hard_on_another_format():
     """A pin that cannot run must fail, not widen to the sibling that can.
 
@@ -547,6 +579,95 @@ def test_registering_megamoe_cutedsl_leaves_the_backend_literal_path_unchanged()
     assert impl_class_for(report) is TrtllmCutedslMegaMoeNvfp4Impl
     assert report.selected_by == "pinned"
     assert report.requested == MoeBackendType.MEGAMOE_CUTEDSL.value
+
+
+def _mxfp4_mtp_layer_report(backend: str, eplb_mode: str = "disabled") -> MoEResolutionReport:
+    """Resolve the MTP layer of an NVFP4 DeepSeek-V4 checkpoint, whose experts are MXFP4."""
+    model_config = _megamoe_cutedsl_model_config()
+    model_config.moe_backend = backend
+    deployment = _megamoe_cutedsl_deployment()
+    if eplb_mode != "disabled":
+        deployment = dataclasses.replace(
+            deployment, eplb_enabled=True, eplb_mode=eplb_mode, num_slots=12
+        )
+    return resolve_moe_impl(
+        model_config,
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=deployment,
+        layer_idx=61,
+    )
+
+
+@pytest.mark.parametrize(
+    "backend,leaf",
+    [
+        ("TRTLLM", TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl),
+        (MoeBackendType.MEGAMOE_CUTEDSL.value, TrtllmCutlassW4a8Mxfp4Mxfp8Impl),
+    ],
+)
+def test_adaptive_eplb_runs_the_mxfp4_mtp_layer_as_plain_ep(backend, leaf) -> None:
+    """No implementation that supports adaptive EPLB serves the MXFP4 MTP layer, so it runs as plain
+    EP outside the balancer on the leaf its backend resolves to without one: TRTLLM-Gen from
+    ``moe_backend: AUTO``, the Cutlass fallback when unset. The report says why. An NVFP4 layer of
+    the same model stays on MegaMoE under the balancer."""
+    report = _mxfp4_mtp_layer_report(backend, eplb_mode="adaptive")
+    assert impl_class_for(report) is leaf
+    assert "supports adaptive EPLB" in report.load_balancer_off
+    assert (report.deployment.eplb_enabled, report.deployment.eplb_mode) == (False, "disabled")
+    assert report.deployment.num_slots == _megamoe_cutedsl_problem().num_experts
+    assert "plain EP outside the load balancer" in report.describe()
+    assert report.to_dict()["load_balancer_off"] == report.load_balancer_off
+
+    deployment = dataclasses.replace(
+        _megamoe_cutedsl_deployment(), eplb_enabled=True, eplb_mode="adaptive", num_slots=12
+    )
+    balanced = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(), problem=_megamoe_cutedsl_problem(), deployment=deployment
+    )
+    assert impl_class_for(balanced) is TrtllmCutedslMegaMoeNvfp4Impl
+    assert balanced.load_balancer_off is None and balanced.deployment is deployment
+
+
+def test_create_moe_builds_the_mxfp4_mtp_layer_outside_the_adaptive_balancer(monkeypatch) -> None:
+    """``create_moe`` builds a layer whose report runs it outside the adaptive EPLB balancer inside
+    the balancer's ``unbalanced_layer()`` and on a model config without the balancer, so the layer
+    registers no slots or statistics; the caller's config keeps the balancer."""
+    create = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
+    from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
+
+    scopes, built = [], []
+
+    @contextlib.contextmanager
+    def unbalanced_layer():
+        scopes.append("open")
+        yield
+        scopes.append("closed")
+
+    report = _mxfp4_mtp_layer_report("TRTLLM", eplb_mode="adaptive")
+    monkeypatch.setattr(create, "resolve_moe_impl", lambda *args, **kwargs: report)
+    balancer = SimpleNamespace(unbalanced_layer=unbalanced_layer)
+    monkeypatch.setattr(create, "get_moe_load_balancer", lambda: balancer)
+
+    def configurable_moe(**kwargs):
+        built.append((kwargs["moe_cls"], list(scopes), kwargs["model_config"].moe_load_balancer))
+        return "layer"
+
+    monkeypatch.setattr(create, "ConfigurableMoE", configurable_moe)
+    model_config = ModelConfig()
+    model_config.moe_backend = "TRTLLM"
+    model_config.moe_load_balancer = MoeAdaptiveLoadBalancerConfig(num_slots=12)
+    layer = create.create_moe(
+        routing_method=None,
+        num_experts=8,
+        hidden_size=1024,
+        intermediate_size=1024,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        layer_idx=61,
+    )
+    assert layer == "layer" and scopes == ["open", "closed"]
+    assert built == [(TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl, ["open"], None)]
+    assert model_config.moe_load_balancer.mode == "adaptive"
 
 
 # =====================================================================
