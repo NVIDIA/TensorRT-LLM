@@ -105,7 +105,7 @@ class HostMoeTensorSharer:
         self.expert_ids = sorted(expert_ids)
         self.own_expert_ids = self.rank_expert_ids(self.local_rank)
 
-    def rank_expert_ids(self, local_rank: int) -> List[int]:
+    def rank_expert_ids(self, local_rank: int) -> list[int]:
         """
         Get the experts whose host weights a local rank loads and shares.
 
@@ -382,8 +382,8 @@ class SingleLayerMoeLoadBalancer:
         self.repeated_count = repeated_count
         self.total_slot_count_per_rank = total_slot_count_per_rank
         self.spare_slot_count = spare_slot_count
-        self.unbacked_slot_tensors: Dict[str, torch.Tensor] = {}
-        self.slot_tensors: Dict[str, torch.Tensor] = {}
+        self.unbacked_slot_tensors: dict[str, torch.Tensor] = {}
+        self.slot_tensors: dict[str, torch.Tensor] = {}
         self.initial_placement: Optional[np.ndarray] = None
         layer_id = self.single_layer_load_balancer_impl.get_layer_id()
         self.host_tensor_sharer = host_tensor_sharer_cls(
@@ -427,7 +427,7 @@ class SingleLayerMoeLoadBalancer:
     def get_old_rank_expert_ids(self):
         return self.single_layer_load_balancer_impl.get_old_rank_expert_ids()
 
-    def get_unusable_local_slots(self) -> List[int]:
+    def get_unusable_local_slots(self) -> list[int]:
         return self.single_layer_load_balancer_impl.get_unusable_local_slots()
 
     def get_load_expert_ids(self):
@@ -525,7 +525,7 @@ class SingleLayerMoeLoadBalancer:
         host_weight = _tensor_to_weight(t)
         self._add_host_weight(expert_id, name, host_weight)
 
-    def with_spare_slots(self, eplb_assignments: List[int]) -> List[int]:
+    def with_spare_slots(self, eplb_assignments: list[int]) -> list[int]:
         """Return ``eplb_assignments`` with each rank's spare slots appended empty."""
         if not self.spare_slot_count:
             return eplb_assignments

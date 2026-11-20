@@ -478,6 +478,14 @@ def sync_group_all_greedy_sample(
     )
     if modes is None:
         modes = dist.tp_allgather_int64([local])[:, 0].tolist() if mapping.tp_size > 1 else [local]
+    elif len(modes) != mapping.tp_size:
+        # The padding exchange gathers the active ranks only. Sampling from vocabulary shards
+        # needs every rank's shard, so Wide-EP fault tolerance, which removes failed ranks, does
+        # not support it.
+        raise RuntimeError(
+            f"sampling from vocabulary shards needs all {mapping.tp_size} TP ranks, but the "
+            f"padding exchange gathered {len(modes)}"
+        )
     elif modes[mapping.tp_rank] != local:
         raise RuntimeError(
             f"rank {mapping.tp_rank} sent sampling mode {modes[mapping.tp_rank]} "

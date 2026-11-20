@@ -181,6 +181,7 @@ l0_gb200_multi_gpus:
   - test_wide_ep_rank_failure.py::test_rejoin_on_target[nvfp4] TIMEOUT (70)
   - test_wide_ep_rank_failure.py::test_rejoin_on_target[nvfp4_cutlass] TIMEOUT (70)
   - test_wide_ep_rank_failure.py::test_rejoin_on_target[bf16_online_eplb] TIMEOUT (70)
+  - test_wide_ep_rank_failure.py::test_rejoin_on_target[bf16_static_eplb] TIMEOUT (70)
   - test_wide_ep_rank_failure.py::TestAdmissionFailures::test_refused_joins_and_admission_kill TIMEOUT (110)
   - test_wide_ep_rank_failure.py::TestAdmissionFailures::test_failure_during_admission TIMEOUT (90)
   - test_wide_ep_rank_failure.py::TestAdmissionFailures::test_failure_during_install TIMEOUT (90)

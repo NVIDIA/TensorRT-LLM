@@ -28,7 +28,7 @@ import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, TritonFusedMoE, VanillaMoE
-from tensorrt_llm._torch.moe.fused_moe.communication import AllGatherReduceScatter
+from tensorrt_llm._torch.moe.fused_moe.communication import AllGatherReduceScatter, execution_state
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
@@ -46,6 +46,7 @@ _JOIN_TIMEOUT_S = 10.0
 
 def _bindable_state(**attributes) -> SimpleNamespace:
     """Return a stand-in for an execution state that records the layers bound to it."""
+    attributes.setdefault("ep_group_health", EPGroupHealth(_EP_SIZE))
     return SimpleNamespace(register_layer=Mock(), register_workspace=Mock(), **attributes)
 
 
@@ -129,12 +130,15 @@ def test_abort_and_rearm_after_peer_failure() -> None:
 
     _collective_round(state, workspace, meta, experts, payload)
     done = _queued_work_done()
-    # A long wait names the flag value it expects from rank 1. It is not an abort.
-    _wait_for(state.waited_flags, state, "the dispatch published no waited flag")
-    assert state.waited_flags() == {1: 1}
-    assert not state.aborted()
-    requester = threading.Thread(target=state.request_abort)
-    requester.start()
+    try:
+        # A long wait names the flag value it expects from rank 1. It is not an abort.
+        _wait_for(state.waited_flags, state, "the dispatch published no waited flag")
+        assert state.waited_flags() == {1: 1}
+        assert not state.aborted()
+    finally:
+        # Also on a failed check, so that the dispatch does not keep waiting for rank 1.
+        requester = threading.Thread(target=state.request_abort)
+        requester.start()
     requester.join(_JOIN_TIMEOUT_S)
     assert not requester.is_alive(), "abort request queued behind the spinning kernel"
     _wait_for(done, state, "collective kept waiting after the abort request")
@@ -219,23 +223,63 @@ def test_rearm_resets_bound_layers_and_shared_workspaces() -> None:
     assert comm._dispatch_state == {"phase": "idle"}
 
 
-def test_graph_replay_follows_installed_mask() -> None:
-    """A CUDA graph captured with every rank active replays without the rank masked out later."""
-    workspace, meta, experts, payload = a2a_workspace(_EP_SIZE)
-    health = EPGroupHealth(_EP_SIZE)
-    state = MoeExecutionState(health, 0, workspace.device)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output = _collective_round(state, workspace, meta, experts, payload)
+def test_abort_requested_during_rearm_stays(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rearm clears the requests made before it, the status and the waited flags, but not a
+    request made while it waits for the device."""
+    health = EPGroupHealth(2)
+    state = MoeExecutionState(health, 0, torch.device("cuda"))
+    state.request_abort()
+    state.abort[1] = 1  # a kernel stopped waiting
+    state.abort[_WAITED_FLAGS + 1] = 7
+    synchronize = torch.cuda.synchronize
+    requests = [state.request_abort]
 
+    def synchronize_then_request(device=None) -> None:
+        synchronize(device)
+        while requests:
+            requests.pop()()
+
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize_then_request)
+    state.rearm()
+    assert state.abort[:2].tolist() == [1, 0]
+    assert not state.abort[_WAITED_FLAGS:].any()
     health.mark_failed(1)
-    state.install_mask()
-    for _ in range(2):
-        graph.replay()
-        _wait_for(_queued_work_done(), state, "the replay waited for the masked-out rank")
-        torch.testing.assert_close(output, payload, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="abort state"):
+        state.install_mask()
+    state.rearm()
     assert not state.aborted()
+    state.install_mask()
+    assert state.active_rank_mask.cpu().tolist() == [1, 0, 0, 0]
+
+
+def test_install_mask_refused_mid_round() -> None:
+    """A layer between its dispatch and its combine keeps the mask of its dispatch."""
+    health = EPGroupHealth(2)
+    state = MoeExecutionState(health, 0, torch.device("cuda"))
+    comm = _frontend()
+    comm.bind_execution_state(state)
+    comm._dispatch_state = {"phase": "dispatched"}
+    health.mark_failed(1)
+    with pytest.raises(RuntimeError, match="only between rounds"):
+        state.install_mask()
+    assert state.active_rank_mask.cpu().tolist() == [3, 0, 0, 0]
+    comm.reset_state()
+    state.install_mask()
+    assert state.active_rank_mask.cpu().tolist() == [1, 0, 0, 0]
+
+
+@pytest.mark.cpu_only
+def test_state_refused_under_confidential_computing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The kernels read the abort state in pinned host memory, which Confidential Computing rules out."""
+    monkeypatch.setattr(execution_state, "confidential_compute_enabled", lambda: True)
+    with pytest.raises(RuntimeError, match="not supported with Confidential Computing"):
+        MoeExecutionState(EPGroupHealth(2), 0, torch.device("cuda"))
+
+
+def test_abort_state_is_pinned() -> None:
+    """The kernels read the abort state in place from host memory, so it is pinned when built."""
+    state = MoeExecutionState(EPGroupHealth(2), 0, torch.device("cuda"))
+    assert state.abort.is_pinned()
 
 
 def _workspace(device_bytes: int, fresh_rows: frozenset[int]) -> Mock:
@@ -324,6 +368,9 @@ def test_bind_refuses_unsupported_layers() -> None:
         _frontend(fault_tolerance=False).bind_execution_state(state)
     with pytest.raises(ValueError, match="cannot run EP rank 1"):
         _frontend(ep_rank=1).bind_execution_state(state)
+    other_group = _bindable_state(ep_rank=0, ep_group_health=EPGroupHealth(2 * _EP_SIZE))
+    with pytest.raises(ValueError, match=f"EP size {2 * _EP_SIZE} cannot run EP size {_EP_SIZE}"):
+        _frontend().bind_execution_state(other_group)
 
 
 def test_bind_refused_after_membership_change() -> None:
@@ -381,7 +428,7 @@ def test_bound_layer_passes_the_device_mask(monkeypatch: pytest.MonkeyPatch) -> 
         assert kwargs["enable_rank_mask"] is True and kwargs["use_sentinel"] is False
         assert kwargs["active_rank_mask"] is state.active_rank_mask
         assert kwargs["abort_state"] is state.abort
-    state.register_layer.assert_called_once_with(bound.reset_state)
+    state.register_layer.assert_called_once_with(bound.reset_state, bound._mnnvl_checkpoint_is_idle)
     state.register_workspace.assert_called_once_with(
         bound.mnnvl_mem,
         bound._reset_local_workspace,
@@ -403,28 +450,98 @@ def _moe_layer(cls: type, **attributes) -> torch.nn.Module:
     return layer
 
 
+def _layer_mapping(attention_dp: bool = True, dp_size: int = 2, moe_tp_size: int = 1):
+    """Return the mapping fields that tell why a MoE layer has no NVLinkOneSided."""
+    return SimpleNamespace(
+        enable_attention_dp=attention_dp, dp_size=dp_size, moe_tp_size=moe_tp_size
+    )
+
+
+_BACKEND_CAUSE = "The layer's MoE backend, or the communication method that TRTLLM_FORCE_COMM"
+_ATTENTION_DP_CAUSE = "only under attention DP over more than one rank"
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "kind, uses",
+    "kind, mapping, uses, cause",
     [
-        ("all_gather", "(ConfigurableMoE) uses AllGatherReduceScatter"),
-        ("no_communication", "(ConfigurableMoE) uses no communication strategy"),
-        ("triton", "(TritonFusedMoE) uses no communication strategy"),
-        ("vanilla", "(VanillaMoE) uses no communication strategy"),
+        (
+            "all_gather",
+            _layer_mapping(),
+            "(ConfigurableMoE) uses AllGatherReduceScatter",
+            _BACKEND_CAUSE,
+        ),
+        (
+            "all_gather",
+            _layer_mapping(moe_tp_size=2),
+            "(ConfigurableMoE) uses AllGatherReduceScatter",
+            "only without MoE TP (moe_tensor_parallel_size=1, not 2)",
+        ),
+        (
+            "no_communication",
+            _layer_mapping(),
+            "(ConfigurableMoE) uses no communication strategy",
+            _BACKEND_CAUSE,
+        ),
+        (
+            "no_communication",
+            _layer_mapping(attention_dp=False, dp_size=1),
+            "(ConfigurableMoE) uses no communication strategy",
+            _ATTENTION_DP_CAUSE,
+        ),
+        (
+            "no_communication",
+            _layer_mapping(dp_size=1),
+            "(ConfigurableMoE) uses no communication strategy",
+            _ATTENTION_DP_CAUSE,
+        ),
+        (
+            "triton",
+            _layer_mapping(),
+            "(TritonFusedMoE) uses no communication strategy",
+            _BACKEND_CAUSE,
+        ),
+        (
+            "vanilla",
+            _layer_mapping(),
+            "(VanillaMoE) uses no communication strategy",
+            _BACKEND_CAUSE,
+        ),
     ],
 )
-def test_unbindable_moe_layer_is_refused(kind: str, uses: str) -> None:
-    """Every MoE layer must bind, whatever its class."""
+def test_unbindable_moe_layer_is_refused(kind: str, mapping, uses: str, cause: str) -> None:
+    """Every MoE layer must bind, whatever its class; the refusal names the cause."""
     layer = {
-        "all_gather": lambda: _moe_layer(ConfigurableMoE, comm=AllGatherReduceScatter(Mapping())),
-        "no_communication": lambda: _moe_layer(ConfigurableMoE, comm=None),
-        "triton": lambda: _moe_layer(TritonFusedMoE),
-        "vanilla": lambda: _moe_layer(VanillaMoE),
+        "all_gather": lambda: _moe_layer(
+            ConfigurableMoE, comm=AllGatherReduceScatter(Mapping()), mapping=mapping
+        ),
+        "no_communication": lambda: _moe_layer(ConfigurableMoE, comm=None, mapping=mapping),
+        "triton": lambda: _moe_layer(TritonFusedMoE, mapping=mapping),
+        "vanilla": lambda: _moe_layer(VanillaMoE, mapping=mapping),
     }[kind]()
     bound = _moe_layer(ConfigurableMoE, comm=_frontend())
     with pytest.raises(ValueError, match=re.escape(f"MoE layer 1 {uses}")) as error:
         moe_comms(torch.nn.ModuleList([bound, layer]))
-    assert "enable_wide_ep_fault_tolerance=False" in str(error.value)
+    assert cause in str(error.value)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+@pytest.mark.cpu_only
+def test_layers_over_different_ep_groups_refused() -> None:
+    """Every MoE layer must run over the same EP group as the first one."""
+    layers = [
+        _moe_layer(ConfigurableMoE, comm=_frontend(ep_rank=1)),
+        _moe_layer(ConfigurableMoE, comm=_frontend(ep_rank=0)),
+    ]
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            f"MoE layer 1 communicates as EP rank 0 of {_EP_SIZE}, but MoE layer 0 as EP rank 1 "
+            f"of {_EP_SIZE}"
+        ),
+    ) as error:
+        moe_comms(torch.nn.ModuleList(layers))
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
 
 
 @pytest.mark.cpu_only
@@ -454,7 +571,12 @@ def test_unsupported_architecture_refused(architectures) -> None:
 def test_layers_bound_to_one_execution_state(
     monkeypatch: pytest.MonkeyPatch, replacement: bool
 ) -> None:
-    """prepare_model binds every MoE layer to one execution state; a replacement starts alone."""
+    """prepare_model binds every MoE layer to one execution state over the layers' EP group.
+
+    A replacement starts alone. The model mapping's MoE parallelism (no expert parallelism here)
+    differs from the layers' EP group, as for a model that builds its own mapping for its routed
+    experts.
+    """
     monkeypatch.setattr(
         rank_failure_model_load,
         "MoeExecutionState",
@@ -463,14 +585,60 @@ def test_layers_bound_to_one_execution_state(
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(Distributed, "startup_record", StartupRecord())
     monkeypatch.setattr(StartupRecord, "replacement", replacement)
-    comms = [Mock(spec=["bind_execution_state"]) for _ in range(2)]
+    comms = [Mock(spec=NVLinkOneSided, ep_size=4, ep_rank=1) for _ in range(2)]
     model = torch.nn.ModuleList([_moe_layer(ConfigurableMoE, comm=comm) for comm in comms])
     model.model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
-        mapping=SimpleNamespace(moe_ep_size=4, moe_ep_rank=1),
+        mapping=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
     )
     prepare_model(model)
     (state,), (other,) = (comm.bind_execution_state.call_args.args for comm in comms)
     assert state is other
     assert state.ep_rank == 1
     assert state.ep_group_health.get_mask() == (0b0010 if replacement else 0b1111)
+
+
+def _target_with_drafter(
+    target_comm: NVLinkOneSided, draft_comm: NVLinkOneSided
+) -> torch.nn.Module:
+    """Build a model with one MoE layer and a one-model drafter (``draft_model``) with another."""
+    model = torch.nn.Module()
+    model.moe = _moe_layer(ConfigurableMoE, comm=target_comm)
+    model.draft_model = torch.nn.Module()
+    model.draft_model.moe = _moe_layer(ConfigurableMoE, comm=draft_comm)
+    model.model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
+    )
+    return model
+
+
+@pytest.mark.cpu_only
+def test_drafter_layers_bound_to_the_target_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """prepare_model binds the drafter's MoE layers to the execution state of the target's."""
+    monkeypatch.setattr(
+        rank_failure_model_load,
+        "MoeExecutionState",
+        lambda health, ep_rank, device: _bindable_state(ep_group_health=health, ep_rank=ep_rank),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(Distributed, "startup_record", StartupRecord())
+    target, drafter = _frontend(), _frontend()
+    prepare_model(_target_with_drafter(target, drafter))
+    assert target.execution_state is not None
+    assert drafter.execution_state is target.execution_state
+    assert target.execution_state.register_layer.call_count == 2
+
+
+@pytest.mark.cpu_only
+def test_drafter_over_another_ep_group_refused() -> None:
+    """A drafter whose MoE layers run as another EP rank than the target's is refused."""
+    model = _target_with_drafter(_frontend(ep_rank=0), _frontend(ep_rank=1))
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            f"MoE layer draft_model.moe communicates as EP rank 1 of {_EP_SIZE}, but MoE layer "
+            f"moe as EP rank 0 of {_EP_SIZE}"
+        ),
+    ) as error:
+        prepare_model(model)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)

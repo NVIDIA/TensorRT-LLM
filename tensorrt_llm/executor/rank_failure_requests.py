@@ -14,7 +14,7 @@
 # limitations under the License.
 """Requests that a rank failure ends under Wide-EP fault tolerance: their error and their resubmission."""
 
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING
 
 from .utils import RequestError
 
@@ -59,7 +59,7 @@ class RankFailureRequests:
         self._worker = worker
         # Each tracked request with its multimodal params and their multimodal input, which the
         # first enqueue sets to None after converting it.
-        self._without_first_response: Dict[int, Tuple["GenerationRequest", Optional[Tuple]]] = {}
+        self._without_first_response: dict[int, tuple["GenerationRequest", tuple | None]] = {}
 
     def add(self, client_id: int, request: "GenerationRequest") -> None:
         """Start tracking a request. Call it before the first enqueue, which may answer at once."""

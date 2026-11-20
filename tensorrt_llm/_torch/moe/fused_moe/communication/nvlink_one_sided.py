@@ -98,6 +98,8 @@ def _sentinel_env() -> tuple[str | None, ...]:
 def get_sync_protocol() -> str:
     """``TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL``: "auto" (also when unset), "fence" or "sentinel".
 
+    Also warns once about each set variable that NVLinkOneSided no longer reads.
+
     Raises:
         NVLinkOneSidedConfigError: If the value is none of these.
     """
@@ -633,8 +635,9 @@ class NVLinkOneSided(Communication):
                 barrier=not enable_wide_ep_fault_tolerance,
             )
             if enable_wide_ep_fault_tolerance:
-                # Each rank may be its own MPI world, so the workspace's own communicator synchronizes
-                # the ranks: no rank may write into a peer's row before the peer has initialized it.
+                # The workspace's own communicator, which its membership changes also use,
+                # synchronizes the ranks: no rank may write into a peer's row before the peer has
+                # initialized it.
                 memory_cls.get_comm(mapping).barrier()
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
@@ -951,12 +954,18 @@ class NVLinkOneSided(Communication):
             )
         if self.execution_state is not None:
             raise RuntimeError("NVLinkOneSided is already bound to an execution state")
+        # The mask holds one bit per rank of the state's EP group, which must be this layer's.
+        state_ep_size = state.ep_group_health.moe_world_size
+        if state_ep_size != self.ep_size:
+            raise ValueError(
+                f"An execution state of EP size {state_ep_size} cannot run EP size {self.ep_size}"
+            )
         # The kernels treat the local rank as active, which the state checks for its own rank.
         if state.ep_rank != self.ep_rank:
             raise ValueError(
                 f"An execution state of EP rank {state.ep_rank} cannot run EP rank {self.ep_rank}"
             )
-        state.register_layer(self.reset_state)
+        state.register_layer(self.reset_state, self._mnnvl_checkpoint_is_idle)
         state.register_workspace(
             self.mnnvl_mem,
             self._reset_local_workspace,
@@ -1461,8 +1470,10 @@ class NVLinkOneSided(Communication):
         It resets this Python state machine only. After a sentinel dispatch
         without its combine, the native op still holds the round open, and the
         peers' rows of that round are still in flight; only re-initializing
-        the workspace (``moe_a2a_initialize``, collective) recovers it. The
-        in-tree caller (the warmup OOM handler) runs only without peers.
+        the workspace (``moe_a2a_initialize``, collective) recovers it. Of the
+        in-tree callers, the warmup OOM handler runs only without peers, and
+        ``MoeExecutionState.rearm`` also re-initializes this rank's row of
+        the workspace.
         """
         self._dispatch_state = {"phase": "idle"}
 

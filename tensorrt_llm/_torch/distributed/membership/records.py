@@ -21,7 +21,8 @@ whose bit ``r`` is set when it holds rank ``r``.
 
 import enum
 import os
-from typing import Dict, Iterable, List, Literal, Mapping, Optional, Tuple
+from collections.abc import Iterable, Mapping
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -76,7 +77,7 @@ _RUN_AS_ROOT_VARS = (
 _SHARED_MEMORY_BTLS = ("sm", "vader")
 
 
-def launcher_free_env(environ: Mapping[str, str]) -> Dict[str, str]:
+def launcher_free_env(environ: Mapping[str, str]) -> dict[str, str]:
     """Return ``environ`` without the launcher's variables, for a process that runs no MPI."""
     return {
         name: value
@@ -97,7 +98,7 @@ def remove_cpu_affinity_constraints() -> None:
         _set_affinity_all_threads(list(range(os.cpu_count())))
 
 
-def rank_env(environ: Mapping[str, str]) -> Dict[str, str]:
+def rank_env(environ: Mapping[str, str]) -> dict[str, str]:
     """Return ``environ`` for a rank, a one-process MPI world started outside the launcher's job.
 
     Keep the opt-in to running as root, and drop the shared-memory ``btl``, which has no peer in a
@@ -150,7 +151,7 @@ def next_epoch(epoch: int) -> int:
     return epoch % _EPOCHS + 1
 
 
-def latest_epoch(epochs: List[int]) -> int:
+def latest_epoch(epochs: list[int]) -> int:
     """Return the latest of ``epochs``. They must lie within half the epoch range of each other.
 
     The epochs compare on the circle relative to ``epochs[0]``, so 1 counts as later than
@@ -219,7 +220,7 @@ class MembershipRecord(_Message):
     state: MembershipState
     active_mask: int
     resume: ResumeState = ResumeState()
-    incarnations: Tuple[int, ...] = ()
+    incarnations: tuple[int, ...] = ()
     joining_mask: int = 0
     given_up_mask: int = 0
     reason: str = ""
@@ -251,7 +252,7 @@ class NodeView(_Message):
 
     record: MembershipRecord
     # The ranks whose replacement made no startup progress for the rendezvous timeout.
-    stalled_replacements: Tuple[int, ...] = ()
+    stalled_replacements: tuple[int, ...] = ()
     # Rank mask of the ranks whose current process has a liveness connection to the authority.
     connected_mask: int = 0
 
@@ -266,7 +267,7 @@ class NodeReport(_Message):
         received_s: When the authority received the report, on its monotonic clock.
     """
 
-    given_up: Tuple[int, ...] = ()
+    given_up: tuple[int, ...] = ()
     paused_mask: int = 0
     received_s: float = 0.0
 
@@ -302,8 +303,8 @@ class RankReport(_Message):
     paused_at: ResumeState = ResumeState()
     incarnation: int = 0
     received_s: float = 0.0
-    waited_flags: Tuple[Tuple[int, int], ...] = ()
-    waited_epochs: Tuple[Tuple[int, int], ...] = ()
+    waited_flags: tuple[tuple[int, int], ...] = ()
+    waited_epochs: tuple[tuple[int, int], ...] = ()
     install_steps: int = 0
     joining_ready: bool = False
     started: bool = False
@@ -315,17 +316,17 @@ class TransactionSummary(_Message):
 
     generation: int
     outcome: Literal["COMMITTED", "ABORTED"]
-    removed_ranks: Tuple[int, ...]
+    removed_ranks: tuple[int, ...]
     # Why each removed rank was removed: "disconnected" (its liveness connection closed) or "hung".
-    causes: Dict[int, str] = {}
-    added_ranks: Tuple[int, ...]
+    causes: dict[int, str] = {}
+    added_ranks: tuple[int, ...]
     # When the first removed rank stalled or disconnected, or when the first replacement was ready.
     detected_unix_ms: float
     began_unix_ms: float
     ready_unix_ms: Optional[float] = None
     ended_unix_ms: float
     # Ended transactions per kind (failover, admission or abort), this one included.
-    changes: Dict[str, int] = {}
+    changes: dict[str, int] = {}
     # Why the deployment aborted, for an aborted transaction.
     reason: str = ""
 

@@ -40,11 +40,11 @@ static constexpr int64_t kDefaultTimeoutCycles = 300ll * kAssumedClockHz;
 
 // Waits on a peer shorter than kAbortPollCycles never read the host abort state.
 // Longer waits read it once per kAbortPollCycles per block.
-static constexpr int64_t kAbortPollCycles = 100ll * 1000ll;
+static constexpr int64_t kAbortPollCycles = 100LL * 1000LL;
 
 // A wait on a peer longer than kPublishWaitedFlagCycles publishes the flag value it waits for in
 // MoeA2AAbortState::waited_flag, so the host can tell which peer this rank waits on.
-static constexpr int64_t kPublishWaitedFlagCycles = 20ll * 1000ll * 1000ll;
+static constexpr int64_t kPublishWaitedFlagCycles = 20LL * 1000LL * 1000LL;
 
 //! \brief Abort state of the rank-mask collectives, in pinned host memory.
 //!
@@ -56,10 +56,10 @@ struct MoeA2AAbortState
     static constexpr int32_t kCancelled = 1;
 
     int32_t requested;
-    // kCancelled once a kernel stopped waiting because of `requested`, or the incomplete-round check found the word
-    // set, 0 otherwise
+    //! kCancelled once a kernel stopped waiting because of `requested`, or the incomplete-round check found the word
+    //! set, 0 otherwise
     int32_t status;
-    // Per peer, the round flag value that a long wait on the peer waits for, 0 otherwise
+    //! Per peer, the round flag value that a long wait on the peer waits for, 0 otherwise
     uint32_t waited_flag[kMaxRanks];
 };
 
@@ -294,16 +294,16 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 
-// Mark `abort` cancelled if the incomplete-round word (see above) is set, ordered after every earlier fence combine in
-// `stream`. Launch once per forward, after its last combine.
+//! Mark `abort` cancelled if the incomplete-round word (see above) is set, ordered after every earlier fence combine
+//! in `stream`. Launch once per forward, after its last combine.
 void moe_a2a_check_incomplete_round_launch(
     uint32_t const* incomplete_round, MoeA2AAbortState* abort, cudaStream_t stream);
 
 // Sanitize expert IDs for invalid tokens
 // expert_ids: [ep_size, max_tokens_per_rank, top_k] (int32)
 // recv_counters: [2, ep_size] (int32), number of valid tokens per source
-// incomplete_round: incomplete-round word (see above), or nullptr. While it is nonzero, only the tokens from ep_rank
-// are valid.
+// incomplete_round: incomplete-round word (see above), or nullptr. While it holds a nonzero value other than the
+// incomplete-round value of this round's combine, only the tokens from ep_rank are valid.
 // invalid_id: value to fill for invalid tokens' expert ids
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, uint32_t const* flag_val,
     uint32_t const* incomplete_round, int32_t invalid_id, int ep_rank, int ep_size, int max_tokens_per_rank, int top_k,

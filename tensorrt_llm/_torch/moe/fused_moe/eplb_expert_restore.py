@@ -30,9 +30,10 @@ import itertools
 import os
 import stat
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from multiprocessing import resource_tracker, shared_memory
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 import torch
@@ -45,6 +46,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
 from .moe_load_balancer import HostMoeTensorSharer, MoeLoadBalancer, SingleLayerMoeLoadBalancer
+
+# The empty spare slots of this many MoE layers are released per call. Each call that releases any
+# first waits for the device to finish its queued work, so a call per layer would finish later.
+_RELEASE_LAYERS_PER_CALL = 8
 
 
 def plan_layer_placement(
@@ -149,9 +154,9 @@ class ExpertRestorePlan:
     same on every active rank.
     """
 
-    active_ranks: Tuple[bool, ...]
-    placements: Tuple[np.ndarray, ...]
-    placement_before: Tuple[np.ndarray, ...]
+    active_ranks: tuple[bool, ...]
+    placements: tuple[np.ndarray, ...]
+    placement_before: tuple[np.ndarray, ...]
     staged: np.ndarray
     digest: str
     device_bytes: int
@@ -161,7 +166,7 @@ class ExpertRestorePlanMismatchError(ValueError):
     """The expert restore plan of a rank differs from rank 0's."""
 
 
-def _next_piece(half: Tuple[int, int], cursor: int, size: int) -> Optional[Tuple[int, int]]:
+def _next_piece(half: tuple[int, int], cursor: int, size: int) -> Optional[tuple[int, int]]:
     """Return the next aligned piece of up to ``size`` bytes in ``half``, or None if it is full."""
     begin, end = half
     start = HostMoeTensorSharer.align_size(max(begin, cursor))
@@ -195,7 +200,7 @@ class StagingPiece(NamedTuple):
 
 def staging_pieces(
     staged: np.ndarray, weight_bytes: Sequence[Sequence[int]], row_bytes: int
-) -> List[StagingPiece]:
+) -> list[StagingPiece]:
     """Return the pieces that copy the ``staged`` slots through workspace rows of ``row_bytes``.
 
     Per target, chunks alternate between the two halves of the row, so that a chunk's writes miss
@@ -212,8 +217,8 @@ def staging_pieces(
     halves = ((0, split), (split, row_bytes))
     if not all(end > HostMoeTensorSharer.align_size(begin) for begin, end in halves):
         raise ValueError(f"A workspace row of {row_bytes} bytes leaves no aligned room to stage in")
-    chunks: Dict[int, int] = collections.defaultdict(int)
-    cursors: Dict[int, int] = collections.defaultdict(int)
+    chunks: dict[int, int] = collections.defaultdict(int)
+    cursors: dict[int, int] = collections.defaultdict(int)
     pieces = []
     for layer, target, slot, expert, source in staged.tolist():
         for weight, size in enumerate(weight_bytes[layer]):
@@ -239,7 +244,7 @@ def _bytes(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.view(-1).view(torch.uint8)
 
 
-def _phase_done(times: Optional[Dict[str, float]], phase: str, start_s: float) -> float:
+def _phase_done(times: Optional[dict[str, float]], phase: str, start_s: float) -> float:
     """Record the milliseconds since ``start_s`` as ``phase`` in ``times`` and return the time."""
     now_s = time.perf_counter()
     if times is not None:
@@ -265,7 +270,7 @@ def create_spare_slot_storage(
     return storage
 
 
-def slot_parameters(module: torch.nn.Module) -> List[Tuple[str, torch.nn.Parameter]]:
+def slot_parameters(module: torch.nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
     """Return the named weights of ``module`` that have one row per local slot.
 
     Restoring an expert into a spare slot needs host weights for each of them.
@@ -313,7 +318,7 @@ def use_spare_slot_storage(layer: SingleLayerMoeLoadBalancer, wt: torch.Tensor, 
     layer.slot_tensors[name] = wt
 
 
-def filled_spare_slots(layer: SingleLayerMoeLoadBalancer, local: np.ndarray) -> List[int]:
+def filled_spare_slots(layer: SingleLayerMoeLoadBalancer, local: np.ndarray) -> list[int]:
     """Return the spare slots of ``layer`` that ``local`` fills."""
     return [slot for slot in layer.spare_slots if local[slot] >= 0]
 
@@ -341,7 +346,7 @@ def next_node_experts(placement: np.ndarray, ranks: Sequence[int]) -> np.ndarray
 
 
 _FINGERPRINT_BYTES = 32
-SHARED_MEMORY_DIR = "/dev/shm"
+SHARED_MEMORY_DIR = "/dev/shm"  # nosec B108 - the POSIX shared-memory directory, not a temporary file
 
 
 class DeploymentHostWeights(HostMoeTensorSharer):
@@ -361,14 +366,14 @@ class DeploymentHostWeights(HostMoeTensorSharer):
         self.next_node_ranks = next_node_ranks
         self.reattached_own_shm = False
         # The host weights on this node by expert and weight name, which restores load slots from.
-        self.node_host_weights: Dict[Tuple[int, str], torch.Tensor] = {}
+        self.node_host_weights: dict[tuple[int, str], torch.Tensor] = {}
 
     def keep_next_node_experts(self, placement: np.ndarray) -> None:
         """Keep host weights for the experts that ``placement`` puts on the next node."""
         if self.next_node_ranks is not None:
             self.keep_experts(next_node_experts(placement, self.next_node_ranks).tolist())
 
-    def reattach_own_shm(self, name_info: Dict[str, Tuple[torch.dtype, torch.Size]]) -> bool:
+    def reattach_own_shm(self, name_info: dict[str, tuple[torch.dtype, torch.Size]]) -> bool:
         """Return whether this replacement reattaches its failed rank's shared memory.
 
         It reattaches the shared memory if it holds host weights matching ``name_info``. It then
@@ -435,7 +440,7 @@ class DeploymentHostWeights(HostMoeTensorSharer):
         self.own_shm = None
         super().post_shutdown_cleanup()
 
-    def node_bytes(self, slot_bytes: List[int]) -> int:
+    def node_bytes(self, slot_bytes: list[int]) -> int:
         """Return the bytes that all local ranks' shared memory for this layer takes in /dev/shm."""
         return (
             len(self.expert_ids) * sum(self.align_size(size) for size in slot_bytes)
@@ -454,7 +459,7 @@ class DeploymentHostWeights(HostMoeTensorSharer):
         return present
 
     def _fingerprint(
-        self, rank: int, name_info: Dict[str, Tuple[torch.dtype, torch.Size]]
+        self, rank: int, name_info: dict[str, tuple[torch.dtype, torch.Size]]
     ) -> bytes:
         layout = (
             self.layer_id,
@@ -470,7 +475,7 @@ class DeploymentHostWeights(HostMoeTensorSharer):
         return hashlib.sha256(repr(layout).encode()).digest()
 
     def _attach(
-        self, rank: int, name_info: Dict[str, Tuple[torch.dtype, torch.Size]]
+        self, rank: int, name_info: dict[str, tuple[torch.dtype, torch.Size]]
     ) -> Optional[shared_memory.SharedMemory]:
         """Return the intact shared memory of local ``rank`` if this user owns it with mode 0600.
 
@@ -528,10 +533,10 @@ class EplbExpertRestore:
                 "because online EPLB's CPU copies reach the spare slots only through GDRCopy. Set "
                 f"layer_updates_per_iter=0 or {TURN_FAULT_TOLERANCE_OFF}."
             )
-        self.active_ranks: Tuple[bool, ...] = (True,) * balancer.ep_size
+        self.active_ranks: tuple[bool, ...] = (True,) * balancer.ep_size
         self.backed_spare_slot_bytes = 0
         # By layer, the slots of this rank that a restore wrote and no installed placement names yet.
-        self._invalid_slots: Dict[int, Set[int]] = {}
+        self._invalid_slots: dict[int, set[int]] = {}
 
     def spare_slot_count(self, expert_count: int, eplb_slot_count: int) -> int:
         """Return the spare slots per rank that hold the largest recoverable failure's experts."""
@@ -539,10 +544,11 @@ class EplbExpertRestore:
         active_ranks = self.balancer.ep_size - self.largest_failure
         return ceil_div(lost_experts, active_ranks)
 
-    def _rank_nodes(self) -> List[int]:
+    # EP rank r is global rank r because fault tolerance requires pipeline_parallel_size=1.
+    def _rank_nodes(self) -> list[int]:
         return [self.balancer.mapping.get_node_rank(rank) for rank in range(self.balancer.ep_size)]
 
-    def next_node_ranks(self) -> Optional[List[int]]:
+    def next_node_ranks(self) -> Optional[list[int]]:
         """Return the next node's ranks, or None with online EPLB, where nodes keep all experts."""
         if self.balancer.layer_updates_per_iter > 0:
             return None
@@ -563,12 +569,12 @@ class EplbExpertRestore:
         return has_host_weights
 
     @staticmethod
-    def _recoverable_failures(nodes: List[int]) -> List[List[int]]:
+    def _recoverable_failures(nodes: list[int]) -> list[list[int]]:
         """Return the lost ranks of each recoverable failure.
 
         A recoverable failure loses a node other than rank 0's, or one rank on rank 0's node.
         """
-        node_ranks: Dict[int, List[int]] = {}
+        node_ranks: dict[int, list[int]] = {}
         for rank, node in enumerate(nodes):
             node_ranks.setdefault(node, []).append(rank)
         rank_0_node = node_ranks.pop(nodes[0], [])
@@ -586,7 +592,7 @@ class EplbExpertRestore:
             largest = max(largest, self.plan_expert_restore(active_ranks, current).device_bytes)
         return largest
 
-    def current_placement(self) -> List[Tuple[int, List[List[int]]]]:
+    def current_placement(self) -> list[tuple[int, list[list[int]]]]:
         """Return each layer's expert count and placement as this rank sees it."""
         return [
             (layer.expert_count, self._placement_view(i, layer).tolist())
@@ -602,14 +608,14 @@ class EplbExpertRestore:
         placement[self.balancer.ep_rank, sorted(self._invalid_slots.get(layer_idx, ()))] = -1
         return placement
 
-    def _host_tensor_sharers(self) -> List[DeploymentHostWeights]:
+    def _host_tensor_sharers(self) -> list[DeploymentHostWeights]:
         return [
             layer.host_tensor_sharer
             for layer in self.balancer.single_layer_load_balancers
             if layer.need_load_shared_weights()
         ]
 
-    def node_ranks_without_host_weights(self) -> List[int]:
+    def node_ranks_without_host_weights(self) -> list[int]:
         """Return the other ranks of this node whose shared memory lacks their host weights."""
         ep_rank = self.balancer.ep_rank
         sharers = self._host_tensor_sharers()
@@ -633,7 +639,8 @@ class EplbExpertRestore:
         Args:
             active_ranks: Whether each EP rank is active.
             current: The per-layer placement that the active ranks agreed on, so that every
-                active rank plans the same placement.
+                active rank plans the same placement. An active rank's row is its row of
+                ``current_placement``, so a slot that a stopped restore wrote loads again.
             rejoining: Whether each EP rank rejoins. If one does, the active slots of all active
                 ranks take the initial placement, which the rejoining rank loaded.
 
@@ -658,7 +665,7 @@ class EplbExpertRestore:
         placements_before = []
         staged = []
         # Each set of source ranks takes turns, so that the copies spread over them.
-        turns: Dict[Tuple[int, ...], int] = collections.defaultdict(int)
+        turns: dict[tuple[int, ...], int] = collections.defaultdict(int)
         device_bytes = 0
         for i, (layer, layer_current) in enumerate(
             zip(balancer.single_layer_load_balancers, current, strict=True)
@@ -720,6 +727,42 @@ class EplbExpertRestore:
         Returns:
             The number of bytes whose backing changed.
         """
+        changed = self._set_backed(layer_slots, backed)
+        self.backed_spare_slot_bytes += changed if backed else -changed
+        return changed
+
+    def empty_spare_slots(self) -> list[list[int]]:
+        """Return, by layer, the spare slots that the installed placement leaves empty.
+
+        Raises:
+            RuntimeError: An iteration is active.
+        """
+        balancer = self.balancer
+        if balancer.in_iter:
+            raise RuntimeError("Cannot read the empty spare slots while an iteration is active")
+        return [layer.get_unusable_local_slots() for layer in balancer.single_layer_load_balancers]
+
+    def release_spare_slots(self, layer_slots: Sequence[Sequence[int]]) -> int:
+        """Map the empty spare slots ``layer_slots``, by layer, back to the shared scratch.
+
+        It may run on a worker thread while forwards and online EPLB updates run: no token reaches
+        an empty spare slot, no kernel reads the weights of a slot without tokens, no update fills
+        these slots, and no CUDA graph is captured outside warmup (``allow_capture`` in
+        ``cuda_graph_runner.py``). It leaves ``backed_spare_slot_bytes`` to the caller's thread.
+
+        Returns:
+            The number of bytes released.
+        """
+        released = 0
+        for start in range(0, len(layer_slots), _RELEASE_LAYERS_PER_CALL):
+            end = start + _RELEASE_LAYERS_PER_CALL
+            released += self._set_backed(
+                [slots if start <= i < end else [] for i, slots in enumerate(layer_slots)], False
+            )
+        return released
+
+    def _set_backed(self, layer_slots: Sequence[Sequence[int]], backed: bool) -> int:
+        """Back or unback ``layer_slots`` in one call and return the bytes whose backing changed."""
         tensors, slots, slot_counts = [], [], []
         for layer, spare_slots in zip(
             self.balancer.single_layer_load_balancers, layer_slots, strict=True
@@ -732,34 +775,14 @@ class EplbExpertRestore:
                 slot_counts.append(len(spare_slots))
         if not tensors:
             return 0
-        changed = torch.ops.trtllm.moe_unbacked_slots_set_backed(
-            tensors, slots, slot_counts, backed
-        )
-        self.backed_spare_slot_bytes += changed if backed else -changed
-        return changed
-
-    def release_empty_spare_slots(self) -> int:
-        """Map the spare slots that the installed placement leaves empty back to the shared scratch.
-
-        An online EPLB update may still run, because it never fills these slots.
-
-        Returns:
-            The number of bytes released.
-        """
-        balancer = self.balancer
-        if balancer.in_iter:
-            raise RuntimeError("Cannot release spare slots while an iteration is active")
-        return self.set_spare_slots_backed(
-            [layer.get_unusable_local_slots() for layer in balancer.single_layer_load_balancers],
-            False,
-        )
+        return torch.ops.trtllm.moe_unbacked_slots_set_backed(tensors, slots, slot_counts, backed)
 
     def restore_lost_experts(
         self,
         plan: ExpertRestorePlan,
         workspace: torch.Tensor,
         allgather: Callable[[Any], Sequence[Any]],
-        times: Optional[Dict[str, float]] = None,
+        times: Optional[dict[str, float]] = None,
         progress: Callable[[], None] = lambda: None,
     ) -> int:
         """Load the slots that ``plan`` changes on this rank, install it and return the bytes mapped.
@@ -774,8 +797,9 @@ class EplbExpertRestore:
                 for an inactive rank.
             times: Receives each phase's duration in milliseconds.
             progress: Called after each staged chunk and each layer loaded locally, so that a long
-                restore keeps reporting progress. It may raise to stop the restore. The slots loaded
-                so far then hold no expert in this rank's view until the next restore.
+                restore keeps reporting progress. It may raise to stop the restore. The slots that
+                ``plan`` loads on this rank then hold no expert in ``current_placement`` until a
+                restore installs a placement.
 
         Raises:
             ExpertRestorePlanMismatchError: The plan or the workspace row size of this rank differs
@@ -826,7 +850,7 @@ class EplbExpertRestore:
             max_workers=1, thread_name_prefix="spare_slot_backing"
         )
         try:
-            layer_backings: List[concurrent.futures.Future] = []
+            layer_backings: list[concurrent.futures.Future] = []
             for i, (layer, placement) in enumerate(zip(layers, plan.placements)):
                 layer_backings.append(
                     backing.submit(
@@ -881,16 +905,16 @@ class EplbExpertRestore:
     def _back_layer_spare_slots(
         self,
         layer_idx: int,
-        slots: List[int],
+        slots: list[int],
         previous: Optional[concurrent.futures.Future],
-    ) -> Tuple[int, float]:
+    ) -> tuple[int, float]:
         """Back ``slots`` of layer ``layer_idx``. Return the bytes mapped and when it finished.
 
         If backing the ``previous`` layer failed, raise its error and back nothing.
         """
         if previous is not None:
             previous.result()
-        layer_slots: List[List[int]] = [[] for _ in self.balancer.single_layer_load_balancers]
+        layer_slots: list[list[int]] = [[] for _ in self.balancer.single_layer_load_balancers]
         layer_slots[layer_idx] = slots
         return self.set_spare_slots_backed(layer_slots, True), time.perf_counter()
 
@@ -992,7 +1016,7 @@ class FaultTolerantMoeLoadBalancer(MoeLoadBalancer):
         *args,
         mapping: Mapping,
         replacement: bool,
-        wait_for_host_weights: Callable[[int, Callable[[], List[int]]], None],
+        wait_for_host_weights: Callable[[int, Callable[[], list[int]]], None],
         **kwargs,
     ):
         """Create the load balancer of one rank of a deployment.

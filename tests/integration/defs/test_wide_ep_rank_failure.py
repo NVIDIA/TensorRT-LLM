@@ -118,6 +118,10 @@ REFUSAL_LOG = "Closing a liveness connection: "
 RETRYABLE_LOG = re.compile(
     r"Membership generation (\d+) ended (\d+) requests that no active rank holds"
 )
+# Each active rank logs the experts it loaded to restore a membership generation.
+RESTORE_LOG = re.compile(
+    r"Rank (\d+) restored membership generation (\d+) in \d+ ms\. Loaded (\d+) experts"
+)
 # The authority logs each record it publishes.
 MEMBERSHIP_LOG = re.compile(r"Membership: MembershipRecord\(.*?state=<MembershipState\.(\w+)")
 # trtllm-llmapi-launch logs the PID of rank 0's trtllm-serve, which a SIGINT stops.
@@ -235,6 +239,29 @@ class Deployment:
         return status
 
 
+# V3-Lite's routed experts, and its MoE layers: 1 to 29 and the MTP layer 30.
+V3_LITE_EXPERTS = 72
+V3_LITE_MOE_LAYERS = range(1, 31)
+# The redundant EPLB slots per rank of the static EPLB target.
+REDUNDANT_SLOTS_PER_RANK = 2
+
+
+def _static_eplb_placement() -> List[int]:
+    """Return a placement of every expert on a rank, and of replicas of the next rank's first experts.
+
+    The victim's first experts keep a replica on the rank before it, so a failover restores only
+    its other experts.
+    """
+    experts_per_rank = V3_LITE_EXPERTS // WORLD_SIZE
+    placement = []
+    for rank in range(WORLD_SIZE):
+        first = rank * experts_per_rank
+        next_first = (rank + 1) % WORLD_SIZE * experts_per_rank
+        placement += range(first, first + experts_per_rank)
+        placement += range(next_first, next_first + REDUNDANT_SLOTS_PER_RANK)
+    return placement
+
+
 # The supported targets at 4 GPUs: the checkpoint under the models root and the options its default
 # configuration adds to the generated ones.
 TARGETS = {
@@ -256,6 +283,21 @@ TARGETS = {
         {
             "moe_config": {
                 "load_balancer": {"num_slots": 72 + WORLD_SIZE, "layer_updates_per_iter": 1}
+            }
+        },
+    ),
+    # Static EPLB with redundant slots, at the given placement.
+    "bf16_static_eplb": (
+        "DeepSeek-V3-Lite/bf16",
+        {
+            "moe_config": {
+                "load_balancer": {
+                    "num_slots": V3_LITE_EXPERTS + REDUNDANT_SLOTS_PER_RANK * WORLD_SIZE,
+                    "layer_updates_per_iter": 0,
+                    "initial_global_assignments": {
+                        layer: _static_eplb_placement() for layer in V3_LITE_MOE_LAYERS
+                    },
+                }
             }
         },
     ),
@@ -543,6 +585,16 @@ def _retryable_failures_logged(logs: str) -> Dict[int, int]:
     """Return the requests rank 0 logged as failed with a retryable error, by membership generation."""
     matches = filter(None, map(RETRYABLE_LOG.search, _log_lines(logs)))
     return {int(m.group(1)): int(m.group(2)) for m in matches}
+
+
+def _experts_loaded(logs: str) -> Dict[int, int]:
+    """Return the experts that the active ranks loaded, by membership generation."""
+    matches = filter(None, map(RESTORE_LOG.search, _log_lines(logs)))
+    by_rank = {(int(m.group(2)), int(m.group(1))): int(m.group(3)) for m in matches}
+    loaded: Dict[int, int] = Counter()
+    for (generation, _), count in by_rank.items():
+        loaded[generation] += count
+    return loaded
 
 
 def _rank_gpus(workers: Dict[int, psutil.Process]) -> Dict[int, List[str]]:
@@ -1738,6 +1790,18 @@ def test_rejoin_on_target(tmp_path: Path, target: str):
     with _deploy(tmp_path, target=target) as deployment:
         with Run(deployment) as run:
             run.cycle("crash")
+        load_balancer = TARGETS[target][1].get("moe_config", {}).get("load_balancer", {})
+        placements = load_balancer.get("initial_global_assignments")
+        if placements is not None:
+            # The failover loads the victim's experts that no other rank holds, and the rejoin none.
+            expected = 0
+            for placement in placements.values():
+                slots = len(placement) // WORLD_SIZE
+                victim = placement[VICTIM * slots : (VICTIM + 1) * slots]
+                others = placement[: VICTIM * slots] + placement[(VICTIM + 1) * slots :]
+                expected += len(set(victim) - set(others))
+            loaded = [count for count in _experts_loaded(deployment.logs).values() if count]
+            assert loaded == [expected], f"generations loaded {loaded} experts, expected {expected}"
 
 
 @pytest.mark.skip_less_device(WORLD_SIZE)

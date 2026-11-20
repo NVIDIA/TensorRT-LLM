@@ -35,6 +35,7 @@ from tensorrt_llm._torch.distributed.membership import (
     UnsignedValueError,
     rendezvous,
 )
+from tensorrt_llm._torch.distributed.membership.signed_store import shared_secret_digest
 from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
 from tensorrt_llm._torch.pyexecutor import hang_detector
 
@@ -79,6 +80,21 @@ def test_split_orders_members_by_key():
     results = _run_ranks({r: lambda r=r: split(r) for r in groups})
     assert results[0] == results[2] == ((2, 0), [2, 0])
     assert results[1] == results[3] == ((3, 1), [3, 1])
+
+
+def test_split_leaves_out_inactive_members():
+    """Split the active members only, as an inactive member's color is unknown."""
+    store = InMemoryStore()
+    active = (0, 1, 3)
+    groups = {r: _group(store, r, range(4), active=active) for r in active}
+
+    def split(rank):
+        subgroup = groups[rank].Split(color=rank % 2, key=rank)
+        return subgroup.membership, subgroup.allgather(rank)
+
+    results = _run_ranks({r: lambda r=r: split(r) for r in groups})
+    assert results[0] == ((0,), [0])
+    assert results[1] == results[3] == ((1, 3), [1, 3])
 
 
 def _replacement_of_rank_2(monkeypatch):
@@ -270,6 +286,15 @@ def test_hard_kill_ends_only_this_rank(monkeypatch):
     hang_detector.propagate_hard_kill(3, diagnostics=False)
     assert exits == [3]
     assert kills == []
+
+
+def test_store_client_requires_set_secret(monkeypatch):
+    """Refuse a store client and a secret digest without a shared secret, naming the variable."""
+    monkeypatch.delenv(SHARED_SECRET_ENV, raising=False)
+    with pytest.raises(ValueError, match=re.escape(_SHORT_SECRET)):
+        SignedStore(InMemoryStore())
+    with pytest.raises(ValueError, match=re.escape(_SHORT_SECRET)):
+        shared_secret_digest(b"label")
 
 
 @pytest.mark.parametrize("secret", ["ab" * 31, "zz" * 32], ids=["short", "not_hex"])

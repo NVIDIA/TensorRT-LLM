@@ -20,7 +20,8 @@ report :class:`TransactionSummary` times in Unix milliseconds.
 """
 
 import time
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 from tensorrt_llm.logger import logger
 
@@ -45,12 +46,12 @@ from .records import (
 )
 
 
-def _ranks(mask: int) -> List[int]:
+def _ranks(mask: int) -> list[int]:
     """Return the ranks set in ``mask``, lowest first."""
     return [r for r in range(mask.bit_length()) if has_rank(mask, r)]
 
 
-def _chain_ends(ranks: Iterable[int], waits: Dict[int, int]) -> int:
+def _chain_ends(ranks: Iterable[int], waits: dict[int, int]) -> int:
     """Return a mask of the ``ranks`` that are the end of a wait-for chain, so they may be hung.
 
     ``waits`` maps each rank to a mask of the ranks it waits on. A rank is an end when every rank
@@ -62,9 +63,9 @@ def _chain_ends(ranks: Iterable[int], waits: Dict[int, int]) -> int:
     The ends are the strongly connected components that no wait leaves. Tarjan's algorithm finds
     the components in one depth-first search over the waits.
     """
-    order: Dict[int, int] = {}
-    low: Dict[int, int] = {}
-    stack: List[int] = []
+    order: dict[int, int] = {}
+    low: dict[int, int] = {}
+    stack: list[int] = []
     # The ranks whose component is found, and the ends among them.
     done = ends = 0
     for root in ranks:
@@ -99,7 +100,7 @@ def _chain_ends(ranks: Iterable[int], waits: Dict[int, int]) -> int:
     return ends
 
 
-def _update_last_change(seen: Dict[int, tuple], rank: int, value, now_s: float) -> float:
+def _update_last_change(seen: dict[int, tuple], rank: int, value: tuple, now_s: float) -> float:
     """Store ``value`` for ``rank`` in ``seen`` if it changed and return when it last changed."""
     if seen.get(rank, (None,))[0] != value:
         seen[rank] = (value, now_s)
@@ -129,7 +130,7 @@ class Authority:
         hang_timeout_s: float = HANG_TIMEOUT_S,
         rendezvous_timeout_s: float = RENDEZVOUS_TIMEOUT_S,
         admission_timeout_s: float = ADMISSION_TIMEOUT_S,
-    ):
+    ) -> None:
         """Start with every rank of the deployment in a STARTING record.
 
         Args:
@@ -158,33 +159,33 @@ class Authority:
         # The ranks that connected at least once during the startup.
         self._connected_once = 0
         # rank -> (value, time it last changed), for the progress and the startup progress.
-        self._progress: Dict[int, tuple] = {}
-        self._startup_progress: Dict[int, tuple] = {}
-        self._hung_since: Dict[int, float] = {}
+        self._progress: dict[int, tuple] = {}
+        self._startup_progress: dict[int, tuple] = {}
+        self._hung_since: dict[int, float] = {}
         # rank -> when the latest node report that counted it as paused arrived.
-        self._last_paused_s: Dict[int, float] = {}
+        self._last_paused_s: dict[int, float] = {}
         # rank -> the first decision time at which it had no report.
-        self._unreported_since: Dict[int, float] = {}
+        self._unreported_since: dict[int, float] = {}
         # The ranks whose replacement asked to join and is not in a proposed change yet.
-        self._requested: Set[int] = set()
+        self._requested: set[int] = set()
         # The replacements in the current change, until it commits or leaves them out.
-        self._joining: Set[int] = set()
+        self._joining: set[int] = set()
         # rank -> generation of the change that removed it, so replacements for ranks that failed
         # together join in one change.
-        self._failed_in: Dict[int, int] = {}
+        self._failed_in: dict[int, int] = {}
         # Resume epoch of an INSTALL that a newer change replaced before it committed, or 0.
         self._replaced_install_epoch = 0
         # When the pending change's first failure began, or its first replacement was ready.
         self._detected_s: Optional[float] = None
-        self._causes: Dict[int, str] = {}
+        self._causes: dict[int, str] = {}
         # Since when the active ranks have waited on a rank that makes no progress, for longer than
         # a report interval.
         self.stalled_since_s: Optional[float] = None
         self._transaction_began_s: Optional[float] = None
         self._ready_s: Optional[float] = None
         self.last_transaction: Optional[TransactionSummary] = None
-        self.stalled_replacements: Tuple[int, ...] = ()
-        self._changes: Dict[str, int] = {}
+        self.stalled_replacements: tuple[int, ...] = ()
+        self._changes: dict[str, int] = {}
 
     def request_join(self, rank: int) -> None:
         """Request that a replacement of ``rank``, which the membership no longer lists, join.
@@ -196,7 +197,7 @@ class Authority:
     def tick(
         self,
         now_s: float,
-        reports: Dict[int, RankReport],
+        reports: dict[int, RankReport],
         connected: int,
         node_reports: Iterable[NodeReport] = (),
     ) -> Optional[MembershipRecord]:
@@ -207,7 +208,7 @@ class Authority:
         ``stalled_replacements`` and, when a change ends, ``last_transaction``.
         """
         before, committed = self.record.state, self._committed_mask
-        paused_s: Dict[int, float] = {}
+        paused_s: dict[int, float] = {}
         for node_report in node_reports:
             received_s = node_report.received_s
             if now_s - received_s <= self.hang_timeout_s / 2:
@@ -265,9 +266,9 @@ class Authority:
     def _decide(
         self,
         now_s: float,
-        reports: Dict[int, RankReport],
+        reports: dict[int, RankReport],
         connected: int,
-        paused_s: Dict[int, float],
+        paused_s: dict[int, float],
     ) -> Optional[MembershipRecord]:
         """Return the record that follows from the reports, or None if membership stays.
 
@@ -296,7 +297,7 @@ class Authority:
         self._joining -= gone
 
     def _start_change(
-        self, now_s: float, reports: Dict[int, RankReport], failed: int
+        self, now_s: float, reports: dict[int, RankReport], failed: int
     ) -> Optional[MembershipRecord]:
         """Propose to remove the ``failed`` ranks and to add the replacements ready to join."""
         ready = {r for r in self._requested if r in reports and reports[r].joining_ready}
@@ -319,7 +320,7 @@ class Authority:
         )
 
     def _advance_change(
-        self, now_s: float, reports: Dict[int, RankReport]
+        self, now_s: float, reports: dict[int, RankReport]
     ) -> Optional[MembershipRecord]:
         """Move a PROPOSE to INSTALL, or an INSTALL to COMMITTED, once every active rank replied.
 
@@ -345,14 +346,14 @@ class Authority:
             return self._install(now_s, reports, active)
         return self._commit(active)
 
-    def _rank_replied(self, r: int, reports: Dict[int, RankReport], reply: Reply) -> bool:
+    def _rank_replied(self, r: int, reports: dict[int, RankReport], reply: Reply) -> bool:
         """Return whether rank ``r`` replied ``reply``, counting a joiner's readiness as READY."""
         report = reports.get(r)
         ready_to_join = r in self._joining and report is not None and report.joining_ready
         return (reply == Reply.READY and ready_to_join) or self._replied(report, reply)
 
     def _install(
-        self, now_s: float, reports: Dict[int, RankReport], active: List[int]
+        self, now_s: float, reports: dict[int, RankReport], active: list[int]
     ) -> MembershipRecord:
         """Publish INSTALL with the point where every active rank resumes."""
         survivors = [
@@ -368,7 +369,7 @@ class Authority:
         self._ready_s = now_s
         return self._new_record(MembershipState.INSTALL, self.record.active_mask, resume)
 
-    def _resume_epoch(self, epochs: List[int]) -> int:
+    def _resume_epoch(self, epochs: list[int]) -> int:
         """Return the host exchange epoch to resume from, given the survivors' paused epochs."""
         replaced = self._replaced_install_epoch
         # A newer PROPOSE can replace an INSTALL before its commit, after some ranks moved to that
@@ -380,7 +381,7 @@ class Authority:
         # Epochs wrap, so the resume epoch follows the latest one, not the largest.
         return next_epoch(latest_epoch(epochs))
 
-    def _commit(self, active: List[int]) -> MembershipRecord:
+    def _commit(self, active: list[int]) -> MembershipRecord:
         """Commit the change that every active rank installed."""
         record = self.record
         self._joining -= set(active)
@@ -396,7 +397,7 @@ class Authority:
         return self._new_record(MembershipState.COMMITTED, record.active_mask)
 
     def _await_startup(
-        self, now_s: float, reports: Dict[int, RankReport], connected: int
+        self, now_s: float, reports: dict[int, RankReport], connected: int
     ) -> Optional[MembershipRecord]:
         """Commit generation 0 once every rank connected and started.
 
@@ -428,7 +429,7 @@ class Authority:
         return self._new_record(MembershipState.COMMITTED, everyone)
 
     def _waits_for_replacements_of_same_failure(
-        self, now_s: float, reports: Dict[int, RankReport], ready: Set[int], starting: Set[int]
+        self, now_s: float, reports: dict[int, RankReport], ready: set[int], starting: set[int]
     ) -> bool:
         """Return whether to delay adding ``ready`` for a replacement that is still starting.
 
@@ -442,7 +443,7 @@ class Authority:
             for r in starting - ready
         )
 
-    def _startup_advancing(self, r: int, reports: Dict[int, RankReport], now_s: float) -> bool:
+    def _startup_advancing(self, r: int, reports: dict[int, RankReport], now_s: float) -> bool:
         """Return whether the startup of rank ``r``'s replacement progressed within the timeout."""
         report = reports.get(r, RankReport())
         progress = (report.incarnation, report.progress)
@@ -453,14 +454,14 @@ class Authority:
         changed_s = _update_last_change(self._startup_progress, r, progress, now_s)
         return now_s - changed_s <= self.rendezvous_timeout_s
 
-    def _reports_advance(self, r: int, reports: Dict[int, RankReport], now_s: float) -> bool:
+    def _reports_advance(self, r: int, reports: dict[int, RankReport], now_s: float) -> bool:
         """Return whether rank ``r`` sent a report within half the hang timeout.
 
         A rank whose reports stopped is a stopped process, so its last ``waiting_for`` is stale.
         """
         return now_s - self._received_s(r, reports, now_s) <= self.hang_timeout_s / 2
 
-    def _received_s(self, r: int, reports: Dict[int, RankReport], now_s: float) -> float:
+    def _received_s(self, r: int, reports: dict[int, RankReport], now_s: float) -> float:
         """Return when rank ``r``'s latest report arrived, or since when it has sent none."""
         if r in reports:
             self._unreported_since.pop(r, None)
@@ -517,10 +518,10 @@ class Authority:
     def _detect_failures(
         self,
         now_s: float,
-        reports: Dict[int, RankReport],
+        reports: dict[int, RankReport],
         connected: int,
         timeout_s: float,
-        paused_s: Dict[int, float],
+        paused_s: dict[int, float],
     ) -> int:
         """Return a mask of active ranks that are dead, or hung for ``timeout_s``.
 
@@ -553,8 +554,8 @@ class Authority:
                 (r for r in active if not reports.get(r, RankReport()).started), self.world_size
             )
         # A rank's waits count only while its reports advance.
-        waits: Dict[int, int] = {}
-        rounds: Dict[int, Set[tuple]] = {}
+        waits: dict[int, int] = {}
+        rounds: dict[int, set[tuple]] = {}
         for r in active:
             report = reports.get(r, RankReport())
             if self._reports_advance(r, reports, now_s):
@@ -616,11 +617,11 @@ class Authority:
 
     def _describe(
         self,
-        active: List[int],
-        reports: Dict[int, RankReport],
-        waits: Dict[int, int],
+        active: list[int],
+        reports: dict[int, RankReport],
+        waits: dict[int, int],
         now_s: float,
-        paused_s: Dict[int, float],
+        paused_s: dict[int, float],
     ) -> str:
         described = []
         for r in active:

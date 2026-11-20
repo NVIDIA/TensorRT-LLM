@@ -83,7 +83,7 @@ These are fixed for this feature. A change that needs to revisit one is a design
 | Rank startup and replay | `tensorrt_llm/_torch/distributed/membership/startup.py` (`worker_node_main`, the authority's start, the fingerprint, the tuned tactics); `tensorrt_llm/_torch/distributed/startup_record.py` (`StartupRecord`, `REPLACEMENT_CANNOT_START`); the hooks of `Distributed` in `tensorrt_llm/_torch/distributed/communicator.py` |
 | Host collectives | `tensorrt_llm/_torch/distributed/host_exchange.py` (`MnnvlDist`, `HostExchange`, `HostExchangeGroup`); `tensorrt_llm/_torch/distributed/mnnvl_host_exchange.py` (`MnnvlHostExchangeGroup`, `HostExchangeMnnvlMemory`); native wait in `cpp/tensorrt_llm/nanobind/runtime/hostExchange.cpp` |
 | Late-write remap | `tensorrt_llm/_torch/distributed/membership_mnnvl_memory.py` (`MembershipMnnvlMemory.rows_needing_fresh_pages`, `remap`); `tensorrt_llm/_torch/distributed/mnnvl_memory.py` |
-| Masked, abortable all-to-all | `cpp/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.{cu,h}`, `cpp/tensorrt_llm/thop/moe/communication/moeAlltoAllOp.cpp`; `tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py`; `tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py` (`MoeExecutionState`, `BindableCommunication`, `MembershipWorkspace`); `tensorrt_llm/_torch/moe/fused_moe/ep_group_health.py` (`EPGroupHealth`) |
+| Masked, abortable all-to-all | `cpp/tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.{cu,h}`, `cpp/tensorrt_llm/thop/moe/communication/moeAlltoAllOp.cpp`; `tensorrt_llm/_torch/moe/fused_moe/communication/nvlink_one_sided.py`; `tensorrt_llm/_torch/moe/fused_moe/communication/execution_state.py` (`MoeExecutionState`, `MembershipWorkspace`); `tensorrt_llm/_torch/moe/fused_moe/ep_group_health.py` (`EPGroupHealth`) |
 | Spare slots | `cpp/tensorrt_llm/runtime/moeLoadBalancer/unbackedSlotMemory.{h,cpp}`, `cpp/tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.{h,cpp}`, `cpp/tensorrt_llm/thop/moe/loadBalance/moeUnbackedSlotOp.cpp`; `create_spare_slot_storage` in `tensorrt_llm/_torch/moe/fused_moe/eplb_expert_restore.py`; `tensorrt_llm/_torch/moe/fused_moe/impl_blocks.py` (`uses_spare_slots`, `tuner_layout_kwargs`); `tensorrt_llm/_torch/moe/fused_moe/impl_contract.py` (`supports_spare_slots`, `spare_slots_rejection`) |
 | Expert restore | `tensorrt_llm/_torch/moe/fused_moe/eplb_expert_restore.py` (`FaultTolerantMoeLoadBalancer`, `EplbExpertRestore`, `plan_layer_placement`, `DeploymentHostWeights`); `tensorrt_llm/_torch/distributed/membership/host_weights.py` (`host_weights_name`: the `/dev/shm` names derived from the shared secret and the node index); `MoeLoadBalancer::restorePlacement` and `abandonIterations` in `cpp/tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.cpp` |
 | Executor failover and rejoin | `tensorrt_llm/_torch/pyexecutor/rank_failure_recovery.py` (`RankFailureRecovery`); `tensorrt_llm/_torch/pyexecutor/rank_failure_memory.py` (`StartupMemory`, `RecoveryMemory`); hooks in `tensorrt_llm/_torch/pyexecutor/py_executor.py`, `tensorrt_llm/_torch/pyexecutor/executor_request_queue.py`, `tensorrt_llm/_torch/pyexecutor/hang_detector.py`, `tensorrt_llm/_torch/pyexecutor/model_loader.py` and `tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py` |
@@ -109,7 +109,9 @@ node 0                                            node i
   (`startup._turn_off_rank_crash_kill`), so a crashed rank ends only itself and the membership removes it. A user
   value that keeps the kill on is replaced, with one warning that names the variable.
 - The startup group runs over the rendezvous store (`StoreGroup` as `mpi_comm()`); the host collectives of
-  `Distributed` run in `MnnvlDist` over MNNVL memory. No MPI or NCCL communicator spans ranks.
+  `Distributed` run in `MnnvlDist` over MNNVL memory. No MPI or NCCL communicator spans ranks. Code that runs after
+  the startup makes no collective on `mpi_comm()`: the startup group waits for every original rank, so a failed rank
+  stalls it, and a replacement takes the original ranks' values only while it replays its startup.
 - A rank ends with its node supervisor: every rank is started through `_exec_rank`, which arms the parent-death
   signal (SIGTERM) and refuses to start otherwise.
 - When a node supervisor's connection closes, the authority counts the node's ranks as failed and gives them up. On
@@ -200,7 +202,7 @@ work at its resume point, where no forward and no EPLB iteration runs. Phases: `
 | PROPOSE that removes ranks | Request the all-to-all abort and interrupt host-collective waits; drop the step; reply `READY` | - |
 | PROPOSE that only adds ranks | No abort: the forward vote stops every rank at a step boundary; steps in flight complete | Its `joining_ready` report counts as `READY` |
 | INSTALL | Host exchange over the active ranks at the resume epoch (fresh rows when a former member may still write); end EPLB iterations; retire the step in flight; queue interrupted requests for recompute; gather request ids and each rank's slots; plan the placement; shrink the KV cache by the restore bytes; remap the all-to-all workspaces; restore experts; rearm the all-to-all and install the mask; reply `INSTALLED` | Same path; enters the host exchange at rank 0's next epoch; receives rank 0's waiting queue |
-| COMMITTED | Resume; fail requests that no active rank holds (`RankFailureError`); give the empty spare slots' memory back to the KV cache at a voted step boundary | Serve |
+| COMMITTED | Resume; fail requests that no active rank holds (`RankFailureError`); release the empty spare slots on a worker thread and give their memory back to the KV cache at voted step boundaries | Serve |
 | Excluded or ABORTED | Exit (status 1); the node supervisor kills a process that does not | - |
 
 The install runs inside the interrupted host collective, which keeps the executor loop free of rollback code:
@@ -217,9 +219,10 @@ The install runs inside the interrupted host collective, which keeps the executo
 Memory follows the same steps. At INSTALL, `RecoveryMemory.kv_cache_shrunk_by` suspends the KV cache pools and
 resizes the GPU pool to the startup quota less the backed spare-slot bytes and the restore bytes. While the pages in
 use do not fit, it preempts the newest recomputable requests (1, 1, 2, 4, ...); with none left, the rank replies
-`FAILED`. After `COMMITTED`, the empty spare
-slots are released and the pool grows back at a step boundary that the forward vote agrees on, because resizing
-suspends requests and retiring the step in flight runs collectives. Workspace rows remapped to fresh pages are owed
+`FAILED`. After `COMMITTED`, a worker thread releases the empty spare slots while the rank serves; no token reaches
+them. Once it is done, the pool grows back by at most 1 GiB per step boundary that the forward vote agrees on, because
+resizing suspends requests and retiring the step in flight runs collectives. A restore and the teardown wait for the
+worker first. Workspace rows remapped to fresh pages are owed
 until the excluded process releases the old pages. Nothing announces that, so the pool grows into that memory when a
 poll of free device memory, at most once a second, finds it free.
 
@@ -280,15 +283,15 @@ cache estimation and it runs a tuning pass of its own:
 |---|---|
 | `Distributed.rank_varying(name)` | Some payloads differ per process by nature: measurements (measured tactics, the autotuner warmup skip vote, the KV cache load sample) and process identities. The replay accepts a different own payload there, and still returns the recorded payloads, so every rank keeps the values its CUDA graphs and plans were built from |
 | `Distributed.pause_startup_record` / `Distributed.resume_startup_record` | The KV cache estimation runs only on the original ranks, and the tuning pass only on a replacement, so their collectives cannot match call for call. They are neither recorded nor replayed. Pauses nest. The outermost resume on an original rank keeps the tactics tuned so far, which the rank publishes for its replacement |
-| `Distributed.agree_per_process(name, gather, own=None)` | A value each process agrees once, at whichever startup step first needs it, such as the steady-clock offset, the KV cache budget vote or a communicator split. The original ranks gather the steady-clock offset and the KV cache budget vote inside the estimation (paused); a replacement gathers them in its final executor. The value is recorded and replayed even while paused. With `own=(index, value)`, this process's input to the gather, a replacement whose input differs from its predecessor's cannot start (`REPLACEMENT_CANNOT_START`): the communicator split's color and key, and the sentinel vote |
+| `Distributed.agree_per_process(name, gather, own=None)` | A value each process agrees once, at whichever startup step first needs it, such as the steady-clock offset, the KV cache budget vote, the FP8 context-MLA admission cap or a communicator split. The original ranks gather the steady-clock offset, the KV cache budget vote and the admission cap inside the estimation (paused); a replacement gathers them in its final executor. The replacement takes its predecessor's admission cap, as its own budget lacks the measured activation peak. The value is recorded and replayed even while paused. With `own=(index, value)`, this process's input to the gather, a replacement whose input differs from its predecessor's cannot start (`REPLACEMENT_CANNOT_START`): the communicator split's color and key, and the sentinel vote |
 | `Distributed.agree_rank_capacity(name, rank, capacity, gather)` | The replacement keeps its predecessor's KV cache quota, because warmup shapes follow it. A replacement whose own capacity is lower fails, and a later restart may succeed once that memory is free. The host cache tier quota is the original ranks' minimum, replayed the same way: a replacement fails if the quota exceeds its RLIMIT_MEMLOCK (`REPLACEMENT_CANNOT_START`, not restarted) or its share of the node's available host memory (a later restart may succeed) |
 | `reduce_op` of a min or max reduction | A replacement's value below the recorded minimum (a capacity) raises. A value above the recorded maximum (a failed status) takes part in the result, so the replacement fails with its own error. The record keeps each collective's reduction, so a replacement whose collective replays one with another reduction (min, max or none) cannot start (`REPLACEMENT_CANNOT_START`) |
 
 ## Backend Contract
 
-Generic code holds no class checks. A communication strategy binds through the duck-typed
-`bind_execution_state(MoeExecutionState)` (`BindableCommunication`), called for every MoE layer by `prepare_model`
-before weights load. A MoE backend declares `MoEStaticCapability.supports_spare_slots` (the Cutlass unquantized and
+`prepare_model` binds every MoE layer's `NVLinkOneSided` to one `MoeExecutionState`
+(`bind_execution_state`) before weights load, and refuses a layer with another communication strategy, naming the
+cause. A MoE backend declares `MoEStaticCapability.supports_spare_slots` (the Cutlass unquantized and
 NVFP4 leaves and the CuteDSL NVFP4 grouped-GEMM leaf). While the load balancer adds spare slots
 (`MoEDeployment.spare_slots_enabled`), MoE backend selection turns down every other backend with
 `MoERejectReason.SPARE_SLOTS_UNSUPPORTED`, as it does for EPLB. A backend literal (`moe_config.backend`) then falls
@@ -387,7 +390,7 @@ A change must keep all of these. Each has a test listed under [Testing](#testing
    `Distributed` and the startup record; a payload that differs by process is marked `Distributed.rank_varying`.
 10. **Memory is borrowed, not ratcheted.** At every change the KV quota is derived afresh from the startup quota,
     less the backed spare-slot bytes and the bytes the change restores, so repeated failures do not lower it. It
-    returns to the startup quota once the device memory is free again: the spare slots at the voted boundary, the
+    returns to the startup quota once the device memory is free again: the spare slots at the voted boundaries, the
     replaced workspace rows once the excluded process releases them. A startup check rejects a KV cache that cannot
     lend the largest recoverable failure's restore.
 11. **Hang bound.** A hung rank is excluded about `HANG_TIMEOUT_S` plus one report interval after its stall starts;
@@ -415,7 +418,9 @@ install, a second failure during a failover that the spare slots cannot cover (t
 server spawns the ranks and through two frontends, the authority's loss, and shutdowns during an admission and after
 a rank was given up. No CI test covers several nodes: the loss of a whole node under `mpirun --enable-recovery` and
 its return were verified on DeepSeek-R1 over 16 GPUs (4 nodes) by running the node supervisor's `--rejoin`
-directly; the `trtllm-llmapi-launch --rejoin-node` launcher option itself is not yet run.
+directly. The `trtllm-llmapi-launch --rejoin-node` launcher option returned a lost node on DeepSeek-V3-Lite over 2
+nodes (8 GPUs): every process of node 1 was killed, `trtllm-llmapi-launch --rejoin-node 1 --nodes 2` started its
+supervisor again, and its 4 ranks were admitted in one membership change with every request complete.
 
 ```bash
 pytest tests/unittest/_torch/distributed tests/unittest/llmapi/test_node_supervisor.py

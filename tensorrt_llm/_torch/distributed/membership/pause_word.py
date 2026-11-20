@@ -26,7 +26,7 @@ import struct
 
 from .signed_store import shared_secret_digest
 
-_SHM_DIR = "/dev/shm"
+_SHM_DIR = "/dev/shm"  # nosec B108 - the POSIX shared-memory directory, not a temporary file
 # One native int, which holds any PID.
 _FORMAT = "i"
 _SIZE = struct.calcsize(_FORMAT)

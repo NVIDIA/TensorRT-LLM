@@ -47,7 +47,7 @@ from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.anthropic_adapter import reframe_openai_stream
 from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.fault_tolerance_health import FaultToleranceHealth
-from tensorrt_llm.serve.openai_protocol import RerankRequest
+from tensorrt_llm.serve.openai_protocol import EmbeddingRequest, RerankRequest
 from tensorrt_llm.serve.openai_server import _stream_error_events
 from tensorrt_llm.serve.responses_utils import (
     classify_stream_termination,
@@ -379,6 +379,7 @@ def test_rank_failure_is_an_anthropic_overloaded_error(serve_env):
     assert asyncio.run(server._run_batched_message(request)) == ("errored", expected)
 
 
+@pytest.mark.parametrize("role", [ServerRole.RERANK, ServerRole.EMBEDDING])
 @pytest.mark.parametrize(
     "error, status, code",
     [
@@ -386,12 +387,12 @@ def test_rank_failure_is_an_anthropic_overloaded_error(serve_env):
         (RuntimeError("encoder failed"), 500, 500),
     ],
 )
-def test_rerank_rank_failure_answers_503_with_code(serve_env, error, status, code):
-    """Check that a rerank request that a rank failure ends answers 503 rank_failure.
+def test_encoder_rank_failure_answers_503_with_code(serve_env, role, error, status, code):
+    """Check that a rerank or embedding request that a rank failure ends answers 503 rank_failure.
 
     Any other error keeps the route's 500.
     """
-    server = serve_env.build_openai_server(AggConfig(role=ServerRole.RERANK))
+    server = serve_env.build_openai_server(AggConfig(role=role))
     server.tokenizer = SimpleNamespace(
         encode=lambda text, add_special_tokens: [ord(char) for char in text]
     )
@@ -400,8 +401,12 @@ def test_rerank_rank_failure_answers_503_with_code(serve_env, error, status, cod
         raise error
 
     server.encode_batcher = SimpleNamespace(validate_input=lambda token_ids: None, submit=submit)
-    request = RerankRequest(model="reranker", query="query", documents=["a"])
-    response = asyncio.run(server._rerank(request))
+    if role is ServerRole.RERANK:
+        request = RerankRequest(model="reranker", query="query", documents=["a"])
+        response = asyncio.run(server._rerank(request))
+    else:
+        request = EmbeddingRequest(model="embedder", input=[1, 2])
+        response = asyncio.run(server.openai_embedding(request, raw_request=None))
     assert response.status_code == status
     assert json.loads(response.body)["code"] == code
 

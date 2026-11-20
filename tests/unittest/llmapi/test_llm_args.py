@@ -158,6 +158,7 @@ def test_checkpoint_io_policy_rejects_unknown_value() -> None:
 # The smallest configuration that Wide-EP fault tolerance accepts.
 _FAULT_TOLERANT_ARGS = dict(enable_wide_ep_fault_tolerance=True,
                             enable_attention_dp=True,
+                            tensor_parallel_size=2,
                             moe_config={"load_balancer": {
                                 "num_slots": 72
                             }},
@@ -165,34 +166,92 @@ _FAULT_TOLERANT_ARGS = dict(enable_wide_ep_fault_tolerance=True,
 
 
 @pytest.mark.cpu_only
-def test_wide_ep_fault_tolerance_defaults_off(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
-    assert not TorchLlmArgs(
-        model=llama_model_path).enable_wide_ep_fault_tolerance
+def test_wide_ep_fault_tolerance_launch_checked_on_build() -> None:
+    with pytest.raises(
+            ValidationError,
+            match=re.escape("attention DP (enable_attention_dp=True)")):
+        TorchLlmArgs(model=llama_model_path,
+                     **{
+                         **_FAULT_TOLERANT_ARGS, "enable_attention_dp": False
+                     })
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("enable", [False, True])
-def test_fault_tolerance_mode_env_is_deprecated(monkeypatch: pytest.MonkeyPatch,
-                                                enable: bool) -> None:
-    """TLLM_FAULT_TOLERANCE_MODE=1 alone does not turn on fault tolerance."""
-    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
-    fault_tolerance = _FAULT_TOLERANT_ARGS if enable else {}
+@pytest.mark.parametrize(("fields", "fix"), [
+    ({
+        "enable_attention_dp": False
+    }, "attention DP (enable_attention_dp=True)"),
+    ({
+        "tensor_parallel_size": 1
+    }, "more than one attention DP rank (tensor_parallel_size above 1, not 1)"),
+    ({
+        "moe_tensor_parallel_size": 2
+    }, "no MoE TP (moe_tensor_parallel_size=1, not 2)"),
+    ({
+        "moe_expert_parallel_size": 1
+    }, "expert parallelism over more than one rank "
+     "(moe_expert_parallel_size above 1, not 1)"),
+    ({
+        "dwdp_config": DwdpConfig(dwdp_size=2)
+    }, "no expert DWDP (dwdp_config.enable_experts=False)"),
+    ({
+        "modeling_v2": "require"
+    }, "the built-in model (modeling_v2='auto' or 'off', not 'require')"),
+])
+def test_wide_ep_fault_tolerance_launch_rejected(fields: dict[str, Any],
+                                                 fix: str) -> None:
+    """The arguments rule out MoE layers without NVLink one-sided."""
+    args = TorchLlmArgs(model=llama_model_path, **_FAULT_TOLERANT_ARGS)
+    with pytest.raises(ValueError, match=re.escape(fix)) as error:
+        args.model_copy(update=fields).validate_wide_ep_fault_tolerance()
+    assert "set enable_wide_ep_fault_tolerance=False" in str(error.value)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fields", [{}, {
+    "modeling_v2": "auto"
+}],
+                         ids=["default", "explicit"])
+def test_wide_ep_fault_tolerance_uses_builtin_model(
+        fields: dict[str, Any]) -> None:
+    """Fault tolerance turns modeling_v2 'auto' off with one warning."""
     with patch.object(llm_args_mod.logger, "warning") as warning:
         args = TorchLlmArgs(model=llama_model_path,
-                            cuda_graph_config=None,
-                            **fault_tolerance)
-    deprecations = [
-        call.args[0] for call in warning.call_args_list
-        if "TLLM_FAULT_TOLERANCE_MODE" in str(call.args[0])
-    ]
-    assert args.enable_wide_ep_fault_tolerance is enable
-    if enable:
-        assert deprecations == []
-    else:
-        assert len(deprecations) == 1
-        assert "set enable_wide_ep_fault_tolerance=True" in deprecations[0]
+                            **_FAULT_TOLERANT_ARGS,
+                            **fields)
+    assert args.modeling_v2 == "off"
+    messages = [call.args[0] for call in warning.call_args_list]
+    assert sum("using the built-in implementation" in message
+               for message in messages) == 1
+    assert TorchLlmArgs(model=llama_model_path, **fields).modeling_v2 == "auto"
+
+
+@pytest.mark.cpu_only
+def test_wide_ep_fault_tolerance_reaches_the_model_config() -> None:
+    """The loader builds the model's config with the field."""
+
+    class _StopAfterLoadConfig(Exception):
+        pass
+
+    args = TorchLlmArgs(model="/tmp/dummy_model", **_FAULT_TOLERANT_ARGS)
+    checkpoint_loader = create_autospec(HfCheckpointLoader,
+                                        instance=True,
+                                        spec_set=True)
+    checkpoint_loader.load_config.side_effect = _StopAfterLoadConfig
+    loader = model_loader_mod.ModelLoader(
+        args,
+        args.parallel_config.to_mapping(),
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=args.max_num_tokens,
+        max_seq_len=args.max_seq_len,
+    )
+
+    with pytest.raises(_StopAfterLoadConfig):
+        loader._load_and_validate_config("/tmp/dummy_model", checkpoint_loader)
+
+    kwargs = checkpoint_loader.load_config.call_args.kwargs
+    assert kwargs["enable_wide_ep_fault_tolerance"] is True
 
 
 @pytest.mark.cpu_only

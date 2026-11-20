@@ -34,10 +34,7 @@ from torch.distributed import DistStoreError
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
     DeepseekV4CacheManager,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
-    DSACacheManager,
-    DSACacheManagerV2,
-)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.host_exchange import MnnvlDist
 from tensorrt_llm._torch.distributed.membership import (
@@ -75,7 +72,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, WaitingState
 from tensorrt_llm._torch.pyexecutor.rank_failure_memory import StartupMemory
 from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import RankFailureRecovery
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
 from tensorrt_llm.executor.rank_failure_requests import RankFailureError
@@ -249,6 +246,7 @@ def _executor(rank=0):
         capturable_guided_decoder=None,
         perf_manager=MagicMock(),
         model_engine=SimpleNamespace(moe_load_balancer=None, model=torch.nn.Module()),
+        kv_cache_manager=SimpleNamespace(gpu_quota=STARTUP_MEMORY.kv_cache_quota),
         fail_requests_by_id=Mock(),
         recompute_requests=Mock(),
         worker_thread=None,
@@ -326,7 +324,6 @@ def _replacement(monkeypatch):
     monkeypatch.setattr(Distributed, "startup_record", StartupRecord())
     r = _unstarted_rank(FAILED, incarnation=1)
     r.executor.dist.host_exchange = r.exchange
-    r.executor.kv_cache_manager = SimpleNamespace(gpu_quota=STARTUP_MEMORY.kv_cache_quota)
     r.executor.iter_counter = 0
     monkeypatch.setattr(recovery_module, "membership_client", lambda: r.client)
     monkeypatch.setattr(recovery_module, "rendezvous_store", lambda: r.store)
@@ -428,8 +425,17 @@ def test_only_removal_aborts_steps_in_flight(active_mask, joining_mask, aborts):
     assert r.exchange.interrupted() == aborts
 
 
-def _vote(r, batch_size=4, peers=((3, 0, 0), (5, 0, 0), (2, 0, 0))):
-    """Return the (batch size, held, release) row ``r`` sent in a forward vote and the outcome."""
+def _wait_for_release_worker(r):
+    _wait_until(lambda: not r.recovery._memory.release_pending())
+
+
+def _vote(r, batch_size=4, peers=((3, 0, 0), (5, 0, 0), (2, 0, 0)), wait_for_release=True):
+    """Return the (batch size, held, release) row ``r`` sent in a forward vote and the outcome.
+
+    With ``wait_for_release``, the vote follows the end of the spare slot release worker.
+    """
+    if wait_for_release:
+        _wait_for_release_worker(r)
     sent = []
 
     def gather(row, active_only):
@@ -1098,7 +1104,7 @@ def _eplb(monkeypatch, r, restored=6 * MIB, workspace=4 * MIB, device=None, rele
     def back(num_bytes):
         device.take(num_bytes)
         device.backed += num_bytes
-        balancer.expert_restore.backed_spare_slot_bytes = device.backed
+        balancer.expert_restore.backed_spare_slot_bytes += num_bytes
 
     def restore_lost_experts(restore, staging_workspace, allgather, times, progress):
         calls.append(("restore", restore))
@@ -1108,10 +1114,14 @@ def _eplb(monkeypatch, r, restored=6 * MIB, workspace=4 * MIB, device=None, rele
         times.update({"back": 1.0, "load": 2.0, "install": 3.0})
         return restored
 
-    def release_empty_spare_slots():
+    def release_spare_slots(layer_slots):
+        """Unmap the spare slots on the release worker, which leaves the executor's count alone."""
+        assert layer_slots == [[1]]
         calls.append("release")
-        back(-released)
-        return released
+        freed = min(released, device.backed)  # A slot already unmapped frees nothing.
+        device.take(-freed)
+        device.backed -= freed
+        return freed
 
     def plan_expert_restore(active, current, rejoining):
         calls.append(("plan", active, current, rejoining))
@@ -1121,10 +1131,13 @@ def _eplb(monkeypatch, r, restored=6 * MIB, workspace=4 * MIB, device=None, rele
         current_placement=lambda: _PLACEMENT,
         plan_expert_restore=plan_expert_restore,
         restore_lost_experts=restore_lost_experts,
-        release_empty_spare_slots=release_empty_spare_slots,
+        # A setup that releases memory stands for a rejoin, whose placement empties the slot.
+        empty_spare_slots=lambda: [[1] if released else []],
+        release_spare_slots=release_spare_slots,
         backed_spare_slot_bytes=device.backed,
     )
     r.executor.model_engine.moe_load_balancer = balancer
+    r.executor.kv_cache_manager = device
     r.executor.kv_pools_suspended = device.suspended
     r.moe.workspace_bytes.return_value = workspace
     r.moe.remap_workspaces.side_effect = lambda gather, fresh_rows: calls.append("remap")
@@ -1161,8 +1174,8 @@ def test_install_restores_lost_experts(monkeypatch, extra_free):
     r.recovery.before_iteration()
     # Once serving resumed, the pool takes back the workspace memory once per change.
     assert _resizes(device) == [54 * MIB + 4096, 58 * MIB]
-    # The release frees only empty spare slots, so the restored expert keeps its slot.
-    assert "release" in calls
+    # The restored expert fills the only spare slot, so no spare slot is released.
+    assert "release" not in calls
     assert device.backed == 6 * MIB
     # Serving keeps the memory it had free.
     assert device.free == FREE_BYTES + extra_free
@@ -1400,8 +1413,12 @@ def test_rejoin_releases_memory_after_resume(monkeypatch):
     assert _replies(r) == [Reply.INSTALLED]
     assert not r.recovery.pauses_forward()
     r.moe.ep_group_health.mark_active.assert_any_call(FAILED)
-    # Serving resumed with the spare slots still backed and the pool short of the workspace.
-    assert device.backed == 6 * MIB
+    # Serving resumed with the pool short of the workspace and of the spare slot, which a worker
+    # releases meanwhile. The executor counts it as backed until the pool grows into it.
+    expert_restore = r.executor.model_engine.moe_load_balancer.expert_restore
+    _wait_for_release_worker(r)
+    assert device.backed == 0
+    assert expert_restore.backed_spare_slot_bytes == 6 * MIB
     assert device.gpu_quota == 54 * MIB
     retire = r.executor.retire_inflight_batch
     retire.reset_mock()
@@ -1409,27 +1426,30 @@ def test_rejoin_releases_memory_after_resume(monkeypatch):
     assert _vote(r, peers=((3, 1, 0), (5, 0, 0), (2, 0, 0)))[0] == [4, 0, 1]
     r.recovery.before_iteration()
     retire.assert_not_called()
-    assert device.backed == 6 * MIB
+    assert device.gpu_quota == 54 * MIB
     assert _vote(r)[0] == [4, 0, 1]
     r.recovery.before_iteration()
     retire.assert_called_once()
-    assert device.backed == 0
+    assert expert_restore.backed_spare_slot_bytes == 0
     assert device.gpu_quota == STARTUP_MEMORY.kv_cache_quota
     # A rank with nothing to release still retires its step in flight at the same step boundary.
     other = _rank(rank=1)
     _vote(other, peers=((4, 0, 1), (5, 0, 0), (2, 0, 0)))
     other.recovery.before_iteration()
     other.executor.retire_inflight_batch.assert_called_once()
-    (released,) = [c.args[0] for c in info.call_args_list if "returned the empty" in c.args[0]]
-    assert released.startswith(
-        "Rank 0 returned the empty spare slots of membership generation 1 to the KV cache pool: "
-        f"released {6 * MIB} bytes, KV cache quota {STARTUP_MEMORY.kv_cache_quota} bytes, 0 bytes "
-        "short until device memory is freed, in "
+    # One line times the release on the worker and the pool's growth on the executor apart.
+    (released,) = [c.args[0] for c in info.call_args_list if "returned memory" in c.args[0]]
+    assert re.fullmatch(
+        "Rank 0 returned memory to the KV cache pool after membership generation 1: released "
+        rf"{6 * MIB} bytes of empty spare slots in \d+ ms on a worker thread, grew the KV cache "
+        rf"quota by {10 * MIB} to {STARTUP_MEMORY.kv_cache_quota} bytes in 1 steps and \d+ ms, "
+        "0 bytes short until device memory is freed",
+        released,
     )
 
 
 def test_release_waits_for_newer_change(monkeypatch):
-    """Check that a change after the release vote keeps the memory until that change commits."""
+    """Check that a change after the release vote keeps the pool from growing until it commits."""
     r, _, device = _rejoining(monkeypatch)
     r.recovery.before_iteration()
     assert _vote(r)[0] == [4, 0, 1]
@@ -1439,8 +1459,185 @@ def test_release_waits_for_newer_change(monkeypatch):
     retire.side_effect = lambda: r.client.deliver(newer)
     r.recovery.before_iteration()
     retire.assert_called_once()
-    assert device.backed == 6 * MIB
+    assert device.gpu_quota == 54 * MIB
     assert r.recovery.pauses_forward()
+    # The newer change's restore would wait for the release worker; the test ends before it.
+    r.recovery._memory.wait_for_release()
+
+
+def test_release_runs_off_the_executor_thread(monkeypatch):
+    """Check that a worker releases the empty spare slots, and that the vote waits for it."""
+    r, _, device = _rejoining(monkeypatch)
+    expert_restore = r.executor.model_engine.moe_load_balancer.expert_restore
+    release = expert_restore.release_spare_slots
+    may_finish = threading.Event()
+    threads = []
+
+    def blocked_release(layer_slots):
+        threads.append(threading.current_thread())
+        assert may_finish.wait(TIMEOUT_S)
+        return release(layer_slots)
+
+    expert_restore.release_spare_slots = blocked_release
+    r.recovery.before_iteration()  # The install and the commit return while the worker runs.
+    assert _replies(r) == [Reply.INSTALLED]
+    _wait_until(lambda: threads)
+    assert threads[0] is not threading.current_thread()
+    # The rank asks for no release while its worker runs.
+    assert _vote(r, wait_for_release=False)[0] == [4, 0, 0]
+    r.recovery.before_iteration()
+    assert device.gpu_quota == 54 * MIB
+    may_finish.set()
+    assert _vote(r)[0] == [4, 0, 1]
+    r.recovery.before_iteration()
+    assert device.gpu_quota == STARTUP_MEMORY.kv_cache_quota
+    assert expert_restore.backed_spare_slot_bytes == 0
+
+
+def _commit_second_change(r):
+    """Install and commit a change that rank 1 fails in, past the rejoin that ``r`` resumed from."""
+    second = _record(MembershipState.INSTALL, 2, 0b1001, ResumeState(iteration=12, epoch=10))
+    _install(r, second)
+    r.executor.iter_counter = 13
+    committed = second.model_copy(update=dict(state=MembershipState.COMMITTED))
+    r.client.answers[(Reply.INSTALLED, 2)] = [committed]
+    r.recovery.before_iteration()
+    assert _replies(r) == [Reply.INSTALLED, Reply.INSTALLED]
+
+
+def test_change_during_release_waits_for_it(monkeypatch):
+    """Check that a change during the release plans its restore once the release ended."""
+    r, _, device = _rejoining(monkeypatch)
+    memory = r.recovery._memory
+    expert_restore = r.executor.model_engine.moe_load_balancer.expert_restore
+    release, plan_expert_restore = (
+        expert_restore.release_spare_slots,
+        expert_restore.plan_expert_restore,
+    )
+    wait_for_release = memory.wait_for_release
+    waited = threading.Event()
+    order = []
+
+    def held_release(layer_slots):  # Ends only once the executor thread waits for it.
+        assert waited.wait(TIMEOUT_S)
+        freed = release(layer_slots)
+        order.append("released")
+        return freed
+
+    def plan(active, current, rejoining):
+        order.append(("plan", device.backed, expert_restore.backed_spare_slot_bytes))
+        return plan_expert_restore(active, current, rejoining)
+
+    def wait_then_release():
+        waited.set()
+        wait_for_release()
+
+    expert_restore.release_spare_slots = held_release
+    expert_restore.plan_expert_restore = plan
+    r.recovery.before_iteration()  # The rejoin's install and commit start the held release.
+    monkeypatch.setattr(memory, "wait_for_release", wait_then_release)
+    try:
+        _commit_second_change(r)
+    finally:
+        waited.set()
+        memory.wait_for_release()  # The second commit's release, or a held one on a failure.
+    # The rejoin planned with the spare slot backed, the second change once it was released.
+    assert order[:3] == [("plan", 6 * MIB, 6 * MIB), "released", ("plan", 0, 0)]
+
+
+def test_second_commit_before_release_step_keeps_the_released_memory(monkeypatch):
+    """Check that the pool grows into spare slots that the next change's restore waited for."""
+    r, _, device = _rejoining(monkeypatch)
+    # Rank 0 keeps its workspace row, so neither change shrinks its KV cache pool.
+    r.moe.workspace_rows_needing_fresh_pages.return_value = frozenset({FAILED})
+    r.recovery.before_iteration()  # The rejoin's install and commit.
+    assert device.gpu_quota == 58 * MIB
+    _commit_second_change(r)
+    assert _vote(r)[0] == [4, 0, 1]
+    r.recovery.before_iteration()
+    assert device.gpu_quota == STARTUP_MEMORY.kv_cache_quota
+
+
+def test_release_error_raised_on_the_executor_thread(monkeypatch):
+    """Check that an error of the release worker ends the release step of the executor thread."""
+    r, _, _ = _rejoining(monkeypatch)
+    expert_restore = r.executor.model_engine.moe_load_balancer.expert_restore
+
+    def failing_release(layer_slots):
+        raise RuntimeError("cuMemUnmap failed")
+
+    expert_restore.release_spare_slots = failing_release
+    r.recovery.before_iteration()
+    assert _vote(r)[0] == [4, 0, 1]
+    with pytest.raises(RuntimeError, match="cuMemUnmap failed"):
+        r.recovery.before_iteration()
+
+
+def test_pool_grows_back_by_chunks_over_release_votes(monkeypatch):
+    """Check that the pool grows back by at most one chunk per release vote until it is full."""
+    monkeypatch.setattr(memory_module, "_KV_CACHE_GROW_CHUNK_BYTES", 3 * MIB)
+    info = Mock()
+    monkeypatch.setattr(memory_module.logger, "info", info)
+    r, _, device = _rejoining(monkeypatch)
+    r.recovery.before_iteration()
+    assert device.gpu_quota == 54 * MIB
+    quotas = []
+    while _vote(r)[0][2]:
+        r.recovery.before_iteration()
+        quotas.append(device.gpu_quota)
+        assert len(quotas) <= 4
+    assert quotas == [57 * MIB, 60 * MIB, 63 * MIB, STARTUP_MEMORY.kv_cache_quota]
+    assert device.free == FREE_BYTES
+    # The release is logged once, when the pool stops growing.
+    (released,) = [c.args[0] for c in info.call_args_list if "returned memory" in c.args[0]]
+    assert f"quota by {10 * MIB} to {STARTUP_MEMORY.kv_cache_quota} bytes in 4 steps" in released
+
+
+def test_chunk_the_device_cannot_back_leaves_the_owed_quota_short(monkeypatch):
+    """Check that a chunk that the device cannot back reports all the owed quota as short."""
+    monkeypatch.setattr(memory_module, "_KV_CACHE_GROW_CHUNK_BYTES", 3 * MIB)
+    info = Mock()
+    monkeypatch.setattr(memory_module.logger, "info", info)
+    r, _, device = _rejoining(monkeypatch)
+    r.recovery.before_iteration()
+    device.growable = False
+    assert _vote(r)[0] == [4, 0, 1]
+    r.recovery.before_iteration()
+    assert device.gpu_quota == 54 * MIB
+    (released,) = [c.args[0] for c in info.call_args_list if "returned memory" in c.args[0]]
+    assert released.endswith(f", {10 * MIB} bytes short until device memory is freed")
+
+
+def test_change_between_grow_chunks_stops_them(monkeypatch):
+    """Check that a change voted between two chunks of the pool's growth stops the growth."""
+    monkeypatch.setattr(memory_module, "_KV_CACHE_GROW_CHUNK_BYTES", 3 * MIB)
+    r, _, device = _rejoining(monkeypatch)
+    r.recovery.before_iteration()
+    assert _vote(r)[0] == [4, 0, 1]
+    r.recovery.before_iteration()
+    assert device.gpu_quota == 57 * MIB
+    r.client.deliver(_record(MembershipState.PROPOSE, generation=2, active_mask=0b0011))
+    # The rank holds its forward for the change and asks for no further chunk.
+    assert _vote(r)[0] == [0, 1, 0]
+    r.recovery.before_iteration()
+    assert device.gpu_quota == 57 * MIB
+    assert r.recovery.pauses_forward()
+
+
+@pytest.mark.parametrize("eplb", [False, True], ids=["no EPLB", "no empty spare slot"])
+def test_commit_without_empty_spare_slots_starts_no_worker(monkeypatch, eplb):
+    """Check that a commit with no empty spare slot to release starts no release worker."""
+    r = _resuming()
+    release_spare_slots = Mock(return_value=0)
+    if eplb:
+        _eplb(monkeypatch, r)
+        r.executor.model_engine.moe_load_balancer.expert_restore.release_spare_slots = (
+            release_spare_slots
+        )
+    r.recovery.before_iteration()
+    assert _replies(r) == [Reply.INSTALLED]
+    _wait_for_release_worker(r)
+    release_spare_slots.assert_not_called()
 
 
 # EPLB and waiting requests across a membership change.
@@ -1652,22 +1849,6 @@ def test_startup_rejects_kv_cache_manager_with_own_reuse_commits(
     assert steps == []
 
 
-@pytest.mark.parametrize("manager_cls", [KVCacheManager, DSACacheManager])
-def test_startup_rejects_kv_cache_manager_v1(
-    fresh_startup_record, shared_secret, monkeypatch, manager_cls
-):
-    """Check that startup refuses the V1 KV cache manager, which has no deferred reuse commits."""
-    r, device, steps = _original_rank(monkeypatch, 0)
-    r.executor.resource_manager.resource_managers = {
-        ResourceManagerType.KV_CACHE_MANAGER: manager_cls.__new__(manager_cls),
-    }
-    with pytest.raises(
-        ValueError, match=f"use_kv_cache_manager_v2=True, not {manager_cls.__name__}"
-    ):
-        RankFailureRecovery.create(r.executor)
-    assert steps == []
-
-
 @pytest.mark.parametrize("replacement", [False, True], ids=["original", "replacement"])
 def test_no_rank_creates_a_process_group(fresh_startup_record, monkeypatch, replacement):
     """Check that no rank creates a torch.distributed group, which no replacement could join."""
@@ -1833,6 +2014,7 @@ def test_active_ranks_retire_step_before_resize(monkeypatch, rank):
     r.exchange.admit = lambda active_mask, epoch: steps.append("admit")
     r.moe.workspace_bytes.return_value = 4 * MIB
     device.measure(monkeypatch)
+    executor.kv_cache_manager = device
     executor.kv_pools_suspended = device.suspended
     r.recovery.before_iteration()
     _vote(r)

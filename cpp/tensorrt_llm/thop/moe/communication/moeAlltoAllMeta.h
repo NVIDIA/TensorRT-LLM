@@ -112,6 +112,12 @@ enum MoeA2AMetaInfoIndex : int64_t
 using MoeA2AWorkspaceLayout = std::array<int64_t, NUM_METAINFO_FIELDS>;
 static constexpr int64_t kWorkspaceAlignment = 256;
 
+// The host holds the abort state as an int32 tensor of kAbortStateWords words and addresses `requested` and `status`
+// as its words 0 and 1.
+static constexpr int64_t kAbortStateWords = sizeof(tensorrt_llm::kernels::moe_comm::MoeA2AAbortState) / sizeof(int32_t);
+static_assert(offsetof(tensorrt_llm::kernels::moe_comm::MoeA2AAbortState, requested) == 0);
+static_assert(offsetof(tensorrt_llm::kernels::moe_comm::MoeA2AAbortState, status) == sizeof(int32_t));
+
 inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs()
 {
     using namespace tensorrt_llm::kernels::moe_comm;
@@ -156,7 +162,7 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_SENTINEL_FORMAT_MXFP8", static_cast<int>(sentinel::PayloadFormat::kMxfp8)},
         {"MOE_A2A_SENTINEL_FORMAT_FP8_BLOCK128", static_cast<int>(sentinel::PayloadFormat::kFp8Block128)},
         {"MOE_A2A_SENTINEL_FORMAT_NVFP4", static_cast<int>(sentinel::PayloadFormat::kNvfp4)},
-        {"MOE_A2A_ABORT_STATE_WORDS", sizeof(MoeA2AAbortState) / sizeof(int32_t)},
+        {"MOE_A2A_ABORT_STATE_WORDS", kAbortStateWords},
         {"MOE_A2A_ABORT_WAITED_FLAG_INDEX", offsetof(MoeA2AAbortState, waited_flag) / sizeof(int32_t)},
     };
 }

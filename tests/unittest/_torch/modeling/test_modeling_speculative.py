@@ -28,6 +28,7 @@ from tensorrt_llm._torch import model_config as model_config_module
 from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig, MoESelection
+from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
     Eagle3ForCausalLM,
@@ -146,6 +147,68 @@ def test_draft_construction_preserves_kv_override_through_exclusion(
     assert loaded_configs[-1].extra_attrs is target_config.extra_attrs
     assert target_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
     assert "preserve_kv_cache_quant_algo" not in target_config.extra_attrs
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "draft_kind", ["eagle3", "eagle3_mistral", "external_model", "external_drafter"]
+)
+@pytest.mark.parametrize("enabled", [False, True], ids=["off", "on"])
+def test_draft_config_carries_wide_ep_fault_tolerance(
+    monkeypatch: pytest.MonkeyPatch, draft_kind: str, enabled: bool
+) -> None:
+    """A drafter's MoE layers bind to the target's execution state, so its config has the flag."""
+    pretrained = PretrainedConfig(
+        hidden_size=128,
+        vocab_size=32,
+        num_hidden_layers=1,
+        torch_dtype=torch.bfloat16,
+        tie_word_embeddings=False,
+        architectures=["LlamaForCausalLM"],
+    )
+    spec_kwargs = dict(max_draft_len=3, speculative_model="draft-checkpoint")
+    if draft_kind == "eagle3":
+        spec_config = Eagle3DecodingConfig(**spec_kwargs)
+    elif draft_kind == "eagle3_mistral":
+        spec_config = Eagle3DecodingConfig(**spec_kwargs, eagle3_model_arch="mistral_large3")
+    elif draft_kind == "external_model":
+        spec_config = MTPDecodingConfig(**spec_kwargs)
+        update_spec_config_from_model_config(
+            spec_config,
+            pretrained,
+            target_model_cls=SimpleNamespace(build_mtp_draft_model_from_config=True),
+        )
+    else:
+        spec_config = DraftTargetDecodingConfig(**spec_kwargs)
+    target_config = ModelConfig(
+        pretrained_config=pretrained,
+        spec_config=spec_config,
+        enable_wide_ep_fault_tolerance=enabled,
+        skip_create_weights_in_init=True,
+    )
+    draft_loads: list[dict] = []
+
+    def load_draft_config(*_args: object, **kwargs: object) -> ModelConfig:
+        draft_loads.append(kwargs)
+        return ModelConfig(pretrained_config=pretrained, skip_create_weights_in_init=True)
+
+    monkeypatch.setattr(
+        ModelConfig,
+        "from_pretrained",
+        classmethod(lambda _cls, *args, **kwargs: load_draft_config(*args, **kwargs)),
+    )
+    monkeypatch.setattr(
+        MistralConfigLoader,
+        "load",
+        lambda _loader, *args, **kwargs: load_draft_config(*args, **kwargs),
+    )
+    monkeypatch.setattr("tensorrt_llm._torch.modules.linear.get_sm_version", lambda: 100)
+    monkeypatch.setattr(speculative_modeling, "get_spec_worker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(speculative_modeling, "get_draft_model", lambda *args: nn.Module())
+    with torch.device("cpu"):
+        SpecDecOneEngineForCausalLM(nn.Identity(), target_config)
+
+    assert [kwargs["enable_wide_ep_fault_tolerance"] for kwargs in draft_loads] == [enabled]
 
 
 @pytest.mark.cpu_only

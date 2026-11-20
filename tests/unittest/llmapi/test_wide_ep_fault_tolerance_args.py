@@ -18,7 +18,6 @@ import re
 import subprocess  # nosec B404
 import sys
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -53,7 +52,6 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
     UserProvidedDecodingConfig,
 )
-from tensorrt_llm.logger import logger
 
 pytestmark = pytest.mark.cpu_only
 
@@ -65,6 +63,7 @@ def _args(**fields) -> TorchLlmArgs:
             "model": "dummy",
             "enable_wide_ep_fault_tolerance": True,
             "enable_attention_dp": True,
+            "tensor_parallel_size": 2,
             "max_seq_len": 4096,
             "moe_config": {"load_balancer": {"num_slots": 8}},
             **fields,
@@ -114,8 +113,11 @@ def test_supported_configuration_is_accepted(fields):
 @pytest.mark.parametrize(
     "fields, fix",
     [
-        ({"enable_attention_dp": False}, "enable_attention_dp=True"),
         ({"pipeline_parallel_size": 2}, "pipeline_parallel_size=1, not 2"),
+        (
+            {"context_parallel_size": 2, "cp_config": {"cp_type": "HELIX"}},
+            "no context parallelism (context_parallel_size=1, not 2)",
+        ),
         ({"max_beam_width": 2}, "max_beam_width=1, not 2"),
         ({"disable_overlap_scheduler": True}, "disable_overlap_scheduler=False"),
         ({"moe_config": {}}, "moe_config.load_balancer.num_slots, for example the number"),
@@ -249,7 +251,6 @@ def test_supported_configuration_is_accepted(fields):
             )
         ),
         ({"sleep_config": SleepConfig()}, "sleep_config=None), because sleep releases"),
-        ({"modeling_v2": "require"}, "modeling_v2='auto' or 'off', not 'require'"),
         (
             {"enable_return_routed_experts": True},
             "no routed-expert capture (enable_return_routed_experts=False), because a step",
@@ -260,17 +261,6 @@ def test_unsupported_configuration_names_field(fields, fix):
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         _args(**fields)
     assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
-
-
-@pytest.mark.parametrize("fields", [{}, {"modeling_v2": "auto"}], ids=["default", "explicit"])
-def test_modeling_v2_auto_uses_builtin_model(monkeypatch, fields):
-    """Check that fault tolerance turns modeling_v2 'auto' off with one warning."""
-    warning = Mock()
-    monkeypatch.setattr(logger, "warning", warning)
-    assert _args(**fields).modeling_v2 == "off"
-    messages = [call.args[0] for call in warning.call_args_list]
-    assert sum("using the built-in implementation" in message for message in messages) == 1
-    assert _args(enable_wide_ep_fault_tolerance=False, **fields).modeling_v2 == "auto"
 
 
 def test_check_leaves_args_unchanged():

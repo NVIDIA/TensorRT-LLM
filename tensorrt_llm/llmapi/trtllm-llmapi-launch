@@ -70,6 +70,11 @@ if [ -n "$TLLM_FAULT_TOLERANCE_SHARED_SECRET" ] && [ -z "$TLLM_FAULT_TOLERANCE_R
     fi
     exec python3 "$launcher_directory/_llmapi_node_supervisor.py" "${node_options[@]}" -- \
         "$launcher_directory/$(basename -- "${BASH_SOURCE[0]}")" "${task_with_command[@]}"
+elif [ -z "$TLLM_FAULT_TOLERANCE_SHARED_SECRET" ] \
+    && { [ "${task_with_command[0]}" = "--rejoin-node" ] || [ "${task_with_command[0]}" = "--nodes" ]; }; then
+    echo "trtllm-llmapi-launch ${task_with_command[0]} returns a node to a fault-tolerant deployment: export the" \
+        "deployment's TLLM_FAULT_TOLERANCE_SHARED_SECRET and TLLM_FAULT_TOLERANCE_RENDEZVOUS" >&2
+    exit 2
 fi
 
 # A completed guard holds its workload leader unreaped until we retire the

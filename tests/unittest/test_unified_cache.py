@@ -3,7 +3,7 @@
 
 import os
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -172,6 +172,7 @@ def test_mpi_pool_environment_forwards_unified_cache_variables(
     monkeypatch.setenv("UNRELATED_CACHE_DIR", "/not-forwarded")
     monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor, raising=False)
     session = SimpleNamespace(mpi_pool=None, n_workers=1, _env_overrides={})
+    session._create_pool = MethodType(mpi_session.MpiPoolSession._create_pool, session)
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
 
@@ -215,6 +216,7 @@ def test_mpi_pool_flashinfer_isolation_respects_unified_cache_configuration(
     monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor, raising=False)
     _bootstrap._setup_unified_cache()
     session = SimpleNamespace(mpi_pool=None, n_workers=2, _env_overrides={})
+    session._create_pool = MethodType(mpi_session.MpiPoolSession._create_pool, session)
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
 

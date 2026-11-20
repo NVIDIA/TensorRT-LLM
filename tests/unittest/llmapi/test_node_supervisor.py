@@ -2098,6 +2098,19 @@ def test_malformed_rejoin_node_rejected(tmp_path, task):
     assert not (tmp_path / "python3-args").exists()
 
 
+@pytest.mark.parametrize(
+    "task",
+    [["--rejoin-node", "1", "--nodes", "3", "task"], ["--nodes", "3", "task"]],
+    ids=["rejoin-node", "nodes"],
+)
+def test_rejoin_node_without_shared_secret_rejected(tmp_path, task):
+    """Reject a node's options without the shared secret, rather than running them as the task."""
+    result = _run_launcher(tmp_path, 1, task)
+    assert result.returncode == 2, result.stderr
+    assert "export the deployment's TLLM_FAULT_TOLERANCE_SHARED_SECRET" in result.stderr
+    assert not (tmp_path / "python3-args").exists()
+
+
 @pytest.mark.parametrize("fault_tolerance", [False, True])
 def test_early_mpi_server_exit_status(tmp_path, fault_tolerance):
     """Exit 0 on a clean shutdown of a rank that the node supervisor started, and 1 otherwise.

@@ -1268,7 +1268,9 @@ __device__ __forceinline__ void prepareCombine(uint8_t* combine_input_base, void
     if constexpr (HAS_INCOMPLETE_ROUND)
     {
         if (rank_idx != ep_rank && only_own_rows_valid(*incomplete_round, flag_value))
+        {
             return;
+        }
     }
 
     size_t const source_offset = static_cast<size_t>(global_token_idx) * source_stride_per_token;

@@ -15,7 +15,8 @@
 """Configuration checks for Wide-EP fault tolerance, and the rank identity from its launcher."""
 
 import os
-from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 if TYPE_CHECKING:
     from .llmapi.llm_args import TorchLlmArgs
@@ -26,7 +27,7 @@ FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
 # The rendezvous store's host:port. The authority hosts the store.
 RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 # The hex secret that every deployment process holds. It derives the hello token.
-SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"
+SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"  # nosec B105 - environment variable name, not a secret
 # The model architectures that Wide-EP fault tolerance supports, as named in config.json.
 SUPPORTED_ARCHITECTURES = ("DeepseekV3ForCausalLM",)
 # The alternative that each error about an unmet fault tolerance requirement offers.
@@ -46,7 +47,7 @@ def check_node_supervisor_launch(enabled: bool) -> None:
         )
 
 
-def check_fault_tolerance_requirements(checks: Sequence[Tuple[bool, str]]) -> None:
+def check_fault_tolerance_requirements(checks: Sequence[tuple[bool, str]]) -> None:
     """Raise ValueError naming every unmet ``(met, requirement)`` check."""
     missing = [requirement for met, requirement in checks if not met]
     if missing:
@@ -112,15 +113,16 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     check_fault_tolerance_requirements(
         [
             (
-                llm_args.enable_attention_dp,
-                "attention DP (enable_attention_dp=True), because a failed rank must take only its "
-                "own requests with it",
-            ),
-            (
                 llm_args.pipeline_parallel_size == 1,
                 "no pipeline parallelism (pipeline_parallel_size=1, not "
                 f"{llm_args.pipeline_parallel_size}), because a failed pipeline stage leaves its "
                 "layers on no rank",
+            ),
+            (
+                llm_args.context_parallel_size == 1,
+                "no context parallelism (context_parallel_size=1, not "
+                f"{llm_args.context_parallel_size}), because a replacement rank would size its KV "
+                "cache and admit contexts without the limits of the rank it replaces",
             ),
             (
                 llm_args.max_beam_width in (None, 1),
@@ -231,13 +233,6 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "which run it), because fault tolerance does not support torch.compile yet (for "
                 "example, the userbuffers that it can enable exchange memory handles over an MPI "
                 "world of every rank, while each rank is its own MPI world)",
-            ),
-            (
-                llm_args.modeling_v2 != "require",
-                "the built-in model (modeling_v2='auto' or 'off', not 'require'), because no "
-                "modeling_v2 target supports it yet: a target's MoE layers would need EPLB spare "
-                "slots and the NVLink one-sided all-to-all, which take over a failed rank's "
-                "experts and stop waiting on it",
             ),
             (
                 llm_args.sleep_config is None,

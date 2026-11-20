@@ -159,3 +159,21 @@ def test_feature_off_retains_existing_lm_head_tp_group_sync(enabled):
     exchange.assert_called_once_with([True])
     assert not metadata.group_all_greedy_sample
     assert not metadata.is_all_greedy_sample
+
+
+def test_shard_sampling_refuses_modes_of_active_ranks_only():
+    """Check that shard sampling refuses a padding exchange that left out an inactive rank."""
+    mapping = SimpleNamespace(
+        enable_attention_dp=True, enable_lm_head_tp_in_adp=False, tp_size=2, tp_rank=0
+    )
+    metadata = object.__new__(SpecMetadata)
+    metadata.use_rejection_sampling = False
+    metadata.samples_from_vocab_shards = True
+    metadata.is_all_greedy_sample = True
+    metadata.local_all_temperature_only = False
+    # Rank 0's own mode, but only one of the two TP ranks' modes.
+    runner = SimpleNamespace(take_sampling_modes=lambda batch: [1])
+    with pytest.raises(RuntimeError, match="needs all 2 TP ranks"):
+        sync_group_all_greedy_sample(
+            metadata, mapping, Mock(), cuda_graph_runner=runner, batch=object()
+        )

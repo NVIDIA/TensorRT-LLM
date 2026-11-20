@@ -1726,8 +1726,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             # Unexpected fault (not a client error): surface as 500, not 400.
             logger.error(traceback.format_exc())
-            return self.create_error_response(
-                str(e),
+            return self.create_exception_error_response(
+                e,
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
@@ -1918,7 +1918,8 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._launcher_forwarder is None:
             return
         routes = FORWARDED_ROUTES
-        if self.generator.args.enable_wide_ep_fault_tolerance:
+        if getattr(self.generator.args, "enable_wide_ep_fault_tolerance",
+                   False):
             from tensorrt_llm.serve import fault_tolerance_health
             routes += fault_tolerance_health.FORWARDED_ROUTES
         for method, path in routes:

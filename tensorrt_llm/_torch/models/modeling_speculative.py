@@ -1841,6 +1841,10 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         # the same format as the target's.
         use_low_precision_moe_combine=model_config.
         use_low_precision_moe_combine,
+        # So is Wide-EP fault tolerance: the drafter's MoE layers bind to the
+        # target's execution state.
+        enable_wide_ep_fault_tolerance=model_config.
+        enable_wide_ep_fault_tolerance,
         # A MEGAMOE_CUTEDSL drafter shares the target's bucket workspaces, so its kernels must match.
         megamoe_fuse_shared_expert=model_config.megamoe_fuse_shared_expert,
     )
@@ -2126,6 +2130,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_load_balancer=model_config.moe_load_balancer,
+                            enable_wide_ep_fault_tolerance=model_config.
+                            enable_wide_ep_fault_tolerance,
                             skip_create_weights_in_init=True,
                         )
                         if draft_moe_selection is not None:
@@ -2147,7 +2153,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             ),
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
-                            moe_max_num_tokens=model_config.moe_max_num_tokens)
+                            moe_max_num_tokens=model_config.moe_max_num_tokens,
+                            enable_wide_ep_fault_tolerance=model_config.
+                            enable_wide_ep_fault_tolerance)
                     else:
                         raise ValueError(
                             f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
@@ -2169,7 +2177,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         mapping=model_config.mapping.mapping_for_full_rows(),
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
-                        moe_max_num_tokens=model_config.moe_max_num_tokens)
+                        moe_max_num_tokens=model_config.moe_max_num_tokens,
+                        enable_wide_ep_fault_tolerance=model_config.
+                        enable_wide_ep_fault_tolerance)
                     self.draft_config.extra_attrs = model_config.extra_attrs
                     _set_draft_kv_cache_quant_algo(self.draft_config,
                                                    model_config)

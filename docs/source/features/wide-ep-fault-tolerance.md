@@ -14,8 +14,8 @@ A rank fails when its process exits, or when it makes no progress for 60 s while
 ```{warning}
 Wide-EP fault tolerance is a prototype and is subject to change. CI tests it on one GB200 NVL72 node (4 ranks).
 Several nodes and the loss and rejoin of a whole node were verified on DeepSeek-R1 over 16 GPUs, with no CI test,
-by running the node supervisor's `--rejoin` directly; the `--rejoin-node` launcher option was verified on
-DeepSeek-V3-Lite over 2 nodes.
+by running the node supervisor's `--rejoin` directly. The `--rejoin-node` launcher option returned a lost node on
+DeepSeek-V3-Lite over 2 nodes (8 GPUs), with every request complete.
 ```
 
 ## Requirements
@@ -83,9 +83,11 @@ load.
 3. On node 0's host, start `trtllm-llmapi-launch` once per node with `mpirun --enable-recovery` of Open MPI 5, which
    the release container provides. A launch by `srun` of several tasks is rejected, unlike the one-task step that
    returns a lost node (see [Returning a lost node](#returning-a-lost-node)). On Slurm, run `mpirun` in a
-   `--no-requeue` allocation, since Slurm would start a requeued job as a new deployment. On each node the launcher
-   runs a node supervisor, which starts one rank per GPU and a replacement for each rank that fails. Rank 0 also runs
-   the membership authority, the process that decides which ranks belong to the deployment.
+   `--no-requeue` allocation, since Slurm would start a requeued job as a new deployment. With
+   `TLLM_FAULT_TOLERANCE_SHARED_SECRET` exported, the launcher runs a node supervisor on each node, which starts one
+   rank per GPU and a replacement for each rank that fails. Without it, the launcher starts the command as without fault
+   tolerance, with no node supervisor, and rejects `--rejoin-node`. Rank 0 also runs the membership authority, the process that decides which
+   ranks belong to the deployment.
 
 ```bash
 export TLLM_FAULT_TOLERANCE_SHARED_SECRET=$(openssl rand -hex 32)
@@ -136,8 +138,9 @@ node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the
 - Requests in flight on the surviving ranks continue by recompute and keep their streamed tokens. A request in flight
   on a failed rank is ended, not migrated: if it streamed nothing, it runs again on a surviving rank, at most once.
   Otherwise it fails with HTTP 503 and the error code `rank_failure`, or a started stream ends with an error event of
-  that code, and the client discards the output and sends the request again. On `/v1/messages` both are an
-  `overloaded_error`.
+  that code, and the client discards the output and sends the request again. On `/v1/messages` the response is
+  HTTP 503 with the error type `overloaded_error` (not the 529 that Anthropic's API uses for that type), and a started
+  stream's error event has that type.
 - Requests with `n > 1`, `best_of > 1` or `use_beam_search` are rejected with HTTP 400.
 - `GET /health` answers 200 while the deployment serves, degraded or not. Once the deployment cannot recover, the
   server starts shutting down after its next status refresh (once a second) and store read (up to 1 s), so about 2 s
@@ -146,7 +149,7 @@ node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the
   timeouts above 70 s.
 - `GET /fault_tolerance_status` returns the `state`, `active_ranks`, `failed_ranks`, the failed ranks' `replacements`
   (`pending` or `given_up`) and `last_transaction`, the last membership change. `/prometheus/metrics` reports them as
-  `trtllm_fault_tolerance_*` metrics, also without `return_perf_metrics`.
+  the metrics below, also without `return_perf_metrics`.
 - No replacement of a `given_up` rank starts automatically. A rank is given up when its replacements failed 3 times
   in a row, when a replacement cannot start at all (exit status 78, for example because its TensorRT-LLM version or
   checkpoint differs from the deployment's), when its GPU stays in use or a killed replacement does not end for
@@ -167,6 +170,20 @@ node's ranks are not in the deployment (check `--rejoin-node`, `--nodes` and the
 | `unprotected` | The rendezvous store has not answered yet, or not for 30 s, so a further failure is not recovered. |
 | `failed` | The deployment cannot recover. Start it again from outside, for example by submitting the job again. |
 | `stopped` | The deployment shut down without a failure. |
+
+Every metric has the labels `model_name` and `engine_type`. The rank and replacement metrics appear once a membership
+record was read, and `last_change_pause_seconds` once a membership change ended.
+
+| Metric | Type | Value |
+| --- | --- | --- |
+| `trtllm_fault_tolerance_state{state}` | gauge | 1 for the current state, 0 for the others |
+| `trtllm_fault_tolerance_stalled_seconds` | gauge | How long the active ranks have waited on a rank that makes no progress |
+| `trtllm_fault_tolerance_active_ranks` | gauge | Number of active ranks |
+| `trtllm_fault_tolerance_failed_ranks` | gauge | Number of failed ranks |
+| `trtllm_fault_tolerance_replacements{state}` | gauge | Failed ranks whose replacement is `pending` or `given_up` |
+| `trtllm_fault_tolerance_rank_restarts_total` | counter | Replacements that connected to the authority, over all ranks, including any later refused or ended during admission |
+| `trtllm_fault_tolerance_membership_changes_total{kind}` | counter | Ended membership changes by `kind`: `failover`, `admission` or `abort` |
+| `trtllm_fault_tolerance_last_change_pause_seconds` | gauge | Time from the detection of the last change's cause to its end |
 
 ## Limitations
 

@@ -19,17 +19,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    Dict,
-    List,
-    Literal,
-    Mapping,
-    Optional,
-    TypeVar,
-    get_args,
-)
+from typing import TYPE_CHECKING, Callable, Literal, Mapping, TypeVar, get_args
 
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -89,20 +79,18 @@ class FaultToleranceStatus(BaseModel):
     # How long the active ranks have waited on a rank that makes no progress.
     stalled_seconds: float
     # The fields below are None until a membership record was read.
-    generation: Optional[int] = None
-    active_ranks: Optional[List[int]] = None
-    failed_ranks: Optional[List[int]] = None
-    replacements: Optional[Dict[int, ReplacementState]] = None
-    incarnations: Optional[List[int]] = None
-    last_transaction: Optional[TransactionSummary] = None
+    generation: int | None = None
+    active_ranks: list[int] | None = None
+    failed_ranks: list[int] | None = None
+    replacements: dict[int, ReplacementState] | None = None
+    incarnations: list[int] | None = None
+    last_transaction: TransactionSummary | None = None
 
 
 _Generational = TypeVar("_Generational", MembershipRecord, TransactionSummary)
 
 
-def _latest(
-    last: Optional[_Generational], read: Optional[_Generational]
-) -> Optional[_Generational]:
+def _latest(last: _Generational | None, read: _Generational | None) -> _Generational | None:
     """Return ``read`` unless it is None or of an older generation than ``last``."""
     if read is None or (last is not None and read.generation < last.generation):
         return last
@@ -116,8 +104,8 @@ class FaultToleranceHealth:
         self,
         address: str,
         secret: str,
-        metric_labels: Optional[Mapping[str, str]] = None,
-        on_failed: Optional[Callable[[], None]] = None,
+        metric_labels: Mapping[str, str] | None = None,
+        on_failed: Callable[[], None] | None = None,
     ):
         """Prepare to read the membership status from the rendezvous store at ``address``.
 
@@ -137,17 +125,17 @@ class FaultToleranceHealth:
         self._secret = secret
         self._metric_labels = dict(metric_labels or {})
         self._on_failed = on_failed
-        self._store: Optional[SignedStore] = None
-        self._record: Optional[MembershipRecord] = None
-        self._transaction: Optional[TransactionSummary] = None
-        self._stalled_since_unix_ms: Optional[float] = None
+        self._store: SignedStore | None = None
+        self._record: MembershipRecord | None = None
+        self._transaction: TransactionSummary | None = None
+        self._stalled_since_unix_ms: float | None = None
         self._next_open = 0.0
-        self._answered_s: Optional[float] = None
+        self._answered_s: float | None = None
         self._authority_ended = False
         self._lock = threading.Lock()
         self._closed = threading.Event()
         self._last_status = self._status(authority_alive=False)
-        self._refresh_thread: Optional[threading.Thread] = None
+        self._refresh_thread: threading.Thread | None = None
 
     def start(self) -> None:
         """Read the status once, then start the thread that refreshes it."""
@@ -216,7 +204,7 @@ class FaultToleranceHealth:
             self._answered_s = time.monotonic()
             return True
 
-    def _get_if_set(self, key: str) -> Optional[bytes]:
+    def _get_if_set(self, key: str) -> bytes | None:
         return self._store.get(key) if self._store.check([key]) else None
 
     def _answered_recently(self) -> bool:
@@ -237,7 +225,7 @@ class FaultToleranceHealth:
         return False
 
     @staticmethod
-    def _parse(parse: Callable[[bytes], object], value: Optional[bytes]):
+    def _parse(parse: Callable[[bytes], object], value: bytes | None):
         if value is None:
             return None
         try:
@@ -345,7 +333,7 @@ class FaultToleranceMetricsCollector:
     REPLACEMENT_STATES = get_args(ReplacementState)
     CHANGE_KINDS = ("failover", "admission", "abort")
 
-    def __init__(self, health: FaultToleranceHealth, labels: Dict[str, str]):
+    def __init__(self, health: FaultToleranceHealth, labels: dict[str, str]):
         self._health = health
         self._labels = labels
 

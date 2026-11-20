@@ -29,13 +29,14 @@ import pickle  # nosec B403
 import secrets
 import select
 import socket
-import subprocess
+import subprocess  # nosec B404 - starts the membership authority with sys.executable and a fixed argv, no shell
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, List, NoReturn, Optional, Tuple
+from typing import TYPE_CHECKING, NoReturn, Optional
 
 from tensorrt_llm._utils import global_mpi_size, local_mpi_comm, set_mpi_world_comm
 from tensorrt_llm._wide_ep_fault_tolerance import (
@@ -98,7 +99,7 @@ _state = RankStartState(StartupRecord(report_progress=lambda: _report_startup_wa
 
 def ensure_rendezvous(
     orchestrator_type: Optional[str],
-) -> Tuple[Dict[str, str], Optional[socket.socket]]:
+) -> tuple[dict[str, str], Optional[socket.socket]]:
     """Return the shared secret and rendezvous address for the ranks this process starts.
 
     Exported values are kept. Otherwise the secret is new, and an SO_REUSEADDR socket that never
@@ -230,7 +231,7 @@ _HOST_WEIGHTS_CHECK_S = 1.0
 
 
 def wait_for_node_host_weights(
-    rank: int, ranks_without_host_weights: Callable[[], List[int]]
+    rank: int, ranks_without_host_weights: Callable[[], list[int]]
 ) -> None:
     """Wait until the other ranks on this node hold their EPLB host weights.
 
@@ -256,7 +257,7 @@ def wait_for_node_host_weights(
         waited = _peers_to_wait_for(ranks_without_host_weights)
 
 
-def _peers_to_wait_for(ranks_without_host_weights: Callable[[], List[int]]) -> List[int]:
+def _peers_to_wait_for(ranks_without_host_weights: Callable[[], list[int]]) -> list[int]:
     """Return the other ranks on this node whose replacements still build their host weights."""
     # The store can hold an older record written back, but the connection cannot. A rank builds
     # its host weights before it joins, so read the record first.

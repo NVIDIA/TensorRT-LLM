@@ -91,9 +91,18 @@ def _client(port):
 
 @pytest.fixture(autouse=True)
 def fresh_start(monkeypatch):
-    """Give each test the startup state of a process that has not started a rank yet."""
+    """Give each test the startup state of a process that has not started a rank yet.
+
+    A rank's startup sets the rank-crash kill grace in the environment and installs the
+    ``MnnvlDist`` factory, whose communicators ``Distributed.get`` caches. Neither outlives the test.
+    """
     record = StartupRecord(report_progress=lambda: startup_module._report_startup_wait(0))
     monkeypatch.setattr(startup_module, "_state", startup_module.RankStartState(record))
+    # setenv records the original value for the teardown, which delenv alone skips when unset.
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "")
+    monkeypatch.delenv(RANK_CRASH_KILL_GRACE_ENV)
+    yield
+    Distributed.get.cache_clear()
 
 
 @pytest.fixture

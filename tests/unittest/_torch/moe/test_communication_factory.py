@@ -614,25 +614,63 @@ def test_one_sided_runs_rank_mask_kernels_only_with_fault_tolerance(
     assert one_sided.call_args.kwargs["enable_wide_ep_fault_tolerance"] is fault_tolerance
 
 
-@pytest.mark.parametrize("fault_tolerance", [False, True])
-def test_fault_tolerance_reports_one_sided_error(
-    monkeypatch: pytest.MonkeyPatch, fault_tolerance: bool
-):
+def test_fault_tolerance_reports_one_sided_error(monkeypatch: pytest.MonkeyPatch):
     """Fault tolerance runs only on NVLinkOneSided, so its construction error is not swallowed."""
     model_config = _make_model_config(torch.float16)
-    model_config.enable_wide_ep_fault_tolerance = fault_tolerance
+    model_config.enable_wide_ep_fault_tolerance = True
     monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
     monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
     monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
 
-    if fault_tolerance:
-        with pytest.raises(
-            ValueError, match="requires the NVLinkOneSided.*strategy unavailable"
-        ) as error:
-            _create_one_sided(model_config, forced=False)
-        assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+    with pytest.raises(
+        ValueError, match="requires the NVLinkOneSided.*strategy unavailable"
+    ) as error:
+        _create_one_sided(model_config, forced=False)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+@pytest.mark.parametrize("fault_tolerance", [False, True])
+@pytest.mark.parametrize(
+    ("name", "value", "warned"),
+    [
+        ("TRTLLM_ALLTOALL_WATCHDOG_TIMEOUT_S", "5", "the all-to-all watchdog was removed"),
+        ("TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S", "1", "the all-to-all watchdog was removed"),
+        ("TLLM_FAULT_TOLERANCE_MODE", "1", "set enable_wide_ep_fault_tolerance=True"),
+        ("TLLM_FAULT_TOLERANCE_MODE", "0", None),
+    ],
+    ids=["watchdog-timeout", "watchdog-poll-interval", "mode-1", "mode-0"],
+)
+def test_removed_fault_tolerance_setting_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+    warned: str | None,
+    fault_tolerance: bool,
+):
+    """Every strategy selection warns about a set variable of the earlier fault tolerance mode."""
+    for removed in (
+        *communication_factory._REMOVED_WATCHDOG_ENVS,
+        communication_factory._FAULT_TOLERANCE_MODE_ENV,
+    ):
+        monkeypatch.delenv(removed, raising=False)
+    monkeypatch.setenv(name, value)
+    warnings = []
+    monkeypatch.setattr(
+        communication_factory.logger,
+        "warning_once",
+        lambda message, key: warnings.append((key, message)),
+    )
+    # Without attention DP the factory selects no all-to-all at all.
+    model_config = _make_model_config()
+    model_config.mapping.enable_attention_dp = False
+    model_config.enable_wide_ep_fault_tolerance = fault_tolerance
+
+    assert _create_one_sided(model_config, forced=False) is None
+    if warned is None:
+        assert warnings == []
     else:
-        assert isinstance(_create_one_sided(model_config, forced=False), AllGatherReduceScatter)
+        assert [key for key, _ in warnings] == [f"removed_env_{name}"]
+        assert warned in warnings[0][1]
 
 
 _NCCL_EP_QUANT_ALGOS = [
