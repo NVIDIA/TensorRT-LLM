@@ -181,7 +181,7 @@ record was read, and `last_change_pause_seconds` once a membership change ended.
 | `trtllm_fault_tolerance_active_ranks` | gauge | Number of active ranks |
 | `trtllm_fault_tolerance_failed_ranks` | gauge | Number of failed ranks |
 | `trtllm_fault_tolerance_replacements{state}` | gauge | Failed ranks whose replacement is `pending` or `given_up` |
-| `trtllm_fault_tolerance_rank_restarts_total` | counter | Replacements that the membership admitted, over all ranks |
+| `trtllm_fault_tolerance_rank_restarts_total` | counter | Replacements that connected to the authority, over all ranks, including any later refused or ended during admission |
 | `trtllm_fault_tolerance_membership_changes_total{kind}` | counter | Ended membership changes by `kind`: `failover`, `admission` or `abort` |
 | `trtllm_fault_tolerance_last_change_pause_seconds` | gauge | Time from the detection of the last change's cause to its end |
 
