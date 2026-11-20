@@ -54,6 +54,8 @@ H3 family       DiT attention    -->  DiT Q/K norm + RoPE  --> Triton DiT kernel
 
 Changing which channels the DiT rotates changes the [family op](ops/rope.py) and its reference tests. Changing the tile size for the same result belongs in the [kernel](kernels/fused_rope.py). The TP text encoder has its [own op](default_pipeline/ops/text_qk_norm_rope.py) and [kernel](default_pipeline/kernels/text_qk_norm_rope.py) for one-dimensional text positions.
 
+Use the `trtllm::minimax_h3_v2_` prefix for H3 V2 Python-registered Triton ops so V1 and V2 can coexist in the process-wide dispatcher. For a new C++/CUDA kernel, follow the [native code guide](../../../../../cpp/tensorrt_llm/modeling_v2/README.md) for namespaces and registration. [CMake discovery](../../../../../cpp/tensorrt_llm/modeling_v2/CMakeLists.txt) scans `_torch/modeling_v2/models/`. A family library under `_torch/visual_gen/models/` also needs build discovery and loading from the VisualGen path.
+
 ### Choose the sharing scope
 
 | Owner | When to use it | Example |
@@ -125,60 +127,6 @@ The [H3 attention component](components/dense_attention.py) adapts model inputs 
 Use the public operation or runner exported by the catalog entry. For example, H3 creates `FlashInferPrefillRunner` from [flashinfer_prefill.py](../../catalog/attention/flashinfer_prefill.py) and supplies the per-model plan cache. The [FA4 entry](../../catalog/attention/flash_attention_4.py) owns compatibility with the provider's `_flash_attn_fwd` binding. Keep mask conversion, layer selection and denoising policy with the model. Use the [Modeling V2 operation contract](../../../modeling_v2/README.md#writing-operations) for new entries.
 
 H3 keeps backend-specific adapters in the model. [Uncached attention](ops/uncached_attention.py) calls `FallbackFmha.attention`. [H3 PrimTS](components/trtllm_attention_prims.py) calls `_validate_block_sparse_static_profile`. The [TRTLLM SOL adapter](components/trtllm_attention.py) calls the [VisualGen SOL predictor](../../attention/backends/sparse/sol/predictor.py), and the [CuTe SOL path](components/dense_attention.py) checks availability through `_cute_fmha_kernel`. Treat these as implementation dependencies. New consumers should use an exported kernel or runner interface, or introduce a model-independent operation with a reference. See the [LLM V2 dependency rule](../../../modeling_v2/README.md#modeling-v1-code).
-
-## File map
-
-Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.py) exports the base V2 pipeline class. The other `__init__.py` files mark their directories as Python packages.
-
-| Family and target files | Responsibility |
-| --- | --- |
-| [pipeline_registry.py](pipeline_registry.py) | Select the checkpoint target and apply FastH3 attention settings before construction. |
-| [checkpoint.py](checkpoint.py) | Read and recognize the FastH3 inference manifest. |
-| [pipeline.py](pipeline.py) | Implement the shared pipeline lifecycle, request preparation, joint denoising loop and decode hooks. |
-| [packing.py](packing.py) | Build packed text, video, audio and reference rows, positions and timestep indices. |
-| [weights.py](weights.py) | Remap checkpoint keys and assemble transformer weights for loading. |
-| [default_pipeline/pipeline.py](default_pipeline/pipeline.py) | Compose the base target, choose workflow weights and configure conditioning, text encoder and scheduler shifts. |
-| [default_pipeline/ref2va.py](default_pipeline/ref2va.py) | Validate, normalize and order reference media for Ref2VA. |
-| [default_pipeline/text_encoder_tp.py](default_pipeline/text_encoder_tp.py) | Shard the Qwen3-VL text encoder and load its rank-local weights. |
-| [default_pipeline/ops/text_attention.py](default_pipeline/ops/text_attention.py) | Implement causal grouped-query attention for the TP text encoder. |
-| [default_pipeline/ops/text_qk_norm_rope.py](default_pipeline/ops/text_qk_norm_rope.py) | Define per-head Q/K normalization and rotation for the TP encoder's one-dimensional text positions. |
-| [default_pipeline/kernels/text_qk_norm_rope.py](default_pipeline/kernels/text_qk_norm_rope.py) | Normalize and rotate the rank-local Q and K heads of a packed projection in place. |
-| [fasth3/pipeline.py](fasth3/pipeline.py) | Configure gated video sparse attention (VSA) and select the trained generation and warmup schedules. |
-| [fasth3/schedule.py](fasth3/schedule.py) | Convert trained DMD steps to video and audio scheduler timesteps and sigmas. |
-
-| Components and parallelism | Responsibility |
-| --- | --- |
-| [components/dense_attention.py](components/dense_attention.py) | Select the H3 dense attention path, own its runner and adapt H3 masks and per-step choices to the operation. |
-| [components/trtllm_attention.py](components/trtllm_attention.py) | Pack H3 Q/K/V and run TRTLLM attention with the model's masks and sparse routes. |
-| [components/trtllm_attention_prims.py](components/trtllm_attention_prims.py) | Maintain contiguous attention plans and quantization state for an H3 instance. |
-| [components/transformer.py](components/transformer.py) | Assemble the token refiner, DiT blocks and joint audio/video outputs. |
-| [components/cudnn_runner.py](components/cudnn_runner.py) | Build dense cuDNN plans for H3. |
-| [components/skip_softmax_threshold.py](components/skip_softmax_threshold.py) | Resolve the current threshold for H3 CuTe attention. |
-| [components/attention.py](components/attention.py) | Partition heads across TP ranks and construct H3 projections, per-head normalization, three-axis RoPE and dense or gated attention. |
-| [components/linear.py](components/linear.py) | Compute projection shard bounds, own rank-local weights, dispatch GEMM and reduce row-parallel outputs. |
-| [components/projection_weights.py](components/projection_weights.py) | Partition, pack and quantize checkpoint tensors and scales for those projections. |
-| [components/mlp.py](components/mlp.py) | Compose gate/up projections, SwiGLU and down projection. |
-| [components/norm.py](components/norm.py) | Own H3 RMSNorm and per-head RMSNorm weights. |
-| [components/text_encoder.py](components/text_encoder.py) | Extract H3 conditioning from the required Qwen3-VL hidden layer. |
-| [components/vae.py](components/vae.py) | Prepare the video decoder and decode video and audio latents. |
-| [components/sequence_sharder.py](components/sequence_sharder.py) | Pad and shard refiner and DiT inputs, prepare padding masks, and gather and trim output rows. |
-| [components/ulysses_attention.py](components/ulysses_attention.py) | Compose head/sequence exchanges, projection ordering and CUDA stream synchronization. |
-| [components/tiled_vae.py](components/tiled_vae.py) | Partition video decode tiles across the participating VAE ranks and combine their results. |
-
-| Operations and kernels | Responsibility |
-| --- | --- |
-| [ops/uncached_attention.py](ops/uncached_attention.py) | Issue uncached TRTLLM attention for packed H3 rows. |
-| [kernels/sol_attention.py](kernels/sol_attention.py) | Launch SOL attention or invoke the supplied dense fallback. |
-| [ops/ulysses_qkv.py](ops/ulysses_qkv.py) | Exchange Q/K/V for synchronous H3 attention and convert asynchronous receive buffers into its attention layout. |
-| [ops/activation.py](ops/activation.py) | Define the H3 SwiGLU operation. |
-| [ops/adaln.py](ops/adaln.py) | Define adaptive normalization/modulation and its gated residual variant. |
-| [ops/quantized_gemm.py](ops/quantized_gemm.py) | Define FP8 scaled and block GEMMs and FP4 activation quantization. |
-| [ops/rope.py](ops/rope.py) | Apply partial rotary embedding and expose fused Q/K norm and RoPE. |
-| [ops/vsa.py](ops/vsa.py) | Build H3 tile routes, run fine attention and combine it with coarse attention through the learned gate. |
-| [kernels/fused_adaln.py](kernels/fused_adaln.py) | Implement and register H3's fused AdaLN Triton kernels. |
-| [kernels/fused_rope.py](kernels/fused_rope.py) | Implement and register fused BF16 Q/K normalization and RoPE. |
-
-Use the `trtllm::minimax_h3_v2_` prefix for H3 V2 Python-registered Triton ops so V1 and V2 can coexist in the process-wide dispatcher. For a new C++/CUDA kernel, follow the [native code guide](../../../../../cpp/tensorrt_llm/modeling_v2/README.md) for namespaces and registration. [CMake discovery](../../../../../cpp/tensorrt_llm/modeling_v2/CMakeLists.txt) scans `_torch/modeling_v2/models/`. A family library under `_torch/visual_gen/models/` also needs build discovery and loading from the VisualGen path.
 
 ## Test a change
 
