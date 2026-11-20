@@ -365,3 +365,4 @@ Being selective keeps CI turnaround fast and conserves hardware resources.
 Avoid habitually using `--disable-fail-fast` as it wastes scarce hardware resources. The CI system automatically reuses successful test stages when commits remain unchanged, and subsequent `/bot run` commands only retry failed stages. Overusing `--disable-fail-fast` keeps failed pipelines consuming resources (like DGX-H100s), increasing queue backlogs and reducing team efficiency.
 
 <!-- Test pull request for the bot --commit check. Do not merge. (1) -->
+<!-- Test pull request for the bot --commit check. Do not merge. (2) -->
