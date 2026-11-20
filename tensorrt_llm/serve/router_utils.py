@@ -515,7 +515,8 @@ class BlockHashMixin:
             return responses_utils._render_for_completion(
                 responses_utils._construct_harmony_messages(request, None)
             )
-        extension = self._render_resources(request.model).extension
+        res = self._render_resources(request.model)
+        extension = res.extension
         prepared = request.model_copy(deep=True)
         try:
             extension.apply_responses_extensions(prepared)
@@ -551,7 +552,9 @@ class BlockHashMixin:
             model=request.model,
             messages=messages,
             tools=tools,
-            chat_template_kwargs=responses_utils.reasoning_chat_template_kwargs(prepared),
+            chat_template_kwargs=responses_utils.reasoning_chat_template_kwargs(
+                prepared, model_type=res.model_type
+            ),
             injected_chat_template_kwargs=list(
                 responses_utils.reasoning_injected_chat_template_keys(prepared)
             ),
