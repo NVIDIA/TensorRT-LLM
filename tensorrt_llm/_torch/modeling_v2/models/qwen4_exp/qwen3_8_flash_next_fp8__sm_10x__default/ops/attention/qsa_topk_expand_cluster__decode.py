@@ -19,7 +19,8 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Consecutive scores a thread loads at once (one 16-byte load): a group.
 KPT = 4
@@ -585,7 +586,7 @@ class QsaTopkExpandClusterDecode(OpWrapper):
     groups' tokens below `sequence_lengths[row]`, then the causal tail, then -1.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(

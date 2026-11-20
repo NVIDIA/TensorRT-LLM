@@ -11,7 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 BLOCK = 512
 
@@ -47,7 +48,7 @@ class EmbedRows(OpWrapper):
     path. Ids past the table (or negative without `clamp`) read out of bounds: the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="batch-4 verify: 12 rows over 4 streams", spec=dict(rows=12, copies=4, clamp=False)),
         Cell(why="draft decode step: 1 row, clamped", spec=dict(rows=1, copies=1, clamp=True)),

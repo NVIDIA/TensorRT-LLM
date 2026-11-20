@@ -23,7 +23,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's geometry: 4 streams of 2560, rank-320 mixer bottleneck.
 CKPT_HC_COUNT = 4
@@ -67,7 +68,7 @@ class Qwen4ExpGatedResidual(OpWrapper):
     as stored (`nn.Linear` layout), nothing is cached.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: leading (token dims), inject (True). Every cell is this
     # checkpoint's 4x2560 bf16 geometry with synthetic weights of its measured

@@ -13,7 +13,8 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 def _ckpt(tokens: int, output_dtype: torch.dtype = torch.bfloat16, capture: bool = False) -> dict:
@@ -50,7 +51,7 @@ class RenormMoeRoutingOp(OpWrapper):
     expert parallelism -- every column of the row is ranked.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # The trunk pre-routes the trtllm-gen FP4 runner with bf16 weights at every
     # member: tp4/tep4 route every row the rank holds; dep4 routes the

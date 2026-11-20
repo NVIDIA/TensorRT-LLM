@@ -17,7 +17,8 @@ import triton
 # tensorrt_llm._torch.custom_ops` alone, torch.ops.trtllm has no
 # `fused_sigmoid_mul_inplace` (measured).
 import tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate as _gate_mod
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 def _launch(attention_output: torch.Tensor, gate: torch.Tensor) -> bool:
@@ -105,7 +106,7 @@ class FusedSigmoidMulInplace(OpWrapper):
     operands and everything downstream (the o projection). `gate` is read-only.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         # The target at tp1: hidden 6144, the trunk's gate off the 14080-wide fused

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 from .fp4_block_scale_moe_renorm_routed import _ckpt, run_renorm_moe
 from .fp4_block_scale_moe_renorm_routed import fp4_block_scale_moe_renorm_routed as _finalized
@@ -49,7 +50,7 @@ class Fp4BlockScaleMoeRenormPermuted(OpWrapper):
     finalized entry's output on the same operands.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(

@@ -33,7 +33,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.rms_norm_gated_token_major import (
     rms_norm_gated_token_major as _gated_norm,
 )
@@ -383,7 +384,7 @@ class GdnDecodeGatedNormPdl(OpWrapper):
     read and write, the gated RMS norm. The projection and the conv are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows; k_heads / v_heads (default 16 / 48); pool (default a contiguous 461-slot
     # pool | "coalesced": the cache manager's page, slot stride 36 layers' states -- 102 slots

@@ -32,7 +32,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
     _asm,
     _mapa,
@@ -884,7 +885,7 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
     handed on instead of the `[R, C * H]` normed stream.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     # spec: rows, site (combine: after a MoE block; inject: after an attention / GDN block or
     # the draft front's embedding add; norm: no pending block), cols (324, or 320 for the
     # stack-final / draft-head mixer); the checkpoint's geometry, bf16.
@@ -1023,7 +1024,7 @@ class Qwen4ExpHcDecodeRowsMix(OpWrapper):
     `qwen4_exp_hc_up_gate_mean`, from `hc_out` and its rstd instead of the normed stream.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="1 row: a one-request decode step / draft pass", spec=dict(rows=1)),
         Cell(why="16 rows: a 4-request MTP-3 verify step (MAX_ROWS)", spec=dict(rows=16)),

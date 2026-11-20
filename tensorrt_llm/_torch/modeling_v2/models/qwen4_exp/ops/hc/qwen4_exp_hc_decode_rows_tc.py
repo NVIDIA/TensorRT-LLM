@@ -39,7 +39,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
     _asm,
     _mapa,
@@ -1197,7 +1198,7 @@ class Qwen4ExpHcDecodeRowsFirst(OpWrapper):
     RMS statistics, first projection and activations.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="site after a MoE block: combine + injection, 2 rows",
@@ -1329,7 +1330,7 @@ class Qwen4ExpHcDecodeRowsMix(OpWrapper):
     (`xq` / `xsf` None without `global_scale`); one rounding per output.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="MoE site with NVFP4 output, 8 rows", spec=dict(rows=8, site="inject")),
         Cell(why="plain mix, 2 rows", spec=dict(rows=2, site="combine")),

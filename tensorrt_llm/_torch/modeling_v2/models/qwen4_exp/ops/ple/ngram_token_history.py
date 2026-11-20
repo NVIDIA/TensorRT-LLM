@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's PLE constants: `ngram_size` 3, so a 2-id context row
 #: (`Qwen4ExpPLECacheParams.ngram_context_len`).
@@ -98,7 +99,7 @@ class NgramTokenHistory(OpWrapper):
     assignment are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: lengths, slots, carries, pool_slots (the cache manager's width, not
     # the batch's), eos_density (0.0, of the packed ids), ids_dtype (int64),

@@ -47,7 +47,8 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_scores import (
     qsa_paged_index_scores as _index_scores,
 )
@@ -657,7 +658,7 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
     projection before and the selection after are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="decode, 1 row at position 8699 (a group's last token)", spec=dict(pos=(8699,))),

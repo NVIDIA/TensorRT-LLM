@@ -34,7 +34,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T as _ty
 from cutlass.cutlass_dsl import dsl_user_op
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 K, V, HIST = 128, 128, 16
 #: Value heads a q/k head serves.
@@ -2650,7 +2651,7 @@ class GdnCachedReplayCute(OpWrapper):
     of the input projection (unit head stride).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: the test harness's `_Bench` spec (path, n x t, steps with random acceptance, start,
     # accept, dup, H / HV, slots, page_layers) plus `strided_gates` (g / beta as column views of

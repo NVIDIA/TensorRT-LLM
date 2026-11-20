@@ -19,7 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modules.fla.fused_state_io import cast_scatter_fp32_vk_to_vk
 
 #: The Gated DeltaNet at tp1 and dep4: (H, HV, K, V).
@@ -447,7 +448,7 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     caller's. Returns `(o, None)`, `o` `[1, T, HV, V]` in `q.dtype` (`output` when given).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: geometry (H, HV, K, V); seqlens; `slots`-row pool with `indices`; pool_dtype;
     # output (None | "buffer" | "slice", a prefix view of a wider buffer); page_layers (the

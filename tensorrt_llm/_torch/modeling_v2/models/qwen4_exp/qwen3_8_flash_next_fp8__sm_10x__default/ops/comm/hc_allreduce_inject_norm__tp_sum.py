@@ -22,7 +22,8 @@ from typing import Sequence
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (  # noqa: E501
     qwen4_exp_hc_inject_norm,
 )
@@ -80,7 +81,7 @@ class HcAllreduceInjectNorm(OpWrapper):
     program_warps)`. `workspace`, `rank` and `nranks` are the stock IPC all-reduce's
     (`catalog/comm/allreduce`); `fits` says which operands the kernel takes."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"tp{world}: {rows} rows, {why}",

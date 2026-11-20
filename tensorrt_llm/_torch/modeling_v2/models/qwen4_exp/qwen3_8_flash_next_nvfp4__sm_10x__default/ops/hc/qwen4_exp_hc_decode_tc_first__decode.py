@@ -43,7 +43,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Largest row count this entry is certified for: two 128-row MMA tiles.
 MAX_ROWS = 256
@@ -592,7 +593,7 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     `qwen4_exp_hc_lowrank_act` compute (cuBLAS's split-K reduce included).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows, inject (True). The checkpoint's geometry throughout: hc_count 4,
     # rank 320, hidden 2560, the padded [384, K] weight, bf16. HC is replicated, so the

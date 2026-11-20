@@ -21,7 +21,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modules.fla.cached_replay import (
     fused_recurrent_gated_delta_rule_cached_replay_update as _cached_replay_update,
 )
@@ -124,7 +125,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     nothing is read or written for them, their output rows included.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: path ("small": no work items, the kernel commits a wrap itself |
     # "all_layer": work items + use_all_layer_commit, the test then runs the

@@ -12,7 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
     causal_conv1d_triton_update,
 )
@@ -255,7 +256,7 @@ class CausalConv1dTokenMajor(OpWrapper):
     contiguous token-major `[rows * p, C]` output.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="tep4 verify, 1 request x 3 tokens (MTP-2 c=1)", spec=dict(rows=1, p=3)),
         Cell(why="tep4 verify, 4 requests x 4 tokens (MTP-3)", spec=dict(rows=4, p=4)),

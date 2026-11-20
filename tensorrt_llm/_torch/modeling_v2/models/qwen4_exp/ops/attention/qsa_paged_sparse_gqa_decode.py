@@ -53,7 +53,8 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 # Approved exception (as for `qsa_paged_sparse_gqa`): QSA's sparse path has no torch.ops
 # surface; its row-count PDL policy is reached as Python.
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import _qsa_pdl_enabled
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa import (
     qsa_paged_sparse_gqa as _composition,
 )
@@ -692,7 +693,7 @@ class QsaPagedSparseGqaDecode(OpWrapper):
     The selection, the K/V store and the output projection are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="decode, 1 row at position 8700, gated", spec=dict(pos=(8700,), gated=True)),

@@ -10,7 +10,8 @@ from typing import Tuple
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 from . import qsa_triton_kernels__stable_jit as _qsa_kernels
 
@@ -113,7 +114,7 @@ class QsaPagedKvStore(OpWrapper):
     `(k_cache, v_cache)`, written in place.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(

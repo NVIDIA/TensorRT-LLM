@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's hyper-connection geometry: 4 streams of 2560, packed
 #: stream-major into a 10240-wide residual.
@@ -39,7 +40,7 @@ class Qwen4ExpPostInject(OpWrapper):
     formula), and the block itself are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: leading (token dims), hc_count, hidden, dtype; layout
     # "contiguous" (default) | "col_slice" (`buf[:, :width]`, last-dim stride 1).

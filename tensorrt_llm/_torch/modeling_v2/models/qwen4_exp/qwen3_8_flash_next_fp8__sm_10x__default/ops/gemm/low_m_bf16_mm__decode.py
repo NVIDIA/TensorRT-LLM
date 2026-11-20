@@ -19,7 +19,8 @@ from flashinfer.gemm.kernels import dense_bf16_gemm_direct as _fi_direct
 from flashinfer.gemm.kernels import dense_bf16_gemm_warp_splitk as _fi_warp
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 class _Plan(NamedTuple):
@@ -116,7 +117,7 @@ class LowMBf16Mm(OpWrapper):
     so it is safe after any kernel; it changes nothing on the cuBLAS branch.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # One cell per `_TABLE` tactic (PDL on), N=1288, both cuBLAS fallbacks and PDL off for each
     # FlashInfer kernel; `kind` pins the branch (the test's plan pins hold the other M buckets).

@@ -13,7 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Columns a program forms.
 BLOCK = 512
@@ -68,7 +69,7 @@ class MtpMoeCombineInject(OpWrapper):
     No input is written.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="tep4 draft step 1: 1 row", spec=_ckpt(1)),
         Cell(why="batch-4 draft step 0: 12 rows", spec=_ckpt(12)),

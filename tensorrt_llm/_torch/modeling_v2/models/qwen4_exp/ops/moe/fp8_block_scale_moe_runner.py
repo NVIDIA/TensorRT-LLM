@@ -13,7 +13,8 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Block edge on every scale axis: 1x128 activations, 128x128 weights.
 BLOCK = 128
@@ -101,7 +102,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     `output` is given (the result is then in `output`).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         # The token column at the checkpoint geometry, the only one the draft layer

@@ -15,7 +15,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's shared expert: intermediate 640, the fused GEMM output row 2 * 640 + 8.
 _INTER = 640
@@ -43,7 +44,7 @@ class SiluAndMulRows(OpWrapper):
     `out` are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="prefill chunk 16384 rows of the fused 1288-wide output", spec=dict(rows=16384)),

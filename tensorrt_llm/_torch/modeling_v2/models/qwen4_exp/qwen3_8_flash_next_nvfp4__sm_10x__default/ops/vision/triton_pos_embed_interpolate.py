@@ -19,7 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint: num_position_embeddings 2304 (a 48 x 48 grid), hidden 1152,
 #: spatial_merge_size 2.
@@ -162,7 +163,7 @@ class TritonPosEmbedInterpolate(OpWrapper):
     embeddings, the 2-D rope, and joining images are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: t, h, w, num_grid_per_side, m_size, dtype, hidden. The tower is
     # replicated on every rank, so these are every member's shapes.

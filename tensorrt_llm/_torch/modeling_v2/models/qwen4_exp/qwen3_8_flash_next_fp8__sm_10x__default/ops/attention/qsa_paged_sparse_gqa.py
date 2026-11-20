@@ -12,7 +12,8 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 from .qsa_triton_kernels__stable_jit import (
     can_fuse_splitk_output_gate as _can_fuse_qsa_splitk_output_gate,
@@ -145,7 +146,7 @@ class QsaPagedSparseGqa(OpWrapper):
     handed a gate it cannot carry.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         # ---- tp4 / tep4 / dep4 ranks: 6 / 1 and 24 / 2 heads, trunk-layout pools ----------
