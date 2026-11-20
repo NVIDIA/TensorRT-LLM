@@ -1277,7 +1277,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             (False, False, False, True, False),
             (True, False, True, True, False),
             (True, True, True, True, False),
-            # low_precision_combine only valid with attention_dp=True
             (False, True, False, False, True),
             (True, True, True, True, True),
         ])
@@ -1291,6 +1290,27 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          overlap_scheduler, low_precision_combine, tp_size,
                          pp_size, ep_size, torch_compile, mtp_nextn,
                          moe_tactic):
+        # create_strategy passes use_low_precision_moe_combine to
+        # NVLinkOneSided, NVLinkTwoSided, NcclEP, and DeepEPLowLatency. It
+        # returns None or AllGatherReduceScatter, without the flag, when
+        # attention DP is off or dp_size == 1, moe_tp_size != 1, or the tactic
+        # disallows all-to-all. dp_size is tp_size under attention_dp, and
+        # moe_tp_size is tp_size // ep_size.
+        tactic_allows_alltoall = moe_tactic != "cutlass"
+        if moe_tactic == "cutlass":
+            from tensorrt_llm._torch.moe.fused_moe.impl_environment import \
+                collect_moe_environment
+
+            # Cutlass NVFP4 issues the fused_moe op, which rejects all-to-all
+            # unless the build enables the OSS Cutlass MoE GEMM.
+            tactic_allows_alltoall = collect_moe_environment().oss_cutlass_moe
+        if low_precision_combine and not (attention_dp and tp_size > 1
+                                          and tp_size == ep_size
+                                          and tactic_allows_alltoall):
+            pytest.skip(
+                "use_low_precision_moe_combine is unused unless attention_dp, "
+                "dp_size > 1, moe_tp_size == 1, and the tactic allows all-to-all"
+            )
         skip_unless_moe_tactic_runs_here(moe_tactic)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -3435,11 +3455,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         ])
     def test_eagle3(self, eagle3_one_model, enable_chunked_prefill,
                     enable_max_concurrency, enable_draft_len_schedule):
-        max_concurrency = 100 if enable_max_concurrency else None
+        max_concurrency = 16 if enable_max_concurrency else None
         draft_len_schedule = {
-            50: 4,
-            200: 3,
-            350: 2
+            4: 4,
+            16: 2,
+            32: 1,
         } if enable_draft_len_schedule else None
         cuda_graph_config = (CudaGraphConfig(
             enable_padding=True, max_batch_size=32) if enable_draft_len_schedule
