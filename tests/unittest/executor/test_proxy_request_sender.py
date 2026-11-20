@@ -425,8 +425,14 @@ def test_worker_unpacks_batched_requests_in_order():
         def get(self):
             return self._messages.pop(0)
 
-    request_queue = _ListQueue(["a", _payloads("b", "c"), "d", None, "after sentinel"])
+    request_queue = _ListQueue(
+        [_payloads("a"), _payloads("b", "c"), _payloads("d"), None, "after sentinel"]
+    )
     assert list(_incoming_requests(request_queue)) == ["a", "b", "c", "d"]
+
+    # Every command message is a list; anything else is not a command.
+    with pytest.raises(TypeError, match="Expected a list of pickled commands"):
+        list(_incoming_requests(_ListQueue([_payloads("a"), pickle.dumps("b")])))
 
 
 @pytest.mark.timeout(30, method="thread")

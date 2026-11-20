@@ -376,9 +376,15 @@ def _incoming_requests(request_queue: IpcQueue,
                        poll_control: Optional[Callable[[], bool]] = None):
     """Yield the proxy's requests until its shutdown sentinel arrives.
 
-    With TRTLLM_PROXY_BATCH_REQUESTS=1 the proxy sends a burst of requests as
-    one list of pickled requests. ``request_queue.get()`` has already
-    authenticated that message, and with it every payload inside.
+    Every command message is a list of pickled requests; with
+    TRTLLM_PROXY_BATCH_REQUESTS=1 one list carries a burst of requests.
+    ``request_queue.get()`` has already authenticated that message, and with
+    it every payload inside. Any other message is rejected.
+
+    ``poll_control`` returns True while a profile operation is pending. The
+    loop then waits for a command in short polls and calls it between them,
+    so the operation is acknowledged when it completes instead of when the
+    next command arrives.
     """
     while True:
         if poll_control is not None and poll_control():
@@ -386,42 +392,41 @@ def _incoming_requests(request_queue: IpcQueue,
                 continue
         if (msg := request_queue.get()) is None:
             return
-        if isinstance(msg, list):
-            for payload in msg:
-                yield pickle.loads(payload)  # nosec B301
-        else:
-            yield msg
+        if not isinstance(msg, list):
+            raise TypeError(f"Expected a list of pickled commands, got "
+                            f"{type(msg).__name__}")
+        for payload in msg:
+            yield pickle.loads(payload)  # nosec B301
 
 
 def _dispatch_requests(worker: GenerationExecutorWorker,
                        request_queue: IpcQueue) -> None:
     """Keep command ingress live while serialized profiling control waits."""
-    profile_ack_queue = None
-    profile_ack_addr = None
+    # The acknowledgement address and the queue connected to it.
+    profile_ack: Optional[tuple[tuple[str, Optional[bytes]], IpcQueue]] = None
     pending = None
-    pending_request = None
 
     def send_profile_ack(kind: str, err: Optional[str],
                          req: StartProfileRequest | StopProfileRequest) -> None:
-        nonlocal profile_ack_queue, profile_ack_addr
+        nonlocal profile_ack
         addr = req.ack_addr
         if addr is None:
             return
-        if profile_ack_queue is None or addr != profile_ack_addr:
-            if profile_ack_queue is not None:
-                profile_ack_queue.close()
-            profile_ack_queue = IpcQueue(addr,
-                                         is_server=False,
-                                         name="worker_profile_ack_queue")
-            profile_ack_addr = addr
+        if profile_ack is None or addr != profile_ack[0]:
+            if profile_ack is not None:
+                profile_ack[1].close()
+            profile_ack = (addr,
+                           IpcQueue(addr,
+                                    is_server=False,
+                                    name="worker_profile_ack_queue"))
         try:
-            profile_ack_queue.put((kind, err), timeout=1.0)
+            profile_ack[1].put((kind, err), timeout=1.0)
         except zmq.Again:
             logger.warning("Profile control acknowledgement timed out")
 
     def run_profile(
         req: StartProfileRequest | StopProfileRequest
-    ) -> tuple[str, Optional[str]]:
+    ) -> tuple[str, Optional[str], StartProfileRequest | StopProfileRequest]:
         kind = "start" if isinstance(req, StartProfileRequest) else "stop"
         try:
             if kind == "start":
@@ -433,20 +438,19 @@ def _dispatch_requests(worker: GenerationExecutorWorker,
                 # Trace export remains on the executor thread; this caller
                 # waits for its completion without blocking command ingress.
                 worker.stop_profile()
-        except RequestError as error:
-            return kind, str(error)
-        return kind, None
+        except Exception as error:
+            # A failed profile operation is reported to its caller and never
+            # ends command ingress.
+            return kind, str(error), req
+        return kind, None, req
 
     def poll_profile() -> bool:
-        nonlocal pending, pending_request
+        nonlocal pending
         if pending is not None and pending.done():
-            completed, req = pending, pending_request
-            pending = pending_request = None
-            kind, error = completed.result()
-            send_profile_ack(kind, error, req)
+            completed, pending = pending, None
+            send_profile_ack(*completed.result())
         return pending is not None
 
-    completed_normally = False
     try:
         # Threads start lazily. At most one profile operation is admitted;
         # subsequent controls get a rejection rather than accumulating work.
@@ -464,7 +468,6 @@ def _dispatch_requests(worker: GenerationExecutorWorker,
                             kind, "Profiling control is already in progress",
                             req)
                     else:
-                        pending_request = req
                         pending = profile_executor.submit(run_profile, req)
                 elif isinstance(req, GenerationRequest):
                     try:
@@ -476,17 +479,12 @@ def _dispatch_requests(worker: GenerationExecutorWorker,
                             ErrorResponse(req.id, e, req.id))
                 else:
                     raise ValueError(f"Unknown request type: {type(req)}")
-
-            completed_normally = True
+        # The profile thread has joined, so a pending operation is complete
+        # and is acknowledged before engine teardown.
+        poll_profile()
     finally:
-        try:
-            # The executor has joined before engine teardown. A shutdown
-            # sentinel does not acknowledge an unfinished trace export.
-            if completed_normally:
-                poll_profile()
-        finally:
-            if profile_ack_queue is not None:
-                profile_ack_queue.close()
+        if profile_ack is not None:
+            profile_ack[1].close()
 
 
 @contextmanager

@@ -24,6 +24,7 @@ import pickle
 import queue
 import threading
 import time
+from contextlib import closing
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,7 +55,7 @@ pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
 @pytest.mark.threadleak(enabled=True)
 @pytest.mark.timeout(15, method="thread")
-@pytest.mark.parametrize("outcome", ["success", "rejected", "fatal"])
+@pytest.mark.parametrize("outcome", ["success", "rejected", "failed"])
 def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
     address = (f"ipc://{tmp_path}/commands", b"k" * 32)
     entered = threading.Event()
@@ -70,7 +71,7 @@ def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
             assert release.wait(5)
             if outcome == "rejected":
                 raise RequestError("profile rejected")
-            if outcome == "fatal":
+            if outcome == "failed":
                 raise RuntimeError("profile failed")
 
         def submit(self, request):
@@ -120,29 +121,54 @@ def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
         assert errors.empty()
         assert not ack.poll(0.01), "profile acknowledged before trace export completed"
         release.set()
-        if outcome == "fatal":
-            error = errors.get(timeout=3)
-            assert isinstance(error, RuntimeError)
-            assert str(error) == "profile failed"
-        else:
-            assert ack.get(timeout=3) == (
-                "stop",
-                "profile rejected" if outcome == "rejected" else None,
-            )
+        assert ack.get(timeout=3) == (
+            "stop",
+            {"success": None, "rejected": "profile rejected", "failed": "profile failed"}[outcome],
+        )
     finally:
         release.set()
         senders[1].close(timeout=3)
-        senders[0].close(timeout=3, send_sentinel=outcome != "fatal")
+        senders[0].close(timeout=3, send_sentinel=True)
         thread.join(timeout=3)
         ack.close()
     assert not thread.is_alive()
-    if outcome == "fatal":
-        # Closing the failed worker's ingress can independently notify both
-        # frontend owners before their orderly cleanup begins.
-        while not errors.empty():
-            assert isinstance(errors.get_nowait(), ConnectionError)
-    else:
-        assert errors.empty()
+    assert errors.empty()
+
+
+@pytest.mark.threadleak(enabled=True)
+@pytest.mark.timeout(15, method="thread")
+def test_invalid_profile_start_is_acknowledged_and_ingress_continues():
+    """``LLM.start_profile(num_steps=0)`` reaches the worker unvalidated."""
+    received = []
+
+    class Worker:
+        def start_profile(self, **kwargs):
+            raise ValueError("num_steps must be >= 1")
+
+        def submit(self, request):
+            received.append(request.id)
+
+    request = GenerationRequest([1], SamplingParams())
+    request.set_id(3)
+    with closing(IpcQueue(is_server=True)) as ack:
+
+        class Commands:
+            def __init__(self):
+                self._messages = [
+                    [pickle.dumps(StartProfileRequest(num_steps=0, ack_addr=ack.address))],
+                    [pickle.dumps(request)],
+                    None,
+                ]
+
+            def poll(self, timeout):
+                return True
+
+            def get(self):
+                return self._messages.pop(0)
+
+        _dispatch_requests(Worker(), Commands())
+        assert ack.get(timeout=3) == ("start", "num_steps must be >= 1")
+    assert received == [3]
 
 
 @pytest.fixture
