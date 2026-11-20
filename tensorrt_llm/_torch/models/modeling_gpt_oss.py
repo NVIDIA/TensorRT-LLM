@@ -9,6 +9,7 @@ from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from transformers import GptOssConfig
 
+from tensorrt_llm._torch.configs.gpt_oss import normalize_gpt_oss_config
 from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -602,20 +603,7 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
         self,
         model_config: ModelConfig[GptOssConfig],
     ):
-        # Map config to HF format.
-        if hasattr(model_config.pretrained_config, 'num_experts'):
-            model_config.pretrained_config.num_local_experts = model_config.pretrained_config.num_experts
-            model_config.pretrained_config.num_experts_per_tok = model_config.pretrained_config.experts_per_token
-            model_config.pretrained_config.rope_scaling = {
-                'factor':
-                model_config.pretrained_config.rope_scaling_factor,
-                'beta_fast':
-                model_config.pretrained_config.rope_ntk_beta,
-                'beta_slow':
-                model_config.pretrained_config.rope_ntk_alpha,
-                'original_max_position_embeddings':
-                model_config.pretrained_config.initial_context_length,
-            }
+        normalize_gpt_oss_config(model_config.pretrained_config)
         if model_config.pretrained_config.torch_dtype is None:
             model_config.pretrained_config.torch_dtype = torch.bfloat16
 

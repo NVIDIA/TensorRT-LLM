@@ -234,7 +234,9 @@ def test_exaone4_5_config_preserves_unexpected_layer_type_mismatch():
     text_config["num_nextn_predict_layers"] = 1
     text_config["layer_types"].extend(["sliding_attention", "sliding_attention"])
 
-    with pytest.raises(StrictDataclassClassValidationError, match="number of layer types"):
+    with pytest.raises(
+        StrictDataclassClassValidationError, match=r"number of (?:layer types|`layer_types`)"
+    ):
         Exaone4_5Config(**config)
 
 
