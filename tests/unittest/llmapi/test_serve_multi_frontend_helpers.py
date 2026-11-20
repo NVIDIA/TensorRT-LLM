@@ -31,6 +31,7 @@ from aiohttp import web
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.routing import Match
+from test_common.serve.app_factory import AggConfig, isolated_serve_env
 from utils.executor_stubs import bare_proxy
 
 from tensorrt_llm._utils import AdjustedSteadyClock
@@ -270,12 +271,6 @@ def test_watchdog_uses_launcher_health_without_transport_grace(tmp_path, monkeyp
             available=True, fail=lambda _: None, close=lambda **_: None
         ),
     )
-    server = object.__new__(OpenAIServer)
-    server.embedding_batcher = None
-    server.generator = SimpleNamespace(_executor=proxy, _check_health=proxy.check_health)
-    server._uvicorn_server = None
-    server._http_shutdown_requested = False
-    monkeypatch.setattr(openai_server, "_record_generator_termination", lambda _: None)
     monkeypatch.setattr(signal, "raise_signal", lambda _: None)
     deaths = []
 
@@ -300,7 +295,7 @@ def test_watchdog_uses_launcher_health_without_transport_grace(tmp_path, monkeyp
             if failure == "engine":
                 proxy._handle_worker_death(RuntimeError("command connection lost"))
             else:
-                server.embedding_batcher = SimpleNamespace(is_alive=lambda: False)
+                server.encode_batcher = SimpleNamespace(is_alive=lambda: False)
             assert (await server.health()).status_code == 503
             await asyncio.wait_for(task, timeout=10)
             assert len(deaths) == 1
@@ -310,7 +305,12 @@ def test_watchdog_uses_launcher_health_without_transport_grace(tmp_path, monkeyp
             await forwarder.close()
             await asyncio.to_thread(launcher.close)
 
-    asyncio.run(run())
+    with isolated_serve_env(tmp_path / "serve") as env:
+        server = env.build_openai_server(AggConfig())
+        # The real proxy's health contract, behind the real /health handler.
+        server.generator._executor = proxy
+        env.record_terminations()
+        asyncio.run(run())
 
 
 def test_watchdog_notices_a_gone_launcher_process(tmp_path) -> None:
@@ -372,29 +372,6 @@ def test_on_launcher_lost_fails_fast_then_shuts_down(
 
     assert fatal_errors == [error]
     # Only HTTP shutdown prevents another signal; executor cleanup is separate.
-    assert signals == ([] if server_exiting else [signal.SIGINT])
-    assert terminations == ([] if server_exiting else [server.generator])
-
-
-@pytest.mark.parametrize("server_exiting", [False, True])
-def test_fatal_health_requests_http_shutdown_after_executor_cleanup(
-    monkeypatch, server_exiting
-) -> None:
-    proxy = bare_proxy(doing_shutdown=True, _fatal_error=RuntimeError("worker died"))
-    server = object.__new__(OpenAIServer)
-    server.generator = SimpleNamespace(_executor=proxy, _check_health=proxy.check_health)
-    server.embedding_batcher = None
-    server._uvicorn_server = SimpleNamespace(should_exit=server_exiting)
-    server._http_shutdown_requested = False
-    signals, terminations = [], []
-    monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
-    monkeypatch.setattr(openai_server, "_record_generator_termination", terminations.append)
-
-    async def probe() -> None:
-        assert (await server.health()).status_code == 503
-        assert (await server.health()).status_code == 503
-
-    asyncio.run(probe())
     assert signals == ([] if server_exiting else [signal.SIGINT])
     assert terminations == ([] if server_exiting else [server.generator])
 

@@ -20,12 +20,13 @@ Tests cover:
 - WorkerProcessMonitor process-liveness detection
 - GenerationExecutorProxy.check_health(), pre_shutdown() and
   _error_monitor_loop(), run on a proxy built without workers
-- GrpcRequestManager.health_check(), the OpenAIServer /health endpoint and
-  BaseLLM._check_health()
+- GrpcRequestManager.health_check() and BaseLLM._check_health()
+
+The OpenAIServer /health endpoint is tested through the real constructor in
+tests/unittest/serve/api/ops/system/test_system_endpoints.py.
 """
 
 import asyncio
-import signal
 import subprocess
 import sys
 import threading
@@ -48,8 +49,6 @@ from tensorrt_llm.executor.worker_process_monitor import (
     capture_worker_process_identity,
 )
 from tensorrt_llm.llmapi.llm import BaseLLM
-from tensorrt_llm.serve import openai_server
-from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
 
@@ -810,46 +809,6 @@ class TestGrpcHealthCheck:
         assert healthy is expected_healthy
         assert msg_substr in msg
         assert "second line" not in msg
-
-
-# ---------------------------------------------------------------------------
-# OpenAI /health endpoint
-# ---------------------------------------------------------------------------
-class TestOpenAIHealthEndpoint:
-    """Tests for the OpenAIServer /health endpoint with fatal error shutdown."""
-
-    @pytest.mark.parametrize(
-        "state,expect_code,sigint",
-        [
-            ("healthy", 200, False),
-            ("shutting_down", 503, False),
-            ("fatal", 503, True),
-            # Executor cleanup can start before HTTP shutdown is requested.
-            ("fatal_during_cleanup", 503, True),
-        ],
-    )
-    def test_health(self, monkeypatch, state, expect_code, sigint):
-        """A fatal engine answers 503 and requests HTTP shutdown once."""
-        executor = _Executor()
-        if state == "shutting_down":
-            executor.doing_shutdown = True
-        elif state.startswith("fatal"):
-            executor._set_fatal_error(RuntimeError("CUDA OOM"))
-            executor.doing_shutdown = state == "fatal_during_cleanup"
-        server = object.__new__(OpenAIServer)
-        server.generator = SimpleNamespace(_executor=executor, _check_health=executor.check_health)
-        server.embedding_batcher = None
-        server._uvicorn_server = None
-        server._http_shutdown_requested = False
-        signals = []
-        monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
-        monkeypatch.setattr(openai_server, "_record_generator_termination", lambda _: None)
-
-        async def probe_twice():
-            return [(await server.health()).status_code for _ in range(2)]
-
-        assert asyncio.run(probe_twice()) == [expect_code, expect_code]
-        assert signals == ([signal.SIGINT] if sigint else [])
 
 
 # ---------------------------------------------------------------------------

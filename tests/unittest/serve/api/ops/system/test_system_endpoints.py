@@ -21,6 +21,7 @@ linger as a zombie; the signal is patched out here before any unhealthy request.
 """
 
 import signal
+from types import SimpleNamespace
 
 import pytest
 from test_common.serve.app_factory import AggConfig
@@ -82,15 +83,30 @@ def test_fatal_error_triggers_sigint_and_termination_record(role, serve_env, sig
 
 
 @pytest.mark.parametrize("role", [None, ServerRole.MM_ENCODER], ids=["llm", "mm"])
-def test_fatal_error_during_shutdown_signals_once(role, serve_env, sigint_recorder):
+def test_fatal_error_during_executor_cleanup_signals_once(role, serve_env, sigint_recorder):
+    # Executor cleanup can start before HTTP shutdown, for example after the
+    # engine marked itself dead; HTTP serving must still stop, once.
     server = serve_env.build_openai_server(AggConfig(role=role))
     client = serve_env.client(server.app)
     seen = serve_env.record_terminations()
     server.generator._executor._fatal_error = RuntimeError("boom")
     server.generator._executor.doing_shutdown = True
+    assert client.get("/health").status_code == 503
+    assert client.get("/health").status_code == 503
+    assert sigint_recorder == [signal.SIGINT]
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("role", [None, ServerRole.MM_ENCODER], ids=["llm", "mm"])
+def test_fatal_error_while_http_shutdown_runs_does_not_signal(role, serve_env, sigint_recorder):
+    server = serve_env.build_openai_server(AggConfig(role=role))
+    client = serve_env.client(server.app)
+    seen = serve_env.record_terminations()
+    server._uvicorn_server = SimpleNamespace(should_exit=True)
+    server.generator._executor._fatal_error = RuntimeError("boom")
     response = client.get("/health")
     assert response.status_code == 503
-    assert sigint_recorder == [], "a teardown already in progress must not stack signals"
+    assert sigint_recorder == [], "an HTTP shutdown already in progress must not stack signals"
     assert seen == []
 
 
