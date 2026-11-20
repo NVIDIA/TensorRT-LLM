@@ -390,6 +390,8 @@
 /tests/scripts/perf-sanity/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/unittest/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/unittest/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
+/tests/test_common/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
+/jenkins/scripts/cbts/cbts/rules/visual_gen.py @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-torch-visual-gen-devs
 
 # ===== SCAFFOLDING =====
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671

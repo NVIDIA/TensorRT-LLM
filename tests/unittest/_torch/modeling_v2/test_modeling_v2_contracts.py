@@ -23,24 +23,36 @@ _UNIT_ROOT = Path(__file__).resolve().parent
 
 
 def _entry_files() -> list[Path]:
-    """Every entry module: the shared catalog, each family's ``ops/`` and each target's."""
+    """Entry modules in the shared catalogs, model families and targets."""
     shared = (_ROOT / "catalog").glob("*/*.py")
+    vg = _ROOT.parent / "visual_gen"
+    vg_catalog = (vg / "catalog").glob("*/*.py")
+    vg_family = (vg / "models").glob("*/ops/**/*.py")
+    vg_target = (vg / "models").glob("*/*/ops/**/*.py")
     family = (_ROOT / "models").glob("*/ops/*/*.py")
     owned = (_ROOT / "models").glob("*/*/ops/*/*.py")
-    return sorted(p for p in (*shared, *family, *owned) if p.name != "__init__.py")
+    return sorted(
+        p
+        for p in (*shared, *vg_catalog, *vg_family, *vg_target, *family, *owned)
+        if p.name != "__init__.py"
+    )
 
 
-def test_entry_discovery_covers_family_level_ops(tmp_path, monkeypatch):
+def test_entry_discovery_covers_shared_and_owned_ops(tmp_path, monkeypatch):
+    root = tmp_path / "modeling_v2"
     entries = {
-        tmp_path / "catalog/attention/shared.py",
-        tmp_path / "models/family/ops/attention/family.py",
-        tmp_path / "models/family/target/ops/attention/target.py",
+        root / "catalog/attention/shared.py",
+        root / "models/family/ops/attention/family.py",
+        root / "models/family/target/ops/attention/target.py",
+        tmp_path / "visual_gen/catalog/attention/shared.py",
+        tmp_path / "visual_gen/models/family/ops/family.py",
+        tmp_path / "visual_gen/models/family/target/ops/target.py",
     }
     for path in entries:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
         (path.parent / "__init__.py").touch()
-    monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], "_ROOT", root)
     assert set(_entry_files()) == entries
 
 
@@ -73,7 +85,9 @@ def test_call_reads_no_instance_state():
                     and isinstance(inner.value, ast.Name)
                     and inner.value.id == "self"
                 ):
-                    offenders.append(f"{path.relative_to(_ROOT)}:{inner.lineno} self.{inner.attr}")
+                    offenders.append(
+                        f"{path.relative_to(_ROOT.parent)}:{inner.lineno} self.{inner.attr}"
+                    )
     assert not offenders, (
         "__call__ must take every argument explicitly; these read instance state: "
         + ", ".join(offenders)
@@ -104,7 +118,7 @@ def test_is_valid_accepts_everything_call_accepts():
             params = [a.arg for a in fn.args.args]
             if not params or params[0] != "self":
                 problems.append(
-                    f"{path.relative_to(_ROOT)}: {cls.name}.{name} first param is not self"
+                    f"{path.relative_to(_ROOT.parent)}: {cls.name}.{name} first param is not self"
                 )
 
         is_valid = funcs.get("is_valid")
@@ -115,7 +129,7 @@ def test_is_valid_accepts_everything_call_accepts():
         missing = sorted(call_names - valid_names)
         if missing:
             problems.append(
-                f"{path.relative_to(_ROOT)}: {cls.name}.is_valid does not accept "
+                f"{path.relative_to(_ROOT.parent)}: {cls.name}.is_valid does not accept "
                 f"{missing} that __call__ accepts, and has no ** absorber"
             )
     assert not problems, "; ".join(problems)
@@ -129,21 +143,33 @@ _DRIVES_TARGET_CELLS = re.compile(r"^CELLS\s*=\s*certified_cells\(\w+,\s*TARGET_
 def test_every_entry_with_cells_has_a_test_that_drives_them():
     """A cell list no test runs reads as coverage that does not exist.
 
-    An entry that declares `Cell(` needs a test under this tree that names both
-    the entry and `.CELLS`, or assigns `CELLS = certified_cells(op, TARGET_CELLS)`,
+    An entry that declares `Cell(` needs a test that names both the entry and
+    `.CELLS`, or assigns `CELLS = certified_cells(op, TARGET_CELLS)`,
     which drives the entry's cells and its targets'. This reads the source, so it
     shows that some test refers to the cells, not that they ran.
+    VisualGen tests live under their catalog category, family or target.
     """
-    sources = [t.read_text() for t in Path(__file__).resolve().parent.rglob("*.py")]
+    llm_sources = [t.read_text() for t in _UNIT_ROOT.rglob("*.py")]
+    vg = _ROOT.parent / "visual_gen"
     undriven = []
     for entry in _entry_files():
         if "Cell(" not in entry.read_text():
             continue
+        sources = llm_sources
+        if entry.is_relative_to(vg):
+            owner = entry.parent.relative_to(vg)
+            if owner.parts[0] == "catalog":
+                mirror = _UNIT_ROOT.parent / "visual_gen" / owner / f"test_{entry.name}"
+                sources = [mirror.read_text()] if mirror.is_file() else []
+            else:
+                owner = Path(*owner.parts[: owner.parts.index("ops")])
+                test_dir = _UNIT_ROOT.parent / "visual_gen" / owner
+                sources = [t.read_text() for t in test_dir.rglob("test_*.py")]
         if not any(
             entry.stem in src and (".CELLS" in src or _DRIVES_TARGET_CELLS.search(src))
             for src in sources
         ):
-            undriven.append(str(entry.relative_to(_ROOT)))
+            undriven.append(str(entry.relative_to(_ROOT.parent)))
     assert not undriven, (
         f"{len(undriven)} entry(ies) declare cells that no test drives: "
         f"{', '.join(undriven)}. Parametrize the entry's test off its CELLS."

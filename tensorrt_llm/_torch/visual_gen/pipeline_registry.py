@@ -56,6 +56,9 @@ if TYPE_CHECKING:
     from .pipeline import BasePipeline
 
 
+_PipelineResolver = Callable[["DiffusionPipelineConfig", str], Type["BasePipeline"]]
+
+
 class PipelineComponent(str, Enum):
     """Identifiers for Diffusers-pipeline components.
 
@@ -91,6 +94,7 @@ class _PipelineEntry:
     download_patterns: List[str] = field(default_factory=list)
     doc: str = ""
     supports_nvfp4_vae: bool = False
+    opt_in: Optional[tuple[str, _PipelineResolver]] = None
 
 
 # Keyed by Diffusers ``_class_name`` (from either manifest format). ~3-5 entries
@@ -148,6 +152,21 @@ def register_pipeline(
     return decorator
 
 
+def register_pipeline_opt_in(
+    name: str, env_var: str
+) -> Callable[[_PipelineResolver], _PipelineResolver]:
+    """Attach an opt-in resolver to an existing checkpoint family."""
+
+    def decorator(resolver: _PipelineResolver) -> _PipelineResolver:
+        entry = PIPELINE_REGISTRY[name]
+        if entry.opt_in is not None:
+            raise ValueError(f"Pipeline opt-in already registered: {name}")
+        entry.opt_in = (env_var, resolver)
+        return resolver
+
+    return decorator
+
+
 class AutoPipeline:
     """Factory for creating pipelines from config."""
 
@@ -156,31 +175,32 @@ class AutoPipeline:
         config: "DiffusionPipelineConfig",
         checkpoint_dir: str,
     ) -> "BasePipeline":
-        """
-        Create pipeline instance from DiffusionPipelineConfig.
-        """
-        # Detect pipeline type from model_index.json or from model safetensors
-        class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
+        return AutoPipeline.resolve_class(config, checkpoint_dir)(config)
 
+    @staticmethod
+    def resolve_class(
+        config: "DiffusionPipelineConfig", checkpoint_dir: str
+    ) -> Type["BasePipeline"]:
+        """Resolve the checkpoint family and its registered variant."""
+        class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
         if class_name not in PIPELINE_REGISTRY:
             raise ValueError(
                 f"Unknown pipeline: '{class_name}'. "
                 f"Available: {list(PIPELINE_REGISTRY.keys())}\n"
                 f"Checkpoint: {checkpoint_dir}"
             )
-
         entry = PIPELINE_REGISTRY[class_name]
+        if entry.opt_in is not None:
+            from ._pipeline_opt_in import resolve_opt_in
+
+            target = resolve_opt_in(config, checkpoint_dir, class_name, entry, entry.opt_in)
+            if target is not None:
+                return target
+
         AutoPipeline._validate_vae_quantization(config, class_name, entry)
-        pipeline_class = entry.pipeline_cls
-
-        # Let the pipeline class upgrade itself to a specialised variant
-        # (e.g. LTX2Pipeline → LTX2TwoStagesPipeline) based on config.
-        pipeline_class = pipeline_class.resolve_variant(config)
-
+        pipeline_class = entry.pipeline_cls.resolve_variant(config)
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
-
-        # Instantiate pipeline with DiffusionPipelineConfig
-        return pipeline_class(config)
+        return pipeline_class
 
     @staticmethod
     def _validate_vae_quantization(

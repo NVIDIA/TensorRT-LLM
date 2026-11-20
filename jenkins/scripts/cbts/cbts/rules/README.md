@@ -276,7 +276,7 @@ Outcomes:
 
 ## VisualGenRule
 
-Path-only rule. Claims source files under `examples/visual_gen/`,
+Claims source files under `examples/visual_gen/`,
 `scripts/visualgen_eval/`, `tensorrt_llm/_torch/visual_gen/`,
 `tensorrt_llm/media/`, and `tensorrt_llm/visual_gen/` (excluding documentation,
 which `DocsRule` handles). It also claims the exact generated schema
@@ -290,7 +290,10 @@ used as test fixtures (e.g. `examples/visual_gen/cat_piano.png` and
 loaded by `tests/unittest/_torch/visual_gen/`), so edits to them must
 still force VG stages.
 
-Block selection — entry-pattern based only:
+A VisualGen model family with a `pipeline_registry.py` selects its routed target suites and mirrored family unit tests. A family router or native family change runs the family. Changes under the Modeling V2 catalog also select the VisualGen targets that transitively import the entry.
+
+Changes under `_torch/visual_gen/catalog/` select the mirrored operation tests, the routed targets that import the operation directly or through helpers, and the CPU operation-contract checks. Changes to a routed family or target’s `ops/` also run the CPU contract checks. Changes to the shared `OpWrapper` base select every routed VisualGen family and its catalog consumers.
+
 VisualGen has no `condition.terms.backend` of its own; VG entries
 live in `backend: pytorch` and `backend: tensorrt` blocks. A block
 "belongs to VG" iff any of its `tests:` entries lives under a dedicated
@@ -321,7 +324,7 @@ test set than internal VG changes without requiring all unrelated GPU tests.
 
 Outcomes:
 
-- No VG source files in the diff → rule returns `None`.
+- No VG source or imported catalog changes → rule returns `None`.
 - VG source touched, all internal (`examples/visual_gen/**`,
   `scripts/visualgen_eval/**`, or `tensorrt_llm/_torch/visual_gen/**`)
   → `scope=visualgenonly`;
