@@ -20,6 +20,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceArena.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceMessage.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceResult.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransferPlan.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ControlChannel.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/CreditScheduler.h"
@@ -78,8 +79,12 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //                                    availability have been observed.
 //        [S] ACK(rid, chunk, h)   -> releaseLocal() that chunk's region; acked++;
 //                                    all acked -> resolve the request's future SUCCESS.
+//        [S] NACK(rid, chunk, h)  -> fail the request (kPeerNack); like an ACK, it answers its chunk.
+//                                    For a failed request, ACKs and NACKs end its unanswered sent chunks.
 //        [R] WANT(rid, sizes[])   -> scheduler.onWant(peer:rid, sizes) -> send GRANT(s).
-//        [R] DATA(rid, chunk, h, plan) -> enqueue a scatter job over region `h`.
+//        [R] DATA(rid, chunk, h, plan) -> enqueue a scatter job over region `h`; a DATA it will not
+//                                    scatter (undecodable, or `h` no longer the flow's) -> NACK,
+//                                    unless region `h` is still scattering.
 //   2. poll every in-flight write (TransferStatus::wait(0)); on Done send DATA (data has
 //      landed at the remote) and mark on-wire. THIS is why no notifMsg is needed.
 //   3. drain scatter completions posted by workers: release receiver regions and re-GRANT.
@@ -91,40 +96,14 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // "peer\x1f rid" so multiple concurrent requests from one peer are independent flows.
 //
 // Lifetime: submit() returns a shared_future<BounceResult>; it resolves SUCCESS on full ACK and
-// FAILURE on transfer error, peer invalidation, shutdown, or request timeout. requestTimeoutMs must
-// be > 0 (the config layer enforces this): abandoned-flow resolution and the receiver lease both
-// hang off this timer, so disabling it would let a protocol-error flow hold wait() forever.
+// FAILURE on transfer error, peer invalidation, shutdown, or request timeout (see
+// BounceConfig::requestTimeoutMs). When a FAILURE resolves, and what it may still access, is
+// FailedRequest's contract.
 //
 // The agent (data plane) & ControlChannel are injected (not owned) so the same reactor runs
 // unchanged in tests and production (both over the real NIXL/zmq stack; failure tests subclass
 // NixlTransferAgent and override postXferRequest to inject deterministic transfer faults).
 // ============================================================================
-
-/// Why a bounce request resolved kFAILURE — carried inside the request's result future and
-/// surfaced to the upper layer through TransferStatus::getLastStatusStr(); the bare kFAILURE
-/// enum alone tells an operator nothing.
-enum class BounceFailReason : std::uint8_t
-{
-    kNone = 0,
-    kPlanRejected,      // request did not fit a transfer plan (submit-time TLLM_CHECK)
-    kNoProgressTimeout, // no GRANT/ACK progress within requestTimeoutMs (peer unreachable/stalled)
-    kPeerDropped,       // forgetPeer()/invalidateRemoteAgent while the request was in flight
-    kGatherFailed,      // gather kernel launch / event-record / async poll failure (CUDA error)
-    kWriteFailed,       // the RDMA write reported failure (getXferStatus == failed)
-    kProtocolError,     // GRANT mispair or plan overflow — the flow was abandoned
-    kShutdown,          // transport shut down while the request was still pending
-    kPeerNack,          // receiver reported it cannot complete the chunk/request (NACK)
-};
-
-[[nodiscard]] char const* toString(BounceFailReason reason);
-
-/// A bounce request's single result: the terminal state plus, on kFAILURE, its cause. The future
-/// is the ONE source of truth — no side channel to keep in sync.
-struct BounceResult
-{
-    TransferState state{TransferState::kFAILURE};
-    BounceFailReason reason{BounceFailReason::kNone};
-};
 
 /// Shared dependencies used by both roles. Holds the injected channel/agent/arena/exec (borrowed,
 /// not owned), the one CreditScheduler that carves the shared arena for both roles, and
@@ -274,7 +253,8 @@ public:
     explicit BounceSender(BounceContext& ctx);
 
     /// Submit a WRITE of (src -> dst) descriptors to `peer`. Returns a future that resolves
-    /// {kSUCCESS} once every chunk is scattered+ACKed, or {kFAILURE, reason} on error/shutdown.
+    /// {kSUCCESS} once every chunk is scattered+ACKed, or {kFAILURE, reason, outstanding} on
+    /// error/shutdown (see FailedRequest).
     /// Chunks are cut to cfg.maxChunkSizeBytes. NixlTransferAgent validates peer compatibility
     /// before calling this; direct users of BounceTransport must establish the same invariant
     /// themselves.
@@ -285,6 +265,7 @@ public:
     void onAck(std::string const& peer, BounceMsgHeader const& h);
     /// The receiver reported it cannot complete a chunk/request: fail the request now (kPeerNack)
     /// instead of waiting out requestTimeoutMs. Unknown / wrong-peer NACKs are dropped like ACKs.
+    /// For a failed request, a NACK answers one of its sent chunks, like an ACK.
     void onNack(std::string const& peer, BounceMsgHeader const& h);
     /// Issue the RDMA write for any chunk whose gather kernel has now completed (poll ctx->event,
     /// non-blocking). Decouples the IO thread from gather latency on a shared GPU. Returns true if it
@@ -300,16 +281,20 @@ public:
     bool drainOrphanGather();
     /// Retry parked credits for every request (called on the IO loop after ACKs free regions).
     void drainPendingPosts();
-    /// Fail requests that have made no progress within requestTimeoutMs (e.g. peer never granted).
+    /// Fail requests that have made no progress within requestTimeoutMs (e.g. peer never granted),
+    /// resolve failed requests whose answer wait is over, and drop those no longer worth keeping.
     void checkTimeouts();
-    /// A peer is gone: fail any in-flight request targeting it so its wait() returns.
+    /// A peer is gone: fail every active request targeting it (see FailedRequest; answers to its sent
+    /// chunks still reach our ROUTER).
     void forget(std::string const& peer);
-    /// Shutdown: fail every still-pending request, wait (bounded) for in-flight outbound writes to
-    /// reach a terminal state so the NIC is done reading the arena before it is freed, then release
-    /// each write's TransferStatus handle and return the parked gathers' exec contexts. Recycles no
-    /// regions (all are left to arena destruction) and sends no grants. Called after the IO/workers
-    /// are joined and local CUDA work has been synced.
+    /// Shutdown, called after the IO/workers are joined and local CUDA work has been synced: wait
+    /// (bounded) for in-flight outbound writes to reach a terminal state so the NIC is done reading the
+    /// arena before it is freed, then resolve every request (an active one fails with kShutdown unless
+    /// abandoned; see FailedRequest), release each write's TransferStatus handle and return the parked
+    /// gathers' exec contexts. Recycles no regions (all are left to arena destruction) and sends no grants.
     void failAll();
+    /// Failed requests still kept for the receiver's answers (observability; takes the request lock).
+    [[nodiscard]] std::size_t failedRequestCount();
 
     /// True while a local gather region is held or an orphaned write/gather is still in flight
     /// (drives the IO loop's 0ms busy-poll). Called on the IO thread.
@@ -393,6 +378,20 @@ private:
         // Pipeline-starvation spans (can open/close several times per request, one range per period):
         std::uint64_t nvtxCreditStarved{0}; // every credit consumed, chunks left -> next GRANT (onGrant ends)
         std::uint64_t nvtxArenaStarved{0};  // credits parked: no local region / exec ctx -> parked credits drain
+
+        [[nodiscard]] BounceFailReason failureCause(BounceFailReason trigger) const
+        {
+            return abandonReason != BounceFailReason::kNone ? abandonReason : trigger;
+        }
+    };
+
+    // A failed request whose chunks are retired (by failRequest or failAll): only its result and the
+    // receiver's answers to its sent chunks are left.
+    struct FailedEntry
+    {
+        std::string peer;
+        FailedRequest request;
+        std::uint64_t nvtxReq{0}; // submit -> result resolved
     };
 
     // Regions of a FAILED request whose RDMA write was still in flight (state == Writing).
@@ -424,6 +423,7 @@ private:
         std::uint64_t rid{};
         std::chrono::steady_clock::time_point since{}; // when the gather was orphaned (age for the stall warning)
         bool warned{false};                            // stall WARNING already emitted once
+        OutstandingAccess::SourceRead sourceRead;      // ends when the orphan is dropped
     };
 
     /// GRANT-mispair guard shared by attachCredits()/pumpRequest(): a credit smaller than its chunk
@@ -445,16 +445,50 @@ private:
     /// (rest parked/retried).
     /// Caller MUST hold mReqMu. Runs attachCredits() first so credit pairing stays in chunk order.
     void pumpRequest(std::uint64_t rid, Request& req);
-    /// Resolve `rid` to kFAILURE, recording `reason` (unless a more specific one was tagged earlier)
-    /// and logging ONE warning with the request's progress context — the single choke point that
-    /// keeps every failure mode observable. See the body for the region-recycling rules.
-    void failRequest(std::uint64_t rid, Request& req, BounceFailReason reason);
+    /// Fail the active request `rid`, logging ONE warning with its progress context — the single choke
+    /// point that keeps every failure mode observable: retire its chunks, cancel its flow and move it to
+    /// mFailed, where its result waits answerWaitFor(trigger) from `now` for answers. False if `rid` is not
+    /// active.
+    bool failRequest(std::uint64_t rid, BounceFailReason trigger, std::chrono::steady_clock::time_point now);
+    /// Orphan the chunks whose write or gather may still run (a running gather keeps a SourceRead on
+    /// `outstanding`) and recycle the rest. True if a write is still in flight.
+    bool retireChunks(std::uint64_t rid, Request& req, std::shared_ptr<OutstandingAccess> const& outstanding,
+        std::chrono::steady_clock::time_point now);
+    /// Retract the flow's credits on the receiver, once no RDMA write of it is in flight.
+    void cancelFlow(std::uint64_t rid, std::string const& peer, bool writeInFlight);
+    /// The failed form of `req`, holding its result back for `answerWait`. Ends `req`'s pipeline spans.
+    static FailedEntry toFailedEntry(Request&& req, BounceFailReason cause,
+        std::shared_ptr<OutstandingAccess> outstanding, std::chrono::milliseconds answerWait,
+        std::chrono::steady_clock::time_point now);
+    /// Recycle the Sent chunk an ACK/NACK answers (same chunk index and region handle): end its
+    /// ack-wait span, return its staging region and drop it from `posted`. False if none matches.
+    bool releaseAnsweredChunk(Request& req, BounceMsgHeader const& h);
+    /// An ACK or NACK for a request that is no longer active: the answer to a failed request's sent chunk.
+    void answerFailedRequest(std::string const& peer, BounceMsgHeader const& h);
+    void failStalledRequests(std::chrono::steady_clock::time_point now);
+    /// The one place that resolves failed requests whose answer wait is over and drops those no longer
+    /// worth keeping.
+    void settleFailedRequests(std::chrono::steady_clock::time_point now);
+    /// Log and trace a failed request's result that was just resolved with `unanswered` sent chunks.
+    void onFailureResolved(std::uint64_t rid, FailedEntry& failed, std::size_t unanswered);
+    /// A record of `req`'s Sent chunks: their DATA is out, so the receiver may scatter them into the
+    /// destination until it answers.
+    static std::shared_ptr<OutstandingAccess> unansweredSentChunks(Request const& req);
+    static void endPipelineSpans(Request& req);
+    static void endChunkSpans(Posted& p);
+
+    [[nodiscard]] std::chrono::milliseconds requestTimeout() const
+    {
+        return std::chrono::milliseconds(mCtx.cfg.requestTimeoutMs);
+    }
 
     BounceContext& mCtx;
 
-    // request table (IO thread + submit() from app threads)
+    // Request tables (IO thread + submit() from app threads): active requests, and failed ones whose
+    // result still waits for answers or is resolved in-doubt with someone holding it.
     std::mutex mReqMu;
     std::unordered_map<std::uint64_t, Request> mRequests;
+    std::unordered_map<std::uint64_t, FailedEntry> mFailed;
     std::atomic<std::uint64_t> mNextRid{1};
 
     std::vector<OrphanLocal> mOrphanLocal;
@@ -515,11 +549,18 @@ public:
     void forgetPeer(std::string const& peer);
 
     /// Submit a WRITE of (src -> dst) descriptors to `peer`. Returns a future that resolves
-    /// {kSUCCESS} once every chunk is scattered+ACKed, or {kFAILURE, reason} on error/shutdown.
+    /// {kSUCCESS} once every chunk is scattered+ACKed, or {kFAILURE, reason, outstanding} on
+    /// error/shutdown (see FailedRequest).
     [[nodiscard]] std::shared_future<BounceResult> submit(
         TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
     {
         return mSender.submit(srcDescs, dstDescs, peer);
+    }
+
+    /// Failed requests still kept for the receiver's answers (observability; takes the request lock).
+    [[nodiscard]] std::size_t failedRequestCount()
+    {
+        return mSender.failedRequestCount();
     }
 
     /// This side's EFFECTIVE per-chunk cap: cfg.maxChunkSizeBytes AFTER the constructor's clamp to
