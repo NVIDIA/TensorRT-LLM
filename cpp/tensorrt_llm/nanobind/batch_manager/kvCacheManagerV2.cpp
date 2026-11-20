@@ -3874,22 +3874,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "set_host_drop_hook",
             [](kv::KvCacheManager& self, nb::object callback)
             {
-                // The callable gets a list of (key: bytes, life_cycle: int, num_tokens: int, address: int, bytes: int),
-                // one per committed page the last host level drops, from inside eviction and before the slots are
-                // freed. `address` is valid only during the call. None removes the hook.
+                // See the stub in tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi for the record layout and the
+                // hook's rules.
                 kv::HostDropHook hook;
-                std::shared_ptr<PythonHostDropCallback> holder;
                 if (!callback.is_none())
                 {
-                    if (!PyCallable_Check(callback.ptr()))
+                    KVCM2_REJECT_IF_POISONED();
+                    TLLM_CHECK_WITH_INFO(
+                        PyCallable_Check(callback.ptr()), "set_host_drop_hook: callback must be callable or None");
+                    auto holder = std::make_shared<PythonHostDropCallback>(callback);
+                    hook = [holder = std::move(holder)](std::vector<kv::HostDropRecord> const& records)
                     {
-                        throw nb::type_error("set_host_drop_hook: callback must be callable or None");
-                    }
-                    holder = std::make_shared<PythonHostDropCallback>(callback);
-                    // The storage manager owns the hook, so its stats outlive it.
-                    auto* const stats = &self.storage().hostDropStats();
-                    hook = [holder, stats](std::vector<kv::HostDropRecord> const& records)
-                    {
+                        // Keeps the callable alive for this call even if the closure that holds it is destroyed.
+                        auto const callable = holder;
                         nb::gil_scoped_acquire gil;
                         // ~CommittedPage can get here from tp_dealloc while an exception is in flight: park it, so
                         // the hook starts with a clean error indicator and the caller gets its exception back.
@@ -3902,16 +3899,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                                 items.append(nb::make_tuple(nb::bytes(r.key.data(), r.key.size()), r.lifeCycle,
                                     r.numTokens, r.address, r.bytes));
                             }
-                            holder->get()(items);
+                            callable->get()(items);
                         }
                         catch (std::exception const& error) // nb::python_error included
                         {
-                            auto const n = ++stats->errors;
-                            if (n <= 20 || n % 10000 == 0)
-                            {
-                                TLLM_LOG_WARNING("KV cache host-drop hook raised (#%lld): %s",
-                                    static_cast<long long>(n), error.what());
-                            }
+                            // Rethrown as a plain C++ exception while the GIL is held (a python_error must not leave
+                            // it), so the storage manager counts and logs the failed hand-off as for a C++ hook.
+                            throw std::runtime_error(error.what());
                         }
                     };
                 }
@@ -3922,6 +3916,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 kv::HostDropHook previous;
                 {
                     auto const apiLock = self.lockExclusive();
+                    // A hook runs under this lock: a nested call would replace, and destroy, the running hook.
+                    TLLM_CHECK_WITH_INFO(
+                        apiLock.owns(), "set_host_drop_hook cannot be called from inside a KVCacheManager callback");
                     previous = self.storage().setHostDropHook(std::move(hook));
                 }
             },
@@ -3939,12 +3936,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     // Setup shares the storage with eviction and shutdown, so it takes the exclusive API lock (after
                     // the GIL is released, as in set_host_drop_hook) and runs in the manager's CUDA context.
+                    KVCM2_REJECT_IF_POISONED();
                     nb::gil_scoped_release release;
                     kv::CudaContextScope const context(self.cudaContext());
                     TLLM_CHECK_WITH_INFO(context.usable(), "host_drop_ring: the manager's CUDA context is unusable");
                     auto const apiLock = self.lockExclusive();
-                    info = self.storage().setUpHostDropRing(
-                        ringBytes, preferKernel, kv::HostDropLosslessConfig{lossless, losslessMaxWaitS, losslessChunk});
+                    TLLM_CHECK_WITH_INFO(
+                        apiLock.owns(), "host_drop_ring cannot be called from inside a KVCacheManager callback");
+                    info = self.storage().setUpHostDropRing(ringBytes, preferKernel,
+                        kv::HostDropLosslessConfig{
+                            .enabled = lossless, .maxWaitS = losslessMaxWaitS, .minChunk = losslessChunk});
                 }
                 return nb::make_tuple(info.address, info.slotBytes, info.numSlots, info.kernelCopy);
             },

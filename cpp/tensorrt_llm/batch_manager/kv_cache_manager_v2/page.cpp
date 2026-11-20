@@ -158,11 +158,13 @@ CommittedPage::CommittedPage(
 CommittedPage::~CommittedPage()
 {
     // A committed host page that leaves outside last-level eviction (e.g. a request releasing it) is handed off while
-    // its block link and slot still hold the data: staged into the ring in async mode, else passed to the hook.
+    // its block link and slot still hold the data: staged into the ring in async mode, else passed to the hook. Like
+    // every other Block access here, it is skipped once KVCM2 is poisoned (the block may be gone), and anything other
+    // than a std::exception, which the hand-off reports itself, poisons rather than terminates.
     if (cacheLevel != kHotLevel && block != nullptr && hasValidSlot() && !hostDropHandled
         && (manager->hostDropAsync() || manager->hasHostDropHook()))
     {
-        manager->handOffDestroyedPage(*this);
+        KVCM2_POISON_ON_EXCEPT([this]() { manager->handOffDestroyedPage(*this); });
     }
     if (block != nullptr)
     {

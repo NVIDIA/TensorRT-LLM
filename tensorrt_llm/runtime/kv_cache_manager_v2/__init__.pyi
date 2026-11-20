@@ -1995,6 +1995,71 @@ class KVCacheManager:
     def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
     @property
     def pool_group_descs(self) -> Sequence[PoolGroupDesc]: ...
+    def set_host_drop_hook(
+        self, callback: Callable[[list[tuple[bytes, int, int, int, int]]], None] | None
+    ) -> None:
+        """Hand the committed pages the last host-memory level drops to `callback`; None removes it.
+
+        `callback` gets one list per drop, of `(key, life_cycle, num_tokens, address, bytes)`
+        tuples: the radix block key, the page's life cycle, the tokens it holds, and the host
+        address and size in bytes of its cold-page form. `address` is valid only during the call.
+
+        The hook runs synchronously on the evicting thread, inside eviction and under the
+        manager's exclusive lock: it must not call the manager (a call from inside it raises),
+        and it delays the eviction for as long as it runs. An exception it raises is logged and
+        counted in `host_drop_stats()["errors"]`, and eviction goes on. `shutdown()` removes the
+        hook; until then the manager holds a reference to `callback`, so a hook that refers back
+        to its owner keeps both alive. Ignored once `host_drop_ring()` is set up.
+        """
+        ...
+    def host_drop_ring(
+        self,
+        ring_bytes: int,
+        prefer_kernel: bool = True,
+        lossless: bool = False,
+        lossless_max_wait_s: float = 2.0,
+        lossless_chunk: int = 64,
+    ) -> tuple[int, int, int, bool]:
+        """Set up the pinned ring the last host-memory level copies its drops into.
+
+        Returns `(address, slot_bytes, num_slots, kernel_copy)`. The ring takes at most
+        `ring_bytes` (at least 16 slots). From then on the hook is no longer called: each dropped
+        committed page is copied into a free slot on a dedicated stream, and the consumer gets it
+        from `drain_host_drops()`. A page that finds no free slot is dropped without a hand-off
+        and counted in `ring_full`, unless `lossless`: then the evicting call waits for released
+        slots, `lossless_chunk` at a time, within a budget of `lossless_max_wait_s` (finite, in
+        (0, 60]) per window of twice that, and drops pages without waiting for as long once the
+        budget is spent. The wait holds the manager's exclusive lock and releases the GIL.
+
+        `prefer_kernel=False` forces the host-callback copy; `kernel_copy` says which one runs.
+        A repeated call must pass the same arguments and returns the same ring. Must not be
+        called from inside a manager callback.
+        """
+        ...
+    def drain_host_drops(self, max_records: int = 4096) -> list[tuple[bytes, int, int, int, int]]:
+        """Ring records whose copies completed, oldest first: `(key, life_cycle, num_tokens, slot, bytes)`.
+
+        Slot `slot` of the ring holds the page's `bytes` bytes until it is released.
+        `max_records` is a soft cap: a batch is never split, so one call may return more. Runs on
+        any thread, without the manager's lock, and never waits for it. Between this call and
+        `release_host_drop_slots()` the consumer must not take the manager's lock or call a
+        manager method that does, since an evicting thread may hold it while waiting for slots.
+        """
+        ...
+    def release_host_drop_slots(self, slots: Sequence[int]) -> None:
+        """Return drained ring slots once their contents are consumed.
+
+        Each slot must have come from `drain_host_drops()` and is released once; otherwise the
+        call raises and releases none of `slots`. Runs without the manager's lock.
+        """
+        ...
+    def host_drop_stats(self) -> dict[str, int]:
+        """Cumulative hand-off counters, in pages. Lock-free.
+
+        Keys: `handed`, `ring_full`, `errors`, and for a lossless ring `waits`, `wait_ns` and
+        `timeouts`.
+        """
+        ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...
     def adjust(self) -> None: ...
     @property

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/page.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
+#include "tensorrt_llm/common/tllmException.h"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -30,9 +31,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -63,6 +66,36 @@ bool allBytesEqual(void const* data, size_t size, uint8_t expected)
     auto const* bytes = static_cast<uint8_t const*>(data);
     return std::all_of(bytes, bytes + size, [expected](uint8_t byte) { return byte == expected; });
 }
+
+//! Joins a thread on every exit path, so a failed assertion does not leave it running past the test.
+class JoiningThread
+{
+public:
+    template <typename F>
+    explicit JoiningThread(F&& body)
+        : mThread(std::forward<F>(body))
+    {
+    }
+
+    ~JoiningThread()
+    {
+        join();
+    }
+
+    JoiningThread(JoiningThread const&) = delete;
+    JoiningThread& operator=(JoiningThread const&) = delete;
+
+    void join()
+    {
+        if (mThread.joinable())
+        {
+            mThread.join();
+        }
+    }
+
+private:
+    std::thread mThread;
+};
 
 //! makeTieredConfig(): two GPU slots and two host slots of 2 MiB for one life cycle. Every round commits a two-block
 //! chain on the GPU; the next round's allocation offloads them to the host level, which drops the round before them.
@@ -248,14 +281,87 @@ TEST_F(HostDropTest, HookExceptionIsCountedAndEvictionContinues)
     EXPECT_EQ(calls, 2);
     EXPECT_EQ(storage.hostDropStats().errors.load(), 2);
     EXPECT_EQ(storage.hostDropStats().handed.load(), 0);
-    // The level still has its two slots in use and frees the dropped ones.
-    EXPECT_EQ(storage.getStatistics(kHostLevel).total, 2);
+    // Eviction went on: the host level holds the last round, and the dropped pages' slots were reused for it.
+    auto const hostStats = storage.getStatistics(kHostLevel);
+    EXPECT_EQ(hostStats.evictable, 2);
+    EXPECT_EQ(hostStats.free, 0);
 }
 
 TEST_F(HostDropTest, NoHostLevelMeansNoRing)
 {
     auto gpuOnly = std::make_shared<KvCacheManager>(makeConfig());
-    EXPECT_THROW(gpuOnly->storage().setUpHostDropRing(1 << 20, true), std::exception);
+    EXPECT_THROW(gpuOnly->storage().setUpHostDropRing(1 << 20, true), tensorrt_llm::common::TllmException);
+}
+
+TEST_F(HostDropTest, ShutdownReleasesTheHook)
+{
+    // A hook that refers back to its owner forms a cycle through the manager; shutdown() must break it.
+    auto owner = std::make_shared<int>(0);
+    std::weak_ptr<int> const watch = owner;
+    (void) mManager->storage().setHostDropHook([owner](std::vector<HostDropRecord> const&) {});
+    owner.reset();
+    ASSERT_FALSE(watch.expired());
+    mManager->shutdown();
+    EXPECT_TRUE(watch.expired());
+    EXPECT_FALSE(mManager->storage().hasHostDropHook());
+}
+
+TEST_F(HostDropTest, RingSetUpValidatesItsArguments)
+{
+    auto& storage = mManager->storage();
+    for (double const maxWaitS :
+        {std::nan(""), std::numeric_limits<double>::infinity(), 0.0, -1.0, kHostDropMaxWaitS * 2})
+    {
+        EXPECT_THROW(storage.setUpHostDropRing(0, false, HostDropLosslessConfig{.enabled = true, .maxWaitS = maxWaitS}),
+            tensorrt_llm::common::TllmException)
+            << maxWaitS;
+    }
+    EXPECT_FALSE(storage.hostDropAsync());
+    auto const info = storage.setUpHostDropRing(0, false);
+    // A repeated call returns the same ring, and only for the same arguments.
+    EXPECT_EQ(storage.setUpHostDropRing(0, false).address, info.address);
+    EXPECT_THROW(storage.setUpHostDropRing(1 << 30, false), tensorrt_llm::common::TllmException);
+    EXPECT_THROW(storage.setUpHostDropRing(0, false, HostDropLosslessConfig{.enabled = true}),
+        tensorrt_llm::common::TllmException);
+}
+
+TEST_F(HostDropTest, FailedRingSetUpLeavesNothingBehind)
+{
+    auto& storage = mManager->storage();
+    // No host can pin this much: the call fails at the last allocation.
+    EXPECT_ANY_THROW(storage.setUpHostDropRing(size_t{1} << 52, false));
+    EXPECT_FALSE(storage.hostDropAsync());
+    // A retry with other arguments sets the ring up afresh.
+    auto const info = storage.setUpHostDropRing(0, false);
+    EXPECT_NE(info.address, 0U);
+    EXPECT_TRUE(storage.hostDropAsync());
+}
+
+TEST_F(HostDropTest, ReleaseRejectsSlotsNotDrainedOrReleasedTwice)
+{
+    auto& storage = mManager->storage();
+    auto const info = storage.setUpHostDropRing(/*ringBytes=*/0, /*preferKernel=*/false);
+    commitRound();
+    commitRound();
+    commitRound(); // the first round dropped into the ring
+    auto const records = drainAtLeast(2);
+    ASSERT_EQ(records.size(), 2U);
+    int32_t const a = records[0].slot;
+    int32_t const b = records[1].slot;
+    int32_t notDrained = 0;
+    while (notDrained == a || notDrained == b)
+    {
+        ++notDrained;
+    }
+    using tensorrt_llm::common::TllmException;
+    EXPECT_THROW(storage.releaseHostDropSlots({-1}), TllmException);
+    EXPECT_THROW(storage.releaseHostDropSlots({static_cast<int32_t>(info.numSlots)}), TllmException);
+    EXPECT_THROW(storage.releaseHostDropSlots({notDrained}), TllmException);
+    // A rejected call releases nothing, not even its valid slots.
+    EXPECT_THROW(storage.releaseHostDropSlots({a, a}), TllmException);
+    EXPECT_THROW(storage.releaseHostDropSlots({a, notDrained}), TllmException);
+    storage.releaseHostDropSlots({a, b});
+    EXPECT_THROW(storage.releaseHostDropSlots({a}), TllmException);
 }
 
 TEST_F(HostDropTest, DrainWorksWithoutAContextAndLeavesTheCallersCurrent)
@@ -311,8 +417,8 @@ TEST_P(HostDropRingTest, RingCopiesDroppedPagesAndRecyclesSlots)
     {
         EXPECT_FALSE(info.kernelCopy);
     }
-    // A second call returns the same ring.
-    auto const again = storage.setUpHostDropRing(1 << 30, preferKernel);
+    // A second call with the same arguments returns the same ring.
+    auto const again = storage.setUpHostDropRing(/*ringBytes=*/0, preferKernel);
     EXPECT_EQ(again.address, info.address);
     EXPECT_EQ(again.numSlots, info.numSlots);
 
@@ -374,8 +480,16 @@ TEST_P(HostDropRingTest, RingCopiesDroppedPagesAndRecyclesSlots)
     }
     storage.releaseHostDropSlots(moreSlots);
     commitRound();
-    EXPECT_EQ(drainAtLeast(2).size(), 2U);
+    auto const last = drainAtLeast(2);
+    EXPECT_EQ(last.size(), 2U);
     EXPECT_EQ(storage.hostDropStats().handed.load(), drained + 2);
+    // Every drained slot is back, so teardown does not wait for the consumer.
+    std::vector<int32_t> lastSlots;
+    for (auto const& record : last)
+    {
+        lastSlots.push_back(record.slot);
+    }
+    storage.releaseHostDropSlots(lastSlots);
 }
 
 TEST_P(HostDropRingTest, LosslessRingWaitsForReleasedSlotsInsteadOfDropping)
@@ -396,7 +510,7 @@ TEST_P(HostDropRingTest, LosslessRingWaitsForReleasedSlotsInsteadOfDropping)
     std::atomic<bool> stop{false};
     std::mutex recordsMutex;
     std::vector<std::pair<std::string, int>> seen;
-    std::thread consumer(
+    JoiningThread consumer(
         [&]
         {
             while (!stop.load())
@@ -463,7 +577,7 @@ TEST_P(HostDropRingTest, LosslessWaitIsBoundedWhenSlotsNeverComeBack)
     bool const preferKernel = GetParam();
     auto& storage = mManager->storage();
     auto const info = storage.setUpHostDropRing(
-        /*ringBytes=*/0, preferKernel, HostDropLosslessConfig{/*enabled=*/true, /*maxWaitS=*/0.2, /*minChunk=*/2});
+        /*ringBytes=*/0, preferKernel, HostDropLosslessConfig{.enabled = true, .maxWaitS = 1.0, .minChunk = 2});
     if (preferKernel && !info.kernelCopy)
     {
         GTEST_SKIP() << "the batched page-copy kernel is not available on this device";
@@ -477,9 +591,74 @@ TEST_P(HostDropRingTest, LosslessWaitIsBoundedWhenSlotsNeverComeBack)
     auto const& stats = storage.hostDropStats();
     EXPECT_EQ(stats.handed.load(), 16);
     EXPECT_EQ(stats.ringFull.load(), 2 * (14 - 2) - 16);
-    EXPECT_GE(stats.timeouts.load(), 1);
-    // One timed-out wait pauses waiting; with the pause there is at most one wait per 0.2 s, never a hang.
+    // One wait spends the budget and pauses waiting; the remaining rounds, well within the pause, drop without one.
+    EXPECT_EQ(stats.waits.load(), 1);
+    EXPECT_EQ(stats.timeouts.load(), 1);
     EXPECT_LT(elapsed, std::chrono::seconds(5));
+}
+
+TEST_P(HostDropRingTest, LosslessWaitsShareOneBudget)
+{
+    bool const preferKernel = GetParam();
+    auto& storage = mManager->storage();
+    constexpr double kMaxWaitS = 0.5;
+    auto const info = storage.setUpHostDropRing(
+        /*ringBytes=*/0, preferKernel, HostDropLosslessConfig{.enabled = true, .maxWaitS = kMaxWaitS, .minChunk = 2});
+    if (preferKernel && !info.kernelCopy)
+    {
+        GTEST_SKIP() << "the batched page-copy kernel is not available on this device";
+    }
+    // A slow but live consumer: it frees two slots every 0.9 x maxWaitS, so each wait alone would end in time. The
+    // waits share one budget per 2 x maxWaitS, so they still give up and pause instead of stalling every eviction.
+    std::atomic<bool> stop{false};
+    JoiningThread consumer(
+        [&]
+        {
+            std::vector<int32_t> held;
+            auto nextRelease = std::chrono::steady_clock::now();
+            while (!stop.load())
+            {
+                for (auto const& record : storage.drainHostDrops(4096))
+                {
+                    held.push_back(record.slot);
+                }
+                if (held.size() >= 2 && std::chrono::steady_clock::now() >= nextRelease)
+                {
+                    storage.releaseHostDropSlots({held.end() - 2, held.end()});
+                    held.resize(held.size() - 2);
+                    nextRelease = std::chrono::steady_clock::now()
+                        + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(0.9 * kMaxWaitS));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            // Drain and release the rest, so teardown does not wait for the consumer.
+            for (auto const& record : storage.drainHostDrops(4096))
+            {
+                held.push_back(record.slot);
+            }
+            if (!held.empty())
+            {
+                storage.releaseHostDropSlots(held);
+            }
+        });
+    auto const t0 = std::chrono::steady_clock::now();
+    for (int round = 0; round < 2 + 8 + 6; ++round)
+    {
+        commitRound(); // 16 drops fill the ring; the last 6 rounds each need released slots
+    }
+    double const elapsedS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    // Let the consumer catch up on the drops still in flight before it stops.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    stop.store(true);
+    consumer.join();
+    auto const& stats = storage.hostDropStats();
+    EXPECT_GE(stats.timeouts.load(), 1) << "a wait spent the shared budget";
+    EXPECT_GT(stats.ringFull.load(), 0) << "drops during the pause go without a hand-off";
+    double const waitedS = static_cast<double>(stats.waitNs.load()) * 1e-9;
+    double const windows = std::floor(elapsedS / (2 * kMaxWaitS)) + 1;
+    EXPECT_LE(waitedS, windows * kMaxWaitS + 0.1) << "at most maxWaitS of waiting per 2 x maxWaitS";
+    EXPECT_EQ(stats.errors.load(), 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(CopyPath, HostDropRingTest, ::testing::Values(true, false),
