@@ -40,6 +40,14 @@ KIMI_K3 = "Kimi-K3"  # tiktoken, a Python (native) chat template, control tokens
 
 SERVER_TEMPLATE = "SERVER:{% for m in messages %}{{ m.content }}|{% endfor %}"
 REQUEST_TEMPLATE = "REQUEST:{% for m in messages %}{{ m.content }}|{% endfor %}"
+# Reads `reasoning_effort` the way GLM-5.3's template does: `low` and `high` are levels, and any
+# other value, or none, renders its default, Max.
+EFFORT_TEMPLATE = (
+    "{%- set effort = reasoning_effort if reasoning_effort is defined"
+    " and reasoning_effort in ['low', 'high'] else 'max' -%}"
+    "Reasoning Effort: {{ effort | capitalize }}|"
+    "{%- for m in messages %}{{ m.content }}|{%- endfor %}"
+)
 
 WEATHER_TOOL = {
     "type": "function",
