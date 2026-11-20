@@ -29,12 +29,12 @@ import pickle  # nosec B403
 import secrets
 import select
 import socket
-import subprocess
+import subprocess  # nosec B404 - starts the membership authority with sys.executable and a fixed argv, no shell
 import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, NoReturn, Optional, Tuple
+from typing import TYPE_CHECKING, NoReturn, Optional
 
 from tensorrt_llm._utils import global_mpi_size, local_mpi_comm, set_mpi_world_comm
 from tensorrt_llm._wide_ep_fault_tolerance import (
@@ -97,7 +97,7 @@ _state = RankStartState(StartupRecord(report_progress=lambda: _report_startup_wa
 
 def ensure_rendezvous(
     orchestrator_type: Optional[str],
-) -> Tuple[Dict[str, str], Optional[socket.socket]]:
+) -> tuple[dict[str, str], Optional[socket.socket]]:
     """Return the shared secret and rendezvous address for the ranks this process starts.
 
     Exported values are kept. Otherwise the secret is new, and an SO_REUSEADDR socket that never

@@ -65,6 +65,7 @@ def _admission_executor(
         "_get_request_admission_capacity",
         "_pop_from_waiting_queue",
         "_cancel_queued_context_requests",
+        "_has_pending_context_retirement",
     ):
         setattr(executor, name, MethodType(getattr(PyExecutor, name), executor))
     return executor

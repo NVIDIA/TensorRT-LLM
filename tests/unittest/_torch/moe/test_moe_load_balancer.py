@@ -800,6 +800,30 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
         balancer.abandon_iterations()
         if layer_updates_per_iter:
             assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, 2, -1, -1]
+            # A newer membership change stops a rejoin restore once it loaded
+            # rank 0's active slots with the initial placement, before it
+            # installed that placement.
+            stopped = balancer.expert_restore.plan_expert_restore(
+                [True, True], [layer.get_old_rank_expert_ids()],
+                rejoining=[False, True])
+            with pytest.raises(RuntimeError, match="newer membership change"):
+                balancer.expert_restore.restore_lost_experts(
+                    stopped,
+                    progress=MagicMock(side_effect=[
+                        None, RuntimeError("a newer membership change")
+                    ]))
+            assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, 2, -1, -1]
+            assert_loaded([0, 1, 2])
+            # Rank 1 fails again. Rank 0's view names no expert in the slots
+            # the stopped restore wrote, so the next plan loads them again.
+            ((_, view), ) = balancer.expert_restore.current_placement()
+            retry = balancer.expert_restore.plan_expert_restore([True, False],
+                                                                [view])
+            balancer.expert_restore.restore_lost_experts(retry)
+            assert_loaded(layer.get_old_rank_expert_ids()[0][:4])
+            assert layer.get_old_rank_expert_ids()[0] == [0, 1, 3, 2, -1, -1]
+            assert route([0, 1, 3, 2]) == [0, 1, 2, 3]
+            balancer.abandon_iterations()
         rejoin = balancer.expert_restore.plan_expert_restore(
             [True, True], [layer.get_old_rank_expert_ids()],
             rejoining=[False, True])

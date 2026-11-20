@@ -2758,7 +2758,7 @@
         },
         "enable_wide_ep_fault_tolerance": {
           "default": false,
-          "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires the NVLink one-sided all-to-all.",
+          "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires attention DP over more than one rank, no MoE TP and the built-in MoE layers. Turns off the sentinel transport and the two-rank pull combine of the NVLink one-sided all-to-all. Does not yet recover from a failed rank.",
           "status": "prototype",
           "title": "Enable Wide Ep Fault Tolerance",
           "type": "boolean"
@@ -11139,7 +11139,7 @@
     },
     "enable_wide_ep_fault_tolerance": {
       "default": false,
-      "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires the NVLink one-sided all-to-all.",
+      "description": "Run the MoE all-to-all of wide expert parallelism in its fault-tolerant mode, in which the NVLink one-sided all-to-all exchanges only with the EP ranks marked active. Requires attention DP over more than one rank, no MoE TP and the built-in MoE layers. Turns off the sentinel transport and the two-rank pull combine of the NVLink one-sided all-to-all. Does not yet recover from a failed rank.",
       "status": "prototype",
       "title": "Enable Wide Ep Fault Tolerance",
       "type": "boolean"

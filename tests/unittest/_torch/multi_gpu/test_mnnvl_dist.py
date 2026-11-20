@@ -45,6 +45,24 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
+# Longer than any case waits at a barrier, so that a rank that never arrives fails the test.
+_BARRIER_TIMEOUT_S = 120.0
+# Bounds a whole case, so that a worker stuck outside a barrier fails the test instead of the stage.
+_WORKER_TIMEOUT_S = 600.0
+
+
+def _bounded_barrier() -> None:
+    """Wait for every rank; raise instead of hanging when a peer never arrives."""
+    request = MPI.COMM_WORLD.Ibarrier()
+    deadline = time.monotonic() + _BARRIER_TIMEOUT_S
+    while not request.Test():
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"rank {MPI.COMM_WORLD.Get_rank()} waited {_BARRIER_TIMEOUT_S:.0f} s at a barrier "
+                "that a peer never reached"
+            )
+        time.sleep(0.01)
+
 
 def _in_mask(mask, rank):
     return bool(mask & (1 << rank))
@@ -77,7 +95,7 @@ def _dists(tp):
     mapping = Mapping(
         world_size=tp, tp_size=tp, moe_ep_size=tp, rank=rank, enable_attention_dp=True
     )
-    MPI.COMM_WORLD.barrier()
+    _bounded_barrier()
     return MnnvlDist(mapping), MPIDist(mapping), rank
 
 
@@ -424,7 +442,7 @@ def _wait_polling(tp):
         (1.0, True, False),
     ):
         mnnvl.barrier()
-        MPI.COMM_WORLD.barrier()
+        _bounded_barrier()
         started_s, started_cpu_s = time.monotonic(), time.thread_time()
         if rank == 0:
             time.sleep(late_s)
@@ -445,7 +463,7 @@ def _wait_polling(tp):
                 polled_as_expected = cpu_s - spin_s < (wait_s - spin_s) / 4
             if not polled_as_expected:
                 failed.append((late_s, cpu_s, wait_s))
-    MPI.COMM_WORLD.barrier()
+    _bounded_barrier()
     assert not failed, failed
 
 
@@ -690,5 +708,7 @@ def test_mnnvl_dist(case, mpi_pool_executor):
         skip_no_mnnvl_fabric_handles(tp)
     elif not torch.cuda.is_available():
         pytest.skip("needs a GPU")
-    results = list(mpi_pool_executor.map(_worker, [CASES[case]] * tp, [tp] * tp))
+    results = list(
+        mpi_pool_executor.map(_worker, [CASES[case]] * tp, [tp] * tp, timeout=_WORKER_TIMEOUT_S)
+    )
     assert all(results)

@@ -34,14 +34,30 @@ def a2a_workspace(ep_size: int, tokens: int = CAPACITY) -> tuple[torch.Tensor, .
     return workspace, meta, experts, payload.reshape(tokens, HIDDEN)
 
 
-def a2a_dispatch(workspace, meta, experts, controls, payload, tokens=CAPACITY, rank=0):
+def a2a_dispatch(
+    workspace: torch.Tensor,
+    meta: torch.Tensor,
+    experts: torch.Tensor,
+    controls: dict[str, bool | torch.Tensor],
+    payload: torch.Tensor,
+    tokens: int = CAPACITY,
+    rank: int = 0,
+) -> tuple[list[torch.Tensor], int, torch.Tensor]:
     """Dispatch [payload, experts] like the MoE layer as ``rank``."""
     ep_size = workspace.size(0)
     args = (experts, [payload, experts], workspace, meta, tokens, rank, ep_size, 1, ep_size, None)
     return torch.ops.trtllm.moe_a2a_dispatch(*args, **controls)
 
 
-def a2a_combine(workspace, meta, payload, offset, controls, tokens=CAPACITY, rank=0):
+def a2a_combine(
+    workspace: torch.Tensor,
+    meta: torch.Tensor,
+    payload: torch.Tensor,
+    offset: int,
+    controls: dict[str, bool | torch.Tensor],
+    tokens: int = CAPACITY,
+    rank: int = 0,
+) -> torch.Tensor:
     """Combine like the MoE layer as ``rank``."""
     args = (payload, tokens, workspace, meta, tokens, rank, workspace.size(0), 1, offset, False)
     return torch.ops.trtllm.moe_a2a_combine(*args, **controls)

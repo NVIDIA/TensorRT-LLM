@@ -36,7 +36,7 @@ import functools
 import pickle  # nosec B403
 import traceback
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterator, NamedTuple, Sequence
 
 # The exit status of a replacement whose startup failure any other replacement would repeat.
 REPLACEMENT_CANNOT_START = 78
@@ -47,7 +47,7 @@ _DIVERGING_CALL_FRAMES = 10
 class ReplacementCannotStart(SystemExit):
     """A ``SystemExit`` that ends a replacement rank with ``REPLACEMENT_CANNOT_START``."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.code = REPLACEMENT_CANNOT_START
 
@@ -69,17 +69,17 @@ class RecordedExchange(NamedTuple):
     """A startup collective's :meth:`StartupRecord.rank_varying` block, every rank's payload and
     its reduction (``"min"``, ``"max"`` or None)."""
 
-    rank_varying: Optional[str]
-    payloads: List[Optional[bytes]]
-    reduction: Optional[str]
+    rank_varying: str | None
+    payloads: list[bytes | None]
+    reduction: str | None
 
 
-def _describe(index: int, rank_varying: Optional[str]) -> str:
+def _describe(index: int, rank_varying: str | None) -> str:
     collective = f"host collective {index}"
     return collective if rank_varying is None else f"{collective} ({rank_varying})"
 
 
-def _describe_reduction(reduction: Optional[str]) -> str:
+def _describe_reduction(reduction: str | None) -> str:
     return "no min or max reduction" if reduction is None else f"a {reduction} reduction"
 
 
@@ -99,21 +99,21 @@ class StartupRecord:
             report_progress: Called after each startup step of this rank, such as a replayed
                 collective, an autotuner warmup step or a loaded checkpoint file.
         """
-        self.values: Dict[str, List[Any]] = {}
-        self.exchanges: List[RecordedExchange] = []
+        self.values: dict[str, list[Any]] = {}
+        self.exchanges: list[RecordedExchange] = []
         # This rank's profiling cache where the recorded collectives start, at the end of its KV cache
         # estimation. A replacement takes its predecessor's.
-        self.tuned_tactics: Dict[Any, Any] = {}
+        self.tuned_tactics: dict[Any, Any] = {}
         self._recording = False
         self._replacement = False
         self._replaying = False
-        self._taken: Dict[str, int] = {}
+        self._taken: dict[str, int] = {}
         self._replayed_exchanges = 0
         self.report_progress = report_progress
         self._pauses = 0
-        self._rank_varying: Optional[str] = None
+        self._rank_varying: str | None = None
         # The agreement whose gather runs on a recording rank.
-        self._gathering: Optional[str] = None
+        self._gathering: str | None = None
 
     @property
     def active(self) -> bool:
@@ -139,12 +139,12 @@ class StartupRecord:
         self._pauses = 0
         self._recording = True
 
-    def replay(self, published: Dict[str, Any]) -> None:
+    def replay(self, published: dict[str, Any]) -> None:
         """Replay the record that rank 0 published until :meth:`close`."""
         self.values, self.exchanges = published["values"], published["exchanges"]
         self._replacement = self._replaying = True
 
-    def published(self) -> Dict[str, Any]:
+    def published(self) -> dict[str, Any]:
         return {"values": self.values, "exchanges": self.exchanges}
 
     def pause(self) -> None:
@@ -212,7 +212,7 @@ class StartupRecord:
         name: str,
         gather: Callable[[], Any],
         per_process: bool = False,
-        own: Optional[Tuple[int, Any]] = None,
+        own: tuple[int, Any] | None = None,
     ) -> Any:
         """Return the result of ``gather``, or rank 0's recorded result while a replacement replays.
 
@@ -287,11 +287,11 @@ class StartupRecord:
         self,
         rank: int,
         payload: bytes,
-        readers: Optional[Sequence[int]],
-        run: Callable[[], List[Optional[bytes]]],
-        reduce_op: Optional[Callable[[Any, Any], Any]] = None,
+        readers: Sequence[int] | None,
+        run: Callable[[], list[bytes | None]],
+        reduce_op: Callable[[Any, Any], Any] | None = None,
         decode: Callable[[bytes], Any] = pickle.loads,
-    ) -> List[Optional[bytes]]:
+    ) -> list[bytes | None]:
         """Return every rank's pickled payload, from ``run()``, or on a replacement from the record.
 
         ``reduce_op`` is ``min`` or ``max`` for a reduction by it, else None. A replacement's own
@@ -363,7 +363,7 @@ class StartupRecord:
         collective: str,
         reduce_op: Callable[[Any, Any], Any],
         own: Any,
-        payloads: List[Optional[bytes]],
+        payloads: list[bytes | None],
         decode: Callable[[bytes], Any],
     ) -> bool:
         """Return whether this replacement's own value changes the original ranks' maximum.

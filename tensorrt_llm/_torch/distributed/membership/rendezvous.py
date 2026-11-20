@@ -15,18 +15,22 @@
 """Rendezvous store communicators for Wide-EP fault tolerance."""
 
 import hashlib
+import os
 import pickle  # nosec B403
+from collections.abc import Callable, Sequence
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 from tensorrt_llm._torch.modules.dwdp.rendezvous import StoreComm
 from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST
+from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV
 
 from ..communicator import Distributed
 from ..startup_record import diverged
 from .records import MAX_RANKS, REPORT_INTERVAL_S, rank_mask
 
 if TYPE_CHECKING:
+    from mpi4py import MPI
     from torch.distributed import Store
 
 
@@ -42,15 +46,27 @@ STALLED_SINCE_KEY = "stalled_since"
 _RANKS_PER_COUNTER = 63
 
 
-def rendezvous_host_port(address: str) -> Tuple[str, int]:
+def rendezvous_address() -> str:
+    """Return the rendezvous address ``host:port`` that ``RENDEZVOUS_ENV`` holds.
+
+    Raises:
+        ValueError: ``RENDEZVOUS_ENV`` is not set.
+    """
+    address = os.environ.get(RENDEZVOUS_ENV)
+    if not address:
+        raise ValueError(f"Wide-EP fault tolerance requires host:port in {RENDEZVOUS_ENV}")
+    return address
+
+
+def rendezvous_host_port(address: str) -> tuple[str, int]:
     """Split a rendezvous address ``host:port`` into its host and port."""
     host, port = address.rsplit(":", 1)
     return host, int(port)
 
 
 def wait_for_keys(
-    store: "Store", keys: List[str], check_s: float, check: Callable[[], None]
-) -> List[bytes]:
+    store: "Store", keys: list[str], check_s: float, check: Callable[[], None]
+) -> list[bytes]:
     """Wait until ``keys`` are set and return their values.
 
     Call ``check`` every ``check_s`` while waiting. ``check`` may raise to stop waiting.
@@ -86,7 +102,7 @@ class StoreGroup(StoreComm):
         active: Optional[Sequence[int]] = None,
         gpus_per_node: int = 1,
         startup: bool = False,
-    ):
+    ) -> None:
         """Build the group's communicator over ``store``.
 
         Args:
@@ -117,7 +133,7 @@ class StoreGroup(StoreComm):
         self._startup = startup
         self._subgroups = 0
 
-    def allgather(self, value: Any) -> List[Any]:
+    def allgather(self, value: Any) -> list[Any]:
         """Return every member's value by communicator rank, with None for an inactive member.
 
         ``exchange_failed`` tells afterwards whether the exchange itself raised.
@@ -128,7 +144,7 @@ class StoreGroup(StoreComm):
         self._check_alone_at_startup("allgather")
         return self._gather_values(value)
 
-    def _gather_values(self, value: Any) -> List[Any]:
+    def _gather_values(self, value: Any) -> list[Any]:
         from torch.distributed import DistError
 
         self.exchange_failed = False
@@ -162,7 +178,7 @@ class StoreGroup(StoreComm):
         self._check_alone_at_startup("bcast")
         return self._gather_values(obj if self.Get_rank() == root else None)[root]
 
-    def allreduce(self, obj: Any, op: Any = None) -> Any:
+    def allreduce(self, obj: Any, op: Optional["MPI.Op"] = None) -> Any:
         """Reduce the active members' ``obj`` by ``MPI.SUM`` (default), ``MIN`` or ``MAX``."""
         from mpi4py import MPI
 
@@ -235,12 +251,14 @@ class StoreGroup(StoreComm):
     def Split(self, color: int = 0, key: int = 0) -> "StoreGroup":
         """Split as ``MPI.Comm.Split`` does, a replacement taking the colors from the record.
 
+        The subgroup leaves out the inactive members, whose colors are unknown.
+
         Raises:
             ReplacementCannotStart: A replacement's ``color`` or ``key`` differs from its
                 predecessor's.
         """
 
-        def gather():
+        def gather() -> list[Any]:
             return self.allgather((color, key))
 
         # A process splits at whichever startup step first needs the communicator, even while the
@@ -251,12 +269,17 @@ class StoreGroup(StoreComm):
         ranks = sorted(
             (split[1], index, rank)
             for index, (rank, split) in enumerate(zip(self.membership, splits))
-            if split[0] == color
+            if split is not None and split[0] == color
         )
         return self.subgroup(rank for _, _, rank in ranks)
 
-    def Split_type(self, split_type: int, key: int = 0, info: Any = None) -> "StoreGroup":
-        """Return the members on this rank's node, supporting only the node split types."""
+    def Split_type(
+        self, split_type: int, key: int = 0, info: Optional["MPI.Info"] = None
+    ) -> "StoreGroup":
+        """Return the members on this rank's node, supporting only the node split types.
+
+        The subgroup orders its members by global rank; ``key`` and ``info`` are ignored.
+        """
         from mpi4py import MPI
 
         if split_type not in (MPI.COMM_TYPE_SHARED, OMPI_COMM_TYPE_HOST):
@@ -266,7 +289,7 @@ class StoreGroup(StoreComm):
         node = self.rank // self._gpus_per_node
         return self.subgroup(r for r in self.membership if r // self._gpus_per_node == node)
 
-    def _gather(self, prefix: str) -> List[Optional[bytes]]:
+    def _gather(self, prefix: str) -> list[Optional[bytes]]:
         """Return the active members' payloads for call ``prefix``, None for the others."""
         self._store.add(self._counter(prefix, self.rank), 1 << self.rank % _RANKS_PER_COUNTER)
         index = {r: i for i, r in enumerate(self.membership)}
@@ -280,7 +303,7 @@ class StoreGroup(StoreComm):
         by_rank = dict(zip(self._active, values))
         return [by_rank.get(r) for r in self.membership]
 
-    def _delete_calls(self, first: int, end: int, indices: List[int], counters: bool) -> None:
+    def _delete_calls(self, first: int, end: int, indices: list[int], counters: bool) -> None:
         """Delete the values of the members ``indices`` in calls ``first`` to ``end`` (exclusive).
 
         Also delete the calls' arrival counters if ``counters``.
@@ -293,7 +316,7 @@ class StoreGroup(StoreComm):
                 for key in self._counters(prefix):
                     self._store.delete_key(key)
 
-    def _wait(self, prefix: str, keys: List[str]) -> List[bytes]:
+    def _wait(self, prefix: str, keys: list[str]) -> list[bytes]:
         active_mask = rank_mask(self._active, MAX_RANKS)
 
         def check() -> None:
@@ -305,7 +328,7 @@ class StoreGroup(StoreComm):
 
         return wait_for_keys(self._store, keys, REPORT_INTERVAL_S, check)
 
-    def _counters(self, prefix: str) -> List[str]:
+    def _counters(self, prefix: str) -> list[str]:
         return sorted({self._counter(prefix, r) for r in self._active})
 
     @staticmethod

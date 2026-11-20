@@ -15,7 +15,8 @@
 """Configuration checks for Wide-EP fault tolerance, and the rank identity from its launcher."""
 
 import os
-from typing import NamedTuple, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import NamedTuple, Optional
 
 # Set for every rank under Wide-EP fault tolerance to
 # "<rank>,<world size>,<GPUs per node>,<replacement>".
@@ -23,12 +24,12 @@ FAULT_TOLERANCE_RANK_ENV = "TLLM_FAULT_TOLERANCE_RANK"
 # The rendezvous store's host:port. The authority hosts the store.
 RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 # The hex secret that every deployment process holds. It derives the hello token.
-SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"
+SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"  # nosec B105 - environment variable name, not a secret
 # The alternative that each error about an unmet fault tolerance requirement offers.
 TURN_FAULT_TOLERANCE_OFF = "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
 
 
-def check_fault_tolerance_requirements(checks: Sequence[Tuple[bool, str]]) -> None:
+def check_fault_tolerance_requirements(checks: Sequence[tuple[bool, str]]) -> None:
     """Raise ValueError naming every unmet ``(met, requirement)`` check."""
     missing = [requirement for met, requirement in checks if not met]
     if missing:

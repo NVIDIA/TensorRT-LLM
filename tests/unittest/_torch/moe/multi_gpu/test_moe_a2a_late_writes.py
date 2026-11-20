@@ -136,7 +136,10 @@ def _survivor(
     gather = StoreComm(store, rank, "survivors", range(VICTIM))
     state.ep_group_health.mark_failed(VICTIM)
     if mode != "no-remap":
-        state.remap_workspaces(gather, frozenset(range(EP_SIZE)))
+        # The victim mapped the survivors' rows, so every row needs fresh pages.
+        fresh_rows = state.workspace_rows_needing_fresh_pages(gather)
+        assert fresh_rows == frozenset(range(EP_SIZE))
+        state.remap_workspaces(gather, fresh_rows)
         assert memory.mapped
     state.rearm()
     state.install_mask()

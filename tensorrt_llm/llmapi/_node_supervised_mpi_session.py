@@ -18,7 +18,7 @@ import os
 import subprocess  # nosec B404
 import sys
 from concurrent.futures import Future
-from typing import Callable, Dict, List, Optional, TypeVar
+from typing import Callable, TypeVar
 
 from mpi4py.futures import MPIPoolExecutor
 
@@ -35,31 +35,31 @@ class NodeSupervisedMpiPoolSession(MpiPoolSession):
     Each rank is its own MPI world under Wide-EP fault tolerance, so the pool holds rank 0 only.
     """
 
-    def __init__(self, n_workers: int, env_overrides: Optional[Dict[str, str]] = None):
+    def __init__(self, n_workers: int, env_overrides: dict[str, str] | None = None):
         """Start the ``n_workers`` ranks of one node.
 
         Args:
             n_workers: The number of ranks.
             env_overrides: Extra environment variables of every rank.
         """
-        self._node_supervisor: Optional[subprocess.Popen] = None
+        self._node_supervisor: subprocess.Popen | None = None
         super().__init__(n_workers, env_overrides=env_overrides)
 
-    def submit(self, task: Callable[..., T], *args, **kwargs) -> List[Future[T]]:
+    def submit(self, task: Callable[..., T], *args, **kwargs) -> list[Future[T]]:
         """Run ``task`` on rank 0 and return its future."""
         return [self.mpi_pool.submit(_run_on_each_worker, task, *args, **kwargs)]
 
-    def shutdown(self, wait=True):
+    def shutdown(self, wait: bool = True) -> None:
         # A dead pool can never be joined, as in MpiPoolSession.shutdown.
         wait = wait and not getattr(self, "_pool_dead", False)
         super().shutdown(wait)
         self._stop_node_supervisor(_mgmn_shutdown_grace_seconds() if wait else None)
 
-    def abort(self):
+    def abort(self) -> None:
         self._stop_node_supervisor(None)
         super().abort()
 
-    def _create_pool(self, env: Dict[str, str], python_args: List[str]) -> MPIPoolExecutor:
+    def _create_pool(self, env: dict[str, str], python_args: list[str]) -> MPIPoolExecutor:
         self._node_supervisor = start_session_node_supervisor(self.n_workers, {**os.environ, **env})
         # One node of n_workers ranks, as the node supervisor's.
         env[FAULT_TOLERANCE_RANK_ENV] = RankIdentity(
@@ -71,7 +71,7 @@ class NodeSupervisedMpiPoolSession(MpiPoolSession):
             self._stop_node_supervisor(None)
             raise
 
-    def _stop_node_supervisor(self, grace_s: Optional[float]) -> None:
+    def _stop_node_supervisor(self, grace_s: float | None) -> None:
         """Stop the node supervisor, if any, after waiting ``grace_s`` seconds for it to exit."""
         if self._node_supervisor is not None:
             stop_session_node_supervisor(self._node_supervisor, grace_s)

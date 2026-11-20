@@ -632,7 +632,7 @@ def test_node_ranks_follow_gpus_per_node(rank, local):
         ("tp", "tensor_parallel_size equal to the world size"),
         ("cp", "context_parallel_size=1"),
         ("mnnvl", "multi-node NVLink (MNNVL) domain"),
-        ("fabric", "fabric handles (GB200-class aarch64 nodes with IMEX"),
+        ("fabric", "an aarch64 host (such as a GB200 node), on which MNNVL memory is shared"),
         ("mpi", "the MPI orchestrator (TLLM_DISABLE_MPI unset)"),
     ],
 )

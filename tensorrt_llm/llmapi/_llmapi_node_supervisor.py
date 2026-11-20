@@ -33,7 +33,11 @@ import threading
 import time
 from dataclasses import dataclass
 from types import FrameType
-from typing import Dict, List, NoReturn, Optional, Set
+from typing import TYPE_CHECKING, NoReturn
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed.membership import MembershipRecord, NodeView
+    from tensorrt_llm._torch.distributed.membership.liveness import LivenessConnection
 
 _CONNECT_TIMEOUT_S = 2.0
 _CONNECT_WARNING_INTERVAL_S = 30.0
@@ -63,15 +67,15 @@ class _Process:
 
     child: subprocess.Popen
     replacement: bool
-    pidfd: Optional[int]
-    incarnation: Optional[int] = None
+    pidfd: int | None
+    incarnation: int | None = None
     listed: bool = False
     # When a COMMITTED record first listed it as an active member.
-    admitted_s: Optional[float] = None
+    admitted_s: float | None = None
     # The reason the membership left it out while it joined.
     left_out_reason: str = ""
-    killed_s: Optional[float] = None
-    status: Optional[int] = None
+    killed_s: float | None = None
+    status: int | None = None
     started_s: float = 0.0
 
 
@@ -99,11 +103,11 @@ class NodeSupervisor:
         node: int,
         nodes: int,
         gpus_per_node: int,
-        command: List[str],
-        environ: Dict[str, str],
+        command: list[str],
+        environ: dict[str, str],
         rank_0_in_session: bool = False,
-        parent: Optional[int] = None,
-    ):
+        parent: int | None = None,
+    ) -> None:
         from tensorrt_llm._torch.distributed import membership
         from tensorrt_llm.llmapi._llmapi_process_guard import _signal_group
         from tensorrt_llm.logger import logger
@@ -124,12 +128,12 @@ class NodeSupervisor:
         # Written by the signal handler and the connector, so that they end the selector's wait.
         self._wake_read, self._wake_write = socket.socketpair()
         self._wake_write.setblocking(False)
-        self._connecting: Optional[concurrent.futures.Future] = None
-        self._connection = None
+        self._connecting: concurrent.futures.Future | None = None
+        self._connection: "LivenessConnection | None" = None
         # A connection that waits for the authority's first view until _view_due_s.
-        self._connection_awaiting_view = None
+        self._connection_awaiting_view: "LivenessConnection | None" = None
         self._view_due_s = 0.0
-        self._view = None
+        self._view: "NodeView | None" = None
         self._view_received_s = 0.0
         # Set once a record is past STARTING. Before that, the failure of any rank stops the node.
         self._deployment_started = False
@@ -142,18 +146,18 @@ class NodeSupervisor:
         self._connect_due_s = 0.0
         self._connect_warning_due_s = time.monotonic() + _CONNECT_WARNING_INTERVAL_S
         # Times at which the loop must step again. Each step rebuilds the list.
-        self._deadlines_s: List[float] = []
-        self._processes: Dict[int, _Process] = {}
-        self._given_up: Set[int] = set()
+        self._deadlines_s: list[float] = []
+        self._processes: dict[int, _Process] = {}
+        self._given_up: set[int] = set()
         # Per rank, the failed replacements in a row and when the next one may start.
-        self._failed_replacements: Dict[int, int] = {}
-        self._replacement_due_s: Dict[int, float] = {}
-        self._first_failure: Optional[int] = None
-        self._signum: Optional[int] = None
+        self._failed_replacements: dict[int, int] = {}
+        self._replacement_due_s: dict[int, float] = {}
+        self._first_failure: int | None = None
+        self._signum: int | None = None
         self._signal_handled = False
         self._shutdown_handled = False
         # When the supervisor stops the ranks still running after SHUTDOWN, once the authority left.
-        self._shutdown_grace_due_s: Optional[float] = None
+        self._shutdown_grace_due_s: float | None = None
         self._signal_grace_due_s = 0.0
         # This process may have threads, so no Python code runs between a rank's fork and exec. A
         # new interpreter arms the rank's parent-death signal instead.
@@ -164,7 +168,7 @@ class NodeSupervisor:
         self._unsent = b""
         self._warned_unreadable_state = False
 
-    def on_signal(self, signum: int, frame: Optional[FrameType] = None) -> None:
+    def on_signal(self, signum: int, frame: FrameType | None = None) -> None:
         """Unlink the ranks' pause words, then stop the supervisor and signal rank 0 the same.
 
         The unlink runs here, before the loop wakes, since the launcher may kill this process soon
@@ -268,7 +272,7 @@ class NodeSupervisor:
         self._selector.unregister(key.fileobj)
         os.close(key.fileobj)
 
-    def _step(self, now_s: float) -> Optional[int]:
+    def _step(self, now_s: float) -> int | None:
         """Handle the latest events and timers, and return the exit status once the node stops."""
         self._deadlines_s = []
         if self._signum is not None:
@@ -310,7 +314,7 @@ class NodeSupervisor:
             return self._stop(self._first_failure or 0)
         return None
 
-    def _stop_on_signal(self, now_s: float) -> Optional[int]:
+    def _stop_on_signal(self, now_s: float) -> int | None:
         """Stop the node on a signal, and return the exit status once it stopped.
 
         The launcher signals every node supervisor, and the signal makes rank 0 shut the deployment
@@ -344,7 +348,7 @@ class NodeSupervisor:
         self._logger.warning(f"Stopping the node's ranks on signal {self._signum}")
         return self._stop(128 + self._signum)
 
-    def _stop_after_shutdown(self, record, now_s: float) -> Optional[int]:
+    def _stop_after_shutdown(self, record: "MembershipRecord", now_s: float) -> int | None:
         """Stop the node once its active ranks ended after a shutdown, and return the exit status.
 
         The active ranks end after they leave the membership, and the authority ends once all of
@@ -376,7 +380,7 @@ class NodeSupervisor:
         )
         return self._stop(self._shutdown_status(record) or 1)
 
-    def _shutdown_status(self, record) -> int:
+    def _shutdown_status(self, record: "MembershipRecord") -> int:
         """Return the first nonzero exit status of an active rank, in rank order, or 0."""
         return next(
             (
@@ -387,7 +391,7 @@ class NodeSupervisor:
             0,
         )
 
-    def _check_abort(self, record) -> Optional[int]:
+    def _check_abort(self, record: "MembershipRecord") -> int | None:
         """Stop the node if ``record`` aborts the deployment, and return the exit status."""
         state = self._membership.MembershipState
         if record.state == state.ABORTED:
@@ -401,7 +405,7 @@ class NodeSupervisor:
     def _ranks_running(self) -> bool:
         return any(process.status is None for process in self._processes.values())
 
-    def _active_ranks_running(self, record) -> List[int]:
+    def _active_ranks_running(self, record: "MembershipRecord | None") -> list[int]:
         """Return the node's running ranks that ``record`` lists as active, or all without one."""
         return [
             rank
@@ -409,7 +413,7 @@ class NodeSupervisor:
             if process.status is None and (record is None or record.is_active(rank))
         ]
 
-    def _supervise(self, rank: int, record, now_s: float) -> Optional[int]:
+    def _supervise(self, rank: int, record: "MembershipRecord | None", now_s: float) -> int | None:
         """Act on ``rank``, and return the exit status once the node stopped."""
         process = self._processes.get(rank)
         if not self._deployment_started:
@@ -424,21 +428,23 @@ class NodeSupervisor:
             self._replace_when_due(rank, record, now_s)
         return None
 
-    def _check_before_serving(self, rank: int, process: Optional[_Process]) -> Optional[int]:
+    def _check_before_serving(self, rank: int, process: _Process | None) -> int | None:
         """Stop the node if ``rank`` failed before the deployment serves, and return its status."""
         if process is None or process.status in (None, 0):
             return None
         self._logger.error(f"Rank {rank} failed before serving (status {process.status})")
         return self._stop(_exit_status(process.status))
 
-    def _check_rank_0(self, process: Optional[_Process]) -> Optional[int]:
+    def _check_rank_0(self, process: _Process | None) -> int | None:
         """Stop the node once rank 0 ended, which ends the deployment, and return its status."""
         if process is None or process.status is None:
             return None
         self._logger.error("Rank 0 ended, so the deployment ends with it")
         return self._stop(_exit_status(process.status))
 
-    def _check_running(self, rank: int, process: _Process, record, now_s: float) -> None:
+    def _check_running(
+        self, rank: int, process: _Process, record: "MembershipRecord", now_s: float
+    ) -> None:
         """Track the membership of a running rank, and kill it once the membership drops it."""
         if record.is_active(rank):
             process.listed = True
@@ -491,7 +497,7 @@ class NodeSupervisor:
         )
         self._give_up(rank)
 
-    def _replace_when_due(self, rank: int, record, now_s: float) -> None:
+    def _replace_when_due(self, rank: int, record: "MembershipRecord", now_s: float) -> None:
         """Replace ``rank`` if the membership left it out and its backoff has passed."""
         if record.is_active(rank) or rank in self._given_up:
             return
@@ -785,13 +791,13 @@ class NodeSupervisor:
             self._logger.warning("The connection to the membership authority closed")
         self._close_connection(connection)
 
-    def _close_connection(self, connection) -> None:
+    def _close_connection(self, connection: "LivenessConnection") -> None:
         self._selector.unregister(connection.sock)
         connection.sock.close()
         self._connection = self._connection_awaiting_view = None
         self._unsent = b""
 
-    def _on_view(self, view) -> None:
+    def _on_view(self, view: "NodeView") -> None:
         if self._view is not None:
             self._note_left_out(self._view.record, view.record)
         self._view = view
@@ -803,7 +809,7 @@ class NodeSupervisor:
         ):
             self._deployment_started = True
 
-    def _note_left_out(self, previous, record) -> None:
+    def _note_left_out(self, previous: "MembershipRecord", record: "MembershipRecord") -> None:
         """Note why ``record`` leaves out a replacement that ``previous`` listed as joining."""
         for rank in self._ranks:
             process = self._processes.get(rank)
@@ -831,7 +837,7 @@ class NodeSupervisor:
         self._unlink_shared_memory()
         return status
 
-    def _wait_for(self, processes: List[_Process]) -> None:
+    def _wait_for(self, processes: list[_Process]) -> None:
         """Wait up to the stop grace period for ``processes`` to end, without reaping them.
 
         Until a rank's process is reaped, its process group's ID cannot be reused.
@@ -858,7 +864,7 @@ class NodeSupervisor:
                 os.unlink(path)
 
 
-def start_session_node_supervisor(n_workers: int, env: Dict[str, str]) -> subprocess.Popen:
+def start_session_node_supervisor(n_workers: int, env: dict[str, str]) -> subprocess.Popen:
     """Start the node supervisor of ranks 1 to ``n_workers - 1`` for a session that runs rank 0.
 
     Raises:
@@ -890,7 +896,7 @@ def start_session_node_supervisor(n_workers: int, env: Dict[str, str]) -> subpro
     )
 
 
-def stop_session_node_supervisor(supervisor: subprocess.Popen, grace_s: Optional[float]) -> None:
+def stop_session_node_supervisor(supervisor: subprocess.Popen, grace_s: float | None) -> None:
     """Stop ``supervisor`` after waiting ``grace_s`` seconds for it to exit, unless that is None."""
     if grace_s is not None:
         with contextlib.suppress(subprocess.TimeoutExpired):
@@ -906,7 +912,7 @@ def stop_session_node_supervisor(supervisor: subprocess.Popen, grace_s: Optional
         supervisor.wait()
 
 
-def _exec_rank(supervisor: int, command: List[str]) -> NoReturn:
+def _exec_rank(supervisor: int, command: list[str]) -> NoReturn:
     """Run a rank's ``command`` in place of this process, to end once ``supervisor`` ends."""
     # The process guard sits next to this script, and this script runs without site packages.
     from _llmapi_process_guard import _arm_parent_death_signal
@@ -923,7 +929,7 @@ def _exec_rank(supervisor: int, command: List[str]) -> NoReturn:
     os.execvp(command[0], command)  # nosec B606
 
 
-def main(argv: Optional[List[str]] = None) -> NoReturn:
+def main(argv: list[str] | None = None) -> NoReturn:
     # Before the imports below, which take seconds, so that a parent ending meanwhile is noticed.
     parent = os.getppid()
     parser = argparse.ArgumentParser(

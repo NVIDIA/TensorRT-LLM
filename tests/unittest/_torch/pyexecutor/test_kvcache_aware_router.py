@@ -143,7 +143,8 @@ class TestKVCacheAwareADPRouter:
         assert states[0].num_retiring_requests == 1
         assert states[0].num_active_tokens == 100
 
-    def test_gather_all_rank_states_retiring_and_in_transfer(self):
+    @pytest.mark.parametrize("account_for_in_transfer", [True, False])
+    def test_gather_all_rank_states_retiring_and_in_transfer(self, account_for_in_transfer):
         dist = _mock_dist(tp_rank=0)
         mgr = _mock_kv_cache_manager()
         transfer_mgr = MagicMock()
@@ -154,7 +155,7 @@ class TestKVCacheAwareADPRouter:
             kv_cache_manager=mgr,
             has_seq_slot_headroom=True,
             async_transfer_manager=transfer_mgr,
-            account_for_in_transfer=True,
+            account_for_in_transfer=account_for_in_transfer,
         )
 
         req1 = Mock(
@@ -171,10 +172,16 @@ class TestKVCacheAwareADPRouter:
 
         states = router.gather_all_rank_states([req1, req2])
 
-        assert states[0].num_active_requests == 2  # 1 routable + 1 in transfer
-        assert states[0].num_in_transfer_requests == 1
         assert states[0].num_retiring_requests == 1
-        assert states[0].num_active_tokens == 170
+        if account_for_in_transfer:
+            assert states[0].num_active_requests == 2  # 1 routable + 1 in transfer
+            assert states[0].num_in_transfer_requests == 1
+            assert states[0].num_active_tokens == 170
+        else:
+            # The send is still in the transfer manager but adds no routing load.
+            assert states[0].num_active_requests == 1
+            assert states[0].num_in_transfer_requests == 0
+            assert states[0].num_active_tokens == 100
 
     def test_create_rank_state_cp_helix(self):
         dist = _mock_dist(tp_rank=1, has_cp_helix=True)

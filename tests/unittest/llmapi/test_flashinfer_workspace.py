@@ -18,7 +18,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -249,6 +249,7 @@ def test_mpi_pool_configures_worker_bootstrap(
         _env_overrides=env_overrides,
         mpi_pool=None,
     )
+    session._create_pool = MethodType(mpi_session.MpiPoolSession._create_pool, session)
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
 
@@ -289,6 +290,7 @@ def test_mpi_pool_distinguishes_managed_and_explicit_workspaces(
         _env_overrides=env_overrides,
         mpi_pool=None,
     )
+    session._create_pool = MethodType(mpi_session.MpiPoolSession._create_pool, session)
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
 

@@ -22,11 +22,11 @@ import threading
 import time
 import traceback
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Callable, List, Optional
+from typing import IO, Optional
 
-from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV
 from tensorrt_llm.logger import logger
 
 from .records import (
@@ -38,7 +38,7 @@ from .records import (
     RankReport,
     message_bytes,
 )
-from .rendezvous import LIVENESS_KEY, rendezvous_host_port
+from .rendezvous import LIVENESS_KEY, rendezvous_address, rendezvous_host_port
 from .signed_store import SignedStore, shared_secret_digest
 
 _MAX_LINE_BYTES = 1 << 20
@@ -49,14 +49,14 @@ _AUTHORITY_WAIT_WARNING_S = 30.0
 class Lines:
     """Line framing for one side of a liveness connection."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._buffer = b""
 
     @staticmethod
     def encode(payload: bytes) -> bytes:
         return payload + b"\n"
 
-    def decode(self, data: bytes) -> List[bytes]:
+    def decode(self, data: bytes) -> list[bytes]:
         """Return the payloads of the lines that ``data`` completes."""
         *lines, self._buffer = (self._buffer + data).split(b"\n")
         if len(self._buffer) > _MAX_LINE_BYTES:
@@ -98,7 +98,7 @@ def configure_connection(sock: socket.socket) -> None:
 
 
 @functools.lru_cache(maxsize=1)
-def _closed_in_forked_child() -> "weakref.WeakSet[Any]":
+def _closed_in_forked_child() -> "weakref.WeakSet[socket.socket | IO[bytes]]":
     resources = weakref.WeakSet()
 
     def close_all() -> None:
@@ -109,7 +109,7 @@ def _closed_in_forked_child() -> "weakref.WeakSet[Any]":
     return resources
 
 
-def close_in_forked_child(resource: Any) -> None:
+def close_in_forked_child(resource: socket.socket | IO[bytes]) -> None:
     """Close ``resource`` in every child that this process forks, without keeping it alive."""
     _closed_in_forked_child().add(resource)
 
@@ -163,7 +163,7 @@ def open_liveness_connection(
 def open_node_supervisor_connection(
     store: SignedStore,
     node: int,
-    ranks: List[int],
+    ranks: list[int],
     host: str,
     timeout_s: float = HELLO_TIMEOUT_S,
 ) -> LivenessConnection:
@@ -198,8 +198,12 @@ def open_store(address: str, timeout_s: float, secret: Optional[str] = None) -> 
 
 
 def rendezvous_store(timeout_s: float = DEAD_TIMEOUT_S) -> SignedStore:
-    """Open a rendezvous store client from this process's environment."""
-    return open_store(os.environ[RENDEZVOUS_ENV], timeout_s)
+    """Open a rendezvous store client from this process's environment.
+
+    Raises:
+        ValueError: The environment holds no rendezvous address or shared secret.
+    """
+    return open_store(rendezvous_address(), timeout_s)
 
 
 class MembershipClient:
@@ -217,7 +221,7 @@ class MembershipClient:
         on_record: Callable[[MembershipRecord], None],
         replacement: bool = False,
         on_error: Optional[Callable[[Exception], None]] = None,
-    ):
+    ) -> None:
         """Prepare the client. :meth:`start` connects to the authority.
 
         Args:
@@ -247,7 +251,7 @@ class MembershipClient:
         )
         self._sock: Optional[socket.socket] = None
         self._lines: Optional[Lines] = None
-        self._received: List[bytes] = []
+        self._received: list[bytes] = []
 
     def start(self) -> None:
         """Connect, take the authority's first record and start the thread.
@@ -257,26 +261,33 @@ class MembershipClient:
         """
         connection = open_liveness_connection(self._store, self.rank, self._replacement)
         self._sock, self._lines = connection.sock, connection.lines
-        self._sock.settimeout(HELLO_TIMEOUT_S)
-        while not self._received:
-            data = self._sock.recv(1 << 16)
-            if not data:
-                self._sock.close()
-                raise ConnectionError(
-                    f"the membership authority refused this process of rank {self.rank}"
-                )
-            self._received = self._lines.decode(data)
-        self._sock.settimeout(None)
-        self.record = MembershipRecord.model_validate_json(self._received[0])
-        self.incarnation = self.record.incarnations[self.rank]
-        self._send_report()
+        try:
+            self._sock.settimeout(HELLO_TIMEOUT_S)
+            while not self._received:
+                data = self._sock.recv(1 << 16)
+                if not data:
+                    raise ConnectionError(
+                        f"the membership authority refused this process of rank {self.rank}"
+                    )
+                self._received = self._lines.decode(data)
+            self._sock.settimeout(None)
+            self.record = MembershipRecord.model_validate_json(self._received[0])
+            self.incarnation = self.record.incarnations[self.rank]
+            self._send_report()
+        except BaseException:
+            # The authority admits a replacement for this rank only once the connection closes.
+            self._sock.close()
+            self._sock = None
+            raise
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._wake()
-        self._thread.join()
-        self._sock.close()
+        if self._thread.ident is not None:
+            self._thread.join()
+        if self._sock is not None:
+            self._sock.close()
         # A report() racing this stop must not write to a closed or reused descriptor.
         with self._lock:
             os.close(self._wake_read)

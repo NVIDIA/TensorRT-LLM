@@ -18,7 +18,7 @@ import hashlib
 import hmac
 import os
 from datetime import timedelta
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 from tensorrt_llm._wide_ep_fault_tolerance import SHARED_SECRET_ENV
 from tensorrt_llm.math_utils import ceil_div
@@ -57,8 +57,12 @@ def parse_shared_secret(secret: str) -> bytes:
 
 
 def shared_secret_digest(label: bytes) -> str:
-    """Return the hex HMAC-SHA256 of ``label`` keyed by the shared secret in ``SHARED_SECRET_ENV``."""
-    secret = parse_shared_secret(os.environ[SHARED_SECRET_ENV])
+    """Return the hex HMAC-SHA256 of ``label`` keyed by the shared secret in ``SHARED_SECRET_ENV``.
+
+    Raises:
+        ValueError: ``SHARED_SECRET_ENV`` is not set or holds no valid shared secret.
+    """
+    secret = parse_shared_secret(os.environ.get(SHARED_SECRET_ENV, ""))
     return hmac.new(secret, label, hashlib.sha256).hexdigest()
 
 
@@ -78,13 +82,14 @@ class SignedStore:
     chunk count of 0.
     """
 
-    def __init__(self, store: "Store", secret: Optional[str] = None):
+    def __init__(self, store: "Store", secret: Optional[str] = None) -> None:
         """Sign the values of ``store`` with ``secret`` (hex), by default ``SHARED_SECRET_ENV``.
 
         Raises:
-            ValueError: ``secret`` is not a valid shared secret (:func:`parse_shared_secret`).
+            ValueError: ``secret`` is not a valid shared secret (:func:`parse_shared_secret`), or
+                is None and ``SHARED_SECRET_ENV`` is not set.
         """
-        secret = os.environ[SHARED_SECRET_ENV] if secret is None else secret
+        secret = os.environ.get(SHARED_SECRET_ENV, "") if secret is None else secret
         self._store = store
         self._key = hmac.new(
             parse_shared_secret(secret), b"rendezvous store values", hashlib.sha256
@@ -118,14 +123,14 @@ class SignedStore:
         """
         return self._value(key, self._store.get(key))
 
-    def multi_get(self, keys: List[str]) -> List[bytes]:
+    def multi_get(self, keys: list[str]) -> list[bytes]:
         """Return the values for ``keys``, as :meth:`get` does."""
         return [self._value(k, v) for k, v in zip(keys, self._store.multi_get(keys))]
 
-    def check(self, keys: List[str]) -> bool:
+    def check(self, keys: list[str]) -> bool:
         return self._store.check(keys)
 
-    def wait(self, keys: List[str], timeout: timedelta) -> None:
+    def wait(self, keys: list[str], timeout: timedelta) -> None:
         self._store.wait(keys, timeout)
 
     def add(self, key: str, amount: int) -> int:

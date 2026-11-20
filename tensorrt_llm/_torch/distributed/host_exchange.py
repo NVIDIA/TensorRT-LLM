@@ -143,7 +143,7 @@ class HostExchange:
         self._ranks_by_mask: dict[int, tuple[np.ndarray, list[int]]] = {}
 
     @classmethod
-    def create(cls, mapping, group_type: type[HostExchangeGroup]) -> "HostExchange":
+    def create(cls, mapping: Mapping, group_type: type[HostExchangeGroup]) -> "HostExchange":
         """Create the exchange over ``group_type``, collectively over the TP group's ranks."""
         group, active_mask = group_type.open(mapping, cls.DEFAULT_SLOT_PAYLOAD_BYTES)
         exchange = cls(group)
@@ -478,7 +478,7 @@ class MnnvlDist(Distributed):
         check_fault_tolerance_requirements(checks)
 
     @property
-    def local_world_size(self):
+    def local_world_size(self) -> int:
         """Return the number of ranks on this node that share its free memory as this rank starts.
 
         An original rank counts all ranks on the node. A replacement rank counts only the node's
@@ -501,7 +501,7 @@ class MnnvlDist(Distributed):
         return len(node_ranks)
 
     @property
-    def host_exchange(self):
+    def host_exchange(self) -> HostExchange:
         """Return the ``HostExchange``, created collectively on first use.
 
         Raises:
@@ -542,7 +542,7 @@ class MnnvlDist(Distributed):
         host_exchange = self.host_exchange
         payload = pickle.dumps(obj)
 
-        def run():
+        def run() -> list[bytes | None]:
             return host_exchange.exchange(payload, readers, recipients, idle)
 
         record = Distributed.startup_record
