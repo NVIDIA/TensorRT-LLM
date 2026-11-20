@@ -9,7 +9,7 @@ import shutil
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, TextIO
 
 from filelock import FileLock
 from flashinfer.jit.core import get_tmpdir, logger
@@ -45,6 +45,15 @@ class JitSpecCuteDsl(_FlashInferJitSpecCuteDsl):
     def module_lock_path(self) -> Path:
         return get_tmpdir() / f"{self.module_dir_name}.lock"
 
+    def _same_cache_generation(self, marker: TextIO) -> bool | None:
+        """False if the marker was replaced or removed, None if it cannot be checked."""
+        try:
+            return os.path.samestat(os.fstat(marker.fileno()), self.meta_path.stat())
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError:
+            return None
+
     def _cached_entry(self, *, load: bool) -> Any:
         # meta.json is the generation's commit marker, published after the
         # object. Keep its inode alive across the lookup to detect replacement
@@ -60,14 +69,15 @@ class JitSpecCuteDsl(_FlashInferJitSpecCuteDsl):
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 return None
 
-            value = self._load_from_disk() if load else True
-
             try:
-                if os.path.samestat(os.fstat(marker.fileno()), self.meta_path.stat()):
-                    return value
-            except OSError:
-                return None
-        return None
+                value = self._load_from_disk() if load else True
+            except Exception:
+                # A sibling can invalidate the object after the existence check.
+                # Preserve genuine loader errors for the same (or unknown) generation.
+                if self._same_cache_generation(marker) is False:
+                    return None
+                raise
+            return value if self._same_cache_generation(marker) else None
 
     @property
     def is_compiled(self) -> bool:
@@ -90,6 +100,8 @@ class JitSpecCuteDsl(_FlashInferJitSpecCuteDsl):
             try:
                 if self.module_dir.exists() and _read_meta(self.meta_path) != self.expected_meta:
                     logger.info(f"Invalidating stale CuTe-DSL module {self.module_dir_name}")
+                    # Retire the generation before removing any of its objects.
+                    self.meta_path.unlink(missing_ok=True)
                     shutil.rmtree(self.module_dir)
                 self._export()
             except Exception as error:
