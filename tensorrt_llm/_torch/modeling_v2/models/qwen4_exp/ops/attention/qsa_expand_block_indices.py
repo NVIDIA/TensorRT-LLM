@@ -141,7 +141,7 @@ class QsaExpandBlockIndices(OpWrapper):
     metadata view reports contiguous and is accepted -- benign at one row.
 
     Source: a Triton kernel JIT-compiled on first call for the device it runs
-    on; the cells were driven through that JIT path on sm_103 (GB300).
+    on; the cells were driven through that JIT path on sm_103 and sm_107.
 
     Launch: one program per (row, 256 columns) below 128 rows, one per row
     from 128 up. No autotune. CUDA-graph capturable (captured at 1, 128, 256

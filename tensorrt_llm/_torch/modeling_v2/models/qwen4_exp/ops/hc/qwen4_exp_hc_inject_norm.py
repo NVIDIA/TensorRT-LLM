@@ -916,7 +916,7 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     last before the switch). It releases dependents at its start as the Triton
     kernel does.
 
-    Certified on sm_103 (GB300), bf16, the checkpoint's 4 x 2560, PDL trigger
+    Certified on sm_103 and sm_107, bf16, the checkpoint's 4 x 2560, PDL trigger
     on (the default): the Triton kernel and the CuTe fold kernel are JIT-
     compiled at first call for the running GPU, and the cells ran that path.
       tp1: the injection at 128 rows (eight-warp form), the combine at 16384

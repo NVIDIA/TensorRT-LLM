@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""QSA index scores of a context chunk's rows on SM103 tensor cores (CuTe DSL, tcgen05).
+"""QSA index scores of a context chunk's rows on SM103/SM107 tensor cores (CuTe DSL, tcgen05).
 
 Bitwise equal to the family's `_qsa_paged_index_scores_qtile_kernel` (`only_visible_blocks`):
 columns at and past a row's visible block count are unspecified. A persistent CTA takes

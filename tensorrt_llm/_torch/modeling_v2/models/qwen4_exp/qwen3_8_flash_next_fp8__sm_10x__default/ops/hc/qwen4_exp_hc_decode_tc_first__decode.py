@@ -739,7 +739,7 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     memory, no global workspace. PDL off with TRTLLM_ENABLE_PDL=0. Graph-capturable (current
     stream, no host sync, no persistent state); compiles once per (BN, KS, C, R, N, K,
     inject), so call `precompile` before capture.
-    Certified on GB300 at the cells' rows, graph replay bitwise the eager launch.
+    Certified on sm_103 and sm_107 at the cells' rows, graph replay bitwise the eager launch.
     Not certified: hc_count other than 4, an unpadded weight (N = R + C), zero rows.
     """
 

@@ -133,9 +133,17 @@ _TP2 = dict(enable_attention_dp=False, moe_tp_size=2, moe_ep_size=1)
 _TEP2 = dict(enable_attention_dp=False, moe_tp_size=1, moe_ep_size=2)
 
 
-def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD, text=None, **config):
-    """The core of rank `rank` of a `world`-rank engine at `layout`, every parameter on meta;
-    `text` overrides text config fields and `config` sets further `ModelConfig` fields."""
+def _core(
+    rank: int,
+    layout: dict,
+    spec_config=None,
+    world: int = WORLD,
+    text=None,
+    gpu=archs.SM_103,
+    **config,
+):
+    """The core of rank `rank` of a `world`-rank engine at `layout` on `gpu`, every parameter on
+    meta; `text` overrides text config fields and `config` sets further `ModelConfig` fields."""
     model_config = ModelConfig(
         pretrained_config=Qwen4ExpTextConfig(**{**_TEXT, **(text or {})}),
         mapping=Mapping(world_size=world, tp_size=world, rank=rank, **layout),
@@ -151,7 +159,7 @@ def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD, text=No
     )
     # The core asserts the device it runs on; the weights it declares stay on meta.
     with (
-        mock.patch.object(torch.cuda, "get_device_capability", return_value=archs.SM_103),
+        mock.patch.object(torch.cuda, "get_device_capability", return_value=gpu),
         torch.device("meta"),
     ):
         return M.Qwen4ExpDefaultModelingV2(model_config, composite)
@@ -827,13 +835,17 @@ def test_both_draft_targets_pad_the_draft_moe_by_the_workers_counts(target) -> N
 # ---- engine knobs the target reads ---------------------------------------------------------
 
 
-@pytest.mark.parametrize("strategy", [AllReduceStrategy.AUTO, AllReduceStrategy.NCCL])
-def test_the_tp_sum_runs_at_the_engines_allreduce_strategy(strategy, monkeypatch) -> None:
-    core = _core(0, _TEP4, allreduce_strategy=strategy)
+@pytest.mark.parametrize(
+    "strategy, raw",
+    [("AUTO", "AUTO"), ("NCCL", "NCCL"), ("MNNVL", "AUTO"), ("SYMM_MEM", "AUTO")],
+)
+def test_the_tp_sum_runs_at_the_engines_allreduce_strategy(strategy, raw, monkeypatch) -> None:
+    """The raw all-reduce op has no MNNVL or SYMM_MEM branch: those run it at AUTO."""
+    core = _core(0, _TEP4, allreduce_strategy=AllReduceStrategy[strategy])
     seen = []
     monkeypatch.setattr(M, "allreduce_group_args", lambda mapping, s: seen.append(s) or {})
     core._tp_sum_op()
-    assert seen == [int(strategy)]
+    assert seen == [int(AllReduceStrategy[raw])]
 
 
 @pytest.mark.parametrize("value", ["1", "true", "On", "0", "no", ""])
@@ -844,13 +856,15 @@ def test_a_switch_takes_the_usual_spellings(value, monkeypatch) -> None:
     assert M._ple_host_offload_enabled() is (value.lower() not in ("0", "no"))
 
 
+@pytest.mark.parametrize("gpu", sorted(archs.SERVED))
 @pytest.mark.parametrize(
     "env", [M._DENSE_FP8_ENV, M._PLE_HOST_OFFLOAD_ENV, M._MOE_PREFILL_COPY_ENV]
 )
-def test_a_misspelled_switch_refuses_the_build(env, monkeypatch) -> None:
+def test_a_misspelled_switch_refuses_the_build(env, gpu, monkeypatch) -> None:
+    """On every served GPU: the CuTe DSL prefill copy's switch too, where the copy never runs."""
     monkeypatch.setenv(env, "disable")
     with pytest.raises(ValueError, match=env):
-        _core(0, _TEP4)
+        _core(0, _TEP4, gpu=gpu)
 
 
 def test_a_tp1_switch_away_from_tp1_is_reported(monkeypatch) -> None:

@@ -251,9 +251,9 @@ def _flashinfer_path(spec) -> str:
 
 
 def _certified_path(spec) -> str:
-    """`fi_path` was recorded on sm_103; FlashInfer picks the pipeline by SM count elsewhere."""
-    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
-    return spec["fi_path"] if on_sm103 else _flashinfer_path(spec)
+    """The pipeline the cell recorded for this GPU (FlashInfer picks it by SM count)."""
+    path = spec["fi_path"]
+    return path if isinstance(path, str) else path[torch.cuda.get_device_capability()]
 
 
 def _chunk_build(spec, seed):
@@ -938,13 +938,13 @@ def _variant_ht_verify(n) -> None:
     """A tp2/tep2 rank's HT verify step as `_gdn_verify` launches it (`_GDN_REPLAY_HT_LAUNCH`,
     gated norm folded, the conv too at few requests) bitwise the plain chain on twin state. A
     folded conv leaves the pool to the acceptance promote (the plain advance: the last window)."""
-    core = types.SimpleNamespace(num_k_heads=8, num_v_heads=24)
+    tuned = torch.cuda.get_device_capability() == (10, 3)
+    core = types.SimpleNamespace(num_k_heads=8, num_v_heads=24, gdn_replay_ht_tuned=tuned)
     t, h, hv = 3, 8, 24
     assert _m._gdn_verify_folds_norm(core, n, t)
     conv_fold = _m._gdn_verify_folds_conv(core, n)
     pdl, mapping = _m._gdn_replay_launch(core, n)
-    tuned = torch.cuda.get_device_capability() in _m._GDN_REPLAY_HT_GPUS
-    assert ((pdl, mapping) != (False, None)) is tuned, "the HT table applies on its GPUs only"
+    assert ((pdl, mapping) != (False, None)) is tuned, "the HT table applies on sm_103 only"
     spec = dict(
         state_dtype=torch.bfloat16, H=h, HV=hv, path="all_layer", n=n, t=t, layers=1, slots=n + 8
     )
@@ -1191,6 +1191,7 @@ def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(
         num_v_heads=hv,
         head_v_dim=GVR_V,
         eps=1e-6,
+        gdn_replay_ht_tuned=torch.cuda.get_device_capability() in _m._GDN_REPLAY_HT_GPUS,
         _bound=types.SimpleNamespace(
             pools=pools,
             int_conv={0: torch.zeros(nmax, t, conv_dim, GVR_CONV_W - 1, dtype=bf, device=DEV)},
@@ -1485,6 +1486,7 @@ def _dispatch_core(bench, separate):
         head_k_dim=K,
         num_v_heads=bench.hv,
         head_v_dim=V,
+        gdn_replay_ht_tuned=torch.cuda.get_device_capability() in _m._GDN_REPLAY_HT_GPUS,
         _bound=types.SimpleNamespace(
             pools=types.SimpleNamespace(ssm=dict(enumerate(bench.pool))),
             replay=replay,

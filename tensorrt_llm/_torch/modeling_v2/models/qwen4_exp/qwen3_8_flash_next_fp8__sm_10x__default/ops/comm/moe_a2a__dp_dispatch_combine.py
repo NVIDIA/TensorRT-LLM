@@ -14,7 +14,8 @@ from typing import List, NamedTuple, Sequence
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 HIDDEN = 2560
 NUM_EXPERTS = 512
@@ -71,7 +72,7 @@ class Dispatched(NamedTuple):
 class MoeA2aDispatch(OpWrapper):
     """Send every rank the rows routed into its window; see the module docstring."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = _CELLS
 
     note = """
@@ -138,7 +139,7 @@ class MoeA2aCombine(OpWrapper):
     `partials` is `[world * max(counts), hidden]` in the order `moe_a2a_dispatch` handed the rows
     (a slot that holds no token may hold anything); returns this rank's `[rows, hidden]`."""
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = _CELLS
 
     note = """

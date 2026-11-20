@@ -2185,6 +2185,16 @@ class GdnCachedReplayCute(OpWrapper):
             steps=4,
             strided_gates=True,
         ),
+        _tep2_cell(
+            "small n=1 T=8 full accept: MTP7 appends to the history's end, then wraps",
+            "small",
+            1,
+            8,
+            steps=8,
+            start="fresh",
+            accept="full",
+            strided_gates=True,
+        ),
         _whole_layer_cell(
             "small n=1 T=3: MTP2 verify at con1 (the tp1 AgentX engines), in-kernel commit",
             "small",
@@ -2228,7 +2238,7 @@ class GdnCachedReplayCute(OpWrapper):
     `[N*T, 2560]` rows (`packed_qkv`; 10240 at 16 / 48), `g` / `beta` the input projection's raw
     a / b columns read through its row stride (no copies), `A_log` / `dt_bias` fp32, the
     layer's view of the stock manager's bf16 state page (slot stride 36 layers' states), the
-    history buffers `[slots, 2, 16, 24|12|4, 128]` / `[slots, 2, 12, 16]` (addressed by the
+    history buffers `[slots, 2, 16, 16|8|4, 128]` / `[slots, 2, 48|24|12, 16]` (addressed by the
     manager's replay slots, `replay_indices`, when it keeps the history in slots of its own;
     the work items then carry the replay slot as a fifth field), and work items +
     `use_all_layer_commit` exactly when the Triton entry gets them (N >= 16 with the manager's
@@ -2248,9 +2258,10 @@ class GdnCachedReplayCute(OpWrapper):
     8 (T = 8 with full acceptance appending to the history's end, then wrapping), CUDA-graph
     padding rows sharing one slot, and the all-layer commit at N = 16 and 128 (T = 4); g / beta
     as column views of a `[N*T, 4120]` projection. At 8 / 24 heads (tp2/tep2) the in-kernel
-    commit at N = 4 and the all-layer commit at N = 32, both T = 4.
-    Against the Triton entry's bands (fractions
-    of each gate): output elements <= 0.50 of 4 bf16 ulps of their token block, relative RMS
+    commit at N = 4 (T = 4) and N = 1 (T = 8, full acceptance appending to the history's end,
+    then wrapping), and the all-layer commit at N = 32 (T = 4).
+    Against the Triton entry's bands (fractions of each gate, over every cell but the 8 / 24
+    T = 8 one): output elements <= 0.50 of 4 bf16 ulps of their token block, relative RMS
     <= 0.71 of 1.5 ulps, bf16 checkpoint <= 0.68 of 2 ulps of its head's absmax, `old_u` <=
     0.50 of 4 ulps, `old_G` <= 0.06 -- the Triton entry's own margins (0.52 / 0.64 / 0.84 /
     0.50 / 0.08). A reference with the key heads reversed is refused by the output gate.

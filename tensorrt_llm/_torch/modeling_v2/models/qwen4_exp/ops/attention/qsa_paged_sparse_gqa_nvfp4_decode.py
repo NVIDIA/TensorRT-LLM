@@ -1484,7 +1484,7 @@ class QsaPagedSparseGqaNvfp4Decode(OpWrapper):
     5.2 GB of scales), past a normal cell's 40 GiB: `large`.
 
     Compiled variants: CuTe DSL, JIT-compiled on the first call of each key for the device
-    that runs it; every cell ran that path on sm_103 (GB300). The key holds the pool's page
+    that runs it; every cell ran that path on sm_103 and sm_107. The key holds the pool's page
     count, the table's shape, the planes' strides, the split plan and whether the gate is
     fused, so the dep4 cells compile the variants a dep4 engine at those settings runs; any
     other page count or table shape compiles a variant of its own.

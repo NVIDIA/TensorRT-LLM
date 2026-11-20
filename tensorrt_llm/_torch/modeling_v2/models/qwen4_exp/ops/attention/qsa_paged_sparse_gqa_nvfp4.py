@@ -1039,7 +1039,7 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     bitwise the eager call on them.
 
     Compiled variants: the kernels are Triton, JIT-compiled on first call for the
-    device that runs them; every cell ran that path on sm_103 (GB300). They take
+    device that runs them; every cell ran that path on sm_103 and sm_107. They take
     the pool's page count (`num_pages`), the
     table's row count (`num_requests`) and the split-K kernel the step's row
     count as plain ints, and Triton compiles each apart at 1, at multiples of 16

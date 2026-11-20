@@ -177,7 +177,7 @@ class VisionRope2dPackedQk(OpWrapper):
     (tp4, tep4, dep4) runs the tower at these shapes.
 
     Source: Triton, JIT-compiled at first call for the running device; the cells ran that
-    path on sm_103 (GB300). The token counts are not specialized, so one compile serves
+    path on sm_103 and sm_107. The token counts are not specialized, so one compile serves
     every grid (the tower's `warm_up` makes it at load; the test holds one variant).
     Launch: `(cdiv(heads, 4), cdiv(T, 8))` programs, one per 4 heads x 8 tokens, each
     loading its 8 tokens' cos / sin once and both half-heads of its 4 heads with 64-lane

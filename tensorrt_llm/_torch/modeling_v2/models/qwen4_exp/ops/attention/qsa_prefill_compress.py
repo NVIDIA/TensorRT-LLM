@@ -206,7 +206,7 @@ class QsaPrefillCompress(OpWrapper):
     elements off by up to 1.56e-2, and is not certified. Text rows reduce
     mRoPE to plain RoPE bit for bit (measured, not pinned by a test). Plain
     `@triton.jit`, no autotune, JIT-compiled at first call; the cells drove
-    that JIT path on sm_103 (GB300). Every stride is a
+    that JIT path on sm_103 and sm_107. Every stride is a
     `tl.constexpr`, so each pool layout (contiguous, the NVFP4 shared page,
     the default target's coalesced bf16 pool) is its own compiled specialization, and
     each is driven by a cell. CUDA-graph capturable at a fixed row count

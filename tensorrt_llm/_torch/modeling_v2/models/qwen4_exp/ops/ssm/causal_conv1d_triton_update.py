@@ -209,7 +209,7 @@ class CausalConv1dTritonUpdate(OpWrapper):
     is written.
 
     The kernel is Triton, JIT-compiled at the first call; the cells ran that
-    path on sm_103. The x strides, the seqlen and the snapshot strides are
+    path on sm_103 and sm_107. The x strides, the seqlen and the snapshot strides are
     `tl.constexpr`, so each (p, row stride) the target sends is its own
     compile.
 

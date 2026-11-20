@@ -178,7 +178,7 @@ class FusedSigmoidMulInplace(OpWrapper):
     the running device at the first call of each (hidden, head_dim, block)
     specialization, no autotuner: grid `(T, cdiv(hidden, block))`,
     `block = min(next_pow2(hidden), 1024 if T < 1024 else 2048)`, 4 warps. The
-    cells ran on sm_103. With `direct_launch=True` (the FP8 target), `_launch` makes
+    cells ran on sm_103 and sm_107. With `direct_launch=True` (the FP8 target), `_launch` makes
     that same launch itself where the preconditions below hold and skips only the
     custom-op dispatch (15 instead of 28 us of host time a call on GB300);
     otherwise the op is called and refuses the call. `_launch` is a copy of the

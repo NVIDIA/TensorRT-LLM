@@ -1047,7 +1047,7 @@ class GdnPrefillConvPost(OpWrapper):
     Compiled at first call, per `(num_k_heads, num_v_heads, head_k_dim, row
     stride of x)` (`_CONV_PASS`): the conv pass by CuTe DSL (TVM-FFI entry,
     `--opt-level 2`), the gates and publish by Triton. The cells ran both JIT
-    paths on sm_103 (GB300).
+    paths on sm_103 and sm_107.
 
     Not certified: fp16/fp32 activations; head geometries other than 16 / 48
     and 4 / 12; bias; a row stride of `x` other than the projections' 16480

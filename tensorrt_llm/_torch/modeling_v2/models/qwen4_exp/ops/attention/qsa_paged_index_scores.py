@@ -1112,7 +1112,7 @@ class QsaPagedIndexScores(OpWrapper):
     (`_qsa_paged_index_scores_kernel`, `_qsa_paged_index_scores_qtile_kernel`,
     `_qsa_paged_index_scores_group_kernel`),
     JIT-compiled for the running device on first call; the cells ran that JIT
-    path on sm_103.
+    path on sm_103 and sm_107.
 
     Visible-split kernel (decode-sized visible-only calls). Its grid is
     `(row tiles, request slots, split)`: a row tile is `min(rows, 16 // heads)`

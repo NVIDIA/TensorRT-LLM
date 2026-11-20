@@ -91,7 +91,7 @@ class FusedSigmoidGateMulAdd(OpWrapper):
     note = """
     Metadata consumed: none; stateless, no autotuner, no architecture branch.
     Source: a Triton kernel (`_sigmoid_gate_mul_add_kernel`) JIT-compiled on first
-    call for the running device; the cells ran on sm_103.
+    call for the running device; the cells ran on sm_103 and sm_107.
 
     Call sites in the default target: the decode PLE-layer combine
     (`DecodeTarget.forward`) and the MTP layer's MoE (`DecodeTarget.mtp_forward`),

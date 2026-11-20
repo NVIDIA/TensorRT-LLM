@@ -83,9 +83,10 @@ skip_without_flashinfer_ring = pytest.mark.skipif(
     not is_flashinfer_gdn_decode_supported_arch(),
     reason="FlashInfer ships no GDN decode / verify kernels for this GPU",
 )
-# A world across nodes is launched from outside (`trtllm-llmapi-launch` under an MPI launcher).
+# A world across nodes is launched from outside (`trtllm-llmapi-launch` under an MPI launcher);
+# the case names its node size (`gpus_per_node`), and `skip_less_mpi_world_size` its ranks.
 skip_not_in_a_world_across_nodes = pytest.mark.skipif(
-    not get_spawn_proxy_process_env(), reason="runs inside an MPI world launched over two nodes"
+    not get_spawn_proxy_process_env(), reason="runs inside an MPI world of launched ranks"
 )
 
 # Check the target's step contract on the first forward, against metadata the
@@ -462,7 +463,7 @@ _MTP3_LAYOUTS = [
 
 
 class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
-    """qwen3.8-flash-next-nvfp4 / sm_10x / default: tp1, tp4, tep4, dep4 and dep2."""
+    """qwen3.8-flash-next-nvfp4 / sm_10x / default: every layout routing admits."""
 
     # References are keyed by model name plus the quantization the engine
     # resolves for this checkpoint (MIXED_PRECISION), and the MTP row by the

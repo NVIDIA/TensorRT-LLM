@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """ModelingV2 target: Qwen3.8-Flash-Next-FP8 (hf-236dfdf_orig) / sm_10x / default.
 
-One target for every layout `routing.py` admits (`_LAYOUTS`, and dep<world size> across nodes):
+One target for every layout `routing.py` admits (`_LAYOUTS`, and dep8 across nodes):
 tp1; tp2, tep2 (attention TP2) and dep2 (attention DP) at two ranks; tp4, tep4 (attention TP4)
 and dep4 (attention DP) at four. The core holds this rank's share of the weights, the derived
 operands and the per-manager pool views; `PrefillTarget` (any batch with context rows) and
@@ -1080,6 +1080,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.index_col = self.qkv_width + self.q_width
         self.num_k_heads = d.num_k_heads
         self.num_v_heads = d.num_v_heads
+        # Read per GDN layer of a verify step (`_gdn_replay_launch`), so settled once.
+        self.gdn_replay_ht_tuned = torch.cuda.get_device_capability() in _GDN_REPLAY_HT_GPUS
         self.key_dim = d.key_dim
         self.value_dim = d.value_dim
         self.conv_dim = d.conv_dim
@@ -2127,7 +2129,7 @@ def _gdn_replay_launch(core, n: int) -> tuple:
     if (
         heads == _GDN_REPLAY_HT_GEOMETRY
         and n >= _GDN_REPLAY_HT_MIN_REQUESTS
-        and torch.cuda.get_device_capability() in _GDN_REPLAY_HT_GPUS
+        and core.gdn_replay_ht_tuned
     ):
         for bound, pdl, mapping in _GDN_REPLAY_HT_LAUNCH:
             if n <= bound:
@@ -6872,8 +6874,7 @@ def _text_settings(text) -> dict:
 class ModelingV2Qwen38FlashNextFp8Sm10xDefault(
     DecoderModelForCausalLM[Qwen4ExpDefaultModelingV2, PretrainedConfig]
 ):
-    """Qwen3.8-Flash-Next-FP8 at tp1, tp2, tep2, dep2, tp4, tep4, dep4, or dep<world size>
-    across nodes."""
+    """Qwen3.8-Flash-Next-FP8 at tp1, tp2, tep2, dep2, tp4, tep4, dep4, or dep8 across nodes."""
 
     # Keeps a requested NVFP4 KV pool, which the engine otherwise turns into FP8 on sm_107.
     supports_nvfp4_kv_cache = True

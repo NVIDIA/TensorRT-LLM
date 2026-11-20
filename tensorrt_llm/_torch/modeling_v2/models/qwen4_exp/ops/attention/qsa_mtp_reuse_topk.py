@@ -198,7 +198,7 @@ class QsaMtpReuseTopk(OpWrapper):
 
     Source: tier 2, an in-tree Triton kernel in the QSA attention backend,
     JIT-compiled on first call for the device it runs on; the cells were driven
-    through that JIT path on sm_103 (GB300). One program per output row, no
+    through that JIT path on sm_103 and sm_107. One program per output row, no
     autotune, no PDL.
 
     The default target (tp4 / tep4 / dep4) calls it with the same geometry on every

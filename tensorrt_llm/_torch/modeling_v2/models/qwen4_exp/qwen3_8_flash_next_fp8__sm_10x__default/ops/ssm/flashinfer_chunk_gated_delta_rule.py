@@ -62,10 +62,11 @@ def _rank_slots(num_seqs: int, slots: int) -> tuple[int, ...]:
     return picked
 
 
-def _rank_cell(why: str, geometry, seqlens, slots: int, initial, fi_path: str) -> Cell:
+def _rank_cell(why: str, geometry, seqlens, slots: int, initial, fi_path) -> Cell:
     """The target's call at one rank: the layer's view of the bf16 state page at the member's
-    slot count, a prefix view of a wider output buffer. `fi_path` is the path it reaches on
-    sm_103 (`cp`, `chunked` or `inplace`)."""
+    slot count, a prefix view of a wider output buffer. `fi_path` is the path it reaches
+    (`cp`, `chunked` or `inplace`) on every served GPU, or a `{(major, minor): path}` map
+    where FlashInfer's SM-count heuristic picks differently."""
     return Cell(
         why=why,
         spec=dict(
@@ -479,7 +480,7 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
         ),
         _rank_cell(
             "dep4 16/48, carried 512-token prompt, 850-slot bf16 page",
-            QWEN38_GEOMETRY, (512,), DEP4_SLOTS, (True,), "chunked",
+            QWEN38_GEOMETRY, (512,), DEP4_SLOTS, (True,), {(10, 3): "chunked", (10, 7): "cp"},
         ),
         _rank_cell(
             "tep4 4/12 envelope, 8192 rows over 128 seqs of 63/65, chunked path",
@@ -530,7 +531,7 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     this op concurrently. Slot offsets are int64 (every certified page's last slot is past
     int32).
 
-    Certified on GB300 against the fp64 reference at the cells: bf16 pools at 16/48, 8/24 and
+    Certified on sm_103 and sm_107 against the fp64 reference at the cells: bf16 pools at 16/48, 8/24 and
     4/12 heads on each path they reach. Not certified: fp32 / fp16 pools, `scale` other than the
     default, other head layouts, K or V other than 128, 2 context sequences on CP at 4/12, a
     carried sequence on CP at 8/24, the measured slot counts of tp4, tp2 and tep2 (stand-ins

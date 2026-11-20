@@ -70,7 +70,7 @@ class SiluAndMulRows(OpWrapper):
     Preconditions: 2-D `x` with unit column stride, `x.shape[1] >= 2 * inter`; bf16 or fp16.
 
     Source: Triton, JIT-compiled at first call for the running device; the cells ran that
-    path on sm_103 (GB300). Launch: `(rows, cdiv(inter, 1024))` programs of 4 warps, the
+    path on sm_103 and sm_107. Launch: `(rows, cdiv(inter, 1024))` programs of 4 warps, the
     same kernel at every row count (no path switch). Row offsets are int64, so no index
     product overflows inside the envelope (2^31 elements of the 1288-wide input is 1.67M
     rows).

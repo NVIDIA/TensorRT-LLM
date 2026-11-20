@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.8-Flash-Next-FP8 / sm_10x / default: tp1, tp2, tep2, dep2, tp4, tep4 and dep4.
+"""Qwen3.8-Flash-Next-FP8 / sm_10x / default: tp1, tp2, tep2, dep2, tp4, tep4, dep4, and dep8
+across nodes.
 
 The collective matrices (`tests/unittest/.../qwen3_8_flash_next_fp8__sm_10x__default/comm`) run in
 the pre-merge GB300 multi-GPU stage (`l0_gb300.yml`), which CI schedules only when a file it lists

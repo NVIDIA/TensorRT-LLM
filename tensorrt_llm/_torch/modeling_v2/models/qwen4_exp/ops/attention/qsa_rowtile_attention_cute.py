@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The row-tile pass of `qsa_sparse_gqa_rowtile` on SM103 tensor cores (CuTe DSL, tcgen05).
+"""The row-tile pass of `qsa_sparse_gqa_rowtile` on SM103/SM107 tensor cores (CuTe DSL, tcgen05).
 
 Inputs and output: per group of `rows_per_tile` rows of one request, the plan's packed
 slot list (`slots[group]`, `listed` entries), each row's bitmap re-indexed onto it
@@ -945,7 +945,7 @@ class _RowtileAttentionKernel:
         # (or two 16-column halves).
         cS = cute.make_identity_tensor((self.bm, self.bn))
         tScS = qk_thr.partition_C(cS)
-        # The load also reduces the row max over the tile's 64 columns (tcgen05.ld.red, SM103): an
+        # The load also reduces the row max over the tile's 64 columns (tcgen05.ld.red, SM103/SM107): an
         # upper bound of the row's masked max, which serves as the softmax offset just as well.
         load_s = tcgen05.make_tmem_copy(
             cute.make_copy_atom(
@@ -1307,7 +1307,7 @@ def eligible(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> b
         return False
     if not (q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16):
         return False
-    if not archs.fast_path("qsa_rowtile", torch.cuda.get_device_capability(q.device)):
+    if not archs.served(torch.cuda.get_device_capability(q.device)):
         return False
     if (
         q.stride(2) != 1

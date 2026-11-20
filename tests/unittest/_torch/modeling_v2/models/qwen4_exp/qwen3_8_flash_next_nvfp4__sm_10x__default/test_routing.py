@@ -5,7 +5,7 @@
 `qwen4_exp` routes to its one target one rank (tp1), tp4 and tep4 with or without MTP, and
 the attention-DP layouts dep4 and dep2 (the disaggregated-serving engines' layout) with or
 without MTP, neither with a breakable prefill graph, and tp2, tep2
-and dep<world size> across nodes, on every GPU in `archs.SERVED`. The layouts the target does
+and dep8 across nodes, on every GPU in `archs.SERVED`. The layouts the target does
 not serve fall back under `auto`. The tp1 engine choices are exercised in
 `tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py`.
 """
@@ -19,10 +19,12 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs, ple_host_table, routing
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MoeConfig,
     MTPDecodingConfig,
+    MultimodalConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
 )
@@ -212,18 +214,25 @@ def test_mtp_at_every_draft_length_routes_at_dep4(max_draft_len):
 @pytest.mark.parametrize("gpu", sorted(archs.SERVED))
 def test_every_layout_routes_on_every_served_gpu(gpu, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: gpu)
-    for member, kwargs in {**_LAYOUTS, **_TWO_RANK, "dep2": _DEP2, "dep8": _DEP8}.items():
+    layouts = {"tp1": {}, **_LAYOUTS, **_TWO_RANK, "dep2": _DEP2, "dep8": _DEP8}
+    for member, kwargs in layouts.items():
         assert routing.layout(Mapping(**kwargs)) == member
         for spec in [None, MTPDecodingConfig(max_draft_len=3)]:
             config = _model_config(spec, **kwargs)
             _claimed(config, kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="bfloat16"))
 
 
-def test_attention_tp_across_nodes_declines():
-    for kwargs in (dict(tp_size=8), dict(tp_size=8, moe_tp_size=1, moe_ep_size=8)):
-        config = _model_config(world_size=8, gpus_per_node=4, **kwargs)
+def test_other_layouts_across_nodes_decline():
+    """Attention TP across nodes, and attention DP wider than the dep8 that was run."""
+    dep16 = dict(_DEP8, world_size=16, tp_size=16, moe_ep_size=16)
+    for kwargs in (
+        dict(world_size=8, tp_size=8, gpus_per_node=4),
+        dict(_DEP8, enable_attention_dp=False),
+        dep16,
+    ):
+        config = _model_config(**kwargs)
         assert config.mapping.is_multi_node() and routing.layout(config.mapping) is None
-        _declined(config, match="dep<world size> across nodes")
+        _declined(config, match="dep8 across nodes")
 
 
 # --- what the target does not run under attention DP ------------------------------
@@ -493,7 +502,7 @@ def test_the_cutedsl_backend_declines_where_its_fast_path_does_not_run(monkeypat
     config = replace(_model_config(), moe_backend_requested="CUTEDSL")
     _claimed(config)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: archs.SM_107)
-    _declined(config, match="moe_config.backend=CUTEDSL")
+    _declined(config, match="moe_config.backend='CUTEDSL'; at tp1 the target runs")
     _claimed(replace(config, moe_backend_requested="TRTLLM"))
 
 
@@ -509,6 +518,28 @@ def test_a_float32_state_cache_declines():
 @pytest.mark.parametrize("member", _ATTENTION_TP)
 def test_no_or_the_breakable_prefill_cuda_graph_matches(member, backend):
     _claimed(_model_config(**_LAYOUTS[member]), prefill_cuda_graph_backend=backend)
+
+
+def test_engine_choices_the_target_does_not_honor_decline(monkeypatch):
+    """A strategy whose buffers only the stock `AllReduce` module sets up, under attention TP; a
+    forced attention-DP MoE round trip; GPU-side pixel normalization. MNNVL and SYMM_MEM run the
+    raw all-reduce at AUTO, and one rank has no TP sum."""
+    for strategy in ("UB", "LOWPRECISION"):
+        config = replace(
+            _model_config(**_TWO_RANK["tp2"]), allreduce_strategy=AllReduceStrategy[strategy]
+        )
+        _declined(config, match=f"allreduce_strategy={strategy} at tp2")
+        _claimed(replace(_model_config(), allreduce_strategy=AllReduceStrategy[strategy]))
+    for strategy in ("MNNVL", "SYMM_MEM"):
+        config = _model_config(**_LAYOUTS["tep4"])
+        _claimed(replace(config, allreduce_strategy=AllReduceStrategy[strategy]))
+    monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", "deepeplowlatency")
+    _declined(_model_config(**_DEP2), match="TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY at dep2")
+    _claimed(_model_config(**_LAYOUTS["tep4"]))
+    monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", "ALLGATHER")
+    _claimed(_model_config(**_DEP2))
+    mm = MultimodalConfig(vision_gpu_normalize=True)
+    _declined(_model_config(), match="vision_gpu_normalize", multimodal_config=mm)
 
 
 def test_the_piecewise_prefill_cuda_graph_declines():
@@ -562,8 +593,6 @@ def test_a_misspelled_ple_host_table_mode_fails_at_routing(monkeypatch):
 def test_the_gpus_the_family_serves_and_each_fast_path_runs_on():
     assert {f"sm_{a}{b}" for a, b in archs.SERVED} == {a.value for a in archs.SERVED_ARCHS}
     assert archs.served_names() == "sm_103, sm_107" and not archs.served((10, 0))
-    # The targets enter the row-tile pass without asking.
-    assert archs.FAST_PATHS["qsa_rowtile"] == archs.SERVED
     for name, capabilities in archs.FAST_PATHS.items():
         assert capabilities <= archs.SERVED, name
         assert archs.fast_path(name, archs.SM_107) is (name != "cute_dsl_moe"), name
