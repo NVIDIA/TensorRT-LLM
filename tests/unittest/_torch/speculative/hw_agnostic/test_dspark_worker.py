@@ -216,7 +216,8 @@ def test_worker_lazy_init_configures_generation_autotuner_once():
 
 
 def test_worker_tunes_generation_batch_not_seq_slot_pool():
-    """With a 2x seq-slot pool, the autotuner still gets the engine's generation batch."""
+    """With a 2x seq-slot pool and a first call on a narrowed graph copy, the
+    autotuner still gets the engine's generation batch."""
     worker = _make_worker()
     draft_model = _fake_draft_model()
     draft_model.configure_generation_autotuner = Mock()
@@ -246,6 +247,8 @@ def test_metadata_preserves_seq_slot_pool_in_graph_copy():
     assert metadata.num_seq_slots == 5
     assert graph_metadata.max_num_requests == 2
     assert graph_metadata.num_seq_slots == 5
+    assert metadata.max_generation_batch == 5
+    assert graph_metadata.max_generation_batch == 5
 
 
 @pytest.mark.parametrize("num_seq_slots", [4, 8], ids=["pool-eq-batch", "disagg-adp-2x-pool"])
@@ -339,6 +342,7 @@ def test_seed_context_pages_preserves_state_across_prefill_chunks():
     metadata = types.SimpleNamespace(
         max_num_requests=1,
         num_seq_slots=1,
+        max_generation_batch=1,
         request_ids=[100],
         get_hidden_states=lambda _num_tokens: torch.zeros(
             3, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
@@ -644,7 +648,7 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     target rows by their runtime width rather than the configured K+1 width."""
     worker = _make_worker()
     draft_model = _RecordingDraftModel()
-    metadata = types.SimpleNamespace(max_num_requests=2, num_seq_slots=2)
+    metadata = types.SimpleNamespace(max_num_requests=2, num_seq_slots=2, max_generation_batch=2)
     worker._lazy_init(draft_model, metadata)
     manager = _bind_manager(worker, [1000, 1001])
     manager.kv_cache_map[1000].history_length = 4016

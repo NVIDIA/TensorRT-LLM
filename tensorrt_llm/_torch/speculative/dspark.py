@@ -118,6 +118,8 @@ class DSparkSpecMetadata(SpecMetadata):
     max_num_tokens: int = 0
     dtype: torch.dtype = torch.bfloat16
     captured_hidden_states: Optional[torch.Tensor] = None
+    # Engine generation batch before CUDA-graph narrowing; 0 -> max_num_requests.
+    max_generation_batch: int = 0
 
     def __post_init__(self):
         # Keep the full slot capacity across CUDA graph copies, whose
@@ -125,8 +127,9 @@ class DSparkSpecMetadata(SpecMetadata):
         self.num_seq_slots = self.num_seq_slots or self.max_num_requests
         # The engine's generation batch before any graph-copy narrowing. A
         # generation step never carries more requests than this, even when the
-        # seq-slot pool is larger (disaggregated attention DP overlap).
-        self.max_generation_batch = self.max_num_requests
+        # seq-slot pool is larger (disaggregated attention DP overlap). Set on
+        # the base metadata; CUDA-graph copies keep it, like num_seq_slots.
+        self.max_generation_batch = self.max_generation_batch or self.max_num_requests
 
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
@@ -346,9 +349,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             max_batch = spec_metadata.num_seq_slots
             # Tune for the batch a generation step can carry, not the slot pool:
             # a pool of 2 * max_batch_size would tune buckets no step reaches.
-            draft_model.configure_generation_autotuner(
-                getattr(spec_metadata, "max_generation_batch", spec_metadata.max_num_requests)
-            )
+            draft_model.configure_generation_autotuner(spec_metadata.max_generation_batch)
             self._num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
             self._head_dim = int(draft_model._attn_params["head_dim"])
