@@ -364,6 +364,8 @@ def _resize_executor(adjust):
     mgr = types.SimpleNamespace(
         impl=types.SimpleNamespace(
             adjust=adjust,
+            # A GPU resize: adjust() needs every request suspended (not in place, not a host-only re-split).
+            adjust_needs_suspend=True,
             init_config=types.SimpleNamespace(
                 pool_rebalance=types.SimpleNamespace(in_place_relocation=False)
             ),
