@@ -39,6 +39,11 @@ from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
+requires_workflow_decorators = pytest.mark.skipif(
+    not profiler.custom_region_enabled("workflow"),
+    reason="workflow decorators must be selected before importing their owners",
+)
+
 
 def _request(**values: object) -> SimpleNamespace:
     """Construct the host dummy flags consumed by workflow metadata."""
@@ -185,6 +190,7 @@ def test_none_selection_suppresses_real_trace(monkeypatch: pytest.MonkeyPatch) -
 )
 @pytest.mark.parametrize("active,selected", [(True, True), (False, True), (True, False)])
 @pytest.mark.parametrize("is_warmup", [False, True])
+@requires_workflow_decorators
 def test_executor_forward_preserves_replay_and_diagnostic_order(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -275,13 +281,14 @@ def test_executor_forward_preserves_replay_and_diagnostic_order(
             if active
             else nullcontext()
         ) as trace:
-            actual = py_executor.PyExecutor._forward_step(executor, batch)
+            actual = py_executor.PyExecutor._forward_step(executor, batch, microbatch_id=3)
     if active and selected:
         nodes = profiler_nodes(tmp_path / "forward.json")
         for name in ("trtllm::forward",):
             node = next(node for node in nodes if node["name"] == name)
             fields = decode_node_metadata(node)[1]
             assert fields["workflow.executor.iteration"] == 7
+            assert fields["workflow.executor.microbatch_slot"] == 3
             assert fields["workflow.executor.is_warmup"] is is_warmup
             assert (
                 fields["workflow.batch.live_requests"]
@@ -439,8 +446,9 @@ def test_batch_dummy_counts_mapping_and_microbatch_metadata(
 @pytest.mark.parametrize("warmup_only", [False, True])
 @pytest.mark.parametrize(
     "temperature_only,ragged_verify_bucket",
-    [(False, None), (True, None), (False, 12), (True, 12)],
+    [(False, None), (True, None), (False, 8), (True, 8)],
 )
+@requires_workflow_decorators
 def test_decoder_capture_and_replay_named_capacity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -471,14 +479,22 @@ def test_decoder_capture_and_replay_named_capacity(
         ragged_verify_bucket=ragged_verify_bucket,
     )
     attn = object()
+    num_tokens = ragged_verify_bucket or 12
     inputs = {
-        "input_ids": torch.arange(12),
-        "position_ids": torch.arange(12).reshape(1, 12),
+        "input_ids": torch.arange(num_tokens),
+        "position_ids": torch.arange(num_tokens).reshape(1, num_tokens),
         "attn_metadata": attn,
     }
-    owner = object.__new__(cuda_graph_runner.CUDAGraphRunner)
+    owner_type = (
+        cuda_graph_runner.DSparkCUDAGraphRunner
+        if ragged_verify_bucket is not None
+        else cuda_graph_runner.CUDAGraphRunner
+    )
+    owner = object.__new__(owner_type)
     vars(owner).update(
-        config=SimpleNamespace(use_mrope=False),
+        config=SimpleNamespace(
+            use_mrope=False, prioritize_decode_graphs=False, stage_decode_inputs=False
+        ),
         max_beam_width=1,
         padding_enabled=True,
         is_warmup_only=warmup_only,
@@ -491,6 +507,7 @@ def test_decoder_capture_and_replay_named_capacity(
         graphs={},
         graph_outputs={},
         memory_pool=object(),
+        _hostfunc_graph_keys=set(),
         _step_input_prologue_keys={},
         _pre_replay_hooks=[],
     )
@@ -504,7 +521,7 @@ def test_decoder_capture_and_replay_named_capacity(
             owner, key, lambda inputs: inputs["input_ids"] + 1, inputs
         )
         if not warmup_only:
-            for live_count, staged_count in ((1, 0), (3, 12)):
+            for live_count, staged_count in ((1, 0), (3, num_tokens)):
                 batch = SimpleNamespace(
                     context_requests=[],
                     generation_requests=[_request() for _ in range(live_count)],
@@ -541,8 +558,8 @@ def test_decoder_capture_and_replay_named_capacity(
         assert fields["workflow.graph.key.ragged_verify_bucket"] == ragged_verify_bucket
         assert fields["workflow.graph.key.sample_type"] == "FULL"
         assert fields["workflow.graph.batch_capacity"] == 4
-        assert fields["workflow.graph.token_capacity"] == 12
-        assert fields["workflow.graph.input_token_rows"] == 12
+        assert fields["workflow.graph.token_capacity"] == (ragged_verify_bucket or 12)
+        assert fields["workflow.graph.input_token_rows"] == num_tokens
         assert fields["workflow.graph.padding_enabled"] is True
         assert "workflow.batch.live_requests" not in fields
         assert "workflow.graph.padding_requests" not in fields
@@ -681,6 +698,7 @@ def test_encoder_feature_shape_compatibility(
         pytest.param([torch.tensor(3)], False, id="tensor-length"),
     ],
 )
+@requires_workflow_decorators
 def test_encoder_graph_preserves_source_and_key_semantics(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -759,6 +777,7 @@ def test_encoder_graph_preserves_source_and_key_semantics(
 
 
 @pytest.mark.parametrize("is_dummy", [False, True])
+@requires_workflow_decorators
 def test_eager_model_physical_rows_are_not_generation_requests(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, is_dummy: bool
 ) -> None:
@@ -913,6 +932,7 @@ def test_executor_pp_loop_passes_consecutive_slots(
     assert owner._event_loop_completed
 
 
+@requires_workflow_decorators
 def test_prepare_inputs_owner_scope_preserves_exception_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -978,6 +998,7 @@ def test_microbatch_slot_unknown_is_not_a_numeric_sentinel(
 
 
 @pytest.mark.parametrize("selected", [False, True])
+@requires_workflow_decorators
 def test_graph_metadata_failure_keeps_replay_body_exception(
     monkeypatch: pytest.MonkeyPatch, selected: bool
 ) -> None:
@@ -999,7 +1020,9 @@ def test_graph_metadata_failure_keeps_replay_body_exception(
     attn = object()
     owner = object.__new__(cuda_graph_runner.CUDAGraphRunner)
     vars(owner).update(
-        config=SimpleNamespace(use_mrope=False),
+        config=SimpleNamespace(
+            use_mrope=False, prioritize_decode_graphs=False, stage_decode_inputs=False
+        ),
         max_beam_width=1,
         graph_metadata={key: {"attn_metadata": attn, "spec_metadata": None}},
         shared_static_tensors={"input_ids": torch.zeros(1), "position_ids": torch.zeros(1, 1)},
@@ -1040,6 +1063,7 @@ def test_graph_metadata_failure_keeps_replay_body_exception(
         ("_handle_responses", "trtllm::handle_responses", (), "perf_manager"),
     ],
 )
+@requires_workflow_decorators
 def test_executor_owner_scope_preserves_body_exception(
     monkeypatch: pytest.MonkeyPatch,
     method: str,
