@@ -95,6 +95,18 @@ class DeepSeekV32Parser(BaseToolParser):
         """Check if the text contains a deepseek v32 format tool call."""
         return self.bot_token in text
 
+    @property
+    def single_call_stops(self) -> tuple[str, ...]:
+        # Each call is its own invoke block, so its closing tag ends exactly one
+        # call. That leaves the calls block open; the whole-text and streaming
+        # parses both deliver the complete invokes of an open block.
+        # Stops match on token ids, and the encoders follow the tag with a
+        # newline that tokenizes together with ">", so the tag is also listed
+        # with that newline. That form comes first: the decoded text is cut
+        # after the first listed stop it contains, and the newline belongs to
+        # the stop's last token.
+        return (self.invoke_end_token + "\n", self.invoke_end_token)
+
     def _parse_parameters_from_xml(self, invoke_content: str) -> dict:
         """Parse parameters from either XML-like format or JSON format to dict.
 
@@ -148,16 +160,15 @@ class DeepSeekV32Parser(BaseToolParser):
 
         calls = []
         try:
-            # Extract content between function_calls tags
-            function_calls_match = re.search(
-                re.escape(self.bot_token) + r"(.*?)" + re.escape(self.eot_token),
-                text,
-                re.DOTALL,
-            )
-            if not function_calls_match:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
-
-            function_calls_content = function_calls_match.group(1)
+            # The calls block runs to its closing tag, or to the end of the text
+            # when generation stopped inside it (single_call_stops, a token
+            # limit). Only its complete invokes are calls; an unfinished last
+            # invoke is dropped, as the streaming parse holds it back.
+            block_start = idx + len(self.bot_token)
+            block_end = text.find(self.eot_token, block_start)
+            if block_end == -1:
+                block_end = len(text)
+            function_calls_content = text[block_start:block_end]
 
             # Find all invoke blocks
             invoke_pattern = self.invoke_begin_regex + r"(.*?)" + re.escape(self.invoke_end_token)
