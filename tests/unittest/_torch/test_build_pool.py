@@ -23,12 +23,6 @@ _RECORD = f"{targets.__name__}:record"
 _HOLD = f"{targets.__name__}:hold"
 
 
-@pytest.fixture(autouse=True)
-def _every_build_to_a_worker(monkeypatch):
-    """Workers take every build, however short; the tests of that rule set it themselves."""
-    monkeypatch.setenv("TLLM_KERNEL_BUILDER_MIN_BUILD_S", "0")
-
-
 @pytest.fixture
 def worker_env(monkeypatch):
     """Worker processes that import build_pool_targets, started from a launcher's environment."""
@@ -221,25 +215,6 @@ def test_no_worker_starts_while_the_gpu_lacks_room(pool, monkeypatch):
     assert pool.counts() == {"refused": 1}
 
 
-def test_a_worker_takes_only_builds_long_enough_to_repay_it(pool):
-    pool.min_build_s = 5.0
-    with pool.pass_scope():
-        # Neither measured nor expected: the caller measures one first.
-        assert not pool.worth_a_worker("new") and pool.unmeasured("new")
-        assert pool.worth_a_worker("new", expected_s=30.0)
-        assert not pool.worth_a_worker("new", expected_s=1.0)
-        assert not pool.unmeasured("new", expected_s=1.0)
-        # Once measured, the measure decides.
-        pool.record_build("new", 0.5)
-        assert not pool.worth_a_worker("new", expected_s=30.0) and not pool.unmeasured("new")
-        pool.record_build("slow", 10.0)
-        assert pool.worth_a_worker("slow")
-    assert not pool.worth_a_worker("slow")
-    pool.min_build_s = 0.0
-    with pool.pass_scope():
-        assert pool.worth_a_worker("new") and not pool.unmeasured("other")
-
-
 _SPAN = f"{targets.__name__}:span"
 
 
@@ -290,12 +265,6 @@ def test_a_kind_of_build_not_measured_yet_builds_one_at_a_time(pool, gpu, tmp_pa
         results = pool.build([Build(_HOLD, (a, b, 60.0), "new"), Build(_HOLD, (b, a, 60.0), "new")])
     assert [result.status for result in results] == ["built", "built"]
     assert pool.peak_bytes("new") == 0
-
-
-def test_a_build_in_a_worker_measures_its_kind(pool, tmp_path):
-    with pool.pass_scope():
-        pool.build([Build(_RECORD, (str(tmp_path / "r"), 1), "recorded")])
-    assert pool.build_seconds("recorded") is not None
 
 
 def test_arguments_that_do_not_pickle_are_built_here(pool):

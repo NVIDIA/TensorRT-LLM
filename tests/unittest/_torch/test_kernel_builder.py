@@ -28,12 +28,6 @@ from tensorrt_llm._torch.kernel_builder import (
 pytestmark = pytest.mark.cpu_only
 
 
-@pytest.fixture(autouse=True)
-def _every_build_to_a_worker(monkeypatch):
-    """Workers take every build, however short; the tests of that rule set it themselves."""
-    monkeypatch.setenv("TLLM_KERNEL_BUILDER_MIN_BUILD_S", "0")
-
-
 _RECORD = f"{targets.__name__}:record"
 _FAIL = f"{targets.__name__}:fail"
 
@@ -73,7 +67,7 @@ def _lister(tmp_path, calls):
     return list_builds
 
 
-_CONFIG = BuildConfig((DynamicSpec("m", lambda m: range(1, m + 1)),))
+_CONFIG = BuildConfig((DynamicSpec("m", lambda m: range(1, m + 1)),), use_build_pool_in_warmup=True)
 
 
 def _record(path, value, config=_CONFIG):
@@ -162,17 +156,15 @@ def test_with_kernel_builder_off_nothing_is_listed(monkeypatch, tmp_path):
     assert calls == []
 
 
-def test_builds_too_short_for_a_worker_are_not_listed(builder, tmp_path):
-    BuildPool.get().min_build_s = 5.0
+def test_in_build_mode_an_op_off_the_build_pool_lists_and_builds_nothing(builder, tmp_path):
     calls = []
+    config = BuildConfig(_CONFIG.dynamic_specs)
     with builder.build_pass("test"):
-        # Neither measured nor expected: the op builds them on first use.
-        builder.prebuild("op", "sig", _CONFIG, {"m": 2}, _lister(tmp_path, calls))
-        BuildPool.get().record_build("measured", 6.0)
-        builder.prebuild("measured", "sig", _CONFIG, {"m": 2}, _lister(tmp_path, calls))
-        expected = BuildConfig(_CONFIG.dynamic_specs, build_seconds=30.0)
-        builder.prebuild("expected", "sig", expected, {"m": 1}, _lister(tmp_path, calls))
-    assert calls == [[1, 2], [1]]
+        # The op builds its kernels on first use.
+        builder.prebuild("op", "sig", config, {"m": 2}, _lister(tmp_path, calls))
+        builder.build("op", [("k", *_record(tmp_path / "k", 1, config))])
+    assert calls == [] and not (tmp_path / "k").exists()
+    assert builder.stats("op").inline == 1
 
 
 @pytest.fixture
@@ -208,20 +200,14 @@ def test_in_inference_mode_listed_kernels_compile_in_their_calls(builder, cute):
     assert builder.stats(targets.NAME).built == 0
 
 
-@pytest.mark.parametrize(
-    "min_build_s, in_workers", [(5.0, False), (1e-9, True)], ids=["short", "long"]
-)
-def test_until_a_function_is_measured_its_first_listed_kernel_compiles_here(
-    builder, cute, min_build_s, in_workers
-):
-    BuildPool.get().min_build_s = min_build_s
+def test_in_build_mode_a_function_off_the_build_pool_compiles_in_its_calls(builder, cute):
+    in_rank = targets.compile_kernel_in_rank
+    in_rank.cache_clear()
     with builder.build_pass("test"):
-        assert builder.build_kernels(_kernels((50,), (51,), (52,))) == 3
-    pids = [cute(value).pid for value in (50, 51, 52)]
-    assert pids[0] == os.getpid()
-    assert [pid != os.getpid() for pid in pids[1:]] == [in_workers] * 2
-    stats = builder.stats(targets.NAME)
-    assert (stats.built, stats.inline) == ((2, 1) if in_workers else (0, 3))
+        assert builder.build_kernels([(in_rank, (50,)), (in_rank, (51,))]) == 2
+    assert all(in_rank(value).pid == os.getpid() for value in (50, 51))
+    stats = builder.stats(in_rank._compiler.name)
+    assert (stats.built, stats.inline) == (0, 2)
 
 
 def test_a_listed_function_that_is_not_process_built_is_called(builder, cute):
@@ -248,7 +234,9 @@ def shared(monkeypatch, tmp_path):
 
 
 def _shared_config(scope="here"):
-    return BuildConfig(strategy=BuildStrategy.SHARED, share_scope=lambda: scope)
+    return BuildConfig(
+        strategy=BuildStrategy.SHARED, share_scope=lambda: scope, use_build_pool_in_warmup=True
+    )
 
 
 def test_ranks_split_shared_builds(builder, shared, tmp_path):

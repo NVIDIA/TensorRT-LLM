@@ -919,9 +919,8 @@ def precompile(
     snapshots_after_wait: bool = False,
 ) -> None:
     """JIT-compile the variant :func:`run_attn_res` launches for these parameters (``cluster``
-    as :func:`cluster_size` picks it), so its first launch does not compile. In KernelBuilder's
-    build mode a worker process of the rank builds it if such compiles take long enough to repay
-    a worker (``BuildPool.worth_a_worker``)."""
+    as :func:`cluster_size` picks it), so its first launch does not compile. Listed through
+    :meth:`KernelBuilder.build_kernels`; its compiles are short, so they run in the rank."""
     KernelBuilder.get().build_kernels(
         [(_compiled, (num_candidates, add_mode, cluster, hidden, mxfp8, snapshots_after_wait))]
     )

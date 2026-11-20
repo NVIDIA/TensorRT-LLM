@@ -5,16 +5,16 @@
 For ops whose kernels compile on first use outside the autotuner. Two modes:
 
 * Inference (outside a build pass): an op compiles a kernel it lacks on first use.
-* Build (inside :meth:`KernelBuilder.build_pass`, which the memory-profiling warmup opens): the
-  first call of an op signature lists the kernels of every shape its ``BuildConfig`` sweeps, as
-  tuning buckets do, builds them on the rank's workers (``tensorrt_llm._torch.build_pool``), and
-  goes on once they are built.
+* Build (inside :meth:`KernelBuilder.build_pass`, which the memory-profiling warmup opens): for
+  an op that sets ``BuildConfig.use_build_pool_in_warmup``, the first call of an op signature
+  lists the kernels of every shape its ``BuildConfig`` sweeps, as tuning buckets do, builds them
+  on the rank's workers (``tensorrt_llm._torch.build_pool``), and goes on once they are built.
+  The other ops compile their kernels on first use, as in inference mode.
 
-A build is a :class:`BuildTask`. Only builds that take ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds
-(measured, or ``BuildConfig.build_seconds``) go to workers. ``BuildConfig.strategy=SHARED``
-splits them across the ranks that share JIT builds and ``BuildConfig.share_scope``.
-:meth:`KernelBuilder.build_kernels` builds a list of ``process_built`` CuTe DSL compile calls,
-such as a model's prewarm list. ``TLLM_KERNEL_BUILDER=0`` turns KernelBuilder off.
+A build is a :class:`BuildTask`. ``BuildConfig.strategy=SHARED`` splits the builds across the
+ranks that share JIT builds and ``BuildConfig.share_scope``. :meth:`KernelBuilder.build_kernels`
+builds a list of ``process_built`` CuTe DSL compile calls, such as a model's prewarm list.
+``TLLM_KERNEL_BUILDER=0`` turns KernelBuilder off.
 """
 
 from __future__ import annotations
@@ -101,14 +101,15 @@ class BuildConfig:
         share_scope: For SHARED: names where the op's kernels land, such as its compiler's disk
             cache on this host. Only ranks with the same scope split the builds: each loads the
             kernels the others built from there.
-        build_seconds: How long one build of the op takes, until builds of it are measured; it
-            decides whether workers take them (``BuildPool.worth_a_worker``).
+        use_build_pool_in_warmup: In build mode, the op's calls build the kernels of the shapes
+            they sweep on the build pool's workers before they go on. For ops whose builds are
+            long enough to repay a worker; without it, the op compiles on first use.
     """
 
     dynamic_specs: Tuple[DynamicSpec, ...] = ()
     strategy: BuildStrategy = BuildStrategy.PER_RANK
     share_scope: Optional[Callable[[], str]] = None
-    build_seconds: Optional[float] = None
+    use_build_pool_in_warmup: bool = False
 
     def shapes(self, observed: Mapping[str, int]) -> List[Dict[str, int]]:
         """Every combination of the dimensions' buckets for a call that has ``observed``."""
@@ -221,16 +222,15 @@ class KernelBuilder:
         observed: Mapping[str, int],
         list_builds: Callable[[List[Dict[str, int]]], Iterable[tuple]],
     ) -> None:
-        """In build mode, build the kernels ``list_builds(shapes)`` returns (:meth:`build`), and
-        return once they are built; ``shapes`` are those ``config`` sweeps for a call that has
-        ``observed`` and that no earlier call of ``(op, signature)`` swept. ``list_builds``
-        returns ``(key, BuildTask)`` pairs, or ``(key, BuildTask, BuildConfig)`` for a build whose
-        configuration is not ``config``.
+        """In build mode, for a ``config`` that sets ``use_build_pool_in_warmup``, build the
+        kernels ``list_builds(shapes)`` returns (:meth:`build`), and return once they are built;
+        ``shapes`` are those ``config`` sweeps for a call that has ``observed`` and that no earlier
+        call of ``(op, signature)`` swept. ``list_builds`` returns ``(key, BuildTask)`` pairs, or
+        ``(key, BuildTask, BuildConfig)`` for a build whose configuration is not ``config``.
 
-        A failure to list leaves the kernels to the op, and so do builds of ``op`` too short for
-        a worker (``BuildPool.worth_a_worker``), which are not listed.
+        A failure to list leaves the kernels to the op.
         """
-        if not self.active() or not BuildPool.get().worth_a_worker(op, config.build_seconds):
+        if not (self.active() and config.use_build_pool_in_warmup and BuildPool.get().accepting()):
             return
         swept = config.shapes(observed)
         with self._lock:
@@ -270,9 +270,9 @@ class KernelBuilder:
 
         With the SHARED strategy, a build another rank's worker started first is that rank's:
         this one waits for the builds it left to other ranks, at most ``TLLM_JIT_SHARE_WAIT_S``
-        seconds in all. A build no worker takes, one too short for a worker
-        (``BuildPool.worth_a_worker``), and one that fails are left to the op, which builds them
-        on first use.
+        seconds in all. A build whose configuration does not set ``use_build_pool_in_warmup``,
+        one no worker takes, and one that fails are left to the op, which builds them on first
+        use.
         """
         if not self.active():
             return
@@ -285,14 +285,15 @@ class KernelBuilder:
         if not new:
             return
         pool = BuildPool.get()
-        expected = next((c.build_seconds for _, _, c in new if c.build_seconds is not None), None)
-        if not pool.worth_a_worker(op, expected):
+        to_pool = [b for b in new if b[2].use_build_pool_in_warmup] if pool.accepting() else []
+        if len(to_pool) < len(new):
             with self._lock:
-                self._op_stats(op).inline += len(new)
+                self._op_stats(op).inline += len(new) - len(to_pool)
+        if not to_pool:
             return
         jobs = [
             Build(task.function, task.args, op, self._claim(op, key, config))
-            for key, task, config in self._rotated(new)
+            for key, task, config in self._rotated(to_pool)
         ]
         t0 = time.perf_counter()
         results = pool.build(jobs)
@@ -323,11 +324,10 @@ class KernelBuilder:
         list. Each ``process_built`` CuTe DSL compile function (``tensorrt_llm._torch.build_pool``)
         is an op here, under its name.
 
-        In build mode, the kernels of a function whose compiles take long enough to repay a worker
-        (``BuildPool.worth_a_worker``) build on the rank's worker processes first, all together,
-        and the calls load them; until a function's compiles are measured, its first kernel
-        compiles here, timed. The other kernels, any a worker did not build, and those of any
-        other function compile in the calls, as in inference mode.
+        In build mode, the kernels of a function that sets ``use_build_pool_in_warmup``
+        (``process_built``) build on the rank's worker processes first, all together, and the
+        calls load them. The other kernels, any a worker did not build, and those of any other
+        function compile in the calls, as in inference mode.
         """
         kernels = list(dict.fromkeys(kernels))
         if self.active():
@@ -338,12 +338,10 @@ class KernelBuilder:
                 compiler = getattr(fn, "_compiler", None)
                 if compiler is None or args in compiler.memo:
                     continue
-                if pool.worth_a_worker(compiler.name, compiler.build_seconds):
+                if compiler.use_build_pool_in_warmup and pool.accepting():
                     to_workers.append((fn, args))
-                    continue
-                if pool.unmeasured(compiler.name, compiler.build_seconds):
-                    fn(*args)  # Measured here: the rule decides for the function's other kernels.
-                counts[compiler.name][REFUSED] += 1
+                else:
+                    counts[compiler.name][REFUSED] += 1
             t0 = time.perf_counter()
             results = pool.build_kernels(to_workers)
             seconds = time.perf_counter() - t0
@@ -389,10 +387,9 @@ class KernelBuilder:
             return dataclasses.replace(self._op_stats(op))
 
     def op_compiled(self, op: str, key: Hashable, seconds: float) -> None:
-        """Record a kernel the op's own call had to compile: it measures the op's builds."""
+        """Record a kernel the op's own call had to compile."""
         if not self.enabled:
             return
-        BuildPool.get().record_build(op, seconds)
         with self._lock:
             stats = self._op_stats(op)
             stats.late += 1

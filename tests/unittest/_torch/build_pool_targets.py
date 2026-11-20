@@ -43,7 +43,7 @@ def load_kernel(obj: str, name: str, meta: str):
         return pickle.load(f)
 
 
-@process_built(NAME)
+@process_built(NAME, use_build_pool_in_warmup=True)
 def compile_kernel(value: int, in_worker: str = "") -> Kernel:
     """Compile a kernel; in a worker process, ``in_worker="raise"`` raises and
     ``in_worker="exit"`` ends the process instead."""
@@ -54,6 +54,12 @@ def compile_kernel(value: int, in_worker: str = "") -> Kernel:
             os._exit(3)
     launcher_vars = tuple(k for k in LAUNCHER_VARS if k in os.environ)
     return Kernel(value, os.getpid(), launcher_vars)
+
+
+@process_built(NAME + "_in_rank")
+def compile_kernel_in_rank(value: int) -> Kernel:
+    """A compile function whose kernels build in the rank's process."""
+    return compile_kernel.raw(value)
 
 
 def build_by_running(value: int) -> None:
