@@ -60,6 +60,8 @@ from ..memory.monitor.providers.kv_cache import \
     KvCacheProvider as MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.modeling_utils import (declares_recurrent_state,
+                                     resolve_model_class)
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
@@ -336,6 +338,11 @@ def get_kv_cache_manager_cls(
       * ``TLLM_MAMBA_MANAGER_PREFERENCE`` — explicit manager preference.
     """
     config = model_config.pretrained_config
+    if is_hybrid_linear(config) and resolve_model_class(config) is None:
+        # The model class declares the layer kinds that the selection counts.
+        raise ValueError("No model class is registered for this hybrid Mamba / "
+                         "linear-attention config (architectures="
+                         f"{getattr(config, 'architectures', None)!r}).")
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
     # An algorithm that keeps the dense KV cache, such as Skip Softmax, takes
@@ -1049,7 +1056,7 @@ def _derive_v2_layer_type_attention_windows(
             config, max_seq_len)
     if derived_windows is None:
         return None
-    if is_hybrid_linear(config):
+    if declares_recurrent_state(config):
         return None
     pool_ratio = kv_cache_config.pool_ratio
     num_layer_groups = len(set(derived_windows))
@@ -1111,7 +1118,7 @@ def _get_num_pool_groups_for_estimation(
             model_config):
         attention_windows = _derive_v2_layer_type_attention_windows(
             kv_cache_config, KVCacheManagerV2, model_config, max_seq_len)
-    if attention_windows is not None and not is_hybrid_linear(config):
+    if attention_windows is not None and not declares_recurrent_state(config):
         normalized_windows = _normalize_attention_windows(
             attention_windows, max_seq_len)
         return 1 if normalized_windows is None else len(set(normalized_windows))
@@ -1392,14 +1399,15 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._validate_or_fallback_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
-        if is_hybrid_linear(model_config.pretrained_config):
+        is_hybrid = declares_recurrent_state(model_config.pretrained_config)
+        if is_hybrid:
             logger.info_once(
                 f"Selected hybrid KV cache manager: {cls.__name__}",
                 key=f"hybrid_kv_cache_manager_{cls.__name__}")
         # Compatibility managers do not support MTP block reuse. Warn at the
         # routing site so users see the concrete manager selected for the
         # incompatible combination.
-        if is_hybrid_linear(model_config.pretrained_config) \
+        if is_hybrid \
                 and kv_cache_config.enable_block_reuse \
                 and self._speculative_config is not None:
             if not issubclass(cls, MambaHybridCacheManagerV2):
@@ -1429,6 +1437,7 @@ class KvCacheCreator:
             fp4_mla = (sparse_attn_config is None and is_mla(config)
                        and quant_config is not None
                        and quant_config.quant_mode.has_fp4_kv_cache())
+            is_hybrid = declares_recurrent_state(config)
             incompat = kv_cache_manager_v2_incompatible_features(
                 self._max_beam_width,
                 enable_sleep=self._llm_args.sleep_config is not None)
@@ -1443,8 +1452,7 @@ class KvCacheCreator:
             # The C++ V2 cache expands beams after receive completion, copying
             # the prompt's partial tail before the first generation step.
             if (self._max_beam_width is not None and self._max_beam_width > 1
-                    and (is_hybrid_linear(config)
-                         or uses_sparse_kv_cache_manager or fp4_mla)
+                    and (is_hybrid or uses_sparse_kv_cache_manager or fp4_mla)
                     and "max_beam_width > 1" not in incompat):
                 incompat.append("max_beam_width > 1")
             if incompat:
@@ -1480,7 +1488,7 @@ class KvCacheCreator:
                         "FP4 MLA requires Fp4MlaKVCacheManagerV2, which is "
                         f"not yet supported with {incompat_str}. Disable these "
                         "features to run FP4 MLA.")
-                if is_hybrid_linear(config):
+                if is_hybrid:
                     raise NotImplementedError(
                         "Hybrid Mamba KVCacheManagerV2 does not support "
                         f"{incompat_str}; automatic fallback is unavailable "

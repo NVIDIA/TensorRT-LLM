@@ -1064,7 +1064,9 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         model_engine_module, "resolve_mrope_position_deltas_cache", lambda model: None
     )
     monkeypatch.setattr(
-        model_engine_module, "is_hybrid_linear", lambda config: model_kind in ("gdn", "mamba")
+        model_engine_module,
+        "declares_recurrent_state",
+        lambda config: model_kind in ("gdn", "mamba"),
     )
     monkeypatch.setattr(
         model_engine_module.MultimodalItemScheduler, "maybe_create", Mock(return_value=None)

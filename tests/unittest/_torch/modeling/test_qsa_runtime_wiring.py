@@ -245,7 +245,7 @@ def test_qsa_hybrid_routes_to_sparse_v2_cache_manager(monkeypatch) -> None:
 
     monkeypatch.setattr(_util, "is_hybrid_linear", lambda config: True)
     model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(),
+        pretrained_config=SimpleNamespace(architectures=["Qwen4ExpForCausalLM"]),
         sparse_attention_config=QSASparseAttentionConfig(),
         get_num_mamba_layers=lambda: 1,
         # Real ModelConfig declares both with defaults; the helix x
@@ -265,7 +265,7 @@ def test_qsa_hybrid_rejects_kv_cache_manager_v1(monkeypatch) -> None:
 
     monkeypatch.setattr(_util, "is_hybrid_linear", lambda config: True)
     model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(),
+        pretrained_config=SimpleNamespace(architectures=["Qwen4ExpForCausalLM"]),
         sparse_attention_config=QSASparseAttentionConfig(),
         get_num_mamba_layers=lambda: 1,
         # Real ModelConfig declares both with defaults; the helix x

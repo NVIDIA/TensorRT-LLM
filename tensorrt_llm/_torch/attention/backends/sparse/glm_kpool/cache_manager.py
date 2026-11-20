@@ -706,9 +706,10 @@ def get_glm5_next_cache_params(config, *, spec_config=None, quant_config=None):
         quant_config=quant_config,
     )
     if params.mamba_ssm_cache_dtype != torch.float32:
-        logger.info(
+        logger.info_once(
             f"glm5_next KDA: overriding mamba_ssm_cache_dtype "
-            f"{params.mamba_ssm_cache_dtype} -> torch.float32"
+            f"{params.mamba_ssm_cache_dtype} -> torch.float32",
+            key=f"glm5_next_kda_ssm_cache_dtype_{params.mamba_ssm_cache_dtype}",
         )
         params.mamba_ssm_cache_dtype = torch.float32
     return params

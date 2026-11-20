@@ -300,6 +300,7 @@ def test_mamba_kv_cache_params_separate_target_and_draft_masks():
 
 def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
     config = SimpleNamespace(
+        architectures=["KimiLinearForCausalLM"],
         model_type="kimi_linear",
         num_hidden_layers=4,
         linear_attn_config={
@@ -333,6 +334,7 @@ def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
 
 def _kimi_kda_hf_config() -> SimpleNamespace:
     return SimpleNamespace(
+        architectures=["KimiLinearForCausalLM"],
         model_type="kimi_linear",
         num_hidden_layers=4,
         linear_attn_config={
@@ -1546,15 +1548,8 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
 def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     max_beam_width, has_connector, expected
 ):
-    config = SimpleNamespace(
-        architectures=["Qwen3_5MoeForCausalLM"],
-        num_hidden_layers=2,
-        layer_types=["linear_attention", "full_attention"],
-    )
-    model_config = SimpleNamespace(
-        pretrained_config=config,
-        sparse_attention_config=None,
-    )
+    model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
+    model_config.sparse_attention_config = None
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = object() if has_connector else None
     creator._max_beam_width = max_beam_width
@@ -8908,6 +8903,7 @@ def test_v2_kda_replay_estimate_reserves_the_fixed_pool(manager_cls):
         assert mgr._fixed_region_quota() == fixed_bytes
         # The manager's geometry: two KDA layers of 6 heads, K = V = 8, and a 4-tap convolution.
         config = Glm5NextTextConfig(
+            architectures=["Glm5NextForCausalLM"],
             num_hidden_layers=3,
             layer_types=["linear_attention", "linear_attention", "deepseek_sparse_attention"],
             kv_lora_rank=512,

@@ -94,6 +94,7 @@ def test_indexer_static_cache_cost(
         _kda_kernels, "kda_mtp_replay_num_spec", lambda num_spec: num_spec if replay else None
     )
     config = Glm5NextTextConfig(
+        architectures=["Glm5NextForCausalLM"],
         num_hidden_layers=2,
         layer_types=["linear_attention", "deepseek_sparse_attention"],
         kv_lora_rank=512,

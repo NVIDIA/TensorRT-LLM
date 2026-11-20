@@ -1769,11 +1769,12 @@ def resolve_kimi_ssm_cache_dtype(config) -> torch.dtype:
 
     declared = resolve_ssm_cache_dtype(config)
     if declared is not None and declared != torch.float32:
-        logger.info(
+        logger.info_once(
             "Kimi K3: the checkpoint declares "
             f"mamba_ssm_cache_dtype={declared}; keeping the fp32 "
             "recurrent-state pool (kv_cache_config.mamba_ssm_cache_dtype "
-            "opts in to bfloat16)."
+            "opts in to bfloat16).",
+            key=f"kimi_k3_kda_ssm_cache_dtype_{declared}",
         )
     return torch.float32
 

@@ -489,8 +489,10 @@ def _materialize_meta(module: torch.nn.Module) -> None:
 
 def _config():
     config = PretrainedConfig(
+        architectures=["Glm5NextForConditionalGeneration"],
         model_type="glm5_next",
         text_config=PretrainedConfig(
+            architectures=["Glm5NextForCausalLM"],
             model_type="glm5_next_text",
             dtype="bfloat16",
             rms_norm_eps=1e-05,

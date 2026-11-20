@@ -82,7 +82,6 @@ def _creator(model, monkeypatch, resolved=_Resolved):
         "_validate_or_fallback_kv_cache_manager_v2",
         lambda self, cls, model_config, kv_cache_config: cls,
     )
-    monkeypatch.setattr(_util, "is_hybrid_linear", lambda config: False)
     model.model_config = SimpleNamespace(pretrained_config=object())
     creator = object.__new__(_util.KvCacheCreator)
     creator._model_engine = SimpleNamespace(model=model)
