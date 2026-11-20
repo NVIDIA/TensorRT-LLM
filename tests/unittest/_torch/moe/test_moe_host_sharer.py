@@ -78,21 +78,26 @@ class TestHostMoeTensorSharer(unittest.TestCase):
         # Get MPI communication information
         comm = MPI.COMM_WORLD
         rank = comm.Get_rank()
-        size = comm.Get_size()
         layer_id = 0
+
+        # The sharer splits the experts among the processes of one node, so
+        # expert ownership follows the shared-memory communicator. Its rank and
+        # size differ from COMM_WORLD's once the ranks span nodes.
+        shared_comm = comm.Split_type(split_type=MPI.COMM_TYPE_SHARED)
+        local_rank = shared_comm.Get_rank()
+        local_size = shared_comm.Get_size()
 
         # Test tensor parameters
         experts_per_rank = 2  # Each rank is responsible for 2 consecutive experts
-        expert_count = size * experts_per_rank
+        expert_count = local_size * experts_per_rank
         tensor_shape = (16, 32)  # Use 2D tensor for testing
 
-        # Maximum supported ranks (can adjust as needed)
+        # Maximum supported processes per node (can adjust as needed), decided
+        # on the largest node so that every rank skips or none does.
         max_ranks = 8
-        if size > max_ranks:
-            self.skipTest(f"This test supports up to {max_ranks} MPI processes")
-
-        # Create shared communicator
-        shared_comm = comm.Split_type(split_type=MPI.COMM_TYPE_SHARED)
+        if comm.allreduce(local_size, op=MPI.MAX) > max_ranks:
+            self.skipTest(
+                f"This test supports up to {max_ranks} MPI processes per node")
 
         # Initialize HostMoeTensorSharer
         sharer = HostMoeTensorSharer(layer_id, expert_count, shared_comm)
@@ -102,7 +107,7 @@ class TestHostMoeTensorSharer(unittest.TestCase):
         sharer.set_shared_memory_base_name(shared_memory_base_name)
 
         # Calculate the range of experts this rank is responsible for
-        start_expert_id = rank * experts_per_rank
+        start_expert_id = local_rank * experts_per_rank
         end_expert_id = start_expert_id + experts_per_rank
         my_expert_ids = list(range(start_expert_id, end_expert_id))
 
@@ -129,8 +134,9 @@ class TestHostMoeTensorSharer(unittest.TestCase):
 
         sharer.finalize_layer_weights()
 
-        # Ensure all processes have created and registered their tensors
-        comm.Barrier()
+        # Ensure all processes of this node have created and registered their
+        # tensors
+        shared_comm.Barrier()
 
         # Define callback function to retrieve all tensors
         def tensor_callback(expert_id, tensor_name, tensor_data):
@@ -141,8 +147,8 @@ class TestHostMoeTensorSharer(unittest.TestCase):
         # Finalize host tensor sharing with the callback
         sharer.finalize_host_tensor_sharing(tensor_callback)
 
-        # Ensure finalization is complete across all ranks
-        comm.Barrier()
+        # Ensure finalization is complete on every process of this node
+        shared_comm.Barrier()
 
         # Verify all expected tensors were retrieved
         expected_tensor_count = expert_count  # One tensor per expert
@@ -212,12 +218,16 @@ class TestHostMoeTensorSharer(unittest.TestCase):
         """Share 3D expert tensors, e.g. TRTLLM-Gen BlockMajorK weights."""
         comm = MPI.COMM_WORLD
         rank = comm.Get_rank()
-        size = comm.Get_size()
-        if size > 8:
-            self.skipTest("This test supports up to 8 MPI processes")
+        # Expert ownership follows the shared-memory communicator the sharer
+        # splits the experts over, not COMM_WORLD (see the basic test).
+        shared_comm = comm.Split_type(split_type=MPI.COMM_TYPE_SHARED)
+        local_rank = shared_comm.Get_rank()
+        local_size = shared_comm.Get_size()
+        if comm.allreduce(local_size, op=MPI.MAX) > 8:
+            self.skipTest("This test supports up to 8 MPI processes per node")
 
         experts_per_rank = 2
-        expert_count = size * experts_per_rank
+        expert_count = local_size * experts_per_rank
         tensor_shape = (4, 8, 64)  # [K / block_k, Mn, block_k]
         numel = 4 * 8 * 64
 
@@ -225,12 +235,11 @@ class TestHostMoeTensorSharer(unittest.TestCase):
             return (torch.arange(numel, dtype=torch.float32) +
                     expert_id * numel).reshape(tensor_shape)
 
-        shared_comm = comm.Split_type(split_type=MPI.COMM_TYPE_SHARED)
         sharer = HostMoeTensorSharer(0, expert_count, shared_comm)
         sharer.set_shared_memory_base_name("test_host_sharer_3d")
 
-        my_expert_ids = range(rank * experts_per_rank,
-                              (rank + 1) * experts_per_rank)
+        my_expert_ids = range(local_rank * experts_per_rank,
+                              (local_rank + 1) * experts_per_rank)
         for expert_id in range(expert_count):
             if expert_id in my_expert_ids:
                 sharer.share_host_tensor_with_shape(expert_id, "weight",
@@ -241,7 +250,7 @@ class TestHostMoeTensorSharer(unittest.TestCase):
                     torch.Size(tensor_shape))
 
         sharer.finalize_layer_weights()
-        comm.Barrier()
+        shared_comm.Barrier()
 
         received = {}
 
@@ -250,7 +259,7 @@ class TestHostMoeTensorSharer(unittest.TestCase):
             return True
 
         sharer.finalize_host_tensor_sharing(tensor_callback)
-        comm.Barrier()
+        shared_comm.Barrier()
 
         failures = []
         for expert_id in range(expert_count):

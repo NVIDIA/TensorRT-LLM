@@ -21,7 +21,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
+from types import SimpleNamespace
 from typing import Callable, Optional, cast
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -1632,3 +1634,52 @@ def iter_base_test_configs(
             skip_reason,
             base_test_id,
         )
+
+
+# ============================================================================
+# RL weight refit
+# ============================================================================
+
+
+def _refit_extension(model: torch.nn.Module):
+    """A ``WorkerExtension`` that serves ``model`` in place of a running engine.
+
+    Its ``begin_weight_update`` and ``finalize_weight_update`` then run the
+    engine's own refit walk over ``model``: which modules it visits, which
+    hooks it calls, and in which order. Only what they touch outside the model
+    is stubbed, namely the model loader's update session and the
+    torch.compile unwrap.
+    """
+    # Imported here: rlhf_utils pulls in the Ray executor, which the other users
+    # of these utilities do not need.
+    from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
+
+    extension = WorkerExtension.__new__(WorkerExtension)
+    extension.engine = SimpleNamespace(
+        model_engine=SimpleNamespace(
+            model=model,
+            model_loader=MagicMock(),
+            unwrap_compiled_model_for_refit=MagicMock(),
+        )
+    )
+    return extension
+
+
+def begin_moe_refit(model: torch.nn.Module) -> None:
+    """Run ``WorkerExtension.begin_weight_update`` over ``model``."""
+    _refit_extension(model).begin_weight_update()
+
+
+def finalize_moe_refit(model: torch.nn.Module) -> None:
+    """Run ``WorkerExtension.finalize_weight_update`` over ``model``, then wait for the device."""
+    _refit_extension(model).finalize_weight_update()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def refit_moe_in_buckets(model: torch.nn.Module, buckets: list[dict[str, torch.Tensor]]) -> None:
+    """One RL refit of ``model``: begin, one partial load per bucket, finalize."""
+    begin_moe_refit(model)
+    for bucket in buckets:
+        model.load_weights([dict(bucket)], allow_partial_loading=True)
+    finalize_moe_refit(model)
