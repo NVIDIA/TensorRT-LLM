@@ -158,6 +158,15 @@ def test_kimi_factory_passes_kda_mtp_replay_for_the_pytorch_mixer(monkeypatch):
     assert not _util._uses_kda_mtp_replay(torch.nn.ModuleList([mixer(4, None)]))
     assert not _util._uses_kda_mtp_replay(torch.nn.ModuleList([torch.nn.Linear(2, 2)]))
     assert not _util._uses_kda_mtp_replay(SimpleNamespace(model=SimpleNamespace()))
+    # TRTLLM_USE_KDA_MTP_REPLAY=0 keeps the fused verify.
+    monkeypatch.setenv("TRTLLM_USE_KDA_MTP_REPLAY", "0")
+    assert not _util._uses_kda_mtp_replay(model)
+    monkeypatch.delenv("TRTLLM_USE_KDA_MTP_REPLAY")
+    # A modeling_v2 target runs its own KDA verify and speculative step.
+    model.model_config = SimpleNamespace(modeling_v2_target=object)
+    assert not _util._uses_kda_mtp_replay(model)
+    model.model_config = SimpleNamespace(modeling_v2_target=None)
+    assert _util._uses_kda_mtp_replay(model)
 
 
 def _manager(manager_cls=KimiK3HybridCacheManager, num_spec=2, **kwargs):

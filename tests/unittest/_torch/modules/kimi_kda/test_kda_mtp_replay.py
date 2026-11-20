@@ -332,6 +332,87 @@ def test_kda_mtp_replay_paired_slots_match_separate_slots(state_dtype, width, ba
         assert torch.equal(separate, paired)
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@torch.no_grad()
+def test_kda_mtp_replay_conv_pool_past_2g_matches_a_dense_copy(state_dtype):
+    """Conv-state slots that start past element 2**31 give the dense-pool result bit for bit.
+
+    V2 coalesces a rank's KDA layers in each slot, so the Conv pool's slot stride
+    is layers x 3 x channels elements; here it puts the last slot past 2**31.
+    About 5 GiB of device memory.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_replay import kda_mtp_replay
+
+    torch.manual_seed(13)
+    heads, width, token_capacity = 4, 4, 8
+    channels = 3 * heads * DIM
+    slots = 1100
+    slot_stride = (2**31 // 1000) // 8 * 8
+    pool_elements = (slots - 1) * slot_stride + channels * 3
+    assert (slots - 1) * slot_stride >= 2**31
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < pool_elements * 2 + (2 << 30):
+        pytest.skip("the past-2**31 Conv pool needs about 5 GiB of free device memory")
+    rows = [0, slots // 2, slots - 1]
+    batch = len(rows)
+    big_conv = torch.empty(pool_elements, device="cuda", dtype=torch.bfloat16).as_strided(
+        (slots, channels, 3), (slot_stride, 3, 1)
+    )
+    dense_conv = _randn((batch, channels, 3), 0.09).to(torch.bfloat16)
+    for i, row in enumerate(rows):
+        big_conv[row].copy_(dense_conv[i])
+    dense_checkpoint = _randn((batch, heads, DIM, DIM), 0.012).to(state_dtype)
+    big_checkpoint = torch.zeros((slots, heads, DIM, DIM), device="cuda", dtype=state_dtype)
+    big_checkpoint[rows] = dense_checkpoint
+    raw_x = _randn((batch, width, channels), 0.09).to(torch.bfloat16)
+    conv_weight = _randn((channels, 4), 0.18).to(torch.bfloat16)
+    raw_g = _randn((batch, width, heads, DIM), 0.85, -0.36).to(torch.bfloat16)
+    raw_beta = _randn((batch, width, heads), 1.0, 2.7).to(torch.bfloat16)
+    capacity = WINDOW + token_capacity
+    (history_k,), (history_u,), (history_G,), history_len = _make_pool_history(
+        1, batch, heads, capacity
+    )
+    history_len.copy_(torch.tensor([7, 2, 15], device="cuda", dtype=torch.int32))
+    replay_indices = torch.arange(batch, device="cuda", dtype=torch.int32)
+    is_dummy = torch.zeros(batch, device="cuda", dtype=torch.bool)
+    A_log = _randn((heads,), 0.42, -0.21).clamp_(-0.75, 0.9)
+    dt_bias = _randn((heads * DIM,), 1.4, -4.6).clamp_(-8.0, -1.25)
+
+    results = []
+    for conv_state, checkpoint, state_indices in (
+        (dense_conv, dense_checkpoint, replay_indices),
+        (big_conv, big_checkpoint, torch.tensor(rows, device="cuda", dtype=torch.int32)),
+    ):
+        k, u, g = history_k.clone(), history_u.clone(), history_G.clone()
+        output = torch.empty(batch, width, heads, DIM, device="cuda", dtype=torch.bfloat16)
+        candidate_x = torch.zeros(
+            (batch, token_capacity, channels), device="cuda", dtype=torch.bfloat16
+        )
+        kda_mtp_replay(
+            raw_x,
+            conv_weight,
+            conv_state,
+            raw_g,
+            raw_beta,
+            checkpoint,
+            state_indices,
+            is_dummy,
+            k,
+            u,
+            g,
+            history_len,
+            A_log,
+            dt_bias,
+            output,
+            candidate_x,
+            history_window=WINDOW,
+            replay_indices=replay_indices,
+        )
+        results.append((output, candidate_x, k, u, g))
+    for dense, large in zip(*results):
+        assert torch.equal(dense, large)
+
+
 @torch.no_grad()
 def _commit_reference(
     state_views,
