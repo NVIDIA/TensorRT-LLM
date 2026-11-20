@@ -915,8 +915,12 @@ class FluxTransformer2DModel(BaseDiffusionModel):
         # All-gather hidden states across ranks (no-op when sharder is inactive).
         hidden_states = self.sharder.gather(hidden_states, dim=1)
 
-        # Output projection
-        hidden_states = self.norm_out(hidden_states, temb)
+        # Output projection. Match the strides of a step cache's output (a new tensor) so
+        # the compiled norm_out does not recompile on a stride guard. .contiguous() would
+        # not copy the batch-1 slice: a size-1 dim's stride is ignored for contiguity.
+        hidden_states = self.norm_out(
+            hidden_states.clone(memory_format=torch.contiguous_format), temb
+        )
         output = self.proj_out(hidden_states)
 
         if not return_dict:

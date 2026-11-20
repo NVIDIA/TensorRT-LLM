@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import contextlib
+import math
+from typing import Any, Dict, Iterator, List, Optional
 
 import cache_dit
+import torch.nn as nn
 
 from tensorrt_llm.logger import logger
 
@@ -56,3 +59,45 @@ class CacheDiTAccelerator(CacheAccelerator):
 
     def is_enabled(self) -> bool:
         return self._result is not None
+
+    def min_warmup_steps(self, default_steps: int) -> int:
+        if not self._can_force_warmup_cache():
+            return default_steps
+        return self._result.min_warmup_steps(default_steps)
+
+    @contextlib.contextmanager
+    def warmup_scope(self) -> Iterator[None]:
+        """Force cached steps during warmup; restore the configured threshold on exit."""
+        # refresh_context() with one field resets only that field; other settings are kept.
+        if not self._can_force_warmup_cache():
+            yield
+            return
+        # Just below 1.0: cache-dit skips the residual comparison (itself a
+        # first-request cost) at a threshold of 1.0 or more.
+        force_threshold = math.nextafter(1.0, 0.0)
+        forced: List[nn.Module] = []
+        try:
+            for module in self._result.summary_modules:
+                cache_dit.refresh_context(
+                    module,
+                    residual_diff_threshold=force_threshold,
+                    verbose=False,
+                )
+                forced.append(module)
+            yield
+        finally:
+            for module in forced:
+                cache_dit.refresh_context(
+                    module,
+                    residual_diff_threshold=self._cfg.residual_diff_threshold,
+                    verbose=False,
+                )
+
+    def _can_force_warmup_cache(self) -> bool:
+        # Only for enablers that opt in. With an SCM steps mask, the mask (not the
+        # threshold) decides the full-compute steps.
+        return (
+            self._result is not None
+            and self._result.min_warmup_steps is not None
+            and self._cfg.scm_steps_mask_policy is None
+        )

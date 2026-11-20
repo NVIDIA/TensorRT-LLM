@@ -967,6 +967,11 @@ class BasePipeline(nn.Module):
             logger.info("Warmup disabled (no warmup shapes)")
             return
 
+        # Reach the step cache's cached path so its first-time costs are paid here.
+        cache_acc = self._warmup_cache_accelerator()
+        if cache_acc is not None:
+            steps = cache_acc.min_warmup_steps(steps)
+
         shape_list = ", ".join(f"{h}x{w}x{f}" for h, w, f in shapes)
         logger.info(
             f"Running warmup for {self.__class__.__name__}: "
@@ -987,27 +992,28 @@ class BasePipeline(nn.Module):
 
         self._is_warmup = True
         try:
-            if not enable_autotune:
-                self._run_warmup_pass(shapes, steps)
-            elif post_tune_merge_dist is None:
-                # Single rank: nothing to merge; tune and capture in one pass.
-                with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+            with cache_acc.warmup_scope() if cache_acc is not None else contextlib.nullcontext():
+                if not enable_autotune:
                     self._run_warmup_pass(shapes, steps)
-            else:
-                # Multi rank: tune with capture off, merge tactics across ranks
-                # at autotune() exit, then recapture from the merged tactics
-                # (only needed when CUDA graphs are enabled).
-                with (
-                    self.disallow_cuda_graph_capture(),
-                    autotune(
-                        cache_path=cache_path,
-                        skip_dynamic_tuning_buckets=True,
-                        post_tune_merge_dist=post_tune_merge_dist,
-                    ),
-                ):
-                    self._run_warmup_pass(shapes, steps)
-                if self.pipeline_config.cuda_graph.enable:
-                    self._run_warmup_pass(shapes, steps)
+                elif post_tune_merge_dist is None:
+                    # Single rank: nothing to merge; tune and capture in one pass.
+                    with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+                        self._run_warmup_pass(shapes, steps)
+                else:
+                    # Multi rank: tune with capture off, merge tactics across ranks
+                    # at autotune() exit, then recapture from the merged tactics
+                    # (only needed when CUDA graphs are enabled).
+                    with (
+                        self.disallow_cuda_graph_capture(),
+                        autotune(
+                            cache_path=cache_path,
+                            skip_dynamic_tuning_buckets=True,
+                            post_tune_merge_dist=post_tune_merge_dist,
+                        ),
+                    ):
+                        self._run_warmup_pass(shapes, steps)
+                    if self.pipeline_config.cuda_graph.enable:
+                        self._run_warmup_pass(shapes, steps)
         finally:
             self._is_warmup = False
 
@@ -1016,6 +1022,13 @@ class BasePipeline(nn.Module):
         )
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
+
+    def _warmup_cache_accelerator(self) -> Optional["CacheAccelerator"]:
+        """Step cache to warm up; None if disabled or under CUDA graphs (capture can't cache)."""
+        acc = getattr(self, "cache_accelerator", None)
+        if acc is None or not acc.is_enabled() or self.pipeline_config.cuda_graph.enable:
+            return None
+        return acc
 
     def _run_warmup_pass(self, shapes, steps) -> None:
         """Run one warmup pass over all shapes (denoise loop with dummy inputs)."""
