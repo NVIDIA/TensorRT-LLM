@@ -75,6 +75,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
     TURN_FAULT_TOLERANCE_OFF,
     RankIdentity,
 )
+from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.mapping import Mapping
 
@@ -670,6 +671,27 @@ def test_attached_frontend_gets_no_rendezvous(monkeypatch):
     assert startup_module.ensure_rendezvous("ray") == ({}, None)
 
 
+@pytest.mark.parametrize("secret", [None, ""], ids=["unset", "empty"])
+def test_rendezvous_port_reserved_until_shutdown(monkeypatch, secret):
+    """Check that no other process takes the rendezvous port until the LLM's shutdown."""
+    for name in (SHARED_SECRET_ENV, RENDEZVOUS_ENV):
+        monkeypatch.delenv(name, raising=False)
+    if secret is not None:
+        monkeypatch.setenv(SHARED_SECRET_ENV, secret)
+    llm = object.__new__(BaseLLM)
+    env, llm._rendezvous_socket = startup_module.ensure_rendezvous(None)
+    try:
+        assert len(bytes.fromhex(env[SHARED_SECRET_ENV])) == 32
+        _, port = rendezvous_host_port(env[RENDEZVOUS_ENV])
+        with socket.socket() as other, pytest.raises(OSError):
+            other.bind(("", port))
+    finally:
+        llm.shutdown()
+    llm.shutdown()
+    with socket.socket() as other:
+        other.bind(("", port))
+
+
 @pytest.mark.parametrize(
     "port, warned", [(29600, False), (32767, False), (32768, True), (60999, True), (61000, False)]
 )
@@ -948,6 +970,7 @@ def test_rank0_publishes_args_without_ipc_keys(store, launched, monkeypatch):
     from tensorrt_llm.executor.utils import WorkerCommIpcAddrs
 
     events = []
+    authority = Mock()
     monkeypatch.setenv(FAULT_TOLERANCE_RANK_ENV, "0,8,4,0")
     # Two nodes, so the rendezvous host must resolve to an address that the other node reaches.
     monkeypatch.setenv(RENDEZVOUS_ENV, "192.0.2.1:29600")
@@ -955,7 +978,7 @@ def test_rank0_publishes_args_without_ipc_keys(store, launched, monkeypatch):
         startup_module,
         "_start_authority",
         lambda world_size, gpus_per_node, timeout_s: (
-            events.append(("authority", world_size, gpus_per_node)) or Mock()
+            events.append(("authority", world_size, gpus_per_node)) or authority
         ),
     )
     monkeypatch.setattr(
@@ -980,6 +1003,8 @@ def test_rank0_publishes_args_without_ipc_keys(store, launched, monkeypatch):
     }
     startup_module.start_rank(args)
     assert events == [("authority", 8, 4), ("join", True, 0)]
+    # Rank 0 hands its authority process to the executor, which waits for it to end at shutdown.
+    assert startup_module.authority_process() is authority
     # Rank 0 records its startup for the replacements.
     record = startup_module._state.record
     assert record.agree("rank_hosts", lambda: ["a"] * WORLD) == ["a"] * WORLD

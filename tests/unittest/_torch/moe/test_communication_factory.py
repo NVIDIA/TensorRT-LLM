@@ -31,6 +31,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm._wide_ep_fault_tolerance import TURN_FAULT_TOLERANCE_OFF
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -621,8 +622,11 @@ def test_fault_tolerance_reports_one_sided_error(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
     monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
 
-    with pytest.raises(ValueError, match="requires the NVLinkOneSided.*strategy unavailable"):
+    with pytest.raises(
+        ValueError, match="requires the NVLinkOneSided.*strategy unavailable"
+    ) as error:
         _create_one_sided(model_config, forced=False)
+    assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
 
 
 @pytest.mark.parametrize("fault_tolerance", [False, True])

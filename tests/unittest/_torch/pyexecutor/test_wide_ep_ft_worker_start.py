@@ -19,6 +19,7 @@ others) and the real membership authority. A fake ``worker_main`` sleeps to stan
 load, calls ``wait_for_every_rank``, and serves until it is ended.
 """
 
+import inspect
 import os
 import queue
 import signal
@@ -26,6 +27,7 @@ import subprocess  # nosec B404
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -38,6 +40,7 @@ from tensorrt_llm._torch.distributed.membership import (
     startup,
 )
 from tensorrt_llm._wide_ep_fault_tolerance import FAULT_TOLERANCE_RANK_ENV
+from tensorrt_llm.executor import worker
 
 pytestmark = pytest.mark.cpu_only
 
@@ -264,3 +267,24 @@ def test_rank_without_rank_0_times_out():
         printed = [line for _, line in ranks.seen + list(ranks.lines.queue)]
     assert waited_s >= RENDEZVOUS_TIMEOUT_S - 1.0, waited_s
     assert any("timed out" in line.lower() for line in printed), printed
+
+
+def test_rank_0_forwards_every_worker_argument(monkeypatch):
+    """Check that rank 0 hands every worker_main argument to the other ranks."""
+
+    class Started(Exception):
+        pass
+
+    forwarded = {}
+
+    def start_rank(worker_main_args):
+        forwarded.update(worker_main_args)
+        raise Started
+
+    monkeypatch.setattr(startup, "start_rank", start_rank)
+    monkeypatch.setattr(worker, "check_node_supervisor_launch", lambda fault_tolerance: None)
+    arguments = {name: object() for name in inspect.signature(worker.worker_main).parameters}
+    arguments["llm_args"] = SimpleNamespace(enable_wide_ep_fault_tolerance=True)
+    with pytest.raises(Started):
+        worker.worker_main(**arguments)
+    assert forwarded == arguments

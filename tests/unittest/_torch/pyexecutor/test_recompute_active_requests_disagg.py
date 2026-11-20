@@ -59,6 +59,7 @@ class _RecomputeExecutor:
 
     _DISAGG_TRANSFER_BOUND_STATES = PyExecutor._DISAGG_TRANSFER_BOUND_STATES
     _is_disagg_transfer_bound = PyExecutor._is_disagg_transfer_bound
+    recompute_requests = PyExecutor.recompute_requests
 
     def __init__(self, active_requests, *, transceiver, transfer_manager, previous_batch=None):
         self.active_requests = list(active_requests)

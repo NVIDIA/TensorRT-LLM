@@ -1184,7 +1184,12 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
     worker_main = _extract_function(
         _ROOT / "tensorrt_llm/executor/worker.py",
         "worker_main",
-        {**common, "GenerationExecutorWorker": object, "mpi_comm": runtime_init("mpi_comm")},
+        {
+            **common,
+            "GenerationExecutorWorker": object,
+            "mpi_comm": runtime_init("mpi_comm"),
+            "check_node_supervisor_launch": lambda enabled: None,
+        },
     )
     args = worker_args()
     assert run(

@@ -296,8 +296,9 @@ class TestProcessLifecycleCounters:
         class Args:
             model_fields = {}
             # Read by the constructor before it reaches mpi_session, so the
-            # double has to carry the real field's default to get that far.
+            # double has to carry the real fields' defaults to get that far.
             kv_connector_config = None
+            enable_wide_ep_fault_tolerance = False
 
             def __init__(self, **kwargs):
                 self.telemetry_config = llm_args.TelemetryConfig()

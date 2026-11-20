@@ -1009,3 +1009,86 @@ def test_worker_enqueues_serializable_python_input_envelope(
         assert translated.py_return_routed_experts
         torch.testing.assert_close(translated.py_multimodal_data["embedding"],
                                    torch.ones(2, 4))
+
+
+def _ipc_worker(monkeypatch, fault_tolerance=True):
+    """Return the executor worker of rank 0 past its startup and its response helper.
+
+    The worker has two postprocessing workers. A request's responses go to its
+    postprocessing worker and its errors go to the result queue.
+    """
+    monkeypatch.setattr(
+        base_worker, "GenerationResult",
+        lambda request, **kwargs: SimpleNamespace(
+            _params_transmitted=False,
+            _streaming=True,
+            sampling_params="sampling params",
+            postproc_params="postproc params",
+            disaggregated_params=None,
+        ))
+    monkeypatch.setattr(base_worker, "_maybe_wrap_response",
+                        lambda worker, response: response)
+    worker = BaseWorker(llm_args=TorchLlmArgs(
+        model="dummy",
+        enable_wide_ep_fault_tolerance=fault_tolerance,
+        enable_attention_dp=True,
+        tensor_parallel_size=2,
+        max_seq_len=4096,
+        moe_config={"load_balancer": {
+            "num_slots": 4
+        }},
+    ))
+    worker.doing_shutdown = True  # Nothing to shut down at exit.
+    worker.rank = 0
+    worker.start = Mock()
+    worker._get_logprob_params = Mock(return_value=None)
+    worker._handle_background_error = Mock()
+    worker._has_background_error = Mock(return_value=False)
+    # The engine numbers the enqueued requests from 100 on.
+    worker._enqueue_request = Mock(side_effect=range(100, 200))
+    worker.postproc_config = SimpleNamespace(num_postprocess_workers=2,
+                                             enabled=True)
+    worker.postproc_queues = [Mock(), Mock()]
+    worker.frontend_result_queues = None
+    worker.result_queue = Mock()
+    return worker, base_worker.AwaitResponseHelper(worker)
+
+
+def _submit(worker, client_id):
+    request = SimpleNamespace(id=client_id,
+                              multimodal_params=None,
+                              disaggregated_params=None)
+    worker.submit(request)
+    return request
+
+
+def _set_up_engine(monkeypatch, worker, rank_failure_recovery):
+    """Set up the worker's engine, whose rank failure recovery is ``rank_failure_recovery``."""
+    engine = SimpleNamespace(max_seq_len=None,
+                             rank_failure_recovery=rank_failure_recovery)
+    # Patching create_py_executor first imports py_executor_creator, so that
+    # module keeps the real construct_checkpoint_loader after the test.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor_creator.create_py_executor",
+        Mock(return_value=engine))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.model_loader.construct_checkpoint_loader",
+        Mock())
+    worker._configure_device = Mock()
+    worker.setup_engine()
+    assert worker.engine is engine
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fault_tolerance", [True, False])
+def test_worker_gives_engine_its_outstanding_requests(monkeypatch,
+                                                      fault_tolerance):
+    """Check that the engine's rank failure recovery, if any, reads the outstanding requests."""
+    worker, _ = _ipc_worker(monkeypatch, fault_tolerance=fault_tolerance)
+    recovery = Mock() if fault_tolerance else None
+    _set_up_engine(monkeypatch, worker, recovery)
+    if fault_tolerance:
+        _submit(worker, 7)
+        recovery.set_outstanding_requests.assert_called_once()
+        outstanding, = recovery.set_outstanding_requests.call_args.args
+        assert outstanding() == {100: 7}

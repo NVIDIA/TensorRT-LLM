@@ -158,7 +158,11 @@ def test_checkpoint_io_policy_rejects_unknown_value() -> None:
 # The smallest configuration that Wide-EP fault tolerance accepts.
 _FAULT_TOLERANT_ARGS = dict(enable_wide_ep_fault_tolerance=True,
                             enable_attention_dp=True,
-                            tensor_parallel_size=2)
+                            tensor_parallel_size=2,
+                            moe_config={"load_balancer": {
+                                "num_slots": 72
+                            }},
+                            enable_chunked_prefill=True)
 
 
 @pytest.mark.cpu_only

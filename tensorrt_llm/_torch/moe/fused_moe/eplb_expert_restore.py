@@ -36,6 +36,10 @@ from tensorrt_llm.math_utils import ceil_div
 
 from .moe_load_balancer import HostMoeTensorSharer, MoeLoadBalancer, SingleLayerMoeLoadBalancer
 
+# The empty spare slots of this many MoE layers are released per call. Each call that releases any
+# first waits for the device to finish its queued work, so a call per layer would finish later.
+_RELEASE_LAYERS_PER_CALL = 8
+
 
 def plan_layer_placement(
     current: np.ndarray,
@@ -287,6 +291,18 @@ class EplbExpertRestore:
         rank_0_node = node_ranks.pop(nodes[0], [])
         return list(node_ranks.values()) + [[rank] for rank in rank_0_node[1:]]
 
+    def largest_failure_restore_bytes(self) -> int:
+        """Return the most device memory this rank backs to restore any recoverable failure."""
+        ep_rank, ep_size = self.balancer.ep_rank, self.balancer.ep_size
+        current = [np.array(ranks, dtype=np.int32) for _, ranks in self.current_placement()]
+        largest = 0
+        for failure in self._recoverable_failures(self._rank_nodes()):
+            if ep_rank in failure:
+                continue
+            active_ranks = [rank not in failure for rank in range(ep_size)]
+            largest = max(largest, self.plan_expert_restore(active_ranks, current).device_bytes)
+        return largest
+
     def current_placement(self) -> list[tuple[int, list[list[int]]]]:
         """Return each layer's expert count and placement as this rank sees it."""
         return [
@@ -384,6 +400,42 @@ class EplbExpertRestore:
         Returns:
             The number of bytes whose backing changed.
         """
+        changed = self._set_backed(layer_slots, backed)
+        self.backed_spare_slot_bytes += changed if backed else -changed
+        return changed
+
+    def empty_spare_slots(self) -> list[list[int]]:
+        """Return, by layer, the spare slots that the installed placement leaves empty.
+
+        Raises:
+            RuntimeError: An iteration is active.
+        """
+        balancer = self.balancer
+        if balancer.in_iter:
+            raise RuntimeError("Cannot read the empty spare slots while an iteration is active")
+        return [layer.get_unusable_local_slots() for layer in balancer.single_layer_load_balancers]
+
+    def release_spare_slots(self, layer_slots: Sequence[Sequence[int]]) -> int:
+        """Map the empty spare slots ``layer_slots``, by layer, back to the shared scratch.
+
+        It may run on a worker thread while forwards and online EPLB updates run: no token reaches
+        an empty spare slot, no kernel reads the weights of a slot without tokens, no update fills
+        these slots, and no CUDA graph is captured outside warmup (``allow_capture`` in
+        ``cuda_graph_runner.py``). It leaves ``backed_spare_slot_bytes`` to the caller's thread.
+
+        Returns:
+            The number of bytes released.
+        """
+        released = 0
+        for start in range(0, len(layer_slots), _RELEASE_LAYERS_PER_CALL):
+            end = start + _RELEASE_LAYERS_PER_CALL
+            released += self._set_backed(
+                [slots if start <= i < end else [] for i, slots in enumerate(layer_slots)], False
+            )
+        return released
+
+    def _set_backed(self, layer_slots: Sequence[Sequence[int]], backed: bool) -> int:
+        """Back or unback ``layer_slots`` in one call and return the bytes whose backing changed."""
         tensors, slots, slot_counts = [], [], []
         for layer, spare_slots in zip(
             self.balancer.single_layer_load_balancers, layer_slots, strict=True
@@ -396,27 +448,7 @@ class EplbExpertRestore:
                 slot_counts.append(len(spare_slots))
         if not tensors:
             return 0
-        changed = torch.ops.trtllm.moe_unbacked_slots_set_backed(
-            tensors, slots, slot_counts, backed
-        )
-        self.backed_spare_slot_bytes += changed if backed else -changed
-        return changed
-
-    def release_empty_spare_slots(self) -> int:
-        """Map the spare slots that the installed placement leaves empty back to the shared scratch.
-
-        An online EPLB update may still run, because it never fills these slots.
-
-        Returns:
-            The number of bytes released.
-        """
-        balancer = self.balancer
-        if balancer.in_iter:
-            raise RuntimeError("Cannot release spare slots while an iteration is active")
-        return self.set_spare_slots_backed(
-            [layer.get_unusable_local_slots() for layer in balancer.single_layer_load_balancers],
-            False,
-        )
+        return torch.ops.trtllm.moe_unbacked_slots_set_backed(tensors, slots, slot_counts, backed)
 
     def restore_lost_experts(
         self,

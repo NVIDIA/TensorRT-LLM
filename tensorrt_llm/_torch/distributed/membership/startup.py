@@ -504,6 +504,11 @@ def membership_client() -> MembershipClient:
     return _state.client
 
 
+def authority_process() -> Optional[subprocess.Popen]:
+    """Return the authority process that this process started. Only rank 0 starts one."""
+    return _state.authority
+
+
 def publish_startup_record(store: SignedStore) -> None:
     """Publish rank 0's startup record and startup fingerprint for a replacement to replay."""
     agreed_startup = {**_state.record.published(), "fingerprint": _state.fingerprint}

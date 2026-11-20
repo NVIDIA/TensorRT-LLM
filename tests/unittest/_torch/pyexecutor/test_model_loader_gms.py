@@ -362,6 +362,8 @@ def test_wide_ep_fault_tolerance_binds_moe_layers_before_weight_load(monkeypatch
     events = []
     loader = _make_loader(monkeypatch, events=events)
     loader.llm_args.enable_wide_ep_fault_tolerance = True
+    monkeypatch.setattr(rank_failure_model_load, "check_supported", lambda llm_args, mapping: None)
+    monkeypatch.setattr(rank_failure_model_load, "create_moe_load_balancer", _moe_context)
     monkeypatch.setattr(
         rank_failure_model_load, "prepare_model", lambda model: events.append("prepare_model")
     )

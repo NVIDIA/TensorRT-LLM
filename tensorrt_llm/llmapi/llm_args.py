@@ -52,6 +52,7 @@ from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from .._errors import ConfigInputError
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
+from .._wide_ep_fault_tolerance import check_llm_args
 
 # yapf: disable
 # isort: off
@@ -8765,13 +8766,14 @@ class TorchLlmArgs(BaseLlmArgs):
 
     enable_wide_ep_fault_tolerance: bool = Field(
         default=False,
-        description="Run the MoE all-to-all of wide expert parallelism in its "
-        "fault-tolerant mode, in which the NVLink one-sided all-to-all "
-        "exchanges only with the EP ranks marked active. Requires attention "
-        "DP over more than one rank, no MoE TP and the built-in MoE layers. "
-        "Turns off the sentinel transport and the two-rank pull combine of "
-        "the NVLink one-sided all-to-all. Does not yet recover from a failed "
-        "rank.",
+        description=
+        "Keep a wide expert-parallel deployment serving at reduced capacity "
+        "when one of its ranks fails, until a replacement rejoins. "
+        "Requires attention DP over more than one rank, no MoE TP, the "
+        "built-in MoE layers, EPLB and KV cache manager V2; unsupported "
+        "configurations are rejected at startup with the reason. Turns off "
+        "the sentinel transport and the two-rank pull combine of the NVLink "
+        "one-sided all-to-all.",
         status="prototype")
 
     reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
@@ -9941,17 +9943,20 @@ class TorchLlmArgs(BaseLlmArgs):
         self.moe_config.resolve_load_balancer_compatibility()
         return self
 
+    # Runs after validate_load_balancer, so a load balancer given as a YAML path
+    # is loaded by then.
     @model_validator(mode="after")
     def validate_wide_ep_fault_tolerance(self) -> 'TorchLlmArgs':
         """Refuse a fault-tolerant launch that these arguments rule out.
 
         ``_validate_wide_ep_fault_tolerance_launch`` checks the parallel layout
-        and model of the MoE all-to-all. ``modeling_v2='auto'`` falls back to
-        the built-in model, because no modeling_v2 target supports fault
-        tolerance yet.
+        and model of the MoE all-to-all, ``check_llm_args`` the features that
+        failover supports. ``modeling_v2='auto'`` falls back to the built-in
+        model, because no modeling_v2 target supports fault tolerance yet.
         """
         if self.enable_wide_ep_fault_tolerance:
             _validate_wide_ep_fault_tolerance_launch(self)
+            check_llm_args(self)
             if self.modeling_v2 == "auto":
                 logger.warning(
                     "modeling_v2: no target supports Wide-EP fault tolerance; "

@@ -325,8 +325,31 @@ def test_release_keeps_filled_spare_slots_during_update(monkeypatch):
     monkeypatch.setattr(
         torch.ops.trtllm, "moe_unbacked_slots_set_backed", set_backed, raising=False
     )
-    assert load_balancer.expert_restore.release_empty_spare_slots() == 4 << 20
+    restore = load_balancer.expert_restore
+    assert restore.release_spare_slots(restore.empty_spare_slots()) == 4 << 20
     assert released == [3]
+
+
+def test_release_unmaps_a_few_layers_per_call(monkeypatch):
+    """Release empty spare slots a few layers per call, leaving the backed bytes to the caller."""
+    load_balancer, layer = _online_balancer(monkeypatch, _ONLINE)
+    monkeypatch.setattr(load_balancer, "single_layer_load_balancers", [layer] * 3)
+    monkeypatch.setattr(f"{_ER}._RELEASE_LAYERS_PER_CALL", 2)
+    calls = []
+
+    def set_backed(tensors, slots, slot_counts, backed):
+        assert not backed
+        calls.append(slot_counts)
+        return len(slots) * (4 << 20)
+
+    monkeypatch.setattr(
+        torch.ops.trtllm, "moe_unbacked_slots_set_backed", set_backed, raising=False
+    )
+    restore = load_balancer.expert_restore
+    assert restore.release_spare_slots([[2, 3], [], [3]]) == 3 * (4 << 20)
+    # The first call takes layers 0 and 1, the second layer 2.
+    assert calls == [[2], [1]]
+    assert restore.backed_spare_slot_bytes == 0
 
 
 def test_restore_reads_no_placement_while_an_update_may_swap_it(monkeypatch):
@@ -344,6 +367,25 @@ def test_restore_reads_no_placement_while_an_update_may_swap_it(monkeypatch):
     with pytest.raises(RuntimeError, match="abandonIterations"):
         restore.restore_lost_experts(plan)
     old_rank_expert_ids.assert_not_called()
+
+
+@pytest.mark.parametrize("ep_rank, largest", [(0, 8 << 20), (2, 4 << 20)])
+def test_largest_failure_restore_bytes_skips_failures_that_lose_this_rank(
+    monkeypatch, ep_rank, largest
+):
+    """Size the restore of each recoverable failure that this rank survives, at its placement."""
+    load_balancer, _ = _online_balancer(monkeypatch, _ONLINE, ep_rank=ep_rank)
+    restore = load_balancer.expert_restore
+    # The recoverable failures of nodes [0, 1] and [2, 3] lose node 1 or rank 1.
+    device_bytes = {(2, 3): 8 << 20, (1,): 4 << 20}
+
+    def plan_expert_restore(active_ranks, current):
+        np.testing.assert_array_equal(current[0], _ONLINE)
+        lost = tuple(rank for rank, active in enumerate(active_ranks) if not active)
+        return SimpleNamespace(device_bytes=device_bytes[lost])
+
+    monkeypatch.setattr(restore, "plan_expert_restore", plan_expert_restore)
+    assert restore.largest_failure_restore_bytes() == largest
 
 
 def test_current_placement_hides_invalid_slots(monkeypatch):

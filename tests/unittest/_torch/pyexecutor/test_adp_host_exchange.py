@@ -224,6 +224,30 @@ def test_can_queue_gathers_only_the_batch_size():
     assert can_queue is False and this_rank is True
 
 
+def test_can_queue_takes_recovery_vote():
+    """Check that the gathered rows alone decide on every rank under rank failure recovery.
+
+    The recovery takes the vote over the executor's gather, since it holds its steps before the
+    gather.
+    """
+    executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = True
+    executor.model_engine = SimpleNamespace(_dspark_confidence_enabled=False)
+    executor.rank_failure_recovery = Mock(forward_vote=Mock(return_value=(False, False)))
+    executor.dist = SimpleNamespace(
+        tp_size=2,
+        cp_size=1,
+        tp_rank=0,
+        tp_cp_allgather_int64=Mock(),
+    )
+
+    can_queue, this_rank = PyExecutor._can_queue(executor, types.SimpleNamespace(batch_size=2))
+
+    executor.rank_failure_recovery.forward_vote.assert_called_once_with(2)
+    executor.dist.tp_cp_allgather_int64.assert_not_called()
+    assert can_queue is False and this_rank is False
+
+
 @pytest.mark.parametrize("batch_size", [1, 0], ids=["padded_cp_rank", "empty_cp_rank"])
 def test_can_queue_this_rank_is_shared_by_the_cp_peers_of_a_dp_rank(batch_size):
     """Under helix one CP rank can pad a dummy its peer could not allocate. The

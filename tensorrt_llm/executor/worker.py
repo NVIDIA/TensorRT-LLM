@@ -30,6 +30,7 @@ from tensorrt_llm.logger import logger
 
 from .._startup_errors import classify_startup_error, wrap_worker_startup_error
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
+from .._wide_ep_fault_tolerance import check_node_supervisor_launch
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -401,6 +402,30 @@ def worker_main(
     rpc_addr: Optional[str] = None,
     hmac_key: bytes = b"",
 ) -> None:
+    fault_tolerance = getattr(llm_args, "enable_wide_ep_fault_tolerance", False)
+    check_node_supervisor_launch(fault_tolerance)
+    if fault_tolerance:
+        from tensorrt_llm._torch.distributed.membership.startup import (
+            join_startup_group, start_rank)
+
+        # Every other rank starts with these arguments.
+        start_rank(
+            dict(worker_queues=worker_queues,
+                 log_level=log_level,
+                 worker_cls=worker_cls,
+                 tracer_init_kwargs=tracer_init_kwargs,
+                 _torch_external_model_modules=_torch_external_model_modules,
+                 postproc_worker_config=postproc_worker_config,
+                 ready_signal=ready_signal,
+                 worker_process_identities_signal=
+                 worker_process_identities_signal,
+                 is_llm_executor=is_llm_executor,
+                 hf_model_dir=hf_model_dir,
+                 tokenizer=tokenizer,
+                 llm_args=llm_args,
+                 rpc_addr=rpc_addr,
+                 hmac_key=hmac_key))
+        join_startup_group(llm_args.parallel_config.to_mapping())
 
     launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
     if llm_args is not None and llm_args.env_overrides:
@@ -468,7 +493,8 @@ def worker_main(
             register_external_model_modules
         register_external_model_modules(_torch_external_model_modules or {})
 
-    set_mpi_session_cpp(mpi_comm())
+    if not fault_tolerance:
+        set_mpi_session_cpp(mpi_comm())
 
     if is_leader:
         # Only set the log level for the leader process, the other processes will
@@ -586,8 +612,15 @@ def worker_main(
     #         error to the error_queue in the main thread.
 
     mpi_comm().barrier()
-    worker_process_identities = mpi_comm().allgather(
-        capture_worker_process_identity(mpi_rank()))
+    if fault_tolerance:
+        # The membership authority on rank 0 handles the death of any other
+        # rank, so the proxy watches rank 0 alone.
+        worker_process_identities = [
+            capture_worker_process_identity(mpi_rank())
+        ]
+    else:
+        worker_process_identities = mpi_comm().allgather(
+            capture_worker_process_identity(mpi_rank()))
 
     # Publish the process identities before backend construction begins. Model
     # construction can load weights for several minutes, and an externally

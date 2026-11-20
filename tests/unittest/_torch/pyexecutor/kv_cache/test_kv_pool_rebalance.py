@@ -127,7 +127,16 @@ def _make_executor(
     # Same for the suspend/adjust/resume core, which both the inline path and
     # the PP drain delegate to.
     exe._rebalance_kv_pools_now = lambda: PyExecutor._rebalance_kv_pools_now(exe)
+    exe._suspend_for_rebalance = lambda mgr: PyExecutor._suspend_for_rebalance(exe, mgr)
+    exe._resume_after_rebalance = lambda mgr, paused, dummies: (
+        PyExecutor._resume_after_rebalance(exe, mgr, paused, dummies)
+    )
     exe._pp_ring_is_quiescent = lambda: PyExecutor._pp_ring_is_quiescent(exe)
+    # And the accept step, which accepts nothing without rank failure recovery.
+    exe.rank_failure_recovery = None
+    exe._accept_or_discard_previous_batch = lambda: PyExecutor._accept_or_discard_previous_batch(
+        exe
+    )
 
     # KV cache manager (resource-manager wrapper).
     exe.kv_cache_manager = MagicMock()

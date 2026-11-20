@@ -125,6 +125,10 @@ class MoeExecutionState:
         """
         self._workspaces.setdefault(workspace, (reset_workspace, check_incomplete_round))
 
+    def workspace_bytes(self) -> int:
+        """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
+        return sum(workspace.local_device_bytes for workspace in self._workspaces)
+
     def workspace_rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
         """Return every row if a former member may still write into any bound workspace.
 

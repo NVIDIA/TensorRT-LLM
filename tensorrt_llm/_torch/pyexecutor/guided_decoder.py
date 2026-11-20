@@ -727,6 +727,12 @@ class CapturableGuidedDecoder(GuidedDecoder):
         ]
         return taken
 
+    def discard_batch(self, batch_id: int) -> None:
+        """Drop the build failures of a discarded batch."""
+        # Its host functions report their failures before they are dropped.
+        self._drain_host_functions()
+        self.take_failed_requests(batch_id)
+
     def execute(self,
                 logits: torch.Tensor,
                 d2t: Optional[torch.Tensor] = None) -> None:
