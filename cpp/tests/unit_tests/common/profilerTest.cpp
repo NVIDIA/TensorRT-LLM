@@ -134,7 +134,7 @@ TEST(ProfilerStartupDeathTest, SharedSelectorCasesAreCached)
 {
     std::ifstream fixture{TRTLLM_PROFILER_SELECTOR_CASES};
     ASSERT_TRUE(fixture.is_open());
-    auto const cases = nlohmann::json::parse(fixture);
+    auto const cases = nlohmann::json::parse(fixture).at("cases");
     ASSERT_FALSE(cases.empty());
     for (auto const& selection : cases)
     {
