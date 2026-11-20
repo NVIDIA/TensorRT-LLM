@@ -139,7 +139,7 @@ CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 # ---- device targets ----------------------------------------------------------
-# GVR V2 runs on Hopper (sm_90), datacenter Blackwell (sm_100, sm_103) and Rubin (sm_107): all have
+# GVR V2 runs on Hopper, datacenter Blackwell and Rubin (sm_90/100/103/107), which have
 # thread-block clusters, distributed shared memory and st.async, and the device module
 # compiles for either. The dispatch reads the device as (num_sms, sm_version):
 #   - ``num_sms`` sizes the register-resident waves on every target;
@@ -147,6 +147,12 @@ BLKC = 1024  # CTA size of the clustered register path
 #     148 SMs, Hopper uses its SM count; prefill uses physical counts on Hopper/Rubin;
 #   - ``cluster_fits`` keeps clustered plans to the clusters a Hopper GPU co-schedules.
 SUPPORTED_SM_VERSIONS = (90, 100, 103, 107)
+# BF16 elements per 8-byte PCW load.
+PCW_VECTOR_ELEMENTS = 4
+# Public GVR row alignment in BF16 elements.
+PCW_API_ROW_ELEMENTS = 16 // 2
+# Historical PCW dispatch filter in elements.
+PCW_LEGACY_ROW_ELEMENTS = 64
 _BLACKWELL_SM_VERSIONS = (100, 103, 107)
 _BLACKWELL_WAVE_SMS = 148
 # Targets that take the register rungs and compile options below measured on hardware
@@ -2643,8 +2649,10 @@ def _varlen_launcher(
 
         lowp_tuning = select_lowp_tuning(num_rows, n_kernel, npad, k, num_sms, sm_version)
         if lowp_tuning is not None:
-            # Keep the actual compilation target and device profile in the cache key.
-            sm_version = lowp_tuning.sm_version
+            # Tuned launcher options use the physical SM count; the family router
+            # uses the Blackwell decode wave from its routing profile.
+            wave = num_sms
+            sm_version = lowp_tuning.routing_sm_version
     cr_shift = 0 if cr == 1 else 2
     if _tallws_gate(num_rows, n_kernel, k, num_sms, sm_version, dtype, det):
         lc = _tallws_launcher(num_rows, npad, k, next_n, cr_shift, num_sms, dtype)
@@ -3042,7 +3050,11 @@ def _varlen_launcher(
                 dtype is torch.bfloat16
                 and _REG_CODE_RADIX_FORCE is None
                 and plan_free["kernel"] == "reg"
-                and (lowp_tuning.pcw_aligned if lowp_tuning is not None else npad % 64 == 0)
+                and (
+                    lowp_tuning.pcw_aligned
+                    if lowp_tuning is not None
+                    else npad % PCW_LEGACY_ROW_ELEMENTS == 0
+                )
                 and num_rows <= 64
                 and 2 * num_rows <= num_sms
                 and (
@@ -3331,6 +3343,12 @@ def _varlen_launcher(
                 # wave's loads overlap this wave's select. Plans at the 32-register wall (blk * minb
                 # = 2048 threads per SM) keep it off: there it gained nothing (up to 5 % slower).
                 reg_options["succ_la"] = wave * int(plan_free["tpl"][2])
+            pcw_cluster = (
+                pcw
+                and reg_parts > 1
+                and (reg_parts < 8 or reg_parts * num_rows <= 64)
+                and sm_version in _BLACKWELL_SM_VERSIONS
+            )
             fn = dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
                 varlen=True,
@@ -3347,10 +3365,7 @@ def _varlen_launcher(
                 parts=reg_parts,
                 pcw=pcw,
                 # the cluster only co-schedules a row's parts, which pays off on Blackwell only
-                pcw_cluster=pcw
-                and reg_parts > 1
-                and (reg_parts < 8 or reg_parts * num_rows <= 64)
-                and sm_version in _BLACKWELL_SM_VERSIONS,
+                pcw_cluster=pcw_cluster,
                 pcw_bins=512 if (pcw and dtype is torch.bfloat16 and k == 2048) else 1024,
                 **reg_options,
             )
@@ -3436,7 +3451,7 @@ def _varlen_launcher(
             ),
         )
         if dtype is torch.bfloat16 and reg_parts > 1:
-            if not pcw or reg_parts < 8 or reg_parts * num_rows <= 64:
+            if not pcw or pcw_cluster:
                 cluster_size = reg_parts
     elif plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]

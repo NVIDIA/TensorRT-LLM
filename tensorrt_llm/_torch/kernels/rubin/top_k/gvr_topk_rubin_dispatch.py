@@ -9,12 +9,17 @@ import math
 from collections.abc import Callable
 from typing import NamedTuple
 
+from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host import (
+    PCW_API_ROW_ELEMENTS,
+    PCW_LEGACY_ROW_ELEMENTS,
+)
+
 
 class _LowpTuning(NamedTuple):
     widen_crc: bool
     cr2: bool
     pcw_aligned: bool
-    sm_version: int = 100
+    routing_sm_version: int = 100
 
     def crc_geometry(self, block: int, vpt: int, cluster: int) -> tuple[int, int]:
         if self.widen_crc and block == 512 and cluster == 16:
@@ -31,7 +36,9 @@ def select_lowp_tuning(
     return _LowpTuning(
         widen_crc=rows * 32 <= num_sms,
         cr2=k != 2048 or rows > num_sms,
-        pcw_aligned=npad % 64 == 0 or (n > 2048 and npad % 8 == 0),
+        # Keep the legacy filter on short rows where extra PCW instructions can outweigh the gain.
+        pcw_aligned=npad % PCW_LEGACY_ROW_ELEMENTS == 0
+        or (n > 2048 and npad % PCW_API_ROW_ELEMENTS == 0),
     )
 
 
@@ -449,7 +456,7 @@ def make_plan(
         plan = streaming_route(rows, n, npad, k, force_main=True, num_sms=num_sms, sm_version=107)
         block = tuning.block
         parts = tuning.parts
-        # Keep one-wave split geometry inside the actual stream's SM resources.
+        # Bound split geometry by the supplied planning budget (full device for local_preserve).
         if parts > 1:
             parts = max(1, min(parts, num_sms // rows, max(1, math.ceil(n / 4096))))
         kpt = 1 if k <= block else 2 if k <= 2 * block else 4 if k <= 4 * block else 8

@@ -15,9 +15,16 @@ from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sam
 from .gvr_topk_locality_policy import COSCHEDULED_SM_COUNT, choose_backfill, choose_locality
 
 
+class _CudaError(RuntimeError):
+    def __init__(self, status: cuda.CUresult, operation: str) -> None:
+        super().__init__(f"{operation}: {status}")
+        self.status = status
+        self.operation = operation
+
+
 def _check(result: tuple, operation: str) -> object:
     if result[0] != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"{operation}: {result[0]}")
+        raise _CudaError(result[0], operation)
     if len(result) == 2:
         return result[1]
     return result[1:]
@@ -40,9 +47,9 @@ def _backfill_counts(
 class _Domain:
     ordinal: int
     sm_count: int
-    context: cuda.CUgreenCtx
-    driver_stream: cuda.CUstream
-    stream: torch.cuda.ExternalStream
+    context: cuda.CUgreenCtx | None
+    driver_stream: cuda.CUstream | None = None
+    stream: torch.cuda.ExternalStream | None = None
 
 
 class LocalityDomainExecutor:
@@ -111,8 +118,11 @@ class LocalityDomainExecutor:
             try:
                 for ordinal, partition in enumerate(resources):
                     self._add_domain(ordinal, partition)
-            except RuntimeError:
-                self.close()
+            except BaseException as error:
+                try:
+                    self.close()
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
                 raise
 
     def _try_backfill(
@@ -145,6 +155,7 @@ class LocalityDomainExecutor:
         if result[0] in (
             cuda.CUresult.CUDA_ERROR_INVALID_VALUE,
             cuda.CUresult.CUDA_ERROR_NOT_SUPPORTED,
+            cuda.CUresult.CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION,
         ):
             return resources, remainder
         filled, rest = _check(result, "backfill SM split")
@@ -165,45 +176,54 @@ class LocalityDomainExecutor:
             ),
             "green context",
         )
-        try:
-            driver_stream = _check(
-                cuda.cuGreenCtxStreamCreate(context, cuda.CUstream_flags.CU_STREAM_NON_BLOCKING, 0),
-                "green stream",
-            )
-        except RuntimeError:
-            cuda.cuGreenCtxDestroy(context)
-            raise
-        try:
-            stream = torch.cuda.ExternalStream(int(driver_stream), device=self.device)
-            actual = _check(
-                cuda.cuStreamGetDevResource(
-                    driver_stream, cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
-                ),
-                "stream SM resource",
-            )
-            if int(actual.sm.localityDomainId) != ordinal:
-                raise RuntimeError("Green stream does not belong to the requested locality domain")
-            if int(actual.sm.smCount) != int(partition.sm.smCount):
-                raise RuntimeError("Green stream SM count differs from its partition")
-        except RuntimeError:
-            cuda.cuStreamDestroy(driver_stream)
-            cuda.cuGreenCtxDestroy(context)
-            raise
-        self.domains.append(
-            _Domain(ordinal, int(actual.sm.smCount), context, driver_stream, stream)
+        domain = _Domain(ordinal, int(partition.sm.smCount), context)
+        self.domains.append(domain)
+        domain.driver_stream = _check(
+            cuda.cuGreenCtxStreamCreate(context, cuda.CUstream_flags.CU_STREAM_NON_BLOCKING, 0),
+            "green stream",
         )
+        domain.stream = torch.cuda.ExternalStream(int(domain.driver_stream), device=self.device)
+        actual = _check(
+            cuda.cuStreamGetDevResource(
+                domain.driver_stream, cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+            ),
+            "stream SM resource",
+        )
+        if int(actual.sm.localityDomainId) != ordinal:
+            raise RuntimeError("Green stream does not belong to the requested locality domain")
+        if int(actual.sm.smCount) != domain.sm_count:
+            raise RuntimeError("Green stream SM count differs from its partition")
 
     def close(self) -> None:
-        """Synchronize owned streams and release their green contexts."""
-        if self.closed:
-            return
-        for domain in self.domains:
-            _check(cuda.cuStreamSynchronize(domain.driver_stream), "synchronize green stream")
-        for domain in reversed(self.domains):
-            _check(cuda.cuStreamDestroy(domain.driver_stream), "destroy green stream")
-            _check(cuda.cuGreenCtxDestroy(domain.context), "destroy green context")
-        self.domains.clear()
+        """Disable execution and release owned handles; failed releases may be retried."""
         self.closed = True
+        error = None
+        for domain in reversed(self.domains):
+            if domain.driver_stream is not None:
+                try:
+                    _check(
+                        cuda.cuStreamSynchronize(domain.driver_stream), "synchronize green stream"
+                    )
+                except RuntimeError as exc:
+                    error = error or exc
+                try:
+                    _check(cuda.cuStreamDestroy(domain.driver_stream), "destroy green stream")
+                    domain.driver_stream = None
+                    domain.stream = None
+                except RuntimeError as exc:
+                    error = error or exc
+            # Retain the context while a failed stream release is still outstanding.
+            if domain.context is not None and domain.driver_stream is None:
+                try:
+                    _check(cuda.cuGreenCtxDestroy(domain.context), "destroy green context")
+                    domain.context = None
+                except RuntimeError as exc:
+                    error = error or exc
+        self.domains[:] = [
+            d for d in self.domains if d.context is not None or d.driver_stream is not None
+        ]
+        if error is not None:
+            raise error
 
     def __enter__(self) -> "LocalityDomainExecutor":
         return self
@@ -213,7 +233,7 @@ class LocalityDomainExecutor:
 
 
 class _Bound:
-    def __init__(self, x, lengths, output, n, cr, rows, sms, sm, *, use_rubin_tuning=True):
+    def __init__(self, x, lengths, output, n, cr, rows, sms, sm):
         self.workspace = torch.zeros(gvr.workspace_bytes(), device=x.device, dtype=torch.uint8)
         self.logits, self.lengths, self.output = x, lengths, output
         compile_guard = gvr._COMPILE_LOCK_16BIT if x.dtype != torch.float32 else nullcontext()
@@ -229,7 +249,6 @@ class _Bound:
                 sm,
                 dtype=x.dtype,
                 device_index=x.get_device(),
-                use_rubin_tuning=use_rubin_tuning,
             )
         self.ws = gvr.kernel_view(self.workspace)
         self.cluster_size = getattr(self.launcher, "cluster_size", None)
@@ -316,9 +335,13 @@ class PreparedRowTopK:
     Verify complete padded-row ownership before applying the full-batch plan to
     domain slices; ordinary or ineligible inputs retain tuned global execution.
     Preparation never copies logits. Separate concurrent calls need separate instances.
+    The upstream producer must allocate its logits output with complete padded rows
+    in matching locality domains; ordinary producer outputs use tuned global execution.
     Prepare and warm before capture; retain allocations and executor until graphs
     are destroyed. Values and lengths may change, but addresses and ownership may not.
-    ``co_local=True`` requires verified ownership; ``False`` disables locality.
+    ``co_local=None`` or ``True`` probes ownership and falls back when ineligible;
+    ``False`` skips the probe. ``mode`` reports the selected execution path.
+    This opt-in API is not used by the model TopK module.
     Lengths are uncompressed token counts. Only ``next_n=1`` is supported.
     """
 
@@ -337,7 +360,7 @@ class PreparedRowTopK:
         self.executor = None
         self.owns_executor = False
         self.closed = False
-        success = False
+        self.parts = []
         try:
             self._initialize(
                 logits,
@@ -349,12 +372,14 @@ class PreparedRowTopK:
                 co_local=co_local,
                 executor=executor,
             )
-            success = True
-        finally:
-            if not success:
-                if self.owns_executor and self.executor is not None:
+        except BaseException as error:
+            self.closed = True
+            if self.owns_executor and self.executor is not None:
+                try:
                     self.executor.close()
-                self.closed = True
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            raise
 
     def _initialize(
         self,
@@ -389,6 +414,8 @@ class PreparedRowTopK:
             raise ValueError("Lengths and output must match logits rows")
         if not kv_lens.is_contiguous() or not indices.is_contiguous() or logits.stride(1) != 1:
             raise ValueError("Lengths/output must be contiguous, and logits columns contiguous")
+        if indices.data_ptr() % 16:
+            raise ValueError("Output base must be 16-byte aligned")
         max_seq_len = operator.index(max_seq_len)
         compress_ratio = operator.index(compress_ratio)
         if compress_ratio not in (1, 4) or max_seq_len < 0:
@@ -437,18 +464,26 @@ class PreparedRowTopK:
         if choice is not None and counts is not None:
             mode, budget = choice
             if executor is None:
-                executor = LocalityDomainExecutor(
-                    self.device,
-                    budget,
-                    backfill=choose_backfill(logits.dtype, k, max_seq_len, rows, sms, sm),
-                )
-                self.owns_executor = True
-                self.executor = executor
+                try:
+                    executor = LocalityDomainExecutor(
+                        self.device,
+                        budget,
+                        backfill=choose_backfill(logits.dtype, k, max_seq_len, rows, sms, sm),
+                    )
+                except _CudaError as error:
+                    if not (
+                        error.operation == "split SM resources"
+                        and error.status == cuda.CUresult.CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION
+                    ):
+                        raise
+                else:
+                    self.owns_executor = True
+                    self.executor = executor
+        if choice is not None and counts is not None and executor is not None:
+            mode, budget = choice
             if executor.closed or executor.device != self.device:
                 raise ValueError("Executor is closed or on another device")
             if len(counts) != len(executor.domains):
-                if self.owns_executor:
-                    executor.close()
                 raise ValueError("row_counts needs one entry for every queried domain")
             self.executor = executor
             if executor.coscheduled_sm_count == budget:
@@ -458,19 +493,15 @@ class PreparedRowTopK:
                     abs(c - rows * d.sm_count / total) <= 1
                     for c, d in zip(counts, executor.domains)
                 )
-                if balanced and mode == "global_original":
-                    self.mode = mode
-                if balanced and mode != "global_original":
+                if balanced:
                     offset = 0
                     prepared = []
                     for domain, count in zip(executor.domains, counts):
                         if count:
-                            plan_rows = rows if mode == "local_preserve" else count
-                            plan_sms = sms if mode == "local_preserve" else domain.sm_count
                             plan = None
                             if logits.dtype == torch.float32:
                                 plan = gvr._route_fp32_varlen(
-                                    plan_rows, max(max_seq_len, k + 1), stride, k, plan_sms, sm
+                                    rows, max(max_seq_len, k + 1), stride, k, sms, sm
                                 )
                                 if plan["cluster"] > executor.coscheduled_sm_count:
                                     prepared = []
@@ -481,8 +512,8 @@ class PreparedRowTopK:
                                 indices[offset : offset + count],
                                 max_seq_len,
                                 compress_ratio,
-                                plan_rows,
-                                plan_sms,
+                                rows,
+                                sms,
                                 sm,
                             )
                             if plan is None:
@@ -516,7 +547,6 @@ class PreparedRowTopK:
                         rows,
                         sms,
                         sm,
-                        use_rubin_tuning=self.mode != "global_original",
                     ),
                     None,
                 )
@@ -533,25 +563,54 @@ class PreparedRowTopK:
         with torch.cuda.device(self.device):
             if self.closed or (self.executor is not None and self.executor.closed):
                 raise RuntimeError("Prepared call or its executor is closed")
-            if self.mode in ("global_original", "tuned"):
+            if self.mode == "tuned":
                 self.parts[0][1]()
                 return
             parent = torch.cuda.current_stream(self.device)
-            self.start.record(parent)
-            for domain, bound, done in self.parts:
-                domain.stream.wait_event(self.start)
-                with torch.cuda.stream(domain.stream):
-                    bound()
-                    done.record(domain.stream)
-            for _, _, done in self.parts:
-                parent.wait_event(done)
+            capturing = torch.cuda.is_current_stream_capturing()
+            submitted = []
+            try:
+                self.start.record(parent)
+                for domain, bound, done in self.parts:
+                    submitted.append((domain, done))
+                    domain.stream.wait_event(self.start)
+                    with torch.cuda.stream(domain.stream):
+                        bound()
+                        done.record(domain.stream)
+                for _, _, done in self.parts:
+                    parent.wait_event(done)
+            except BaseException:
+                self.closed = True
+                if not capturing:
+                    for domain, done in submitted:
+                        try:
+                            done.record(domain.stream)
+                            parent.wait_event(done)
+                        except BaseException:
+                            try:
+                                domain.stream.synchronize()
+                            except BaseException:
+                                pass  # Preserve the submission error after best-effort draining.
+                raise
 
     def close(self):
         """Call after destroying graphs which reference this prepared invocation."""
-        if self.closed:
+        if self.closed and not self.parts and not self.owns_executor:
             return
-        torch.cuda.synchronize(self.device)
-        if self.owns_executor and self.executor is not None:
-            self.executor.close()
-        self.parts.clear()
         self.closed = True
+        error = None
+        if self.parts:
+            try:
+                torch.cuda.synchronize(self.device)
+            except RuntimeError as exc:
+                error = exc
+        if self.owns_executor and self.executor is not None:
+            try:
+                self.executor.close()
+            except RuntimeError as exc:
+                error = error or exc
+            if not self.executor.domains:
+                self.owns_executor = False
+        self.parts.clear()
+        if error is not None:
+            raise error

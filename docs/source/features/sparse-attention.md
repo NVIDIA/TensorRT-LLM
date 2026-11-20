@@ -298,11 +298,11 @@ llm = LLM(
 )
 ```
 
-On supported Blackwell configurations, Guess-Verify-Refine (GVR) can replace
-the regular decode Top-K dispatcher. The current implementation accepts
-`index_topk` values `512`, `1024`, and `2048`, and indexer compression ratios
-`1` and `4`. Unsupported combinations fall back to the production
-insertion/radix Top-K path.
+On supported Blackwell and Rubin configurations, Guess-Verify-Refine (GVR) can replace the regular decode Top-K dispatcher. The current implementation accepts `index_topk` values `512`, `1024`, and `2048`, and indexer compression ratios `1` and `4`. Unsupported combinations fall back to the production insertion/radix Top-K path.
+
+On Rubin (SM107), the self-sampling decode entry applies shape-based tuning for FP32, FP16, and BF16 logits. FP16/BF16 reuse the Blackwell host routing profile with Rubin-specific options; compilation and cache keys retain the actual device target. Ordinary allocations use this global path without probing locality ownership or creating domain resources.
+
+Locality execution is a separate, explicit opt-in API, `PreparedRowTopK` in `tensorrt_llm._torch.kernels.rubin.top_k.gvr_topk_locality`; it is not wired into the model `TopK` module. The upstream producer must place its logits output in localized allocations with complete padded-row ownership; compatible domain resources and an eligible shape are also required. This API does not relocate ordinary producer outputs. It preserves full-batch planning while launching each domain's row slice. `co_local=None` or `True` allows probing and tuned-global fallback; `False` skips the probe. Inspect `mode` for the actual execution path: `locality_allocation` alone only reports verified ownership. Prepare and warm outside CUDA Graph capture, retain input/output allocations and the executor while graphs exist, destroy those graphs before calling `close()`, and explicitly close any caller-owned executor. Failed releases can be retried with `close()`; a closed or failed prepared call cannot be invoked again.
 
 ```yaml
 sparse_attention_config:
