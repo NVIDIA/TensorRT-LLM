@@ -298,6 +298,7 @@ def test_request():
     assert isinstance(request.lora_config, trtllm.LoraConfig)
     assert not hasattr(request, "prompt_tuning_config")
     with pytest.raises(TypeError, match="incompatible function arguments"):
+        # pyrefly: ignore [unexpected-keyword]
         trtllm.Request(**kwargs, prompt_tuning_config=None)
 
 

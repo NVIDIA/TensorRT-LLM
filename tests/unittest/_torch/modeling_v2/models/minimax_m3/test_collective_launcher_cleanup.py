@@ -9,8 +9,9 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import NoReturn, Optional
+from typing import NoReturn, Optional, cast
 
 import pytest
 
@@ -153,7 +154,8 @@ def test_rank_runner_resolves_launcher_without_entry_name_table(
     args = {"world_size": 2} if any(a.arg == "world_size" for a in run.args.args) else {}
     if explicit_directory:
         args["directory"] = tmp_path
+    run_launcher = cast(Callable[..., str], namespace["run"])
     with pytest.raises(LauncherLocated):
-        namespace["run"]("new_collective", **args)
+        run_launcher("new_collective", **args)
     base = tmp_path if explicit_directory else runner.parent
     assert selected == [base.resolve() / "_new_collective_op_matrix.py"]

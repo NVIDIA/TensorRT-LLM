@@ -339,7 +339,7 @@ def _request_with_end_id(end_id: int | None) -> LlmRequest:
 def test_validate_token_id_range_accepts_end_id(end_id) -> None:
     model = Mock(spec=DecoderModelForCausalLM)
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.model_engine = types.SimpleNamespace(model=model)
     executor._num_embeddings = model.lm_head.num_embeddings
     request = _request_with_end_id(end_id)
@@ -354,7 +354,7 @@ def test_validate_token_id_range_accepts_end_id(end_id) -> None:
 def test_validate_token_id_range_rejects_end_id(end_id) -> None:
     model = Mock(spec=DecoderModelForCausalLM)
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.model_engine = types.SimpleNamespace(model=model)
     executor._num_embeddings = model.lm_head.num_embeddings
     request = _request_with_end_id(end_id)
@@ -517,7 +517,7 @@ def test_completed_remote_tail_receive_restarts_local_context(tail_start: int) -
         state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
         py_csa2_remote_tail_mode="source",
     )
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.active_requests = [destination, pending, source]
 
     PyExecutor._activate_completed_remote_tails(executor)
@@ -751,8 +751,8 @@ def test_remote_tail_rejects_replay_window_larger_than_batch(limited_by: str) ->
 
 
 def test_model_without_remote_tail_does_not_inspect_request() -> None:
-    executor = make_host_executor()
-    executor.model_engine.model = None
+    executor = object.__new__(PyExecutor)
+    executor.model_engine = types.SimpleNamespace(model=None)
     request = _request_with_end_id(None)
 
     with patch.object(
@@ -1012,7 +1012,7 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(
     draft = types.SimpleNamespace(
         prepare_disagg_generation_request=lambda req: events.append(("draft", req))
     )
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.model_engine = types.SimpleNamespace(model=target, max_total_draft_tokens=0)
     executor.enable_spec_decode = enable_spec_decode
     executor.draft_model_engine = types.SimpleNamespace(model=draft)
@@ -1075,7 +1075,7 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward(
             ("rebuild", [req.py_request_id for req in requests])
         ),
     )
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.enable_spec_decode = enable_spec_decode
     executor.resource_manager = types.SimpleNamespace(
         resource_managers={
@@ -1107,7 +1107,7 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
     events = []
     sampler = Mock()
     sampler.release_request.side_effect = lambda request: events.append(request.py_seq_slot)
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.sampler = sampler
     executor.model_engine = types.SimpleNamespace(model=target)
     executor.draft_model_engine = types.SimpleNamespace(model=draft)
@@ -3405,7 +3405,7 @@ def _make_adp_executor(
     exclude_retiring_requests: bool = True,
     tp_size: int = 2,
 ) -> PyExecutor:
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = enable_attention_dp
     executor.kv_cache_transceiver = kv_cache_transceiver
     executor.is_warmup = is_warmup
@@ -5521,7 +5521,7 @@ def test_dynamo_recompile_limit_is_reapplied_on_the_worker_thread():
     config = torch._dynamo.config
     original = config.cache_size_limit
     seen = {}
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor._uses_torch_compile = True
 
     def worker():

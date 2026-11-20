@@ -42,7 +42,10 @@ INPUT_NAMES = (
 )
 def test_certified_cells(cell) -> None:
     x = make_inputs(cell)
-    inputs = tuple(x[name] for name in INPUT_NAMES)
+    layer_residual, addend, block_residual, res_weight, rms_weight, output_rms_weight = (
+        x[name] for name in INPUT_NAMES
+    )
+    inputs = (layer_residual, addend, block_residual, res_weight, rms_weight, output_rms_weight)
     before = [t.clone() for t in inputs]
     eps = (cell.spec["eps"], cell.spec["output_eps"])
     with validating(attn_res_add_rmsnorm_fwd):

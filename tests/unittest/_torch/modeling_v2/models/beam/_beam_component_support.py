@@ -31,8 +31,7 @@ import torch
 from torch.overrides import TorchFunctionMode, resolve_name
 
 if TYPE_CHECKING:
-    __extra_import_path__ = ["~/tests/integration/defs"]
-    from beam._components.moe.moe import BeamMoeBf16Sm103Tp1
+    from integration.defs.beam._components.moe.moe import BeamMoeBf16Sm103Tp1
 
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
