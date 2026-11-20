@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -33,6 +34,9 @@ from tensorrt_llm._utils import confidential_compute_enabled, prefer_pinned
 from tensorrt_llm.bindings import internal as _tllm_internal
 
 from ..ep_group_health import EP_MASK_NUM_WORDS, EPGroupHealth
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed.membership import StoreGroup
 
 _MASK_WORD_BITS = 64
 _ABORT_REQUESTED = 0
@@ -87,6 +91,8 @@ class MoeExecutionState:
         self._layers: list[tuple[Callable[[], None], Callable[[], bool]]] = []
         snapshot = ep_group_health.snapshot()
         self._generation = snapshot.generation
+        # A layer bound after a membership change has a workspace that the change's remaps left out.
+        self._bound_generation = snapshot.generation
         self.active_rank_mask = torch.tensor(
             _mask_words(snapshot.mask, ep_rank), dtype=torch.uint64, device=device
         )
@@ -98,7 +104,12 @@ class MoeExecutionState:
 
         ``reset_state`` returns it to idle, and ``between_rounds`` returns whether it is idle, that
         is, no dispatch of the layer waits for its combine.
+
+        Raises:
+            RuntimeError: The EP membership changed since this state was created.
         """
+        if self.ep_group_health.generation != self._bound_generation:
+            raise RuntimeError("Bind MoE layers only before the EP membership changes")
         self._layers.append((reset_state, between_rounds))
 
     def register_workspace(
@@ -113,6 +124,30 @@ class MoeExecutionState:
         check of this rank's incomplete-round word in it (:meth:`check_incomplete_rounds`).
         """
         self._workspaces.setdefault(workspace, (reset_workspace, check_incomplete_round))
+
+    def workspace_rows_needing_fresh_pages(self, comm: StoreGroup) -> frozenset[int]:
+        """Return every row if a former member may still write into any bound workspace.
+
+        Pass the result to :meth:`remap_workspaces`. This call is collective over ``comm``.
+        """
+        return frozenset().union(
+            *(workspace.rows_needing_fresh_pages(comm) for workspace in self._workspaces)
+        )
+
+    def remap_workspaces(self, comm: StoreGroup, fresh_rows: frozenset[int]) -> None:
+        """Map every bound workspace at the same addresses among the active members of ``comm``.
+
+        ``fresh_rows`` is :meth:`workspace_rows_needing_fresh_pages` of the same ``comm``. Call only
+        while no rank is in a collective: after a membership change, between the barrier that
+        follows the aborted collectives and :meth:`rearm` (see :meth:`rearm` for the order). Every
+        rank must :meth:`rearm` before the next collective. This call is collective over ``comm``.
+
+        A workspace's remap that raises on this rank before its own exchanges (an unmap failure, or
+        a workspace in an unexpected state) leaves the other active ranks waiting in that exchange
+        until the membership removes this rank.
+        """
+        for workspace in self._workspaces:
+            workspace.remap(comm, fresh_rows)
 
     def request_abort(self) -> None:
         """Make running and future collectives return without their peers. Safe from any thread.

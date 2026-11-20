@@ -16,6 +16,7 @@
  */
 
 #include "bindings.h"
+#include "hostExchange.h"
 #include "hostfunc.h"
 #include "moeBindings.h"
 #include "tensorrt_llm/common/bindingUtils.h"
@@ -340,6 +341,7 @@ void initBindings(nb::module_& m)
     initMoeBindings(m);
     // Initialize HostFunc bindings
     initHostFuncBindings(m);
+    initHostExchangeBindings(m);
 }
 
 void initBindingsEarly(nb::module_& m)
