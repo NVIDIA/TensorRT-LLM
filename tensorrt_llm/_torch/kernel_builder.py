@@ -11,7 +11,7 @@ For ops whose kernels compile on first use outside the autotuner. Two modes:
   goes on once they are built.
 
 A build is a :class:`BuildTask`. Only builds that take ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds
-(measured, or ``BuildConfig.build_seconds``) go to workers. ``BuildConfig.strategy=PARALLEL``
+(measured, or ``BuildConfig.build_seconds``) go to workers. ``BuildConfig.strategy=SHARED``
 splits them across the ranks that share JIT builds and ``BuildConfig.share_scope``.
 :meth:`KernelBuilder.build_kernels` builds a list of ``process_built`` CuTe DSL compile calls,
 such as a model's prewarm list. ``TLLM_KERNEL_BUILDER=0`` turns KernelBuilder off.
@@ -96,9 +96,9 @@ class BuildConfig:
 
     Args:
         dynamic_specs: The dimensions, swept as their ``DynamicSpec`` says.
-        strategy: ``BuildStrategy.PARALLEL`` splits the builds with the other ranks that share JIT
-            builds and ``share_scope``; ``INDEPENDENT`` builds every kernel on this rank.
-        share_scope: For PARALLEL: names where the op's kernels land, such as its compiler's disk
+        strategy: ``BuildStrategy.SHARED`` splits the builds with the other ranks that share JIT
+            builds and ``share_scope``; ``PER_RANK`` builds every kernel on this rank.
+        share_scope: For SHARED: names where the op's kernels land, such as its compiler's disk
             cache on this host. Only ranks with the same scope split the builds: each loads the
             kernels the others built from there.
         build_seconds: How long one build of the op takes, until builds of it are measured; it
@@ -106,7 +106,7 @@ class BuildConfig:
     """
 
     dynamic_specs: Tuple[DynamicSpec, ...] = ()
-    strategy: BuildStrategy = BuildStrategy.INDEPENDENT
+    strategy: BuildStrategy = BuildStrategy.PER_RANK
     share_scope: Optional[Callable[[], str]] = None
     build_seconds: Optional[float] = None
 
@@ -268,7 +268,7 @@ class KernelBuilder:
         not asked for before on the rank's worker processes, in parallel, and return once they
         are built.
 
-        With the PARALLEL strategy, a build another rank's worker started first is that rank's:
+        With the SHARED strategy, a build another rank's worker started first is that rank's:
         this one waits for the builds it left to other ranks, at most ``TLLM_JIT_SHARE_WAIT_S``
         seconds in all. A build no worker takes, one too short for a worker
         (``BuildPool.worth_a_worker``), and one that fails are left to the op, which builds them
@@ -369,9 +369,9 @@ class KernelBuilder:
         return len(kernels)
 
     def _claim(self, op: str, key: Hashable, config: BuildConfig) -> Optional[Claim]:
-        """The claim of a PARALLEL build in the directory the ranks share; None for a build that
+        """The claim of a SHARED build in the directory the ranks share; None for a build that
         is this rank's alone."""
-        if config.strategy is not BuildStrategy.PARALLEL:
+        if config.strategy is not BuildStrategy.SHARED:
             return None
         try:
             scope = config.share_scope() if config.share_scope is not None else ""

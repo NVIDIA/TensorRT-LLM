@@ -247,17 +247,17 @@ def shared(monkeypatch, tmp_path):
     return share
 
 
-def _parallel(scope="here"):
-    return BuildConfig(strategy=BuildStrategy.PARALLEL, share_scope=lambda: scope)
+def _shared_config(scope="here"):
+    return BuildConfig(strategy=BuildStrategy.SHARED, share_scope=lambda: scope)
 
 
-def test_ranks_split_parallel_builds(builder, shared, tmp_path):
+def test_ranks_split_shared_builds(builder, shared, tmp_path):
     other = KernelBuilder(enabled=True)  # Another rank of the launch.
     with builder.build_pass("a"):
-        builder.build("op", [("k", *_record(tmp_path / "k", 1, _parallel()))])
+        builder.build("op", [("k", *_record(tmp_path / "k", 1, _shared_config()))])
     with other.build_pass("b"):
         # The other rank finds the build made, and makes nothing.
-        other.build("op", [("k", *_record(tmp_path / "k2", 1, _parallel()))])
+        other.build("op", [("k", *_record(tmp_path / "k2", 1, _shared_config()))])
     assert (tmp_path / "k").exists() and not (tmp_path / "k2").exists()
     assert (builder.stats("op").built, other.stats("op").elsewhere) == (1, 1)
 
@@ -265,35 +265,35 @@ def test_ranks_split_parallel_builds(builder, shared, tmp_path):
 def test_ranks_whose_kernels_land_apart_build_their_own(builder, shared, tmp_path):
     other = KernelBuilder(enabled=True)
     with builder.build_pass("a"):
-        builder.build("op", [("k", *_record(tmp_path / "a", 1, _parallel("a")))])
+        builder.build("op", [("k", *_record(tmp_path / "a", 1, _shared_config("a")))])
     with other.build_pass("b"):
-        other.build("op", [("k", *_record(tmp_path / "b", 1, _parallel("b")))])
+        other.build("op", [("k", *_record(tmp_path / "b", 1, _shared_config("b")))])
     assert (tmp_path / "a").exists() and (tmp_path / "b").exists()
 
 
 def test_a_listed_build_of_its_own_config_is_split_as_its_config_says(builder, shared, tmp_path):
     def list_builds(shapes):
         return [
-            ("own", *_record(tmp_path / "own", 1, _parallel())),
+            ("own", *_record(tmp_path / "own", 1, _shared_config())),
             ("op's", *_record(tmp_path / "op", 2)[:1]),
         ]
 
     with builder.build_pass("a"):
         builder.prebuild("op", "sig", _CONFIG, {"m": 1}, list_builds)
     assert (tmp_path / "own").exists() and (tmp_path / "op").exists()
-    # Only the PARALLEL build was claimed.
+    # Only the SHARED build was claimed.
     own = kernel_builder._claim_files("op", "own", "here")
     claims = sorted(os.listdir(shared / "kernel_builder"))
     assert claims == sorted(os.path.basename(path) for path in (own.claim, own.done))
 
 
-def test_a_parallel_build_marks_its_end_for_the_other_ranks(builder, shared, tmp_path):
+def test_a_shared_build_marks_its_end_for_the_other_ranks(builder, shared, tmp_path):
     with builder.build_pass("a"):
         builder.build(
             "op",
             [
-                ("made", *_record(tmp_path / "made", 1, _parallel())),
-                ("fails", BuildTask(_FAIL), _parallel()),
+                ("made", *_record(tmp_path / "made", 1, _shared_config())),
+                ("fails", BuildTask(_FAIL), _shared_config()),
             ],
         )
     made = kernel_builder._claim_files("op", "made", "here")
@@ -333,7 +333,7 @@ def test_a_rank_waits_for_a_build_another_rank_claimed(builder, shared, tmp_path
     claim = _claimed_elsewhere("k")
     timers = _ends_elsewhere(monkeypatch, claim.done)
     with builder.build_pass("a"):
-        builder.build("op", [("k", *_record(tmp_path / "x", 1, _parallel()))])
+        builder.build("op", [("k", *_record(tmp_path / "x", 1, _shared_config()))])
         # The call went on once the other rank's build had ended.
         assert os.path.exists(claim.done)
     for timer in timers:
@@ -350,7 +350,7 @@ def test_a_rank_stops_waiting_for_a_build_that_failed_elsewhere(
     timers = _ends_elsewhere(monkeypatch, claim.failed)
     with builder.build_pass("a"):
         start = time.monotonic()
-        builder.build("op", [("k", *_record(tmp_path / "x", 1, _parallel()))])
+        builder.build("op", [("k", *_record(tmp_path / "x", 1, _shared_config()))])
         assert time.monotonic() - start < 60
     for timer in timers:
         timer.join()

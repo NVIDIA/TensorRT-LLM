@@ -200,7 +200,7 @@ class MXFP8GemmUnifiedRunner(TunableRunner):
     tuning_config = TuningConfig(
         cold_l2_flush_bytes=_COLD_L2_FLUSH_BYTES,
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
-        build_strategy=BuildStrategy.PARALLEL,
+        build_strategy=BuildStrategy.SHARED,
     )
     # Expose JIT participation so loaded winners are primed before graph capture.
     kernel_cache: ClassVar[dict] = MXFP8SwapABGemmRunner.kernel_cache

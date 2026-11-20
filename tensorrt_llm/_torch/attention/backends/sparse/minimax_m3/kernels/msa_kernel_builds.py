@@ -58,7 +58,7 @@ def _cache_scope() -> str:
 _BUILD_SECONDS = 40.0
 _QUERY_LEN = DynamicSpec("qo_len", _query_len_buckets)
 _SHARED = dict(
-    strategy=BuildStrategy.PARALLEL, share_scope=_cache_scope, build_seconds=_BUILD_SECONDS
+    strategy=BuildStrategy.SHARED, share_scope=_cache_scope, build_seconds=_BUILD_SECONDS
 )
 # A call's query segment lengths.
 _CONFIG = BuildConfig((_QUERY_LEN,), **_SHARED)

@@ -168,8 +168,8 @@ class TuningConfig:
             rank is pinned to a subset, up to 32: neighbouring sweep points often select
             the same kernel and compile it twice, so more threads keep paying off.
             TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
-        build_strategy (BuildStrategy): How the ranks split the op's kernel builds. INDEPENDENT:
-            each rank builds every kernel it needs. PARALLEL: when the ranks share JIT builds
+        build_strategy (BuildStrategy): How the ranks split the op's kernel builds. PER_RANK:
+            each rank builds every kernel it needs. SHARED: when the ranks share JIT builds
             (tensorrt_llm._jit_share), each kernel is built by the rank that claims it and loaded
             by the others. For DeepGEMM kernels and CuTe DSL kernels kept in the runner class's
             ``kernel_cache`` (or in a library's cache its ``share_kernel_caches()`` shares).
@@ -192,7 +192,7 @@ class TuningConfig:
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
     parallel_jit_warmup: int = 0
-    build_strategy: BuildStrategy = BuildStrategy.INDEPENDENT
+    build_strategy: BuildStrategy = BuildStrategy.PER_RANK
     cold_l2_flush_bytes: int = 0
     use_build_pool_in_warmup: bool = False
 
@@ -1588,8 +1588,8 @@ class AutoTuner:
                             **kwargs)
                     new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
-            share_builds = (tuning_config.build_strategy
-                            is BuildStrategy.PARALLEL and jit_share.enabled())
+            share_builds = (tuning_config.build_strategy is BuildStrategy.SHARED
+                            and jit_share.enabled())
             built_in_pool = False
             if self._builds_in_pool(tuning_config):
                 jit_share.share_kernel_caches(runners)
