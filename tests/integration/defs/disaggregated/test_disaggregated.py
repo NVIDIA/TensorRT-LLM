@@ -41,8 +41,9 @@ from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_pre_hopper)
 from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
 from defs.trt_test_alternative import check_call, check_output, print_info
-from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
-                               run_disagg_server, run_gen_worker, terminate,
+from disagg_test_utils import (ProcessWrapper, resolve_server_start_timeout,
+                               run_ctx_worker, run_disagg_server,
+                               run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics,
@@ -788,7 +789,7 @@ def setup_disagg_cluster(
     model_name: str | None = None,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
-    server_start_timeout: int = 300,
+    server_start_timeout: int | None = None,
     schedule_style: str | None = None,
     save_log: bool = False,
     startup_callback=None,
@@ -800,7 +801,7 @@ def setup_disagg_cluster(
     share_gpu: bool = False,
     config_overrides: dict[str, Any] | None = None,
     log_output_dir: str | None = None,
-    prepare_fmha_metadata: bool = False,
+    share_jit_builds: bool = False,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch the workers and the disagg server, wait for ready.
@@ -809,7 +810,8 @@ def setup_disagg_cluster(
         config_file: Path to disaggregated server config YAML
         model_name: Model path override (defaults to config's 'model' field)
         env: Environment variables to pass to subprocess (workers and disagg server)
-        server_start_timeout: Timeout in seconds for server to become ready
+        server_start_timeout: Timeout in seconds for server to become ready;
+            None picks one from the config (see resolve_server_start_timeout)
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
         disagg_cluster_overrides: Entries merged over
             get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
@@ -820,8 +822,9 @@ def setup_disagg_cluster(
             work_dir instead of the inherited stdout
         log_output_dir: With save_log, directory the logs are copied to if
             startup fails (CI's --output-dir, so they get uploaded)
-        prepare_fmha_metadata: Prepare shared FMHA artifacts before single-rank
-            Blackwell Python transceiver workers start.
+        share_jit_builds: Give the workers one TLLM_JIT_SHARE_DIR in work_dir,
+            so a kernel that every server's warmup tunes is built once instead
+            of concurrently in each process
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir),
@@ -834,6 +837,8 @@ def setup_disagg_cluster(
             config.setdefault(key, {}).update(value)
         else:
             config[key] = value
+    server_start_timeout = resolve_server_start_timeout(config,
+                                                        server_start_timeout)
 
     if perf_metrics_output_dir is not None:
         config["perf_metrics_output_dir"] = perf_metrics_output_dir
@@ -860,6 +865,12 @@ def setup_disagg_cluster(
     else:
         work_dir = tempfile.mkdtemp()
     logger.info(f"Disagg cluster work_dir (worker logs): {work_dir}")
+    ctx_worker_env = ctx_env or env
+    gen_worker_env = gen_env or env
+    if share_jit_builds:
+        jit_share = {"TLLM_JIT_SHARE_DIR": os.path.join(work_dir, "jit_share")}
+        ctx_worker_env = {**(ctx_worker_env or os.environ), **jit_share}
+        gen_worker_env = {**(gen_worker_env or os.environ), **jit_share}
     server_env = env
     report_addr = None
     if config.get("num_workers", 1) > 1:
@@ -923,43 +934,6 @@ def setup_disagg_cluster(
                                                 disagg_cluster)
         gen_worker_config = build_worker_config(config, gen_servers,
                                                 disagg_cluster)
-        if prepare_fmha_metadata and get_sm_version() in (100, 103):
-            prepared_caches = set()
-            for worker_config, ranks, worker_env in (
-                (ctx_worker_config, gpus_per_ctx, ctx_env or env),
-                (gen_worker_config, gpus_per_gen, gen_env or env),
-            ):
-                worker_env = worker_env or os.environ
-                if (ranks != 1 or worker_config.get(
-                        "cache_transceiver_config",
-                    {}).get("transceiver_runtime") != "PYTHON"):
-                    continue
-                # Managed MPI workspaces select their cache after spawning.
-                if (not worker_env.get("FLASHINFER_CUBIN_DIR") and
-                    (worker_env.get("TRTLLM_CACHE_DIR")
-                     or worker_env.get("TRTLLM_FLASHINFER_WORKSPACE_MANAGED")
-                     == "1")):
-                    continue
-                cache_key = tuple(
-                    (key, value) for key, value in sorted(worker_env.items())
-                    if key.startswith("FLASHINFER_") or key in (
-                        "HOME", "PATH", "PYTHONPATH", "TRTLLM_CACHE_DIR"))
-                if cache_key in prepared_caches:
-                    continue
-                # Both single-rank workers must see verified metadata before
-                # either starts warming up against their shared cold cache.
-                check_call([
-                    "python3", "-c",
-                    "from flashinfer.jit.attention import gen_trtllm_gen_fmha_module; "
-                    "from flashinfer.jit.env import FLASHINFER_CUBIN_DIR; "
-                    "print(f'Preparing FMHA metadata in {FLASHINFER_CUBIN_DIR}', flush=True); "
-                    "gen_trtllm_gen_fmha_module()"
-                ],
-                           env=worker_env,
-                           cwd=cwd,
-                           timeout=server_start_timeout)
-                prepared_caches.add(cache_key)
-
         server_config = {
             "hostname":
             server_host,
@@ -1007,7 +981,7 @@ def setup_disagg_cluster(
                 cluster_uri=f"http://{server_host}:{server_port}")
 
         # Build worker configs and launch workers
-        # The server may have selected a port after metadata preparation.
+        # The server may have selected its port above.
         ctx_worker_config["disagg_cluster"] = disagg_cluster
         gen_worker_config["disagg_cluster"] = disagg_cluster
         ctx_worker_config[
@@ -1024,7 +998,7 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=ctx_env or env,
+                               env=ctx_worker_env,
                                save_log=save_log,
                                worker_index=i)
             ctx_workers.append(w)
@@ -1045,7 +1019,7 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=gen_env or env,
+                               env=gen_worker_env,
                                save_log=save_log,
                                worker_index=i)
             gen_workers.append(w)
@@ -1188,9 +1162,10 @@ def run_disaggregated_test(example_dir,
                            ctx_env=None,
                            gen_env=None,
                            share_gpu=False,
-                           server_start_timeout=300,
+                           server_start_timeout=None,
                            assert_ctx_log_contains=None,
-                           config_overrides=None):
+                           config_overrides=None,
+                           share_jit_builds=False):
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_ctx_log_contains or assert_gen_log_contains is set (a substring or a tuple of them),
@@ -1227,11 +1202,13 @@ def run_disaggregated_test(example_dir,
                              ctx_env=ctx_run_env, gen_env=gen_run_env,
                              share_gpu=share_gpu,
                              config_overrides=config_overrides,
-                             prepare_fmha_metadata=test_desc in (
-                                 "overlap_transceiver_runtime_python",
-                                 "overlap_transceiver_runtime_python_bounce"))
+                             share_jit_builds=share_jit_builds)
 
     server_host = config.get("hostname", "localhost")
+    # The client gets the same budget as the readiness wait in
+    # setup_disagg_cluster: both resolve it from this post-override config.
+    server_start_timeout = resolve_server_start_timeout(config,
+                                                        server_start_timeout)
 
     success = False
     try:
@@ -2022,14 +1999,11 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
         qwen_model_root
     ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
-    # Cold model initialization and JIT across eight Blackwell ranks took
-    # about 640s on B300; allow headroom for CI variability (NVBug 6771023).
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=900)
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)
@@ -3245,7 +3219,8 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
                            env=llm_venv._new_env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=900)
+                           server_start_timeout=900,
+                           share_jit_builds=True)
 
 
 def _deepseek_v41_completion(server_url: str, model: str, prompt: str,
@@ -4234,7 +4209,8 @@ def run_disaggregated_mixed_stress(example_dir: str,
                                    env=None,
                                    cwd=None,
                                    startup_callback=None,
-                                   progress_callback=None) -> None:
+                                   progress_callback=None,
+                                   share_jit_builds: bool = False) -> None:
     """Run the Qwen3-32B FP8 Eagle3 mixed-stress test.
 
     Spins up a disaggregated cluster, drives total_requests heterogeneous
@@ -4274,7 +4250,8 @@ def run_disaggregated_mixed_stress(example_dir: str,
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env,
                              cwd=cwd, server_start_timeout=server_start_timeout,
                              save_log=True, startup_callback=startup_callback,
-                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
+                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS,
+                             share_jit_builds=share_jit_builds)
     print(f"[startup] cluster ready in {time.monotonic() - setup_start:.1f}s",
           flush=True)
 
@@ -4815,4 +4792,5 @@ def test_disaggregated_mixed_stress_test(disaggregated_test_root,
         incomplete_threshold=test_config.incomplete_threshold,
         server_start_timeout=600,
         env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory())
+        cwd=llm_venv.get_working_directory(),
+        share_jit_builds=True)

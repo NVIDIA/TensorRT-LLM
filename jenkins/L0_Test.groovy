@@ -3881,6 +3881,9 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
+  // Capture the outer node before entering a nested SLURM compute agent.
+  String dispatcherNodeName = env.NODE_NAME
+
   // Per-stage override of the SLURM infra-retry budget (from opts.infraRetryMax,
   // threaded via the dispatcher's retryContext). Lets resource-scarce pools cap
   // or disable stage-level retries (0 = no retry). Null falls back to the global.
@@ -3906,6 +3909,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
     // Shared by result suppression and the retry decision for this attempt only.
     Map slurmRetryContext = [
       scope: InfraFailure.SLURM,
+      dispatcherNodeName: dispatcherNodeName,
       stageName: stageName,
       attempt: attempt,
       backoffMs: 60L * 1000L,
@@ -3950,15 +3954,6 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
       // User abort / pipeline timeout -- never retry
       throw e
     } catch (Exception e) {
-      // If the K8s dispatcher pod this stage runs inside died mid-run, every
-      // retry attempt would execute on that same dead pod and fail immediately,
-      // and the in-pod cleanup can no longer reach the SLURM controller. Stop
-      // retrying in place and propagate so the pod-level wrapper reconciles the
-      // orphaned SLURM job / Jenkins node off-pod (fail closed).
-      if (isDispatcherPodFailure(e)) {
-        echo "[INFRA-RETRY] ${stageName}: dispatcher pod died mid-run; not retrying on the dead pod (${e.toString()}). Failing closed for off-pod reconciliation."
-        throw e
-      }
       // classifyFailure() handles FlowInterruptedException + exit-code-143 +
       // typed throws + originating-step evidence and cause-chain fallback, returning one of
       // PipelineInterruption / InfraFailure / UserFailure. Scope=SLURM
@@ -3970,6 +3965,13 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
         // exception matches no catalog pattern lands here and would
         // otherwise decline the retry with no log output at all.
         echo "[INFRA-RETRY] ${stageName}: SLURM attempt failed with no infra pattern matched (classified as user failure); not retrying. Exception: ${e.toString()}"
+        throw e
+      }
+
+      // A compute-agent failure does not imply the outer dispatcher died.
+      // Only retry in place when that dispatcher is still online.
+      if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+        echo "[INFRA-RETRY] ${stageName}: dispatcher is offline or unknown; not retrying in place. Failing closed for off-pod reconciliation."
         throw e
       }
 
@@ -3994,6 +3996,12 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
       echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
 
       sleep(60)
+      // The dispatcher may have gone offline during cooldown.
+      if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+        echo "[INFRA-RETRY] ${stageName}: dispatcher is offline or unknown after cooldown; " +
+             "not starting another SLURM attempt."
+        throw e
+      }
     }
   }
 }
@@ -4384,6 +4392,12 @@ boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error,
     def classified = classifyFailure(pipeline, error, scope, retryContext)
     if (!(classified instanceof InfraFailure)) {
         return false
+    }
+    if (scope == InfraFailure.SLURM) {
+        String dispatcherNodeName = retryContext.dispatcherNodeName
+        if (!dispatcherNodeName || !CloudManager.isNodeOnline(dispatcherNodeName)) {
+            return false
+        }
     }
     Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
     int attempt = parsedAttempt != null ? parsedAttempt as int : 1
@@ -7258,7 +7272,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
     sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
 
     sh "pwd && ls -alh"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${whlUrl}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${whlUrl}' -O '${wheel_path.tokenize('/').last()}'")
 
     if (reinstall_dependencies) {
         // Test installation in the new environment
@@ -7274,7 +7288,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
 
     def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${pkgUrl}' -O '${linuxPkgName}'")
     sh "tar -zvxf ${linuxPkgName}"
 
     // TODO: The steps below drove the removed TensorRT engine flow (trtllm-build / examples/run.py).
@@ -8248,7 +8262,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         if (values[5] != DLFW_IMAGE) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb -O cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             // Match the CUDA the DLFW base image builds the wheel with.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")

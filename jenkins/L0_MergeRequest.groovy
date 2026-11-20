@@ -1003,13 +1003,15 @@ def launchTestListCheck(pipeline, globalVars)
     def image = globalVars["LLM_DOCKER_IMAGE"]
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${key}] Run") {
-            echoNodeAndGpuInfo(pipeline, key)
-            sh "git config --global --add safe.directory \"*\""
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+            timeout(time: 30, unit: 'MINUTES') {
+                echoNodeAndGpuInfo(pipeline, key)
+                sh "git config --global --add safe.directory \"*\""
+                trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
 
-            def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
-               "python3 ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
+                def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
+                sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
+                   "python3 -u ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
+            }
         }
     })
 }

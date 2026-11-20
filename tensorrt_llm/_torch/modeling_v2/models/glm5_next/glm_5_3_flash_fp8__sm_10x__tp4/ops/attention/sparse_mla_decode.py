@@ -60,7 +60,7 @@ class SparseMlaDecode(OpWrapper):
     element.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # TP4 decode and verify rows attend with the rank's 16 heads; the context rows of a prefill
     # step attend sequence parallel, all 64 heads for the rank's ceil(T / 4) rows, whatever the
     # prompt length. Every row selects up to 512 pools of 4 plus a tail of up to 3: lengths up
