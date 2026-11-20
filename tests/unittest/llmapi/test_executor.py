@@ -15,7 +15,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-import torch
 import zmq
 
 from tensorrt_llm._utils import mpi_world_size, nvtx_range_debug
@@ -574,7 +573,7 @@ def test_ZeroMqQueue_serialization_complicated_dataclass():
         80, None, tllm.KvCacheTransferMode.DRAM, "test_dir")
 
     sampling_params = SamplingParams(max_tokens=4,
-                                     embedding_bias=torch.randn(2, 2))
+                                     embedding_bias=((42, -2.0), (123, -1.0)))
 
     for i in range(iterations):
         request = GenerationRequest(prompt_token_ids=[i],

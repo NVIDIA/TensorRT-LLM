@@ -2190,3 +2190,112 @@ def test_owner_prompt_delivery_matches_full_broadcast(mpi_pool_executor) -> None
     for rank in full:
         for request_id, tokens, prompt_len in rank:
             assert tokens == prompts[request_id] and prompt_len == len(tokens)
+
+
+@pytest.mark.parametrize("beam_width", [1, 2])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_prepared_response_keeps_outputs_and_metadata_stable(
+    beam_width: int, overlap: bool
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
+
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(beam_width=beam_width),
+        is_streaming=True,
+        return_log_probs=True,
+        return_generation_logits=True,
+        return_context_logits=True,
+        return_logits_device_memory=False,
+        exclude_last_generation_logits=overlap,
+        additional_outputs=["hidden"],
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.py_decoding_iter = 1
+    request.py_draft_tokens = [7, 8]
+    request.py_per_pos_drafted[0] = 2
+    request.py_per_pos_accepted[0] = 1
+    request.py_total_draft_tokens = 2
+    request.py_total_accepted_draft_tokens = 1
+    request.py_disaggregated_params = SimpleNamespace(ctx_usage={"prompt_tokens": 3})
+    request.py_ctx_computed_tokens = 3
+    request.py_ctx_first_begin = 0
+    request.py_ctx_num_chunks = 2
+    request.add_new_tokens([4] * beam_width)
+    first_probs = [[{4: Logprob(-0.5)}] for _ in range(beam_width)]
+    request.py_result.set_log_probs(first_probs, [-0.5] * beam_width)
+    first_logits = torch.arange(beam_width * 4, dtype=torch.float32).reshape(1, beam_width, 4)
+    request.py_result.append_generation_logits(first_logits)
+    request.py_result.append_context_logits(torch.ones(3, 1, 4))
+    first_prompt_rows = torch.arange(6, dtype=torch.float64).reshape(2, 3)
+    request.py_result.append_prompt_logprobs(first_prompt_rows)
+    request.py_result.append_additional_context_outputs("hidden", torch.ones(3, 2))
+    request.py_result.append_additional_generation_outputs("hidden", torch.ones(1, 2))
+    response = prepare_response(request, publish_metadata=True, include_latest_logits=overlap)
+    assert response is not None
+    assert request.decoding_iter == 1
+    assert request.draft_tokens == [7, 8]
+    assert response.result.per_pos_drafted[0] == 2
+    assert response.result.spec_dec_totals == (1, 2)
+    assert response.result.ctx_computed_tokens == 3
+    assert response.result.ctx_first_begin == 0
+    assert response.result.ctx_num_chunks == 2
+
+    request.py_result.set_log_probs(
+        [[{5: Logprob(-1.0)}] for _ in range(beam_width)], [-1.0] * beam_width
+    )
+    request.py_result.append_generation_logits(first_logits + 10)
+    request.py_result.append_prompt_logprobs(torch.ones(1, 3, dtype=torch.float64))
+    request.py_result.append_additional_context_outputs("hidden", torch.zeros(1, 2))
+    request.py_result.append_additional_generation_outputs("hidden", torch.zeros(1, 2))
+    request.py_per_pos_drafted[0] = 9
+    request.py_per_pos_accepted[0] = 7
+    request.py_total_draft_tokens = 9
+    request.py_disaggregated_params.ctx_usage["prompt_tokens"] = 99
+    request.py_result.set_exclude_last_generation_logits(False)
+
+    assert response.result.log_probs == first_probs
+    assert response.result.cum_log_probs == [-0.5] * beam_width
+    assert len(request.py_result.context_prompt_logprob_rows) == 2
+    assert len(response.result.context_prompt_logprob_rows) == 1
+    assert response.result.context_prompt_logprob_rows[0] is first_prompt_rows
+    torch.testing.assert_close(response.result.generation_logits, first_logits.transpose(0, 1))
+    torch.testing.assert_close(response.result.context_logits, torch.ones(3, 4))
+    torch.testing.assert_close(
+        response.result.additional_context_outputs["hidden"], torch.ones(3, 2)
+    )
+    torch.testing.assert_close(
+        response.result.additional_generation_outputs["hidden"], torch.ones(1, 2)
+    )
+    assert response.result.per_pos_drafted[0] == 2
+    assert response.result.per_pos_accepted[0] == 1
+    assert response.result.spec_dec_totals == (1, 2)
+    assert response.result.ctx_usage == {"prompt_tokens": 3}
+
+
+def test_suppressed_response_preserves_pending_logprobs() -> None:
+    from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
+
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        return_log_probs=True,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    first = [{4: Logprob(-0.5)}]
+    request.py_result.append_log_probs([first])
+    assert prepare_response(request) is not None
+    pending = [{5: Logprob(-0.25)}]
+    request.py_result.append_log_probs([pending])
+    assert prepare_response(request) is None
+    assert request.py_result.log_probs == [pending]
+    request.add_new_tokens([5])
+    response = prepare_response(request)
+    assert response.result.log_probs == [pending]
+    assert response.result.cum_log_probs == [-0.75]

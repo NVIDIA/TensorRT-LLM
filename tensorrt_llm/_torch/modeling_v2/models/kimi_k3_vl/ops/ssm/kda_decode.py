@@ -16,15 +16,29 @@ class KdaDecode(OpWrapper):
     and, with ``update_conv_cache``, the conv pools there. Returns None."""
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
-    CELLS: tuple[Cell, ...] = tuple(
+    CELLS: tuple[Cell, ...] = (
+        *(
+            Cell(
+                why=(
+                    f"{num} requests at six heads on real manager pools: "
+                    f"{'four-CTA cluster' if num <= 5 else 'legacy compact-heads'} dispatch"
+                ),
+                spec=dict(num=num),
+            )
+            for num in range(1, 9)
+        ),
+        # Kimi K3's generic decode: more than 8 requests, which the K3 decode kernels do not take.
         Cell(
-            why=(
-                f"{num} requests at six heads on real manager pools: "
-                f"{'four-CTA cluster' if num <= 5 else 'legacy compact-heads'} dispatch"
-            ),
-            spec=dict(num=num),
-        )
-        for num in range(1, 9)
+            why="16 requests (B*H 96): the generic decode's legacy compact-heads dispatch",
+            spec=dict(num=16),
+        ),
+        *(
+            Cell(
+                why=f"{num} requests (B*H {num * 6} > 144): the generic decode's architecture-specific dispatch",
+                spec=dict(num=num),
+            )
+            for num in (64, 128)
+        ),
     )
     note = """
     Caller-owned pools only. The V2 hybrid manager uses conv_state_layout=q_k_v,
@@ -45,7 +59,8 @@ class KdaDecode(OpWrapper):
     Kimi K3 uses six heads, lower_bound=-5, scale=128**-0.5, onorm_eps=1e-5.
     On SM100/SM103 B*H <= 32 selects four-CTA clusters, <=144 legacy compact
     heads, then architecture-specific kernels; other architectures use legacy
-    kernels. Only SM100 B=1..8 is certified here.
+    kernels. Certified here: SM100 B=1..8, 16, 64 and 128 (Kimi K3's
+    generic decode of more than 8 requests).
 
     run_kda_decode_fusion_cuda fills optional arguments with cached dummies;
     this entry exposes the raw schema. k3_kda_decode_attn additionally fuses
