@@ -221,11 +221,8 @@ Its 45-minute test timeout reserves five minutes for cleanup, leaving at most 40
 server startup and evaluation. The generated `beam-baseline.yaml` and evaluator outputs are
 written to the test's temporary output directory.
 
-The gate is listed in `tests/integration/test_lists/qa/functional/llm_function_core.txt` and
-has a dedicated on-demand selector in
-`tests/integration/test_lists/test-db/qa_gb300_beam_baseline_gsm8k_first100.yml`.
-These entries define how the gate is selected; they do not establish that a particular
-revision has passed it. Full 1,319-question GSM8K evaluation remains manual-only.
+QA selects this gate through `tests/integration/test_lists/qa/functional/llm_function_core.txt`.
+Full 1,319-question GSM8K evaluation remains manual-only.
 
 ## Comparing results
 
