@@ -136,6 +136,8 @@ def _glm52_config(**overrides):
         n_routed_experts=256,
         q_lora_rank=2048,
         index_n_heads=32,
+        first_k_dense_replace=3,
+        indexer_types=["full"] * 78,
     )
     fields.update(overrides)
     return PretrainedConfig(**fields)
