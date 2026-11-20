@@ -14,7 +14,6 @@
 # limitations under the License.
 """TensorRT-LLM text implementation for Qwen3.8-Flash-Next checkpoints."""
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import torch
@@ -23,7 +22,6 @@ from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
     from ...models.modeling_utils import QuantConfig
-    from ..speculative.interface import SpecWorkerBase
 
 from ...inputs import (
     ContentFormat,
@@ -1178,23 +1176,6 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
         self.preload_weight_modules = self.model.preload_weight_modules
         if spec_config is not None and spec_config.spec_dec_mode.is_mtp_one_model():
             self.model.layers.extend(self.draft_model.mtp_layers)
-            self._register_auxiliary_speculative_state_handlers(
-                self.spec_worker,
-                self.model.layers[: self.model.num_hidden_layers],
-            )
-
-    @staticmethod
-    def _register_auxiliary_speculative_state_handlers(
-        spec_worker: "SpecWorkerBase", layers: Sequence[DecoderLayer]
-    ) -> None:
-        """Register target recurrent side state that follows MTP acceptance."""
-        for layer in layers:
-            attention = getattr(layer, "self_attn", None)
-            indexer = getattr(attention, "indexer", None)
-            if indexer is not None:
-                if not hasattr(indexer, "commit_speculative_states"):
-                    raise TypeError("QSA indexers must implement speculative commit")
-                spec_worker.register_auxiliary_state_handler(indexer)
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:

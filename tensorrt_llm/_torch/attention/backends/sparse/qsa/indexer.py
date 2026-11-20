@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA index projection, compressed-key selection, and exact sparse GQA."""
 
-from typing import TYPE_CHECKING
+import dataclasses
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import nn
@@ -94,6 +95,64 @@ def _logical_to_pages(
     return pages, within
 
 
+@dataclasses.dataclass(eq=False)
+class QSASpeculativeRecord:
+    """QSA side-cache entries one verification forward overwrote, kept until acceptance is known.
+
+    ``index_values`` and, on the layer that owns the request-wide positions,
+    ``position_values`` are the entries as they were before the forward.
+    :meth:`commit` puts back the ones written for rejected tokens.
+
+    Attributes:
+        request_indices: ``[tokens]`` integer tensor, one entry per verification
+            token of a generation request: the batch row of its request.
+        token_ordinals: ``[tokens]`` integer tensor: each token's zero-based
+            ordinal among its request's tokens in the forward.
+        pages: ``[tokens]`` integer tensor: the side-cache page of each token.
+        within: ``[tokens]`` integer tensor: each token's offset in its page.
+        index_values: ``[tokens, heads, dim]``, in the dtype of ``index_cache``.
+        index_cache: ``[pages, tokens_per_block, heads, dim]`` index-K view.
+        position_values: ``[tokens, 3]``, in the dtype of ``position_cache``.
+        position_cache: ``[pages, tokens_per_block, 3]`` position view.
+    """
+
+    request_indices: torch.Tensor
+    token_ordinals: torch.Tensor
+    pages: torch.Tensor
+    within: torch.Tensor
+    index_values: torch.Tensor
+    index_cache: torch.Tensor
+    position_values: Optional[torch.Tensor] = None
+    position_cache: Optional[torch.Tensor] = None
+
+    def commit(self, num_accepted_tokens: torch.Tensor) -> None:
+        """Restore QSA side-cache entries written for rejected verify tokens.
+
+        Args:
+            num_accepted_tokens: ``[batch]`` integer tensor on the device: the
+                accepted token count of every request, context requests first.
+        """
+        # QSA snapshots already carry scheduler request indices. Unlike GDN or
+        # PLE, they do not address a separate recurrent-state slot pool.
+        request_indices = self.request_indices
+        accepted = num_accepted_tokens.to(request_indices.device)[request_indices]
+        restore = self.token_ordinals >= accepted
+        pages = self.pages
+        within = self.within
+        index_cache = self.index_cache
+        current_index = index_cache[pages, within]
+        index_cache[pages, within] = torch.where(
+            restore[:, None, None], self.index_values, current_index
+        )
+        position_values = self.position_values
+        if position_values is not None:
+            position_cache = self.position_cache
+            current_positions = position_cache[pages, within]
+            position_cache[pages, within] = torch.where(
+                restore[:, None], position_values, current_positions
+            )
+
+
 class QSAIndexer(nn.Module):
     """Checkpoint-defined replicated Q/K projection and compressed side cache.
 
@@ -174,7 +233,6 @@ class QSAIndexer(nn.Module):
                 head_dim=params.index_head_dim,
                 is_neox=pos.is_neox,
             )
-        self._pending_speculative_cache = None
         use_cute_dsl_prefill_topk = IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()
         # Both QSA selection sites drive TopK through its row-range (prefill)
         # entry, including decode, so the prefill engine is the one that runs.
@@ -514,8 +572,12 @@ class QSAIndexer(nn.Module):
         position_cache: torch.Tensor,
         metadata: "QSAAttentionMetadata",
     ) -> None:
-        """Snapshot QSA side-cache entries that target verification may reject."""
-        self._pending_speculative_cache = None
+        """Snapshot QSA side-cache entries that target verification may reject.
+
+        The cache manager holds the snapshot until acceptance is known.
+        """
+        kv_cache_manager = metadata.kv_cache_manager
+        kv_cache_manager.drop_qsa_speculative_record(layer_idx)
         num_contexts = metadata.num_contexts
         num_seqs = metadata.num_seqs
         if metadata.is_cuda_graph and num_contexts == 0 and metadata.num_tokens == num_seqs:
@@ -551,48 +613,15 @@ class QSAIndexer(nn.Module):
             # CUDA-graph target verification batch.
             request_indices = request_indices.to(torch.long)
 
-        pending = {
-            "request_indices": request_indices,
-            "token_ordinals": token_ordinals,
-            "pages": pages,
-            "within": within,
-            "index_values": index_cache[pages, within].clone(),
-            "index_cache": index_cache,
-        }
-        if layer_idx == metadata.kv_cache_manager.qsa_position_layer_id:
-            pending["position_values"] = position_cache[pages, within].clone()
-            pending["position_cache"] = position_cache
-        self._pending_speculative_cache = pending
-
-    def commit_speculative_states(
-        self,
-        num_accepted_tokens: torch.Tensor,
-        state_indices: torch.Tensor,
-        num_contexts: int,
-    ) -> None:
-        """Restore QSA side-cache entries written for rejected verify tokens."""
-        # QSA snapshots already carry scheduler request indices. Unlike GDN or
-        # PLE, they do not address a separate recurrent-state slot pool.
-        del state_indices, num_contexts
-        pending = self._pending_speculative_cache
-        self._pending_speculative_cache = None
-        if pending is None:
-            return
-
-        request_indices = pending["request_indices"]
-        accepted = num_accepted_tokens.to(request_indices.device)[request_indices]
-        restore = pending["token_ordinals"] >= accepted
-        pages = pending["pages"]
-        within = pending["within"]
-        index_cache = pending["index_cache"]
-        current_index = index_cache[pages, within]
-        index_cache[pages, within] = torch.where(
-            restore[:, None, None], pending["index_values"], current_index
+        record = QSASpeculativeRecord(
+            request_indices=request_indices,
+            token_ordinals=token_ordinals,
+            pages=pages,
+            within=within,
+            index_values=index_cache[pages, within].clone(),
+            index_cache=index_cache,
         )
-        position_values = pending.get("position_values")
-        if position_values is not None:
-            position_cache = pending["position_cache"]
-            current_positions = position_cache[pages, within]
-            position_cache[pages, within] = torch.where(
-                restore[:, None], position_values, current_positions
-            )
+        if layer_idx == kv_cache_manager.qsa_position_layer_id:
+            record.position_values = position_cache[pages, within].clone()
+            record.position_cache = position_cache
+        kv_cache_manager.hold_qsa_speculative_record(layer_idx, record)

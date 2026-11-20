@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import (
     QSAIndexer,
+    QSASpeculativeRecord,
     _position_coordinates,
     average_pool_qsa_keys,
 )
@@ -1931,39 +1932,42 @@ def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:
     assert calls[0][2] is PageIndexMode.SHARED
 
 
+def _qsa_record_manager(records=None) -> Qwen4ExpHybridCacheManager:
+    """A V2 QSA manager reduced to the speculative records it holds for the indexers."""
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
+    manager._qsa_speculative_records = dict(records or {})
+    manager.qsa_position_layer_id = 0
+    return manager
+
+
 def test_qsa_speculative_commit_restores_rejected_side_cache_entries() -> None:
-    indexer = object.__new__(QSAIndexer)
-    torch.nn.Module.__init__(indexer)
     index_cache = torch.arange(24, dtype=torch.float32).reshape(3, 2, 1, 4)
     position_cache = torch.arange(18, dtype=torch.int32).reshape(3, 2, 3)
     pages = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     within = torch.tensor([0, 1, 0, 1], dtype=torch.long)
-    indexer._pending_speculative_cache = {
-        "request_indices": torch.zeros(4, dtype=torch.long),
-        "token_ordinals": torch.arange(4),
-        "pages": pages,
-        "within": within,
-        "index_values": index_cache[pages, within].clone(),
-        "index_cache": index_cache,
-        "position_values": position_cache[pages, within].clone(),
-        "position_cache": position_cache,
-    }
+    record = QSASpeculativeRecord(
+        request_indices=torch.zeros(4, dtype=torch.long),
+        token_ordinals=torch.arange(4),
+        pages=pages,
+        within=within,
+        index_values=index_cache[pages, within].clone(),
+        index_cache=index_cache,
+        position_values=position_cache[pages, within].clone(),
+        position_cache=position_cache,
+    )
+    rejected_index = index_cache[pages[2:], within[2:]].clone()
+    rejected_positions = position_cache[pages[2:], within[2:]].clone()
     index_cache[pages, within] = -1
     position_cache[pages, within] = -1
 
-    indexer.commit_speculative_states(
-        num_accepted_tokens=torch.tensor([2]),
-        state_indices=torch.tensor([0]),
-        num_contexts=0,
-    )
+    record.commit(num_accepted_tokens=torch.tensor([2]))
 
     # Two accepted verification tokens retain their new values; later proposal
     # entries are restored to the snapshot.
-    assert torch.all(index_cache[pages[:2], within[:2], 0] == -1)
+    assert torch.all(index_cache[pages[:2], within[:2]] == -1)
     assert torch.all(position_cache[pages[:2], within[:2]] == -1)
-    assert torch.all(index_cache[pages[2:], within[2:], 0] != -1)
-    assert torch.all(position_cache[pages[2:], within[2:]] != -1)
-    assert indexer._pending_speculative_cache is None
+    assert torch.equal(index_cache[pages[2:], within[2:]], rejected_index)
+    assert torch.equal(position_cache[pages[2:], within[2:]], rejected_positions)
 
 
 @pytest.mark.parametrize(
@@ -1992,13 +1996,14 @@ def test_qsa_speculative_snapshot_state_uses_host_lengths(
 def test_qsa_ordinary_mixed_batch_skips_speculative_cache_snapshot() -> None:
     indexer = object.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
-    indexer._pending_speculative_cache = object()
+    manager = _qsa_record_manager({0: object()})
     metadata = SimpleNamespace(
         num_contexts=1,
         num_seqs=2,
         num_tokens=2,
         is_cuda_graph=False,
         qsa_needs_speculative_snapshot=False,
+        kv_cache_manager=manager,
     )
     empty = torch.empty(0, dtype=torch.long)
 
@@ -2012,13 +2017,13 @@ def test_qsa_ordinary_mixed_batch_skips_speculative_cache_snapshot() -> None:
         metadata=metadata,
     )
 
-    assert indexer._pending_speculative_cache is None
+    assert manager._qsa_speculative_records == {}
 
 
 def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> None:
     indexer = object.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
-    indexer._pending_speculative_cache = None
+    manager = _qsa_record_manager()
     metadata = SimpleNamespace(
         num_contexts=0,
         num_seqs=1,
@@ -2026,7 +2031,7 @@ def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> Non
         is_cuda_graph=False,
         qsa_needs_speculative_snapshot=True,
         seq_lens_cuda=torch.tensor([4], dtype=torch.int32),
-        kv_cache_manager=SimpleNamespace(qsa_position_layer_id=0),
+        kv_cache_manager=manager,
     )
     request_indices = torch.zeros(4, dtype=torch.long)
     pages = torch.tensor([0, 0, 1, 1], dtype=torch.long)
@@ -2044,11 +2049,10 @@ def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> Non
         metadata=metadata,
     )
 
-    pending = indexer._pending_speculative_cache
-    assert pending is not None
-    assert pending["token_ordinals"].tolist() == [0, 1, 2, 3]
-    torch.testing.assert_close(pending["index_values"], index_cache[pages, within])
-    torch.testing.assert_close(pending["position_values"], position_cache[pages, within])
+    record = manager._qsa_speculative_records[0]
+    assert record.token_ordinals.tolist() == [0, 1, 2, 3]
+    torch.testing.assert_close(record.index_values, index_cache[pages, within])
+    torch.testing.assert_close(record.position_values, position_cache[pages, within])
 
 
 class _QsaPageConverter:

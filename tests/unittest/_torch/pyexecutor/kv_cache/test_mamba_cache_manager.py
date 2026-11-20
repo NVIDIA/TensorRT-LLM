@@ -27,6 +27,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.config import has_fp4_mla_ca
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
+from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import QSASpeculativeRecord
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import (
@@ -147,6 +148,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
     ResourceManagerType,
+    SpeculativeAcceptance,
     SpeculativeAcceptancePhase,
     get_pp_layers,
 )
@@ -11271,6 +11273,71 @@ def test_acceptance_keeps_the_ple_state_on_a_rebuilt_manager():
         second.shutdown()
 
 
+@skip_no_cuda
+def test_verification_and_acceptance_replay_in_a_cuda_graph():
+    """One CUDA graph captures a verification forward and the acceptance after it. Replayed with other accepted counts,
+    it keeps the PLE state of the tokens accepted then and restores a target layer's QSA entries of those rejected."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        initial = _fill_ple_pools(mgr)
+        verify, tokens, values = _ple_layer_verification(mgr)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+        attn_metadata = SimpleNamespace(kv_cache_manager=mgr)
+        accepted = torch.zeros(2, dtype=torch.int32, device="cuda")
+        # The QSA index entries of the first request's four verification tokens, in a target layer.
+        index_cache = torch.zeros(1, 4, 1, 2, device="cuda")
+        written = torch.ones(4, 1, 2, device="cuda")
+        first_request = pages = torch.zeros(4, dtype=torch.long, device="cuda")
+        within = torch.arange(4, device="cuda")
+
+        def step():
+            verify(mgr)
+            mgr.hold_qsa_speculative_record(
+                2,
+                QSASpeculativeRecord(
+                    request_indices=first_request,
+                    token_ordinals=within,
+                    pages=pages,
+                    within=within,
+                    index_values=index_cache[pages, within].clone(),
+                    index_cache=index_cache,
+                ),
+            )
+            index_cache[pages, within] = written
+            worker._commit_accepted_auxiliary_state(
+                SpeculativeAcceptance(attn_metadata, accepted, num_contexts=0, num_gens=2)
+            )
+
+        def start(counts):
+            for pool, state in zip(mgr.ple_layer_cache(0), initial):
+                pool.copy_(state)
+            index_cache.zero_()
+            accepted.copy_(torch.tensor(counts, dtype=torch.int32))
+
+        def assert_kept(counts):
+            _assert_ple_prefix_state(mgr, initial, tokens, values, counts)
+            assert index_cache[0, :, 0, 0].tolist() == [
+                float(token < counts[0]) for token in range(4)
+            ]
+
+        start([2, 3])
+        step()
+        assert_kept([2, 3])
+
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            step()
+        for counts in ([3, 1], [1, 2]):
+            start(counts)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert_kept(counts)
+    finally:
+        mgr.shutdown()
+
+
 def _run_whole_step(worker, mgr, draft_loop):
     """Run a step of two generation requests to its end, the draft pass being one call over the target's KV cache."""
     worker._uses_external_shared_target_kv = True
@@ -11311,5 +11378,61 @@ def test_eagle3_acceptance_leaves_the_ple_state_as_verification_wrote_it():
         worker = _acceptance_worker("eagle3", torch.tensor([2, 3], dtype=torch.int32).cuda())
         _run_whole_step(worker, mgr, lambda **kwargs: None)
         _assert_ple_slots(mgr, staged, kept={}, empty=[0, 1, 2, 3])
+    finally:
+        mgr.shutdown()
+
+
+def _hold_qsa_record(mgr, layer_idx):
+    """Leave on the manager what a layer's QSA indexer leaves: the index entries of the first request's four
+    verification tokens as they were before the forward wrote them. Returns a view of the entries, now written."""
+    index_cache = torch.zeros(1, 4, 1, 2, device="cuda")
+    pages = torch.zeros(4, dtype=torch.long, device="cuda")
+    within = torch.arange(4, device="cuda")
+    mgr.hold_qsa_speculative_record(
+        layer_idx,
+        QSASpeculativeRecord(
+            request_indices=torch.zeros(4, dtype=torch.long, device="cuda"),
+            token_ordinals=within,
+            pages=pages,
+            within=within,
+            index_values=index_cache[pages, within].clone(),
+            index_cache=index_cache,
+        ),
+    )
+    index_cache.fill_(1)
+    return index_cache[0, :, 0, 0]
+
+
+@skip_no_cuda
+def test_mtp_acceptance_restores_the_qsa_entries_of_rejected_tokens_in_target_layers():
+    """The first request accepts two of its four verification tokens: a target layer gets the entries of the other two
+    back, a draft layer keeps what its forward wrote."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        _stage_ple_candidates(mgr, slots=[3, 1])
+        # The model has three layers; the layer after them is the draft's.
+        target_entries = _hold_qsa_record(mgr, layer_idx=2)
+        draft_entries = _hold_qsa_record(mgr, layer_idx=3)
+        worker = _acceptance_worker("mtp", torch.tensor([2, 3], dtype=torch.int32).cuda())
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=[3, 1])
+        assert target_entries.tolist() == [1, 1, 0, 0]
+        assert draft_entries.tolist() == [1, 1, 1, 1]
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_eagle3_acceptance_leaves_the_qsa_entries_as_verification_wrote_them():
+    mgr = _build_ple_acceptance_manager(
+        Eagle3DecodingConfig(max_draft_len=2, speculative_model="draft")
+    )
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        target_entries = _hold_qsa_record(mgr, layer_idx=2)
+        worker = _acceptance_worker("eagle3", torch.tensor([2, 3], dtype=torch.int32).cuda())
+        _run_whole_step(worker, mgr, lambda **kwargs: None)
+        assert target_entries.tolist() == [1, 1, 1, 1]
     finally:
         mgr.shutdown()

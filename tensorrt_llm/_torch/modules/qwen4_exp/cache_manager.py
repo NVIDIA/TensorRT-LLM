@@ -63,6 +63,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, Pag
 if TYPE_CHECKING:
     import transformers
 
+    from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import QSASpeculativeRecord
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # Storage-layout constants; model geometry comes from QSASparseParams.
@@ -278,6 +279,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         self.qsa_sparse_layer_ids = []
         self.qsa_position_layer_id = None
         self.qsa_side_planes_size: int | None = None
+        self._qsa_speculative_records: dict[int, QSASpeculativeRecord] = {}
         self._qsa_enabled = (
             sparse_attention_config is not None and sparse_attention_config.algorithm == "qsa"
         )
@@ -520,6 +522,14 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
             dtype=torch.uint8,
             page_shape=page_shape,
         )
+
+    def hold_qsa_speculative_record(self, layer_idx: int, record: QSASpeculativeRecord) -> None:
+        """Keep the side-cache entries a layer's verification forward overwrote."""
+        self._qsa_speculative_records[layer_idx] = record
+
+    def drop_qsa_speculative_record(self, layer_idx: int) -> None:
+        """Forget what an earlier forward of the layer overwrote."""
+        self._qsa_speculative_records.pop(layer_idx, None)
 
     @torch.compiler.disable
     def get_qsa_position_buffer(self) -> Optional[torch.Tensor]:
@@ -804,11 +814,19 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
 
     @override
     def _commit_auxiliary_speculative_state(self, acceptance: SpeculativeAcceptance) -> None:
-        """Keep the PLE state of the accepted tokens; only one-model MTP steps commit it."""
+        """Keep the PLE state and the QSA side-cache entries of the accepted tokens.
+
+        Only one-model MTP steps commit them, and of the QSA layers only the target's.
+        """
         if not self._serves_one_model_mtp:
             return
         for record in self._ple_speculative_records.values():
             record.commit(acceptance.num_accepted_tokens, acceptance.num_contexts)
+        qsa_records = self._qsa_speculative_records
+        if qsa_records:
+            num_target_layers = self._pretrained_config.num_hidden_layers
+            for layer_idx in [layer for layer in qsa_records if layer < num_target_layers]:
+                qsa_records.pop(layer_idx).commit(acceptance.num_accepted_tokens)
 
     def _ple_buffer_configs(self) -> list[BufferConfig]:
         if not self._ple_layer_ids:
@@ -1028,6 +1046,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         self._ple_conv_states.clear()
         self._ple_ngram_contexts.clear()
         self._ple_speculative_records.clear()
+        self._qsa_speculative_records.clear()
         self._inforward_snapshots.shutdown()
         self._inforward_stage_ple = {}
         super().shutdown()
