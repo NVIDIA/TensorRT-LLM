@@ -256,6 +256,8 @@ class _Decider:
         planned = np.flatnonzero(self.committed <= applied_window)
         # The busiest rank's rows per forward size the CUDA graph bucket the steps pad to.
         model = cfg.model.at(float((routed.sum(2) / forwards).mean(1).max()))
+        if not model.trusted:  # a bucket without a calibrated model: no decision, the layouts stay
+            return update
         self.evaluations.model = model
         new_layout = np.empty((len(planned), slots), dtype=np.int64)
         new_shares, resolved = np.empty((2, len(planned), slots))

@@ -246,6 +246,9 @@ class AdaptiveEplbBackend(Protocol):
         """The :class:`~.policy.TimeModel` fields of the backend's decode kernels at ``rates``
         (bytes/s, FLOP/s) of a calibration; ``expert_bytes`` is the size of one expert's weights."""
 
+    def time_decode_steps(self, tokens: int, steps: list, *, warmup: int, iters: int) -> tuple:
+        """Microseconds per launch of each step's decode launch, and host microseconds per launch."""
+
 
 def _plan_layer(layer: int, backend: AdaptiveEplbBackend) -> LayerBlockLayout:
     backend.check_weights_movable()

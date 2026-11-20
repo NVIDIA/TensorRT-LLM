@@ -169,6 +169,8 @@ l0_gb300_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph[dp4] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy[dp4] TIMEOUT (240)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp4] TIMEOUT (240)
+  # Adaptive EPLB's decode time model, DeepSeek-V4-Pro NVFP4 DEP4: calibrated at the first start, cached for the second.
+  - unittest/_torch/moe/test_adaptive_eplb_calibrate_gpu.py TIMEOUT (60)
   # DeepSeek-V4.1 on SM103: MegaMoE serving path, online expert placement, attention-DP
   # graph passes and breakable prefill graphs against eager prefill.
   - unittest/_torch/moe/test_megamoe_e2e.py

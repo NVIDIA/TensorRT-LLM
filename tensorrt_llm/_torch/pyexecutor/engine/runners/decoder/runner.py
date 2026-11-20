@@ -390,6 +390,7 @@ class DecoderRunner(ScheduledModelRunner):
             torch_compile_bypass=self._bypass_torch_compile,
             context_promotion_supported=self._context_graph_promotion_supported,
             warmup_inputs=self._buffers.input_ids_cuda,
+            moe_load_balancer=self._moe_load_balancer,
         )
 
     @property

@@ -74,6 +74,7 @@ class _CaptureGraphsStub(DecoderCudaGraphs):
         self.cuda_graph_runner = _GraphRunnerStub()
         self.passes: list[tuple[bool, bool]] = []
         self._guard = guard
+        self._moe_load_balancer = None  # no load balancer: no work between the warmup passes
 
     def run_cuda_graph_warmup(self, resource_manager: object) -> None:
         self.passes.append((self.cuda_graph_runner.is_warmup_only, self._guard.in_warmup))

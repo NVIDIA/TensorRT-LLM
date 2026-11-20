@@ -5,9 +5,11 @@
 import json
 import multiprocessing
 import os
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from _torch.moe import adaptive_eplb_reference as reference
@@ -15,6 +17,7 @@ from _torch.moe import adaptive_eplb_reference as reference
 import tensorrt_llm
 from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer as base
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import balancer as module
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import calibrate
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import AdaptiveMoeLoadBalancer
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     ExpertStatistics,
@@ -173,11 +176,14 @@ FIELDS = dict(zip(TimeModel.__dataclass_fields__, (1.0, 2.0, 3.0, 4.0, 0.9, 8)))
 
 
 def _prepare(monkeypatch, path=None, tokens=(8, 16), domain=(None, 1), others=(), **fake):
-    """``prepare_runtime`` of rank ``fake["rank"]`` (0) of ``fake["layers"]`` (1) layers on fakes
-    with the calibration file at ``path``; see the other ``fake`` keys below; the other ranks vote
-    ``others`` unless ``fake["allgather"]`` does -> the balancer, its layer, what the start-up saw
-    and the warnings."""
-    balancer = _balancer(ep_rank=fake.get("rank", 0), time_model_file=path)
+    """``prepare_runtime`` of rank ``fake["rank"]`` (0) of ``fake["layers"]`` (1) layers on fakes,
+    under ``time_model`` ``file`` with ``path``, else ``fake["mode"]`` (auto) and the config
+    ``fake["config"]``; see the other ``fake`` keys below; the other ranks vote ``others`` unless
+    ``fake["allgather"]`` does -> the balancer, its layer, what the start-up saw and the warnings."""
+    monkeypatch.delenv("TRTLLM_CACHE_DIR", raising=False)
+    mode = "file" if path else fake.get("mode", "auto")
+    config = dict(time_model_file=path, time_model=mode, **fake.get("config", {}))
+    balancer = _balancer(ep_rank=fake.get("rank", 0), **config)
     balancer.mapping = SimpleNamespace(gpus_per_node=4)
     layers = fake.get("layers", 1)
     layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE) if layers else None
@@ -185,14 +191,18 @@ def _prepare(monkeypatch, path=None, tokens=(8, 16), domain=(None, 1), others=()
 
     def time_model(expert_bytes, rates, tile_rows):
         seen["priced"] = (expert_bytes, rates)
-        return dict(FIELDS, per_active_slot_us=4e12 / rates[0], tile_rows=tile_rows)
+        tiles = {
+            k: FIELDS[k] * tile_rows / 8 for k in ("per_extra_tile_us", "hot_slot_extra_tile_us")
+        }
+        return dict(FIELDS, per_active_slot_us=4e12 / rates[0], tile_rows=tile_rows, **tiles)
 
     weights = {"w": torch.arange(8.0)}
     backend = SimpleNamespace(
         decode_time_model=time_model,
-        decode_tile_rows=lambda tokens: FIELDS["tile_rows"],
         decode_calibration_identity=lambda t: dict(
-            top_k=2, tactics={str(n): tactic(n) for n in t if n <= fake.get("top", 8192)}
+            top_k=2,
+            tactics={str(n): tactic(n) for n in t if n <= fake.get("top", 8192)},
+            tile_rows={str(n): fake.get("tiles", {}).get(n, 8) for n in t},
         ),
         slot_id_dtype=torch.int32,
         slot_weight_planes=lambda: [("w", 16)],
@@ -240,7 +250,7 @@ def _prepare(monkeypatch, path=None, tokens=(8, 16), domain=(None, 1), others=()
 def _calibration(tmp_path, **identity) -> str:
     """A calibration file of buckets of 8 and 16 tokens per GPU for the fakes of :func:`_prepare`."""
     mine = dict(device="NVIDIA GB300", sm=103, sm_count=152, ep_size=EP_SIZE, hosts=1, top_k=2)
-    mine.update(num_slots=NUM_SLOTS)
+    mine.update(num_slots=NUM_SLOTS, tile_rows={"8": 8, "16": 8})
     doc = dict(zip(("schema", "version"), module.CALIBRATION))
     doc.update(identity=dict(dict(mine, tactics={"8": "a", "16": "a"}), **identity))
     doc.update(rates=dict(hbm_bytes_per_s=4e12, fp4_dense_flops_per_s=1e16))
@@ -251,14 +261,28 @@ def _calibration(tmp_path, **identity) -> str:
     return str(tmp_path / "calibration.json")
 
 
+def test_prepare_runtime_moves_the_weights_and_leaves_an_uncached_calibration_to_the_warmup(
+    monkeypatch,
+):
+    balancer, _, seen, warnings = _prepare(monkeypatch)
+    assert "start" not in seen and not warnings and "CUDA graph warmup" in balancer.off_reason
+    assert (balancer.transport, balancer.copy_stream) == (seen["moved"][1], "stream")
+    _observe(balancer, 4, warmup=True)
+    assert not balancer.recording and not warnings and balancer._pending is not None
+    # Serving begins with no warmup having calibrated it (no CUDA graphs): off, said aloud, for good.
+    _observe(balancer, 4)
+    assert not balancer.recording and "no CUDA graph warmup" in warnings[0]
+    balancer.before_capture()
+    assert "start" not in seen
+
+
 def test_a_calibration_file_prices_every_decode_bucket_at_its_own_scale(monkeypatch, tmp_path):
     path = _calibration(tmp_path, device="NVIDIA B200")  # no built-in calibration for it
-    balancer, _, seen, warnings = _prepare(monkeypatch, path, device="B200")
+    _, _, seen, warnings = _prepare(monkeypatch, path, device="B200")
     model = seen["start"][0]
-    assert (balancer.transport, balancer.copy_stream) == (seen["moved"][1], "stream")
     assert seen["priced"] == (1000, (4e12, 1e16)) and not warnings
     # A bucket's read cost from the calibration's held-out checks also solves its shares by time.
-    assert model.scales == ((16, 0.8, 0.0, 1.5, True), (32, 1.1, 1.0, 0.0, False))
+    assert model.scales == ((16, 0.8, 0.0, 1.5, True, 8, True), (32, 1.1, 1.0, 0.0, False, 8, True))
     assert model.route_us == 0.0 and not model.time_shares
 
 
@@ -301,8 +325,11 @@ def test_a_decode_bucket_beyond_the_largest_launch_needs_no_calibration(monkeypa
 
 
 def test_without_a_time_model_adaptive_eplb_stays_off(monkeypatch):
-    balancer, _, seen, warnings = _prepare(monkeypatch)
-    assert "moved" not in seen and "no time_model_file" in balancer.off_reason and warnings
+    balancer, _, seen, warnings = _prepare(monkeypatch, mode="off")
+    assert "moved" not in seen and "time_model is off" in balancer.off_reason and warnings
+    balancer.before_capture()  # nothing to calibrate
+    with pytest.raises(ValueError, match="time_model_file"):
+        _balancer(time_model_file="calibration.json")
 
 
 @pytest.mark.parametrize(
@@ -360,14 +387,12 @@ def test_every_rank_votes_whatever_one_rank_raises(monkeypatch, tmp_path, error)
     assert all("(EP rank 1)" in (tmp_path / f"off{rank}").read_text() for rank in range(2))
 
 
-def test_a_model_without_a_balanced_layer_serves_with_adaptive_eplb_off(monkeypatch, tmp_path):
+def test_a_model_without_a_balanced_layer_serves_with_adaptive_eplb_off(monkeypatch):
     """No balanced layer, or ranks balancing different numbers: the ranks vote, nothing starts."""
     balancer, _, seen, _ = _prepare(monkeypatch, layers=0)
     assert balancer.off_reason == f"{module.NO_LAYER} (EP rank 0)" and "start" not in seen
     assert balancer.shutdown() is True
-    path = _calibration(tmp_path)
-    digest = module.hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    balancer, *_ = _prepare(monkeypatch, path, others=[(None, digest, 2, "")])
+    balancer, *_ = _prepare(monkeypatch, others=[(None, "", 2, "", None)])
     assert balancer.off_reason == "the EP ranks balance different MoE layers or decode kernels"
 
 
@@ -400,6 +425,41 @@ def test_the_nvml_fabric_query_fills_this_gpus_view(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     module.nvlink_domain_error(SimpleNamespace(allgather=lambda own: sent.append(own) or [own]))
     assert sent[0][0] is True and sent[0][2] == ("0709" + "00" * 14, 5)
+
+
+@pytest.mark.parametrize("read", [0.0, 2.0, 4.0])
+def test_a_read_cost_is_fitted_where_the_held_out_designs_confirm_it(read):
+    rng = np.random.default_rng(0)  # 96 designs of 8 GPUs: slots with rows, other terms, zeros
+    terms = np.dstack([rng.integers(1, 17, (96, 8)), rng.uniform(20, 140, (96, 8))]) @ np.eye(2, 4)
+    y = 50.0 + 0.9 * (read * terms[..., 0] + terms[..., 1]).max(1) + rng.normal(0, 0.5, 96)
+    theta, fitted, own = calibrate.read_cost(terms, np.r_[4.0, 1, 0, 0], y)
+    assert theta == pytest.approx(read, abs=0.1) and (fitted < own or theta == 4.0)
+
+
+def test_a_slot_read_is_priced_where_the_designs_resolve_no_row_cost():
+    # DEP4, 100 slots per GPU, top-6, tile 256: a slot read costs 5 us, a row 0.01 us, noise 1 us.
+    tile, unit = 256, np.r_[0.0, 256, 1, 128]  # the default: no prior read cost
+    for t in range(1, 17):
+        g = SimpleNamespace(ep=4, M=100, T=t, K=6, tile=tile)
+        xs = calibrate.make_designs(g, 128, np.random.default_rng([4, t]))
+        noise = np.random.default_rng([9, t]).normal(0.0, 1.0, len(xs))
+        y = 60.0 + (5.0 * (xs > 0).sum(2) + 0.01 * xs.sum(2)).max(1) + noise
+        terms = calibrate.model_terms(xs, tile)
+        theta = calibrate.read_cost(terms, unit, y)[0]
+        p = (terms @ np.r_[theta, unit[1:]]).max(1)
+        scale = calibrate.fit_bucket(p, y, np.random.default_rng([4, t, 1]), draws=20)[0]
+        assert scale * theta == pytest.approx(5.0, abs=0.3), t
+
+
+def test_a_bucket_is_refused_when_its_held_out_designs_disagree():
+    measure = calibrate
+    rng = np.random.default_rng(0)
+    p = rng.uniform(40.0, 160.0, 128)
+    y = 70.0 + 0.9 * p + rng.normal(0.0, 0.5, 128)
+    scale, se, z = measure.fit_bucket(p, y, np.random.default_rng(1), draws=200)
+    assert abs(scale - 0.9) < 3 * se and abs(z) <= 3.0
+    y[3::4] += 0.2 * p[3::4]  # the held-out designs scale differently
+    assert abs(measure.fit_bucket(p, y, np.random.default_rng(1), draws=200)[2]) > 3.0
 
 
 def test_start_runtime_needs_torch_distributed(monkeypatch):
@@ -486,3 +546,227 @@ def test_a_moe_layer_runs_a_forward_through_the_load_balancer_hooks():
     assert slots.tolist() == [[0, 7], [10, 10]]
     assert torch.equal(layer.statistics.rows, _counts(2, 0, 0, 0, 0, 2, 0, 4))
     assert layer.statistics.forwards.item() == 1
+
+
+def _timer(read=6.0, held_out=1.0, touch=None, tiles=None, off=(8, 16)):
+    """A ``calibrate.LiveTimer`` stand-in: the times of a model with read cost ``read`` at scale
+    0.01 plus noise, every fourth design of the buckets ``off`` ``held_out`` times slower, a route
+    cost of 2 us, a bucket's tile ``tiles[tokens]`` rows (8); it calls ``touch()`` while it times."""
+
+    class Timer:
+        made = []
+
+        def __init__(self, backend, rank, num_experts, settings, gather):
+            self.reps, self.rng, self.host_us = settings.reps, np.random.default_rng(0), 1.0
+            Timer.made.append(self)
+
+        def designs(self, tokens, top_k, xs):
+            tile = (tiles or {}).get(tokens, 8)
+            unit = np.r_[read, FIELDS["per_extra_tile_us"] * tile / 8, 3, 4 * tile / 8]
+            truth = (calibrate.model_terms(xs, tile) @ unit).max(1)
+            truth[3::4] *= held_out if tokens in off else 1.0
+            (touch or (lambda: None))()
+            # Noise of 0.002 us: the fitted read cost then spreads by about 0.04 over noise draws,
+            # well inside the tests' 5% (0.3); at 0.02 it spread by 0.33.
+            return 5.0 + 0.01 * truth + self.rng.normal(0.0, 0.002, (self.reps, len(xs)))
+
+        def fixed(self, tokens, top_k, xs):
+            parts = np.zeros((self.reps, len(xs), 3)) + [0.0, 0.0, 2.0]
+            return parts + self.rng.normal(0.0, 0.01, parts.shape)
+
+    return Timer
+
+
+SMALL = dict(calibration_designs=32, calibration_fixed_designs=4)
+
+
+def test_a_miss_calibrates_in_the_warmup_and_caches_it_for_the_next_start(monkeypatch, tmp_path):
+    timer = _timer()
+    monkeypatch.setattr(calibrate, "LiveTimer", timer)
+    config = dict(SMALL, calibration_cache_dir=str(tmp_path))
+    balancer, _, seen, warnings = _prepare(monkeypatch, config=config)
+    assert "start" not in seen and not timer.made and not list(tmp_path.iterdir())
+    balancer.before_capture()
+    model, *_ = seen["start"]
+    assert balancer.off_reason is None and len(timer.made) == 1 and not warnings
+    assert [read for _, _, read, *_ in model.scales] == pytest.approx([6.0, 6.0], rel=0.05)
+    assert [scale for _, scale, *_ in model.scales] == pytest.approx([0.01, 0.01], rel=0.05)
+    assert model.route_us == pytest.approx(2.0, abs=0.05) and model.time_shares
+    # The cache, and beside it every bucket's design times to replay the fit with.
+    cached, times = sorted(tmp_path.iterdir(), key=lambda p: p.name.endswith(".times.json"))
+    buckets = {str(b["tokens"]) for b in json.loads(cached.read_text())["buckets"]}
+    assert set(json.loads(times.read_text())) == buckets
+    # The next start of the same run takes the cached calibration and calibrates nothing.
+    balancer, _, seen, _ = _prepare(monkeypatch, config=config)
+    balancer.before_capture()
+    assert seen["start"][0] == model and balancer.off_reason is None and len(timer.made) == 1
+    # Another identity (here its decode buckets) misses: its file is another one.
+    balancer, _, seen, _ = _prepare(monkeypatch, tokens=(8,), config=config)
+    balancer.before_capture()
+    assert (
+        "start" in seen and len(timer.made) == 2 and len(list(tmp_path.glob("*[0-9a-f].json"))) == 2
+    )
+
+
+def test_buckets_of_different_tiles_calibrate_and_price_each_at_its_own(monkeypatch, tmp_path):
+    tiles = {8: 8, 16: 16}  # tokens per GPU: rows of the MMA tile of the bucket's tactic
+    monkeypatch.setattr(calibrate, "LiveTimer", _timer(tiles=tiles))
+    balancer, _, seen, _ = _prepare(monkeypatch, config=SMALL, tiles=tiles)
+    balancer.before_capture()
+    model, *_ = seen["start"]
+    assert [bucket[5] for bucket in model.scales] == [8, 16]
+    assert [read for _, _, read, *_ in model.scales] == pytest.approx([6.0, 6.0], rel=0.05)
+    small, large = model.at(16), model.at(32)  # rows per GPU: tokens times top_k
+    assert (small.tile_rows, large.tile_rows) == (8, 16)
+    assert large.per_extra_tile_us == pytest.approx(2 * small.per_extra_tile_us)
+
+
+def test_a_bucket_failing_its_hold_out_check_has_no_model_and_the_others_serve(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(calibrate, "LiveTimer", _timer(held_out=1.5, off=(16,)))
+    config = dict(SMALL, calibration_cache_dir=str(tmp_path))
+    balancer, _, seen, warnings = _prepare(monkeypatch, config=config)
+    balancer.before_capture()
+    model, *_ = seen["start"]
+    assert [trusted for *_, trusted in model.scales] == [True, False]
+    assert (
+        len(warnings) == 1
+        and "adaptive EPLB bucket 16" in warnings[0]
+        and "held False" in warnings[0]
+    )
+    (cached,) = tmp_path.glob("*[0-9a-f].json")
+    assert [b["held"] for b in json.loads(cached.read_text())["buckets"]] == [True, False]
+    assert not model.at(32).trusted and model.at(16).trusted
+
+
+def test_every_bucket_failing_its_hold_out_check_keeps_adaptive_eplb_off(monkeypatch, tmp_path):
+    monkeypatch.setattr(calibrate, "LiveTimer", _timer())
+    monkeypatch.setattr(calibrate, "fit_bucket", lambda p, y, rng: (0.01, 0.001, 9.0))  # z beyond 3
+    config = dict(SMALL, calibration_cache_dir=str(tmp_path))
+    balancer, _, seen, warnings = _prepare(monkeypatch, config=config)
+    balancer.before_capture()
+    assert "start" not in seen and "held-out designs" in balancer.off_reason and warnings
+    assert [p.name.endswith(".times.json") for p in tmp_path.iterdir()] == [True]  # no cache
+
+
+def test_an_unwritable_cache_keeps_the_calibration_in_memory(monkeypatch, tmp_path):
+    monkeypatch.setattr(calibrate, "LiveTimer", _timer())
+    (tmp_path / "taken").write_text("")  # a file where the cache directory would be
+    config = dict(SMALL, calibration_cache_dir=str(tmp_path / "taken"))
+    balancer, _, seen, warnings = _prepare(monkeypatch, config=config)
+    balancer.before_capture()
+    assert "start" in seen and "in memory only" in warnings[0]
+
+
+@pytest.mark.parametrize("touched", ["route_tables", "statistics", "weights"])
+def test_the_calibration_must_leave_the_weights_and_the_balancer_state_unchanged(
+    monkeypatch, tmp_path, touched
+):
+    tensors = {}
+    monkeypatch.setattr(calibrate, "LiveTimer", _timer(touch=lambda: tensors[touched].add_(1)))
+    monkeypatch.setattr(calibrate, "DIGEST_WORDS", 2)  # the weights by their digest
+    balancer, _, seen, _ = _prepare(monkeypatch, config=SMALL)
+    tensors.update(
+        route_tables=balancer.route_tables("cpu"), statistics=balancer._statistics["rows"]
+    )
+    tensors["weights"] = balancer._pending[0].get_parameter("w")
+    with pytest.raises(RuntimeError, match="changed the weights or balancer state"):
+        balancer.before_capture()
+    assert "start" not in seen
+
+
+def test_a_state_change_on_another_rank_raises_on_every_rank_after_the_vote(monkeypatch):
+    def allgather(vote):  # EP rank 1 found its state changed; this rank's is not
+        after = isinstance(vote, tuple) and len(vote) == 2 and type(vote[0]) is bool
+        return [vote, (True, None) if after else vote]
+
+    monkeypatch.setattr(calibrate, "LiveTimer", _timer())
+    balancer, _, seen, _ = _prepare(monkeypatch, config=SMALL, allgather=allgather)
+    with pytest.raises(RuntimeError, match=r"balancer state: \[1\]"):
+        balancer.before_capture()
+    assert "start" not in seen
+
+
+def test_a_snapshot_widens_one_chunk_of_a_large_tensor_at_a_time(monkeypatch):
+    live, peak, widen = set(), [0], torch.Tensor.long
+
+    def long(self, *args, **kwargs):  # the int64 chunks alive at once
+        out = widen(self, *args, **kwargs)
+        live.add(id(out))
+        weakref.finalize(out, live.discard, id(out))
+        peak[0] = max(peak[0], len(live))
+        return out
+
+    monkeypatch.setattr(torch.Tensor, "long", long)
+    monkeypatch.setattr(calibrate, "DIGEST_WORDS", 4)
+    calibrate.snapshot([torch.arange(64, dtype=torch.int32)])  # 16 chunks
+    assert 0 < peak[0] <= 2
+
+
+@pytest.mark.parametrize("scale", [0.0, -0.5, float("nan"), float("inf")])
+def test_a_bucket_of_a_degenerate_scale_has_no_model_and_the_others_serve(monkeypatch, scale):
+    fits = iter([(0.01, 0.001, 0.0), (scale, 0.001, 0.0)])  # the buckets of 8 and 16 tokens
+    monkeypatch.setattr(calibrate, "fit_bucket", lambda p, y, rng: next(fits))
+    monkeypatch.setattr(calibrate, "LiveTimer", _timer())
+    balancer, _, seen, _ = _prepare(monkeypatch, config=SMALL)
+    balancer.before_capture()
+    assert [trusted for *_, trusted in seen["start"][0].scales] == [True, False]
+
+
+def test_a_file_bucket_out_of_range_has_no_model_and_the_others_serve(monkeypatch, tmp_path):
+    path = Path(_calibration(tmp_path))
+    doc = json.loads(path.read_text())
+    doc["buckets"][0].update(scale=-1.0, route_us=float("inf"))
+    path.write_text(json.dumps(doc))
+    _, _, seen, _ = _prepare(monkeypatch, str(path))
+    assert [trusted for *_, trusted in seen["start"][0].scales] == [False, True]
+
+
+def test_a_cache_that_does_not_parse_is_stale_and_recalibrated(monkeypatch, tmp_path):
+    timer = _timer()
+    monkeypatch.setattr(calibrate, "LiveTimer", timer)
+    config = dict(SMALL, calibration_cache_dir=str(tmp_path))
+    _prepare(monkeypatch, config=config)[0].before_capture()
+    (cached,) = tmp_path.glob("*[0-9a-f].json")
+    doc = json.loads(cached.read_text())
+    doc["identity"]["tile_rows"] = list(doc["identity"]["tile_rows"])  # a field of another type
+    cached.write_text(json.dumps(doc))
+    balancer, _, seen, _ = _prepare(monkeypatch, config=config)
+    balancer.before_capture()
+    assert "start" in seen and len(timer.made) == 2
+
+
+def test_the_calibration_settings_leave_every_fit_its_points():
+    MoeAdaptiveLoadBalancerConfig(
+        num_slots=NUM_SLOTS, calibration_designs=12, calibration_fixed_designs=2, calibration_reps=1
+    )
+    with pytest.raises(ValueError, match="calibration_designs"):
+        MoeAdaptiveLoadBalancerConfig(num_slots=NUM_SLOTS, calibration_designs=11)
+    with pytest.raises(ValueError, match="at least 2"):
+        MoeAdaptiveLoadBalancerConfig(
+            num_slots=NUM_SLOTS, calibration_fixed_designs=1, calibration_reps=1
+        )
+
+
+def test_one_slow_pass_of_one_design_leaves_the_read_cost(monkeypatch):
+    class Timer(_timer()):
+        def designs(self, tokens, top_k, xs):
+            y = super().designs(tokens, top_k, xs)
+            y[0, 5] *= 15.0  # one stalled launch: one pass of one design 15 times slower
+            return y
+
+    monkeypatch.setattr(calibrate, "LiveTimer", Timer)
+    balancer, _, seen, _ = _prepare(monkeypatch, config=SMALL)
+    balancer.before_capture()
+    model, *_ = seen["start"]
+    assert [read for _, _, read, *_ in model.scales] == pytest.approx([6.0, 6.0], rel=0.05)
+
+
+def test_forced_routes_realize_a_design_with_distinct_slots_per_token():
+    g = SimpleNamespace(ep=4, M=5, T=6, K=3, tile=4)
+    for x in calibrate.make_designs(g, 20, np.random.default_rng(0)):
+        ids = np.stack([calibrate.forced_routes(x, rank, g.K) for rank in range(g.ep)])
+        assert ids.shape == (g.ep, g.T, g.K)
+        assert (np.bincount(ids.ravel(), minlength=x.size).reshape(x.shape) == x).all()
+        assert (np.diff(np.sort(ids, -1), axis=-1) > 0).all()

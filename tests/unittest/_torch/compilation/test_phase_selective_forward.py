@@ -240,6 +240,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         reset_padding_dummies=Mock(),
     )
     graphs.preallocate_padding_dummies = Mock()
+    graphs._moe_load_balancer = None  # no load balancer: no work between the warmup passes
     warmup = object.__new__(DecoderWarmup)
     warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
     warmup.sparse_attention_config = None
