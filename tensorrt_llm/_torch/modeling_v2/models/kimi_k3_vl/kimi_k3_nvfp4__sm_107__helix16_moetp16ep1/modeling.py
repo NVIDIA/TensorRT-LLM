@@ -177,13 +177,13 @@ from ..kernels.k3r_gemm.low_m_bf16_splitk import SplitKTactic, run_splitk_dense
 from ..kernels.k3r_mla_decode.cute_dsl_mla import launch_mla_split_kv_plan
 from ..kernels.k3r_moe import k3_route_tail_ull  # noqa: F401 - registers the dispatcher op
 from ..kernels.k3r_spec.dspark_draft3 import draft_qhead, fold_rmsnorm_weight
-from ..kernels.k3r_spec.dspark_draft_ar_ull import (
+from ..kernels.k3r_spec.dspark_draft_ar import (
     ELTS,
     EMBED_THREADS,
     ar_norm_config,
     run_draft_ar_norm,
 )
-from ..kernels.k3r_spec.dspark_draft_gemm_push_ull import (
+from ..kernels.k3r_spec.dspark_draft_gemm_push import (
     ensure_cute_runtime,
     run_gemm_push,
     validate_push_tactic,
@@ -238,7 +238,7 @@ from ..ops.gemm.k3_fp8w_mid_gemm_push import k3_fp8w_mid_gemm_push as k3_fp8w_mi
 from ..ops.gemm.k3_mxfp8_gemm_ull import k3_mxfp8_gemm as k3_mxfp8_gemm_op
 from ..ops.norm.attn_res_fwd_ull import attn_res_fwd
 from ..ops.norm.k3_attn_res_norm_ull import k3_attn_res_norm
-from ..ops.spec.k3_draft_embed_ull import k3_draft_embed
+from ..ops.spec.k3_draft_embed import k3_draft_embed
 from ..ops.spec.k3_dspark_mla_ctx_norm_rope import k3_dspark_mla_ctx_norm_rope
 
 

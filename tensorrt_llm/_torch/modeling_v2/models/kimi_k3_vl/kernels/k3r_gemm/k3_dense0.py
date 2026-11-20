@@ -38,7 +38,7 @@ import torch
 from cutlass import Float32, Int32, Int64
 from cutlass.cute import experimental as cute_ext
 
-from ..k3r_spec.dspark_draft_gemm_push_ull import (
+from ..k3r_spec.dspark_draft_gemm_push import (
     SplitKArPushGemmKernel,
     _bmm_push,
     _make_layout_tensor,

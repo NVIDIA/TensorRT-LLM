@@ -231,8 +231,8 @@
     "kernels/k3r_spec/dspark_draft3.py": "_qhead_kernel (draft_qhead: inverse q_a RMS, block RoPE, latent RMSNorm, owner-masked FP8 block store, W_UK absorption, FP8 query); fold_rmsnorm_weight (host, once per layer)",
     "kernels/k3r_spec/dspark_ull2.py": "draft_helix_tail -> kernels/k3_helix_tail.py K3HelixTailKernel via mla.K3HelixTail",
     "kernels/k3r_gemm/low_m_bf16_splitk.py": "SplitKDenseGemmKernel (draft_gemm: ctx_latent, q_kv_a, q_b (folded weight, strided q_a rows), gate_up, lm_head)",
-    "kernels/k3r_spec/dspark_draft_gemm_push_ull.py": "SplitKArPushGemm (o_proj / down sites)",
-    "kernels/k3r_spec/dspark_draft_ar_ull.py": "DraftArNorm (sites), DraftEmbedKernel (draft_embed_site)",
+    "kernels/k3r_spec/dspark_draft_gemm_push.py": "SplitKArPushGemm (o_proj / down sites)",
+    "kernels/k3r_spec/dspark_draft_ar.py": "DraftArNorm (sites), DraftEmbedKernel (draft_embed_site)",
     "kernels/k3r_spec/dspark_mla_rope.py": "DSparkMlaCtxNormRoPEKernel (ops/spec/k3_dspark_mla_ctx_norm_rope)",
     "kernels/k3r_mla_decode/cute_dsl_mla.py": "_mla_split_kv_plan_kernel (launch_mla_split_kv_plan, piece_cost 60)",
     "kernels/k3r_mla_decode/mla_decode_fp8.py": "BlackwellMultiHeadLatentAttentionForwardFP8 (FP8 in, BF16 out, softmax stats, kv_bounds, per-request plan) via ops/attention/k3_mla_decode_fp8 (the served CuteDSLNVMlaDecodeBlackwellRunner's only tactic: tilers (128,128)/(128,256), default split of the batch's power-of-two bucket, non-persistent, reduce_unroll 8 (TRTLLM_K3_DRAFT3_REDUCE_UNROLL=8 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it)))"
