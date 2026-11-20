@@ -56,67 +56,60 @@ void expectNextSlice(char const* name, Slice const& slice, size_t size, size_t& 
     expectedOffset += tc::alignSize(size, kAlignment);
 }
 
-constexpr int32_t kBatchSize = 2;
-constexpr int32_t kInputSequenceLength = 11;
-constexpr int32_t kCrossKvLength = 7;
-constexpr int32_t kPackedTokenCount = 14;
-constexpr int32_t kHeadSize = 8;
-
-size_t expectedUnfusedContextWorkspace(bool crossAttention)
-{
-    constexpr size_t kElementSize = sizeof(half);
-    size_t const batchSize = kBatchSize;
-    size_t const inputSequenceLength = kInputSequenceLength;
-    size_t const kvSequenceLength = crossAttention ? kCrossKvLength : kInputSequenceLength;
-    size_t const paddedTokenCount = batchSize * inputSequenceLength;
-    size_t const paddedKvTokenCount = batchSize * kvSequenceLength;
-
-    tcop::AttentionContextWorkspaceSizes sizes{};
-    sizes.attentionMask = kElementSize * paddedTokenCount * kvSequenceLength;
-    sizes.cuQSeqlens = sizeof(int) * (batchSize + 1);
-    sizes.cuKvSeqlens = sizes.cuQSeqlens;
-    sizes.cuMaskRows = sizes.cuQSeqlens;
-    sizes.qBuf = kElementSize * paddedTokenCount * kHeadSize;
-    sizes.kBuf = kElementSize * paddedKvTokenCount * kHeadSize;
-    sizes.vBuf = sizes.kBuf;
-    sizes.qkBuf = kElementSize * batchSize * inputSequenceLength * kvSequenceLength;
-    sizes.qkvBuf = kElementSize * paddedTokenCount * kHeadSize;
-    sizes.qkFloatBuf = sizeof(float) * batchSize * inputSequenceLength * kvSequenceLength;
-    sizes.paddingOffset = sizeof(int) * paddedTokenCount;
-    sizes.encoderPaddingOffset = crossAttention ? sizeof(int) * batchSize * kCrossKvLength : 0;
-    sizes.tokensInfo = sizeof(int2) * kPackedTokenCount;
-    return tcop::AttentionWorkspaceManager::buildContextLayout(sizes).totalSize;
-}
-
-tcop::AttentionContextWorkspaceSizes getUnfusedContextSizes(bool crossAttention)
-{
-    return tcop::AttentionWorkspaceManager::buildUnfusedContextSizes({.elementSize = sizeof(half),
-        .batchSize = kBatchSize,
-        .querySequenceLength = kInputSequenceLength,
-        .kvSequenceLength = static_cast<size_t>(crossAttention ? kCrossKvLength : kInputSequenceLength),
-        .crossKvLength = static_cast<size_t>(crossAttention ? kCrossKvLength : 0),
-        .packedTokenCount = kPackedTokenCount,
-        .numQueryHeads = 1,
-        .numAttnKvHeads = 1,
-        .headSize = kHeadSize});
-}
-
 } // namespace
 
 TEST(AttentionWorkspaceManagerTest, RaggedUnfusedSelfAttentionUsesPaddedTokenCounts)
 {
-    auto const sizes = getUnfusedContextSizes(false);
+    auto const sizes = tcop::AttentionWorkspaceManager::buildUnfusedContextSizes({.elementSize = sizeof(half),
+        .batchSize = 4,
+        .querySequenceLength = 64,
+        .kvSequenceLength = 64,
+        .crossKvLength = 0,
+        .packedTokenCount = 100,
+        .numQueryHeads = 8,
+        .numAttnKvHeads = 2,
+        .headSize = 64});
+
+    EXPECT_EQ(sizes.attentionMask, 32768);
+    EXPECT_EQ(sizes.cuQSeqlens, 20);
+    EXPECT_EQ(sizes.cuKvSeqlens, 20);
+    EXPECT_EQ(sizes.cuMaskRows, 20);
+    EXPECT_EQ(sizes.qBuf, 262144);
+    EXPECT_EQ(sizes.kBuf, 65536);
+    EXPECT_EQ(sizes.vBuf, 65536);
+    EXPECT_EQ(sizes.qkBuf, 262144);
+    EXPECT_EQ(sizes.qkvBuf, 262144);
+    EXPECT_EQ(sizes.qkFloatBuf, 524288);
+    EXPECT_EQ(sizes.paddingOffset, 1024);
     EXPECT_EQ(sizes.encoderPaddingOffset, 0);
-    EXPECT_EQ(
-        tcop::AttentionWorkspaceManager::buildContextLayout(sizes).totalSize, expectedUnfusedContextWorkspace(false));
+    EXPECT_EQ(sizes.tokensInfo, 800);
 }
 
 TEST(AttentionWorkspaceManagerTest, RaggedUnfusedCrossAttentionUsesPaddedTokenCounts)
 {
-    auto const sizes = getUnfusedContextSizes(true);
-    EXPECT_EQ(sizes.encoderPaddingOffset, sizeof(int) * kBatchSize * kCrossKvLength);
-    EXPECT_EQ(
-        tcop::AttentionWorkspaceManager::buildContextLayout(sizes).totalSize, expectedUnfusedContextWorkspace(true));
+    auto const sizes = tcop::AttentionWorkspaceManager::buildUnfusedContextSizes({.elementSize = sizeof(half),
+        .batchSize = 4,
+        .querySequenceLength = 64,
+        .kvSequenceLength = 32,
+        .crossKvLength = 32,
+        .packedTokenCount = 100,
+        .numQueryHeads = 8,
+        .numAttnKvHeads = 2,
+        .headSize = 64});
+
+    EXPECT_EQ(sizes.attentionMask, 16384);
+    EXPECT_EQ(sizes.cuQSeqlens, 20);
+    EXPECT_EQ(sizes.cuKvSeqlens, 20);
+    EXPECT_EQ(sizes.cuMaskRows, 20);
+    EXPECT_EQ(sizes.qBuf, 262144);
+    EXPECT_EQ(sizes.kBuf, 32768);
+    EXPECT_EQ(sizes.vBuf, 32768);
+    EXPECT_EQ(sizes.qkBuf, 131072);
+    EXPECT_EQ(sizes.qkvBuf, 262144);
+    EXPECT_EQ(sizes.qkFloatBuf, 262144);
+    EXPECT_EQ(sizes.paddingOffset, 1024);
+    EXPECT_EQ(sizes.encoderPaddingOffset, 512);
+    EXPECT_EQ(sizes.tokensInfo, 800);
 }
 
 TEST(AttentionWorkspaceManagerTest, UnfusedGroupedQuerySizesDistinguishQueryAndKvHeads)
