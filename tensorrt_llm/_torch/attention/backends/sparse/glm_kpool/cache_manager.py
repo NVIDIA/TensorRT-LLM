@@ -381,6 +381,13 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             return 0
         return torch.int64.itemsize
 
+    @override
+    def _get_external_cache_bytes(self, cache) -> int:
+        external = super()._get_external_cache_bytes(cache)
+        if self._kda_replay is not None:
+            external += self._kda_replay.external_gpu_bytes(self._state_layout)
+        return external
+
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:

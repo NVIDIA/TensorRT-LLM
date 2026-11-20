@@ -462,6 +462,12 @@ def test_k3_prepare_interleaves_generation_slots_for_the_mtp_replay(mtp_replay: 
     pairs = metadata.generation_slot_pairs
     if not mtp_replay:
         assert pairs is None
+        # The fused verify takes 16-byte-aligned copies of the misaligned slices.
+        assert metadata.generation_state_indices.tolist() == [4, 7]
+        assert metadata.generation_replay_state_indices.tolist() == [0, 5]
         return
+    # The replay reads only the pairs: no aligned copies are made.
+    assert metadata.generation_state_indices is None
+    assert metadata.generation_replay_state_indices is None
     assert pairs.tolist() == [[4, 0], [7, 5]]
     assert pairs[:, 1].data_ptr() == pairs[:, 0].data_ptr() + 4

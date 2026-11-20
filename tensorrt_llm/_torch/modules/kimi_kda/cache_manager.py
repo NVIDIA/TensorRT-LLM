@@ -985,6 +985,10 @@ class KDAReplayState:
             raise RuntimeError("KDA replay buffers are not bound")
         return tuple(buffer for buffer in buffers if buffer is not None)
 
+    def external_gpu_bytes(self, context: MambaStateLayout) -> int:
+        """GPU bytes ``bind`` allocates outside the KV cache pools for ``context``."""
+        return 0
+
     def shutdown(self) -> None:
         self.pool_layers = None
         self._pool_views = None
@@ -1093,6 +1097,26 @@ class KDAMtpReplayState(KDAReplayState):
             dtype.itemsize * math.prod(shape) for dtype, shape in self.pool_layout(context).values()
         )
 
+    def _candidate_shape(self, context: MambaStateLayout) -> list[int]:
+        """``candidate_x``: every local layer's raw Conv inputs of a full verify batch."""
+        return [
+            len(context.mamba_pp_layers),
+            context.max_batch_size,
+            self.replay_step_width,
+            context.conv_state_shape[0],
+        ]
+
+    @override
+    def external_gpu_bytes(self, context: MambaStateLayout) -> int:
+        """``candidate_x`` and the commit's work items live outside the pools."""
+        if not context.mamba_pp_layers:
+            return 0
+        from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_commit import WI_MIN_WIDTH
+
+        candidate_bytes = math.prod(self._candidate_shape(context)) * torch.bfloat16.itemsize
+        work_item_bytes = context.max_batch_size * WI_MIN_WIDTH * torch.int32.itemsize
+        return candidate_bytes + work_item_bytes
+
     @override
     def bind(
         self,
@@ -1109,14 +1133,7 @@ class KDAMtpReplayState(KDAReplayState):
         device = ssm_states[0].device
         self._num_heads = context.ssm_state_shape[0]
         self.candidate_x = torch.zeros(
-            [
-                len(context.mamba_pp_layers),
-                context.max_batch_size,
-                self.replay_step_width,
-                context.conv_state_shape[0],
-            ],
-            dtype=torch.bfloat16,
-            device=device,
+            self._candidate_shape(context), dtype=torch.bfloat16, device=device
         )
         from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_commit import (
             WI_MIN_WIDTH,
@@ -2035,6 +2052,13 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if self._kda_replay is None or not self._kda_replay._stochastic_rounding:
             return 0
         return torch.int64.itemsize
+
+    @override
+    def _get_external_cache_bytes(self, cache) -> int:
+        external = super()._get_external_cache_bytes(cache)
+        if self._kda_replay is not None:
+            external += self._kda_replay.external_gpu_bytes(self._state_layout)
+        return external
 
     @classmethod
     @override

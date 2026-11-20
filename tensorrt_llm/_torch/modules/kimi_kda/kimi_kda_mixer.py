@@ -124,18 +124,8 @@ def _writeback_state_rows(
 def _packed_qkv_rows(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """``[..., 3 * D]`` raw q|k|v rows: a view when the sections are adjacent
     column blocks of one projection, otherwise a concatenated copy."""
-    width = q.shape[-1]
-    step = width * q.element_size()
-    if (
-        k.shape == q.shape
-        and v.shape == q.shape
-        and q.stride() == k.stride() == v.stride()
-        and q.stride(-1) == 1
-        and k.data_ptr() == q.data_ptr() + step
-        and v.data_ptr() == q.data_ptr() + 2 * step
-    ):
-        return q.as_strided((*q.shape[:-1], 3 * width), q.stride())
-    return torch.cat((q, k, v), dim=-1)
+    packed = _adjacent_sections_view(q, k, v)
+    return packed if packed is not None else torch.cat((q, k, v), dim=-1)
 
 
 def _kda_split_conv_sections(

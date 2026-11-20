@@ -405,10 +405,9 @@ def _kda_kernel(
         eb = cute.math.exp2(btv[t].to(f32) * f32(-LOG2E), approx=True, ftz=True)
         bet[t] = cute.math.rcp(f32(1.0) + eb, approx=True, ftz=True)
     # ---------------- cached history rows (kept in registers) ----------------
-    # Every row index is clamped rather than branched on: masked rows re-read
-    # row 0 (an L1 hit, no extra HBM traffic) and are selected away afterwards,
-    # which lets all of these loads be in flight at once instead of paying one
-    # full memory round trip per window slot.
+    # Only the L accepted rows are loaded; the rows at or past L stay zero and
+    # add nothing to the replay. Each K row is pre-scaled by its decay to the
+    # latest accepted row, exp(G[L - 1] - G[i]).
     prevG = f32(0.0)
     if L > 0:
         prevG = gHG[L - 1, tid]

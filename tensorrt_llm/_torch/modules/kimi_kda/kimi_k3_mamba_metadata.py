@@ -80,27 +80,27 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.generation_slot_pairs = None
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
-        if (
-            getattr(attn_metadata.kv_cache_manager, "use_kda_replay_update", False)
-            and batch_size > num_contexts
-        ):
-            self.generation_state_indices = self._aligned_generation_indices(
-                self.state_indices, self._generation_state_indices, num_contexts, batch_size
-            )
-            if self.replay_state_indices is self.state_indices:
-                self.generation_replay_state_indices = self.generation_state_indices
-            else:
-                self.generation_replay_state_indices = self._aligned_generation_indices(
-                    self.replay_state_indices,
-                    self._generation_replay_state_indices,
-                    num_contexts,
-                    batch_size,
-                )
-            if getattr(attn_metadata.kv_cache_manager, "use_kda_mtp_replay", False):
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        if getattr(kv_cache_manager, "use_kda_replay_update", False) and batch_size > num_contexts:
+            if getattr(kv_cache_manager, "use_kda_mtp_replay", False):
+                # The KDA MTP replay reads only the pairs, whatever the slices' alignment.
                 pairs = self._generation_slot_pairs[: batch_size - num_contexts]
                 pairs[:, 0].copy_(self.state_indices[num_contexts:batch_size])
                 pairs[:, 1].copy_(self.replay_state_indices[num_contexts:batch_size])
                 self.generation_slot_pairs = pairs
+            else:
+                self.generation_state_indices = self._aligned_generation_indices(
+                    self.state_indices, self._generation_state_indices, num_contexts, batch_size
+                )
+                if self.replay_state_indices is self.state_indices:
+                    self.generation_replay_state_indices = self.generation_state_indices
+                else:
+                    self.generation_replay_state_indices = self._aligned_generation_indices(
+                        self.replay_state_indices,
+                        self._generation_replay_state_indices,
+                        num_contexts,
+                        batch_size,
+                    )
 
         self.kda_max_seqlen = max(context_lengths, default=0)
         n = len(context_lengths)
