@@ -139,28 +139,31 @@ def test_invalid_startup_configuration_warns_and_uses_defaults() -> None:
 
 
 @pytest.mark.parametrize(
-    ("payload", "expected"),
+    ("payload", "expected_region", "expected"),
     [
         (
             r"""TRTLLM1:8:workflow{"quoted'\u96ea":"slash\\line\n\t'\u96ea"""
             r"""\ud83d\ude80","rank":-7,"ids":[]}""",
+            "workflow",
             {"quoted'雪": "slash\\line\n\t'雪🚀", "rank": -7, "ids": []},
         ),
         (
             "TRTLLM18:workflow{'quoted\\'key':'slash\\\\line\\n\\t\\'雪','rank':-7,'ids':[]}",
+            "workflow",
             {"quoted'key": "slash\\line\n\t'雪", "rank": -7, "ids": []},
         ),
         (
             "TRTLLM16:区域{'nested':{'values':[None,True,1.5,('x',-2)]}}",
+            "区域",
             {"nested": {"values": [None, True, 1.5, ("x", -2)]}},
         ),
     ],
 )
 def test_decoder_handles_native_and_unicode_golden_payloads(
-    payload: str, expected: dict[str, profiler.MetadataValue]
+    payload: str, expected_region: str, expected: dict[str, profiler.MetadataValue]
 ) -> None:
     region, metadata = decode_profiler_metadata(payload)
-    assert region in {"workflow", "区域"}
+    assert region == expected_region
     assert metadata == expected
 
 
