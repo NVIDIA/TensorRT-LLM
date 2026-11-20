@@ -199,7 +199,7 @@ class TestKVCacheStats:
 
 
 class TestRequestTransferMetrics:
-    def test_transfer_perf_metrics_count_once_across_candidates(self, collector):
+    def test_transfer_perf_metrics_count_once_across_candidates(self, collector, scrape):
         from tensorrt_llm.executor.result import GenerationResultBase
         from tensorrt_llm.sampling_params import SamplingParams
 
@@ -216,7 +216,7 @@ class TestRequestTransferMetrics:
         )
         stats = {
             RequestEventTiming.KV_CACHE_TRANSFER_START: 10.0,
-            RequestEventTiming.KV_CACHE_TRANSFER_END: 12.0,
+            RequestEventTiming.KV_CACHE_TRANSFER_END: 10.003,
             RequestEventTiming.KV_CACHE_SIZE: 1024,
         }
         for sequence_index in [0, 1]:
@@ -225,7 +225,13 @@ class TestRequestTransferMetrics:
             collector.log_request_metrics_dict(candidate)
         assert _get_counter_value(collector, "kv_cache_transfer_bytes") == 1024
         assert _get_histogram_count(collector, "histogram_kv_cache_transfer_duration") == 1
-        assert _get_histogram_sum(collector, "histogram_kv_cache_transfer_duration") == 2.0
+        assert _get_histogram_sum(
+            collector, "histogram_kv_cache_transfer_duration"
+        ) == pytest.approx(0.003)
+        buckets = "kv_cache_transfer_duration_seconds_bucket"
+        assert scrape(buckets, le="0.0025") == [0]
+        assert scrape(buckets, le="0.005") == [1]
+        assert scrape(buckets, le="600.0") == [1]
         assert MetricNames.KV_CACHE_TRANSFER_BYTES not in result.candidate_metrics[1]
         assert MetricNames.KV_CACHE_TRANSFER_TIME not in result.candidate_metrics[1]
         invalid = process_req_perf_metrics(
@@ -1873,7 +1879,7 @@ def test_iteration_record_exports_rank_owned_timings_and_transfer_outcomes(colle
     assert scrape("kv_cache_transfer_requests_total", dp_rank=1, outcome="timeout") == [2]
 
 
-def test_storage_report_exports_capacity_and_cumulative_movement(collector, scrape):
+def test_storage_report_exports_capacity_and_cumulative_movement(collector, scrape, mocker):
     report = KVCacheV2IterationStatsReport(
         {},
         {},
@@ -1888,19 +1894,26 @@ def test_storage_report_exports_capacity_and_cumulative_movement(collector, scra
                 "freeNumBlocks": 2,
                 "evictableNumBlocks": 3,
                 "restoredBlocks": 4,
+                "evictedBlocks": 0,
             }
         ],
     )
     record = IterationStatsRecord(IterationStats(), kv_iteration_stats=report, attention_dp_rank=3)
     collector.log_iteration_stats(record.to_dict())
-    for restored in (4, 6):
+    blocks = mocker.spy(collector.kv_cache_tier_moved_blocks, "labels")
+    moved_bytes = mocker.spy(collector.kv_cache_tier_moved_bytes, "labels")
+    collector.log_iteration_stats(record.to_dict())
+    blocks.assert_not_called()
+    moved_bytes.assert_not_called()
+    for restored in (6, 1, 2):
         report.storage_stats[0]["restoredBlocks"] = restored
         collector.log_iteration_stats(record.to_dict())
     labels = dict(dp_rank=3, cache_level=1, cache_tier="host", pool_group=2)
     assert scrape("kv_cache_tier_blocks", **labels, state="unavailable") == [5]
     assert scrape("kv_cache_tier_bytes", **labels, state="evictable") == [192]
-    assert scrape("kv_cache_tier_moved_blocks_total", **labels, operation="restore") == [6]
-    assert scrape("kv_cache_tier_moved_bytes_total", **labels, operation="restore") == [384]
+    assert scrape("kv_cache_tier_moved_blocks_total", **labels, operation="restore") == [7]
+    assert scrape("kv_cache_tier_moved_bytes_total", **labels, operation="restore") == [448]
+    assert scrape("kv_cache_tier_moved_blocks_total", **labels, operation="evict") == [0]
     assert not scrape("kv_cache_tier_blocks", dp_rank=0)
     assert scrape("kv_cache_num_conversations", dp_rank=3) == [7]
 

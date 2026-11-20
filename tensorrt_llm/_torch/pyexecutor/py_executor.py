@@ -9118,11 +9118,13 @@ class PyExecutor:
             snapshots = [(state.rank, state.iter_stats.kv_transfer_outcomes,
                           state.iter_stats.conversation_activity)
                          for state in rank_states]
-            self._next_adp_activity_refresh = time.monotonic() + min(
+            refresh_after = min(
                 (activity.refresh_after_ms / 1000
                  for _, _, activity in snapshots
                  if activity is not None and activity.refresh_after_ms),
                 default=math.inf)
+            self._next_adp_activity_refresh = time.monotonic() + max(
+                IDLE_HEARTBEAT_PERIOD_S, refresh_after)
         changed = {}
         for rank, outcomes, activity in snapshots:
             if activity is not None and activity.refresh_after_ms:

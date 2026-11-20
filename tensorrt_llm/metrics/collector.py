@@ -453,10 +453,7 @@ class PrometheusExposure:
             name=self.metric_prefix + "kv_cache_transfer_duration_seconds",
             documentation=
             "Completed-request KV-transfer elapsed time in seconds",
-            buckets=[
-                0.0001, 0.001, 0.01, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300,
-                600
-            ],
+            buckets=(*_PROCESSING_TIME_BUCKETS, 60.0, 120.0, 300.0, 600.0),
             labelnames=self.labels.keys())
         self.kv_cache_transfer_bytes = Counter(
             name=self.metric_prefix + "kv_cache_transfer_bytes_total",
@@ -1029,9 +1026,12 @@ class PrometheusExposure:
                 if not isinstance(value, int) or isinstance(value,
                                                             bool) or value < 0:
                     continue
-                delta = self._snapshot_delta(
-                    self._prev_tier_movement,
-                    (rank, level, pool_group, operation), value)
+                key = (rank, level, pool_group, operation)
+                first = key not in self._prev_tier_movement
+                delta = self._snapshot_delta(self._prev_tier_movement, key,
+                                             value)
+                if not delta and not first:
+                    continue
                 movement_labels = {**labels, "operation": operation}
                 self._log_counter(self.kv_cache_tier_moved_blocks,
                                   movement_labels, delta)
