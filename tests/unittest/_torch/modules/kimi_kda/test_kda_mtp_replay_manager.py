@@ -141,6 +141,33 @@ def _reason_without_device_checks(**kwargs):
     return None
 
 
+def test_packed_qkv_rows_views_only_one_projection():
+    """Slices of one fused projection pack as a view; separate projections whose
+    storages merely sit back to back are concatenated."""
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _packed_qkv_rows
+
+    fused = torch.randn(2, 3, 3 * DIM).bfloat16()
+    q, k, v = fused.split(DIM, dim=-1)
+    packed = _packed_qkv_rows(q, k, v)
+    assert packed.data_ptr() == fused.data_ptr()
+    assert torch.equal(packed, fused)
+
+    # Three storages at adjacent addresses: Q's storage holds Q only.
+    buffer = bytearray(3 * DIM * torch.bfloat16.itemsize)
+    q, k, v = (
+        torch.frombuffer(
+            buffer, dtype=torch.bfloat16, count=DIM, offset=i * DIM * torch.bfloat16.itemsize
+        ).view(1, 1, DIM)
+        for i in range(3)
+    )
+    for section in (q, k, v):
+        section.copy_(torch.randn(1, 1, DIM).bfloat16())
+    assert k.data_ptr() == q.data_ptr() + DIM * torch.bfloat16.itemsize
+    packed = _packed_qkv_rows(q, k, v)
+    assert packed.untyped_storage().data_ptr() != q.untyped_storage().data_ptr()
+    assert torch.equal(packed, torch.cat((q, k, v), dim=-1))
+
+
 def test_kimi_factory_passes_kda_mtp_replay_for_the_pytorch_mixer(monkeypatch):
     from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
     from tensorrt_llm._torch.pyexecutor import _util
@@ -185,8 +212,9 @@ def _manager(manager_cls=KimiK3HybridCacheManager, num_spec=2, **kwargs):
         mamba_layer_mask=[True] * num_layers + [False],
         mamba_cache_dtype=torch.bfloat16,
         mamba_ssm_cache_dtype=kwargs.pop("ssm_cache_dtype", torch.float32),
-        kv_cache_config=KvCacheConfig(
-            max_tokens=4096, enable_block_reuse=False, max_util_for_resume=1.0
+        kv_cache_config=kwargs.pop(
+            "kv_cache_config",
+            KvCacheConfig(max_tokens=4096, enable_block_reuse=False, max_util_for_resume=1.0),
         ),
         kv_cache_type=CacheTypeCpp.SELF,
         num_layers=1,
@@ -204,6 +232,45 @@ def _manager(manager_cls=KimiK3HybridCacheManager, num_spec=2, **kwargs):
         kda_replay_num_spec=num_spec,
         **kwargs,
     )
+
+
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
+def test_kda_mtp_replay_buffers_fit_the_gpu_byte_budget(manager_cls):
+    """The candidate rows and work items, allocated outside the pools, count against
+    max_gpu_total_bytes: the native pools shrink to leave room for them."""
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
+
+    _requires_mtp_replay_kernels()
+    mgr = _manager(manager_cls, kda_mtp_replay=True)
+    try:
+        external = mgr._get_external_cache_bytes(mgr.impl)
+        candidate_x = mgr._kda_replay.candidate_x
+        work_items = mgr._kda_replay._work_items
+        assert external == (
+            candidate_x.numel() * candidate_x.element_size()
+            + work_items.numel() * work_items.element_size()
+        )
+        # A byte limit sizes the native pools to the whole budget first; the fit
+        # must then shrink them by the external bytes.
+        byte_limit = mgr.impl.get_quota(GPU_LEVEL) + external
+    finally:
+        mgr.shutdown()
+    mgr = _manager(
+        manager_cls,
+        kda_mtp_replay=True,
+        kv_cache_config=KvCacheConfig(
+            max_gpu_total_bytes=byte_limit, enable_block_reuse=False, max_util_for_resume=1.0
+        ),
+    )
+    try:
+        assert mgr.use_kda_mtp_replay
+        native = mgr.impl.get_quota(GPU_LEVEL)
+        assert mgr._get_external_cache_bytes(mgr.impl) == external
+        assert native + external <= byte_limit
+        assert native < byte_limit
+        assert mgr._kda_replay.candidate_x is not None
+    finally:
+        mgr.shutdown()
 
 
 @pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
