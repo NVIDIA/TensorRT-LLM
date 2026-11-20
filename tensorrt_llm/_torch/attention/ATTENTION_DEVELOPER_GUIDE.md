@@ -504,7 +504,30 @@ The main differences across backends:
 
 Each `TrtllmAttention` owns a `FmhaManager` that constructs the layer's FMHA
 libraries, performs phase-aware selection, and caches request-dependent
-selections. By default the candidates follow the order in `fmha/registry.py`.
+selections. Existing callers can omit `fmha_libs` to keep using the ordered
+`DEFAULT_FMHA_LIBS` in `fmha/registry.py`.
+
+For a shared library that callers can opt into, decorate the class with
+`@fmha_lib("name")` and import its module in `fmha/__init__.py`. This makes the
+name available to `fmha_libs` and `TLLM_FMHA_LIBS`. Choose a unique name
+in the process-wide registry. Registration alone leaves the default
+candidates unchanged. Add the name to `DEFAULT_FMHA_LIBS` only
+when layers using the defaults should consider the library automatically.
+Validate its availability, request support, and position in the default
+order as part of that change.
+
+For a Modeling V2 target that customizes TRTLLM attention, keep a model-only
+implementation in its family or target and pass the unregistered `Fmha`
+subclass directly in `fmha_libs`. List every candidate the model intends to
+use in order, including any shared libraries needed as fallbacks after
+preferred libraries. Maintain that list in the model so that changes to
+`DEFAULT_FMHA_LIBS` do not carry over to explicit lists. If a model-owned
+library needs selection by name through `TLLM_FMHA_LIBS`, register it
+without adding it to the defaults and import its module before the
+environment variable is parsed. The name is visible process-wide after
+import. Keep its availability and support checks aligned with the model's
+requirements.
+
 Pass `fmha_libs` to `create_attention()` or `TrtllmAttention` to supply the
 layer's complete ordered list. Its entries are names registered with
 `@fmha_lib("name")` or FMHA classes that accept the owning attention in their
@@ -548,14 +571,16 @@ raw FP8 E4M3 query input and custom masks. Keep this admission contract aligned
 with the native `AttentionOp` input requirements.
 
 `TLLM_FMHA_LIBS` accepts an exact list of registered names in selection order
-or a list of `+name` and `-name` entries. An exact list replaces the candidates.
-In a signed list, `+name` moves or adds the corresponding class to the front
-in the order written, and `-name` removes it. The last operation for a name
-determines whether it is included. These overrides also apply to explicit
-`fmha_libs` lists unless `use_fmha_libs_env=False`. With `fmha_libs=None`, legacy
-prepended classes still come before the resolved global candidates and remain
-outside these environment overrides. An explicit `fmha_libs` list replaces
-that legacy prepend path.
+or a list of `+name` and `-name` entries. An exact list replaces the layer's
+entire candidate list, including any anonymous classes. In a signed list,
+`+name` moves or adds the corresponding class to the front in the order
+written, and `-name` removes it. The last operation for a name determines
+whether it is included. The environment variable addresses only registered
+names. Set `use_fmha_libs_env=False` to skip these candidate-list overrides
+for a layer. Shared metadata still reads the global setting. With
+`fmha_libs=None`, legacy prepended classes still come before the resolved
+global candidates and remain outside these environment overrides. An
+explicit `fmha_libs` list replaces that legacy prepend path.
 
 Dense PrimTS is opt-in because it may add host overhead. Use
 `TLLM_FMHA_LIBS=+prims_ts` to enable it or `TLLM_FMHA_LIBS=fallback` to select
