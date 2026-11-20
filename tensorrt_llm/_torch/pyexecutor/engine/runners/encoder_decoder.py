@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.host_staging import staged_encode, staged_uploader
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
@@ -80,9 +81,6 @@ class EncoderStage(EncoderMixin):
             moe_load_balancer=moe_load_balancer,
             attention_runtime_features=attention_runtime_features,
         )
-        self._feature_staging: torch.Tensor | None = None
-        self._feature_staging_event: torch.cuda.Event | None = None
-        self._feature_copy_stream: torch.cuda.Stream | None = None
 
     def _build_attention_metadata(
         self,
@@ -232,44 +230,11 @@ class EncoderStage(EncoderMixin):
         if not uniform:
             return torch.cat(features, dim=0).to("cuda", non_blocking=True)
 
-        rows = sum(feature.shape[0] for feature in features)
-        staging = self._feature_staging
-        if (
-            staging is None
-            or staging.dtype != first.dtype
-            or staging.shape[1:] != first.shape[1:]
-            or staging.shape[0] < rows
-        ):
-            if staging is not None:
-                assert self._feature_staging_event is not None
-                self._feature_staging_event.synchronize()
-            staging = torch.empty(
-                (rows, *first.shape[1:]),
-                dtype=first.dtype,
-                pin_memory=prefer_pinned(),
-            )
-            self._feature_staging = staging
-            self._feature_staging_event = torch.cuda.Event()
-            if self._feature_copy_stream is None:
-                self._feature_copy_stream = torch.cuda.Stream()
-        else:
-            assert self._feature_staging_event is not None
-            self._feature_staging_event.synchronize()
-
-        offset = 0
+        pieces, rows = [], 0
         for feature in features:
-            staging[offset : offset + feature.shape[0]].copy_(feature)
-            offset += feature.shape[0]
-
-        assert self._feature_copy_stream is not None
-        assert self._feature_staging_event is not None
-        consumer_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(self._feature_copy_stream):
-            packed = staging[:rows].to("cuda", non_blocking=True)
-            self._feature_staging_event.record()
-        consumer_stream.wait_event(self._feature_staging_event)
-        packed.record_stream(consumer_stream)
-        return packed
+            pieces.append((feature, (rows,) + (0,) * (feature.dim() - 1)))
+            rows += feature.shape[0]
+        return staged_uploader("cuda").upload_pieces((rows, *first.shape[1:]), first.dtype, pieces)
 
     def warmup(self, resource_manager: ResourceManager) -> None:
         """Warm up and capture the encoder graph shapes."""
@@ -346,15 +311,22 @@ class EncoderStage(EncoderMixin):
         *,
         resource_manager: ResourceManager,
     ) -> dict[str, Any]:
-        prepared = self._prepare_inputs(
-            inputs.batch,
-            resource_manager=resource_manager,
-        )
-        hidden_states = self._execute_prepared(prepared)
+        # One encode for the uploader's bound on the feature batches its pool holds, ended once
+        # the pass dropped them, also after an error (`staged_encode`). Encoder-decoder models
+        # skip the KV-cache estimate, so the bound stays at its default and nothing is reserved.
+        with staged_encode():
+            hidden_states, sequence_lengths = self._encode(inputs.batch, resource_manager)
         return {
             "encoder_hidden_states": hidden_states,
-            "encoder_seq_lens": prepared.sequence_lengths,
+            "encoder_seq_lens": sequence_lengths,
         }
+
+    def _encode(
+        self, batch: ScheduledRequests, resource_manager: ResourceManager
+    ) -> tuple[torch.Tensor, list[int]]:
+        """One encoder pass; its inputs live only in this call."""
+        prepared = self._prepare_inputs(batch, resource_manager=resource_manager)
+        return self._execute_prepared(prepared), prepared.sequence_lengths
 
     def _forward_encoder_stack(self, inputs: dict[str, Any]) -> torch.Tensor:
         encoder = getattr(self._model, "encoder", None)

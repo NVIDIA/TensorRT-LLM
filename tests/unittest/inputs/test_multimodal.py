@@ -18,6 +18,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
+    _batch_item_values,
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
     select_multimodal_fields,
@@ -157,6 +158,80 @@ def test_item_partition_rejects_out_of_bounds_indices(index: int, packed: bool) 
         MultimodalItemPartition(item_lengths=lengths).select(values, [index])
 
 
+def _rows(*markers_and_rows, dtype=torch.float32):
+    """A packed payload: ``rows`` rows holding ``marker`` per item."""
+    return torch.cat(
+        [torch.full((rows, 1), float(marker)) for marker, rows in markers_and_rows]
+    ).to(dtype)
+
+
+class TestBatchItemValues:
+    """How the encoder builder batches the item values of one declared key."""
+
+    def test_one_row_per_item(self):
+        first, second = torch.arange(6.0).reshape(2, 3), torch.arange(3.0).reshape(1, 3) + 10
+        assert torch.equal(_batch_item_values([first, second], 0), torch.cat([first, second]))
+
+    def test_ragged_item_dims_are_zero_padded_at_their_end(self):
+        first = torch.arange(30, dtype=torch.float32).reshape(2, 5, 3) + 1
+        second = torch.arange(9, dtype=torch.float32).reshape(1, 3, 3) + 100
+        value = _batch_item_values([first, second], 0)
+        assert value.shape == (3, 5, 3) and value.dtype == torch.float32
+        assert torch.equal(value[:2], first)
+        assert torch.equal(value[2, :3], second[0])
+        assert torch.equal(value[2, 3:], torch.zeros(2, 3))
+
+    def test_bool_values_are_padded_with_false(self):
+        value = _batch_item_values(
+            [torch.ones(2, 5, dtype=torch.bool), torch.ones(1, 3, dtype=torch.bool)], 0
+        )
+        assert value.dtype == torch.bool
+        assert value.tolist() == [[True] * 5, [True] * 5, [True] * 3 + [False] * 2]
+
+    def test_ragged_middle_piece_is_padded(self):
+        # The first and last pieces agree, so batching tries a plain concatenation first.
+        value = _batch_item_values(
+            [torch.full((1, 3), 1.0), torch.full((1, 2), 2.0), torch.full((1, 3), 3.0)], 0
+        )
+        assert value.tolist() == [[1.0, 1.0, 1.0], [2.0, 2.0, 0.0], [3.0, 3.0, 3.0]]
+
+    def test_padding_value_fills_the_added_entries(self):
+        # Position ids whose -1 marks padding pad with -1, not zero.
+        first = torch.arange(6).reshape(1, 3, 2)
+        second = torch.tensor([[[7, 7], [-1, -1]]])
+        value = _batch_item_values([first, second], 0, padding_value=-1)
+        assert value.tolist() == [
+            [[0, 1], [2, 3], [4, 5]],
+            [[7, 7], [-1, -1], [-1, -1]],
+        ]
+
+    def test_other_dims_of_a_non_leading_item_axis_are_padded(self):
+        # Audio-like features [mel, frames] packed along the frame axis.
+        first = torch.ones(2, 3)
+        second = torch.full((4, 2), 2.0)
+        value = _batch_item_values([first, second], 1)
+        assert value.shape == (4, 5)
+        assert torch.equal(value[:2, :3], first)
+        assert torch.equal(value[2:, :3], torch.zeros(2, 3))
+        assert torch.equal(value[:, 3:], second)
+
+    def test_single_piece(self):
+        piece = _rows((1, 2), (2, 1))
+        assert torch.equal(_batch_item_values([piece], 0), piece)
+
+    def test_lists_are_batched_on_item_axis_zero(self):
+        assert _batch_item_values([[(4, 6), (2, 2)], [(8, 8)]], 0) == [(4, 6), (2, 2), (8, 8)]
+
+    def test_pieces_must_share_dtype_and_rank(self):
+        with pytest.raises(ValueError, match="share dtype and rank"):
+            _batch_item_values([torch.zeros(1, 2), torch.zeros(1, 2, dtype=torch.bfloat16)], 0)
+        with pytest.raises(ValueError, match="share dtype and rank"):
+            _batch_item_values([torch.zeros(1, 2), torch.zeros(1, 2, 1)], 0)
+        with pytest.raises(ValueError, match="share dtype and rank"):
+            # torch.cat alone would accept the empty 1-D piece and return two rows.
+            _batch_item_values([torch.ones(1, 2), torch.empty(0), torch.ones(1, 2)], 0)
+
+
 def test_media_modalities_match_io_and_validation_contract() -> None:
     assert MEDIA_MODALITIES == get_args(MediaModality) == ("image", "video", "audio")
     assert set(MEDIA_MODALITIES) == set(MEDIA_IO_REGISTRY)
@@ -293,6 +368,18 @@ def test_mm_item_metadata_selection_rebases_refs_without_mutating_source(
     assert metadata.encoder_token_lengths == (20, 50, 30, 40)
     assert metadata.output_embedding_lengths == (2, 5, 3, 4)
     assert subset is not metadata
+
+
+@pytest.mark.parametrize("indices", [[1], [1, 0]], ids=["one_item", "items"])
+def test_item_metadata_selection_keeps_padding_values(indices) -> None:
+    padded = MultimodalItemPartition(item_lengths=(2, 3), padding_value=-1)
+    metadata = MultimodalItemMetadata(
+        [("image", 0), ("image", 1)],
+        input_partitions={"image": {"positions": padded}},
+    )
+    selected = metadata.select(indices).input_partitions["image"]["positions"]
+    assert selected.padding_value == -1
+    assert selected.item_lengths == tuple(padded.item_lengths[i] for i in indices)
 
 
 @pytest.mark.parametrize("indices", [[3, 0, 2], [2, 0], [-1, 0], [], [1, 1]])

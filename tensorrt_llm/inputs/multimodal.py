@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from blake3 import blake3
 
-from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
 from tensorrt_llm.inputs.multimodal_data import (MEDIA_MODALITIES,
                                                  BaseModalityData, VideoData,
                                                  _hash_serialized_item)
@@ -43,11 +43,15 @@ class MultimodalItemPartition(NamedTuple):
     for a value shared by every item. Lists and tuples have item axis zero.
     ``item_lengths`` partitions a packed input along that axis, for example
     patch counts for vision or frame counts for audio. Lengths are host-side
-    metadata, independent of the payload tensor's device.
+    metadata, independent of the payload tensor's device. ``padding_value``
+    fills the other dims of a tensor input when items of different sizes are
+    batched together for one encoder call: zero (False for bool) by default,
+    or for example ``-1`` for position ids whose ``-1`` marks padding.
     """
 
     item_axis: int | None = 0
     item_lengths: tuple[int, ...] | None = None
+    padding_value: int | float = 0
 
     def select(self, value: Any, item_indices: Sequence[int]) -> Any:
         """Select items in the requested order, preserving tensor dtype/device.
@@ -59,7 +63,7 @@ class MultimodalItemPartition(NamedTuple):
         read-only. Other selections copy only the selected items; shared values
         retain identity.
         """
-        axis, lengths = self
+        axis, lengths = self.item_axis, self.item_lengths
         if axis is None or value is None:
             return value
         if isinstance(value, torch.Tensor):
@@ -138,6 +142,110 @@ def select_multimodal_fields(
         if name in modality_data:
             selected[name] = partition.select(modality_data[name], item_indices)
     return selected
+
+
+def _batch_item_values(values: Sequence[Any],
+                       axis: int,
+                       padding_value: int | float = 0,
+                       device: str | torch.device | None = None) -> Any:
+    """Batch the item values of one input field along ``axis``.
+
+    Tensors whose other dims differ are padded at the end of those dims with
+    ``padding_value`` (`_cat_padded`); lists and tuples are concatenated on
+    item axis zero. The encoder builder batches each declared key with it.
+    With ``device``, the batch is made on that device: host tensors are copied
+    once, straight into their place (`_batch_to_device`), and tensors in lists
+    are moved as ``MultimodalParams.to_device`` moves them.
+    """
+    first = values[0]
+    if isinstance(first, torch.Tensor):
+        if device is None:
+            return _cat_padded(values, axis, padding_value)
+        return _batch_to_device(values, axis, padding_value, device)
+    if isinstance(first, (list, tuple)) and axis == 0:
+        batched = type(first)([item for items in values for item in items])
+        return batched if device is None else _move_to_device(batched, device)
+    raise TypeError(
+        "Item fields must be tensors or lists/tuples on item axis zero")
+
+
+def _move_to_device(value: Any, device: str | torch.device) -> Any:
+    """Move the tensors in ``value`` as ``MultimodalParams.to_device`` does."""
+    return MultimodalParams()._apply_tensor_operation(
+        value, "to_device", device=device, pin_memory=prefer_pinned())
+
+
+def _batch_to_device(values: Sequence[torch.Tensor], axis: int,
+                     padding_value: int | float,
+                     device: str | torch.device) -> torch.Tensor:
+    """Make the `_cat_padded` result on ``device`` straight from host values.
+
+    The device's `StagedUploader` allocates the batch once on its copy stream
+    and copies each host value into its place through its pinned staging
+    buffers, so nothing is copied on the device and the copies do not queue
+    behind compute. Values already on a device, Confidential Compute (pageable
+    copies) and stream capture take the per-value copy and device `_cat_padded`;
+    every value is moved to ``device`` (one already there is used as it is).
+    """
+    from tensorrt_llm._torch.host_staging import staged_uploader
+    first = values[0]
+    if len({(value.dtype, value.ndim) for value in values}) > 1:
+        raise ValueError("Item tensors of one field must share dtype and rank")
+    if (any(value.device.type != "cpu" for value in values)
+            or not prefer_pinned() or torch.cuda.is_current_stream_capturing()):
+        moved = [(maybe_pin_memory(value) if value.device.type == "cpu" else
+                  value).to(device, non_blocking=True) for value in values]
+        return _cat_padded(moved, axis, padding_value)
+    axis %= first.dim()
+    shapes = [value.shape for value in values]
+    padded = [max(sizes) for sizes in zip(*shapes)]
+    padded[axis] = sum(shape[axis] for shape in shapes)
+    ragged = any(shape[dim] != padded[dim] for shape in shapes
+                 for dim in range(first.dim()) if dim != axis)
+    starts = accumulate((shape[axis] for shape in shapes), initial=0)
+    return staged_uploader(device).upload_pieces(
+        padded, first.dtype,
+        [(value, [start if dim == axis else 0 for dim in range(first.dim())])
+         for value, start in zip(values, starts)],
+        padding_value if ragged else None)
+
+
+def _cat_padded(values: Sequence[torch.Tensor], axis: int,
+                padding_value: int | float) -> torch.Tensor:
+    """Concatenate along ``axis``, padding other dims at their end.
+
+    Values whose other dims agree take one ``torch.cat``, which checks the
+    sizes itself; the first and last value pick that path. Otherwise each
+    value is copied into its span of one tensor filled with ``padding_value``.
+    """
+    first = values[0]
+    # Checked before torch.cat, which also accepts a 1-D empty tensor next to
+    # tensors of another rank.
+    if len({(value.dtype, value.ndim) for value in values}) > 1:
+        raise ValueError("Item tensors of one field must share dtype and rank")
+    axis %= first.dim()
+    head, tail = first.shape, values[-1].shape
+    if head[:axis] + head[axis + 1:] == tail[:axis] + tail[axis + 1:]:
+        try:
+            return torch.cat(values, dim=axis)
+        except RuntimeError:
+            # Another value differs in its other dims: pad below. Re-raise other errors.
+            if len({
+                    value.shape[:axis] + value.shape[axis + 1:]
+                    for value in values
+            }) == 1:
+                raise
+    shapes = [value.shape for value in values]
+    padded = [max(sizes) for sizes in zip(*shapes)]
+    spans = [shape[axis] for shape in shapes]
+    padded[axis] = sum(spans)
+    batched = first.new_full(padded, padding_value)
+    for value, span in zip(values, batched.split_with_sizes(spans, axis)):
+        for dim, size in enumerate(value.shape):
+            if size != padded[dim] and dim != axis:
+                span = span.narrow(dim, 0, size)
+        span.copy_(value)
+    return batched
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -252,7 +360,8 @@ class MultimodalItemMetadata:
                         name:
                         partition if partition.item_lengths is None else
                         MultimodalItemPartition(partition.item_axis, (
-                            partition.item_lengths[local_index], ))
+                            partition.item_lengths[local_index], ),
+                                                partition.padding_value)
                         for name, partition in partitions.items()
                     }
                 },
@@ -268,11 +377,12 @@ class MultimodalItemMetadata:
         for modality, indices in local_indices.items():
             if modality in self.input_partitions:
                 partitions[modality] = {
-                    name: (partition if partition.item_lengths is None else
-                           MultimodalItemPartition(
-                               partition.item_axis,
-                               tuple(partition.item_lengths[i]
-                                     for i in indices)))
+                    name:
+                    (partition if partition.item_lengths is None else
+                     MultimodalItemPartition(
+                         partition.item_axis,
+                         tuple(partition.item_lengths[i]
+                               for i in indices), partition.padding_value))
                     for name, partition in
                     self.input_partitions[modality].items()
                 }

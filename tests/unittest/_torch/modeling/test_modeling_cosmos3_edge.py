@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -23,9 +24,15 @@ from tensorrt_llm._torch.models.modeling_cosmos3_edge import (
     Cosmos3EdgeImageProcessor,
     Cosmos3EdgeInputProcessor,
     Cosmos3EdgeModel,
+    Cosmos3EdgeVisionEncoder,
+    _cpu_int_rows,
     _edge_positional_embedding_params,
     merge_spatial_patches,
     resize_positional_embeddings_packed,
+)
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
+    MultimodalEncoderContractError,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionPatchMerger
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -144,6 +151,42 @@ class _FakeTokenizer:
     def __call__(self, prompt, return_tensors=None):
         assert return_tensors == "pt"
         return SimpleNamespace(input_ids=torch.tensor([self.input_ids]))
+
+
+def _edge_image_param(
+    processor: Cosmos3EdgeInputProcessor, pixels: torch.Tensor, grid: torch.Tensor
+) -> MultimodalParams:
+    """One image request, with the item record the processor makes for it."""
+    config = processor.config
+    image = {"pixel_values": pixels, "image_grid_thw": grid}
+    rows = int(grid.prod()) // processor.spatial_merge_unit
+    prompt_token_ids = [
+        11,
+        config.vision_start_token_id,
+        *[config.image_token_id] * rows,
+        config.vision_end_token_id,
+        12,
+    ]
+    # The processor declares the payload partitions the encoder batches.
+    metadata = processor.get_mm_item_metadata(prompt_token_ids, {"image": image})
+    metadata.validate()
+    return MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[rows],
+        ),
+        multimodal_data={
+            "image": image,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+            "mm_processor_kwargs_hash": "edge-review",
+        },
+        multimodal_runtime=MultimodalRuntimeData(
+            embed_mask_cumsum=torch.arange(1, rows + 1, dtype=torch.int64),
+            past_seen_token_num=0,
+            chunk_end_pos=rows,
+        ),
+    )
 
 
 @pytest.mark.cpu_only
@@ -373,6 +416,12 @@ class TestCosmos3Edge(_qwen3vl.TestQwen3VL):
         pixels = torch.randn(height * width, patch_dim, device="cuda")
         grid = torch.tensor([[1, height, width]], dtype=torch.int64)
         model.mm_encoder.setup_attn_metadata(max_num_tokens=max(64, height * width))
+        image_token_id = self.hf_config.image_token_id
+        vision_start = self.hf_config.vision_start_token_id
+        vision_end = self.hf_config.vision_end_token_id
+        processor = object.__new__(Cosmos3EdgeInputProcessor)
+        processor._config = self.hf_config
+        processor._tokenizer = _FakeTokenizer([11, vision_start, image_token_id, vision_end, 12])
 
         calls = {"n": 0}
         visual_forward = model.mm_encoder.visual.forward
@@ -385,25 +434,7 @@ class TestCosmos3Edge(_qwen3vl.TestQwen3VL):
         try:
 
             def image_param():
-                return MultimodalParams(
-                    multimodal_input=MultimodalInput(
-                        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
-                        multimodal_positions=[1],
-                        multimodal_lengths=[rows],
-                    ),
-                    multimodal_data={
-                        "image": {"pixel_values": pixels, "image_grid_thw": grid},
-                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                            item_refs=[("image", 0)], output_embedding_lengths=[rows]
-                        ),
-                        "mm_processor_kwargs_hash": "edge-review",
-                    },
-                    multimodal_runtime=MultimodalRuntimeData(
-                        embed_mask_cumsum=torch.arange(1, rows + 1, dtype=torch.int64),
-                        past_seen_token_num=0,
-                        chunk_end_pos=rows,
-                    ),
-                )
+                return _edge_image_param(processor, pixels, grid)
 
             first = model._get_or_encode_multimodal_embeddings([image_param()])
             self.assertEqual(tuple(first.shape), (rows, model.embedding_dim))
@@ -414,12 +445,6 @@ class TestCosmos3Edge(_qwen3vl.TestQwen3VL):
         finally:
             model.mm_encoder.visual.forward = visual_forward
 
-        image_token_id = self.hf_config.image_token_id
-        vision_start = self.hf_config.vision_start_token_id
-        vision_end = self.hf_config.vision_end_token_id
-        processor = object.__new__(Cosmos3EdgeInputProcessor)
-        processor._config = self.hf_config
-        processor._tokenizer = _FakeTokenizer([11, vision_start, image_token_id, vision_end, 12])
         prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(
             {"prompt": "image"},
             [{"tensor_size": tuple(first.shape)}],
@@ -497,3 +522,96 @@ def test_cosmos3_edge_init_preserves_caller_quant_config():
     assert model.mm_encoder.model_config.quant_config is not quant_config
     assert model.mm_encoder.model_config.quant_config.kv_cache_quant_algo is None
     assert model.mm_encoder.model_config.quant_config.quant_algo is None
+
+
+def _legacy_cosmos3_edge_encode_batched(
+    self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+) -> torch.Tensor:
+    """Copy of the `Cosmos3EdgeVisionEncoder.encode_batched` body this change replaced."""
+    grid_cpu = _cpu_int_rows(grid_thw)
+    hidden = self.visual(pixel_values, grid_thw, grid_cpu=grid_cpu)
+    merged = merge_spatial_patches(hidden, grid_cpu, merge_size=self.spatial_merge_size)
+    merged = merged.view(-1, self.spatial_merge_size**2, hidden.shape[-1])
+    return self.projector(merged)
+
+
+def _edge_vision_stand_in() -> SimpleNamespace:
+    """Edge vision encoder with its own groups; records each SigLIP input.
+
+    The SigLIP stand-in returns its patch rows; the projector sums each 2x2 block.
+    """
+    vision = SimpleNamespace(spatial_merge_size=2, inputs=[], multimodal_data_device_paths=[])
+    vision.visual = lambda pixel_values, grid_thw, grid_cpu: (
+        vision.inputs.append((pixel_values, grid_thw)) or pixel_values
+    )
+    vision.projector = lambda merged: merged.sum(dim=1)
+    vision.encode_batched = partial(Cosmos3EdgeVisionEncoder.encode_batched, vision)
+    vision.mm_encoder_groups = Cosmos3EdgeVisionEncoder.mm_encoder_groups.fget(vision)
+    return vision
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("raw", [False, True], ids=["normalized", "raw_uint8"])
+def test_cosmos3_edge_vision_group_matches_legacy_packing(raw: bool) -> None:
+    params = [
+        _qwen3vl._qwen_vision_request(items, raw=raw)
+        for items in _qwen3vl._QWEN_VISION_BATCHES["mixed"]
+    ]
+
+    new, legacy = _edge_vision_stand_in(), _edge_vision_stand_in()
+    legacy.mm_encoder_groups = (
+        EncoderGroup(
+            ("image", "video"),
+            partial(_legacy_cosmos3_edge_encode_batched, legacy),
+            _qwen3vl._legacy_qwen3vl_build_batched_input,
+        ),
+    )
+    with torch.inference_mode():
+        (batched,) = Cosmos3EdgeVisionEncoder.forward(new, params)
+        (expected,) = Cosmos3EdgeVisionEncoder.forward(legacy, params)
+
+    assert len(new.inputs) == len(legacy.inputs) == 1
+    _qwen3vl._assert_same_tensors(new.inputs[0], legacy.inputs[0])
+    assert torch.equal(batched, expected)
+
+
+@pytest.mark.cpu_only
+def test_edge_image_record_from_the_processor_feeds_the_vision_group() -> None:
+    """The cache-to-prefill test's image request, on a small image, without the checkpoint."""
+    processor = object.__new__(Cosmos3EdgeInputProcessor)
+    processor._config = SimpleNamespace(
+        image_token_id=19,
+        video_token_id=18,
+        vision_start_token_id=20,
+        vision_end_token_id=21,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+    )
+    height = width = 4
+    rows = (height // 2) * (width // 2)
+    pixels = torch.randn(height * width, 12)
+    grid = torch.tensor([[1, height, width]], dtype=torch.int64)
+    vision = _edge_vision_stand_in()
+
+    def encode(param: MultimodalParams) -> torch.Tensor:
+        with torch.inference_mode():
+            (embeds,) = Cosmos3EdgeVisionEncoder.forward(vision, [param])
+        return embeds
+
+    # A record without input partitions gives the vision group nothing to batch.
+    unpartitioned = _edge_image_param(processor, pixels, grid)
+    unpartitioned.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        item_refs=[("image", 0)], output_embedding_lengths=[rows]
+    )
+    with pytest.raises(MultimodalEncoderContractError, match="declares no input partitions"):
+        encode(unpartitioned)
+    assert vision.inputs == []
+
+    param = _edge_image_param(processor, pixels, grid)
+    metadata = param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert metadata.output_embedding_lengths == (rows,)
+    embeds = encode(param)
+    ((seen_pixels, seen_grid),) = vision.inputs
+    assert torch.equal(seen_pixels, pixels)
+    assert torch.equal(seen_grid, grid)
+    expected = _legacy_cosmos3_edge_encode_batched(_edge_vision_stand_in(), pixels, grid)
+    assert torch.equal(embeds, expected)
