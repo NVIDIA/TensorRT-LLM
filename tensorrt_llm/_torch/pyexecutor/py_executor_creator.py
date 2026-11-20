@@ -431,34 +431,40 @@ def _rank_dspark_on_host_without_overlap(
         spec_config.enable_fused_confidence_scheduler = False
 
 
-def _branch_snapshot_ctx_chunk_config(
+def _snapshot_ctx_chunk_config(
     ctx_chunk_config: Optional[tuple],
     kv_cache_manager: Optional[BaseResourceManager],
     tokens_per_block: int,
     configured_policy: Optional[ContextChunkingPolicy] = None
 ) -> Optional[tuple]:
-    """Force chunk boundaries at SWA branch points if the manager records them.
+    """Force chunk boundaries at the snapshot points of the built manager, if it needs them.
 
-    Decided on the built manager, which alone knows whether branch points apply
-    (SWA layers present, no joint target/draft reuse). Otherwise the configured
-    chunking is kept unchanged.
+    Decided on the built manager, which alone knows whether its snapshot points
+    need chunk boundaries: SWA branch points it records (SWA layers present, no
+    joint target/draft reuse), and recurrent-state snapshots under block reuse,
+    also of a manager a model declares for a configuration that
+    `is_hybrid_linear` does not recognize. Otherwise the configured chunking is
+    kept unchanged.
     """
-    if not (isinstance(kv_cache_manager, KVCacheManagerV2)
-            and kv_cache_manager.records_branch_snapshots):
+    if not isinstance(kv_cache_manager, KVCacheManagerV2):
+        return ctx_chunk_config
+    if kv_cache_manager.records_branch_snapshots:
+        reason = "block_reuse_config.enable_branch_snapshot"
+    elif kv_cache_manager.chunks_at_snapshot_points:
+        reason = "KV cache block reuse of recurrent state"
+    else:
         return ctx_chunk_config
     if ctx_chunk_config is None:
         logger.warning_once(
-            "block_reuse_config.enable_branch_snapshot turns on chunked "
-            "prefill with the FORCE_CHUNK policy, although "
-            "enable_chunked_prefill is False.",
-            key="branch_snapshot_enables_chunking")
+            f"{reason} turns on chunked prefill with the FORCE_CHUNK policy, "
+            "although enable_chunked_prefill is False.",
+            key="snapshot_points_enable_chunking")
     elif (configured_policy is not None
           and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
         logger.warning_once(
-            "block_reuse_config.enable_branch_snapshot replaces "
-            f"scheduler_config.context_chunking_policy={configured_policy} "
-            "with FORCE_CHUNK.",
-            key="branch_snapshot_replaces_chunking_policy")
+            f"{reason} replaces scheduler_config.context_chunking_policy="
+            f"{configured_policy} with FORCE_CHUNK.",
+            key="snapshot_points_replace_chunking_policy")
     # Keep the unit chosen for this model; it only aligns budget-shortened chunks.
     chunk_unit_size = (ctx_chunk_config[1]
                        if ctx_chunk_config is not None else tokens_per_block)
@@ -1509,7 +1515,7 @@ def _create_py_executor(
                 resources=resources,
                 mapping=mapping,
                 llm_args=llm_args,
-                ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                ctx_chunk_config=_snapshot_ctx_chunk_config(
                     ctx_chunk_config,
                     resources.get(ResourceManagerType.KV_CACHE_MANAGER),
                     tokens_per_block, scheduler_config.context_chunking_policy),
@@ -1591,7 +1597,7 @@ def _create_py_executor(
                     resources=resources,
                     mapping=mapping,
                     llm_args=llm_args,
-                    ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                    ctx_chunk_config=_snapshot_ctx_chunk_config(
                         ctx_chunk_config,
                         resources.get(ResourceManagerType.KV_CACHE_MANAGER),
                         tokens_per_block,

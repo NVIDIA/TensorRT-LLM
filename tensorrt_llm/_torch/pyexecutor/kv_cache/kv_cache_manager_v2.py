@@ -6852,6 +6852,13 @@ class KVCacheManagerV2(BaseResourceManager):
         """Whether lookups write SWA branch points, which need forced context chunking."""
         return self._record_branch_snapshots
 
+    @property
+    def chunks_at_snapshot_points(self) -> bool:
+        """Whether contexts must be chunked at their snapshot points
+        (`LlmRequest.expect_snapshot_points`): the manager keeps recurrent state that block
+        reuse saves only where a chunk ends. False for a manager of attention layers alone."""
+        return False
+
     def _record_branch_snapshot_point(
         self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
     ) -> None:
