@@ -29,10 +29,11 @@ load across every bucket order, including the case that regressed the BF16
 path (a w2-only bucket arriving after the w3/w1 bucket).
 """
 
-from typing import Dict, List
+from typing import Dict
 
 import pytest
 import torch
+from _torch.moe.moe_test_utils import finalize_moe_refit, refit_moe_in_buckets
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import getSMVersion
 
@@ -85,31 +86,6 @@ def _make_module():
 def _backend(module):
     # create_moe may return a ConfigurableMoE wrapper owning a backend module.
     return getattr(module, "backend", module)
-
-
-def _rlhf_finalize(module) -> None:
-    # Mirrors rlhf_utils.WorkerExtension.finalize_weight_update: the walk
-    # invokes BOTH process_weights_after_loading and post_load_weights on
-    # every eligible module.
-    for mod in module.modules():
-        if hasattr(mod, "process_weights_after_loading") and not getattr(
-            mod, "_weights_removed", False
-        ):
-            mod.process_weights_after_loading()
-        if hasattr(mod, "post_load_weights") and not getattr(mod, "_weights_removed", False):
-            mod.post_load_weights()
-
-
-def _refit(module, buckets: List[Dict[str, torch.Tensor]]) -> None:
-    # Mirrors rlhf_utils.WorkerExtension.update_weights: one pre_reload_weights
-    # walk, then one partial load per bucket, then a single finalize.
-    for mod in module.modules():
-        if hasattr(mod, "pre_reload_weights") and not getattr(mod, "_weights_removed", False):
-            mod.pre_reload_weights()
-    for bucket in buckets:
-        module.load_weights([dict(bucket)], allow_partial_loading=True)
-    _rlhf_finalize(module)
-    torch.cuda.synchronize()
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -217,7 +193,7 @@ def test_mxfp8_bucketed_refit_matches_single_shot(bucket_order):
     }[bucket_order]
 
     module = _make_module()
-    _refit(module, buckets)
+    refit_moe_in_buckets(module, buckets)
     _assert_matches(module, expected, bucket_order)
 
 
@@ -233,11 +209,11 @@ def test_mxfp8_repeated_finalize_is_noop():
     expected = _fresh_load(_make_module(), weights)
 
     module = _make_module()
-    _refit(module, [_split(weights, {"w1", "w3"}), _split(weights, {"w2"})])
+    refit_moe_in_buckets(module, [_split(weights, {"w1", "w3"}), _split(weights, {"w2"})])
     _assert_matches(module, expected, "after first finalize")
 
     for _ in range(3):
-        _rlhf_finalize(module)
+        finalize_moe_refit(module)
         torch.cuda.synchronize()
     _assert_matches(module, expected, "after repeated finalize")
 
@@ -264,7 +240,7 @@ def test_mxfp8_pending_slots_drained_after_finalize():
     module.load_weights([_split(weights, {"w2"})], allow_partial_loading=True)
     assert backend._mxfp8_w2_sf_pending_slots
 
-    _rlhf_finalize(module)
+    finalize_moe_refit(module)
     torch.cuda.synchronize()
     assert not backend._mxfp8_w3_w1_sf_pending_slots
     assert not backend._mxfp8_w2_sf_pending_slots
@@ -283,8 +259,8 @@ def test_mxfp8_two_sequential_refits_match_single_shot():
     expected_b = _fresh_load(_make_module(), weights_b)
 
     module = _make_module()
-    _refit(module, [_split(weights_a, {"w1", "w3"}), _split(weights_a, {"w2"})])
-    _refit(module, [_split(weights_b, {"w1", "w3"}), _split(weights_b, {"w2"})])
+    refit_moe_in_buckets(module, [_split(weights_a, {"w1", "w3"}), _split(weights_a, {"w2"})])
+    refit_moe_in_buckets(module, [_split(weights_b, {"w1", "w3"}), _split(weights_b, {"w2"})])
     _assert_matches(module, expected_b, "second refit")
 
 
@@ -302,6 +278,6 @@ def test_mxfp8_single_projection_refit_after_finalize_matches_fresh_load(leaf):
     expected = _fresh_load(_make_module(), merged)
 
     module = _make_module()
-    _refit(module, [weights_a])
-    _refit(module, [_split(weights_b, {leaf})])
+    refit_moe_in_buckets(module, [weights_a])
+    refit_moe_in_buckets(module, [_split(weights_b, {leaf})])
     _assert_matches(module, expected, f"{leaf}-only refit after finalize")
