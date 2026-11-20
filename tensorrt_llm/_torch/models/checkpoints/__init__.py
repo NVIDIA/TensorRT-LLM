@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .base_checkpoint_loader import BaseCheckpointLoader
+from .beam.checkpoint_loader import (BEAM_NVFP4_CHECKPOINT_FORMAT,
+                                     beam_nvfp4_checkpoint_loader)
 from .hf.afmoe_weight_mapper import AfmoeHfWeightMapper
 from .hf.checkpoint_loader import HfCheckpointLoader
 from .hf.config_loader import HfConfigLoader
@@ -44,5 +46,6 @@ __all__ = [
     "LlavaNextHfWeightMapper", "MistralLarge3CheckpointLoader",
     "MistralLarge3WeightMapper", "MXCheckpointLoader", "Qwen3VLHfWeightMapper",
     "Cosmos3HfWeightMapper", "Cosmos3EdgeHfWeightMapper",
-    "Qwen4ExpHfWeightMapper", "Glm5NextHfWeightMapper"
+    "Qwen4ExpHfWeightMapper", "Glm5NextHfWeightMapper",
+    "BEAM_NVFP4_CHECKPOINT_FORMAT", "beam_nvfp4_checkpoint_loader"
 ]

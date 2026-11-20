@@ -183,6 +183,7 @@ class ServeTestEnv:
         model_dir = self.tmp_dir / f"model-{model_type}"
         model_dir.mkdir(parents=True, exist_ok=True)
         architectures = {
+            "beam": ["BeamForCausalLM"],
             "llama": ["LlamaForCausalLM"],
             "gpt_oss": ["GptOssForCausalLM"],
         }[model_type]

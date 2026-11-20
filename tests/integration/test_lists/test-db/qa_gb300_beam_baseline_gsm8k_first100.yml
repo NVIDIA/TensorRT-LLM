@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 0.0.1
+# Dedicated on-demand stage for the same gate scheduled in QA's llm_function_core.txt.
+qa_gb300_beam_baseline_gsm8k_first100:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - accuracy/modeling_v2/beam/full_model_nvfp4__sm_103__tp4/test_accuracy.py::TestModelingV2BeamFullModelNvfp4Sm103Tp4::test_gsm8k_first100 TIMEOUT (45)

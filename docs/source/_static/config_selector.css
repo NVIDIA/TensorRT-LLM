@@ -414,6 +414,33 @@
   color: var(--pst-color-text-muted);
 }
 
+.trtllm-config-selector__pageList {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trtllm-config-selector__page {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+
+.trtllm-config-selector__pageTitle {
+  font-weight: 600;
+}
+
+.trtllm-config-selector__pageConfigs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 0.8rem;
+}
+
 .trtllm-config-selector__form--dimmed .trtllm-config-selector__field {
   opacity: 0.4;
   pointer-events: none;

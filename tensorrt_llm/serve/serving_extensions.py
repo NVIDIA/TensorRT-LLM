@@ -21,8 +21,8 @@ to ``openai_protocol.py`` / ``openai_server.py``. Lookups are keyed two ways:
 - by the checkpoint's top-level ``model_type`` for chat-request preprocessing
   and the other per-model hooks (:func:`apply_model_chat_extensions`,
   :func:`get_serving_extension`), and
-- by reasoning-parser name for structured-output placement
-  (:func:`structured_output_format_for`).
+- by reasoning-parser name for tool validation and structured-output placement
+  (:func:`validate_tools_for`, :func:`structured_output_format_for`).
 
 Built-in extensions live in :mod:`tensorrt_llm.serve.extensions`; importing
 that package registers them. The hook lookup functions import it on first use so
@@ -89,6 +89,9 @@ class ServingExtension:
     def serialize_tool(self, tool) -> Dict[str, Any]:
         """Dump one request tool into the dict handed to the chat template."""
         return tool.model_dump()
+
+    def validate_tools(self, tools: Optional[List[Any]]) -> None:
+        """Raise ValueError if the active parser cannot support request tools."""
 
     def dynamic_tools(self, messages) -> List[Dict[str, Any]]:
         """Tool declarations carried on messages rather than on the request."""
@@ -222,6 +225,14 @@ def normalize_reasoning_effort(effort: str, model_type: Optional[str]) -> Option
     _load_builtin_extensions()
     extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
     return effort if extension is None else extension.normalize_reasoning_effort(effort)
+
+
+def validate_tools_for(reasoning_parser: Optional[str], tools: Optional[List[Any]]) -> None:
+    """Validate tools against the active reasoning parser before generation."""
+    _load_builtin_extensions()
+    extension = _BY_REASONING_PARSER.get(reasoning_parser) if reasoning_parser else None
+    if extension is not None:
+        extension.validate_tools(tools)
 
 
 def structured_output_format_for(

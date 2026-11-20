@@ -326,6 +326,30 @@ class MessageType:
     SESSION_QUIESCED = b"SESSION_QUIESCED"
 
 
+#: Test-only fault injection: a directory whose ``<unique_rid>`` files hold KV submissions.
+TEST_SENDER_LATCH_DIR_ENV = "TRTLLM_DISAGG_TEST_SENDER_LATCH_DIR"
+
+
+def _hold_test_sender_latch(unique_rid: int) -> None:
+    """Test-only: hold a request's KV submission while ``<latch dir>/<unique_rid>`` exists.
+
+    Inert unless ``TRTLLM_DISAGG_TEST_SENDER_LATCH_DIR`` names a directory. The hold sits after
+    the destination was published and the write was built, and before the session-status check
+    that precedes the NIXL submission, so a session cancelled or expired while held ends
+    through the normal aborted-session path without writing anything.
+    """
+    latch_dir = os.environ.get(TEST_SENDER_LATCH_DIR_ENV)
+    if not latch_dir:
+        return
+    path = os.path.join(latch_dir, str(unique_rid))
+    if not os.path.exists(path):
+        return
+    logger.warning(f"test sender latch: holding the KV submission of request {unique_rid}")
+    while os.path.exists(path):
+        time.sleep(0.05)
+    logger.warning(f"test sender latch: released the KV submission of request {unique_rid}")
+
+
 class PeerIncompatibleError(ValueError):
     """A context peer failed the KV/recurrent-state layout compatibility check.
 
@@ -1313,6 +1337,7 @@ class Sender(SenderBase):
         assert write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size, (
             f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}"
         )
+        _hold_test_sender_latch(write_meta.unique_rid)
 
         owned = self._owns_task(write_meta.task)
         with self._sessions_lock:
@@ -2182,6 +2207,11 @@ class Sender(SenderBase):
                 else:
                     self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
+                    if session._need_aux and session.aux_task is not None:
+                        # Context-first: send_aux() ran before this peer's REQUEST_DATA, so its
+                        # peer snapshot lacked this peer. Deliver the packed auxiliary record
+                        # now, as for KV slices sent before the request arrived.
+                        tasks.append(session.aux_task)
                     terminal = session.has_failed()
                     include_aux = terminal and bool(
                         session._claim_unsubmitted_aux_failures_locked((info,))
@@ -2449,12 +2479,15 @@ class TxSession(TxSessionBase):
         overall_timeout_s: Optional[float] = None,
         *,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        need_aux: bool = False,
     ):
+        """``need_aux`` requires the auxiliary slot in every schedule style (it always is for
+        generation-first), as when it carries the model's context handoff record."""
         super().__init__(sender, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        self._need_aux = need_aux or params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._enforce_physical_ownership = Sender.ownership_enabled(
             sender, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
         )
@@ -3623,6 +3656,9 @@ class Receiver(ReceiverBase):
                 sender_info = RankInfo.from_bytes(message[0])
                 validate_protocol_version(sender_info)
                 self._registrar.validate_bounded_replay_compatible(sender_info)
+                PeerRegistrar.validate_cache_identity_compatible(
+                    self._registrar.self_rank_info, sender_info
+                )
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
@@ -3635,6 +3671,7 @@ class Receiver(ReceiverBase):
                 )
                 self._registrar.validate_draft_layers_compatible(sender_info)
                 self._registrar.validate_view_head_geometry(sender_info)
+                self._registrar.validate_complete_coverage(sender_info)
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "
@@ -3832,10 +3869,12 @@ class RxSession(RxSessionBase):
         prompt_len: Optional[int] = None,
         *,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        need_aux: bool = False,
     ):
+        """``need_aux`` requires the auxiliary slot in every schedule style (see TxSession)."""
         super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        self._need_aux = need_aux or params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._enforce_physical_ownership = Receiver.ownership_enabled(
             receiver, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
         )
@@ -4434,6 +4473,13 @@ class RxSession(RxSessionBase):
     def exception(self) -> Optional[Exception]:
         return self._exception
 
+    def unpack_handoff(self, request: LlmRequest) -> None:
+        """Read the context handoff record from the aux buffer slot into
+        ``request.py_disagg_handoff`` (None when the sender attached none)."""
+        assert self._aux_buffer is not None, "No aux_buffer set for this session"
+        assert self.aux_slot is not None, "No aux_slot set for this session"
+        request.py_disagg_handoff = self._aux_buffer.get_slot_handoff(self.aux_slot)  # type: ignore[attr-defined]
+
     def unpack_aux(self, request: LlmRequest) -> None:
         """Read token data from the aux buffer slot into the given request."""
         assert self._aux_buffer is not None, "No aux_buffer set for this session"
@@ -4884,6 +4930,11 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
+    # Published in RankInfo for the peer registrar's semantic compatibility check.
+    cache_identity: Optional[dict] = None
+    # Transfer the auxiliary slot in every session, not only generation-first ones; it then
+    # carries the model's context handoff record (LlmRequest.py_disagg_handoff).
+    transfer_handoff_aux: bool = False
     rank_info_auth_key: Optional[bytes] = field(default=None, repr=False)
 
 
@@ -4911,6 +4962,7 @@ class TransferWorker:
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
+            cache_identity=config.cache_identity,
         )
         self._rank_info.context_first_ownership = config.context_first_ownership
         self._setup_peer_infrastructure(kvm)
@@ -4960,6 +5012,7 @@ class TransferWorker:
             prompt_len=request.prompt_len,
             overall_timeout_s=self._config.tx_overall_timeout_s,
             retirement_watchdog=getattr(self, "_retirement_watchdog", None),
+            need_aux=self._config.transfer_handoff_aux,
         )
 
     def create_receive_retirement(self, request_id: int) -> RetirementDeadline:
@@ -4997,6 +5050,7 @@ class TransferWorker:
             timeout_s=self._config.rx_timeout_s,
             prompt_len=request.prompt_len,
             retirement_watchdog=getattr(self, "_retirement_watchdog", None),
+            need_aux=self._config.transfer_handoff_aux,
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
@@ -5012,7 +5066,7 @@ class TransferWorker:
             if kvm.mapping.rank == 0
             else None
         )
-        self._kv_extractor = KVRegionExtractorV1(kvm)
+        self._kv_extractor = KVRegionExtractorV1(self._rank_info.page_table)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
     def _setup_transfer_engine(self):

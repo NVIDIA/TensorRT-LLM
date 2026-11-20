@@ -354,6 +354,53 @@ test("models with both curated and database entries appear in both", () => {
   assert.ok(dbModels.has(DEEPSEEK_MODEL), "DeepSeek-R1 should be in database");
 });
 
+// --- Recipe-page (documentation-only) records ---
+
+const BEAM_PAGE = "docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md";
+
+test("recipe-page records link the page and configs and never form a command", () => {
+  const selector = loadSelectorExports();
+  const payload = loadConfigDb();
+  const pages = selector.curatedPagesForSelector(payload, null);
+  const beam = pages.filter((page) => page.recipe_page === BEAM_PAGE);
+  assert.equal(beam.length, 1);
+  const page = beam[0];
+  for (const key of ["model", "arch", "model_url", "command", "config_path"]) {
+    assert.ok(!(key in page), `a recipe-page record has no ${key}`);
+  }
+  assert.deepEqual(
+    page.configs.map((config) => config.config_filename),
+    [
+      "beam-nvfp4-dflash2-fp8kv-aggregated.yaml",
+      "beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
+      "beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml",
+    ]
+  );
+  for (const config of page.configs) {
+    assert.ok(fs.existsSync(path.join(REPO_ROOT, config.config_path)), config.config_path);
+  }
+  assert.ok(fs.existsSync(path.join(REPO_ROOT, page.recipe_page)));
+  assert.equal(
+    selector.recipePageHref(page, "https://example.com/docs/_static/config_db.json"),
+    "https://example.com/docs/deployment-guide/deployment-guide-for-beam-on-trtllm.html"
+  );
+  assert.equal(selector.recipePageHref(page, ""), page.recipe_page_github_url);
+  assert.ok(!payload.curated_entries.some((entry) => entry.config_path.includes("beam-nvfp4")));
+  assert.ok(!Object.keys(payload.models).some((model) => /beam/i.test(model)));
+});
+
+test("a model-filtered selector shows no recipe-page records", () => {
+  const selector = loadSelectorExports();
+  const payload = loadConfigDb();
+  for (const pages of [
+    selector.curatedPagesForSelector(payload, [DEEPSEEK_MODEL]),
+    selector.curatedPagesForSelector({}, null),
+  ]) {
+    assert.ok(Array.isArray(pages));
+    assert.equal(pages.length, 0);
+  }
+});
+
 test("data-models filter applies to curated entries too", () => {
   const selector = loadSelectorExports();
   const payload = loadConfigDb();

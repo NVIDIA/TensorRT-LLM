@@ -8321,6 +8321,23 @@ _TORCH_LLMARGS_REMOVED_ARG_CHECKS: Dict[str, Callable[[Any], None]] = {
 TORCH_LLMARGS_REMOVED_ARGS = frozenset(_TORCH_LLMARGS_REMOVED_ARG_CHECKS)
 
 
+def disagg_shares_draft_kv(
+        speculative_config: Optional[DecodingBaseConfig]) -> bool:
+    """Whether a disaggregated worker transfers its drafter's KV with the target's.
+
+    TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires the draft KV to share the target's
+    KV cache manager, and 0 keeps it private. Unset, a DFlash drafter on a
+    backend that can share it (AUTO or TRTLLM) does, so a context and a
+    generation server given the same speculative_config agree on their own;
+    the transceiver rejects a pair that does not.
+    """
+    env = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+    if env:
+        return env == "1"
+    return (isinstance(speculative_config, DFlashDecodingConfig)
+            and speculative_config.attention_backend in ("AUTO", "TRTLLM"))
+
+
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
     generation_config: Literal["auto", "trtllm"] = Field(
@@ -9783,21 +9800,25 @@ class TorchLlmArgs(BaseLlmArgs):
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
                 if (self.cache_transceiver_config is not None
-                        and self.cache_transceiver_config.backend is not None):
-                    # The transceiver moves the target KV cache, but the
-                    # drafter's context is built from target hidden states
-                    # during prefill and is not transferred with it, so a
-                    # generation server drafts without the prompt. Drafts are
-                    # verified against the target, so this costs acceptance
-                    # rather than correctness: warn, do not reject.
+                        and self.cache_transceiver_config.backend is not None
+                        and
+                        not disagg_shares_draft_kv(self.speculative_config)):
+                    # The drafter's context is built from target hidden states
+                    # during prefill and travels to the generation server only
+                    # in draft layers the target's KV cache manager owns.
+                    # Drafts are verified against the target either way, so the
+                    # missing context changes proposals and acceptance, not the
+                    # greedy verification rule: warn, do not reject.
                     logger.warning(
                         "DFlash acceptance is degraded under disaggregated "
-                        "serving: the cache transceiver moves the target KV "
-                        "cache, but the drafter's context is built during "
-                        "prefill and is not transferred, so a generation "
-                        "server drafts without the prompt context. Output is "
-                        "unaffected; expect a lower acceptance rate than the "
-                        "same configuration run aggregated.")
+                        "serving because it keeps the "
+                        "drafter's KV private (attention_backend VANILLA or "
+                        "FA4, or TRTLLM_DISAGG_SHARED_DRAFT_KV=0), so the "
+                        "generation server drafts without the prompt "
+                        "context; expect a lower acceptance rate and "
+                        "different speculative trajectories than the same "
+                        "configuration run aggregated. To transfer it, run "
+                        "both servers with attention_backend TRTLLM.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
                 # A Hugging Face repo id is not readable yet: both calls below
                 # then run without the drafter's config.json (the budget check
@@ -10067,6 +10088,15 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = CheckpointFormat.HF
 
+        beam_loader = self.checkpoint_format == "beam_nvfp4"
+        if self.checkpoint_loader is not None:
+            from tensorrt_llm._torch.models.checkpoints.beam.checkpoint_loader import \
+                BeamNvfp4CheckpointLoader
+            beam_loader = isinstance(self.checkpoint_loader,
+                                     BeamNvfp4CheckpointLoader)
+        if beam_loader and self.modeling_v2 != "require":
+            raise ValueError(
+                "Beam NVFP4 checkpoint loading requires modeling_v2='require'")
         return self
 
     @model_validator(mode="after")
