@@ -47,7 +47,7 @@ class TransferRequest(SimpleNamespace):
             py_kv_transfer_timed_out=False,
             py_multimodal_params=None,
             py_disaggregated_params=None,
-            cached_tokens=0,
+            reported_cached_tokens=0,
             response=None,
         )
         defaults.update(overrides)
