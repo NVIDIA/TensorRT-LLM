@@ -535,6 +535,7 @@ common-files: &common_files |
         tests/unittest/_torch/attention/test_vanilla_attention.py |
         tests/unittest/_torch/compilation/test_add_norm.py |
         tests/unittest/_torch/debugger/test_debugger_addon.py |
+        tests/unittest/_torch/disaggregation/test_cache_transceiver_comm.py |
         tests/unittest/_torch/helpers.py |
         tests/unittest/_torch/kernels/parallel/deep_gemm_tests.py |
         tests/unittest/_torch/kernels/parallel/test_dsv3_fused_a_gemm.py |
@@ -614,7 +615,6 @@ common-files: &common_files |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_executor.py |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_mapping.py |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py |
-        tests/unittest/_torch/disaggregation/test_cache_transceiver_comm.py |
         tests/unittest/_torch/sampler/test_beam_search.py |
         tests/unittest/_torch/sampler/test_best_of_n.py |
         tests/unittest/_torch/speculative/test_eagle3.py |
@@ -1257,6 +1257,7 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/attention/test_vanilla_attention.py |
         tests/unittest/_torch/compilation/test_add_norm.py |
         tests/unittest/_torch/debugger/test_debugger_addon.py |
+        tests/unittest/_torch/disaggregation/test_cache_transceiver_comm.py |
         tests/unittest/_torch/helpers.py |
         tests/unittest/_torch/kernels/parallel/deep_gemm_tests.py |
         tests/unittest/_torch/kernels/parallel/test_dsv3_fused_a_gemm.py |
@@ -1336,7 +1337,6 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_executor.py |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_mapping.py |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py |
-        tests/unittest/_torch/disaggregation/test_cache_transceiver_comm.py |
         tests/unittest/_torch/sampler/test_beam_search.py |
         tests/unittest/_torch/sampler/test_best_of_n.py |
         tests/unittest/_torch/speculative/test_eagle3.py |
