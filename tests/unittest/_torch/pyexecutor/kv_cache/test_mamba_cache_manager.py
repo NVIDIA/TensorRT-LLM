@@ -827,6 +827,10 @@ def test_skip_softmax_hybrid_follows_the_dense_manager_routing(
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
     model_config = _hybrid_model_config()
     model_config.get_num_mamba_layers = lambda: num_mamba_layers
+    # The stub config carries no state geometry for the model's declaration to read.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.declares_recurrent_state", lambda config: True
+    )
     if variable_geometry:
         model_config.kv_cache_layer_specs = tuple(
             ModelKVCacheLayerSpec(head_dim=head_dim, num_kv_heads=2, num_q_heads=8)

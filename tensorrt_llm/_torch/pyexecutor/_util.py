@@ -61,7 +61,8 @@ from ..memory.monitor.providers.kv_cache import \
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import (declares_recurrent_state,
-                                     resolve_model_class)
+                                     resolve_model_class,
+                                     resolve_recurrent_kv_cache_manager_cls)
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
@@ -82,6 +83,7 @@ from .dwdp import DwdpManager
 from .engine.lora import make_lora_model_config
 from .engine.multimodal import is_multimodal, use_mrope
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from .kv_cache.fp4_mla_layout_hooks import Fp4MlaLayoutHooks
 from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner, KVCacheLayerSpec,
                                            KVCacheManagerV2, Role,
                                            _resolve_v2_max_attention_window_vec)
@@ -324,8 +326,9 @@ def get_kv_cache_manager_cls(
 
     For hybrid mamba models the choice between
     ``MambaHybridCacheManagerV2`` and compatibility managers is made here.
-    Callers that don't care about disagg can omit ``is_disagg`` and get the
-    unified-pool default.
+    The V2 class is the one the model class declares for its recurrent
+    family. Callers that don't care about disagg can omit ``is_disagg`` and
+    get the unified-pool default.
 
     Model loading resolves ``use_kv_cache_manager_v2="auto"`` to V2 for
     supported hybrid Mamba models. An explicit ``False`` selects a
@@ -338,11 +341,35 @@ def get_kv_cache_manager_cls(
       * ``TLLM_MAMBA_MANAGER_PREFERENCE`` — explicit manager preference.
     """
     config = model_config.pretrained_config
-    if is_hybrid_linear(config) and resolve_model_class(config) is None:
-        # The model class declares the layer kinds that the selection counts.
-        raise ValueError("No model class is registered for this hybrid Mamba / "
-                         "linear-attention config (architectures="
-                         f"{getattr(config, 'architectures', None)!r}).")
+    family_cls = None
+    if is_hybrid_linear(config):
+        # The model class declares the layer kinds that the selection counts
+        # and the V2 manager of its family.
+        family_cls = resolve_recurrent_kv_cache_manager_cls(config)
+        architectures = getattr(config, 'architectures', None)
+        if family_cls is None:
+            model_cls = resolve_model_class(config)
+            if model_cls is None:
+                raise ValueError(
+                    "No model class is registered for this hybrid Mamba / "
+                    "linear-attention config (architectures="
+                    f"{architectures!r}); the model class declares the "
+                    "recurrent state and its cache manager.")
+            raise ValueError(
+                f"{model_cls.__name__} declares no recurrent cache manager "
+                "for this hybrid Mamba / linear-attention config "
+                f"(architectures={architectures!r}). A model class declares "
+                "it with get_recurrent_kv_cache_manager_cls, beside "
+                "get_recurrent_state_spec.")
+        # A missing declaration counts no recurrent layer, which the routes
+        # below take for a model without recurrent layers.
+        if (model_config.get_num_mamba_layers() == 0
+                and not declares_recurrent_state(config)):
+            raise ValueError(
+                f"{family_cls.__name__} is declared for this hybrid Mamba / "
+                "linear-attention config, but its model class declares no "
+                f"recurrent state (architectures={architectures!r}). A model "
+                "class declares it with get_recurrent_state_spec.")
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
     # An algorithm that keeps the dense KV cache, such as Skip Softmax, takes
@@ -369,30 +396,25 @@ def get_kv_cache_manager_cls(
                     "cache_transceiver_config backend='NIXL' with "
                     "transceiver_runtime='PYTHON' (got "
                     f"backend={backend!r}, transceiver_runtime={runtime!r}).")
-        if (is_hybrid_linear(config)
-                and model_config.get_num_mamba_layers() > 0):
-            # Kimi K3 is the hybrid linear-attention family with an FP4 MLA
-            # cache layout: its manager composes the layout with the
-            # recurrent-state lifecycle and the KDA replay caches used by
-            # fused speculative verification, and its disaggregation
-            # declarations cover both the MLA and the recurrent-state roles.
-            # The other families are not MLA models, or (glm5_next) NoPE ones,
-            # which is_mla() excludes.
-            if not is_kimi_linear(config):
+        if family_cls is not None and model_config.get_num_mamba_layers() > 0:
+            # A family manager that runs the FP4 MLA layout hooks keeps the
+            # layout with the recurrent-state lifecycle and its replay caches,
+            # and its disaggregation declarations cover both the MLA and the
+            # recurrent-state roles.
+            if not issubclass(family_cls, Fp4MlaLayoutHooks):
                 raise ValueError(
-                    "An NVFP4 MLA KV cache is supported for hybrid "
-                    "linear-attention models only on Kimi K3 (kimi_linear); "
-                    f"got model_type={getattr(config, 'model_type', None)!r}.")
+                    "An NVFP4 MLA KV cache is not supported for this hybrid "
+                    f"linear-attention model: {family_cls.__name__} does not "
+                    "compose the FP4 MLA cache layout (model_type="
+                    f"{getattr(config, 'model_type', None)!r}).")
             _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
-            from ..modules.kimi_kda.cache_manager import \
-                KimiK3HybridCacheManager
-            return KimiK3HybridCacheManager
+            return family_cls
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2
 
         return Fp4MlaKVCacheManagerV2
     use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
-    if is_hybrid_linear(config):
+    if family_cls is not None:
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid routes.
         if model_config.get_num_mamba_layers() == 0:
@@ -422,34 +444,35 @@ def get_kv_cache_manager_cls(
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
 
-        if config_utils.is_glm5_next(config):
-            # glm5_next indexer state is a V2 extra buffer: reject any knob
-            # that would select a non-V2 manager.
+        model_cls = resolve_model_class(config)
+        get_requires_v2 = getattr(model_cls, "requires_kv_cache_manager_v2",
+                                  None)
+        if get_requires_v2 is not None and get_requires_v2(config):
+            # The model has no V1 route: reject any knob that would select a
+            # non-V2 manager.
+            model_name = model_cls.__name__
             if use_py_mamba_cache_manager() or os.environ.get(
                     'TLLM_MAMBA_MANAGER_PREFERENCE'):
                 raise ValueError(
-                    "glm5_next supports only its V2 cache manager; unset "
+                    f"{model_name} supports only KV cache manager V2; unset "
                     "TRTLLM_USE_PY_MAMBA / TLLM_MAMBA_MANAGER_PREFERENCE.")
             if is_disagg:
-                # Only the Python NIXL transceiver moves KDA and indexer state.
+                # Only the Python NIXL transceiver moves the V2 state.
                 backend, runtime = _resolve_disagg_transceiver_route(
                     cache_transceiver_config)
                 if runtime != "PYTHON" or backend != "NIXL":
                     raise ValueError(
-                        "glm5_next disaggregated serving requires "
-                        "cache_transceiver_config backend='NIXL' with "
-                        "transceiver_runtime='PYTHON' (got "
+                        f"{model_name} supports only KV cache manager V2, "
+                        "which disaggregated serving keeps only on "
+                        "backend='NIXL' with transceiver_runtime='PYTHON' (got "
                         f"backend={backend!r}, transceiver_runtime={runtime!r})."
                     )
             if not use_v2:
                 raise ValueError(
-                    "glm5_next requires KV cache manager V2 (the sparse-layer "
-                    "indexer state is a V2 extra buffer). Leave "
+                    f"{model_name} requires KV cache manager V2. Leave "
                     "kv_cache_config.use_kv_cache_manager_v2='auto' or set it "
                     "to True.")
-            from ..attention.backends.sparse.glm_kpool import \
-                Glm5NextCacheManager
-            return Glm5NextCacheManager
+            return family_cls
 
         # Helix x speculation bookkeeping (per-token verify groups on the
         # superblock ledger, py_helix_decode_group_index advancement) exists
@@ -578,19 +601,7 @@ def get_kv_cache_manager_cls(
         if sparse_attn_algorithm == "qsa":
             return get_sparse_attn_kv_cache_manager(
                 sparse_attn_config, use_kv_cache_manager_v2=True)
-        if is_kimi_linear(config):
-            from ..modules.kimi_kda.cache_manager import \
-                KimiK3HybridCacheManager
-            return KimiK3HybridCacheManager
-        if is_qwen4_exp(config):
-            from ..modules.qwen4_exp.cache_manager import \
-                Qwen4ExpHybridCacheManager
-            return Qwen4ExpHybridCacheManager
-        if is_qwen3_hybrid(config):
-            from ..modules.fla.cache_manager import Qwen35HybridCacheManager
-            return Qwen35HybridCacheManager
-        from ..modules.mamba.cache_manager import NemotronHybridCacheManager
-        return NemotronHybridCacheManager
+        return family_cls
     elif uses_sparse_kv_cache_manager:
         if sparse_attn_algorithm == "qsa":
             # The QSA manager extends the hybrid manager because it must retain

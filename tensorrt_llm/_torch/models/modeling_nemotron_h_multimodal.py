@@ -3088,6 +3088,12 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         llm_config = getattr(pretrained_config, "llm_config", None) or pretrained_config
         return NemotronHForCausalLM.get_recurrent_state_spec(llm_config, quant_config=quant_config)
 
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the NemotronH backbone's cache manager class."""
+        llm_config = getattr(pretrained_config, "llm_config", None) or pretrained_config
+        return NemotronHForCausalLM.get_recurrent_kv_cache_manager_cls(llm_config)
+
     def post_config(self):
         # use llm.config as config for pytorch model engine
         self.config = self.llm.config

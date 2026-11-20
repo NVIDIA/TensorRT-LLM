@@ -10,19 +10,32 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+    Glm5NextCacheManager,
     get_glm5_next_cache_params,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import (
+    MODEL_CLASS_MAPPING,
     declares_recurrent_state,
+    resolve_recurrent_kv_cache_manager_cls,
     resolve_recurrent_state_spec,
 )
-from tensorrt_llm._torch.modules.fla.cache_manager import get_gdn_cache_params
-from tensorrt_llm._torch.modules.kimi_kda.cache_manager import get_kimi_cache_params
-from tensorrt_llm._torch.modules.mamba.cache_manager import get_nemotron_cache_params
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    Qwen35HybridCacheManager,
+    get_gdn_cache_params,
+)
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KimiK3HybridCacheManager,
+    get_kimi_cache_params,
+)
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    NemotronHybridCacheManager,
+    get_nemotron_cache_params,
+)
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     PLE_CONV_STATE,
     PLE_NGRAM_CONTEXT,
+    Qwen4ExpHybridCacheManager,
     _qwen4_exp_ple_state_bytes_per_rank,
 )
 from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
@@ -63,6 +76,15 @@ _FAMILY_CACHE_PARAMS = {
     "qwen4": get_gdn_cache_params,
     "kimi": get_kimi_cache_params,
     "glm": get_glm5_next_cache_params,
+}
+
+# Family -> V2 cache manager class that holds its recurrent state.
+_FAMILY_MANAGERS = {
+    "nemotron": NemotronHybridCacheManager,
+    "gdn": Qwen35HybridCacheManager,
+    "qwen4": Qwen4ExpHybridCacheManager,
+    "kimi": KimiK3HybridCacheManager,
+    "glm": Glm5NextCacheManager,
 }
 
 # Every architecture name registered for a text model of a recurrent family.
@@ -496,6 +518,8 @@ def test_wrapper_declares_the_state_of_its_language_model(architecture, mirrored
     assert is_hybrid_linear(config) == (architecture not in _PREDICATE_BLIND_WRAPPERS)
     assert spec == resolve_recurrent_state_spec(text_config, quant_config=QuantConfig())
     assert ModelConfig(pretrained_config=config).get_num_mamba_layers() == 2
+    family = _WRAPPERS[architecture][0]
+    assert resolve_recurrent_kv_cache_manager_cls(config) is _FAMILY_MANAGERS[family]
 
 
 @pytest.mark.parametrize(
@@ -510,20 +534,78 @@ def test_wrapper_declares_the_state_of_its_language_model(architecture, mirrored
 )
 def test_no_declaration_without_a_recurrent_model_class(config):
     assert resolve_recurrent_state_spec(config) is None
+    assert resolve_recurrent_kv_cache_manager_cls(config) is None
 
 
-@pytest.mark.parametrize("architectures", [None, ["NoSuchArchitectureForCausalLM"]])
-def test_hybrid_config_without_a_model_class_is_rejected(architectures):
+class _ManagerOnlyModel:
+    """A model class that names a recurrent cache manager and declares no recurrent state."""
+
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: object) -> type:
+        return NemotronHybridCacheManager
+
+
+@pytest.mark.parametrize(
+    "architectures, params_message, selection_message",
+    [
+        (None, "No model class is registered", "No model class is registered"),
+        (
+            ["NoSuchArchitectureForCausalLM"],
+            "No model class is registered",
+            "No model class is registered",
+        ),
+        (
+            ["LlamaForCausalLM"],
+            "not a supported hybrid",
+            "LlamaForCausalLM declares no recurrent cache manager",
+        ),
+        (
+            ["ManagerOnlyForCausalLM"],
+            "not a supported hybrid",
+            "NemotronHybridCacheManager is declared .* its model class declares no recurrent state",
+        ),
+    ],
+    ids=["architectures_none", "unregistered", "no_declaration", "manager_only"],
+)
+def test_hybrid_config_without_a_declaring_model_class_is_rejected(
+    monkeypatch, architectures, params_message, selection_message
+):
+    monkeypatch.setitem(MODEL_CLASS_MAPPING, "ManagerOnlyForCausalLM", _ManagerOnlyModel)
     config = _text_config("nemotron")
     config.architectures = architectures
 
-    with pytest.raises(ValueError, match="No model class is registered"):
+    with pytest.raises(ValueError, match=params_message):
         extract_mamba_kv_cache_params(config)
-    with pytest.raises(ValueError, match="No model class is registered"):
+    with pytest.raises(ValueError, match=selection_message):
         get_kv_cache_manager_cls(
-            SimpleNamespace(pretrained_config=config, sparse_attention_config=None),
+            SimpleNamespace(
+                pretrained_config=config,
+                sparse_attention_config=None,
+                # What `ModelConfig` counts for a class without a declaration.
+                get_num_mamba_layers=lambda: 0,
+            ),
             KvCacheConfig(),
         )
+
+
+@pytest.mark.parametrize("family, architecture", _TEXT_ARCHITECTURES)
+def test_v2_selection_returns_the_cache_manager_the_model_class_declares(
+    monkeypatch, family, architecture
+):
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    config = _text_config(family, architecture=architecture)
+
+    manager_cls = resolve_recurrent_kv_cache_manager_cls(config)
+
+    assert manager_cls is _FAMILY_MANAGERS[family]
+    assert (
+        get_kv_cache_manager_cls(
+            ModelConfig(pretrained_config=config),
+            KvCacheConfig(use_kv_cache_manager_v2=True, enable_block_reuse=False),
+        )
+        is manager_cls
+    )
 
 
 @skip_no_cuda

@@ -632,6 +632,18 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         params = get_glm5_next_cache_params(pretrained_config, quant_config=quant_config)
         return recurrent_state_spec_from_mamba_params(params, conv_sections="q_k_v")
 
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the cache manager that holds the KDA state and the indexer state."""
+        from ..attention.backends.sparse.glm_kpool.cache_manager import Glm5NextCacheManager
+
+        return Glm5NextCacheManager
+
+    @classmethod
+    def requires_kv_cache_manager_v2(cls, pretrained_config: Any = None) -> bool:
+        """The indexer state of the sparse layers is an extra buffer of the V2 manager."""
+        return True
+
     # -- whole-model materialization --------------------------------------
 
     def load_weights(

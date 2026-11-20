@@ -808,6 +808,12 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
         return Qwen3NextForCausalLM.get_recurrent_state_spec(text_config, quant_config=quant_config)
 
+    @classmethod
+    def get_recurrent_kv_cache_manager_cls(cls, pretrained_config: Any) -> type:
+        """Return the hybrid text decoder's cache manager class."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return Qwen3NextForCausalLM.get_recurrent_kv_cache_manager_cls(text_config)
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel
         kwargs["disable_fuse_rope"] = kwargs.get("disable_fuse_rope", False)

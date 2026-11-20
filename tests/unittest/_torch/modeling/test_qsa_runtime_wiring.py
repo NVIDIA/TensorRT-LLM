@@ -244,6 +244,10 @@ def test_qsa_hybrid_routes_to_sparse_v2_cache_manager(monkeypatch) -> None:
     from tensorrt_llm._torch.pyexecutor import _util
 
     monkeypatch.setattr(_util, "is_hybrid_linear", lambda config: True)
+    # The model declares another manager, so only the QSA route selects the sparse one.
+    monkeypatch.setattr(
+        _util, "resolve_recurrent_kv_cache_manager_cls", lambda config: MambaHybridCacheManagerV2
+    )
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["Qwen4ExpForCausalLM"]),
         sparse_attention_config=QSASparseAttentionConfig(),
