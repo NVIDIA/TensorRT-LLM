@@ -222,6 +222,8 @@ When the served model is Kimi K3, `trtllm-serve` applies Kimi/Moonshot API seman
 * **`KIMI_K3_MXFP8_SHARED_EXPERT`** (default `0`; SM107 with the CuTe DSL Rubin package, attention DP only): when set to `1`, runs the shared experts on lossy MXFP8 weights, through a fused FC1 + SiTU + FC2 kernel for large eager batches and two MXFP8 GEMMs otherwise. Without attention DP (TEP8, TEP16) the shared experts keep their BF16 path. It has no end-to-end accuracy or performance measurement yet, and weight reloading is not supported with it.
 * **`TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR`** (default `0`): opt-in constrained decoding for tools with `strict: true` (requires `guided_decoding_backend: xgrammar`). Disabled by default pending the investigation of a device-side assert observed under sustained concurrent guided load; strict tools otherwise fall back to warn-and-continue.
 
+Independently of the Kimi extensions, `parallel_tool_calls: false` ends generation after the model's first tool call on `/v1/chat/completions` and `/v1/responses`, as does `disable_parallel_tool_use` on `/v1/messages`; without it the model may return several tool calls in one turn.
+
 ## Testing API Endpoint
 
 The server (the OpenAI-compatible REST endpoint) runs on the rank-0 node, listening on port `8000`. Send requests to that node's hostname or IP; `localhost` only works from the rank-0 node itself.

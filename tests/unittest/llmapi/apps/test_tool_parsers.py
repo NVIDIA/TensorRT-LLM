@@ -16,6 +16,8 @@
 import abc
 import functools
 import json
+import logging
+import re
 import time
 from contextlib import AbstractContextManager
 from typing import Callable, Iterator, NamedTuple
@@ -23,6 +25,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
@@ -49,6 +52,7 @@ from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
 
 from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
@@ -103,6 +107,35 @@ def sample_tools():
                 },
             ),
         ),
+    ]
+
+
+@pytest.fixture
+def trtllm_log(monkeypatch):
+    """The records the TRT-LLM logger emits during a test, debug level included."""
+    records = []
+
+    class Capture(logging.Handler):
+
+        def emit(self, record):
+            records.append(record)
+
+    handler = Capture(level=logging.DEBUG)
+    monkeypatch.setattr(logger, "_min_severity", "debug")
+    previous_level = logger._logger.level
+    logger._logger.setLevel(logging.DEBUG)
+    logger._logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger._logger.removeHandler(handler)
+        logger._logger.setLevel(previous_level)
+
+
+def _logged(records, level):
+    """The messages of ``records`` at exactly ``level``."""
+    return [
+        record.getMessage() for record in records if record.levelno == level
     ]
 
 
@@ -3680,6 +3713,212 @@ def test_deepseek_streaming_prefix_is_delta_independent(
 
 
 # ============================================================================
+# DeepSeek DSML: generation stopped after one call, calls block left open
+# ============================================================================
+
+# Each DSML generation: parser, calls tag, invoke tag, parameter tag.
+_SINGLE_CALL_DSML_FORMATS = [
+    (DeepSeekV32Parser, "function_calls", "invoke", "parameter"),
+    (DeepSeekV4Parser, "tool_calls", "invoke", "parameter"),
+    (DeepSeekV41Parser, " calls", " invoke", " parameter"),
+]
+_SINGLE_CALL_DSML_IDS = ["v32", "v4", "v41"]
+
+_WEATHER_CALL = ("get_weather", {"location": "NYC"})
+_SEARCH_CALL = ("search_web", {"query": "AI news"})
+
+
+def _encoder_invoke(invoke_tag: str, parameter_tag: str, name: str,
+                    arguments: dict[str, str]) -> str:
+    """One call as the checkpoints' encoders write it."""
+    parameters = "\n".join(
+        f'<｜DSML｜{parameter_tag} name="{key}" string="true">{value}'
+        f"</｜DSML｜{parameter_tag}>" for key, value in arguments.items())
+    return (f'<｜DSML｜{invoke_tag} name="{name}">\n{parameters}\n'
+            f"</｜DSML｜{invoke_tag}>")
+
+
+def _encoder_reply(calls_tag: str, invoke_tag: str, parameter_tag: str,
+                   content: str, calls: list) -> str:
+    """A reply with tool calls as the encoders write it, block closed."""
+    invokes = "\n".join(
+        _encoder_invoke(invoke_tag, parameter_tag, name, arguments)
+        for name, arguments in calls)
+    return (f"{content}\n\n<｜DSML｜{calls_tag}>\n{invokes}\n"
+            f"</｜DSML｜{calls_tag}>")
+
+
+def _delta_splits(text: str) -> Iterator[list[str]]:
+    """Ways the detokenizer may cut ``text`` into deltas, and more.
+
+    The DSML marker is one token, so it is never cut; other text is cut at
+    any character, which covers every token boundary. Yields the whole text,
+    one unit per delta, every cut into two deltas, and fixed-width deltas of
+    2 to 7 units.
+    """
+    marker = "｜DSML｜"
+    units, pos = [], 0
+    while pos < len(text):
+        step = len(marker) if text.startswith(marker, pos) else 1
+        units.append(text[pos:pos + step])
+        pos += step
+    yield [text]
+    yield units
+    for cut in range(1, len(units)):
+        yield ["".join(units[:cut]), "".join(units[cut:])]
+    for width in range(2, 8):
+        yield [
+            "".join(units[start:start + width])
+            for start in range(0, len(units), width)
+        ]
+
+
+def _whole_text_view(parser_cls, text, tools):
+    result = parser_cls().detect_and_parse(text, tools)
+    return result.normal_text.strip(), [(call.name, json.loads(call.parameters))
+                                        for call in result.calls]
+
+
+def _streamed_view(parser_cls, deltas, tools):
+    """What a streaming client receives, finish() included."""
+    parser = parser_cls()
+    normal, names, arguments = [], {}, {}
+    results = [parser.parse_streaming_increment(d, tools) for d in deltas]
+    for result in results + [parser.finish(tools)]:
+        normal.append(result.normal_text)
+        for call in result.calls:
+            if call.name:
+                names[call.tool_index] = call.name
+            arguments[call.tool_index] = (arguments.get(call.tool_index, "") +
+                                          call.parameters)
+    return "".join(normal).strip(), [
+        (names[index], json.loads(arguments[index])) for index in sorted(names)
+    ]
+
+
+def _assert_both_views(parser_cls, text, tools, expected):
+    """The whole-text parse and every streaming split read ``expected``."""
+    assert _whole_text_view(parser_cls, text, tools) == expected
+    for deltas in _delta_splits(text):
+        assert _streamed_view(parser_cls, deltas, tools) == expected, deltas
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_single_call_stops_are_the_invoke_close_tag(
+        parser_cls, calls_tag, invoke_tag, parameter_tag):
+    """The close tag with the newline the encoders write after it comes first.
+
+    '>' and that newline are one token, and stops match token ids, so the bare
+    tag alone would never match the encoders' layout.
+    """
+    close_tag = f"</｜DSML｜{invoke_tag}>"
+    assert parser_cls().single_call_stops == (close_tag + "\n", close_tag)
+
+
+@pytest.mark.parametrize("stop_index", [0, 1], ids=["with_newline", "bare"])
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_generation_stopped_after_its_first_call_delivers_that_call(
+        sample_tools, parser_cls, calls_tag, invoke_tag, parameter_tag,
+        stop_index):
+    """The output ends on the kept stop, inside a calls block never closed."""
+    reply = _encoder_reply(calls_tag, invoke_tag, parameter_tag,
+                           "Checking both.", [_WEATHER_CALL, _SEARCH_CALL])
+    stop = parser_cls().single_call_stops[stop_index]
+    stopped = reply[:reply.index(stop) + len(stop)]
+
+    _assert_both_views(parser_cls, stopped, sample_tools,
+                       ("Checking both.", [_WEATHER_CALL]))
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "",
+        "\n",
+        # Cut inside the next invoke: header, parameter, close tags.
+        "\n<",
+        "\n<｜DSML｜{invoke}",
+        '\n<｜DSML｜{invoke} name="search',
+        '\n<｜DSML｜{invoke} name="search_web">\n<｜DSML｜{parameter} name="query" '
+        'string="true">AI',
+        '\n<｜DSML｜{invoke} name="search_web">\n<｜DSML｜{parameter} name="query" '
+        'string="true">AI news</｜DSML｜{parameter}>\n</｜DSML｜{invoke}',
+        # Cut inside the block's closing tag.
+        "\n</｜DSML｜{calls_prefix}",
+    ],
+    ids=[
+        "after_close_tag", "after_newline", "next_tag_opened",
+        "next_invoke_tag", "next_invoke_name", "next_parameter_value",
+        "next_close_tag", "block_close_tag"
+    ],
+)
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_open_block_delivers_its_complete_invokes_only(
+        sample_tools, parser_cls, calls_tag, invoke_tag, parameter_tag, tail):
+    """A block left open, by a stop or a token limit, keeps its complete calls.
+
+    The unfinished invoke after them is not a call, and its markup is not
+    text, in the whole-text parse and the stream alike.
+    """
+    text = ("Checking.\n\n" + f"<｜DSML｜{calls_tag}>\n" +
+            _encoder_invoke(invoke_tag, parameter_tag, *_WEATHER_CALL) +
+            tail.format(invoke=invoke_tag,
+                        parameter=parameter_tag,
+                        calls_prefix=calls_tag[:-2]))
+
+    _assert_both_views(parser_cls, text, sample_tools,
+                       ("Checking.", [_WEATHER_CALL]))
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_open_block_delivers_every_complete_invoke(sample_tools,
+                                                        parser_cls, calls_tag,
+                                                        invoke_tag,
+                                                        parameter_tag):
+    """The parser does not limit the calls; only the stop does."""
+    reply = _encoder_reply(calls_tag, invoke_tag, parameter_tag, "Checking.",
+                           [_WEATHER_CALL, _SEARCH_CALL])
+    open_block = reply[:reply.rindex("\n</｜DSML｜")]
+
+    _assert_both_views(parser_cls, open_block, sample_tools,
+                       ("Checking.", [_WEATHER_CALL, _SEARCH_CALL]))
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_open_block_without_a_complete_invoke_has_no_call(
+        sample_tools, parser_cls, calls_tag, invoke_tag, parameter_tag):
+    invoke = _encoder_invoke(invoke_tag, parameter_tag, *_WEATHER_CALL)
+    text = "Checking.\n\n" + f"<｜DSML｜{calls_tag}>\n" + invoke[:-1]
+
+    _assert_both_views(parser_cls, text, sample_tools, ("Checking.", []))
+
+
+def test_the_parsers_that_declare_single_call_stops():
+    """Formats whose markup ends each call with its own text.
+
+    Other formats have no stop, so their requests keep every call.
+    """
+    declaring = {
+        name
+        for name, parser_cls in ToolParserFactory.parsers.items()
+        if parser_cls().single_call_stops
+    }
+    assert declaring == {
+        "deepseek_v32", "deepseek_v4", "deepseek_v41", "kimi_k3"
+    }
+
+
+# ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
 
@@ -6770,6 +7009,240 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
 
         assert [call.name for call in result.calls] == ["a<b", "get_weather"]
         assert json.loads(result.calls[1].parameters) == {"k<ey": "v"}
+
+    # Pieces of a generation with a call whose close tags the model left out.
+    # The generation prompt ends inside `<|open|>think<|sep|>`.
+    PREFIX = ("Need the weather.<|close|>think<|sep|>"
+              "<|open|>response<|sep|>Checking.<|close|>response<|sep|>")
+    WEATHER = '<|open|>call tool="get_weather" index="1"<|sep|>'
+    LOCATION = '<|open|>argument key="location" type="string"<|sep|>'
+    LOCATION_LA = LOCATION + "LA<|close|>argument<|sep|>"
+    SEARCH = ('<|open|>call tool="search_web" index="2"<|sep|>'
+              '<|open|>argument key="query" type="string"<|sep|>AI'
+              "<|close|>argument<|sep|><|close|>call<|sep|>")
+    MESSAGE_END = "<|close|>message<|sep|><|end_of_msg|>"
+    LA_AND_AI = [(0, "get_weather", {
+        "location": "LA"
+    }), (1, "search_web", {
+        "query": "AI"
+    })]
+
+    @staticmethod
+    def _chunkings(text):
+        """Every way these tests split a generation into stream deltas."""
+        yield [text]
+        yield list(text)
+        for size in (2, 3, 5, 7, 11):
+            yield [text[i:i + size] for i in range(0, len(text), size)]
+        for cut in range(1, len(text)):
+            yield [text[:cut], text[cut:]]
+
+    def _read_chained(self, generation, tools):
+        """Read a generation as serving does: the K3 reasoning parser feeds this one.
+
+        Asserts that the stream, split every way, reads like the whole text, and
+        returns the whole-text reading: (text, [(tool_index, name, arguments)]).
+        """
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        def reading(text, calls):
+            return text, [(call.tool_index, call.name,
+                           json.loads(call.parameters)) for call in calls]
+
+        content = ReasoningParserFactory.create_reasoning_parser(
+            "kimi_k3").parse(generation).content
+        whole = self.make_parser().detect_and_parse(content, tools)
+        expected = reading(whole.normal_text, whole.calls)
+        for chunks in self._chunkings(generation):
+            reasoning = ReasoningParserFactory.create_reasoning_parser(
+                "kimi_k3")
+            deltas = [reasoning.parse_delta(chunk).content for chunk in chunks]
+            deltas.append(reasoning.finish().content)
+            parser = self.make_parser()
+            results = [
+                parser.parse_streaming_increment(delta, tools)
+                for delta in deltas
+            ]
+            results.append(parser.finish(tools))
+            streamed = reading(
+                "".join(result.normal_text for result in results),
+                [call for result in results for call in result.calls])
+            assert streamed == expected, chunks
+        return expected
+
+    @pytest.mark.parametrize(
+        "left_open, ending, calls",
+        [
+            # A value followed straight by the call's close tag.
+            pytest.param(WEATHER + LOCATION + "LA",
+                         "<|close|>call<|sep|>" + SEARCH + EOT + MESSAGE_END,
+                         LA_AND_AI,
+                         id="value-call_close-next_call"),
+            pytest.param(WEATHER + LOCATION + "LA",
+                         "<|close|>call<|sep|>",
+                         LA_AND_AI[:1],
+                         id="value-call_close-end"),
+            # A call whose argument is complete, followed by the next call or
+            # the end of the section.
+            pytest.param(WEATHER + LOCATION_LA,
+                         SEARCH + EOT + MESSAGE_END,
+                         LA_AND_AI,
+                         id="call-next_call"),
+            pytest.param(WEATHER + LOCATION_LA,
+                         EOT + MESSAGE_END,
+                         LA_AND_AI[:1],
+                         id="call-section_close"),
+            # A call or a value left open by the response's close tag and the
+            # message framing.
+            pytest.param(WEATHER + LOCATION_LA,
+                         "<|close|>response<|sep|>" + MESSAGE_END,
+                         LA_AND_AI[:1],
+                         id="call-response_close"),
+            pytest.param(WEATHER + LOCATION + "LA",
+                         "<|close|>response<|sep|>" + MESSAGE_END,
+                         LA_AND_AI[:1],
+                         id="value-response_close"),
+        ])
+    def test_call_with_missing_close_tags_is_read(self, sample_tools, left_open,
+                                                  ending, calls):
+        """Read a call whose close tags the model left out where it ends.
+
+        ``left_open`` is the call up to where the model ended it without its
+        close tags, and ``ending`` what it wrote instead. A generation that
+        stops at ``left_open`` may have cut the call off, so it is not read.
+        """
+        generation = self.PREFIX + self.BOT + left_open
+
+        assert self._read_chained(generation + ending,
+                                  sample_tools) == ("Checking.", calls)
+        assert self._read_chained(generation, sample_tools) == ("Checking.", [])
+
+    def test_value_without_close_tag_is_read_only_where_the_call_ends(
+            self, sample_tools):
+        """Read a value without its close tag only up to tags that end the call.
+
+        The call's close tag ends it where a call can end, not before prose.
+        The section's close tag alone does not: a value may quote it, and the
+        section ends at the first one.
+        """
+        value = (self.PREFIX + self.BOT + self.WEATHER + self.LOCATION +
+                 "New York")
+
+        _, calls = self._read_chained(value + "<|close|>call<|sep|>",
+                                      sample_tools)
+        assert calls == [(0, "get_weather", {"location": "New York"})]
+        for tail in ("<|close|>call<|sep|> and Boston",
+                     self.EOT + self.MESSAGE_END):
+            _, calls = self._read_chained(value + tail, sample_tools)
+            assert all("location" not in arguments
+                       for _, _, arguments in calls), tail
+
+    def test_call_read_without_close_tags_is_logged(self, sample_tools, parser,
+                                                    monkeypatch):
+        """A call read without its close tags is logged with the tags it lacks."""
+        log = Mock()
+        monkeypatch.setattr(
+            "tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger", log)
+
+        result = parser.detect_and_parse(
+            self.BOT + self.WEATHER + self.LOCATION_LA + self.EOT, sample_tools)
+
+        assert [call.name for call in result.calls] == ["get_weather"]
+        warnings = [str(call.args[0]) for call in log.warning.call_args_list]
+        assert any("'get_weather' read without <|close|>call<|sep|>" in warning
+                   for warning in warnings)
+
+    # What a generation stopped after its first call leaves
+    # (parallel_tool_calls=false): the call, closed by the kept stop, in a
+    # tools section the stop left open.
+    STOPPED_CALL = WEATHER + LOCATION_LA + "<|close|>call<|sep|>"
+    _SPECIAL_TOKEN = re.compile(r"(<\|open\|>|<\|close\|>|<\|sep\|>)")
+
+    def _token_chunkings(self, text):
+        """Splits of ``text`` at its special tokens, which the model writes whole.
+
+        Every piece on its own, then every two-way cut at a piece boundary.
+        """
+        pieces = [piece for piece in self._SPECIAL_TOKEN.split(text) if piece]
+        yield pieces
+        for cut in range(1, len(pieces)):
+            yield ["".join(pieces[:cut]), "".join(pieces[cut:])]
+
+    def _stream(self, chunks, tools):
+        """Read ``chunks`` as a stream, finish included: (text, [(name, arguments)])."""
+        parser = self.make_parser()
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+        results.append(parser.finish(tools))
+        return ("".join(result.normal_text for result in results),
+                [(call.name, json.loads(call.parameters)) for result in results
+                 for call in result.calls])
+
+    def test_the_single_call_stop_is_the_call_close_tag(self):
+        """parallel_tool_calls=false stops generation on this text, kept in the output."""
+        assert KimiK3ToolParser().single_call_stops == (
+            "<|close|>call<|sep|>", )
+
+    @pytest.mark.parametrize("trailing", ["", "\n"],
+                             ids=["at_the_stop", "newline_after_the_call"])
+    def test_a_generation_stopped_after_its_first_call_delivers_that_call_quietly(
+            self, sample_tools, trtllm_log, trailing):
+        """The kept stop completes the call; the section it leaves open is no error.
+
+        Whole and streamed alike deliver that call and nothing else. Every
+        parallel_tool_calls=false turn with a call ends this way, so the open
+        section is noted at debug, not warned about; so is a generation cut
+        right after the newline following the call.
+        """
+        content = "Checking." + self.BOT + self.STOPPED_CALL + trailing
+        (stop, ) = KimiK3ToolParser().single_call_stops
+        assert content.rstrip().endswith(stop)
+        expected = ("Checking.", [("get_weather", {"location": "LA"})])
+
+        whole = self.make_parser().detect_and_parse(content, sample_tools)
+        assert (whole.normal_text, [(call.name, json.loads(call.parameters))
+                                    for call in whole.calls]) == expected
+        for chunks in self._token_chunkings(content):
+            assert self._stream(chunks, sample_tools) == expected, chunks
+
+        assert _logged(trtllm_log, logging.WARNING) == []
+        assert any("stream ended before" in message
+                   for message in _logged(trtllm_log, logging.DEBUG))
+
+    def test_a_generation_stopped_after_its_first_call_reads_the_same_through_the_pipeline(
+            self, sample_tools):
+        """With the reasoning parser in front, as served: the reasoning, then the one call."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        generation = self.PREFIX + self.BOT + self.STOPPED_CALL
+
+        reasoning = ReasoningParserFactory.create_reasoning_parser("kimi_k3")
+        assert reasoning.parse(
+            generation).reasoning_content == "Need the weather."
+        assert self._read_chained(generation, sample_tools) == ("Checking.", [
+            (0, "get_weather", {
+                "location": "LA"
+            })
+        ])
+
+    @pytest.mark.parametrize("ending", [
+        pytest.param(" and then I", id="prose_after_the_call"),
+        pytest.param('<|open|>call tool="search_web"', id="next_call_cut_off"),
+        pytest.param('<|open|>call tool="search_web" index="2"<|sep|>' +
+                     LOCATION + "New",
+                     id="next_call_value_cut_off"),
+    ])
+    def test_a_section_left_open_any_other_way_still_warns(
+            self, sample_tools, trtllm_log, ending):
+        """Only a section whose last content is a complete call is quiet."""
+        text, calls = self._stream(
+            ["Checking.", self.BOT + self.STOPPED_CALL, ending], sample_tools)
+
+        assert text == "Checking."
+        assert calls[:1] == [("get_weather", {"location": "LA"})]
+        assert any("stream ended before" in message
+                   for message in _logged(trtllm_log, logging.WARNING))
 
 
 class TestForcedToolChoicePostprocessing:
