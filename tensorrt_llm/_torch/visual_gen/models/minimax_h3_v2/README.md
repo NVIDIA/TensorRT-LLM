@@ -15,7 +15,7 @@ TLLM_VISUALGEN_MODELING2_H3=1 python examples/visual_gen/models/minimax_h3.py \
     --visual_gen_args examples/visual_gen/configs/minimax-h3-bf16-1gpu.yaml
 ```
 
-The [family registry](pipeline_registry.py) selects a V2 target from the resolved checkpoint before transformer construction. Check the fully qualified class in the loader's `AutoPipeline: Creating` message before timing a target.
+The [family registry](pipeline_registry.py) selects a V2 target before transformer construction. It recognizes FastH3 by the `fasth3-` prefix of `schema_version` in `fastvideo_inference.json`. The worker's `AutoPipeline: Creating` message prints the fully qualified class for V2 and the class name for V1.
 
 | Checkpoint contract | V2 target | Denoising schedule |
 | --- | --- | --- |
@@ -41,21 +41,21 @@ Place a change according to the decision it makes. Then choose its [sharing scop
 | Pipeline | How a request moves through conditioning, denoising and decoding, including which components run at each step. | The [family pipeline](pipeline.py) advances the joint audio/video denoising loop. The [FastH3 target](fasth3/pipeline.py) supplies its trained schedule. |
 | Component | How a model block computes its output. It composes operations and holds the parameters or other instance state that block needs. | [H3 attention](components/attention.py) owns its projections and normalization weights and chooses when to apply fused Q/K norm and RoPE. |
 | Parallel | Define rank-local shard ranges and schedule collectives on the participating process group. Components use those ranges to construct paired projections and load weights. | [H3 Ulysses](parallel/ulysses.py) schedules V, Q, K on the asynchronous path and waits for the transfers before attention. |
-| Operation | What one tensor computation or collective returns for explicit inputs, layouts and parameters. The call is stateless. It can select a compatible kernel or compose several calls that satisfy the same contract. | The [Q/K norm and RoPE op](ops/rope.py) takes packed QKV, norm weights and rotation tables. Its PyTorch reference defines the expected Q and K. |
+| Operation | The inputs, outputs and observable buffer mutations of one tensor computation or collective. The caller supplies any runner, workspace or other execution state. | The [Q/K norm and RoPE op](ops/rope.py) takes packed QKV, norm weights and rotation tables. Its PyTorch reference defines the expected Q and K. |
 | Kernel | How the device executes the operation, including fusion, tiling, memory access and launch configuration. | The [fused Triton kernel](kernels/fused_rope.py) loads the Q/K head data, computes RMS normalization and rotates the leading channels in one launch. |
 
 Changing the fused RoPE tile size belongs in `kernels/`. Changing the rotation from the leading channels to the trailing channels changes the contract in `ops/` and its reference tests. In asynchronous Ulysses, [parallel/ulysses.py](parallel/ulysses.py) determines when the V/Q/K transfers run. [ops/ulysses.py](ops/ulysses.py) determines how the three received buffers map to the attention layout.
 
 ### Choose the sharing scope
 
-The VisualGen catalog is for **Modeling V2**. Add a model-independent operation when its data contract, reference and tested configurations are precise enough for another V2 family to use unchanged. The first migrated family can introduce it. V1 pipelines keep their existing paths. Each family starts using a catalog entry when its V2 implementation calls it.
+Keep a target independent of its siblings. When two targets need the same implementation, put it in the family and import it from both. The VisualGen V2 catalog can accept an operation from its first consumer when another family could use the same tensor contract, reference and supported configurations unchanged. V1 callers keep their existing backend paths.
 
 | Scope of the change | Place it here | Example |
 | --- | --- | --- |
 | One checkpoint target | The target directory | Base H3's text-only TP encoder, or FastH3's trained schedule |
-| Model-specific computation shared by sibling targets | The family directory | Packed rows, H3 attention components, learned VSA gates and Ulysses scheduling |
-| A reusable model-independent computation | The [VisualGen V2 catalog](../../catalog/attention/) | Attention over explicit valid KV lengths or preselected KV tiles |
-| An existing kernel, library primitive or runtime interface | Its existing owner | PyTorch SDPA, process groups and compatible GEMM primitives |
+| Model-specific computation shared by sibling targets | The family directory | Joint audio/video token packing, DiT blocks and gated VSA attention |
+| A reusable model-independent computation | The [VisualGen V2 catalog](../../catalog/) | Attention over explicit valid KV lengths or preselected KV tiles |
+| An existing operation or runtime interface with the required contract | Import it from its owner | H3 [projections](components/linear.py) use the LLM V2 `cublas_mm` and `nvfp4_gemm` ops, and [normalization](components/norm.py) uses `flashinfer_rmsnorm`. |
 
 ### How large is a catalog operation?
 
@@ -73,16 +73,18 @@ For a proposed entry, write its reference using only the arguments at the call s
 | --- | --- | --- |
 | [FA4](../../catalog/attention/flash_attention_4.py) | Attention output and logsumexp from Q/K/V, scale, causal mode and optional valid KV lengths | Convert trailing-padding masks to prefix lengths and restore the model's output dtype |
 | [FlashInfer prefill](../../catalog/attention/flashinfer_prefill.py) | Select a compatible provider kernel and compute prefill with explicit quantization formats, mask and runner | Create the runner for the loaded instance and pass its plan cache and the selected precision |
-| [CuTe FMHA](../../catalog/attention/cute_fmha.py) | Full attention on equal-head BSHD tensors, including quantization and a numerical skip-softmax threshold | Choose the recipe, resolve the threshold for the step and handle padding or dense fallback |
+| [CuTe FMHA](../../catalog/attention/cute_fmha.py) | Full attention on unpadded, equal-head BSHD tensors with an optional quantization recipe and skip-softmax threshold | Choose the recipe and per-step threshold. H3's SOL path uses masked SDPA when a padding mask is present. |
 | [Fine block-sparse attention](../../catalog/attention/block_sparse_attention.py) | Evaluate attention on explicit KV tile indices, counts and valid tile lengths | Construct text/video/audio routes and combine the result with coarse attention using the learned gate |
 
 FlashInfer uses *prefill* for attention over a sequence of query rows. H3 calls it for noncausal self-attention during denoising. Existing [LTX-2.3 FlashInfer deployments](../../../../../examples/visual_gen/configs/ltx23-t2v-fp8-1gpu.yaml) use the V1 backend.
 
 The [H3 attention component](components/dense_attention.py) adapts model inputs to these contracts. The [gated VSA computation](ops/vsa.py) serves both base checkpoints with gate weights and explicit VSA configuration and the FastH3 target.
 
-**H3 communication.** [H3 parallel code](parallel/ulysses.py) owns the V, Q, K projection order, streams and barriers. The [Ulysses ops](ops/ulysses.py) exchange Q/K/V or convert receive buffers to H3 attention layouts. Models can call the same native communication kernel with different schedules and layouts.
+**H3 communication.** Base H3 uses the [family Ulysses implementation](parallel/ulysses.py) for projection order, streams and barriers. FastH3 runs on one GPU. The [Ulysses ops](ops/ulysses.py) exchange Q/K/V or convert receive buffers to H3 attention layouts. Models can call the same native communication kernel with different schedules and layouts.
 
-Use the [Modeling V2 operation contract](../../../modeling_v2/README.md#writing-operations) at target, family and catalog scope. Pass execution state explicitly, put model-scoped runner lifetimes with the component, and test each supported layout and dtype against a reference. Use lower-level kernel or library interfaces in forward, fallback and loading paths, in line with the [V1 dependency rule](../../../modeling_v2/README.md#modeling-v1-code).
+Use the public operation or runner exported by the catalog entry. For example, H3 creates `FlashInferPrefillRunner` from [flashinfer_prefill.py](../../catalog/attention/flashinfer_prefill.py) and supplies the per-model plan cache. The [FA4 entry](../../catalog/attention/flash_attention_4.py) owns compatibility with the provider's `_flash_attn_fwd` binding. Keep mask conversion, layer selection and denoising policy with the model. Use the [Modeling V2 operation contract](../../../modeling_v2/README.md#writing-operations) for new entries.
+
+The H3 pilot still has adapter-specific dependencies. [H3 uncached attention](ops/uncached_attention.py) calls `FallbackFmha.attention`, the [H3 PrimTS adapter](components/trtllm_attention_prims.py) calls the private `_validate_block_sparse_static_profile` helper, and the [H3 SOL path](components/dense_attention.py) checks CuTe availability through `_cute_fmha_kernel`. These implementation details belong to their adapters. New consumers should use a public kernel or runner interface, or expose a model-independent operation with a tested contract. See the [LLM V2 dependency rule](../../../modeling_v2/README.md#modeling-v1-code).
 
 ## File map
 
@@ -100,7 +102,7 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 | [default_pipeline/text_encoder_tp.py](default_pipeline/text_encoder_tp.py) | Shard the Qwen3-VL text encoder and load its rank-local weights. |
 | [default_pipeline/ops/text_attention.py](default_pipeline/ops/text_attention.py) | Implement causal grouped-query attention for the TP text encoder. |
 | [default_pipeline/ops/text_qk_norm_rope.py](default_pipeline/ops/text_qk_norm_rope.py) | Define per-head Q/K normalization and rotation for the TP encoder's one-dimensional text positions. |
-| [default_pipeline/kernels/text_qk_norm_rope.py](default_pipeline/kernels/text_qk_norm_rope.py) | Apply text RoPE in place to the rank-local Q and K heads of a packed projection. |
+| [default_pipeline/kernels/text_qk_norm_rope.py](default_pipeline/kernels/text_qk_norm_rope.py) | Normalize and rotate the rank-local Q and K heads of a packed projection in place. |
 | [fasth3/pipeline.py](fasth3/pipeline.py) | Configure gated video sparse attention (VSA) and select the trained generation and warmup schedules. |
 | [fasth3/schedule.py](fasth3/schedule.py) | Convert trained DMD steps to video and audio scheduler timesteps and sigmas. |
 
@@ -145,4 +147,4 @@ Mirror family and target code in the [unit tests](../../../../../tests/unittest/
 
 A target change exercises that target. A shared family change exercises its consumers. Registry changes exercise both checkpoint targets and both switch settings. A catalog change runs its mirrored contract tests and the V2 targets that import the operation. V1 paths retain their existing tests.
 
-For V1/V2 comparisons, use the same checkpoint revision, seed, inputs, precision, backend, topology and explicit step count. Use 50 points on both sides for the base-H3 quality reference and test omitted defaults separately. Before retiring V1 and the opt-in switch, qualify generated video and audio, supported parallel paths, warmed latency and peak memory against V1 on representative deployments.
+For each deployment tested, run the same request in separate V1 and V2 processes on the same GPUs. Fix the checkpoint revision, conditioning inputs, seed, weight and attention precision, backend, parallel layout, compilation settings and sigma schedule. Compare the two decoded videos and audio waveforms directly. A multi-GPU run against one GPU measures topology sensitivity. A Diffusers comparison measures reference quality. Report these separately from refactor parity. Use 50 points for the base-H3 quality reference and test omitted defaults separately. Before retiring V1 and the opt-in switch, qualify generated video and audio, supported parallel paths, warmed latency and peak memory against V1 on representative deployments.
