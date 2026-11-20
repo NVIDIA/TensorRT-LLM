@@ -5,11 +5,15 @@
 import ast
 import copy
 import fnmatch
+import itertools
 import logging
 import os
 import re
+import subprocess
 import sys
 import unittest
+import weakref
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
@@ -54,6 +58,8 @@ def _routing_namespace():
         "Type": Type,
         "Callable": Callable,
         "os": os,
+        "torch": SimpleNamespace(bfloat16="BF16"),
+        "resolve_attention_precision": _attention_precision_resolver(),
         "QuantAlgo": SimpleNamespace(FP8="FP8", NVFP4="NVFP4"),
         "logger": logging.getLogger(__name__),
         "_MODES": ("off", "auto", "require"),
@@ -65,6 +71,76 @@ def _routing_namespace():
         namespace,
     )
     return namespace
+
+
+def _source_definitions(path, names, namespace):
+    """Compile actual definitions without importing CUDA-dependent package parents."""
+    definitions = [
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names
+    ]
+    for node in definitions:
+        node.decorator_list = []
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    tree = ast.fix_missing_locations(ast.Module(body=[future, *definitions], type_ignores=[]))
+    exec(compile(tree, str(path), "exec"), namespace)
+    return namespace
+
+
+@lru_cache(maxsize=1)
+def _attention_precision_resolver():
+    path = MODEL / "attention_precision.py"
+    tree = ast.parse(path.read_text())
+    tree.body = [
+        n
+        for n in tree.body
+        if not (isinstance(n, ast.Import) and any(alias.name == "torch" for alias in n.names))
+    ]
+    namespace = {"torch": SimpleNamespace(dtype=object, bfloat16="BF16")}
+    exec(compile(tree, str(path), "exec"), namespace)
+    return namespace["resolve_attention_precision"]
+
+
+def _copy_pipeline_model_config(config):
+    """Exercise the real pre-routing component factory and its actual copy helper."""
+    path = REPO / "tensorrt_llm/_torch/visual_gen/config.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DiffusionPipelineConfig"
+    )
+    factory = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_make_model_config"
+    )
+    namespace = _source_definitions(
+        path,
+        {"_model_config_value"},
+        {"BaseModel": type("BaseModel", (), {}), "deepcopy": copy.deepcopy},
+    )
+    namespace["DiffusionModelConfig"] = lambda **values: SimpleNamespace(
+        torch_dtype="BF16", **values
+    )
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[future, factory], type_ignores=[])),
+            str(path),
+            "exec",
+        ),
+        namespace,
+    )
+    for node in ast.walk(factory):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+            and not hasattr(config, node.attr)
+        ):
+            setattr(config, node.attr, None)
+    pretrained = config.model_configs["transformer"].pretrained_config
+    config.model_configs["transformer"] = namespace["_make_model_config"](
+        config, "transformer", pretrained
+    )
 
 
 @lru_cache(maxsize=1)
@@ -124,6 +200,9 @@ def _config():
             "transformer": SimpleNamespace(
                 quant_config=_quant_config(),
                 quant_config_dict=None,
+                torch_dtype="BF16",
+                pretrained_config=SimpleNamespace(quantization_config=None),
+                extra_attrs={},
             )
         },
         quant_config=_quant_config(),
@@ -306,6 +385,136 @@ class RoutingContracts(unittest.TestCase):
         namespace["ROUTES"] = (lambda cfg: self.fail("off must not inspect or import scenarios"),)
         self.assertIs(namespace["resolve_scenario"](object, cfg), object)
 
+    def test_checkpoint_alias_exclusions_keep_family_route(self):
+        cases = [
+            [f"transformer_blocks.0.attn.to_{name}" for name in "qkv"],
+            ["transformer_blocks.1.ff.net.0.proj"],
+            ["transformer_blocks.2.ff.net.2"],
+            ["transformer_blocks.*.ff.net.2"],
+        ]
+        for ignored in cases:
+            with self.subTest(ignored=ignored):
+                config = _config()
+                config.model_configs["transformer"].quant_config.exclude_modules = ignored
+                config.extra_attrs["visual_gen_scenario"] = "auto"
+                namespace = _routing_namespace()
+                self.assertIs(namespace["resolve_scenario"](object, config), object)
+                with self.assertRaisesRegex(namespace["NoScenario"], "excluded"):
+                    namespace["route_fp8_sm_107_u1"](config)
+
+    def test_route_aliases_match_actual_checkpoint_linear_mapping(self):
+        path = MODEL / "transformer_minimax_h3.py"
+        tree = ast.parse(path.read_text())
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "MiniMaxH3Transformer3DModel"
+        )
+        mapping = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.Assign) and n.targets[0].id == "_FUSED_CHECKPOINT_LINEARS"
+        )
+        method = copy.deepcopy(
+            next(
+                n
+                for n in cls.body
+                if isinstance(n, ast.FunctionDef) and n.name == "_checkpoint_linear_names"
+            )
+        )
+        method.decorator_list = []
+        namespace = {}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+        model = SimpleNamespace(_FUSED_CHECKPOINT_LINEARS=ast.literal_eval(mapping.value))
+        route = next(
+            n
+            for n in ast.parse((MODEL / "scenarios.py").read_text()).body
+            if isinstance(n, ast.FunctionDef) and n.name == "route_fp8_sm_107_u1"
+        )
+        projections = next(
+            n
+            for n in ast.walk(route)
+            if isinstance(n, ast.For)
+            and isinstance(n.target, ast.Name)
+            and n.target.id == "projection"
+        )
+        expected = set()
+        for projection in ["attn.qkv_proj", "attn.to_out.0", "ff.gate_up_proj", "ff.down_proj"]:
+            expected.add(projection)
+            expected.update(namespace["_checkpoint_linear_names"](model, projection))
+        self.assertEqual(set(ast.literal_eval(projections.iter)), expected)
+
+    def test_non_bf16_model_dtype_declines_before_selection(self):
+        config = _config()
+        config.model_configs["transformer"].torch_dtype = "FP16"
+        config.extra_attrs["visual_gen_scenario"] = "auto"
+        self.assertIs(_routing_namespace()["resolve_scenario"](object, config), object)
+
+    def test_attention_policy_matches_checkpoint_component_and_pipeline_factory(self):
+        for source in ["checkpoint", "component", "pipeline"]:
+            for main_block in [False, True]:
+                with self.subTest(source=source, main_block=main_block):
+                    config = _config()
+                    component = config.model_configs["transformer"]
+                    name = (
+                        "transformer_blocks.0.attn"
+                        if main_block
+                        else "token_refiner.refiner_blocks.0.attn"
+                    )
+                    policy = {"schema_version": 1, "layers": {name: "bf16"}}
+                    if source == "checkpoint":
+                        component.pretrained_config.quantization_config = {
+                            "attention_precision": policy
+                        }
+                    elif source == "component":
+                        component.extra_attrs["minimax_h3_attention_precision"] = policy
+                    else:
+                        config.extra_attrs["minimax_h3_attention_precision"] = policy
+                        _copy_pipeline_model_config(config)
+                        self.assertEqual(
+                            config.model_configs["transformer"].extra_attrs[
+                                "minimax_h3_attention_precision"
+                            ],
+                            policy,
+                        )
+                        self.assertIsNot(
+                            config.model_configs["transformer"].extra_attrs, config.extra_attrs
+                        )
+                    config.extra_attrs["visual_gen_scenario"] = "auto"
+                    namespace = _routing_namespace()
+                    if main_block:
+                        self.assertIs(namespace["resolve_scenario"](object, config), object)
+                    else:
+                        module = "_h3_fp8_cpu_contracts.minimax_h3_fp8__sm_107__u1"
+                        selection = ModuleType(module + ".config")
+                        selection.select = lambda: None
+                        pipeline = ModuleType(module + ".pipeline")
+                        pipeline.MiniMaxH3Fp8Sm107U1Pipeline = type("Pipeline", (), {})
+                        with patch.dict(
+                            sys.modules,
+                            {module + ".config": selection, module + ".pipeline": pipeline},
+                        ):
+                            self.assertIs(
+                                namespace["resolve_scenario"](object, config),
+                                pipeline.MiniMaxH3Fp8Sm107U1Pipeline,
+                            )
+
+    def test_conflicting_attention_policies_remain_configuration_errors(self):
+        config = _config()
+        component = config.model_configs["transformer"]
+        component.pretrained_config.quantization_config = {
+            "attention_precision": {
+                "schema_version": 1,
+                "layers": {"transformer_blocks.0.attn": "bf16"},
+            }
+        }
+        component.extra_attrs["minimax_h3_attention_precision"] = {
+            "schema_version": 1,
+            "layers": {"token_refiner.refiner_blocks.0.attn": "bf16"},
+        }
+        with self.assertRaisesRegex(ValueError, "differ"):
+            _routing_namespace()["route_fp8_sm_107_u1"](config)
+
 
 class ForwardContract(unittest.TestCase):
     def test_qkv_gemm_keeps_the_opaque_framework_backend(self):
@@ -440,6 +649,11 @@ class _LayoutTensor:
 
     def reshape_as(self, other):
         return self.reshape(*other.shape)
+
+    view = reshape
+
+    def to(self, dtype):
+        return _LayoutTensor(self.shape, dtype)
 
     def t(self):
         return _LayoutTensor(self.shape[::-1], self.dtype)
@@ -692,6 +906,265 @@ class LengthFallbackContracts(unittest.TestCase):
             with self.subTest(shape=shape, dtype=dtype):
                 with self.assertRaisesRegex(ValueError, "qualified BF16"):
                     self._run_block(shape, dtype)
+
+
+class LifecycleContracts(unittest.TestCase):
+    def test_conditioning_fake_uses_actual_linear_output_dtype(self):
+        for weight_dtype in ["BF16", "FP8"]:
+            for timesteps in [1, 2]:
+                with self.subTest(weight_dtype=weight_dtype, timesteps=timesteps):
+                    namespace = _source_definitions(
+                        FP8 / "conditioning.py",
+                        {"ConditioningCache", "_table_fake", "_table", "_time_forward"},
+                        {
+                            "torch": SimpleNamespace(
+                                empty=lambda shape, *, device, dtype: _LayoutTensor(shape, dtype)
+                            ),
+                            "types": SimpleNamespace(MethodType=MethodType),
+                            "_IDENTIFIERS": itertools.count(),
+                            "_OWNERS": weakref.WeakValueDictionary(),
+                        },
+                    )
+                    tree = ast.parse((MODEL / "transformer_minimax_h3.py").read_text())
+                    cls = next(
+                        n
+                        for n in tree.body
+                        if isinstance(n, ast.ClassDef)
+                        and n.name == "MiniMaxH3AdaLayerNormModulation"
+                    )
+                    table = next(
+                        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "table"
+                    )
+                    table.returns = None
+                    for arg in table.args.args:
+                        arg.annotation = None
+                    namespace["F"] = SimpleNamespace(silu=lambda value: value)
+                    exec(
+                        compile(
+                            ast.Module(body=[table], type_ignores=[]),
+                            "<actual-AdaLN-table>",
+                            "exec",
+                        ),
+                        namespace,
+                    )
+
+                    class Linear:
+                        dtype = "BF16"
+                        weight = _LayoutTensor((96768, 2688), weight_dtype)
+                        bias = _LayoutTensor((96768,))
+
+                        def __call__(self, value):
+                            return _LayoutTensor((*value.shape[:-1], 96768), self.dtype)
+
+                    modulation = SimpleNamespace(linear=Linear(), hidden_size=5376)
+                    modulation.table = MethodType(namespace["table"], modulation)
+                    transformer = SimpleNamespace(
+                        time_proj=SimpleNamespace(num_channels=2688, forward=lambda value: value),
+                        transformer_blocks=[SimpleNamespace(adaln_proj=modulation)],
+                    )
+                    cache = namespace["ConditioningCache"](transformer)
+                    temb = _LayoutTensor((timesteps, 2688))
+                    actual = cache.tables[0](temb)
+                    fake = namespace["_table_fake"](
+                        temb, modulation.linear.weight, modulation.linear.bias, cache.identifier, 0
+                    )
+                    self.assertEqual(fake.shape, actual.shape)
+                    self.assertEqual(fake.dtype, actual.dtype)
+                    self.assertEqual(fake.dtype, "BF16")
+
+    def test_post_load_supports_skipped_vae_and_preserves_full_vae_order(self):
+        for skip in [False, True]:
+            with self.subTest(skip=skip):
+                calls = []
+
+                class Parent:
+                    def post_load_weights(self):
+                        calls.append("base")
+
+                namespace = _source_definitions(
+                    FP8 / "pipeline.py",
+                    {"MiniMaxH3Fp8Sm107U1Pipeline"},
+                    {
+                        "MiniMaxH3Nvfp4Sm107U1U4Pipeline": Parent,
+                        "Path": Path,
+                        "get_default_build_root": lambda: "/tmp/h3-fp8-contracts",
+                    },
+                )
+                pipeline = namespace["MiniMaxH3Fp8Sm107U1Pipeline"]()
+                pipeline.transformer = SimpleNamespace(
+                    initialize_fp8=lambda cache: calls.append("initialize")
+                )
+                pipeline.vae = (
+                    None if skip else SimpleNamespace(enable_tiling=lambda **kw: calls.append(kw))
+                )
+                pipeline.post_load_weights()
+                expected = ["base", "initialize"]
+                if not skip:
+                    expected.append(
+                        dict(
+                            tile_sample_min_height=288,
+                            tile_sample_min_width=272,
+                            tile_sample_min_overlap_height=32,
+                            tile_sample_min_overlap_width=32,
+                        )
+                    )
+                self.assertEqual(calls, expected)
+
+    def test_initialize_and_prepare_enter_and_restore_model_device(self):
+        for failure in [False, True]:
+            with self.subTest(failure=failure):
+                state = {"current": 0, "calls": []}
+                target = SimpleNamespace(type="cuda", index=1)
+
+                @contextmanager
+                def device_context(device):
+                    self.assertIs(device, target)
+                    before = state["current"]
+                    state["current"] = device.index
+                    try:
+                        yield
+                    finally:
+                        state["current"] = before
+
+                def inner(value):
+                    self.assertEqual(state["current"], 1)
+                    state["calls"].append(value)
+                    if failure:
+                        raise RuntimeError("inner context probe")
+                    return "result"
+
+                tree = ast.parse((FP8 / "modeling.py").read_text())
+                cls = next(
+                    n
+                    for n in tree.body
+                    if isinstance(n, ast.ClassDef) and n.name == "Fp8Transformer"
+                )
+                wrapper = next(
+                    n
+                    for n in cls.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "initialize_fp8"
+                )
+                namespace = {
+                    "torch": SimpleNamespace(cuda=SimpleNamespace(device=device_context)),
+                    "Path": Path,
+                }
+                exec(
+                    compile(
+                        ast.Module(body=[wrapper], type_ignores=[]),
+                        "<actual-initialize-fp8>",
+                        "exec",
+                    ),
+                    namespace,
+                )
+                transformer = SimpleNamespace(
+                    proj_out=SimpleNamespace(weight=SimpleNamespace(device=target)),
+                    _initialize_fp8=inner,
+                )
+                if failure:
+                    with self.assertRaisesRegex(RuntimeError, "inner context"):
+                        namespace["initialize_fp8"](transformer, Path("cache"))
+                else:
+                    namespace["initialize_fp8"](transformer, Path("cache"))
+                self.assertEqual(state["current"], 0)
+                self.assertEqual(state["calls"], [Path("cache")])
+                state["calls"].clear()
+                namespace = _source_definitions(
+                    FP8 / "kernels/conversion.py",
+                    {"prepare"},
+                    {
+                        "torch": SimpleNamespace(cuda=SimpleNamespace(device=device_context)),
+                        "_prepare": lambda scales, cache: inner(cache),
+                    },
+                )
+                scales = SimpleNamespace(device=target)
+                if failure:
+                    with self.assertRaisesRegex(RuntimeError, "inner context"):
+                        namespace["prepare"](scales, Path("cache"))
+                else:
+                    self.assertEqual(namespace["prepare"](scales, Path("cache")), "result")
+                self.assertEqual(state["current"], 0)
+                self.assertEqual(state["calls"], [Path("cache")])
+
+    def test_prepare_queries_scales_device_before_numerical_work(self):
+        target, queries = object(), []
+
+        class StopProbe(Exception):
+            pass
+
+        def properties(device):
+            queries.append(("properties", device))
+            return SimpleNamespace(multi_processor_count=212)
+
+        def capability(device):
+            queries.append(("capability", device))
+            raise StopProbe()
+
+        namespace = _source_definitions(
+            FP8 / "kernels/conversion.py",
+            {"_prepare"},
+            {
+                "torch": SimpleNamespace(
+                    cuda=SimpleNamespace(
+                        get_device_properties=properties, get_device_capability=capability
+                    )
+                )
+            },
+        )
+        with self.assertRaises(StopProbe):
+            namespace["_prepare"](SimpleNamespace(device=target), Path("cache"))
+        self.assertEqual(queries, [("properties", target), ("capability", target)])
+
+    def test_route_device_queries_use_same_current_device(self):
+        queries = []
+        namespace = _source_definitions(
+            MODEL / "scenarios.py",
+            {"_device_capability", "_device_multiprocessors"},
+            {
+                "torch": SimpleNamespace(
+                    cuda=SimpleNamespace(
+                        is_available=lambda: True,
+                        current_device=lambda: 1,
+                        get_device_capability=lambda: (10, 7),
+                        get_device_properties=lambda device: (
+                            queries.append(device)
+                            or SimpleNamespace(multi_processor_count=212 if device == 1 else 148)
+                        ),
+                    )
+                )
+            },
+        )
+        self.assertEqual(namespace["_device_capability"](), (10, 7))
+        self.assertEqual(namespace["_device_multiprocessors"](), 212)
+        self.assertEqual(queries, [1])
+
+    def test_optimized_python_rejects_prepare_before_any_cuda_or_inner_call(self):
+        path = FP8 / "kernels/conversion.py"
+        tree = ast.parse(path.read_text())
+        wrapper = next(
+            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "prepare"
+        )
+        source = "from __future__ import annotations\n" + ast.unparse(wrapper)
+        probe = (
+            source
+            + """
+from types import SimpleNamespace
+def forbidden(*args, **kwargs):
+    raise AssertionError("CUDA or qualification body was reached")
+torch = SimpleNamespace(cuda=SimpleNamespace(device=forbidden))
+_prepare = forbidden
+try:
+    prepare(SimpleNamespace(device="cuda:1"), None)
+except RuntimeError as error:
+    if "requires Python assertions" not in str(error):
+        raise
+else:
+    raise RuntimeError("-O did not fail closed")
+print("rejected-before-CUDA")
+"""
+        )
+        result = subprocess.run([sys.executable, "-O", "-c", probe], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "rejected-before-CUDA")
 
 
 if __name__ == "__main__":

@@ -237,6 +237,10 @@ class Fp8Transformer(ScenarioTransformer):
 
     def initialize_fp8(self, kernel_cache: Path) -> None:
         """Prepare fixed kernels and derived weights before torch.compile and warmup."""
+        with torch.cuda.device(self.proj_out.weight.device):
+            self._initialize_fp8(kernel_cache)
+
+    def _initialize_fp8(self, kernel_cache: Path) -> None:
         properties = torch.cuda.get_device_properties(self.proj_out.weight.device)
         if (properties.major, properties.minor, properties.multi_processor_count) != (10, 7, 212):
             raise ValueError("The fused FP8 scenario requires an SM107 GPU with 212 SMs")
@@ -277,7 +281,11 @@ class Fp8Transformer(ScenarioTransformer):
                         raise ValueError(
                             "The fused FP8 scenario needs finite positive per-tensor scales"
                         )
-            if not block._fused_adaln or block.norm1.weight.dtype != torch.bfloat16:
+            if (
+                not block._fused_adaln
+                or block.norm1.weight.dtype != torch.bfloat16
+                or block.adaln_proj.linear.dtype != torch.bfloat16
+            ):
                 raise ValueError("The fused FP8 scenario requires BF16 fused AdaLN")
             attention = block.attn
             if (

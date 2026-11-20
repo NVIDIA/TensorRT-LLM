@@ -59,6 +59,9 @@ match. No new public argument or separate benchmark command is introduced.
   scenario. The conditioning-keyed DiT cache is outside those graph captures.
 - CuTe DSL, CUDA 13.4 tooling and the SM107 runtime are required. Exact conversion
   kernels are compiled and qualified before pipeline compilation and warmup.
+  Python assertions must be enabled; conversion preparation rejects `python -O`.
+- Initialization uses the model/scales CUDA device for allocations and launches.
+  Execution on a nonzero CUDA device still needs independent GPU qualification.
 
 ## Implementation
 
@@ -73,6 +76,11 @@ The FP8 attention passes its RoPE cast explicitly to the shared QK orchestration
 the NVFP4 scenario's default cast and behavior are unchanged. Model loading
 prepares packed GateUp weights, reciprocals and conversion factors before
 `torch.compile` wraps the blocks.
+
+The conditioning cache can retain approximately 1.2 GiB for 64 distinct
+two-timestep keys. Reclaiming these allocations across sleep/wake is unverified
+and remains follow-up work; this scenario does not clear a cache concurrently
+with inference.
 
 ## Validation and attribution
 

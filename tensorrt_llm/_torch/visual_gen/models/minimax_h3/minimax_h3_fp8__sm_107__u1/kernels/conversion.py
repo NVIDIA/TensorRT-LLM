@@ -173,9 +173,19 @@ def prepare(scales: torch.Tensor, cache: Path) -> tuple[ModuleType, ModuleType, 
     ``scales`` is the frozen model's contiguous CUDA FP32 tensor of shape [50].
     This preparation runs before request timing and is repeated for each new process.
     """
-    properties = torch.cuda.get_device_properties(0)
+    if not __debug__:
+        raise RuntimeError("FP8 conversion qualification requires Python assertions; do not use -O")
+    with torch.cuda.device(scales.device):
+        return _prepare(scales, cache)
+
+
+def _prepare(
+    scales: torch.Tensor, cache: Path
+) -> tuple[ModuleType, ModuleType, torch.Tensor, dict]:
+    properties = torch.cuda.get_device_properties(scales.device)
     assert (
-        torch.cuda.get_device_capability(0) == (10, 7) and properties.multi_processor_count == 212
+        torch.cuda.get_device_capability(scales.device) == (10, 7)
+        and properties.multi_processor_count == 212
     )
     assert scales.is_cuda and scales.dtype == torch.float32 and scales.shape == (50,)
     assert scales.is_contiguous() and bool(scales.isfinite().all()) and bool((scales > 0).all())

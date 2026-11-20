@@ -66,7 +66,11 @@ def table_lookup(
 
 @table_lookup.register_fake
 def _table_fake(temb, weight, bias, cache_id, block_id):
-    return torch.empty((temb.shape[0] * 3, 6 * 5376), device=temb.device, dtype=weight.dtype)
+    return torch.empty(
+        (temb.shape[0] * 3, 6 * 5376),
+        device=temb.device,
+        dtype=_OWNERS[cache_id].table_dtypes[block_id],
+    )
 
 
 def _time_forward(module, conditioning: torch.Tensor) -> torch.Tensor:
@@ -102,6 +106,9 @@ class ConditioningCache:
         self.time_dim = int(transformer.time_proj.num_channels)
         self.original_time = transformer.time_proj.forward
         self.tables = [block.adaln_proj.table for block in transformer.transformer_blocks]
+        self.table_dtypes = [
+            block.adaln_proj.linear.dtype for block in transformer.transformer_blocks
+        ]
         _OWNERS[self.identifier] = self
         transformer.time_proj._h3_fp8_cache_id = self.identifier
         transformer.time_proj.forward = types.MethodType(_time_forward, transformer.time_proj)

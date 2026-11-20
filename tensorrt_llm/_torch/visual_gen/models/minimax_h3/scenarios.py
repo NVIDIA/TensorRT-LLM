@@ -42,6 +42,8 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .attention_precision import resolve_attention_precision
+
 if TYPE_CHECKING:
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -64,7 +66,7 @@ def _device_capability() -> Optional[tuple[int, int]]:
 def _device_multiprocessors() -> Optional[int]:
     if not torch.cuda.is_available():
         return None
-    return int(torch.cuda.get_device_properties(0).multi_processor_count)
+    return int(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
 
 
 def _transformer_quant_config(config: "DiffusionPipelineConfig") -> "QuantConfig":
@@ -177,9 +179,27 @@ def route_fp8_sm_107_u1(config: "DiffusionPipelineConfig") -> Type["BasePipeline
         or config.force_dynamic_quantization
     ):
         raise NoScenario("the static-FP8 fusion needs a uniform pre-quantized FP8 checkpoint")
+    model_config = config.model_configs["transformer"]
+    if model_config.torch_dtype != torch.bfloat16:
+        raise NoScenario("the static-FP8 fusion needs BF16 transformer activations")
+    attention_precision = (
+        resolve_attention_precision(model_config.pretrained_config, model_config.extra_attrs) or {}
+    )
+    if any(name.startswith("transformer_blocks.") for name in attention_precision):
+        raise NoScenario("the static-FP8 fusion needs FP8 Attention in all main transformer blocks")
     quant_config = _transformer_quant_config(config)
     for block_index in range(50):
-        for projection in ("attn.qkv_proj", "attn.to_out.0", "ff.gate_up_proj", "ff.down_proj"):
+        for projection in (
+            "attn.qkv_proj",
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.to_out.0",
+            "ff.gate_up_proj",
+            "ff.net.0.proj",
+            "ff.down_proj",
+            "ff.net.2",
+        ):
             name = f"transformer_blocks.{block_index}.{projection}"
             if quant_config.is_module_excluded_from_quantization(name):
                 raise NoScenario(
