@@ -51,8 +51,8 @@ from tensorrt_llm._torch.kernels.blackwell.top_k import (
 
 if getSMVersion() not in ss_host.SUPPORTED_SM_VERSIONS:
     pytest.skip(
-        "self-sampling GVR kernels target Hopper and datacenter Blackwell "
-        "(sm_90/100/103) — same gate as the production dispatch; consumer "
+        "self-sampling GVR kernels target Hopper and datacenter Blackwell/Rubin "
+        "(sm_90/100/103/107) — same gate as the production dispatch; consumer "
         "Blackwell (sm_120/121) lacks thread-block clusters",
         allow_module_level=True,
     )
@@ -66,7 +66,7 @@ def _varlen_cache_key(*parts: int) -> tuple[int, ...]:
 
 
 def _device_wave() -> int:
-    return ss_host._device_wave_sms(torch.cuda.current_device())
+    return ss_host._device_prefill_wave_sms(torch.cuda.current_device())
 
 
 def _prefill_key(*parts, **kwargs) -> tuple:
@@ -946,7 +946,7 @@ def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
 def test_selfsampling_wave_budget_per_target() -> None:
     """Blackwell keeps the 148-SM streaming and clustered wave budget on every SKU; Hopper
     sizes those waves by its own SM count."""
-    assert ss_host.SUPPORTED_SM_VERSIONS == (90, 100, 103)
+    assert ss_host.SUPPORTED_SM_VERSIONS == (90, 100, 103, 107)
     for num_sms in (132, 148, 160):
         assert ss_host.wave_sms(num_sms, 100) == 148
         assert ss_host.wave_sms(num_sms, 103) == 148
@@ -3054,7 +3054,7 @@ def test_prefill_warmup_idempotent_and_no_rejit(dtype):
     assert calls["n"] == 0, f"warmup missed keys: {calls['n']} live compiles"
     tag = _DTYPE_IDS[dtype]
     # the reachable engine set for this k above the k-th column: one tier-0 key
-    # per bucket where a <= 148-row launch keeps the BLK=1024 plan at either
+    # per bucket where a <= wave-row launch keeps the BLK=1024 plan at either
     # bucket edge, plus the bucket-free tier-1 and tier-2 keys — and nothing else
     # (buckets <= k belong to identity-only launches other tests make directly;
     # production never requests them: scores.shape[1] <= top_k takes the radix path).
@@ -3086,15 +3086,15 @@ def test_prefill_warmup_idempotent_and_no_rejit(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=lambda d: _DTYPE_IDS[d])
 def test_prefill_16bit_tier2_staging_follows_row_stride(dtype, monkeypatch):
-    """16-bit launches of more than 296 rows (the BLK=256 tier-2 engine) stage code16|idx16
+    """16-bit launches beyond two waves (the BLK=256 tier-2 engine) stage code16|idx16
     words when the row stride fits 16-bit indices and keep the 32-bit staging above 65536.
     Warmup with an envelope whose rows can have a wider stride (65400 columns) compiles both
     engines; each launch below then looks up exactly the engine of its row stride and compiles
     nothing. Windows mix short and long rows, and the wide case selects past column 65535."""
     k = 1024  # leaves test_prefill_warmup_idempotent_and_no_rejit's k=512 key set intact
-    rows = 300
+    rows = 2 * _device_wave() + 1
     tag = _DTYPE_IDS[dtype]
-    ss_host.warmup_prefill(k, 65400, num_rows_list=(297,), dtype=dtype)
+    ss_host.warmup_prefill(k, 65400, num_rows_list=(rows,), dtype=dtype)
     for v16 in (True, False):
         assert _prefill_key(2, k, 0, tag, v16=v16) in ss_host._PREFILL_CACHE
     looked = []
@@ -3122,10 +3122,12 @@ def test_prefill_16bit_tier2_staging_follows_row_stride(dtype, monkeypatch):
 
 
 @_PREFILL_DTYPES
-@pytest.mark.parametrize("rows", [64, 300], ids=lambda r: f"r{r}")
+@pytest.mark.parametrize("rows", [64, None], ids=["r64", "tier2"])
 def test_prefill_capture_no_host_sync(rows, dtype):
     """After warmup, a run_prefill call captures under a CUDA graph (proves no
-    .item()/.max() host read); 300 rows capture the BLK=256 engine (16-bit: v16)."""
+    .item()/.max() host read); the larger case captures the BLK=256 engine (16-bit: v16)."""
+    if rows is None:
+        rows = 2 * _device_wave() + 1
     k = 512
     n = 8192
     ss_host.warmup_prefill(k, max(n, 32768), dtype=dtype)

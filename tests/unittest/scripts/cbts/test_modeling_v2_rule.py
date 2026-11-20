@@ -499,33 +499,55 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
     # Tests whose GPU stage is the single-GPU GR100 stage (SM107) are not part of this check; their
     # cpu_only cases may also run in l0_cpu.
     expected = files("") - (gr100 - other_gpu)
-    # The 4-GPU tests, by path under the family's unit directory: they run on GB300, every other GPU test on B300.
+    # The 4-GPU MNNVL tests, by path under the family's unit directory: they run on GB300. Every other GPU test runs on
+    # B300, except the two sets below.
     collective_tests = {
         "kernels/k3_fused_moe/test_k3_fused_moe_push.py",
         "kernels/k3_fused_moe/test_k3_latent_reduce.py",
         "kernels/k3_fused_moe/test_k3_moe_front.py",
-        "kernels/k3_markov/test_k3_markov.py",
         "kernels/k3_sandwich/test_k3_sandwich.py",
-        "kernels/k3_spec_accept/test_k3_spec_accept_sharded.py",
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/kernels/k3_moe_engines/test_k3_moe_push.py",
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_decode_comm_tp16_moetp16ep1_op_matrix.py",
-        "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_decode_moe_tp16_moetp16ep1_op_matrix.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/kernels/k3_markov/test_k3_markov.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/kernels/k3_spec_accept/test_k3_spec_accept_sharded.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_markov_op_matrix.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_sandwich_plain_op_matrix.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_spec_accept_op_matrix.py",
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_decode_comm_tp16_moetp4ep4_op_matrix.py",
         "ops/comm/test_k3_mnnvl_comm.py",
+        "ops/comm/test_modeling_v2_k3_allreduce_op_matrix.py",
         "ops/comm/test_modeling_v2_k3_latent_reduce_op_matrix.py",
         "ops/comm/test_modeling_v2_k3_sandwich_oproj_op_matrix.py",
-        "ops/comm/test_modeling_v2_k3_sandwich_plain_op_matrix.py",
         "ops/comm/test_modeling_v2_k3_sandwich_tail_op_matrix.py",
         "ops/comm/test_modeling_v2_mnnvl_allgather_split_op_matrix.py",
         "ops/comm/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py",
         "ops/comm/test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py",
         "ops/moe/test_modeling_v2_k3_moe_front_op_matrix.py",
+        "test_modeling_v2_mnnvl_mcast_workspace_op_matrix.py",
         "kimi_k3_nvfp4__sm_107__dep16/test_k3_megamoe.py",
         "ops/comm/test_core_allreduce.py",
         "ops/gemm/test_k3_fp8w_gemm_push_cells.py",
         *files("kernels/k3r_comm"),
     }
     assert collective_tests <= expected, collective_tests - expected
+    # The tests that run on the MXFP4 targets' SM (sm_100; B300 is sm_103): one B200. Their kernels are certified on
+    # sm_100 only, except the parity test of the family's attention-residual CUDA against the built-in ops.
+    sm100_tests = {
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_dspark_mla_ops.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_mla_drafter.py",
+        "ops/attention/test_modeling_v2_k3_cute_dsl_mla_decode.py",
+        "ops/attention/test_modeling_v2_k3_flashinfer_mla_decode.py",
+        "ops/attention/test_modeling_v2_k3_load_chunked_kv_cache_for_mla.py",
+        "ops/attention/test_modeling_v2_k3_merge_chunked_attention_for_mla.py",
+        "ops/norm/test_attn_res_v1_parity.py",
+        "test_kimi_k3_mla_steps.py",
+    }
+    # The all-reduce off MNNVL: four x86 B200 (GB300 has MNNVL).
+    non_mnnvl_tests = {
+        "ops/comm/test_modeling_v2_k3_allreduce_fallback_op_matrix.py",
+    }
+    assert sm100_tests | non_mnnvl_tests <= expected, (sm100_tests | non_mnnvl_tests) - expected
     stages = parse_stages_from_groovy(repo / "jenkins/L0_Test.groovy")
     seen = set()
     for block in index.blocks:
@@ -549,12 +571,22 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
                 assert name not in seen, (block.yaml_stem, name)
                 seen.add(name)
                 if block.yaml_stem == "l0_cpu":
-                    assert name not in collective_tests
+                    assert name not in collective_tests | sm100_tests | non_mnnvl_tests, (
+                        block.yaml_stem,
+                        name,
+                    )
                     continue
                 multi = name in collective_tests
                 post_merge = multi and block.yaml_stem == "l0_gb300_multi_gpus"
-                assert post_merge or block.yaml_stem == ("l0_gb300" if multi else "l0_b300")
-                count = 4 if multi else 1
+                if name in sm100_tests:
+                    yaml_stem, count = "l0_b200", 1
+                elif name in non_mnnvl_tests:
+                    yaml_stem, count = "l0_dgx_b200", 4
+                elif multi:
+                    yaml_stem, count = "l0_gb300", 4
+                else:
+                    yaml_stem, count = "l0_b300", 1
+                assert post_merge or block.yaml_stem == yaml_stem, name
                 assert block.condition["ranges"]["system_gpu_count"] == {"gte": count, "lte": count}
                 assert block.condition["terms"]["stage"] == (
                     "post_merge" if post_merge else "pre_merge"
