@@ -190,7 +190,6 @@ l0_b200:
   - unittest/_torch/speculative/test_verify_logits_dtype.py
   # Fused DS-V4 routing and activation quantization for the TRTLLM and MegaMoE backends.
   - unittest/_torch/moe/test_dsv4_route_quant.py
-  - unittest/_torch/moe/test_megamoe_stage_inputs.py
   - unittest/_torch/moe/test_moe_module.py::test_dsv4_fused_route_quant_matches_separate_launches
   - unittest/_torch/moe/test_moe_module.py::test_dspark_draft_fused_route_quant_matches_separate_launches
   - unittest/_torch/modules/test_gated_mlp.py::test_fp8_block_scale_mlp_small_m_matches_deep_gemm
@@ -309,9 +308,13 @@ l0_b200:
   - unittest/_torch/moe/test_megamoe_streaming_load.py
   - unittest/_torch/moe/test_megamoe_combine_dedup_tactic.py
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run
+  - unittest/_torch/moe/test_megamoe_stage_routes.py -k "not record_their_ptx"
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_kernel_properties_report_whether_the_reduce_masks_dropped_routes
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_in_kernel_routing_256_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts

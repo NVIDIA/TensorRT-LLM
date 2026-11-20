@@ -38,7 +38,7 @@ import dataclasses
 import functools
 import math
 import weakref
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -93,6 +93,21 @@ MEGAMOE_OP_UNAVAILABLE_REASON: Optional[str] = None
 # (counter, signal) was fenced-reset. Module-global because the runner is
 # rebuilt every op call; the fence must fire ONCE per key (see forward()).
 _MEGAMOE_FENCED_KEYS: set = set()
+# The DSL scalars of an adaptive route's launch arguments by (type, value): building one costs
+# microseconds of host time per launch, and a layer launches with the same device addresses and few
+# row counts, so each scalar is made once.
+_ADAPTIVE_ROUTE_SCALARS: dict = {}
+
+
+def _adaptive_route_scalar(kind, value: int):
+    key = (kind, int(value))
+    scalar = _ADAPTIVE_ROUTE_SCALARS.get(key)
+    if scalar is None:
+        if len(_ADAPTIVE_ROUTE_SCALARS) >= 4096:
+            _ADAPTIVE_ROUTE_SCALARS.clear()
+        scalar = _ADAPTIVE_ROUTE_SCALARS[key] = kind(int(value))
+    return scalar
+
 
 # fkey -> (weakref(local UntypedStorage), weakref(shared UntypedStorage))
 # recorded when the fence ran. Fence keys are RAW pointers, so a new
@@ -173,6 +188,9 @@ _TACTIC_LEN = 12
 _TACTIC_LEN_V5 = 11
 _TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
+# SM versions whose load-balanced (helper-bearing) tactic candidates also come with atomic-counter
+# work ids; measured on SM103, and SM100 runs the same kernel.
+_ATOMIC_COUNTER_TWIN_SM_VERSIONS = (100, 103)
 _DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"  # nosec B105 -- scheduler mode name, not a credential
 _TOKEN_BACK_READY_GRANULARITIES = ("expert", "token_tile")
 
@@ -1074,6 +1092,32 @@ def _default_megamoe_tactic_for_key(
     return tactic
 
 
+_MEGAMOE_LAUNCHED_TACTICS: Dict[Tuple, Tuple] = {}
+"""The tactic the last launch (not a profiling one) of each problem ran, by
+:func:`megamoe_launch_key`: the default tables' or the autotuner's choice, as the launch resolved it."""
+
+
+def megamoe_launch_key(
+    world_size: int,
+    num_topk: int,
+    num_experts_per_rank: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    max_tokens_per_rank: int,
+    combine_format: str,
+) -> Tuple:
+    """The key of :data:`_MEGAMOE_LAUNCHED_TACTICS`: a layer geometry and its launch bucket."""
+    return (
+        int(world_size),
+        int(num_topk),
+        int(num_experts_per_rank),
+        int(hidden_size),
+        int(intermediate_size_per_partition),
+        int(max_tokens_per_rank),
+        str(combine_format),
+    )
+
+
 def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
     """Return the heuristic tactic followed by shape-safe fallbacks."""
     tactic = _unpack_tactic(tactic)
@@ -1264,6 +1308,9 @@ def _construct_megamoe_kernel(
         "token_back_ready_granularity": str(common.get("token_back_ready_granularity", "expert")),
         "reduce_topk_in_kernel": bool(common["in_kernel_fc2_reduce"]),
     }
+    if common.get("adaptive_route_experts"):
+        # Only an adaptive-route build carries the key: every other build keeps its descriptor.
+        impl_values["adaptive_route_experts"] = int(common["adaptive_route_experts"])
     if sm_version == 107:
         impl_values.update(
             mma_instruction_mnk=(
@@ -1329,6 +1376,38 @@ def _construct_megamoe_kernel(
 def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:
     local_bytes, shared_bytes = kernel.require_zero_workspace_leading_bytes
     return 0, int(local_bytes), 0, int(shared_bytes), f"export-{type(kernel).__name__}"
+
+
+def _require_megamoe_shared_workspace(
+    kernel, shared_workspace: torch.Tensor, num_experts_per_rank: int
+) -> None:
+    """Refuse a caller's shared workspace smaller than ``kernel`` addresses.
+
+    Its layout grows with the expert count and the token bucket, so a workspace sized for
+    another problem lets the kernel write and read past the end of the allocation.
+    """
+    _, needed = kernel.get_workspace_sizes()
+    have = shared_workspace.numel() * shared_workspace.element_size()
+    if have < int(needed):
+        raise ValueError(
+            f"MegaMoE-CuteDSL: the shared workspace has {have} bytes, but the kernel for "
+            f"{num_experts_per_rank} experts per rank needs {int(needed)}; size it with "
+            f"query_megamoe_kernel_properties for this runner's problem."
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class MegaMoeKernelProperties:
+    """What a bucket's default kernel tells the backend before its first launch
+    (``query_megamoe_kernel_properties``). Read the fields by name: a new field then breaks no
+    caller."""
+
+    shared_workspace_bytes: int
+    # The kernel reads the caller's inputs in place (an exact-size generation-phase bucket).
+    supports_direct_inputs: bool
+    # The kernel's top-k reduce masks routes with an invalid expert, so routes staged as -1
+    # drop their rows.
+    masks_invalid_routes: bool
 
 
 def megamoe_activation_sf_bytes_per_row(hidden_size: int) -> int:
@@ -1565,6 +1644,10 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         #     requires use_bulk_fc2_store, and get_valid_tactics already drops
         #     every bulk candidate when in_kernel_fc2_reduce is set.
         unmet = []
+        if sm_version in (100, 103):
+            # The vendored Blackwell kernel builds only expert readiness (_validate_geometry:
+            # "Blackwell requires token_back_ready_granularity='expert'").
+            unmet.append(f"SM{sm_version} (token_tile builds on SM107 only)")
         if work_id_mode != "atomic_counter":
             unmet.append(f"work_id_mode={work_id_mode!r} (need 'atomic_counter')")
         if token_back_mode not in ("standalone_warps", "reuse_dispatch_warps"):
@@ -1601,6 +1684,31 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             )
         if unmet:
             raise ValueError("combine_dedup=True is unmet by: " + "; ".join(unmet))
+
+
+def _with_atomic_counter_work_ids(candidates: list[Tuple], sm_version: int) -> list[Tuple]:
+    """The candidates of a helper-bearing (load-balanced) launch and, on
+    _ATOMIC_COUNTER_TWIN_SM_VERSIONS, each one's twin with atomic-counter work ids.
+
+    The autotuner then chooses the work-id mode per shape.
+
+    Per-layer dynamic EPLB launches MegaMoE on the full grid while the HALO-Q
+    + TMA copy kernel can still hold its auxiliary SMs, so with grid-stride work
+    ids the CTAs that start late keep a static share of the tiles. A twin differs
+    from its candidate only in the work-id field and is validated again. Other
+    SMs keep their candidates.
+    """
+    if sm_version not in _ATOMIC_COUNTER_TWIN_SM_VERSIONS:
+        return list(candidates)
+    tactics = list(candidates)
+    canonical = [tuple(_unpack_tactic(tactic)) for tactic in candidates]
+    for fields in list(canonical):
+        twin = fields[:4] + ("atomic_counter",) + fields[5:]  # the fifth field is the work-id mode
+        if twin not in canonical:
+            validate_megamoe_tactic(twin, sm_version=sm_version)
+            tactics.append(twin)
+            canonical.append(twin)
+    return tactics
 
 
 def _expand_megamoe_ready_tactics(
@@ -1817,6 +1925,8 @@ def enumerate_megamoe_candidate_tactics(
         )
         validate_megamoe_tactic(tactic, sm_version=sm_version)
         candidates.append(tactic)
+    if load_balance:
+        candidates = _with_atomic_counter_work_ids(candidates, sm_version)
     return _expand_megamoe_ready_tactics(candidates, sm_version, load_balance=load_balance)
 
 
@@ -2007,6 +2117,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
     ) -> torch.Tensor:
         cached = _MEGAMOE_LOCAL_WORKSPACE_CACHE.get(cache_key)
         if cached is not None:
+            local_bytes, _ = kernel.get_workspace_sizes()
+            if cached.numel() != int(local_bytes):
+                raise RuntimeError(
+                    f"MegaMoE-CuteDSL: the cached local workspace has {cached.numel()} bytes but the "
+                    f"kernel needs {int(local_bytes)}; kernels that share a local workspace must "
+                    "share its layout."
+                )
             return cached
         # Cache MISS = new (tactic, shape): release any workspace latched for
         # a previously-profiled candidate (never relaunched; profiling is
@@ -2280,11 +2397,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
         output_dtype: torch.dtype,
         combine_format: str,
         shared_workspace_bytes: int,
+        adaptive_route: bool = False,
     ) -> MegaMoeSymmMemProvider:
         """Return a cached provider for (group, layout). The cache is
         keyed on the group ``group_name`` plus every layout knob that
         affects allocation size so two MoE layers with the same shape
-        share the same symmetric buffer.
+        share the same symmetric buffer. ``adaptive_route`` (a layer whose
+        dispatch router applies an adaptive balancer's route) is part of the
+        key too: such layers never share a buffer with layers without it.
 
         First call from each rank performs the (collective)
         ``torch_symm_mem.rendezvous``; subsequent calls return the
@@ -2304,6 +2424,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             str(output_dtype),
             str(combine_format),
             int(shared_workspace_bytes),
+            bool(adaptive_route),
         )
         cached = _MEGAMOE_SYMM_PROVIDER_CACHE.get(cache_key)
         if cached is not None:
@@ -2465,8 +2586,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
         situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
-    ) -> Tuple[int, bool]:
-        """Probe workspace size and direct-input support of the default kernel."""
+    ) -> MegaMoeKernelProperties:
+        """Probe the default kernel: its shared workspace bytes, whether it reads its inputs in
+        place (direct inputs), and whether its top-k reduce masks routes with an invalid expert
+        (``masks_invalid_combine_slots``), so that routes staged as -1 drop their rows."""
 
         sm_version = get_sm_version()
         use_default_tactic = tactic is None
@@ -2598,7 +2721,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 build=build,
             )
             shared_bytes = max(shared_bytes, plain.get_workspace_sizes()[1])
-        return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
+        return MegaMoeKernelProperties(
+            shared_workspace_bytes=int(shared_bytes),
+            supports_direct_inputs=isinstance(probe, RubinInferenceGenphaseMegaMoE),
+            masks_invalid_routes=bool(getattr(probe, "masks_invalid_combine_slots", False)),
+        )
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
         """Shape-derivation rule: the activation token count (input[0] dim0)
@@ -2655,6 +2782,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             shared_intermediate_size: Optional[int] = None,
             shared_gate_up_clamp: Optional[float] = None,
             helper_expert_count: int = 0,
+            adaptive_route_experts: int = 0,
         ) -> None:
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103, 107):
@@ -2728,6 +2856,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Set by the op right after construction; never a codegen input.
             self._helper_ready_flags = None
             self._helper_ready_generation = 0
+            # > 0: the router maps and counts an adaptive load balancer's routes of this many experts
+            # (codegen-changing, so in unique_id(), not in the tactic key: the tactic tables stay shared).
+            self.adaptive_route_experts = int(adaptive_route_experts)
+            # Per-launch adaptive route bundle (tensors, token rows, first call); set by the op per call.
+            self._adaptive_route = None
 
         def unique_id(self):
             # local_rank is intentionally excluded: every EP rank must run the
@@ -2742,6 +2875,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         def _build_unique_id(self):
             key = self._tactic_lookup_key()
+            if self.adaptive_route_experts:
+                key = (*key, ("adaptive_route", self.adaptive_route_experts))
             if self.shared_intermediate_size is not None:
                 key = (
                     *key,
@@ -2812,8 +2947,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
             )
-            if default_tactic not in candidates:
-                candidates.append(default_tactic)
+            defaults = [default_tactic]
+            if self.helper_expert_count > 0:
+                defaults = _with_atomic_counter_work_ids(defaults, self.sm_version)
+            candidates.extend(tactic for tactic in defaults if tactic not in candidates)
             for default_tactic in (
                 _shape_tuned_megamoe_tactic(self._tactic_lookup_key()),
                 _SM107_KIMI_K3_GENPHASE_TACTICS.get(self._tactic_lookup_key()),
@@ -3052,6 +3189,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 shared_intermediate_size=self.shared_intermediate_size,
                 shared_gate_up_clamp=self.shared_gate_up_clamp,
                 helper_expert_count=self.helper_expert_count,
+                adaptive_route_experts=self.adaptive_route_experts,
                 **_LOCKED_KERNEL_KWARGS,
             )
             kernel, rejection = _construct_megamoe_kernel(
@@ -3183,6 +3321,21 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tactic_t,
                 allow_fallback=use_default_tactic,
             )
+            if self._profiling_scratch is None:  # a real launch, not an autotuner candidate
+                key = megamoe_launch_key(
+                    self.world_size,
+                    self.num_topk,
+                    self.num_experts_per_rank,
+                    self.hidden_size,
+                    self.intermediate_size_per_partition,
+                    self.max_tokens_per_rank,
+                    self.combine_format,
+                )
+                _MEGAMOE_LAUNCHED_TACTICS[key] = _unpack_tactic(tactic_t)
+            if shared_workspace is not None:
+                _require_megamoe_shared_workspace(
+                    kernel, shared_workspace, self.num_experts_per_rank
+                )
 
             # form-B accumulates the top-k reduction into ``combine_output``,
             # so its live rows MUST start at 0; the CALLER zeros [:num_tokens]
@@ -3195,9 +3348,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # first, and `tactic_t` is final from `_resolve_megamoe_kernel_tactic`
             # above.
             cache_key = self._tactic_cache_key(tactic_t)
+            # The adaptive-route variant differs only in device code (it registers no
+            # workspace region), so it shares the staged variant's local workspace. Both
+            # advance the dispatch barrier phase of the same shared workspace (a forward
+            # can run both: hash-routed layers take the staged route); a second local
+            # workspace would drop out of phase and lose its barrier-reset fence.
+            route = ("adaptive_route", self.adaptive_route_experts)
             local_workspace = _get_or_alloc_local_workspace(
                 kernel,
-                cache_key=cache_key,
+                cache_key=(tuple(k for k in cache_key[0] if k != route), *cache_key[1:]),
                 device=activation.device,
                 latch_in_tuning_mode=self.tactic_autotune,
             )
@@ -3432,6 +3591,34 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 runtime_kwargs["hot_expert_weight_ready_generation"] = cutlass.Uint64(
                     int(self._helper_ready_generation)
                 )
+            if self.adaptive_route_experts:
+                if self._adaptive_route is None:
+                    raise RuntimeError(
+                        "MegaMoE-CuteDSL: an adaptive-route kernel needs the layer's adaptive route; got None."
+                    )
+                tables, rows, forwards, enabled, live_word, route_tokens, first = (
+                    self._adaptive_route
+                )
+                for name, tensor, dtype in (
+                    ("tables", tables, torch.int32),
+                    ("rows", rows, torch.float32),
+                    ("forwards", forwards, torch.int64),
+                    ("enabled", enabled, torch.int32),
+                    ("live_word", live_word, torch.int32),
+                ):
+                    if tensor.dtype != dtype or not tensor.is_cuda or not tensor.is_contiguous():
+                        raise RuntimeError(
+                            f"MegaMoE-CuteDSL: adaptive route {name} must be contiguous CUDA {dtype}"
+                        )
+                    runtime_kwargs[f"adaptive_route_{name}"] = _adaptive_route_scalar(
+                        cutlass.Int64, tensor.data_ptr()
+                    )
+                runtime_kwargs["adaptive_route_num_tokens"] = _adaptive_route_scalar(
+                    cutlass.Int32, route_tokens
+                )
+                runtime_kwargs["adaptive_route_first"] = _adaptive_route_scalar(
+                    cutlass.Int32, 1 if first else 0
+                )
             # unique_id() includes helper_expert_count, separating cached ABIs.
             cached = self.__class__.kernel_cache.get(cache_key)
             if cached is None:
@@ -3485,6 +3672,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count,
         shared_intermediate_size=None,
         shared_gate_up_clamp=None,
+        adaptive_route_experts=0,
     ):
         """Reuse a runner by its complete constructor key.
 
@@ -3512,6 +3700,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             helper_expert_count,
             shared_intermediate_size,
             shared_gate_up_clamp,
+            adaptive_route_experts,
         )
 
         def _make():
@@ -3537,6 +3726,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 helper_expert_count=helper_expert_count,
                 shared_intermediate_size=shared_intermediate_size,
                 shared_gate_up_clamp=shared_gate_up_clamp,
+                adaptive_route_experts=adaptive_route_experts,
             )
 
         # A runner that may profile owns profiling scratch, so tuning-mode calls
@@ -3606,6 +3796,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        # Adaptive route tail (all or none): the router maps ``adaptive_route_experts`` experts' staged ids
+        # through the layer's packed route table row and adds the live rows' picks to its statistics row and
+        # forward count while ``adaptive_route_enabled`` is set (the dispatch routers' adaptive route).
+        adaptive_route_experts: int = 0,
+        adaptive_route_tables: Optional[torch.Tensor] = None,
+        adaptive_route_rows: Optional[torch.Tensor] = None,
+        adaptive_route_forwards: Optional[torch.Tensor] = None,
+        adaptive_route_enabled: Optional[torch.Tensor] = None,
+        adaptive_route_live_word: Optional[torch.Tensor] = None,
+        adaptive_route_tokens: int = 0,
+        adaptive_route_first: bool = True,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -3673,6 +3874,22 @@ if IS_MEGAMOE_OP_AVAILABLE:
             helper_expert_count,
             shared_intermediate_size=shared_intermediate_size,
             shared_gate_up_clamp=shared_gate_up_clamp,
+            adaptive_route_experts=adaptive_route_experts,
+        )
+        # The adaptive route belongs to this launch too.
+        adaptive_route = (
+            adaptive_route_tables,
+            adaptive_route_rows,
+            adaptive_route_forwards,
+            adaptive_route_enabled,
+            adaptive_route_live_word,
+        )
+        if adaptive_route_experts and any(tensor is None for tensor in adaptive_route):
+            raise ValueError("an adaptive-route launch needs every adaptive_route_* tensor")
+        runner._adaptive_route = (
+            (*adaptive_route, int(adaptive_route_tokens), bool(adaptive_route_first))
+            if adaptive_route_experts
+            else None
         )
         # READY inputs belong to this launch. Never regenerate them or retain stale
         # values across calls, even when the runner itself is cached.
@@ -3787,7 +4004,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
     # and skip the custom-op dispatch; traced code must use the registered op.
     cute_dsl_megamoe_nvfp4_blackwell = torch.library.custom_op(
         "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
-        mutates_args=("combine_output", "shared_workspace"),
+        mutates_args=(
+            "combine_output",
+            "shared_workspace",
+            "adaptive_route_rows",
+            "adaptive_route_forwards",
+        ),
         device_types="cuda",
     )(run_cute_dsl_megamoe_nvfp4_blackwell)
 
@@ -3842,5 +4064,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        # Adaptive route tail (all or none): the router maps ``adaptive_route_experts`` experts' staged ids
+        # through the layer's packed route table row and adds the live rows' picks to its statistics row and
+        # forward count while ``adaptive_route_enabled`` is set (the dispatch routers' adaptive route).
+        adaptive_route_experts: int = 0,
+        adaptive_route_tables: Optional[torch.Tensor] = None,
+        adaptive_route_rows: Optional[torch.Tensor] = None,
+        adaptive_route_forwards: Optional[torch.Tensor] = None,
+        adaptive_route_enabled: Optional[torch.Tensor] = None,
+        adaptive_route_live_word: Optional[torch.Tensor] = None,
+        adaptive_route_tokens: int = 0,
+        adaptive_route_first: bool = True,
     ) -> None:
         return None

@@ -29,6 +29,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
 
     # ``route`` publishes a ``MoEReplicaPlan`` that the caller must finish.
     produces_replica_plan = True
+    stages_routes = False
 
     def __init__(
         self,
@@ -92,6 +93,10 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         broader: it enables CPU statistics and host-weight migration, neither
         of which belongs to the per-layer dynamic CUDA planner.
         """
+        return False
+
+    def records_statistics(self) -> bool:
+        """The CUDA planner keeps its own statistics: no statistics hooks."""
         return False
 
     def need_load_shared_weights(self) -> bool:

@@ -39,6 +39,7 @@ from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div, round_up
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
+from .one_round_router import fence_proxy_async_global
 from .symmetric_buffer import SymmetricBufferDevice
 
 
@@ -1977,6 +1978,9 @@ class TokenCommDedup(KernelComponent):
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
+        # The peers' staged inputs this flag publishes were written with generic stores; they are pulled
+        # below with TMA (async proxy).
+        fence_proxy_async_global()
         iket.range_pop()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
@@ -2109,7 +2113,13 @@ class TokenCommDedup(KernelComponent):
                             destination_sf_vectors[None, sf_vector_idx],
                         )
 
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                # The FC1 GEMM TMA-loads a row once a flag covering it is visible. .read only means the
+                # bulk store has read the stage, so a row whose accumulate() publishes waits for the
+                # stores to complete, which also completes the batch's earlier rows.
+                if flag_tracker.publishes_on_accumulate(Int32(0), self.token_in_flag_batch):
+                    cute.arch.cp_async_bulk_wait_group(0)
+                else:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
                 cute.arch.sync_warp()
                 ready_address = (fc1_ready_counter + ready_slot_idx).toint()
                 flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
@@ -2127,6 +2137,10 @@ class TokenCommDedup(KernelComponent):
             )
             local_expert = local_expert + Int32(1)
 
+        # The tail flush publishes a batch that never filled.
+        if cutlass.const_expr(self.token_in_flag_batch > 1):
+            cute.arch.cp_async_bulk_wait_group(0)
+            cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
         iket.range_pop()
@@ -2227,6 +2241,9 @@ class TokenCommDedup(KernelComponent):
                             wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
                     # Order every lane's fc2_done acquire before the TMA that reads the completed copies.
                     cute.arch.sync_warp()
+                    # The FC2 epilogue writes the copies this counter publishes with ordinary stores; TMA reads
+                    # them below.
+                    cute.arch.fence_proxy("async.global")
                     iket.range_pop()
                     block_index = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
                     block_address = order_pointer.toint() + block_index * Int64(self.order_block_bytes)

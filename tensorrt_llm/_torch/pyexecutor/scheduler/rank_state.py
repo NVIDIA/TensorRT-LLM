@@ -120,6 +120,30 @@ class RankSpecDecodingStats(NamedTuple):
         return cls(int(data[0]), int(data[1]), int(data[2]))
 
 
+class RankMoeLoadBalancerStats(NamedTuple):
+    """Cumulative adaptive-MoE counters captured by the owning rank."""
+
+    windows: int
+    installs: int
+    installed_layers: int
+
+    @classmethod
+    def wire_size(cls) -> int:
+        return len(cls._fields)
+
+    @classmethod
+    def deserialize(cls, data: list[int | float]) -> RankMoeLoadBalancerStats:
+        """Restore an immutable counter snapshot, rejecting an incorrect field count."""
+        if len(data) != cls.wire_size():
+            raise ValueError(f"MoE snapshot requires {cls.wire_size()} fields")
+        return cls(*(int(value) for value in data))
+
+    def as_dict(self) -> dict[str, int]:
+        return dict(
+            windows=self.windows, installs=self.installs, installedLayers=self.installed_layers
+        )
+
+
 @dataclass
 class RankIterStatsPayload:
     """Per-rank iteration payload piggybacked on the ADP allgather."""
@@ -136,6 +160,9 @@ class RankIterStatsPayload:
         "num_queued_gen_kv_tokens",
     )
     _SNAPSHOT_HEADER_SIZE: ClassVar[int] = 6
+    # The queued layout with one more presence flag in the header, for the MoE
+    # load-balancer counters that follow the other snapshots.
+    _MOE_WIRE_VERSION: ClassVar[int] = -5
 
     has_iter_stats: int = 0
     iter_stats_iter: int = -1
@@ -160,6 +187,7 @@ class RankIterStatsPayload:
     # Current activity is refreshed at each routing exchange, independently
     # of the sampled iteration whose counters travel in this payload.
     has_pending_work: bool = False
+    moe_load_balancer_stats: RankMoeLoadBalancerStats | None = None
 
     def serialize(self, include_kv_cache_load: bool = False) -> list[int | float]:
         """Serialize to a flat list for allgather transport."""
@@ -189,12 +217,21 @@ class RankIterStatsPayload:
             self.scheduling_counters,
         )
         queued_values = [getattr(self, name) for name in self._QUEUED_FIELDS]
-        has_extended_stats = any(queued_values) or self.has_pending_work
+        has_moe_stats = self.moe_load_balancer_stats is not None
+        has_extended_stats = any(queued_values) or self.has_pending_work or has_moe_stats
+        if has_moe_stats:
+            snapshots += (self.moe_load_balancer_stats,)
         if any(snapshot is not None for snapshot in snapshots) or has_extended_stats:
             # The negative version cannot be confused with has_iter_stats (0/1).
             # Presence flags frame the snapshots and the independent load fields.
+            if has_moe_stats:
+                version = self._MOE_WIRE_VERSION
+            elif has_extended_stats:
+                version = self._QUEUED_WIRE_VERSION
+            else:
+                version = self._SNAPSHOT_WIRE_VERSION
             values = [
-                self._QUEUED_WIRE_VERSION if has_extended_stats else self._SNAPSHOT_WIRE_VERSION,
+                version,
                 int(include_kv_cache_load),
                 *(int(snapshot is not None) for snapshot in snapshots),
                 *values,
@@ -220,21 +257,37 @@ class RankIterStatsPayload:
         Raises:
             ValueError: The header is incomplete or contains an unsupported version or flag.
         """
+        header_size = cls._header_size(data)
         if (
-            len(data) < cls._SNAPSHOT_HEADER_SIZE
-            or data[0] not in (cls._SNAPSHOT_WIRE_VERSION, cls._QUEUED_WIRE_VERSION)
-            or any(flag not in (0, 1) for flag in data[1 : cls._SNAPSHOT_HEADER_SIZE])
+            len(data) < header_size
+            or data[0]
+            not in (cls._SNAPSHOT_WIRE_VERSION, cls._QUEUED_WIRE_VERSION, cls._MOE_WIRE_VERSION)
+            or any(flag not in (0, 1) for flag in data[1:header_size])
         ):
             raise ValueError("Invalid snapshot payload header")
         return (
-            cls._SNAPSHOT_HEADER_SIZE
+            header_size
             + cls._ITER_STATS_FIELD_COUNT
             + int(data[1]) * cls._KV_LOAD_FIELD_COUNT
             + int(data[2] + data[3]) * RankKvCacheStats.wire_size()
             + int(data[4]) * RankSpecDecodingStats.wire_size()
             + int(data[5]) * RankSchedulingCounters.wire_size()
-            + (len(cls._QUEUED_FIELDS) + 1 if data[0] == cls._QUEUED_WIRE_VERSION else 0)
+            + (
+                int(data[6]) * RankMoeLoadBalancerStats.wire_size()
+                if header_size > cls._SNAPSHOT_HEADER_SIZE
+                else 0
+            )
+            + (
+                len(cls._QUEUED_FIELDS) + 1
+                if data[0] in (cls._QUEUED_WIRE_VERSION, cls._MOE_WIRE_VERSION)
+                else 0
+            )
         )
+
+    @classmethod
+    def _header_size(cls, data: list[int | float]) -> int:
+        """The header's length: the MoE layout has one more presence flag."""
+        return cls._SNAPSHOT_HEADER_SIZE + int(bool(data) and data[0] == cls._MOE_WIRE_VERSION)
 
     @classmethod
     def deserialize(cls, data: list[int | float]) -> RankIterStatsPayload:
@@ -244,12 +297,13 @@ class RankIterStatsPayload:
             expected_size = cls.snapshot_payload_size(values)
             if len(values) != expected_size:
                 raise ValueError(f"Snapshot payload requires {expected_size} fields")
+            header_size = cls._header_size(values)
             scalar_end = (
-                cls._SNAPSHOT_HEADER_SIZE
+                header_size
                 + cls._ITER_STATS_FIELD_COUNT
                 + int(values[1]) * cls._KV_LOAD_FIELD_COUNT
             )
-            result = cls(*values[cls._SNAPSHOT_HEADER_SIZE : scalar_end])
+            result = cls(*values[header_size:scalar_end])
             cursor = scalar_end
             if values[2]:
                 result.kv_cache_stats = RankKvCacheStats.deserialize(
@@ -271,7 +325,12 @@ class RankIterStatsPayload:
                     values[cursor : cursor + RankSchedulingCounters.wire_size()]
                 )
                 cursor += RankSchedulingCounters.wire_size()
-            if values[0] == cls._QUEUED_WIRE_VERSION:
+            if header_size > cls._SNAPSHOT_HEADER_SIZE and values[6]:
+                result.moe_load_balancer_stats = RankMoeLoadBalancerStats.deserialize(
+                    values[cursor : cursor + RankMoeLoadBalancerStats.wire_size()]
+                )
+                cursor += RankMoeLoadBalancerStats.wire_size()
+            if values[0] in (cls._QUEUED_WIRE_VERSION, cls._MOE_WIRE_VERSION):
                 queue_end = cursor + len(cls._QUEUED_FIELDS)
                 for name, value in zip(cls._QUEUED_FIELDS, values[cursor:queue_end]):
                     setattr(result, name, int(value))

@@ -191,7 +191,8 @@ class DSv4RouteNvfp4QuantKernel:
     """Route each token as ``gate_forward`` and NVFP4-quantize it as ``fp4_quantize``, bitwise;
     with ``routing_tiles`` one CTA routes every token and also writes TRTLLM-Gen's routing tables.
     ``staged`` writes into a launch bucket: ids also in the bucket's index type, and extra CTAs give
-    the rows past the tokens expert -1 and weight 0. ``remap`` writes the bucket ids through an
+    the rows past the tokens expert -1 and weight 0; with ``drop_rows`` the rows past a live-row
+    word's live rows (its padding requests) get them too. ``remap`` writes the bucket ids through an
     expert -> slot table, with ``replicas`` a table of copies (``replica_slot_table``). ``count``
     adds the routes of counted rows to a per-expert histogram (the warmup expert placement's rules:
     a flag, a live-row bound, with ``count_mask`` a row mask, and rows with all-zero logits
@@ -222,6 +223,7 @@ class DSv4RouteNvfp4QuantKernel:
         pdl: bool = False,
         cta_scoring: bool = True,
         splits: int = 1,
+        drop_rows: bool = False,
     ):
         warp = cute.arch.WARP_SIZE
         num_local = num_experts if num_local is None else num_local
@@ -238,6 +240,7 @@ class DSv4RouteNvfp4QuantKernel:
             or (remap and not staged)
             or (count_mask and not count)
             or (replicas and not remap)
+            or (drop_rows and not staged)
         ):
             raise ValueError(
                 f"expected experts divisible by {warp} ({warp * ROUTING_TABLES_MAX_TOKENS} to "
@@ -272,6 +275,7 @@ class DSv4RouteNvfp4QuantKernel:
         self.replicas = replicas
         self.count = count
         self.count_mask = count_mask
+        self.drop_rows = drop_rows
         # The two lanes of an MXFP8 block exchange their amax, so every warp's groups must exist.
         if mxfp8 and self.groups % warp != 0:
             raise ValueError(f"MXFP8 needs hidden divisible by {self.group_size * warp}")
@@ -300,6 +304,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_row_offset: Int32,
         x_fp8: Optional[cute.Tensor],
         x_sf8: Optional[cute.Tensor],
+        live_word: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         rows = self.num_rows(logits)
@@ -327,6 +332,7 @@ class DSv4RouteNvfp4QuantKernel:
             count_row_offset,
             x_fp8,
             x_sf8,
+            live_word,
         ).launch(
             grid=[rows, 1 + self.quant_ctas, 1],
             block=[self.num_threads, 1, 1],
@@ -357,6 +363,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_row_offset: Int32,
         x_fp8: Optional[cute.Tensor],
         x_sf8: Optional[cute.Tensor],
+        live_word: Optional[cute.Tensor],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row, part, _ = cute.arch.block_idx()
@@ -421,6 +428,7 @@ class DSv4RouteNvfp4QuantKernel:
                         count_bound,
                         count_rows,
                         count_row_offset,
+                        live_word,
                     )
                 else:
                     if tidx < cute.arch.WARP_SIZE:
@@ -438,6 +446,7 @@ class DSv4RouteNvfp4QuantKernel:
                             count_bound,
                             count_rows,
                             count_row_offset,
+                            live_word,
                         )
             elif cutlass.const_expr(self.staged):
                 self.clear_tail(self.num_rows(logits), staged_ids, weights, row, tidx)
@@ -521,6 +530,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_bound: Optional[cute.Tensor] = None,
         count_rows: Optional[cute.Tensor] = None,
         count_row_offset: Int32 = 0,
+        live_word: Optional[cute.Tensor] = None,
     ):
         """Route token ``row`` with the CTA: every thread scores some experts, warp 0 picks."""
         warp_size = cute.arch.WARP_SIZE
@@ -562,6 +572,7 @@ class DSv4RouteNvfp4QuantKernel:
                 count_bound,
                 count_rows,
                 count_row_offset,
+                live_word,
             )
 
     @cute.jit
@@ -582,6 +593,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_bound: Optional[cute.Tensor] = None,
         count_rows: Optional[cute.Tensor] = None,
         count_row_offset: Int32 = 0,
+        live_word: Optional[cute.Tensor] = None,
     ) -> Int32:
         """Pick token ``row``'s experts with one warp from the keys and scores at ``base``; lane
         ``k < top_k`` returns pick ``k``. ``nonzero``: some logit of the row is non-zero."""
@@ -630,6 +642,7 @@ class DSv4RouteNvfp4QuantKernel:
             count_bound,
             count_rows,
             count_row_offset,
+            live_word,
         )
 
     @cute.jit
@@ -648,6 +661,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_bound: Optional[cute.Tensor] = None,
         count_rows: Optional[cute.Tensor] = None,
         count_row_offset: Int32 = 0,
+        live_word: Optional[cute.Tensor] = None,
     ) -> Int32:
         """Route token ``row`` with one warp, its scores in registers; lane ``k < top_k`` returns
         pick ``k``."""
@@ -714,6 +728,7 @@ class DSv4RouteNvfp4QuantKernel:
             count_bound,
             count_rows,
             count_row_offset,
+            live_word,
         )
 
     @cute.jit
@@ -733,6 +748,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_bound: Optional[cute.Tensor],
         count_rows: Optional[cute.Tensor],
         count_row_offset: Int32,
+        live_word: Optional[cute.Tensor] = None,
     ) -> Int32:
         """Write token ``row``'s picks from the warp whose lane ``k < top_k`` holds pick ``k`` and
         its unbiased score (the other lanes zero): ids, staged ids, weights and counts."""
@@ -764,6 +780,11 @@ class DSv4RouteNvfp4QuantKernel:
                     )
                 elif cutlass.const_expr(self.remap):
                     bucket_id = Int32(slot_of_expert[expert])
+                if cutlass.const_expr(self.drop_rows):
+                    if row >= self.live_rows(live_word, ids.shape[0]):
+                        bucket_id = Int32(
+                            -1
+                        )  # a padding request's row: neither routed nor computed
                 staged_ids[row, lane] = bucket_id.to(staged_ids.element_type)
             weight = cute.math.div(
                 score,
@@ -771,8 +792,27 @@ class DSv4RouteNvfp4QuantKernel:
                 rounding=cute.math.RoundingMode.NEAREST_EVEN,
             )
             weight = _mul_rn(weight, Float32(self.routed_scaling_factor))
+            if cutlass.const_expr(self.drop_rows):
+                if row >= self.live_rows(live_word, ids.shape[0]):
+                    weight = Float32(0.0)
             weights[row, lane] = weight.to(weights.element_type)
         return expert
+
+    @cute.jit
+    def live_rows(self, live_word: cute.Tensor, num_rows: Int32) -> Int32:
+        """The leading live rows of ``num_rows`` under the forward's live-row word: none when it
+        holds no requests, all when every request is real or the requests do not divide the rows,
+        else the real requests' rows (``live_rows.live_row_count``, ``megaMoeLiveRows``)."""
+        word = Int32(live_word[0])
+        real = word & Int32(0xFFFF)
+        requests = (word >> Int32(16)) & Int32(0xFFFF)
+        rows = Int32(num_rows)
+        # Selects rather than traced ifs that reassign the count: a word without requests kept
+        # every row through those ifs.
+        divisor = cutlass.max(requests, Int32(1))
+        live = cutlass.select_(rows % divisor == Int32(0), rows // divisor * real, rows)
+        live = cutlass.select_(real < requests, live, rows)
+        return cutlass.select_(requests == Int32(0), Int32(0), live)
 
     @cute.jit
     def counts_row(
@@ -1009,6 +1049,7 @@ def _compile(
     pdl: bool = False,
     cta_scoring: bool = True,
     splits: int = 1,
+    drop_rows: bool = False,
 ):
     tokens = cute.sym_int()
     # A launch bucket has its own row count, at least the tokens'.
@@ -1074,6 +1115,7 @@ def _compile(
             pdl=pdl,
             cta_scoring=cta_scoring,
             splits=splits,
+            drop_rows=drop_rows,
         ),
         logits,
         cute.runtime.make_fake_compact_tensor(Float32, (num_experts,), stride_order=(0,)),
@@ -1098,6 +1140,7 @@ def _compile(
         Int32(0),
         x_fp8,
         x_sf8,
+        scalar(drop_rows),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
@@ -1166,6 +1209,7 @@ def dsv4_route_nvfp4_quant(
     replicas: bool = False,
     local_experts: Optional[tuple[int, int]] = None,
     routing_tiles: tuple[int, ...] = ROUTING_TABLE_TILES,
+    live_row_word: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """DeepSeek-V4 routing and NVFP4 input quantization in one launch, bitwise ``routing.apply``
     then ``fp4_quantize``; ``with_routing_tables`` also returns ``run_moe``'s routing tables for
@@ -1174,7 +1218,10 @@ def dsv4_route_nvfp4_quant(
 
     ``staged`` = a launch bucket's (ids, weights, NVFP4 rows, scale rows) with at least as many rows
     as tokens: the launch also writes the ids there and writes the rest there instead, returning
-    their token rows; the bucket's other rows get expert -1 and weight 0.
+    their token rows; the bucket's other rows get expert -1 and weight 0. With ``live_row_word``
+    (the forward's word, ``moe/live_rows.py``, int32 [1] on the device) the rows of padding
+    requests in the bucket get expert -1 and weight 0 as well, as ``megamoe_stage_routes``
+    stages them; the returned token ids keep their picks.
 
     ``slot_of_expert`` (int32 [num_experts], with ``staged``) writes the bucket ids as expert slots;
     the returned ids stay expert ids; with ``replicas`` it is a ``replica_slot_table`` and a pick in
@@ -1225,6 +1272,10 @@ def dsv4_route_nvfp4_quant(
             raise ValueError(f"{name} must be a contiguous int32 [{num_experts}] tensor")
     if slot_of_expert is not None and staged is None:
         raise ValueError("slot_of_expert maps the staged ids; pass staged")
+    if live_row_word is not None and (
+        staged is None or live_row_word.dtype != torch.int32 or live_row_word.numel() != 1
+    ):
+        raise ValueError("live_row_word bounds the staged rows: pass staged and one int32 word")
     if counters is not None and with_routing_tables:
         raise ValueError("counters are not supported with routing tables")
     x_fp8 = x_sf8 = None
@@ -1262,6 +1313,7 @@ def dsv4_route_nvfp4_quant(
             num_local=num_local,
             cta_scoring=_cta_scoring(num_tokens, num_experts),
             splits=splits,
+            drop_rows=live_row_word is not None,
         )(
             logits,
             selection_bias,
@@ -1282,6 +1334,7 @@ def dsv4_route_nvfp4_quant(
             int(count_row_offset),
             x_fp8,
             x_sf8,
+            None if live_row_word is None else live_row_word.view(1),
         )
     if staged is not None:
         rows = slice(0, num_tokens)
@@ -1290,7 +1343,7 @@ def dsv4_route_nvfp4_quant(
 
 
 def dsv4_route(
-    router_logits: torch.Tensor,
+    router_logits: Union[torch.Tensor, "RouterLogitPartials"],  # noqa: F821
     selection_bias: torch.Tensor,
     top_k: int,
     routed_scaling_factor: float,
@@ -1304,10 +1357,23 @@ def dsv4_route(
     ``weights_dtype``, for an input already quantized; ``with_routing_tables`` also returns
     ``run_moe``'s routing tables for ``routing_tiles`` (as ``dsv4_route_nvfp4_quant``). It launches
     as a programmatic dependent of the router GEMM."""
-    if not isinstance(router_logits, torch.Tensor):
+    from tensorrt_llm._torch.custom_ops.router_logit_partials import RouterLogitPartials
+
+    logits, splits = router_logits, 1
+    if isinstance(router_logits, RouterLogitPartials):
+        logits, splits = router_logits.parts, router_logits.parts.shape[0]
+        if splits < 1:
+            raise ValueError("router logit partials need at least one split")
+        if logits.stride(1) != logits.shape[2]:
+            raise ValueError("router logit partials need each row contiguous over the experts")
+        if splits == 1:
+            logits = logits[0]
+    elif not isinstance(router_logits, torch.Tensor):
         raise TypeError("dsv4_route takes [tokens, experts] router logits")
-    num_tokens, num_experts = router_logits.shape
-    device = router_logits.device
+    elif logits.dim() != 2:
+        raise ValueError("dsv4_route takes [tokens, experts] router logits")
+    num_tokens, num_experts = logits.shape[-2:]
+    device = logits.device
     ids = torch.empty((num_tokens, top_k), dtype=torch.int32, device=device)
     weights = torch.empty((num_tokens, top_k), dtype=weights_dtype, device=device)
     local_start, num_local = _local_range(local_experts, num_experts)
@@ -1326,11 +1392,12 @@ def dsv4_route(
             weights_dtype,
             routing_tiles,
             quant=False,
+            splits=splits,
             num_local=num_local,
             pdl=TRTLLM_ENABLE_PDL,
             cta_scoring=_cta_scoring(num_tokens, num_experts),
         )(
-            router_logits,
+            logits,
             selection_bias,
             None,
             None,
@@ -1347,6 +1414,7 @@ def dsv4_route(
             None,
             None,
             0,
+            None,
             None,
             None,
         )

@@ -1788,41 +1788,66 @@ def test_executors_of_one_engine_share_the_execution_stream():
         assert isinstance(stream, ast.Name) and stream.id == "execution_stream"
 
 
-def test_route_wait_occurs_after_independent_staging():
+@pytest.mark.parametrize("plan", [None, "plan"])
+def test_route_wait_occurs_after_independent_staging(plan):
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
+    trace = []
+
+    def stage_routes(
+        ids, weights, ids_out, weights_out, live_row_word=None, live_ids=True, rest=True
+    ):
+        parts = "+".join(name for name, on in (("ids", live_ids), ("rest", rest)) if on)
+        trace.append(f"stage_routes:{ids_out.name},{weights_out.name}:{parts}")
+
     impl = _extract_class(
         source,
         "TrtllmCutedslMegaMoeNvfp4Impl",
         {"_stage_inputs"},
-        {"torch": SimpleNamespace(uint8="uint8")},
+        {
+            "torch": SimpleNamespace(
+                uint8="uint8",
+                ops=SimpleNamespace(trtllm=SimpleNamespace(megamoe_stage_routes=stage_routes)),
+            )
+        },
     )
 
-    def run():
-        trace = []
-        owner = impl()
-        owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
-        bufs = SimpleNamespace(
-            **{
-                key: _StageTensor(key, trace)
-                for key in ("topk_idx_local", "activation", "activation_sf", "topk_weights")
-            }
-        )
-        owner._stage_inputs(
-            bufs=bufs,
-            x=_StageTensor("x", trace),
-            x_sf=_StageTensor("sf", trace),
-            topk_idx=_StageTensor("routes", trace),
-            topk_weights=_StageTensor("weights", trace),
-            num_tokens=4,
-            top_k=6,
-            stage_activation=True,
-        )
-        return trace, owner
-
-    trace, owner = run()
-    assert trace.index("copy:activation") < trace.index("wait")
-    assert trace.index("copy:topk_weights") < trace.index("wait")
-    assert trace.index("wait") < trace.index("copy:topk_idx_local")
+    owner = impl()
+    owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
+    bufs = SimpleNamespace(
+        **{
+            key: _StageTensor(key, trace)
+            for key in ("topk_idx_local", "activation", "activation_sf", "topk_weights")
+        }
+    )
+    owner._stage_inputs(
+        bufs=bufs,
+        x=_StageTensor("x", trace),
+        x_sf=_StageTensor("sf", trace),
+        topk_idx=_StageTensor("routes", trace, shape=(4, 6)),
+        topk_weights=_StageTensor("weights", trace, shape=(4, 6)),
+        num_tokens=4,
+        top_k=6,
+        stage_activation=True,
+        replica_plan=plan,
+    )
+    if plan is None:
+        # No route wait: one op writes the slot ids and gate weights of the whole bucket.
+        assert trace == [
+            "copy:activation",
+            "copy:activation_sf",
+            "wait",
+            "stage_routes:topk_idx_local,topk_weights:ids+rest",
+        ]
+    else:
+        # The gate weights and both tails stage while HALO-Q runs; only the live rows' slot
+        # ids wait for its routes.
+        assert trace == [
+            "copy:activation",
+            "copy:activation_sf",
+            "stage_routes:topk_idx_local,topk_weights:rest",
+            "wait",
+            "stage_routes:topk_idx_local,topk_weights:ids",
+        ]
 
 
 @pytest.mark.parametrize("has_sm_budget", [True, False])
@@ -1831,6 +1856,8 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     calls = []
 
     class Activation:
+        device = "cpu"
+
         def __init__(self, rows, cols):
             self.shape = (rows, cols)
 
@@ -1863,10 +1890,17 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
         "ceil_div": lambda a, b: -(-a // b),
     }
     _extract_function(source, "_fp4_quantize_has_sm_budget", namespace)
-    impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
+    impl = _extract_class(
+        source,
+        "TrtllmCutedslMegaMoeNvfp4Impl",
+        {"quantize_input", "_activation_to_quantize"},
+        namespace,
+    )
     owner = impl()
     owner._shared_activation_target = lambda num_tokens: None
     owner.fc31_input_scale = "scale"
+    # A forward that run_moe does not stage.
+    owner._staging_of_next_run = lambda num_tokens, device: None
 
     owner.quantize_input(Activation(3, 64))
     owner.quantize_input(Activation(3, 64), reserved_sms=4)
@@ -1986,6 +2020,7 @@ def _autotune_helpers(torch):
         "validate_megamoe_tactic",
         "_epi_flag_batch_for_tokens",
         "_expand_megamoe_ready_tactics",
+        "_with_atomic_counter_work_ids",
         "enumerate_megamoe_candidate_tactics",
     }
     constants = {
@@ -1998,6 +2033,7 @@ def _autotune_helpers(torch):
         "_TACTIC_LEN",
         "_TACTIC_LEN_V5",
         "_TACTIC_LEN_V4",
+        "_ATOMIC_COUNTER_TWIN_SM_VERSIONS",
         "_LEGACY_TACTIC_LEN",
         "_FLAG_BATCH_MAX",
         "_GEOMETRIES",
@@ -2377,9 +2413,11 @@ class _ChunkRoutes:
 
 
 @pytest.mark.parametrize("mode", ["per_layer_dynamic", "standard", "off"])
-def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
+@pytest.mark.parametrize("takes_before_launch", [False, True])
+def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, takes_before_launch):
     source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
     trace = []
+    forwarded_dtype = []
     labels = []
 
     class ExpertStatistic:
@@ -2392,6 +2430,10 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             labels.append(num_slots)
             trace.append(("statistic", routes.name))
 
+        @staticmethod
+        def get():
+            return None
+
     def maybe_collect_or_replay_slots(num_slots, routes):
         labels.append(num_slots)
         trace.append(("calibrator", routes.name))
@@ -2400,18 +2442,28 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     namespace = {
         "ExpertStatistic": ExpertStatistic,
         "get_calibrator": lambda: SimpleNamespace(
-            maybe_collect_or_replay_slots=maybe_collect_or_replay_slots
+            maybe_collect_or_replay_slots=maybe_collect_or_replay_slots,
+            mode=SimpleNamespace(name="NONE"),
         ),
         "get_active_route_capture": lambda: None,
         "torch": SimpleNamespace(int32="int32", float32="float32"),
         "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
         "RouterLogitPartials": type("RouterLogitPartials", (), {}),
         "MoERunContext": lambda **kwargs: SimpleNamespace(**kwargs),
+        "functools": functools,
     }
     _extract_function(source, "_record_routes", namespace)
     _extract_function(source, "_leading_rows", namespace)
+    _extract_function(source, "_routes_recorded", namespace)
     _extract_function(source, "_num_rows", namespace)
-    _extract_class(source, "MoEScheduler", {"_try_fused_route_quant"}, namespace)
+    methods = {
+        "_try_fused_route_quant",
+        "_router_route",
+        "_route_quant_eligible",
+        "_partials_route",
+        "_route_only",
+    }
+    _extract_class(source, "MoEScheduler", methods, namespace)
     scheduler_cls = _extract_class(
         source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace, bases=("MoEScheduler",)
     )
@@ -2421,17 +2473,21 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         None
         if mode == "off"
         else SimpleNamespace(
-            produces_replica_plan=mode != "standard",
+            produces_replica_plan=mode == "per_layer_dynamic",
             require_replica_plan=lambda: plan,
         )
     )
 
-    def route(routes, use_dp):
+    def route(routes, use_dp, token_final_scales=None):
         trace.append(("route", routes.name))
         return _ChunkRoutes("physical" if mode == "per_layer_dynamic" else "slots")
 
     def run_moe(ctx):
         trace.append(("run_moe", ctx.token_selected_experts.name, ctx.replica_plan))
+        before_launch = getattr(ctx, "before_launch", None)
+        assert before_launch is None or takes_before_launch
+        if before_launch is not None:  # the backend's own launch path issues the wait
+            before_launch()
         return "out"
 
     moe = SimpleNamespace(
@@ -2454,6 +2510,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         _load_balancer_update_statistic=lambda routes, *args, **kwargs: trace.append(
             ("update_statistic", routes.name)
         ),
+        _load_balancer_wait_for_statistic_allreduce=lambda: trace.append("wait_statistic"),
         _load_balancer_uses_replica_plan=lambda: mode == "per_layer_dynamic",
         _load_balancer_route=route,
         _load_balancer_start_set_cpu_stage=lambda is_last_call: trace.append("start_set_cpu"),
@@ -2464,8 +2521,12 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         backend=SimpleNamespace(
             fused_route_quant_enabled=False,
             quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
-            set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
+            set_adaptive_launch_tokens=lambda tokens, output_dtype: (
+                trace.append(("bucket", tokens)) or forwarded_dtype.append(output_dtype)
+            ),
             run_moe=run_moe,
+            supports_fused_prepare=lambda: False,
+            takes_before_launch=takes_before_launch,
         ),
     )
     scheduler = scheduler_cls()
@@ -2481,6 +2542,9 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     )
 
     assert out == "out"
+    assert forwarded_dtype == ["bf16"]
+    # The bucket hint precedes the route and the quantization, which may write
+    # into that bucket's staging.
     if mode == "per_layer_dynamic":
         # The planner consumes the logical routes the calibrator records or
         # replays, and quantization leaves the plan's SMs to its copy kernel.
@@ -2505,7 +2569,13 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             ("statistic", "slots"),
             ("calibrator", "slots"),
             ("quantize", {}),
+            # The fused kernel must not run alongside the statistic allreduce
+            # the update above started on the balancer's auxiliary stream. A
+            # backend that takes the wait issues it inside run_moe, after its
+            # own input preparation; for any other backend the scheduler waits.
+            *([] if takes_before_launch else ["wait_statistic"]),
             ("run_moe", "replayed slots", None),
+            *(["wait_statistic"] if takes_before_launch else []),
             "start_set_cpu",
             "done_set_cpu",
         ]
@@ -2913,3 +2983,54 @@ def test_live_plane_binding_restores_per_expert_scalar_defaults():
         [("fc31_alpha", 1.0), ("fc2_alpha", 1.0), ("fc1_norm_const", 1.0)]
     )
     assert all(getattr(module, name).data is alias for name, alias in zip(names, aliases))
+
+
+def test_adp_moe_rows_use_owner_snapshot_and_preserve_missing():
+    """Regression: ADP rows dropped MoE stats. Fanout must not copy rank zero's MoE counts to
+    other owners or idle ranks."""
+    import importlib.util
+    import json
+    import re
+
+    path = _TORCH_ROOT / "pyexecutor/scheduler/rank_state.py"
+    spec = importlib.util.spec_from_file_location("_test_adp_moe_rank_state", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        source = _TORCH_ROOT / "pyexecutor/adp_iter_stats.py"
+        tree = ast.parse(source.read_text())
+        ns = dict(vars(module), json=json, re=re)
+        constants = [n for n in tree.body if isinstance(n, ast.Assign)]
+        exec(compile(ast.Module(body=constants, type_ignores=[]), str(source), "exec"), ns)
+        for name in ("_kv_cache_stats_text", "_specdec_stats_text"):
+            _extract_function(source, name, ns)
+        _extract_function(
+            _TORCH_ROOT / "pyexecutor/iteration_stats_json.py", "iteration_stats_row", ns
+        )
+        ns["append_kv_cache_iteration_stats"] = lambda row, stats: None
+        buffer = _extract_class(source, "ADPIterStatsBuffer", {"_rank_rows"}, ns)()
+        stats = SimpleNamespace(
+            to_json_str=lambda: json.dumps(
+                dict(inflightBatchingStats={}, kvCacheStats=None, specDecodingStats=None)
+            )
+        )
+        buffer._make_rank_iter_stats = lambda original, state: stats
+        states = [module.RankState(rank=rank) for rank in range(4)]
+        for state in states[:3]:
+            state.iter_stats.moe_load_balancer_stats = module.RankMoeLoadBalancerStats(
+                state.rank + 1, state.rank * 2, state.rank * 3
+            )
+        rows = [
+            json.loads(row)
+            for row in buffer._rank_rows(
+                SimpleNamespace(specdec_stats=None), states, None, None, {}, is_queue_snapshot=False
+            )
+        ]
+        for rank in range(3):
+            assert rows[rank]["moeLoadBalancerStats"] == dict(
+                windows=rank + 1, installs=rank * 2, installedLayers=rank * 3
+            )
+        assert "moeLoadBalancerStats" not in rows[3]
+    finally:
+        sys.modules.pop(spec.name, None)

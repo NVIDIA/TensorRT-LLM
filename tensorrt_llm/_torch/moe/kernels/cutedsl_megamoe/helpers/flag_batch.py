@@ -6,9 +6,17 @@ from typing import Any, Union
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
 from .ptx_helpers import red_add_release_gpu_s32, red_add_release_sys_s32, red_async_add_release_gpu_s32
+
+
+@cute.jit
+def _publishes(accumulated_flags: Int32, phase: Int32, next_phase: Any, flush_threshold: int) -> Boolean:
+    """The flush condition of both trackers' ``accumulate()``, evaluated before the call."""
+    if cutlass.const_expr(flush_threshold == 1):
+        return Boolean(True)
+    return (accumulated_flags + Int32(1) == Int32(flush_threshold)) | (next_phase != phase)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,6 +39,12 @@ class GpuReleaseFlagBatchTracker:
         if self.flag_address != Int64(0):
             pointer = cute.make_ptr(cutlass.Int32, self.flag_address, AddressSpace.gmem, assumed_align=4)
             red_add_release_gpu_s32(pointer, Int32(1))
+
+    @cute.jit
+    def publishes_on_accumulate(self, next_phase: Any, flush_threshold: int) -> Boolean:
+        """Whether ``accumulate(next_phase, flush_threshold, ...)`` publishes: the data its flags cover has to be
+        complete before that call."""
+        return _publishes(self.accumulated_flags, self.phase, next_phase, flush_threshold)
 
     @cute.jit
     def accumulate(
@@ -96,6 +110,12 @@ class GpuAsyncReleaseFlagBatchTracker:
             pointer = cute.make_ptr(cutlass.Int32, self.flag_address, AddressSpace.gmem, assumed_align=4)
             with cute.arch.elect_one():
                 red_async_add_release_gpu_s32(pointer, Int32(1))
+
+    @cute.jit
+    def publishes_on_accumulate(self, next_phase: Any, flush_threshold: int) -> Boolean:
+        """Whether ``accumulate(next_phase, flush_threshold, ...)`` publishes: the data its flags cover has to be
+        complete before that call."""
+        return _publishes(self.accumulated_flags, self.phase, next_phase, flush_threshold)
 
     @cute.jit
     def accumulate(
