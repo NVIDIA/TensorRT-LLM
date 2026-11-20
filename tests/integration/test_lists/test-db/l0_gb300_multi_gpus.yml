@@ -70,7 +70,7 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_gsm8k[dep4] TIMEOUT (180)
   # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 tp target: the GSM8K identity gate at tp4.
   - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_gsm8k[tp4] TIMEOUT (180)
-  # Native DSpark: GSM8K precision/acceptance, RULER-lite and reuse/envelope.
+  # Native DSpark: GSM8K precision/acceptance, MMMU and the multimodal panel with block reuse.
   - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep4-quick] TIMEOUT (180)
   - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_accuracy[dep4-quick] TIMEOUT (180)
   - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_accuracy[tp4-quick] TIMEOUT (180)

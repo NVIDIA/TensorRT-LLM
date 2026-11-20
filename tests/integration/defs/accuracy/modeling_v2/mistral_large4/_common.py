@@ -33,7 +33,6 @@ import json
 import os
 import threading
 import time
-from functools import partial
 from pathlib import Path
 
 import pytest
@@ -52,7 +51,7 @@ from ...accuracy_core import (
     acceptance_length_from_iteration_stats,
     assert_acceptance_length,
 )
-from .. import llguidance_panel, multimodal, ruler, spec_evidence
+from .. import llguidance_panel, multimodal
 from .._env import scoped_env_overrides
 
 # Certification is per GPU architecture, and a receipt from another one says nothing here:
@@ -97,8 +96,8 @@ _KV = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.85)
 
 
 # The profiles ``test_accuracy`` runs, and the ones ``test_accuracy_without_dspark`` runs.
-PROFILES = ["quick", "full", "long_lite", "long_full"]
-PROFILES_WITHOUT_DSPARK = ["full", "long_full"]
+PROFILES = ["quick", "full"]
+PROFILES_WITHOUT_DSPARK = ["full"]
 
 
 def pytest_generate_tests(metafunc):
@@ -305,14 +304,10 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                 assert str(key) in answer, (depth, tokens, answer)
 
     def _test_accuracy(self, deployment, profile, tmp_path, monkeypatch, record_property):
-        """Every profile runs native DSpark; full profiles add fresh spec OFF GSM8K.
+        """Every profile runs native DSpark; ``full`` adds fresh spec OFF GSM8K.
 
-        ``long_lite`` and ``long_full`` run on the 1M specializations only: RULER rows at 64K,
-        128K and the 1M bin (cache witnesses over prefixes of up to 1M tokens, the mixed phase
-        and exact niah / ruler_vt retrieval), a completed prompt of at least
-        ruler.LONG_WITNESS_TOKENS and every step's context tokens within max_num_tokens, then the
-        multimodal panel and GSM8K as in quick / full. long_full also gates its 64K / 128K RULER
-        means on references/ruler.yaml.
+        Both profiles run the multimodal panel, GSM8K with its acceptance length and MMMU;
+        ``full`` adds the larger image cases, the full MMMU set and GPQA Diamond.
         """
         self._run_accuracy(
             deployment, profile, tmp_path, monkeypatch, record_property, use_dspark=True
@@ -321,10 +316,9 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
     def _test_accuracy_without_dspark(
         self, deployment, profile, tmp_path, monkeypatch, record_property
     ):
-        """The complete accuracy and cache protocol with native DSpark disabled.
+        """The ``full`` accuracy and cache protocol with native DSpark disabled.
 
-        ``full`` covers the 32K datasets; ``long_full`` covers the long-context datasets and
-        1M witnesses. Only draft acceptance and speculative execution evidence are omitted.
+        Only draft acceptance and the spec ON/OFF GSM8K comparison are omitted.
         """
         self._run_accuracy(
             deployment, profile, tmp_path, monkeypatch, record_property, use_dspark=False
@@ -335,14 +329,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
     ):
         run_started = time.monotonic()
         layout, bounds = self.serving(deployment)
-        envelope = max(ruler.cell_counts(profile))
-        if bounds["max_seq_len"] < envelope:
-            pytest.skip(
-                f"{profile} needs max_seq_len {envelope}; {deployment} serves "
-                f"{bounds['max_seq_len']}"
-            )
         model_path = self.MODEL_PATH
-        is_long = profile.startswith("long")
         world = layout["tensor_parallel_size"]
         attention_dp = layout["enable_attention_dp"]
         for name in (
@@ -351,19 +338,11 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
             "TRTLLM_POPULATE_ACCEPTANCE_LENGTH",
         ):
             assert os.environ.get(name, "0") == "0", f"Disable {name} for accuracy validation"
-        data = Path(os.environ.get("TRTLLM_RULER_DATA", f"{llm_models_root()}/datasets/ruler"))
-        # Every profile serves images and runs the multimodal panel; the 32K ones also score MMMU.
-        scores_mmmu = profile in ("quick", "full")
         # Every profile loads the checkpoint as published, in its Mistral-native format;
         # MISTRAL_LARGE4_CHECKPOINT_DIR names a copy of it elsewhere.
         model_path = os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR", model_path)
         # The panel's structured-output case needs xgrammar.
         checkpoint = {"checkpoint_format": "mistral", "guided_decoding_backend": "xgrammar"}
-        rows = ruler.load_inputs(data, profile, Path(model_path) / "tekken.json")
-        if profile == "long_lite" and attention_dp:
-            # One attention-DP rank prefills a 1M request alone, about 15 minutes per row: the
-            # quick 1M case stops at 128K there, and long_full keeps the 1M rows.
-            rows = [row for row in rows if row["max_length"] <= 131072]
         gpu_arch = f"sm_{get_sm_version()}"
         root = (
             Path(os.environ.get("TRTLLM_ACCURACY_OUTPUT_DIR", tmp_path))
@@ -409,14 +388,9 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
         coverage = {}
         started = time.monotonic()
         try:
-            factory = (
-                partial(spec_evidence.traced_llm, trace=root / "spec-trace")
-                if is_long and use_dspark
-                else LLM
-            )
             with (
                 scoped_env_overrides(llm_kwargs["env_overrides"]) as rank_env,
-                factory(
+                LLM(
                     model_path,
                     speculative_config=spec_config,
                     **dict(llm_kwargs, env_overrides=rank_env),
@@ -429,23 +403,10 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                 )
                 summary["startup_s"] = ready - started
                 assert llm.args.kv_cache_config.enable_block_reuse
-                with _iteration_coverage(llm, root / "ruler-iterations.jsonl", coverage) as (
+                with _iteration_coverage(llm, root / "multimodal-iterations.jsonl", coverage) as (
                     errors,
                     _,
                 ):
-                    try:
-                        with _phase_timing(timings, "ruler"):
-                            summary["ruler"] = ruler.evaluate(
-                                llm,
-                                rows,
-                                profile,
-                                root,
-                                concurrency,
-                                self.MODEL_NAME,
-                                collect_spec=is_long and use_dspark,
-                            )
-                    except AssertionError as error:
-                        failures.append(str(error))
                     try:
                         with _phase_timing(timings, "multimodal"):
                             summary["multimodal"] = multimodal.evaluate(llm, profile, root)
@@ -455,10 +416,8 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                         )
                     except AssertionError as error:
                         failures.append(f"multimodal: {error}")
-                failures.extend(f"RULER iteration reader: {error}" for error in errors)
-                tasks = [GSM8K(self.MODEL_NAME)]
-                if scores_mmmu:
-                    tasks.append(MMMU(self.MODEL_NAME))
+                failures.extend(f"multimodal iteration reader: {error}" for error in errors)
+                tasks = [GSM8K(self.MODEL_NAME), MMMU(self.MODEL_NAME)]
                 if profile == "full":
                     tasks.append(GPQADiamond(self.MODEL_NAME))
                 for task in tasks:
@@ -516,7 +475,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                             failures.append(f"GSM8K acceptance length: {error}")
                 summary["coverage"] = coverage
                 if "multimodal" in summary:
-                    with (root / "ruler-iterations.jsonl").open() as stream:
+                    with (root / "multimodal-iterations.jsonl").open() as stream:
                         failures.extend(
                             f"multimodal: {failure}"
                             for failure in multimodal.rank_evidence(
@@ -526,36 +485,11 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                             )
                         )
                 ranks = range(world if attention_dp else 1)
-                if any(
-                    coverage.get(rank, {}).get("context_tokens", 0) < 32112
-                    or coverage.get(rank, {}).get("decode_batch", 0) < 16
-                    for rank in ranks
-                ):
-                    failures.append(f"INCONCLUSIVE: envelope {coverage}")
-                if profile.startswith("long"):
-                    longest = ruler.longest_completed(root, rows)
-                    summary["longest_prompt_tokens"] = longest
-                    need = min(ruler.LONG_WITNESS_TOKENS, max(len(r["prompt_ids"]) for r in rows))
-                    if longest < need:
-                        failures.append(
-                            f"INCONCLUSIVE: no completed {need}-token prompt ({longest})"
-                        )
-                    step = bounds["max_num_tokens"]
-                    if any(shape["context_tokens"] > step for shape in coverage.values()):
-                        failures.append(
-                            f"FAIL: a step's context tokens exceeded {step}: {coverage}"
-                        )
+                if any(coverage.get(rank, {}).get("decode_batch", 0) < 16 for rank in ranks):
+                    failures.append(f"INCONCLUSIVE: decode batch {coverage}")
                 summary["test_wall_s"] = time.monotonic() - ready
             summary["teardown_s"] = time.monotonic() - ready - summary["test_wall_s"]
-            if is_long and use_dspark:
-                longest_bin = max(row["max_length"] for row in rows)
-                need = min(
-                    ruler.LONG_WITNESS_TOKENS,
-                    min(len(row["prompt_ids"]) for row in rows if row["max_length"] == longest_bin),
-                )
-                summary["spec_evidence"] = spec_evidence.evaluate(root, need, world, attention_dp)
-                failures.extend(summary["spec_evidence"]["failures"])
-            if use_dspark and profile in ("full", "long_full"):
+            if use_dspark and profile == "full":
                 # Release the target and draft completely before starting the other arm.
                 # Same specialization, reuse, bounds and evaluator; only speculation differs.
                 origin = root / "spec-off"

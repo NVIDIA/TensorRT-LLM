@@ -520,7 +520,7 @@ See [Disaggregated Serving](../features/disagg-serving.md) for the general setup
 
 ## Running Evaluations to Verify Accuracy (Optional)
 
-The accuracy tests in `tests/integration/defs/accuracy/modeling_v2/mistral_large4/` (one directory per target, the shared harness in `_common.py`) build the configurations above through the LLM API and compare the scores with the references in `tests/integration/defs/accuracy/references/` (`gsm8k.yaml`, `gpqa_diamond.yaml`, `mmmu.yaml`, `ruler.yaml` and `acceptance_length.yaml`). They read the checkpoint from `${LLM_MODELS_ROOT}/Mistral-Large-4-1T-A52B-NVFP4`, the [downloaded](#download-the-checkpoint) NVFP4 repository, and the datasets from `LLM_MODELS_ROOT`. The tests are not part of the release container or the wheel: run them from a checkout of this branch with its development requirements (`requirements-dev.txt`), as in the [source build](#build-from-source) environment. On a node with 4 GB300 GPUs:
+The accuracy tests in `tests/integration/defs/accuracy/modeling_v2/mistral_large4/` (one directory per target, the shared harness in `_common.py`) build the configurations above through the LLM API and compare the scores with the references in `tests/integration/defs/accuracy/references/` (`gsm8k.yaml`, `gpqa_diamond.yaml`, `mmmu.yaml` and `acceptance_length.yaml`). They read the checkpoint from `${LLM_MODELS_ROOT}/Mistral-Large-4-1T-A52B-NVFP4`, the [downloaded](#download-the-checkpoint) NVFP4 repository, and the datasets from `LLM_MODELS_ROOT`. The tests are not part of the release container or the wheel: run them from a checkout of this branch with its development requirements (`requirements-dev.txt`), as in the [source build](#build-from-source) environment. On a node with 4 GB300 GPUs:
 
 ```bash
 cd tests/integration/defs
@@ -529,7 +529,7 @@ export LLM_MODELS_ROOT=/path/to/models
 # GSM8K on the NVFP4 TEP4 deployment, without speculative decoding.
 pytest -v "accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_gsm8k[tep4]"
 
-# The quick profile on TEP4 with DSpark: GSM8K, RULER, image and acceptance-length checks.
+# The quick profile on TEP4 with DSpark: GSM8K, MMMU, image and acceptance-length checks.
 pytest -v "accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep4-quick]"
 ```
 
@@ -537,9 +537,8 @@ pytest -v "accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__te
 
 | Profile | Deployments | Contents |
 | :-- | :-- | :-- |
-| `quick` | `tep4`, `dep4`, `tp4`, `tep8`, `dep8`, `tp8` and their `_1m` variants | GSM8K, a reduced RULER set, a reduced MMMU set, image, structured-output and cache checks, DSpark acceptance length |
-| `full` | the same | The quick checks with the full RULER and MMMU sets, more image cases, GPQA Diamond, and GSM8K with speculative decoding off |
-| `long_lite`, `long_full` | the `_1m` deployments | RULER at 64K, 128K and 1M tokens, cache and retrieval checks over prompts of up to 1M tokens, then the image checks and GSM8K |
+| `quick` | `tep4`, `dep4`, `tp4`, `tep8`, `dep8`, `tp8` and their `_1m` variants | GSM8K, a reduced MMMU set, image, structured-output and cache checks, DSpark acceptance length |
+| `full` | the same | The quick checks with the full MMMU set, more image cases, GPQA Diamond, and GSM8K with speculative decoding off |
 
 GPQA Diamond and MMMU run with `reasoning_effort: low`.
 
@@ -549,10 +548,10 @@ The 8-GPU cases run on two nodes with 4 GPUs each, under `trtllm-llmapi-launch`.
 
 The gate classes `TestModelingV2MistralLarge4Nvfp4Sm107Tep`, `TestModelingV2MistralLarge4Nvfp4Sm107Dep` and `TestModelingV2MistralLarge4Nvfp4Sm107Tp`, in the `mistral_large_4_nvfp4__sm_107__*` directories of `tests/integration/defs/accuracy/modeling_v2/mistral_large4/`, define the VR200 accuracy configurations: `test_accuracy` runs with DSpark and `test_accuracy_without_dspark` without it. Validation covered 24 base configurations: TEP4, TP4, DEP4, TEP8, TP8 and DEP8, each at `max_seq_len` 32768 and 1048576, with DSpark enabled and disabled:
 
-* The six TEP4, TP4 and DEP4 configurations at `max_seq_len` 1048576 each passed `full` and `long_full`, for 12 panels covering GSM8K, MMMU, GPQA Diamond, RULER, image, cache and execution-coverage checks.
+* The six TEP4, TP4 and DEP4 configurations at `max_seq_len` 1048576 each passed `full` and a long-context retrieval panel at 64K, 128K and 1M tokens, for 12 panels covering GSM8K, MMMU, GPQA Diamond, image, cache and execution-coverage checks.
 * The other 18 configurations each passed the complete 1,319-question GSM8K evaluation.
 
-All 30 workloads passed with the existing accuracy references and tolerances unchanged. Each core `long_full` panel includes three fixed 1M-token NIAH/VT retrieval cases, in addition to the 64K and 128K sets. The 8-GPU 1M configurations were validated with GSM8K only, not with long prompts. The separate llguidance and disaggregated-serving recipes have not been validated on VR200.
+All 30 workloads passed with the existing accuracy references and tolerances unchanged. Each long-context panel included three fixed 1M-token retrieval cases, in addition to the 64K and 128K sets. The 8-GPU 1M configurations were validated with GSM8K only, not with long prompts. The separate llguidance and disaggregated-serving recipes have not been validated on VR200.
 
 ## Known Limitations
 
