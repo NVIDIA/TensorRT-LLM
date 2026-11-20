@@ -16,7 +16,6 @@
 
 import asyncio
 import os
-import queue
 import signal
 import subprocess
 import sys
@@ -32,9 +31,9 @@ from aiohttp import web
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.routing import Match
+from utils.executor_stubs import bare_proxy
 
 from tensorrt_llm._utils import AdjustedSteadyClock
-from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
 from tensorrt_llm.serve import _frontend_processes, multi_frontend, openai_server
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
@@ -215,9 +214,10 @@ def test_watchdog_counts_health_failures_only_after_the_launcher_answered(
 def test_watchdog_ignores_health_answers_that_are_not_engine_verdicts(
     tmp_path, monkeypatch
 ) -> None:
-    # Regression: a --middleware that answers the internal /health probe with
-    # 401 made every attached frontend mark its engine dead and exit after
-    # three probes, although the launcher and engine were healthy.
+    # Answers that a --middleware can give the internal /health probe (any
+    # status before the first engine verdict, a client error after it) do not
+    # describe the engine: the watchdog warns once and the frontend keeps
+    # serving. A server error after a verdict still counts as a failure.
     warnings = []
     monkeypatch.setattr(multi_frontend.logger, "warning", warnings.append)
     path = str(tmp_path / "launcher.sock")
@@ -264,16 +264,11 @@ def test_watchdog_ignores_health_answers_that_are_not_engine_verdicts(
 
 @pytest.mark.parametrize("failure", ["engine", "batcher"])
 def test_watchdog_uses_launcher_health_without_transport_grace(tmp_path, monkeypatch, failure):
-    proxy = object.__new__(GenerationExecutorProxy)
-    proxy.workers_started = False
-    proxy.doing_shutdown = False
-    proxy._fatal_error = None
-    proxy._engine_dead = False
-    proxy._results = {}
-    proxy._error_queue = queue.Queue()
-    proxy._check_mpi_workers = lambda: False
-    proxy._request_sender = SimpleNamespace(
-        available=True, fail=lambda _: None, close=lambda **_: None
+    proxy = bare_proxy(
+        _check_mpi_workers=lambda: False,
+        _request_sender=SimpleNamespace(
+            available=True, fail=lambda _: None, close=lambda **_: None
+        ),
     )
     server = object.__new__(OpenAIServer)
     server.embedding_batcher = None
@@ -383,10 +378,7 @@ def test_on_launcher_lost_fails_fast_then_shuts_down(
 def test_fatal_health_requests_http_shutdown_after_executor_cleanup(
     monkeypatch, server_exiting
 ) -> None:
-    proxy = object.__new__(GenerationExecutorProxy)
-    proxy.workers_started = False
-    proxy.doing_shutdown = True
-    proxy._fatal_error = RuntimeError("worker died")
+    proxy = bare_proxy(doing_shutdown=True, _fatal_error=RuntimeError("worker died"))
     server = object.__new__(OpenAIServer)
     server.generator = SimpleNamespace(_executor=proxy, _check_health=proxy.check_health)
     server.embedding_batcher = None

@@ -25,6 +25,7 @@ from unittest.mock import Mock as _Mock
 
 import pytest
 import zmq
+from utils.executor_stubs import bare_proxy as _bare_proxy
 
 from tensorrt_llm._errors import RuntimeInitError
 from tensorrt_llm._startup_errors import (
@@ -61,19 +62,6 @@ class _FakeResult:
 
     def __init__(self):
         self.queue = _queue.Queue()
-
-
-def _bare_proxy():
-    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-    proxy._engine_dead = False
-    proxy.doing_shutdown = False
-    proxy._results = {}
-    # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
-    proxy.workers_started = False
-    proxy._multi_frontend_ipc_dir = None
-    # Borrowed-session default; ownership-sensitive tests override it.
-    proxy._owns_mpi_session = False
-    return proxy
 
 
 def test_mark_engine_dead_broadcasts_to_pending_results():
@@ -595,12 +583,7 @@ def test_submit_rechecks_engine_death_after_registration(monkeypatch, failure):
 
 
 def _serving_proxy():
-    proxy = _bare_proxy()
-    proxy._workers_ready = True
-    proxy._fatal_error = None
-    proxy._request_sender = None
-    proxy._error_queue = _queue.Queue()
-    proxy._shutdown_event = threading.Event()
+    proxy = _bare_proxy(_workers_ready=True)
 
     def unexpected_shutdown():
         raise AssertionError("the request path must not run a blocking shutdown")
@@ -611,9 +594,9 @@ def _serving_proxy():
 
 @pytest.mark.parametrize("queued", [True, False])
 def test_background_engine_error_reaches_a_request_as_engine_dead(queued):
-    # Regression: the first request to drain a worker or command-connection
-    # error got the raw exception, which HTTP reported as 400, while every
-    # other request got EngineDeadError (503). It also ran a blocking shutdown().
+    # Every request sees a worker or command-connection error as
+    # EngineDeadError (HTTP 503), including the one that drains it, and that
+    # request does not run a blocking shutdown().
     proxy = _serving_proxy()
     pending = _FakeResult()
     proxy._results = {1: pending}
@@ -632,9 +615,9 @@ def test_background_engine_error_reaches_a_request_as_engine_dead(queued):
 
 
 def test_error_monitor_tears_down_when_a_request_records_the_error_first():
-    # Regression: a request that recorded the fatal error first woke the
-    # error monitor, which then exited without pre_shutdown, so no stop
-    # sentinel was sent and pending requests were not aborted.
+    # When a request records the fatal error before the error monitor sees
+    # it, the monitor still runs pre_shutdown, which sends the stop sentinel
+    # and aborts pending requests.
     proxy = _serving_proxy()
     proxy._check_remote_worker_death = lambda: False
     proxy._check_mpi_workers = lambda include_remote=False: False
@@ -688,10 +671,10 @@ def _llm_with_executor(executor):
 
 @pytest.mark.parametrize("state", ["dead", "dead_then_shut_down", "shutting_down"])
 def test_generate_async_tells_a_dead_engine_from_an_orderly_shutdown(state):
-    """Regression: a dead engine raised the retryable EngineUnavailableError.
+    """A dead engine raises EngineDeadError, not the retryable EngineUnavailableError.
 
-    is_shutdown() is also true once a fatal error is recorded, so integrations
-    that retry EngineUnavailableError kept sending work to a dead instance.
+    is_shutdown() is also true once a fatal error is recorded, and integrations
+    that retry EngineUnavailableError would keep sending work to a dead instance.
     """
     from tensorrt_llm.executor.utils import EngineUnavailableError
 
@@ -1208,9 +1191,8 @@ def test_remote_supervision_failure_after_ready_preserves_startup_error():
 def test_rank_lost_before_its_first_report_fails_init_before_ready(monkeypatch):
     """A remote rank that never reports must fail init, not wait for READY.
 
-    Regression: a rank that exited after submission but before its helper's
-    first report could never expire, so the proxy waited for READY while the
-    reporting ranks blocked in the init collective.
+    The rank can exit after submission but before its helper's first report,
+    while the reporting ranks block in the init collective.
     """
     from tensorrt_llm.executor import remote_worker_process_monitor as remote
     from tensorrt_llm.executor.worker_process_monitor import WorkerProcessMonitor
@@ -1474,9 +1456,9 @@ def test_cancellation_tolerates_concurrent_terminal_failure():
 
 @pytest.mark.parametrize("remote_loss", [False, True])
 def test_classified_worker_error_precedes_remote_liveness_loss_during_init(remote_loss):
-    # Regression: a non-leader's helper reports its call's end before MPI
-    # delivers the classified startup error. The generic liveness loss must not
-    # replace that error once both are known.
+    # A non-leader's helper reports its call's end before MPI delivers the
+    # classified startup error. The generic liveness loss must not replace
+    # that error once both are known.
     from tensorrt_llm._errors import ConfigInputError
 
     try:

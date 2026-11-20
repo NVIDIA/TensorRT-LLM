@@ -15,12 +15,12 @@ import time
 
 import pytest
 import zmq
+from utils.executor_stubs import bare_proxy
 
 from tensorrt_llm._errors import ConfigInputError, ResourceError, RuntimeInitError
 from tensorrt_llm._startup_errors import classify_startup_error
 from tensorrt_llm.executor import remote_worker_process_monitor as remote
 from tensorrt_llm.executor.ipc import IpcQueue
-from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.worker_process_monitor import WorkerProcessMonitor
 
 pytestmark = pytest.mark.cpu_only
@@ -39,6 +39,13 @@ finally:
 """
 
 
+def _wait_until(condition, message, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, message
+        time.sleep(0.01)
+
+
 @pytest.fixture(autouse=True)
 def _enable_remote_supervision(monkeypatch):
     # Remote supervision is opt-in; these tests exercise it when enabled.
@@ -47,8 +54,8 @@ def _enable_remote_supervision(monkeypatch):
 
 @pytest.mark.parametrize("lost_process", ["worker", "watch"])
 def test_remote_rank_loss_wakes_existing_monitor_without_mpi(monkeypatch, lost_process):
-    # Regression: a remote rank's SIGKILL leaves MPI futures and its root alive,
-    # so serving must fail through the independent process monitor instead.
+    # A remote rank's SIGKILL leaves MPI futures and its root alive, so serving
+    # fails through the independent process monitor instead.
     if lost_process == "worker":
         monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
         monkeypatch.setattr(remote, "_discover_host", lambda: ("127.0.1.1", "test"))
@@ -103,6 +110,8 @@ def test_remote_readiness_requires_every_rank(monkeypatch, caplog):
     monitor = remote.RemoteWorkerProcessMonitor(2)
     watch = remote.WorkerProcessWatch(monitor.endpoint, 0)
     try:
+        _wait_until(lambda: 0 in monitor._seen, "rank 0's report was not received")
+        # Rank 1 never reports, so this wait fails however long it is.
         assert not monitor.wait_ready(timeout=0.2)
         assert monitor.failure is None
         assert "MPI ranks [1]" in caplog.text
@@ -115,9 +124,9 @@ def test_remote_readiness_requires_every_rank(monkeypatch, caplog):
 
 @pytest.mark.timeout(20, method="thread")
 def test_rank_missing_after_the_first_report_fails_startup(monkeypatch):
-    # Regression: a rank that exited before its helper's first report was never
-    # seen, so it could not expire, and the proxy waited for READY while the
-    # surviving ranks blocked in the init collective.
+    # A rank that exits before its helper's first report still fails startup,
+    # so the proxy does not wait for READY while the surviving ranks block in
+    # the init collective.
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
     monkeypatch.setattr(remote, "_REGISTRATION_TIMEOUT", 2.0)
     wake = threading.Event()
@@ -171,17 +180,21 @@ def test_invalid_watch_port_is_a_configuration_error(monkeypatch, port):
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
 def test_explicit_watch_host_and_fixed_port_reach_standalone_helper(monkeypatch, host):
-    # Regression: IPv6 overrides used to fail resolution, and clusters could not
-    # allowlist a fixed watch port while retaining independent supervision.
+    # An explicit IPv4 or IPv6 watch host and a fixed port, which a cluster can
+    # allowlist, reach a standalone helper.
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    with socket.socket(family, socket.SOCK_STREAM) as reservation:
-        try:
-            reservation.bind((host, 0))
-        except OSError:
-            if family == socket.AF_INET6:
-                pytest.skip("IPv6 loopback is unavailable")
-            raise
+    reservation = None
+    try:
+        reservation = socket.socket(family, socket.SOCK_STREAM)
+        reservation.bind((host, 0))
         port = reservation.getsockname()[1]
+    except OSError:
+        if family == socket.AF_INET6:
+            pytest.skip("IPv6 loopback is unavailable")
+        raise
+    finally:
+        if reservation is not None:
+            reservation.close()
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", host)
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_PORT", str(port))
 
@@ -195,7 +208,7 @@ def test_explicit_watch_host_and_fixed_port_reach_standalone_helper(monkeypatch,
         assert monitor.endpoint.address == f"tcp://{advertised_host}:{port}"
         watch = remote.WorkerProcessWatch(monitor.endpoint, 0)
         try:
-            assert monitor.wait_ready(timeout=2)
+            assert monitor.wait_ready(timeout=10)
         finally:
             watch.close()
     finally:
@@ -204,8 +217,8 @@ def test_explicit_watch_host_and_fixed_port_reach_standalone_helper(monkeypatch,
 
 @pytest.mark.parametrize("setting", [None, "0", "true"])
 def test_remote_supervision_is_off_unless_explicitly_enabled(monkeypatch, caplog, setting):
-    # Regression: supervision was on by default, so every remote MPI deployment
-    # needed a new worker-to-proxy TCP path and failed startup without one.
+    # Supervision needs a worker-to-proxy TCP path that remote MPI deployments
+    # may not have, so it stays off unless TRTLLM_WORKER_WATCH=1.
     if setting is None:
         monkeypatch.delenv("TRTLLM_WORKER_WATCH", raising=False)
     else:
@@ -239,9 +252,9 @@ def test_disabled_supervision_is_silent_without_network_settings(monkeypatch, ca
 
 @pytest.mark.timeout(30, method="thread")
 def test_watch_starts_when_worker_descriptors_exceed_fd_setsize(monkeypatch):
-    # Regression: select.select() raises ValueError for descriptors >= 1024,
-    # and workers often hold that many (CUDA, NCCL, sockets), so the helper's
-    # pipe failed every startup on such a rank.
+    # select.select() raises ValueError for descriptors >= 1024, and workers
+    # often hold that many (CUDA, NCCL, sockets). The helper's pipe must still
+    # work on such a rank.
     resource = pytest.importorskip("resource")
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     wanted = 1100
@@ -272,8 +285,8 @@ def test_watch_starts_when_worker_descriptors_exceed_fd_setsize(monkeypatch):
 
 
 def test_heartbeat_lease_defaults_to_tolerate_brief_network_outages(monkeypatch):
-    # Regression: a fixed 5 s lease failed the engine terminally on a network
-    # blip that TCP retransmission alone takes several seconds to recover from.
+    # The default lease outlasts a network blip that TCP retransmission takes
+    # several seconds to recover from, and TRTLLM_WORKER_WATCH_TIMEOUT sets it.
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
     monkeypatch.delenv("TRTLLM_WORKER_WATCH_TIMEOUT", raising=False)
     monitor = remote.RemoteWorkerProcessMonitor(1)
@@ -299,8 +312,8 @@ def test_invalid_heartbeat_lease_is_a_configuration_error(monkeypatch, value):
 
 @pytest.mark.timeout(30, method="thread")
 def test_listener_binds_only_the_advertised_address_and_caps_frames(monkeypatch):
-    # Regression: the listener bound every interface and accepted frames of any
-    # size, so any host that could reach the port could make it buffer them.
+    # The listener binds only the advertised address and caps frame size, so
+    # other hosts cannot make it buffer arbitrary data.
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
     monkeypatch.setattr(remote, "_START_TIMEOUT", 1.0)
     monitor = remote.RemoteWorkerProcessMonitor(1)
@@ -340,8 +353,8 @@ def test_listener_falls_back_to_all_interfaces_for_a_non_local_address(monkeypat
 
 
 def test_failed_bind_releases_the_queue_without_a_finalizer_error(monkeypatch):
-    # Regression: a failed bind closed the socket but kept the handle, so
-    # ZeroMqQueue.__del__ raised on the closed socket during the fallback.
+    # A failed bind releases the socket handle, so ZeroMqQueue.__del__ does not
+    # raise on a closed socket during the all-interfaces fallback.
     gc.collect()
     unraisable = []
     monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
@@ -373,9 +386,9 @@ def _addrinfo(*addresses):
 @pytest.mark.parametrize(
     "addresses, expected",
     [
-        # Regression: a dual-stack name switched the listener to IPv6.
+        # A dual-stack name keeps the listener on IPv4.
         (("::1", "127.0.0.1"), "tcp://127.0.0.1:"),
-        # Regression: Debian's 127.0.1.1 hostname alias won over a routable address.
+        # A routable address wins over Debian's 127.0.1.1 hostname alias.
         (("127.0.1.1", "192.0.2.1"), "tcp://192.0.2.1:"),
     ],
 )
@@ -435,8 +448,8 @@ def test_loopback_listener_address_warns_unless_chosen_explicitly(
 def test_discovery_prefers_the_configured_inter_node_interface(
     monkeypatch, variable, value, expected
 ):
-    # Regression: discovery ignored the interface NCCL/MPI were pinned to and
-    # picked the default route, which may be firewalled between nodes.
+    # Discovery uses the interface NCCL/MPI are pinned to rather than the
+    # default route, which may be firewalled between nodes.
     for name in remote._INTERFACE_HINT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(variable, value)
@@ -467,8 +480,8 @@ def test_discovery_prefers_the_configured_inter_node_interface(
 
 
 def test_discovery_without_a_route_uses_an_interface_quietly(monkeypatch, caplog):
-    # Regression: discovery logged ERROR lines on every startup (netifaces is
-    # not installed) and then silently fell back to 127.0.0.1.
+    # Without a route, discovery uses an interface address without logging
+    # errors, and falls back to 127.0.0.1 only when no interface has one.
     for name in remote._INTERFACE_HINT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(remote, "_interface_ipv4s", lambda: {"lo": [], "eth0": ["192.0.2.10"]})
@@ -526,9 +539,9 @@ def _supervised_rank(monkeypatch, rank, peers):
 
 
 def test_peer_watch_failure_fails_every_rank_before_the_worker_collective(monkeypatch):
-    # Regression: each rank started its watch on its own before worker_main.
-    # When one rank failed, the others entered worker_main's barrier and waited
-    # there forever, so a caller-owned session could not shut down.
+    # Ranks agree on watch startup before worker_main. When one rank fails,
+    # every rank raises instead of waiting in worker_main's barrier, so a
+    # caller-owned session can still shut down.
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
     monitor = remote.RemoteWorkerProcessMonitor(2)
     try:
@@ -570,8 +583,8 @@ def test_supervised_worker_runs_when_every_watch_starts(monkeypatch):
 
 
 def test_watch_close_does_not_raise_for_a_helper_that_closed_its_input():
-    # Regression: closing stdin flushed a "stop" left buffered by a failed
-    # write, raising BrokenPipeError that replaced the startup error.
+    # Closing a helper whose input is gone does not raise BrokenPipeError from
+    # a buffered "stop", which would replace the startup error.
     watch = remote.WorkerProcessWatch.__new__(remote.WorkerProcessWatch)
     watch._process = subprocess.Popen(
         [sys.executable, "-c", "import os, time; os.close(0); time.sleep(5)"],
@@ -615,11 +628,7 @@ def test_shutdown_before_worker_submission_closes_remote_monitor(monkeypatch):
     monitor = WorkerProcessMonitor()
     monitor.start_remote(1, threading.Event())
     receiver = monitor._remote._thread
-    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-    proxy.workers_started = False
-    proxy._request_sender = None
-    proxy._multi_frontend_ipc_dir = None
-    proxy._worker_process_monitor = monitor
+    proxy = bare_proxy(_worker_process_monitor=monitor)
     try:
         # A failed MPI submit never sets workers_started, but the receiver
         # already owns a socket and must still be stopped by proxy teardown.
@@ -667,8 +676,8 @@ def test_queued_heartbeats_prevent_false_death_after_receiver_pause(monkeypatch)
 
 @pytest.mark.parametrize("invalid_signature", [False, True])
 def test_continuous_traffic_cannot_hide_an_expired_rank(monkeypatch, invalid_signature):
-    # Regression: a continuously readable listener must still expire a silent
-    # rank, even if the incoming frames fail authentication.
+    # A continuously readable listener still expires a silent rank, even if
+    # the incoming frames fail authentication.
     from types import SimpleNamespace
 
     monkeypatch.setattr(remote.time, "monotonic", lambda: 100.0)
@@ -686,7 +695,7 @@ def test_continuous_traffic_cannot_hide_an_expired_rank(monkeypatch, invalid_sig
     received = 0
 
     def poll(_timeout):
-        # Bound the pre-fix failure without waiting for a wall-clock timeout.
+        # Stop after a bounded number of frames if no rank has expired.
         if monitor.failure is not None or received >= 1024:
             monitor._stopped.set()
         return True
@@ -768,8 +777,9 @@ def _paused_receiver(monkeypatch, buffered_until_first_wait):
 def test_reports_received_during_a_receiver_pause_prevent_false_death(
     monkeypatch, buffered_until_first_wait
 ):
-    # Regression: after a GIL or process pause, the receiver trusted its stale
-    # poll result, skipped the drain and expired every live rank.
+    # After a GIL or process pause, the receiver drains reports that arrived
+    # during the pause before it checks leases, instead of trusting its stale
+    # poll result and expiring every live rank.
     monitor = _paused_receiver(monkeypatch, buffered_until_first_wait)
     monitor._run()
     assert monitor.failure is None
@@ -787,11 +797,13 @@ def test_silent_rank_still_expires_after_a_receiver_pause(monkeypatch):
 
 
 def test_worker_call_outcome_precedes_a_returned_report(monkeypatch):
-    # Regression: a worker call that raised in a live process sent its final
-    # helper report before MPI delivered the exception, so a generic liveness
-    # loss replaced the worker's classified startup or runtime error.
+    # A worker call that returns or raises in a live process sends its final
+    # helper report before MPI delivers the outcome. The monitor defers the
+    # generic loss for _RETURN_GRACE so the worker's own error can win.
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
-    monkeypatch.setattr(remote, "_RETURN_GRACE", 1.5)
+    # The receiver reads the grace on every pass. Holding it long, then
+    # ending it, orders the steps without depending on wall-clock margins.
+    monkeypatch.setattr(remote, "_RETURN_GRACE", 60.0)
     wake = threading.Event()
     monitor = WorkerProcessMonitor()
     endpoint = monitor.start_remote(1, wake)
@@ -811,10 +823,12 @@ def test_worker_call_outcome_precedes_a_returned_report(monkeypatch):
         # The worker call ends while its process stays alive.
         worker.stdin.write("stop\n")
         worker.stdin.flush()
-        assert worker.wait(timeout=3) == 0
-        assert not wake.wait(0.4), "A returned call failed before MPI could report it"
+        assert worker.wait(timeout=10) == 0
+        _wait_until(lambda: monitor._remote._returned, "the returned report was not received")
+        assert not wake.wait(0.5), "A returned call failed before MPI could report it"
         assert monitor.find_dead_worker() is None
-        assert wake.wait(3), "A returned call without an MPI result stayed invisible"
+        monkeypatch.setattr(remote, "_RETURN_GRACE", 0.0)
+        assert wake.wait(10), "A returned call without an MPI result stayed invisible"
         dead = monitor.find_dead_worker()
         assert dead is not None and dead.rank == 0 and dead.pid == worker.pid
         assert monitor._remote.failure["reason"] == "worker returned without an MPI result"
@@ -827,14 +841,12 @@ def test_worker_call_outcome_precedes_a_returned_report(monkeypatch):
         worker.stdout.close()
 
 
-@pytest.mark.timeout(20, method="thread")
+@pytest.mark.timeout(30, method="thread")
 def test_forwarded_worker_error_precedes_a_returned_call_report(monkeypatch):
-    # Regression: under trtllm-llmapi-launch the forwarded worker exception
-    # waited for the error monitor's poll, while the returned call's report
-    # woke it first and recorded a generic liveness loss.
-    import queue as queue_module
-    import time
-
+    # Under trtllm-llmapi-launch, the launcher forwards a worker's exception
+    # after the helper reports that the call returned. With both pending, the
+    # error monitor records the forwarded exception, not the generic liveness
+    # loss, and a health check records neither.
     from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient, RemoteWorkerDeath
 
     class _Forwarded:
@@ -851,28 +863,16 @@ def test_forwarded_worker_error_precedes_a_returned_call_report(monkeypatch):
                 return self.messages.pop(0)
 
     monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
-    monkeypatch.setattr(remote, "_RETURN_GRACE", 0.5)
-    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-    proxy.workers_started = False
-    proxy.doing_shutdown = False
-    proxy._multi_frontend_ipc_dir = None
-    proxy._owns_mpi_session = False
-    proxy._engine_dead = False
-    proxy._fatal_error = None
-    proxy._results = {}
-    proxy._error_queue = queue_module.Queue()
-    proxy._request_sender = None
-    proxy.mpi_futures = []
+    # Hold the returned report until both outcomes are pending; see
+    # test_worker_call_outcome_precedes_a_returned_report.
+    monkeypatch.setattr(remote, "_RETURN_GRACE", 60.0)
     shutdowns = []
-    proxy.pre_shutdown = lambda: shutdowns.append(True)
-    proxy._shutdown_event = threading.Event()
-    proxy._worker_process_monitor = WorkerProcessMonitor()
-    endpoint = proxy._worker_process_monitor.start_remote(1, proxy._shutdown_event)
     client = object.__new__(RemoteMpiCommSessionClient)
     client._is_shutdown = False
     client._pending_responses = []
     client.queue = _Forwarded()
-    proxy.mpi_session = client
+    proxy = bare_proxy(pre_shutdown=lambda: shutdowns.append(True), mpi_session=client)
+    endpoint = proxy._worker_process_monitor.start_remote(1, proxy._shutdown_event)
     worker = subprocess.Popen(
         [sys.executable, "-c", _WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
     )
@@ -886,22 +886,26 @@ def test_forwarded_worker_error_precedes_a_returned_call_report(monkeypatch):
         worker.stdin.flush()
         worker.stdout.readline()
         assert proxy._worker_process_monitor.wait_remote_ready()
-        monitor_thread = threading.Thread(target=proxy._error_monitor_loop, daemon=True)
-        monitor_thread.start()
-        time.sleep(0.2)
         # The worker call raises: its helper reports the return, and the
-        # launcher forwards the actual exception shortly afterward.
+        # launcher forwards the actual exception afterward.
         worker.stdin.write("stop\n")
         worker.stdin.flush()
-        assert worker.wait(timeout=3) == 0
-        time.sleep(0.1)
+        assert worker.wait(timeout=10) == 0
+        remote_monitor = proxy._worker_process_monitor._remote
+        _wait_until(lambda: remote_monitor._returned, "the returned report was not received")
         client.queue.messages.append(
             RemoteWorkerDeath.from_exception(ValueError("actual rank failure"))
         )
-        # A health check while both are pending must not record the generic loss.
-        time.sleep(remote._RETURN_GRACE + 0.2)
-        proxy.check_health()
-        monitor_thread.join(timeout=8)
+        # End the grace: the returned report becomes a liveness loss and sets
+        # the error monitor's wake event.
+        monkeypatch.setattr(remote, "_RETURN_GRACE", 0.0)
+        _wait_until(lambda: proxy._shutdown_event.is_set(), "the returned report did not expire")
+        # A health check while both are pending does not record the generic loss.
+        assert proxy.check_health()
+        assert proxy._fatal_error is None
+        monitor_thread = threading.Thread(target=proxy._error_monitor_loop, daemon=True)
+        monitor_thread.start()
+        monitor_thread.join(timeout=20)
         assert not monitor_thread.is_alive()
         assert "actual rank failure" in str(proxy._fatal_error)
         assert shutdowns

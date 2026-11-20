@@ -234,8 +234,8 @@ def harmony_server(monkeypatch) -> OpenAIServer:
 async def test_harmony_engine_failure_returns_503_or_an_explicit_stream_error(
     harmony_server, stage, error
 ):
-    # Regression: Harmony must not turn worker loss into a bad request or a
-    # broken streaming connection, including after partial output.
+    # Harmony must not turn worker loss into a bad request or a broken
+    # streaming connection, including after partial output.
     def generate(**_kwargs):
         if stage == "admission":
             raise error

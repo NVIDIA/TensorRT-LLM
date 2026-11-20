@@ -366,10 +366,10 @@ class TestClassicFrontendProxyEndToEnd:
 
     @pytest.mark.parametrize("drained_by", ["health", "request"])
     def test_frontend_fatal_error_still_cancels_its_requests_on_the_engine(self, drained_by):
-        # Regression: an attached frontend's own fatal error failed its command
-        # sender, so pre_shutdown sent no cancellations and its in-flight
-        # requests kept generating on the shared, still healthy engine. When a
-        # request drained the error before /health, pre_shutdown never ran.
+        # After an attached frontend's own fatal error, its command sender stays
+        # open, so pre_shutdown cancels the frontend's in-flight requests on
+        # the shared engine, which may still be healthy. pre_shutdown runs
+        # whether /health or a request drains the error first.
         from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
         from tensorrt_llm.executor.utils import EngineDeadError
         from tensorrt_llm.sampling_params import SamplingParams
@@ -419,9 +419,9 @@ class TestClassicFrontendProxyEndToEnd:
             self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
 
     def test_command_loss_reaches_a_response_waiter_as_service_unavailable(self):
-        # Regression: when a response was already queued ahead of the
-        # EngineDeadError, the waiter drained the raw ConnectionError from the
-        # error queue, and the HTTP layer answered 400 with an internal message.
+        # With a response already queued ahead of the EngineDeadError, the
+        # waiter that drains the ConnectionError from the error queue still
+        # gets EngineDeadError, which the HTTP layer answers with 503.
         from http import HTTPStatus
 
         import tensorrt_llm.bindings.executor as tllm

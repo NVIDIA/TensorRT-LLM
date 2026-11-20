@@ -365,8 +365,10 @@ def test_generation_request_pickle_preserves_snapshot() -> None:
 @pytest.mark.timeout(15, method="thread")
 def test_proxy_batching_preserves_hint_snapshots() -> None:
     """Batched worker transport preserves hints, fallback and prompt tokens."""
+    from utils.executor_stubs import bare_proxy
+
     from tensorrt_llm.executor.ipc import IpcQueue
-    from tensorrt_llm.executor.proxy import GenerationExecutorProxy, _RequestSender
+    from tensorrt_llm.executor.proxy import _RequestSender
     from tensorrt_llm.executor.worker import _incoming_requests
 
     hints = _hints()
@@ -381,9 +383,7 @@ def test_proxy_batching_preserves_hint_snapshots() -> None:
             receiver.address, is_server=False, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES
         )
         sender = _RequestSender(request_queue, error_queue)
-        proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-        proxy.workers_started = False
-        proxy._request_sender = sender
+        proxy = bare_proxy(_request_sender=sender)
         try:
             proxy._send_request(request)
             proxy._send_request(fallback)

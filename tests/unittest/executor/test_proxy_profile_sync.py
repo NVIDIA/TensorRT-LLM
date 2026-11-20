@@ -24,14 +24,14 @@ import pickle
 import queue
 import threading
 import time
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import zmq
+from utils import executor_stubs
 
 from tensorrt_llm.executor.ipc import IpcQueue
-from tensorrt_llm.executor.proxy import GenerationExecutorProxy, _RequestSender
+from tensorrt_llm.executor.proxy import _RequestSender
 from tensorrt_llm.executor.request import (
     CancellingRequest,
     GenerationRequest,
@@ -157,31 +157,17 @@ def bare_proxy():
     this matches the production setup, where the shared command sender
     owns writes and the profile-control executor owns profile replies.
     """
-    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-    # Set by ``GenerationExecutor.__init__`` in production; the profile
-    # handlers reject control once ``pre_shutdown()`` flips it.
-    proxy.doing_shutdown = False
-    proxy.workers_started = False
-    proxy._engine_dead = False
-    proxy._fatal_error = None
+    # The profile handlers reject control once ``pre_shutdown()`` sets
+    # ``doing_shutdown``.
+    proxy = executor_stubs.bare_proxy()
     proxy.request_queue = MagicMock()
-    # The fix introduces a ``profile_ack_queue`` attribute. Pre-fix this
-    # attribute does not exist; we stub it as MagicMock so old code paths
-    # accessing it via getattr() see a sentinel.
+    # Tests script the worker's acknowledgements through this mock's ``get``.
     proxy.profile_ack_queue = MagicMock()
     proxy.profile_ack_queue.address = ("unused-profile-ack", b"k" * 32)
     delivered = queue.Queue()
 
     class Commands:
-        socket = SimpleNamespace(
-            setsockopt=lambda *args: None,
-            get_monitor_socket=lambda **kwargs: SimpleNamespace(
-                poll=lambda timeout: False,
-                getsockopt=lambda option: 0,
-                close=lambda **kwargs: None,
-            ),
-            disable_monitor=lambda: None,
-        )
+        socket = executor_stubs.stub_command_socket()
 
         def setup_lazily(self):
             pass
@@ -419,13 +405,7 @@ def test_stop_profile_timeout_warns_does_not_hang(bare_proxy, monkeypatch):
 
 @pytest.mark.threadleak(enabled=True)
 def test_profile_ack_wait_fails_promptly_after_worker_death():
-    proxy = object.__new__(GenerationExecutorProxy)
-    proxy.workers_started = False
-    proxy.doing_shutdown = False
-    proxy._engine_dead = False
-    proxy._fatal_error = None
-    proxy._results = {}
-    proxy._request_sender = None
+    proxy = executor_stubs.bare_proxy()
     entered = threading.Event()
     outcomes = queue.Queue()
 

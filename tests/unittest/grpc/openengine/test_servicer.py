@@ -747,9 +747,8 @@ def test_submission_failure_preserves_retryability(failure, code) -> None:
 
 
 def test_dead_engine_refusal_is_unavailable_and_an_engine_failure() -> None:
-    # Regression: a dead engine's admission error mapped to INTERNAL when it
-    # arrived as EngineDeadError, or was counted as a retryable rejection when
-    # it arrived as EngineUnavailableError, depending on timing.
+    # An admission-time EngineDeadError maps to UNAVAILABLE and counts as an
+    # engine failure, not as INTERNAL or a retryable rejection.
     llm = _FakeLlm([])
 
     def refuse(**kwargs):

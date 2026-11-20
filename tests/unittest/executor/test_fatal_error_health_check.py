@@ -15,62 +15,43 @@
 """Unit tests for fatal error detection and health check functionality.
 
 Tests cover:
-- classify_error() module-level function (tested directly, not via mock)
-- PyExecutor token-bucket error budget and _handle_errors()
+- classify_error() and the PyExecutor token-bucket error budget
 - GenerationExecutor.check_health(), _set_fatal_error(), is_shutdown()
-- GenerationExecutorProxy.check_health() with MPI worker liveness
-- GenerationExecutorProxy._error_monitor_loop() background detection
-- GrpcRequestManager.health_check() integration
-- OpenAIServer /health endpoint with fatal error shutdown
-- BaseLLM._check_health() delegation
+- WorkerProcessMonitor process-liveness detection
+- GenerationExecutorProxy.check_health(), pre_shutdown() and
+  _error_monitor_loop(), run on a proxy built without workers
+- GrpcRequestManager.health_check(), the OpenAIServer /health endpoint and
+  BaseLLM._check_health()
 """
 
-# Import classify_error directly from the source file to avoid triggering
-# the heavy tensorrt_llm.__init__ (which loads C++ extensions).
-import importlib.util
-import logging
-import pathlib
+import asyncio
 import signal
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import Future
-from queue import Empty, Queue
-from unittest.mock import MagicMock, Mock, patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
+from utils.executor_stubs import bare_proxy
+
+from tensorrt_llm._torch.pyexecutor.error_classification import ErrorBudget, classify_error
+from tensorrt_llm.executor import worker_process_monitor as _monitor_mod
+from tensorrt_llm.executor.executor import GenerationExecutor
+from tensorrt_llm.executor.proxy import GenerationExecutorFrontendProxy
+from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.executor.worker_process_monitor import (
+    WorkerProcessMonitor,
+    _read_process_state,
+    capture_worker_process_identity,
+)
+from tensorrt_llm.llmapi.llm import BaseLLM
+from tensorrt_llm.serve import openai_server
+from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
-
-
-logger = logging.getLogger(__name__)
-
-_mod_path = (
-    pathlib.Path(__file__).resolve().parents[3]
-    / "tensorrt_llm"
-    / "_torch"
-    / "pyexecutor"
-    / "error_classification.py"
-)
-_spec = importlib.util.spec_from_file_location("error_classification", _mod_path)
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-classify_error = _mod.classify_error
-ErrorBudget = _mod.ErrorBudget
-
-_monitor_path = (
-    pathlib.Path(__file__).resolve().parents[3]
-    / "tensorrt_llm"
-    / "executor"
-    / "worker_process_monitor.py"
-)
-_monitor_spec = importlib.util.spec_from_file_location("worker_process_monitor", _monitor_path)
-_monitor_mod = importlib.util.module_from_spec(_monitor_spec)
-_monitor_spec.loader.exec_module(_monitor_mod)
-WorkerProcessMonitor = _monitor_mod.WorkerProcessMonitor
-_read_process_state = _monitor_mod._read_process_state
-capture_worker_process_identity = _monitor_mod.capture_worker_process_identity
 
 
 # ---------------------------------------------------------------------------
@@ -119,163 +100,6 @@ class MockPyExecutorForFatalError:
             self.active_requests = [r for r in self.active_requests if r not in requests]
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
-
-
-# ---------------------------------------------------------------------------
-# Minimal executor mocks for GenerationExecutor / Proxy tests
-# ---------------------------------------------------------------------------
-class ConcreteExecutor:
-    """Mirrors GenerationExecutor's fatal-error and health-check logic."""
-
-    def __init__(self):
-        self._error_queue: Queue = Queue()
-        self.doing_shutdown: bool = False
-        self._fatal_error = None
-
-    def _set_fatal_error(self, error):
-        """Record the first fatal error; subsequent calls are no-ops."""
-        if self._fatal_error is None:
-            self._fatal_error = error
-
-    def is_shutdown(self) -> bool:
-        """Return True if shutdown is in progress or a fatal error occurred."""
-        return self.doing_shutdown or self._fatal_error is not None
-
-    def check_health(self) -> bool:
-        """Check if executor is healthy, draining all queued errors."""
-        if self.doing_shutdown or self._fatal_error is not None:
-            return False
-        drained = False
-        while True:
-            try:
-                e = self._error_queue.get_nowait()
-                self._error_queue.task_done()
-                drained = True
-                if not isinstance(e, str):
-                    self._set_fatal_error(e)
-                    self.doing_shutdown = True
-                    break
-            except Empty:
-                break
-        if drained:
-            return self._fatal_error is None and not self.doing_shutdown
-        return True
-
-    def shutdown(self):
-        """Mark executor as shutting down."""
-        self.doing_shutdown = True
-
-
-class ConcreteProxyExecutor(ConcreteExecutor):
-    """Mirrors GenerationExecutorProxy's MPI-aware health check + monitor.
-
-    Uses shared ``_check_mpi_futures()`` and ``_drain_error_queue()``
-    helpers to match the production proxy's unified pattern.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.mpi_futures: list = []
-        self._pre_shutdown_called: bool = False
-        self._shutdown_event = threading.Event()
-        # Track sentinel sends so the pre_shutdown sentinel test can
-        # observe whether ``request_queue.put_noblock(None, ...)`` would
-        # have been called by the real proxy.
-        self.request_queue = Mock()
-        self.workers_started: bool = True
-        self._abort_all_requests_called: bool = False
-        self._worker_process_monitor = WorkerProcessMonitor()
-
-    def _check_mpi_futures(self) -> bool:
-        """Return True if any MPI worker future has completed."""
-        for f in self.mpi_futures:
-            if f.done():
-                exc = f.exception() if not f.cancelled() else None
-                error = exc or RuntimeError("MPI worker exited unexpectedly")
-                self._set_fatal_error(error)
-                if not self.doing_shutdown:
-                    self.pre_shutdown()
-                return True
-        return False
-
-    def _drain_error_queue(self) -> bool:
-        """Drain all queued errors, skipping per-request str errors."""
-        drained = False
-        while True:
-            try:
-                e = self._error_queue.get_nowait()
-                self._error_queue.task_done()
-                drained = True
-                if isinstance(e, str):
-                    continue
-                self._set_fatal_error(e)
-                if not self.doing_shutdown:
-                    self.pre_shutdown()
-                break
-            except Empty:
-                break
-        return drained
-
-    def _check_mpi_workers(self) -> bool:
-        """Return True if an OS process handle or MPI future is dead."""
-        dead_worker = self._worker_process_monitor.find_dead_worker()
-        if dead_worker is not None:
-            self._set_fatal_error(
-                RuntimeError(
-                    "MPI worker rank "
-                    f"{dead_worker.rank} (pid {dead_worker.pid}) "
-                    "exited unexpectedly"
-                )
-            )
-            if not self.doing_shutdown:
-                self.pre_shutdown()
-            return True
-        return self._check_mpi_futures()
-
-    def check_health(self) -> bool:
-        """Check executor health including MPI worker liveness."""
-        if self.doing_shutdown or self._fatal_error is not None:
-            return False
-        if self._drain_error_queue():
-            return self._fatal_error is None and not self.doing_shutdown
-        if self._check_mpi_workers():
-            return False
-        return True
-
-    def _error_monitor_loop(self):
-        """Background loop using shared helpers."""
-        while not self.doing_shutdown and self._fatal_error is None:
-            try:
-                if self._check_mpi_workers():
-                    return
-                self._drain_error_queue()
-                if self._fatal_error is not None:
-                    return
-            except Exception as exc:
-                logger.debug(f"Mock monitor: unexpected exception (ignored): {exc}")
-            self._shutdown_event.wait(timeout=0.5)
-
-    def pre_shutdown(self):
-        """Mirror production GenerationExecutorProxy.pre_shutdown.
-
-        Sentinel-send logic must match production exactly so the
-        ``TestPreShutdownSentinel`` regression suite catches a future
-        revert.  See PR #12718 investigation -- the bug was a one-character
-        change from ``all`` to ``any`` here, which silently dropped the
-        sentinel for the empty-``mpi_futures`` case used by
-        ``RemoteMpiCommSessionClient`` / ``trtllm-llmapi-launch``.
-        """
-        if not self.workers_started:
-            return
-        if self.doing_shutdown:
-            return
-        self.doing_shutdown = True
-        self._worker_process_monitor.close()
-        self._pre_shutdown_called = True
-        self._shutdown_event.set()
-        self._abort_all_requests_called = True
-        if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
-            self.request_queue.put_noblock(None, retry=4)
 
 
 # ===========================================================================
@@ -457,31 +281,37 @@ class TestErrorBudget:
         assert req not in executor.active_requests
 
 
-# NOTE: An earlier version of this file had a `test_charge_budget_true_is_default`
-# test here that was functionally identical to `test_immediate_fatal_bypasses_budget`
-# (both call `_handle_errors("device-side assert ...")` and assert `_fatal_error is
-# not None`).  The intent of "true is default" is now captured by
-# `test_immediate_fatal_bypasses_budget` which does not pass `charge_budget` and
-# therefore relies on the default of True.  Removed to reduce noise.
-
-
 # ---------------------------------------------------------------------------
 # GenerationExecutor: _set_fatal_error, is_shutdown, check_health
 # ---------------------------------------------------------------------------
+class _Executor(GenerationExecutor):
+    """A GenerationExecutor with no engine; shutdown() only records the call."""
+
+    def __init__(self):
+        super().__init__()
+        self.shutdowns = 0
+
+    def submit(self, request):
+        raise NotImplementedError
+
+    def abort_request(self, request_id):
+        raise NotImplementedError
+
+    def shutdown(self):
+        self.shutdowns += 1
+        self.doing_shutdown = True
+
+
 class TestGenerationExecutor:
     """Tests for GenerationExecutor's _set_fatal_error, is_shutdown, check_health."""
 
-    @pytest.fixture
-    def executor(self):
-        """Return a fresh ConcreteExecutor for each test."""
-        return ConcreteExecutor()
-
-    def test_fatal_error_none_initially(self, executor):
+    def test_fatal_error_none_initially(self):
         """Fatal error starts as None."""
-        assert executor._fatal_error is None
+        assert _Executor()._fatal_error is None
 
-    def test_set_fatal_error_first_wins(self, executor):
+    def test_set_fatal_error_first_wins(self):
         """Only the first fatal error is recorded; subsequent calls are no-ops."""
+        executor = _Executor()
         first, second = RuntimeError("a"), RuntimeError("b")
         executor._set_fatal_error(first)
         executor._set_fatal_error(second)
@@ -498,28 +328,40 @@ class TestGenerationExecutor:
     )
     def test_is_shutdown(self, doing_shutdown, fatal_error, expected):
         """is_shutdown reflects both doing_shutdown flag and fatal error state."""
-        ex = ConcreteExecutor()
-        ex.doing_shutdown = doing_shutdown
-        ex._fatal_error = fatal_error
-        assert ex.is_shutdown() is expected
+        executor = _Executor()
+        executor.doing_shutdown = doing_shutdown
+        executor._fatal_error = fatal_error
+        assert executor.is_shutdown() is expected
 
     @pytest.mark.parametrize(
-        "doing_shutdown,fatal_error,queue_error,expected",
+        "doing_shutdown,fatal_error,queued,expected",
         [
-            (False, None, None, True),
-            (True, None, None, False),
-            (False, RuntimeError("x"), None, False),
-            (False, None, RuntimeError("bg"), False),
+            (False, None, [], True),
+            (True, None, [], False),
+            (False, RuntimeError("x"), [], False),
+            (False, None, [RuntimeError("bg")], False),
+            (False, None, ["bad request", RequestError("bad request")], True),
+            (False, None, ["bad request", RuntimeError("bg")], False),
         ],
     )
-    def test_check_health(self, doing_shutdown, fatal_error, queue_error, expected):
-        """check_health returns False for shutdown, fatal error, or queued errors."""
-        ex = ConcreteExecutor()
-        ex.doing_shutdown = doing_shutdown
-        ex._fatal_error = fatal_error
-        if queue_error is not None:
-            ex._error_queue.put(queue_error)
-        assert ex.check_health() is expected
+    def test_check_health(self, doing_shutdown, fatal_error, queued, expected):
+        """check_health is False for shutdown, a fatal error, or a queued system error."""
+        executor = _Executor()
+        executor.doing_shutdown = doing_shutdown
+        executor._fatal_error = fatal_error
+        for item in queued:
+            executor._error_queue.put(item)
+        assert executor.check_health() is expected
+
+    def test_queued_system_error_is_recorded_and_shuts_down(self):
+        """A system error behind a per-request error is recorded and shuts down."""
+        executor = _Executor()
+        failure = RuntimeError("bg")
+        executor._error_queue.put("bad request")
+        executor._error_queue.put(failure)
+        assert executor.check_health() is False
+        assert executor._fatal_error is failure
+        assert executor.shutdowns == 1
 
 
 # ---------------------------------------------------------------------------
@@ -627,331 +469,402 @@ class TestWorkerProcessMonitor:
 
 
 # ---------------------------------------------------------------------------
-# GenerationExecutorProxy: check_health with MPI worker liveness
+# GenerationExecutorProxy: check_health, pre_shutdown, _error_monitor_loop
 # ---------------------------------------------------------------------------
-class TestProxyCheckHealth:
-    """Tests for GenerationExecutorProxy's MPI worker health checks."""
+class _RecordingSender:
+    """Command sender stand-in that records how the proxy fails and closes it."""
 
-    @pytest.fixture
-    def executor(self):
-        """Return a fresh ConcreteProxyExecutor for each test."""
-        return ConcreteProxyExecutor()
+    def __init__(self):
+        self.available = True
+        self.failures = []
+        self.closes = []
+
+    def fail(self, error):
+        self.failures.append(error)
+        self.available = False
+
+    def close(self, **kwargs):
+        self.closes.append(kwargs)
+
+
+@pytest.fixture
+def live_proxy():
+    """Return a factory for proxies whose workers count as started."""
+    proxies = []
+
+    def make(*futures, monitor=None):
+        sender = _RecordingSender()
+        proxy = bare_proxy(workers_started=True, mpi_futures=list(futures), _request_sender=sender)
+        if monitor is not None:
+            proxy._worker_process_monitor = monitor
+        proxies.append(proxy)
+        return proxy, sender
+
+    yield make
+    for proxy in proxies:
+        proxy._shutdown_event.set()
+        proxy._worker_process_monitor.close()
+        # No workers exist, so __del__ -> shutdown() must not wait for them.
+        proxy.workers_started = False
+
+
+def _future(state):
+    if state == "alive":
+        return Future()
+    if state == "cancelled":
+        return _cancelled_future()
+    return _done_future(RuntimeError("crash") if state == "crashed" else None)
+
+
+def _lost_worker_monitor(rank):
+    """A process monitor that reports ``rank`` as lost."""
+    monitor = Mock(spec=WorkerProcessMonitor)
+    monitor.find_dead_worker.return_value = capture_worker_process_identity(rank=rank)
+    return monitor
+
+
+def _start_monitor(proxy):
+    thread = threading.Thread(target=proxy._error_monitor_loop, daemon=True)
+    thread.start()
+    return thread
+
+
+def _wait_until(condition, message, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, message
+        time.sleep(0.01)
+
+
+class TestProxyCheckHealth:
+    """Tests for GenerationExecutorProxy.check_health and its check order."""
 
     @pytest.mark.parametrize(
-        "future_factory,expected_healthy,error_substr",
+        "state,expected_healthy,error_substr",
         [
-            (lambda: Future(), True, None),
-            (lambda: _done_future(RuntimeError("segfault")), False, "segfault"),
-            (lambda: _done_future(None), False, "unexpectedly"),
-            (lambda: _cancelled_future(), False, "unexpectedly"),
+            ("alive", True, None),
+            ("crashed", False, "crash"),
+            ("done", False, "unexpectedly"),
+            ("cancelled", False, "unexpectedly"),
         ],
     )
-    def test_worker_states(self, executor, future_factory, expected_healthy, error_substr):
-        """Verify health status for different MPI worker future states."""
-        executor.mpi_futures = [future_factory()]
-        assert executor.check_health() is expected_healthy
+    def test_worker_states(self, live_proxy, state, expected_healthy, error_substr):
+        """A finished MPI worker future is fatal and starts teardown."""
+        proxy, sender = live_proxy(_future(state))
+        assert proxy.check_health() is expected_healthy
         if error_substr:
-            assert error_substr in str(executor._fatal_error)
+            assert error_substr in str(proxy._fatal_error)
+            assert proxy.doing_shutdown and len(sender.closes) == 1
+        else:
+            assert not sender.closes
 
-    def test_healthy_with_no_mpi_futures(self, executor):
-        """No MPI futures means healthy (single-process mode)."""
-        assert executor.check_health() is True
+    def test_healthy_with_no_mpi_futures(self, live_proxy):
+        """No MPI futures means healthy (remote session workers)."""
+        proxy, _ = live_proxy()
+        assert proxy.check_health() is True
 
-    def test_parent_unhealthy_short_circuits(self, executor):
-        """Parent executor being unhealthy short-circuits MPI future checks."""
-        executor._set_fatal_error(RuntimeError("parent"))
-        executor.mpi_futures = [Future()]
-        assert executor.check_health() is False
+    def test_recorded_fatal_error_short_circuits(self, live_proxy):
+        """A recorded fatal error is unhealthy without checking the workers."""
+        future = Mock(spec=Future)
+        proxy, _ = live_proxy(future)
+        proxy._fatal_error = RuntimeError("parent")
+        assert proxy.check_health() is False
+        future.done.assert_not_called()
+
+    def test_unavailable_command_sender_is_unhealthy(self, live_proxy):
+        proxy, sender = live_proxy(Future())
+        sender.available = False
+        assert proxy.check_health() is False
+
+    @pytest.mark.parametrize("error", ["bad request", RequestError("bad request")])
+    def test_per_request_errors_stay_healthy(self, live_proxy, error):
+        proxy, sender = live_proxy(Future())
+        proxy._error_queue.put(error)
+        assert proxy.check_health() is True
+        assert proxy._error_queue.empty()
+        assert proxy._fatal_error is None and not sender.closes
+
+    def test_queued_error_is_checked_before_worker_liveness(self, live_proxy):
+        proxy, sender = live_proxy(_future("crashed"), monitor=_lost_worker_monitor(0))
+        queued = RuntimeError("queued failure")
+        proxy._error_queue.put(queued)
+        assert proxy.check_health() is False
+        assert proxy._fatal_error is queued
+        assert len(sender.closes) == 1
+
+    def test_worker_future_error_precedes_process_liveness_loss(self, live_proxy):
+        """A future carries the worker's actual failure, so it wins over liveness loss."""
+        monitor = _lost_worker_monitor(0)
+        proxy, _ = live_proxy(_future("crashed"), monitor=monitor)
+        assert proxy.check_health() is False
+        assert "crash" in str(proxy._fatal_error)
+        monitor.find_dead_worker.assert_not_called()
+
+    def test_process_liveness_loss_with_a_pending_future(self, live_proxy):
+        """Health checks read local liveness only; remote supervision is the monitor's."""
+        monitor = _lost_worker_monitor(2)
+        proxy, sender = live_proxy(Future(), monitor=monitor)
+        assert proxy.check_health() is False
+        assert "rank 2" in str(proxy._fatal_error)
+        monitor.find_dead_worker.assert_called_once_with(include_remote=False)
+        # A worker may still be alive, so teardown asks it to stop.
+        assert [close["send_sentinel"] for close in sender.closes] == [True]
 
     @pytest.mark.skipif(
         not sys.platform.startswith("linux"), reason="pidfd/procfs worker monitoring is Linux-only"
     )
-    def test_killed_process_detected_while_future_remains_pending(self, executor):
+    def test_killed_process_detected_while_future_remains_pending(self, live_proxy):
         """A SIGKILLed worker is fatal even when its MPI future stays pending."""
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         future = Future()
+        proxy, sender = live_proxy(future)
         try:
             process_state = _read_process_state(process.pid)
             assert process_state is not None
             identity = capture_worker_process_identity(rank=0, pid=process.pid)
             assert identity.start_time == process_state[1]
-            executor._worker_process_monitor.register([identity])
-            executor.mpi_futures = [future]
-            assert executor.check_health() is True
+            proxy._worker_process_monitor.register([identity])
+            assert proxy.check_health() is True
 
             process.kill()
             process.wait(timeout=5)
 
-            deadline = time.monotonic() + 5
-            while executor.check_health() and time.monotonic() < deadline:
-                time.sleep(0.01)
-
-            assert executor.check_health() is False
+            _wait_until(lambda: not proxy.check_health(), "the killed worker was not detected")
             assert future.done() is False
-            assert "rank 0" in str(executor._fatal_error)
-            assert executor._pre_shutdown_called
+            assert "rank 0" in str(proxy._fatal_error)
+            assert proxy.doing_shutdown and len(sender.closes) == 1
         finally:
-            executor._worker_process_monitor.close()
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
 
 
-# ---------------------------------------------------------------------------
-# pre_shutdown sentinel send (regression: PR #12718)
-# ---------------------------------------------------------------------------
 class TestPreShutdownSentinel:
-    """Verify pre_shutdown puts a None sentinel on request_queue when needed.
+    """pre_shutdown has the command sender send the stop sentinel while a worker may live.
 
-    Regression: switching the gate from ``all(not f.done() ...)`` to bare
-    ``any(...)`` silently dropped the sentinel when ``mpi_futures`` is
-    empty (the ``RemoteMpiCommSessionClient`` / ``trtllm-llmapi-launch``
-    case).  Without the sentinel, workers never receive the quit signal,
-    never put None on ``result_queue``, and the proxy's
-    ``dispatch_result_thread`` blocks indefinitely on
-    ``result_queue.get()`` -- causing a 2400 s test timeout.
+    ``RemoteMpiCommSessionClient`` (``trtllm-llmapi-launch``) returns no
+    futures because its workers run in a separate process. Without the
+    sentinel, those workers never stop and never send the ``None`` that ends
+    the proxy's ``dispatch_result_thread``.
     """
 
-    @pytest.fixture
-    def executor(self):
-        return ConcreteProxyExecutor()
+    @pytest.mark.parametrize(
+        "states,sentinel",
+        [
+            ((), True),
+            (("alive", "alive"), True),
+            (("done", "done"), False),
+            (("crashed", "alive"), True),
+        ],
+        ids=["no-futures", "all-alive", "all-done", "partial-crash"],
+    )
+    def test_sentinel_rule(self, live_proxy, states, sentinel):
+        proxy, sender = live_proxy(*(_future(state) for state in states))
+        proxy.pre_shutdown()
+        assert [close["send_sentinel"] for close in sender.closes] == [sentinel]
+        assert proxy.doing_shutdown and proxy._shutdown_event.is_set()
 
-    def test_empty_mpi_futures_sends_sentinel(self, executor):
-        """Empty ``mpi_futures`` must still trigger the sentinel send.
+    def test_aborts_pending_requests_and_stops_process_monitoring(self, live_proxy):
+        monitor = Mock(spec=WorkerProcessMonitor)
+        proxy, _ = live_proxy(Future(), monitor=monitor)
+        pending = Mock()
+        proxy._results = {7: pending}
+        proxy.pre_shutdown()
+        pending.abort.assert_called_once_with()
+        monitor.close.assert_called()
 
-        This is the case used by ``RemoteMpiCommSessionClient.submit()``
-        which returns ``[]`` because workers run in a separate
-        ``mgmn_leader_node`` process.
-        """
-        executor.mpi_futures = []
-        executor.pre_shutdown()
-        executor.request_queue.put_noblock.assert_called_once_with(None, retry=4)
+    def test_double_call_is_idempotent(self, live_proxy):
+        """Calling pre_shutdown twice must not close the sender twice."""
+        proxy, sender = live_proxy()
+        proxy.pre_shutdown()
+        proxy.pre_shutdown()
+        assert len(sender.closes) == 1
 
-    def test_all_workers_alive_sends_sentinel(self, executor):
-        """At least one alive future means workers need to be told to quit."""
-        executor.mpi_futures = [Future(), Future()]
-        executor.pre_shutdown()
-        executor.request_queue.put_noblock.assert_called_once_with(None, retry=4)
+    def test_workers_not_started_is_noop(self, live_proxy):
+        """If workers were never started, there is no one to stop."""
+        proxy, sender = live_proxy()
+        proxy.workers_started = False
+        proxy.pre_shutdown()
+        assert not sender.closes
+        assert proxy.doing_shutdown is False
 
-    def test_all_workers_done_skips_sentinel(self, executor):
-        """All futures already done means there is no one to notify."""
-        executor.mpi_futures = [_done_future(None), _done_future(None)]
-        executor.pre_shutdown()
-        executor.request_queue.put_noblock.assert_not_called()
-
-    def test_partial_crash_sends_sentinel(self, executor):
-        """One worker dead, one alive: surviving worker still needs the sentinel."""
-        executor.mpi_futures = [_done_future(RuntimeError("crash")), Future()]
-        executor.pre_shutdown()
-        executor.request_queue.put_noblock.assert_called_once_with(None, retry=4)
-
-    def test_double_call_is_idempotent(self, executor):
-        """Calling pre_shutdown twice must not double-send the sentinel."""
-        executor.mpi_futures = []
-        executor.pre_shutdown()
-        executor.pre_shutdown()
-        assert executor.request_queue.put_noblock.call_count == 1
-
-    def test_workers_not_started_is_noop(self, executor):
-        """If workers were never started, do not send the sentinel."""
-        executor.workers_started = False
-        executor.mpi_futures = []
-        executor.pre_shutdown()
-        executor.request_queue.put_noblock.assert_not_called()
-        assert executor.doing_shutdown is False
+    def test_attached_frontend_cancels_its_requests_without_the_sentinel(self):
+        """Only the launcher stops the engine; a frontend cancels its own requests."""
+        sender = _RecordingSender()
+        frontend = bare_proxy(
+            GenerationExecutorFrontendProxy,
+            _request_sender=sender,
+            _results={5: Mock(), 6: Mock()},
+            rpc_client=None,
+        )
+        frontend.pre_shutdown()
+        assert sender.closes == [
+            dict(timeout=7.0, send_sentinel=False, cancel_ids=(5, 6), wait=False)
+        ]
 
 
-# ---------------------------------------------------------------------------
-# _error_monitor_loop background thread
-# ---------------------------------------------------------------------------
 class TestErrorMonitorLoop:
     """Tests for the _error_monitor_loop background thread."""
 
-    def test_detects_worker_crash(self):
-        """Monitor thread detects MPI worker crash and triggers pre_shutdown."""
-        executor = ConcreteProxyExecutor()
-        f = Future()
-        executor.mpi_futures = [f]
+    def test_detects_worker_crash(self, live_proxy):
+        """The monitor reaps a finished worker future without a health check."""
+        proxy, sender = live_proxy(_future("crashed"))
+        thread = _start_monitor(proxy)
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert "crash" in str(proxy._fatal_error)
+        assert proxy.doing_shutdown and len(sender.closes) == 1
 
-        t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
-        t.start()
-        time.sleep(0.05)
-        f.set_exception(RuntimeError("OOM"))
-        t.join(timeout=2.0)
+    def test_detects_error_queue_item(self, live_proxy):
+        """The monitor records a queued system error and starts teardown."""
+        proxy, sender = live_proxy(Future())
+        failure = RuntimeError("bg failure")
+        proxy._error_queue.put(failure)
+        thread = _start_monitor(proxy)
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert proxy._fatal_error is failure
+        assert proxy.doing_shutdown and len(sender.closes) == 1
 
-        assert not t.is_alive()
-        assert executor._fatal_error is not None
-        assert executor._pre_shutdown_called
+    def test_skips_per_request_errors(self, live_proxy):
+        """Per-request errors do not trigger fatal shutdown."""
+        proxy, sender = live_proxy(Future())
+        proxy._error_queue.put("per-request error string")
+        proxy._error_queue.put(RequestError("bad request"))
+        thread = _start_monitor(proxy)
+        _wait_until(
+            lambda: proxy._error_queue.unfinished_tasks == 0, "the monitor did not drain the queue"
+        )
+        assert thread.is_alive()
+        assert proxy._fatal_error is None and not sender.closes
+        proxy.doing_shutdown = True
+        proxy._shutdown_event.set()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
 
-    def test_detects_error_queue_item(self):
-        """Monitor thread detects system errors in the error queue."""
-        executor = ConcreteProxyExecutor()
+    def test_stops_on_shutdown_flag(self, live_proxy):
+        """The monitor exits promptly when doing_shutdown is set and it is woken."""
+        proxy, _ = live_proxy(Future())
+        thread = _start_monitor(proxy)
+        proxy.doing_shutdown = True
+        proxy._shutdown_event.set()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
 
-        t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
-        t.start()
-        time.sleep(0.05)
-        executor._error_queue.put(RuntimeError("bg failure"))
-        t.join(timeout=2.0)
+    def test_forwarded_worker_error_precedes_process_liveness_loss(self, live_proxy):
+        """A remote session's forwarded worker error wins over a liveness loss."""
+        monitor = _lost_worker_monitor(1)
+        proxy, _ = live_proxy(monitor=monitor)
+        forwarded = ValueError("rank 1 failed to load")
+        proxy.mpi_session = SimpleNamespace(check_worker_error=lambda: forwarded)
+        thread = _start_monitor(proxy)
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert proxy._fatal_error is forwarded
+        monitor.find_dead_worker.assert_not_called()
 
-        assert not t.is_alive()
-        assert executor._fatal_error is not None
-
-    def test_skips_per_request_string_errors(self):
-        """Per-request string errors should not trigger fatal shutdown."""
-        executor = ConcreteProxyExecutor()
-
-        t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
-        t.start()
-        time.sleep(0.05)
-        executor._error_queue.put("per-request error string")
-        # Wait past one full poll cycle (0.5s) so the monitor processes
-        # the string error and loops back, proving it didn't go fatal.
-        time.sleep(0.7)
-
-        assert executor._fatal_error is None
-        executor.doing_shutdown = True
-        executor._shutdown_event.set()
-        t.join(timeout=2.0)
-
-    def test_stops_on_shutdown_flag(self):
-        """Monitor thread exits promptly when doing_shutdown is set."""
-        executor = ConcreteProxyExecutor()
-
-        t = threading.Thread(target=executor._error_monitor_loop, daemon=True)
-        t.start()
-        time.sleep(0.05)
-        executor.doing_shutdown = True
-        executor._shutdown_event.set()  # Wake the monitor immediately
-        t.join(timeout=2.0)
-
-        assert not t.is_alive()
+    def test_monitor_consumes_remote_supervision(self, live_proxy):
+        monitor = _lost_worker_monitor(3)
+        proxy, _ = live_proxy(Future(), monitor=monitor)
+        thread = _start_monitor(proxy)
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert "rank 3" in str(proxy._fatal_error)
+        monitor.find_dead_worker.assert_called_once_with(include_remote=True)
 
 
 # ---------------------------------------------------------------------------
 # gRPC health check
 # ---------------------------------------------------------------------------
 class TestGrpcHealthCheck:
-    """Tests for gRPC health check integration with fatal error state."""
+    """Tests for GrpcRequestManager.health_check against executor health state."""
 
-    @staticmethod
-    async def _health_check(self):
-        """Mirrors GrpcRequestManager.health_check logic."""
-        try:
-            if self.llm is None:
-                return False, "LLM not initialized"
-            if hasattr(self.llm, "_executor"):
-                if self.llm._executor is None:
-                    return False, "Executor is not available"
-                if not self.llm._executor.check_health():
-                    error_msg = "Executor is unhealthy"
-                    if self.llm._executor._fatal_error is not None:
-                        exc = self.llm._executor._fatal_error
-                        short = str(exc).splitlines()[0][:200]
-                        error_msg = f"{type(exc).__name__}: {short}"
-                    return False, error_msg
-            return True, "OK"
-        except Exception as e:
-            return False, f"Error: {e}"
-
-    def _make_manager(self, executor=None):
-        """Create a mock gRPC manager with the given executor."""
-        m = MagicMock()
-        m.llm = MagicMock()
-        m.llm._executor = executor
-        m.health_check = self._health_check.__get__(m)
-        return m
-
-    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "setup,expected_healthy,msg_substr",
         [
             ("healthy", True, "OK"),
-            ("fatal", False, "CUDA OOM"),
+            ("fatal", False, "RuntimeError: CUDA OOM"),
             ("no_executor", False, "not available"),
             ("no_llm", False, "not initialized"),
             ("shutdown", False, "unhealthy"),
         ],
     )
-    async def test_health_check(self, setup, expected_healthy, msg_substr):
+    def test_health_check(self, setup, expected_healthy, msg_substr):
         """Verify gRPC health check returns correct status and message."""
-        if setup == "no_llm":
-            m = MagicMock()
-            m.llm = None
-            m.health_check = self._health_check.__get__(m)
-        else:
-            ex = ConcreteExecutor()
-            if setup == "fatal":
-                ex._set_fatal_error(RuntimeError("CUDA OOM"))
-            elif setup == "no_executor":
-                ex = None
-            elif setup == "shutdown":
-                ex.doing_shutdown = True
-            m = self._make_manager(ex)
+        pytest.importorskip(
+            "smg_grpc_proto",
+            reason='SMG gRPC adapter dependency not installed (pip install "tensorrt_llm[grpc-smg]")',
+        )
+        from tensorrt_llm.grpc.smg.request_manager import GrpcRequestManager
 
-        healthy, msg = await m.health_check()
+        llm = None
+        if setup != "no_llm":
+            executor = None if setup == "no_executor" else _Executor()
+            if setup == "fatal":
+                executor._set_fatal_error(RuntimeError("CUDA OOM\nsecond line"))
+            elif setup == "shutdown":
+                executor.doing_shutdown = True
+            llm = SimpleNamespace(_executor=executor)
+
+        healthy, msg = asyncio.run(GrpcRequestManager(llm).health_check())
         assert healthy is expected_healthy
         assert msg_substr in msg
+        assert "second line" not in msg
 
 
 # ---------------------------------------------------------------------------
 # OpenAI /health endpoint
 # ---------------------------------------------------------------------------
 class TestOpenAIHealthEndpoint:
-    """Tests for OpenAI /health endpoint with fatal error shutdown."""
+    """Tests for the OpenAIServer /health endpoint with fatal error shutdown."""
 
-    @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "check_healthy,fatal_error,expect_code,sigint",
+        "state,expect_code,sigint",
         [
-            (True, None, 200, False),
-            (False, None, 503, False),
-            (False, RuntimeError("CUDA OOM"), 503, True),
+            ("healthy", 200, False),
+            ("shutting_down", 503, False),
+            ("fatal", 503, True),
+            # Executor cleanup can start before HTTP shutdown is requested.
+            ("fatal_during_cleanup", 503, True),
         ],
     )
-    async def test_health(self, check_healthy, fatal_error, expect_code, sigint):
-        """Verify status code and SIGINT behavior for different health states."""
-        from starlette.responses import Response
+    def test_health(self, monkeypatch, state, expect_code, sigint):
+        """A fatal engine answers 503 and requests HTTP shutdown once."""
+        executor = _Executor()
+        if state == "shutting_down":
+            executor.doing_shutdown = True
+        elif state.startswith("fatal"):
+            executor._set_fatal_error(RuntimeError("CUDA OOM"))
+            executor.doing_shutdown = state == "fatal_during_cleanup"
+        server = object.__new__(OpenAIServer)
+        server.generator = SimpleNamespace(_executor=executor, _check_health=executor.check_health)
+        server.embedding_batcher = None
+        signals = []
+        monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
+        monkeypatch.setattr(openai_server, "_record_generator_termination", lambda _: None)
 
-        server = MagicMock()
-        server._check_health = Mock(return_value=check_healthy)
-        executor = Mock()
-        executor._fatal_error = fatal_error
-        executor.doing_shutdown = False
-        server.generator = Mock()
-        server.generator._executor = executor
+        async def probe_twice():
+            return [(await server.health()).status_code for _ in range(2)]
 
-        with patch.object(signal, "raise_signal") as mock_sig:
-            if server._check_health():
-                response = Response(status_code=200)
-            else:
-                ex = getattr(server.generator, "_executor", None)
-                if (
-                    ex is not None
-                    and getattr(ex, "_fatal_error", None) is not None
-                    and not getattr(ex, "doing_shutdown", True)
-                ):
-                    signal.raise_signal(signal.SIGINT)
-                response = Response(status_code=503)
-
-            assert response.status_code == expect_code
-            if sigint:
-                mock_sig.assert_called_once_with(signal.SIGINT)
-            else:
-                mock_sig.assert_not_called()
+        assert asyncio.run(probe_twice()) == [expect_code, expect_code]
+        assert signals == ([signal.SIGINT] if sigint else [])
 
 
 # ---------------------------------------------------------------------------
 # BaseLLM._check_health delegation
 # ---------------------------------------------------------------------------
-class TestBaseLLMCheckHealth:
-    """Tests for BaseLLM._check_health delegation to executor."""
+def _llm(**attributes):
+    llm = object.__new__(BaseLLM)
+    llm._encode_only = False
+    # No engine was started, so __del__ -> shutdown() has nothing to stop.
+    llm.shutdown = lambda: None
+    for name, value in attributes.items():
+        setattr(llm, name, value)
+    return llm
 
-    @staticmethod
-    def _check_health(llm) -> bool:
-        """Mirrors BaseLLM._check_health logic."""
-        if hasattr(llm, "_executor") and llm._executor is not None:
-            return llm._executor.check_health()
-        return False
+
+class TestBaseLLMCheckHealth:
+    """Tests for BaseLLM._check_health delegation to the executor."""
 
     @pytest.mark.parametrize(
         "has_executor,fatal,expected",
@@ -962,20 +875,17 @@ class TestBaseLLMCheckHealth:
         ],
     )
     def test_delegation(self, has_executor, fatal, expected):
-        """_check_health delegates to executor.check_health correctly."""
-        llm = Mock()
+        """_check_health delegates to executor.check_health."""
+        executor = None
         if has_executor:
-            ex = ConcreteExecutor()
+            executor = _Executor()
             if fatal:
-                ex._set_fatal_error(RuntimeError("x"))
-            llm._executor = ex
-        else:
-            llm._executor = None
-        assert self._check_health(llm) is expected
+                executor._set_fatal_error(RuntimeError("x"))
+        assert _llm(_executor=executor)._check_health() is expected
 
     def test_no_executor_attr(self):
-        """Returns False when the object has no _executor attribute."""
-        assert self._check_health(object()) is False
+        """Returns False when the LLM has no _executor attribute."""
+        assert _llm()._check_health() is False
 
 
 # ---------------------------------------------------------------------------
