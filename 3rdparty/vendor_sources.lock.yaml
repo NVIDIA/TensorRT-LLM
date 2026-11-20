@@ -23,6 +23,27 @@ vendors:
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:5e55c3a806193ca253952d06a8878c3fee8a8c2611cfc59105226d438ecefb2b
     digest: sha256-tree-v1:22ffdd5e818e383b9aa4627202e2c06706cfc5b7f233105b8f7c7d2fd1cbb993
+  flashinfer-prims-ts-moe:
+    url: https://github.com/flashinfer-ai/flashinfer.git
+    branch: main
+    commit: 855eece4e9b5b796a46148664a3e27da571cd98b
+    source: flashinfer/prims_ts
+    destination: tensorrt_llm/_torch/moe/kernels/prims_ts
+    include:
+    - __init__.py
+    - cutlass_dsl.py
+    - utils.py
+    - batched_gemm/*.py
+    - moe/__init__.py
+    - moe/compile_cache.py
+    - moe/config_mapper.py
+    - moe/partition.py
+    - moe/support.py
+    - moe/tensor_adapter.py
+    - moe/*.json
+    patch: 3rdparty/vendor_patches/flashinfer-prims-ts-moe.patch
+    patch_digest: sha256:0cfe8e1c35e9599bf0e1a6fbeb7382128dd1b0f7ad82356320e946698ec7f2bb
+    digest: sha256-tree-v1:4ecc60cf4ae2d51b759d7e57dbbee0793fc882e266c2675a6e7302ab127aaee9
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

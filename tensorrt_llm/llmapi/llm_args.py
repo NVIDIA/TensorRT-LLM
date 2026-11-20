@@ -2431,8 +2431,8 @@ def _resolve_load_balancer_config(value: Any) -> Any:
 
 
 _MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
-                      "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
-                      "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
+                      "PRIMS_TS", "DEEPGEMM", "DENSEGEMM", "VANILLA", "TRITON",
+                      "MARLIN", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
 
 
 def auto_moe_backend_for_load_balancer(

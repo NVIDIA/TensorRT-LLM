@@ -149,6 +149,7 @@ def test_precompiled_preserves_source_schemas(
     paths = (
         "tensorrt_llm/schemas/trtllm-serve-config.schema.json",
         "tensorrt_llm/usage/schemas/trtllm_usage_event_schema.json",
+        "tensorrt_llm/_torch/moe/kernels/prims_ts/moe/prims_ts_moe_configs.json",
     )
     for name in paths:
         path = Path(name)
@@ -166,7 +167,10 @@ def test_precompiled_preserves_source_schemas(
                 archive.writestr(name, "old-precompiled-build")
     monkeypatch.setenv("TRTLLM_PRECOMPILED_LINK", "1" if source_kind == "link" else "0")
     extract_from_precompiled(
-        str(source), PACKAGE_DATA + ["schemas/*.json", "usage/schemas/*.json"], str(tmp_path)
+        str(source),
+        PACKAGE_DATA
+        + ["schemas/*.json", "usage/schemas/*.json", "_torch/moe/kernels/prims_ts/moe/*.json"],
+        str(tmp_path),
     )
     for name in paths:
         assert Path(name).read_text() == "current-checkout"

@@ -35,6 +35,7 @@ from .fused_moe_cute_dsl_b12x import (CuteDslB12xFusedMoE,
 from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
+from .fused_moe_prims_ts import PrimsTsFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -95,6 +96,7 @@ __all__ = [
     "resolve_moe_impl",
     "Llama4RenormalizeMoeRoutingMethod",
     "MarlinFusedMoE",
+    "PrimsTsFusedMoE",
     "LoadBalancedMoeRoutingMethod",
     "moe_load_balancer_set_repeated_for_next_layer",
     "MoE",

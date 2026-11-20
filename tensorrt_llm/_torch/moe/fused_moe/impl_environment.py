@@ -14,6 +14,7 @@
 # limitations under the License.
 """Collect and freeze machine inputs used for MoE selection."""
 
+import importlib.util
 import os
 from contextlib import contextmanager
 from enum import Enum
@@ -40,6 +41,9 @@ class MoEDep(str, Enum):
     #: The installed CuTe DSL exposes the Rubin helpers the SM107 CuteDSL
     #: kernels are written against.
     CUTEDSL_RUBIN = "cutedsl_rubin"
+    #: The CuTe DSL primitives and task-scheduling modules the vendored PrimsTS
+    #: MoE kernels are written against, and flashinfer, whose helpers they use.
+    PRIMS_TS = "prims_ts"
     #: Locality-domain execution is usable here: SM107, driver support, and
     #: ``DISABLE_LOCALITY_DOMAINS`` unset.
     LOCALITY_DOMAIN = "locality_domain"
@@ -97,6 +101,23 @@ def _probe_cutedsl_rubin() -> Tuple[bool, str]:
     return False, "installed CuTe DSL lacks Rubin helpers"
 
 
+def _probe_prims_ts() -> Tuple[bool, str]:
+    # Locate rather than import: importing the vendored package would set the
+    # process-wide CuTe DSL cache directory as a side effect.
+    for module in (
+        "flashinfer",
+        "cutlass.experimental.primitives",
+        "cutlass.experimental.task_scheduling",
+    ):
+        try:
+            found = importlib.util.find_spec(module) is not None
+        except ModuleNotFoundError:
+            found = False
+        if not found:
+            return False, f"{module} is not importable"
+    return True, ""
+
+
 def _probe_locality_domain() -> Tuple[bool, str]:
     from ...locality_domain_utils import is_locality_domain_enabled
 
@@ -120,6 +141,7 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
     MoEDep.CUTEDSL_RUBIN: _probe_cutedsl_rubin,
+    MoEDep.PRIMS_TS: _probe_prims_ts,
     MoEDep.LOCALITY_DOMAIN: _probe_locality_domain,
 }
 
