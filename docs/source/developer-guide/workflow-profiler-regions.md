@@ -133,7 +133,7 @@ Decoder fields are:
 | `workflow.graph.key.batch_size`, `.draft_len`, `.short_seq_len_mode`, `.is_all_greedy_sample`, `.sample_type`, `.num_contexts`, `.context_query_len`, `.num_encoder_tokens`, `.peft_cache_data_type`, `.use_lora_graph` | Named dimensions of the existing decoder `KeyType`; sampling enum uses its name and optional PEFT dtype uses its string or `None` |
 | `workflow.graph.batch_capacity` | Key batch-size request capacity, not a live request count |
 | `workflow.graph.max_beam_width` | Owner's configured beam width used in the existing graph token-capacity formula, not observed live beam occupancy |
-| `workflow.graph.token_capacity` | Existing `_get_num_tokens_for_key`: `num_contexts * context_query_len + (batch_size * max_beam_width - num_contexts) * (draft_len + 1)` |
+| `workflow.graph.token_capacity` | Existing `_get_num_tokens_for_key`: normally `num_contexts * context_query_len + (batch_size * max_beam_width - num_contexts) * (draft_len + 1)`; the DSpark runner uses `ragged_verify_bucket` when set (pure generation only) |
 | `workflow.graph.input_token_rows` | Supplied `input_ids.shape[0]` at capture/replay entry, when present; capture then substitutes static capacity-shaped tensors |
 | `workflow.graph.encoder_hidden_state_rows` | Supplied `encoder_hidden_states.shape[0]` for mixed encoder-decoder input, when present; may be shorter than the key's encoder extent |
 

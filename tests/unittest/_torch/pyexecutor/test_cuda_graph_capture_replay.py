@@ -36,6 +36,7 @@ import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 from profiler_test_utils import select_regions
 
+from tensorrt_llm import _profiler as profiler
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor import cuda_graph_runner as cuda_graph_runner_module
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunnerConfig,
     KeyType,
 )
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
@@ -307,6 +309,10 @@ class TestCaptureReplayStaticTensors:
 
         assert static_buf[:batch_size].tolist() == [dummy_seq_slot] * batch_size
 
+    @pytest.mark.skipif(
+        not profiler.custom_region_enabled("workflow"),
+        reason="workflow decorators must be selected before importing their owners",
+    )
     @pytest.mark.parametrize("kind", ["decoder", "encoder"])
     def test_replay_output_reflects_latest_inputs(
         self, monkeypatch: pytest.MonkeyPatch, kind: str
@@ -348,9 +354,19 @@ class TestCaptureReplayStaticTensors:
                 "input_features": [torch.full((1, 1), value, dtype=torch.float32)],
             }
 
+        def model_call(
+            *, input_ids: torch.Tensor, position_ids: torch.Tensor, attn_metadata: object
+        ) -> torch.Tensor:
+            return input_ids.clone() + position_ids.clone()
+
+        decoder = DecoderRunner.__new__(DecoderRunner)
+        decoder._model_caller = model_call
+        decoder._eager_workspace_reclaimer = None
+        decoder._moe_workspace_reclaimer = None
+
         def forward_fn(inputs: dict) -> torch.Tensor:
             if kind == "decoder":
-                return inputs["input_ids"].clone() + inputs["position_ids"].clone()
+                return DecoderRunner._model_forward(decoder, is_dummy=True, **inputs)
             return inputs["input_features"] * 2
 
         with torch.profiler.profile(
@@ -369,6 +385,8 @@ class TestCaptureReplayStaticTensors:
         ]
         assert names.count("trtllm::cuda_graph_capture") == 1
         assert names.count("trtllm::cuda_graph_replay") == 2
+        if kind == "decoder":
+            assert names.count("trtllm::model_forward") == runner.WARMUP_STEPS + 1
 
 
 class TestEngineBuffersAsStaticInputs:
