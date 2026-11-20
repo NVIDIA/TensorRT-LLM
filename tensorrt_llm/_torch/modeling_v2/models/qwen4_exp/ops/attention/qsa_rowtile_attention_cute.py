@@ -54,6 +54,8 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
+
 try:
     from cutlass.memory import SmemAllocator
 except ImportError:  # DSL releases before the memory namespace split
@@ -1298,14 +1300,14 @@ def _aligned(t: torch.Tensor, strides: int) -> bool:
 
 
 def eligible(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> bool:
-    """Whether a launch fits this pass: SM103, bf16 q and K/V, D = 256, unit-stride head
+    """Whether a launch fits this pass: SM103/SM107, bf16 q and K/V, D = 256, unit-stride head
     dimension and 16-byte-aligned rows.
     """
     if q.shape[2] != HEAD_DIM:
         return False
     if not (q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16):
         return False
-    if torch.cuda.get_device_capability(q.device) != (10, 3):
+    if not archs.fast_path("qsa_rowtile", torch.cuda.get_device_capability(q.device)):
         return False
     if (
         q.stride(2) != 1

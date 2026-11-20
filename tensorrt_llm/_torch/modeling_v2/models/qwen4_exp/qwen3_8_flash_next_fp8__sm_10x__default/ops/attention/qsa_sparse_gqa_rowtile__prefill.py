@@ -26,7 +26,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa import (
     qsa_paged_sparse_gqa as _per_row_entry,
 )
@@ -1439,7 +1440,7 @@ def _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_ind
         raise ValueError("a row's query heads per KV head must fit the 128-row tile")
     if not _cute_eligible(q, k_cache, v_cache):
         raise ValueError(
-            "the row-tile pass needs SM103, head_dim 256, unit-stride heads (q's heads packed) "
+            "the row-tile pass needs SM103/SM107, head_dim 256, unit-stride heads (q's heads packed) "
             "and 16-byte-aligned rows"
         )
 
@@ -1605,7 +1606,7 @@ class QsaSparseGqaRowtile(OpWrapper):
     fresh, contiguous `[rows, Hq, D]` tensor of `q.dtype`.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -1646,7 +1647,7 @@ class QsaSparseGqaRowtile(OpWrapper):
 
     note = """
     Source: this target's plan (CuTe DSL `_block_plan` / `_group_plan`), lone-row (Triton) and
-    row-tile (`qsa_rowtile_attention_cute`, tcgen05) passes: SM103, bf16 q and K/V, D 256. It
+    row-tile (`qsa_rowtile_attention_cute`, tcgen05) passes: SM103/SM107, bf16 q and K/V, D 256. It
     takes `qsa_paged_sparse_gqa`'s arguments with the prefill pair required.
 
     Preconditions (not checkable without reading the contents):

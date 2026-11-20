@@ -25,6 +25,7 @@ from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_scores import (
     qsa_paged_index_scores as _family_index_scores,
 )
@@ -898,7 +899,7 @@ def supports(q, index_cache, tokens_per_block, compress_ratio) -> bool:
         and index_cache.data_ptr() % 16 == 0
         and tokens_per_block % compress_ratio == 0
         and tokens_per_block // compress_ratio == KEYS_PER_PAGE
-        and torch.cuda.get_device_capability(q.device) == (10, 3)
+        and archs.fast_path("qsa_index_scores", torch.cuda.get_device_capability(q.device))
     )
 
 
