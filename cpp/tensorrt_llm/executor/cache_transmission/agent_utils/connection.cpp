@@ -24,6 +24,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <utility>
 
@@ -76,7 +77,21 @@ auto computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectio
 namespace
 {
 
-void logDroppedNotification(char const* category, std::exception const& e, uint64_t requestId = 0)
+std::string boundedLogText(std::string_view value, size_t limit)
+{
+    std::string result;
+    auto const length = value.size() < limit ? value.size() : limit;
+    result.reserve(length);
+    for (size_t i = 0; i < length; ++i)
+    {
+        auto const ch = static_cast<unsigned char>(value[i]);
+        result.push_back(ch >= 0x20 && ch <= 0x7e ? static_cast<char>(ch) : '?');
+    }
+    return result;
+}
+
+void logDroppedNotification(char const* category, std::exception const& e, std::string const& agent,
+    size_t payloadBytes, uint64_t requestId = 0, bool actionable = false)
 {
     static std::atomic<uint64_t> count{0};
     auto const n = ++count;
@@ -85,16 +100,18 @@ void logDroppedNotification(char const* category, std::exception const& e, uint6
         return;
     }
     auto const* message = e.what();
-    std::string reason;
-    constexpr size_t kMaxReasonBytes = 160;
-    auto const length = strnlen(message, kMaxReasonBytes);
-    reason.reserve(length);
-    for (size_t i = 0; i < length; ++i)
+    auto const reason = boundedLogText(std::string_view(message, strnlen(message, 160)), 160);
+    auto const sender = boundedLogText(agent, 80);
+    if (actionable)
     {
-        auto const ch = static_cast<unsigned char>(message[i]);
-        reason.push_back(ch >= 0x20 && ch <= 0x7e ? static_cast<char>(ch) : '?');
+        TLLM_LOG_ERROR("Rejecting %s from '%s' (request id %lu, payload %zu bytes, occurrence %lu): %s", category,
+            sender.c_str(), requestId, payloadBytes, n, reason.c_str());
     }
-    TLLM_LOG_WARNING("Dropping %s (request id %lu, occurrence %lu): %s", category, requestId, n, reason.c_str());
+    else
+    {
+        TLLM_LOG_WARNING("Dropping %s from '%s' (request id %lu, payload %zu bytes, occurrence %lu): %s", category,
+            sender.c_str(), requestId, payloadBytes, n, reason.c_str());
+    }
 }
 
 bool isValidBufferKind(uint8_t kind)
@@ -265,12 +282,9 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
     NotificationSyncInfo syncInfo{mAgentName, ctx};
     bool const received
         = mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
-    if (common::getEnvDisaggEnableInflightCancel())
-    {
-        TLLM_CHECK_WITH_INFO(received,
-            "AgentConnection::recv ended before receiving sync notification (ctx tag=%d, remote=%s)", ctx.getTag(),
-            mRemoteAgentName.c_str());
-    }
+    TLLM_CHECK_WITH_INFO(received,
+        "AgentConnection::recv ended before receiving sync notification (ctx tag=%d, remote=%s)", ctx.getTag(),
+        mRemoteAgentName.c_str());
 }
 
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
@@ -567,7 +581,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                 }
                 catch (std::exception const& e)
                 {
-                    logDroppedNotification("malformed agent notification", e);
+                    logDroppedNotification("malformed agent notification", e, agent, notifIt->size());
                     notifIt = notifs.erase(notifIt);
                     continue;
                 }
@@ -760,7 +774,8 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     catch (std::exception const& e)
                     {
                         auto const requestId = requestAndBufferInfo.mRequestInfo.getRequestId();
-                        logDroppedNotification("invalid agent request", e, requestId);
+                        logDroppedNotification(
+                            "invalid agent request", e, agent, notifIt->size(), requestId, trustedIdentity);
                         if (trustedIdentity)
                         {
                             try
@@ -777,7 +792,8 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                             }
                             catch (std::exception const& nackError)
                             {
-                                logDroppedNotification("agent request rejection signal", nackError, requestId);
+                                logDroppedNotification("agent request rejection signal", nackError, agent,
+                                    notifIt->size(), requestId, true);
                             }
                         }
                         notifIt = notifs.erase(notifIt);
@@ -958,9 +974,9 @@ bool AgentConnectionManager::waitForNotification(
                 }
                 catch (std::exception const& e)
                 {
-                    logDroppedNotification("malformed agent notification", e);
+                    logDroppedNotification("malformed agent notification", e, agent, notifIt->size());
                     notifIt = notifs.erase(notifIt);
-                    continue;
+                    return false;
                 }
                 auto const& notificationInfo = *notificationStorage;
                 bool erase = false;

@@ -325,7 +325,19 @@ TEST_P(AgentCommTest, MalformedNotificationRecovery)
     auto const syncStatus = syncFuture.wait_for(kTimeout);
     terminate.store(true);
     ASSERT_EQ(syncStatus, std::future_status::ready);
-    EXPECT_TRUE(syncFuture.get());
+    EXPECT_FALSE(syncFuture.get());
+
+    terminate.store(false);
+    auto validSyncFuture = std::async(std::launch::async,
+        [&]()
+        {
+            TLLM_CUDA_CHECK(cudaSetDevice(0));
+            return receiver.waitForSyncInfo(senderName, expected, terminate);
+        });
+    auto const validSyncStatus = validSyncFuture.wait_for(kTimeout);
+    terminate.store(true);
+    ASSERT_EQ(validSyncStatus, std::future_status::ready);
+    EXPECT_TRUE(validSyncFuture.get());
 }
 
 INSTANTIATE_TEST_SUITE_P(AvailableBackends, AgentCommTest, ::testing::ValuesIn(getAvailableBackends()),
