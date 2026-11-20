@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/ipUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/direct/DirectPeerCopy.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -896,6 +897,29 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     // Bring up bounce v2 now, if enabled, so its shared arena is registered before any peer fetches
     // our metadata. This is a no-op when bounce is disabled or not built.
     maybeInitBounce(config.agentBufferSizeMb, config.bounceParams);
+
+    // Direct peer copy over NVLink (opt-in). Constructed before any metadata exchange so the first AgentDesc this
+    // agent publishes already carries its exported regions.
+    if (direct::DirectConfig::fromEnv().enabled)
+    {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess)
+        {
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): cudaGetDevice failed; direct copy assumes device 0", mName.c_str());
+            dev = 0;
+        }
+        try
+        {
+            mDirect = std::make_unique<direct::DirectPeerCopy>(dev);
+        }
+        catch (std::exception const& e)
+        {
+            mDirect.reset();
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): direct copy init failed (%s) -> NIXL path", mName.c_str(), e.what());
+        }
+    }
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
@@ -951,15 +975,26 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
         name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
+    // The AgentDesc extension blob: a raw bounce handshake (older peers) or tagged sections (bounce, direct).
+    auto const extensions = direct::unpackExtensions(agentDesc.getBounceHandshake());
+    auto const extension = [&extensions](direct::ExtensionTag tag) -> std::string
+    {
+        auto it = extensions.find(static_cast<std::uint32_t>(tag));
+        return it == extensions.end() ? std::string{} : it->second;
+    };
 #ifdef TLLM_BOUNCE_V2
     // Validate the peer's bounce capability handshake from AgentDesc and register its control
     // channel. Only peers with the same wire version, control kind, effective maxChunkSizeBytes and
     // requestTimeoutMs pass; missing or incompatible handshakes leave the peer on standard NIXL.
     if (mBounce)
     {
-        mBounce->transport->registerPeerHandshake(name, agentDesc.getBounceHandshake());
+        mBounce->transport->registerPeerHandshake(name, extension(direct::ExtensionTag::kBounce));
     }
 #endif
+    if (mDirect)
+    {
+        mDirect->importPeer(name, extension(direct::ExtensionTag::kDirect));
+    }
 
     // Store remote VMM region info for chunk boundary calculations in
     // VmmDescSplitter::splitAndCoalesceTransferDescs. Per-agent map because different remote agents may have
@@ -1001,6 +1036,21 @@ AgentDesc NixlTransferAgent::getLocalAgentDesc()
         bounceHandshake = mBounce->transport->localHandshakeBlob();
     }
 #endif
+    if (mDirect)
+    {
+        // Wrap both sections in the extension envelope; peers without direct support only read the bounce one.
+        std::string directHandshake = mDirect->localHandshake(mLocalVramRegionInfo);
+        if (!directHandshake.empty())
+        {
+            std::vector<std::pair<direct::ExtensionTag, std::string>> sections;
+            if (!bounceHandshake.empty())
+            {
+                sections.emplace_back(direct::ExtensionTag::kBounce, std::move(bounceHandshake));
+            }
+            sections.emplace_back(direct::ExtensionTag::kDirect, std::move(directHandshake));
+            bounceHandshake = direct::packExtensions(sections);
+        }
+    }
     return AgentDesc{nixlBlob, std::move(regions), std::move(bounceHandshake)};
 }
 
@@ -1014,6 +1064,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
     // Clean up remote VMM region info before invalidating the remote agent.
     mRemoteVramRegionInfo.erase(name);
+    if (mDirect)
+    {
+        mDirect->forgetPeer(name);
+    }
 #ifdef TLLM_BOUNCE_V2
     // Drop bounce credits and in-flight requests tied to this peer so it cannot retain receiver
     // allocations or leave a sender request pending. forgetPeer also removes the handshake record;
@@ -1030,6 +1084,18 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
     std::shared_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::submitTransferRequests called after shutdown");
+
+    // Direct peer copy: one copy kernel for the whole descriptor list when the peer's destination regions are mapped
+    // here; anything it declines takes the bounce / standard NIXL path below. It takes precedence over bounce on
+    // purpose: for a peer it can map it moves the bytes once (no staging arena, no credit protocol), so with both
+    // enabled bounce only carries writes to peers the direct path cannot reach.
+    if (mDirect)
+    {
+        if (auto status = mDirect->trySubmit(request, mLocalVramRegionInfo))
+        {
+            return status;
+        }
+    }
 
 #ifdef TLLM_BOUNCE_V2
     // Bounce fast path for many-small-desc VRAM writes (opt-in). Falls through to the standard
@@ -1264,6 +1330,8 @@ void NixlTransferAgent::shutdown() noexcept
     }
     mBounce.reset();
 #endif
+    // Waits for in-flight direct copies, then unmaps every imported peer region.
+    mDirect.reset();
 
     if (mRawAgent)
     {
@@ -1301,6 +1369,21 @@ void NixlTransferAgent::shutdown() noexcept
     }
     mLocalVramRegionInfo.clear();
     mRemoteVramRegionInfo.clear();
+}
+
+std::uint64_t NixlTransferAgent::getDirectSubmitCount() const noexcept
+{
+    return mDirect ? mDirect->submitCount() : 0;
+}
+
+std::uint64_t NixlTransferAgent::getDirectCrossNodeSubmitCount() const noexcept
+{
+    return mDirect ? mDirect->crossNodeSubmitCount() : 0;
+}
+
+std::uint64_t NixlTransferAgent::getDirectMappedPeerCount() const
+{
+    return mDirect ? mDirect->mappedPeerCount() : 0;
 }
 
 NixlTransferAgent::~NixlTransferAgent()

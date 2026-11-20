@@ -55,6 +55,12 @@ enum class BounceRejectReason : std::uint8_t
 };
 } // namespace bounce
 
+namespace direct
+{
+// Direct peer copy over NVLink (opt-in, TRTLLM_NIXL_DIRECT_COPY=1): see direct/DirectPeerCopy.h.
+class DirectPeerCopy;
+} // namespace direct
+
 struct NixlHelper
 {
     [[nodiscard]] static nixl_mem_t convert(MemoryType type);
@@ -167,6 +173,22 @@ public:
         return mBounceSubmitCount.load(std::memory_order_relaxed);
     }
 
+    /// Whether the direct peer copy is enabled on this agent (TRTLLM_NIXL_DIRECT_COPY=1).
+    [[nodiscard]] bool isDirectEnabled() const noexcept
+    {
+        return mDirect != nullptr;
+    }
+
+    /// Number of transfer requests served by the direct peer copy so far (defined out of line: the type is
+    /// incomplete here).
+    [[nodiscard]] std::uint64_t getDirectSubmitCount() const noexcept;
+
+    /// The part of getDirectSubmitCount() written to peers on other nodes of the NVLink domain.
+    [[nodiscard]] std::uint64_t getDirectCrossNodeSubmitCount() const noexcept;
+
+    /// Remote agents whose memory the direct peer copy has mapped (imports run in the background).
+    [[nodiscard]] std::uint64_t getDirectMappedPeerCount() const;
+
     /// snake_case name of a reject reason (also the key of the Python `bounce_reject_counts` dict).
     [[nodiscard]] static char const* bounceRejectReasonName(bounce::BounceRejectReason reason) noexcept;
 
@@ -230,6 +252,12 @@ private:
     /// unless enabled & built; when null the agent behaves exactly as before. See the design overview
     /// at the top of bounce/BounceTransport.h.
     std::unique_ptr<bounce::NixlBounceState> mBounce;
+
+    /// Direct peer copy over NVLink (opt-in, TRTLLM_NIXL_DIRECT_COPY=1). Null when disabled; then the agent behaves
+    /// exactly as before. Exports this agent's registered VRAM regions through the AgentDesc extension blob and
+    /// serves eligible VRAM writes to peers whose regions it mapped (same node, or another node of the NVLink domain
+    /// in the same IMEX channel) with one copy kernel instead of NIXL.
+    std::unique_ptr<direct::DirectPeerCopy> mDirect;
 
     /// Lazily create the bounce transport (ctor, before any metadata exchange) when enabled.
     /// @param agentBufferSizeMb bounce buffer size in MiB from BaseAgentConfig; 0 keeps bounce disabled.

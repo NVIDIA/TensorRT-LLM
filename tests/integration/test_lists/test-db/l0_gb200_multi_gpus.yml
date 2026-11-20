@@ -19,6 +19,8 @@ l0_gb200_multi_gpus:
   tests:
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_workspace.py TIMEOUT (10)
   - unittest/kv_cache_manager_v2_tests/test_host_numa_placement.py ISOLATION
+  # NIXL same-node direct peer copy between two GPUs over fabric-exportable VMM memory.
+  - unittest/disaggregated/test_nixl_direct_copy.py
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------

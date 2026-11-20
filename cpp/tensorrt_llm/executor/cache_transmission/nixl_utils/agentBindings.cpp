@@ -311,6 +311,10 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def_prop_ro("bounce_enabled", &kvc::NixlTransferAgent::isBounceEnabled)
         .def_prop_ro("bounce_submit_count", &kvc::NixlTransferAgent::getBounceSubmitCount)
         .def_prop_ro("bounce_reject_count", &kvc::NixlTransferAgent::getBounceRejectCount)
+        .def_prop_ro("direct_enabled", &kvc::NixlTransferAgent::isDirectEnabled)
+        .def_prop_ro("direct_submit_count", &kvc::NixlTransferAgent::getDirectSubmitCount)
+        .def_prop_ro("direct_cross_node_submit_count", &kvc::NixlTransferAgent::getDirectCrossNodeSubmitCount)
+        .def_prop_ro("direct_mapped_peer_count", &kvc::NixlTransferAgent::getDirectMappedPeerCount)
         .def_prop_ro("bounce_reject_counts",
             [](kvc::NixlTransferAgent const& self)
             {

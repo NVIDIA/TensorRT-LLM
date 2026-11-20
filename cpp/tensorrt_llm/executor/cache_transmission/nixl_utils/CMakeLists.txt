@@ -14,6 +14,7 @@
 # the License.
 
 add_subdirectory(bounce)
+add_subdirectory(direct)
 
 # ============================================================================
 # NIXL Wrapper Library
@@ -46,6 +47,14 @@ if(NIXL_ROOT)
 
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+
+  # Same-node direct peer copy (runtime opt-in: TRTLLM_NIXL_DIRECT_COPY=1).
+  target_link_libraries(
+    ${NIXL_WRAPPER_TARGET}
+    PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_executor_direct_copy>
+            CUDA::cuda_driver)
+  set_target_properties(${NIXL_WRAPPER_TARGET}
+                        PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
   # ------------------------------------------------------------------------
   # Bounce v2 transport. Its real dependencies are NIXL (data plane, gated by
