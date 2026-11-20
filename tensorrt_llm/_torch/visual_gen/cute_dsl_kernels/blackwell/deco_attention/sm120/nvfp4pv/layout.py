@@ -38,6 +38,7 @@ from cutlass.cute.typing import Int32, Int64, Uint32
 
 from ...common.mem import gptr, load_invariant, store_vector
 from ..ptx.nvfp4pv import ld_global_nc_b32_v4_pred
+from ..valid_len import valid_len
 
 # tile image layout (bytes)
 SK_OFF = 0  # K' codes: 6 arrays (16-byte channel chunk u) of 128 rows x 16 B, rows in n-tile order (8 j + c)
@@ -60,9 +61,12 @@ def relayout_kernel(
     img_ptr: cute.Pointer,
     S: cutlass.Constexpr,
     H: cutlass.Constexpr,
+    lens_ptr,
 ):
     """The image of one key tile of one (batch, head): CTA = (batch, head, tile), 256 threads, every thread a few
-    16-byte chunks (K' rows of keys past S are zero)."""
+    16-byte chunks (K' rows of keys past S are zero). lens_ptr: None, or the valid prefix lengths: the tiles of a
+    batch element then end with the one that holds its last valid key (the unpaired last tile, when its index is
+    even), and the CTAs of the tiles after it write nothing."""
     nT = (S + 127) // 128
     SP2 = 64 * nT
     SP16 = 8 * nT
@@ -72,51 +76,59 @@ def relayout_kernel(
     bh = tile_id // nT
     hh = bh % H
     bb = bh // H
-    img = img_ptr.toint() + Int64(bh * nT + kt) * STAGE
-    # K': key r of the tile -> row pos(r) = 8 j + c of the n-tile order, 16-byte chunk u -> array u
-    for i in cutlass.range_constexpr(3):
-        q = tidx + 256 * i
-        r = q // 6
-        u = q - r * 6
-        rp = r & 31
-        pos = 8 * (8 * (r >> 6) + 4 * ((r >> 5) & 1) + ((rp & 7) >> 1)) + 2 * (rp >> 3) + (rp & 1)
-        key = kt * 128 + r
-        w = ld_global_nc_b32_v4_pred(
-            k_ptr.toint() + Int64((bb * S + key) * H + hh) * 128 + 16 * u, Int32(key < S)
-        )
-        store_vector(gptr(Int32, img + SK_OFF + u * 2048 + pos * 16, 16), w)
-    if tidx < 96:
-        w = ld_global_nc_b32_v4_pred(
-            ksf_ptr.toint() + Int64(bh * nT + kt) * 1536 + 16 * tidx, Int32(1)
-        )
-        store_vector(gptr(Int32, img + SKSF_OFF + 16 * tidx, 16), w)
-    for i in cutlass.range_constexpr(2):
-        q = tidx + 256 * i
-        ch = q >> 2
-        u = q & 3
-        w = ld_global_nc_b32_v4_pred(
-            v_ptr.toint() + Int64(bh * 128 + ch) * SP2 + kt * 64 + 16 * u, Int32(1)
-        )
-        store_vector(gptr(Int32, img + SV_OFF + u * 2048 + ch * 16, 16), w)
-    if tidx < 128:
-        w2 = load_invariant(Int32, vsf_ptr.toint() + Int64(bh * 128 + tidx) * SP16 + kt * 8, 2)
-        # Two adjacent 32-channel groups form one 128-bit vector per MMA lane.
-        u = tidx >> 5
-        r = tidx & 31
-        lane_perm = 4 * (r & 7) + (r >> 3)
-        store_vector(
-            gptr(Uint32, img + SVSF_OFF + 512 * (u >> 1) + 16 * lane_perm + 8 * (u & 1), 8), w2
-        )
-    # v_mean rows of the pair (kt - 1, kt) for an odd tile, (kt, zeros) for an unpaired last tile
-    if ((kt & 1) == 1) | (kt == nT - 1):
-        r = tidx >> 4
-        jc = tidx & 15
-        src_t = kt - 1 + (r >> 3)
-        ok = Int32(1)
-        if (kt & 1) == 0:
-            src_t = kt
-            ok = Int32(r < 8)
-        w = ld_global_nc_b32_v4_pred(
-            vm_ptr.toint() + (Int64(bh * SP16 + src_t * 8 + (r & 7)) * 128 + 8 * jc) * 2, ok
-        )
-        store_vector(gptr(Int32, img + SVM_OFF + r * 256 + (jc ^ (r & 7)) * 16, 16), w)
+    # the last key tile of the (batch, head)
+    last = nT - 1
+    if cutlass.const_expr(lens_ptr is not None):
+        last = ((valid_len(lens_ptr.toint(), bb, S) + 127) >> 7) - 1
+    live = cutlass.const_expr(lens_ptr is None) or kt <= last
+    if live:
+        img = img_ptr.toint() + Int64(bh * nT + kt) * STAGE
+        # K': key r of the tile -> row pos(r) = 8 j + c of the n-tile order, 16-byte chunk u -> array u
+        for i in cutlass.range_constexpr(3):
+            q = tidx + 256 * i
+            r = q // 6
+            u = q - r * 6
+            rp = r & 31
+            pos = (
+                8 * (8 * (r >> 6) + 4 * ((r >> 5) & 1) + ((rp & 7) >> 1)) + 2 * (rp >> 3) + (rp & 1)
+            )
+            key = kt * 128 + r
+            w = ld_global_nc_b32_v4_pred(
+                k_ptr.toint() + Int64((bb * S + key) * H + hh) * 128 + 16 * u, Int32(key < S)
+            )
+            store_vector(gptr(Int32, img + SK_OFF + u * 2048 + pos * 16, 16), w)
+        if tidx < 96:
+            w = ld_global_nc_b32_v4_pred(
+                ksf_ptr.toint() + Int64(bh * nT + kt) * 1536 + 16 * tidx, Int32(1)
+            )
+            store_vector(gptr(Int32, img + SKSF_OFF + 16 * tidx, 16), w)
+        for i in cutlass.range_constexpr(2):
+            q = tidx + 256 * i
+            ch = q >> 2
+            u = q & 3
+            w = ld_global_nc_b32_v4_pred(
+                v_ptr.toint() + Int64(bh * 128 + ch) * SP2 + kt * 64 + 16 * u, Int32(1)
+            )
+            store_vector(gptr(Int32, img + SV_OFF + u * 2048 + ch * 16, 16), w)
+        if tidx < 128:
+            w2 = load_invariant(Int32, vsf_ptr.toint() + Int64(bh * 128 + tidx) * SP16 + kt * 8, 2)
+            # Two adjacent 32-channel groups form one 128-bit vector per MMA lane.
+            u = tidx >> 5
+            r = tidx & 31
+            lane_perm = 4 * (r & 7) + (r >> 3)
+            store_vector(
+                gptr(Uint32, img + SVSF_OFF + 512 * (u >> 1) + 16 * lane_perm + 8 * (u & 1), 8), w2
+            )
+        # v_mean rows of the pair (kt - 1, kt) for an odd tile, (kt, zeros) for an unpaired last tile
+        if ((kt & 1) == 1) | (kt == last):
+            r = tidx >> 4
+            jc = tidx & 15
+            src_t = kt - 1 + (r >> 3)
+            ok = Int32(1)
+            if (kt & 1) == 0:
+                src_t = kt
+                ok = Int32(r < 8)
+            w = ld_global_nc_b32_v4_pred(
+                vm_ptr.toint() + (Int64(bh * SP16 + src_t * 8 + (r & 7)) * 128 + 8 * jc) * 2, ok
+            )
+            store_vector(gptr(Int32, img + SVM_OFF + r * 256 + (jc ^ (r & 7)) * 16, 16), w)

@@ -65,17 +65,19 @@ def scratch(b, s, h, sm_count):
 _compiled = {}
 
 
-def _get_compiled(args, device, sm_count, rank, cluster_m, split, pdl):
+def _get_compiled(args, device, sm_count, rank, cluster_m, split, pdl, lens):
     return compiled(
         _compiled,
-        (device.index, sm_count, rank, cluster_m, split, pdl),
-        lambda: PingPongAttention(sm_count, rank, cluster_m=cluster_m, split=split, pdl=pdl),
+        (device.index, sm_count, rank, cluster_m, split, pdl, lens),
+        lambda: PingPongAttention(
+            sm_count, rank, cluster_m=cluster_m, split=split, pdl=pdl, lens=lens
+        ),
         *args,
     )
 
 
 def _make_args(
-    qk_ptrs, v, v_mean, o, s, h, b, score_scale, v_scale, stream, n_valid, n_parts=1, ws=None
+    qk_ptrs, v, v_mean, o, s, h, b, score_scale, v_scale, lens, stream, n_valid, n_parts=1, ws=None
 ):
     return (
         qk_ptrs,
@@ -92,17 +94,21 @@ def _make_args(
         Int32(n_parts),
         # the split launch's merge scratch (null addresses without one)
         *((Int64(t.data_ptr()) for t in ws) if ws is not None else (Int64(0),) * 3),
+        # the valid prefix lengths, read in place (a null address without them)
+        Int64(lens.data_ptr() if lens is not None else 0),
         stream,
     )
 
 
 @torch.no_grad()
-def run(buffers, o, rank):
+def run(buffers, o, rank, lens=None):
     """NVFP4 Q'K' + FP8 PV attention on the operands of the preparation at compensation rank `rank` (buffers: the
     buffers of the call, the layout of this package) into BF16 o [B, S, H, 128]. score_scale is the multiplier of the
     raw scores in log2 units, a power of two of at least 2^softmax.MIN_SCORE_LOG2, and stays on the device like
     v8_scale. The main launch covers the whole waves and the split launch the last partial wave. Nothing here reads a
-    device value or allocates (graph-capturable, no host sync); every launch goes to the current stream."""
+    device value or allocates (graph-capturable, no host sync); every launch goes to the current stream. lens: None,
+    or the int32 valid prefix lengths [B] of the preparation, read in place by the kernel variant with lengths; the
+    launch plan follows the padded sequence either way."""
     q4, k4, q_sf, k_sf, v8, v_mean, score_scale, v8_scale = (
         buffers[n] for n in ("q4", "k4", "q_sf", "k_sf", "v8", "v_mean", "score_scale", "v8_scale")
     )
@@ -118,7 +124,9 @@ def run(buffers, o, rank):
     sm_count = num_sms(dev)
     _, n_full, n_parts = split_plan(s, h, b, sm_count)
     if n_full > 0:
-        args = _make_args(qk_ptrs, v8, v_mean, o, s, h, b, score_scale, v8_scale, stream, n_full)
+        args = _make_args(
+            qk_ptrs, v8, v_mean, o, s, h, b, score_scale, v8_scale, lens, stream, n_full
+        )
         # CTA pairs share K/V when both always work on the same head: an even number of 256-row blocks per head,
         # an even unit count and an even persistent stride keep units (2c, 2c+1) in one head in every round.
         cluster_m = (
@@ -126,12 +134,25 @@ def run(buffers, o, rank):
             if (((s + 255) // 256) % 2 == 0 and n_full % 2 == 0 and min(sm_count, n_full) % 2 == 0)
             else 1
         )
-        _get_compiled(args, dev, sm_count, rank, cluster_m, False, True)(*args)
+        _get_compiled(args, dev, sm_count, rank, cluster_m, False, True, lens is not None)(*args)
     if "split_flags" in buffers:
         # last partial wave: every remaining unit split into n_parts KV pieces (at most one piece per SM), merged in
         # the epilogue
         ws = (buffers["split_o"], buffers["split_ml"], buffers["split_flags"])
         args = _make_args(
-            qk_ptrs, v8, v_mean, o, s, h, b, score_scale, v8_scale, stream, n_full, n_parts, ws
+            qk_ptrs,
+            v8,
+            v_mean,
+            o,
+            s,
+            h,
+            b,
+            score_scale,
+            v8_scale,
+            lens,
+            stream,
+            n_full,
+            n_parts,
+            ws,
         )
-        _get_compiled(args, dev, sm_count, rank, 1, True, n_full > 0)(*args)
+        _get_compiled(args, dev, sm_count, rank, 1, True, n_full > 0, lens is not None)(*args)

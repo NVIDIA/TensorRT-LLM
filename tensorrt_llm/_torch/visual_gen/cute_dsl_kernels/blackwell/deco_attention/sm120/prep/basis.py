@@ -34,6 +34,7 @@ from ...common.mem import cp_async16, gptr, load_invariant, load_vector, sptr, s
 from ...common.ptx import ld_global_acquire_b32, vote_ballot
 from ...common.state import State
 from ..ptx.shared import ld_global_nc_b32_hint_pred, ld_shared_f32_v4_pred, mma_bf16
+from ..valid_len import valid_len
 
 EIG_THREADS = 512
 NIT_BIS = 6
@@ -86,12 +87,28 @@ def _uhh_off(k: Int32) -> Int32:
 # them between the steps, and a step reads from shared memory what the steps before the last barrier wrote. acc, A,
 # uu, za and zbv are the register tensors of _eig.
 @cute.jit
+def sampled_token(st, sidx):
+    """The token of sample sidx of this batch element, from rows_p. With lengths (st.lens = (address of the lengths,
+    rows mode)) the batch element has st.nv valid tokens: rows mode 0 is the default draw over the padded sequence,
+    whose row r stands for token floor(r nv / S); modes 1 and 2 are the caller's rows, shared by the batch [NQK] or
+    per batch element [B, NQK], taken as given below nv and as the last valid token from nv on."""
+    if cutlass.const_expr(st.lens is None):
+        return load_invariant(Uint32, st.rows_p + Int64(sidx) * 4)
+    mode = st.lens[1]
+    own = Int64(cutlass.select_(mode == 2, st.b * st.NQK, Int32(0)))
+    r = Int32(load_invariant(Uint32, st.rows_p + (own + Int64(sidx)) * 4))
+    mapped = Int32((Int64(r) * Int64(st.nv)) // Int64(st.S))
+    tok = Int32(cutlass.select_(mode == 0, mapped, cutlass.min(r, st.nv - 1)))
+    return Uint32(cutlass.max(tok, Int32(0)))
+
+
+@cute.jit
 def preload_tokens(st):
     """Thread tid < NQK copies sampled token index tid from rows_p to SM_IDX2: the first 512 indices, which the Gram
     copies read from there (those beyond are read from rows_p per copy)."""
     sIdx = st.sIdx
     if st.tid < st.NQK:
-        sIdx[st.tid] = load_invariant(Uint32, st.rows_p + Int64(st.tid) * 4)
+        sIdx[st.tid] = sampled_token(st, st.tid)
 
 
 @cute.jit
@@ -130,6 +147,9 @@ def stage_first_rounds(st):
             mat, sm, chk = round_chunk(st, it)
             sidx = pre * 48 + sm
             ok = Int32(sidx < st.NQK)
+            if cutlass.const_expr(st.lens is not None):
+                # a batch element without a valid token copies zeros
+                ok = ok & Int32(st.nv > 0)
             tok = preloaded_token(st, sidx)
             src = chunk_src(st, mat, tok, chk)
             cp_async16(
@@ -178,10 +198,12 @@ def refill(st, buf, rd):
         mat, sm, chk = round_chunk(st, it)
         sidx = (rd + 2) * 48 + sm
         ok = Int32(sidx < st.NQK)
+        if cutlass.const_expr(st.lens is not None):
+            ok = ok & Int32(st.nv > 0)
         tok = preloaded_token(st, sidx)
         if sidx >= 512:
             if sidx < st.NQK:
-                tok = Int32(load_invariant(Uint32, st.rows_p + Int64(sidx) * 4))
+                tok = Int32(sampled_token(st, sidx))
         src = chunk_src(st, mat, tok, chk)
         cp_async16(
             buf + (mat * 48 + sm) * 272 + chk * 16,
@@ -679,6 +701,7 @@ def _eig(
     NQK: Int32,
     tid: Int32,
     sb: Int32,
+    lens,
 ):
     """The eigensolver CTA of (batch, head) bh (thread tid of EIG_THREADS, shared memory at sb with the map SM_*): the
     compensation basis U^T [32][128] in BF16 at ut_p [bh], from the NQK tokens of q and k that rows_p samples and the
@@ -687,8 +710,10 @@ def _eig(
     the loops around them have the same trip count in all threads. The state st gets the coordinates, the region
     addresses and the typed views of a phase where the phase begins. A view (s...) covers a region that is a regular
     array of one scalar type, for the scalar loads and stores that index it; the 16-byte vector loads and stores of
-    the same arrays, the asynchronous copies, ldmatrix and the predicated loads take the region addresses."""
-    st = State(tid=tid, sb=sb, NQK=NQK, H=H, q_p=q_p, k_p=k_p, rows_p=rows_p)
+    the same arrays, the asynchronous copies, ldmatrix and the predicated loads take the region addresses. lens: None,
+    or (the global address of the valid prefix lengths, the rows mode of sampled_token): the sampled tokens then lie
+    in the valid prefix of the batch element."""
+    st = State(tid=tid, sb=sb, NQK=NQK, H=H, q_p=q_p, k_p=k_p, rows_p=rows_p, lens=lens)
     st.lane = tid & 31
     st.warp = tid >> 5
     # the lane's entries of an mma.sync accumulator fragment: rows g and g + 8, columns 2 t and 2 t + 1
@@ -696,6 +721,10 @@ def _eig(
     st.t = st.lane & 3
     b = bh // H
     st.h = bh - b * H  # head, of batch b
+    if cutlass.const_expr(lens is not None):
+        st.b = b
+        st.S = S
+        st.nv = valid_len(lens[0], b, S)  # the valid tokens of the batch element
     st.work = sb + SM_WORK
     st.zb = st.work  # Z [128][32], once G has left SM_WORK
     # the 16 warp parts of two sums or bounds (the second set at 16; at 4 for the bounds of four warps)
@@ -855,14 +884,16 @@ def group16(base, rstride, cnt):
     return sums, vmx, vmn
 
 
-def stage_rows(v_p, vin, st, tl, S, H, T):
+def stage_rows(v_p, vin, st, tl, S, H, T, lens_p=None):
     """cp.async of the 128 x 256 B rows of V tile tl (flat over (batch, head, tile)) into the shared-memory buffer
     vin by the 256 threads of a V-pass half, thread st eight of the 16-byte parts: row `key` at key * 256, its part p
-    at (p ^ (key >> 4)) % 16 (zeros for the keys past S)."""
+    at (p ^ (key >> 4)) % 16 (zeros for the keys past S; lens_p: the global address of the valid prefix lengths, the
+    keys from the length of the batch element on are then zeros too)."""
     bh = tl // T
     tt = tl - bh * T
     bb = bh // H
     hh = bh - bb * H
+    nk = S if lens_p is None else valid_len(lens_p, bb, S)
     for it in range(8):
         c = it * 256 + st
         key = c >> 4
@@ -876,7 +907,7 @@ def stage_rows(v_p, vin, st, tl, S, H, T):
         cp_async16(
             vin + key * 256 + ((part ^ (key >> 4)) & 15) * 16,
             src,
-            Int32(Uint32(cutlass.select_(kg < S, Uint32(16), Uint32(0)))),
+            Int32(Uint32(cutlass.select_(kg < nk, Uint32(16), Uint32(0)))),
         )
 
 
@@ -899,11 +930,12 @@ def basis_cta(
     vscan_gs,
     vscan,
     vpass,
+    lens=None,
 ):
     """The CTA of a basis launch (grid BH + nspare, EIG_THREADS threads): the CTAs below BH solve one eigenproblem
     each, the nspare others scan V with the scan of the kernel's PV format (FUSED: vscan(lo, hi, slot, tid, sb) over
     a range of tiles each, then its V pass vpass(ntiles, pid, tid, sb); otherwise vscan_gs(cta, tid, sb), grid-stride
-    over all of V). sb: the CTA's shared memory."""
+    over all of V). sb: the CTA's shared memory. lens: the lengths argument of _eig."""
     tid, _, _ = cute.arch.thread_idx()
     pid, _, _ = cute.arch.block_idx()
     smem = SmemAllocator()
@@ -913,12 +945,12 @@ def basis_cta(
     if cutlass.const_expr(not FUSED):
         # eigenproblems, and the V maxima in the other CTAs (the V pass is a separate launch)
         if pid < BH:
-            _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, NQK, tid, sb)
+            _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, NQK, tid, sb, lens)
         else:
             vscan_gs(pid - BH, tid, sb)
     else:
         if pid < BH:
-            _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, NQK, tid, sb)
+            _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, NQK, tid, sb, lens)
         else:
             sp = pid - BH
             lo = (sp * ntiles) // nspare

@@ -34,13 +34,35 @@ class Tuning(NamedTuple):
     # The softmax step does the bookkeeping of a means batch (block-sum read-back, zeroing, A-operand store, row-sum
     # add) in one branch on the step after the batch ended.
     vs_batched: bool
+    # The warp roles (among load, mma, softmax, epilogue, store) that read the valid prefix lengths with loads of
+    # their own in a main launch with lengths (kernel.py, _role_work); the other roles read them as data that no
+    # thread writes.
+    lens_own_loads: tuple
 
 
 # The values of the schedule constants per compile target (fields: Tuning).
 TUNING = {
-    "sm_100": Tuning(load_sleep_ns=32, s_probe=False, rescale_loop=True, vs_batched=False),
-    "sm_103": Tuning(load_sleep_ns=0, s_probe=True, rescale_loop=False, vs_batched=False),
-    "sm_107": Tuning(load_sleep_ns=0, s_probe=False, rescale_loop=False, vs_batched=True),
+    "sm_100": Tuning(
+        load_sleep_ns=32,
+        s_probe=False,
+        rescale_loop=True,
+        vs_batched=False,
+        lens_own_loads=("load", "mma"),
+    ),
+    "sm_103": Tuning(
+        load_sleep_ns=0,
+        s_probe=True,
+        rescale_loop=False,
+        vs_batched=False,
+        lens_own_loads=("load", "epilogue", "store"),
+    ),
+    "sm_107": Tuning(
+        load_sleep_ns=0,
+        s_probe=False,
+        rescale_loop=False,
+        vs_batched=True,
+        lens_own_loads=("load", "mma", "softmax", "epilogue", "store"),
+    ),
 }
 
 # K/V ring slots, each holding K(i) and V(i-1). Three: the means operands of V smoothing follow the ring in shared

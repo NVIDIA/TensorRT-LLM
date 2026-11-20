@@ -486,13 +486,8 @@ def test_attention_dispatches_fused_qk_norm_rope_per_instance(monkeypatch):
     )
 
 
-@requires_cuda
-@requires_cuda
-def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(monkeypatch):
-    """Under a DeCo-Attention recipe the transformer blocks hand the token tags of the packed
-    sequence to the DeCo backend, and the text-only token refiner runs unquantized on VANILLA."""
-    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention, VanillaAttention
-
+def _deco_model() -> h3.MiniMaxH3Transformer3DModel:
+    """A one-layer model under a DeCo-Attention recipe; skips on a GPU without its kernels."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7), (12, 0)):
         pytest.skip("DeCo-Attention kernels need an SM100, SM103, SM107 or SM120 GPU.")
     config = _make_model_config(
@@ -508,6 +503,16 @@ def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(mon
     model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
     _initialize_weights(model, scale=0.1)
     model.requires_grad_(False)
+    return model
+
+
+@requires_cuda
+def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(monkeypatch):
+    """Under a DeCo-Attention recipe the transformer blocks hand the token tags of the packed
+    sequence to the DeCo backend, and the text-only token refiner runs unquantized on VANILLA."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention, VanillaAttention
+
+    model = _deco_model()
 
     backends = {
         name: module.attn
@@ -521,7 +526,7 @@ def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(mon
 
     seen = []
 
-    def launch(self, q, k, v, token_tags=None):
+    def launch(self, q, k, v, token_tags=None, valid_seq_len=None):
         seen.append(token_tags)
         return torch.zeros_like(q)
 
@@ -531,6 +536,37 @@ def test_deco_recipe_tags_the_joint_blocks_and_keeps_the_refiner_unquantized(mon
         model(**inputs)
     assert len(seen) == len(joint)
     assert all(tags is not None and torch.equal(tags, inputs["token_tags"]) for tags in seen)
+
+
+@requires_cuda
+def test_deco_recipe_passes_the_valid_prefix_of_a_padded_sequence(monkeypatch):
+    """Under a DeCo-Attention recipe a packed sequence with trailing padding reaches the DeCo
+    backend with the length of its valid prefix instead of a mask, and interior padding is
+    rejected; the token refiner is built on VANILLA, which takes padding as a mask."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import DeCoAttention
+
+    model = _deco_model()
+    assert model._supports_key_padding_mask
+    assert model.token_refiner._attn_backend == "VANILLA"
+    assert model.token_refiner._supports_key_padding_mask
+
+    seen = []
+
+    def launch(self, q, k, v, token_tags=None, valid_seq_len=None):
+        seen.append((token_tags, valid_seq_len))
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(DeCoAttention, "_launch", launch)
+    inputs = _model_inputs("cuda")
+    inputs["token_tags"] = torch.tensor([1, 0, 2, -1], device="cuda")
+    with torch.inference_mode():
+        model(**inputs)
+    assert seen and all(valid_seq_len == 3 for _, valid_seq_len in seen)
+    assert all(torch.equal(tags, inputs["token_tags"]) for tags, _ in seen)
+
+    inputs["token_tags"] = torch.tensor([1, -1, 2, 0], device="cuda")
+    with torch.inference_mode(), pytest.raises(NotImplementedError, match="trailing"):
+        model(**inputs)
 
 
 @pytest.mark.parametrize("grad_input", ["hidden_states", "cos", "sin"])

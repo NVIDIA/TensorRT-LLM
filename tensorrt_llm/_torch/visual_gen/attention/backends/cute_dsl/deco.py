@@ -32,7 +32,9 @@ whole sequence, which leaves the few text and audio tokens almost unsampled.
 
 The kernels take NHD layout ([B, S, H, D]) with D = 128, as many K/V heads as Q heads, queries
 and keys of one sequence, bfloat16 and no mask; other calls (cross-attention, a causal or key
-padding mask, another dtype) run on the VANILLA backend.
+padding mask, another dtype) run on the VANILLA backend. A sequence that is padded after its
+tokens is served: with ``valid_seq_len`` the kernels attend the keys of that prefix only and
+return zeros in the padded rows.
 """
 
 from typing import Any
@@ -154,7 +156,22 @@ class DeCoAttention(AttentionBackend):
 
         A model's cross-attention layers take this path on every call, inside the compiled
         model, so it logs nothing; ``forward`` warns once when a self-attention call takes it.
+        VANILLA takes no ``valid_seq_len``: the valid prefix of a self-attention call is
+        attended alone and the padded rows come back zero, as from the kernels.
         """
+        valid_seq_len = kwargs.pop("valid_seq_len", None)
+        if (
+            valid_seq_len is not None
+            and valid_seq_len < q.shape[1]
+            and q.shape == k.shape
+            and kwargs.get("key_padding_mask") is None
+        ):
+            out = torch.zeros_like(q)
+            if valid_seq_len > 0:
+                out[:, :valid_seq_len] = self._delegate(
+                    q[:, :valid_seq_len], k[:, :valid_seq_len], v[:, :valid_seq_len], **kwargs
+                )
+            return out
         out = self._vanilla.forward(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **kwargs
         )
@@ -220,13 +237,26 @@ class DeCoAttention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         token_tags: torch.Tensor | None = None,
+        valid_seq_len: int | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, num_heads, _ = q.shape
         pv = self.quant_attention_config.v_dtype
         num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, q.device, pv)
         rows = self._basis_rows(token_tags, seq_len, q.device)
+        valid_seq_lens = None
+        if valid_seq_len is not None and valid_seq_len < seq_len:
+            # The kernels read one length per sample from the device.
+            valid_seq_lens = torch.full(
+                (batch_size,), valid_seq_len, dtype=torch.int32, device=q.device
+            )
         operands = deco_attention.prepare(
-            q, k, v, self._workspace(num_bytes, q.device), pv, rows=rows
+            q,
+            k,
+            v,
+            self._workspace(num_bytes, q.device),
+            pv,
+            rows=rows,
+            valid_seq_lens=valid_seq_lens,
         )
         return deco_attention.attention(operands, torch.empty_like(q))
 
@@ -262,14 +292,20 @@ class DeCoAttention(AttentionBackend):
 
         ``token_tags`` (keyword, ``[S]``): the modality of every token of a packed multimodal
         sequence (``AttentionBackend.forward``); the preparation then draws its basis rows by
-        modality.
+        modality. ``valid_seq_len`` (keyword, a host integer): the rows after this prefix are
+        padding, whatever they hold; they get no attention weight and come back zero.
         """
+        valid_seq_len = kwargs.get("valid_seq_len")
+        if valid_seq_len is not None and (
+            type(valid_seq_len) is not int or not 0 <= valid_seq_len <= q.shape[1]
+        ):
+            raise ValueError("valid_seq_len must be a host integer in [0, sequence length].")
         if not self._can_serve(q, k, v, **kwargs):
             # A call of the kernels' shape that a mask or a dtype keeps from them.
             if q.shape == k.shape and not self._noted_unquantized:
                 self._note_unquantized(q, **kwargs)
             return self._delegate(q, k, v, **kwargs)
-        return self._launch(*self._compact_qkv(q, k, v), kwargs.get("token_tags"))
+        return self._launch(*self._compact_qkv(q, k, v), kwargs.get("token_tags"), valid_seq_len)
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

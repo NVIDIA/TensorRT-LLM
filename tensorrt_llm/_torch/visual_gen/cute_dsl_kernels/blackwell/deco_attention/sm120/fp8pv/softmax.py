@@ -132,12 +132,13 @@ def softmax_tile(
     P[4 i + r], the row sums of the quantized P and its 16-key block sums (P[16], P[17]: the means-MMA B fragments),
     landed with the current anchors. Only when some score exceeds an anchor by more than T (or is non-finite) does the
     warp take the exact tile max of the scores (kept in registers), move the anchors, rescale O and the sums, and
-    re-land. Keys at or past lim (< 128) are masked: always (mask_tail None) or where the runtime mask_tail is 1.
+    re-land. Keys at or past lim (< 128, or a run-time count with lengths) are masked: always (mask_tail None) or
+    where the runtime mask_tail is 1.
     release() counts the warp's release of its stage and refill(count) refills the stage when the count says so (the
     stage ring of kernel.py; None: the phase releases nothing). Returns the anchors, the row sums and the landing
     path."""
     acc = [list(r) for r in acc]
-    if cutlass.const_expr(lim < KT):
+    if cutlass.const_expr(not isinstance(lim, int) or lim < KT):
         mask_tile(acc, q, lim, mask_tail)
     na0 = anc0
     na1 = anc1

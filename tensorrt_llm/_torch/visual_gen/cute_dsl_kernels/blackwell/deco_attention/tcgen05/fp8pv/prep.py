@@ -37,11 +37,11 @@ from cutlass.cute.runtime import from_dlpack
 from ...constants import HEAD_DIM, qk_scale_atoms
 from ...inputs import hadamard
 from ...runtime import num_sms
-from ..prep.basis import EIG_THREADS, GMAX_WORDS, clear_kernel, eig_kernel
+from ..prep.basis import EIG_THREADS, GMAX_WORDS, clear_kernel, eig_kernel, eig_kernel_lens
 from ..prep.encode import encode_kernel, encode_threads
-from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel
+from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel, qk_kernel_lens
 from .softmax import MIN_SCORE_LOG2
-from .v_pass import V_BLOCK, V_CTAS_PER_SM, V_THREADS, v_kernel
+from .v_pass import V_BLOCK, V_CTAS_PER_SM, V_THREADS, v_kernel, v_kernel_lens
 
 
 def gemm_view(t):
@@ -51,15 +51,165 @@ def gemm_view(t):
     )
 
 
-def _make_host(rank):
+def _launch_chain(
+    q,
+    k,
+    v,
+    qk_rows,
+    hadamard,
+    q4,
+    k4,
+    q_sf,
+    k_sf,
+    score_scale,
+    v8,
+    v_mean,
+    v8_scale,
+    gmax,
+    uT,
+    q_sfv,
+    k_sfv,
+    S,
+    H,
+    NQK,
+    NCQ,
+    BH,
+    NB,
+    v_units,
+    v_grid,
+    ntiles,
+    qgrid,
+    egrid,
+    stream,
+    rank,
+    lens,
+):
+    """The launches of the chain of compensation rank `rank` on `stream`. lens: None, or (the valid prefix lengths
+    [B], rows per sample, mapped rows): the eigensolver, the V pass and the Q/K pass are then their variants with
+    lengths."""
+    min_prod = HEAD_DIM * 2.0**MIN_SCORE_LOG2
+    clear_kernel(gmax).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+    if lens is None:
+        eig = eig_kernel(q, k, qk_rows, hadamard, uT, S, H, NQK, NCQ, rank)
+        vp = v_kernel(v, v8, v_mean, gmax, S, H, NB, v_units)
+    else:
+        eig = eig_kernel_lens(
+            q, k, qk_rows, hadamard, uT, lens[0], S, H, NQK, NCQ, rank, lens[1], lens[2]
+        )
+        vp = v_kernel_lens(v, v8, v_mean, gmax, lens[0], S, H, NB, v_units)
+    eig.launch(grid=(BH, 1, 1), block=(EIG_THREADS, 1, 1), use_pdl=True, stream=stream)
+    vp.launch(
+        grid=(v_grid, 1, 1),
+        block=(V_THREADS, 1, 1),
+        min_blocks_per_mp=V_CTAS_PER_SM,
+        use_pdl=True,
+        stream=stream,
+    )
+    tiled_mma = sm100_utils.make_trivial_tiled_mma(
+        BFloat16,
+        BFloat16,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
+        Float32,
+        tcgen05.CtaGroup.ONE,
+        (128, 128),
+        tcgen05.OperandSource.SMEM,
+    )
+    a_layout = sm100_utils.make_smem_layout_a(tiled_mma, (128, 128, 128), BFloat16, X_STAGES)
+    op = cpasync.CopyBulkTensorTileG2SOp()
+    tma_q = cute.nvgpu.make_tiled_tma_atom_A(op, gemm_view(q), a_layout, (128, 128, 128), tiled_mma)
+    tma_k = cute.nvgpu.make_tiled_tma_atom_A(op, gemm_view(k), a_layout, (128, 128, 128), tiled_mma)
+    qk_args = (tiled_mma, tma_q, tma_k, hadamard, uT, q4, k4, q_sfv, k_sfv, gmax)
+    if lens is None:
+        qkp = qk_kernel(*qk_args, S, H, NB, ntiles, rank)
+    else:
+        qkp = qk_kernel_lens(*qk_args, lens[0], S, H, NB, ntiles, rank)
+    qkp.launch(grid=(qgrid, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
+    encode_kernel(
+        q_sfv, k_sfv, q_sf, k_sf, gmax, score_scale, BH * NB, v8_scale, min_prod, rank
+    ).launch(grid=(egrid, 1, 1), block=(encode_threads(rank), 1, 1), stream=stream)
+
+
+def _make_host(rank, rows_per_sample=None, map_rows=False):
     """The host function launching the chain of compensation rank `rank` on `stream`. The score prescale log2(e) /
     sqrt(128) is folded into Q' (QPRE), so the multiplier of the raw scores in log2 units is the score scale (group
     scale product / 128) itself, a power of two, which the encode launch raises to at least 2^MIN_SCORE_LOG2, the
-    floor of the attention's landing (softmax.py), by shrinking the Q' and K' block scales."""
-    min_prod = HEAD_DIM * 2.0**MIN_SCORE_LOG2
+    floor of the attention's landing (softmax.py), by shrinking the Q' and K' block scales. rows_per_sample: None for
+    a call whose batch elements are all full; otherwise the host function takes the valid prefix lengths [B] after
+    the buffers, with qk_rows [B, NQK] (True) or [NQK] (False); map_rows: the eigensolver maps the rows into each
+    valid prefix (the default draw)."""
+    if rows_per_sample is None:
+
+        @cute.jit
+        def deco_host(
+            q: cute.Tensor,
+            k: cute.Tensor,
+            v: cute.Tensor,
+            qk_rows: cute.Tensor,
+            hadamard: cute.Tensor,
+            q4: cute.Tensor,
+            k4: cute.Tensor,
+            q_sf: cute.Tensor,
+            k_sf: cute.Tensor,
+            score_scale: cute.Tensor,
+            v8: cute.Tensor,
+            v_mean: cute.Tensor,
+            v8_scale: cute.Tensor,
+            gmax: cute.Tensor,
+            uT: cute.Tensor,
+            q_sfv: cute.Tensor,
+            k_sfv: cute.Tensor,
+            S: Int32,
+            H: Int32,
+            NQK: Int32,
+            NCQ: Int32,
+            BH: Int32,
+            NB: Int32,
+            v_units: Int32,
+            v_grid: Int32,
+            ntiles: Int32,
+            qgrid: Int32,
+            egrid: Int32,
+            stream: cuda.CUstream,
+        ):
+            _launch_chain(
+                q,
+                k,
+                v,
+                qk_rows,
+                hadamard,
+                q4,
+                k4,
+                q_sf,
+                k_sf,
+                score_scale,
+                v8,
+                v_mean,
+                v8_scale,
+                gmax,
+                uT,
+                q_sfv,
+                k_sfv,
+                S,
+                H,
+                NQK,
+                NCQ,
+                BH,
+                NB,
+                v_units,
+                v_grid,
+                ntiles,
+                qgrid,
+                egrid,
+                stream,
+                rank,
+                None,
+            )
+
+        return deco_host
 
     @cute.jit
-    def deco_host(
+    def deco_host_lens(
         q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
@@ -77,6 +227,7 @@ def _make_host(rank):
         uT: cute.Tensor,
         q_sfv: cute.Tensor,
         k_sfv: cute.Tensor,
+        lens: cute.Tensor,
         S: Int32,
         H: Int32,
         NQK: Int32,
@@ -90,57 +241,41 @@ def _make_host(rank):
         egrid: Int32,
         stream: cuda.CUstream,
     ):
-        clear_kernel(gmax).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
-        eig_kernel(q, k, qk_rows, hadamard, uT, S, H, NQK, NCQ, rank).launch(
-            grid=(BH, 1, 1), block=(EIG_THREADS, 1, 1), use_pdl=True, stream=stream
-        )
-        v_kernel(v, v8, v_mean, gmax, S, H, NB, v_units).launch(
-            grid=(v_grid, 1, 1),
-            block=(V_THREADS, 1, 1),
-            min_blocks_per_mp=V_CTAS_PER_SM,
-            use_pdl=True,
-            stream=stream,
-        )
-        tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            BFloat16,
-            BFloat16,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            Float32,
-            tcgen05.CtaGroup.ONE,
-            (128, 128),
-            tcgen05.OperandSource.SMEM,
-        )
-        a_layout = sm100_utils.make_smem_layout_a(tiled_mma, (128, 128, 128), BFloat16, X_STAGES)
-        op = cpasync.CopyBulkTensorTileG2SOp()
-        tma_q = cute.nvgpu.make_tiled_tma_atom_A(
-            op, gemm_view(q), a_layout, (128, 128, 128), tiled_mma
-        )
-        tma_k = cute.nvgpu.make_tiled_tma_atom_A(
-            op, gemm_view(k), a_layout, (128, 128, 128), tiled_mma
-        )
-        qk_kernel(
-            tiled_mma,
-            tma_q,
-            tma_k,
+        _launch_chain(
+            q,
+            k,
+            v,
+            qk_rows,
             hadamard,
-            uT,
             q4,
             k4,
+            q_sf,
+            k_sf,
+            score_scale,
+            v8,
+            v_mean,
+            v8_scale,
+            gmax,
+            uT,
             q_sfv,
             k_sfv,
-            gmax,
             S,
             H,
+            NQK,
+            NCQ,
+            BH,
             NB,
+            v_units,
+            v_grid,
             ntiles,
+            qgrid,
+            egrid,
+            stream,
             rank,
-        ).launch(grid=(qgrid, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
-        encode_kernel(
-            q_sfv, k_sfv, q_sf, k_sf, gmax, score_scale, BH * NB, v8_scale, min_prod, rank
-        ).launch(grid=(egrid, 1, 1), block=(encode_threads(rank), 1, 1), stream=stream)
+            (lens, rows_per_sample, map_rows),
+        )
 
-    return deco_host
+    return deco_host_lens
 
 
 _hosts = {}
@@ -186,17 +321,20 @@ def scratch(B, S, H, rank):
     }
 
 
-def run(q, k, v, qk_rows, buffers, rank):
+def run(q, k, v, qk_rows, buffers, rank, lens=None, map_rows=False):
     """Fill the operands (buffers: the buffers of the call, the layout of this package) from raw BF16 q, k, v [B, S,
     H, 128]: q4, k4 rows of packed E2M1 (the rotated head channels and the 2 x rank compensation channels), q_sf, k_sf
     their UE4M3 scale factors, v8 E4M3 (V minus the BF16 mean of its block of 128 keys, over v8_scale), v_mean BF16
     (row j: the mean of block j over v8_scale) and the one-element float32 score_scale and v8_scale. qk_rows: int32
     indices of the tokens whose q and k rows estimate the compensation basis (inputs.sample_rows). The score prescale
     log2(e) / sqrt(128) is folded into Q', and score_scale is the multiplier of the raw scores in log2 units, a power
-    of two of at least 2^MIN_SCORE_LOG2."""
+    of two of at least 2^MIN_SCORE_LOG2. lens: None, or the int32 valid prefix lengths [B] on the device, which the
+    kernels read in place; qk_rows is then [NQK] for every batch element or [B, NQK] per batch element: positions in
+    the padded sequence that the eigensolver maps into each valid prefix with map_rows, tokens otherwise."""
     B, S, H, _ = q.shape
     NB = (S + 127) // 128
-    NQK = qk_rows.shape[0]
+    NQK = qk_rows.shape[-1]
+    rows_per_sample = None if lens is None else qk_rows.dim() == 2
     dev = q.device
     nsm = num_sms(dev)
     BH = B * H
@@ -210,12 +348,15 @@ def run(q, k, v, qk_rows, buffers, rank):
     qgrid = min(nsm, ntiles)
     egrid = min(4 * nsm, BH * NB)
     tensors = (q, k, v, qk_rows, hadamard(dev), *(buffers[n] for n in _HOST_BUFFERS))
+    if lens is not None:
+        tensors += (lens,)
     sizes = (S, H, NQK, (NQK + 255) // 256, BH, NB, v_units, v_grid, ntiles, qgrid, egrid)
-    fn = _hosts.get((dev.index, rank))
+    key = (dev.index, rank, rows_per_sample, lens is not None and map_rows)
+    fn = _hosts.get(key)
     if fn is None:
         cargs = [_ctf(t) for t in tensors] + [Int32(x) for x in sizes]
         cargs.append(cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True))
-        fn = _hosts[dev.index, rank] = cute.compile(
-            _make_host(rank), *cargs, options="--enable-tvm-ffi"
+        fn = _hosts[key] = cute.compile(
+            _make_host(rank, rows_per_sample, key[3]), *cargs, options="--enable-tvm-ffi"
         )
     fn(*tensors, *sizes)

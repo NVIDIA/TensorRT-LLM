@@ -34,6 +34,7 @@ from ...common.dsl import barrier_cta_sync
 from ...common.mem import cp_async16, load_invariant, load_vector, mbar_wait, sptr
 from ..ptx.fp8pv import block_sums_of_p, expcast_transpose4, ldsm_b8_x2_trans
 from ..ptx.shared import ldsm_b16_x4, ldsm_b16_x4_trans, mbar_init_imm, mma_nvf4
+from ..valid_len import valid_len
 from .epilogue import inv_row_sums, store_rows
 from .layout import EP, K_STEPS, KT, NTHR, SF_BYTES, V_BYTES, VM_BYTES, key_grp, key_rot
 from .mma import DIST, load_q, mma_bf16_k8, mma_fp8
@@ -189,15 +190,17 @@ def small_mma_phase(
 @cute.jit
 def small_softmax(acc, P, sc, q, lim: cutlass.Constexpr):
     """Softmax of the single tile (rows g and g + 8 of the warp): tile max as the anchor (keys >= lim masked, lim <
-    KT), P = E4M3(2^(s - anchor + 4)) into P[4 i + r], the row sums of the quantized P and its block sums (P[16],
-    P[17])."""
+    KT, or a run-time count with lengths), P = E4M3(2^(s - anchor + 4)) into P[4 i + r], the row sums of the
+    quantized P and its block sums (P[16], P[17])."""
     for nt in cutlass.range_constexpr(16):
         s = nt % 4
         i = nt // 4
         for e in cutlass.range_constexpr(2):
             kk = 32 * i + 8 * key_grp(s) + ((2 * q + e) ^ key_rot(s))
             ok = Int32(1)
-            if kk >= lim:
+            if cutlass.const_expr(not isinstance(lim, int)):
+                ok = Int32(kk < lim)
+            elif kk >= lim:
                 ok = Int32(0)
             acc[nt][e] = Float32(cutlass.select_(ok != 0, acc[nt][e], Float32(-math.inf)))
             acc[nt][2 + e] = Float32(cutlass.select_(ok != 0, acc[nt][2 + e], Float32(-math.inf)))
@@ -229,9 +232,11 @@ def small_kernel(
     o_ptr: cute.Pointer,
     S: cutlass.Constexpr,
     H: cutlass.Constexpr,
+    lens_ptr,
 ):
     """Grid (1, H, B), NTHR threads: the S < 128 queries of one (batch, head) against its S keys. ss_ptr, vs_ptr: the
-    score scale and v8_scale."""
+    score scale and v8_scale. lens_ptr: None, or the valid prefix lengths: the keys from the length of the batch
+    element on are masked and its query rows from there on are zero in o."""
     tidx_, _, _ = cute.arch.thread_idx()
     _, hh_, bb_ = cute.arch.block_idx()
     tidx = Int32(tidx_)
@@ -307,7 +312,10 @@ def small_kernel(
         (fbar, Int32(0)),
     )
     cute.arch.barrier_arrive(barrier_id=bid_pass, number_of_threads=NTHR, aligned=False)
-    l0, l1 = small_softmax([list(r) for r in acc], P, sc, q, S)
+    nv = None if cutlass.const_expr(lens_ptr is None) else valid_len(lens_ptr.toint(), bb, S)
+    l0, l1 = small_softmax(
+        [list(r) for r in acc], P, sc, q, S if cutlass.const_expr(nv is None) else nv
+    )
     # ---- phase 1: PV and its means term
     barrier_cta_sync(bid_wait, thread_count=NTHR)
     small_mma_phase(
@@ -332,5 +340,19 @@ def small_kernel(
     # ---- epilogue: o = O * v8_scale / l through the warp's own staging rows
     f = inv_row_sums(l0, l1, q)
     store_rows(
-        O, f, vsc, smem + SEPI_OFF + warp * (16 * EP), g, q, lane, warp, Int32(0), ob, bb, hh, S, H
+        O,
+        f,
+        vsc,
+        smem + SEPI_OFF + warp * (16 * EP),
+        g,
+        q,
+        lane,
+        warp,
+        Int32(0),
+        ob,
+        bb,
+        hh,
+        S,
+        H,
+        nv,
     )

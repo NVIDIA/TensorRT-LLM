@@ -30,9 +30,11 @@ rank 64, which the MMA warp reuses once the compensation warps have loaded it.
 The kernel body (qk_kernel) is the setup of the CTA and one role per warp, each a function of this module: the load
 warp, the MMA warp, the compensation warps and the math warps. A CTA takes a contiguous range of tiles in the order
 (batch, head), 128-token block, q then k; every role walks that range with its own copy of the tile iterator
-(_first_tile, _next_tile), and the roles meet on the mbarriers listed below. The state object of the kernel holds what
-the roles share: the thread's warp and lane, the shared-memory and TMEM addresses, the tile range and the trace-time
-constants."""
+(_first_tile, _next_tile), and the roles meet on the mbarriers listed below. With valid prefix lengths the CTAs share
+the live tiles, those that hold a token below the length of their batch element, in the same order: the iterator walks
+only them, and the load warp stores zero block scales for the other tiles of the CTA's range of all tiles. The state
+object of the kernel holds what the roles share: the thread's warp and lane, the shared-memory and TMEM addresses, the
+tile range and the trace-time constants."""
 
 import cutlass
 import cutlass.cute as cute
@@ -52,6 +54,7 @@ from ..tmem import (
     ld_tmem_f32_x32_wait,
     st_tmem_16x32bx2_f32_x32_wait,
 )
+from ..valid_len import valid_len
 from .quant import quant16, quant16_dq_knownmax
 
 QK_THREADS = 22 * 32  # 16 math warps, load warp 16, MMA warp 17, compensation warps 18-21
@@ -143,9 +146,17 @@ def _tile_origin(st):
     return bh, st.t0 - bh * st.nb2
 
 
+def _live_blocks(st, b):
+    """With lengths: the 128-token blocks of batch element b that hold a valid token (those of the last element for
+    a b past it)."""
+    return (valid_len(st.lens, cutlass.min(b, st.B - 1), st.S) + 127) // 128
+
+
 def _first_tile(st):
     """The CTA's first tile as the iterator (kind, sblk, bh, h, b), fastest first: kind 0 for the q tile of a block and
     1 for its k tile, 128-token block sblk, (batch, head) index bh = b H + h, head h, batch b."""
+    if st.lens is not None:
+        return st.first
     bh, rem = _tile_origin(st)
     sblk = rem >> 1
     kind = rem & 1
@@ -157,17 +168,25 @@ def _first_tile(st):
 @cute.jit
 def _next_tile(st, kind, sblk, bh, h, b):
     """The tile after (kind, sblk, bh, h, b): the k tile of the block, then the q tile of the next block, of the next
-    head, of the next batch. The iterator advances without divisions."""
+    head, of the next batch. The iterator advances without divisions. With lengths a head ends with the last live block
+    of its batch element, and the batch elements without a valid token are passed over."""
     kind = kind ^ 1
     if kind == 0:
         sblk = sblk + 1
-        if sblk == st.NB:
+        blocks = st.NB
+        if cutlass.const_expr(st.lens is not None):
+            blocks = _live_blocks(st, b)
+        if sblk == blocks:
             sblk = 0
             bh = bh + 1
             h = h + 1
             if h == st.H:
                 h = 0
                 b = b + 1
+                if cutlass.const_expr(st.lens is not None):
+                    while (b < st.B) & (_live_blocks(st, b) == 0):
+                        b = b + 1
+                        bh = bh + st.H
     return kind, sblk, bh, h, b
 
 
@@ -272,7 +291,7 @@ def _stage_basis(st, ut_base, bh, ucount):
 
 
 @cute.jit
-def _load_warp(st, ut_base):
+def _load_warp(st, ut_base, scales):
     """Load warp (16): stages the basis of each (batch, head) of the CTA's tiles as the U operand (ut_base: the global
     address of the basis uT) and copies the q and k tiles into the X ring.
 
@@ -312,6 +331,27 @@ def _load_warp(st, ut_base):
                 tma_bar_ptr=st.bars_p + (B_XFULL + xs),
             )
         kind, sblk, bh, h, b = _next_tile(st, kind, sblk, bh, h, b)
+    if cutlass.const_expr(st.lens is not None):
+        _zero_scales(st, scales)
+
+
+@cute.jit
+def _zero_scales(st, scales):
+    """Load warp, with lengths: zero block scales for the tiles without a valid token among the CTA's range of all
+    tiles (t0_all, n_all), which no role visits. scales: the global addresses of (q_sfv, k_sfv); a lane stores its
+    share of the 16-byte chunks of a tile's BF16 scales."""
+    z = Uint32(0)
+    for t in cutlass.range(st.t0_all, st.t0_all + st.n_all):
+        bh = t // st.nb2
+        rem = t - bh * st.nb2
+        sblk = rem >> 1
+        if sblk >= _live_blocks(st, bh // st.H):
+            base = scales[0]
+            if rem & 1 == 1:
+                base = scales[1]
+            base = base + _scale_tile(st, bh, sblk) * Int64(2)
+            for c in cutlass.range(st.lane, st.sfv_tile // 8, 32):
+                store_vector(gptr(Uint32, base + Int64(c * 16), 16), (z, z, z, z))
 
 
 # ------------------------------------------------------------------------------------------------ MMA warp
@@ -376,7 +416,11 @@ def _mma_warp(st):
         _qk_rotation(st, Int32(0), idesc1)
     bh_prev = Int32(-1)
     ucount = Int32(-1)
-    bh, rem = _tile_origin(st)
+    if cutlass.const_expr(st.lens is not None):
+        kind, sblk, bh, h, b = _first_tile(st)
+        rem = Int32(0)
+    else:
+        bh, rem = _tile_origin(st)
     for i in cutlass.range(st.n):
         if i + 1 < st.n:
             _qk_rotation(st, i + 1, idesc1)
@@ -394,13 +438,19 @@ def _mma_warp(st):
         tc_commit(st.bars + 8 * B_AEMPTY)
         tc_commit(st.bars + 8 * (B_XREMPTY + p))
         # the tile's position in its (batch, head): the U stage is released after the last one
-        rem = rem + 1
-        if rem == st.nb2:
-            rem = 0
-        if (i + 1 == st.n) or (rem == 0):
-            tc_commit(st.bars + 8 * (B_UEMPTY + (ucount & 1)))
-        if rem == 0:
-            bh = bh + 1
+        if cutlass.const_expr(st.lens is not None):
+            # with lengths the last one is the k tile of the last live block of the batch element
+            if (i + 1 == st.n) or ((kind == 1) & (sblk + 1 == _live_blocks(st, b))):
+                tc_commit(st.bars + 8 * (B_UEMPTY + (ucount & 1)))
+            kind, sblk, bh, h, b = _next_tile(st, kind, sblk, bh, h, b)
+        else:
+            rem = rem + 1
+            if rem == st.nb2:
+                rem = 0
+            if (i + 1 == st.n) or (rem == 0):
+                tc_commit(st.bars + 8 * (B_UEMPTY + (ucount & 1)))
+            if rem == 0:
+                bh = bh + 1
 
 
 # ------------------------------------------------------------------------------------------------ compensation warps
@@ -428,6 +478,8 @@ def _compensation_warps(st, codes, scales, gmax):
         mbar_wait_bounded(st.bars + 8 * (B_DFULL + p), _d_rounds(j, st.d_stages) & 1)
         tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
         tok = sblk * 128 + row
+        if cutlass.const_expr(st.lens is not None):
+            n_valid = valid_len(st.lens, b, st.S)
         code_base, scale_base, row0 = _tile_outputs(st, codes, scales, rstride, kind, sblk, b, h)
         soff = _scale_tile(st, bh, sblk) + Int64(1024 + q2 * 32 + st.lane)
         for part in cutlass.range_constexpr(st.RANK // 16):
@@ -441,6 +493,8 @@ def _compensation_warps(st, codes, scales, gmax):
             for grp in cutlass.range_constexpr(2):
                 cqi = part * 2 + grp
                 sg, w0, w1 = quant16(dv[16 * grp : 16 * grp + 16])
+                if cutlass.const_expr(st.lens is not None):
+                    sg = Float32(cutlass.select_(tok < n_valid, sg, Float32(0.0)))
                 ws.append(w0)
                 ws.append(w1)
                 sg_dst = scale_base + Int64((soff + Int64(cqi * 128)) * 2)
@@ -532,6 +586,11 @@ def _math_warps(st, codes, scales, gmax):
         tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
         _warp_arrive(st, B_AFULL)
         tok = sblk * 128 + row
+        if cutlass.const_expr(st.lens is not None):
+            # a token past the valid prefix of its batch element: zero block scales, outside the maxima
+            live = tok < valid_len(st.lens, b, st.S)
+            sc0 = Float32(cutlass.select_(live, sc0, Float32(0.0)))
+            sc1 = Float32(cutlass.select_(live, sc1, Float32(0.0)))
         code_base, scale_base, row0 = _tile_outputs(st, codes, scales, rstride, kind, sblk, b, h)
         if tok < st.S:
             store_vector(
@@ -554,26 +613,14 @@ def _math_warps(st, codes, scales, gmax):
 
 
 # ------------------------------------------------------------------------------------------------ kernel
-@cute.kernel
-def qk_kernel(
-    tiled_mma: cute.TiledMma,
-    tma_q: cpasync.TmaInfo,
-    tma_k: cpasync.TmaInfo,
-    hadamard: cute.Tensor,
-    uT: cute.Tensor,
-    q4: cute.Tensor,
-    k4: cute.Tensor,
-    q_sfv: cute.Tensor,
-    k_sfv: cute.Tensor,
-    gmax: cute.Tensor,
-    S: Int32,
-    H: Int32,
-    NB: Int32,
-    ntiles: Int32,
-    RANK: cutlass.Constexpr,
+@cute.jit
+def _qk_body(
+    tiled_mma, tma_q, tma_k, hadamard, uT, q4, k4, q_sfv, k_sfv, gmax, S, H, NB, ntiles, RANK, lens
 ):
     """The Q'/K' pass of the CTA's share of the ntiles tiles: the setup of the CTA, the role of the thread's warp, then
-    the release of the TMEM columns. RANK: the directions of the basis uT [B, H, RANK, 128]."""
+    the release of the TMEM columns. RANK: the directions of the basis uT [B, H, RANK, 128]. lens: None, or the global
+    address of the valid prefix lengths: the block scales of the tokens past the length of their batch element are
+    then zero and stay out of the maxima, and the CTAs share the tiles that hold a valid token (_live_tiles)."""
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     gdim, _, _ = cute.arch.grid_dim()
@@ -619,6 +666,10 @@ def qk_kernel(
     tm = Int32(cute.arch.load(sptr(Uint32, hold), Uint32))
 
     thr_mma = tiled_mma.get_slice(0)
+    t0_all, n_all, first, batch = t0, n, None, None
+    if cutlass.const_expr(lens is not None):
+        batch = ntiles // (nb2 * H)
+        n, first = _live_tiles(lens, S, H, batch, bidx, gdim)
     st = State(
         warp=warp,
         lane=lane,
@@ -638,6 +689,13 @@ def qk_kernel(
         S=S,
         H=H,
         NB=NB,
+        # with lengths: n counts the live tiles of the CTA from the tile `first`, (t0_all, n_all) is its range of
+        # all tiles and B the batch size
+        lens=lens,
+        first=first,
+        t0_all=t0_all,
+        n_all=n_all,
+        B=batch,
         # trace-time constants
         RANK=RANK,
         ustage=ustage,
@@ -651,7 +709,11 @@ def qk_kernel(
     # One role per warp. A role takes the global addresses it reads or writes; each is read from its tensor here, in
     # the branch of the role.
     if warp == 16:
-        _load_warp(st, Int64(uT.iterator.toint()))
+        _load_warp(
+            st,
+            Int64(uT.iterator.toint()),
+            (Int64(q_sfv.iterator.toint()), Int64(k_sfv.iterator.toint())),
+        )
     elif warp == 17:
         _mma_warp(st)
     elif warp >= 18:
@@ -676,3 +738,106 @@ def qk_kernel(
         cute.arch.dealloc_tmem(
             cute.make_ptr(Float32, tm, cute.AddressSpace.tmem, assumed_align=16), 512
         )
+
+
+@cute.jit
+def _live_tiles(lens, S, H, batch, bidx, gdim):
+    """With lengths: (the number of live tiles of CTA bidx of gdim, its first one as the tile iterator). The live
+    tiles, in the order of all tiles, are the q and k tiles of the blocks that hold a valid token, in every head of
+    their batch element; the CTAs take contiguous ranges of them of the same size."""
+    total = Int32(0)
+    for b in cutlass.range(batch):
+        total = total + H * 2 * ((valid_len(lens, b, S) + 127) // 128)
+    l0 = (bidx * total) // gdim
+    n = ((bidx + 1) * total) // gdim - l0
+    # the batch element that holds live tile l0, and the live tiles before it
+    b = Int32(0)
+    before = Int32(0)
+    per_head = 2 * ((valid_len(lens, cutlass.min(b, batch - 1), S) + 127) // 128)
+    while (b < batch) & (l0 >= before + H * per_head):
+        before = before + H * per_head
+        b = b + 1
+        per_head = 2 * ((valid_len(lens, cutlass.min(b, batch - 1), S) + 127) // 128)
+    local = l0 - before
+    h = local // cutlass.max(per_head, Int32(1))
+    rem = local - h * per_head
+    return n, (rem & 1, rem >> 1, b * H + h, h, b)
+
+
+@cute.kernel
+def qk_kernel(
+    tiled_mma: cute.TiledMma,
+    tma_q: cpasync.TmaInfo,
+    tma_k: cpasync.TmaInfo,
+    hadamard: cute.Tensor,
+    uT: cute.Tensor,
+    q4: cute.Tensor,
+    k4: cute.Tensor,
+    q_sfv: cute.Tensor,
+    k_sfv: cute.Tensor,
+    gmax: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    ntiles: Int32,
+    RANK: cutlass.Constexpr,
+):
+    """The Q'/K' pass (_qk_body) of a call whose batch elements are all full."""
+    _qk_body(
+        tiled_mma,
+        tma_q,
+        tma_k,
+        hadamard,
+        uT,
+        q4,
+        k4,
+        q_sfv,
+        k_sfv,
+        gmax,
+        S,
+        H,
+        NB,
+        ntiles,
+        RANK,
+        None,
+    )
+
+
+@cute.kernel
+def qk_kernel_lens(
+    tiled_mma: cute.TiledMma,
+    tma_q: cpasync.TmaInfo,
+    tma_k: cpasync.TmaInfo,
+    hadamard: cute.Tensor,
+    uT: cute.Tensor,
+    q4: cute.Tensor,
+    k4: cute.Tensor,
+    q_sfv: cute.Tensor,
+    k_sfv: cute.Tensor,
+    gmax: cute.Tensor,
+    lens: cute.Tensor,
+    S: Int32,
+    H: Int32,
+    NB: Int32,
+    ntiles: Int32,
+    RANK: cutlass.Constexpr,
+):
+    """The Q'/K' pass (_qk_body) of a call with valid prefix lengths lens [B] (int32)."""
+    _qk_body(
+        tiled_mma,
+        tma_q,
+        tma_k,
+        hadamard,
+        uT,
+        q4,
+        k4,
+        q_sfv,
+        k_sfv,
+        gmax,
+        S,
+        H,
+        NB,
+        ntiles,
+        RANK,
+        Int64(lens.iterator.toint()),
+    )

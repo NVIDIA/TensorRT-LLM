@@ -220,6 +220,11 @@ def test_deco_delegates_unsupported_calls() -> None:
     assert out.dtype == torch.float16
     assert _relative_error(out, _sdpa(q, k, v)) < 2e-2
 
+    # A delegated call with a valid prefix attends the prefix alone; its padded rows are zero.
+    out = attn.forward(q.half(), k.half(), v.half(), valid_seq_len=200)
+    assert not out[:, 200:].any()
+    assert _relative_error(out[:, :200], _sdpa(q[:, :200], k[:, :200], v[:, :200])) < 2e-2
+
     assert "deco_workspace" not in attn._state
     # The causal call has the shape of a self-attention call: the layer notes it once.
     assert attn._noted_unquantized
@@ -259,6 +264,38 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
     assert len(state["deco_tagged_rows"]) == 1
     with pytest.raises(ValueError, match="token tags"):
         attn.forward(q, k, v, token_tags=token_tags[:-1])
+
+
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_deco_valid_seq_len_attends_the_prefix(v_dtype: str) -> None:
+    """With ``valid_seq_len`` the rows after the prefix are padding: the prefix attends its own
+    keys only, whatever the padding holds, and the padded rows come back zero."""
+    device = _require_deco_gpu(v_dtype)
+    batch_size, seq_len, valid_seq_len, num_heads = 2, 1024, 700, 3
+    q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
+    attn = _backend(num_heads, v_dtype)
+
+    # A prefix that covers the sequence is the call without a length.
+    assert torch.equal(attn.forward(q, k, v, valid_seq_len=seq_len), attn.forward(q, k, v))
+
+    out = attn.forward(q, k, v, valid_seq_len=valid_seq_len)
+
+    assert out.shape == q.shape and out.dtype == torch.bfloat16
+    assert not out[:, valid_seq_len:].any()
+    prefix = out[:, :valid_seq_len].clone()
+    ref = _sdpa(q[:, :valid_seq_len], k[:, :valid_seq_len], v[:, :valid_seq_len])
+    uniform_weights = v[:, :valid_seq_len].float().mean(dim=1, keepdim=True).expand_as(ref)
+    assert _relative_error(prefix, ref) < max(0.5 * _relative_error(uniform_weights, ref), 0.02)
+
+    for padding in (0.0, 1e30, float("nan")):
+        for tensor in (q, k, v):
+            tensor[:, valid_seq_len:] = padding
+        out = attn.forward(q, k, v, valid_seq_len=valid_seq_len)
+        assert torch.equal(out[:, :valid_seq_len], prefix)
+        assert not out[:, valid_seq_len:].any()
+
+    with pytest.raises(ValueError, match="valid_seq_len"):
+        attn.forward(q, k, v, valid_seq_len=seq_len + 1)
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)

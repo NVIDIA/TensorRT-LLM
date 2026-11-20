@@ -58,14 +58,16 @@ def layout(b, s, h, nsm):
     }
 
 
-def prepare(q, k, v, rows, buffers):
+def prepare(q, k, v, rows, buffers, lens=None, map_rows=False):
     """The preparation of this kernel on the buffers of a call (layout): the operands from BF16 q, k, v and the
     sampled rows. Every buffer may hold anything on entry. Only the two counters of the basis launch must be zero
-    when it starts: they are zeroed here."""
+    when it starts: they are zeroed here. lens, map_rows: None, or the int32 valid prefix lengths [B], and the rows
+    switch (prep.run)."""
     buffers["done"].zero_()
-    prep.run(q, k, v, rows, buffers)
+    prep.run(q, k, v, rows, buffers, lens, map_rows)
 
 
-def attention(buffers, o):
-    """The attention of this kernel: BF16 o from the buffers of a call that prepare has filled."""
-    launch.run(buffers, o)
+def attention(buffers, o, lens=None):
+    """The attention of this kernel: BF16 o from the buffers of a call that prepare has filled. lens: the valid prefix
+    lengths that prepare took (None: every batch element is full)."""
+    launch.run(buffers, o, lens)

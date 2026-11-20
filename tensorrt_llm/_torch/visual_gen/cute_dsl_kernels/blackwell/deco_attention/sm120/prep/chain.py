@@ -29,20 +29,20 @@ from ...runtime import current_stream, num_sms
 from .encode import ENCODE_THREADS
 
 
-def _compile(host, cache, device, fused):
-    """The host function of a chain compiled for a device and a chain form (fused: the V pass in the basis launch),
-    kept in the cache of its kernel package."""
-    fn = cache.get((device.index, fused))
+def _compile(host, cache, device, fused, lens):
+    """The host function of a chain compiled for a device and a chain form (fused: the V pass in the basis launch;
+    lens: the kernels read valid prefix lengths), kept in the cache of its kernel package."""
+    fn = cache.get((device.index, fused, lens))
     if fn is None:
         # placeholders of the host function's run-time parameters (Int64 addresses, Int32 sizes), then the stream and
-        # the switch
+        # the switches
         args = [
             Int64(0) if p.annotation is Int64 else Int32(1)
             for p in inspect.signature(host).parameters.values()
             if p.annotation in (Int64, Int32)
         ]
-        args += [cute.runtime.make_fake_stream(), fused]
-        fn = cache[(device.index, fused)] = cute.compile(host, *args)
+        args += [cute.runtime.make_fake_stream(), fused, lens]
+        fn = cache[(device.index, fused, lens)] = cute.compile(host, *args)
     return fn
 
 
@@ -78,11 +78,18 @@ def scratch(B, S, H, nsm):
     }
 
 
-def run(host, cache, host_buffers, min_score_log2, q, k, v, qk_rows, buffers):
+def run(
+    host, cache, host_buffers, min_score_log2, q, k, v, qk_rows, buffers, lens=None, map_rows=False
+):
     """The launches of a chain on the current stream, from raw BF16 q, k, v [B, S, H, 128] into the buffers of the
     call. host: the host function of the kernel package, cache: its compile cache, host_buffers: the buffers whose
     addresses the host function takes after q, k, v, the rows and the rotation, in its order, min_score_log2: log2
-    of the score-scale floor of the attention. qk_rows: the sampled tokens of the Q/K basis (inputs.sample_rows)."""
+    of the score-scale floor of the attention. qk_rows: the sampled tokens of the Q/K basis (inputs.sample_rows). lens:
+    None, or the int32 valid prefix lengths [B] on the device, which the kernels read in place: every pass then
+    takes the tokens of a batch element below its length only. qk_rows is then, with map_rows, the default draw over
+    the padded sequence, which the eigensolver maps into each valid prefix, and otherwise the caller's rows, [n]
+    shared by the batch or [B, n] per batch element, taken as given (a row at or past a length stands for the last
+    valid token)."""
     B, S, H, _ = q.shape
     T = (S + 127) // 128
     dev = q.device
@@ -90,7 +97,7 @@ def run(host, cache, host_buffers, min_score_log2, q, k, v, qk_rows, buffers):
     nspare, nqk_items, nqk_cta, nv_items, nv_cta, nenc_cta = _grids(nsm, B, S, H)
     # the V pass shares the basis launch when the eigenproblems take at most a quarter of the SMs and the grid of the
     # launch has at most as many CTAs as the device has SMs
-    fn = _compile(host, cache, dev, 4 * B * H <= nsm and B * H + nspare <= nsm)
+    fn = _compile(host, cache, dev, 4 * B * H <= nsm and B * H + nspare <= nsm, lens is not None)
     fn(
         q.data_ptr(),
         k.data_ptr(),
@@ -98,10 +105,11 @@ def run(host, cache, host_buffers, min_score_log2, q, k, v, qk_rows, buffers):
         qk_rows.data_ptr(),
         hadamard(dev).data_ptr(),
         *(buffers[n].data_ptr() for n in host_buffers),
+        lens.data_ptr() if lens is not None else 0,
         B,
         S,
         H,
-        qk_rows.shape[0],
+        qk_rows.shape[-1],
         T,
         min_score_log2,
         nspare,
@@ -110,5 +118,8 @@ def run(host, cache, host_buffers, min_score_log2, q, k, v, qk_rows, buffers):
         nv_items,
         nv_cta,
         nenc_cta,
+        # the rows mode of the eigensolver: the mapped default draw, the caller's shared rows, or its rows per batch
+        # element
+        0 if map_rows else qk_rows.dim(),
         current_stream(dev),
     )

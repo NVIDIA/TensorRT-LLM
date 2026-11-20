@@ -28,6 +28,7 @@ from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
 
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
 from ..ptx.shared import ex2_approx_f32, fma_rn_f32, mul_rn_f32
+from ..valid_len import valid_len
 from .layout import EP, NTHR, QT
 
 PART_N = 68  # FP32 words per thread of a piece's partials: 64 of O, 2 anchors, 2 row sums
@@ -50,11 +51,26 @@ def inv_row_sums(l0, l1, q):
 
 @cute.jit
 def store_rows(
-    O, f, vsc, ep, g, q, lane, warp, qt, ob, bb, hh, S: cutlass.Constexpr, H: cutlass.Constexpr
+    O,
+    f,
+    vsc,
+    ep,
+    g,
+    q,
+    lane,
+    warp,
+    qt,
+    ob,
+    bb,
+    hh,
+    S: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    nv=None,
 ):
     """The warp's 16 output rows o = O f v8_scale as BF16 (f = inv_row_sums: normalized first, as v8_scale / l may
     underflow where (O / l) v8_scale does not), staged in shared memory at ep (rows EP bytes apart), then 16-byte
-    global stores of the rows below S (query QT qt + 16 warp + row)."""
+    global stores of the rows below S (query QT qt + 16 warp + row). nv: with lengths, the valid tokens of the batch
+    element: the rows from there on are stored as zeros."""
     fa, fb, fc, fd = f
     for ct in cutlass.range_constexpr(8):
         for h in cutlass.range_constexpr(2):
@@ -77,8 +93,20 @@ def store_rows(
         c16 = lane & 15
         w = load_vector(sptr(Int32, ep + row * EP + c16 * 16, 16), 4)
         oq = qt * QT + warp * 16 + row
+        if cutlass.const_expr(nv is not None):
+            w = [Int32(cutlass.select_(oq < nv, x, Int32(0))) for x in w]
         if oq < S:
             store_vector(gptr(Int32, ob + Int64((bb * S + oq) * H + hh) * 256 + c16 * 16, 16), w)
+
+
+@cute.jit
+def store_zero_rows(lane, warp, qt, ob, bb, hh, S: cutlass.Constexpr, H: cutlass.Constexpr):
+    """The warp's 16 output rows of a unit without a valid query row: zeros, in the global stores of store_rows."""
+    for it in cutlass.range_constexpr(8):
+        oq = qt * QT + warp * 16 + 2 * it + (lane >> 4)
+        if oq < S:
+            dst = ob + Int64((bb * S + oq) * H + hh) * 256 + (lane & 15) * 16
+            store_vector(gptr(Int32, dst, 16), [Int32(0)] * 4)
 
 
 def store_partials(part_ptr, bid, tidx, O, anc0, anc1, l0, l1):
@@ -103,10 +131,13 @@ def merge_partial_kernel(
     nT: cutlass.Constexpr,
     split: cutlass.Constexpr,
     unit0: cutlass.Constexpr,
+    lens_ptr,
 ):
     """The merge of the split key-range pieces of unit unit0 + CTA index, in the thread mapping of the attention: the
     partials of the pieces are brought to their common anchor (the anchors are in log2 units already) and summed, then
-    the rows are normalized and stored as in a whole unit."""
+    the rows are normalized and stored as in a whole unit. lens_ptr: None, or the valid prefix lengths: the rows
+    from the length of the batch element on are zeros (a piece without a valid key tile has left an anchor of -inf
+    and zeros; a unit without a valid query row has no partials)."""
     bid_, _, _ = cute.arch.block_idx()
     tidx_, _, _ = cute.arch.thread_idx()
     bid = Int32(bid_)
@@ -156,4 +187,5 @@ def merge_partial_kernel(
     vsc = load_invariant(Float32, vs_ptr.toint())
     ob = o_ptr.toint()
     smem = Int32(cute.arch.get_dyn_smem(cutlass.Uint8, alignment=16).toint())
-    store_rows(O, f, vsc, smem + warp * (16 * EP), g, q, lane, warp, qt, ob, bb, hh, S, H)
+    nv = None if cutlass.const_expr(lens_ptr is None) else valid_len(lens_ptr.toint(), bb, S)
+    store_rows(O, f, vsc, smem + warp * (16 * EP), g, q, lane, warp, qt, ob, bb, hh, S, H, nv)

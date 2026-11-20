@@ -408,7 +408,6 @@ class SoftmaxRole:
                 0,
             )
             cS = cute.domain_offset(logical_offset, cS_base)
-            value_args_ = (seqlen_k, score_scale, o_done_ptr, p_tail_stage_ptr, thr_inc, scale_sub)
             atom_args = (
                 qk_thr_mma,
                 tiled_tmem_load,
@@ -428,7 +427,14 @@ class SoftmaxRole:
             )
             kv_begin, n_local = self.kv_range(work_tile, n_kv_tiles)
             n_unmasked = n_local
-            if cutlass.const_expr(self.split):
+            mask_len = seqlen_k
+            if cutlass.const_expr(self.lens):
+                # the keys of the batch element end at its length: the last KV tile of the work masks when it holds
+                # keys from the length on
+                mask_len = self.valid_keys(work_tile)
+                if (kv_begin + n_local) * self.qk_mma_tiler[1] > mask_len:
+                    n_unmasked = n_local - 1
+            elif cutlass.const_expr(self.split):
                 # only the piece holding the last KV tile masks
                 if seqlen_k % self.qk_mma_tiler[1] != 0:
                     if kv_begin + n_local == n_kv_tiles:
@@ -436,6 +442,7 @@ class SoftmaxRole:
             else:
                 if seqlen_k % self.qk_mma_tiler[1] != 0:
                     n_unmasked = n_kv_tiles - 1
+            value_args_ = (mask_len, score_scale, o_done_ptr, p_tail_stage_ptr, thr_inc, scale_sub)
             for i in cutlass.range(0, n_unmasked, 1, unroll=1):
                 cS_iter = cute.domain_offset((0, (kv_begin + i) * self.qk_mma_tiler[1]), cS)
                 stats_args, pipeline_args_ = self.softmax_step(

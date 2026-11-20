@@ -57,17 +57,22 @@ def workspace_size(b, s, h, device, pv, rank):
     return workspace_bytes(_KERNELS[pv].layout(b, s, h, rank, num_sms(device)))
 
 
-def prepare(q, k, v, workspace, pv, rank, rows):
+def prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens=None, map_rows=False):
     """The buffers of the call, views into the workspace (name -> tensor, the layout of the kernel package), with the
     operands filled from raw BF16 q, k, v [B, S, H, 128] on the current stream. rows: the int32 indices of the
-    sampled tokens that estimate the compensation basis of Q' and K' (inputs.sample_rows)."""
+    sampled tokens that estimate the compensation basis of Q' and K' (inputs.sample_rows). valid_seq_lens: None, or
+    the int32 valid prefix lengths [B] on the device, read by the kernels in place: batch element b attends its
+    first valid_seq_lens[b] keys and its query rows after them are zero in o; rows is then [m] for every batch
+    element or [B, m] per batch element, and with map_rows (the default draw) the kernel maps row r into each valid
+    prefix of n tokens as token floor(r n / S); other rows are tokens, those from n on standing for token n - 1."""
     b, s, h, _ = q.shape
     kernel = _KERNELS[pv]
     buffers = carve(workspace, kernel.layout(b, s, h, rank, num_sms(q.device)))
-    kernel.prepare(q, k, v, rows, buffers, rank)
+    kernel.prepare(q, k, v, rows, buffers, rank, valid_seq_lens, map_rows)
     return buffers
 
 
-def attention(buffers, o, pv, rank):
-    """BF16 o [B, S, H, 128] from the buffers of prepare, on the current stream."""
-    _KERNELS[pv].attention(buffers, o, rank)
+def attention(buffers, o, pv, rank, valid_seq_lens=None):
+    """BF16 o [B, S, H, 128] from the buffers of prepare, on the current stream. valid_seq_lens: the lengths that
+    prepare took."""
+    _KERNELS[pv].attention(buffers, o, rank, valid_seq_lens)

@@ -60,6 +60,9 @@ CNT_OFF = (
     BAR_OFF + 8 * STAGES
 )  # per-stage release counters: one increment per warp and use of the stage
 SMEM_BYTES = CNT_OFF + 4 * STAGES
+# with lengths, behind them: the valid tokens of the unit's batch element (one word), which the threads read there
+LEN_OFF = SMEM_BYTES
+LEN_BYTES = 16
 
 
 def key_rot(s):

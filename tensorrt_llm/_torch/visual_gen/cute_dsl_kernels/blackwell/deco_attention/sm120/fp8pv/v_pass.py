@@ -33,6 +33,7 @@ from ...common.mem import gptr, load_vector, sptr, store_vector
 from ..prep.basis import EIG_THREADS, SM_RED, basis_cta, bf16_f32, group16, stage_rows
 from ..ptx.fp8pv import st_global_cs_b32_pred, st_global_cs_b32_v2_pred
 from ..ptx.shared import ld_global_nc_b32_hint_pred
+from ..valid_len import valid_len
 
 V_THREADS = 128
 
@@ -141,10 +142,12 @@ def _vscan(
     sp: Int32,
     tid: Int32,
     sb: Int32,
+    lens_p,
 ):
     """max|v - vbar| (vbar = BF16 tile means) over the 128-key tiles [lo, hi) (flat over (batch, head, tile)); four
     tiles at a time, thread = (8-channel chunk, 16-key group), the groups of a chunk in lanes 8 j .. 8 j + 7. Writes
-    slot sp."""
+    slot sp. lens_p: None, or the global address of the valid prefix lengths: the keys of a batch element then end
+    at its length."""
     u = tid & 127
     grp = u & 7
     cc = u >> 3
@@ -160,13 +163,17 @@ def _vscan(
         bb = bh // H
         hh = bh - bb * H
         k0 = tt * 128 + 16 * grp
-        cnt = cutlass.max(cutlass.min(S - k0, 16), 0) * tv
+        nk = S if cutlass.const_expr(lens_p is None) else valid_len(lens_p, bb, S)
+        cnt = cutlass.max(cutlass.min(nk - k0, 16), 0) * tv
         kb = cutlass.min(k0, S - 1)
         base = (
             v_p + ((Int64(bb) * Int64(S) + Int64(kb)) * Int64(H) + Int64(hh)) * 256 + Int64(cc * 16)
         )
-        sums, vmx, vmn = group16(base, rstride, cnt)
-        mx = _tile_fold(sums, vmx, vmn, cnt, mx)
+        # with lengths: a tile without a valid key is skipped
+        live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
+        if live:
+            sums, vmx, vmn = group16(base, rstride, cnt)
+            mx = _tile_fold(sums, vmx, vmn, cnt, mx)
     _store_slot(mx, tid, sb, vmax_p, sp)
 
 
@@ -181,10 +188,11 @@ def _vscan_gs(
     ncta: Int32,
     tid: Int32,
     sb: Int32,
+    lens_p,
 ):
     """max|v - vbar| over all of V, grid-stride: item = (batch, tile, head, 8-channel chunk, 16-key group), the 8
     groups of a tile in lanes 8 j .. 8 j + 7 (a warp takes 32 consecutive items, so its lanes run the same
-    iterations). Writes slot cta."""
+    iterations). Writes slot cta. lens_p: as in _vscan."""
     T = (S + 127) >> 7
     nitems = B * T * H * 128
     mx = Float32(0.0)
@@ -197,13 +205,17 @@ def _vscan_gs(
         tt = rest % T
         bb = rest // T
         k0 = tt * 128 + 16 * grp
-        cnt = cutlass.max(cutlass.min(S - k0, 16), 0)
+        nk = S if cutlass.const_expr(lens_p is None) else valid_len(lens_p, bb, S)
+        cnt = cutlass.max(cutlass.min(nk - k0, 16), 0)
         kb = cutlass.min(k0, S - 1)
         base = (
             v_p + ((Int64(bb) * Int64(S) + Int64(kb)) * Int64(H) + Int64(hh)) * 256 + Int64(cc * 16)
         )
-        sums, vmx, vmn = group16(base, Int64(H) * 256, cnt)
-        mx = _tile_fold(sums, vmx, vmn, cnt, mx)
+        # with lengths: a tile without a valid key is skipped
+        live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
+        if live:
+            sums, vmx, vmn = group16(base, Int64(H) * 256, cnt)
+            mx = _tile_fold(sums, vmx, vmn, cnt, mx)
     _store_slot(mx, tid, sb, vmax_p, cta)
 
 
@@ -223,10 +235,13 @@ def _vpass(
     nspare: Int32,
     tid: Int32,
     sb: Int32,
+    lens_p,
 ):
     """The V pass in the basis launch, tiles handed out by a counter in descending order to two 256-thread halves per
     CTA, thread = (16-key group, 4-channel quad), the 8 groups of a quad in lanes 8 j .. 8 j + 7: the E4M3 V - vbar of
-    the keys below S and v_mean = vbar / v8_scale in the tile's 8 rows."""
+    the keys below S and v_mean = vbar / v8_scale in the tile's 8 rows. lens_p: None, or the global address of the
+    valid prefix lengths: the mean of a tile is then over the keys below the length of its batch element, the keys
+    from there on get zero codes, and a tile without a valid key is left as it is."""
     red = sb + SM_RED
     # the tensor scale from all scan slots (written by this launch's scan CTAs: cop "cg"; red was the scan's)
     v8s = tensor_scale(vmax_p, nspare, tid, red, "cg", EIG_THREADS, True)
@@ -250,7 +265,7 @@ def _vpass(
     cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
     tix = Int32(cute.arch.load(sptr(Uint32, slot), Uint32))
     if tix < ntiles:
-        stage_rows(v_p, vin, st, ntiles - 1 - tix, S, H, T)
+        stage_rows(v_p, vin, st, ntiles - 1 - tix, S, H, T, lens_p)
     cute.arch.cp_async_commit_group()
     cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
     if st == 0:
@@ -267,7 +282,13 @@ def _vpass(
         bb = bh // H
         hh = bh - bb * H
         k0 = tt * 128 + 16 * grp
-        cnt = cutlass.max(cutlass.min(S - k0, 16), 0)
+        cnt_s = cutlass.max(cutlass.min(S - k0, 16), 0)
+        nk = S if cutlass.const_expr(lens_p is None) else valid_len(lens_p, bb, S)
+        cnt = (
+            cnt_s
+            if cutlass.const_expr(lens_p is None)
+            else cutlass.max(cutlass.min(nk - k0, 16), 0)
+        )
         kb = cutlass.min(k0, S - 1)
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
@@ -287,31 +308,39 @@ def _vpass(
         cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
         # prefetch the next tile while this one is processed
         if nix < ntiles:
-            stage_rows(v_p, vin, st, ntiles - 1 - nix, S, H, T)
+            stage_rows(v_p, vin, st, ntiles - 1 - nix, S, H, T, lens_p)
         cute.arch.cp_async_commit_group()
-        # the mean of the tile; v_mean = vbar / v8_scale (exact), in the row of the thread's group
-        mf = tile_mean(sums, cnt)
-        mean_dst = (
-            vmean_p + ((Int64(bh) * Int64(SP16) + Int64(tt * 8 + grp)) * 128 + Int64(cq * 4)) * 2
-        )
-        mean_words = [bf16x2(mf[2 * e] * i8, mf[2 * e + 1] * i8) for e in range(2)]
-        store_vector(gptr(Uint32, mean_dst, 8), mean_words, cop="cs")
-        # E4M3 (V - vbar) / v8_scale: 4 channels per key = 4 bytes, running address
-        v8a = (
-            v8_p + ((Int64(bb) * Int64(S) + Int64(kb)) * Int64(H) + Int64(hh)) * 128 + Int64(cq * 4)
-        )
-        v8st = Int64(H) * 128
-        for kk in cutlass.range_constexpr(16):
-            w0 = wv[kk * 2]
-            w1 = wv[kk * 2 + 1]
-            pk = e4m3x4(
-                (u2f(w0 << Uint32(16)) - mf[0]) * i8,
-                (u2f(w0 & Uint32(0xFFFF0000)) - mf[1]) * i8,
-                (u2f(w1 << Uint32(16)) - mf[2]) * i8,
-                (u2f(w1 & Uint32(0xFFFF0000)) - mf[3]) * i8,
+        # with lengths: a tile without a valid key is skipped
+        live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
+        if live:
+            # the mean of the tile; v_mean = vbar / v8_scale (exact), in the row of the thread's group
+            mf = tile_mean(sums, cnt)
+            mean_dst = (
+                vmean_p
+                + ((Int64(bh) * Int64(SP16) + Int64(tt * 8 + grp)) * 128 + Int64(cq * 4)) * 2
             )
-            st_global_cs_b32_pred(v8a, pk, Int32(kk < cnt))
-            v8a = v8a + v8st
+            mean_words = [bf16x2(mf[2 * e] * i8, mf[2 * e + 1] * i8) for e in range(2)]
+            store_vector(gptr(Uint32, mean_dst, 8), mean_words, cop="cs")
+            # E4M3 (V - vbar) / v8_scale: 4 channels per key = 4 bytes, running address
+            v8a = (
+                v8_p
+                + ((Int64(bb) * Int64(S) + Int64(kb)) * Int64(H) + Int64(hh)) * 128
+                + Int64(cq * 4)
+            )
+            v8st = Int64(H) * 128
+            for kk in cutlass.range_constexpr(16):
+                w0 = wv[kk * 2]
+                w1 = wv[kk * 2 + 1]
+                pk = e4m3x4(
+                    (u2f(w0 << Uint32(16)) - mf[0]) * i8,
+                    (u2f(w0 & Uint32(0xFFFF0000)) - mf[1]) * i8,
+                    (u2f(w1 << Uint32(16)) - mf[2]) * i8,
+                    (u2f(w1 & Uint32(0xFFFF0000)) - mf[3]) * i8,
+                )
+                if cutlass.const_expr(lens_p is not None):
+                    pk = Uint32(cutlass.select_(kk < cnt, pk, Uint32(0)))
+                st_global_cs_b32_pred(v8a, pk, Int32(kk < cnt_s))
+                v8a = v8a + v8st
         if st == 0:
             cute.arch.store(
                 sptr(Uint32, slot),
@@ -343,8 +372,11 @@ def basis_kernel(
     BH: Int32,
     nspare: Int32,
     FUSED: cutlass.Constexpr,
+    lens_p,
+    rows_mode,
 ):
-    """The basis launch of the FP8-PV kernel: basis_cta with the scan and the pass of the smoothed V."""
+    """The basis launch of the FP8-PV kernel: basis_cta with the scan and the pass of the smoothed V. lens_p,
+    rows_mode: None, or the global address of the valid prefix lengths and the rows mode of the eigensolver."""
     basis_cta(
         q_p,
         k_p,
@@ -359,11 +391,12 @@ def basis_kernel(
         BH,
         nspare,
         FUSED,
-        lambda cta, tid, sb: _vscan_gs(v_p, vmax_p, B, S, H, cta, nspare, tid, sb),
-        lambda lo, hi, sp, tid, sb: _vscan(v_p, vmax_p, S, H, T, lo, hi, sp, tid, sb),
+        lambda cta, tid, sb: _vscan_gs(v_p, vmax_p, B, S, H, cta, nspare, tid, sb, lens_p),
+        lambda lo, hi, sp, tid, sb: _vscan(v_p, vmax_p, S, H, T, lo, hi, sp, tid, sb, lens_p),
         lambda ntiles, pid, tid, sb: _vpass(
-            v_p, vmax_p, v8_p, vmean_p, v8s_p, done_p, S, H, T, ntiles, pid, nspare, tid, sb
+            v_p, vmax_p, v8_p, vmean_p, v8s_p, done_p, S, H, T, ntiles, pid, nspare, tid, sb, lens_p
         ),
+        None if lens_p is None else (lens_p, rows_mode),
     )
 
 
@@ -380,10 +413,11 @@ def v_kernel(
     nspare: Int32,
     nitems: Int32,
     ncta: Int32,
+    lens_p,
 ):
     """One 128-key tile of one (batch, head) per iteration: thread (16-key group, 8-channel chunk), the tile's groups
     in lanes 8 j .. 8 j + 7, loads 16 x 16 bytes and stores the E4M3 V - vbar of the keys below S and its row of
-    v_mean."""
+    v_mean. lens_p: as in _vpass."""
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     smem = SmemAllocator()
@@ -407,44 +441,61 @@ def v_kernel(
         bb = bh // H
         hh = bh - bb * H
         k0 = tile * 128 + 16 * grp
-        cnt = cutlass.max(cutlass.min(S - k0, 16), 0)
+        cnt_s = cutlass.max(cutlass.min(S - k0, 16), 0)
+        nk = S if cutlass.const_expr(lens_p is None) else valid_len(lens_p, bb, S)
+        cnt = (
+            cnt_s
+            if cutlass.const_expr(lens_p is None)
+            else cutlass.max(cutlass.min(nk - k0, 16), 0)
+        )
         kb = cutlass.min(k0, S - 1)
         base = (
             v_p + ((Int64(bb) * Int64(S) + Int64(kb)) * Int64(H) + Int64(hh)) * 256 + Int64(cc * 16)
         )
-        wv = cute.make_rmem_tensor((64,), Uint32)
-        sums = [Float32(0.0)] * 8
-        for kk in cutlass.range_constexpr(16):
-            w = ld_global_nc_b32_hint_pred(base + rstride * kk, Int32(kk < cnt), "evict_first", 4)
-            for e in cutlass.range_constexpr(4):
-                wv[kk * 4 + e] = w[e]
-                sums[2 * e] = sums[2 * e] + u2f(w[e] << Uint32(16))
-                sums[2 * e + 1] = sums[2 * e + 1] + u2f(w[e] & Uint32(0xFFFF0000))
-        mf = tile_mean(sums, cnt)
-        # v_mean = vbar / v8_scale (exact), 8 channels = 16 bytes
-        mean_dst = (
-            vmean_p + ((Int64(bh) * Int64(SP16) + Int64(tile * 8 + grp)) * 128 + Int64(cc * 8)) * 2
-        )
-        mean_words = [bf16x2(mf[2 * e] * i8, mf[2 * e + 1] * i8) for e in range(4)]
-        store_vector(gptr(Uint32, mean_dst, 16), mean_words, cop="cs")
-        # E4M3 (V - vbar) / v8_scale: 8 channels per key = 8 bytes
-        v8b = (
-            v8_p + ((Int64(bb) * Int64(S) + Int64(kb)) * Int64(H) + Int64(hh)) * 128 + Int64(cc * 8)
-        )
-        for kk in cutlass.range_constexpr(16):
-            w4 = [wv[kk * 4 + e] for e in range(4)]
-            lo = e4m3x4(
-                (u2f(w4[0] << Uint32(16)) - mf[0]) * i8,
-                (u2f(w4[0] & Uint32(0xFFFF0000)) - mf[1]) * i8,
-                (u2f(w4[1] << Uint32(16)) - mf[2]) * i8,
-                (u2f(w4[1] & Uint32(0xFFFF0000)) - mf[3]) * i8,
+        # with lengths: a tile without a valid key is skipped
+        live = cutlass.const_expr(lens_p is None) or tile * 128 < nk
+        if live:
+            wv = cute.make_rmem_tensor((64,), Uint32)
+            sums = [Float32(0.0)] * 8
+            for kk in cutlass.range_constexpr(16):
+                w = ld_global_nc_b32_hint_pred(
+                    base + rstride * kk, Int32(kk < cnt), "evict_first", 4
+                )
+                for e in cutlass.range_constexpr(4):
+                    wv[kk * 4 + e] = w[e]
+                    sums[2 * e] = sums[2 * e] + u2f(w[e] << Uint32(16))
+                    sums[2 * e + 1] = sums[2 * e + 1] + u2f(w[e] & Uint32(0xFFFF0000))
+            mf = tile_mean(sums, cnt)
+            # v_mean = vbar / v8_scale (exact), 8 channels = 16 bytes
+            mean_dst = (
+                vmean_p
+                + ((Int64(bh) * Int64(SP16) + Int64(tile * 8 + grp)) * 128 + Int64(cc * 8)) * 2
             )
-            hi = e4m3x4(
-                (u2f(w4[2] << Uint32(16)) - mf[4]) * i8,
-                (u2f(w4[2] & Uint32(0xFFFF0000)) - mf[5]) * i8,
-                (u2f(w4[3] << Uint32(16)) - mf[6]) * i8,
-                (u2f(w4[3] & Uint32(0xFFFF0000)) - mf[7]) * i8,
+            mean_words = [bf16x2(mf[2 * e] * i8, mf[2 * e + 1] * i8) for e in range(4)]
+            store_vector(gptr(Uint32, mean_dst, 16), mean_words, cop="cs")
+            # E4M3 (V - vbar) / v8_scale: 8 channels per key = 8 bytes
+            v8b = (
+                v8_p
+                + ((Int64(bb) * Int64(S) + Int64(kb)) * Int64(H) + Int64(hh)) * 128
+                + Int64(cc * 8)
             )
-            st_global_cs_b32_v2_pred(v8b + Int64(H) * 128 * kk, lo, hi, Int32(kk < cnt))
+            for kk in cutlass.range_constexpr(16):
+                w4 = [wv[kk * 4 + e] for e in range(4)]
+                lo = e4m3x4(
+                    (u2f(w4[0] << Uint32(16)) - mf[0]) * i8,
+                    (u2f(w4[0] & Uint32(0xFFFF0000)) - mf[1]) * i8,
+                    (u2f(w4[1] << Uint32(16)) - mf[2]) * i8,
+                    (u2f(w4[1] & Uint32(0xFFFF0000)) - mf[3]) * i8,
+                )
+                hi = e4m3x4(
+                    (u2f(w4[2] << Uint32(16)) - mf[4]) * i8,
+                    (u2f(w4[2] & Uint32(0xFFFF0000)) - mf[5]) * i8,
+                    (u2f(w4[3] << Uint32(16)) - mf[6]) * i8,
+                    (u2f(w4[3] & Uint32(0xFFFF0000)) - mf[7]) * i8,
+                )
+                if cutlass.const_expr(lens_p is not None):
+                    lo = Uint32(cutlass.select_(kk < cnt, lo, Uint32(0)))
+                    hi = Uint32(cutlass.select_(kk < cnt, hi, Uint32(0)))
+                st_global_cs_b32_v2_pred(v8b + Int64(H) * 128 * kk, lo, hi, Int32(kk < cnt_s))
         cute.arch.sync_threads()
         cute.arch.sync_threads()

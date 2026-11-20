@@ -58,6 +58,7 @@ def _host(
     gmax_p: Int64,
     prov_p: Int64,
     done_p: Int64,
+    lens_p: Int64,
     B: Int32,
     S: Int32,
     H: Int32,
@@ -70,9 +71,15 @@ def _host(
     nv_items: Int32,
     nv_cta: Int32,
     nenc_cta: Int32,
+    rows_mode: Int32,
     stream: cuda.CUstream,
     FUSED: cutlass.Constexpr,
+    LENS: cutlass.Constexpr,
 ):
+    # LENS: the call has valid prefix lengths (int32 [B] at lens_p, read by the kernels in place; rows_mode: the
+    # rows mode of the eigensolver, prep/basis.py); otherwise both are unused and the kernels take None
+    lens = lens_p if cutlass.const_expr(LENS) else None
+    mode = rows_mode if cutlass.const_expr(LENS) else None
     BH = B * H
     basis_kernel(
         q_p,
@@ -94,13 +101,15 @@ def _host(
         BH,
         nspare,
         FUSED,
+        lens,
+        mode,
     ).launch(grid=(BH + nspare, 1, 1), block=(EIG_THREADS, 1, 1), stream=stream)
     if cutlass.const_expr(not FUSED):
-        v_kernel(v_p, vmax_p, v8_p, vmean_p, v8s_p, S, H, T, nspare, nv_items, nv_cta).launch(
+        v_kernel(v_p, vmax_p, v8_p, vmean_p, v8s_p, S, H, T, nspare, nv_items, nv_cta, lens).launch(
             grid=(nv_cta, 1, 1), block=(V_THREADS, 1, 1), stream=stream
         )
     qk_kernel(
-        q_p, k_p, had_p, ut_p, q4_p, k4_p, prov_p, gmax_p, B, S, H, T, nqk_items, nqk_cta
+        q_p, k_p, had_p, ut_p, q4_p, k4_p, prov_p, gmax_p, B, S, H, T, nqk_items, nqk_cta, lens
     ).launch(grid=(nqk_cta, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
     encode_kernel(
         prov_p, gmax_p, qsf_p, ksf_p, score_scale_p, B, H, T, nqk_cta, msl, nenc_cta
@@ -131,8 +140,11 @@ _HOST_BUFFERS = (
 scratch = chain.scratch
 
 
-def run(q, k, v, qk_rows, buffers):
+def run(q, k, v, qk_rows, buffers, lens=None, map_rows=False):
     """The operands of the attention kernel (buffers: the buffers of the call, the layout of this package) from raw
     BF16 q, k, v [B, S, H, 128]: Q'/K' (q4, k4, q_sf, k_sf), score_scale (floored at 2^MIN_SCORE_LOG2) and the
-    smoothed E4M3 V (v8, v_mean, v8_scale). qk_rows: the sampled tokens of the Q/K basis (inputs.sample_rows)."""
-    chain.run(_host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, qk_rows, buffers)
+    smoothed E4M3 V (v8, v_mean, v8_scale). qk_rows: the sampled tokens of the Q/K basis (inputs.sample_rows). lens,
+    map_rows: the valid prefix lengths and the rows switch of chain.run."""
+    chain.run(
+        _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, qk_rows, buffers, lens, map_rows
+    )
