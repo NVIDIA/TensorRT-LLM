@@ -19,73 +19,58 @@ limitations under the License.
 
 Scope: this directory and everything under it. Supplements the repo-root `AGENTS.md`.
 
-## Test value and execution placement
+## Test value and CI placement
 
-Use these questions when deciding whether to add a test or parameter value.
+Before adding a test or parameter value, answer three questions:
 
 - Which regression do its assertions catch?
 - What coverage does it add beyond existing tests?
-- Should it run in pre-merge CI, post-merge CI, QA, or only as a one-time local
-  check, and why is that frequency worth its setup and execution cost?
+- Where should it run — pre-merge CI, post-merge CI, QA, or local-only — and is
+  that frequency worth its setup and runtime cost?
 
-Summarize the rationale in the PR. One sentence can cover a small addition,
-such as another dtype, and cases with the same rationale can be described
-together. For a new CI entry, a larger parameter matrix or an expensive GPU
-stage, explain the extra coverage and why it warrants the recurring cost.
+Summarize the placement and rationale in the PR description. One sentence is
+enough for a small addition (such as another dtype or boundary case), and
+related cases can share one rationale. For a new CI entry, a larger parameter
+matrix, or an expensive GPU stage, explain the added coverage and recurring
+cost.
 
-Keep focused, reliable regression coverage in pre-merge CI; justify expensive
-or broad coverage there instead of registering every new test automatically.
-Use post-merge or QA for coverage suited to those schedules. Keep one-time
-investigation checks out of recurring CI unless they protect a lasting
-regression. Prune redundant cases while preserving meaningful failure modes.
-
-For Python unit-test case design and parameter matrices, follow
-the [unit-test guidance](unittest/AGENTS.md). For C++ targets, build artifacts and
-execution, follow the [C++ test guidance](../cpp/tests/AGENTS.md).
-Before changing CI registrations or waivers, read the
-[test-list guidance](integration/test_lists/AGENTS.md).
+- **Do not register every new test in pre-merge CI.** Keep pre-merge CI focused
+  on fast, reliable regression checks. Use post-merge CI or QA for heavier or
+  broader matrices, and keep one-time investigation checks local unless they
+  guard a lasting regression. Prune redundant cases while keeping distinct
+  failure modes.
+- **Make CI registration intentional.** For list-driven CI, verify that an entry
+  under `tests/integration/test_lists/test-db/` actually selects the case under
+  the stage's options, markers, and waivers — a parent-directory entry alone
+  does not prove a case runs. Native C++ gtests run through registered wrappers
+  and CTest/binary selection rather than per-case YAML entries. Leaving a test
+  out of CI lists is fine for QA-only or local-only tests, as long as it is
+  deliberate and confirmed with the author/reviewer when unclear.
+- **Pick the list by hardware requirement:**
+  - CPU-only unit tests → `l0_cpu.yml` with `pytest.mark.cpu_only` (CPU stages
+    select `cpu_only`; standard GPU stages select `not cpu_only`, except sanity
+    stages).
+  - Single-GPU tests → the target GPU list (e.g., `l0_b200.yml`).
+  - Multi-GPU tests → a matching multi-GPU list (e.g., `l0_dgx_b200.yml`,
+    `l0_gb300_multi_gpus.yml`).
 
 ## Build test helpers before the test stage
 
-Build new CI test helpers and executables in the build stage and consume
+Build new CI test helpers and native executables in the build stage and consume
 matching artifacts in the test stage. Do not add ad hoc compiler, CMake, or
-extension builds during test discovery, setup, or execution merely to prepare a
-helper. Extend the existing build targets and artifact flow for new requirements.
+extension builds during test discovery, setup, or execution.
 
-Existing documented source-build fallbacks are supported exceptions, including
-CI configurations without a usable prebuilt bundle. For the C++ fixtures and
-their exact fallback conditions, read
-[Existing source-build fallback](../cpp/tests/AGENTS.md#existing-source-build-fallback).
-Preserve those paths and explicit local/source-build workflows. Outside these
-exceptions, do not bypass available matching artifacts to rebuild ordinary
-helpers on each test node.
+- Preserve the existing documented source-build fallbacks (see
+  [CI bundle and source-build fallback](../cpp/tests/AGENTS.md#ci-bundle-and-source-build-fallback))
+  and explicit local source-build workflows. Outside those exceptions, do not
+  bypass available matching artifacts on test nodes.
+- Keep intentional runtime compilation when it is part of the behavior under
+  test (for example, a JIT kernel), and account for its cost when choosing the
+  CI tier.
 
-Keep intentional runtime compilation when it is part of the behavior under
-test (for example, a JIT kernel), and account for its cost when choosing the CI
-layer.
+## Scoped guides
 
-## Whether a new test runs in CI
-
-This is a reminder for whoever adds a test, not a hard gate. Not every test
-belongs in recurring CI; QA-only and local developer tests are valid choices.
-
-For the list-driven CI pipeline, ensure the intended case is selected by an
-entry under `tests/integration/test_lists/test-db/`. Python unit tests may be
-covered by an existing file or parent-directory bridge entry. Native C++ cases
-are reached through registered integration wrappers and their CTest or binary
-selection; they do not each need a YAML entry.
-
-Check the effective pre-merge/post-merge stage, options, marker filters and
-waivers. A parent entry alone does not prove a case runs. A case that no entry
-selects will not execute in this pipeline and cannot protect it from regressions.
-Record whether a new test belongs in CI, QA or local testing, and confirm the
-intended placement with the author/reviewer rather than leaving it accidental.
-
-Choose the list by the execution requirements: CPU-only unit tests go in
-`l0_cpu.yml` and must carry `pytest.mark.cpu_only`; the CPU stages select that
-marker. Standard GPU stages select `not cpu_only` (sanity stages are exceptions).
-Single-GPU tests use the target platform's list (e.g. `l0_b200.yml`); multi-GPU
-tests use a suitable multi-GPU list (e.g. `l0_dgx_b200.yml`,
-`l0_gb300_multi_gpus.yml`). If the intended list or selection is unclear, ask the
-author/reviewer. Follow the [test-list guidance](integration/test_lists/AGENTS.md)
-when adding or changing registrations.
+- Python unit tests: [unit-test guidance](unittest/AGENTS.md)
+- CI test lists, batching, and waives: [test-list guidance](integration/test_lists/AGENTS.md)
+  (detailed matching and batching reference in [test-list README](integration/test_lists/README.md))
+- C++ tests and wrappers: [C++ test guidance](../cpp/tests/AGENTS.md)

@@ -146,8 +146,10 @@ a temporary whole-entry or multi-platform waive. Tests deliberately retired for
 low value or redundant coverage should be removed with their registrations and
 obsolete waives, rather than waived indefinitely.
 
-Before editing a waive, see **Waive list** in the
-[test-list guidance](source:tests/integration/test_lists/AGENTS.md).
+For matching rules, platform/SM prefixes, and troubleshooting, see
+[`tests/integration/test_lists/README.md`](source:tests/integration/test_lists/README.md)
+(routine edit rules live in
+[`tests/integration/test_lists/AGENTS.md`](source:tests/integration/test_lists/AGENTS.md)).
 
 ## Multi-GPU Tests
 

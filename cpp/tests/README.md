@@ -35,8 +35,8 @@ pytest tests/integration/defs/cpp/test_multi_gpu.py --collect-only
 
 The build fixtures first try the prebuilt C++ test bundle. If no applicable
 bundle is available, they configure and build selected native targets. See
-[Existing source-build fallback](AGENTS.md#existing-source-build-fallback) for
-the exact bundle conditions, supported fallback fixtures and target selection.
+[CI bundle and source-build fallback](AGENTS.md#ci-bundle-and-source-build-fallback)
+for bundle rules, supported fallback fixtures, and target selection.
 The multi-GPU wrappers also use this bundle-first fixture.
 
 Choose a collected case for your hardware and required GPU count. For example,
