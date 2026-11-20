@@ -4,6 +4,7 @@
 import torch
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.activation import gelu_tanh_and_mul, silu_and_mul
@@ -31,7 +32,7 @@ if IS_FLASHINFER_AVAILABLE:
         return torch.empty_like(x).chunk(2, dim=-1)[1].contiguous()
 
     # Warp this into custom op since flashinfer provides default value for eps with would produce two different graphs depends on the eps value.
-    @torch.library.custom_op("trtllm::flashinfer_rmsnorm", mutates_args=())
+    @fast_custom_op("trtllm::flashinfer_rmsnorm", mutates_args=())
     def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor,
                            eps: float) -> torch.Tensor:
         return rmsnorm(input, weight, eps, enable_pdl=get_env_enable_pdl())
@@ -55,8 +56,8 @@ if IS_FLASHINFER_AVAILABLE:
           eps: float) -> torch.Tensor:
         return torch.empty_like(input)
 
-    @torch.library.custom_op("trtllm::flashinfer_fused_add_rmsnorm",
-                             mutates_args=("input", "residual"))
+    @fast_custom_op("trtllm::flashinfer_fused_add_rmsnorm",
+                    mutates_args=("input", "residual"))
     def flashinfer_fused_add_rmsnorm(input: torch.Tensor,
                                      residual: torch.Tensor,
                                      weight: torch.Tensor, eps: float) -> None:
@@ -65,6 +66,11 @@ if IS_FLASHINFER_AVAILABLE:
                           weight,
                           eps,
                           enable_pdl=get_env_enable_pdl())
+
+    @flashinfer_fused_add_rmsnorm.register_fake
+    def _(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+          eps: float) -> None:
+        return None
 
     @torch.library.custom_op("trtllm::flashinfer_fused_add_rmsnorm_quant",
                              mutates_args=("out", "residual"))
@@ -87,8 +93,8 @@ if IS_FLASHINFER_AVAILABLE:
           weight: torch.Tensor, scale: torch.Tensor, eps: float) -> None:
         pass
 
-    @torch.library.custom_op("trtllm::flashinfer_gemma_fused_add_rmsnorm",
-                             mutates_args=("input", "residual"))
+    @fast_custom_op("trtllm::flashinfer_gemma_fused_add_rmsnorm",
+                    mutates_args=("input", "residual"))
     def flashinfer_gemma_fused_add_rmsnorm(input: torch.Tensor,
                                            residual: torch.Tensor,
                                            weight: torch.Tensor,
@@ -98,6 +104,11 @@ if IS_FLASHINFER_AVAILABLE:
                                 weight,
                                 eps,
                                 enable_pdl=get_env_enable_pdl())
+
+    @flashinfer_gemma_fused_add_rmsnorm.register_fake
+    def _(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+          eps: float) -> None:
+        return None
 
     @torch.library.custom_op(
         "trtllm::flashinfer_apply_rope_with_cos_sin_cache_inplace",

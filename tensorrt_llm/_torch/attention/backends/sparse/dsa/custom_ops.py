@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import torch
 
+from tensorrt_llm._torch.custom_ops.fast_custom_op import fast_custom_op
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import eager_on_graph
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
@@ -19,7 +20,27 @@ def _extract_extra_attrs(layer_idx: str):
     return extract_extra_attrs(layer_idx, "mla")
 
 
-@torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())
+def _mla_dsa_proj(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+    hidden_states_fp4: Optional[torch.Tensor],
+    hidden_states_sf: Optional[torch.Tensor],
+) -> List[torch.Tensor]:
+    metadata, mla_layer = _extract_extra_attrs(layer_idx)
+    if hidden_states_fp4 is not None or hidden_states_sf is not None:
+        assert hidden_states_fp4 is not None and hidden_states_sf is not None, (
+            "hidden_states_fp4 and hidden_states_sf must be passed together"
+        )
+        hidden_states = Fp4QuantizedTensor(
+            fp4_tensor=hidden_states_fp4,
+            scaling_factor=hidden_states_sf,
+            unquantized_hidden_states=hidden_states,
+        )
+    return forward_dsa_proj(mla_layer, position_ids, hidden_states, metadata)
+
+
+@fast_custom_op("trtllm::mla_dsa_proj", mutates_args=())
 def mla_dsa_proj(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
@@ -42,17 +63,15 @@ def mla_dsa_proj(
     The trailing q_scale is only consumed by the FP4 dispatch; the FP8
     path ignores it in _forward_dsa_attn.
     """
-    metadata, mla_layer = _extract_extra_attrs(layer_idx)
-    if hidden_states_fp4 is not None or hidden_states_sf is not None:
-        assert hidden_states_fp4 is not None and hidden_states_sf is not None, (
-            "hidden_states_fp4 and hidden_states_sf must be passed together"
-        )
-        hidden_states = Fp4QuantizedTensor(
-            fp4_tensor=hidden_states_fp4,
-            scaling_factor=hidden_states_sf,
-            unquantized_hidden_states=hidden_states,
-        )
-    return forward_dsa_proj(mla_layer, position_ids, hidden_states, metadata)
+    # The op has no autograd kernel, so the body runs with grad mode as the caller
+    # set it. Run the nested projections and quantization below autograd, as they
+    # would be under custom_op (an out= call there fails when an input requires
+    # grad); the branch keeps no_grad off the inference-mode path.
+    args = (hidden_states, position_ids, layer_idx, hidden_states_fp4, hidden_states_sf)
+    if torch.is_grad_enabled():
+        with torch.no_grad():
+            return _mla_dsa_proj(*args)
+    return _mla_dsa_proj(*args)
 
 
 @mla_dsa_proj.register_fake
@@ -102,7 +121,7 @@ def _mla_dsa_proj_fake(
     return [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights, q_scale]
 
 
-@torch.library.custom_op("trtllm::mla_dsa_attn_inplace", mutates_args=("output",))
+@fast_custom_op("trtllm::mla_dsa_attn_inplace", mutates_args=("output",))
 def mla_dsa_attn_inplace(
     q: torch.Tensor,
     compressed_kv: torch.Tensor,
@@ -121,8 +140,12 @@ def mla_dsa_attn_inplace(
     ignores it. Runs sparse_attn_indexer then dispatches context/generation
     attention. This op is excluded from CUDA graph capture.
     """
+    # The op has no autograd kernel, so the body runs with grad mode as the caller
+    # set it. Run the nested indexer and attention calls below autograd, as they
+    # would be under custom_op (an out= call there fails when an input requires
+    # grad); the branch keeps no_grad off the inference-mode path.
     metadata, mla_layer = _extract_extra_attrs(layer_idx)
-    _forward_dsa_attn(
+    args = (
         mla_layer,
         q,
         compressed_kv,
@@ -133,6 +156,11 @@ def mla_dsa_attn_inplace(
         metadata,
         output,
     )
+    if torch.is_grad_enabled():
+        with torch.no_grad():
+            _forward_dsa_attn(*args)
+    else:
+        _forward_dsa_attn(*args)
 
 
 @mla_dsa_attn_inplace.register_fake
