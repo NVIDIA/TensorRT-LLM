@@ -2178,6 +2178,9 @@ def test_code_fingerprint_follows_kernel_objects_and_imports(
     (fp_modules.root / "fp_pkg").mkdir()
     fp_modules.write("fp_pkg/__init__", "")
     fp_modules.write("fp_pkg/mod", "def run():\n    return 0\n")
+    (fp_modules.root / "fp_pkg" / "sub").mkdir()
+    fp_modules.write("fp_pkg/sub/__init__", "")
+    fp_modules.write("fp_pkg/sub/deep", "def run():\n    return 0\n")
     runners = fp_modules.load(
         "fp_runners", """
         import lazypkg
@@ -2203,6 +2206,12 @@ def test_code_fingerprint_follows_kernel_objects_and_imports(
                 return mod.run()
 
 
+        class ImportsDeepAliasedModule(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import fp_pkg.sub.deep as deep
+                return deep.run()
+
+
         class UsesLazyPackage(Base):
             def forward(self, inputs, tactic=-1, **kwargs):
                 return lazypkg.backend.run()
@@ -2211,22 +2220,52 @@ def test_code_fingerprint_follows_kernel_objects_and_imports(
     monkeypatch.setattr(autotuner, "_package_versions",
                         lambda top: versions.get(top, ""))
     classes = (runners.UsesKernel, runners.ImportsInForward,
-               runners.ImportsAliasedModule, runners.UsesLazyPackage)
+               runners.ImportsAliasedModule, runners.ImportsDeepAliasedModule,
+               runners.UsesLazyPackage)
 
+    # Each change, and which of the runners above it must re-key.
+    def bump_side_effect_mod():
+        versions["side_effect_mod"] = "2.0"
+
+    changes = [
+        (lambda: fp_modules.edit("fp_kernels", "def helper():\n    return 0",
+                                 "def helper():\n    return 42"),
+         [1, 1, 0, 0, 0]),
+        (lambda: fp_modules.edit("fp_pkg/mod", "return 0", "return 42"),
+         [0, 0, 1, 0, 0]),
+        (lambda: fp_modules.edit("fp_pkg/sub/deep", "return 0", "return 42"),
+         [0, 0, 0, 1, 0]),
+        (bump_side_effect_mod, [0, 1, 0, 0, 0]),
+    ]
     before = fp_modules.fingerprints(*classes)
     assert "side_effect_mod" not in sys.modules
+    for change, expected in changes:
+        change()
+        after = fp_modules.fingerprints(*classes)
+        assert _changed(before, after) == [bool(e) for e in expected]
+        before = after
+    assert "side_effect_mod" not in sys.modules
     assert lazy.CALLS == []
-    fp_modules.edit("fp_kernels", "def helper():\n    return 0",
-                    "def helper():\n    return 42")
-    after_helper = fp_modules.fingerprints(*classes)
-    assert _changed(before, after_helper) == [True, True, False, False]
-    fp_modules.edit("fp_pkg/mod", "return 0", "return 42")
-    after_module = fp_modules.fingerprints(*classes)
-    assert _changed(after_helper, after_module) == [False, False, True, False]
-    versions["side_effect_mod"] = "2.0"
-    after_upgrade = fp_modules.fingerprints(*classes)
-    assert _changed(after_module, after_upgrade) == [False, True, False, False]
-    assert lazy.CALLS == []
+
+
+def test_code_fingerprint_survives_a_module_that_fails_to_import(fp_modules):
+    # A runner may import, in a branch it never takes here, a module that
+    # cannot load on this system; the key must still compute.
+    fp_modules.write("fp_broken", "raise ValueError('unsupported system')\n")
+    runners = fp_modules.load(
+        "fp_runners", """
+        from fp_base import Base
+
+
+        class ImportsBrokenModule(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                if tactic == 99:
+                    from fp_broken import kernel
+                    return kernel()
+                return inputs[0]
+        """)
+    [fingerprint] = fp_modules.fingerprints(runners.ImportsBrokenModule)
+    assert fp_modules.fingerprints(runners.ImportsBrokenModule) == [fingerprint]
 
 
 def test_code_fingerprint_follows_which_definition_a_name_binds(fp_modules):
@@ -2346,11 +2385,12 @@ def test_native_library_id_is_the_elf_build_id(tmp_path):
     assert autotuner._library_id(library) == build_id.hex()
 
     no_sections = bytearray(header)
-    struct.pack_into("<HH", no_sections, 0x3A, 0, 2)  # entry size 0
-    stripped = tmp_path / "libstripped.so"
-    stripped.write_bytes(bytes(no_sections))
-    assert autotuner._library_id(stripped) == hashlib.sha256(
-        bytes(no_sections)).hexdigest()
+    for entry_size, count in ((0, 2), (64, 0)):
+        struct.pack_into("<HH", no_sections, 0x3A, entry_size, count)
+        stripped = tmp_path / f"libstripped_{entry_size}_{count}.so"
+        stripped.write_bytes(bytes(no_sections))
+        assert autotuner._library_id(stripped) == hashlib.sha256(
+            bytes(no_sections)).hexdigest()
 
     other = tmp_path / "libother.so"
     other.write_bytes(b"not an ELF file")

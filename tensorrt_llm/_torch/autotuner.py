@@ -596,13 +596,14 @@ def _resolve_loads(names, globals_: Dict[str, Any]):
 
 
 def _load_module(name: str):
-    """Tracked module `name`, imported if it is not yet (code the runner runs
-    imports it anyway), or None if it cannot load."""
+    """Tracked module `name`, imported if it is not yet, or None if it cannot
+    load. The import may sit in a branch this process never runs (kernels for
+    another architecture), so its failure must not fail the cache lookup."""
     module = sys.modules.get(name)
     if module is None:
         try:
             module = importlib.import_module(name)
-        except (ImportError, OSError, RuntimeError):
+        except Exception:  # noqa: BLE001 - an import runs the module's code
             return None  # What cannot load is not run either.
     return module
 
