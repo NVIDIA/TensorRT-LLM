@@ -23,6 +23,7 @@ __all__ = [
     "CudaGraphPlan",
     "cuda_graph_capture",
     "cuda_graph_disabled",
+    "decode_tokens_per_forward",
     "filter_cuda_graph_batch_sizes",
     "filter_cuda_graph_num_tokens",
     "filter_cuda_graph_seq_lens",
@@ -62,6 +63,19 @@ def filter_cuda_graph_batch_sizes(
             result.append(max_cuda_graph_batch_size)
         break
     return result
+
+
+def decode_tokens_per_forward(
+    cuda_graph_batch_sizes: list[int],
+    max_batch_size: int,
+    max_num_tokens: int,
+    tokens_per_request: int,
+) -> list[int]:
+    """Tokens per forward of every decode batch size an engine runs: its CUDA graph batch sizes and
+    the largest batch the request and token budgets admit, which runs eagerly past the graphs."""
+    largest = min(max_batch_size, max_num_tokens // tokens_per_request)
+    sizes = {*cuda_graph_batch_sizes, largest}
+    return sorted(size * tokens_per_request for size in sizes if size > 0)
 
 
 def filter_cuda_graph_num_tokens(

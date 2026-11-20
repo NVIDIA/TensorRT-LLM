@@ -1467,7 +1467,7 @@ def dsv4_route_nvfp4_quant(
 
 
 def dsv4_route(
-    router_logits: torch.Tensor,
+    router_logits: Union[torch.Tensor, "RouterLogitPartials"],  # noqa: F821
     selection_bias: torch.Tensor,
     top_k: int,
     routed_scaling_factor: float,
@@ -1483,10 +1483,23 @@ def dsv4_route(
     ``weights_dtype``, for an input already quantized; ``with_routing_tables`` also returns
     ``run_moe``'s routing tables for ``routing_tiles`` (as ``dsv4_route_nvfp4_quant``, also for
     ``one_cluster``). It launches as a programmatic dependent of the router GEMM."""
-    if not isinstance(router_logits, torch.Tensor):
+    from tensorrt_llm._torch.custom_ops.router_logit_partials import RouterLogitPartials
+
+    logits, splits = router_logits, 1
+    if isinstance(router_logits, RouterLogitPartials):
+        logits, splits = router_logits.parts, router_logits.parts.shape[0]
+        if splits < 1:
+            raise ValueError("router logit partials need at least one split")
+        if logits.stride(1) != logits.shape[2]:
+            raise ValueError("router logit partials need each row contiguous over the experts")
+        if splits == 1:
+            logits = logits[0]
+    elif not isinstance(router_logits, torch.Tensor):
         raise TypeError("dsv4_route takes [tokens, experts] router logits")
-    num_tokens, num_experts = router_logits.shape
-    device = router_logits.device
+    elif logits.dim() != 2:
+        raise ValueError("dsv4_route takes [tokens, experts] router logits")
+    num_tokens, num_experts = logits.shape[-2:]
+    device = logits.device
     ids = torch.empty((num_tokens, top_k), dtype=torch.int32, device=device)
     weights = torch.empty((num_tokens, top_k), dtype=weights_dtype, device=device)
     local_start, num_local = _local_range(local_experts, num_experts)
@@ -1499,10 +1512,11 @@ def dsv4_route(
     routing_tiles = routing_tiles if with_routing_tables else ()
     if (
         one_cluster
+        and splits == 1
         and tables is not None
         and route_one.applies(num_tokens, num_experts, top_k, routing_tiles)
         and route_one.route_one(
-            router_logits,
+            logits,
             selection_bias,
             routed_scaling_factor,
             ids,
@@ -1525,12 +1539,13 @@ def dsv4_route(
             weights_dtype,
             routing_tiles,
             quant=False,
+            splits=splits,
             num_local=num_local,
             pdl=TRTLLM_ENABLE_PDL,
             cta_scoring=_cta_scoring(num_tokens, num_experts),
             dynamic_ep=tuple(dynamic_ep) if dynamic_ep else (0, 0),
         )(
-            router_logits,
+            logits,
             selection_bias,
             None,
             None,

@@ -44,6 +44,7 @@ from tensorrt_llm._torch.modeling_v2._router_index import (
     ANY_MOE_IMPL,
     ModelingV2Mode,
     NoTarget,
+    _check_eplb_mode,
     disable_v2_by_default,
     modeling_v2_resolve,
     registered_routes,
@@ -56,6 +57,7 @@ from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     DeepSeekSparseAttentionConfig,
     KvCacheConfig,
+    MoeAdaptiveLoadBalancerConfig,
     MoeLoadBalancerConfig,
     MoePerLayerDynamicLoadBalancerConfig,
     MoeWarmupPlacementConfig,
@@ -296,6 +298,8 @@ def _eplb_config(eplb_mode, num_slots=288):
     """A ``moe_config.load_balancer`` that runs ``eplb_mode``."""
     if eplb_mode == "per_layer_dynamic":
         return MoePerLayerDynamicLoadBalancerConfig(num_slots=num_slots)
+    if eplb_mode == "adaptive":
+        return MoeAdaptiveLoadBalancerConfig(num_slots=num_slots)
     updates = 2 if eplb_mode == "online" else 0
     return MoeLoadBalancerConfig(num_slots=num_slots, layer_updates_per_iter=updates)
 
@@ -332,6 +336,15 @@ def test_eplb_builds_a_target_for_the_modes_it_lists(monkeypatch, eplb_mode):
     config = _balanced(_claimed_by(monkeypatch, _TargetWithStaticEplb, **_DEP4), eplb_mode)
     expected = _TargetWithStaticEplb if eplb_mode == "static" else None
     assert modeling_v2_resolve(config, _llm_args("auto")) is expected
+
+
+def test_adaptive_eplb_is_a_mode_of_its_own(monkeypatch):
+    """An adaptive balancer reports its own mode, so a target that lists only static EPLB is refused."""
+    _balance_the_claimed_arch(monkeypatch)
+    config = _balanced(_claimed_by(monkeypatch, _TargetWithStaticEplb, **_DEP4), "adaptive")
+    assert moe_load_balancer.moe_load_balancer_mode(config, config.mapping) == "adaptive"
+    with pytest.raises(NoTarget, match="adaptive EPLB .* implements static"):
+        _check_eplb_mode(_TargetWithStaticEplb, config)
 
 
 @pytest.mark.parametrize(

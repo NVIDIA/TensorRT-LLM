@@ -25,8 +25,9 @@ divide T, else the leading T / P * R. The MegaMoE CuteDSL route staging
 rows' routes as expert -1 with weight 0, for kernels whose top-k reduce masks such
 routes (``masks_invalid_combine_slots``): the routed experts neither route nor compute
 those rows, and a shared expert fused into the kernel (``megamoe_fuse_shared_expert``)
-reads the same word and skips them too, so their output is zero. EPLB statistics still
-count the dropped rows.
+reads the same word and skips them too, so their output is zero. Standard EPLB statistics still
+count the dropped rows; adaptive EPLB's route op
+stages under the word handed out with the bucket's staging and does not count them.
 
 That rule holds for a launch over all rows of the forward. A MoE layer that splits a
 forward into chunks launches over parts of it, so those launches read a word that keeps

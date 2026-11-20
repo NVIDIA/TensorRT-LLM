@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
@@ -130,6 +131,11 @@ def _record_backend_slots(moe: "ConfigurableMoE", expert_ids: torch.Tensor) -> t
     return expert_ids if recorded is slots else moe.backend.experts_of_slots(recorded)
 
 
+def _routes_recorded() -> bool:
+    """Whether ``_record_routes`` reads or replaces the slots (expert statistics, the calibrator)."""
+    return ExpertStatistic.get() is not None or get_calibrator().mode.name != "NONE"
+
+
 def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
     """Join a pending ``input_ready_event`` before the first read of ``x``.
 
@@ -182,24 +188,99 @@ class MoEScheduler(ABC):
     def __init__(self, moe: "ConfigurableMoE") -> None:
         self.moe = moe
 
+    def _route_quant_eligible(
+        self, routing_aux: Optional[torch.Tensor], *, staged_routes: bool = False
+    ) -> bool:
+        moe = self.moe
+        return (
+            routing_aux is None
+            and not moe.apply_router_weight_on_input
+            and not moe._using_dynamic_load_balancer()
+            and bool(getattr(moe.layer_load_balancer, "stages_routes", False)) == staged_routes
+            and moe.backend.fused_route_quant_enabled
+            and not moe._load_balancer_uses_replica_plan()
+        )
+
+    def _partials_route(
+        self, routing_aux: Optional[torch.Tensor]
+    ) -> Optional[Callable[[RouterLogitPartials], Tuple[torch.Tensor, torch.Tensor]]]:
+        """A route-only consumer leaves adaptive mapping, quantization and statistics deferred."""
+        if self._route_quant_eligible(routing_aux, staged_routes=True):
+            if self.moe.backend.takes_router_logit_partials():
+                route = getattr(self.moe.backend, "route_from_logit_partials", None)
+                return route if callable(route) else None
+        return None
+
+    def _route_only(
+        self,
+        router_logits: Union[torch.Tensor, RouterLogitPartials],
+        routing_aux: Optional[torch.Tensor],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """The routes of the backend's route-only launch, or None to route with ``routing_method.apply``.
+
+        Partial logits have no other consumer. Whole logits (the small-batch router GEMM's) take the
+        same launch wherever partials would, as the FP32 rows ``apply`` reads: it returns ``apply``'s
+        experts and weights bit for bit, in place of the separate ``gate_forward`` kernel.
+        """
+        route = self._partials_route(routing_aux)
+        if isinstance(router_logits, RouterLogitPartials):
+            if route is None:
+                raise RuntimeError(
+                    "router logit partials reached a routing path that does not sum them"
+                )
+            return route(router_logits)
+        if route is None:
+            return None
+        return route(router_logits.to(torch.float32).contiguous())
+
+    def _router_route(self, x, routing_aux, route_counters, first: bool) -> Optional[tuple]:
+        """An adaptive balancer's route for a backend whose dispatch router maps and counts the
+        routes (``routes_adaptive_in_router``), so the routing keeps the model's own one-launch
+        route and quantization, or None to route as before: a routing aux, a router weight on the
+        input, a dynamic balancer or replica plan, a quantized input, warmup counters, a recorder of
+        the slots, or a launch bucket the router does not take need the separate launches."""
+        moe = self.moe
+        balancer = moe.layer_load_balancer
+        router_route = getattr(balancer, "router_route", None)
+        takes = getattr(moe.backend, "routes_adaptive_in_router", None)
+        if (
+            router_route is None
+            or takes is None
+            or routing_aux is not None
+            or moe.apply_router_weight_on_input
+            or moe._using_dynamic_load_balancer()
+            or moe._load_balancer_uses_replica_plan()
+            or not moe.backend.fused_route_quant_enabled
+            or isinstance(x, Fp4QuantizedTensor)
+            or route_counters is not None
+            or _routes_recorded()
+            or not takes(x.shape[0])
+        ):
+            return None
+        return router_route(first)
+
     def _try_fused_route_quant(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         routing_aux: Optional[torch.Tensor],
         route_counters=None,
+        first: bool = True,
+        adaptive: bool = False,
     ) -> Optional[MoEFusedRouteQuant]:
         """The backend's one-launch routing and input quantization (only the routing for an input
         that arrives quantized), unless a routing aux, a router weight on the input, a dynamic
         balancer or a cleared ``fused_route_quant_enabled`` needs the separate launches. A backend
-        that ``counts_routes`` also adds the picks to the warmup placement's ``route_counters``."""
+        that ``counts_routes`` also adds the picks to the warmup placement's ``route_counters``.
+        With ``adaptive`` (a caller that handles ``routes_mapped``), an adaptive balancer's layer
+        keeps the same launch where the backend's dispatch router maps and counts its routes."""
         moe = self.moe
-        if (
-            routing_aux is not None
-            or moe.apply_router_weight_on_input
-            or moe._using_dynamic_load_balancer()
-            or not moe.backend.fused_route_quant_enabled
-        ):
+        router_route = (
+            self._router_route(x, routing_aux, route_counters, first) if adaptive else None
+        )
+        if router_route is not None:
+            return moe.backend.try_fused_route_quant(x, router_logits, adaptive_route=router_route)
+        if not self._route_quant_eligible(routing_aux):
             return None
         if isinstance(x, Fp4QuantizedTensor):
             if route_counters is not None:
@@ -1429,18 +1510,12 @@ class FusedCommMoEScheduler(MoEScheduler):
     """
 
     def routes_from_logit_partials(self, routing_aux: Optional[torch.Tensor]) -> bool:
-        """The fused launch routes this forward whenever ``_try_fused_route_quant`` admits it: no
-        routing aux, router weight on the input, dynamic balancer or per-layer dynamic replica
-        plan, and a backend that fuses."""
+        """Accept partials only for a matching fused or adaptive route-only consumer; routing aux,
+        input weighting, host migration and replica plans need full logits."""
         moe = self.moe
         return (
-            routing_aux is None
-            and not moe.apply_router_weight_on_input
-            and not moe._using_dynamic_load_balancer()
-            and not moe._load_balancer_uses_replica_plan()
-            and moe.backend.fused_route_quant_enabled
-            and moe.backend.takes_router_logit_partials()
-        )
+            self._route_quant_eligible(routing_aux) and moe.backend.takes_router_logit_partials()
+        ) or self._partials_route(routing_aux) is not None
 
     def forward(
         self,
@@ -1826,22 +1901,21 @@ class FusedCommMoEScheduler(MoEScheduler):
                 router_logits_chunk_real,
                 routing_aux,
                 moe._warmup_placement_route_counters(row_offset),
+                first=is_first_call,
+                adaptive=True,
             )
             if num_tokens > 0 and not uses_replica_plan
             else None
         )
-        if (
-            num_tokens > 0
-            and fused_result is None
-            and isinstance(router_logits_chunk_real, RouterLogitPartials)
-        ):
-            raise RuntimeError(
-                "router logit partials reached a routing path that does not sum them"
-            )
+        partial_routes = None
+        if num_tokens > 0 and fused_result is None:
+            partial_routes = self._route_only(router_logits_chunk_real, routing_aux)
         if num_tokens > 0:
             if fused_result is not None:
                 token_selected_experts = fused_result.token_selected_experts
                 token_final_scales = fused_result.token_final_scales
+            elif partial_routes is not None:
+                token_selected_experts, token_final_scales = partial_routes
             elif routing_aux is None:
                 token_selected_experts, token_final_scales = moe.routing_method.apply(
                     router_logits_chunk_real, input_ids_chunk_real
@@ -1883,6 +1957,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         # drives both arms.
         statistic_allreduce_pending = False
         fused_prepare = getattr(moe.backend, "supports_fused_prepare", lambda: False)()
+        deferred_route = None
         if uses_replica_plan:
             token_selected_experts = _record_routes(moe, token_selected_experts, moe.num_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
@@ -1894,7 +1969,11 @@ class FusedCommMoEScheduler(MoEScheduler):
                         token_selected_experts, router_logits_chunk_real, row_offset
                     )
             maps_expert_slots = getattr(moe.backend, "maps_expert_slots", False)
-            if moe.layer_load_balancer and not maps_expert_slots:
+            if fused_result is not None and fused_result.routes_mapped:
+                # The dispatch router maps the bucket's expert ids to slots and counts them.
+                moe._load_balancer_done_wait_gpu_stage(is_first_call)
+                token_selected_slots = token_selected_experts
+            elif moe.layer_load_balancer and not maps_expert_slots:
                 statistic_allreduce_pending = True
                 moe._load_balancer_done_wait_gpu_stage(is_first_call)
                 # ignore_allreduce=False: the fused kernel has no side channel
@@ -1908,8 +1987,25 @@ class FusedCommMoEScheduler(MoEScheduler):
                     is_last_call,
                     ignore_allreduce=False,
                 )
-                token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
-                token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
+                if (
+                    fused_prepare
+                    and fused_result is None
+                    and moe.layer_load_balancer.stages_routes
+                    and not _routes_recorded()
+                ):
+                    # run_moe launches the route with its input staging; nothing reads the slots before.
+                    deferred_route = functools.partial(
+                        moe._load_balancer_route,
+                        token_selected_experts,
+                        moe.use_dp,
+                        token_final_scales=token_final_scales,
+                    )
+                    token_selected_slots = token_selected_experts
+                else:
+                    token_selected_slots = moe._load_balancer_route(
+                        token_selected_experts, moe.use_dp, token_final_scales=token_final_scales
+                    )
+                    token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
             elif maps_expert_slots:
                 # A static placement the backend applies itself (into the launch bucket when the
                 # routing launch wrote it): it takes expert IDs, recorded as the slots they go to.
@@ -1966,6 +2062,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 output_dtype=output_dtype,
                 replica_plan=replica_plan,
                 before_launch=before_launch,
+                route=deferred_route,
             )
         )
 
