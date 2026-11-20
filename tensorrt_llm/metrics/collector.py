@@ -509,7 +509,7 @@ class MetricsCollector:
         self.counter_spec_decode_num_drafts = Counter(
             name=self.metric_prefix + "spec_decode_num_drafts_total",
             documentation=
-            ("Total request verification rounds with draft tokens reported by rank 0. "
+            ("Total request verification rounds with draft tokens. "
              "Use with spec_decode_num_accepted_tokens_total to compute "
              "mean acceptance length: 1 + accepted / rounds."),
             labelnames=self.labels.keys())
