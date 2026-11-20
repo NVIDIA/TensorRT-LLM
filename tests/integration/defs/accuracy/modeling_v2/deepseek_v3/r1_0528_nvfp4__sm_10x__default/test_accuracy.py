@@ -31,7 +31,12 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import (
+    AutoTunerNvMMHConfig,
+    CudaGraphConfig,
+    KvCacheConfig,
+    MTPDecodingConfig,
+)
 
 from .....conftest import llm_models_root
 from ....accuracy_core import (
@@ -256,6 +261,9 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 cuda_graph_config=CudaGraphConfig(),
                 enable_iter_perf_stats=True,
                 modeling_v2=mode,
+                # The modeling_v2 target's nvfp4_gemm excludes cutedsl, so it never reaches
+                # the CuTe DSL dense runners; only the stock leg sweeps them.
+                autotuner_nvmmh_config=AutoTunerNvMMHConfig() if mode == "off" else None,
                 env_overrides=rank_env,
                 **parallel,
             ) as llm,

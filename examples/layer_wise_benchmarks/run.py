@@ -12,7 +12,7 @@ import nvtx
 import torch
 import yaml
 
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, NvMMHConfig, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.nccl_window_graph import (
     nccl_window_graph_capture,
@@ -105,6 +105,12 @@ group = parser.add_mutually_exclusive_group()
 group.add_argument("--enable-autotuner", action="store_true", dest="enable_autotuner")
 group.add_argument("--no-enable-autotuner", action="store_false", dest="enable_autotuner")
 parser.set_defaults(enable_autotuner=None)
+parser.add_argument(
+    "--enable-autotuner-nvmmh",
+    action="store_true",
+    dest="enable_autotuner_nvmmh",
+    help="Use nvMatmulHeuristics to prune CuTe DSL GEMM/BMM tactics (requires autotuner enabled)",
+)
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--use-cuda-graph", action="store_true", dest="use_cuda_graph")
 group.add_argument("--no-use-cuda-graph", action="store_false", dest="use_cuda_graph")
@@ -183,6 +189,8 @@ if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:
     args.enable_autotuner = True
+if args.enable_autotuner_nvmmh and not args.enable_autotuner:
+    parser.error("--enable-autotuner-nvmmh requires autotuner to be enabled")
 if args.use_cuda_graph is None:
     args.use_cuda_graph = False
 if (args.replay_start_iter is None) != (args.replay_stop_iter is None):
@@ -352,6 +360,8 @@ run_pack = runner.create_run_pack(
 )
 if args.enable_autotuner:
     cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
+    AutoTuner.get().nvmmh_config = NvMMHConfig() if args.enable_autotuner_nvmmh else None
+    logger.info(f"Layer-wise benchmarks: Autotuner nvmmh_config={AutoTuner.get().nvmmh_config}")
     AutoTuner.get().setup_distributed_state(mapping)
     with autotune(cache_path=cache_path):
         run_pack()
