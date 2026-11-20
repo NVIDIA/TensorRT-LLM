@@ -17,11 +17,15 @@ Extracted from ``router.py`` so the surface routers there can share a single
 implementation of block hashing without importing the whole router module.
 """
 
+import base64
 import os
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterable, Optional, Union
+
+import numpy as np
 
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
@@ -185,13 +189,16 @@ class BlockHashMixin:
         model_path: Optional[str] = None,
         enable_tokenization_cache: bool = False,
         checkpoint_format: Optional[str] = None,
+        revision: Optional[str] = None,
     ) -> None:
         """Set up tokenization for block hashing.
 
         ``checkpoint_format`` is the servers' checkpoint format. For a Mistral-native one
         (``mistral``, ``mistral_large_3``) the router loads the tokenizer and the rendering
         resources from the checkpoint as the servers do (``RenderResources.load``); for any
-        other it loads the Hugging Face tokenizer.
+        other it loads the Hugging Face tokenizer. ``revision`` is the servers' model
+        revision, at which the router reads a Mistral-native checkpoint given as a Hugging
+        Face Hub ID.
         """
         env_tokens_per_block = os.environ.get("TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
@@ -205,6 +212,7 @@ class BlockHashMixin:
         self._model_path = model_path
         self._use_harmony = use_harmony
         self._checkpoint_format = checkpoint_format
+        self._revision = revision
         self._tok_prefix_cache: OrderedDict = OrderedDict()
         self._enable_tokenization_cache = enable_tokenization_cache
         # id(tokenizer) -> (tokenizer, its prefix token cache or None)
@@ -215,6 +223,7 @@ class BlockHashMixin:
             f", custom_tokenizer={self._custom_tokenizer}"
             f", model_path={self._model_path}"
             f", checkpoint_format={self._checkpoint_format}"
+            f", revision={self._revision}"
             f", use_harmony={self._use_harmony}"
             f", enable_tokenization_cache={self._enable_tokenization_cache}"
         )
@@ -367,6 +376,27 @@ class BlockHashMixin:
             return self._model_path or self._tokenizer_dir or model
         return model
 
+    def _mistral_native_checkpoint_dir(self, key: str) -> str:
+        """The local directory of the Mistral-native checkpoint ``key`` names.
+
+        A server given a Hugging Face Hub ID reads the snapshot of that repo at its revision,
+        and the native configuration loader reads only local directories. The router reads
+        the same snapshot's rendering files: the configuration (``params.json``) and the
+        mistral-common tokenizer file (``tekken.json`` or a SentencePiece ``*.model*``), not
+        the weights. A model name a client sends is not resolved.
+        """
+        if Path(key).is_dir() or key not in (self._model_path, self._tokenizer_dir):
+            return key
+        from tensorrt_llm.llmapi.utils import download_hf_partial
+
+        return str(
+            download_hf_partial(
+                key,
+                allow_patterns=["params.json", "tekken.json", "*.model*"],
+                revision=self._revision,
+            )
+        )
+
     def _render_resources(self, model: str) -> RenderResources:
         """Rendering resources of this router for ``model``, built once."""
         cache = self.__dict__.setdefault("_render_resources_cache", {})
@@ -376,7 +406,7 @@ class BlockHashMixin:
             # What a server of this checkpoint loads: the tokenizer and input processor of
             # the checkpoint format, and the model type from its native configuration.
             resources = cache[key] = RenderResources.load(
-                key,
+                self._mistral_native_checkpoint_dir(key),
                 tokenizer=self._tokenizer_dir,
                 trust_remote_code=self._tokenizer_dir is not None,
                 custom_tokenizer=self._custom_tokenizer,
@@ -477,6 +507,13 @@ class BlockHashMixin:
         """Render a chat request with the shared core and decide on write-back."""
         if request.prompt_token_ids is not None:
             return list(request.prompt_token_ids)
+        if request.prompt_token_ids_b64:
+            # The context worker's ids, which the orchestrator relays to the generation worker
+            # with gen_tokids_ctxbytes. That worker serves them instead of the messages, which
+            # gen_strip_message_history cuts to the last one, so they are not rendered here.
+            return np.frombuffer(
+                base64.b64decode(request.prompt_token_ids_b64), dtype=np.int32
+            ).tolist()
         # Outside the fallbacks below: resources that cannot be loaded are a configuration
         # error, not a request the router cannot render.
         resources = self._render_resources(request.model)

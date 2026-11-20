@@ -362,26 +362,33 @@ def test_extract_router_config_propagates_kv_model_path() -> None:
     assert router_config.args["model_path"] == "/models/gpt-oss-checkpoint"
 
 
-def test_extract_router_config_propagates_kv_checkpoint_format() -> None:
+@pytest.mark.parametrize("router_type", ["kv_cache_aware", "KV_CACHE_AWARE"])
+@pytest.mark.parametrize("revision_key", ["revision", "hf_revision"])
+def test_extract_router_config_propagates_kv_checkpoint(router_type,
+                                                        revision_key) -> None:
+    """A cache-aware router, however its type is spelled, reads the servers' checkpoint."""
     cfg = {
-        "model": "/models/mistral-native",
+        "model": "mistralai/Mistral-Native",
+        revision_key: "0123abcd",
         "checkpoint_format": "mistral",
         "router": {
-            "type": "kv_cache_aware"
+            "type": router_type
         },
     }
-    assert extract_router_config(cfg).args["checkpoint_format"] == "mistral"
+    router_config = extract_router_config(cfg)
+    assert router_config.type == "kv_cache_aware"
+    assert router_config.args == {
+        "model_path": "mistralai/Mistral-Native",
+        "revision": "0123abcd",
+        "checkpoint_format": "mistral",
+    }
 
     # An explicit router value wins; other router types do not tokenize.
-    cfg["router"] = {"type": "kv_cache_aware", "checkpoint_format": "HF"}
+    cfg["router"] = {"type": router_type, "checkpoint_format": "HF"}
     assert extract_router_config(cfg).args["checkpoint_format"] == "HF"
     cfg["router"] = {"type": "load_balancing"}
-    assert "checkpoint_format" not in extract_router_config(cfg).args
-    assert "checkpoint_format" not in extract_router_config({
-        "router": {
-            "type": "kv_cache_aware"
-        }
-    }).args
+    assert extract_router_config(cfg).args == {}
+    assert extract_router_config({"router": {"type": router_type}}).args == {}
 
 
 def test_extract_disagg_cfg_gives_the_top_level_checkpoint_format_to_kv_routers(

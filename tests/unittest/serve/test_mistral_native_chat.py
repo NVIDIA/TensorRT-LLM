@@ -482,12 +482,12 @@ def test_kv_cache_truncation_renders_the_chat_routes_prefix(tokenizer):
     It applies the request's reasoning effort as the chat route does.
     """
     from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
-    from tensorrt_llm.serve.resource_governor import _chat_template_kwargs
+    from tensorrt_llm.serve.resource_governor import _chat_route_request
 
     effort = "high"
     assert effort in _declared_efforts(tokenizer)
     request = KVCacheTruncateRequest(model="m", messages=_HI, reasoning_effort=effort)
-    kwargs = _chat_template_kwargs(request, get_serving_extension(_MODEL_TYPE))
+    kwargs = _chat_route_request(request, get_serving_extension(_MODEL_TYPE)).chat_template_kwargs
     assert kwargs == {"reasoning_effort": effort}
     truncated = _server_ids(tokenizer, messages=_HI, chat_template_kwargs=kwargs)
     assert truncated == _server_ids(tokenizer, messages=_HI, reasoning_effort=effort)

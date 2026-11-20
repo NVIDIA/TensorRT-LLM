@@ -80,6 +80,45 @@ class TestResourceGovernor:
         assert expected.text.startswith("SERVER:")
         assert ids == expected.token_ids
 
+    @pytest.mark.asyncio
+    async def test_a_derived_kwarg_the_template_does_not_read_is_dropped(self, tokenizer) -> None:
+        """A message-based truncation renders a request-level field as the chat route does.
+
+        Muse Spark's extension turns ``reasoning_effort`` into a chat-template kwarg it lists
+        as injected, so a server template that does not read the kwarg renders without it.
+        """
+        from queue import Queue
+
+        from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
+        from tensorrt_llm.serve.resource_governor import ResourceGovernor
+
+        model_type = "muse_spark"
+        messages = [{"role": "user", "content": "hello world"}]
+        queue = Queue()
+        governor = ResourceGovernor(
+            queue,
+            tokenizer,
+            SimpleNamespace(model_type=model_type),
+            chat_template=SERVER_TEMPLATE,
+        )
+
+        response = await governor._truncate_kv_cache(
+            KVCacheTruncateRequest(model="m", messages=messages, reasoning_effort="high")
+        )
+
+        assert response.status_code == 200, response.body
+        expected = render_chat(
+            chat_request(messages=messages, reasoning_effort="high"),
+            RenderResources.from_parts(
+                tokenizer=tokenizer,
+                model_type=model_type,
+                hf_config=None,
+                default_chat_template=SERVER_TEMPLATE,
+            ),
+            tokenize=True,
+        )
+        assert queue.get_nowait().messages == expected.token_ids
+
 
 class _Router:
     """A KV-aware router whose tokenizer is the test tokenizer."""

@@ -19,7 +19,9 @@ input processor and model configuration from the checkpoint's native files and r
 with mistral-common. The router loads the same resources, so a completion or chat encodes to
 the ids the server would build, and the server takes the router's chat ids when their
 rendering fingerprints agree. A chat the router cannot render routes on no ids instead of
-failing. Other checkpoint formats keep the Hugging Face tokenizer path.
+failing, and a generation router hashes the ids relayed from the context worker. A model
+given as a Hugging Face Hub ID is read from its snapshot in the cache. Other checkpoint formats
+keep the Hugging Face tokenizer path.
 
 The router reads Mistral-Small-4's ``params.json`` and ``tekken.json`` alone (a directory
 without ``config.json``) from LLM_MODELS_ROOT; a server of Mistral-Large-3 stands for one
@@ -31,6 +33,7 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from PIL import Image
 from utils.llm_data import llm_models_root
@@ -38,12 +41,18 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm.inputs import prompt_inputs
-from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig, ServerRole
 from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatMessage,
     CompletionRequest,
+    DisaggregatedParams,
     ResponsesRequest,
+    UsageInfo,
 )
 from tensorrt_llm.serve.render import render_chat
 from tensorrt_llm.serve.render.resources import RenderResources
@@ -182,6 +191,79 @@ def test_a_truncated_chat_forwards_its_last_ids(router, same_server):
     request = ChatCompletionRequest(model="m", messages=_MESSAGES, truncate_prompt_tokens=2)
     assert router._routing_key_sync(request)["num_tokens"] == 2
     assert request.prompt_token_ids == expected[-2:]
+
+
+def test_a_generation_router_leaves_the_relayed_context_ids_to_the_worker(router, same_server):
+    """The generation worker gets the ids the context worker prefilled.
+
+    With gen_tokids_ctxbytes and gen_strip_message_history the orchestrator relays the context
+    worker's ids in base64 and keeps only the last message. The router hashes the relayed ids
+    and does not replace them with ids rendered from that message.
+    """
+    messages = [
+        *_MESSAGES,
+        {"role": "assistant", "content": "Hello."},
+        {"role": "user", "content": "And now?"},
+    ]
+    context_ids = _servers_chat_ids(router, messages)
+    service = OpenAIDisaggregatedService(
+        DisaggServerConfig(
+            server_configs=[], gen_strip_message_history=True, gen_tokids_ctxbytes=True
+        ),
+        SimpleNamespace(ctx_router=None, gen_router=router),
+        client_factory=lambda *args, **kwargs: None,
+    )
+    context_response = ChatCompletionResponse(
+        model="m",
+        usage=UsageInfo(prompt_tokens=len(context_ids), completion_tokens=1),
+        prompt_token_ids_b64=base64.b64encode(np.asarray(context_ids, np.int32).tobytes()).decode(),
+        choices=[
+            ChatCompletionResponseChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=""),
+                finish_reason="length",
+                disaggregated_params=DisaggregatedParams(
+                    request_type="context_only", ctx_request_id=1, disagg_request_id=1
+                ),
+            )
+        ],
+    )
+    request = service._get_gen_request(
+        ChatCompletionRequest(model="m", messages=messages), context_response, 1
+    )
+    assert len(request.messages) == 1
+    assert router._routing_key_sync(request)["num_tokens"] == len(context_ids)
+    # The worker decodes the relayed ids only when the request carries no plain ids.
+    assert request.prompt_token_ids is None
+    relayed = np.frombuffer(base64.b64decode(request.prompt_token_ids_b64), np.int32)
+    assert relayed.tolist() == context_ids
+
+
+def test_a_hub_model_is_read_from_its_snapshot_at_the_servers_revision(
+    checkpoint, router, tmp_path, monkeypatch
+):
+    """Given a Hub ID, the router reads the snapshot a server loads, at the server's revision."""
+    import huggingface_hub
+
+    model_dir, checkpoint_format = checkpoint
+    repo, revision = "mistralai/Tekken-Only", "1" * 40
+    repo_cache = tmp_path / "models--mistralai--Tekken-Only"
+    snapshot = repo_cache / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    for name in ("params.json", "tekken.json"):
+        (snapshot / name).symlink_to(Path(model_dir) / name)
+    # The default branch points at a revision the cache does not hold.
+    (repo_cache / "refs").mkdir()
+    (repo_cache / "refs" / "main").write_text("2" * 40)
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+
+    hub = _router(model_path=repo, revision=revision, checkpoint_format=checkpoint_format)
+    local = router._render_resources("m")
+    assert hub._render_resources("m").fingerprint()["digest"] == local.fingerprint()["digest"]
+    assert hub._tokenize(CompletionRequest(model="m", prompt=_PROMPT)) == router._tokenize(
+        CompletionRequest(model="m", prompt=_PROMPT)
+    )
 
 
 def test_chat_ids_are_not_forwarded_to_a_server_that_renders_differently(router):

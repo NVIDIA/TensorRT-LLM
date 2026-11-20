@@ -42,12 +42,13 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.render import RenderResources, render_conversation_with_media
 
 
-def _chat_template_kwargs(request: KVCacheTruncateRequest, extension: Any) -> Dict[str, Any]:
-    """The chat-template kwargs the chat route renders ``request``'s messages with.
+def _chat_route_request(request: KVCacheTruncateRequest, extension: Any) -> ChatCompletionRequest:
+    """The chat request the chat route renders ``request``'s messages from.
 
-    The chat route lets the model's serving extension derive kwargs from request-level
-    fields (a Mistral-native checkpoint's reasoning effort, for one); the cache to truncate
-    holds the prompt rendered with them.
+    The model's serving extension derives chat-template kwargs from request-level fields (a
+    Mistral-native checkpoint's reasoning effort, for one) and lists them in
+    ``injected_chat_template_kwargs``, so a template that does not read one drops it instead
+    of rejecting the request. The cache to truncate holds the prompt rendered with both.
     """
     fields: Dict[str, Any] = {
         "model": request.model,
@@ -59,7 +60,7 @@ def _chat_template_kwargs(request: KVCacheTruncateRequest, extension: Any) -> Di
         fields["reasoning_effort"] = request.reasoning_effort
     chat_request = ChatCompletionRequest(**fields)
     extension.apply_chat_extensions(chat_request)
-    return chat_request.chat_template_kwargs or {}
+    return chat_request
 
 
 class ResourceGovernor:
@@ -158,6 +159,7 @@ class ResourceGovernor:
         documents,
         chat_template,
         chat_template_kwargs,
+        injected_chat_template_kwargs=None,
     ) -> List[int]:
         """Convert chat messages to token IDs via chat template + tokenization."""
         conversation: List[ConversationMessage] = []
@@ -174,6 +176,7 @@ class ResourceGovernor:
             documents=documents,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
+            injected_chat_template_kwargs=injected_chat_template_kwargs,
             tokenize=True,
         )
         return rendered.token_ids
@@ -187,7 +190,7 @@ class ResourceGovernor:
                 if request.tools is None
                 else [extension.serialize_tool(tool) for tool in request.tools]
             )
-            chat_template_kwargs = _chat_template_kwargs(request, extension)
+            chat_request = _chat_route_request(request, extension)
 
             messages_to_retain = (
                 await self._convert_messages(
@@ -196,7 +199,8 @@ class ResourceGovernor:
                     request.add_generation_prompt,
                     request.documents,
                     request.chat_template,
-                    chat_template_kwargs,
+                    chat_request.chat_template_kwargs or {},
+                    chat_request.injected_chat_template_kwargs,
                 )
                 if request.messages_to_retain
                 else []
@@ -209,7 +213,8 @@ class ResourceGovernor:
                     request.add_generation_prompt,
                     request.documents,
                     request.chat_template,
-                    chat_template_kwargs,
+                    chat_request.chat_template_kwargs or {},
+                    chat_request.injected_chat_template_kwargs,
                 )
                 if request.messages
                 else []
