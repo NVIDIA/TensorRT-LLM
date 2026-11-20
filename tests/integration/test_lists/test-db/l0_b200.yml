@@ -65,6 +65,7 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3.py::test_packaged_nvfp4_experts_load_and_run_on_cutlass
   - unittest/_torch/models/test_minimax_m3.py::test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
+  - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_hybrid_receive_counts_attention_and_recurrent_bytes
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_bf16_dflash

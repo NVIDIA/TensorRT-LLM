@@ -30,11 +30,12 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
+    CppMambaHybridCacheManager, MambaHybridCacheManagerV2,
+    MixedMambaHybridCacheManager)
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -338,6 +339,94 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
     finally:
         shutdown_transceivers(kv_cache_transceiver_gen,
                               kv_cache_transceiver_ctx)
+
+
+@pytest.mark.timeout(40)
+def test_cpp_nixl_hybrid_receive_counts_attention_and_recurrent_bytes():
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+
+    def manager():
+        return CppMambaHybridCacheManager(
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_num_heads=4,
+            mamba_n_groups=1,
+            mamba_head_dim=8,
+            mamba_num_layers=1,
+            mamba_layer_mask=[True, False],
+            mamba_cache_dtype=torch.float16,
+            mamba_ssm_cache_dtype=torch.float16,
+            kv_cache_config=KvCacheConfig(max_tokens=512,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=4,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=128,
+            max_batch_size=1,
+            mapping=mapping,
+            dtype=DataType.HALF,
+            layer_mask=[False, True],
+        )
+
+    context, generation = manager(), manager()
+    config = CacheTransceiverConfig(backend="NIXL",
+                                    transceiver_runtime="CPP",
+                                    max_tokens_in_buffer=128)
+    sampling_config = tensorrt_llm.bindings.SamplingConfig(
+        SamplingParams()._get_sampling_config())
+
+    def request(cache, direction, context_phase_params=None):
+        req = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=list(range(32)),
+            sampling_config=sampling_config,
+            is_streaming=False,
+            llm_request_type=direction,
+            context_phase_params=context_phase_params,
+        )
+        cache.impl.add_sequence_batch([(req.py_request_id, req.prompt_len, 1)],
+                                      [req])
+        return req
+
+    sender = create_kv_cache_transceiver(mapping, dist, context,
+                                         AttentionTypeCpp.DEFAULT, config,
+                                         context)
+    receiver = None
+    try:
+        receiver = create_kv_cache_transceiver(mapping, dist, generation,
+                                               AttentionTypeCpp.DEFAULT, config,
+                                               generation)
+        ctx = request(context, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+        ctx_attention = context.get_buffers(1)
+        gen_attention = generation.get_buffers(1)
+        ctx_attention.fill_(2)
+        gen_attention.zero_()
+        context.all_ssm_states.fill_(3)
+        context.all_conv_states.fill_(4)
+        torch.cuda.synchronize()
+        sender.respond_and_send_async(ctx)
+        gen = request(generation,
+                      LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+                      ctx.context_phase_params)
+        receiver.request_and_receive_sync(gen)
+        assert gen.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        assert (gen_attention == 2).any().item()
+        assert (generation.all_ssm_states == 3).any().item()
+        assert (generation.all_conv_states == 4).any().item()
+        attention_bytes = ctx_attention[0].numel() * ctx_attention.element_size(
+        )
+        recurrent_bytes = context.ssm_bytes + context.conv_bytes
+        assert gen.kv_cache_transfer_local_size == attention_bytes + recurrent_bytes
+        assert not sender.check_context_transfer_status(1).error_request_ids
+    finally:
+        if receiver is not None:
+            receiver.shutdown()
+        sender.shutdown()
 
 
 def _run_cpp_nixl_sync_transfer_stress():
