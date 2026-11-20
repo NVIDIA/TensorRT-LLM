@@ -71,11 +71,8 @@ before they are classified.
 | `ReturnRoutedExperts` | `enable_return_routed_experts` | to verify | |
 | `DisaggregatedServing` | `cache_transceiver_config` | to verify | KV transfer planners already declare the deployments they serve (`supports_deployment`) |
 | `KvConnector` | `kv_connector_config` | to verify | |
-| `KvCacheCompression` | `kv_cache_compression_config` | to verify | |
 | `GuidedDecoding` | `guided_decoding_backend` | planned | GLM-5.3-Flash mtp_fused refuses it in `route`. |
-| `ReturnLogits` | `gather_generation_logits` | planned | GLM-5.3-Flash mtp_fused drops `return_context_logits`. |
-| `LogitsPostProcessor` | `batched_logits_processor` | to verify | Sampler side; check the targets that fuse sampling into a draft loop. |
-| `TextWatermarking` | `watermark_config` | to verify | As above. |
+| `ReturnGenerationLogits` | `gather_generation_logits` | planned | |
 
 ### Advanced perf features
 
@@ -84,12 +81,10 @@ before they are classified.
 | `PrefillCudaGraph` | `prefill_cuda_graph_backend` | in code | Declared by GLM-5.2 sm103 tp8 and sm107 low_latency (all backends), Kimi K3 tp16 (breakable), MiniMax-M3 sm107 tp2 (breakable; decode left uncompiled), Qwen3.8-Flash-Next (breakable under attention TP; decode left uncompiled). MiniMax-M3 sm103 tp4/tp8 and sm107 tp4/tp8 raise at runtime under any prefill CUDA graph and need a refusal in `route`. |
 | `TorchCompile` | `torch_compile_config` | planned | No target is written for torch.compile; targets that fail under it need a refusal in `route` as well. |
 | `MoeLoadBalancer` | `moe_config.load_balancer` | planned | Qwen3.8-Flash-Next (with expert parallelism) and GLM-5.2 sm107 high_throughput refuse it because it would do nothing; a warning fits. |
-| `MoeTactic` | `moe_config.tactic`, `speculative_config.moe_tactic` | planned | Refused today unless the target lists `moe_impls_honored` / `draft_moe_impls_honored`; only GLM-5.2 sm107 low_latency and Kimi K3 list trunk ids. |
 | `MoeBackend` | `moe_config.backend` | to verify | Qwen3.8-Flash-Next and GLM-5.2 sm107 high_throughput restrict it. |
 | `CudaGraphSamplingVariants`, `InGraphSampling` | `cuda_graph_config.sampling_variants`, `enable_in_graph_sampling` | to verify | |
 | `AttentionDpBalance` | `attention_dp_config` | to verify | |
 | `UserBuffers`, `CuteDslBlockscaling`, `MinLatency` | `torch_compile_config.enable_userbuffers`, `use_cute_dsl_blockscaling_mm/bmm`, `enable_min_latency` | to verify | |
-| `AllReduceStrategy` | `allreduce_strategy` | to verify | Kimi K3 asserts AUTO or MNNVL; decide whether that limit is functional or perf. |
 
 ### Kept in `route`
 
@@ -99,11 +94,17 @@ numerics a checkpoint is served with. `route` keeps checking them.
 - Parallel layout: pipeline parallelism, context parallelism and helix,
   attention DP, `enable_lm_head_tp_in_adp`, MoE TP×EP.
 - Numerics: KV cache dtype, `mamba_ssm_cache_dtype`, model dtype, quantization
-  format, `sparse_attention_config`.
+  format, `sparse_attention_config`, `kv_cache_compression_config`.
 
 The engine settings the model never sees (scheduler policy, `batch_wait_*`,
-`stream_interval`, statistics, tokenizer) are neither features nor checked in
-`route`.
+`stream_interval`, statistics, tokenizer, and the sampler's
+`batched_logits_processor` and `watermark_config`) are neither features nor
+checked in `route`. A target that fuses sampling into its draft loop bypasses
+the sampler; `SpeculativeDecoding` states that limit with `when`.
+
+Nor are the kernel choices a target makes for itself, such as
+`allreduce_strategy` and `moe_config.tactic`: they are Modeling V1 settings, and
+a Modeling V2 target picks its own kernels.
 
 ## Known gaps
 
@@ -116,6 +117,7 @@ Found while recording the targets above; each is a change of its own.
   attention or Eagle3 configuration it does not serve.
 - **Runtime failures under a perf feature.** MiniMax-M3 sm103 tp4/tp8 and sm107
   tp4/tp8 under any prefill CUDA graph.
-- **Silent wrong results.** LoRA, beam search and context logits on the targets
-  listed above; the planned `LoRA`, `BeamSearch` and `ReturnLogits` features
-  close them.
+- **Silent wrong results.** LoRA and beam search on the targets listed above;
+  the planned `LoRA` and `BeamSearch` features close them. GLM-5.3-Flash
+  mtp_fused drops a request's `return_context_logits`; a request sets it, so no
+  feature sees it, and the target has to refuse the request itself.
