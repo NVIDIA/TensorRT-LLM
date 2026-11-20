@@ -796,7 +796,7 @@ class _RecordingKeyExchange:
 def temperature_worker(monkeypatch):
     """A worker that went through enable_vocab_parallel_argmax with a key
     exchange (recorded, single process), rank 1 of TP2."""
-    monkeypatch.delenv(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, raising=False)
+    monkeypatch.setenv(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, "1")
     monkeypatch.setattr(interface, "tp_pair_exchange", lambda mapping, strategy: "pairs")
     worker = _Worker()
     assert worker.enable_vocab_parallel_argmax(_lm_head(rank=1), _RecordingKeyExchange())
@@ -839,22 +839,22 @@ def test_temperature_only_tokens_come_from_the_key_exchange(temperature_worker):
 @pytest.mark.parametrize(
     "switch, key_exchange, samples",
     [
-        (None, True, True),
-        ("1", True, True),
-        (" 0 ", True, False),
-        (None, False, False),
+        (None, True, False),
+        (" 1 ", True, True),
+        ("0", True, False),
+        ("1", False, False),
     ],
 )
 def test_enable_decides_temperature_sampling(switch, key_exchange, samples, monkeypatch, gathered):
-    """Temperature-only sampling on the shard needs the key exchange and can
-    be turned off on its own (``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=0``); the
-    greedy argmax on the shard stays on in every case."""
+    """Temperature-only sampling on the shard is opt-in
+    (``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1``) and needs the key exchange;
+    the greedy argmax on the shard stays on in every case."""
     monkeypatch.setattr(interface, "tp_pair_exchange", lambda mapping, strategy: "pairs")
     if switch is None:
         monkeypatch.delenv(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, raising=False)
     else:
         monkeypatch.setenv(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, switch)
-    assert vocab_parallel_temperature_enabled() == (switch is None or switch == "1")
+    assert vocab_parallel_temperature_enabled() == (switch is not None and switch.strip() == "1")
     worker = _Worker()
     exchange = _RecordingKeyExchange() if key_exchange else None
     lm_head = _lm_head()

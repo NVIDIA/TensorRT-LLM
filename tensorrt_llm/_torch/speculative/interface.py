@@ -2245,11 +2245,11 @@ class SpecWorkerBase(nn.Module, ABC):
         """Select the greedy target tokens of this worker from the vocab
         shard of ``lm_head`` (and greedy draft tokens of a vocab-sharded draft
         head through ``key_exchange``) instead of the gathered logits. With a
-        key exchange, the target tokens of temperature-only batches are drawn
-        on the shard too (Gumbel-max in the exchange, see
-        :meth:`_sample_sharded_temperature`), unless
-        ``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=0`` or the acceptance reads
-        more than the selected target tokens.
+        key exchange and ``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1`` (opt-in),
+        the target tokens of temperature-only batches are drawn on the shard
+        too (Gumbel-max in the exchange, see
+        :meth:`_sample_sharded_temperature`), unless the acceptance reads more
+        than the selected target tokens.
 
         Collective over the TP group: every rank calls it at construction,
         with the same arguments. ``key_exchange`` is the TP group's

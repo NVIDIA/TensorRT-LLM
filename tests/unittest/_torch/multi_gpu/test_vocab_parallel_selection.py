@@ -472,11 +472,14 @@ def _worker_temperature_check(rank, tp, mnnvl):
     step; greedy rows of the batch take the argmax; greedy and temperature-only
     CUDA graphs replayed in any order keep their own path; and the draws follow
     ``softmax(logits / T)``."""
+    from unittest import mock
+
     from _torch.helpers import chi_square, gumbel_max_reference
 
     from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
     from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
     from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+    from tensorrt_llm._torch.speculative.vocab_parallel import VOCAB_PARALLEL_TEMPERATURE_ENV_VAR
 
     class _Worker(SpecWorkerBase):
         verifies_on_target_shard = True
@@ -494,7 +497,10 @@ def _worker_temperature_check(rank, tp, mnnvl):
     assert key_exchange is not None, "no peer memory for the key exchange"
     try:
         worker = _Worker()
-        assert worker.enable_vocab_parallel_argmax(lm_head, key_exchange)
+        # The opt-in switch is read once, when the path is enabled; the pooled MPI worker runs
+        # later tasks, so it is restored right away.
+        with mock.patch.dict(os.environ, {VOCAB_PARALLEL_TEMPERATURE_ENV_VAR: "1"}):
+            assert worker.enable_vocab_parallel_argmax(lm_head, key_exchange)
         assert worker.samples_sharded_temperature
         worker.cache_derived_state()
 

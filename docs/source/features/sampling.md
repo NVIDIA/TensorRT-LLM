@@ -314,23 +314,24 @@ from each rank's vocab shard of the target logits instead of gathering them:
 
 * Greedy batches take the global argmax across the ranks: the same tokens as
   the gathered logits.
-* Temperature-only batches (every sampled request sets only `temperature`: no
-  `top_k` / `top_p` / `min_p`, no `seed`, no penalties, no rejection sampling,
-  no guided decoding) draw their target tokens by Gumbel-max on the shards when
-  CUDA graphs are enabled and `watermark_config` is not set (with
-  `cuda_graph_config.sampling_variants`, only if it lists `temperature_only`,
-  which it accepts for MTP-Eagle only). The tokens follow the same distribution,
-  softmax(logits / temperature), as the gathered sampler (up to a tail below
-  ~4e-9 probability that is never drawn), but from a different random stream,
-  so an unseeded request does not reproduce the tokens of a run that gathers
-  the logits. A request that sets `seed` keeps the gathered sampler and its
-  per-request random stream.
+* Temperature-only batches are sampled from the gathered logits by default.
+  With `TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1` (opt-in), they draw their target
+  tokens by Gumbel-max on the shards instead when every sampled request sets
+  only a `temperature` of at least 1e-4 (no `top_k` / `top_p` / `min_p`, no
+  `seed`), the spec config enables neither rejection sampling nor penalties,
+  there is no guided decoding, CUDA graphs are enabled and `watermark_config`
+  is not set (with `cuda_graph_config.sampling_variants`, only if it lists
+  `temperature_only`, which it accepts for MTP-Eagle only). The tokens follow
+  the same distribution, softmax(logits / temperature), as the gathered sampler
+  (up to a tail below ~4e-9 probability that is never drawn), but from a
+  different random stream, so an unseeded request does not reproduce the tokens
+  of a run that gathers the logits. A request that sets `seed`, or a
+  temperature below 1e-4, keeps the gathered sampler.
 
-`TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=0` keeps the greedy selection on the
-shards but samples temperature-only batches from the gathered logits again;
-`TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0` gathers the logits for both, except on models
-that take the speculative fast paths (`spec_decode_fast_paths`), whose workers keep
-selecting their greedy and temperature-only target tokens from the shards.
+`TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0` gathers the logits for greedy batches too.
+The models that take the speculative fast paths (`spec_decode_fast_paths`) read
+neither variable: their workers always select their greedy and temperature-only
+target tokens from the shards.
 
 ## Beam search
 
