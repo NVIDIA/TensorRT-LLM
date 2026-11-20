@@ -3043,6 +3043,7 @@ class KVRecvTask(_LogicalTask):
         self.expected_transfers = 0
         # One terminal result per writer rank, keyed by the rank the result frame carries.
         self._writer_reports: dict[int, bool] = {}
+        self.destination_published = False
         # Verified-range admission accounting: the receiver-computed byte
         # total the writers must cover for this piece, and the bytes the
         # writers attested as actually submitted-and-completed. None means
@@ -3472,33 +3473,35 @@ class Receiver(ReceiverBase):
             rank: secrets.token_bytes(_KV_RESULT_REPORT_TOKEN_BYTES) for rank in peer_overlap.ranks
         }
         if not session._enforce_physical_ownership:
-            session.mark_transferring(task.slice_id)
-            # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
-            session._sender_endpoints.update(sender_endpoints)
-            for rank in peer_overlap.ranks:
-                if task._perf_timer is not None:
-                    task._perf_timer.record_task_start(rank)
-                send_timestamp = None
-                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                    with disagg_diagnostics.suppress_diagnostic_errors():
-                        send_timestamp = disagg_diagnostics.capture_timestamp()
-                self._request_sender_data(
-                    peer_infos.sender_endpoints[rank],
-                    receiver_req_bytes,
-                    task._kv_result_report_tokens[rank],
-                )
-                if send_timestamp is not None:
-                    with disagg_diagnostics.suppress_diagnostic_errors():
-                        disagg_diagnostics.emit_event(
-                            "gen_request_data_sent",
-                            side="gen",
-                            request_id=receiver_req.unique_rid,
-                            request_id_scope=disagg_diagnostics.get_request_id_scope(task._params),
-                            rank_info=self._registrar.self_rank_info,
-                            slice_id=receiver_req.slice_id,
-                            peer_rank=rank,
-                            timestamp=send_timestamp,
-                        )
+            with session._publication_lock:
+                if not session.mark_transferring(task.slice_id, sender_endpoints=sender_endpoints):
+                    return
+                for rank in peer_overlap.ranks:
+                    if task._perf_timer is not None:
+                        task._perf_timer.record_task_start(rank)
+                    send_timestamp = None
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            send_timestamp = disagg_diagnostics.capture_timestamp()
+                    self._request_sender_data(
+                        peer_infos.sender_endpoints[rank],
+                        receiver_req_bytes,
+                        task._kv_result_report_tokens[rank],
+                    )
+                    if send_timestamp is not None:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_diagnostics.emit_event(
+                                "gen_request_data_sent",
+                                side="gen",
+                                request_id=receiver_req.unique_rid,
+                                request_id_scope=disagg_diagnostics.get_request_id_scope(
+                                    task._params
+                                ),
+                                rank_info=self._registrar.self_rank_info,
+                                slice_id=receiver_req.slice_id,
+                                peer_rank=rank,
+                                timestamp=send_timestamp,
+                            )
             return
 
         peer_ranks = list(peer_overlap.ranks)
@@ -3905,7 +3908,7 @@ class RxSession(RxSessionBase):
         self.transfer_end_time = None
         self.kv_cache_size_bytes: int = 0
         self._kv_tasks: list[KVRecvTask] = []
-        self._aux_count = 0
+        self._aux_successful_writers: set[int] = set()
         self._aux_status: TaskStatus = TaskStatus.INIT
         self._publication_may_have_escaped = False
         self._aux_physical_owner: Optional[_ReceiveOperationOwner] = None
@@ -4132,17 +4135,31 @@ class RxSession(RxSessionBase):
                 self._aux_physical_owner.finish_publication()
             return True
 
-    def mark_transferring(self, slice_id: int, writer_cohort: Optional[set[int]] = None) -> None:
+    def mark_transferring(
+        self,
+        slice_id: int,
+        writer_cohort: Optional[set[int]] = None,
+        *,
+        sender_endpoints: Optional[set[str]] = None,
+    ) -> bool:
         if not self._enforce_physical_ownership:
             with self.lock:
-                self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
-            return
+                if self._closed or self._terminal_status is not None:
+                    return False
+                task = self._kv_tasks[slice_id]
+                task.destination_published = True
+                task.status = TaskStatus.TRANSFERRING
+                if sender_endpoints:
+                    self._sender_endpoints.update(sender_endpoints)
+            return True
         if writer_cohort is None:
             raise ValueError("ownership-mode publication requires an explicit writer cohort")
         if not self.try_begin_transfer(slice_id, set(), writer_cohort):
             raise RuntimeError(
                 f"RxSession {self.disagg_request_id} became terminal before publication"
             )
+
+        return True
 
     def receive(self, chunk: Chunk, expected_write_bytes: Optional[int] = None) -> None:
         if self.transfer_start_time is None:
@@ -4440,16 +4457,19 @@ class RxSession(RxSessionBase):
                 if not accepted:
                     return
             if status == AgentResult.SUCCESS:
-                self._aux_count += 1
+                if peer_rank in self._aux_successful_writers:
+                    return
+                self._aux_successful_writers.add(peer_rank)
 
                 if (self._aux_physical_owner is not None and all_succeeded) or (
-                    self._aux_physical_owner is None and self._aux_count == task.expected_transfers
+                    self._aux_physical_owner is None
+                    and len(self._aux_successful_writers) == task.expected_transfers
                 ):
                     self._aux_status = TaskStatus.TRANSFERRED
                     aux_logical_index = getattr(self, "_aux_logical_index", None)
                     if aux_logical_index is not None:
                         self._logical_outcomes.complete(aux_logical_index)
-                elif self._aux_count > task.expected_transfers:
+                elif len(self._aux_successful_writers) > task.expected_transfers:
                     self._aux_status = TaskStatus.ERROR
                     self._exception = RuntimeError(
                         f"Session {self.request_id} received too many aux transfers"
@@ -4514,9 +4534,30 @@ class RxSession(RxSessionBase):
         """Non-blocking check: has the transfer failed or been cancelled?"""
         return self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
 
+    def _legacy_destinations_drained(self) -> bool:
+        """Check every published destination under the session lock.
+
+        Legacy FAILED also represents an unfenced submission. On cancellation
+        keep those pages and the auxiliary slot quarantined until teardown.
+        """
+        for task in self._kv_tasks:
+            if task.status == TaskStatus.TRANSFERRING:
+                return False
+            if not task.destination_published:
+                continue
+            if task.status != TaskStatus.TRANSFERRED:
+                return False
+            if self._need_aux and self.aux_slot is not None:
+                if not self._aux_successful_writers.issuperset(task._writer_reports):
+                    return False
+        return True
+
     def resources_drained(self) -> bool:
         if not self._enforce_physical_ownership:
-            return not any(task.status == TaskStatus.TRANSFERRING for task in self._kv_tasks)
+            with self.lock:
+                if self.status != SessionStatus.ERROR:
+                    return self._legacy_destinations_drained()
+                return not any(task.status == TaskStatus.TRANSFERRING for task in self._kv_tasks)
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
             return False
@@ -4618,8 +4659,8 @@ class RxSession(RxSessionBase):
         rather than pinning its pages and slot on a worker that may never act on its own
         receive timeout. The hold covers cancellation too: a client abort or a timeout that
         cancels the receive after it failed must not free it early either (``cancel_request``
-        refuses while ``has_transferring_tasks``). A receive cancelled before it failed is
-        not held. Polled from the executor thread.
+        refuses while ``has_transferring_tasks``). Cancelled destinations also require positive
+        completion evidence in ``resources_drained()``. Polled from the executor thread.
         """
         if self._enforce_physical_ownership or not self._logical_outcomes.failed:
             return False
@@ -4660,6 +4701,8 @@ class RxSession(RxSessionBase):
         With blocking=True: waits up to _timeout_s for each task.
         Returns WaitResult.COMPLETED on full success, WaitResult.FAILED on error/timeout.
         """
+        if self.status == SessionStatus.CANCELLED and not self._enforce_physical_ownership:
+            return WaitResult.FAILED if self.resources_drained() else None
         if self.has_failed() and self._enforce_physical_ownership:
             return self._failed_wait_result()
         if not blocking:
@@ -4721,9 +4764,15 @@ class RxSession(RxSessionBase):
                     return False
                 self._closed = True
         else:
-            if getattr(self, "_closed", False):
-                return True
-            self._closed = True
+            with self.lock:
+                if self._closed:
+                    return True
+                if (
+                    self._terminal_status == SessionStatus.CANCELLED
+                    and not self._legacy_destinations_drained()
+                ):
+                    return False
+                self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:
             self._aux_buffer.free_slot(self.aux_slot)
             self.aux_slot = None

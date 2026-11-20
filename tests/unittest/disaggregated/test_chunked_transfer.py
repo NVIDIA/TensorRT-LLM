@@ -452,6 +452,8 @@ def test_rx_session_process_aux_completes_at_expected_transfers():
     assert session._aux_status != TaskStatus.TRANSFERRED
 
     session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    assert session._aux_status != TaskStatus.TRANSFERRED
+    session.process_aux_agent_result(1, AgentResult.SUCCESS)
     assert session._aux_status == TaskStatus.TRANSFERRED
 
 

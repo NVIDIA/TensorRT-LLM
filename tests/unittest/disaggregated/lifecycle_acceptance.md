@@ -63,13 +63,13 @@ allocation pools are controlled CPU substitutes. This is **component acceptance*
 not a real `PyExecutor`, KV allocator, distributed cohort, or GPU/NIXL test.
 
 `test_cancelled_receive_retains_destinations_until_all_accessors_settle` covers
-four cases: user cancellation or elapsed request timeout, with KV or auxiliary
-completion last. Each case requires:
+user cancellation and elapsed request timeout with the bridge enabled and disabled.
+Each configuration runs with both KV and auxiliary completion last.
 
 1. Publish a receive with pending KV and auxiliary writers, then cancel it.
    Timeout cases exercise the coordinator's elapsed-time check before and after
    the threshold, then use the same executor-effect cancellation seam. Verify
-   the cancellation notification reaches the published CTX endpoint once; later
+   in bridge mode that the cancellation notification reaches the published CTX endpoint once; later
    polls must not notify that successfully contacted endpoint again.
 2. Repeatedly poll actual receive status and attempt replacement allocation;
    neither destination may be released or reused while either writer is pending.
@@ -79,19 +79,10 @@ completion last. Each case requires:
    and check unchanged sentinels and release counts. This checks bookkeeping
    after notification replay, not real DMA against reused GPU addresses.
 
-`test_default_receive_cancellation_retains_pending_destinations` repeats the
-pending-writer reuse check with the bridge disabled (user and timeout cases).
-These are **strict expected failures**, limited to the dedicated premature-reuse
-assertion. Other exceptions fail normally, and an unexpected pass fails CI so the
-expectation must be revisited. An xfail records an open safety gap, not acceptance.
-The default-off baseline is not an additional qualified profile.
-
-The four bridge-enabled cases are ordinary regression tests and must pass. The
-two expected failures run the known-bug reproducers without making that specific
-failure a pytest job failure; they must not count toward completed acceptance.
-Retaining them in CI is a maintainer decision. A fix must remove the corresponding
-`xfail` marker and pass the same test normally. `--runxfail` is a diagnostic mode
-that deliberately makes the unfixed cases fail, not the normal CI command.
+The default Python receiver keeps a cancelled destination reserved when a legacy
+writer reports FAILED. That result can also mean a previously submitted write
+has an unknown outcome, so releasing the pages requires worker teardown in
+that case.
 
 ## Roadmap coverage ledger
 
@@ -114,7 +105,7 @@ has passed. Track those results separately for each exact revision/configuration
 | --- | --- | --- | --- |
 | A-PROFILE | Activate only the initial profile | Ownership: `test_fp4_mla_bridge_uses_production_cache_layout`, `test_fp4_mla_bridge_rejects_requests_outside_qualified_protocol` | Activation and matching configuration on every real participant |
 | A-ADMISSION | Cancel before publication; retain partial publication | Ownership: `test_pre_cancelled_rx_session_never_publishes_destination`, `test_aborted_publication_cannot_complete_during_failure_unwind`, `test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission` | Actual executor/allocator lifetime and publication-race qualification |
-| A-CANCEL-REUSE | Repeated cancellation/status polling cannot release active destinations | Acceptance: `test_cancelled_receive_retains_destinations_until_all_accessors_settle` (4 cases); default-off companion has 2 strict xfails | Real allocator reuse under delayed remote writes and actual executor cancellation/timeout cleanup |
+| A-CANCEL-REUSE | Repeated cancellation/status polling cannot release active destinations | Acceptance: `test_cancelled_receive_retains_destinations_until_all_accessors_settle` (8 cases across bridge-enabled and default modes) | Real allocator reuse under delayed remote writes and actual executor cancellation/timeout cleanup |
 | A-SOURCE | Exact backend completion protects the source | Ownership: `test_sender_physical_operation_rejects_unproven_retirement`, `test_sender_retires_only_after_backend_done`, `test_ambiguous_sender_result_retains_source_and_reports_in_doubt` | Backend conformance and real source-page retention |
 | A-COHORT | All writers and independent holds must settle | Ownership: `test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group`, `test_gen_first_aux_owner_uses_anonymous_no_retry_writer_count`, `test_failed_receive_consensus_waits_for_every_rank_to_drain` | Multi-rank cohort and manager-hold composition |
 | B-OUTCOME | Stable event-time logical outcomes | Outcome: `test_receive_outcome_does_not_depend_on_polling_before_late_completion`, `test_receive_cancel_keeps_its_outcome_when_a_writer_later_fails`, `test_sender_cancel_survives_late_kv_and_aux_exceptions` | Same semantics through native executor/backend paths |
@@ -135,12 +126,10 @@ qualification. Do not represent those gaps with skipped acceptance tests.
 In a TensorRT-LLM test environment with its normal dependencies installed:
 
 ```bash
-python -m pytest tests/unittest/disaggregated/test_transfer_lifecycle_acceptance.py -m cpu_only -q -rXx
-python -m pytest tests/unittest/disaggregated/test_transfer_lifecycle_acceptance.py -k default_receive --runxfail -q
+python -m pytest tests/unittest/disaggregated/test_transfer_lifecycle_acceptance.py -m cpu_only -q
 ```
 
-The first command should report 4 passes and 2 expected failures at this baseline.
-The second intentionally exposes the two default-path failures. Existing CPU CI
+The command should report eight passes. CPU CI
 already selects `unittest/disaggregated` via
 [l0_cpu.yml](../../integration/test_lists/test-db/l0_cpu.yml); the new file contains
 the required `pytest.mark.cpu_only` marker. GPU qualification is a separate test

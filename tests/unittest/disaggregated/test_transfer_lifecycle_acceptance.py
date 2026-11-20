@@ -55,10 +55,6 @@ def _publish_report_tokens(session, ranks=range(16)):
         task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
 
 
-class _PrematureReuse(AssertionError):
-    """The pending destination was exposed to a subsequent allocation."""
-
-
 class _Slot:
     def __init__(self) -> None:
         self.owner: int | None = None
@@ -250,8 +246,7 @@ class _ReceiveCase:
         self.poll_and_cleanup()
         kv_reused = self.kv.allocate(_NEW_REQUEST)
         aux_reused = self.aux.slot.allocate(_NEW_REQUEST)
-        if kv_reused or aux_reused:
-            raise _PrematureReuse("status polling released a destination with an active writer")
+        assert not kv_reused and not aux_reused
         assert self.cleanup_count == self.kv.release_count == self.aux.slot.release_count == 0
         assert self.transceiver._recv_sessions[_OLD_REQUEST] is self.session
         assert self.transceiver._recv_reqs[_OLD_REQUEST] is self.request
@@ -276,12 +271,14 @@ class _ReceiveCase:
 
 @pytest.mark.parametrize("cause", ["user", "timeout"])
 @pytest.mark.parametrize("last_resource", ["kv", "aux"])
+@pytest.mark.parametrize("bridge_enabled", [False, True])
 def test_cancelled_receive_retains_destinations_until_all_accessors_settle(
     monkeypatch: pytest.MonkeyPatch,
     cause: Literal["user", "timeout"],
     last_resource: Literal["kv", "aux"],
+    bridge_enabled: bool,
 ) -> None:
-    case = _ReceiveCase(monkeypatch, bridge_enabled=True)
+    case = _ReceiveCase(monkeypatch, bridge_enabled=bridge_enabled)
     case.cancel(cause)
     for _ in range(2):
         case.assert_not_reusable()
@@ -308,17 +305,3 @@ def test_cancelled_receive_retains_destinations_until_all_accessors_settle(
         case.assert_cancelled()
     assert case.cleanup_count == case.kv.release_count == case.aux.slot.release_count == 1
     assert case.kv.data == case.aux.slot.data == _SENTINEL
-
-
-@pytest.mark.parametrize("cause", ["user", "timeout"])
-@pytest.mark.xfail(
-    strict=True,
-    raises=_PrematureReuse,
-    reason="default Python receive retirement does not enforce physical ownership",
-)
-def test_default_receive_cancellation_retains_pending_destinations(
-    monkeypatch: pytest.MonkeyPatch, cause: Literal["user", "timeout"]
-) -> None:
-    case = _ReceiveCase(monkeypatch, bridge_enabled=False)
-    case.cancel(cause)
-    case.assert_not_reusable()

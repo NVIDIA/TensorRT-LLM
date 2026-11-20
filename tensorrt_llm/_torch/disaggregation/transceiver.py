@@ -1284,13 +1284,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _retirement_blocked(cls, session: object) -> bool:
         """Whether a terminal session must stay open for an accessor that may still be active.
 
-        Besides ownership-held resources, this covers a failed receive whose
-        other writers have not all reported yet (see
-        ``RxSession.failed_receive_awaits_writers``).
+        Legacy receives also retain their KV and auxiliary destinations while
+        a writer can still access them.
         """
-        if cls._ownership_blocks_retirement(session):
-            return True
-        return isinstance(session, RxSession) and session.failed_receive_awaits_writers()
+        if isinstance(session, RxSession):
+            return session.has_transferring_tasks()
+        return cls._ownership_blocks_retirement(session)
 
     def _close_session_or_raise(self, session: object, rid: int, outcome: str) -> None:
         """Close one terminal session or fail-stop instead of diverging locally."""
