@@ -6,6 +6,7 @@
 # behind `trtllm-serve disaggregated`. Steps, inputs, limits and requests:
 # docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md
 #
+#   export TRTLLM_DISAGG_SHARED_DRAFT_KV=1
 #   export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
 #   export TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES>
 #   trtllm-serve <TARGET_CHECKPOINT> --config beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml \
@@ -13,9 +14,8 @@
 #
 # Replace <DRAFTER_CHECKPOINT> below with the DFlash2 drafter directory. Both workers must use the
 # same checkpoints, scale table and settings; they check each other's model, cache format and
-# scale identity before any KV transfer. The drafter's KV layers share the target's KV cache, so
-# the prompt's draft context travels with the target's pages (do not set
-# TRTLLM_DISAGG_SHARED_DRAFT_KV=0). Settings equal to today's defaults are pinned.
+# scale identity before any KV transfer. Export the shared-draft-KV setting on both nodes so
+# the drafter's prompt context travels with the target's pages.
 modeling_v2: require
 checkpoint_format: beam_nvfp4
 reasoning_parser: beam_harmony_text

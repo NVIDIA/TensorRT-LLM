@@ -286,14 +286,15 @@ checkpoints, scale table and settings; before any KV transfer they check each ot
 format and scale identity, and refuse to transfer between mismatched workers. The context worker
 moves each request's KV cache over NIXL to the generation worker. The drafter's prompt context
 travels in the same cache, in the drafter's layers, together with the drafter's context position.
-These recipes rely on that shared cache, which is the default: do not set
-`TRTLLM_DISAGG_SHARED_DRAFT_KV=0`, with which the workers refuse to start.
+Set `TRTLLM_DISAGG_SHARED_DRAFT_KV=1` on both nodes to require the shared cache. Each worker
+checks at startup that it can provide the draft layers needed for this handoff.
 
 ### Launch the workers
 
 On the context node, with the disaggregated context recipe (replace `<DRAFTER_CHECKPOINT>` in it):
 
 ```bash
+export TRTLLM_DISAGG_SHARED_DRAFT_KV=1
 export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
 export TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES>
 
@@ -308,6 +309,7 @@ trtllm-serve <TARGET_CHECKPOINT> \
 On the generation node, with the disaggregated generation recipe:
 
 ```bash
+export TRTLLM_DISAGG_SHARED_DRAFT_KV=1
 export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
 export TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES>
 
