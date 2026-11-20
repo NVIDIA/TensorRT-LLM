@@ -41,7 +41,7 @@ AttentionContextWorkspaceSizes AttentionWorkspaceManager::buildUnfusedContextSiz
     sizes.qkvBuf = sizes.qBuf;
     sizes.qkFloatBuf = sizeof(float) * scoreElements;
     sizes.paddingOffset = sizeof(int) * paddedQueryTokens;
-    sizes.encoderPaddingOffset = sizeof(int) * paddedKvTokens;
+    sizes.encoderPaddingOffset = sizeof(int) * params.batchSize * params.crossKvLength;
     sizes.tokensInfo = sizeof(int2) * params.packedTokenCount;
     return sizes;
 }

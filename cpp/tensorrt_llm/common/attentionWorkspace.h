@@ -79,6 +79,7 @@ struct AttentionUnfusedContextWorkspaceParams
     size_t batchSize{};
     size_t querySequenceLength{};
     size_t kvSequenceLength{};
+    size_t crossKvLength{}; //!< Encoder sequence extent; zero for self-attention.
     size_t packedTokenCount{};
     int numHeads{};
     int numAttnHeads{};

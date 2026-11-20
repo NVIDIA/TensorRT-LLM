@@ -807,6 +807,7 @@ tensorrt_llm::common::op::AttentionContextWorkspaceLayout MHA::contextWorkspaceL
                                                  .batchSize = batch_size,
                                                  .querySequenceLength = static_cast<size_t>(input_seq_length),
                                                  .kvSequenceLength = static_cast<size_t>(kv_seq_length),
+                                                 .crossKvLength = static_cast<size_t>(cross_kv_length),
                                                  .packedTokenCount = static_cast<size_t>(max_num_tokens),
                                                  .numHeads = static_cast<int>(num_heads),
                                                  .numAttnHeads = mNumAttnHeads,

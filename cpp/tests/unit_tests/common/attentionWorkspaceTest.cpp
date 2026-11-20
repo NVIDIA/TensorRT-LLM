@@ -83,35 +83,41 @@ size_t expectedUnfusedContextWorkspace(bool crossAttention)
     sizes.qkvBuf = kElementSize * paddedTokenCount * kHeadSize;
     sizes.qkFloatBuf = sizeof(float) * batchSize * inputSequenceLength * kvSequenceLength;
     sizes.paddingOffset = sizeof(int) * paddedTokenCount;
-    sizes.encoderPaddingOffset = sizeof(int) * paddedKvTokenCount;
+    sizes.encoderPaddingOffset = crossAttention ? sizeof(int) * batchSize * kCrossKvLength : 0;
     sizes.tokensInfo = sizeof(int2) * kPackedTokenCount;
     return tcop::AttentionWorkspaceManager::buildContextLayout(sizes).totalSize;
 }
 
-size_t getUnfusedContextWorkspace(bool crossAttention)
+tcop::AttentionContextWorkspaceSizes getUnfusedContextSizes(bool crossAttention)
 {
-    auto const sizes = tcop::AttentionWorkspaceManager::buildUnfusedContextSizes({.elementSize = sizeof(half),
+    return tcop::AttentionWorkspaceManager::buildUnfusedContextSizes({.elementSize = sizeof(half),
         .batchSize = kBatchSize,
         .querySequenceLength = kInputSequenceLength,
         .kvSequenceLength = static_cast<size_t>(crossAttention ? kCrossKvLength : kInputSequenceLength),
+        .crossKvLength = static_cast<size_t>(crossAttention ? kCrossKvLength : 0),
         .packedTokenCount = kPackedTokenCount,
         .numHeads = 1,
         .numAttnHeads = 1,
         .numAttnKvHeads = 1,
         .headSize = kHeadSize});
-    return tcop::AttentionWorkspaceManager::buildContextLayout(sizes).totalSize;
 }
 
 } // namespace
 
 TEST(AttentionWorkspaceManagerTest, RaggedUnfusedSelfAttentionUsesPaddedTokenCounts)
 {
-    EXPECT_EQ(getUnfusedContextWorkspace(false), expectedUnfusedContextWorkspace(false));
+    auto const sizes = getUnfusedContextSizes(false);
+    EXPECT_EQ(sizes.encoderPaddingOffset, 0);
+    EXPECT_EQ(
+        tcop::AttentionWorkspaceManager::buildContextLayout(sizes).totalSize, expectedUnfusedContextWorkspace(false));
 }
 
 TEST(AttentionWorkspaceManagerTest, RaggedUnfusedCrossAttentionUsesPaddedTokenCounts)
 {
-    EXPECT_EQ(getUnfusedContextWorkspace(true), expectedUnfusedContextWorkspace(true));
+    auto const sizes = getUnfusedContextSizes(true);
+    EXPECT_EQ(sizes.encoderPaddingOffset, sizeof(int) * kBatchSize * kCrossKvLength);
+    EXPECT_EQ(
+        tcop::AttentionWorkspaceManager::buildContextLayout(sizes).totalSize, expectedUnfusedContextWorkspace(true));
 }
 
 TEST(AttentionWorkspaceManagerTest, UnfusedGroupedQuerySizesDistinguishQueryAndKvHeads)
@@ -120,6 +126,7 @@ TEST(AttentionWorkspaceManagerTest, UnfusedGroupedQuerySizesDistinguishQueryAndK
         .batchSize = 3,
         .querySequenceLength = 5,
         .kvSequenceLength = 2,
+        .crossKvLength = 2,
         .packedTokenCount = 7,
         .numHeads = 4,
         .numAttnHeads = 4,
