@@ -57,6 +57,7 @@ import math
 import os
 import signal
 import sys
+from contextlib import ExitStack
 from typing import Any, Optional, Sequence
 
 from gsm8k_eval import protocol, runner
@@ -262,23 +263,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 }
             elif concurrency is None:
                 concurrency = DEFAULT_CONCURRENCY
-        signal.signal(signal.SIGTERM, _interrupt)
-        summary = runner.run(
-            dataset_dir=args.dataset_dir,
-            output_dir=args.output_dir,
-            num_questions=args.num_questions,
-            concurrency=concurrency,
-            time_budget_s=args.time_budget_s,
-            endpoint=args.endpoint,
-            served_model=args.served_model_name,
-            managed=managed,
-            max_seq_len=max_seq_len,
-            min_correct=args.min_correct,
-            request_timeout_s=args.request_timeout_s,
-            chat_template_kwargs=args.chat_template_kwargs,
-            identity_extra=identity_extra,
-            attempt_extra={"client_concurrency": concurrency},
-        )
+        with ExitStack() as handlers:
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                previous = signal.signal(sig, _interrupt)
+                handlers.callback(signal.signal, sig, previous)
+            summary = runner.run(
+                dataset_dir=args.dataset_dir,
+                output_dir=args.output_dir,
+                num_questions=args.num_questions,
+                concurrency=concurrency,
+                time_budget_s=args.time_budget_s,
+                endpoint=args.endpoint,
+                served_model=args.served_model_name,
+                managed=managed,
+                max_seq_len=max_seq_len,
+                min_correct=args.min_correct,
+                request_timeout_s=args.request_timeout_s,
+                chat_template_kwargs=args.chat_template_kwargs,
+                identity_extra=identity_extra,
+                attempt_extra={"client_concurrency": concurrency},
+            )
         for problem in summary["verdict"]["problems"]:
             print(f"problem: {problem}", file=sys.stderr)
         return 0 if summary["verdict"]["passed"] else 1

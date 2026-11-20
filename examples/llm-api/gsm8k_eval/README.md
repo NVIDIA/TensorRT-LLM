@@ -42,7 +42,7 @@ python examples/llm-api/eval_gsm8k.py \
 
 Managed server: the evaluator launches `trtllm-serve <MODEL> --config <CONFIG>` bound to
 `127.0.0.1` on a free port, evaluates, and stops every process of that launch (and only those)
-when the run ends, fails, times out or is interrupted:
+when the run ends, fails, times out or is interrupted (including a terminal hangup):
 
 ```bash
 python examples/llm-api/eval_gsm8k.py \

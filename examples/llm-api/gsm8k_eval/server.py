@@ -91,7 +91,7 @@ def _ignore_cleanup_signals() -> Iterator[None]:
     saved = {}
     try:
         if threading.current_thread() is threading.main_thread():
-            for sig in (signal.SIGINT, signal.SIGTERM):
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 saved[sig] = signal.signal(sig, signal.SIG_IGN)
         yield
     finally:

@@ -75,12 +75,14 @@ class ManagedServer:
         env: The complete launch environment.
         gpu_ids: GPU indices whose used memory is polled while the server lives (optional).
         settings: Recorded launch settings (e.g. the rendered config's digest).
+        generated_config: Optional YAML to save and launch with after the resume check.
     """
 
     argv: tuple[str, ...]
     env: Mapping[str, str]
     gpu_ids: tuple[str, ...] = ()
     settings: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    generated_config: Optional[str] = None
 
 
 async def _post(client, url, *, json, timeout):
@@ -546,6 +548,8 @@ def run(
         "max_seq_len": max_seq_len,
         **(identity_extra or {}),
     }
+    if managed is not None and managed.generated_config is not None:
+        identity["generated_config_sha256"] = protocol.sha256_text(managed.generated_config)
     identity_sha256 = protocol.sha256_text(protocol.canonical_json(identity))
     results_dir = Path(output_dir)
     with _output_lock(results_dir):
@@ -605,6 +609,10 @@ def run(
                     "memory": results_dir / f"gpu-memory-attempt-{attempt}.csv",
                 }
                 argv = server.serve_argv(managed.argv, files["addr"])
+                if managed.generated_config is not None:
+                    config_path = results_dir / f"recipe-attempt-{attempt}.yaml"
+                    config_path.write_text(managed.generated_config, encoding="utf-8")
+                    argv.extend(["--config", str(config_path)])
                 attempt_info["server_command"] = argv
                 attempt_info["server_settings"] = dict(managed.settings)
             run_manifest["attempts"].append(attempt_info)

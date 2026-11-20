@@ -62,7 +62,9 @@ def test_stop_finishes_sweep_and_restores_handlers(monkeypatch, interrupted):
     monkeypatch.setattr(server, "owned_processes", lambda *args: next(snapshots))
     sent = Mock()
     monkeypatch.setattr(server, "_signal_process", sent)
-    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    handlers = {
+        sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    }
 
     def waiting(pid, timeout):
         assert process.wait.call_count == 0, "leader must remain unreaped through the scan"

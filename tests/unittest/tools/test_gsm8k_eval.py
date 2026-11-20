@@ -910,6 +910,7 @@ def test_managed_run_owns_directory_and_removes_stale_address(tmp_path, monkeypa
     @contextmanager
     def launch(argv, env, log_path):
         assert not addr.exists()
+        assert Path(argv[argv.index("--config") + 1]).read_text() == "original recipe"
         manifest = (tmp_path / "run_manifest.json").read_bytes()
         # An independent process cannot acquire the lock while the server is alive.
         child = subprocess.run(
@@ -945,13 +946,24 @@ with open(sys.argv[1], 'a') as lock:
         ),
         post=AsyncMock(return_value=(200, _payload())),
     )
-    managed = runner.ManagedServer(argv=("trtllm-serve", "model"), env={})
+    managed = runner.ManagedServer(
+        argv=("trtllm-serve", "model"), env={}, generated_config="original recipe"
+    )
     if interrupt:
         with pytest.raises(KeyboardInterrupt):
             runner.run(**options, managed=managed, deps=deps)
     else:
         result = runner.run(**options, managed=managed, deps=deps)
         assert result["verdict"]["passed"]
+    with pytest.raises(runner.EvaluationError, match="different|identity"):
+        runner.run(
+            **options,
+            managed=runner.ManagedServer(
+                argv=managed.argv, env={}, generated_config="different recipe"
+            ),
+            deps=deps,
+        )
+    assert [p.read_text() for p in tmp_path.glob("recipe-*.yaml")] == ["original recipe"]
     # Both normal exit and interruption release ownership without deleting the lock inode.
     with runner._output_lock(tmp_path):
         assert (tmp_path / ".lock").is_file()

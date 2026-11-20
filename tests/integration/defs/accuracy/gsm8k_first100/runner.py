@@ -25,6 +25,9 @@ first 100 pinned questions with ``max_batch_size`` requests in flight, records e
 ``results.jsonl``, stops the server and writes ``summary.json``. The results directory is
 ``<--output-dir>/nvfp4_serving_gsm8k_first100`` (a fresh temporary directory without
 ``--output-dir``); running again with the same directory and run identity resumes.
+Each admitted attempt retains its own rendered recipe. Outside a Git checkout, the installed
+wheel's file hashes identify the build. If neither source nor package identity is available,
+each invocation gets a fresh identity and needs a fresh results directory.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import importlib.metadata
 import os
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn, Optional
 
@@ -113,6 +117,28 @@ def _source_revision(repo: str) -> Optional[str]:
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _build_identity(repo: str) -> dict[str, str]:
+    """Identify a source checkout or an installed wheel without hashing its binaries."""
+    revision = _source_revision(repo)
+    if revision:
+        return {"source_revision": revision}
+    try:
+        files = importlib.metadata.files("tensorrt_llm") or ()
+    except importlib.metadata.PackageNotFoundError:
+        files = ()
+    # RECORD contains digests of the installed package payload. Ignore dist-info
+    # and installer-generated paths, which may vary between equivalent installs.
+    payload = {
+        str(path): f"{path.hash.mode}={path.hash.value}"
+        for path in files
+        if path.parts[0] == "tensorrt_llm" and path.hash
+    }
+    if payload:
+        return {"wheel_payload_sha256": protocol.sha256_text(protocol.canonical_json(payload))}
+    # No reproducible build identity: a fresh run is safe, resuming one is not.
+    return {"unverified_build_run_id": uuid.uuid4().hex}
 
 
 def _content_identity(description: Mapping[str, Any]) -> dict[str, Any]:
@@ -204,7 +230,7 @@ def run_first100(
         "kv_scales": kv_scales,
         "gpus": [[gpu["name"], gpu["compute_cap"]] for gpu in gpus],
         "tensorrt_llm": _package_version("tensorrt_llm"),
-        "source_revision": _source_revision(repo_root()),
+        **_build_identity(repo_root()),
     }
     if criterion is not None:
         mismatched = deployment.criterion_mismatches(
@@ -222,13 +248,12 @@ def run_first100(
                 f"{', '.join(mismatched)}"
             )
     results_dir = _results_dir(output_dir)
-    config_path = results_dir / "recipe.yaml"
-    config_path.write_text(recipe_text, encoding="utf-8")
     managed = evaluator.ManagedServer(
-        argv=tuple(deployment.serve_command(inputs.target, str(config_path))),
+        argv=tuple(deployment.serve_command(inputs.target)),
         env=deployment.server_environment(environ, inputs.kv_scales),
         gpu_ids=tuple(gpu["index"] for gpu in gpus),
         settings={"recipe": recipe},
+        generated_config=recipe_text,
     )
     try:
         summary = evaluator.run(

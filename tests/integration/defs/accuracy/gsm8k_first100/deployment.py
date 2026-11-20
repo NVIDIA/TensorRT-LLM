@@ -287,13 +287,12 @@ def materialize_recipe(template: str, drafter_dir: str) -> tuple[str, dict[str, 
     }
 
 
-def serve_command(target_dir: str, config_path: str) -> list[str]:
+def serve_command(target_dir: str, config_path: Optional[str] = None) -> list[str]:
     """The documented aggregated launch; the evaluator adds the host and reported port."""
     return [
         "trtllm-serve",
         target_dir,
-        "--config",
-        config_path,
+        *(["--config", config_path] if config_path is not None else []),
         "--chat_template",
         os.path.join(target_dir, "chat_template.jinja"),
     ]
