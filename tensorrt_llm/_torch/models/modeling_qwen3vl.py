@@ -30,7 +30,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     vision_normalization_from_processor,
 )
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.mapping import Mapping
 
 from ..._utils import async_tensor_h2d
 from ...inputs import (
@@ -68,6 +67,7 @@ from .modeling_multimodal_mixin import (
     MultimodalModelMixin,
     PreparedLlmInputs,
     encode_multimodal_by_groups,
+    make_multimodal_encoder_model_config,
 )
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
@@ -809,19 +809,9 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
         )
 
         self.mapping = model_config.mapping
-        overridden_tp_size = 1 if model_config.mapping.enable_attention_dp else None
-        if overridden_tp_size is not None:
-            assert self.mapping.tp_size % overridden_tp_size == 0
-            tp_size = overridden_tp_size
-            # "Misuse" pp_size here to perform all-reduce within smaller groups
-            pp_size = self.mapping.pp_size * self.mapping.tp_size // overridden_tp_size
-            mapping = Mapping(
-                world_size=tp_size * pp_size,
-                rank=self.mapping.rank,
-                gpus_per_node=self.mapping.gpus_per_node,
-                tp_size=tp_size,
-                pp_size=pp_size,
-            )
+        if self.mapping.enable_attention_dp:
+            # Each rank runs the merger alone.
+            mapping = self.mapping.split_tp(self.mapping.tp_size)
         else:
             mapping = self.mapping
 
@@ -1623,6 +1613,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 
     supports_mm_encoder_item_scheduling = True
     supports_vision_gpu_normalize = True
+    supported_encoder_parallel_modes = frozenset({"tp", "dp"})
 
     def get_multimodal_item_partitions(
         self,
@@ -1750,12 +1741,13 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         # saves the encoder's GPU memory for the KV cache pool.
         if not (_is_mm_disagg() or model_config.disable_mm_encoder):
             vision_encoder_class = kwargs.get("vision_encoder_class")
+            encoder_model_config = make_multimodal_encoder_model_config(model_config)
             if vision_encoder_class is None:
                 self.mm_encoder = Qwen3VisionModelBase(
-                    copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
+                    encoder_model_config, kwargs.get("vision_model_class", None)
                 ).eval()
             else:
-                self.mm_encoder = vision_encoder_class(copy.deepcopy(model_config)).eval()
+                self.mm_encoder = vision_encoder_class(encoder_model_config).eval()
             # Reuse the encoder's own group definition so the aggregated and
             # mm-encoder-only paths share a single source of truth.
             self.mm_encoder_groups = self.mm_encoder.mm_encoder_groups

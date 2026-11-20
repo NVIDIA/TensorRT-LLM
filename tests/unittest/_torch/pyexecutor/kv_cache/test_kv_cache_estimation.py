@@ -10,6 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+import gc
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -361,6 +362,7 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
         input_processor=input_processor,
         encoder_batch_size=4,
         encoder_max_num_tokens=8192,
+        mm_encoder_collective_required=False,
     )
     creator._llm_args = TorchLlmArgs(model="dummy", checkpoint_format="HF")
     creator._profiling_stage_data = {"enable_mm_reqs": True}
@@ -390,6 +392,38 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     assert model.forwarded_item_counts == [2]
     assert retained_output.data_ptr() != model.last_output.data_ptr()
     assert creator._dummy_encoder_inputs == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("collective", [False, True], ids=["local", "shared_encoder_tp"])
+def test_encoder_profiling_counts_gathered_inputs_of_shared_encoder_tp(collective, monkeypatch):
+    input_bytes = 4 << 20
+
+    class _Model(MultimodalModelMixin):
+        def encode_multimodal_inputs(self, multimodal_params):
+            self.allocated_in_forward = torch.cuda.memory_allocated()
+            return torch.zeros(4, 4, device="cuda")
+
+    model = _Model()
+    pixels = torch.zeros(input_bytes // 4, device="cuda")
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(model=model, mm_encoder_collective_required=collective)
+    creator._dummy_encoder_inputs = [
+        MultimodalParams(multimodal_data={"image": {"pixel_values": pixels}})
+    ]
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    # Free earlier tests' CUDA tensors now, so no collection runs inside the measured call.
+    gc.collect()
+    before = torch.cuda.memory_allocated()
+    with patch(
+        "tensorrt_llm._torch.pyexecutor._util.discard_nccl_window_tensor_outputs",
+        return_value=nullcontext(),
+    ):
+        creator._encode_dummy_inputs()
+
+    # A shared encoder TP pass holds this rank's inputs and the gathered group
+    # inputs at once, so the profiled forward holds one more copy of the inputs.
+    assert model.allocated_in_forward - before == (input_bytes if collective else 0)
 
 
 def _make_creator(

@@ -11,6 +11,7 @@ Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 3. [Step-by-Step Guide](#step-by-step-guide)
     1. [Model Configuration](#model-configuration)
     2. [Model Definition](#model-definition)
+        1. [Multimodal Encoder Parallelism](#multimodal-encoder-parallelism)
     3. [Weight Loading](#weight-loading)
     4. [Model Registration](#model-registration)
         1. [Core Models](#core-models)
@@ -127,6 +128,37 @@ Optionally, you may replace the native PyTorch modules with our implementations 
 - `RMSNorm` (in `tensorrt_llm/_torch/modules/rms_norm.py`): Enables performant RMS norm.
 
 For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.
+
+#### Multimodal Encoder Parallelism
+
+For models using `MultimodalModelMixin`, explicit encoder TP/DP uses the shared
+item metadata, input slicing, and encoder execution contract. Construct encoder
+front ends with `make_multimodal_encoder_model_config(model_config)` so their
+mapping is independent of the language model's attention parallelism.
+
+Set `supported_encoder_parallel_modes` to declare the supported modes. Declare
+`tp` when the encoders, projectors and weight loader shard weights with the
+encoder mapping, and `dp` when the model supports independent replicas through
+the shared execution path. If the enabled encoders change the answer (for
+example, an audio encoder that supports only `dp`), override
+`get_supported_encoder_parallel_modes(model_config)`. The loader checks the
+declaration before constructing weights. See [multimodal encoder parallelism](../features/parallel-strategy.md#multimodal-encoders)
+for the configuration.
+
+A model gives one encoder hook, `encode_multimodal_inputs`: it encodes the
+params it gets and returns their rows in prompt order. The mixin owns the
+dispatch. `_run_multimodal_encoder` calls the hook directly, or splits the items
+between encoder DP replicas first, so the rows are the same with and without
+DP. The shared `prepare_multimodal_inputs` path uses it. A model with its own
+`forward` must also get its embeddings through it, for example
+`get_multimodal_embeddings(encoder_forward_fn=self._run_multimodal_encoder, ...)`,
+and never call its encoder module directly; otherwise every DP replica encodes
+the whole batch.
+
+`supports_mm_encoder_item_scheduling` describes the separate item scheduling
+contract. Shared encoder TP across attention-DP ranks requires it. Validate
+output ordering, empty-rank participation, and unsupported combinations with
+each encoder and with the model's combined modalities.
 
 ### Weight Loading
 

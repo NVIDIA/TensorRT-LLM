@@ -19,6 +19,7 @@ from contextlib import ExitStack
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
+from torch.utils._pytree import tree_flatten
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
@@ -1903,8 +1904,17 @@ class KvCacheCreator:
                 # The clone is retained only for memory accounting; no tensor
                 # data is consumed after this profiling forward returns.
                 with discard_nccl_window_tensor_outputs(encoder_inputs):
+                    # A shared encoder TP pass holds the gathered inputs of a
+                    # group, up to one step, beside this rank's own inputs.
+                    # Hold a second copy during the forward to count it.
+                    gathered_inputs = [
+                        leaf.clone() for leaf in tree_flatten(
+                            [p.multimodal_data for p in encoder_inputs])[0]
+                        if isinstance(leaf, torch.Tensor) and leaf.is_cuda
+                    ] if self._model_engine.mm_encoder_collective_required else []
                     output = self._model_engine.model.encode_multimodal_inputs(
                         encoder_inputs)
+                    del gathered_inputs
                     # The runtime store owns detached copies rather than views
                     # of an encoder batch. Reproduce that allocation boundary.
                     return output.detach().clone()

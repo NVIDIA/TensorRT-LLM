@@ -9,7 +9,7 @@ byte budget before each decode step. This is a capability facet, orthogonal to
 the runner family axis -- it has no warmup or graph-capture phase.
 """
 
-from collections.abc import Hashable, Mapping
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -21,7 +21,11 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
 )
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _concat_embeddings
+from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import (
+    EncoderDpStatus,
+    raise_shared_system_error,
+)
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
@@ -339,15 +343,23 @@ class MultimodalItemScheduler:
         input_processor: BaseMultimodalDummyInputsBuilder | None = None,
         attention_metadata_capacity: dict[str, int] | None = None,
         encoder_max_num_tokens: int | None = None,
+        encoder_batch_size: int | None = None,
         output_budget_bytes: int | None = None,
         bytes_per_embedding: int | None = None,
+        collective: bool = False,
+        defer_encoder_input_transfer: bool = False,
     ) -> None:
         self.model = model
         self.input_processor = input_processor
         self.attention_metadata_capacity = attention_metadata_capacity
         self.encoder_max_num_tokens = encoder_max_num_tokens
+        self.encoder_batch_size = encoder_batch_size
         self.output_budget_bytes = output_budget_bytes
         self.bytes_per_embedding = bytes_per_embedding
+        # Read from the eager model: whole-model torch.compile wraps the engine's model later.
+        self.collective = collective
+        """Every TP rank must enter each encoder step to share one encoder TP pass."""
+        self._defer_encoder_input_transfer = defer_encoder_input_transfer
 
     @classmethod
     def maybe_create(
@@ -357,6 +369,7 @@ class MultimodalItemScheduler:
         model: nn.Module,
         input_processor: BaseMultimodalDummyInputsBuilder,
         encoder_max_num_tokens: int | None,
+        encoder_batch_size: int | None = None,
     ) -> "MultimodalItemScheduler | None":
         """Build the scheduler if this run engages item scheduling, else ``None``.
 
@@ -378,6 +391,7 @@ class MultimodalItemScheduler:
             input_processor=input_processor,
             encoder_max_num_tokens=encoder_max_num_tokens,
             configured_encoder_max_num_tokens=llm_args.encoder_max_num_tokens,
+            encoder_batch_size=encoder_batch_size,
         )
 
     @classmethod
@@ -388,6 +402,7 @@ class MultimodalItemScheduler:
         input_processor: BaseMultimodalDummyInputsBuilder,
         encoder_max_num_tokens: int | None,
         configured_encoder_max_num_tokens: int | None,
+        encoder_batch_size: int | None = None,
     ) -> "MultimodalItemScheduler":
         """Resolve the encoder budgets and build the scheduler.
 
@@ -463,13 +478,19 @@ class MultimodalItemScheduler:
             input_processor, encoder_max_num_tokens, model
         )
 
+        layout = model.encoder_parallel_layout
         return cls(
             model=model,
             input_processor=input_processor,
             attention_metadata_capacity=attention_metadata_capacity,
             encoder_max_num_tokens=encoder_max_num_tokens,
+            encoder_batch_size=encoder_batch_size,
             output_budget_bytes=output_budget_bytes,
             bytes_per_embedding=bytes_per_embedding,
+            collective=layout.collective,
+            # Replicated requests can select their encoder DP share on the host.
+            # With attention DP, only the request owner stages inputs for sharing.
+            defer_encoder_input_transfer=layout.distributes_items and not layout.collective,
         )
 
     @property
@@ -505,25 +526,70 @@ class MultimodalItemScheduler:
             state.stable_item_cache_keys = keys
         return keys
 
+    @staticmethod
+    def _to_request_error(
+        error: Exception, request_ids: Iterable[int]
+    ) -> MultimodalEncoderRequestError | None:
+        """Scope a request-level encoder error to ``request_ids``; ``None`` for a system error."""
+        if isinstance(error, MultimodalEncoderRequestError):
+            return error
+        if isinstance(error, MultimodalEncoderContractError):
+            request_error = MultimodalEncoderRequestError(str(error), request_ids=request_ids)
+            request_error.__cause__ = error
+            return request_error
+        return None
+
     @torch.inference_mode()
     def forward_items(
         self,
         requests: list[LlmRequest],
         scheduled_items: dict[int, list[int]],
     ) -> None:
-        """Encode selected producer items into their reserved cache entries."""
-        if not scheduled_items:
-            return
+        """Encode selected producer items into their reserved cache entries.
+
+        With a shared encoder pass, every TP rank enters, also with no items.
+        A request error then fails only this rank's producers, and a system
+        error on any rank makes every rank raise the same ``EncoderDpError``.
+        """
         if not isinstance(self.model, MultimodalModelMixin):
             raise TypeError("Item-level MM scheduling requires MultimodalModelMixin")
-
+        if not scheduled_items and not self.collective:
+            return
         encoder_cache = self.encoder_cache
         if encoder_cache is None:
             raise RuntimeError("MM item scheduling requires a model-owned encoder cache")
-        request_by_id = {request.request_id: request for request in requests}
-        encoder_items = []
-        output_targets: list[tuple[int, Hashable, int]] = []
-        scheduled_cache_keys: set[Hashable] = set()
+
+        # A batch-level error cannot be traced to one output, so fail only the
+        # scheduled producers. Requests that only share a scheduled entry keep
+        # their references, and the next scheduling pass picks a new producer.
+        producer_request_ids = scheduled_items.keys()
+        prepare_error: Exception | None = None
+        request_error: MultimodalEncoderRequestError | None = None
+        try:
+            encoder_inputs, output_targets, scheduled_cache_keys = self._prepare_items(
+                requests, scheduled_items
+            )
+        except Exception as error:
+            request_error = self._to_request_error(error, producer_request_ids)
+            if not self.collective:
+                raise request_error or error
+            # This rank sends nothing, but still takes part in the shared pass.
+            prepare_error = error
+            encoder_inputs, output_targets, scheduled_cache_keys = [], [], set()
+        if self.collective:
+            # One CPU exchange per step shares which ranks have inputs and
+            # which failed to prepare them, before any encoder TP work.
+            status = (
+                EncoderDpStatus.of(prepare_error)
+                if request_error is None
+                else EncoderDpStatus.REQUEST_ERROR
+            )
+            rows = self.model.exchange_encoder_status([int(bool(encoder_inputs)), status])
+            raise_shared_system_error([row[1] for row in rows], prepare_error)
+            if not any(row[0] for row in rows):
+                if request_error is not None:
+                    raise request_error
+                return
 
         def requests_using_cache_keys(cache_keys: set[Hashable]) -> set[int]:
             return {
@@ -537,52 +603,6 @@ class MultimodalItemScheduler:
                 )
             }
 
-        for request_id, item_indices in scheduled_items.items():
-            request = request_by_id.get(request_id)
-            if request is None:
-                raise MultimodalEncoderRequestError(
-                    f"Scheduled MM request {request_id} is no longer active",
-                    request_ids={request_id},
-                )
-            state = request.py_mm_encoder_state
-            if state is None:
-                raise MultimodalEncoderRequestError(
-                    f"Scheduled MM request {request_id} has no encoder item state",
-                    request_ids={request_id},
-                )
-            multimodal_param = MultimodalParams(
-                multimodal_data=request.py_multimodal_params.multimodal_data
-            )
-            embedding_lengths = state.embedding_lengths
-            for item_idx in item_indices:
-                cache_key = state.item_cache_keys[item_idx]
-                if cache_key is None:
-                    raise MultimodalEncoderRequestError(
-                        f"Scheduled MM item {item_idx} has no cache key",
-                        request_ids={request_id},
-                    )
-                scheduled_cache_keys.add(cache_key)
-                encoder_items.append((multimodal_param, item_idx))
-                output_targets.append((item_idx, cache_key, embedding_lengths[item_idx]))
-
-        # A batch-level error cannot be traced to one output, so fail only the
-        # scheduled producers. Requests that only share a scheduled entry keep
-        # their references, and the next scheduling pass picks a new producer.
-        producer_request_ids = scheduled_items.keys()
-        try:
-            encoder_inputs = self.model.prepare_multimodal_encoder_inputs(encoder_items)
-        except MultimodalEncoderContractError as error:
-            raise MultimodalEncoderRequestError(
-                str(error), request_ids=producer_request_ids
-            ) from error
-        for encoder_input, _, _ in encoder_inputs:
-            encoder_input.to_device(
-                "multimodal_data",
-                "cuda",
-                pin_memory=prefer_pinned(),
-                target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
-            )
-
         # The encoder can hold the GIL while it waits on the device, so the host functions of the
         # previous graph replay must run first.
         drain_captured_hostfuncs()
@@ -590,19 +610,34 @@ class MultimodalItemScheduler:
         # The vision tower runs outside ModelCaller, so its TP all-reduces can
         # return NCCL window tensors here. The cache stores clones, so every
         # window lease produced by this batch ends with the scope. Request-level
-        # failures are raised only after the forward returned and are identical
-        # on every rank, so they are raised once the scope has closed normally:
-        # a failed scope would quarantine this batch's window buffers for the
-        # communicator's lifetime while the executor keeps serving.
-        pending_error: MultimodalEncoderRequestError | None = None
-        with discard_nccl_window_tensor_outputs(encoder_inputs):
+        # failures, including this rank's own preparation failure, are raised
+        # only after the scope has closed normally: a failed scope would
+        # quarantine this batch's window buffers for the communicator's
+        # lifetime while the executor keeps serving.
+        pending_error = request_error
+        # The embedding weight anchors the CUDA scope before deferred transfers, even on empty replicas.
+        scope_inputs = (
+            (encoder_inputs, self.model.text_embedding_layer.weight)
+            if self._defer_encoder_input_transfer
+            else encoder_inputs
+        )
+        with discard_nccl_window_tensor_outputs(scope_inputs):
             try:
-                outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
-            except MultimodalEncoderContractError as error:
-                pending_error = MultimodalEncoderRequestError(
-                    str(error), request_ids=producer_request_ids
-                )
-                pending_error.__cause__ = error
+                if self._defer_encoder_input_transfer:
+                    outputs = self.model.forward_multimodal_encoder_items(
+                        encoder_inputs, transfer_local_inputs=self._transfer_encoder_inputs
+                    )
+                else:
+                    # Shared encoder TP groups the ranks' batches within the limits of one step.
+                    outputs = self.model.forward_multimodal_encoder_items(
+                        encoder_inputs,
+                        max_tokens=self.encoder_max_num_tokens,
+                        max_items=self.encoder_batch_size,
+                    )
+            except Exception as error:
+                pending_error = self._to_request_error(error, producer_request_ids)
+                if pending_error is None:
+                    raise
             if pending_error is None and len(outputs) != len(output_targets):
                 pending_error = MultimodalEncoderRequestError(
                     "MM item encoder must return one output per item",
@@ -658,6 +693,63 @@ class MultimodalItemScheduler:
         except (AttributeError, NotImplementedError):
             expected_dtype = self.model.model_config.torch_dtype
         return expected_dtype, self.bytes_per_embedding // expected_dtype.itemsize
+
+    def _prepare_items(
+        self,
+        requests: list[LlmRequest],
+        scheduled_items: dict[int, list[int]],
+    ) -> tuple[
+        list[tuple[MultimodalParams, Sequence[int], str]],
+        list[tuple[int, Hashable, int]],
+        set[Hashable],
+    ]:
+        """Prepare local producer inputs without publishing cache entries."""
+        request_by_id = {request.request_id: request for request in requests}
+        encoder_items = []
+        output_targets: list[tuple[int, Hashable, int]] = []
+        scheduled_cache_keys: set[Hashable] = set()
+
+        for request_id, item_indices in scheduled_items.items():
+            request = request_by_id.get(request_id)
+            if request is None:
+                raise MultimodalEncoderRequestError(
+                    f"Scheduled MM request {request_id} is no longer active",
+                    request_ids={request_id},
+                )
+            state = request.py_mm_encoder_state
+            if state is None:
+                raise MultimodalEncoderRequestError(
+                    f"Scheduled MM request {request_id} has no encoder item state",
+                    request_ids={request_id},
+                )
+            multimodal_param = MultimodalParams(
+                multimodal_data=request.py_multimodal_params.multimodal_data
+            )
+            embedding_lengths = state.embedding_lengths
+            for item_idx in item_indices:
+                cache_key = state.item_cache_keys[item_idx]
+                if cache_key is None:
+                    raise MultimodalEncoderRequestError(
+                        f"Scheduled MM item {item_idx} has no cache key",
+                        request_ids={request_id},
+                    )
+                scheduled_cache_keys.add(cache_key)
+                encoder_items.append((multimodal_param, item_idx))
+                output_targets.append((item_idx, cache_key, embedding_lengths[item_idx]))
+
+        encoder_inputs = self.model.prepare_multimodal_encoder_inputs(encoder_items)
+        if not self._defer_encoder_input_transfer:
+            self._transfer_encoder_inputs(param for param, _, _ in encoder_inputs)
+        return encoder_inputs, output_targets, scheduled_cache_keys
+
+    def _transfer_encoder_inputs(self, encoder_inputs: Iterable[MultimodalParams]) -> None:
+        for encoder_input in encoder_inputs:
+            encoder_input.to_device(
+                "multimodal_data",
+                "cuda",
+                pin_memory=prefer_pinned(),
+                target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
+            )
 
     def build_multimodal_data_for_llm(
         self, request: LlmRequest, runtime: MultimodalRuntimeData | None = None
@@ -718,7 +810,7 @@ class MultimodalItemScheduler:
             # cached output for every small LLM chunk. One segment stays a view.
             # TODO: Remove the remaining current-chunk join at the common LLM
             # fusion boundary in the separate embedding-materialization follow-up.
-            embedding = _join_embeddings(segments, start=start, end=end)
+            embedding = _concat_embeddings(segments, start=start, end=end)
         else:
             # A chunk without MM rows still attaches an empty embedding so the
             # model does not encode this request inline.

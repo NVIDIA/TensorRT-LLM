@@ -330,11 +330,17 @@ class Distributed(ABC):
     # (no pickle); the defaults below reuse the object paths, sending plain
     # int lists so the pickled payload stays small on every backend.
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_allgather_int64(self,
+                           values: ArrayLike,
+                           *,
+                           prefer_cpu: bool = False) -> np.ndarray:
         """All-gather a fixed-size int64 vector across the TP group.
 
         Returns an int64 array of shape ``[tp_size, len(values)]`` whose row
         *i* is rank *i*'s vector. Every rank must pass the same length.
+        ``prefer_cpu`` keeps it on the CPU transport (see :meth:`broadcast`),
+        for example for an error vote that must still work after a CUDA
+        error. Every rank must pass the same value.
         """
         vec = np.asarray(values, dtype=np.int64).reshape(-1)
         gathered = self.tp_allgather(vec.tolist(), small_payload=True)
@@ -956,7 +962,11 @@ class MPIDist(Distributed):
         comm.Bcast([buf, MPI.INT64_T], root=root)
         return buf
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_allgather_int64(self,
+                           values: ArrayLike,
+                           *,
+                           prefer_cpu: bool = False) -> np.ndarray:
+        # prefer_cpu is a no-op here: MPI buffer collectives are host-side.
         return self._allgather_int64_comm(self.tp_comm, values)
 
     def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
@@ -1712,7 +1722,10 @@ class TorchDist(Distributed):
                                    group=self.mapping.tp_group_pg)
             return output_list
 
-    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+    def tp_allgather_int64(self,
+                           values: ArrayLike,
+                           *,
+                           prefer_cpu: bool = False) -> np.ndarray:
         """Fixed-size int64 TP all-gather on the CUDA-staged CPU-tensor path.
 
         The base implementation ships the vector as a pickled object, which on
@@ -1722,15 +1735,27 @@ class TorchDist(Distributed):
         instead -- one kernel and one sync, the same transport as the
         attention-DP RankState exchange. Falls back to the base path when the
         object-collective groups are unavailable (kill switch, graph capture),
-        a rank-consistent condition (see ``_cuda_obj_pg``).
+        a rank-consistent condition (see ``_cuda_obj_pg``). ``prefer_cpu``
+        gathers the CPU tensor on the TP group's CPU backend instead, with no
+        CUDA work.
         """
-        vote_pg = self._cuda_obj_pg("tp")
-        if vote_pg is None:
-            return super().tp_allgather_int64(values)
+        if prefer_cpu:
+            vote_pg = None
+        else:
+            vote_pg = self._cuda_obj_pg("tp")
+            if vote_pg is None:
+                return super().tp_allgather_int64(values)
         vec = torch.from_numpy(
             np.ascontiguousarray(
                 np.asarray(values, dtype=np.int64).reshape(-1)))
-        rows = self._cuda_allgather_cpu_tensor(vec, vote_pg)
+        if vote_pg is None:
+            rows = [
+                torch.empty_like(vec)
+                for _ in range(self.mapping.tp_group_pg.size())
+            ]
+            dist.all_gather(rows, vec, group=self.mapping.tp_group_pg)
+        else:
+            rows = self._cuda_allgather_cpu_tensor(vec, vote_pg)
         return torch.stack(rows).numpy().astype(np.int64, copy=False).reshape(
             len(rows), -1)
 

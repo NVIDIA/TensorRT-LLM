@@ -1576,6 +1576,19 @@ def get_mm_max_resident_embeddings(
                default=0)
 
 
+def needs_multimodal_item_encoding(mm_data: Optional[dict]) -> bool:
+    """Whether a request's multimodal data has raw inputs for the encoder.
+
+    Data that carries the full embedding needs no encoder work.
+    """
+    has_raw_payload = isinstance(mm_data, dict) and any(
+        isinstance(mm_data.get(modality), dict)
+        for modality in ("image", "video", "audio"))
+    has_full_embedding = (isinstance(mm_data, dict)
+                          and mm_data.get("multimodal_embedding") is not None)
+    return has_raw_payload and not has_full_embedding
+
+
 def initialize_multimodal_encoder_request(
         request: LlmRequest,
         max_num_tokens: int,
@@ -1593,12 +1606,7 @@ def initialize_multimodal_encoder_request(
     (see `get_mm_max_resident_embeddings`).
     """
     mm_data = request.py_multimodal_data
-    has_raw_payload = isinstance(mm_data, dict) and any(
-        isinstance(mm_data.get(modality), dict)
-        for modality in ("image", "video", "audio"))
-    has_full_embedding = (isinstance(mm_data, dict)
-                          and mm_data.get("multimodal_embedding") is not None)
-    needs_item_encoding = has_raw_payload and not has_full_embedding
+    needs_item_encoding = needs_multimodal_item_encoding(mm_data)
     token_lengths = (get_multimodal_encoder_token_lengths(request)
                      if needs_item_encoding else None)
     if needs_item_encoding and token_lengths is None:

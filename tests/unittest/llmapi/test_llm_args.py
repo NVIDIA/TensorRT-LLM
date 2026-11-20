@@ -2934,6 +2934,7 @@ class TestMultimodalConfig:
         assert MultimodalConfig().vision_gpu_normalize is False
         assert MultimodalConfig().encoder_attention_backend is None
         assert MultimodalConfig().encoder_cuda_graph is None
+        assert MultimodalConfig().encoder_data_parallel_size is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
         assert MultimodalConfig().encoder_scheduling_policy == "DEFAULT"
@@ -2945,6 +2946,7 @@ class TestMultimodalConfig:
         assert args.multimodal_config.vision_gpu_normalize is False
         assert args.multimodal_config.encoder_attention_backend is None
         assert args.multimodal_config.encoder_cuda_graph is None
+        assert args.multimodal_config.encoder_data_parallel_size is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
@@ -3001,6 +3003,85 @@ class TestMultimodalConfig:
         assert kwargs.get("vision_gpu_normalize", False) is enabled
         assert ("vision_gpu_normalize" in kwargs) is enabled
 
+    @pytest.mark.parametrize(
+        "parallel_args,error_match",
+        [
+            ({
+                "tensor_parallel_size": 2,
+                "pipeline_parallel_size": 2
+            }, "requires pipeline_parallel_size"),
+            ({
+                "tensor_parallel_size": 2,
+                "context_parallel_size": 2
+            }, "requires pipeline_parallel_size"),
+            ({
+                "tensor_parallel_size": 3
+            }, "must divide tensor_parallel_size"),
+            ({
+                "tensor_parallel_size": 4,
+                "orchestrator_type": "ray"
+            }, "must be 1 or tensor_parallel_size"),
+        ],
+    )
+    def test_encoder_dp_rejects_invalid_parallelism_at_startup(
+            self, parallel_args, error_match):
+        with pytest.raises(ValueError, match=error_match):
+            TorchLlmArgs(
+                model=llama_model_path,
+                multimodal_config=MultimodalConfig(
+                    encoder_data_parallel_size=2),
+                **parallel_args,
+            )
+
+    @pytest.mark.parametrize("encoder_dp_size", [None, 1, 2, 4])
+    @pytest.mark.parametrize("attention_dp", [False, True])
+    def test_encoder_dp_accepts_valid_parallelism(self, encoder_dp_size,
+                                                  attention_dp):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            tensor_parallel_size=4,
+            enable_attention_dp=attention_dp,
+            multimodal_config=MultimodalConfig(
+                encoder_data_parallel_size=encoder_dp_size),
+        )
+        assert args.multimodal_config.encoder_data_parallel_size == encoder_dp_size
+
+    @pytest.mark.parametrize("encoder_options,error_match", [
+        ({
+            "encoder_scheduling_policy": "DISABLED"
+        }, "requires MM encoder item scheduling"),
+        ({
+            "encoder_side_stream_max_ahead": 1
+        }, "does not support encoder_side_stream_max_ahead"),
+        ({
+            "encoder_cuda_graph": {
+                "vision": MultimodalEncoderCudaGraphConfig(buckets=[(16, 1)])
+            }
+        }, "does not support encoder_cuda_graph"),
+    ])
+    def test_attention_dp_encoder_tp_rejects_incompatible_execution(
+            self, encoder_options, error_match):
+        with pytest.raises(ValueError, match=error_match):
+            TorchLlmArgs(
+                model=llama_model_path,
+                tensor_parallel_size=2,
+                enable_attention_dp=True,
+                multimodal_config=MultimodalConfig(encoder_data_parallel_size=1,
+                                                   **encoder_options),
+            )
+
+    def test_encoder_only_rejects_attention_dp_with_shared_encoder_tp(self):
+        with pytest.raises(ValueError,
+                           match="does not support mm_encoder_only"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                tensor_parallel_size=2,
+                enable_attention_dp=True,
+                mm_encoder_only=True,
+                multimodal_config=MultimodalConfig(
+                    encoder_data_parallel_size=1),
+            )
+
     def test_disable_mm_encoder_disables_encoder_cache(self):
         multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
         args = TorchLlmArgs(
@@ -3046,6 +3127,30 @@ class TestMultimodalConfig:
                             multimodal_config=MultimodalConfig(
                                 encoder_scheduling_policy="EAGER"))
         assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
+
+    @pytest.mark.parametrize(
+        "incompatible_config",
+        [
+            {
+                "encoder_side_stream_max_ahead": 1
+            },
+            {
+                "encoder_cuda_graph": {
+                    "vision":
+                    MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)])
+                }
+            },
+        ],
+    )
+    def test_encoder_data_parallel_rejects_incompatible_optimizations(
+            self, incompatible_config):
+        # MultimodalConfig cannot see the parallel sizes; TorchLlmArgs checks.
+        multimodal_config = MultimodalConfig(encoder_data_parallel_size=2,
+                                             **incompatible_config)
+        with pytest.raises(ValueError, match="does not support encoder_"):
+            TorchLlmArgs(model=llama_model_path,
+                         tensor_parallel_size=2,
+                         multimodal_config=multimodal_config)
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
         args = TorchLlmArgs(
@@ -4769,6 +4874,17 @@ class TestStrictBaseModelArbitraryArgs:
                 model=llama_model_path,
                 encode_only=True,
                 mm_encoder_only=True,
+            )
+
+    def test_encoder_data_parallel_rejects_mm_encoder_only(self):
+        with pytest.raises(ValueError,
+                           match="does not support mm_encoder_only yet"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                tensor_parallel_size=2,
+                mm_encoder_only=True,
+                multimodal_config=MultimodalConfig(
+                    encoder_data_parallel_size=2),
             )
 
     def test_multimodal_encoder_rejects_encode_only(self):

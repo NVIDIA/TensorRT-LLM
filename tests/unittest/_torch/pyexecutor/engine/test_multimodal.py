@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import Mock, patch
 
 import pytest
@@ -18,11 +21,18 @@ from _torch.pyexecutor.multimodal_utils import (
 )
 
 import tensorrt_llm
+import tensorrt_llm._torch.models.multimodal_encoder_data_parallel as dp_module
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
     _build_request_multimodal_input,
+)
+from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import (
+    EncoderDpError,
+    EncoderDpStatus,
+    encoder_dp_error_guard,
 )
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     MultimodalItemScheduler,
@@ -42,6 +52,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 )
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
 )
@@ -54,7 +65,7 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from types import TracebackType
 
 # The item-scheduling surface is pure logic: no kernels, no device transfers.
@@ -307,6 +318,7 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
             output_budget_bytes=1024,
             bytes_per_embedding=4,
             attention_metadata_capacity=None,
+            collective=False,
         )
         if item_scheduling
         else None
@@ -382,6 +394,11 @@ def test_encoder_graph_modality_validation_allows_delegated_encoders() -> None:
     setup_mm_encoder_cuda_graphs(
         model, {"audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])}
     )
+
+
+def _own_status(values: Sequence[int]) -> list[Sequence[int]]:
+    """A one-rank status exchange: only this rank's row."""
+    return [values]
 
 
 def _bind_items(
@@ -509,15 +526,28 @@ def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_mode
             MultimodalItemScheduler.maybe_create(**create_kwargs)
 
 
-def test_item_encoder_classifies_request_state_contract_errors() -> None:
-    mm_item_scheduler = bare_mm_item_scheduler(MultimodalModelMixin())
+@pytest.mark.parametrize("collective", [False, True])
+def test_item_encoder_classifies_request_state_contract_errors(collective: bool) -> None:
+    class _Model(MultimodalModelMixin):
+        exchange_encoder_status = staticmethod(_own_status)
+
+    mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    mm_item_scheduler.collective = collective
     request = make_llm_request(1)
+    other = make_mm_request(2, [4])
+    _bind_items(mm_item_scheduler, other)
+    scheduled_items = {request.request_id: [0], other.request_id: [0]}
 
-    with pytest.raises(MultimodalEncoderRequestError, match="no longer active"):
-        mm_item_scheduler.forward_items([], {request.request_id: [0]})
+    with pytest.raises(MultimodalEncoderRequestError, match="no longer active") as error:
+        mm_item_scheduler.forward_items([other], scheduled_items)
+    assert error.value.request_ids == {request.request_id}
+    assert error.value.__cause__ is None
 
-    with pytest.raises(MultimodalEncoderRequestError, match="no encoder item state"):
-        mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+    with pytest.raises(MultimodalEncoderRequestError, match="no encoder item state") as error:
+        mm_item_scheduler.forward_items([request, other], scheduled_items)
+    assert error.value.request_ids == {request.request_id}
+    assert not is_multimodal_encoder_ready(other)
+    assert mm_item_scheduler.encoder_cache.current_bytes == 0
 
 
 def test_item_encoder_classifies_output_count_contract_error() -> None:
@@ -529,7 +559,7 @@ def test_item_encoder_classifies_output_count_contract_error() -> None:
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
             return []
 
@@ -553,7 +583,7 @@ def test_item_encoder_drains_replayed_host_functions_first() -> None:
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
             calls.append("encode")
             return []
@@ -576,8 +606,13 @@ def test_item_encoder_drains_replayed_host_functions_first() -> None:
 
 
 @pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
-def test_item_encoder_translates_model_contract_errors(failure_stage: str) -> None:
+@pytest.mark.parametrize("collective", [False, True])
+def test_item_encoder_translates_model_contract_errors(
+    failure_stage: str, collective: bool
+) -> None:
     class _Model(MultimodalModelMixin):
+        exchange_encoder_status = staticmethod(_own_status)
+
         def prepare_multimodal_encoder_inputs(
             self, _: Sequence[tuple[MultimodalParams, int]]
         ) -> list[tuple[SimpleNamespace, list[int], str]]:
@@ -587,11 +622,13 @@ def test_item_encoder_translates_model_contract_errors(failure_stage: str) -> No
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
-            raise MultimodalEncoderContractError("bad encoder output rows")
+            with encoder_dp_error_guard(_own_status) if collective else nullcontext():
+                raise MultimodalEncoderContractError("bad encoder output rows")
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    mm_item_scheduler.collective = collective
     request = make_mm_request(1, [4])
     _bind_items(mm_item_scheduler, request)
     # A follower of the scheduled entry keeps its reference to produce it later.
@@ -608,27 +645,84 @@ def test_item_encoder_translates_model_contract_errors(failure_stage: str) -> No
 
 
 @pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
-def test_item_encoder_does_not_translate_system_errors(failure_stage: str) -> None:
+@pytest.mark.parametrize("collective", [False, True])
+def test_item_encoder_does_not_translate_system_errors(
+    failure_stage: str, collective: bool
+) -> None:
+    failure = torch.cuda.OutOfMemoryError("encoder OOM")
+
     class _Model(MultimodalModelMixin):
+        exchange_encoder_status = staticmethod(_own_status)
+
         def prepare_multimodal_encoder_inputs(
             self, _: Sequence[tuple[MultimodalParams, int]]
         ) -> list[tuple[SimpleNamespace, list[int], str]]:
             if failure_stage == "prepare":
-                raise torch.cuda.OutOfMemoryError("encoder OOM")
+                raise failure
             encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
-            raise torch.cuda.OutOfMemoryError("encoder OOM")
+            with encoder_dp_error_guard(_own_status) if collective else nullcontext():
+                with encoder_dp_error_guard(_own_status) if collective else nullcontext():
+                    raise failure
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    mm_item_scheduler.collective = collective
     request = make_mm_request(1, [4])
     _bind_items(mm_item_scheduler, request)
 
-    with pytest.raises(torch.cuda.OutOfMemoryError, match="encoder OOM"):
+    # With a shared pass, every rank raises the same EncoderDpError; nested
+    # guards do not wrap it again.
+    expected = EncoderDpError if collective else torch.cuda.OutOfMemoryError
+    with pytest.raises(expected) as error:
         mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+    assert (error.value.__cause__ if collective else error.value) is failure
+    assert failure.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "peer_status", [EncoderDpStatus.REQUEST_ERROR, EncoderDpStatus.SYSTEM_ERROR]
+)
+def test_item_encoder_scopes_peer_prepare_failure(peer_status: EncoderDpStatus) -> None:
+    statuses = []
+
+    class _Model(MultimodalModelMixin):
+        embedding_dtype = torch.float32
+
+        def exchange_encoder_status(self, values):
+            statuses.append(list(values))
+            # The peer failed to prepare, so it has no inputs.
+            return [values, [0, peer_status]]
+
+        def prepare_multimodal_encoder_inputs(
+            self, _: Sequence[tuple[MultimodalParams, int]]
+        ) -> list[tuple[SimpleNamespace, list[int], str]]:
+            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
+            return [(encoder_input, [1], "image")]
+
+        forward_multimodal_encoder_items = Mock(return_value=[torch.ones(1, 2)])
+
+    model = _Model()
+    scheduler = bare_mm_item_scheduler(model)
+    scheduler.collective = True
+    scheduler.bytes_per_embedding = 8
+    producer = make_mm_request(1, [4])
+    _bind_items(scheduler, producer)
+
+    if peer_status == EncoderDpStatus.REQUEST_ERROR:
+        # A peer's bad request stays on the peer: this rank encodes its own items.
+        scheduler.forward_items([producer], {producer.request_id: [0]})
+        assert is_multimodal_encoder_ready(producer)
+    else:
+        with pytest.raises(EncoderDpError, match=r"rank\(s\) \[1\]"):
+            scheduler.forward_items([producer], {producer.request_id: [0]})
+        model.forward_multimodal_encoder_items.assert_not_called()
+        assert scheduler.encoder_cache.current_bytes == 0
+    # One exchange carries this rank's inputs and preparation status.
+    assert statuses == [[1, EncoderDpStatus.OK]]
 
 
 @pytest.mark.parametrize(
@@ -637,6 +731,9 @@ def test_item_encoder_does_not_translate_system_errors(failure_stage: str) -> No
         ("output_count", MultimodalEncoderRequestError, False),
         ("contract", MultimodalEncoderRequestError, False),
         ("system", torch.cuda.OutOfMemoryError, True),
+        ("wrapped_contract", MultimodalEncoderRequestError, False),
+        ("wrapped_system", EncoderDpError, True),
+        ("request", MultimodalEncoderRequestError, False),
     ],
 )
 def test_item_encoder_closes_window_scope_before_request_errors(
@@ -650,12 +747,19 @@ def test_item_encoder_closes_window_scope_before_request_errors(
             return [(encoder_input, [1], "image")]
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor]:
-            if forward_failure == "contract":
-                raise MultimodalEncoderContractError("bad encoder output rows")
-            if forward_failure == "system":
-                raise torch.cuda.OutOfMemoryError("encoder OOM")
+            with (
+                encoder_dp_error_guard(_own_status)
+                if forward_failure.startswith("wrapped_")
+                else nullcontext()
+            ):
+                if forward_failure.endswith("contract"):
+                    raise MultimodalEncoderContractError("bad encoder output rows")
+                if forward_failure.endswith("system"):
+                    raise torch.cuda.OutOfMemoryError("encoder OOM")
+                if forward_failure == "request":
+                    raise MultimodalEncoderRequestError("bad request", request_ids={17})
             return []
 
     class _RecordingScope:
@@ -684,12 +788,14 @@ def test_item_encoder_closes_window_scope_before_request_errors(
         "tensorrt_llm._torch.pyexecutor.engine.multimodal.discard_nccl_window_tensor_outputs",
         _RecordingScope,
     ):
-        with pytest.raises(expected_error):
+        with pytest.raises(expected_error) as error:
             mm_item_scheduler.forward_items([request], {request.request_id: [0]})
 
     # Request-level failures leave the scope normally so its window leases are
     # released; anything else still fails the scope and quarantines them.
     assert _RecordingScope.exits == [scope_failed]
+    if forward_failure == "request":
+        assert error.value.request_ids == {17}
 
 
 @pytest.mark.parametrize("invalid_output", ["rows", "width", "dtype", "rank", "type"])
@@ -703,7 +809,7 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
             return []
 
         def forward_multimodal_encoder_items(
-            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]], **limits: int | None
         ) -> list[torch.Tensor | None]:
             return outputs
 
@@ -764,7 +870,9 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
         embedding_dtype = torch.float32
 
         def forward_multimodal_encoder_items(
-            self, encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+            self,
+            encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
+            **limits: int | None,
         ) -> list[torch.Tensor]:
             return [
                 torch.full((embedding_length, 2), float(embedding_length))
@@ -954,3 +1062,441 @@ class MultimodalSetupTestCase(unittest.TestCase):
 
                 self.assertEqual(encoder.setup_args, encoder_max_num_tokens)
                 self.assertEqual(encoder.max_seq_len, expected_max_seq_len)
+
+
+@pytest.mark.parametrize("collective", [False, True])
+def test_empty_rank_participates_in_collective_encoder_step(collective):
+    class _Model(MultimodalModelMixin):
+        embedding_dtype = torch.float32
+        peer_has_inputs = 1
+
+        def exchange_encoder_status(self, values):
+            assert values == [0, EncoderDpStatus.OK]
+            return [values, [self.peer_has_inputs, EncoderDpStatus.OK]]
+
+        forward_multimodal_encoder_items = Mock(return_value=[])
+
+    model = _Model()
+    scheduler = bare_mm_item_scheduler(model)
+    scheduler.collective = collective
+    scheduler.bytes_per_embedding = 4
+    scheduler.encoder_max_num_tokens, scheduler.encoder_batch_size = 64, 4
+    scheduler.forward_items([], {})
+    assert model.forward_multimodal_encoder_items.call_count == int(collective)
+    if collective:
+        # The shared pass groups the ranks' batches within one encoder step.
+        assert model.forward_multimodal_encoder_items.call_args.kwargs == {
+            "max_tokens": 64,
+            "max_items": 4,
+        }
+    model.forward_multimodal_encoder_items.reset_mock()
+    model.peer_has_inputs = 0
+    scheduler.forward_items([], {})
+    model.forward_multimodal_encoder_items.assert_not_called()
+
+
+class _ThreadTpGroup:
+    """A TP group of thread ranks. A broken barrier means a real run would hang."""
+
+    def __init__(self, size: int) -> None:
+        self.barrier = threading.Barrier(size, timeout=10)
+        self.slots: list[object] = [None] * size
+
+    def allgather(self, rank: int, value: object) -> list[object]:
+        self.slots[rank] = value
+        self.barrier.wait()
+        gathered = list(self.slots)
+        self.barrier.wait()
+        return gathered
+
+    def get(self, mapping: Mapping) -> SimpleNamespace:
+        """Stands in for ``Distributed.get``."""
+        return SimpleNamespace(tp_allgather=lambda obj, **_: self.allgather(mapping.tp_rank, obj))
+
+
+@pytest.mark.parametrize("encoder_dp_size", [None, 2], ids=["encoder_tp", "encoder_dp"])
+def test_item_encoder_transfers_only_its_assigned_pixels(
+    encoder_dp_size: int | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    group = _ThreadTpGroup(2)
+    active_rank = threading.local()
+
+    class Model(MultimodalModelMixin):
+        embedding_dim = 2
+        embedding_dtype = torch.float32
+        multimodal_data_device_paths = ["image.pixel_values"]
+
+        def __init__(self, rank: int) -> None:
+            self.rank = rank
+            self.model_config = ModelConfig(
+                mapping=Mapping(world_size=2, rank=rank, tp_size=2),
+                multimodal_config=MultimodalConfig(encoder_data_parallel_size=encoder_dp_size),
+            )
+            self.text_embedding = torch.nn.Embedding(1, self.embedding_dim)
+            self.residuals: list[MultimodalParams] = []
+            self._encoder_forward_context = self._time_encoder
+
+        @property
+        def text_embedding_layer(self) -> torch.nn.Embedding:
+            return self.text_embedding
+
+        def exchange_encoder_status(self, values: Sequence[int]) -> list[list[int]]:
+            return cast(list[list[int]], group.allgather(self.rank, list(values)))
+
+        def _allgather_encoder_dp_output(
+            self, tensor: torch.Tensor, row_counts: list[int]
+        ) -> torch.Tensor:
+            outputs = cast(list[torch.Tensor], group.allgather(self.rank, tensor))
+            assert [output.shape[0] for output in outputs] == row_counts
+            return torch.cat(outputs)
+
+        def build_multimodal_encoder_input(
+            self,
+            param: MultimodalParams,
+            local_item_indices: Sequence[int],
+            modality: str | None = None,
+        ) -> MultimodalParams:
+            residual = super().build_multimodal_encoder_input(param, local_item_indices, modality)
+            self.residuals.append(residual)
+            return residual
+
+        def encode_multimodal_inputs(self, params: Sequence[MultimodalParams]) -> torch.Tensor:
+            assert active_rank.inside_encoder
+            return torch.cat(
+                [param.multimodal_data["image"]["pixel_values"][:, :2] for param in params]
+            )
+
+        @contextmanager
+        def _time_encoder(self) -> Iterator[None]:
+            assert not active_rank.inside_encoder
+            active_rank.inside_encoder = True
+            try:
+                yield
+            finally:
+                active_rank.inside_encoder = False
+
+    transferred = [[], []]
+
+    def record_transfer(
+        param: MultimodalParams, tensor: torch.Tensor, operation: str, **kwargs: object
+    ) -> torch.Tensor:
+        assert operation == "to_device" and kwargs["device"] == "cuda"
+        assert tensor.device.type == "cpu" and not active_rank.inside_encoder
+        transferred[active_rank.rank].append((param, tensor.nbytes, tensor[:, 0].tolist()))
+        return tensor
+
+    monkeypatch.setattr(MultimodalParams, "_apply_tensor_operation", record_transfer)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.engine.multimodal.prefer_pinned", lambda: False
+    )
+
+    processor = Mock(spec=BaseMultimodalDummyInputsBuilder)
+    processor.get_mm_max_tokens_per_item.return_value = {"image": 8}
+    processor.get_mm_encoder_attention_metadata_capacity.return_value = None
+    processor.get_max_mm_encoder_output_embeddings.return_value = 4
+
+    def run(rank: int) -> Model:
+        active_rank.rank = rank
+        active_rank.inside_encoder = False
+        model = Model(rank)
+        # Install the cache and resolve the actual layout through the scheduler factory.
+        bare_mm_item_scheduler(model)
+        scheduler = MultimodalItemScheduler.create(
+            model=model,
+            input_processor=processor,
+            encoder_max_num_tokens=32,
+            configured_encoder_max_num_tokens=32,
+        )
+        requests = []
+        scheduled = {}
+        for request_id, (costs, values) in enumerate([([8], [10]), ([3, 4, 4], [20, 21, 22])], 1):
+            pixels = torch.tensor(values, dtype=torch.float32)[:, None].expand(-1, 6).contiguous()
+            request = make_llm_request(
+                request_id,
+                {
+                    "image": {"pixel_values": pixels},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        item_refs=[("image", i) for i in range(len(costs))],
+                        encoder_token_lengths=costs,
+                        output_embedding_lengths=[1] * len(costs),
+                        input_partitions={"image": {"pixel_values": MultimodalItemPartition()}},
+                    ),
+                },
+            )
+            initialize_multimodal_encoder_request(request, max_num_tokens=32)
+            _bind_items(scheduler, request)
+            requests.append(request)
+            scheduled[request_id] = list(range(len(costs)))
+
+        scheduler.forward_items(requests, scheduled)
+        for request in requests:
+            state = request.py_mm_encoder_state
+            assert all(state.item_ready)
+            expected = request.py_multimodal_data["image"]["pixel_values"][:, :2]
+            outputs = torch.cat([scheduler.encoder_cache.get(key) for key in state.item_cache_keys])
+            torch.testing.assert_close(outputs, expected)
+        return model
+
+    with ThreadPoolExecutor(2) as ranks:
+        models = list(ranks.map(run, range(2)))
+
+    assert [sum(nbytes for _, nbytes, _ in rank) for rank in transferred] == (
+        [48, 48] if encoder_dp_size == 2 else [96, 96]
+    )
+    if encoder_dp_size == 2:
+        assert [[values for _, _, values in rank] for rank in transferred] == [
+            [[10], [20]],
+            [[21, 22]],
+        ]
+        # Rank 0 owns the first residual in full and stages the same object.
+        assert transferred[0][0][0] is models[0].residuals[0]
+
+
+class _SharedEncoderTpModel(MultimodalModelMixin):
+    """TP2 with attention DP: both ranks encode each owner's batch together.
+
+    An item encodes to rows filled with its pixel value. The encoder raises a
+    request error for ``bad_value``, and preparation raises ``prepare_error``.
+    """
+
+    embedding_dtype = torch.float32
+    multimodal_data_device_paths: list[str] = []  # Keep the inputs on the CPU.
+
+    def __init__(self, rank: int, group: _ThreadTpGroup, **failures: object) -> None:
+        self.model_config = ModelConfig(
+            mapping=Mapping(world_size=2, rank=rank, tp_size=2, enable_attention_dp=True),
+            multimodal_config=MultimodalConfig(
+                encoder_data_parallel_size=1, encoder_cache_max_bytes=0
+            ),
+        )
+        self.group = group
+        self.bad_value = failures.get("bad_value")
+        self.prepare_error = failures.get("prepare_error")
+        self.encoded_values: list[float] = []
+
+    def exchange_encoder_status(self, values: Sequence[int]) -> list[object]:
+        return self.group.allgather(self.model_config.mapping.tp_rank, list(values))
+
+    def prepare_multimodal_encoder_inputs(
+        self, selected_items: Sequence[tuple[MultimodalParams, int]]
+    ) -> list[tuple[MultimodalParams, list[int], str]]:
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        return [
+            (param, [param.item_metadata.output_embedding_lengths[index]], "image")
+            for param, index in selected_items
+        ]
+
+    def encode_multimodal_inputs(self, multimodal_params, **_) -> torch.Tensor:
+        rows = []
+        for param in multimodal_params:
+            value = float(param.multimodal_data["image"]["pixel_values"][0, 0])
+            self.encoded_values.append(value)
+            if value == self.bad_value:
+                raise MultimodalEncoderContractError(f"bad item {value}")
+            rows.append(torch.full((1, 2), value))
+        return torch.cat(rows)
+
+
+@pytest.mark.parametrize("failure", ["prepare_request", "prepare_system", "encode_request"])
+def test_shared_encoder_tp_fails_only_the_requests_that_failed(failure: str) -> None:
+    """Rank 0's request 100 fails; rank 1's request 200 is good."""
+    group = _ThreadTpGroup(2)
+    rank0_failure = {
+        "prepare_request": {"prepare_error": MultimodalEncoderContractError("bad request 100")},
+        "prepare_system": {"prepare_error": RuntimeError("CUDA error on rank 0")},
+        # Both ranks encode owner 0's batch, so both see the bad item.
+        "encode_request": {"bad_value": 100.0},
+    }[failure]
+    models = [
+        _SharedEncoderTpModel(0, group, **rank0_failure),
+        _SharedEncoderTpModel(1, group, bad_value=rank0_failure.get("bad_value")),
+    ]
+    schedulers, requests = [], []
+    for model, request_id in zip(models, (100, 200)):
+        scheduler = bare_mm_item_scheduler(model)
+        scheduler.collective = True
+        scheduler.bytes_per_embedding = 8
+        request = make_mm_request(request_id, [4])
+        request.py_multimodal_params.multimodal_data["image"]["pixel_values"].fill_(request_id)
+        _bind_items(scheduler, request)
+        schedulers.append(scheduler)
+        requests.append(request)
+
+    outcomes: list[BaseException | None] = [None, None]
+
+    def run(rank: int) -> None:
+        try:
+            request = requests[rank]
+            schedulers[rank].forward_items([request], {request.request_id: [0]})
+        except BaseException as error:  # noqa: BLE001 - record every outcome
+            outcomes[rank] = error
+
+    with patch.object(dp_module, "Distributed", group), ThreadPoolExecutor(2) as ranks:
+        list(ranks.map(run, range(2)))
+
+    if failure == "prepare_system":
+        # Every rank raises the same error, and nothing is encoded.
+        assert all(isinstance(outcome, EncoderDpError) for outcome in outcomes)
+        assert str(outcomes[0]) == str(outcomes[1])
+        assert outcomes[0].__cause__ is rank0_failure["prepare_error"]
+        assert models[1].encoded_values == []
+        assert not is_multimodal_encoder_ready(requests[1])
+        return
+    # Only rank 0's own producer fails. Rank 1's batch is still encoded, by
+    # both ranks, and committed.
+    assert isinstance(outcomes[0], MultimodalEncoderRequestError)
+    assert outcomes[0].request_ids == {100}
+    assert outcomes[1] is None
+    expected_values = [100.0, 200.0] if failure == "encode_request" else [200.0]
+    assert [model.encoded_values for model in models] == [expected_values] * 2
+    assert not is_multimodal_encoder_ready(requests[0])
+    assert is_multimodal_encoder_ready(requests[1])
+
+
+class _MismatchedCollective(BaseException):
+    """The ranks entered different collectives: a real run would hang."""
+
+
+class _ModalityTpModel(MultimodalModelMixin):
+    """Shared encoder TP over two thread ranks; each encoder call is one TP forward.
+
+    The forward starts with a TP collective. ``fail_after_image`` is raised on
+    this rank after its image forward, as a rank-local failure would be.
+    """
+
+    embedding_dtype = torch.float32
+
+    def __init__(self, rank: int, group: _ThreadTpGroup, fail_after_image=None) -> None:
+        self.model_config = ModelConfig(
+            mapping=Mapping(world_size=2, rank=rank, tp_size=2, enable_attention_dp=True),
+            multimodal_config=MultimodalConfig(
+                encoder_data_parallel_size=1, encoder_cache_max_bytes=0
+            ),
+        )
+        self.group = group
+        self.fail_after_image = fail_after_image
+        self.forwards: list[str] = []
+        self.status_exchanges = 0
+
+    def exchange_encoder_status(self, values: Sequence[int]) -> list[object]:
+        self.status_exchanges += 1
+        rows = self.group.allgather(self.model_config.mapping.tp_rank, list(values))
+        if not all(isinstance(row, list) for row in rows):
+            raise _MismatchedCollective
+        return rows
+
+    def encode_multimodal_inputs(self, multimodal_params, **_) -> torch.Tensor:
+        (modality,) = {
+            key for key in multimodal_params[0].multimodal_data if key in ("image", "video")
+        }
+        peers = self.group.allgather(self.model_config.mapping.tp_rank, ("encoder TP", modality))
+        if any(peer != peers[0] for peer in peers):
+            raise _MismatchedCollective
+        self.forwards.append(modality)
+        if modality == "image" and self.fail_after_image is not None:
+            raise self.fail_after_image
+        return torch.cat(
+            [param.multimodal_data[modality]["pixel_values"] for param in multimodal_params]
+        )
+
+
+def _modality_input(modality: str, value: float) -> list[tuple[MultimodalParams, list[int], str]]:
+    data = {
+        modality: {"pixel_values": torch.full((1, 2), value)},
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [(modality, 0)], encoder_token_lengths=[4], output_embedding_lengths=[1]
+        ),
+    }
+    return [(MultimodalParams(multimodal_data=data), [1], modality)]
+
+
+@pytest.mark.parametrize("failure", ["system_error", "request_error"])
+def test_shared_encoder_tp_shares_failures_before_the_next_modality(failure: str) -> None:
+    """Rank 0 owns an image, rank 1 a video. Both fit one group, so both ranks
+    run the image forward and then the video forward. Rank 0 fails after the
+    image forward. Rank 1 must not start the video forward alone."""
+    group = _ThreadTpGroup(2)
+    error = {
+        "system_error": RuntimeError("CUDA out of memory on rank 0"),
+        "request_error": MultimodalEncoderContractError("bad image on rank 0"),
+    }[failure]
+    models = [_ModalityTpModel(0, group, fail_after_image=error), _ModalityTpModel(1, group)]
+    inputs = [_modality_input("image", 100.0), _modality_input("video", 200.0)]
+    outcomes: list[object] = [None, None]
+
+    def run(rank: int) -> None:
+        try:
+            outcomes[rank] = models[rank].forward_multimodal_encoder_items(
+                inputs[rank], max_tokens=8, max_items=2
+            )
+        except BaseException as caught:  # noqa: BLE001 - record every outcome
+            outcomes[rank] = caught
+
+    with patch.object(dp_module, "Distributed", group), ThreadPoolExecutor(2) as ranks:
+        list(ranks.map(run, range(2)))
+
+    assert not any(isinstance(outcome, _MismatchedCollective) for outcome in outcomes)
+    if failure == "system_error":
+        # Every rank raises the same error before the video forward.
+        assert all(isinstance(outcome, EncoderDpError) for outcome in outcomes)
+        assert str(outcomes[0]) == str(outcomes[1])
+        assert [model.forwards for model in models] == [["image"]] * 2
+        return
+    # Only rank 0's request fails. The group is encoded again one owner at a
+    # time, and rank 1 gets its video rows.
+    assert outcomes[0] is error
+    torch.testing.assert_close(outcomes[1], [torch.full((1, 2), 200.0)])
+    assert [model.forwards for model in models] == [["image", "image", "video"]] * 2
+
+
+class _UndescribableParams(MultimodalParams):
+    """A batch whose item metadata cannot be read, so it cannot be sent to the other ranks."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(multimodal_data={"image": {"pixel_values": torch.zeros(1, 2)}})
+        self.error = error
+
+    @property
+    def item_metadata(self) -> MultimodalItemMetadata:
+        raise self.error
+
+
+@pytest.mark.parametrize("failure", ["system_error", "request_error"])
+def test_shared_encoder_tp_shares_the_batch_status_with_its_metadata(failure: str) -> None:
+    """Rank 0 cannot describe its batch, and rank 1 owns a video. The status
+    goes with the batch metadata, so no status exchange runs before it."""
+    group = _ThreadTpGroup(2)
+    error = {
+        "system_error": TypeError("unreadable item metadata on rank 0"),
+        "request_error": MultimodalEncoderContractError("bad request on rank 0"),
+    }[failure]
+    models = [_ModalityTpModel(0, group), _ModalityTpModel(1, group)]
+    inputs = [[(_UndescribableParams(error), [1], "image")], _modality_input("video", 200.0)]
+    outcomes: list[object] = [None, None]
+
+    def run(rank: int) -> None:
+        try:
+            outcomes[rank] = models[rank].forward_multimodal_encoder_items(
+                inputs[rank], max_tokens=8, max_items=2
+            )
+        except BaseException as caught:  # noqa: BLE001 - record every outcome
+            outcomes[rank] = caught
+
+    with patch.object(dp_module, "Distributed", group), ThreadPoolExecutor(2) as ranks:
+        list(ranks.map(run, range(2)))
+
+    if failure == "system_error":
+        # Every rank raises the same error right after the metadata gather.
+        assert all(isinstance(outcome, EncoderDpError) for outcome in outcomes)
+        assert str(outcomes[0]) == str(outcomes[1])
+        assert outcomes[0].__cause__ is error
+        assert [model.forwards for model in models] == [[], []]
+        assert [model.status_exchanges for model in models] == [0, 0]
+        return
+    # Rank 0 sends no batch and fails only its own request after the pass.
+    # Rank 1's video is encoded by both ranks, with one status exchange.
+    assert outcomes[0] is error
+    torch.testing.assert_close(outcomes[1], [torch.full((1, 2), 200.0)])
+    assert [model.forwards for model in models] == [["video"], ["video"]]
+    assert [model.status_exchanges for model in models] == [1, 1]

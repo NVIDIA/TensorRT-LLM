@@ -74,7 +74,9 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_encoder import \
     prepare_encoder_attn_metadata as _prepare_qwen_vl_vision_attn_metadata
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import (
+    MultimodalModelMixin, make_multimodal_encoder_model_config,
+    reorder_multimodal_embeddings_by_modality)
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
     fuse_input_embeds, get_attached_multimodal_embeddings,
@@ -2329,6 +2331,8 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     }
 
     supports_mm_encoder_item_scheduling = True
+    # The Hugging Face Qwen2-VL vision tower does not shard weights.
+    supported_encoder_parallel_modes = frozenset({"dp"})
 
     def get_multimodal_item_partitions(
         self,
@@ -2407,7 +2411,8 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
 
         # Normal worker owns encoder. MM E/P prefill worker gets attached embeddings.
         if not _is_mm_disagg():
-            mm_encoder_config = copy.deepcopy(model_config)
+            mm_encoder_config = make_multimodal_encoder_model_config(
+                model_config)
             self.mm_encoder = Qwen2VisionModelBase(
                 mm_encoder_config, kwargs.get('vision_model_class', None))
         else:
@@ -2429,6 +2434,18 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     @property
     def mm_token_ids(self) -> torch.Tensor:
         return self._mm_token_ids
+
+    @property
+    def text_embedding_layer(self):
+        return self.llm.model.embed_tokens
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.text_embedding_layer.embedding_dim
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return self.text_embedding_layer.weight.dtype
 
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config
@@ -2464,18 +2481,23 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     def encode_multimodal_inputs(self,
                                  multimodal_params: List[MultimodalParams],
                                  **encoder_kwargs: Any) -> torch.Tensor:
-        """Uniform encoder entry (``MultimodalModelMixin`` contract).
+        """Local encode hook (``MultimodalModelMixin`` contract).
 
-        Runs the vision encoder over ``multimodal_params`` and returns the
-        embeddings as a single tensor (Qwen folds any deepstack streams into
-        the hidden dim, so the single-tensor contract holds). Used by the
-        startup memory profiler to invoke the encoder directly; the model's
-        own ``forward`` keeps its custom deepstack fusion path.
+        Runs the vision encoder over ``multimodal_params`` and returns one
+        tensor with the rows in prompt order. ``forward`` reaches it through
+        the mixin entry ``_run_multimodal_encoder``, which also splits the
+        items between encoder DP replicas.
         """
-        mm_embeds = get_multimodal_embeddings(
-            encoder_forward_fn=self.mm_encoder.forward,
-            multimodal_params=list(multimodal_params))
-        return mm_embeds[0]
+        params = list(multimodal_params)
+        modalities = tuple(modality for modality in ("image", "video") if any(
+            param.multimodal_data.get(modality) is not None
+            for param in params))
+        encoder_outputs = self.mm_encoder.forward(params)
+        return reorder_multimodal_embeddings_by_modality(
+            params,
+            modalities,
+            encoder_outputs,
+        )
 
     def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models
@@ -2537,7 +2559,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             # Local encoder present: raw pixels/videos become embeddings here.
             if self.mm_encoder is not None:
                 mm_embeds = get_multimodal_embeddings(
-                    encoder_forward_fn=self.mm_encoder.forward,
+                    encoder_forward_fn=self._run_multimodal_encoder,
                     multimodal_params=mm_multimodal_params)
             elif not getattr(self, "support_mm_disagg", False):
                 raise NotImplementedError(
@@ -2750,6 +2772,7 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     supported_encoder_attention_backends = Qwen2VLModelBase.supported_encoder_attention_backends
+    supported_encoder_parallel_modes = frozenset({"tp", "dp"})
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):

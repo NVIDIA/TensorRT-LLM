@@ -1468,6 +1468,19 @@ class ModelLoader:
         self._checkpoint_loader = checkpoint_loader
         config: ModelConfig = self._load_and_validate_config(
             checkpoint_dir, checkpoint_loader)
+        multimodal_config = getattr(config, "multimodal_config", None)
+        encoder_dp_size = (multimodal_config.encoder_data_parallel_size
+                           if multimodal_config is not None else None)
+        if encoder_dp_size is not None and not config.disable_mm_encoder:
+            from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+
+            model_cls = AutoModelForCausalLM._resolve_class(config)
+            if model_cls is not None:
+                if not issubclass(model_cls, MultimodalModelMixin):
+                    raise NotImplementedError(
+                        f"{model_cls.__name__} does not support explicit multimodal encoder parallelism."
+                    )
+                model_cls.validate_multimodal_encoder_parallelism(config)
         load_format = self.llm_args.load_format
         gms_loading.check_gms_locality_domain_compat(load_format, config)
         self._startup_metadata = _checkpoint_startup_metadata(
