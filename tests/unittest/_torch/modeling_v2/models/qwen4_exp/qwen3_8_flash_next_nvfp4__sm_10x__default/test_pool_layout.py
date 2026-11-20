@@ -187,9 +187,6 @@ _MEMBER_RANKS = [
     (member, rank) for member, m in MEMBERS.items() for rank in sorted({0, m["world_size"] - 1})
 ]
 _MEMBER_RANK_IDS = [f"{member}-rank{rank}" for member, rank in _MEMBER_RANKS]
-# dep2 serves without speculation (routing declines a `speculative_config` there).
-_MTP_MEMBER_RANKS = [(member, rank) for member, rank in _MEMBER_RANKS if member != "dep2"]
-_MTP_MEMBER_RANK_IDS = [f"{member}-rank{rank}" for member, rank in _MTP_MEMBER_RANKS]
 
 
 @pytest.mark.parametrize("member, rank", _MEMBER_RANKS, ids=_MEMBER_RANK_IDS)
@@ -306,7 +303,7 @@ def test_the_stock_manager_serves_the_layout(member, rank, algo):
 
 
 @_needs_gpu
-@pytest.mark.parametrize("member, rank", _MTP_MEMBER_RANKS, ids=_MTP_MEMBER_RANK_IDS)
+@pytest.mark.parametrize("member, rank", _MEMBER_RANKS, ids=_MEMBER_RANK_IDS)
 def test_the_mtp_verify_buffers_hold_this_ranks_heads(monkeypatch, member, rank):
     """With MTP (three drafts, the GDN cached replay) the verify buffers -- the per-step conv
     windows and every GDN layer's replay history -- are this rank's heads. Under attention TP the

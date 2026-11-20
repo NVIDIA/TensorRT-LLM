@@ -3,9 +3,10 @@
 """Qwen3.8-Flash-Next-NVFP4 routing at its layouts, driven by synthetic configs on CPU.
 
 `qwen4_exp` routes to its one target one rank (tp1), tp4 and tep4 with or without MTP, and
-the attention-DP layouts dep4 (with or without MTP) and dep2 (the disaggregated-serving
-engines' layout, without speculation), neither with a breakable prefill graph. The layouts
-the target does not serve fall back under `auto`. The tp1 engine choices are exercised in
+the attention-DP layouts dep4 and dep2 (the disaggregated-serving engines' layout) with or
+without MTP, neither with a breakable prefill graph, and tp2, tep2
+and dep<world size> across nodes, on every GPU in `archs.SERVED`. The layouts the target does
+not serve fall back under `auto`. The tp1 engine choices are exercised in
 `tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py`.
 """
 
@@ -17,10 +18,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import ple_host_table, routing
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
-    modeling as M,
-)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs, ple_host_table, routing
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MoeConfig,
@@ -52,6 +50,16 @@ _LAYOUTS = {
 # The two-rank layout both engines of the disaggregated-serving test run: attention DP,
 # the routed experts in two 256-expert windows.
 _DEP2 = dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2, enable_attention_dp=True)
+
+# Two ranks at attention TP (tp2: experts split by intermediate, tep2: by expert), and eight
+# ranks over two nodes of four GPUs at attention DP.
+_TWO_RANK = {
+    "tp2": dict(world_size=2, tp_size=2, moe_tp_size=2, moe_ep_size=1),
+    "tep2": dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2),
+}
+_DEP8 = dict(
+    world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8, enable_attention_dp=True, gpus_per_node=4
+)
 
 # The layouts with attention TP, which serve MTP and the breakable prefill graph, and the
 # attention-DP ones, which serve neither.
@@ -159,12 +167,6 @@ def _declined(config, match=None, **llm_args_kwargs) -> None:
         modeling_v2_resolve(config, _llm_args("require", **llm_args_kwargs))
 
 
-def test_routing_and_the_target_agree_on_the_gpu():
-    """`route` gates on the GPU before it imports the target, whose constructor asserts the
-    same one; the target's `check_deployment` holds every other admission fact."""
-    assert routing._SM == M._SM
-
-
 # --- each layout lands on the default target ------------------------------------
 
 
@@ -204,16 +206,27 @@ def test_mtp_at_every_draft_length_routes_at_dep4(max_draft_len):
     _claimed(config, kv_cache_config=KvCacheConfig(dtype="fp8", mamba_ssm_cache_dtype="bfloat16"))
 
 
+# --- every GPU the family serves -------------------------------------------------
+
+
+@pytest.mark.parametrize("gpu", sorted(archs.SERVED))
+def test_every_layout_routes_on_every_served_gpu(gpu, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: gpu)
+    for member, kwargs in {**_LAYOUTS, **_TWO_RANK, "dep2": _DEP2, "dep8": _DEP8}.items():
+        assert routing.layout(Mapping(**kwargs)) == member
+        for spec in [None, MTPDecodingConfig(max_draft_len=3)]:
+            config = _model_config(spec, **kwargs)
+            _claimed(config, kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="bfloat16"))
+
+
+def test_attention_tp_across_nodes_declines():
+    for kwargs in (dict(tp_size=8), dict(tp_size=8, moe_tp_size=1, moe_ep_size=8)):
+        config = _model_config(world_size=8, gpus_per_node=4, **kwargs)
+        assert config.mapping.is_multi_node() and routing.layout(config.mapping) is None
+        _declined(config, match="dep<world size> across nodes")
+
+
 # --- what the target does not run under attention DP ------------------------------
-
-
-@pytest.mark.parametrize("max_draft_len", [1, 3, 7])
-def test_dep2_declines_speculation(max_draft_len):
-    """MTP under attention DP is admitted only where its draft acceptance was measured (dep4);
-    neither family claims dep2 with speculation."""
-    config = _model_config(MTPDecodingConfig(max_draft_len=max_draft_len), **_DEP2)
-    assert routing.layout(config.mapping) == "dep2"
-    _declined(config, match=r"speculative decoding with attention DP \(dep2\)")
 
 
 @pytest.mark.parametrize("member", sorted(_ATTENTION_DP))
@@ -227,17 +240,6 @@ def test_attention_dp_declines_the_breakable_prefill_graph(member):
         prefill_cuda_graph_backend="breakable",
     )
     _claimed(config, prefill_cuda_graph_backend="disabled")
-
-
-def test_attention_dp_declines_speculation_before_the_engine_choices(monkeypatch):
-    """MTP without the cached replay is declined at dep2 for attention DP: that is the
-    structural reason, and no engine choice would lift it. At dep4 the same draft is declined
-    for the missing cached replay alone."""
-    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
-    config = _model_config(MTPDecodingConfig(max_draft_len=7), **_DEP2)
-    _declined(config, match=r"speculative decoding with attention DP \(dep2\)")
-    config = _model_config(MTPDecodingConfig(max_draft_len=7), **_LAYOUTS["dep4"])
-    _declined(config, match="TRTLLM_USE_GDN_REPLAY=0")
 
 
 def test_dep4_declines_mtp_with_the_breakable_prefill_graph():
@@ -271,15 +273,13 @@ def test_attention_dp_at_one_rank_declines():
 @pytest.mark.parametrize(
     "mapping_kwargs",
     [
-        dict(world_size=2, tp_size=2),
-        dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2),
         dict(_DEP2, moe_tp_size=2, moe_ep_size=1),
         dict(_DEP2, enable_lm_head_tp_in_adp=True),
         dict(world_size=8, tp_size=8),
         dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8),
         dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8, enable_attention_dp=True),
     ],
-    ids=["tp2", "tep2", "dep2-moetp2", "dep2-lm-head-tp", "tp8", "tep8", "dep8"],
+    ids=["dep2-moetp2", "dep2-lm-head-tp", "tp8", "tep8", "dep8"],
 )
 def test_other_two_or_eight_rank_layouts_decline(mapping_kwargs):
     """The target does not claim it, and ``require`` names the layout and what the target
@@ -289,7 +289,7 @@ def test_other_two_or_eight_rank_layouts_decline(mapping_kwargs):
     with pytest.raises(ValueError) as raised:
         modeling_v2_resolve(config, _llm_args("require"))
     message = str(raised.value)
-    assert "the qwen4_exp target is" in message, message
+    assert "the qwen4_exp targets serve" in message, message
     assert f"world_size={mapping_kwargs['world_size']}" in message, message
 
 
@@ -489,6 +489,14 @@ def test_other_moe_backends_decline(backend):
     _declined(config, match="moe_config.backend")
 
 
+def test_the_cutedsl_backend_declines_where_its_fast_path_does_not_run(monkeypatch):
+    config = replace(_model_config(), moe_backend_requested="CUTEDSL")
+    _claimed(config)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: archs.SM_107)
+    _declined(config, match="moe_config.backend=CUTEDSL")
+    _claimed(replace(config, moe_backend_requested="TRTLLM"))
+
+
 def test_a_float32_state_cache_declines():
     _declined(
         _model_config(**_LAYOUTS["dep4"]),
@@ -546,3 +554,16 @@ def test_a_misspelled_ple_host_table_mode_fails_at_routing(monkeypatch):
         modeling_v2_resolve(_model_config(**_LAYOUTS["tep4"]), _llm_args("auto"))
     monkeypatch.setenv(ple_host_table.PLE_HOST_TABLE_ENV, "Node")
     _claimed(_model_config(**_LAYOUTS["tep4"]))
+
+
+# --- the family's GPUs and fast paths (`archs.py`) ------------------------------------
+
+
+def test_the_gpus_the_family_serves_and_each_fast_path_runs_on():
+    assert {f"sm_{a}{b}" for a, b in archs.SERVED} == {a.value for a in archs.SERVED_ARCHS}
+    assert archs.served_names() == "sm_103, sm_107" and not archs.served((10, 0))
+    # The targets enter the row-tile pass without asking.
+    assert archs.FAST_PATHS["qsa_rowtile"] == archs.SERVED
+    for name, capabilities in archs.FAST_PATHS.items():
+        assert capabilities <= archs.SERVED, name
+        assert archs.fast_path(name, archs.SM_107) is (name != "cute_dsl_moe"), name

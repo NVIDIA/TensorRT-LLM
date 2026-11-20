@@ -1236,9 +1236,9 @@ _QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.
 
 @pytest.fixture
 def _qwen4_exp_sm(_on_sm10x):
-    """The qwen4_exp target is certified on sm_103 only; on sm_100 it routes nowhere."""
+    """The qwen4_exp cases here run on sm_103; on sm_100 the family routes nowhere."""
     if _on_sm10x != (10, 3):
-        pytest.skip("the qwen4_exp target is certified on sm_103 only")
+        pytest.skip("the qwen4_exp cases here run on sm_103")
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
@@ -1301,12 +1301,6 @@ def test_qwen4_exp_unsupported_speculation_falls_back(spec_config):
 @pytest.mark.usefixtures("_qwen4_exp_sm")
 def test_qwen4_exp_deepstack_vision_tower_does_not_match():
     config = _model_config(_qwen4_exp_config(deepstack_visual_indexes=[5, 11, 17]))
-    assert modeling_v2_resolve(config, _llm_args("auto")) is None
-
-
-@pytest.mark.usefixtures("_qwen4_exp_sm")
-def test_qwen4_exp_on_two_ranks_does_not_match():
-    config = _model_config(_qwen4_exp_config(), world_size=2, tp_size=2)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
 
 

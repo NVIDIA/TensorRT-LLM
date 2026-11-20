@@ -43,6 +43,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner impo
     quantize_nvfp4,
 )
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
     fp8_block_scale_moe_runner,
 )
@@ -485,8 +486,17 @@ def _token_error(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return (out - ref).norm(dim=1) / ref.norm(dim=1).clamp_min(1e-12)
 
 
+needs_cute_dsl_moe = pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not archs.fast_path("cute_dsl_moe", torch.cuda.get_device_capability()),
+    reason="the CuTe DSL MoE does not run on this GPU",
+)
+
+
 @_cuda
-@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    "backend", [pytest.param("CUTEDSL", marks=needs_cute_dsl_moe), "TRTLLM"], ids=list(BACKENDS)
+)
 def test_routed_output_matches_the_float64_reference(backend: str) -> None:
     case = "one_hot"
     _, ids, weights = _problem(case)
@@ -497,6 +507,7 @@ def test_routed_output_matches_the_float64_reference(backend: str) -> None:
 
 
 @_cuda
+@needs_cute_dsl_moe
 def test_cutedsl_matches_trtllm_gen_under_a_uniform_input_scale() -> None:
     case = "weighted"
     _, ids, weights = _problem(case)

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The default target's core at tp4, tep4, dep4 and dep2: each rank's forward widths and its
-experts.
+"""The default target's core at tp4, tep4, dep4, dep2, tp2 and tep2: each rank's forward widths
+and its experts.
 
 The core is built on the meta device from the checkpoint's text and vision config values at
 every rank of a tp4, tep4, dep4 or dep2 mapping, so nothing here touches a device. What is pinned is
@@ -26,6 +26,7 @@ import torch
 
 from tensorrt_llm._torch.configs import Qwen4ExpTextConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
     modeling as M,
 )
@@ -128,6 +129,8 @@ _TEP4 = dict(enable_attention_dp=False, moe_tp_size=1, moe_ep_size=4)
 _DEP4 = dict(enable_attention_dp=True, moe_tp_size=1, moe_ep_size=4)
 _DEP2 = dict(enable_attention_dp=True, moe_tp_size=1, moe_ep_size=2)
 _TP4 = dict(enable_attention_dp=False, moe_tp_size=4, moe_ep_size=1)
+_TP2 = dict(enable_attention_dp=False, moe_tp_size=2, moe_ep_size=1)
+_TEP2 = dict(enable_attention_dp=False, moe_tp_size=1, moe_ep_size=2)
 
 
 def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD, text=None, **config):
@@ -148,7 +151,7 @@ def _core(rank: int, layout: dict, spec_config=None, world: int = WORLD, text=No
     )
     # The core asserts the device it runs on; the weights it declares stay on meta.
     with (
-        mock.patch.object(torch.cuda, "get_device_capability", return_value=M._SM),
+        mock.patch.object(torch.cuda, "get_device_capability", return_value=archs.SM_103),
         torch.device("meta"),
     ):
         return M.Qwen4ExpDefaultModelingV2(model_config, composite)
@@ -214,6 +217,24 @@ def test_a_tp4_rank_holds_every_expert_at_its_padded_intermediate_slice(rank) ->
     assert tuple(core.w["l0_fc2_w"].shape) == (512, 2560, 256 // 2)
     assert tuple(core.w["l0_fc2_s"].shape) == (512, 2560, 256 // 16)
     assert tuple(core.w["l0_e_isc2"].shape) == (512,)
+
+
+@pytest.mark.parametrize("layout", [_TP2, _TEP2], ids=["tp2", "tep2"])
+def test_a_two_rank_core_holds_half_the_heads(layout) -> None:
+    """12 q heads and one KV head a rank and 8 / 24 GDN heads; tep2 holds a 256-expert window,
+    tp2 every expert at a 320-row intermediate slice stored 384 wide."""
+    for rank in range(2):
+        core = _core(rank, layout, world=2)
+        assert (core.heads_q, core.heads_kv, core.kv_head_start) == (12, 1, rank)
+        assert (core.num_k_heads, core.num_v_heads, core.attn_in_width) == (8, 24, 7424)
+        assert tuple(core.w["l3_attn_in_w"].shape) == (7424, 2560)
+        assert tuple(core.w["l0_conv_w"].shape) == (5120, 1, 4)
+        experts = (core.local_experts, core.expert_offset, core.expert_inter)
+        if layout is _TEP2:
+            assert experts == (256, 256 * rank, 640)
+        else:
+            assert experts == (512, 0, 384)
+            assert tuple(core.w["l0_fc2_w"].shape) == (512, 2560, 384 // 2)
 
 
 @pytest.mark.parametrize("layout", [_TEP4, _DEP4], ids=["tep4", "dep4"])
