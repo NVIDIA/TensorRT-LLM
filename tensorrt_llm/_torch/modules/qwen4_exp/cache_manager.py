@@ -783,10 +783,15 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         ]
 
     @override
-    def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
-        state = create_gdn_state(self, self._requested_replay, allow_flashinfer_ring=True)
-
-        validate_gdn_layout(self, state)
+    def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState | None:
+        if self._context_only and self.spec_config is not None:
+            # A disaggregated context server never verifies drafts: it keeps
+            # neither the replay history nor the intermediate buffers.
+            self.recurrent_context_only = True
+            state = None
+        else:
+            state = create_gdn_state(self, self._requested_replay, allow_flashinfer_ring=True)
+            validate_gdn_layout(self, state)
         params = self._ple_params
         if self._is_ple_draft:
             params = None

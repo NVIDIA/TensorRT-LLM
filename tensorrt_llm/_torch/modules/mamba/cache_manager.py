@@ -617,7 +617,12 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_spec_state(self) -> Mamba2State | ReplayHistory:
+    def _initialize_spec_state(self) -> Mamba2State | ReplayHistory | None:
+        if self._context_only and self.spec_config is not None:
+            # A disaggregated context server never verifies drafts: it keeps
+            # neither the replay history nor the intermediate buffers.
+            self.recurrent_context_only = True
+            return None
         if self._requested_replay is not None:
             state = create_mamba2_state(
                 spec_config=self.spec_config,
@@ -824,7 +829,8 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
         return state.get_replay_metadata() if isinstance(state, ReplayHistory) else None
 
     def get_mamba_ssm_rand_seed(self) -> torch.Tensor | None:
-        return self._speculative_state.rand_seed
+        state = self._speculative_state
+        return state.rand_seed if state is not None else None
 
 
 def get_nemotron_cache_params(config, *, spec_config=None, quant_config=None):
