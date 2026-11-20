@@ -529,9 +529,11 @@ import. Keep its availability and support checks aligned with the model's
 requirements.
 
 Pass `fmha_libs` to `create_attention()` or `TrtllmAttention` to supply the
-layer's complete ordered list. Its entries are names registered with
+layer's complete ordered base list. Its entries are names registered with
 `@fmha_lib("name")` or FMHA classes that accept the owning attention in their
-constructor. `None` selects the defaults, while `[]` starts with no candidates.
+constructor. `None` selects the defaults, while `[]` selects an empty base
+list. The resolver places any model classes in
+`prepended_fmha_lib_classes` before the base list.
 For dense FP4 MLA, an explicit list must include a library that can serve the
 FP8 context path. The temporary FP8 attention view uses the same list and
 checks availability for its own KV cache type.
@@ -576,11 +578,11 @@ entire candidate list, including any anonymous classes. In a signed list,
 `+name` moves or adds the corresponding class to the front in the order
 written, and `-name` removes it. The last operation for a name determines
 whether it is included. The environment variable addresses only registered
-names. Set `use_fmha_libs_env=False` to skip these candidate-list overrides
-for a layer. Shared metadata still reads the global setting. With
-`fmha_libs=None`, legacy prepended classes still come before the resolved
-global candidates and remain outside these environment overrides. An
-explicit `fmha_libs` list replaces that legacy prepend path.
+names. The resolver applies these overrides to the combined model prepend
+and base list, then deduplicates by class. A signed list therefore orders
+environment additions first, then model prepends, then the remaining base
+candidates. Set `use_fmha_libs_env=False` to skip these candidate-list
+overrides for a layer. Shared metadata still reads the global setting.
 
 Dense PrimTS is opt-in because it may add host overhead. Use
 `TLLM_FMHA_LIBS=+prims_ts` to enable it or `TLLM_FMHA_LIBS=fallback` to select

@@ -23,6 +23,7 @@ import torch
 from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha
 
 from tensorrt_llm._torch.attention.backends.fmha import manager as fmha_manager
+from tensorrt_llm._torch.attention.backends.fmha import registry as fmha_registry
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
@@ -1081,29 +1082,72 @@ def test_manager_without_prepended_libraries_builds_the_registry_list(declared: 
     assert TrtllmAttention.prepended_fmha_lib_classes == ()
 
 
-def test_manager_tries_a_prepended_library_first() -> None:
+@pytest.mark.parametrize(
+    ("fmha_libs", "env", "use_env", "expected"),
+    [
+        pytest.param(None, "", True, ["model", "first", "second"], id="prepend-before-defaults"),
+        pytest.param(None, "+second", True, ["second", "model", "first"], id="env-before-prepend"),
+        pytest.param(None, "-model", True, ["first", "second"], id="env-removes-prepend"),
+        pytest.param(None, "first", True, ["first"], id="exact-env-replaces-prepend"),
+        pytest.param(["second", "model"], "", True, ["model", "second"], id="explicit-dedup"),
+        pytest.param([], "", True, ["model"], id="empty-base"),
+        pytest.param(None, "first", False, ["model", "first", "second"], id="env-disabled"),
+    ],
+)
+def test_manager_resolves_prepended_library_priority(
+    monkeypatch: pytest.MonkeyPatch,
+    fmha_libs: list[str] | None,
+    env: str,
+    use_env: bool,
+    expected: list[str],
+) -> None:
     checked: list = []
-    registry = [_listed_fmha("First", True, checked), _listed_fmha("Second", True, checked)]
-    prepended = _listed_fmha("Prepended", True, checked)
+    libraries = {name: _listed_fmha(name, True, checked) for name in ("model", "first", "second")}
+    monkeypatch.setattr(fmha_registry, "FMHA_LIBS", libraries)
+    monkeypatch.setattr(fmha_registry, "DEFAULT_FMHA_LIBS", ("first", "second"))
+    monkeypatch.setenv("TLLM_FMHA_LIBS", env)
     attn = FakeAttention()
-    attn.prepended_fmha_lib_classes = (prepended,)
+    attn.prepended_fmha_lib_classes = (libraries["model"],)
 
-    with patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=registry):
-        manager = FmhaManager(attn)
+    manager = FmhaManager(attn, fmha_libs=fmha_libs, use_fmha_libs_env=use_env)
 
-    assert [type(lib) for lib in manager.fmha_libs] == [prepended, *registry]
-    assert [name for name, _ in checked] == ["Prepended", "First", "Second"]
-    assert all(checked_attn is attn for _, checked_attn in checked)
+    assert [type(lib) for lib in manager.fmha_libs] == [libraries[name] for name in expected]
+    assert checked == [(name, attn) for name in expected]
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        pytest.param("-first", ["anonymous", "second"], id="signed-keeps-anonymous-prepend"),
+        pytest.param("second", ["second"], id="exact-replaces-anonymous-prepend"),
+    ],
+)
+def test_manager_env_override_with_anonymous_prepend(
+    monkeypatch: pytest.MonkeyPatch, env: str, expected: list[str]
+) -> None:
+    checked: list = []
+    first = _listed_fmha("first", True, checked)
+    second = _listed_fmha("second", True, checked)
+    anonymous = _listed_fmha("anonymous", True, checked)
+    monkeypatch.setattr(fmha_registry, "FMHA_LIBS", {"first": first, "second": second})
+    monkeypatch.setattr(fmha_registry, "DEFAULT_FMHA_LIBS", ("first", "second"))
+    monkeypatch.setenv("TLLM_FMHA_LIBS", env)
+    attn = FakeAttention()
+    attn.prepended_fmha_lib_classes = (anonymous,)
+
+    manager = FmhaManager(attn)
+
+    assert [type(lib).__name__ for lib in manager.fmha_libs] == expected
+    assert checked == [(name, attn) for name in expected]
 
 
 def test_manager_skips_an_unavailable_prepended_library() -> None:
     checked: list = []
-    registry = [_listed_fmha("First", True, checked)]
+    first = _listed_fmha("First", True, checked)
     attn = FakeAttention()
     attn.prepended_fmha_lib_classes = (_listed_fmha("Prepended", False, checked),)
 
-    with patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=registry):
-        manager = FmhaManager(attn)
+    manager = FmhaManager(attn, fmha_libs=[first], use_fmha_libs_env=False)
 
-    assert [type(lib) for lib in manager.fmha_libs] == registry
+    assert [type(lib) for lib in manager.fmha_libs] == [first]
     assert [name for name, _ in checked] == ["Prepended", "First"]

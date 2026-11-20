@@ -347,10 +347,12 @@ class FmhaManager:
         # normal forwarding never pays for an environment lookup.
         self._cache_sanity_check_enabled = _is_fmha_cache_sanity_check_enabled()
         self.fmha_libs: list[Fmha] = []
-        # Legacy prepends are independent of the global registry's environment overrides.
-        prepended = getattr(attn, "prepended_fmha_lib_classes", ()) if fmha_libs is None else ()
-        candidates = get_enabled_fmha_lib_classes(fmha_libs, use_fmha_libs_env=use_fmha_libs_env)
-        for fmha_cls in (*prepended, *candidates):
+        candidates = get_enabled_fmha_lib_classes(
+            fmha_libs,
+            use_fmha_libs_env=use_fmha_libs_env,
+            prepended_fmha_lib_classes=getattr(attn, "prepended_fmha_lib_classes", ()),
+        )
+        for fmha_cls in candidates:
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
         self._layer_idx = getattr(attn, "layer_idx", None)

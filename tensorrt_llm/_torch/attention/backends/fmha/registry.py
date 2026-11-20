@@ -91,12 +91,14 @@ def _parse_fmha_libs_env() -> list[tuple[str, FmhaCls]]:
 def get_enabled_fmha_lib_classes(
     fmha_libs: Sequence[str | FmhaCls] | None = None,
     use_fmha_libs_env: bool = True,
+    prepended_fmha_lib_classes: Sequence[FmhaCls] = (),
 ) -> list[FmhaCls]:
     """Resolve ordered candidates and apply environment overrides.
 
     Args:
         fmha_libs: Registered names and classes. None selects the default list.
         use_fmha_libs_env: Apply deltas or an exact list from TLLM_FMHA_LIBS.
+        prepended_fmha_lib_classes: Model classes to place before the base candidates.
     """
     entries = _parse_fmha_libs_env() if use_fmha_libs_env else []
     if entries and not entries[0][0]:
@@ -104,17 +106,18 @@ def get_enabled_fmha_lib_classes(
 
     candidates = DEFAULT_FMHA_LIBS if fmha_libs is None else fmha_libs
     classes = [_get_fmha_lib_class(lib) if isinstance(lib, str) else lib for lib in candidates]
-    prepended: dict[FmhaCls, None] = {}
+    additions: dict[FmhaCls, None] = {}
     excluded: set[FmhaCls] = set()
     for sign, cls in entries:
         if sign == "+":
             excluded.discard(cls)
-            prepended[cls] = None
+            additions[cls] = None
         else:
-            prepended.pop(cls, None)
+            additions.pop(cls, None)
             excluded.add(cls)
 
-    return [cls for cls in dict.fromkeys((*prepended, *classes)) if cls not in excluded]
+    ordered = dict.fromkeys((*additions, *prepended_fmha_lib_classes, *classes))
+    return [cls for cls in ordered if cls not in excluded]
 
 
 def is_fmha_lib_enabled(name: str) -> bool:
