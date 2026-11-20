@@ -45,7 +45,14 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from .config import DS_V4_FLASH, NUM_SMS, SpecDsaConfig, check_device, supported_spec
+from .config import (
+    DS_V4_FLASH,
+    DS_V4_FLASH_FP4,
+    NUM_SMS,
+    SpecDsaConfig,
+    check_device,
+    supported_spec,
+)
 
 __all__ = [
     "ERR_SCHEDULE",
@@ -94,8 +101,12 @@ _KERNEL_CONFIG = dict(
     q_stages=2,
 )
 
-# The knobs of the indexer kernel per spec (kernel_key).
-_KNOBS = {DS_V4_FLASH.kernel_key: _KERNEL_CONFIG}
+# The knobs of the indexer kernel per spec (kernel_key). An FP4 K tile is half the bytes of an FP8 one: twice the
+# stages keep the same bytes in flight.
+_KNOBS = {
+    DS_V4_FLASH.kernel_key: _KERNEL_CONFIG,
+    DS_V4_FLASH_FP4.kernel_key: dict(_KERNEL_CONFIG, kv_stages=8),
+}
 
 _lock = threading.Lock()
 _engines: dict[tuple, dict] = {}
@@ -396,15 +407,19 @@ def run(
     topk: torch.Tensor,
     out: torch.Tensor,
     softmax_scale: float | None = None,
+    *,
+    q_scale: torch.Tensor | None = None,
 ) -> None:
     """Launch the two kernels on the current stream.
 
     Args:
         state: from ``prepare`` for these lengths.
-        q_idx: float8_e4m3fn [B, 64, 128] (or [B, 1, 64, 128]), indexer queries.
+        q_idx: float8_e4m3fn [B, 64, 128] (or [B, 1, 64, 128]), indexer queries; for an FP4 spec packed E2M1, 1 byte
+            per two values ([B, 64, 64]).
         w_idx: float32 [B, 64], indexer head weights.
-        k_cache: uint8 [pages, ...] with 4224 bytes per page, indexer K pages (32 x 128 FP8 values, then 32 float32
-            scales).
+        k_cache: uint8 [pages, ...] with ``config.index_page_bytes`` bytes per page: 4224 for FP8 (32 x 128 FP8 values,
+            then 32 float32 scales), 2176 for FP4 (32 x 64 bytes of E2M1 pairs, then 32 int32 of four UE8M0 scales, one
+            per 32 values).
         idx_block_table: int32 [B, pages], indexer K pages of each row.
         ctx_lens: int32 [B] on the device, the same lengths as given to ``prepare``.
         kv_lens: int32 [B] on the device, uncompressed length of each row (>= 128); the window is its last 128
@@ -415,14 +430,23 @@ def run(
         topk: int32 [B, 512] output, the selected compressed positions (in no particular order).
         out: bfloat16 [B, 64 * 512] output.
         softmax_scale: attention softmax scale (default: ``1 / sqrt(kv_dim)`` of the spec).
+        q_scale: int32 [B, 64] (or [B, 1, 64]), the four UE8M0 query scales of each head in one int32 (FP4 specs only).
 
     The shapes are those of the DS-V4-Flash spec; ``state.config`` gives the sizes the checks use.
     """
     config = state.config
     b = state.batch_size
+    fp4 = config.index_k_dtype == "fp4"
     if softmax_scale is None:
         softmax_scale = config.default_softmax_scale
-    _check_numel("q_idx", q_idx, b * config.index_heads * config.index_head_dim)
+    q_values = config.index_head_dim // 2 if fp4 else config.index_head_dim
+    _check_numel("q_idx", q_idx, b * config.index_heads * q_values)
+    if fp4:
+        if q_scale is None:
+            raise ValueError("an FP4 spec needs q_scale (the UE8M0 scales of the FP4 queries)")
+        _check_numel("q_scale", q_scale, b * config.index_heads, torch.int32)
+    elif q_scale is not None:
+        raise ValueError("q_scale belongs to FP4 specs")
     if q_idx.element_size() != 1:
         raise ValueError(f"q_idx must be FP8 (1 byte per value), got {q_idx.dtype}")
     _check_numel("w_idx", w_idx, b * config.index_heads, torch.float32)
@@ -453,8 +477,8 @@ def run(
         k_cache.view(pages, -1),
         q_idx.reshape(-1)
         .as_strided(
-            (config.index_heads, config.index_head_dim, b),
-            (config.index_head_dim, 1, config.index_heads * config.index_head_dim),
+            (config.index_heads, q_values, b),
+            (q_values, 1, config.index_heads * q_values),
         )
         .view(torch.uint8),
         w_idx.reshape(-1).as_strided((config.index_heads, b), (1, config.index_heads)),
@@ -481,6 +505,11 @@ def run(
         softmax_scale,
         pages,
         b,
+        *(
+            (q_scale.reshape(-1).as_strided((config.index_heads, b), (1, config.index_heads)),)
+            if fp4
+            else ()
+        ),
     )
     e["tail_fn"](
         q_att8, swa8, c8, state.gidx, state.sinks, out3, state.ready_queue, softmax_scale, NUM_SMS

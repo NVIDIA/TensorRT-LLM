@@ -28,10 +28,11 @@ needs, not a fork of the kernels (see ``README.md``).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 __all__ = [
     "DS_V4_FLASH",
+    "DS_V4_FLASH_FP4",
     "INDEX_TILE",
     "KNOWN_SHAPES",
     "NUM_SMS",
@@ -219,8 +220,16 @@ DS_V4_FLASH = SpecDsaConfig(
     max_batch=1024,
 )
 
+# The same model with the MXFP4 indexer K cache of the cache manager (E2M1 data and a UE8M0 scale per 32 elements,
+# 68 bytes per position) and an FP4 indexer query with a scale per 32 elements.
+# The FP4 K stream is twice as fast per byte, but the megakernel row cost (the epilogue warps' hand-over of every
+# row, the teams' selection and attention) does not shrink with it: from 23 rows the large-batch kernels are faster.
+DS_V4_FLASH_FP4 = replace(
+    DS_V4_FLASH, name="DS-V4-Flash-FP4", index_k_dtype="fp4", megakernel_max_batch=22
+)
+
 # The specs the kernels were built and validated for.
-SUPPORTED_SPECS = {DS_V4_FLASH.name: DS_V4_FLASH}
+SUPPORTED_SPECS = {DS_V4_FLASH.name: DS_V4_FLASH, DS_V4_FLASH_FP4.name: DS_V4_FLASH_FP4}
 
 # Indexer shapes of the DeepSeek models (index heads, index head dim, top-k, compression ratio), as in the model tables
 # of the top-K adapter; only the ones in SUPPORTED_SPECS have kernels.

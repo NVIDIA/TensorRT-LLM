@@ -292,6 +292,48 @@ def u32_of_f32(v):
     return Uint32(llvm.bitcast(Uint32.mlir_type, v.ir_value()))
 
 
+@dsl_user_op
+def ld_shared_b32(smem_ptr, *, loc=None, ip=None):
+    addr = smem_ptr.toint(loc=loc, ip=ip)
+    return Int32(
+        llvm.inline_asm(
+            Int32.mlir_type,
+            [addr.ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def st_shared_b32(smem_ptr, val, *, loc=None, ip=None):
+    addr = smem_ptr.toint(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(loc=loc, ip=ip), Int32(val).ir_value(loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def sf_atom_transpose(smem_ptr):
+    """One warp reshuffles 128 int32 (a 128-token scale atom of four UE8M0 each) to the byte layout UTCCP expects."""
+    lane_idx = cute.arch.lane_idx()
+    values = cute.make_rmem_tensor((4,), cutlass.Int32)
+    for i in cutlass.range_constexpr(4):
+        values[i] = ld_shared_b32(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx)
+    cute.arch.sync_warp(-1)
+    for i in cutlass.range_constexpr(4):
+        st_shared_b32(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i])
+
+
 def f32_of_u32(u):
     return Float32(llvm.bitcast(Float32.mlir_type, u.ir_value()))
 

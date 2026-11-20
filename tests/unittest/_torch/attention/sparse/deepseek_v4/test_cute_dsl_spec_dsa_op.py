@@ -14,8 +14,8 @@
 # limitations under the License.
 """One op for every batch size: ``spec_dsa.op`` from 1 to 1,024 rows (SM100).
 
-The op picks the megakernel up to the spec's ``megakernel_max_batch`` rows and the large-batch kernels above it.
-The case builder
+The op picks the megakernel up to the spec's ``megakernel_max_batch`` rows and the large-batch kernels above it, for
+the FP8 and the MXFP4 indexer K cache (the ``idx`` fixture). The case builder
 and the fp64 references of the large-batch test check every row's top-512 and attention here too, so both
 implementations are covered through the one interface: batch sizes around the switch and between the powers of two,
 the CUDA-graph and in-place refresh path, and the argument checks of the op.
@@ -29,6 +29,7 @@ import torch
 from . import test_cute_dsl_spec_dsa_large_batch as H
 
 pytestmark = H.pytestmark
+idx = H.idx
 
 
 def _op():
@@ -37,7 +38,7 @@ def _op():
     return op
 
 
-def _prepare(op, inp, state=None):
+def _prepare(op, inp, state=None, idx="fp8"):
     # host lengths: prepare() reads them without a device sync
     return op.prepare(
         inp["ctx_lens"].cpu(),
@@ -45,6 +46,7 @@ def _prepare(op, inp, state=None):
         inp["idx_block_table"],
         inp["sinks"],
         state=state,
+        config=H._spec_of(idx),
     )
 
 
@@ -65,30 +67,32 @@ def _launch(op, state, inp, topk, out):
         topk,
         out,
         softmax_scale=H.SM_SCALE,
+        **({"q_scale": inp["q_scale"]} if "q_scale" in inp else {}),
     )
 
 
-def test_implementation_for():
+def test_implementation_for(idx):
     op = _op()
-    last = H.SPEC.megakernel_max_batch
-    assert op.implementation_for(1) == "megakernel"
-    assert op.implementation_for(last) == "megakernel"
-    assert op.implementation_for(last + 1) == "large_batch"
-    assert op.implementation_for(H.SPEC.max_batch) == "large_batch"
-    for bad in (-1, 0, H.SPEC.max_batch + 1):
+    spec = H._spec_of(idx)
+    last = spec.megakernel_max_batch
+    assert op.implementation_for(1, spec) == "megakernel"
+    assert op.implementation_for(last, spec) == "megakernel"
+    assert op.implementation_for(last + 1, spec) == "large_batch"
+    assert op.implementation_for(spec.max_batch, spec) == "large_batch"
+    for bad in (-1, 0, spec.max_batch + 1):
         with pytest.raises(ValueError, match="batch size"):
-            op.implementation_for(bad)
+            op.implementation_for(bad, spec)
 
 
 @pytest.mark.parametrize(
     "batch", [1, 2, 3, 4, 5, 8, 9, 13, 16, 17, 24, 32, 33, 40, 47, 48, 49, 64, 149, 1024]
 )
-def test_matches_reference(batch):
+def test_matches_reference(batch, idx):
     op = _op()
-    inp, bases = H._make_case(batch, H._plain(H.LENGTHS), seed=100 + batch)
-    state = _prepare(op, inp)
+    inp, bases = H._make_case(batch, H._plain(H.LENGTHS), seed=100 + batch, idx=idx)
+    state = _prepare(op, inp, idx=idx)
     assert state.batch_size == batch
-    assert state.implementation == op.implementation_for(batch)
+    assert state.implementation == op.implementation_for(batch, H._spec_of(idx))
     topk, out = H._new_outputs(batch)
     _launch(op, state, inp, topk, out)
     torch.cuda.synchronize()
@@ -97,18 +101,18 @@ def test_matches_reference(batch):
 
 
 @pytest.mark.parametrize("batch", [4, 5, 24, 40, 47, 48, 60])
-def test_refresh_in_place_and_cuda_graph(batch):
+def test_refresh_in_place_and_cuda_graph(batch, idx):
     op = _op()
     ns = H.LENGTHS[:batch] if batch <= len(H.LENGTHS) else H.LENGTHS
-    inp, bases = H._make_case(batch, H._plain(ns), seed=7 + batch)
-    state = _prepare(op, inp)
+    inp, bases = H._make_case(batch, H._plain(ns), seed=7 + batch, idx=idx)
+    state = _prepare(op, inp, idx=idx)
     topk, out = H._new_outputs(batch)
     _launch(op, state, inp, topk, out)
     torch.cuda.synchronize()
     H._check_rows(inp, bases, topk, out, "realistic")
     # the same state refreshed in place for another step, then one captured launch replayed
-    inp2, bases2 = H._make_case(batch, H._plain(ns[::-1]), seed=70 + batch)
-    assert _prepare(op, inp2, state=state) is state
+    inp2, bases2 = H._make_case(batch, H._plain(ns[::-1]), seed=70 + batch, idx=idx)
+    assert _prepare(op, inp2, state=state, idx=idx) is state
     topk.fill_(-1)
     out.zero_()
     _launch(op, state, inp2, topk, out)

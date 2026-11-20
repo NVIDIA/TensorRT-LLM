@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""specDSA megakernel (CuTe DSL, SM100) against an fp64 reference of the unfused DeepSeek-V4-Flash decode chain.
+"""specDSA megakernel (CuTe DSL, SM100) against an fp64 reference of the unfused DeepSeek-V4-Flash decode chain
+(FP8 indexer K cache; the MXFP4 cache is covered by ``test_fp4_matches_reference``, with the case builder and
+references of the large-batch test).
 
 Synthetic inputs: per-row indexer K pages and KV rows scattered over shared pools, an opened K-th gap so the top-512
 set is well defined (rows with planted exact ties or all-equal rows are checked as value multisets), and an attention
@@ -493,3 +495,118 @@ def test_rejects_unsupported_shapes():
         op.prepare(
             torch.full((2,), 4096, dtype=i32), torch.full((2,), 16384, dtype=i32), bt2, state=state
         )
+
+
+FP4_CASES = [  # (rows' specs, attention mode)
+    pytest.param([{"n": 262127}], "gather_exact", id="b1-max"),
+    pytest.param([{"n": 8000, "ties": 9}], "gather_exact", id="b1-ties"),
+    pytest.param([{"n": 512}], "realistic", id="b1-select-all"),
+    pytest.param([{"n": 131071}, {"n": 65543, "ties": 7}], "gather_exact", id="b2-ties"),
+    pytest.param(
+        [{"n": 262127}, {"n": 700, "ties": 5}, {"n": 98309, "flat": True}],
+        "gather_exact",
+        id="b3-short-ties-flat",
+    ),
+    pytest.param(
+        [{"n": 131071}, {"n": 98309}, {"n": 50021}, {"n": 32771, "ties": 77}],
+        "realistic",
+        id="b4-mixed",
+    ),
+    pytest.param(
+        [{"n": 262127 - 4099 * r, "ties": 31 if r == 3 else 0} for r in range(8)],
+        "realistic",
+        id="b8-mixed-ties",
+    ),
+    pytest.param([{"n": 262127 - 7001 * r} for r in range(9)], "gather_exact", id="b9-mixed"),
+    pytest.param(
+        [{"n": 262127 - 4093 * r, "ties": 29 if r == 11 else 0} for r in range(16)],
+        "realistic",
+        id="b16-mixed-ties",
+    ),
+    pytest.param([{"n": 262127 - 5003 * r} for r in range(20)], "realistic", id="b20-mixed"),
+    pytest.param(
+        [
+            {
+                "n": 262127 - 3989 * r if r % 3 else 700 + 17 * r,
+                "ties": 3 if r == 5 else 0,
+                "flat": r == 18,
+            }
+            for r in range(22)
+        ],
+        "gather_exact",
+        id="b22-mixed-short-ties-flat",
+    ),
+]
+
+
+@pytest.mark.parametrize("specs,attn", FP4_CASES)
+def test_fp4_matches_reference(specs, attn):
+    """MXFP4 indexer K cache: exact top-512 sets / value multisets and the attention against the fp64 references."""
+    from . import test_cute_dsl_spec_dsa_large_batch as H
+
+    op = _op()
+    batch = len(specs)
+    inp, bases = H._make_case(batch, specs, seed=300 + batch, attn=attn, idx="fp4")
+    state = op.prepare(
+        inp["ctx_lens"].cpu(), inp["kv_lens"].cpu(), inp["idx_block_table"], config=H.SPEC_FP4
+    )
+    topk, out = H._new_outputs(batch)
+
+    def launch():
+        topk.fill_(-1)
+        out.zero_()
+        op.run(
+            state,
+            inp["q_idx"],
+            inp["w_idx"],
+            inp["k_cache"],
+            inp["idx_block_table"],
+            inp["ctx_lens"],
+            inp["q_att"],
+            inp["swa_pool"],
+            inp["bt_swa"],
+            inp["c_pool"],
+            inp["bt_c"],
+            inp["sinks"],
+            topk,
+            out,
+            softmax_scale=SM_SCALE,
+            q_scale=inp["q_scale"],
+        )
+        torch.cuda.synchronize()
+
+    for _ in range(2):  # the second launch runs on the next workspace generation
+        launch()
+        H._check_rows(inp, bases, topk, out, attn)
+    assert int(op.error_bits(state).max()) == 0, "kernel error bits set"
+
+
+def test_fp4_requires_query_scales():
+    from . import test_cute_dsl_spec_dsa_large_batch as H
+
+    op = _op()
+    inp, _ = H._make_case(1, H._plain([4096]), seed=5, idx="fp4")
+    state = op.prepare(
+        inp["ctx_lens"].cpu(), inp["kv_lens"].cpu(), inp["idx_block_table"], config=H.SPEC_FP4
+    )
+    topk, out = H._new_outputs(1)
+    args = (
+        state,
+        inp["q_idx"],
+        inp["w_idx"],
+        inp["k_cache"],
+        inp["idx_block_table"],
+        inp["ctx_lens"],
+        inp["q_att"],
+        inp["swa_pool"],
+        inp["bt_swa"],
+        inp["c_pool"],
+        inp["bt_c"],
+        inp["sinks"],
+        topk,
+        out,
+    )
+    with pytest.raises(ValueError, match="q_scale"):
+        op.run(*args)
+    with pytest.raises(ValueError, match="q_scale"):
+        op.run(*args, q_scale=inp["q_scale"].view(-1)[:3])

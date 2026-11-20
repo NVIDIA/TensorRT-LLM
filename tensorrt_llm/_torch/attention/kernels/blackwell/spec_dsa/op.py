@@ -222,6 +222,8 @@ def run(
     topk: torch.Tensor,
     out: torch.Tensor,
     softmax_scale: float | None = None,
+    *,
+    q_scale: torch.Tensor | None = None,
 ) -> None:
     """Launch the fused kernels on the current stream.
 
@@ -241,6 +243,8 @@ def run(
         topk: int32 [B, 512] output, the selected compressed positions (in no particular order).
         out: bfloat16 [B, 64 * 512] output.
         softmax_scale: attention softmax scale (default: ``1 / sqrt(kv_dim)`` of the spec of ``state``).
+        q_scale: int32 [B, 64], the packed UE8M0 scales of an FP4 ``q_idx`` (FP4 specs only: ``q_idx`` and ``k_cache``
+            are FP4 then).
 
     The shapes are those of DS-V4-Flash; ``state.config`` gives the sizes the checks use.
     """
@@ -261,6 +265,7 @@ def run(
             topk,
             out,
             softmax_scale,
+            q_scale=q_scale,
         )
     else:
         large_batch_op.run(
@@ -279,4 +284,5 @@ def run(
             topk,
             out,
             softmax_scale,
+            q_scale=q_scale,
         )

@@ -34,6 +34,7 @@ from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import (
 )
 
 FLASH = C.DS_V4_FLASH
+FLASH_FP4 = C.DS_V4_FLASH_FP4
 # An indexer shape without kernels: top-1024 instead of top-512.
 PRO = dataclasses.replace(FLASH, name="DS-V4-Pro", topk=1024)
 
@@ -52,7 +53,23 @@ def test_ds_v4_flash_values():
     assert s.index_page_bytes == 32 * (128 + 4)
     assert s.default_softmax_scale == 1.0 / math.sqrt(512.0)
     assert (C.NUM_SMS, C.INDEX_TILE) == (148, 128)
-    assert C.SUPPORTED_SPECS == {"DS-V4-Flash": s}
+    assert C.SUPPORTED_SPECS == {"DS-V4-Flash": s, "DS-V4-Flash-FP4": C.DS_V4_FLASH_FP4}
+
+
+def test_ds_v4_flash_fp4_values():
+    """The same model with the MXFP4 indexer K cache: only the K dtype (and the batch sizes of its kernels) differ."""
+    s = C.DS_V4_FLASH_FP4
+    assert s.name == "DS-V4-Flash-FP4"
+    assert (
+        dataclasses.replace(
+            s, name=FLASH.name, index_k_dtype="fp8", megakernel_max_batch=FLASH.megakernel_max_batch
+        )
+        == FLASH
+    )
+    assert (s.index_k_dtype, s.large_batch, s.max_batch) == ("fp4", True, 1024)
+    assert s.megakernel_max_batch == 22
+    assert s.index_page_bytes == 32 * (128 // 2 + 128 // 32)
+    assert s.shape_key == FLASH.shape_key and s.kernel_key != FLASH.kernel_key
 
 
 def test_index_page_bytes():
@@ -165,8 +182,9 @@ def test_resolve_spec():
         C.resolve_spec(64, 128, 1024, 4)
     with pytest.raises(NotImplementedError, match="DS-V3.2"):
         C.resolve_spec(64, 128, 2048, 1)
-    with pytest.raises(NotImplementedError, match="fp4"):
-        C.resolve_spec(64, 128, 512, 4, index_k_dtype="fp4")
+    assert C.resolve_spec(64, 128, 512, 4, index_k_dtype="fp4") is FLASH_FP4
+    with pytest.raises(NotImplementedError, match="DS-V4-Pro"):
+        C.resolve_spec(64, 128, 1024, 4, index_k_dtype="fp4")
     with pytest.raises(NotImplementedError, match="specDSA has no kernels"):
         C.resolve_spec(32, 128, 512, 4)  # another model with the same top-K
 

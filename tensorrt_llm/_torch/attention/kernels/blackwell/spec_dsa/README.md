@@ -8,8 +8,9 @@ exact top-K selection, the loads of the selected KV rows and the dense attention
 guessed from sampled logits as in the GVR V2 top-K and checked by a count certificate; a row where the guess does not
 hold takes an exact fallback, so the selection stays exact. "spec" here is that guess, not speculative decoding (MTP).
 
-The kernels of this package are specialized for one spec, DS-V4-Flash. `config.py` defines what a spec is and which
-specs have kernels; the rest of this file says where the parts that differ between models live and how to add a model.
+The kernels of this package are specialized for the specs of one model, DS-V4-Flash with an FP8 or an MXFP4 indexer K
+cache. `config.py` defines what a spec is and which specs have kernels; the rest of this file says where the parts that
+differ between models live and how to add a model.
 
 ## Files
 
@@ -30,6 +31,7 @@ specs have kernels; the rest of this file says where the parts that differ betwe
 | Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Large batch |
 | --- | --- | --- | --- | --- | --- | --- |
 | DS-V4-Flash | 64 x 128, fp8 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 47 rows | 48 to 1,024 rows |
+| DS-V4-Flash-FP4 | 64 x 128, fp4 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 22 rows | 23 to 1,024 rows |
 
 `is_supported(device, config)` and `implementation_for(batch_size, config)` answer from this table. For a config that is
 not in it `is_supported` returns `(False, reason)` and `precompile`, `prepare` and `implementation_for` raise
@@ -42,7 +44,7 @@ top-2048, no compression; V4-Pro: top-1024, 4x compression); they have no spec y
 | Axis | Examples | Where |
 | --- | --- | --- |
 | Numbers | top-K, compression ratio, heads, head dim, page sizes, window, longest row | `SpecDsaConfig` fields; the kernels define their structural constants from the spec and reject another `kernel_key` |
-| Indexer K cache | fp8 or fp4 | `index_k_dtype`; a second logits front-end next to the first when the fp4 path is added |
+| Indexer K cache | fp8 or fp4 | `index_k_dtype`; a logits front end per dtype in the megakernel's stream CTAs and in the indexer kernel (fp4: block-scaled MXF4 MMA, the scale factors go to tensor memory with UTCCP; `run` takes the query scales as `q_scale`) |
 | Selection | K sets the candidate buffers, the certificate bounds and the ladder of the threshold guess | the selection primitives (`*_lib.py`); tuning that depends on K lives with them |
 | KV format and dense attention | MLA latent KV (V3.2), E4M3 rows with a footer scale, window and sink (V4), the CSA2 cache (V4.1) | `kv_format`; one attention module per format (today `megakernel_attention.py` and the attention part of `large_batch.py`) |
 | Schedule | teams, ring depth, batch-size ranges per implementation | the knob tables of the host modules, keyed by `kernel_key`; `megakernel_max_batch` and `large_batch` of the spec |
@@ -57,7 +59,7 @@ use these kernels belongs with the model's attention backend (`attention/backend
 2. Turn the module constants of the kernels that depend on the new fields into arguments of the kernel constructors
    (today they come from `DS_V4_FLASH`). The code generated for DS-V4-Flash must not change: compare the PTX and IR of
    the existing spec before and after (the megakernel at every batch-size range and both large-batch kernels).
-3. Add the kernel variants (attention for a new KV format, logits for fp4) and register them by the config field.
+3. Add the kernel variants (attention for a new KV format, logits for a new K dtype) and register them by the config field.
 4. Validate the new spec on its own: the unit tests with its shapes, the 252-case real-capture gates (decode steps of
    real captures of the model, strict top-K and attention checks), a mixed-length stress, and the batch-size sweep.
 5. Document the spec in the table above.

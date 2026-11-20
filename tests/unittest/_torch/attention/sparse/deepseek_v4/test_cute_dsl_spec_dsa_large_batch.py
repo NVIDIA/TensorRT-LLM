@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""specDSA large-batch kernels (CuTe DSL, SM100) against an fp64 reference of the DeepSeek-V4-Flash decode chain.
+"""specDSA large-batch kernels (CuTe DSL, SM100) against an fp64 reference of the DeepSeek-V4-Flash decode chain,
+for the FP8 and the MXFP4 indexer K cache (the ``idx`` fixture).
 
 A batch is built from a few distinct base rows (own queries, indexer K pages, compressed KV rows, length); row ``b``
 uses base ``b % len(bases)`` and its own window pages and attention query, so a 1,024-row batch needs the memory of
@@ -25,6 +26,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa.config import DS_V4_FLASH as SPEC
+from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa.config import (
+    DS_V4_FLASH_FP4 as SPEC_FP4,
+)
 from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa.config import NUM_SMS
 from tensorrt_llm._utils import get_sm_version
 
@@ -78,6 +82,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(params=["fp8", "fp4"])
+def idx(request):
+    """The indexer K cache dtype under test."""
+    return request.param
+
+
 def _cdiv(a, b):
     return (a + b - 1) // b
 
@@ -88,6 +98,32 @@ def _e4m3(x):
 
 def _ue8m0(amax):
     return torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-30) / 448.0)))
+
+
+_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+
+def _spec_of(idx):
+    return SPEC_FP4 if idx == "fp4" else SPEC
+
+
+def _fp4_quantize(x):
+    """[M, 128] fp32 -> (E2M1 codes packed low nibble first uint8 [M, 64], UE8M0 exponents uint8 [M, 4], dequantized
+    fp32 [M, 128]).
+
+    One power-of-two scale per 32 values: the smallest 2**e with amax / 2**e <= 6.
+    """
+    m = x.shape[0]
+    blocks = x.reshape(m, 4, 32)
+    exp = torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-30) / 6.0)).clamp(-126, 127)
+    y = blocks / torch.exp2(exp)[..., None]
+    edges = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    code = torch.bucketize(y.abs(), edges).to(torch.uint8)
+    code = (code | (((y < 0) & (code != 0)).to(torch.uint8) << 3)).reshape(m, 128)
+    packed = (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous()
+    lut = torch.tensor(_E2M1, device=x.device)
+    deq = (lut[code.long()].reshape(m, 4, 32) * torch.exp2(exp)[..., None]).reshape(m, 128)
+    return packed, (exp + 127).to(torch.uint8), deq
 
 
 def _ref_topk(lg):
@@ -150,13 +186,15 @@ def _open_gap(lg, sc, gap_rel, above=False):
 
 
 @torch.no_grad()
-def _make_base(n, seed, ties=0, flat=False):
+def _make_base(n, seed, ties=0, flat=False, idx="fp8"):
     """One distinct row: indexer query and weights, K pages (whole 128-row tiles) with their fp64 logits.
 
     ties: copies the K-th position's K row onto ``ties`` losers (an exact tie group at the K-th value, with the gap
     above it opened as well).
     flat: every position shares one K row (every logit equal).
     """
+    if idx == "fp4":
+        return _make_base_fp4(n, seed, ties, flat)
     dev = torch.device("cuda")
     gh = torch.Generator().manual_seed(seed)
     gd = torch.Generator(device=dev).manual_seed(seed + 1)
@@ -204,14 +242,71 @@ def _make_base(n, seed, ties=0, flat=False):
 
 
 @torch.no_grad()
-def _make_case(batch, specs, seed, attn="realistic"):
+def _make_base_fp4(n, seed, ties=0, flat=False):
+    """_make_base for the FP4 cache: E2M1 K rows and queries with UE8M0 scales; the gap opening and the planted ties
+    act on the scale exponents.
+    """
+    dev = torch.device("cuda")
+    gh = torch.Generator().manual_seed(seed)
+    gd = torch.Generator(device=dev).manual_seed(seed + 1)
+    q_codes, q_sf, q_deq = _fp4_quantize(torch.randn(H_IDX, D_IDX, generator=gd, device=dev) * 2.0)
+    w = (torch.randn(H_IDX, generator=gd, device=dev) * (D_IDX * H_IDX) ** -0.5).float()
+    pg = _cdiv(n, 128) * (128 // TPB_C)
+    npad = pg * TPB_C
+    kf = torch.randn(npad, D_IDX, generator=gd, device=dev) * torch.exp(
+        0.5 * torch.randn(npad, 1, generator=gd, device=dev)
+    )
+    if flat:
+        kf = kf[:1].repeat(npad, 1)
+    k_codes, k_sf, k_deq = _fp4_quantize(kf)
+    sc = torch.ones(
+        npad, device=dev
+    )  # exact power-of-two multiplier per position, folded into the exponents at the end
+    lg = (k_deq[:n].double() @ q_deq.double().t()).clamp_min(0.0) @ w.double()
+    if not flat:
+        _open_gap(lg, sc, 1e-4, above=bool(ties))
+    if ties:
+        order = torch.sort(lg, descending=True, stable=True).indices
+        src = int(order[K_TOP - 1])
+        losers = order[K_TOP:]
+        dst = losers[torch.randperm(losers.numel(), generator=gh)[:ties].to(dev)]
+        k_codes[dst] = k_codes[src].clone()
+        k_sf[dst] = k_sf[src].clone()
+        sc[dst] = sc[src].clone()
+        lg[dst] = lg[src].clone()
+    top1 = int(torch.argmax(lg))
+    if npad > n:  # positions >= n get scores above every real one and must be ignored
+        k_codes[n:] = k_codes[top1].clone()
+        k_sf[n:] = k_sf[top1].clone()
+        sc[n:] = sc[top1] * (256.0 if float(lg[top1]) > 0 else 1.0 / 256.0)
+    shift = torch.round(torch.log2(sc)).to(torch.int32)
+    k_sf = (k_sf.to(torch.int32) + shift[:, None]).clamp(1, 254).to(torch.uint8)
+    pages = torch.empty((pg, SPEC_FP4.index_page_bytes), dtype=torch.uint8, device=dev)
+    pages[:, : TPB_C * (D_IDX // 2)] = k_codes.reshape(pg, TPB_C * (D_IDX // 2))
+    pages[:, TPB_C * (D_IDX // 2) :] = k_sf.reshape(pg, TPB_C * (D_IDX // 32))
+    ref_sel, ref_v, tied = _ref_topk(lg)
+    return {
+        "n": n,
+        "q_idx": q_codes,
+        "q_scale": q_sf.contiguous().view(torch.int32).reshape(H_IDX),
+        "w_idx": w,
+        "pages": pages,
+        "lg": lg,
+        "ref_sel": torch.sort(ref_sel).values,
+        "ref_v": ref_v,
+        "tied": tied,
+    }
+
+
+@torch.no_grad()
+def _make_case(batch, specs, seed, attn="realistic", idx="fp8"):
     """Inputs for ``batch`` rows; row b uses base ``b % len(specs)``. specs: dicts of n, ties, flat."""
     dev = torch.device("cuda")
     gh = torch.Generator().manual_seed(seed)
     gd = torch.Generator(device=dev).manual_seed(seed + 7)
     nb = len(specs)
     bases = [
-        _make_base(s["n"], seed + 100 * j, s.get("ties", 0), s.get("flat", False))
+        _make_base(s["n"], seed + 100 * j, s.get("ties", 0), s.get("flat", False), idx)
         for j, s in enumerate(specs)
     ]
     k_off, off = [], 0
@@ -282,7 +377,7 @@ def _make_case(batch, specs, seed, attn="realistic"):
     inp = {
         "q_idx": q_idx,
         "w_idx": w_idx.contiguous(),
-        "k_cache": k_cache.view(-1, TPB_C, 1, D_IDX + 4),
+        "k_cache": k_cache.view(-1, TPB_C, 1, _spec_of(idx).index_page_bytes // TPB_C),
         "idx_block_table": idx_bt.to(dev),
         "ctx_lens": torch.tensor(ns, dtype=torch.int32, device=dev),
         "kv_lens": torch.tensor(kv_lens, dtype=torch.int32, device=dev),
@@ -293,6 +388,8 @@ def _make_case(batch, specs, seed, attn="realistic"):
         "bt_c": bt_c.to(dev),
         "sinks": sinks.contiguous(),
     }
+    if idx == "fp4":
+        inp["q_scale"] = torch.stack([bases[b % nb]["q_scale"] for b in range(batch)])
     return inp, bases
 
 
@@ -313,6 +410,7 @@ def _launch(op, state, inp, topk, out, scale=SM_SCALE):
         topk,
         out,
         softmax_scale=scale,
+        **({"q_scale": inp["q_scale"]} if "q_scale" in inp else {}),
     )
 
 
@@ -354,10 +452,10 @@ def _plain(ns):
 
 
 @pytest.mark.parametrize("batch", [1, 7, 100, 148, 149, 256, 777, 1024])
-def test_mixed_lengths(batch):
+def test_mixed_lengths(batch, idx):
     op = _op()
-    inp, bases = _make_case(batch, _plain(LENGTHS), seed=11)
-    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"])
+    inp, bases = _make_case(batch, _plain(LENGTHS), seed=11, idx=idx)
+    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], config=_spec_of(idx))
     topk, out = _new_outputs(batch)
     _launch(op, state, inp, topk, out)
     torch.cuda.synchronize()
@@ -366,10 +464,10 @@ def test_mixed_lengths(batch):
 
 
 @pytest.mark.parametrize("batch", [256, 1024])
-def test_uniform_long_rows(batch):
+def test_uniform_long_rows(batch, idx):
     op = _op()
-    inp, bases = _make_case(batch, _plain([N_MAX - 17] * 4 + [N_MAX] * 4), seed=23)
-    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"])
+    inp, bases = _make_case(batch, _plain([N_MAX - 17] * 4 + [N_MAX] * 4), seed=23, idx=idx)
+    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], config=_spec_of(idx))
     topk, out = _new_outputs(batch)
     _launch(op, state, inp, topk, out)
     torch.cuda.synchronize()
@@ -377,18 +475,18 @@ def test_uniform_long_rows(batch):
     _check_rows(inp, bases, topk, out, "realistic")
 
 
-def test_gather_exact():
+def test_gather_exact(idx):
     op = _op()
     batch = 256
-    inp, bases = _make_case(batch, _plain(LENGTHS), seed=31, attn="gather_exact")
-    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"])
+    inp, bases = _make_case(batch, _plain(LENGTHS), seed=31, attn="gather_exact", idx=idx)
+    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], config=_spec_of(idx))
     topk, out = _new_outputs(batch)
     _launch(op, state, inp, topk, out)
     torch.cuda.synchronize()
     _check_rows(inp, bases, topk, out, "gather_exact")
 
 
-def test_ties_and_all_equal_rows():
+def test_ties_and_all_equal_rows(idx):
     op = _op()
     batch = 256
     specs = [
@@ -401,23 +499,23 @@ def test_ties_and_all_equal_rows():
         {"n": 90000},
         {"n": 40000, "ties": 600},
     ]
-    inp, bases = _make_case(batch, specs, seed=41)
-    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"])
+    inp, bases = _make_case(batch, specs, seed=41, idx=idx)
+    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], config=_spec_of(idx))
     topk, out = _new_outputs(batch)
     _launch(op, state, inp, topk, out)
     torch.cuda.synchronize()
     _check_rows(inp, bases, topk, out, "realistic")
 
 
-def test_state_reuse_across_steps():
+def test_state_reuse_across_steps(idx):
     """One state serves several steps with different lengths; prepare refreshes the schedule in place."""
     op = _op()
     batch = 256
     state = None
     topk, out = _new_outputs(batch)
     for step, ns in enumerate((LENGTHS, LENGTHS[5:] + LENGTHS[:5], [N_MAX] * 8)):
-        inp, bases = _make_case(batch, _plain(ns), seed=50 + step)
-        state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], state)
+        inp, bases = _make_case(batch, _plain(ns), seed=50 + step, idx=idx)
+        state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], state, config=_spec_of(idx))
         for _ in range(2):  # a repeated launch on the same step
             _launch(op, state, inp, topk, out)
             torch.cuda.synchronize()
@@ -425,35 +523,37 @@ def test_state_reuse_across_steps():
             _check_rows(inp, bases, topk, out, "realistic")
 
 
-def test_stale_schedule_is_refused():
+def test_stale_schedule_is_refused(idx):
     op = _op()
     batch = 256
-    inp, bases = _make_case(batch, _plain(LENGTHS), seed=61)
+    inp, bases = _make_case(batch, _plain(LENGTHS), seed=61, idx=idx)
     other = torch.tensor([LENGTHS[(b + 3) % len(LENGTHS)] for b in range(batch)], dtype=torch.int32)
-    state = op.prepare(other, inp["sinks"])  # a schedule for other lengths
+    state = op.prepare(other, inp["sinks"], config=_spec_of(idx))  # a schedule for other lengths
     topk, out = _new_outputs(batch)
     out.fill_(5.0)
     _launch(op, state, inp, topk, out)
     torch.cuda.synchronize()
     assert int(op.error_bits(state)[0]) & op.ERR_SCHEDULE
     assert bool((topk == -1).all()) and bool((out.float() == 0).all())
-    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], state)  # refreshed: the launch recovers
+    state = op.prepare(
+        inp["ctx_lens"].cpu(), inp["sinks"], state, config=_spec_of(idx)
+    )  # refreshed: the launch recovers
     _launch(op, state, inp, topk, out)
     torch.cuda.synchronize()
     assert int(op.error_bits(state)[0]) == 0
     _check_rows(inp, bases, topk, out, "realistic")
 
 
-def test_cuda_graph_replay():
+def test_cuda_graph_replay(idx):
     """One captured launch replays over several steps; lengths change in place and prepare refreshes the schedule."""
     op = _op()
     batch = 256
     steps = [
         LENGTHS[r:] + LENGTHS[:r] for r in (0, 5, 9)
     ]  # same pool sizes, other rows get other lengths
-    inp, bases = _make_case(batch, _plain(steps[0]), seed=71)
-    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"])
-    op.precompile(torch.device("cuda"))
+    inp, bases = _make_case(batch, _plain(steps[0]), seed=71, idx=idx)
+    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], config=_spec_of(idx))
+    op.precompile(torch.device("cuda"), _spec_of(idx))
     topk, out = _new_outputs(batch)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -465,11 +565,11 @@ def test_cuda_graph_replay():
         _launch(op, state, inp, topk, out)
     for step, ns in enumerate(steps):
         if step:
-            new_inp, bases = _make_case(batch, _plain(ns), seed=71 + step)
+            new_inp, bases = _make_case(batch, _plain(ns), seed=71 + step, idx=idx)
             for key, buf in inp.items():
                 assert buf.shape == new_inp[key].shape, key
                 buf.copy_(new_inp[key])
-            op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], state)
+            op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], state, config=_spec_of(idx))
         topk.fill_(-5)
         out.zero_()
         graph.replay()
@@ -577,3 +677,22 @@ def test_rejects_unsupported_arguments():
     state = op.prepare(ok, sinks)
     with pytest.raises(ValueError):
         op.prepare(torch.full((128,), 4096, dtype=torch.int32), sinks, state)
+
+
+def test_fp4_arguments_are_checked():
+    """An FP4 launch needs the query scales and FP4-sized K pages; the FP8 spec takes no scales."""
+    op = _op()
+    inp, _ = _make_case(256, _plain(LENGTHS), seed=81, idx="fp4")
+    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], config=SPEC_FP4)
+    topk, out = _new_outputs(256)
+    bad = dict(inp)
+    del bad["q_scale"]
+    with pytest.raises(ValueError, match="q_scale"):
+        _launch(op, state, bad, topk, out)
+    bad = dict(inp, k_cache=inp["k_cache"].view(-1)[: inp["k_cache"].numel() - 1])
+    with pytest.raises(ValueError):
+        _launch(op, state, bad, topk, out)
+    inp8, _ = _make_case(256, _plain(LENGTHS), seed=82, idx="fp8")
+    state8 = op.prepare(inp8["ctx_lens"].cpu(), inp8["sinks"])
+    with pytest.raises(ValueError, match="q_scale"):
+        _launch(op, state8, dict(inp8, q_scale=inp["q_scale"]), topk, out)

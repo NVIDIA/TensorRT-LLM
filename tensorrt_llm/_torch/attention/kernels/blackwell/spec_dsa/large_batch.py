@@ -18,9 +18,11 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as xcuda
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import Boolean, Float32, Int32, Int64, Uint32, Uint64
+import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass import Boolean, Float4E2M1FN, Float8E8M0FNU, Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu.tcgen05 import find_tmem_tensor_col_offset
 from cutlass.cutlass_dsl import T as _T
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
@@ -28,6 +30,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from . import large_batch_lib as L
 from .config import DS_V4_FLASH as SPEC
+from .config import DS_V4_FLASH_FP4 as SPEC_FP4
 from .config import NUM_SMS, SpecDsaConfig, require_built_for
 
 # ====================================================================================================================
@@ -1377,7 +1380,9 @@ def _issue_kv_tile(slot_base, mbar_base, tma_swa, tma_cmp, use_swa, gidx_t, wl, 
 
 class AttentionTail:
     def __init__(self, config: SpecDsaConfig | None = None):
-        require_built_for(config, SPEC)
+        require_built_for(
+            config, SPEC_FP4 if config is not None and config.index_k_dtype == "fp4" else SPEC
+        )
         self.threads = 288  # warps 0-3 loader, 4-7 softmax/epilogue, 8 MMA issue
 
     @cute.jit
@@ -2445,6 +2450,23 @@ def _finalize_seg(
     return (done_row, gv0, gv1, gv2, gv3, gv4)
 
 
+def _shared_storage(kv_stages: int, q_stages: int, umma_stages: int, fp4: bool):
+    """The shared-storage struct of the indexer kernel; the FP4 variant adds the SFB write-after-read mbarrier."""
+    # real annotation objects: this module postpones annotation evaluation, which cute.struct cannot resolve for
+    # local names
+    fields = {
+        "kv_mbar_0": cute.struct.MemRange[cutlass.Int64, kv_stages * 2],
+        "kv_mbar_1": cute.struct.MemRange[cutlass.Int64, kv_stages * 2],
+        "q_mbar": cute.struct.MemRange[cutlass.Int64, q_stages * 2],
+        "umma_mbar_0": cute.struct.MemRange[cutlass.Int64, umma_stages * 2],
+        "umma_mbar_1": cute.struct.MemRange[cutlass.Int64, umma_stages * 2],
+    }
+    if fp4:
+        fields["sfb_war_mbar"] = cute.struct.MemRange[cutlass.Int64, 2]
+    fields["tmem_holding_buf"] = cutlass.Int32
+    return cute.struct(type("SharedStorage", (), {"__annotations__": fields}))
+
+
 class IndexerKernel:
     def __init__(
         self,
@@ -2499,7 +2521,8 @@ class IndexerKernel:
         tiebin: bool = True,
         config: SpecDsaConfig | None = None,
     ):
-        require_built_for(config, SPEC)
+        self.fp4 = config is not None and config.index_k_dtype == "fp4"
+        require_built_for(config, SPEC_FP4 if self.fp4 else SPEC)
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
         self.num_blocks_per_mma = block_kv // phys_block_kv
@@ -2590,6 +2613,14 @@ class IndexerKernel:
         self.dq_cap = int(dq_cap)
         self.validate = bool(validate)
         self.tiebin = bool(tiebin)
+        if self.fp4:
+            # MXFP4 block-scaled MMA (E2M1 data, a UE8M0 scale per 32 elements): the SF TMEM regions are not
+            # staged, so there is one accumulator stage
+            self.num_umma_stages = 1
+            self.num_groups = 2
+            self.sf_dtype = Float8E8M0FNU
+            self.sf_vec_size = 32
+            self.umma_inst_k = 64
 
     def _epi_half(self, tTR_rAcc, w_cache, head_start, s0x, s0y, s1x, s1y):
         # The same four FMA chains continue across the two 32-head TMEM loads.
@@ -2750,6 +2781,8 @@ class IndexerKernel:
         return ctx
 
     def _setup_mma(self, a_dtype, b_dtype, a_major, b_major):
+        if self.fp4:
+            return self._setup_mma_fp4(a_dtype, b_dtype, a_major, b_major)
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
         self.mma_tiler = (*self.mma_tiler_mn, 1)
@@ -2781,6 +2814,123 @@ class IndexerKernel:
         self.num_tmem_alloc_cols_total = self.num_tmem_alloc_cols * 2 * self.num_umma_stages
         return tiled_mma
 
+    def _setup_mma_fp4(self, a_dtype, b_dtype, a_major, b_major):
+        """The block-scaled MXF4 MMA (K 64 per instruction, two per head dim) and its scale-factor layouts."""
+        self.a_dtype = a_dtype
+        self.b_dtype = b_dtype
+        self.mma_tiler = (*self.mma_tiler_mn, 1)
+        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            a_dtype,
+            b_dtype,
+            a_major,
+            b_major,
+            self.sf_dtype,
+            self.sf_vec_size,
+            self.cta_group,
+            self.mma_tiler_mn,
+        )
+        mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
+        mma_inst_tile_k = self.head_dim // mma_inst_shape_k
+        full_k = mma_inst_shape_k * mma_inst_tile_k
+        self.mma_tiler = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], full_k)
+        self.cta_tile_shape_mnk = (
+            self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
+            self.mma_tiler[1],
+            self.mma_tiler[2],
+        )
+        self.cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((*self.cluster_shape_mn, 1)), (tiled_mma.thr_id.shape,)
+        )
+        self.epi_tile = self.cta_tile_shape_mnk[:2]
+        self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
+            tiled_mma, self.mma_tiler, a_dtype, self.num_kv_stages
+        )
+        self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
+            tiled_mma, self.mma_tiler, b_dtype, self.num_q_stages
+        )
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+        self.num_tmem_alloc_cols = find_tmem_tensor_col_offset(tCtAcc_fake)
+        sfa_smem = blockscaled_utils.make_smem_layout_sfa(
+            tiled_mma, self.mma_tiler, self.sf_vec_size, 1
+        )
+        sfb_smem = blockscaled_utils.make_smem_layout_sfb(
+            tiled_mma, self.mma_tiler, self.sf_vec_size, 1
+        )
+        tmem_sfa = blockscaled_utils.make_tmem_layout_sfa(
+            tiled_mma,
+            self.mma_tiler,
+            self.sf_vec_size,
+            cute.slice_(sfa_smem, (None, None, None, 0)),
+        )
+        tmem_sfb = blockscaled_utils.make_tmem_layout_sfb(
+            tiled_mma,
+            self.mma_tiler,
+            self.sf_vec_size,
+            cute.slice_(sfb_smem, (None, None, None, 0)),
+        )
+        # a degenerate stage mode keeps the rank-4 slices of the MMA loop valid on both DSL versions
+        self.tmem_sfa_layout = cute.append(tmem_sfa, cute.make_layout(1, stride=0))
+        self.tmem_sfb_layout = cute.append(tmem_sfb, cute.make_layout(1, stride=0))
+        sf_k_modes = cute.size(tmem_sfa, mode=[2])
+        sf_tile_k = self.head_dim // self.umma_inst_k
+        assert sf_k_modes % sf_tile_k == 0
+        self.sf_k_step = sf_k_modes // sf_tile_k
+        self.N_padded = ((self.N + 127) // 128) * 128
+        self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // 32) * sf_tile_k
+        self.num_sfb_tmem_cols = (self.N_padded // 32) * sf_tile_k
+        raw_cols = (
+            self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages
+            + self.num_sfa_tmem_cols * self.num_groups
+            + self.num_sfb_tmem_cols
+        )
+        self.num_tmem_alloc_cols_total = max(1 << math.ceil(math.log2(raw_cols)), 32)
+        assert self.num_tmem_alloc_cols_total <= 512, "FP4 TMEM columns exceed the 512 of SM100"
+        self.sfa_chunk_smem_layout = sfa_smem
+        self.sfb_chunk_smem_layout = sfb_smem
+        self.copy_atom_s2t = cute.make_copy_atom(
+            tcgen05.Cp4x32x128bOp(self.cta_group), self.sf_dtype
+        )
+        return tiled_mma
+
+    def _fp4_views(self, kv_fused, b, num_phys_blocks):
+        """FP4 views of a K page pool [pages, 32 * 68 bytes] and of the queries.
+
+        A page: the E2M1 data of 32 positions, then 32 int32 of four UE8M0 scales each.
+        """
+        phys_block_kv = self.phys_block_kv
+        kv_fp4 = cute.recast_tensor(kv_fused, Float4E2M1FN)
+        b = cute.recast_tensor(b, Float4E2M1FN)
+        block_stride_bytes = kv_fused.layout.stride[0]
+        a = cute.make_tensor(
+            kv_fp4.iterator,
+            cute.make_layout(
+                (phys_block_kv, self.head_dim, num_phys_blocks),
+                stride=(self.head_dim, 1, block_stride_bytes * 2),
+            ),
+        )
+        sf_bytes = cute.make_tensor(
+            kv_fused.iterator + phys_block_kv * (self.head_dim // 2),
+            cute.make_layout((phys_block_kv * 4, num_phys_blocks), stride=(1, block_stride_bytes)),
+        )
+        return a, b, cute.recast_tensor(sf_bytes, cutlass.Int32)
+
+    def _fp4_sf_q_atom(self, sf_q, tma_load_op):
+        """TMA atom of the query scales [64, B] int32 (the SMEM stage is padded to the 128-token UTCCP atom)."""
+        stage_stride = (self.N_padded * 4 + 127) // 128 * 128 // 4
+        self.sf_q_smem_layout_staged = cute.make_layout(
+            (self.N_padded, self.num_q_stages), stride=(1, stage_stride)
+        )
+        self.sf_q_tma_smem_layout_staged = cute.make_layout(
+            (self.N, self.num_q_stages), stride=(1, stage_stride)
+        )
+        return cpasync.make_tiled_tma_atom(
+            tma_load_op,
+            sf_q,
+            cute.select(self.sf_q_tma_smem_layout_staged, mode=[0]),
+            (self.N,),
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -2811,22 +2961,26 @@ class IndexerKernel:
         num_phys_blocks: cutlass.Int32,
         batch_size: cutlass.Int32,
         stream: cuda.CUstream,
+        sf_q: cute.Tensor = None,
     ):
         phys_block_kv = self.phys_block_kv
         scale_offset_elems = phys_block_kv * self.head_dim
-        kv_fp8 = cute.recast_tensor(kv_fused, cutlass.Float8E4M3FN)
-        b = cute.recast_tensor(b, cutlass.Float8E4M3FN)
-        kv_block_stride = kv_fused.layout.stride[0]
-        kv_layout = cute.make_layout(
-            (phys_block_kv, self.head_dim, num_phys_blocks),
-            stride=(self.head_dim, 1, kv_block_stride),
-        )
-        a = cute.make_tensor(kv_fp8.iterator, kv_layout)
-        scale_fp8_layout = cute.make_layout(
-            (phys_block_kv * 4, num_phys_blocks), stride=(1, kv_block_stride)
-        )
-        scale_fp8 = cute.make_tensor(kv_fp8.iterator + scale_offset_elems, scale_fp8_layout)
-        scales = cute.recast_tensor(scale_fp8, cutlass.Float32)
+        if cutlass.const_expr(self.fp4):
+            a, b, scales = self._fp4_views(kv_fused, b, num_phys_blocks)
+        else:
+            kv_fp8 = cute.recast_tensor(kv_fused, cutlass.Float8E4M3FN)
+            b = cute.recast_tensor(b, cutlass.Float8E4M3FN)
+            kv_block_stride = kv_fused.layout.stride[0]
+            kv_layout = cute.make_layout(
+                (phys_block_kv, self.head_dim, num_phys_blocks),
+                stride=(self.head_dim, 1, kv_block_stride),
+            )
+            a = cute.make_tensor(kv_fp8.iterator, kv_layout)
+            scale_fp8_layout = cute.make_layout(
+                (phys_block_kv * 4, num_phys_blocks), stride=(1, kv_block_stride)
+            )
+            scale_fp8 = cute.make_tensor(kv_fp8.iterator + scale_offset_elems, scale_fp8_layout)
+            scales = cute.recast_tensor(scale_fp8, cutlass.Float32)
         a_dtype = a.element_type
         b_dtype = b.element_type
         a_major = cutlass.utils.LayoutEnum.from_tensor(a).mma_major_mode()
@@ -2866,21 +3020,35 @@ class IndexerKernel:
         )
         b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
         w_copy_size = self.N * self.epi_bytes
-        kv_tma_bytes_per_subblock = phys_block_kv * self.head_dim
+        kv_tma_bytes_per_subblock = phys_block_kv * self.head_dim // (2 if self.fp4 else 1)
         scale_tma_bytes_per_subblock = phys_block_kv * 4
         self.num_kv_scale_tma_bytes = self.num_blocks_per_mma * (
             kv_tma_bytes_per_subblock + scale_tma_bytes_per_subblock
         )
         self.num_q_tma_bytes = b_copy_size * atom_thr_size + w_copy_size
+        tma_atom_sf_q = None
+        tma_tensor_sf_q = None
+        sf_q_smem_layout_staged = None
+        sf_q_tma_smem_layout_staged = None
+        tmem_sfa_layout = None
+        tmem_sfb_layout = None
+        sfa_chunk_smem_layout = None
+        sfb_chunk_smem_layout = None
+        copy_atom_s2t = None
+        if cutlass.const_expr(self.fp4):
+            tma_atom_sf_q, tma_tensor_sf_q = self._fp4_sf_q_atom(sf_q, tma_load_op)
+            self.num_q_tma_bytes = self.num_q_tma_bytes + self.N * 4
+            sf_q_smem_layout_staged = self.sf_q_smem_layout_staged
+            sf_q_tma_smem_layout_staged = self.sf_q_tma_smem_layout_staged
+            tmem_sfa_layout = self.tmem_sfa_layout
+            tmem_sfb_layout = self.tmem_sfb_layout
+            sfa_chunk_smem_layout = self.sfa_chunk_smem_layout
+            sfb_chunk_smem_layout = self.sfb_chunk_smem_layout
+            copy_atom_s2t = self.copy_atom_s2t
 
-        @cute.struct
-        class SharedStorage:
-            kv_mbar_0: cute.struct.MemRange[cutlass.Int64, self.num_kv_stages * 2]
-            kv_mbar_1: cute.struct.MemRange[cutlass.Int64, self.num_kv_stages * 2]
-            q_mbar: cute.struct.MemRange[cutlass.Int64, self.num_q_stages * 2]
-            umma_mbar_0: cute.struct.MemRange[cutlass.Int64, self.num_umma_stages * 2]
-            umma_mbar_1: cute.struct.MemRange[cutlass.Int64, self.num_umma_stages * 2]
-            tmem_holding_buf: cutlass.Int32
+        SharedStorage = _shared_storage(
+            self.num_kv_stages, self.num_q_stages, self.num_umma_stages, self.fp4
+        )
 
         tma_q = xcuda.create_tensor_map_tiled(
             global_address=q_att.iterator.toint(),
@@ -2946,6 +3114,15 @@ class IndexerKernel:
             self.a_tma_view_layout,
             self.epi_tile,
             SharedStorage,
+            tma_atom_sf_q,
+            tma_tensor_sf_q,
+            sf_q_smem_layout_staged,
+            sf_q_tma_smem_layout_staged,
+            tmem_sfa_layout,
+            tmem_sfb_layout,
+            sfa_chunk_smem_layout,
+            sfb_chunk_smem_layout,
+            copy_atom_s2t,
         ).launch(
             grid=(1, 1, self.num_sms),
             block=[self.threads_per_cta, 1, 1],
@@ -2996,6 +3173,15 @@ class IndexerKernel:
         a_tma_view_layout: cute.ComposedLayout,
         epi_tile: cute.Tile,
         SharedStorage: cutlass.Constexpr,
+        tma_atom_sf_q: cute.CopyAtom = None,
+        mSF_Q_tma: cute.Tensor = None,
+        sf_q_smem_layout_staged: cute.Layout = None,
+        sf_q_tma_smem_layout_staged: cute.Layout = None,
+        tmem_sfa_layout: cute.Layout = None,
+        tmem_sfb_layout: cute.Layout = None,
+        sfa_chunk_smem_layout: cute.Layout = None,
+        sfb_chunk_smem_layout: cute.Layout = None,
+        copy_atom_s2t: cute.CopyAtom = None,
     ):
         # Let the attention grid start on the SMs this grid leaves free; it consumes rows as they are published.
         cute.arch.griddepcontrol_launch_dependents()
@@ -3042,6 +3228,8 @@ class IndexerKernel:
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_w)
             cpasync.prefetch_descriptor(tma_atom_s)
+            if cutlass.const_expr(self.fp4):
+                cpasync.prefetch_descriptor(tma_atom_sf_q)
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         block_kv_val = self.block_kv
@@ -3070,27 +3258,50 @@ class IndexerKernel:
             pipeline.PipelineUserType.Consumer, self.num_q_stages
         )
         math_warps_per_group = self.num_math_warps // 2
-        kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, math_warps_per_group)
-        kv_pipeline_0 = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.kv_mbar_0.data_ptr(),
-            num_stages=self.num_kv_stages,
-            producer_group=prod_group,
-            consumer_group=kv_cons_group,
-            tx_count=self.num_kv_scale_tma_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk,
-            tidx=tidx,
-            defer_sync=True,
-        )
-        kv_pipeline_1 = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.kv_mbar_1.data_ptr(),
-            num_stages=self.num_kv_stages,
-            producer_group=prod_group,
-            consumer_group=kv_cons_group,
-            tx_count=self.num_kv_scale_tma_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk,
-            tidx=tidx,
-            defer_sync=True,
-        )
+        if cutlass.const_expr(self.fp4):
+            # The tensor core consumes the K tile and its scale factors: the UMMA warp releases the stage
+            # (tcgen05.commit).
+            kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
+            kv_pipeline_0 = pipeline.PipelineTmaUmma.create(
+                barrier_storage=storage.kv_mbar_0.data_ptr(),
+                num_stages=self.num_kv_stages,
+                producer_group=prod_group,
+                consumer_group=kv_cons_group,
+                tx_count=self.num_kv_scale_tma_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
+            kv_pipeline_1 = pipeline.PipelineTmaUmma.create(
+                barrier_storage=storage.kv_mbar_1.data_ptr(),
+                num_stages=self.num_kv_stages,
+                producer_group=prod_group,
+                consumer_group=kv_cons_group,
+                tx_count=self.num_kv_scale_tma_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
+        else:
+            kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, math_warps_per_group)
+            kv_pipeline_0 = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.kv_mbar_0.data_ptr(),
+                num_stages=self.num_kv_stages,
+                producer_group=prod_group,
+                consumer_group=kv_cons_group,
+                tx_count=self.num_kv_scale_tma_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                tidx=tidx,
+                defer_sync=True,
+            )
+            kv_pipeline_1 = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.kv_mbar_1.data_ptr(),
+                num_stages=self.num_kv_stages,
+                producer_group=prod_group,
+                consumer_group=kv_cons_group,
+                tx_count=self.num_kv_scale_tma_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                tidx=tidx,
+                defer_sync=True,
+            )
         kv_prod_state_0 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_kv_stages
         )
@@ -3138,6 +3349,21 @@ class IndexerKernel:
         umma_cons_state_1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
+        if cutlass.const_expr(self.fp4):
+            # At a q transition UMMA warp 0 overwrites the SFB TMEM region that both UMMA warps' previous MMAs
+            # read; each warp's tcgen05.commit lands on this mbarrier and warp 0 waits for both before the copy.
+            # The named barrier locksteps the two warps.
+            sfb_war_pipeline = pipeline.PipelineUmmaAsync.create(
+                barrier_storage=storage.sfb_war_mbar.data_ptr(),
+                num_stages=1,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 2),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
+            sfb_war_prod_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+            sfb_war_cons_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+            sfb_sync_barrier = pipeline.NamedBarrier(barrier_id=6, num_threads=64)
         tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=640)
         tmem = cutlass.utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
@@ -3167,12 +3393,19 @@ class IndexerKernel:
         sW = smem.allocate_tensor(
             element_type=self.epi_dtype, layout=w_smem_layout_staged, byte_alignment=128
         )
+        scale_dtype = cutlass.Int32 if self.fp4 else cutlass.Float32
         sScales_0 = smem.allocate_tensor(
-            element_type=cutlass.Float32, layout=s_smem_layout_staged, byte_alignment=128
+            element_type=scale_dtype, layout=s_smem_layout_staged, byte_alignment=128
         )
         sScales_1 = smem.allocate_tensor(
-            element_type=cutlass.Float32, layout=s_smem_layout_staged, byte_alignment=128
+            element_type=scale_dtype, layout=s_smem_layout_staged, byte_alignment=128
         )
+        if cutlass.const_expr(self.fp4):
+            sSF_Q = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=sf_q_smem_layout_staged,
+                byte_alignment=128,
+            )
         s_ring = smem.allocate_tensor(
             element_type=Uint64, layout=cute.make_layout(RING * 8), byte_alignment=1024
         )
@@ -3388,6 +3621,15 @@ class IndexerKernel:
         tSsS_1, tSgS_1 = cpasync.tma_partition(
             tma_atom_s, 0, cute.make_layout(1), sScales_1_for_tma, gS
         )
+        if cutlass.const_expr(self.fp4):
+            sSF_Q_for_tma = cute.make_tensor(sSF_Q.iterator, sf_q_tma_smem_layout_staged)
+            tSF_Q_sSF_Q, tSF_Q_gSF_Q = cpasync.tma_partition(
+                tma_atom_sf_q,
+                0,
+                cute.make_layout((1,)),
+                cute.group_modes(sSF_Q_for_tma, 0, 1),
+                cute.group_modes(mSF_Q_tma, 0, 1),
+            )
         tCrA_0 = tiled_mma.make_fragment_A(sKV_0)
         tCrA_1 = tiled_mma.make_fragment_A(sKV_1)
         tCrB = tiled_mma.make_fragment_B(sQ)
@@ -3450,6 +3692,13 @@ class IndexerKernel:
                     tWsW[None, q_prod_state.index],
                     tma_bar_ptr=q_bar,
                 )
+                if cutlass.const_expr(self.fp4):
+                    cute.copy(
+                        tma_atom_sf_q,
+                        tSF_Q_gSF_Q[None, next_q_idx],
+                        tSF_Q_sSF_Q[None, q_prod_state.index],
+                        tma_bar_ptr=q_bar,
+                    )
                 q_prod_state.advance()
             seg_s = Int32(0)
             while has_work:
@@ -3480,6 +3729,13 @@ class IndexerKernel:
                             tWsW[None, q_prod_state.index],
                             tma_bar_ptr=q_bar,
                         )
+                        if cutlass.const_expr(self.fp4):
+                            cute.copy(
+                                tma_atom_sf_q,
+                                tSF_Q_gSF_Q[None, prefetch_next],
+                                tSF_Q_sSF_Q[None, q_prod_state.index],
+                                tma_bar_ptr=q_bar,
+                            )
                         q_prod_state.advance()
                 # Keep row metadata and Q handoffs outside the per-tile loop.
                 # One dummy pair is still issued for a zero-length row.
@@ -3633,6 +3889,18 @@ class IndexerKernel:
             )
             q_idx = batch_size
             tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
+            if cutlass.const_expr(self.fp4):
+                sf_base = self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages
+                tCtSFA = cute.make_tensor(
+                    cute.recast_ptr(tmem_ptr + sf_base, dtype=self.sf_dtype), tmem_sfa_layout
+                )
+                tCtSFB = cute.make_tensor(
+                    cute.recast_ptr(
+                        tmem_ptr + sf_base + self.num_sfa_tmem_cols * self.num_groups,
+                        dtype=self.sf_dtype,
+                    ),
+                    tmem_sfb_layout,
+                )
             if is_leader_cta:
                 num_k_blocks = cute.size(tCrA_0.shape[2])
                 q_stage_0 = cutlass.Int32(0)
@@ -3643,9 +3911,41 @@ class IndexerKernel:
                     num_kv = next_num_kv
                     if q_idx != q_idx_old:
                         if q_idx_old < batch_size:
+                            if cutlass.const_expr(self.fp4):
+                                sfb_war_pipeline.producer_commit(sfb_war_prod_state)
                             q_cons_state_umma_0.advance()
                         q_pipeline.consumer_wait(q_cons_state_umma_0)
                         q_stage_0 = q_cons_state_umma_0.index
+                        if cutlass.const_expr(self.fp4):
+                            for atom_idx in cutlass.range_constexpr(self.N_padded // 128):
+                                L.sf_atom_transpose(
+                                    sSF_Q.iterator
+                                    + q_stage_0 * sSF_Q.layout.stride[1]
+                                    + atom_idx * 128
+                                )
+                            cute.arch.fence_view_async_shared()
+                            if q_idx_old < batch_size:
+                                sfb_war_pipeline.consumer_wait(sfb_war_cons_state)
+                                sfb_war_cons_state.advance()
+                            sSF_Q_ue8m0 = cute.recast_tensor(sSF_Q, Float8E8M0FNU)
+                            sSF_Q_chunk = cute.make_tensor(
+                                sSF_Q_ue8m0.iterator + q_stage_0 * sSF_Q_ue8m0.layout.stride[1],
+                                sfb_chunk_smem_layout,
+                            )
+                            tCsSFB_compact = cute.filter_zeros(sSF_Q_chunk)
+                            tCtSFB_compact = cute.filter_zeros(tCtSFB)
+                            tiled_copy_s2t_sfb = tcgen05.make_s2t_copy(
+                                copy_atom_s2t, tCtSFB_compact
+                            )
+                            thr_copy_s2t_sfb = tiled_copy_s2t_sfb.get_slice(0)
+                            tCsSFB_s2t_ = thr_copy_s2t_sfb.partition_S(tCsSFB_compact)
+                            tCsSFB_s2t = tcgen05.get_s2t_smem_desc_tensor(
+                                tiled_copy_s2t_sfb, tCsSFB_s2t_
+                            )
+                            tCtSFB_s2t = thr_copy_s2t_sfb.partition_D(tCtSFB_compact)
+                            cute.copy(tiled_copy_s2t_sfb, tCsSFB_s2t, tCtSFB_s2t)
+                            cute.arch.fence_view_async_tmem_store()
+                            sfb_sync_barrier.arrive_and_wait()
                     # Keep row metadata and Q handoffs outside the per-tile loop.
                     # One dummy pair is still issued for a zero-length row.
                     kv_go = cutlass.Boolean(True)
@@ -3656,8 +3956,43 @@ class IndexerKernel:
                             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                         kv_stage = kv_cons_state_umma_0.index
+                        if cutlass.const_expr(self.fp4):
+                            for atom_idx in cutlass.range_constexpr(self.block_kv // 128):
+                                L.sf_atom_transpose(
+                                    sScales_0.iterator
+                                    + kv_stage * sScales_0.layout.stride[1]
+                                    + atom_idx * 128
+                                )
+                            cute.arch.fence_view_async_shared()
+                            sSF_KV_0_ue8m0 = cute.recast_tensor(sScales_0, Float8E8M0FNU)
+                            sSF_KV_0_chunk = cute.make_tensor(
+                                sSF_KV_0_ue8m0.iterator
+                                + kv_stage * sSF_KV_0_ue8m0.layout.stride[1],
+                                sfa_chunk_smem_layout,
+                            )
+                            tCsSFA_compact_0 = cute.filter_zeros(sSF_KV_0_chunk)
+                            tCtSFA_compact_0 = cute.filter_zeros(tCtSFA)
+                            tiled_copy_s2t_sfa_0 = tcgen05.make_s2t_copy(
+                                copy_atom_s2t, tCtSFA_compact_0
+                            )
+                            thr_copy_s2t_sfa_0 = tiled_copy_s2t_sfa_0.get_slice(0)
+                            tCsSFA_s2t_0_ = thr_copy_s2t_sfa_0.partition_S(tCsSFA_compact_0)
+                            tCsSFA_s2t_0 = tcgen05.get_s2t_smem_desc_tensor(
+                                tiled_copy_s2t_sfa_0, tCsSFA_s2t_0_
+                            )
+                            tCtSFA_s2t_0 = thr_copy_s2t_sfa_0.partition_D(tCtSFA_compact_0)
+                            cute.copy(tiled_copy_s2t_sfa_0, tCsSFA_s2t_0, tCtSFA_s2t_0)
                         tCtAcc_0 = tCtAcc_base_0[None, None, None, umma_prod_state_0.index]
                         for k_block in cutlass.range_constexpr(num_k_blocks):
+                            if cutlass.const_expr(self.fp4):
+                                tCtSFA_k = cute.slice_(
+                                    tCtSFA, (None, None, k_block * self.sf_k_step, None)
+                                )
+                                tCtSFB_k = cute.slice_(
+                                    tCtSFB, (None, None, k_block * self.sf_k_step, None)
+                                )
+                                tiled_mma.set(tcgen05.Field.SFA, tCtSFA_k.iterator)
+                                tiled_mma.set(tcgen05.Field.SFB, tCtSFB_k.iterator)
                             cute.gemm(
                                 tiled_mma,
                                 tCtAcc_0,
@@ -3666,9 +4001,13 @@ class IndexerKernel:
                                 tCtAcc_0,
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        if cutlass.const_expr(self.fp4):
+                            kv_pipeline_0.consumer_release(kv_cons_state_umma_0)
                         kv_cons_state_umma_0.advance()
                         umma_pipeline_0.producer_commit(umma_prod_state_0)
                         umma_prod_state_0.advance()
+                        if cutlass.const_expr(self.fp4):
+                            sfb_sync_barrier.arrive_and_wait()
                         kv_idx = kv_idx + NUM_MATH_WG
                         kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
                     next_q_idx, next_kv_idx, next_num_kv, phase, has_work = self._walk_next(
@@ -3694,6 +4033,21 @@ class IndexerKernel:
             )
             q_idx = batch_size
             tCtAcc_base_1 = cute.make_tensor(tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout)
+            if cutlass.const_expr(self.fp4):
+                sf_base = self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages
+                tCtSFA = cute.make_tensor(
+                    cute.recast_ptr(
+                        tmem_ptr + sf_base + self.num_sfa_tmem_cols, dtype=self.sf_dtype
+                    ),
+                    tmem_sfa_layout,
+                )
+                tCtSFB = cute.make_tensor(
+                    cute.recast_ptr(
+                        tmem_ptr + sf_base + self.num_sfa_tmem_cols * self.num_groups,
+                        dtype=self.sf_dtype,
+                    ),
+                    tmem_sfb_layout,
+                )
             if is_leader_cta:
                 num_k_blocks_1 = cute.size(tCrA_1.shape[2])
                 q_stage_1 = cutlass.Int32(0)
@@ -3704,9 +4058,13 @@ class IndexerKernel:
                     num_kv = next_num_kv
                     if q_idx != q_idx_old:
                         if q_idx_old < batch_size:
+                            if cutlass.const_expr(self.fp4):
+                                sfb_war_pipeline.producer_commit(sfb_war_prod_state)
                             q_cons_state_umma_1.advance()
                         q_pipeline.consumer_wait(q_cons_state_umma_1)
                         q_stage_1 = q_cons_state_umma_1.index
+                        if cutlass.const_expr(self.fp4):
+                            sfb_sync_barrier.arrive_and_wait()
                     # Keep row metadata and Q handoffs outside the per-tile loop.
                     # One dummy pair is still issued for a zero-length row.
                     kv_go = cutlass.Boolean(True)
@@ -3717,8 +4075,43 @@ class IndexerKernel:
                             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                         kv_stage_1 = kv_cons_state_umma_1.index
+                        if cutlass.const_expr(self.fp4):
+                            for atom_idx in cutlass.range_constexpr(self.block_kv // 128):
+                                L.sf_atom_transpose(
+                                    sScales_1.iterator
+                                    + kv_stage_1 * sScales_1.layout.stride[1]
+                                    + atom_idx * 128
+                                )
+                            cute.arch.fence_view_async_shared()
+                            sSF_KV_1_ue8m0 = cute.recast_tensor(sScales_1, Float8E8M0FNU)
+                            sSF_KV_1_chunk = cute.make_tensor(
+                                sSF_KV_1_ue8m0.iterator
+                                + kv_stage_1 * sSF_KV_1_ue8m0.layout.stride[1],
+                                sfa_chunk_smem_layout,
+                            )
+                            tCsSFA_compact_1 = cute.filter_zeros(sSF_KV_1_chunk)
+                            tCtSFA_compact_1 = cute.filter_zeros(tCtSFA)
+                            tiled_copy_s2t_sfa_1 = tcgen05.make_s2t_copy(
+                                copy_atom_s2t, tCtSFA_compact_1
+                            )
+                            thr_copy_s2t_sfa_1 = tiled_copy_s2t_sfa_1.get_slice(0)
+                            tCsSFA_s2t_1_ = thr_copy_s2t_sfa_1.partition_S(tCsSFA_compact_1)
+                            tCsSFA_s2t_1 = tcgen05.get_s2t_smem_desc_tensor(
+                                tiled_copy_s2t_sfa_1, tCsSFA_s2t_1_
+                            )
+                            tCtSFA_s2t_1 = thr_copy_s2t_sfa_1.partition_D(tCtSFA_compact_1)
+                            cute.copy(tiled_copy_s2t_sfa_1, tCsSFA_s2t_1, tCtSFA_s2t_1)
                         tCtAcc_1 = tCtAcc_base_1[None, None, None, umma_prod_state_1.index]
                         for k_block in cutlass.range_constexpr(num_k_blocks_1):
+                            if cutlass.const_expr(self.fp4):
+                                tCtSFA_k = cute.slice_(
+                                    tCtSFA, (None, None, k_block * self.sf_k_step, None)
+                                )
+                                tCtSFB_k = cute.slice_(
+                                    tCtSFB, (None, None, k_block * self.sf_k_step, None)
+                                )
+                                tiled_mma.set(tcgen05.Field.SFA, tCtSFA_k.iterator)
+                                tiled_mma.set(tcgen05.Field.SFB, tCtSFB_k.iterator)
                             cute.gemm(
                                 tiled_mma,
                                 tCtAcc_1,
@@ -3727,9 +4120,13 @@ class IndexerKernel:
                                 tCtAcc_1,
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        if cutlass.const_expr(self.fp4):
+                            kv_pipeline_1.consumer_release(kv_cons_state_umma_1)
                         kv_cons_state_umma_1.advance()
                         umma_pipeline_1.producer_commit(umma_prod_state_1)
                         umma_prod_state_1.advance()
+                        if cutlass.const_expr(self.fp4):
+                            sfb_sync_barrier.arrive_and_wait()
                         kv_idx = kv_idx + NUM_MATH_WG
                         kv_go = (kv_idx < num_kv) & ((q_idx != end_q_idx) | (kv_idx != end_kv_idx))
                     next_q_idx, next_kv_idx, next_num_kv, phase, has_work = self._walk_next(
@@ -3830,10 +4227,12 @@ class IndexerKernel:
                         kv_pos = kv_idx * block_kv_val + m_coord
                         if cutlass.const_expr(self.desc):
                             kv_pos = (seg_s - kv_idx) * block_kv_val + m_coord
-                        kv_ready_0 = kv_pipeline_0.consumer_try_wait(kv_cons_state_math_0)
+                        if cutlass.const_expr(not self.fp4):
+                            kv_ready_0 = kv_pipeline_0.consumer_try_wait(kv_cons_state_math_0)
                         umma_ready_0 = umma_pipeline_0.consumer_try_wait(umma_cons_state_0)
-                        kv_pipeline_0.consumer_wait(kv_cons_state_math_0, kv_ready_0)
-                        scale_val = sScales_0[m_coord, kv_cons_state_math_0.index]
+                        if cutlass.const_expr(not self.fp4):
+                            kv_pipeline_0.consumer_wait(kv_cons_state_math_0, kv_ready_0)
+                            scale_val = sScales_0[m_coord, kv_cons_state_math_0.index]
                         umma_pipeline_0.consumer_wait(umma_cons_state_0, umma_ready_0)
                         if cutlass.const_expr(self.tmem_fences):
                             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -3841,7 +4240,7 @@ class IndexerKernel:
                         tAcc_c0 = tCtAcc_c0[(None, None), 0, 0]
                         tAcc_c0_epi = cute.flat_divide(tAcc_c0, epi_sub_mn)
                         tTR_0 = thr_copy_ref.partition_S(tAcc_c0_epi)
-                        if cutlass.const_expr(not self.late_release):
+                        if cutlass.const_expr(not self.late_release and not self.fp4):
                             scale_val = _consume_f32(scale_val)
                             if cutlass.const_expr(self.pfence):
                                 cute.arch.fence_view_async_shared()
@@ -3869,9 +4268,13 @@ class IndexerKernel:
                             tTR_rAcc, w_cache, 32, s0x, s0y, s1x, s1y
                         )
                         result_t = s0x + s0y + s1x + s1y
-                        scale_mul = scale_val * 0.5
-                        val = self.output_dtype(result_t * scale_mul)
-                        if cutlass.const_expr(self.late_release):
+                        if cutlass.const_expr(self.fp4):
+                            # the block-scaled MMA applies the scales; result_t is twice the sum (relu as x + |x|)
+                            val = self.output_dtype(result_t * 0.5)
+                        else:
+                            scale_mul = scale_val * 0.5
+                            val = self.output_dtype(result_t * scale_mul)
+                        if cutlass.const_expr(self.late_release and not self.fp4):
                             if cutlass.const_expr(self.pfence):
                                 cute.arch.fence_view_async_shared()
                             cute.arch.sync_warp()
@@ -3976,10 +4379,12 @@ class IndexerKernel:
                         kv_pos = kv_idx_1 * block_kv_val + m_coord
                         if cutlass.const_expr(self.desc):
                             kv_pos = (seg_s - kv_idx + 1) * block_kv_val + m_coord
-                        kv_ready_1 = kv_pipeline_1.consumer_try_wait(kv_cons_state_math_1)
+                        if cutlass.const_expr(not self.fp4):
+                            kv_ready_1 = kv_pipeline_1.consumer_try_wait(kv_cons_state_math_1)
                         umma_ready_1 = umma_pipeline_1.consumer_try_wait(umma_cons_state_1)
-                        kv_pipeline_1.consumer_wait(kv_cons_state_math_1, kv_ready_1)
-                        scale_val = sScales_1[m_coord, kv_cons_state_math_1.index]
+                        if cutlass.const_expr(not self.fp4):
+                            kv_pipeline_1.consumer_wait(kv_cons_state_math_1, kv_ready_1)
+                            scale_val = sScales_1[m_coord, kv_cons_state_math_1.index]
                         umma_pipeline_1.consumer_wait(umma_cons_state_1, umma_ready_1)
                         if cutlass.const_expr(self.tmem_fences):
                             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -3987,7 +4392,7 @@ class IndexerKernel:
                         tAcc_c1 = tCtAcc_c1[(None, None), 0, 0]
                         tAcc_c1_epi = cute.flat_divide(tAcc_c1, epi_sub_mn)
                         tTR_1 = thr_copy_ref.partition_S(tAcc_c1_epi)
-                        if cutlass.const_expr(not self.late_release):
+                        if cutlass.const_expr(not self.late_release and not self.fp4):
                             scale_val = _consume_f32(scale_val)
                             if cutlass.const_expr(self.pfence):
                                 cute.arch.fence_view_async_shared()
@@ -4015,9 +4420,13 @@ class IndexerKernel:
                             tTR_rAcc, w_cache, 32, s0x, s0y, s1x, s1y
                         )
                         result_t = s0x + s0y + s1x + s1y
-                        scale_mul = scale_val * 0.5
-                        val = self.output_dtype(result_t * scale_mul)
-                        if cutlass.const_expr(self.late_release):
+                        if cutlass.const_expr(self.fp4):
+                            # the block-scaled MMA applies the scales; result_t is twice the sum (relu as x + |x|)
+                            val = self.output_dtype(result_t * 0.5)
+                        else:
+                            scale_mul = scale_val * 0.5
+                            val = self.output_dtype(result_t * scale_mul)
+                        if cutlass.const_expr(self.late_release and not self.fp4):
                             if cutlass.const_expr(self.pfence):
                                 cute.arch.fence_view_async_shared()
                             cute.arch.sync_warp()
@@ -5311,14 +5720,15 @@ def compile_indexer(mk: IndexerKernel):
     if key in _COMPILED:
         return _COMPILED[key]
     H, D = (mk.num_heads, mk.head_dim)
-    block_bytes = mk.phys_block_kv * (D + 4)
+    fp4 = mk.fp4
+    block_bytes = mk.phys_block_kv * ((D // 2 if fp4 else D) + 4)
     rt = cute.runtime
     sb = cute.sym_int()
     kv_fake = rt.make_fake_tensor(
         cutlass.Uint8, (cute.sym_int(), block_bytes), stride=(cute.sym_int64(), 1)
     )
     q_fake = rt.make_fake_compact_tensor(
-        cutlass.Uint8, (H, D, cute.sym_int()), stride_order=(1, 0, 2)
+        cutlass.Uint8, (H, D // 2 if fp4 else D, cute.sym_int()), stride_order=(1, 0, 2)
     )
     w_fake = rt.make_fake_compact_tensor(cutlass.Float32, (H, cute.sym_int()), stride_order=(0, 1))
     lg_fake = rt.make_fake_tensor(
@@ -5383,6 +5793,11 @@ def compile_indexer(mk: IndexerKernel):
         cutlass.Int32(1),
         cutlass.Int32(1),
         stream,
+        *(
+            (rt.make_fake_compact_tensor(cutlass.Int32, (H, cute.sym_int()), stride_order=(0, 1)),)
+            if fp4
+            else ()
+        ),
         options="--enable-tvm-ffi --generate-line-info",
     )
     _COMPILED[key] = compiled
