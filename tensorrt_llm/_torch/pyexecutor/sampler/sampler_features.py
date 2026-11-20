@@ -39,7 +39,7 @@ from concurrent import futures
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import repeat
-from typing import Any, Callable, Final, Iterator, Optional, cast
+from typing import Any, Callable, Iterator, Optional, cast
 
 import torch
 
@@ -523,21 +523,17 @@ class EmbeddingBiasCache:
         self._device = device
         self._logit_dtype = logit_dtype
         self._vocab_size = vocab_size
-        self.CACHE_SENTINEL_ATTR_NAME: Final[str] = "_py_has_cached_embedding_bias"
 
         # Slots can be reused, but request_id is quasi unique (cf. MIN_GLOBAL_ID).
         # Tracking which request_id is cached in each slot.
         self._slot_to_request_id: dict[int, int] = {}
 
     def _is_cached(self, req: LlmRequest) -> bool:
-        if not getattr(req, self.CACHE_SENTINEL_ATTR_NAME, None):
-            return False
-
-        return self._slot_to_request_id[req.py_seq_slot] == req.py_request_id
+        # NB: LlmRequest.py_request_id is set from .request_id, which is an integer.
+        return self._slot_to_request_id.get(req.py_seq_slot) == req.py_request_id
 
     def _mark_cached(self, req: LlmRequest) -> None:
         self._slot_to_request_id[req.py_seq_slot] = req.py_request_id
-        setattr(req, self.CACHE_SENTINEL_ATTR_NAME, True)
 
     def _update(self, reqs: list[LlmRequest]) -> None:
         # NB: This could be extended to allow reuse of equivalent rows in _flat_cache
