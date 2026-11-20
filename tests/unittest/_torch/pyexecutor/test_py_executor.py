@@ -146,7 +146,7 @@ def _run_forward_step(executor, batch, new_tensors=None):
 )
 def test_shutdown_graph_lifecycle(shutdown_method: str, releases_model_owned_graphs: bool) -> None:
     engine = Mock()
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor._closed = False
     executor._resources_released = False
     executor.worker_started = True
@@ -1154,7 +1154,7 @@ class _InflightRequestIds:
 
 
 def _make_async_encoder_executor(future):
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.dist = types.SimpleNamespace(tp_size=1)
@@ -1179,7 +1179,7 @@ def _encoder_decoder_runner(batch_sizes, *, pad_to_limit):
 
 def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8):
     """Build a PyExecutor stub wired for token-path encoder batch-wait admission."""
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.max_batch_size = 32
@@ -1210,7 +1210,7 @@ def _make_feature_encoder_batch_wait_executor(
     its `batch_sizes` derived rather than configured, so the resolved sizes come
     from the encoder manager's resolved startup settings rather than the config.
     """
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.max_batch_size = 32
@@ -1230,7 +1230,7 @@ def _make_feature_encoder_batch_wait_executor(
 
 def _make_encoder_fallback_batch_wait_executor():
     """Build a PyExecutor stub with no encoder graph config, for the fallback path."""
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.llm_args = types.SimpleNamespace(
@@ -1260,7 +1260,7 @@ def _make_encoder_request(request_id):
 
 
 def test_encoder_graph_warmup_uses_runtime_encoder_stream():
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.device_id = 3
@@ -1296,7 +1296,7 @@ def test_warmup_scope_enters_every_engine_and_nests():
             finally:
                 events.append(("exit", self.name))
 
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.model_engine = _Engine("target")
@@ -1926,7 +1926,7 @@ def test_getter_methods(mock_executor):
 
 
 def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyExecutor:
-    executor = make_host_executor()
+    executor = PyExecutor.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.resource_manager = Mock()
@@ -2469,7 +2469,7 @@ class TestIdleDisaggLoopPacing:
         monkeypatch.setattr(
             "tensorrt_llm._torch.disaggregation.orchestration.coordinator.time.sleep", sleep
         )
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         executor.kv_cache_transceiver = Mock() if has_transceiver else None
@@ -2489,7 +2489,7 @@ class TestDeferUnreadyGenReceivesGate:
 
     @staticmethod
     def _build(*, kv_manager_v2: bool, overlap: bool, pp_size: int, kv_connector: bool):
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.dense_dwdp_manager = None
         executor.kv_cache_transceiver = Mock()
         executor._is_kv_manager_v2 = kv_manager_v2
@@ -2516,9 +2516,7 @@ class TestDeferUnreadyGenReceivesGate:
     def test_unset_executor_attributes_keep_the_blocking_fence(self) -> None:
         """An executor assembled without the scheduler and cache-manager
         attributes falls back to the blocking fence."""
-        executor = make_host_executor()
-        del executor.disable_overlap_scheduler
-        del executor._is_kv_manager_v2
+        executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
 
         assert executor._build_disagg_coordinator()._defer_unready_gen_receives is False
@@ -2528,7 +2526,7 @@ class TestDisaggTransferAdmissionPP:
     def test_pp_schedule_serializes_the_admission_decision(self) -> None:
         """Rank 0 admits right after scheduling; the admitted subset and the
         backpressure flag are what it serializes for the other ranks."""
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         executor.dist = Mock(
@@ -2553,7 +2551,7 @@ class TestDisaggTransferAdmissionPP:
         assert wait_for_progress
 
     def test_pp_schedule_propagates_the_admission_decision_to_the_next_rank(self) -> None:
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         executor.dist = Mock(
@@ -2596,7 +2594,7 @@ class TestDisaggTransferAdmissionPP:
         assert sent.wait_for_disagg_gen_transfer_progress is True
 
     def test_pp_schedule_restores_propagated_gate_decision(self):
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         executor.dist = Mock(
@@ -2639,7 +2637,7 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     class StopLocalSchedule(RuntimeError):
         pass
 
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor._is_kv_manager_v2 = False
@@ -2711,7 +2709,7 @@ def test_each_pp_rank_schedules_once_per_iteration(
     class StopAfterSchedule(RuntimeError):
         pass
 
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor._is_kv_manager_v2 = True
@@ -2764,7 +2762,7 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     class StopAfterReconciliation(RuntimeError):
         pass
 
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.dist = Mock(pp_rank=1, rank=1, is_first_pp_rank=False)
@@ -2828,7 +2826,7 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     class StopSchedule(RuntimeError):
         pass
 
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     request = Mock()
@@ -4516,7 +4514,7 @@ def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
 def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
     # The V2 scheduler grows both pools together, so a skipped batch hands both
     # back. Attention DP keeps one unified pool and never reaches this pairing.
-    stub = make_host_executor()
+    stub = object.__new__(PyExecutor)
     stub.kv_connector_manager = None
     stub.dense_dwdp_manager = None
     stub._is_kv_manager_v2 = True
@@ -4537,7 +4535,7 @@ def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
 
 
 def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
-    stub = make_host_executor()
+    stub = object.__new__(PyExecutor)
     stub.kv_connector_manager = None
     stub.dense_dwdp_manager = None
     stub.kv_cache_manager = Mock()
@@ -4571,7 +4569,7 @@ def test_reset_prefix_cache_preserves_routes_only_if_native_clear_fails(failure_
     failing_step.side_effect = RuntimeError("reset failed")
     route_capture = RouteCapture(rank=0)
     route_capture._shared[1] = torch.ones((1, 1), dtype=torch.int16)
-    stub = make_host_executor()
+    stub = object.__new__(PyExecutor)
     stub.kv_connector_manager = None
     stub.dense_dwdp_manager = None
     stub.kv_cache_manager = manager
@@ -4588,7 +4586,7 @@ def test_reset_prefix_cache_preserves_routes_only_if_native_clear_fails(failure_
 class TestPendingTransferResponseFlush:
     def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
         """A lone fatal rank must fail locally rather than desynchronize TP."""
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         executor._error_budget = Mock()
@@ -4618,7 +4616,7 @@ class TestPendingTransferResponseFlush:
 
     def test_adp_flush_participates_with_an_empty_response_list(self):
         """Ranks without an error still join the synchronized response gather."""
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         executor._pending_transfer_responses = []
@@ -4631,7 +4629,7 @@ class TestPendingTransferResponseFlush:
         executor._enqueue_responses.assert_called_once_with([])
 
     def test_flush_delivers_and_clears_buffered_responses(self):
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         responses = [(7, Mock())]
@@ -4647,7 +4645,7 @@ class TestPendingTransferResponseFlush:
 
     def test_rank_zero_keeps_result_queue_until_buffered_error_flushes(self):
         """A queued client receives a rank-0 ADP error before cleanup."""
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         request_id = 7
@@ -4677,7 +4675,7 @@ class TestPendingTransferResponseFlush:
 
     @staticmethod
     def _make_executor_loop_stub() -> PyExecutor:
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         executor.enable_attention_dp = False
@@ -4862,7 +4860,7 @@ class TestOneModelMTPDraftTokenScheduling:
         enable_attention_dp is False so _pad_empty_attention_dp_batch returns
         immediately instead of padding a batch this test does not exercise.
         """
-        ex = make_host_executor()
+        ex = object.__new__(PyExecutor)
         ex.kv_connector_manager = None
         ex.dense_dwdp_manager = None
         ex.drafter = None
@@ -4974,7 +4972,7 @@ class TestAdpBalanceExcludesPadDummies:
     @staticmethod
     def _make_executor(per_rank, threshold):
         """per_rank: list of (num_ctx, num_gen, num_real) as allgathered."""
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_connector_manager = None
         executor.dense_dwdp_manager = None
         executor.dist = Mock()
@@ -5054,7 +5052,7 @@ class TestAdpBalanceExcludesPadDummies:
 
 
 def _make_pp_relay_executor(*, pp_size: int, is_last_pp_rank: bool) -> PyExecutor:
-    executor = make_host_executor()
+    executor = PyExecutor.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.dist = Mock(pp_size=pp_size, is_last_pp_rank=is_last_pp_rank)
@@ -5094,7 +5092,7 @@ def test_non_last_pp_rank_drains_every_relay_send():
 
 @pytest.mark.parametrize("loop", ["overlap", "pp"])
 def test_v2_generation_update_runs_before_cancel_and_responses(loop):
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     batch = ScheduledRequests()
@@ -5206,7 +5204,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
 
 def _first_token_executor(*, overlap: bool) -> PyExecutor:
     """Bare single-rank executor whose first-token response path runs for real."""
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.should_exclude_last_generation_logits = overlap
@@ -5235,7 +5233,7 @@ def test_prefill_logprobs_lead_the_generation_logprobs_one_entry_per_token():
     the disaggregated params and is prepended before any decode step, so the
     generation side reports exactly one entry per generated token. Beam search
     does not carry per-beam first-token logprobs and prepends nothing."""
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     py_result = PyResult(prompt_len=4, max_new_tokens=4, return_log_probs=True)
@@ -5311,7 +5309,7 @@ def _make_gen_only_stream_request(request_id, decoding_iter):
 
 
 def _make_stream_executor(requests):
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.active_requests = list(requests)

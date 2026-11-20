@@ -28,7 +28,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-from test_common.host_executor import make_host_executor
 
 from tensorrt_llm._torch.pyexecutor import hang_detector as hang_detector_module
 from tensorrt_llm._torch.pyexecutor.hang_detector import (
@@ -37,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.hang_detector import (
     hard_kill_on_rank_crash,
     start_rank_crash_kill_watchdog,
 )
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 pytestmark = pytest.mark.cpu_only
 
@@ -273,7 +273,7 @@ def test_status_provider_errors_are_logged(monkeypatch):
 @pytest.mark.parametrize("with_dwdp", [False, True], ids=["no_dwdp", "dwdp"])
 def test_control_request_wait_pauses_detector(with_dwdp, monkeypatch: pytest.MonkeyPatch):
     fired = []
-    executor = make_host_executor()
+    executor = PyExecutor.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.control_requests = [SimpleNamespace(control_requires_drain=False, control_id=None)]

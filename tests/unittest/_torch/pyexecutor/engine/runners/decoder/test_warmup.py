@@ -406,7 +406,7 @@ class DecoderDsaWarmupTestCase(unittest.TestCase):
             attention_runtime_features=None,
         )
         engine._metadata.setup_attention = Mock()
-        engine._ensure_dsa_attn_metadata_for_warmup((Mock()))
+        engine._ensure_dsa_attn_metadata_for_warmup(Mock())
         engine._warmup_cute_dsl_radix_topk()
 
         engine._metadata.setup_attention.assert_not_called()
@@ -451,10 +451,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
     )
     monkeypatch.setattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", flashinfer_gemm, raising=False)
     monkeypatch.setattr(
-        torch.ops.trtllm,
-        "mxfp8_quantize",
-        (Mock(return_value=(inputs, inputs))),
-        raising=False,
+        torch.ops.trtllm, "mxfp8_quantize", Mock(return_value=(inputs, inputs)), raising=False
     )
     for name in ("mxfp8_mxfp8_gemm", "mxfp8_mxfp8_gemm_autotuned"):
         monkeypatch.setattr(torch.ops.trtllm, name, native_gemm, raising=False)
@@ -499,38 +496,16 @@ def test_compiled_mxfp8_warmup_backend_selection(
         )
     )
     tuner = Mock(profiling_cache={})
+    monkeypatch.setattr(decoder_warmup_module.AutoTuner, "get", lambda: tuner)
     monkeypatch.setattr(
-        decoder_warmup_module.AutoTuner,
-        "get",
-        (lambda: tuner),
+        decoder_warmup_module, "autotune", lambda **kwargs: contextlib.nullcontext()
     )
-    monkeypatch.setattr(
-        decoder_warmup_module,
-        "autotune",
-        (lambda **kwargs: contextlib.nullcontext()),
-    )
-    monkeypatch.setattr(
-        MXFP8GemmRunner,
-        "sync_all_tactic_caches",
-        (Mock()),
-    )
-    monkeypatch.setattr(torch.cuda, "synchronize", (lambda: None))
-    monkeypatch.setattr(torch.cuda, "empty_cache", (lambda: None))
-    monkeypatch.setattr(
-        decoder_warmup_module,
-        "clear_memory_buffers",
-        (lambda: None),
-    )
-    monkeypatch.setattr(
-        model_call_module,
-        "get_model_extra_attrs",
-        (lambda: {}),
-    )
-    monkeypatch.setattr(
-        model_call_module,
-        "is_trace_enabled",
-        (lambda name: False),
-    )
+    monkeypatch.setattr(MXFP8GemmRunner, "sync_all_tactic_caches", Mock())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(decoder_warmup_module, "clear_memory_buffers", lambda: None)
+    monkeypatch.setattr(model_call_module, "get_model_extra_attrs", lambda: {})
+    monkeypatch.setattr(model_call_module, "is_trace_enabled", lambda name: False)
 
     def forward(batch: Mock, *args: object, **kwargs: object) -> torch.Tensor:
         # Stand in for input preparation, but use the real model-call compile scope
@@ -538,7 +513,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
         monkeypatch.setattr(
             model_call_module,
             "get_per_request_prefill_cuda_graph_flag",
-            (lambda: batch.num_gen_requests == 0),
+            lambda: batch.num_gen_requests == 0,
         )
         return model_caller(attn_metadata=batch)
 
@@ -620,12 +595,10 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
         (get_tuner),
     )
     monkeypatch.setattr(
-        decoder_warmup_module,
-        "autotune",
-        (lambda **kwargs: contextlib.nullcontext()),
+        decoder_warmup_module, "autotune", lambda **kwargs: contextlib.nullcontext()
     )
-    monkeypatch.setattr(torch.cuda, "synchronize", (lambda: None))
-    monkeypatch.setattr(torch.cuda, "empty_cache", (lambda: None))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     clear_buffers = Mock()
     monkeypatch.setattr(
         decoder_warmup_module,
@@ -731,7 +704,7 @@ def test_attention_warmup_covers_enabled_request_phases(
         forwarded.append(batch_shapes[id(inputs.batch)])
 
     monkeypatch.setattr(runner, "forward", forward)
-    monkeypatch.setattr(torch.cuda, "synchronize", (lambda: None))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     warmup = decoder_warmup(
         config,
         agreement=agreement,
@@ -804,22 +777,14 @@ def test_autotuner_warmup_leaves_out_generation_shape_on_context_only_cache(
     resources = _context_only_cache_resources(cache_flag, context_only)
     monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
     monkeypatch.setattr(
-        decoder_warmup_module.AutoTuner,
-        "get",
-        (Mock(return_value=Mock(profiling_cache={}))),
+        decoder_warmup_module.AutoTuner, "get", Mock(return_value=Mock(profiling_cache={}))
     )
     monkeypatch.setattr(
-        decoder_warmup_module,
-        "autotune",
-        (lambda **kwargs: contextlib.nullcontext()),
+        decoder_warmup_module, "autotune", lambda **kwargs: contextlib.nullcontext()
     )
-    monkeypatch.setattr(torch.cuda, "synchronize", (lambda: None))
-    monkeypatch.setattr(torch.cuda, "empty_cache", (lambda: None))
-    monkeypatch.setattr(
-        decoder_warmup_module,
-        "clear_memory_buffers",
-        (Mock()),
-    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(decoder_warmup_module, "clear_memory_buffers", Mock())
 
     engine._run_autotuner_warmup(resources)
 
@@ -2134,10 +2099,7 @@ def test_decode_only_skips_prefill_cuda_graph_capture() -> None:
         _dummy_requests=SimpleNamespace(create_warmup_request=Mock()),
     )
 
-    DecoderCudaGraphs._capture_prefill_cuda_graphs(
-        (graphs),
-        (Mock()),
-    )
+    DecoderCudaGraphs._capture_prefill_cuda_graphs(graphs, Mock())
 
     graphs._dummy_requests.create_warmup_request.assert_not_called()
 
@@ -2194,6 +2156,8 @@ def _attention_layer(
     layer = torch.nn.Linear(2, 2)
     layer.attn = object.__new__(TrtllmAttention) if trtllm_backend else object()
     if trtllm_backend:
+        layer.attn.is_mla_enable = False
+        layer.attn.head_dim = 128
         fmha = FlashInferTrtllmGenFmha(layer.attn)
         fmha.can_prewarm = Mock(return_value=True)
         layer.attn._fmha_manager = object.__new__(FmhaManager)
@@ -2376,10 +2340,13 @@ def test_fmha_prewarm_uses_generic_library_hook_once(fails: bool) -> None:
 def test_flashinfer_fmha_static_prewarm_eligibility(case: str, expected: bool) -> None:
     from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
     from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPrewarmConfig
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
     from tensorrt_llm.bindings import DataType
 
     class PrewarmAttention(SimpleNamespace):
         """Attention fixture that supports the FMHA owner's weak reference."""
+
+        out_head_size = TrtllmAttention.out_head_size
 
     attn = PrewarmAttention(
         head_dim=int(case[4:]) if case.startswith("head") else 128,
@@ -2394,6 +2361,8 @@ def test_flashinfer_fmha_static_prewarm_eligibility(case: str, expected: bool) -
         attn.head_dim = 576
         attn.kv_lora_rank = 512
         attn.qk_rope_head_dim = 64
+        attn.v_head_dim = 128
+        attn.rope_append = True
     kv_dtype = {
         "dtype_mismatch": DataType.HALF,
         "fp8_cache": DataType.FP8,

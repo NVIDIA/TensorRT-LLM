@@ -155,7 +155,7 @@ class Sources:
         self.cache: dict[Path, Source] = {}
         self.modules: dict[str, Source] = {}
         self.mros: dict[tuple[Path, int], list[Definition]] = {}
-        self.shapes: dict[tuple[Path, int, bool], Shape] = {}
+        self.shapes: dict[tuple[Path, int, bool, bool], Shape] = {}
         self.binding_bases: dict[str, Definition] = {}
         # These roots contribute no checked members, but still constrain C3 order.
         tree = ast.parse("class object: pass\nclass ABC: pass\nclass Generic: pass\n")
@@ -356,14 +356,16 @@ class Sources:
             if bound or node not in source.tree.body:
                 raise Incomplete("Bound replacement requires a statically resolved instance method")
             return callable_members(source.tree.body, source, False)[node.name]
-        member = callable_members(owner.body, source, True)[node.name]
+        member = callable_members(owner.body, source, True).get(node.name)
+        if member is None:
+            raise Incomplete(f"Class-body assignment replaces {node.name}")
         if member.kind != "callable":
             raise Incomplete("Property replacements require an owning-class registration")
         binding = member.signatures[0]["binding"]
         if bound and binding != "method":
             raise Incomplete("bound=True requires an instance method")
         if binding == "method" and not bound:
-            member = callable_members(owner.body, source, False)[node.name]
+            member = callable_members(owner.body, source, True, keep_receiver=True)[node.name]
         for sig in member.signatures:
             sig["binding"] = "function"
         return member
@@ -540,10 +542,18 @@ def preserves_call_signature(decorator: ast.AST, source: Source) -> bool:
     return False
 
 
-def callable_members(nodes: list[ast.stmt], source: Source, in_class: bool) -> dict[str, Member]:
+def callable_members(
+    nodes: list[ast.stmt], source: Source, in_class: bool, *, keep_receiver: bool = False
+) -> dict[str, Member]:
     result = {}
     overload_names = set()
     for node in nodes:
+        if in_class and isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    result.pop(target.id, None)
+                    overload_names.discard(target.id)
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         decorators = [source.qualified(d) for d in node.decorator_list]
@@ -572,7 +582,9 @@ def callable_members(nodes: list[ast.stmt], source: Source, in_class: bool) -> d
         )
         if repeated:
             member.signature_issue = "Decorator or repeated declaration can change the interface"
-        member.signatures.append(signature(node, binding))
+        member.signatures.append(
+            signature(node, "function" if keep_receiver and binding == "method" else binding)
+        )
         allowed = {
             "staticmethod",
             "classmethod",
@@ -612,11 +624,12 @@ def class_shape(
     seen: frozenset[tuple[Path, int]] = frozenset(),
     *,
     members_only: bool = False,
+    include_type_checking: bool = False,
 ) -> Shape:
     key = definition.source.path, definition.node.lineno
     if key in seen:
         raise Incomplete("Cyclic inheritance")
-    cache_key = (*key, members_only)
+    cache_key = (*key, members_only, include_type_checking)
     if cache_key in sources.shapes:
         return copy.deepcopy(sources.shapes[cache_key])
     shape = Shape()
@@ -626,13 +639,19 @@ def class_shape(
         if any(base is excluded for excluded in sources.binding_bases.values()):
             shape.skipped_bases.append(base.source.module + "." + base.node.name)
             continue
-        _extend_class_shape(base, shape, members_only=members_only)
+        _extend_class_shape(
+            base, shape, members_only=members_only, include_type_checking=include_type_checking
+        )
     sources.shapes[cache_key] = shape
     return copy.deepcopy(shape)
 
 
 def _extend_class_shape(
-    definition: Definition, shape: Shape, *, members_only: bool = False
+    definition: Definition,
+    shape: Shape,
+    *,
+    members_only: bool,
+    include_type_checking: bool,
 ) -> None:
     node, source = definition.node, definition.source
     if not isinstance(node, ast.ClassDef):
@@ -663,7 +682,20 @@ def _extend_class_shape(
             shape.unknown.append("Generated/decorated class interface: " + ast.unparse(dec))
     if node.keywords:
         shape.unknown.append("Metaclass/class keywords can generate members")
-    declared_callables = callable_members(node.body, source, True)
+    runtime_body = []
+    type_checking_properties = {}
+    for item in node.body:
+        if isinstance(item, ast.If) and source.qualified(item.test) == "typing.TYPE_CHECKING":
+            runtime_body.extend(item.orelse)
+            if include_type_checking:
+                type_checking_properties.update(
+                    (name, member)
+                    for name, member in callable_members(item.body, source, True).items()
+                    if member.kind == "property"
+                )
+        else:
+            runtime_body.append(item)
+    declared_callables = callable_members(runtime_body, source, True)
     shape.members.update(declared_callables)
     if generated_initializer and "__init__" not in declared_callables:
         shape.members["__init__"] = Member(
@@ -684,17 +716,20 @@ def _extend_class_shape(
                 }
             ],
         )
-    for item in node.body:
+    for item in runtime_body:
         if isinstance(item, (ast.Assign, ast.AnnAssign)):
             targets = item.targets if isinstance(item, ast.Assign) else [item.target]
             for target in targets:
                 if isinstance(target, ast.Name):
+                    if target.id in declared_callables:
+                        # The last binding for this name is a callable.
+                        continue
                     declared_member = shape.members.get(target.id)
                     if (
                         isinstance(item, ast.AnnAssign)
                         and item.value is None
                         and declared_member is not None
-                        and declared_member.kind == "property"
+                        and declared_member.kind in {"callable", "property"}
                     ):
                         # An annotation without a value does not replace the descriptor.
                         continue
@@ -726,6 +761,9 @@ def _extend_class_shape(
                     if target.id == "__slots__":
                         shape.unknown.append("Slot descriptors require separate resolution")
         elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            member = declared_callables.get(item.name)
+            if member is None or item.lineno < member.line:
+                continue
             args = [*item.args.posonlyargs, *item.args.args]
             if not args or any(
                 source.qualified(d) in {"staticmethod", "classmethod"} for d in item.decorator_list
@@ -791,6 +829,9 @@ def _extend_class_shape(
                 shape.unknown.append("Initializer has early exit or deleted fields")
         elif not (isinstance(item, (ast.Pass, ast.Expr))):
             shape.unknown.append("Conditional/dynamic class body")
+    # A guarded property may describe an inherited native descriptor.
+    for name, member in type_checking_properties.items():
+        shape.members.setdefault(name, member)
     if {
         "__getattr__",
         "__getattribute__",
@@ -914,8 +955,19 @@ class Analyzer:
             child: node for node in ast.walk(source.tree) for child in ast.iter_child_nodes(node)
         }
 
-    def shape(self, definition: Definition, *, members_only: bool = False) -> Shape:
-        shape = class_shape(definition, self.sources, members_only=members_only)
+    def shape(
+        self,
+        definition: Definition,
+        *,
+        members_only: bool = False,
+        include_type_checking: bool = False,
+    ) -> Shape:
+        shape = class_shape(
+            definition,
+            self.sources,
+            members_only=members_only,
+            include_type_checking=include_type_checking,
+        )
         self.skipped_bases.update(shape.skipped_bases)
         return shape
 
@@ -1022,6 +1074,13 @@ class Analyzer:
                             "Only object.__new__(Real) or Real.__new__(Real) is supported"
                         )
                     definition = self.sources.reference(self.source, node.args[0])
+                    if owner != "object":
+                        shape = class_shape(definition, self.sources, members_only=True)
+                        allocator = shape.members.get("__new__")
+                        if allocator is not None and (
+                            allocator.kind in {"callable", "property"} or allocator.default
+                        ):
+                            raise Incomplete(f"Cannot establish the return type of {owner}.__new__")
                     return Value(State(definition=definition), self.source.qualified(node.args[0]))
                 except Incomplete as error:
                     return Value(State(unknown=[str(error)]))
@@ -1261,7 +1320,9 @@ class Analyzer:
         expected_definition = self.sources.definition(target)
         if selected is not None and value.state is not None:
             return self.selected_members(value, expected_definition, selected, line)
-        expected = self.shape(expected_definition, members_only=members_only)
+        expected = self.shape(
+            expected_definition, members_only=members_only, include_type_checking=True
+        )
         if value.state is None:
             return [
                 issue(
@@ -1336,7 +1397,9 @@ class Analyzer:
     def selected_members(
         self, value: Value, definition: Definition, selected: tuple[str, ...], line: int
     ) -> list[dict]:
-        expected = class_shape(definition, self.sources, members_only=True)
+        expected = class_shape(
+            definition, self.sources, members_only=True, include_type_checking=True
+        )
         state = value.state
         assert state is not None
         unknown = set(state.unknown)
@@ -1418,7 +1481,7 @@ class Analyzer:
                                 if self.bound_replacement(decorator):
                                     raise Incomplete("bound=True requires an instance method")
                                 errors = compare_shapes(
-                                    self.shape(real),
+                                    self.shape(real, include_type_checking=True),
                                     self.shape(Definition(self.source, statement)),
                                     statement.lineno,
                                 )

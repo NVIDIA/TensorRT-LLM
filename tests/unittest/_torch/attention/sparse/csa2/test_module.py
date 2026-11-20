@@ -1422,8 +1422,11 @@ def test_fused_compression_step_matches_native(monkeypatch, ratio):
         for parameter in (*compressor.parameters(), *index_wk.parameters()):
             parameter.normal_(std=0.05)
         compressor.norm.weight.normal_(1.0, 0.2)
-        native = [torch.randn(pages, page_size, width) for _ in range(2)]
-        fused = [pool.clone() for pool in native]
+        native = (
+            torch.randn(pages, page_size, width),
+            torch.randn(pages, page_size, width),
+        )
+        fused = (native[0].clone(), native[1].clone())
         kv_pages, score_pages = (torch.randperm(pages).int().view(2, 8) for _ in range(2))
 
     def ints(values):

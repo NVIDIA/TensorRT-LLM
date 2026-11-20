@@ -17,6 +17,7 @@
 import math
 from collections.abc import Callable
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -1818,7 +1819,8 @@ class TestStandaloneDrafterPageSize:
         draft_tokens_per_block,
     ):
         c, _ = self._creator(mocker, request, target_tokens_per_block)
-        size_spy = mocker.spy(KVCacheManagerV2, "get_cache_size_per_token")
+        # The recorder installed by _creator already tracks these calls.
+        size_recorder = cast(Mock, KVCacheManagerV2.get_cache_size_per_token)
         bytes_spy = mocker.spy(KVCacheManagerV2, "get_cache_bytes_per_request")
         quota_spy = mocker.spy(KVCacheManagerV2, "get_cache_quota_per_request")
 
@@ -1828,7 +1830,7 @@ class TestStandaloneDrafterPageSize:
             include_request_cost=True,
         )
 
-        for spy in (size_spy, bytes_spy, quota_spy):
+        for spy in (size_recorder, bytes_spy, quota_spy):
             assert spy.call_count == 1, spy
             assert spy.call_args.kwargs["tokens_per_block"] == draft_tokens_per_block, spy
 
@@ -1850,7 +1852,7 @@ class TestStandaloneDrafterPageSize:
         c._disable_overlap_scheduler = False
         c._joint_kv_cache_reuse = False
         create = mocker.patch("tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager")
-        size_spy = mocker.spy(KVCacheManagerV2, "get_cache_size_per_token")
+        size_recorder = cast(Mock, KVCacheManagerV2.get_cache_size_per_token)
 
         c._create_one_model_draft_kv_cache_manager(c._max_seq_len)
         c._get_kv_size_per_token()
@@ -1858,7 +1860,7 @@ class TestStandaloneDrafterPageSize:
         assert create.call_count == 1
         allocated = create.call_args.kwargs["tokens_per_block"]
         assert allocated == draft_tokens_per_block
-        assert size_spy.call_args.kwargs["tokens_per_block"] == allocated
+        assert size_recorder.call_args.kwargs["tokens_per_block"] == allocated
 
 
 class TestMambaEffectiveTpSize:
