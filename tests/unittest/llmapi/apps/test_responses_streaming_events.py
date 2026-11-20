@@ -24,6 +24,7 @@ an id it has not seen opened.
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import re
 from types import SimpleNamespace
@@ -36,8 +37,10 @@ from starlette.requests import ClientDisconnect
 
 import tensorrt_llm.serve.responses_utils as responses_utils
 from tensorrt_llm.executor import EngineDeadError, RequestError
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
+    RESPONSES_STREAM_KEEPALIVE_ENV,
     ClosingStreamingResponse,
     ResponsesStreamingEventsHelper,
     ResponsesStreamingProcessor,
@@ -48,6 +51,7 @@ from tensorrt_llm.serve.responses_utils import (
     describe_stream_termination,
     guard_responses_stream,
     keep_responses_stream_alive,
+    responses_stream_keepalive_interval,
     stream_error_event,
 )
 
@@ -597,6 +601,12 @@ async def _collect(stream, sent=None, limit=500):
     return sent
 
 
+@pytest.fixture(autouse=True)
+def _keepalive_interval_from_the_constant(monkeypatch):
+    """The tests below set the interval through the module constant; the environment would win over it."""
+    monkeypatch.delenv(RESPONSES_STREAM_KEEPALIVE_ENV, raising=False)
+
+
 async def _send(monkeypatch, frames, interval):
     monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", interval)
     return await _collect(keep_responses_stream_alive(frames))
@@ -894,6 +904,138 @@ async def test_a_source_cancelled_on_its_own_ends_the_stream(monkeypatch):
         await _collect(keep_responses_stream_alive(frames()), sent, limit=50)
 
     assert _keepalive_positions(sent)
+
+
+# ---------------------------------------------------------------------------
+# The keepalive interval is configured through the environment
+# ---------------------------------------------------------------------------
+
+
+def _set_keepalive_env(monkeypatch, raw):
+    if raw is None:
+        monkeypatch.delenv(RESPONSES_STREAM_KEEPALIVE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(RESPONSES_STREAM_KEEPALIVE_ENV, raw)
+
+
+@pytest.fixture()
+def logged_warnings(monkeypatch):
+    """The warnings the TRT-LLM logger emits, with its one-shot warnings armed again.
+
+    A warning passes the logger's own severity gate and then the Python logger's
+    level, so both are opened for the test whatever TLLM_LOG_LEVEL says.
+    """
+    messages = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = Capture(level=logging.WARNING)
+    monkeypatch.setattr(logger, "_min_severity", "warning")
+    monkeypatch.setattr(logger, "_appeared_keys", set())
+    previous_level = logger._logger.level
+    logger._logger.setLevel(logging.WARNING)
+    logger._logger.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        logger._logger.removeHandler(handler)
+        logger._logger.setLevel(previous_level)
+
+
+class TestKeepaliveInterval:
+    def test_the_variable_name(self):
+        assert RESPONSES_STREAM_KEEPALIVE_ENV == "TRTLLM_RESPONSES_STREAM_KEEPALIVE_S"
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            (None, 15.0),
+            ("", 15.0),
+            ("  ", 15.0),
+            ("2.5", 2.5),
+            (" 30 ", 30.0),
+            ("0", 0.0),
+            ("0.0", 0.0),
+        ],
+    )
+    def test_the_interval_is_read_from_the_environment(
+        self, monkeypatch, logged_warnings, raw, expected
+    ):
+        _set_keepalive_env(monkeypatch, raw)
+        assert responses_stream_keepalive_interval() == expected
+        assert logged_warnings == []
+
+    def test_the_module_constant_is_the_default_when_the_variable_is_unset(self, monkeypatch):
+        _set_keepalive_env(monkeypatch, None)
+        monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.25)
+        assert responses_stream_keepalive_interval() == 0.25
+
+    @pytest.mark.parametrize("raw", ["soon", "1s", "nan", "inf", "-3", "-0.5"])
+    def test_a_negative_value_or_one_that_is_not_a_number_keeps_the_default_and_warns_once(
+        self, monkeypatch, logged_warnings, raw
+    ):
+        _set_keepalive_env(monkeypatch, raw)
+        assert responses_stream_keepalive_interval() == 15.0
+        assert responses_stream_keepalive_interval() == 15.0
+        assert len(logged_warnings) == 1, logged_warnings
+        assert RESPONSES_STREAM_KEEPALIVE_ENV in logged_warnings[0]
+        assert repr(raw) in logged_warnings[0]
+
+    def test_an_invalid_value_falls_back_to_the_module_constant(self, monkeypatch, logged_warnings):
+        monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.25)
+        _set_keepalive_env(monkeypatch, "soon")
+        assert responses_stream_keepalive_interval() == 0.25
+        assert len(logged_warnings) == 1, logged_warnings
+
+
+@pytest.mark.asyncio
+async def test_the_environment_sets_the_interval_of_a_stream(monkeypatch):
+    """With the module constant at its default, the environment alone makes a short interval."""
+    _set_keepalive_env(monkeypatch, "0.05")
+    sent = await _collect(
+        keep_responses_stream_alive(_server_frames([(0.4, "Hello"), (0, " world")]))
+    )
+
+    assert len(_keepalive_positions(sent)) >= 2
+    assert _event_type(sent[-1]) == "response.completed"
+    assert [_event_data(f)["sequence_number"] for f in sent] == list(range(len(sent)))
+
+
+@pytest.mark.asyncio
+async def test_zero_turns_the_keepalive_off(monkeypatch):
+    """A silence that would otherwise draw several keepalives passes without one."""
+    monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
+    _set_keepalive_env(monkeypatch, "0")
+    produced = []
+    sent = await _collect(
+        keep_responses_stream_alive(_server_frames([(0.3, "Hello")], produced=produced))
+    )
+
+    assert sent == produced
+    assert _event_type(sent[-1]) == "response.completed"
+
+
+@pytest.mark.asyncio
+async def test_an_interval_below_the_loop_resolution_still_delivers_the_frames(monkeypatch):
+    """A keepalive that is always due must not starve a frame already waiting to be sent.
+
+    With an interval shorter than one event-loop iteration every wait times out at
+    once; the frames the source has queued still have to go out, so the stream sends
+    its output and completes (chattily) instead of sending keepalives forever.
+    """
+    _set_keepalive_env(monkeypatch, "1e-9")
+    stream = keep_responses_stream_alive(_server_frames([(0.05, "Hi")]))
+    try:
+        sent = await _collect(stream, limit=50_000)
+    finally:
+        # Left open after a failure, the stream's reader task would block the
+        # event loop's teardown.
+        await stream.aclose()
+
+    assert any(_event_type(f) == "response.output_item.added" for f in sent)
+    assert _event_type(sent[-1]) == "response.completed"
 
 
 # Payloads as the server serializes them (compact, floats in exponent form,
