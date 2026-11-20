@@ -152,6 +152,121 @@ class EngramDecodeHashKernel:
             output[token, order * self.n_head + head] = remainder
 
 
+class EngramDecodeRefreshKernel:
+    """One CTA runs ``engram_history_scatter``, then ``EngramDecodeHashKernel`` with
+    ``read_current_history`` for every layer; ``outputs`` rows past ``num_tokens`` are zero."""
+
+    num_threads = 256
+
+    def __init__(
+        self,
+        moduli: tuple[tuple[tuple[int, ...], ...], ...],
+        pad_id: int,
+        dead: int,
+        has_mask: bool,
+    ):
+        self.moduli = moduli
+        self.layers = len(moduli)
+        self.max_ngram = len(moduli[0]) + 1
+        self.n_head = len(moduli[0][0])
+        self.pad_id = pad_id
+        self.dead = dead
+        self.has_mask = has_mask
+
+    @cute.jit
+    def __call__(
+        self,
+        input_ids: cute.Tensor,
+        positions: cute.Tensor,
+        rows: cute.Tensor,
+        token_mask: cute.Tensor | None,
+        lookup: cute.Tensor,
+        history: cute.Tensor,
+        multipliers: cute.Tensor,
+        outputs: cute.Tensor,
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            input_ids,
+            positions,
+            rows,
+            token_mask,
+            lookup,
+            history,
+            multipliers,
+            outputs,
+            num_tokens,
+        ).launch(grid=[1, 1, 1], block=[self.num_threads, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        input_ids: cute.Tensor,
+        positions: cute.Tensor,
+        rows: cute.Tensor,
+        token_mask: cute.Tensor | None,
+        lookup: cute.Tensor,
+        history: cute.Tensor,
+        multipliers: cute.Tensor,
+        outputs: cute.Tensor,
+        num_tokens: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        columns = Int64(history.shape[1])
+        for token in cutlass.range(tidx, num_tokens, self.num_threads, unroll=1):
+            raw = Int64(input_ids[token])
+            if raw < 0:
+                raw = Int64(0)
+            if raw > Int64(lookup.shape[0] - 1):
+                raw = Int64(lookup.shape[0] - 1)
+            compressed = Int64(lookup[raw])
+            if cutlass.const_expr(self.has_mask):
+                if Uint8(token_mask[token]) == 0:
+                    compressed = Int64(self.dead)
+            target = Int64(positions[token])
+            if target < 0:
+                target = target + columns
+            if (target >= 0) & (target < columns):
+                history[Int64(rows[token]), target] = Int32(compressed)
+        cute.arch.sync_threads()
+        for token in cutlass.range(tidx, outputs.shape[1], self.num_threads, unroll=1):
+            if token < num_tokens:
+                position = Int64(positions[token])
+                row = Int64(rows[token])
+                compressed = Int64(self.dead)
+                if position < columns:
+                    current = position
+                    if current < 0:
+                        current = Int64(0)
+                    compressed = Int64(history[row, current])
+                for layer in cutlass.range_constexpr(self.layers):
+                    blocked = (position < 0) | (compressed == self.dead)
+                    source = compressed
+                    if blocked:
+                        source = Int64(self.pad_id)
+                    mix = source * Int64(multipliers[layer, 0])
+                    for offset in cutlass.range_constexpr(1, self.max_ngram):
+                        previous = position - offset
+                        source = Int64(self.dead)
+                        if (previous >= 0) & (previous < columns):
+                            source = Int64(history[row, previous])
+                        blocked = blocked | (previous < 0) | (source == self.dead)
+                        if blocked:
+                            source = Int64(self.pad_id)
+                        mix = mix ^ (source * Int64(multipliers[layer, offset]))
+                        for head in cutlass.range_constexpr(self.n_head):
+                            modulus = self.moduli[layer][offset - 1][head]
+                            remainder = mix % Int64(modulus)
+                            if remainder < 0:
+                                remainder = remainder + modulus
+                            outputs[layer, token, (offset - 1) * self.n_head + head] = remainder
+            else:
+                for layer in cutlass.range_constexpr(self.layers):
+                    for column in cutlass.range_constexpr((self.max_ngram - 1) * self.n_head):
+                        outputs[layer, token, column] = Int64(0)
+
+
 _INDEX_DTYPES = {torch.int32: Int32, torch.int64: Int64}
 
 
@@ -203,6 +318,56 @@ def compile_engram_decode_hash(
         history,
         multipliers,
         output,
+        Int32(0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+@functools.cache
+def compile_engram_decode_refresh(
+    moduli: tuple[tuple[tuple[int, ...], ...], ...],
+    pad_id: int,
+    dead: int,
+    has_mask: bool,
+    ids_dtype: torch.dtype,
+    positions_dtype: torch.dtype,
+):
+    """Compile the one-launch scatter + hashes of ``len(moduli)`` layers (TVM-FFI calling)."""
+    tokens = cute.sym_int()
+    input_ids = cute.runtime.make_fake_compact_tensor(
+        _INDEX_DTYPES[ids_dtype], (tokens,), stride_order=(0,)
+    )
+    positions = cute.runtime.make_fake_compact_tensor(
+        _INDEX_DTYPES[positions_dtype], (tokens,), stride_order=(0,)
+    )
+    rows = cute.runtime.make_fake_compact_tensor(Int64, (tokens,), stride_order=(0,))
+    token_mask = (
+        cute.runtime.make_fake_compact_tensor(Uint8, (tokens,), stride_order=(0,))
+        if has_mask
+        else None
+    )
+    lookup = cute.runtime.make_fake_compact_tensor(Int64, (cute.sym_int(),), stride_order=(0,))
+    history = cute.runtime.make_fake_compact_tensor(
+        Int32, (cute.sym_int(), cute.sym_int()), stride_order=(1, 0)
+    )
+    layers, orders, heads = len(moduli), len(moduli[0]), len(moduli[0][0])
+    multipliers = cute.runtime.make_fake_compact_tensor(
+        Int64, (layers, orders + 1), stride_order=(1, 0)
+    )
+    outputs = cute.runtime.make_fake_compact_tensor(
+        Int64, (layers, cute.sym_int(), orders * heads), stride_order=(2, 1, 0)
+    )
+    return cute.compile(
+        EngramDecodeRefreshKernel(moduli, pad_id, dead, has_mask),
+        input_ids,
+        positions,
+        rows,
+        token_mask,
+        lookup,
+        history,
+        multipliers,
+        outputs,
         Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",

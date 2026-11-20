@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host-prepared KDA metadata: packed FlashInfer prefill schedule and aligned slot vectors."""
+"""Host-prepared KDA metadata: packed FlashInfer prefill schedule and replay slots."""
 
 from itertools import accumulate
 
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._utils import prefer_pinned
@@ -18,6 +19,18 @@ class KimiK3MambaMetadata(Mamba2Metadata):
 
     def __init__(self, max_batch_size: int, chunk_size: int, max_num_tokens: int) -> None:
         super().__init__(max_batch_size, chunk_size, max_num_tokens)
+        # Each request's slot in the KDA replay buffers. A cache manager that
+        # keeps replay state in a region of its own fills this static buffer;
+        # otherwise the replay buffers share the recurrent-state slots and
+        # this aliases ``state_indices``.
+        self.replay_state_indices = self.state_indices
+        self._replay_state_indices = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
+        self._replay_state_indices_cpu = torch.zeros(
+            max_batch_size, dtype=torch.int32, pin_memory=prefer_pinned()
+        )
+        self._replay_state_indices_buffer = DeviceCopyBuffer(
+            self._replay_state_indices, pin_memory=prefer_pinned()
+        )
         self.kda_max_seqlen = 0
         # Align both rows to 16 bytes. One transfer refreshes the metadata shared
         # by all layers; device storage stays fixed for CUDA graph replay.
@@ -25,6 +38,13 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self._kda_schedule = torch.zeros((2, width), dtype=torch.int32, device="cuda")
         self.kda_seq_order = self._kda_schedule[0, :0]
         self.kda_cu_chunks = self._kda_schedule[1, :1]
+        # Host copy of the context cu_seqlens: FLA's chunked prefill derives its
+        # chunk indices from it on the CPU instead of reading the counts back
+        # from the GPU in every KDA layer.
+        self.kda_cu_seqlens_cpu: torch.Tensor | None = None
+        # One device cu_seqlens view per forward: FLA caches its chunk metadata
+        # by tensor identity, so every KDA layer must pass the same object.
+        self.kda_cu_seqlens: torch.Tensor | None = None
 
         # KDA's CuTe verify kernel requires a 16-byte-aligned DLPack pointer.
         # Keep the backing allocations stable so metadata preparation remains
@@ -46,8 +66,8 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             f"Expected positive context lengths, got {context_lengths}"
         )
 
-        # Mamba2Metadata.prepare fills replay_state_indices from the manager.
         super().prepare(attn_metadata)
+        self._prepare_replay_state_indices(attn_metadata)
 
         self.generation_state_indices = None
         self.generation_replay_state_indices = None
@@ -75,7 +95,11 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.kda_seq_order = self._kda_schedule[0, :n]
         self.kda_cu_chunks = self._kda_schedule[1, : n + 1]
         if not n:
+            self.kda_cu_seqlens_cpu = None
+            self.kda_cu_seqlens = None
             return
+        self.kda_cu_seqlens = self.query_start_loc_long[: n + 1]
+        self.kda_cu_seqlens_cpu = torch.tensor([0] + context_lengths, dtype=torch.long).cumsum_(0)
         order = sorted(range(n), key=lambda i: (-context_lengths[i], i))
         chunks = list(accumulate(((length + 15) // 16 for length in context_lengths), initial=0))
         width = self._kda_schedule.shape[1]
@@ -88,6 +112,25 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             pin_memory=prefer_pinned(),
         )
         self._kda_schedule.copy_(host_schedule, non_blocking=True)
+
+    def _prepare_replay_state_indices(self, attn_metadata: AttentionMetadata) -> None:
+        """Fill the static replay-slot buffer, or alias the state slots."""
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        request_ids = attn_metadata.request_ids
+        if getattr(kv_cache_manager, "replay_layer_group_id", None) is None or request_ids is None:
+            self.replay_state_indices = self.state_indices
+            return
+        batch_size = attn_metadata.seq_lens.shape[0]
+        indices = kv_cache_manager.get_replay_state_indices(request_ids[:batch_size])
+        assert len(indices) == batch_size, (
+            f"get_replay_state_indices() returned {len(indices)} entries for "
+            f"a batch of {batch_size} requests."
+        )
+        self._replay_state_indices_cpu[:batch_size].copy_(
+            torch.as_tensor(indices, dtype=self._replay_state_indices_cpu.dtype)
+        )
+        self._replay_state_indices_buffer.update(self._replay_state_indices_cpu[:batch_size])
+        self.replay_state_indices = self._replay_state_indices
 
     @staticmethod
     def _aligned_generation_indices(

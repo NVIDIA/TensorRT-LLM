@@ -22,6 +22,7 @@ import pytest
 
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 
 pytestmark = pytest.mark.cpu_only
@@ -66,8 +67,7 @@ def _executor(events: list) -> PyExecutor:
     executor.dense_dwdp_manager = None
     executor.pending_encoder_steps = []
     executor.active_requests = []
-    executor.responses = {}
-    executor.result_wait_queues = {}
+    executor._response_channel = ResponseChannel()
     executor._pending_transfer_responses = []
     executor._pending_response_terminations = []
     executor.request_accumulated = []

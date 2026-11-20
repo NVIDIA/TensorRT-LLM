@@ -27,11 +27,13 @@ from tensorrt_llm._torch.models.checkpoints import model_hooks
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.weight_sharing import (
+    DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_5_MOE_VL_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -125,6 +127,31 @@ _MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
     moe_tp_sizes=frozenset({1, 2}),
     moe_ep_sizes=frozenset({1, 2}),
     moe_cluster_sizes=frozenset({1}),
+)
+# DeepSeek-V3 MLA fuses RoPE into the TRTLLM attention op (the base
+# `rope_fusion`), so it keeps the base BF16 dense RoPE pins and adds the Qwen3
+# MoE CUTLASS backend and partition pins. The CUTLASS pin also fixes the router
+# `e_score_correction_bias` dtype (fp32 here, bf16 under the TRTLLM MoE
+# backend) and keeps the shared experts out of the routed-expert tensors. The
+# layout ABI has a dense first layer and MoE in every later layer, so the
+# checkpoint config must declare `first_k_dense_replace=1` and
+# `moe_layer_freq=1`.
+_MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    moe_backends=frozenset({"CUTLASS"}),
+    moe_tp_sizes=frozenset({1, 2}),
+    moe_ep_sizes=frozenset({1, 2}),
+    moe_cluster_sizes=frozenset({1}),
+    first_k_dense_replaces=frozenset({1}),
+    moe_layer_freqs=frozenset({1}),
+)
+# The Qwen3.5 MoE vision-language root realizes the Qwen3.5 vision-language
+# runtime (interleaved M-RoPE through the fused QK-norm/RoPE kernel) over the
+# Qwen3 MoE CUTLASS backend and partition pins.
+_MX_QWEN3_5_MOE_VL_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+    rope_types=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS.rope_types,
+    rope_fusion=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS.rope_fusion,
 )
 
 
@@ -290,6 +317,32 @@ MX_POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
         ),
+        PostTransformProfile(
+            profile_id="deepseek-v3-for-causal-lm-bf16-cutlass-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_deepseekv3", "DeepseekV3ForCausalLM"
+            ),
+            architecture="DeepseekV3ForCausalLM",
+            model_type="deepseek_v3",
+            speculative_mode=None,
+            protocol_version=MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3_5-moe-for-conditional-generation-bf16-cutlass-complete-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_5", "Qwen3_5MoeVLModel"
+            ),
+            architecture="Qwen3_5MoeForConditionalGeneration",
+            model_type="qwen3_5_moe",
+            speculative_mode=None,
+            protocol_version=MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_5_MOE_VL_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
+            runtime_constraints=_MX_QWEN3_5_MOE_VL_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+        ),
     )
 )
 
@@ -407,8 +460,9 @@ def get_mx_load_weights_kwargs(
         "allow_post_transform_weights": qualification.qualified,
     }
     if qualification.qualified:
-        # The receiver sets up aliases before post-transform bytes arrive.
-        mx_kwargs["prepare_post_transform_receiver"] = model_hooks.setup_aliases
+        # The receiver sets up aliases, including the ones its weight loader
+        # would create, before post-transform bytes arrive.
+        mx_kwargs["prepare_post_transform_receiver"] = model_hooks.prepare_post_transform_receiver
     return mx_kwargs
 
 

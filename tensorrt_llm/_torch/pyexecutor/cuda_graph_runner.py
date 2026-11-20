@@ -1061,6 +1061,13 @@ class CUDAGraphRunner:
             self._can_run_cuda_graph_batch(batch) and
             (spec_metadata is None or self.config.sampling_variants is None or
              sampling_variant(spec_metadata) in self.config.sampling_variants))
+        if can_run_cuda_graph and getattr(
+                attn_metadata, "beam_shared_prefix_enabled", False) is True:
+            # A beam longer than the library's captured tail runs this step eagerly.
+            from ..attention.backends.fmha.beam_shared_prefix import \
+                tail_exceeds_cuda_graph
+            can_run_cuda_graph = not tail_exceeds_cuda_graph(
+                batch.generation_requests)
         batch_size = batch.batch_size
         (shapes_agree, forced_sample_type, forced_kv_regime,
          forced_packed_split) = self._agree_graph_shape(
@@ -2125,11 +2132,13 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
     def pad_batch(self,
                   scheduled_requests: ScheduledRequests,
                   resource_manager: ResourceManager,
-                  runtime_draft_len: int = 0):
+                  runtime_draft_len: int = 0,
+                  sampling_mode: Optional[int] = None):
         """Consume the shape vote once, including an exceptional forward exit."""
         try:
             with super().pad_batch(scheduled_requests, resource_manager,
-                                   runtime_draft_len) as padded_requests:
+                                   runtime_draft_len,
+                                   sampling_mode) as padded_requests:
                 yield padded_requests
         finally:
             self.adp_shape_agreement = None
