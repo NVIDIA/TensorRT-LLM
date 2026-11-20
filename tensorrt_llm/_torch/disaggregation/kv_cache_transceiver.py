@@ -234,15 +234,12 @@ def create_kv_cache_transceiver(
 
 
 class CtxTransferStatus(NamedTuple):
-    """Typed result of ``KvCacheTransceiver.check_context_transfer_status``.
-
-    Unpacks positionally as ``(completed_request_ids, error_request_ids)``
-    for backward compatibility; prefer named field access in new code.
-    """
+    """Typed result of ``KvCacheTransceiver.check_context_transfer_status``."""
     # Requests whose KV send settled successfully during this call.
     completed_request_ids: List[int]
     # Requests whose KV send failed during this call.
     error_request_ids: List[int]
+    cancelled_request_ids: tuple[int, ...] = ()
 
 
 class GenTransferStatus(NamedTuple):

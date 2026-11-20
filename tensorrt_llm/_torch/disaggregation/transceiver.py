@@ -1849,12 +1849,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         quiesced = set(quiesced_ids)
         cancelled = [rid for rid in cancelled if rid in quiesced]
         failed = [rid for rid in failed if rid in quiesced]
+
         owned_cancelled = [
             rid
             for rid in cancelled
             if getattr(self._send_sessions[rid], "_enforce_physical_ownership", False)
         ]
-
         diagnostics_enabled = disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
 
         for rid in cancelled:
@@ -1899,10 +1899,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # DP ranks (entries that will never have a TxSession created for them).
         self._transfer_worker.sweep_stale_req_infos()
 
-        # CtxTransferStatus has no cancellation channel. An owned session's
-        # quiesced cancellation must release its AsyncTransferManager claim.
-        failed.extend(rid for rid in owned_cancelled if rid not in failed)
-        return CtxTransferStatus(completed, failed)
+        failed.extend(owned_cancelled)
+        return CtxTransferStatus(completed, failed, tuple(cancelled))
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:

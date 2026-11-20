@@ -141,7 +141,7 @@ class DashboardTests(unittest.TestCase):
     def test_offline_render_has_no_auth_or_kubernetes_access(self) -> None:
         with patch("subprocess.run", side_effect=AssertionError("Cluster access during render")):
             dashboards, cm, scrape = app.render(config())
-        self.assertEqual(len(dashboards["metrics"]["elements"]), 76)
+        self.assertEqual(len(dashboards["metrics"]["elements"]), 75)
         panels = dashboards["metrics"]["elements"]
         self.assertTrue({"panel-106", "panel-132", "panel-104", "panel-129"}.isdisjoint(panels))
         for key in ("panel-114", "panel-140"):
@@ -186,7 +186,7 @@ class DashboardTests(unittest.TestCase):
             "@@",
         ):
             self.assertNotIn(unwanted, text)
-        self.assertEqual(len(dashboards["metrics"]["elements"]), 78)
+        self.assertEqual(len(dashboards["metrics"]["elements"]), 77)
         self.assertIn("/d/model-logs", text)
         self.assertIn("engine_role", text)
         for panel in dashboards["metrics"]["elements"].values():
@@ -390,7 +390,15 @@ class ReviewedPublicationTests(unittest.TestCase):
         dashboards, _, _ = app.render(c)
         metrics = dashboards["metrics"]
         panels = [p for key, p in metrics["elements"].items() if key.startswith("observability-")]
-        self.assertEqual(len(panels), 10)
+        self.assertEqual(len(panels), 9)
+        self.assertEqual(
+            [
+                p["spec"]["title"]
+                for p in panels
+                if "Request KV transfer duration" in p["spec"]["title"]
+            ],
+            ["Decode - Request KV transfer duration p50/p95"],
+        )
         for p in panels:
             spec = p["spec"]
             custom = spec["vizConfig"]["spec"]["fieldConfig"]["defaults"]["custom"]

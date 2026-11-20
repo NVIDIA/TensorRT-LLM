@@ -1445,7 +1445,9 @@ def test_context_send_failure_is_applied_at_next_loop_boundary():
         [], active_requests=[request]
     )
     transceiver.check_context_transfer_status.return_value = SimpleNamespace(
-        completed_request_ids=[], error_request_ids=[request.py_request_id]
+        completed_request_ids=[],
+        error_request_ids=[request.py_request_id],
+        cancelled_request_ids=(),
     )
     transfer_manager.requests_in_transfer.return_value = {}
 

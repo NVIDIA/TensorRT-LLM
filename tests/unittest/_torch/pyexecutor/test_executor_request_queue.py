@@ -480,7 +480,7 @@ def test_queue_size_methods(executor_queue):
 
 
 @pytest.mark.parametrize("arrives", [False, True])
-def test_conversation_activity_poll_preserves_batch_fill_within_deadline(
+def test_idle_wait_preserves_batch_fill_after_late_arrival(
         executor_queue, monkeypatch, arrives):
     import datetime
     import queue
@@ -497,18 +497,18 @@ def test_conversation_activity_poll_preserves_batch_fill_within_deadline(
         if not arrives:
             now[0] = 1.0
             raise queue.Empty
-        return first if requests.request_queue.get.call_count == 1 else second
+        if requests.request_queue.get.call_count == 1:
+            now[0] = 0.999
+            return first
+        return second
 
     requests.request_queue.get.side_effect = get
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.executor_request_queue.time.monotonic",
         lambda: now[0])
-    result = requests.get_from_request_queue(datetime.timedelta(seconds=1),
-                                             batch_wait_deadline=1.0)
-    if arrives:
-        assert result == [first, second]
-        assert requests.request_queue.get.call_args_list[1].kwargs[
-            "timeout"] == pytest.approx(0.005)
-    else:
-        assert result == []
-        requests.request_queue.get.assert_called_once_with(timeout=1.0)
+    result = requests.get_from_request_queue(datetime.timedelta(seconds=1))
+    assert result == ([first, second] if arrives else [])
+    assert [
+        call.kwargs["timeout"]
+        for call in requests.request_queue.get.call_args_list
+    ] == pytest.approx([1.0, 0.005])

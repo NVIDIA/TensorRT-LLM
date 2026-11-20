@@ -524,7 +524,7 @@ def test_attention_dp_idle_wait_exchanges_before_parking(executor, clock):
     assert executor._plan_idle_heartbeat_wait(poll) == (poll, None)
 
 
-def test_attention_dp_idle_wait_parks_once_peer_rows_are_current(executor):
+def test_attention_dp_idle_wait_parks_once_peer_rows_are_current(executor, clock):
     executor.enable_attention_dp = True
     adp_stats = executor._adp_iter_stats
     adp_stats.last_finalize_settled = True
@@ -535,6 +535,17 @@ def test_attention_dp_idle_wait_parks_once_peer_rows_are_current(executor):
         has_iter_stats=0, kv_transfer_outcomes=(1, 0, 0)
     )
     assert executor._plan_idle_heartbeat_wait(None) == (None, executor._idle_heartbeat_tick)
+
+    executor._next_adp_activity_refresh = clock.value + 599
+    assert executor._plan_idle_heartbeat_wait(None) == (
+        datetime.timedelta(seconds=599),
+        executor._idle_heartbeat_tick,
+    )
+    clock.value += 599
+    assert executor._plan_idle_heartbeat_wait(None) == (
+        datetime.timedelta(0),
+        executor._idle_heartbeat_tick,
+    )
 
     # Snapshots still queued behind the fanned-out one drain one per pass.
     adp_stats.next_payload = lambda: SimpleNamespace(has_iter_stats=1)
@@ -864,7 +875,14 @@ def test_idle_fetch_publishes_rank_observations_before_wait(clock, poll_seconds)
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     activity = ConversationActivityStats(0, 1, 0, 0, 1, 0, 0, 0)
-    manager = Mock(snapshot_activity=Mock(return_value=activity)) if poll_seconds else None
+    manager = (
+        Mock(
+            snapshot_activity=Mock(return_value=activity),
+            next_refresh=Mock(return_value=float("inf")),
+        )
+        if poll_seconds
+        else None
+    )
     poll = datetime.timedelta(seconds=poll_seconds) if poll_seconds else None
     stub = _fetch_stub(
         enable_attention_dp=False,
@@ -875,7 +893,8 @@ def test_idle_fetch_publishes_rank_observations_before_wait(clock, poll_seconds)
         _pending_rank_observations={},
         _disagg_coordinator=SimpleNamespace(transfer_outcomes=(0, 1, 0)),
         _idle_kv_transfer_poll_timeout=lambda: poll,
-        _conversation_manager=manager,
+        _conversation_activity=manager,
+        _conversation_activity_refresh=float("inf"),
         _conversation_activity_capture_time=float("-inf"),
         _conversation_activity_cached=None,
     )
@@ -884,11 +903,18 @@ def test_idle_fetch_publishes_rank_observations_before_wait(clock, poll_seconds)
     kwargs = {"wait_for_batch": True, "idle_tick": stub._idle_heartbeat_tick}
     if manager is not None:
         row["conversationActivity"] = activity.to_dict()
-        kwargs = {"wait_for_batch": True, "batch_wait_deadline": clock.value + poll_seconds}
 
     def fetch(timeout, **options):
         assert (timeout, options) == (poll, kwargs)
-        assert PyExecutor.get_latest_iteration_stats(stub) == [("per_rank_dict", row)]
+        assert PyExecutor.get_latest_iteration_stats(stub) == []
+        existing = {
+            "attentionDpRank": 0,
+            "iter": 3,
+            "inflightBatchingStats": {},
+            "iterLatencyMS": 2,
+        }
+        stub.stats.append(json.dumps(existing))
+        assert PyExecutor.get_latest_iteration_stats(stub) == [("per_rank_dict", existing | row)]
         return []
 
     stub.executor_request_queue.get_from_request_queue.side_effect = fetch
@@ -914,8 +940,8 @@ def test_adp_exchange_publishes_current_peer_observations(clock, payload_kind):
     rank0._last_rank_observations = {}
     rank0._pending_rank_observations = {}
     rank0.max_stats_len = 0
-    rank0.stats.append("iteration sample")
-    activity = ConversationActivityStats(1, 1, 0, 0, 2, 0, 0, 0)
+    rank0.stats.append(json.dumps({"attentionDpRank": 1, "iter": 3, "inflightBatchingStats": {}}))
+    activity = ConversationActivityStats(1, 1, 0, 0, 2, 0, 0, 0, refresh_after_ms=2300)
     outcomes = Mock(return_value=(0, 0, 0))
     rank1._adp_iter_stats = ADPIterStatsBuffer(
         activity_snapshot=lambda: activity, transfer_outcomes_snapshot=outcomes
@@ -926,7 +952,7 @@ def test_adp_exchange_publishes_current_peer_observations(clock, payload_kind):
         rank1._adp_iter_stats._ensure_zero_payload(rank1.iter_counter)
 
     def exchange():
-        peer = RankState(rank=1, iter_stats=rank1._adp_iter_stats.next_payload())
+        peer = RankState(rank=1, iter_stats=rank1._adp_iter_stats.payload_for_exchange())
         for executor in (rank0, rank1):
             executor._publish_adp_iter_stats(
                 [RankState(rank=0), RankState.deserialize(peer.serialize())],
@@ -937,12 +963,14 @@ def test_adp_exchange_publishes_current_peer_observations(clock, payload_kind):
     for count in (1, 2):
         outcomes.return_value = (0, count, 0)
         exchange()
+    assert rank0._next_adp_activity_refresh == pytest.approx(clock.value + 2.3)
     assert PyExecutor.get_latest_iteration_stats(rank0) == [
-        "iteration sample",
         (
             "per_rank_dict",
             {
                 "attentionDpRank": 1,
+                "iter": 3,
+                "inflightBatchingStats": {},
                 "kvTransferOutcomes": {"success": 0, "error": 2, "timeout": 0},
                 "conversationActivity": activity.to_dict(),
             },

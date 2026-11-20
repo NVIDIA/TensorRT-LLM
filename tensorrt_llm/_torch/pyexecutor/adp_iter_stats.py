@@ -285,6 +285,7 @@ class ADPIterStatsBuffer:
         self._rank0_host_step_time_ms: Dict[int, Optional[float]] = {}
         self._rank0_prev_device_step_time_ms: Dict[int, Optional[float]] = {}
         self._rank0_gpu_forward_time_ms: Dict[int, Optional[float]] = {}
+        self._rank0_executor_loops: Dict[int, dict] = {}
         self._oldest_iter: Optional[int] = None
 
     @staticmethod
@@ -325,6 +326,7 @@ class ADPIterStatsBuffer:
         gpu_forward_time_ms: Optional[float] = None,
         is_queue_snapshot: bool = False,
         idle_heartbeat: bool = False,
+        executor_loop: Optional[dict] = None,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout.
 
@@ -368,10 +370,18 @@ class ADPIterStatsBuffer:
             self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
             self._rank0_prev_device_step_time_ms[iter_id] = prev_device_step_time_ms
             self._rank0_gpu_forward_time_ms[iter_id] = gpu_forward_time_ms
+            if executor_loop is not None and not is_queue_snapshot:
+                self._rank0_executor_loops[iter_id] = executor_loop
+            else:
+                self._rank0_executor_loops.pop(iter_id, None)
 
     def next_payload(self) -> Optional[RankIterStatsPayload]:
-        """Return the oldest pending stats payload to piggyback."""
-        payload = self._payloads[self._oldest_iter] if self._oldest_iter is not None else None
+        """Peek at the oldest pending iteration payload."""
+        return self._payloads[self._oldest_iter] if self._oldest_iter is not None else None
+
+    def payload_for_exchange(self) -> Optional[RankIterStatsPayload]:
+        """Attach current rank observations when preparing a routing exchange."""
+        payload = self.next_payload()
         updates = {}
         if self._activity_snapshot is not None:
             activity = self._activity_snapshot()
@@ -434,6 +444,7 @@ class ADPIterStatsBuffer:
         self._rank0_host_step_time_ms.pop(iter_id, None)
         self._rank0_prev_device_step_time_ms.pop(iter_id, None)
         self._rank0_gpu_forward_time_ms.pop(iter_id, None)
+        self._rank0_executor_loops.pop(iter_id, None)
         if recompute_oldest and iter_id == self._oldest_iter:
             self._recompute_oldest_iter()
 
@@ -629,6 +640,7 @@ class ADPIterStatsBuffer:
                     gpu_forward_time_ms=self._rank0_gpu_forward_time_ms.get(iter_stats_iter),
                 ),
                 is_queue_snapshot=is_queue_snapshot,
+                executor_loop=self._rank0_executor_loops.get(iter_stats_iter),
             )
             if idle_with_empty_queues and no_scheduled_work:
                 self.last_idle_rank_states = states
@@ -683,6 +695,7 @@ class ADPIterStatsBuffer:
         kv_iter_stats: Optional[Dict[int, object]],
         timings: Dict[str, object],
         is_queue_snapshot: bool,
+        executor_loop: Optional[dict] = None,
     ) -> List[str]:
         """Rows of ranks other than 0 differ only in their payload counts (with the
         ``numQueuedRequests`` those give), KV cache stats, speculative-decoding stats and rank:
@@ -701,6 +714,8 @@ class ADPIterStatsBuffer:
                     **timings,
                     is_queue_snapshot=is_queue_snapshot,
                 )
+                if executor_loop is not None:
+                    row["executorLoop"] = executor_loop
                 rows.append(json.dumps(row))
                 continue
             if template is None:

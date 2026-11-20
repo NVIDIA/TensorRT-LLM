@@ -16,6 +16,7 @@ from coordinator_harness import CoordinatorHarness as _Harness
 from coordinator_harness import TransferRequest as _Request
 from fake_dist import FakeDistGroup
 
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -125,20 +126,29 @@ def test_send_skips_requests_that_must_not_send() -> None:
 # -- reaping context sends ---------------------------------------------------
 
 
-@pytest.mark.parametrize("cancelled", [False, True])
-def test_settled_send_releases_blocks_and_terminates_a_departed_request(cancelled) -> None:
+@pytest.mark.parametrize(
+    "outcome", ["success", "local_cancel", "legacy_peer_cancel", "owned_peer_cancel"]
+)
+def test_settled_send_releases_blocks_and_terminates_a_departed_request(outcome) -> None:
     """A request already out of active_requests (PP>1 early path) terminates
     exactly once when its send settles."""
     h = _Harness()
     req = _Request(1)
     h.send(req)
-    if cancelled:
+    if outcome == "local_cancel":
         h.coordinator._context_cancellation_drains.add(req.py_request_id)
-    h.transceiver.finish_send(req, outcome="error" if cancelled else "complete")
+        h.transceiver.finish_send(req, outcome="error")
+    elif outcome == "success":
+        h.transceiver.finish_send(req)
+    else:
+        errors = [req.py_request_id] if outcome == "owned_peer_cancel" else []
+        h.transceiver.check_context_transfer_status = Mock(
+            return_value=CtxTransferStatus([], errors, (req.py_request_id,))
+        )
 
     h.coordinator.reap_context_sends(0)
 
-    assert h.coordinator.transfer_outcomes == (int(not cancelled), 0, 0)
+    assert h.coordinator.transfer_outcomes == (int(outcome == "success"), 0, 0)
     assert not h.in_transfer(req)
     h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
     assert h.effects.terminated == [req]
@@ -540,6 +550,11 @@ def test_fail_timed_out_ends_the_receive_state_of_cancelled_requests() -> None:
         state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
     )
 
+    h.registry.canceled = [cancelled.py_request_id, completed_late.py_request_id]
+    for request in (cancelled, completed_late):
+        request.py_kv_transfer_start_time = 1.0
+        h.coordinator._flag_transfer_timeout(request, "generation", 1000, current_time=2.5)
+    assert h.coordinator.transfer_outcomes == (0, 0, 2)
     h.coordinator.fail_timed_out([cancelled, completed_late])
 
     assert cancelled.state == LlmRequestState.DISAGG_TRANS_ERROR
@@ -628,7 +643,7 @@ def test_timed_out_receive_is_cancelled_once_until_the_request_is_forgotten(
     assert "elapsed 2000ms > kv_transfer_timeout_ms=1000ms" in message
     assert "deadline_owner=executor_request" in message
 
-    h.coordinator.forget_request(1)
+    h.coordinator.forget_request(req)
     h.transceiver.request_and_receive_async(req)
     h.coordinator.poll_gen_transfers()
     assert h.transceiver.call_log.count("cancel_request:1") == 2
@@ -727,7 +742,7 @@ def _executor_cleans_up(h: _Harness, req: _Request) -> None:
     """What the executor's error path does after ``fail_requests``: the request
     leaves active_requests and the coordinator drops its bookkeeping."""
     h.active.remove(req)
-    h.coordinator.forget_request(req.py_request_id)
+    h.coordinator.forget_request(req)
 
 
 def test_refused_cancellation_is_settled_once_after_the_retry_is_accepted(

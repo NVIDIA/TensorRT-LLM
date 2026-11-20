@@ -1917,10 +1917,9 @@ def _conversation_request(conversation_id="session", *, lora=None, salt=None):
 
 
 def test_worker_conversations_export_namespace_refresh_and_idle_expiry(collector, scrape):
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+    from tensorrt_llm._torch.pyexecutor.conversation_activity import ConversationActivityTracker
 
-    manager = ConversationManager(0, retention_enabled=False)
-    manager.enable_activity_tracking(now=0.0)
+    manager = ConversationActivityTracker(now=0.0, max_entries=3)
     for request in (
         _conversation_request(" session "),
         _conversation_request(),
@@ -1930,7 +1929,6 @@ def test_worker_conversations_export_namespace_refresh_and_idle_expiry(collector
     ):
         manager.observe_admission(request, 1.0)
     manager.observe_admission(_conversation_request(), 500.0)
-    manager.clear()  # Retention clearing must not erase activity history.
     for now, short, long, complete in (
         (600.0, 3, 3, 0),
         (601.0, 1, 3, 0),
@@ -1949,11 +1947,10 @@ def test_worker_conversations_export_namespace_refresh_and_idle_expiry(collector
 
 @pytest.mark.parametrize("limit", ["entries", "identity_bytes"])
 def test_worker_conversation_overflow_preserves_refresh_and_recovers(collector, scrape, limit):
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+    from tensorrt_llm._torch.pyexecutor.conversation_activity import ConversationActivityTracker
 
-    manager = ConversationManager(0, retention_enabled=False)
-    limits = {"max_entries": 2} if limit == "entries" else {"max_identity_bytes": 1024}
-    manager.enable_activity_tracking(now=0.0, **limits)
+    limits = {"max_entries": 1} if limit == "entries" else {"max_identity_bytes": 1024}
+    manager = ConversationActivityTracker(now=0.0, **limits)
     request = _conversation_request()
     manager.observe_admission(request, 1.0)
     rejected = _conversation_request("other" if limit == "entries" else "x" * 2048)

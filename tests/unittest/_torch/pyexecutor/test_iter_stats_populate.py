@@ -1125,7 +1125,11 @@ def test_attention_dp_fanout_preserves_rank_local_kv_snapshots(
         stats.kv_cache_stats = _make_kv_cache_snapshot(rank * 10)
         stats.cross_kv_cache_stats = _make_kv_cache_snapshot(rank * 10 + 30)
         expected.append(json.loads(stats.to_json_str()))
-        buffer.queue(stats, is_rank0=rank == 0)
+        buffer.queue(
+            stats,
+            is_rank0=rank == 0,
+            executor_loop={"kind": "loop", "per_iter": {"globalRank": rank, "numDummyRequests": 1}},
+        )
         # The queued payload must own primitive values, not native references.
         stats.kv_cache_stats.used_num_blocks = 99
         stats.kv_cache_stats.cache_hit_rate = 0.0
@@ -1146,6 +1150,10 @@ def test_attention_dp_fanout_preserves_rank_local_kv_snapshots(
         exported = json.loads(row)
         assert exported["attentionDpRank"] == rank
         assert exported["inflightBatchingStats"]["numGenRequests"] == rank + 1
+        if rank == 0:
+            assert exported["executorLoop"]["per_iter"] == {"globalRank": 0, "numDummyRequests": 1}
+        else:
+            assert "executorLoop" not in exported
         assert exported["kvCacheStats"] == expected[rank]["kvCacheStats"]
         # IterationStats JSON omits the cross-cache object; check the transported snapshot.
         cross = states[rank].iter_stats.cross_kv_cache_stats

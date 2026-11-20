@@ -486,7 +486,7 @@ def test_forgotten_deferred_receive_is_never_published() -> None:
     req = _gen_init(h, 1)
     h.coordinator.receive_gen_init([req])
 
-    h.coordinator.forget_request(1)
+    h.coordinator.forget_request(req)
     fence._answers = [True]
     h.coordinator.poll_gen_transfers()
 

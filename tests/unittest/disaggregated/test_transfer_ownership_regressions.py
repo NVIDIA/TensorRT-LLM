@@ -1040,7 +1040,8 @@ def test_send_terminal_session_is_retained_when_close_refuses(
     assert transceiver._send_reqs == {rid: request}
 
     session.close.return_value = True
-    completed, failed = transceiver.check_context_transfer_status(None, mark_complete=mark_complete)
+    status = transceiver.check_context_transfer_status(None, mark_complete=mark_complete)
+    completed, failed = status.completed_request_ids, status.error_request_ids
 
     assert failed == ([rid] if status == SessionStatus.CANCELLED else [])
     assert completed == ([rid] if mark_complete else [])

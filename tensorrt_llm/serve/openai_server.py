@@ -795,11 +795,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 os.path.dirname(multi_frontend_serving.launcher_uds))
             if multi_frontend_serving is not None else None)
         self._clock_offset_task: Optional[asyncio.Task] = None
-        # Requests finishing on attached frontends never wake the launcher's
-        # collector, so it also polls.
-        self._iteration_stats_poll_interval: Optional[float] = (
-            1.0 if multi_frontend_serving is not None
-            and multi_frontend_serving.is_launcher else None)
+        # Idle observations and failed transfers can arrive without a successful request.
+        self._iteration_stats_poll_interval = 1.0
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
         # Bounded snapshot of iteration stats for the GET /metrics handler.

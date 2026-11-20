@@ -103,6 +103,7 @@ class DisaggTransferCoordinator:
     # Since take_gen_receive_counters: most deferred receives pending at once, and the wait (s).
     _max_deferred_gen_receives = 0
     _gen_receive_ready_wait_s = 0.0
+    _transfer_outcomes: Optional[list[int]] = None
 
     def __init__(
         self,
@@ -118,8 +119,9 @@ class DisaggTransferCoordinator:
         admission_controller: Optional[DisaggTransferAdmissionController] = None,
         is_kv_manager_v2: bool = False,
         defer_unready_gen_receives: bool = False,
+        enable_transfer_metrics: bool = False,
     ) -> None:
-        self._transfer_outcomes = [0, 0, 0]
+        self._transfer_outcomes = [0, 0, 0] if enable_transfer_metrics else None
         self._settled_transfer_ids: set[int] = set()
         self._transceiver = transceiver
         self._transfers = transfer_manager
@@ -175,9 +177,10 @@ class DisaggTransferCoordinator:
         self._started_gen_receives: dict[int, LlmRequest] = {}
 
     @property
-    def transfer_outcomes(self) -> tuple[int, int, int]:
+    def transfer_outcomes(self) -> Optional[tuple[int, int, int]]:
         """Cumulative whole-request success/error/timeout counts on this rank."""
-        return tuple(getattr(self, "_transfer_outcomes", (0, 0, 0)))
+        counts = self._transfer_outcomes
+        return (counts[0], counts[1], counts[2]) if counts is not None else None
 
     def _record_transfer_outcome(self, request: LlmRequest, outcome: str) -> None:
         """Count each transfer once across output candidates, chunks and repeated polls.
@@ -185,6 +188,9 @@ class DisaggTransferCoordinator:
         An overall deadline breach wins over a later completion or cleanup error.
         User cancellation alone is not a transfer failure.
         """
+        counts = self._transfer_outcomes
+        if counts is None:
+            return
         transfer_id = get_unique_rid(request)
         if transfer_id is None or transfer_id in self._settled_transfer_ids:
             return
@@ -194,12 +200,11 @@ class DisaggTransferCoordinator:
             if getattr(request, "is_child", False) is True
             else request.py_request_id
         )
-        if rid in canceled_ids and outcome != "success":
-            return
         if getattr(request, "py_kv_transfer_timed_out", False) is True:
             outcome = "timeout"
+        elif rid in canceled_ids and outcome == "error":
+            return
         self._settled_transfer_ids.add(transfer_id)
-        counts = self.__dict__.setdefault("_transfer_outcomes", [0, 0, 0])
         counts[("success", "error", "timeout").index(outcome)] += 1
 
     # -- loop head -----------------------------------------------------------
@@ -279,11 +284,7 @@ class DisaggTransferCoordinator:
             f"voted_err_count={len(voted_error_ids)}, "
             f"blocked_err_count={len(voted_error_ids & blocked_error_ids)}"
         )
-        for request in local_voted_error_requests:
-            self._record_transfer_outcome(request, "error")
-        self._effects.fail_requests(
-            "Disagg KV cache transfer error", local_voted_error_requests, charge_budget=False
-        )
+        self._fail_transfer_requests("Disagg KV cache transfer error", local_voted_error_requests)
         return True
 
     @nvtx_range("prepare_context_schedulable")
@@ -1080,24 +1081,34 @@ class DisaggTransferCoordinator:
         ctx_status = self._transceiver.check_context_transfer_status(at_least)
         failed_req_ids = set(ctx_status.error_request_ids)
         succeeded_ids = set(ctx_status.completed_request_ids)
-        completed_req_ids = succeeded_ids | failed_req_ids
+        cancelled_ids = set(ctx_status.cancelled_request_ids)
+        completed_req_ids = succeeded_ids | failed_req_ids | cancelled_ids
         failed_req_ids -= self._context_cancellation_drains
 
         requests_in_transfer = self._transfers.requests_in_transfer()
         for request_id in completed_req_ids:
             if request_id not in requests_in_transfer:
-                if request_id in failed_req_ids:
+                if request_id in failed_req_ids and request_id not in cancelled_ids:
                     self._pending_ctx_transfer_failures.add(request_id)
-                else:
+                elif request_id not in cancelled_ids:
                     logger.warning(f"Request {request_id} not found in transfer manager")
                 continue
             request = requests_in_transfer[request_id]
+            if request_id in cancelled_ids and not request.py_kv_transfer_timed_out:
+                # Preserve the terminal cancellation across the later error
+                # sweep, which also visits owned sends retired as errors.
+                if self._transfer_outcomes is not None:
+                    self._settled_transfer_ids.add(request_id)
+                request.py_kv_transfer_start_time = None
             if request_id in failed_req_ids:
                 self._record_transfer_outcome(request, "error")
                 # Past the context phase: writing the error state here is safe.
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             elif request_id in succeeded_ids:
                 self._record_transfer_outcome(request, "success")
+            elif request_id in cancelled_ids:
+                if request.py_kv_transfer_timed_out:
+                    self._record_transfer_outcome(request, "timeout")
             self.release_transfer(request)
 
         # Releases above may have changed the set of requests in transfer.
@@ -1132,19 +1143,21 @@ class DisaggTransferCoordinator:
     def reap_gen_receives(self, at_least: int = 0) -> None:
         """Poll receive-side transfers; rank-synchronized inside the transceiver."""
         gen_status = self._transceiver.check_gen_transfer_status(at_least)
-        completed_ids = set(gen_status.completed_request_ids)
-        failed_ids = set(gen_status.error_request_ids)
-        benchmark = is_gen_only_no_context_benchmark()
-        # Native receives report completion through state, even with no
-        # completed IDs. Observe both backends before cancellation or handoff.
-        for req in self._registry.active_requests():
-            rid = get_unique_rid(req)
-            if rid in failed_ids:
-                self._record_transfer_outcome(req, "error")
-            elif rid in completed_ids or (
-                not benchmark and req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            ):
-                self._record_transfer_outcome(req, "success")
+        if self._transfer_outcomes is not None and self._started_gen_receives:
+            completed_ids = set(gen_status.completed_request_ids)
+            failed_ids = set(gen_status.error_request_ids)
+            benchmark = is_gen_only_no_context_benchmark()
+            # Native receives can settle through request state without returning an ID.
+            for req in self._started_gen_receives.values():
+                rid = get_unique_rid(req)
+                if rid in self._settled_transfer_ids:
+                    continue
+                if rid in failed_ids:
+                    self._record_transfer_outcome(req, "error")
+                elif rid in completed_ids or (
+                    not benchmark and req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                ):
+                    self._record_transfer_outcome(req, "success")
         if gen_status.cancelled_requests:
             user_canceled_ids = set(self._registry.canceled_request_ids())
             for req in gen_status.cancelled_requests:
@@ -1472,13 +1485,20 @@ class DisaggTransferCoordinator:
         self._pending_ctx_transfer_failures = set()
         return pending
 
-    def forget_request(self, request_id: int, *, transfer_id: Optional[int] = None) -> None:
+    def forget_request(self, request: LlmRequest) -> None:
         """Drop request bookkeeping; retain shared outcome latches until the last alias is freed."""
-        if transfer_id in self._settled_transfer_ids and not any(
-            req.py_request_id != request_id and get_unique_rid(req) == transfer_id
-            for req in self._registry.active_requests()
-        ):
-            self._settled_transfer_ids.discard(transfer_id)
+        request_id = request.py_request_id
+        if self._transfer_outcomes is not None:
+            transfer_id = get_unique_rid(request)
+            has_candidates = request.is_child or getattr(request, "child_requests", ())
+            if transfer_id in self._settled_transfer_ids and (
+                not has_candidates
+                or not any(
+                    req.py_request_id != request_id and get_unique_rid(req) == transfer_id
+                    for req in self._registry.active_requests()
+                )
+            ):
+                self._settled_transfer_ids.discard(transfer_id)
         self._timed_out_ctx_cancelled_ids.discard(request_id)
         self._timed_out_gen_cancelled_ids.discard(request_id)
         self._legacy_retire_retry.pop(request_id, None)
@@ -1563,15 +1583,17 @@ class DisaggTransferCoordinator:
             any_needs_flush = int(local_needs_flush)
         if not any_needs_flush:
             return
-        for request in error_requests:
-            self._record_transfer_outcome(request, "error")
-        self._effects.fail_requests(
-            "Error in kv cache transfer for generation requests",
-            error_requests,
-            charge_budget=False,
+        self._fail_transfer_requests(
+            "Error in kv cache transfer for generation requests", error_requests
         )
 
     # -- transfer errors -----------------------------------------------------
+
+    def _fail_transfer_requests(self, message: str, requests: List[LlmRequest]) -> None:
+        if self._transfer_outcomes is not None:
+            for request in requests:
+                self._record_transfer_outcome(request, "error")
+        self._effects.fail_requests(message, requests, charge_budget=False)
 
     def _check_transfer_errors(self, kind: str) -> None:
         """Fail requests whose transfer errored, rank-locally.
@@ -1583,11 +1605,7 @@ class DisaggTransferCoordinator:
             return
         error_requests = self._requests_in_error_state()
         if error_requests:
-            for request in error_requests:
-                self._record_transfer_outcome(request, "error")
-            self._effects.fail_requests(
-                f"Error in kv cache transfer for {kind}", error_requests, charge_budget=False
-            )
+            self._fail_transfer_requests(f"Error in kv cache transfer for {kind}", error_requests)
 
     def _requests_in_error_state(self) -> List[LlmRequest]:
         return [
@@ -1763,7 +1781,7 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def take_pending_context_failures(self) -> Set[int]:
         return set()
 
-    def forget_request(self, request_id: int, *, transfer_id: Optional[int] = None) -> None:
+    def forget_request(self, request: LlmRequest) -> None:
         return None
 
     def pace_idle(self) -> None:

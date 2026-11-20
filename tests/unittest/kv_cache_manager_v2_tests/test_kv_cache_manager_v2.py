@@ -11836,6 +11836,11 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         # Host -> disk evictions of written-through pages took their disk slot back instead of writing.
         self.assertGreater(filled["reused"], 0)
         self._assert_copies_balance(filled)
+        host = self.manager.get_storage_statistics(CacheLevel(1))
+        disk = self.manager.get_storage_statistics(CacheLevel(2))
+        disk_resident = sum(stats.total - stats.free - stats.retained_copies for stats in disk)
+        self.assertGreater(disk_resident, 0)
+        self.assertEqual(sum(stats.evicted_blocks for stats in host), disk_resident)
 
         # Restore the first request's prefix from disk; refcheck verifies the restored KV.
         prompt = first.kv_cache.committed_tokens[: seq_len // 2]
