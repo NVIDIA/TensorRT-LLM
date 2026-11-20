@@ -302,6 +302,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
                 True,
                 3,
                 "fp8",
+                # SM107 cold runs of this combined ADP/MTP/FP8-KV case can exceed one hour.
                 marks=[pytest.mark.timeout(7200)] if get_sm_version() == 107 else [],
             ),
         ],
