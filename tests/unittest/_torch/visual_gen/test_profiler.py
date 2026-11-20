@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.visual_gen
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import wrap_blocks_with_cuda_graphs
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.profiler import (
     PROFILE_START_STOP_ENV_VAR_NAME,
@@ -385,12 +386,18 @@ class _StubPipeline:
     """Minimal stand-in exercising ``BasePipeline.run_inference`` glue."""
 
     run_inference = BasePipeline.run_inference
+    _stop_block_graph_capture = BasePipeline._stop_block_graph_capture
 
     def __init__(self, profiler: VisualGenProfiler, is_warmup: bool = False) -> None:
         self._profiler = profiler
         self._is_warmup = is_warmup
+        model = torch.nn.Module()
+        model.blocks = torch.nn.ModuleList([torch.nn.Identity()])
+        self._cuda_graph_runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
 
     def infer(self, req: object) -> object:
+        if isinstance(req, Exception):
+            raise req
         return req
 
 
@@ -399,6 +406,7 @@ def test_run_inference_skips_profiling_during_warmup(
 ) -> None:
     profiler, events = _recording_profiler(monkeypatch, "all")
     pipeline = _StubPipeline(profiler, is_warmup=True)
+    (block_runner,) = pipeline._cuda_graph_runners.values()
 
     request = object()
     assert pipeline.run_inference(request) is request
@@ -408,6 +416,13 @@ def test_run_inference_skips_profiling_during_warmup(
     pipeline._is_warmup = False
     assert pipeline.run_inference(request) is request
     assert events == ["start", "stop"]
+    # Block graph capture stays open until a block graph exists, then closes after a
+    # request even when that request fails.
+    assert block_runner.allow_capture
+    block_runner.graphs["captured"] = None
+    with pytest.raises(RuntimeError):
+        pipeline.run_inference(RuntimeError("decode failed"))
+    assert not block_runner.allow_capture
 
 
 # ----------------------------------------------------------------------

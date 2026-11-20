@@ -191,7 +191,8 @@ def test_replay_matches_eager():
 def test_graph_keys():
     """Model graph keys select graphs and reach the block during capture; so do block args.
 
-    Once capture stops (after warmup), a new key runs eagerly and adds no graph.
+    Once capture stops (after warmup), a new key runs eagerly and adds no graph; the block
+    still sees the call's model graph keys, as it would in a replay.
     """
     torch.manual_seed(0)
     model = _TwoBlockModel(timestep_key=True, block_cls=_PhaseBlock).cuda().eval()
@@ -206,7 +207,8 @@ def test_graph_keys():
     longer = dict(
         call, hidden_states=torch.randn(2, 32, _DIM, device="cuda"), image_rotary_emb=rope
     )
-    expected_longer = model(**longer)
+    with resolved_extra_keys_scope({"late_phase": True}):
+        expected_longer = model(**longer)
     runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
 
     for timestep, expected in ((900, early), (100, late), (800, early), (50, late)):
@@ -217,7 +219,7 @@ def test_graph_keys():
     assert len(runners["transformer.blocks.0"].graphs) == 6
 
     BasePipeline._stop_block_graph_capture(SimpleNamespace(_cuda_graph_runners=runners))
-    _assert_same(model(**longer, timestep=900), expected_longer)
+    _assert_same(model(**longer, timestep=100), expected_longer)
     assert [len(runner.graphs) for runner in runners.values()] == [6, 2]
 
 

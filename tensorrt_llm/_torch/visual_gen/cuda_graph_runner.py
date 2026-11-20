@@ -43,7 +43,7 @@ _RESOLVED_EXTRA_KEYS: contextvars.ContextVar[Optional[Dict[str, Any]]] = context
 
 
 def resolved_extra_key(name: str) -> Any:
-    """Return the extra-key value `name` resolved for the call being captured, else None.
+    """Return the extra-key value `name` resolved for the runner's current call, else None.
 
     None means "not inside a runner-driven call" (or the key was omitted), and
     callers must fall back to deriving the value themselves.
@@ -588,7 +588,10 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
 
             if key not in self.graphs:
                 if not self.allow_capture:
-                    return fn(*args, **kwargs)
+                    # Publish the call's graph keys as a replay would, so state a block keeps
+                    # for captured graphs (VC-Attention's per-shape grouping) stays in use.
+                    with resolved_extra_keys_scope(self._last_resolved_extra_keys):
+                        return fn(*args, **kwargs)
 
                 def call_with_tensors(*graph_tensors: torch.Tensor) -> Any:
                     rebuilt = list(leaves)

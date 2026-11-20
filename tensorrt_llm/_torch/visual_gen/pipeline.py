@@ -183,17 +183,20 @@ class BasePipeline(nn.Module):
         profiler_scope = (
             contextlib.nullcontext() if self._is_warmup else self._profiler.request_scope()
         )
-        with profiler_scope:
-            anchor_fn = getattr(self, "_nccl_window_tensor_scope_anchor", None)
-            anchor = anchor_fn() if anchor_fn is not None else None
-            if anchor is None:
-                output = self.infer(req)
-            else:
-                with nccl_window_tensor_scope(anchor) as scope:
-                    output = scope.escape(self.infer(req))
-        if not self._is_warmup:
-            # Without a warmup, block graphs are captured during the first request only.
-            self._stop_block_graph_capture()
+        try:
+            with profiler_scope:
+                anchor_fn = getattr(self, "_nccl_window_tensor_scope_anchor", None)
+                anchor = anchor_fn() if anchor_fn is not None else None
+                if anchor is None:
+                    output = self.infer(req)
+                else:
+                    with nccl_window_tensor_scope(anchor) as scope:
+                        output = scope.escape(self.infer(req))
+        finally:
+            if not self._is_warmup:
+                # Without a warmup, block graphs are captured during the first request
+                # only. Close on every rank, also when the request failed on this one.
+                self._stop_block_graph_capture()
         return output
 
     def _profile_denoise_steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
@@ -298,14 +301,21 @@ class BasePipeline(nn.Module):
         )
 
     def _stop_block_graph_capture(self) -> None:
-        """Run block graph keys first seen from now on eagerly.
+        """Run block graph keys first seen from now on eagerly, once block graphs exist.
 
         Warmup decides the captured shapes, as batch sizes do for LLM CUDA graphs: a shape
         it did not cover runs without graphs instead of adding graphs and input buffers to
-        every block for the rest of the process.
+        every block for the rest of the process. Capture stays open while no block graph
+        exists, e.g. after a first request that ran with graphs disabled (a FLUX.2 edit).
+        Every rank captures the same block graphs, so every rank decides alike.
         """
-        for runner in getattr(self, "_cuda_graph_runners", {}).values():
-            if isinstance(runner, BlockCUDAGraphRunner):
+        runners = [
+            runner
+            for runner in getattr(self, "_cuda_graph_runners", {}).values()
+            if isinstance(runner, BlockCUDAGraphRunner)
+        ]
+        if any(runner.graphs for runner in runners):
+            for runner in runners:
                 runner.allow_capture = False
 
     def _setup_blockwise_cuda_graphs(self) -> None:
