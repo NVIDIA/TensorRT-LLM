@@ -83,7 +83,7 @@ DEFAULT_QUERY_SIZE = 3000
 DEFAULT_RETRY_COUNT = 5
 DEFAULT_LOOKBACK_DAYS = 7
 POST_TIMEOUT_SECONDS = 20
-QUERY_TIMEOUT_SECONDS = 10
+QUERY_TIMEOUT_SECONDS = 20
 
 OPEN_SEARCH_DB_BASE_URL = os.getenv("OPEN_SEARCH_DB_BASE_URL", "")
 OPEN_SEARCH_DB_USERNAME = os.getenv("OPEN_SEARCH_DB_CREDENTIALS_USR", "")
@@ -429,16 +429,16 @@ class OpenSearchDB:
         return False
 
     # HTTP status codes where retry makes sense (transient server/network issues)
-    _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+    _RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
-    # Any 4xx except 429 is a client error — the request itself is wrong, retry won't help.
+    # Any 4xx except 408/429 is a client error — the request itself is wrong, retry won't help.
     # Use _is_non_retryable() rather than checking this set directly.
     _NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 405, 413, 414}
 
     @staticmethod
     def _is_non_retryable(status_code: int) -> bool:
-        """Return True for 4xx client errors (except 429 Too Many Requests)."""
-        return 400 <= status_code < 500 and status_code != 429
+        """Return True for 4xx client errors except Request Timeout and Too Many Requests."""
+        return 400 <= status_code < 500 and status_code not in (408, 429)
 
     @staticmethod
     def queryFromOpenSearchDB(json_data, project):
@@ -505,7 +505,7 @@ class OpenSearchDB:
 
                 last_error = f"HTTP {res.status_code}: {res.text[:200]}"
 
-                # Client errors (4xx except 429) — input is wrong, retry won't help
+                # Client errors (4xx except 408/429) — input is wrong, retry won't help
                 if OpenSearchDB._is_non_retryable(res.status_code):
                     OpenSearchDB._log("error",
                                       "query",
@@ -516,7 +516,7 @@ class OpenSearchDB:
                                       url=url)
                     return None
 
-                # Server errors (5xx, 429) — transient, worth retrying
+                # Server errors and transient client errors (408/429) are worth retrying.
                 if attempt < DEFAULT_RETRY_COUNT:
                     OpenSearchDB._log("warning",
                                       "query",

@@ -154,12 +154,13 @@ class TestPostRetryBehavior:
         assert "cat=non_retryable" in caplog.text
         assert f"status={status_code}" in caplog.text
 
+    @pytest.mark.parametrize("status_code", [408, 503])
     @patch("open_search_db.requests.post")
-    def test_retryable_status_then_success(self, mock_post, caplog):
+    def test_retryable_status_then_success(self, mock_post, status_code, caplog):
         import logging
 
         mock_post.side_effect = [
-            MockResponse(503, text="unavailable"),
+            MockResponse(status_code, text="transient error"),
             MockResponse(200),
         ]
         with caplog.at_level(logging.INFO):
@@ -187,11 +188,12 @@ class TestPostRetryBehavior:
         assert "cat=network" in caplog.text
         assert "ConnectionError" in caplog.text
 
+    @pytest.mark.parametrize("status_code", [408, 503])
     @patch("open_search_db.requests.post")
-    def test_retryable_status_exhaustion_returns_false(self, mock_post, caplog):
+    def test_retryable_status_exhaustion_returns_false(self, mock_post, status_code, caplog):
         import logging
 
-        mock_post.return_value = MockResponse(503, text="unavailable")
+        mock_post.return_value = MockResponse(status_code, text="transient error")
         with caplog.at_level(logging.INFO):
             result = OpenSearchDB.postToOpenSearchDB({"s_name": "test"}, VALID_POST_PROJECT)
         assert result is False
@@ -272,6 +274,7 @@ class TestHTTPSuccess:
         mock_get.return_value = resp
         result = OpenSearchDB.queryFromOpenSearchDB("{}", VALID_PROJECT)
         assert result is resp
+        assert mock_get.call_args.kwargs["timeout"] == 20
 
     @patch("open_search_db.requests.get")
     def test_201_returns_response(self, mock_get):
@@ -318,18 +321,20 @@ class TestRetryableErrors:
         assert result is None
         assert mock_get.call_count == DEFAULT_RETRY_COUNT
 
+    @pytest.mark.parametrize("status_code", [408, 429])
     @patch("open_search_db.requests.get")
-    def test_429_retries(self, mock_get):
-        mock_get.return_value = MockResponse(429, text="Too Many Requests")
+    def test_transient_4xx_retries(self, mock_get, status_code):
+        mock_get.return_value = MockResponse(status_code, text="transient error")
         result = OpenSearchDB.queryFromOpenSearchDB("{}", VALID_PROJECT)
         assert result is None
         assert mock_get.call_count == DEFAULT_RETRY_COUNT
 
+    @pytest.mark.parametrize("status_code", [408, 503])
     @patch("open_search_db.requests.get")
-    def test_503_then_200_succeeds(self, mock_get):
+    def test_transient_status_then_200_succeeds(self, mock_get, status_code):
         success_resp = MockResponse(200, {"hits": {"hits": [{"_id": "1"}]}})
         mock_get.side_effect = [
-            MockResponse(503, text="Service Unavailable"),
+            MockResponse(status_code, text="transient error"),
             success_resp,
         ]
         result = OpenSearchDB.queryFromOpenSearchDB("{}", VALID_PROJECT)
@@ -501,7 +506,7 @@ class TestEdgeCases:
 
     @patch("open_search_db.requests.get")
     def test_unknown_4xx_status_code_non_retryable(self, mock_get):
-        """Any 4xx (except 429) is treated as a client error and fails immediately."""
+        """Any 4xx (except 408/429) is treated as a client error and fails immediately."""
         mock_get.return_value = MockResponse(418, text="I'm a teapot")
         result = OpenSearchDB.queryFromOpenSearchDB("{}", VALID_PROJECT)
         assert result is None
