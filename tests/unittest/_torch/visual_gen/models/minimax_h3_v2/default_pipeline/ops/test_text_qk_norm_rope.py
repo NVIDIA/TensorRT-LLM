@@ -15,6 +15,7 @@ def test_packed_text_qk_norm_rope(cell):
         pytest.skip("Requires a CUDA GPU")
     params = dict(cell.spec)
     tokens = params.pop("tokens")
+    fullgraph = params.pop("fullgraph", False)
     q_heads, kv_heads, dim = params["num_heads_q"], params["num_heads_kv"], params["head_dim"]
     rng = torch.Generator(device="cuda").manual_seed(1892)
 
@@ -31,7 +32,8 @@ def test_packed_text_qk_norm_rope(cell):
     value = qkv[:, qk_width:].clone()
     text_qk_norm_rope.is_valid(*args, **params)
     expected = text_qk_norm_rope.reference(qkv.clone(), q_weight, k_weight, positions, **params)
-    actual = text_qk_norm_rope(*args, **params)
+    run = torch.compile(text_qk_norm_rope, fullgraph=True) if fullgraph else text_qk_norm_rope
+    actual = run(*args, **params)
     assert actual.data_ptr() == qkv.data_ptr()
     torch.testing.assert_close(
         actual[:, :qk_width], expected[:, :qk_width].to(torch.bfloat16), rtol=8e-3, atol=1e-3

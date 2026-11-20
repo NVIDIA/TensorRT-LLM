@@ -82,6 +82,9 @@ def _text_qk_norm_rope(
     gl.store(ptrs, output.to(gl.bfloat16), active[:, None])
 
 
+@torch.library.custom_op(
+    "trtllm::minimax_h3_v2_text_qk_norm_rope_", mutates_args=("qkv",), device_types="cuda"
+)
 def apply_text_qk_norm_rope(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
@@ -98,7 +101,7 @@ def apply_text_qk_norm_rope(
     low: float = 0.0,
     high: float = 0.0,
     attention_factor: float = 1.0,
-) -> torch.Tensor:
+) -> None:
     """Normalize packed Q/K heads in place and rotate the leading channels at each text position."""
     if head_dim not in (64, 128, 256):
         raise ValueError(f"Unsupported H3 text encoder head dimension {head_dim}")
@@ -158,4 +161,8 @@ def apply_text_qk_norm_rope(
                 attention_factor,
                 HEADS_PER_TILE=heads_per_tile,
             )
-    return qkv
+
+
+@apply_text_qk_norm_rope.register_fake
+def _(*args, **kwargs) -> None:
+    return None

@@ -14,9 +14,10 @@ class TextQkNormRope(OpWrapper):
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
         Cell(
-            "Released TP2 text head geometry",
+            "Compiled TP2 text encoder",
             dict(
                 tokens=73,
+                fullgraph=True,
                 num_heads_q=32,
                 num_heads_kv=4,
                 head_dim=128,
@@ -89,7 +90,7 @@ class TextQkNormRope(OpWrapper):
         high: float = 0.0,
         attention_factor: float = 1.0,
     ) -> torch.Tensor:
-        return apply_text_qk_norm_rope(
+        apply_text_qk_norm_rope(
             qkv,
             q_weight,
             k_weight,
@@ -105,6 +106,7 @@ class TextQkNormRope(OpWrapper):
             high=high,
             attention_factor=attention_factor,
         )
+        return qkv
 
     def reference(
         self,
