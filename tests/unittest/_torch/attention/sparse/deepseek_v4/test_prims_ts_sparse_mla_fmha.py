@@ -1400,6 +1400,43 @@ def test_default_worker_count_is_capped_by_the_ranks_on_the_host(monkeypatch) ->
     assert pp.local_rank_count(None) == 4
 
 
+def test_cold_variants_compile_concurrently_once_per_kernel(monkeypatch, tmp_path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+    from threading import Barrier
+
+    from flashinfer.jit import env as jit_env
+
+    from tensorrt_llm._torch.attention.backends import _cute_dsl_compat
+    from tensorrt_llm._torch.attention.backends.prims_ts import _compile_cache
+
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.setattr(_compile_cache, "_kernel_source_files", lambda: ())
+    monkeypatch.setattr(
+        _cute_dsl_compat.JitSpecCuteDsl,
+        "_load_from_disk",
+        lambda self: self.object_path.read_text(),
+    )
+    compiling = Barrier(2, timeout=10)
+    builds = []
+
+    def load_variant(name):
+        def compile_kernel():
+            builds.append(name)
+            compiling.wait()
+            return SimpleNamespace(export_to_c=lambda path, **kwargs: Path(path).write_text(name))
+
+        return _compile_cache.build_and_load_attention_kernel(
+            "mla_decode", "main", name, "", compile_kernel
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(load_variant, ("a", "a", "b"))) == ["a", "a", "b"]
+    assert sorted(builds) == ["a", "b"]
+
+
 def test_precompile_worker_imports_vendor_without_runtime() -> None:
     import json
     import subprocess
@@ -1413,6 +1450,7 @@ import json, runpy, sys
 worker = runpy.run_path(sys.argv[1])
 worker["_init_worker"](json.load(sys.stdin))
 from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+from tensorrt_llm._torch.attention.backends import _cute_dsl_compat
 assert mla_decode.BatchSparseMLADecodePagedTSWrapper.__module__ == mla_decode.__name__
 assert sys.modules["tensorrt_llm"].__spec__.origin is None
 assert "tensorrt_llm._bootstrap" not in sys.modules and "mpi4py.MPI" not in sys.modules

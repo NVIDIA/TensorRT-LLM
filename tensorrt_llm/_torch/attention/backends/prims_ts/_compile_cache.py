@@ -128,10 +128,9 @@ def build_and_load_attention_kernel(
     extra: tuple = (),
 ) -> Any:
     """Build or load under the caller's selected CUDA device context."""
-    from flashinfer.jit.cute_dsl_core import (
-        build_and_load_cute_dsl_kernel,
-        cute_dsl_cache_disabled,
-    )
+    from flashinfer.jit.cute_dsl_core import cute_dsl_cache_disabled
+
+    from .._cute_dsl_compat import build_and_load_cute_dsl_kernel
 
     if cute_dsl_cache_disabled():
         return compile_fn()
