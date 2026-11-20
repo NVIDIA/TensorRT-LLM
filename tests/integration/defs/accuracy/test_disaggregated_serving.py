@@ -860,6 +860,9 @@ def _test_sparse_offload_long_context(
         "FORCE_ALL_REDUCE_DETERMINISTIC": "1",
         "TRTLLM_DISAGG_NO_RETRY": "1",
     }
+    if (unit_tokens == 1
+            and gen_server_config["kv_cache_config"]["dtype"] == "nvfp4"):
+        deterministic_env["TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT"] = "residual"
     world_size = gen_server_config["tensor_parallel_size"]
     print(
         f"Sparse offload profile: {model_name}, "
