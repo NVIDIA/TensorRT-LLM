@@ -193,6 +193,7 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._gpu_match_len: Optional[torch.Tensor] = None
         self._gpu_draft_tokens: Optional[torch.Tensor] = None
         self._gpu_batch_indices: Optional[torch.Tensor] = None
+        self._gpu_nondummy_mask: Optional[torch.Tensor] = None
 
         # Global pool buffers (allocated lazily in _ensure_workspace)
         self._gpu_active_slot_mask: Optional[torch.Tensor] = None

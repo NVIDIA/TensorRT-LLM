@@ -93,6 +93,9 @@ class TestSuffixAutomatonManager:
         draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
         assert draft_list == [0, 0, 0, 0], f"Expected zeroed draft, got {draft_list}"
 
+        assert manager._gpu_nondummy_mask is not None
+        assert manager._cpu_batch_indices is not None
+        assert manager._cpu_nondummy_mask is not None
         manager.shutdown()
         assert manager._gpu_nondummy_mask is None
         assert manager._cpu_batch_indices is None
