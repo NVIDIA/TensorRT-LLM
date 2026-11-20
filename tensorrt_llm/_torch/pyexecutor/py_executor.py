@@ -773,6 +773,7 @@ class PyExecutor:
     # Set on a rank that reports completions while requests its first-token
     # check finished, which run no batch, wait for an iteration-stats record.
     _has_close_outs_pending_iter_stats = False
+    _fleet_has_live_requests = False
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -1327,6 +1328,11 @@ class PyExecutor:
         self._remote_tail_phase = RemoteTailPhase.NONE
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        # Whether any attention-DP rank held a request to step, received one or
+        # awaited a context retirement at the last routing allgather. An idle
+        # rank keeps stepping while it is set, so every rank leaves the
+        # executor loop on the same iteration.
+        self._fleet_has_live_requests = False
         # Buffer for responses staged by rank-divergent paths (disagg transfer
         # completion, ADP error handling). With ADP, _enqueue_responses does a
         # tp_gather collective; the owning DP rank has a response but the other
@@ -3191,6 +3197,7 @@ class PyExecutor:
     @property
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
+            not self._fleet_has_live_requests and \
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
             not self.disagg.has_retiring_gen_receives and \
             not self._has_pending_context_retirement()
@@ -6778,11 +6785,13 @@ class PyExecutor:
                 len(self.request_accumulated) +
                 self.executor_request_queue.get_request_queue_size())
         extra_ints = [n_error_ids, n_blocked_ids, has_kv_timeout]
+        context_retirement = self._has_pending_context_retirement()
         rank_states, vectors = self.adp_router.gather_all_rank_states_with_extras(
             self.active_requests,
             extra_ints,
             iter_stats_payload=iter_stats_payload,
-            num_pending_new_requests=num_pending_new_requests)
+            num_pending_new_requests=num_pending_new_requests,
+            has_pending_context_retirement=context_retirement)
         any_error = any(vector[0] > 0 for vector in vectors)
         any_timeout = any(vector[2] > 0 for vector in vectors)
 
@@ -9446,6 +9455,7 @@ class PyExecutor:
                         self.executor_request_queue.get_request_queue_size())
                 remote_tail_adp = getattr(self, "_enable_remote_tail_adp",
                                           False)
+                context_retirement = self._has_pending_context_retirement()
                 context_ids, generation_ids = (
                     self._snapshot_remote_tail_phase_work(active_requests)
                     if remote_tail_adp else (frozenset(), frozenset()))
@@ -9469,7 +9479,8 @@ class PyExecutor:
                     if remote_tail_adp else None,
                     num_pending_new_requests=num_pending_new_requests,
                     include_kv_cache_load=self._kv_load_tracker.enabled,
-                    iter_stats_enabled=self.enable_iter_perf_stats)
+                    iter_stats_enabled=self.enable_iter_perf_stats,
+                    has_pending_context_retirement=context_retirement)
                 if remote_tail_adp:
                     self._select_remote_tail_phase(all_rank_states, context_ids,
                                                    generation_ids)
@@ -9567,6 +9578,17 @@ class PyExecutor:
             all_new_flat = [
                 req for reqs in all_ranks_new_requests.values() for req in reqs
             ]
+            # Fleet-wide snapshot for should_stop_processing. A rank-local
+            # decision would let an idle rank stop while a peer still runs
+            # collectives. A request still sending KV needs no step, but a
+            # rank whose context request awaits the retirement of its send
+            # keeps stepping until the send retires, so its peers step too.
+            num_requests_to_step = total_num_live_requests - sum(
+                s.num_in_transfer_requests for s in all_rank_states)
+            self._fleet_has_live_requests = (
+                num_requests_to_step > 0 or len(all_new_flat) > 0
+                or any(s.has_pending_context_retirement
+                       for s in all_rank_states))
             if not self._enable_non_overlap_adp_forward_intent:
                 self._update_adp_dummy_role(all_new_flat)
 
