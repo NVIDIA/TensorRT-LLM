@@ -27,6 +27,7 @@ from tensorrt_llm.llmapi import KvCacheConfig
 
 from .....conftest import llm_models_root
 from ....accuracy_core import GSM8KInferenceX, LlmapiAccuracyTestHarness
+from ..._env import scoped_env_overrides
 
 skip_not_sm103 = pytest.mark.skipif(
     get_sm_version() != 103, reason="the target is certified on sm_103 (GB300) only"
@@ -48,18 +49,26 @@ class TestModelingV2Inkling2SmallNvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_gsm8k(self):
-        with LLM(
-            self.MODEL_PATH,
-            tensor_parallel_size=4,
-            moe_expert_parallel_size=4,
-            modeling_v2="require",
-            max_seq_len=32768,
-            max_batch_size=64,
-            max_num_tokens=16384,
-            kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.6),
-            cuda_graph_config=None,
-            disable_overlap_scheduler=True,
-            enable_chunked_prefill=False,
-        ) as llm:
+        # Every Modeling V2 accuracy engine is built in an environment scope
+        # (test_modeling_v2_env_scope.py); this one overrides nothing.
+        with (
+            scoped_env_overrides({}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                modeling_v2="require",
+                max_seq_len=32768,
+                max_batch_size=64,
+                max_num_tokens=16384,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False, free_gpu_memory_fraction=0.6
+                ),
+                cuda_graph_config=None,
+                disable_overlap_scheduler=True,
+                enable_chunked_prefill=False,
+                env_overrides=rank_env,
+            ) as llm,
+        ):
             task = GSM8KInferenceX(self.MODEL_NAME)
             task.evaluate(llm)
