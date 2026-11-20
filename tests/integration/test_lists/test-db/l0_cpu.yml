@@ -18,6 +18,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_modeling_v2_spec_tail_contracts.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/kernels/gemm/test_modeling_v2_m3_lowm_splitk_sync.py
   # MiniMax-M3 Rubin target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_drafter_fullctx_cells.py
   # MiniMax-M3 target unit tests.
