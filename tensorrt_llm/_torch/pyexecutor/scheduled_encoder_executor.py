@@ -573,7 +573,9 @@ class ScheduledEncoderExecutor:
                             max_num_tokens=self.max_num_tokens,
                         )
                         if count:
-                            self._run([self._waiting_queue.pop_request() for _ in range(count)])
+                            items = [self._waiting_queue.pop_request() for _ in range(count)]
+                            self._waiting_queue.mark_admitted(items)
+                            self._run(items)
                         # Every pass counts, idle ones too, so a stop requested while idle fires.
                         self._iter_counter += 1
         finally:

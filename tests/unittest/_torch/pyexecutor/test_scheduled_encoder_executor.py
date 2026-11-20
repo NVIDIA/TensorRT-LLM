@@ -417,6 +417,31 @@ def test_a_priority_queue_admits_the_higher_priority_request_first(max_wait_s):
         assert h.runner.batches == [[running], [high], [low]]
 
 
+def test_a_request_past_the_wait_cap_goes_ahead_of_a_higher_priority_one():
+    max_wait_s = 0.2
+    with _harness(
+        max_batch_size=1,
+        scheduler_config=SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.PRIORITY, waiting_queue_max_wait_s=max_wait_s
+        ),
+    ) as h:
+        h.runner.hold()
+        running = h.submit()
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+        # Arrivals are stamped at enqueue, so the older request is past the cap when popped.
+        old = h.submit(priority=0.1)
+        time.sleep(2 * max_wait_s)
+        new = h.submit(priority=0.9)
+        h.runner.release.set()
+
+        for request_id in (running, old, new):
+            h.result(request_id)
+        assert h.runner.batches == [[running], [old], [new]]
+        # Admitted requests leave no bookkeeping behind in the queue.
+        assert not h.executor._waiting_queue._seq
+
+
 def test_cancelling_a_queued_request_finishes_it_once_as_cancelled(completion):
     with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.hold()
