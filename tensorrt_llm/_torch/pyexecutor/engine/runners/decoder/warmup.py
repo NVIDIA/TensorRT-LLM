@@ -959,24 +959,28 @@ class DecoderWarmup:
             logger.info(f"Throwaway Top-K prewarm complete ({time.perf_counter() - start:.1f} s)")
 
     def _prewarm_lowm_mma_row_buckets(self) -> None:
-        """Compile the row buckets of the low-M MMA GEMMs the warmup forwards ran eagerly, up to the
-        bucket of a step's most rows, then barrier.
+        """Compile the row buckets of the low-M MMA GEMMs the warmup forwards ran eagerly, then
+        barrier.
 
         Eager forwards run these GEMMs on their row count rounded up to a bucket
         (``low_m_gemm._MMA_ROW_BUCKETS``), and the warmup forwards reach only the buckets of their
         own row counts. Runs before CUDA graph capture, so that a capture outside the decode graphs
-        finds its buckets compiled. No such GEMM has more rows than a step's tokens, which attention
-        DP gathers over the TP group. The TP group is held until its slowest rank has finished: the
-        GEMMs a rank ran eagerly, and so its compiles, can differ between ranks.
+        finds its buckets compiled. Without speculative decoding no such GEMM has more rows than a
+        step's tokens, which attention DP gathers over the TP group, so the buckets stop at the one
+        that holds them. A drafter can project more rows than its target verifies, so with
+        speculative decoding every bucket compiles. The TP group is held until its slowest rank has
+        finished: the GEMMs a rank ran eagerly, and so its compiles, can differ between ranks.
         """
         from tensorrt_llm._torch.modules.low_m_gemm import prewarm_mma_row_buckets
 
         start = time.perf_counter()
         compiled = gemms = 0
         try:
-            max_rows = self._config.max_num_tokens
-            if self.mapping.enable_attention_dp:
-                max_rows *= self.mapping.tp_size
+            max_rows = None
+            if not self._config.is_spec_decode:
+                max_rows = self._config.max_num_tokens
+                if self.mapping.enable_attention_dp:
+                    max_rows *= self.mapping.tp_size
             compiled, gemms = prewarm_mma_row_buckets(max_rows)
         except Exception as e:
             # A prewarm miss only defers a compile to the first call that needs it, so it must not
