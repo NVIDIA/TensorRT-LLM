@@ -386,8 +386,7 @@ class _SourceIndex(NamedTuple):
     digest: str
     spans: Dict[str, str]
     # Names evaluated when the definition runs: decorators, defaults, bases,
-    # class bodies and assigned values, without the callees of calls (what a
-    # value is built from, not the code that builds it).
+    # class bodies and assigned values.
     eager: Dict[str, Tuple[str, ...]]
     # Every name a definition loads, its body included.
     loads: Dict[str, Tuple[str, ...]]
@@ -409,7 +408,7 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _dotted_loads(nodes, skip_callees: bool) -> List[str]:
+def _dotted_loads(nodes) -> List[str]:
     """The names, as `a.b.c` chains, that AST nodes load."""
     names: List[str] = []
 
@@ -423,11 +422,7 @@ def _dotted_loads(nodes, skip_callees: bool) -> List[str]:
             if isinstance(base.ctx, ast.Load):
                 names.append(".".join([base.id, *reversed(attrs)]))
             return
-        if skip_callees and isinstance(base, ast.Call):
-            children = [*base.args, *(k.value for k in base.keywords)]
-        else:
-            children = ast.iter_child_nodes(base)
-        for child in children:
+        for child in ast.iter_child_nodes(base):
             walk(child)
 
     for node in nodes:
@@ -464,9 +459,8 @@ def _source_index(path: str) -> _SourceIndex:
                     [d.lineno for d in getattr(node, "decorator_list", ())])
         spans.setdefault(name,
                          []).append("".join(lines[start - 1:node.end_lineno]))
-        eager.setdefault(name, []).extend(_dotted_loads(eager_nodes, True))
-        loads.setdefault(name, []).extend(
-            _dotted_loads(load_nodes, load_nodes is eager_nodes))
+        eager.setdefault(name, []).extend(_dotted_loads(eager_nodes))
+        loads.setdefault(name, []).extend(_dotted_loads(load_nodes))
 
     def visit(node, prefix):
         for child in ast.iter_child_nodes(node):
@@ -556,23 +550,37 @@ def _is_extension(obj) -> bool:
     return False
 
 
-def _attribute(obj, name: str):
-    """getattr, or None for an attribute that is missing or cannot load (a
-    lazy stand-in for an optional package raises ImportError or
+_MISSING = object()
+
+
+def _attribute(obj, name: str, default=None):
+    """getattr, or `default` for an attribute that is missing or cannot load
+    (a lazy stand-in for an optional package raises ImportError or
     RuntimeError)."""
     try:
         return getattr(obj, name)
     except (AttributeError, ImportError, RuntimeError):
-        return None
+        return default
+
+
+def _narrowable(module, attr: str) -> bool:
+    """Whether to look `attr` up on `module`. Only tracked modules, and the
+    torch.ops chain that leads to an operator: a module elsewhere may import
+    on attribute access (PEP 562), and counts by its package anyway."""
+    name = getattr(module, "__name__", "")
+    if not isinstance(name, str):
+        return False
+    return (_tracked(name) or (name == "torch" and attr == "ops")
+            or name == "torch.ops" or name.startswith("torch.ops."))
 
 
 def _narrow(name: str, obj, attrs) -> Tuple[str, Any]:
     """module.attr chains name the attribute, not the whole module."""
     for attr in attrs:
-        if not inspect.ismodule(obj):
+        if not inspect.ismodule(obj) or not _narrowable(obj, attr):
             break
-        value = _attribute(obj, attr)
-        if value is None:
+        value = _attribute(obj, attr, _MISSING)
+        if value is _MISSING:
             break
         name, obj = f"{obj.__name__}.{attr}", value
     return name, obj
@@ -588,11 +596,10 @@ def _resolve_loads(names, globals_: Dict[str, Any]):
 
 
 def _load_module(name: str):
-    """Module `name`, imported only when it is tracked code (code the runner
-    runs imports it anyway); other modules count by their package, so they
-    are not imported for a key."""
+    """Tracked module `name`, imported if it is not yet (code the runner runs
+    imports it anyway), or None if it cannot load."""
     module = sys.modules.get(name)
-    if module is None and _tracked(name):
+    if module is None:
         try:
             module = importlib.import_module(name)
         except (ImportError, OSError, RuntimeError):
@@ -600,31 +607,36 @@ def _load_module(name: str):
     return module
 
 
-def _import_refs(name: str, package: str, level: int, following):
-    """(name, object) for what an import statement binds."""
+def _import_refs(name: str, package: str, level: int, fromlist, following):
+    """(name, object) for what an import statement binds. A module outside
+    the tracked code counts by its package: it is neither imported nor
+    looked into."""
     try:
         target = (importlib.util.resolve_name("." * level +
                                               name, package) if level else name)
     except (ImportError, ValueError):
         return
-    module = _load_module(target)
-    if module is None:
+    if not _tracked(target):
         yield target, _External(target)
         return
-    imported = []
+    module = _load_module(target)
+    if module is None:
+        return
+    if fromlist is None:
+        # `import a.b` binds `a` and `import a.b as c` binds `a.b` (through
+        # IMPORT_FROM on `a`); either way the code reaches `a.b`.
+        yield target, module
+        return
     for ins in following:
         if ins.opname == "IMPORT_FROM":
-            imported.append(ins.argval)
+            value = _attribute(module, ins.argval, _MISSING)
+            if value is _MISSING:
+                value = _load_module(f"{target}.{ins.argval}")
+                if value is None:
+                    continue
+            yield f"{target}.{ins.argval}", value
         elif not ins.opname.startswith("STORE"):
             break
-    if not imported:
-        yield target, module
-    for attr in imported:
-        value = _attribute(module, attr)
-        if value is None:
-            value = _load_module(f"{target}.{attr}") or _External(
-                f"{target}.{attr}")
-        yield f"{target}.{attr}", value
 
 
 def _code_refs(code: types.CodeType, globals_: Dict[str, Any]):
@@ -646,12 +658,30 @@ def _code_refs(code: types.CodeType, globals_: Dict[str, Any]):
                           attrs)
         elif ins.opname == "IMPORT_NAME":
             level = instructions[i - 2].argval if i >= 2 else 0
+            fromlist = instructions[i - 1].argval if i >= 1 else None
             yield from _import_refs(ins.argval, package,
                                     level if isinstance(level, int) else 0,
-                                    instructions[i + 1:])
+                                    fromlist, instructions[i + 1:])
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
             yield from _code_refs(const, globals_)
+
+
+def _closure_functions(fn) -> List[Callable]:
+    """The functions a (possibly wrapped) function holds in its closure."""
+    try:
+        fn = inspect.unwrap(fn)
+    except ValueError:
+        return []
+    functions = []
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            value = cell.cell_contents
+        except ValueError:  # An empty cell.
+            continue
+        if inspect.isfunction(value):
+            functions.append(value)
+    return functions
 
 
 def _function_refs(fn) -> Tuple[Tuple[str, Any], ...]:
@@ -722,6 +752,8 @@ def _elf_build_id(path: Path) -> Optional[str]:
         else:
             (table_offset, ) = struct.unpack_from(order + "I", header, 0x20)
             entry_size, count = struct.unpack_from(order + "HH", header, 0x2E)
+        if not entry_size or not count:
+            return None
         f.seek(table_offset)
         table = f.read(entry_size * count)
         for entry in range(0, entry_size * count, entry_size):
@@ -847,12 +879,21 @@ class _FingerprintWalk:
                 pass  # A cycle of __wrapped__: keep the outermost callable.
         if inspect.ismodule(obj) or inspect.isclass(obj) or inspect.isfunction(
                 obj):
+            if not inspect.ismodule(obj) and isinstance(obj.__module__, str):
+                self.bind(name, f"{obj.__module__}.{obj.__qualname__}")
             self.visit_definition(obj)
         else:
             self.visit_value(name, obj)
 
+    def bind(self, name: str, target: str) -> None:
+        """Record that global `name` refers to `target`, so swapping which
+        definition two names refer to changes the digest even though every
+        definition's source stays the same."""
+        if target != name and name.rpartition(".")[0] in sys.modules:
+            self.sources[f"<ref>:{name}"] = target
+
     def visit_operator(self, packet) -> None:
-        """A torch.ops operator: its Python implementation if it has one,
+        """A torch.ops operator: its Python implementations if it has them,
         else the native library that registers it."""
         qualname = getattr(packet, "_qualified_op_name", "")
         if qualname in self.seen_names:
@@ -860,9 +901,16 @@ class _FingerprintWalk:
         self.seen_names.add(qualname)
         custom_ops = _attribute(_attribute(torch, "_library"), "custom_ops")
         definition = (_attribute(custom_ops, "OPDEFS") or {}).get(qualname)
-        implementation = _attribute(definition, "_init_fn")
-        if implementation is not None:
-            self.todo.append((qualname, implementation))
+        if definition is not None:
+            # The default implementation and each device's registered kernel;
+            # torch keeps a kernel in the closure of a wrapper.
+            implementation = _attribute(definition, "_init_fn")
+            if callable(implementation):
+                self.todo.append((qualname, implementation))
+            for wrapper in (_attribute(definition, "_backend_fns")
+                            or {}).values():
+                self.todo.extend(
+                    (qualname, f) for f in _closure_functions(wrapper))
         elif qualname.partition("::")[0] in ("aten", "prim", "prims"):
             self.packages.add("torch")
         else:
@@ -931,6 +979,7 @@ class _FingerprintWalk:
             return
         self.seen_names.add(name)
         module, attr, index = self.locate(module, attr)
+        self.bind(name, f"{module}.{attr}")
         if not self.counts(module):
             self.add_package(module)
             return
@@ -986,7 +1035,8 @@ def _code_fingerprint(runner_cls: type) -> str:
     * a torch.ops operator by its Python implementation, else by the build IDs
       of TensorRT-LLM's native libraries, as does a native module or class;
     * code outside tensorrt_llm by the installed version of its package; such
-      modules are not imported for a key.
+      modules are neither imported nor looked into for a key;
+    * each global name used, by the definition it refers to.
 
     A TRT-LLM change thus re-tunes only the runners whose code it touches; a
     module that cannot be narrowed counts whole. Sources are read from disk:

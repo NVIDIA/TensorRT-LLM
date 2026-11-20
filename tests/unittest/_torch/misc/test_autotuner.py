@@ -2002,11 +2002,17 @@ def fp_modules(tmp_path, monkeypatch):
         autotuner._code_fingerprint.cache_clear()
         return [autotuner._code_fingerprint(k) for k in runner_classes]
 
+    before = set(sys.modules)
     load("fp_base", _FP_BASE)
-    return SimpleNamespace(write=write,
-                           load=load,
-                           edit=edit,
-                           fingerprints=fingerprints)
+    yield SimpleNamespace(root=tmp_path,
+                          write=write,
+                          load=load,
+                          edit=edit,
+                          fingerprints=fingerprints)
+    # Drop the fp_* modules a fingerprint imported.
+    for name in set(sys.modules) - before:
+        if name.startswith("fp_"):
+            del sys.modules[name]
 
 
 def _changed(before, after):
@@ -2054,6 +2060,14 @@ def test_code_fingerprint_follows_what_values_are_built_from(fp_modules):
         BLOCK = 128
         TILE = BLOCK * 2
         TABLE = {"small": 1}
+        OVERRIDE = None
+
+
+        def build_tactics():
+            return [0]
+
+
+        TACTICS = build_tactics()
         """)
     runners = fp_modules.load(
         "fp_runners", """
@@ -2082,17 +2096,41 @@ def test_code_fingerprint_follows_what_values_are_built_from(fp_modules):
         class UsesDefaultArgument(Base):
             def get_valid_tactics(self, inputs, profile, **kwargs):
                 return tactics()
+
+
+        class UsesBuiltTable(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return fp_util.TACTICS
+
+
+        class UsesNoneConstant(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                return [fp_util.OVERRIDE or 0]
+
+
+        class ImportsNoneConstant(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                from fp_util import OVERRIDE
+                return [OVERRIDE or 0]
         """)
     classes = (runners.UsesDerivedConstant, runners.UsesTable,
-               runners.UsesClassAttribute, runners.UsesDefaultArgument)
+               runners.UsesClassAttribute, runners.UsesDefaultArgument,
+               runners.UsesBuiltTable, runners.UsesNoneConstant,
+               runners.ImportsNoneConstant)
 
+    # Each edit, and which of the runners above it must re-key.
+    edits = [
+        (("BLOCK = 128", "BLOCK = 1024"), [1, 0, 1, 1, 0, 0, 0]),
+        (('{"small": 1}', '{"small": 1, "large": 2}'), [0, 1, 0, 0, 0, 0, 0]),
+        (("return [0]", "return [0, 1]"), [0, 0, 0, 0, 1, 0, 0]),
+        (("OVERRIDE = None", "OVERRIDE = 1024"), [0, 0, 0, 0, 0, 1, 1]),
+    ]
     before = fp_modules.fingerprints(*classes)
-    fp_modules.edit("fp_util", "BLOCK = 128", "BLOCK = 1024")
-    after_block = fp_modules.fingerprints(*classes)
-    assert _changed(before, after_block) == [True, False, True, True]
-    fp_modules.edit("fp_util", '{"small": 1}', '{"small": 1, "large": 2}')
-    after_table = fp_modules.fingerprints(*classes)
-    assert _changed(after_block, after_table) == [False, True, False, False]
+    for (old, new), expected in edits:
+        fp_modules.edit("fp_util", old, new)
+        after = fp_modules.fingerprints(*classes)
+        assert _changed(before, after) == [bool(e) for e in expected], old
+        before = after
 
 
 def test_code_fingerprint_follows_kernel_objects_and_imports(
@@ -2124,12 +2162,25 @@ def test_code_fingerprint_follows_kernel_objects_and_imports(
         def kernel():
             return helper()
         """)
-    # Importing it would fail the test: a key must not import modules
-    # outside tensorrt_llm.
-    fp_modules.write("side_effect_mod",
-                     "raise RuntimeError('imported for a key')\n")
+    # A key must not import modules outside tensorrt_llm: once imported,
+    # this one would stay in sys.modules.
+    fp_modules.write("side_effect_mod", "IMPORTED = True\n")
+    # Nor look up attributes of one, which can import (PEP 562).
+    lazy = fp_modules.load(
+        "lazypkg", """
+        CALLS = []
+
+
+        def __getattr__(name):
+            CALLS.append(name)
+            raise AttributeError(name)
+        """)
+    (fp_modules.root / "fp_pkg").mkdir()
+    fp_modules.write("fp_pkg/__init__", "")
+    fp_modules.write("fp_pkg/mod", "def run():\n    return 0\n")
     runners = fp_modules.load(
         "fp_runners", """
+        import lazypkg
         from fp_base import Base
         from fp_kernels import kernel
 
@@ -2146,23 +2197,65 @@ def test_code_fingerprint_follows_kernel_objects_and_imports(
                 return helper(), side_effect_mod
 
 
-        class Other(Base):
-            pass
+        class ImportsAliasedModule(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import fp_pkg.mod as mod
+                return mod.run()
+
+
+        class UsesLazyPackage(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return lazypkg.backend.run()
         """)
     versions = {"side_effect_mod": "1.0"}
     monkeypatch.setattr(autotuner, "_package_versions",
                         lambda top: versions.get(top, ""))
-    classes = (runners.UsesKernel, runners.ImportsInForward, runners.Other)
+    classes = (runners.UsesKernel, runners.ImportsInForward,
+               runners.ImportsAliasedModule, runners.UsesLazyPackage)
 
     before = fp_modules.fingerprints(*classes)
     assert "side_effect_mod" not in sys.modules
+    assert lazy.CALLS == []
     fp_modules.edit("fp_kernels", "def helper():\n    return 0",
                     "def helper():\n    return 42")
     after_helper = fp_modules.fingerprints(*classes)
-    assert _changed(before, after_helper) == [True, True, False]
+    assert _changed(before, after_helper) == [True, True, False, False]
+    fp_modules.edit("fp_pkg/mod", "return 0", "return 42")
+    after_module = fp_modules.fingerprints(*classes)
+    assert _changed(after_helper, after_module) == [False, False, True, False]
     versions["side_effect_mod"] = "2.0"
     after_upgrade = fp_modules.fingerprints(*classes)
-    assert _changed(after_helper, after_upgrade) == [False, True, False]
+    assert _changed(after_module, after_upgrade) == [False, True, False, False]
+    assert lazy.CALLS == []
+
+
+def test_code_fingerprint_follows_which_definition_a_name_binds(fp_modules):
+    fp_modules.load(
+        "fp_impls", """
+        def primary():
+            return 0
+
+
+        def alternate():
+            return 1
+        """)
+    runner_source = """
+        from fp_base import Base
+        from fp_impls import primary as first, alternate as second
+
+
+        class Runner(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return (first if tactic == 0 else second)()
+        """
+    [before] = fp_modules.fingerprints(
+        fp_modules.load("fp_runners", runner_source).Runner)
+    assert fp_modules.fingerprints(
+        fp_modules.load("fp_runners", runner_source).Runner) == [before]
+    swapped = runner_source.replace("primary as first, alternate as second",
+                                    "alternate as first, primary as second")
+    assert fp_modules.fingerprints(
+        fp_modules.load("fp_runners", swapped).Runner) != [before]
 
 
 def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
@@ -2180,6 +2273,11 @@ def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
         @torch.library.custom_op("fp_test::python_{op}", mutates_args=())
         def python_op(x: torch.Tensor) -> torch.Tensor:
             return x.clone()
+
+
+        @python_op.register_kernel("cpu")
+        def python_op_cpu(x):
+            return x.mul(1)
         """)
     runners = fp_modules.load(
         "fp_runners", f"""
@@ -2205,9 +2303,12 @@ def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
     fp_modules.edit("fp_ops", "return x.clone()", "return x.clone() + 0")
     after_edit = fp_modules.fingerprints(*classes)
     assert _changed(before, after_edit) == [True, False]
+    fp_modules.edit("fp_ops", "x.mul(1)", "x.mul(10)")
+    after_kernel_edit = fp_modules.fingerprints(*classes)
+    assert _changed(after_edit, after_kernel_edit) == [True, False]
     build["id"] = "b"
     after_rebuild = fp_modules.fingerprints(*classes)
-    assert _changed(after_edit, after_rebuild) == [False, True]
+    assert _changed(after_kernel_edit, after_rebuild) == [False, True]
 
 
 def test_code_fingerprint_marks_sources_edited_after_start(
@@ -2243,6 +2344,13 @@ def test_native_library_id_is_the_elf_build_id(tmp_path):
     library = tmp_path / "libfp.so"
     library.write_bytes(bytes(header) + note + bytes(64) + note_section)
     assert autotuner._library_id(library) == build_id.hex()
+
+    no_sections = bytearray(header)
+    struct.pack_into("<HH", no_sections, 0x3A, 0, 2)  # entry size 0
+    stripped = tmp_path / "libstripped.so"
+    stripped.write_bytes(bytes(no_sections))
+    assert autotuner._library_id(stripped) == hashlib.sha256(
+        bytes(no_sections)).hexdigest()
 
     other = tmp_path / "libother.so"
     other.write_bytes(b"not an ELF file")
