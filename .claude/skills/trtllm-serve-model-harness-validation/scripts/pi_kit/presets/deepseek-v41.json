@@ -1,0 +1,33 @@
+{
+ "schema": "pi-kit/compat-preset@1",
+ "id": "deepseek-v41",
+ "model_profile": "deepseek-v41",
+ "checkpoints": ["DeepSeek-V4.1-Flash", "DeepSeek-V4.1-Flash-NVFP4"],
+ "api": "openai-completions",
+ "knob": "chat_template_kwargs.reasoning_effort, read by trtllm-serve's deepseek_v41 tokenizer (--custom_tokenizer deepseek_v41) in thinking mode only (chat_template_kwargs.thinking or enable_thinking true). It takes an integer 1-100, the checkpoint's names low/high/max (50/75/100), and OpenAI's level names placed on the same budget: minimal 25, low 50, medium 62, high 75, xhigh 87, max 100. Without a value it renders 75. The Chat route never passes the top-level reasoning_effort to it.",
+ "compat": {
+  "thinkingFormat": "chat-template",
+  "chatTemplateKwargs": {
+   "thinking": {"$var": "thinking.enabled"},
+   "reasoning_effort": {"$var": "thinking.effort", "omitWhenOff": true}
+  }
+ },
+ "thinkingLevelMap": {
+  "minimal": "minimal",
+  "low": "low",
+  "medium": "medium",
+  "high": "high",
+  "xhigh": "xhigh",
+  "max": "max"
+ },
+ "levels": {
+  "off": "chat mode (thinking false): no effort line",
+  "minimal": "Reasoning Effort: 25",
+  "low": "Reasoning Effort: 50",
+  "medium": "Reasoning Effort: 62 (pi's default level)",
+  "high": "Reasoning Effort: 75 (the encoder's default)",
+  "xhigh": "Reasoning Effort: 87",
+  "max": "Reasoning Effort: 100 (the model card's evaluation setting)"
+ },
+ "notes": "pi sends only strings through $var (a number in thinkingLevelMap is not allowed), so the level names travel and the served tokenizer turns them into budgets. The checkpoint's own encoder knows only low/high/max and integers: a server without trtllm-serve's OpenAI-name table would reject minimal, medium and xhigh."
+}

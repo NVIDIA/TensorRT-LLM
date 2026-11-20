@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Harness profile: Codex with its default configuration as a hosted agent platform runs it
+# against your endpoint (Responses API). Measured from that platform's traffic; the Codex version
+# is not visible (the platform's gateway strips user-agent). It follows the default-config
+# contract (contracts/codex-default.md): top-level JSON function tools, an `instructions` field,
+# parallel_tool_calls true on a turn's request. The validator reads this file; edits are policy
+# changes.
+schema: trtllm-serve-model-harness-validation/harness-profile@1
+id: codex-hosted
+harness: codex
+version: "not visible: the platform's gateway strips user-agent"
+configuration: default, as a hosted agent platform runs it against a custom endpoint (responses API)
+contract: contracts/codex-default.md
+status: measured
+protocol: responses
+routes:
+  - {method: POST, path: /v1/responses, stream: always}
+
+identity:
+  session: {body: prompt_cache_key}
+  thread: {body: client_metadata.thread_id}
+  agent: {body_json: client_metadata.x-codex-turn-metadata, key: agent_name}
+
+request:
+  model_field: served-name      # the model id the platform was given (e.g. deepseek-v4.1-flash)
+  always_present: [model, input, include, instructions, parallel_tool_calls, reasoning, store, stream,
+                   tool_choice, tools, prompt_cache_key, client_metadata]
+  must_accept: [client_metadata, include, store, instructions]
+
+tools:
+  declared_in: [tools]                      # top-level JSON functions; no additional_tools item
+  namespaces: true                          # multi_agent_v1.*
+  custom_tools: false
+  known: [exec_command, write_stdin, request_user_input, view_image, get_goal, create_goal, update_goal,
+          web_search]
+  nested: null
+  tolerated_payload: [additionalProperties]  # an argument a tool does not declare: codex-rs ignores it
+                                            # (exec_command: no deny_unknown_fields) and runs the call; a
+                                            # tool that denies unknown fields fails to parse it, which H-01
+                                            # counts as arguments_rejected. An extra argument the harness
+                                            # ignores is not serving's to control, so not rated in M-01
+parallel_tool_calls: per request            # true on every turn's request; false on the compaction
+                                            # request, which declares no tools. Nothing for the server to
+                                            # enforce: a turn may call in parallel, and the compaction
+                                            # request has no tool to call. C-07 reads each request's
+                                            # own value (a call there is M-01 undeclared)
+
+outcomes:                                   # the same client code as codex-default
+  aborted: {exact: aborted}
+  unsupported: {prefix: "unsupported call:"}
+  arguments_rejected: {prefix: "failed to parse function arguments"}
+  unavailable_in_mode: {regex: 'is unavailable in (\w+) mode'}
+
+errors:
+  overlength: {shape: in_stream, event: response.failed, code: context_length_exceeded}
+
+timeouts:                     # not measured on this path: carried over from the platform's
+  first_event_s: 120          # managed-model Codex, whose gateway cut a silent stream at about
+  idle_s: 120                 # 120 s; the server's keepalive repeats response.in_progress every 15 s
+
+echo:
+  text: exact                 # codex-rs replays message items by id, verbatim
+  reasoning: exact            # by id, the carrier (encrypted_content) by value: codex-rs keeps the item as received
+
+reasoning:
+  carrier: encrypted_content  # include: [reasoning.encrypted_content], store: false
+  request: {reasoning: {summary: auto}}   # no effort: the server's default applies
+
+stream:
+  records_items_on: response.output_item.done
+
+compaction:
+  trigger: model_context_window reached, or in-stream context_length_exceeded
+  request: the whole history, then one appended user message (the compaction prompt); tools [],
+    parallel_tool_calls false, the same instructions (contracts/codex-default.md)
+  next: the next request starts over (developer and user messages) and carries the summary at the
+    end of its last user message; a call in the summary reply is dropped, never answered

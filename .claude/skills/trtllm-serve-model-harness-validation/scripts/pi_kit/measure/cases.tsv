@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# name	api	server	mode	env (KEY=V,...)	fake-server args
+# --- timeouts (pi default settings: httpIdleTimeoutMs 300000)
+t-c-slowfirst	openai-completions	agent	slow_first_event	TIMEOUT_S=900	--gap-seconds 330 --fault-requests 1
+t-a-slowfirst	anthropic-messages	agent	slow_first_event	TIMEOUT_S=900	--gap-seconds 330 --fault-requests 1
+t-r-slowfirst	openai-responses	responses	slow_first_event	TIMEOUT_S=900	--gap-seconds 330 --fault-requests 1 --max-tool-turns 1
+t-c-silent	openai-completions	agent	silent_gap	TIMEOUT_S=900	--gap-seconds 330 --fault-requests 1
+t-a-silent	anthropic-messages	agent	silent_gap	TIMEOUT_S=900	--gap-seconds 330 --fault-requests 1
+t-r-silent	openai-responses	responses	silent_gap	TIMEOUT_S=900	--gap-seconds 330 --fault-requests 1 --max-tool-turns 1
+t-a-pings330	anthropic-messages	agent	silent_gap_pings	TIMEOUT_S=900	--gap-seconds 330 --fault-requests 1
+t-c-comments330	openai-completions	agent	silent_gap_comments	TIMEOUT_S=900	--gap-seconds 330 --fault-requests 1
+t-a-pings660	anthropic-messages	agent	silent_gap_pings	TIMEOUT_S=1200	--gap-seconds 660 --fault-requests 1
+t-c-comments660	openai-completions	agent	silent_gap_comments	TIMEOUT_S=1200	--gap-seconds 660 --fault-requests 1
+t-r-comments330	openai-responses	responses	silent_gap_comments	TIMEOUT_S=900	--gap-seconds 330 --fault-requests 1 --max-tool-turns 1
+# --- HTTP errors (A: OpenAI envelope for Chat/Responses, Anthropic envelope for Messages)
+e-c-400	openai-completions	agent	http_400	-
+e-a-400	anthropic-messages	agent	http_400	-
+e-r-400	openai-responses	responses	http_400	-	--max-tool-turns 1
+e-c-429	openai-completions	agent	http_429	-	--fault-requests 1
+e-a-429	anthropic-messages	agent	http_429	-	--fault-requests 1
+e-r-429	openai-responses	responses	http_429	-	--fault-requests 1 --max-tool-turns 1
+e-c-500	openai-completions	agent	http_500	-
+e-a-500	anthropic-messages	agent	http_500	-
+e-r-500	openai-responses	responses	http_500	-	--max-tool-turns 1
+# --- over-length after three tool turns (a history to compact), and on the first request
+o-c-nested	openai-completions	agent	overlength_profile	CTX=1000000,BIG=1	--prefer-tools read --arguments '{"path":"big.txt"}' --max-tool-turns 3 --fault-skip 3 --fault-requests 1
+o-c-toplevel	openai-completions	agent	overlength_top_level	CTX=1000000,BIG=1	--prefer-tools read --arguments '{"path":"big.txt"}' --max-tool-turns 3 --fault-skip 3 --fault-requests 1
+o-a-anthropic	anthropic-messages	agent	overlength_profile	CTX=1000000,BIG=1	--prefer-tools read --arguments '{"path":"big.txt"}' --max-tool-turns 3 --fault-skip 3 --fault-requests 1
+o-a-openaiwording	anthropic-messages	agent	overlength_400_wrong_wording	CTX=1000000,BIG=1	--prefer-tools read --arguments '{"path":"big.txt"}' --max-tool-turns 3 --fault-skip 3 --fault-requests 1
+o-r-instream	openai-responses	responses	overlength	CTX=1000000,BIG=1	--arguments '{"path":"big.txt"}' --max-tool-turns 3 --fault-skip 3 --fault-requests 1
+o-r-nested	openai-responses	responses	overlength_http_400	CTX=1000000,BIG=1	--arguments '{"path":"big.txt"}' --max-tool-turns 3 --fault-skip 3 --fault-requests 1
+o-r-toplevel	openai-responses	responses	overlength_top_level	CTX=1000000,BIG=1	--arguments '{"path":"big.txt"}' --max-tool-turns 3 --fault-skip 3 --fault-requests 1
+o-c-first	openai-completions	agent	overlength_profile	-	--fault-requests 1
+# --- stream ends without its terminal: through the recorder (a clean end), and cut at the socket (NOREC)
+s-c-cut	openai-completions	agent	cut_mid_stream	-	--fault-requests 1
+s-a-cut	anthropic-messages	agent	cut_mid_stream	-	--fault-requests 1
+s-r-cut	openai-responses	responses	cut_mid_stream	-	--fault-requests 1 --max-tool-turns 1
+s-c-cutraw	openai-completions	agent	cut_mid_stream	NOREC=1	--fault-requests 1
+s-a-cutraw	anthropic-messages	agent	cut_mid_stream	NOREC=1	--fault-requests 1
+s-r-cutraw	openai-responses	responses	cut_mid_stream	NOREC=1	--fault-requests 1 --max-tool-turns 1
+s-c-nofinish	openai-completions	agent	no_finish	-	--fault-requests 1
+s-c-nodone	openai-completions	agent	no_done	-	--fault-requests 1
+s-a-nostop	anthropic-messages	agent	no_message_stop	-	--fault-requests 1
+s-r-noterm	openai-responses	responses	no_terminal	-	--fault-requests 1 --max-tool-turns 1
+# --- tool outcomes (what the next request carries back)
+u-c-undeclared	openai-completions	agent	undeclared_tool	-
+u-a-undeclared	anthropic-messages	agent	undeclared_tool	-
+u-r-undeclared	openai-responses	responses	undeclared_tool	-	--max-tool-turns 1
+u-c-invalid	openai-completions	agent	invalid_input	-
+u-a-invalid	anthropic-messages	agent	invalid_input	-
+u-r-invalid	openai-responses	responses	invalid_input	-	--max-tool-turns 1
+u-c-notobject	openai-completions	agent	arguments_not_object	-
+u-c-length	openai-completions	agent	length_with_call	-
+u-a-length	anthropic-messages	agent	length_with_call	-
+u-r-length	openai-responses	responses	length_with_call	-	--max-tool-turns 1
+u-c-readfail	openai-completions	agent	ok	-
+u-c-bashfail	openai-completions	agent	ok	-	--prefer-tools bash --arguments '{"command":"ls /definitely/not/here"}'
+u-a-bashfail	anthropic-messages	agent	ok	-	--prefer-tools bash --arguments '{"command":"ls /definitely/not/here"}'
+u-r-bashfail	openai-responses	responses	ok	TOOLS=bash	--max-tool-turns 1 --arguments '{"command":"ls /definitely/not/here"}'

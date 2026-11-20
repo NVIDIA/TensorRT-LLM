@@ -1,0 +1,31 @@
+{
+ "schema": "pi-kit/compat-preset@1",
+ "id": "kimi-k3",
+ "model_profile": "kimi-k3",
+ "checkpoints": ["Kimi-K3", "Kimi-K3-NVFP4"],
+ "api": "openai-completions",
+ "knob": "top-level reasoning_effort: trtllm-serve's kimi_k3 serving extension maps low, high and max to chat_template_kwargs.thinking_effort (the encoder's thinking-effort system message) and leaves any other value to the encoder's default, max. The model card documents the same field and levels (default max).",
+ "compat": {
+  "thinkingFormat": "openai",
+  "supportsReasoningEffort": true
+ },
+ "thinkingLevelMap": {
+  "off": null,
+  "minimal": "low",
+  "low": "low",
+  "medium": "high",
+  "high": "high",
+  "xhigh": "max",
+  "max": "max"
+ },
+ "levels": {
+  "off": "not offered: K3 always thinks; pi clamps off to minimal",
+  "minimal": "thinking_effort=low",
+  "low": "thinking_effort=low",
+  "medium": "thinking_effort=high (pi's default level)",
+  "high": "thinking_effort=high",
+  "xhigh": "thinking_effort=max",
+  "max": "thinking_effort=max (the model card's evaluation setting)"
+ },
+ "notes": "reasoning_effort 'none' would turn K3's thinking off (the extension maps it to thinking=false); the preset never sends it, so thinking stays on. 'minimal' and 'xhigh' are not values the Chat request model accepts (400), so they are never sent as such."
+}
