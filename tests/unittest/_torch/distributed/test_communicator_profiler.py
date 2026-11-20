@@ -846,7 +846,8 @@ def test_translated_subgroup_cache_is_bound_to_comm_and_parent(
     assert group.translate.call_count == 1
     replacement = Mock()
     replacement.Get_group.return_value = _MpiGroup([0, 1])
+    group.translate.return_value = [0, 1]
     monkeypatch.setattr(communicator, "mpi_comm", lambda: replacement)
-    assert mpi_dist._profile_group("tp") == [3, 1]
+    assert mpi_dist._profile_group("tp") == [0, 1]
     assert group.translate.call_count == 2
     assert group.translate.call_args.args[2] is replacement.Get_group.return_value

@@ -607,6 +607,10 @@ def test_mpi_profiler(llm_root: str, llm_venv: "PythonVenvRunnerImpl",
         assert len(
             cases) == 1, f"MPI rank {rank} did not run exactly one smoke case"
         case_result = cases[0]
+        assert (case_result.get("classname"), case_result.get("name")) == (
+            "_torch.distributed.test_communicator_profiler",
+            "test_two_rank_collective_p2p_profiler_smoke",
+        ), f"MPI rank {rank} reported a different smoke case"
         assert case_result.find(
             "skipped") is None, f"MPI rank {rank} skipped the smoke case"
         assert case_result.find(
