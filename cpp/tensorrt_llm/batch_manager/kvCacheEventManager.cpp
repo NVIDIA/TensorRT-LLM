@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -83,11 +83,13 @@ KVCacheEventManager::~KVCacheEventManager()
 void KVCacheEventManager::enqueueCreatedEvent(
     std::vector<SizeType32> const& numBlocksPerCacheLevel, SizeType32 windowSize)
 {
+    std::lock_guard<std::mutex> lck(mEventQueueMutex);
     enqueueEvent({mEventId++, tle::KVCacheCreatedData{numBlocksPerCacheLevel}, windowSize, mAttentionDpRank});
 }
 
 void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks, SizeType32 windowSize)
 {
+    std::lock_guard<std::mutex> lck(mEventQueueMutex);
     if (blocks.empty())
     {
         return;
@@ -114,6 +116,7 @@ void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks
 
 void KVCacheEventManager::enqueueRemovedEvent(BlockPtr const& block, SizeType32 windowSize)
 {
+    std::lock_guard<std::mutex> lck(mEventQueueMutex);
     auto& latestRemovedEvent = mLatestRemovedEvents[windowSize];
     if (latestRemovedEvent != std::nullopt)
     {
@@ -140,6 +143,7 @@ void KVCacheEventManager::flushRemovedEvents(SizeType32 windowSize)
 
 void KVCacheEventManager::enqueueUpdatedEvent(tle::KVCacheUpdatedData const& data, SizeType32 windowSize)
 {
+    std::lock_guard<std::mutex> lck(mEventQueueMutex);
     enqueueEvent({mEventId++, data, windowSize, mAttentionDpRank});
 }
 
@@ -167,11 +171,15 @@ std::deque<tle::KVCacheEvent> KVCacheEventManager::getEvents(std::optional<std::
 
 void KVCacheEventManager::flush()
 {
-    for (auto const& [windowSize, latestRemovedEvent] : mLatestRemovedEvents)
+    std::deque<tle::KVCacheEvent> eventQueue;
     {
-        flushRemovedEvents(windowSize);
+        std::lock_guard<std::mutex> lck(mEventQueueMutex);
+        for (auto const& [windowSize, latestRemovedEvent] : mLatestRemovedEvents)
+        {
+            flushRemovedEvents(windowSize);
+        }
+        eventQueue = std::exchange(mEventQueue, {});
     }
-    auto eventQueue = std::exchange(mEventQueue, {});
 
     if (eventQueue.empty())
     {
