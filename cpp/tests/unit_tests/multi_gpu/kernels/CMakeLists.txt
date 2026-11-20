@@ -13,7 +13,7 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
+if(ENABLE_MULTI_DEVICE)
   add_tllm_gtest(
     allReduceKernelTest
     OWNER
