@@ -75,6 +75,7 @@ from .gqa_split_kv_decode import (
 )
 from .interface import FmhaPhase
 from .phased import FmhaParams
+from .registry import fmha_lib
 from .utils import get_attention_chunk_size, get_bmm1_scale
 
 if TYPE_CHECKING:
@@ -182,6 +183,7 @@ def _kv_replica_exchange_sizes(
     return max(_MIN_EXCHANGE_BYTES, (1 << (kib - 1).bit_length()) * 1024), merge_rows
 
 
+@fmha_lib("gqa_decode")
 class GqaDecodeFmha(FlashInferTrtllmGenFmha):
     """trtllm-gen for a layer built with a ``GqaDecodeSetup``; base of the dedicated GQA decode libraries."""
 
@@ -962,6 +964,7 @@ class _GqaKvReplicaFmha(GqaDecodeFmha):
         return True
 
 
+@fmha_lib("gqa_kv_replica_fused")
 class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
     """KV-replica split with the fused partial attention kernel (gqa_kv_replica_fused.py)."""
 
@@ -1161,6 +1164,7 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
             fwd.output_fp8 = out_fp8.view(rows, hq * d)
 
 
+@fmha_lib("gqa_kv_replica")
 class GqaKvReplicaFmha(_GqaKvReplicaFmha):
     """KV-replica split with partials from the segmented trtllm-gen decode."""
 
@@ -1249,6 +1253,7 @@ class GqaKvReplicaFmha(_GqaKvReplicaFmha):
         )
 
 
+@fmha_lib("gqa_split_kv")
 class GqaSplitKvFmha(GqaDecodeFmha):
     """Fused split-KV decode of generation-only calls of up to four requests (gqa_split_kv_decode.py); also runs a
     deferred prologue in the same launch."""
@@ -1440,6 +1445,7 @@ class GqaSplitKvFmha(GqaDecodeFmha):
         return True
 
 
+@fmha_lib("gqa_segmented")
 class GqaSegmentedFmha(GqaDecodeFmha):
     """Segmented split-KV on top of trtllm-gen for generation phases of up to two requests
     (gqa_segmented_decode.py)."""

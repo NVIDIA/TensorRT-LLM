@@ -29,6 +29,7 @@ import torch
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .registry import fmha_lib
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
@@ -391,6 +392,7 @@ def run_msa_prefill_gqa(
     )
 
 
+@fmha_lib("msa_prefill")
 class MsaPrefillFmha(PhasedFmha):
     """SM100 paged GQA FMHA powered by MSA's fmha_sm100 kernel.
 

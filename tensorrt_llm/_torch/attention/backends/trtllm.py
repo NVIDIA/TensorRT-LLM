@@ -3203,6 +3203,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         cache_context_plan: bool = False,
         context_fmha_head_dim_per_stage_kv: int = 0,
         context_last_rows_only: bool = False,
+        fmha_libs: list[str | type["Fmha"]] | None = None,
+        use_fmha_libs_env: bool = True,
         **kwargs,
     ) -> None:
         """
@@ -3234,6 +3236,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 kernel from that plan (dense, non-sparse layers only).
             context_fmha_head_dim_per_stage_kv (int): See the class attribute.
             context_last_rows_only (bool): See the class attribute.
+            fmha_libs: Ordered FMHA names or classes for this layer. None
+                uses the default candidates.
+            use_fmha_libs_env: Apply TLLM_FMHA_LIBS to the layer's candidates.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -3305,6 +3310,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
 
         self.local_layer_idx: Optional[int] = None
+        self._fmha_libs = None if fmha_libs is None else tuple(fmha_libs)
+        self._use_fmha_libs_env = use_fmha_libs_env
         self._fmha_manager: Optional[FmhaManager] = None
         self.gqa_decode = gqa_decode
         if context_fmha_head_dim_per_stage_kv < 0 or (
@@ -3370,22 +3377,29 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
             self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
             )
-        self._fmha_manager = FmhaManager(self)
+        self._rebuild_fmha_manager()
+
+    def _rebuild_fmha_manager(self) -> FmhaManager:
+        manager = FmhaManager(self,
+                              fmha_libs=self._fmha_libs,
+                              use_fmha_libs_env=self._use_fmha_libs_env)
+        self._fmha_manager = manager
         # Every layer input of the FMHA selection and of the context workspace size.
         self._context_plan_layer_key = ()
         if self.cache_context_plan:
             self._context_plan_layer_key = (tuple(
-                type(fmha)
-                for fmha in self._fmha_manager.fmha_libs), self.num_heads,
+                type(fmha) for fmha in manager.fmha_libs), self.num_heads,
                                             self.num_kv_heads, self.head_dim,
                                             self.rope_dim, self.quant_mode,
                                             self.position_embedding_type,
                                             self.attention_chunk_size,
                                             self.q_scaling, self.kv_cache_dtype)
         from .fmha.gqa_decode import GqaDecodeFmha
-        self.gqa_decode_fmha = next((fmha
-                                     for fmha in self._fmha_manager.fmha_libs
-                                     if isinstance(fmha, GqaDecodeFmha)), None)
+        self.gqa_decode_fmha = next(
+            (fmha
+             for fmha in manager.fmha_libs if isinstance(fmha, GqaDecodeFmha)),
+            None)
+        return manager
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",

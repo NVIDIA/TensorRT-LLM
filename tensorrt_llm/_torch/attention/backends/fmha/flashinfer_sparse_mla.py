@@ -13,6 +13,7 @@ from tensorrt_llm._utils import is_sm_120f
 from tensorrt_llm.logger import logger
 
 from .interface import Fmha
+from .registry import fmha_lib
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -42,6 +43,7 @@ def is_flashinfer_sparse_mla_enabled(algorithm: Optional[str]) -> bool:
     return True
 
 
+@fmha_lib("flashinfer_sparse_mla")
 class FlashInferSparseMlaFmha(Fmha):
     """SM120/SM121 sparse MLA for DSA and DeepSeek-V4."""
 
