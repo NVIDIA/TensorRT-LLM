@@ -3170,6 +3170,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 _megamoe_ugpu_die_smid_mask() if self.ugpu_weight_layout != "none" else None,
             )
 
+        def _default_tactic(self, num_tokens: int) -> Tuple:
+            """Default tactic of this runner; a subclass with its own kernels overrides it."""
+            return _default_megamoe_tactic_for_key(self._tactic_lookup_key(), num_tokens=num_tokens)
+
         def _resolve_kernel_descriptor(
             self, tactic: Tuple, *, allow_fallback: bool
         ) -> Tuple[Any, Tuple]:
@@ -3205,11 +3209,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 if not use_default_tactic and _unpack_tactic(tactic) != _unpack_tactic(tactic_t):
                     raise ValueError("Localized MegaMoE weights require the fixed uGPU tactic")
             elif use_default_tactic:
-                num_tokens = int(inputs[0].shape[0])
-                tactic_t = _default_megamoe_tactic_for_key(
-                    self._tactic_lookup_key(),
-                    num_tokens=num_tokens,
-                )
+                tactic_t = self._default_tactic(int(inputs[0].shape[0]))
             elif isinstance(tactic, list):
                 tactic_t = tuple(tactic)
             else:

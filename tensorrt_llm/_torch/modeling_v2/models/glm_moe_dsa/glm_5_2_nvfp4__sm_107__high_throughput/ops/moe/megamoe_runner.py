@@ -11,7 +11,6 @@ from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     _LOCKED_KERNEL_KWARGS,
     _SF_PADDING_BLOCK,
     Sm100MegaMoENvfp4Runner,
-    _default_megamoe_tactic_for_key,
     _launch_cluster_configuration,
     _unpack_tactic,
     validate_megamoe_tactic,
@@ -19,6 +18,60 @@ from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
 from tensorrt_llm.logger import logger
 
 from ...kernels.moe.constants import GEN_TOKEN_BUCKETS
+
+# This model's gen-phase kernel (kernels/moe) predates the decode scheduler: it runs any
+# non-grouped schedule as phase_interleave without checking the hint. Keep the phase_interleave
+# tactics the shared table used before it moved to decode.
+_GLM_GENPHASE_TACTICS: dict[int, Tuple] = {
+    32: (
+        [256, 128, 256],
+        [4, 1, 1],
+        None,
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (2, 4),
+    ),
+    64: (
+        [256, 128, 256],
+        [4, 1, 1],
+        None,
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (1, 4),
+    ),
+    128: (
+        [256, 256, 256],
+        [4, 1, 1],
+        None,
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (1, 4),
+    ),
+    192: (
+        [256, 256, 256],
+        [4, 1, 1],
+        None,
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (1, 4),
+    ),
+}
 
 
 def _construct_rubin_kernel(
@@ -114,8 +167,17 @@ class RubinMegaMoERunner(Sm100MegaMoENvfp4Runner):
         # The shape/tactic keeps the shared runner's positional key contract.
         return (*super()._build_unique_id(), "glm-rubin-high-throughput")
 
+    def _default_tactic(self, num_tokens: int) -> Tuple:
+        tactic = super()._default_tactic(num_tokens)
+        if _unpack_tactic(tactic)[3][0] == "decode":
+            bucket = shared._sm107_tactic_bucket(self.max_tokens_per_rank)
+            tactic = _unpack_tactic(_GLM_GENPHASE_TACTICS[bucket])
+        return tactic
+
     def _build_kernel_once(self, tactic: Tuple):
         validate_megamoe_tactic(tactic, sm_version=self.sm_version)
+        if _unpack_tactic(tactic)[3][0] == "decode":
+            raise ValueError("The GLM gen-phase kernel has no decode scheduler.")
         cached = self.__class__.kernel_cache.get(self._tactic_cache_key(tactic))
         if cached is not None:
             return cached[1]
@@ -214,17 +276,13 @@ def query_rubin_kernel_properties(**kwargs):
     tactic = kwargs.pop("tactic", None)
     runner = RubinMegaMoERunner(local_rank=0, output_dtype=torch.bfloat16, **kwargs)
     if tactic is None:
-        tactic = _default_megamoe_tactic_for_key(
-            runner.unique_id(), num_tokens=runner.max_tokens_per_rank
-        )
+        tactic = runner._default_tactic(runner.max_tokens_per_rank)
     kernel, _ = runner._resolve_kernel_descriptor(tactic, allow_fallback=True)
     return int(kernel.get_workspace_sizes()[1]), True
 
 
 def runner_kernel(runner):
-    tactic = _default_megamoe_tactic_for_key(
-        runner.unique_id(), num_tokens=runner.max_tokens_per_rank
-    )
+    tactic = runner._default_tactic(runner.max_tokens_per_rank)
     return runner._resolve_kernel_descriptor(tactic, allow_fallback=True)[0]
 
 
