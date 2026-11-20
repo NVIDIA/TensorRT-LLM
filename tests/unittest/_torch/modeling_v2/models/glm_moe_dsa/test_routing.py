@@ -312,8 +312,11 @@ def test_tp8_matches_glm53(monkeypatch):
         ({"model.layers.10.mlp.shared_experts.gate_up_proj": "NVFP4"}, "shared_experts"),
         ({"model.layers.10.mlp.experts": None}, r"routed experts in layers \[10\]"),
         ({"model.layers.78.mlp.experts": "NVFP4"}, "MTP layer quantized"),
+        ({"model.layers.10.mlp.experts": "FP8"}, r"'model\.layers\.10\.mlp\.experts' as FP8"),
+        ({"model.layers.10.self_attn.q_a_proj": "FP8"}, "self_attn.q_a_proj"),
+        ({"lm_head": "FP8"}, "'lm_head'"),
     ],
-    ids=["shared-experts", "missing-experts", "mtp-layer"],
+    ids=["shared-experts", "missing-experts", "mtp-layer", "fp8-experts", "attention", "lm-head"],
 )
 def test_tp8_declines_other_mixed_precision(monkeypatch, changes, missed):
     _stub_target(monkeypatch, _TP8_TARGET)

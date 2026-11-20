@@ -78,7 +78,8 @@ def _nvfp4_experts_mixed_precision(normalized: dict, pretrained_config: Any) -> 
     for name, entry in layers.items():
         match = _LAYER_MODULE.fullmatch(name) if isinstance(name, str) else None
         try:
-            # read_modelopt_quant_config already canonicalized the per-layer names.
+            # read_modelopt_quant_config canonicalized the algorithm aliases; any other
+            # spelling (e.g. lowercase) is unreadable here and declines.
             algo = QuantAlgo(entry.get("quant_algo") if isinstance(entry, dict) else None)
         except ValueError:
             return False, f"MIXED_PRECISION with an unreadable algorithm for {name!r}"
@@ -98,7 +99,9 @@ def _nvfp4_experts_mixed_precision(normalized: dict, pretrained_config: Any) -> 
 
 
 def _nvfp4_with_bf16_mtp_layer(pretrained_config: Any) -> Tuple[bool, str]:
-    """Whether the checkpoint is NVFP4 with a bf16 MTP layer, and its quantization in words.
+    """Whether the checkpoint has NVFP4 MoE layers and a bf16 MTP layer, and its quantization
+    in words: a uniform NVFP4 export (GLM-5.2), or a MIXED_PRECISION one whose per-layer map
+    ``_nvfp4_experts_mixed_precision`` accepts (GLM-5.3).
 
     Reads the inline ``quantization_config`` of config.json, and parses only the
     modelopt shape, with the modelopt normalizer (which raises only
