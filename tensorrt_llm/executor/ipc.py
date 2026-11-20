@@ -194,6 +194,15 @@ class ZeroMqQueue:
             self.poller = zmq.Poller()
             self.poller.register(self.socket, zmq.POLLIN)
 
+    @property
+    def zmq_debug_enabled(self) -> bool:
+        """Whether TLLM_LLMAPI_ZMQ_DEBUG limits the socket to one thread.
+
+        In this mode, using the socket from a thread other than the first one
+        that used it raises RuntimeError.
+        """
+        return self._zmq_debug_enabled
+
     def _check_thread_safety(self):
         """Check if the current thread is the same as the thread that first used the socket."""
         if not self._zmq_debug_enabled:

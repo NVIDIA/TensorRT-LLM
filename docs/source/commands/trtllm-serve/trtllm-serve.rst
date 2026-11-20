@@ -106,6 +106,31 @@ A server can still have request handlers running when it is told to stop, for ex
    * It applies to the LLM, embedding and multimodal-encoder servers of ``trtllm-serve``, in every frontend process.
    * The gRPC servers (``--grpc``) and the VisualGen server do not use it, and the disaggregated router keeps its own ``--request_timeout`` for the requests it forwards.
 
+.. _trtllm-serve-overload-and-engine-failure:
+
+Overload and Engine Failure
+---------------------------
+
+``/v1/chat/completions``, ``/v1/completions`` and ``/v1/responses`` return HTTP 503 with an error of type ``ServiceUnavailableError`` when a request is not admitted or the engine has failed:
+
+* The executor command queue is full. Retry later. A full queue does not change ``/health``. For the admission rule, see :ref:`request-admission-and-engine-failure`.
+* The server is shutting down in an orderly way. Retry on another instance.
+* The engine has failed terminally, for example because a worker process exited or the executor command connection was lost. Retry on another instance.
+
+A streamed response has already returned HTTP 200 when it starts. If the engine fails during a chat or completions stream, the stream ends with an error event and ``[DONE]``:
+
+.. code-block:: text
+
+   data: {"error": {"message": "...", "type": "ServiceUnavailableError", "code": 503, "param": null}}
+
+   data: [DONE]
+
+A Responses API stream ends with an ``error`` event and a ``response.failed`` event instead, and a ``/v1/messages`` stream ends with an Anthropic ``error`` event.
+
+After a terminal engine failure, ``/health`` returns 503 and starts an orderly shutdown of the server, so a liveness probe on ``/health`` makes the process exit.
+
+With multiple HTTP frontends, each attached frontend also checks the launcher's ``/health`` every 5 seconds. Three failed checks without a 200 answer in between mean the engine is lost. A 503 answer is a failure at any time. After the launcher's first 200 or 503 answer, a lost connection or any other 5xx answer is also a failure. Other answers, such as 401 or 403 from a ``--middleware`` that protects ``/health``, or 429, are ignored, and the frontend logs one warning. An attached frontend also loses its engine at once when the launcher process exits. It then fails its in-flight requests as described above, returns 503 from ``/health``, and shuts down.
+
 Inference Endpoints
 -------------------
 

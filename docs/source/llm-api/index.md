@@ -367,7 +367,7 @@ nonzero task status still takes precedence.
 
 Remote process supervision is opt-in: set `TRTLLM_WORKER_WATCH=1` to enable it. Without it, the loss of rank 0 is still detected through the command connection, but the abrupt loss of another rank or node can leave MPI stuck and requests waiting. Enable it for multi-node deployments.
 
-When enabled, executor sessions backed by `MpiCommSession` or `RemoteMpiCommSessionClient`, including `trtllm-llmapi-launch` and disaggregated MPI serving, start a separate process-watch helper for every worker. Helpers report process liveness to an authenticated TCP listener owned by the proxy, independently of MPI, CUDA, and the worker's Python thread. Startup requires reports from every rank. After the first rank reports, a rank without a report for 30 seconds fails startup, so a rank that exits before reporting does not leave its peers waiting. A worker exit makes the engine failure terminal within about a second. A rank whose reports stop arriving, for example after a helper exit or a node or network loss, fails the engine when its lease of `TRTLLM_WORKER_WATCH_TIMEOUT` seconds (default 15) expires. When a worker call returns or raises in a live process, the result or error that MPI delivers takes precedence; without one, the failure is terminal after two seconds. This detects process loss, not a live worker stuck in a collective. Local `MpiPoolSession` workers continue to use local process handles instead.
+When enabled, the default executor (`orchestrator_type` unset) starts a separate process-watch helper for every worker in sessions backed by `MpiCommSession` or `RemoteMpiCommSessionClient`, including `trtllm-llmapi-launch` and disaggregated MPI serving. The `rpc` and `ray` orchestrators do not start process watches, and the `TRTLLM_WORKER_WATCH` settings below have no effect on them. Helpers report process liveness to an authenticated TCP listener owned by the proxy, independently of MPI, CUDA, and the worker's Python thread. Startup requires reports from every rank. After the first rank reports, a rank without a report for 30 seconds fails startup, so a rank that exits before reporting does not leave its peers waiting. A worker exit makes the engine failure terminal within about a second. A rank whose reports stop arriving, for example after a helper exit or a node or network loss, fails the engine when its lease of `TRTLLM_WORKER_WATCH_TIMEOUT` seconds (default 15) expires. When a worker call returns or raises in a live process, the result or error that MPI delivers takes precedence; without one, the failure is terminal after two seconds. This detects process loss, not a live worker stuck in a collective. Local `MpiPoolSession` workers continue to use local process handles instead.
 
 Every worker must reach its proxy's listener, including across container network namespaces. Without `TRTLLM_WORKER_WATCH_HOST`, the proxy advertises an IPv4 address chosen in this order: an interface named by `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME` or `OMPI_MCA_oob_tcp_if_include`; the interface of the default route; the first interface with a non-loopback, non-link-local address; and `127.0.0.1` as a last resort. Discovery cannot guarantee the correct interface on a multihomed host. Explicit loopback (`localhost`, `127.0.0.1` or `::1`) is valid only when all workers share the proxy's network namespace. Any other result that is a loopback address logs a warning at startup, and a worker that cannot connect says that the address is loopback.
 
@@ -441,6 +441,24 @@ ranks; populate it before the multi-rank launch, either by installing the
 `flashinfer-cubin` package matching `flashinfer-python` or with a single-rank
 warm-up run, and set `FLASHINFER_NO_DOWNLOAD=1` so a missing artifact fails
 instead of being downloaded concurrently into the shared directory.
+
+(request-admission-and-engine-failure)=
+
+## Request admission and engine failure
+
+`generate_async()` raises one of two errors, both exported from `tensorrt_llm.executor`, when it cannot accept a request:
+
+- `EngineUnavailableError`: the request was not admitted, but the engine has not failed. The executor command queue is full (retry later), or the LLM is shutting down in an orderly way (retry on another instance).
+- `EngineDeadError`: the engine has failed terminally, for example because a worker exited or the executor command connection was lost. This instance does not serve further requests.
+
+With the default executor, up to 1024 generation requests can wait for delivery to rank 0. When that limit is reached, the submitting thread first tries to write the waiting requests itself. If rank 0 still cannot accept them, the outcome depends on the caller:
+
+- `generate_async()` called on a thread that runs an event loop, such as an `async` server handler, raises `EngineUnavailableError` at once instead of blocking the loop.
+- `LLM.generate()` waits for capacity, also in a Jupyter notebook. `generate_async()` called on a thread without a running event loop also waits.
+
+A full queue does not make the engine unhealthy. Aborts are never rejected because the queue is full, and repeated aborts of a request whose abort is still waiting are merged. A lost command connection makes delivery uncertain and is terminal: pending requests fail with `EngineDeadError`, and commands are never replayed after a reconnection. `TRTLLM_PROXY_BATCH_REQUESTS=1` changes how queued requests are written, not this admission rule; see [Keeping Host Stalls out of the Measured Run](../developer-guide/perf-benchmarking.md#keeping-host-stalls-out-of-the-measured-run).
+
+`trtllm-serve` answers both errors with HTTP 503 (see {ref}`Overload and Engine Failure <trtllm-serve-overload-and-engine-failure>`), and the OpenEngine gRPC server rejects both with `UNAVAILABLE`.
 
 ## Tips and Troubleshooting
 

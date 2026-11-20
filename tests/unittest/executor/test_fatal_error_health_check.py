@@ -839,6 +839,8 @@ class TestOpenAIHealthEndpoint:
         server = object.__new__(OpenAIServer)
         server.generator = SimpleNamespace(_executor=executor, _check_health=executor.check_health)
         server.embedding_batcher = None
+        server._uvicorn_server = None
+        server._http_shutdown_requested = False
         signals = []
         monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
         monkeypatch.setattr(openai_server, "_record_generator_termination", lambda _: None)

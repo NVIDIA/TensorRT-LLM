@@ -273,6 +273,8 @@ def test_watchdog_uses_launcher_health_without_transport_grace(tmp_path, monkeyp
     server = object.__new__(OpenAIServer)
     server.embedding_batcher = None
     server.generator = SimpleNamespace(_executor=proxy, _check_health=proxy.check_health)
+    server._uvicorn_server = None
+    server._http_shutdown_requested = False
     monkeypatch.setattr(openai_server, "_record_generator_termination", lambda _: None)
     monkeypatch.setattr(signal, "raise_signal", lambda _: None)
     deaths = []

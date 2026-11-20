@@ -40,7 +40,7 @@ class _RecordingQueue:
     the production factory keeps every write on the sender thread.
     """
 
-    _zmq_debug_enabled = True
+    zmq_debug_enabled = True
 
     def __init__(self, block_first_put: bool = False, *, direct: bool = False):
         self.direct = direct
@@ -770,8 +770,9 @@ def test_production_sender_writes_on_the_submitting_thread_unless_zmq_debug(
         monkeypatch.delenv("TRTLLM_PROXY_BATCH_REQUESTS", raising=False)
     else:
         monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", batching)
+    monkeypatch.setenv("TLLM_LLMAPI_ZMQ_DEBUG", "1" if debug else "0")
     commands = IpcQueue(is_server=True)
-    commands._zmq_debug_enabled = debug
+    assert commands.zmq_debug_enabled is debug
     sender = _create_request_sender(commands, queue.Queue())
     try:
         assert sender._direct_send is direct

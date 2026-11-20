@@ -867,6 +867,10 @@ class BaseLLM:
 
         Returns:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
+
+        Raises:
+            tensorrt_llm.executor.EngineUnavailableError: The request was not admitted, but the engine has not failed: the executor command queue is full (retry later; a call from a thread that runs an event loop is rejected, a call from any other thread waits for capacity), or the LLM is shutting down in an orderly way (retry on another instance).
+            tensorrt_llm.executor.EngineDeadError: The engine has failed terminally. This instance will not serve further requests.
         """
         if self._encode_only:
             raise RuntimeError(

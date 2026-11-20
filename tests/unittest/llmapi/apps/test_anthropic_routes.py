@@ -27,9 +27,10 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
-from tensorrt_llm.executor.utils import EngineDeadError, EngineUnavailableError
+from tensorrt_llm.executor import EngineDeadError, EngineUnavailableError
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve import openai_server as openai_server_module
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -649,6 +650,110 @@ def test_engine_admission_failure_returns_service_unavailable(monkeypatch, route
     body = json.loads(response.body)
     assert body["type"] == "ServiceUnavailableError"
     assert body["message"] == str(error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        EngineDeadError(RuntimeError("worker exited")),
+        EngineUnavailableError("Executor command sender is stopping"),
+    ],
+)
+def test_chat_stream_ended_by_an_engine_error_sends_an_error_event(
+    monkeypatch, server_logger, error
+):
+    """After HTTP 200, an engine error ends the stream with an error event and [DONE]."""
+
+    async def run():
+        generation = _StreamedGeneration([["data: one\n\n"]], then=error)
+        stream, _ = await _chat_stream(monkeypatch, generation)
+        return [frame async for frame in stream]
+
+    frames = asyncio.run(run())
+
+    assert frames[0] == "data: one\n\n"
+    assert json.loads(frames[1][len("data: ") :]) == {
+        "error": {
+            "message": str(error),
+            "type": "ServiceUnavailableError",
+            "code": 503,
+            "param": None,
+        }
+    }
+    assert frames[2:] == ["data: [DONE]\n\n"]
+    server_logger.error.assert_not_called()
+
+
+def test_messages_stream_ended_by_an_engine_error_ends_with_an_error_event(
+    monkeypatch, server_logger
+):
+    """/v1/messages over the chat stream ends with an Anthropic error, not message_stop."""
+    error = EngineDeadError(RuntimeError("worker exited"))
+    first = ChatCompletionStreamResponse(
+        model=MODEL,
+        choices=[{"index": 0, "delta": {"role": "assistant", "content": "partial"}}],
+    )
+
+    async def run():
+        generation = _StreamedGeneration([[f"data: {first.model_dump_json()}\n\n"]], then=error)
+        server = _streaming_chat_server(monkeypatch, generation)
+        request = AnthropicMessagesRequest(
+            model=MODEL, max_tokens=8, stream=True, messages=[{"role": "user", "content": "hi"}]
+        )
+        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        response = await server.anthropic_messages(request, raw_request)
+        return [frame async for frame in response.body_iterator]
+
+    frames = asyncio.run(run())
+
+    events = [frame.split("\n", 1)[0] for frame in frames]
+    assert "event: message_stop" not in events
+    assert events[-1] == "event: error"
+    assert json.loads(frames[-1].split("data: ", 1)[1])["error"] == {
+        "type": "api_error",
+        "message": str(error),
+    }
+
+
+class _FailedGeneration:
+    """An admitted generation whose result raises ``error``."""
+
+    prompt_token_ids = [1, 2, 3]
+
+    def __init__(self, error):
+        self._error = error
+        self.abort = Mock()
+
+    async def aresult(self):
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    "error,status,err_type,traceback_logged",
+    [
+        (EngineDeadError(RuntimeError("worker exited")), 503, "ServiceUnavailableError", False),
+        (ValueError("bad output"), 400, "BadRequestError", False),
+        (RuntimeError("postprocessing failed"), 400, "BadRequestError", True),
+    ],
+)
+def test_chat_failure_after_admission_aborts_the_request(
+    monkeypatch, server_logger, error, status, err_type, traceback_logged
+):
+    """A non-streamed chat that fails after admission aborts its request.
+
+    Only an error that is not an engine error is logged with a traceback.
+    """
+    generation = _FailedGeneration(error)
+    server = _streaming_chat_server(monkeypatch, generation)
+    request = ChatCompletionRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
+    raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+
+    response = asyncio.run(server.openai_chat(request, raw_request))
+
+    assert response.status_code == status
+    assert json.loads(response.body)["type"] == err_type
+    generation.abort.assert_called_once_with()
+    assert server_logger.error.called is traceback_logged
 
 
 @pytest.fixture

@@ -134,13 +134,12 @@ def _create_request_sender(
     writes the backlog when admission is full. ZMQ debug mode requires one
     writing thread, so it keeps every write on the owner.
     """
-    return _RequestSender(
-        request_queue,
-        error_queue,
-        batching=_batch_requests(),
-        on_failure=on_failure,
-        stop_workers_on_failure=stop_workers_on_failure,
-        direct_send=not getattr(request_queue, "_zmq_debug_enabled", False))
+    return _RequestSender(request_queue,
+                          error_queue,
+                          batching=_batch_requests(),
+                          on_failure=on_failure,
+                          stop_workers_on_failure=stop_workers_on_failure,
+                          direct_send=not request_queue.zmq_debug_enabled)
 
 
 class GenerationExecutorProxy(GenerationExecutor):
@@ -878,9 +877,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         The shared command sender owns writes; ``_profile_control_executor``
         owns profile replies and serializes profile operations. The FastAPI
-        thread-pool worker never touches either ZMQ socket directly. ``Future.result()`` re-raises any
-        ``RuntimeError`` from ``_wait_profile_ack`` so the HTTP layer
-        still sees worker rejections.
+        thread-pool worker never touches either ZMQ socket directly.
+        ``Future.result()`` re-raises any ``RuntimeError`` from
+        ``_wait_profile_ack`` so the HTTP layer still sees worker rejections.
         """
         request = StartProfileRequest(output_dir=output_dir,
                                       num_steps=num_steps,

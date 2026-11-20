@@ -166,7 +166,7 @@ class LauncherForwarder:
                 },
             )
 
-    async def get_status(self, timeout_s: float = 5.0) -> Optional[int]:
+    async def get_health_status(self, timeout_s: float = 5.0) -> Optional[int]:
         """Read launcher health, or return None if the request cannot complete."""
         try:
             session = await self._get_session()
@@ -279,7 +279,7 @@ class AttachedFrontendWatchdog:
             if loop.time() < next_health:
                 continue
             next_health = loop.time() + self._health_interval
-            status = await self._forwarder.get_status()
+            status = await self._forwarder.get_health_status()
             if status == 200:
                 launcher_answered = True
                 failures = 0

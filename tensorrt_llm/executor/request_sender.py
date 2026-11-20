@@ -134,9 +134,10 @@ class _RequestSender:
 
     Unbatched callers write each command at once. With batching, the owner
     coalesces queued commands into one message; a caller that finds admission
-    full writes the backlog as one message instead of rejecting. A message is
-    serialized and signed with the condition lock released, so a large batch
-    does not hold up callers that are queuing commands.
+    full first writes the backlog as one message, and waits or is rejected only
+    if the socket cannot take it.
+    A message is serialized and signed with the condition lock released, so a
+    large batch does not hold up callers that are queuing commands.
 
     Code under the condition lock avoids calls that release the GIL where an
     equivalent exists: it checks socket readiness with ``ZMQ_EVENTS`` rather

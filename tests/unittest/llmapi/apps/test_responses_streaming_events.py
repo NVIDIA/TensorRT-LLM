@@ -27,7 +27,7 @@ import json
 import os
 import re
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import pytest
@@ -985,6 +985,51 @@ def _server_streaming(monkeypatch, steps):
 
     monkeypatch.setattr(server_module, "responses_api_request_preprocess", preprocess)
     return server
+
+
+class _FailedGeneration:
+    """An admitted generation whose result raises ``error``."""
+
+    prompt_token_ids = [1, 2, 3]
+    finished = False
+
+    def __init__(self, error):
+        self._error = error
+        self.abort = Mock()
+
+    async def aresult(self):
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    "error,status,err_type,traceback_logged",
+    [
+        (EngineDeadError(RuntimeError("worker exited")), 503, "ServiceUnavailableError", False),
+        (RuntimeError("postprocessing failed"), 400, "BadRequestError", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_responses_failure_after_admission_aborts_the_request(
+    monkeypatch, error, status, err_type, traceback_logged
+):
+    """Only an error that is not an engine error is logged with a traceback."""
+    import tensorrt_llm.serve.openai_server as server_module
+
+    log = Mock()
+    monkeypatch.setattr(server_module, "logger", log)
+    server = _server_streaming(monkeypatch, [])
+    generation = _FailedGeneration(error)
+    server.generator.generate_async = lambda **kwargs: generation
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.openai_responses(
+        ResponsesRequest(model="test-model", input="hi"), raw_request
+    )
+
+    assert response.status_code == status
+    assert json.loads(response.body)["type"] == err_type
+    generation.abort.assert_called_once_with()
+    assert log.error.called is traceback_logged
 
 
 @pytest.mark.asyncio

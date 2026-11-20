@@ -1286,9 +1286,20 @@ async def reframe_openai_stream(
                 done = True
                 continue
             try:
-                chunk = ChatCompletionStreamResponse(**json.loads(data))
+                payload = json.loads(data)
+                upstream_error = payload.get("error") if isinstance(payload, dict) else None
+                if not isinstance(upstream_error, dict):
+                    chunk = ChatCompletionStreamResponse(**payload)
             except (json.JSONDecodeError, ValueError) as e:
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
+            if isinstance(upstream_error, dict):
+                # A chat stream that fails after HTTP 200 sends an error event,
+                # then [DONE]: the message ends with that error, not message_stop.
+                message = str(upstream_error.get("message") or "Internal server error")
+                logger.error(f"Anthropic stream failed upstream: {message}")
+                closing_frames = reframer.error(message)
+                done = True
+                continue
             for frame in reframer.process_chunk(chunk):
                 yield frame
                 last_event = loop.time()
