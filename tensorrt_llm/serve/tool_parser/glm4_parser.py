@@ -188,6 +188,14 @@ class Glm4ToolParser(BaseToolParser):
         """Check if the text contains a GLM-4 format tool call."""
         return self.bot_token in text
 
+    @property
+    def single_call_stops(self) -> tuple[str, ...]:
+        # Each call is its own <tool_call>...</tool_call> block, so the closing
+        # tag ends exactly one call. The GLM tokenizers hold the tag as one
+        # token, and what the model writes after it (a newline, the next
+        # <tool_call>) is another token, so the bare tag is the only form.
+        return (self.eot_token,)
+
     def _split_call(self, body: str) -> Optional[Tuple[str, str, str]]:
         """Split a call's body into (name, markup after the name, argument text).
 
