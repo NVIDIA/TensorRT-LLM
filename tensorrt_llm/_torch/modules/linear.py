@@ -26,8 +26,8 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     BufferKind, FP8BlockScaleGemmRunner, MXFP8QuantizeRunner,
     fp8_block_scale_gemm_autotuned, fp8_block_scale_swiglu_prefers_bf16,
     mxfp8_quantize_gemm_autotuned, small_m_applies_on_tuning_group)
-from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._torch.mmap_utils import populate_tensor_pages
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import (is_device_integrated, mpi_disabled,
                                  pageable_copies_fault_in_driver)
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -314,8 +314,8 @@ def load_weight_shard(
                                           indices: list[slice] | None = None):
             if indices is None:
                 # Avoid unnecessary copy
-                result = (_to_device(tensor, device),
-                          [slice(d) for d in tensor.shape])
+                result = (_to_device(tensor,
+                                     device), [slice(d) for d in tensor.shape])
             else:
                 result = (_to_device(tensor[indices], device), indices)
             return result if return_slice_indices else result[0]

@@ -91,7 +91,8 @@ _PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
 _LAYER_IN_NAME = re.compile(r"^(?:(?:language_)?model\.){0,2}layers\.(\d+)\.")
 _EXPERT_IN_NAME = re.compile(r"\.experts\.(\d+)\.")
 # _LAYER_IN_NAME on the raw JSON header, where each tensor name follows a quote.
-_LAYER_IN_HEADER = re.compile(rb'"(?:(?:language_)?model\.){0,2}layers\.(\d+)\.')
+_LAYER_IN_HEADER = re.compile(
+    rb'"(?:(?:language_)?model\.){0,2}layers\.(\d+)\.')
 
 
 def _first_layer(path: str) -> int:
@@ -1254,8 +1255,7 @@ class HfWeightLoader(BaseWeightLoader):
         # One file after another: mapping is per-tensor Python, so threads
         # only contend for the GIL (26 threads took 5x as long as one).
         weights = {}
-        for file in tqdm.tqdm(weight_files,
-                              desc="Mapping safetensors weights"):
+        for file in tqdm.tqdm(weight_files, desc="Mapping safetensors weights"):
             weights.update(self._load_safetensors_file(file))
         return ConsumableWeightsDict(weights)
 
@@ -1290,7 +1290,8 @@ class HfWeightLoader(BaseWeightLoader):
         # tensor separately, which costs tens of seconds per rank on
         # checkpoints with ~100k tensors.
         file_size, header_bytes, header = _read_safetensors_header(file)
-        if not safetensors_layout_is_valid(header, file_size - 8 - header_bytes):
+        if not safetensors_layout_is_valid(header,
+                                           file_size - 8 - header_bytes):
             return safetensors.torch.load_file(file)  # reports the bad layout
         dtypes = dict(getattr(safetensors.torch, "_TYPES", {}),
                       F8_E8M0=torch.float8_e8m0fnu)
