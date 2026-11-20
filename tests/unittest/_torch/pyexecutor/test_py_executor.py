@@ -2847,7 +2847,8 @@ def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
 
     executor = object.__new__(PyExecutor)
     executor.dist = types.SimpleNamespace(pp_size=pp_size)
-    held = types.SimpleNamespace(py_request_id=1, lora_task_id=7)
+    executor._is_kv_manager_v2 = True
+    held = types.SimpleNamespace(request_id=1, py_request_id=1, lora_task_id=7)
     healthy = types.SimpleNamespace(py_request_id=2, lora_task_id=8)
     executor.active_requests = [held, healthy]
     executor.inflight_req_ids = set()
@@ -2859,8 +2860,8 @@ def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
     with pytest.raises(StopSchedule):
         executor._schedule()
 
-    expected = [healthy] if pp_size == 1 else [held, healthy]
-    executor.scheduler.schedule_request.assert_called_once_with(expected, set())
+    inflight = {held.request_id} if pp_size == 1 else set()
+    executor.scheduler.schedule_request.assert_called_once_with([held, healthy], inflight)
 
 
 class TestComputeScheduledTokens:

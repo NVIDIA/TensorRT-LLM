@@ -3160,6 +3160,21 @@ class TestPEFT:
         batch, _, _ = engine._schedule()
         assert ids(batch.context_requests) == [2, 1]
 
+    @pytest.mark.parametrize("resident", [False, True])
+    def test_inflight_transfer_only_claims_device_resident_adapter(self, resident):
+        peft = make_peft_cache_manager(max_device_pages=1, pages_per_task=1)
+        peft.is_task_cached_device = lambda task_id: resident and task_id == 10
+        sched = make_scheduler(make_kv_cache_manager(), peft_cache_manager=peft)
+        held = (
+            make_ctx_request(0, 100, is_first_context_chunk=False, lora_task_id=10)
+            if resident
+            else make_disagg_request(0, lora_task_id=10)
+        )
+        other = make_ctx_request(1, 100, lora_task_id=20)
+        out = sched.schedule_request([held, other], {held.request_id})
+        assert ids(out.context_requests) == ([] if resident else [1])
+        assert out.fitting_disagg_gen_init_requests == []
+
     def test_no_peft_manager(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, peft_cache_manager=None)

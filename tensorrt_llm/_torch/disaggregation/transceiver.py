@@ -1184,12 +1184,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for rid in candidates
             if not self._retirement_blocked(sessions.get(rid))
             and (terminal is None or rid in terminal)
-            and not (
-                recovery
-                and isinstance(sessions.get(rid), RxSession)
-                and sessions[rid].status == SessionStatus.CANCELLED
-                and sessions[rid].has_transferring_tasks()
-            )
         ]
         outcome = self._consensus_outcome(
             candidates,
@@ -1424,7 +1418,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """
         if cls._ownership_blocks_retirement(session):
             return True
-        return isinstance(session, RxSession) and session.failed_receive_awaits_writers()
+        return isinstance(session, RxSession) and (
+            session.failed_receive_awaits_writers()
+            or (session.status == SessionStatus.CANCELLED and session.has_transferring_tasks())
+        )
 
     def _close_session_or_raise(self, session: object, rid: int, outcome: str) -> None:
         """Close one terminal session or fail-stop instead of diverging locally."""

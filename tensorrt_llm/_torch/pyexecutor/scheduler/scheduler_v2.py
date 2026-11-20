@@ -799,6 +799,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 ):
                     # Paused and displaced decode requests still hold their adapters.
                     budget.pre_claim_peft(req)
+                elif (
+                    req.request_id in inflight_request_ids
+                    and req.lora_task_id is not None
+                    and self.peft_cache_manager.is_task_cached_device(req.lora_task_id)
+                ):
+                    budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:

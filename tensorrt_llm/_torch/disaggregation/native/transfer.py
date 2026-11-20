@@ -957,9 +957,7 @@ class Sender(SenderBase):
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
                 cancelled_by_peer = self._pre_cancelled_rids[unique_rid]
-                if not owned:
-                    self._pre_cancelled_rids.pop(unique_rid)
-            if not (pre_cancel and owned):
+            if not pre_cancel:
                 self._sessions[unique_rid] = tx_session if owned else weakref.ref(tx_session)
         if pre_cancel:
             if owned:
@@ -984,6 +982,11 @@ class Sender(SenderBase):
                     )
             else:
                 tx_session.cancel(by_peer=cancelled_by_peer)
+                with self._sessions_lock:
+                    if self._shutdown_requested:
+                        raise RuntimeError("cannot create a TxSession after Sender shutdown")
+                    self._sessions[unique_rid] = weakref.ref(tx_session)
+                    self._pre_cancelled_rids.pop(unique_rid, None)
             return
 
         req_info = self._get_first_req_info(unique_rid)
@@ -1763,9 +1766,7 @@ class Sender(SenderBase):
             return
         aux_task = session.aux_task
         assert aux_task is not None, f"aux_task is None for session {write_meta.unique_rid}"
-        recovery = not owned and getattr(self, "_recover_agent", None) is not None
-        claim_result = owned or recovery
-        if recovery:
+        if not owned:
             with session.lock:
                 peer = write_meta.peer_rank
                 if (
@@ -1793,7 +1794,7 @@ class Sender(SenderBase):
                 # An admitted operation normally makes this worker the only
                 # eligible claimant. Keep the claim at the send boundary so
                 # duplicate dispatch cannot publish contradictory evidence.
-                if not claim_result or session._claim_aux_terminal_result(write_meta.peer_rank):
+                if session._claim_aux_terminal_result(write_meta.peer_rank):
                     self._get_result_dealer(write_meta.peer_endpoint).send(
                         _make_aux_result_msg(
                             self._instance_rank,
@@ -1833,7 +1834,7 @@ class Sender(SenderBase):
         # An admitted operation normally makes this worker the only eligible
         # claimant. Keep the claim at the send boundary so future cleanup-path
         # changes cannot publish contradictory evidence.
-        if not claim_result or session._claim_aux_terminal_result(write_meta.peer_rank):
+        if session._claim_aux_terminal_result(write_meta.peer_rank):
             if agent_result == AgentResult.IN_DOUBT:
                 self._retain_in_doubt_transfer(
                     write_meta,
@@ -2281,7 +2282,7 @@ class Sender(SenderBase):
 
     def _handle_cancel_session(self, message: list[bytes]):
         unique_rid = int(message[1])
-        session = None
+        unsubmitted = []
         with self._sessions_lock:
             session = self._get_session(unique_rid)
             owned = (
@@ -2296,6 +2297,8 @@ class Sender(SenderBase):
                     self._pre_cancelled_rids.setdefault(unique_rid, True)
                 else:
                     self._pre_cancelled_rids[unique_rid] = True
+                    with self._peer_requests_lock:
+                        unsubmitted = list(self._peer_requests.get(unique_rid, {}).values())
         if session is not None:
             if owned:
                 session.cancel_local(by_peer=True)
@@ -2304,6 +2307,10 @@ class Sender(SenderBase):
         if owned and len(message) == 4:
             # Routing is carried by CANCEL itself, not by expiring REQUEST_DATA.
             self._queue_session_quiescence(unique_rid, message[2].decode(), int(message[3]))
+        for info in unsubmitted:
+            self._send_failed_result_to_receiver(
+                info, include_aux=info.aux_slot is not None and info.slice_id == 0
+            )
 
     def _queue_session_quiescence(
         self, unique_rid: int, instance_name: str, instance_rank: int
@@ -2384,10 +2391,8 @@ class Sender(SenderBase):
                 received_timestamp = disagg_diagnostics.capture_timestamp()
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
-            fenced = (
-                self.ownership_enabled(info.context_first)
-                and info.unique_rid in self._pre_cancelled_rids
-            )
+            pre_cancelled = info.unique_rid in self._pre_cancelled_rids
+            fenced = self.ownership_enabled(info.context_first) and pre_cancelled
             refused = False
             retired = False
             if session is None and not fenced:
@@ -2404,7 +2409,7 @@ class Sender(SenderBase):
                     info.sender_req_id != info.unique_rid
                     and self._get_session(info.sender_req_id) is not None
                 )
-                refused = retired or retry_of_live_session
+                refused = retired or retry_of_live_session or pre_cancelled
                 if not refused:
                     self._save_peer_req_info(info)
         if received_timestamp is not None:
@@ -2433,9 +2438,14 @@ class Sender(SenderBase):
                 # the peer's receive (and its KV pages) waiting forever. Typically the
                 # context side timed out waiting for it while the peer's request sat in
                 # its generation queue, or it is a retry of a request still in flight.
+                reason = (
+                    "was cancelled"
+                    if pre_cancelled
+                    else ("already retired" if retired else "serves an earlier attempt")
+                )
                 logger.warning(
                     f"_respond_with_kv: TxSession {info.sender_req_id} "
-                    f"{'already retired' if retired else 'serves an earlier attempt'}; "
+                    f"{reason}; "
                     f"failing REQUEST_DATA for peer rid={info.unique_rid} "
                     f"rank={info.instance_rank}"
                 )
@@ -2548,10 +2558,7 @@ class Sender(SenderBase):
                 with self._sessions_lock:
                     session = self._get_session(info.unique_rid)
                 if session is not None:
-                    if (
-                        not session._enforce_physical_ownership
-                        and getattr(self, "_recover_agent", None) is not None
-                    ):
+                    if not session._enforce_physical_ownership:
                         if not session._claim_unsubmitted_aux_failure(info):
                             return
                     elif not session._claim_aux_terminal_result(info.instance_rank):
@@ -2967,10 +2974,7 @@ class TxSession(TxSessionBase):
     def _claim_unsubmitted_aux_failures_locked(
         self, req_infos: Iterable[RecvReqInfo]
     ) -> list[RecvReqInfo]:
-        if not self._need_aux or (
-            not self._enforce_physical_ownership
-            and getattr(self._sender, "_recover_agent", None) is None
-        ):
+        if not self._need_aux:
             return []
         claimed = []
         for info in req_infos:
@@ -3108,9 +3112,13 @@ class TxSession(TxSessionBase):
             ):
                 self.aux_task.fail(exc)
             req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
+            no_kv_submitted = not self._enforce_physical_ownership and not self.kv_tasks
             if report_unsubmitted_aux:
                 aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
         self._report_unsubmitted_aux_failures(aux_failures)
+        if no_kv_submitted:
+            for info in req_infos:
+                self._sender._send_failed_result_to_receiver(info, defer_to_worker=True)
         return True
 
     def has_transferring_tasks(self) -> bool:
@@ -3325,6 +3333,7 @@ class KVRecvTask(_LogicalTask):
         self._physical_owner: Optional[_ReceiveOperationOwner] = None
         # Per-writer report tokens this receiver published for the task.
         self._kv_result_report_tokens: dict[int, bytes] = {}
+        self._legacy_published = False
 
     def fail(self, exc: Exception) -> None:
         """Mark the task ERROR.
@@ -4413,6 +4422,7 @@ class RxSession(RxSessionBase):
                 task = self._kv_tasks[slice_id]
                 if self._need_aux and slice_id == 0:
                     self._aux_expected_writers = task.expected_transfers
+                task._legacy_published = True
                 task.status = TaskStatus.TRANSFERRING
             return True
         if writer_cohort is None:
@@ -4794,7 +4804,22 @@ class RxSession(RxSessionBase):
 
     def resources_drained(self) -> bool:
         if not self._enforce_physical_ownership:
-            return not any(task.status == TaskStatus.TRANSFERRING for task in self._kv_tasks)
+            cancelled = self._terminal_status == SessionStatus.CANCELLED
+            return (
+                not any(
+                    task.status == TaskStatus.TRANSFERRING
+                    or (
+                        cancelled
+                        and task._legacy_published
+                        and (
+                            task.reports_outstanding
+                            or task._kv_result_report_tokens.keys() - task._writer_reports.keys()
+                        )
+                    )
+                    for task in self._kv_tasks
+                )
+                and not self._terminal_aux_awaits_writers()
+            )
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
             return False
@@ -4816,10 +4841,17 @@ class RxSession(RxSessionBase):
     def committed_failure(self) -> bool:
         return self._logical_outcomes.failed
 
-    def _recovery_aux_awaits_writers(self) -> bool:
-        # The first slice publishes the session-level AUX slot. A timeout
-        # cannot establish that those writers have stopped accessing it.
-        return self.recovery_failed and len(self._aux_writer_reports) < self._aux_expected_writers
+    def _terminal_aux_awaits_writers(self) -> bool:
+        if self._aux_expected_writers == 0:
+            return False
+        if self._terminal_status == SessionStatus.CANCELLED:
+            return len(self._aux_writer_reports) < self._aux_expected_writers or bool(
+                self._kv_tasks[0]._kv_result_report_tokens.keys() - self._aux_writer_reports
+            )
+        return (
+            self._logical_outcomes.failed
+            and len(self._aux_writer_reports) < self._aux_expected_writers
+        )
 
     def cancel_local(self, by_peer: bool = False) -> bool:
         """Commit cancellation under the same lock used for publication."""
@@ -4920,7 +4952,7 @@ class RxSession(RxSessionBase):
         """
         if self._enforce_physical_ownership or not self._logical_outcomes.failed:
             return False
-        if self._recovery_aux_awaits_writers():
+        if self._terminal_aux_awaits_writers():
             return True
         if self._writer_wait_expired:
             return False
@@ -5023,7 +5055,10 @@ class RxSession(RxSessionBase):
             with self.lock:
                 if getattr(self, "_closed", False):
                     return True
-                if self._recovery_aux_awaits_writers():
+                if self._terminal_aux_awaits_writers() or (
+                    self._terminal_status == SessionStatus.CANCELLED
+                    and not self.resources_drained()
+                ):
                     return False
                 self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:

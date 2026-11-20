@@ -1892,6 +1892,7 @@ def _make_sender_with_cleared_session(rid: int) -> transfer_mod.Sender:
     sender._enforce_physical_ownership = False
     sender._sessions_lock, sender._sessions = threading.Lock(), {rid: object()}
     sender._retired_rids = {}
+    sender._pre_cancelled_rids = {}
     sender._peer_requests_lock = threading.Lock()
     sender._peer_requests, sender._peer_requests_timestamps = {}, {}
     sender._save_peer_req_info = Mock()
@@ -1985,7 +1986,7 @@ def test_retried_request_data_for_a_live_session_is_failed_not_parked() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("attempt", ["cleared", "retry-cleared", "retry-live"])
+@pytest.mark.parametrize("attempt", ["cleared", "retry-cleared", "retry-live", "terminal"])
 @pytest.mark.parametrize("generation_first", [False, True])
 def test_cleared_session_failure_reaches_the_waiting_receive(
     attempt: str, generation_first: bool, monkeypatch: pytest.MonkeyPatch
@@ -1993,7 +1994,7 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
     """A refused attempt settles each published destination under its own id."""
     monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
     ctx_rid = 112
-    gen_rid = ctx_rid if attempt == "cleared" else ctx_rid + 1000
+    gen_rid = ctx_rid if attempt in ("cleared", "terminal") else ctx_rid + 1000
 
     receiver = object.__new__(Receiver)
     receiver._enforce_physical_ownership = False
@@ -2028,6 +2029,21 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
     if attempt == "retry-live":
         sender._retired_rids.clear()
         sender._sessions[ctx_rid] = object()
+    if attempt == "terminal":
+        sender._retired_rids.clear()
+        sender.setup_session = Mock()
+        sender.shutdown = Mock()
+        params = DisaggregatedParams(
+            disagg_request_id=ctx_rid,
+            schedule_style=(
+                DisaggScheduleStyle.GENERATION_FIRST
+                if generation_first
+                else DisaggScheduleStyle.CONTEXT_FIRST
+            ),
+        )
+        tx = transfer_mod.TxSession(ctx_rid, params, sender)
+        tx._terminal_status = SessionStatus.CANCELLED
+        sender._sessions[ctx_rid] = tx
     del sender._send_failed_result_to_receiver  # use the real reply path
     sender._instance_rank = 3
     sender._registrar = SimpleNamespace(
@@ -2361,7 +2377,10 @@ def test_recovery_failure_retains_aux_slot_after_kv_settles(monkeypatch) -> None
 
 
 @pytest.mark.cpu_only
-def test_sync_recovery_failure_retires_after_delayed_aux_result(monkeypatch) -> None:
+@pytest.mark.parametrize("failure_marker_first", [False, True])
+def test_sync_recovery_failure_retires_after_delayed_aux_result(
+    monkeypatch, failure_marker_first
+) -> None:
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
@@ -2402,16 +2421,19 @@ def test_sync_recovery_failure_retires_after_delayed_aux_result(monkeypatch) -> 
                     rid,
                     0,
                     True,
-                    AgentResult.SUCCESS,
+                    AgentResult.FAILED
+                    if peer == 3 and not failure_marker_first
+                    else AgentResult.SUCCESS,
                     kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
                 ),
             )
         receiver._process_aux_agent_result(
             b"ctx", transfer_mod._make_aux_result_msg(3, rid, AgentResult.SUCCESS)
         )
-        receiver._handle_cancel_session(
-            [MessageType.CANCEL_SESSION, str(rid).encode("ascii"), b"FAILED"]
-        )
+        if failure_marker_first:
+            receiver._handle_cancel_session(
+                [MessageType.CANCEL_SESSION, str(rid).encode("ascii"), b"FAILED"]
+            )
 
     gen._open_peer_source = Mock(return_value=SimpleNamespace(session=session, fetch=fetch))
     executor.disagg.receive_gen_init([request])
@@ -2438,6 +2460,58 @@ def test_sync_recovery_failure_retires_after_delayed_aux_result(monkeypatch) -> 
     assert rid not in receiver._sessions
     assert rid not in gen._recv_sessions and rid not in gen._recv_reqs
     assert not gen.has_inflight_transfer(request)
+    assert aux.alloc_slot().id == 0
+
+
+@pytest.mark.cpu_only
+def test_cancelled_receive_drains_after_no_session_reply_and_sibling_result(monkeypatch) -> None:
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    rid = 131
+    aux = transfer_mod.AuxBuffer(max_slot_num=1, beam_width=1, max_draft_len=1)
+    receiver, session, gen, request = _two_writer_receive_failed_by_one(
+        rid, first_result=False, aux_buffer=aux
+    )
+    sender = _make_sender_with_cleared_session(rid)
+    sender._retired_rids.clear()
+    sender._instance_rank = 3
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="gen"))
+    )
+    del sender._send_failed_result_to_receiver
+    dealer = Mock()
+    sender._get_or_connect_dealer = Mock(return_value=dealer)
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+        aux_slot=0,
+        slice_id=0,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
+    sender._add_req_info(rid, 0, info)
+    receiver.send_cancel_to_senders = Mock(
+        side_effect=lambda *_: sender._handle_cancel_session([MessageType.CANCEL_SESSION, b"131"])
+    )
+
+    assert not gen.cancel_request(request)
+    kv_result, aux_result = [call.args[0] for call in dealer.send.call_args_list]
+    receiver._process_kv_agent_result(b"ctx", kv_result)
+    receiver._process_aux_agent_result(b"ctx", aux_result)
+    assert gen.check_gen_transfer_status(0) == ([], [], [])
+    assert session is gen._recv_sessions[rid]
+    with pytest.raises(ValueError, match="No free auxiliary buffer slots"):
+        aux.alloc_slot()
+
+    session.process_kv_agent_result(
+        4, 0, True, AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+    )
+    assert gen.check_gen_transfer_status(0) == ([], [], [])
+    session.process_aux_agent_result(4, AgentResult.SUCCESS)
+    assert gen.check_gen_transfer_status(0) == ([], [], [request])
+    assert rid not in gen._recv_sessions and rid not in gen._recv_reqs
+    assert rid not in receiver._sessions
     assert aux.alloc_slot().id == 0
 
 
