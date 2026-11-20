@@ -1914,7 +1914,7 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
     through ``_update_iter_stats`` with a deliberately different live counter,
     and confirm the construction-time stamp survives.
     """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, ScheduledBatchStats
 
     fake_self = _build_fake_self(queued_items=[], model_engine_iter_states={"num_ctx_tokens": 0})
     # Live counter is several loops ahead of when the batch was built; any
@@ -1938,12 +1938,14 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
             num_completed_requests=0,
             scheduled_batch=_StubScheduledBatch(),
             micro_batch_id=0,
+            scheduled_batch_stats=ScheduledBatchStats(num_paused_requests=3),
         )
 
     # If someone re-introduces ``stats.iter = self.iter_counter`` this becomes 999.
     assert stats.iter == 17
     assert fake_self._perf_metrics.latest_rank["captureIter"] == 999
     assert fake_self._perf_metrics.latest_rank["batchIter"] == 17
+    assert fake_self._perf_metrics.latest_rank["numPausedRequests"] == 3
 
 
 @pytest.mark.parametrize(
