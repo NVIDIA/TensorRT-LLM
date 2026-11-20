@@ -12,6 +12,10 @@ from types import ModuleType, SimpleNamespace
 from typing import Callable, Optional, Type
 from unittest.mock import patch
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 REPO = Path(__file__).resolve().parents[7]
 MODEL = REPO / "tensorrt_llm/_torch/visual_gen/models/minimax_h3"
 FP8 = MODEL / "minimax_h3_fp8__sm_107__u1"
