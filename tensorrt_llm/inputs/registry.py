@@ -52,7 +52,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          find_mm_token_lengths, get_multimodal_item_metadata,
                          hexdigest_to_int32, validate_mm_inputs)
 # yapf: enable
-from .multimodal_data import MEDIA_MODALITIES, serialize_item
+from .multimodal_data import MEDIA_MODALITIES, _to_host, serialize_item
 from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
                                  create_prefix_token_cache)
 from .tokenization import tokenize_prompt
@@ -419,7 +419,8 @@ class BaseMultimodalInputProcessor(ABC):
         item_lengths = list(item_metadata.output_embedding_lengths)
         embeddings = multimodal_data["multimodal_embedding"]
         if isinstance(embeddings, torch.Tensor):
-            embeddings = torch.split(embeddings, item_lengths)
+            # Copy packed rows to the host once rather than once per item.
+            embeddings = torch.split(_to_host(embeddings), item_lengths)
 
         # apply_mm_hashes takes each modality's items in modality-local order.
         rows_by_modality: dict[str, list[torch.Tensor]] = {}
