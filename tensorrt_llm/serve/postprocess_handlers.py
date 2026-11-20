@@ -391,6 +391,29 @@ def _forced_call_name(calls: List[ToolCallItem], forced_name: str) -> str:
     return forced_name
 
 
+def _merge_calls_by_index(calls: List[ToolCallItem]) -> List[ToolCallItem]:
+    """Merge the items of one streaming step that share a tool index.
+
+    A parser may report a call's name and its arguments as separate items of
+    the same step, but a chat completion chunk carries at most one
+    ``tool_calls`` entry per index, as OpenAI streams them: a client may take
+    the first list it receives as the calls themselves. Each index keeps the
+    position of its first item, the first name among its items, and their
+    arguments joined in order.
+    """
+    merged: dict[int, ToolCallItem] = {}
+    for call in calls:
+        first = merged.get(call.tool_index)
+        if first is None:
+            merged[call.tool_index] = call
+            continue
+        arguments = first.parameters + call.parameters
+        merged[call.tool_index] = ToolCallItem(tool_index=call.tool_index,
+                                               name=first.name or call.name,
+                                               parameters=arguments)
+    return list(merged.values())
+
+
 _JSON_DECODER = json.JSONDecoder()
 
 
@@ -561,6 +584,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                   True,
                                                   finished=(output.finish_reason
                                                             is not None))
+            calls = _merge_calls_by_index(calls)
             if forced_tool and calls:
                 forced_name = _forced_call_name(calls,
                                                 forced_tool.function.name)
