@@ -1,7 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import base64
 import functools
 import json
 import zlib
+from collections.abc import Mapping
 from enum import Enum
 from typing import Optional
 
@@ -17,6 +21,90 @@ class Mode(Enum):
     MARK = 2
     COLLECT = 3
     REPLAY = 4
+
+
+_LAYER_LIST_ATTRS = ("layers", "block", "blocks", "h")
+
+# Wrappers that hold the causal LM one level down. Qwen3-VL keeps it under
+# `llm`, the HF-style `*ForConditionalGeneration` classes under
+# `language_model`, and the plain causal-LM wrappers under `model`.
+_INNER_MODEL_ATTRS = ("model", "llm", "language_model")
+
+# Unwraps, not objects examined: the root plus this many levels are searched.
+_MAX_UNWRAP_DEPTH = 4
+
+
+class NoDecoderLayers(AttributeError):
+    """This model does not keep its decoder layers anywhere this tool knows."""
+
+
+def _layer_list(obj):
+    """The decoder layer list directly on `obj`, or None.
+
+    A candidate has to look like a decoder stack -- non-empty, indexable, and
+    holding something with a `forward` to wrap. An unrelated attribute that
+    happens to share the name would be worse than no match: `_wrap_layer_forward`
+    assigns `forward` onto every item it is handed, so the run would measure the
+    wrong thing and still report a number.
+    """
+    for attr in _LAYER_LIST_ATTRS:
+        layers = getattr(obj, attr, None)
+        if layers is None or isinstance(layers, Mapping) or not hasattr(layers, "__getitem__"):
+            continue
+        try:
+            if len(layers) == 0:
+                continue
+            first = layers[0]
+        except (TypeError, KeyError, IndexError):
+            # A sized, indexable object may still reject integer indexing.
+            continue
+        if callable(getattr(first, "forward", None)):
+            return layers
+    return None
+
+
+def _decoder_layers(model):
+    """Resolve decoder layers across supported model wrappers.
+
+    `model.model.layers` holds for the plain causal-LM wrappers and for nothing
+    else. A vision-language checkpoint serving text only exposes no `.model`:
+    Qwen3.5-9B registers as `Qwen3_5VLModel`, which keeps the causal LM under
+    `llm`, so its stack is at `model.llm.model.layers`. Calibration died during
+    executor creation with
+
+        AttributeError: 'Qwen3_5VLModel' object has no attribute 'model'
+
+    after the weights had already loaded, which made COLLECT -- and therefore
+    every replay derived from it -- unavailable for those architectures.
+
+    Both lists of names are deliberately short and explicit rather than a
+    search of the module tree, for the reason given in `_layer_list`.
+    """
+    seen = []
+    pending = [(model, 0, frozenset())]
+    while pending:
+        obj, depth, ancestors = pending.pop()
+        if id(obj) in ancestors:
+            continue
+        layers = _layer_list(obj)
+        if layers is not None:
+            return layers
+        seen.append(type(obj).__name__)
+        if depth == _MAX_UNWRAP_DEPTH:
+            continue
+        ancestors = ancestors | {id(obj)}
+        # Reverse the push order so the first wrapper name is searched first.
+        for attr in reversed(_INNER_MODEL_ATTRS):
+            inner = getattr(obj, attr, None)
+            if inner is not None:
+                pending.append((inner, depth + 1, ancestors))
+    raise NoDecoderLayers(
+        "%s keeps its decoder layers under none of %s, at or below %s. Add the "
+        "name here once you have read the model definition -- guessing which "
+        "attribute is the decoder stack is how a tool measures the wrong thing "
+        "and still reports a number."
+        % (type(model).__name__, ", ".join(_LAYER_LIST_ATTRS), " -> ".join(seen))
+    )
 
 
 class Calibrator:
@@ -362,7 +450,7 @@ class Calibrator:
 
             return forward
 
-        for idx, layer in enumerate(model.model.layers):
+        for idx, layer in enumerate(_decoder_layers(model)):
             layer.forward = make_forward(idx, layer.forward)
 
     def maybe_collect_or_replay_slots(self, num_slots, token_selected_slots):
