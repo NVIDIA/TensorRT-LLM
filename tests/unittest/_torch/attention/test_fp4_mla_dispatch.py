@@ -8,6 +8,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_ho
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch as dp
 
 SM = 212
+ROWS_Q4 = 512
 
 
 def _choose(num_requests, query_len, kv_capacity, *, live=None, unavailable=None, **kw):
@@ -42,6 +43,14 @@ def _clean_env(monkeypatch):
     monkeypatch.setenv("TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE", "1.0")
 
 
+def test_unavailable_4x_is_2x(monkeypatch):
+    s = _choose(128, 4, 30080, unavailable="no 4x kernel on this device")
+    assert s.path == dp.PATH_2X and s.reason == "no 4x kernel on this device"
+    # a forced path cannot bring the kernel back
+    monkeypatch.setenv(dp.DECODE_PATH_ENV, "4x")
+    assert _choose(128, 4, 30080, unavailable="no 4x kernel on this device").path == dp.PATH_2X
+
+
 @pytest.mark.parametrize(
     "num_requests,query_len,waves,floor",
     [
@@ -66,6 +75,49 @@ def test_four_x_floor_is_graded_by_waves(num_requests, query_len, waves, floor):
     if floor:
         assert _choose(num_requests, query_len, 30080, live=floor - 1).path == dp.PATH_2X
     assert _choose(num_requests, query_len, 30080, live=max(floor, 1)).path != dp.PATH_2X
+
+
+def test_helix_and_stats_stay_2x():
+    assert _choose(128, 4, 30080, helix=True).path == dp.PATH_2X
+    assert _choose(128, 4, 30080, softmax_stats=True).path == dp.PATH_2X
+    assert _choose(128, 4, 30080, v_packed=False).path == dp.PATH_2X
+
+
+def test_forced_paths(monkeypatch):
+    monkeypatch.setenv(dp.DECODE_PATH_ENV, "2x")
+    assert _choose(128, 4, 30080).path == dp.PATH_2X
+    monkeypatch.setenv(dp.DECODE_PATH_ENV, "4x")
+    s = _choose(128, 4, 30080)
+    assert s.path == dp.PATH_4X and s.kv_source == "forced"
+    monkeypatch.setenv(dp.DECODE_PATH_ENV, "twostream")
+    assert _choose(128, 4, 30080).path == dp.PATH_TWO_STREAM
+    # a forced two-stream falls back to 4x where no split helps, and to 2x outside the envelope
+    assert _choose(64, 4, 30080).path == dp.PATH_4X
+    assert _choose(128, 4, 30080, helix=True).path == dp.PATH_2X
+    # forcing never bypasses the KV floor only in auto mode: forced 4x at 8K is honoured if the envelope allows it
+    monkeypatch.setenv(dp.DECODE_PATH_ENV, "4x")
+    assert _choose(128, 4, 8192).path == dp.PATH_4X
+
+
+def test_min_kv_knob(monkeypatch):
+    assert dp.min_kv_4x() is None
+    # one flat floor for every shape replaces the grading
+    monkeypatch.setenv(dp.MIN_KV_4X_ENV, "4096")
+    assert dp.min_kv_4x() == 4096 and dp.four_x_floor_kv(16, ROWS_Q4, SM) == 4096
+    assert _choose(128, 4, 30080, live=4096).path != dp.PATH_2X
+    s = _choose(16, 4, 30080, live=2048)
+    assert s.path == dp.PATH_2X and "flat floor" in s.reason and "waves" not in s.reason
+    monkeypatch.delenv(dp.MIN_KV_4X_ENV)
+    s = _choose(128, 4, 30080, live=2048)
+    assert s.path == dp.PATH_2X and "5.6 4x waves" in s.reason
+    monkeypatch.setenv(dp.MIN_KV_4X_ENV, "4096")
+    monkeypatch.setenv(dp.MIN_KV_4X_ENV, "40000")
+    assert _choose(128, 4, 30080).path == dp.PATH_2X
+    assert _choose(16, 4, 30080).path == dp.PATH_2X
+    monkeypatch.setenv(dp.MIN_KV_4X_ENV, "0")
+    assert _choose(128, 4, 30080, live=1).path != dp.PATH_2X
+    monkeypatch.setenv(dp.MIN_KV_4X_ENV, "garbage")
+    assert dp.min_kv_4x() is None and dp.four_x_floor_kv(128, ROWS_Q4, SM) == 8192
 
 
 def _regimes(num_requests, query_len, capacity, num_heads=128):

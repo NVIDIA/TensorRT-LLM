@@ -1100,3 +1100,72 @@ class PackedSplitGraphKeyTestCase(unittest.TestCase):
             (True, SampleType.FULL, (8192, 1)),
         )
         self.assertEqual(exchanges[-1], [True, 1, SampleType.FULL.value, 8192, 0])
+
+    def test_a_missing_graph_of_two_variants_keeps_the_decision_and_rounds_the_regime_up(
+        self,
+    ) -> None:
+        runner = self._runner()
+        runner.set_graph_variants(
+            (
+                kv_regime_variant(lambda batch_size, draft_len: (8192, 16384)),
+                self._split_variant((False, True)),
+            )
+        )
+        captured = [
+            KeyType(batch_size=1, draft_len=0, variants=variants)
+            for variants in ((16384, 0), (8192, 1))
+        ]
+        runner.graph_metadata = {key: object() for key in captured}
+        # the decision is settled first: the unsplit graph exists, in the larger regime only
+        missing = KeyType(batch_size=1, draft_len=0, variants=(8192, 0))
+        self.assertEqual(runner._get_compatible_variant_key(missing), captured[0])
+        self.assertEqual(runner._get_compatible_variant_key(captured[1]), captured[1])
+
+    def test_capture_writes_the_key_values_into_the_fp4_mla_state(self) -> None:
+        from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
+
+        runner = Mock()
+        runner.enabled = True
+        runner._dspark_confidence_enabled = False
+        runner.config = SimpleNamespace(enable_attention_dp=False, use_mrope=False)
+        runner.graph_variants = (
+            kv_regime_variant(lambda batch_size, draft_len: (8192, 16384)),
+            self._split_variant((False, True)),
+        )
+        runner._agree_graph_shape = CUDAGraphRunner._agree_graph_shape.__get__(runner)
+        runner._get_compatible_variant_key = CUDAGraphRunner._get_compatible_variant_key.__get__(
+            runner
+        )
+        runner._is_mixed_encoder_decoder_batch.return_value = False
+        runner._can_run_cuda_graph_batch.return_value = True
+        runner.supported_batch_sizes = {1}
+        runner.max_beam_width = 1
+        runner._capture_allowed = True
+        runner.graph_metadata = {}
+        key = KeyType(batch_size=1, draft_len=0, variants=(8192, 0))
+        runner.get_graph_key.return_value = key
+        # the state the FP4 MLA decode reads, behind the metadata's own entry point
+        state = Fp4MlaState()
+        graph_metadata = SimpleNamespace(
+            is_cuda_graph=True, set_decode_graph_variant=state.set_decode_graph_variant
+        )
+        attn_metadata = SimpleNamespace(
+            create_cuda_graph_metadata=Mock(return_value=graph_metadata)
+        )
+        batch = self._batch(_make_request_stub(1, prompt_len=100))
+
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.cuda_graph_runner.ExpertStatistic.should_record",
+            return_value=False,
+        ):
+            result = CUDAGraphRunner.maybe_get_cuda_graph(
+                runner, batch, enable_spec_decode=False, attn_metadata=attn_metadata
+            )
+
+        self.assertEqual(result, (graph_metadata, None, key))
+        # the decode captured in this graph decides on the regime ceiling and launches one task per request
+        self.assertEqual(state.kv_regime_max_kv, 8192)
+        self.assertIs(state.packed_split, False)
+        # a variant the decode does not serve is an error instead of a graph that ignores its key
+        with self.assertRaises(ValueError):
+            state.set_decode_graph_variant("other", 1)
