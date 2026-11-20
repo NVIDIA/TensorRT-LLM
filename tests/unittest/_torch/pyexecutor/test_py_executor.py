@@ -270,7 +270,10 @@ def test_forward_step_keeps_draft_len_when_forward_fails():
 def test_validate_token_id_range_accepts_end_id(end_id) -> None:
     model = Mock(spec=DecoderModelForCausalLM)
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(model=model),
+        _num_embeddings=model.lm_head.num_embeddings,
+    )
     request = types.SimpleNamespace(
         py_end_id=end_id,
         py_multimodal_data=None,
@@ -285,7 +288,10 @@ def test_validate_token_id_range_accepts_end_id(end_id) -> None:
 def test_validate_token_id_range_rejects_end_id(end_id) -> None:
     model = Mock(spec=DecoderModelForCausalLM)
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(model=model),
+        _num_embeddings=model.lm_head.num_embeddings,
+    )
     request = types.SimpleNamespace(py_end_id=end_id)
 
     with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
@@ -304,7 +310,10 @@ def test_validate_token_id_range_rejects_end_id(end_id) -> None:
 def test_validate_token_id_range_accepts_encoder_decoder_end_id(model_class_name, end_id) -> None:
     model = Mock(spec=getattr(torch_models, model_class_name))
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(model=model),
+        _num_embeddings=model.lm_head.num_embeddings,
+    )
     request = types.SimpleNamespace(py_end_id=end_id)
 
     PyExecutor._validate_token_id_range(executor, request)
@@ -322,7 +331,10 @@ def test_validate_token_id_range_accepts_encoder_decoder_end_id(model_class_name
 def test_validate_token_id_range_rejects_encoder_decoder_end_id(model_class_name, end_id) -> None:
     model = Mock(spec=getattr(torch_models, model_class_name))
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(model=model),
+        _num_embeddings=model.lm_head.num_embeddings,
+    )
     request = types.SimpleNamespace(py_end_id=end_id)
 
     with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
@@ -519,6 +531,7 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     )
     executor._validate_token_id_range = Mock()
     executor._validate_request_budget = Mock()
+    executor._validate_embedding_bias = Mock()
 
     if is_warmup:
         PyExecutor._validate_request(executor, request)
@@ -671,7 +684,9 @@ def _make_admission_executor(model, requests):
         _configure_csa2_remote_tail=Mock(),
         _validate_token_id_range=Mock(),
         _validate_request_budget=Mock(),
+        _validate_embedding_bias=Mock(),
         _handle_errors=Mock(),
+        _num_embeddings=1234,
     )
     executor._validate_request = types.MethodType(PyExecutor._validate_request, executor)
     return executor
@@ -683,6 +698,7 @@ def _make_admission_request(request_id: int) -> types.SimpleNamespace:
         py_disaggregated_params=None,
         sampling_config=None,
         kv_cache_retention_config=None,
+        raise_if_validation_failed=Mock(),
     )
 
 
@@ -1893,6 +1909,7 @@ def test_getter_methods(mock_executor):
 
 def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyExecutor:
     executor = PyExecutor.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
     executor.resource_manager = Mock()
     executor.resource_manager.resource_managers = {
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
@@ -3588,6 +3605,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         _kv_cache_capacity={},
         track_unique_tokens=False,
         _is_kv_manager_v2=False,
+        _num_embeddings=1234,
     )
     seen = {}
     stub._cancel_queued_context_requests = types.MethodType(
@@ -3680,6 +3698,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         _kv_cache_capacity={},
         track_unique_tokens=False,
         _is_kv_manager_v2=False,
+        _num_embeddings=123,
     )
     for name in (
         "_get_request_admission_capacity",
@@ -5052,12 +5071,23 @@ def test_v2_generation_update_runs_before_cancel_and_responses(loop):
 def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> types.SimpleNamespace:
     """Generation request at its first decoding step, carrying what the
     context side transferred for the first token."""
-    transferred = {"first_gen_log_probs": None, "first_gen_logits": None, **disagg_params}
+    transferred = {
+        "first_gen_log_probs": None,
+        "first_gen_logits": None,
+        "ctx_usage": None,
+        **disagg_params,
+    }
     request = types.SimpleNamespace(
         py_request_id=rid,
         py_decoding_iter=1,
         py_batch_idx=None,
         py_result=py_result,
+        cached_tokens=0,
+        py_draft_tokens=[],
+        py_per_pos_drafted=[],
+        py_per_pos_accepted=[],
+        py_total_draft_tokens=0,
+        py_total_accepted_draft_tokens=0,
         py_disaggregated_params=types.SimpleNamespace(**transferred),
     )
     request.create_response = lambda: LlmResponse(request_id=rid, result=LlmResult(b"", py_result))
@@ -5224,3 +5254,46 @@ def test_dynamo_recompile_limit_is_reapplied_on_the_worker_thread():
         "Dynamo config is process-wide; drop the hook"
     )
     assert seen["applied"] == DYNAMO_RECOMPILE_LIMIT
+
+
+def test_early_response_suppresses_repeat_and_leaves_terminal_for_normal_pass() -> None:
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.bindings import executor as native
+
+    executor = _first_token_executor(overlap=True)
+    executor.perf_manager = Mock()
+    executor.iter_counter = 1
+    executor.stream_interval = 1
+    executor.kv_cache_transceiver = None
+    executor.force_terminate_ctx_for_partial_reuse = False
+    executor._terminate_request = Mock()
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=2,
+        sampling_config=native.SamplingConfig(),
+        is_streaming=True,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    request.py_decoding_iter = 1
+    executor.active_requests = [request]
+    batch = types.SimpleNamespace(all_requests=lambda: [request])
+
+    executor._emit_first_token_responses(batch)
+    assert len(executor.responses[42]) == 1
+    assert not executor.responses[42][0].result.is_final
+    executor._handle_responses(emit_first_iter=False)
+    assert len(executor.responses[42]) == 1
+    executor._terminate_request.assert_not_called()
+
+    request.finish_by_reason(native.FinishReason.CANCELLED)
+    executor._emit_first_token_responses(batch)
+    assert len(executor.responses[42]) == 1
+    executor._handle_responses(emit_first_iter=False)
+    assert len(executor.responses[42]) == 2
+    assert executor.responses[42][-1].result.is_final
+    executor._terminate_request.assert_called_once_with(request)
+    executor._handle_responses(emit_first_iter=False)
+    assert len(executor.responses[42]) == 2
+    assert executor._terminate_request.call_count == 1

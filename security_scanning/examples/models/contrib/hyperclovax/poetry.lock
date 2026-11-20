@@ -121,14 +121,14 @@ all = ["cuda-toolkit (==13.*)", "cuda-toolkit[cufile] (==13.*) ; sys_platform ==
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.9.0"
+version = "1.9.1"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "platform_system == \"Linux\""
 files = [
-    {file = "cuda_pathfinder-1.9.0-py3-none-any.whl", hash = "sha256:622df7440f7702f36b7a02a1699aa0b084fe04034d9939188fee9b16d0c36366"},
+    {file = "cuda_pathfinder-1.9.1-py3-none-any.whl", hash = "sha256:b743c132f90ad2d1e71d43fd28f31ebcde518f943e50fd44aca62b2a80d5230d"},
 ]
 
 [[package]]

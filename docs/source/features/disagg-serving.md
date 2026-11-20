@@ -536,6 +536,20 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, the generation worker will not overlap KV cache transfer with model inference. The default value is `0`.
 
+* `TLLM_BENCHMARK_REQ_QUEUES_SIZE`: Gen-only benchmark fill gate on the generation worker. `0`
+  (default) disables it; a scalar `C` holds decoding once, until `C` requests are admitted and their
+  KV transfers are complete. The first decode batch can still be partial. A schedule `C1,C2,...`
+  runs one stage per entry, and `C/N` sets a fill target `C` with a request budget `N`
+  (`0 < C <= N`, default `N = C`); unlike scalar `8`, `8/8` is a one-stage schedule with a budget.
+  Fill targets are clamped to the executor's admission capacity. Each stage gates its initial fill
+  once and advances after its budget is admitted and all requests have drained, so the client must
+  send exactly the declared requests in order; a request that fails before reaching the generation
+  worker shifts later stages, and a stage left short of its fill target ends the worker after
+  `TRTLLM_BENCHMARK_DISAGG_FILL_STALL_SEC`. A schedule requires `n=1` requests and one generation
+  worker without pipeline parallelism; attention DP and context parallelism are untested. Stage
+  transitions are logged as `[BENCH-STAGE]`. Under Slurm, set it inside the container (`env
+  TLLM_BENCHMARK_REQ_QUEUES_SIZE=64,128 ...`); `srun --export` splits comma-separated values.
+
 * `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the transport NIXL itself uses. Valid values are `UCX` (default) and `LIBFABRIC`; an unsupported value logs a warning and falls back to `UCX`. `LIBFABRIC` additionally requires a NIXL build carrying the libfabric plugin — see the [disaggregated serving examples](source:examples/disaggregated/README.md).
 
 * `TRTLLM_GPU_KEEPALIVE`: If set to `1`, a generation worker that is waiting at the benchmark fill gate (`TLLM_BENCHMARK_REQ_QUEUES_SIZE`) keeps a resident warp on every SM in ~100 ms chunks instead of idling through the wait, so GPU-activity metrics do not read idle while the context tier fills it. The work is drained when the gate opens and never overlaps a forward pass. The default value is `0`.

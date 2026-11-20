@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the moe/k3_route_quant catalog entry: trtllm::k3_route_quant on one GPU (sm_100).
+"""GPU test for the moe/k3_route_quant op: trtllm::k3_route_quant on one GPU (sm_100).
 
-The bitwise comparator is the stock op it replaces, trtllm::kimi_k3_noaux_tc_mxfp8_quant: the four outputs (top-16 ids,
+The bitwise comparator is the stock op trtllm::kimi_k3_noaux_tc_mxfp8_quant: the four outputs (top-16 ids,
 routing weights, MXFP8 codes, UE8M0 scales) must be its bits. Checks, in file order:
 - single calls at M 1-8, 16, 33 and 64 with random logits, with and without the early trigger: the stock op's bits,
   run-to-run identical, and each M's rows the bits of the same rows of the 64-token call;
