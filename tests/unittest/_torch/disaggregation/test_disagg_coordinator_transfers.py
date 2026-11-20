@@ -504,6 +504,7 @@ def test_timed_out_requests_under_adp_fail_only_at_the_synced_drain() -> None:
     h.dist.tp_allgather_int64.return_value = Mock(any=lambda: True)
 
     h.coordinator.fail_timed_out([req])
+    h.coordinator.fail_timed_out([req])  # repeated report before the collective
     assert h.effects.failed == []
 
     h.coordinator.handle_timeouts_synced()

@@ -11643,11 +11643,15 @@ class PyExecutor:
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
-        if cancelled:
+        if cancelled or timed_out:
+            # The timeout buffer owns these requests until the rank-wide drain.
+            # Neither the response pass nor the generic transfer-error vote owns them.
+            retired_ids = {req.py_request_id for req in cancelled + timed_out}
             self.active_requests[:] = [
-                request for request in self.active_requests
-                if not any(request is done for done in cancelled)
+                req for req in self.active_requests
+                if req.py_request_id not in retired_ids
             ]
+        if cancelled:
             still_active = {
                 request.parent_request_id
                 if request.is_child else request.py_request_id

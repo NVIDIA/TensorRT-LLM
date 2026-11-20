@@ -135,7 +135,7 @@ class DisaggTransferCoordinator:
         self._pending_ctx_transfer_failures: Set[int] = set()
         # Timed-out generation requests whose error response waits for the
         # ADP-safe consensus point.
-        self._pending_timed_out_requests: List[LlmRequest] = []
+        self._pending_timed_out_requests: Dict[int, LlmRequest] = {}
         # Retire attempts whose legacy cancel could not yet prove page release;
         # retried only every second poll so an idle decode worker's re-poll
         # loop (pace_idle sleeps ~1 ms) does not hammer transceivers that
@@ -1328,7 +1328,7 @@ class DisaggTransferCoordinator:
             if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
         if self._enable_attention_dp and self._dist.world_size != 1:
-            self._pending_timed_out_requests.extend(requests)
+            self._pending_timed_out_requests.update((req.py_request_id, req) for req in requests)
             return
         for req in requests:
             self._effects.fail_requests(
@@ -1343,8 +1343,7 @@ class DisaggTransferCoordinator:
         """
         if not (self._enable_attention_dp and self._dist.world_size != 1):
             return
-        timed_out = self._pending_timed_out_requests
-        self._pending_timed_out_requests = []
+        timed_out = self.take_pending_timed_out()
         any_timed_out = bool(self._dist.tp_allgather_int64([bool(timed_out)]).any())
         if any_timed_out:
             self._effects.fail_requests(
@@ -1360,8 +1359,8 @@ class DisaggTransferCoordinator:
         ``fail_timed_out_synced`` -- the same action ``handle_timeouts_synced``
         takes after its own collective.
         """
-        timed_out = self._pending_timed_out_requests
-        self._pending_timed_out_requests = []
+        timed_out = list(self._pending_timed_out_requests.values())
+        self._pending_timed_out_requests.clear()
         return timed_out
 
     def fail_timed_out_synced(self, requests: List[LlmRequest]) -> None:

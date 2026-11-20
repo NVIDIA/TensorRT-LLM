@@ -743,6 +743,7 @@ def test_an_expired_receive_fails_and_a_late_completion_is_not_decoded():
     executor._cancel_pending_gen_receives()
     # The completed-late receive fails; the in-flight one waits until its writer is fenced.
     assert failures == [("Request 3 timed out", [3])]
+    assert executor.active_requests == [in_flight, on_time]
     assert in_flight.state == State.DISAGG_GENERATION_TRANS_IN_PROGRESS
     assert late.state != State.DISAGG_GENERATION_TRANS_COMPLETE
     assert on_time.state == State.DISAGG_GENERATION_TRANS_COMPLETE
