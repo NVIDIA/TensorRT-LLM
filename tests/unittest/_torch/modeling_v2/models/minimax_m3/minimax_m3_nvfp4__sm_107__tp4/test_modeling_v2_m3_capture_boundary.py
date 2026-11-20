@@ -5,7 +5,7 @@
 
 Every layer's MoE / MLP output goes unreduced to the fused boundary (all-reduce + residual + the next layer's input
 norm, the final norm after the last layer), and a capture layer captures the reduced residual sum that boundary
-writes, with no residual of its own. CPU only: the attention, the feed-forward and the boundaries are stand-ins.
+writes, with no residual of its own. Synthetic attention, feed-forward and collectives isolate the residual routing.
 """
 
 from types import SimpleNamespace
@@ -29,13 +29,10 @@ class _Spec:
 
 
 @pytest.fixture(params=["prefill", "decode"])
-def layer(request, monkeypatch):
-    """(core, the target's generic layer bound to a target over ``core``)."""
+def layer(request, monkeypatch, make_cuda_m3_config):
     calls = []
-    w = {f"l{i}_{n}": f"{n}{i}" for i in range(LAYERS) for n in ("in_norm", "post_norm")}
-    w["final_norm"] = "final"
-    c = SimpleNamespace(
-        w=w, num_layers=LAYERS, moe_layers=frozenset({2, 3}), rms_eps=1e-6, calls=calls
+    core = modeling.MiniMaxM3Tp4ModelingV2(
+        make_cuda_m3_config(4, moe_layers=(0, 0, 1, 1), sparse_layers=(0, 0, 1, 1))
     )
     monkeypatch.setattr(modeling, "_can_mc", lambda x, folded=False: False)
     monkeypatch.setattr(
@@ -66,13 +63,14 @@ def layer(request, monkeypatch):
         )
     monkeypatch.setattr(cls, "_attention", lambda self, i, *a, **k: (("attn", i), False))
     monkeypatch.setattr(cls, "_generic_boundary", boundary)
-    target = cls(c)
-    return c, target._layer if request.param == "prefill" else target._generic_layer
+    target = cls(core)
+    run_layer = target._layer if request.param == "prefill" else target._generic_layer
+    return core, run_layer, calls
 
 
 @pytest.mark.parametrize("i", range(LAYERS))
 def test_a_capture_layer_captures_the_boundary_residual_sum(layer, i) -> None:
-    core, run = layer
+    core, run, calls = layer
     captured = []
     out = run(
         i,
@@ -83,17 +81,17 @@ def test_a_capture_layer_captures_the_boundary_residual_sum(layer, i) -> None:
         _Spec([i]),
         lambda spec, layer, h, r: captured.append((layer, h, r)),
     )
-    norm = core.w[f"l{i + 1}_in_norm"] if i + 1 < LAYERS else "final"
-    assert core.calls[-1][2] == norm, (
+    norm = core.w[f"l{i + 1}_in_norm"] if i + 1 < LAYERS else core.w["final_norm"]
+    assert calls[-1][2] is norm, (
         "the boundary applies the next layer's norm (the final norm after the last)"
     )
     assert captured == [(i, out[1], None)]
     if i in core.moe_layers:
-        assert core.calls[-1][1] == ("routed", i), "the routed part folds into the boundary"
+        assert calls[-1][1] == ("routed", i), "the routed part folds into the boundary"
 
 
 def test_a_layer_without_capture_captures_nothing(layer) -> None:
-    _, run = layer
+    _, run, _ = layer
     captured = []
     run(
         1,
