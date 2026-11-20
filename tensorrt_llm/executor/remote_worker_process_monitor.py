@@ -6,20 +6,14 @@
 from __future__ import annotations
 
 import errno
-import hashlib
-import hmac
+import inspect
 import ipaddress
 import json
-import logging
 import math
 import os
-
-# Only serializes reports; IpcQueue authenticates frames before deserialization.
-import pickle  # nosec B403
-import selectors
 import socket
 
-# Runs this interpreter and this helper with fixed argv, without a shell.
+# Runs this interpreter and the helper script with fixed argv, without a shell.
 import subprocess  # nosec B404
 import sys
 import threading
@@ -27,24 +21,35 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
-from pathlib import Path
 from typing import Any, TypeVar
 
-_HEARTBEAT_INTERVAL = 0.5
+import zmq
+
+from .. import _utils
+from .._errors import ConfigInputError, ResourceError, RuntimeInitError
+from ..logger import logger
+from . import process_watch_helper
+from .hmac_framing import HmacVerificationError
+from .ipc import IpcQueue
+from .process_watch_helper import HEARTBEAT_INTERVAL as _HEARTBEAT_INTERVAL
+from .process_watch_helper import START_TIMEOUT as _START_TIMEOUT
+from .process_watch_helper import wait_readable as _wait_readable
+
 # Default lease. TCP retransmission backoff (0.2, 0.4, 0.8, 1.6, 3.2 s, ...)
 # leaves gaps, so a lease of N seconds tolerates network outages of only about
 # N - 4 seconds. Worker process death is detected in about one interval
 # regardless, because the helper notices its worker's exit directly. A helper
 # that dies itself sends no report, so only the lease detects it.
 _HEARTBEAT_TIMEOUT = 15.0
-# Longest the receiver waits for a report before it checks the leases again.
+# The receiver wakes once per interval and drains every queued report, so its
+# wakeups do not grow with the number of ranks or reports. Detection of a loss
+# is delayed by at most one interval.
 _RECEIVE_WAIT = 0.1
 # Upper bound on one authenticated report frame; real reports are far smaller.
 _MAX_REPORT_BYTES = 4096
 # A worker call that returns or raises reports its outcome through MPI, which
 # arrives after the helper's final report. Defer to that outcome briefly.
 _RETURN_GRACE = 2.0
-_START_TIMEOUT = 10.0
 # MPI sessions start a task on all ranks together after a barrier. Each live rank
 # starts its helper first in the worker call, and reports within _START_TIMEOUT or
 # raises. A rank still missing this long after the first report exited before
@@ -57,7 +62,6 @@ WORKER_WATCH_HINT = (
     "Unset TRTLLM_WORKER_WATCH (or set it to 0) to disable independent remote process "
     "supervision."
 )
-logger = logging.getLogger(__name__)
 
 
 # Interfaces a deployment already configured for inter-node traffic, in order.
@@ -93,7 +97,7 @@ def _discover_host() -> tuple[str, str]:
     try:
         interfaces = _interface_ipv4s()
     except (ImportError, OSError) as error:
-        logger.debug("Cannot list network interfaces for process watch: %s", error)
+        logger.debug(f"Cannot list network interfaces for process watch: {error}")
         interfaces = {}
     for variable in _INTERFACE_HINT_VARIABLES:
         value = os.environ.get(variable, "").strip()
@@ -119,7 +123,7 @@ def _discover_host() -> tuple[str, str]:
         if _usable_ipv4(address):
             return address, "the default route"
     except OSError as error:
-        logger.debug("Cannot find the default route for process watch: %s", error)
+        logger.debug(f"Cannot find the default route for process watch: {error}")
     for interface, addresses in interfaces.items():
         if addresses:
             return addresses[0], f"interface {interface}"
@@ -153,7 +157,7 @@ def _is_loopback_name(host: str | None) -> bool:
         return False
 
 
-def _heartbeat_timeout_from_env(config_error: type) -> float:
+def _heartbeat_timeout_from_env() -> float:
     """Read TRTLLM_WORKER_WATCH_TIMEOUT, the lease in seconds, at construction."""
     value = os.environ.get("TRTLLM_WORKER_WATCH_TIMEOUT")
     if not value:
@@ -162,25 +166,85 @@ def _heartbeat_timeout_from_env(config_error: type) -> float:
     try:
         timeout = float(value)
     except ValueError as error:
-        raise config_error(
+        raise ConfigInputError(
             f"TRTLLM_WORKER_WATCH_TIMEOUT must be a number of seconds greater than {minimum:g}"
         ) from error
     if not math.isfinite(timeout) or timeout <= minimum:
-        raise config_error(
+        raise ConfigInputError(
             f"TRTLLM_WORKER_WATCH_TIMEOUT must be a number of seconds greater than {minimum:g}"
         )
     return timeout
 
 
-def _wait_readable(stream, timeout: float) -> bool:
-    """Wait until a pipe is readable without select()'s FD_SETSIZE limit.
+def _port_from_env() -> str:
+    """Return TRTLLM_WORKER_WATCH_PORT, or "*" for an OS-assigned port when unset or empty."""
+    value = os.environ.get("TRTLLM_WORKER_WATCH_PORT", "").strip()
+    if not value:
+        return "*"
+    try:
+        port = int(value)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        raise ConfigInputError(
+            f"TRTLLM_WORKER_WATCH_PORT must be a port number from 1 through 65535, got "
+            f"{value!r}. {WORKER_WATCH_HINT}",
+            hint=WORKER_WATCH_HINT,
+        )
+    return str(port)
 
-    Workers can hold more than 1024 descriptors (CUDA, NCCL, sockets), so the
-    helper's pipe may be numbered beyond what select.select() accepts.
+
+def start_remote_monitor(
+    world_size: int, wake: threading.Event | None = None
+) -> RemoteWorkerProcessMonitor | None:
+    """Start remote supervision when TRTLLM_WORKER_WATCH=1 opts in.
+
+    Args:
+        world_size: Number of MPI worker ranks required for readiness.
+        wake: Event to set when a worker or its supervision is lost.
+
+    Returns:
+        The started monitor, or None when TRTLLM_WORKER_WATCH is unset, empty
+        or 0.
+
+    Raises:
+        ConfigInputError: If TRTLLM_WORKER_WATCH is anything other than 0 or
+            1, or another TRTLLM_WORKER_WATCH_* setting is invalid.
     """
-    with selectors.DefaultSelector() as selector:
-        selector.register(stream, selectors.EVENT_READ)
-        return bool(selector.select(timeout))
+    switch = os.environ.get("TRTLLM_WORKER_WATCH", "").strip()
+    if switch not in ("", "0", "1"):
+        raise ConfigInputError(
+            "TRTLLM_WORKER_WATCH must be 1 to enable remote worker process supervision "
+            f"or 0 to disable it, got {switch!r}"
+        )
+    if switch == "1":
+        return RemoteWorkerProcessMonitor(world_size, wake)
+    configured = [
+        name
+        for name in ("TRTLLM_WORKER_WATCH_HOST", "TRTLLM_WORKER_WATCH_PORT")
+        if os.environ.get(name)
+    ]
+    if configured:
+        logger.warning(
+            f"{' and '.join(configured)} is set but remote worker process supervision is "
+            "disabled; set TRTLLM_WORKER_WATCH=1 to enable it"
+        )
+    return None
+
+
+def describe_failure(report: dict) -> str:
+    """Describe a supervision failure report for logs and fatal errors."""
+    if report.get("missing"):
+        return (
+            f"MPI worker ranks {report['missing']} did not report to process-watch endpoint "
+            f"{report['endpoint']}: {report['reason']}"
+        )
+    if report["rank"] < 0:
+        return f"Remote MPI worker process supervision failed: {report['reason']}"
+    return (
+        f"MPI worker rank {report['rank']} (pid {report['pid']}) lost process liveness "
+        f"on {report['host']}: {report['reason']}"
+    )
 
 
 @dataclass(frozen=True)
@@ -202,22 +266,18 @@ class RemoteWorkerProcessMonitor:
             world_size: Number of MPI worker ranks required for readiness.
             wake: Event to set when a worker or its supervision is lost.
         """
-        import zmq
-
-        from tensorrt_llm._errors import ConfigInputError, ResourceError, RuntimeInitError
-
-        from .ipc import IpcQueue
-
         self._world_size = world_size
         self._wake = wake
         self._lock = threading.Lock()
         self._stopped = threading.Event()
+        # Each rank's newest report and when it arrived. A "returned" report is
+        # always a helper's last one.
         self._seen: dict[int, tuple[dict, float]] = {}
-        self._returned: dict[int, tuple[dict, float]] = {}
         self._first_report_at: float | None = None
         self._failure: dict | None = None
-        self._heartbeat_timeout = _heartbeat_timeout_from_env(ConfigInputError)
-        override = os.environ.get("TRTLLM_WORKER_WATCH_HOST")
+        self._heartbeat_timeout = _heartbeat_timeout_from_env()
+        port = _port_from_env()
+        override = os.environ.get("TRTLLM_WORKER_WATCH_HOST", "").strip()
         if override:
             host, source = override, "TRTLLM_WORKER_WATCH_HOST"
         else:
@@ -225,8 +285,17 @@ class RemoteWorkerProcessMonitor:
         try:
             family, host = _resolve_host(host)
         except socket.gaierror as error:
+            if override:
+                brackets = (
+                    " Supply IPv6 literals without brackets." if override.startswith("[") else ""
+                )
+                raise ConfigInputError(
+                    f"Cannot resolve TRTLLM_WORKER_WATCH_HOST={override!r}: {error}."
+                    f"{brackets} {WORKER_WATCH_HINT}",
+                    hint=WORKER_WATCH_HINT,
+                ) from error
             raise RuntimeInitError(
-                f"Cannot resolve process-watch host {host!r}. {WORKER_WATCH_HINT}",
+                f"Cannot resolve process-watch host {host!r} from {source}. {WORKER_WATCH_HINT}",
                 hint=WORKER_WATCH_HINT,
             ) from error
         # An explicit loopback choice is valid when every rank shares this
@@ -234,30 +303,19 @@ class RemoteWorkerProcessMonitor:
         # discovery or /etc/hosts problem that fails startup on other hosts.
         if ipaddress.ip_address(host).is_loopback and not _is_loopback_name(override):
             logger.warning(
-                "Process-watch listener advertises loopback address %s (from %s); ranks on "
-                "other hosts cannot reach it. Set TRTLLM_WORKER_WATCH_HOST to an address "
-                "every MPI rank can reach.",
-                host,
-                source,
+                f"Process-watch listener advertises loopback address {host} (from {source}); "
+                "ranks on other hosts cannot reach it. Set TRTLLM_WORKER_WATCH_HOST to an "
+                "address every MPI rank can reach."
             )
         # Reject wildcard advertised addresses; this comparison does not bind.
         # Loopback is valid when every rank can report to this endpoint.
         if ipaddress.ip_address(host).is_unspecified:
-            raise RuntimeInitError(
-                f"Cannot advertise wildcard process-watch host {host!r}. {WORKER_WATCH_HINT}",
+            error_type = ConfigInputError if override else RuntimeInitError
+            raise error_type(
+                f"Cannot advertise wildcard process-watch host {host!r} from {source}. "
+                f"{WORKER_WATCH_HINT}",
                 hint=WORKER_WATCH_HINT,
             )
-        port = os.environ.get("TRTLLM_WORKER_WATCH_PORT", "*")
-        if port != "*":
-            try:
-                port_number = int(port)
-            except ValueError as error:
-                raise ConfigInputError(
-                    "TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535"
-                ) from error
-            if not 1 <= port_number <= 65535:
-                raise ConfigInputError("TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535")
-            port = str(port_number)
         ipv6 = family == socket.AF_INET6
         advertised_host = f"[{host}]" if ipv6 else host
         queue_options = dict(
@@ -284,10 +342,8 @@ class RemoteWorkerProcessMonitor:
                 # forwarded or translated address from TRTLLM_WORKER_WATCH_HOST.
                 bind_address = f"tcp://{'[::]' if ipv6 else '0.0.0.0'}:{port}"  # nosec B104
                 logger.warning(
-                    "Process-watch host %s is not a local address; listening on all "
-                    "interfaces at %s. Restrict ingress to MPI workers.",
-                    host,
-                    bind_address,
+                    f"Process-watch host {host} is not a local address; listening on all "
+                    f"interfaces at {bind_address}. Restrict ingress to MPI workers."
                 )
                 self._queue = IpcQueue((bind_address, None), **queue_options)
         except zmq.ZMQError as error:
@@ -316,12 +372,17 @@ class RemoteWorkerProcessMonitor:
             if self._stopped.is_set() or self._failure is not None:
                 return
             self._failure = report
-        logger.error("Remote MPI worker process supervision failed: %s", report)
+        hint = f" {WORKER_WATCH_HINT}" if report.get("missing") else ""
+        logger.error(f"{describe_failure(report)}{hint}")
         if self._wake is not None:
             self._wake.set()
 
     def wait_ready(self, timeout: float = _START_TIMEOUT) -> bool:
-        """Wait at most timeout seconds for authenticated reports from all ranks."""
+        """Wait at most timeout seconds for authenticated reports from all ranks.
+
+        A timeout records a failure that names the missing ranks and this
+        listener's endpoint.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:
@@ -333,13 +394,20 @@ class RemoteWorkerProcessMonitor:
                 return False
         with self._lock:
             missing = sorted(set(range(self._world_size)) - self._seen.keys())
-        logger.error(
-            "MPI ranks %s did not report to process-watch endpoint %s. %s",
-            missing,
-            self.endpoint.address,
-            WORKER_WATCH_HINT,
-        )
+        if missing:
+            self._fail(self._missing_report(missing, f"no report within {timeout:g} s"))
         return False
+
+    def _missing_report(self, missing: list[int], reason: str) -> dict:
+        # No process identity is known for a rank that never reported.
+        return {
+            "rank": missing[0],
+            "pid": 0,
+            "host": "unknown",
+            "missing": missing,
+            "endpoint": self.endpoint.address,
+            "reason": reason,
+        }
 
     def _accept_report(self, report: dict) -> None:
         if not isinstance(report, dict):
@@ -358,22 +426,49 @@ class RemoteWorkerProcessMonitor:
             self._seen[rank] = (report, time.monotonic())
             if self._first_report_at is None:
                 self._first_report_at = self._seen[rank][1]
-            if report.get("kind") == "returned":
-                self._returned.setdefault(rank, (report, time.monotonic()))
         if report.get("kind") not in ("alive", "returned"):
             self._fail({**report, "reason": "worker exited"})
 
-    def _run(self) -> None:
-        import zmq
+    def _check_leases(self, now: float) -> None:
+        """Fail on the first returned, expired or never-registered rank at ``now``."""
+        with self._lock:
+            returned = [
+                report
+                for report, seen in self._seen.values()
+                if report.get("kind") == "returned" and now - seen > _RETURN_GRACE
+            ]
+            expired = [
+                report
+                for report, seen in self._seen.values()
+                if report.get("kind") != "returned" and now - seen > self._heartbeat_timeout
+            ]
+            first = self._first_report_at
+            unregistered = (
+                sorted(set(range(self._world_size)) - self._seen.keys())
+                if first is not None and now - first > _REGISTRATION_TIMEOUT
+                else []
+            )
+        if returned:
+            self._fail({**returned[0], "reason": "worker returned without an MPI result"})
+        elif expired:
+            self._fail({**expired[0], "reason": "heartbeat timed out"})
+        elif unregistered:
+            self._fail(
+                self._missing_report(
+                    unregistered,
+                    f"no report within {_REGISTRATION_TIMEOUT:g} s of the first rank's report",
+                )
+            )
 
+    def _run(self) -> None:
         try:
-            while not self._stopped.is_set():
+            while True:
                 waited_from = time.monotonic()
-                self._queue.poll(_RECEIVE_WAIT)
+                if self._stopped.wait(_RECEIVE_WAIT):
+                    break
                 # Fix the lease check time before reading. The libzmq I/O
-                # thread queues reports without the GIL, so after this thread
-                # was paused, the earlier poll result is stale while reports
-                # that arrived before ``now`` already wait in the socket.
+                # thread queues reports without the GIL, so reports that
+                # arrived before ``now`` already wait in the socket.
                 now = time.monotonic()
                 # After a pause longer than the report interval, give the I/O
                 # thread one receive interval to surface reports buffered while
@@ -390,43 +485,12 @@ class RemoteWorkerProcessMonitor:
                         break
                     try:
                         report = self._queue.get()
-                    except RuntimeError as error:
-                        if str(error) != "HMAC verification failed":
-                            raise
-                    else:
-                        self._accept_report(report)
+                    except HmacVerificationError:
+                        continue
+                    self._accept_report(report)
                 # Check leases after each bounded drain, even if traffic keeps
                 # arriving. A busy peer must not hide a silent rank forever.
-                with self._lock:
-                    returned = [
-                        r for r, seen in self._returned.values() if now - seen > _RETURN_GRACE
-                    ]
-                    expired = [
-                        r for r, seen in self._seen.values() if now - seen > self._heartbeat_timeout
-                    ]
-                    first = self._first_report_at
-                    unregistered = (
-                        sorted(set(range(self._world_size)) - self._seen.keys())
-                        if first is not None and now - first > _REGISTRATION_TIMEOUT
-                        else []
-                    )
-                if returned:
-                    self._fail({**returned[0], "reason": "worker returned without an MPI result"})
-                elif expired:
-                    self._fail({**expired[0], "reason": "heartbeat timed out"})
-                elif unregistered:
-                    # No process identity is known for a rank that never reported.
-                    self._fail(
-                        {
-                            "rank": unregistered[0],
-                            "pid": 0,
-                            "host": "unknown",
-                            "missing": unregistered,
-                            "endpoint": self.endpoint.address,
-                            "reason": f"no report within {_REGISTRATION_TIMEOUT:g} s "
-                            "of the first rank's report",
-                        }
-                    )
+                self._check_leases(now)
         except Exception as error:
             # Losing the supervisor is itself a terminal loss of worker coverage.
             self._fail(
@@ -444,7 +508,10 @@ class RemoteWorkerProcessMonitor:
 
 
 class WorkerProcessWatch:
-    """Keep process liveness observable while the worker is in Python or CUDA."""
+    """Keep process liveness observable while the worker is in Python or CUDA.
+
+    Use as a context manager, or call close(), to stop the helper.
+    """
 
     def __init__(self, endpoint: ProcessWatchEndpoint, rank: int) -> None:
         """Start an independent helper and require its first report to connect.
@@ -454,7 +521,7 @@ class WorkerProcessWatch:
             rank: MPI rank of the calling worker process.
         """
         self._process = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "--watch"],
+            [sys.executable, process_watch_helper.__file__, "--watch"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
@@ -471,8 +538,6 @@ class WorkerProcessWatch:
             self._process.stdin.flush()
             readable = _wait_readable(self._process.stdout, _START_TIMEOUT)
             if not readable or self._process.stdout.readline().strip() != "ready":
-                from tensorrt_llm._errors import RuntimeInitError
-
                 address_host = endpoint.address[len("tcp://") :].rsplit(":", 1)[0].strip("[]")
                 loopback = (
                     " That is a loopback address, reachable only from the proxy's network "
@@ -489,6 +554,12 @@ class WorkerProcessWatch:
         except BaseException:
             self.close()
             raise
+
+    def __enter__(self) -> WorkerProcessWatch:
+        return self
+
+    def __exit__(self, *_exc_info) -> None:
+        self.close()
 
     def close(self) -> None:
         """Stop and reap this worker's helper, escalating after a bounded wait."""
@@ -520,26 +591,29 @@ _T = TypeVar("_T")
 
 
 def supervise_worker_process(function: Callable[..., _T]) -> Callable[..., _T]:
-    """Keep remote MPI worker supervision alive for the complete worker call."""
+    """Add a ``process_watch_endpoint`` keyword argument that supervises the call.
+
+    With an endpoint, every MPI rank starts a WorkerProcessWatch, the ranks
+    agree on the outcome before calling ``function``, and the watch stays open
+    for the whole call. Without one, ``function`` runs unsupervised. The
+    parameter appears in the wrapper's signature.
+    """
 
     @wraps(function)
     def supervised(
-        *args: Any, _process_watch: ProcessWatchEndpoint | None = None, **kwargs: Any
+        *args: Any, process_watch_endpoint: ProcessWatchEndpoint | None = None, **kwargs: Any
     ) -> _T:
-        if _process_watch is None:
+        if process_watch_endpoint is None:
             return function(*args, **kwargs)
-        from .._errors import RuntimeInitError
-        from .._utils import mpi_comm, mpi_rank
-
         watch, error = None, None
         try:
-            watch = WorkerProcessWatch(_process_watch, mpi_rank())
+            watch = WorkerProcessWatch(process_watch_endpoint, _utils.mpi_rank())
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         # Agree on the outcome before the worker's first collective. A rank
         # that raised here alone would leave its peers waiting in that
         # collective, and the session could then not shut down.
-        errors = mpi_comm().allgather(error)
+        errors = _utils.mpi_comm().allgather(error)
         failed = [rank for rank, message in enumerate(errors) if message is not None]
         if failed:
             if watch is not None:
@@ -550,63 +624,36 @@ def supervise_worker_process(function: Callable[..., _T]) -> Callable[..., _T]:
                 f"Process watch failed to start on MPI ranks {failed}: {errors[failed[0]]}",
                 hint=WORKER_WATCH_HINT,
             )
-        try:
+        with watch:
             return function(*args, **kwargs)
-        finally:
-            watch.close()
 
+    signature = inspect.signature(function)
+    parameters = list(signature.parameters.values())
+    endpoint_parameter = inspect.Parameter(
+        "process_watch_endpoint",
+        inspect.Parameter.KEYWORD_ONLY,
+        default=None,
+        annotation=ProcessWatchEndpoint | None,
+    )
+    position = len(parameters)
+    if parameters and parameters[-1].kind == inspect.Parameter.VAR_KEYWORD:
+        position -= 1
+    parameters.insert(position, endpoint_parameter)
+    supervised.__signature__ = signature.replace(parameters=parameters)
     return supervised
 
 
-def _watch_process() -> int:
-    # This file is executed directly; it must not import TensorRT-LLM or MPI.
-    import zmq
+def describe_lost_worker(identity, remote_failure: dict | None = None) -> str:
+    """Describe a worker returned by WorkerProcessMonitor.find_dead_worker().
 
-    config = json.loads(sys.stdin.readline())
-    key = bytes.fromhex(config.pop("key"))
-    report = {
-        "rank": config["rank"],
-        "pid": config["pid"],
-        "host": socket.gethostname(),
-        "sequence": 0,
-        "kind": "alive",
-    }
-    with zmq.Context() as context, context.socket(zmq.PUSH) as channel:
-        channel.setsockopt(zmq.IPV6, int(config.get("ipv6", False)))
-        channel.setsockopt(zmq.IMMEDIATE, 1)
-        channel.setsockopt(zmq.LINGER, 250)
-        channel.setsockopt(zmq.SNDHWM, 4)
-        channel.setsockopt(zmq.SNDTIMEO, 100)
-        channel.connect(config["address"])
-        # Give up before the worker's _START_TIMEOUT wait for "ready" ends, so
-        # this helper's exit, not that timeout, ends the worker's wait.
-        deadline = time.monotonic() + _START_TIMEOUT - 1
-        ready = False
-        while True:
-            if os.getppid() != config["pid"]:
-                report["kind"] = "exited"
-            try:
-                # Match IpcQueue's authenticated framing without importing its
-                # package (which would import the inference stack in this helper).
-                payload = pickle.dumps(report)
-                channel.send(payload + hmac.digest(key, payload, hashlib.sha256))
-                if not ready:
-                    print("ready", flush=True)
-                    ready = True
-            except zmq.Again:
-                if not ready and time.monotonic() >= deadline:
-                    return 1
-            if report["kind"] != "alive":
-                return 0
-            report["sequence"] += 1
-            if _wait_readable(sys.stdin, _HEARTBEAT_INTERVAL):
-                # A stop request means the worker call ended in a live process;
-                # end of input without one means the worker process is gone.
-                stopped = sys.stdin.readline().strip() == "stop"
-                report["kind"] = "returned" if stopped else "exited"
-
-
-if __name__ == "__main__":
-    if sys.argv[1:] != ["--watch"]:
-        raise SystemExit("Expected --watch")
-    raise SystemExit(_watch_process())
+    Args:
+        identity: The lost worker's WorkerProcessIdentity.
+        remote_failure: WorkerProcessMonitor.remote_failure. When it describes
+            this worker, the result adds the reporting host and the reason.
+    """
+    if isinstance(remote_failure, dict) and (
+        remote_failure.get("rank"),
+        remote_failure.get("pid"),
+    ) == (identity.rank, identity.pid):
+        return describe_failure(remote_failure)
+    return f"MPI worker rank {identity.rank} (pid {identity.pid}) lost process liveness"

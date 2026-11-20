@@ -49,7 +49,8 @@ from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .prompt_tail import PromptTailPolicy
-from .remote_worker_process_monitor import WORKER_WATCH_HINT
+from .remote_worker_process_monitor import (WORKER_WATCH_HINT,
+                                            describe_lost_worker)
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
 from .request_sender import _RequestSender
@@ -342,9 +343,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             include_remote=include_remote)
         if dead_worker is not None:
             self._set_fatal_error(
-                RuntimeError("MPI worker rank "
-                             f"{dead_worker.rank} (pid {dead_worker.pid}) "
-                             "lost process liveness"))
+                RuntimeError(
+                    describe_lost_worker(
+                        dead_worker,
+                        self._worker_process_monitor.remote_failure)))
             if not self.doing_shutdown:
                 self.pre_shutdown()
             return True
@@ -1030,8 +1032,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         init wait loop needs detection kept separate from handling.
 
         A worker's own outcome, from its MPI future or a forwarded error, takes
-        precedence over transport and liveness loss, which only say that the
-        worker is gone and would hide its classified startup error.
+        precedence over liveness and transport loss, which only say that the
+        worker is gone and would hide its classified startup error. Liveness
+        loss precedes command-connection loss because it names the lost rank
+        and process.
         """
         for fut in self.mpi_futures:
             if fut.done():
@@ -1051,12 +1055,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 error = None
             if error is not None:
                 return error
-        if self._command_failure is not None:
-            return self._command_failure
         dead_worker = self._worker_process_monitor.find_dead_worker(
             include_remote=True)
         if dead_worker is None:
-            return None
+            return self._command_failure
         failure = self._worker_process_monitor.remote_failure
         if failure is not None and failure.get("missing"):
             # No process is known for a rank that never reported: it exited
@@ -1067,10 +1069,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                 reason="worker_died",
                 hint=f"{ERROR_HINTS['worker_died']} If a rank is still running, "
                 f"its reports do not reach this proxy. {WORKER_WATCH_HINT}")
-        return RuntimeInitError(
-            f"MPI worker rank {dead_worker.rank} (pid {dead_worker.pid}) "
-            "lost process liveness",
-            reason="worker_died")
+        return RuntimeInitError(describe_lost_worker(dead_worker, failure),
+                                reason="worker_died")
 
     def _start_executor_workers(self, worker_kwargs):
 
@@ -1107,7 +1107,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.WORKER_PROCESS_IDENTITIES_SIGNAL
             if self._can_monitor_worker_processes() else None)
         if not self._can_monitor_worker_processes():
-            mpi_worker_kwargs["_process_watch"] = (
+            mpi_worker_kwargs["process_watch_endpoint"] = (
                 self._worker_process_monitor.start_remote(
                     self.model_world_size, self._shutdown_event))
 

@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import hashlib
-import hmac
 import os
 import pickle  # nosec B403
 import threading
@@ -31,6 +29,7 @@ from tensorrt_llm.logger import logger
 from .._utils import nvtx_mark, nvtx_range_debug
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
                             print_colored)
+from .hmac_framing import sign_frame, verify_frame
 
 # Linger applied by ZeroMqQueue.close() to a socket still at zmq's infinite
 # default, so closing never waits forever for a peer that has exited.
@@ -514,16 +513,9 @@ class ZeroMqQueue:
             self.context.term()
             self.context = None
 
-    def _verify_hmac(self, data: bytes, actual_hmac: bytes) -> bool:
-        """Verify the HMAC of received pickle data."""
-        expected_hmac = hmac.new(self.hmac_key, data, hashlib.sha256).digest()
-        return hmac.compare_digest(expected_hmac, actual_hmac)
-
     def _sign_data(self, data_before_encoding: bytes) -> bytes:
         """Generate HMAC for data."""
-        hmac_signature = hmac.new(self.hmac_key, data_before_encoding,
-                                  hashlib.sha256).digest()
-        return data_before_encoding + hmac_signature
+        return sign_frame(self.hmac_key, data_before_encoding)
 
     def __del__(self):
         self.close()
@@ -536,17 +528,14 @@ class ZeroMqQueue:
         return data
 
     def _parse_data(self, data: bytes) -> Any:
-        """Parse data and optionally verify HMAC signature."""
+        """Parse data and optionally verify HMAC signature.
+
+        Raises:
+            HmacVerificationError: If HMAC is enabled and the signature does
+                not match; nothing is unpickled then.
+        """
         if self.use_hmac_encryption:
-            # Split data and HMAC
-            message_data = data[:-32]
-            actual_hmac = data[-32:]
-
-            # Verify HMAC
-            if not self._verify_hmac(message_data, actual_hmac):
-                raise RuntimeError("HMAC verification failed")
-
-            return pickle.loads(message_data)  # nosec B301
+            return pickle.loads(verify_frame(self.hmac_key, data))  # nosec B301
         else:
             return pickle.loads(data)  # nosec B301
 

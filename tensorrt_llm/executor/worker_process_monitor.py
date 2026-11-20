@@ -125,24 +125,15 @@ class WorkerProcessMonitor:
 
         Returns:
             The helper endpoint, or None when independent supervision is disabled.
-        """
-        if os.environ.get("TRTLLM_WORKER_WATCH") != "1":
-            configured = [
-                name
-                for name in ("TRTLLM_WORKER_WATCH_HOST", "TRTLLM_WORKER_WATCH_PORT")
-                if os.environ.get(name)
-            ]
-            if configured:
-                logger.warning(
-                    "%s is set but remote worker process supervision is disabled; "
-                    "set TRTLLM_WORKER_WATCH=1 to enable it",
-                    " and ".join(configured),
-                )
-            return None
-        from .remote_worker_process_monitor import RemoteWorkerProcessMonitor
 
-        self._remote = RemoteWorkerProcessMonitor(world_size, wake)
-        return self._remote.endpoint
+        Raises:
+            ConfigInputError: If a TRTLLM_WORKER_WATCH* setting is invalid.
+        """
+        # Imported here so this module stays loadable without TensorRT-LLM.
+        from .remote_worker_process_monitor import start_remote_monitor
+
+        self._remote = start_remote_monitor(world_size, wake)
+        return None if self._remote is None else self._remote.endpoint
 
     def wait_remote_ready(self) -> bool:
         """Do not admit requests before every remote worker is supervised."""

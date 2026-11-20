@@ -1328,9 +1328,9 @@ def test_rank_lost_before_its_first_report_fails_init_before_ready(monkeypatch):
     proxy._worker_process_monitor = WorkerProcessMonitor()
     watches = []
 
-    def submit(*_args, _process_watch, **_kwargs):
+    def submit(*_args, process_watch_endpoint, **_kwargs):
         # Rank 0 reports and keeps running; rank 1 is gone before its report.
-        watches.append(remote.WorkerProcessWatch(_process_watch, 0))
+        watches.append(remote.WorkerProcessWatch(process_watch_endpoint, 0))
         return [_Future()]
 
     proxy.mpi_session = _Mock(spec=RemoteMpiCommSessionClient)

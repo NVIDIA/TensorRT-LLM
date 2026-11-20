@@ -277,7 +277,15 @@ One limitation applies to `/v1/responses` on every server, disaggregated or not:
 
 Please refer to [Disaggregated Inference Benchmark Scripts](source:examples/disaggregated/slurm).
 
-Multi-node disaggregated MPI instances should enable [remote process supervision](../llm-api/index.md#remote-mpi-process-supervision) with `TRTLLM_WORKER_WATCH=1`. Without it, the abrupt loss of a remote rank other than rank 0 can leave the instance stuck. Supervision requires worker-to-proxy TCP connectivity, independently of the KV-transfer backend. Configure `TRTLLM_WORKER_WATCH_HOST` for each instance's proxy when local address discovery selects an unreachable interface. Use `TRTLLM_WORKER_WATCH_PORT` for a firewall-allowlisted port, with distinct ports for co-located proxies.
+Multi-node disaggregated MPI instances should enable [remote process supervision](../llm-api/index.md#remote-mpi-process-supervision) with `TRTLLM_WORKER_WATCH=1`. Without it, the abrupt loss of a remote rank other than rank 0 can leave the instance stuck. Supervision requires worker-to-proxy TCP connectivity, independently of the KV-transfer backend. Configure `TRTLLM_WORKER_WATCH_HOST` for each instance's proxy when local address discovery selects an unreachable interface. Use `TRTLLM_WORKER_WATCH_PORT` for a firewall-allowlisted port. Each instance leader runs its own proxy and listener, so co-located proxies need distinct ports.
+
+Under `trtllm-serve disaggregated_mpi_worker`, every instance leader's proxy inherits the one `mpirun` environment. To give context and generation servers different ports, set `TRTLLM_WORKER_WATCH_PORT` in `env_overrides` of the `context_servers` and `generation_servers` sections. When several instances of the same type share a node, launch each rank through a wrapper that derives the port from its rank:
+
+```bash
+mpirun ... bash -c 'TRTLLM_WORKER_WATCH_PORT=$((31000 + OMPI_COMM_WORLD_RANK)) exec trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml'
+```
+
+Choose a base port whose range the firewall allows and that no other service on the node uses. Only the value on an instance's leader rank is used. A port in `env_overrides` replaces the wrapper's value. Under Slurm `srun`, use `SLURM_PROCID` instead of `OMPI_COMM_WORLD_RANK`.
 
 ### Multiple Instances
 
