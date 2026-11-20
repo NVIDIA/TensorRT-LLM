@@ -68,7 +68,7 @@ def _args(spec: dict, seed: int):
     return args, latent_storage, index_storage, scale
 
 
-def _pools(latent_storage, index_storage):
+def _pools(latent_storage, index_storage) -> tuple[torch.Tensor, torch.Tensor]:
     return latent_storage[:, 0], index_storage[:, 1, :, : 3 * HD]
 
 
@@ -99,8 +99,12 @@ def test_mla_context_prologue_matches_reference(cell, certifying):  # noqa: F811
     )
     stale = (latent_storage.clone(), index_storage.clone())
     ref_storage = (latent_storage.clone(), index_storage.clone())
-    q_resid = mla_context_prologue(*args, *_pools(latent_storage, index_storage), TPB, scale)
-    q_ref = mla_context_prologue.reference(*args, *_pools(*ref_storage), TPB, scale)
+    q_resid = mla_context_prologue(
+        *args, *_pools(latent_storage, index_storage), tokens_per_block=TPB, scale=scale
+    )
+    q_ref = mla_context_prologue.reference(
+        *args, *_pools(*ref_storage), tokens_per_block=TPB, scale=scale
+    )
     assert q_resid.shape == (args[0].shape[0], Q_LORA) and q_resid.dtype == torch.bfloat16
     assert bool(((q_resid.float() - q_ref.float()).abs() <= 2**-7 * q_ref.float().abs()).all())
 
@@ -135,4 +139,6 @@ def test_guard_refuses_a_position_written_twice():
     args[8] = torch.tensor([0, 1, 2, 3, 4, 5, 6, 6], device=DEVICE)
     with pytest.raises(AssertionError, match="written twice"):
         with validating(mla_context_prologue):
-            mla_context_prologue(*args, *_pools(latent_storage, index_storage), TPB, scale)
+            mla_context_prologue(
+                *args, *_pools(latent_storage, index_storage), tokens_per_block=TPB, scale=scale
+            )

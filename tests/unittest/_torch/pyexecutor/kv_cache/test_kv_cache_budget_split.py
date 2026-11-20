@@ -15,20 +15,27 @@
 """Tests for KV cache budget splitting between target and draft managers."""
 
 import math
+from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
 import torch
+from test_common.host_cache_manager import make_host_cache_manager
+from test_common.interface_checks import mock_target
+from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor._util import (
     _STANDALONE_DRAFT_TOKENS_PER_BLOCK,
     CacheCost,
     KvCacheCreator,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
+from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import (
     DFlashDecodingConfig,
@@ -49,6 +56,71 @@ GB = 1 << 30
 OFFLOAD_TIER_BUDGET_ATTRS = ("host_cache_size", "disk_cache_size")
 
 
+def _record_token_cost(side_effect: Callable[..., object]):
+    return mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.get_cache_size_per_token"
+    )(
+        patch.object(
+            KVCacheManagerV2, "get_cache_size_per_token", autospec=True, side_effect=side_effect
+        )
+    )
+
+
+def _record_request_cost(side_effect: Callable[..., object]):
+    return mock_target(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2.get_cache_bytes_per_request"
+    )(
+        patch.object(
+            KVCacheManagerV2, "get_cache_bytes_per_request", autospec=True, side_effect=side_effect
+        )
+    )
+
+
+def _budget_creator(
+    kv_cache_config: KvCacheConfig,
+    *,
+    mapping: Mapping,
+    max_num_tokens: int,
+    max_seq_len: int,
+    max_batch_size: int = 1,
+    manager_cls: type = KVCacheManagerV2,
+    target_model_config: object = None,
+    draft_config: object = None,
+    speculative_config: object = None,
+    is_disagg: bool = False,
+) -> KvCacheCreator:
+    """Initialize the creator with the cache manager selected by the test."""
+    with patch.object(KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=manager_cls):
+        return KvCacheCreator(
+            model_engine=SimpleNamespace(
+                model=SimpleNamespace(model_config=target_model_config),
+                cuda_graph_batch_sizes=[],
+                cuda_graph_padding_enabled=False,
+            ),
+            mapping=mapping,
+            net_max_seq_len=max_seq_len,
+            kv_connector_manager=None,
+            max_num_tokens=max_num_tokens,
+            max_beam_width=1,
+            tokens_per_block=64,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            kv_cache_config=kv_cache_config,
+            llm_args=SimpleNamespace(
+                cache_transceiver_config=None,
+                disable_overlap_scheduler=False,
+                enable_locality_domains=False,
+                kv_cache_compression_config=None,
+                sleep_config=None,
+            ),
+            speculative_config=speculative_config,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=is_disagg,
+            draft_config=draft_config,
+        )
+
+
 def _make_creator(
     max_gpu_total_bytes: int,
     host_cache_size=None,
@@ -65,29 +137,19 @@ def _make_creator(
     manager pays per batch regardless of token count. The draft mock receives
     the component-wise ``total - target`` values directly.
     """
-    c = object.__new__(KvCacheCreator)
-
-    c._kv_cache_config = KvCacheConfig(
-        max_gpu_total_bytes=max_gpu_total_bytes,
-        host_cache_size=host_cache_size,
-        disk_cache_size=disk_cache_size,
-        disk_cache_path=disk_cache_path,
+    c = _budget_creator(
+        KvCacheConfig(
+            max_gpu_total_bytes=max_gpu_total_bytes,
+            host_cache_size=host_cache_size,
+            disk_cache_size=disk_cache_size,
+            disk_cache_path=disk_cache_path,
+        ),
+        mapping=Mock(cp_config={}),
+        max_num_tokens=0,
+        max_seq_len=1024,
+        manager_cls=KVCacheManager,
     )
-    c._tokens_per_block = 64
-    c._max_seq_len = 1024
-    c._max_num_tokens = 0
-    c._max_batch_size = 1
-    c._max_beam_width = 1
-    c._is_disagg = False
-    c._cache_transceiver_config = None
-    c._speculative_config = None
-    c._mapping = Mock()
-    c._draft_config = None
     c._model_engine = Mock(cuda_graph_batch_sizes=[], cuda_graph_padding_enabled=False)
-    c._llm_args = SimpleNamespace(
-        kv_cache_compression_config=None, sleep_config=None, enable_locality_domains=False
-    )
-    c._disable_overlap_scheduler = False
 
     c._kv_cache_manager_cls = Mock()
     c._is_kv_cache_manager_v2 = False
@@ -108,7 +170,6 @@ def _make_creator(
             intercept=total_kv_intercept - target_kv_intercept,
         )
     )
-
     return c
 
 
@@ -218,7 +279,6 @@ class TestSplitGpuBudgetForDraft:
             def get_num_attention_layers(self):
                 return 1
 
-        creator = object.__new__(KvCacheCreator)
         target_kv_config = KvCacheConfig(
             enable_block_reuse=False,
             max_attention_window=[16384],
@@ -228,56 +288,50 @@ class TestSplitGpuBudgetForDraft:
         draft_model_config = DraftModelConfig()
         draft_kv_configs = []
 
-        class DraftCostKVCacheManager(KVCacheManagerV2):
-            @staticmethod
-            def get_cache_size_per_token(model_config, *args, **kwargs):
-                if model_config is target_model_config:
-                    return 10
-                draft_kv_configs.append(kwargs["kv_cache_config"])
-                return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
+        original_get_cache_size_per_token = KVCacheManagerV2.get_cache_size_per_token
 
-        creator._kv_cache_config = target_kv_config
-        creator._tokens_per_block = 64
-        creator._max_seq_len = 16384
-        creator._max_batch_size = 1
-        creator._max_num_tokens = 128
-        creator._max_beam_width = 1
-        creator._kv_connector_manager = None
-        creator._cache_transceiver_config = None
-        creator._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
-        creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
-        creator._mapping.has_cp_helix.return_value = False
-        creator._mapping.pp_layers.return_value = [0]
-        creator._mapping.is_last_pp_rank.return_value = True
-        creator._speculative_config = SimpleNamespace(
-            spec_dec_mode=mode,
-            max_draft_len=1,
-            max_total_draft_tokens=0,
-            tokens_per_gen_step=1,
-            use_dynamic_tree=False,
-            _use_shared_kv_cache=False,
+        def get_cache_size_per_token(model_config, *args, **kwargs):
+            if model_config is target_model_config:
+                return 10
+            draft_kv_configs.append(kwargs["kv_cache_config"])
+            return original_get_cache_size_per_token(model_config, *args, **kwargs)
+
+        mapping = Mock(cp_config={}, enable_attention_dp=False, tp_size=1)
+        mapping.has_cp_helix.return_value = False
+        mapping.pp_layers.return_value = [0]
+        mapping.is_last_pp_rank.return_value = True
+        draft_model_config.mapping = mapping
+        creator = _budget_creator(
+            target_kv_config,
+            mapping=mapping,
+            max_num_tokens=128,
+            max_seq_len=16384,
+            manager_cls=KVCacheManagerV2,
+            target_model_config=target_model_config,
+            draft_config=draft_model_config,
+            speculative_config=SimpleNamespace(
+                spec_dec_mode=mode,
+                max_draft_len=1,
+                max_total_draft_tokens=0,
+                tokens_per_gen_step=1,
+                use_dynamic_tree=False,
+                _use_shared_kv_cache=False,
+            ),
         )
-        creator._model_engine = SimpleNamespace(
-            model=SimpleNamespace(model_config=target_model_config)
-        )
-        creator._draft_config = draft_model_config
-        draft_model_config.mapping = creator._mapping
-        creator._kv_cache_manager_cls = DraftCostKVCacheManager
-        creator._is_disagg = False
-        creator._disable_overlap_scheduler = False
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)
         get_manager_cls = mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
-            return_value=DraftCostKVCacheManager,
+            return_value=KVCacheManagerV2,
         )
 
         # The draft layer stores 64 bytes/token in a fixed 512-token window.
         # Generation retains one additional 64-token boundary block and the
         # 128-token context budget consumes two more blocks.
         # Leaking the target's 16K window would instead count it as 64 bytes/token.
-        cost = creator._get_kv_size_per_token()
+        with _record_token_cost(get_cache_size_per_token):
+            cost = creator._get_kv_size_per_token()
         usable_slots = 11
         configured_slots = math.ceil(usable_slots / float(np.float32(0.95)))
         assert cost == CacheCost(slope=10, intercept=configured_slots * 64 * 64)
@@ -347,50 +401,36 @@ class TestSplitGpuBudgetForDraft:
         mode.is_dspark.return_value = False
         costed_windows: list[tuple[object, list[int] | None]] = []
 
-        class RecordingKVCacheManager(KVCacheManagerV2):
-            @staticmethod
-            def get_cache_size_per_token(
-                model_config: object, *args: object, **kwargs: object
-            ) -> tuple[int, int]:
-                costed_windows.append(
-                    (model_config, kwargs["kv_cache_config"].max_attention_window)
-                )
-                return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
+        original_get_cache_size_per_token = KVCacheManagerV2.get_cache_size_per_token
+
+        def get_cache_size_per_token(
+            model_config: object, *args: object, **kwargs: object
+        ) -> tuple[int, int]:
+            costed_windows.append((model_config, kwargs["kv_cache_config"].max_attention_window))
+            return original_get_cache_size_per_token(model_config, *args, **kwargs)
 
         max_batch_size = 2
-        creator = object.__new__(KvCacheCreator)
-        creator._kv_cache_config = target_kv_config
-        creator._llm_args = SimpleNamespace(sleep_config=None)
-        creator._tokens_per_block = 64
-        creator._max_seq_len = 16384
-        creator._max_batch_size = max_batch_size
-        creator._max_num_tokens = 128
-        creator._max_beam_width = 1
-        creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
-        creator._mapping.has_cp_helix.return_value = False
-        creator._mapping.pp_layers.return_value = [0, 1, 2, 3]
-        creator._mapping.is_last_pp_rank.return_value = True
-        # Neutral speculative fields: _get_generation_kv_capacity reads them
-        # to size the generation headroom; these values keep it at the
-        # non-speculative baseline of one token so the window math below stays
-        # the point of the test.
-        creator._speculative_config = SimpleNamespace(
-            spec_dec_mode=mode,
-            max_total_draft_tokens=0,
-            max_draft_len=0,
-            tokens_per_gen_step=1,
-        )
-        creator._model_engine = SimpleNamespace(
-            model=SimpleNamespace(model_config=target_model_config)
-        )
-        creator._draft_config = draft_model_config
-        draft_model_config.mapping = creator._mapping
-        creator._kv_cache_manager_cls = RecordingKVCacheManager
-        creator._is_disagg = False
-        creator._disable_overlap_scheduler = False
-        creator._cache_transceiver_config = None
-        creator._llm_args = SimpleNamespace(
-            kv_cache_compression_config=None, sleep_config=None, enable_locality_domains=False
+        mapping = Mock(cp_config={}, enable_attention_dp=False, tp_size=1)
+        mapping.has_cp_helix.return_value = False
+        mapping.pp_layers.return_value = [0, 1, 2, 3]
+        mapping.is_last_pp_rank.return_value = True
+        draft_model_config.mapping = mapping
+        # Keep generation headroom at one token to isolate the window math.
+        creator = _budget_creator(
+            target_kv_config,
+            mapping=mapping,
+            max_num_tokens=128,
+            max_seq_len=16384,
+            max_batch_size=max_batch_size,
+            manager_cls=KVCacheManagerV2,
+            target_model_config=target_model_config,
+            draft_config=draft_model_config,
+            speculative_config=SimpleNamespace(
+                spec_dec_mode=mode,
+                max_total_draft_tokens=0,
+                max_draft_len=0,
+                tokens_per_gen_step=1,
+            ),
         )
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
@@ -400,10 +440,11 @@ class TestSplitGpuBudgetForDraft:
         mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
             autospec=True,
-            return_value=RecordingKVCacheManager,
+            return_value=KVCacheManagerV2,
         )
 
-        target_kv, draft_kv = creator._get_target_and_draft_cache_costs()
+        with _record_token_cost(get_cache_size_per_token):
+            target_kv, draft_kv = creator._get_target_and_draft_cache_costs()
 
         # K and V, 8 heads x 128 dims, bf16.
         layer_bytes_per_token = 2 * 8 * 128 * 2
@@ -468,29 +509,28 @@ class TestSplitGpuBudgetForDraft:
         target_model_config = TargetModelConfig()
         costed_windows: list[list[int] | None] = []
 
-        class RecordingKVCacheManager(KVCacheManagerV2):
-            @staticmethod
-            def get_cache_size_per_token(
-                model_config: object, *args: object, **kwargs: object
-            ) -> tuple[int, int]:
-                costed_windows.append(kwargs["kv_cache_config"].max_attention_window)
-                return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
+        original_get_cache_size_per_token = KVCacheManagerV2.get_cache_size_per_token
+
+        def get_cache_size_per_token(
+            model_config: object, *args: object, **kwargs: object
+        ) -> tuple[int, int]:
+            costed_windows.append(kwargs["kv_cache_config"].max_attention_window)
+            return original_get_cache_size_per_token(model_config, *args, **kwargs)
 
         max_batch_size = 2
-        creator = object.__new__(KvCacheCreator)
-        creator._kv_cache_config = KvCacheConfig()
-        creator._tokens_per_block = 64
-        creator._max_seq_len = 16384
-        creator._max_batch_size = max_batch_size
-        creator._max_num_tokens = 128
-        creator._speculative_config = None
-        creator._is_disagg = False
-        creator._disable_overlap_scheduler = False
-        # The second of two pipeline ranks: it holds global layers 2 and 3.
-        creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
-        creator._mapping.pp_layers.return_value = [2, 3]
+        # The second of two pipeline ranks holds global layers 2 and 3.
+        mapping = Mock(cp_config={}, enable_attention_dp=False, tp_size=1)
+        mapping.pp_layers.return_value = [2, 3]
+        creator = _budget_creator(
+            KvCacheConfig(),
+            mapping=mapping,
+            max_num_tokens=128,
+            max_seq_len=16384,
+            max_batch_size=max_batch_size,
+        )
 
-        target_kv = creator._per_manager_cache_cost(RecordingKVCacheManager, target_model_config)
+        with _record_token_cost(get_cache_size_per_token):
+            target_kv = creator._per_manager_cache_cost(KVCacheManagerV2, target_model_config)
 
         # K and V, 8 heads x 128 dims, bf16.
         layer_bytes_per_token = 2 * 8 * 128 * 2
@@ -694,62 +734,53 @@ def test_helix_attention_dp_draft_cost_uses_the_drafter_shard(mocker):
     drafter_mapping = helix.repurpose_helix_cp_to_tp()
     drafter_mapping.enable_attention_dp = False
 
-    class DraftModelConfig:
-        quant_config = None
-        sparse_attention_config = None
-        mapping = drafter_mapping
-        pretrained_config = SimpleNamespace(
+    draft_model_config = ModelConfig(
+        mapping=drafter_mapping,
+        pretrained_config=PretrainedConfig(
             num_hidden_layers=5,
             hidden_size=7168,
             num_attention_heads=64,
             num_key_value_heads=16,
             head_dim=64,
             torch_dtype=None,
-        )
-
-        def get_num_attention_layers(self):
-            return 5
+        ),
+    )
 
     target_model_config = SimpleNamespace(
         is_encoder_decoder=False, pretrained_config=SimpleNamespace()
     )
-    draft_model_config = DraftModelConfig()
     seen = []
 
-    class ProbeKVCacheManager(KVCacheManagerV2):
-        @staticmethod
-        def get_cache_size_per_token(model_config, *args, **kwargs):
-            if model_config is target_model_config:
-                return 0
-            seen.append((args, kwargs))
-            return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
+    original_get_cache_size_per_token = KVCacheManagerV2.get_cache_size_per_token
 
-    c = object.__new__(KvCacheCreator)
-    c._kv_cache_config = KvCacheConfig()
-    c._tokens_per_block = 64
-    c._max_seq_len = 16384
-    c._max_batch_size = 1
-    c._max_num_tokens = 8192
-    c._max_beam_width = 1
-    c._cache_transceiver_config = None
-    c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
-    c._mapping = helix
-    c._speculative_config = DSparkDecodingConfig(max_draft_len=7)
-    c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
+    def get_cache_size_per_token(model_config, *args, **kwargs):
+        if model_config is target_model_config:
+            return 0
+        seen.append((args, kwargs))
+        return original_get_cache_size_per_token(model_config, *args, **kwargs)
+
+    c = _budget_creator(
+        KvCacheConfig(),
+        mapping=helix,
+        max_num_tokens=8192,
+        max_seq_len=16384,
+        manager_cls=KVCacheManagerV2,
+        target_model_config=target_model_config,
+        draft_config=draft_model_config,
+        speculative_config=DSparkDecodingConfig(max_draft_len=7),
+        is_disagg=True,
+    )
     c._draft_model_engine = None
-    c._draft_config = draft_model_config
-    c._kv_cache_manager_cls = ProbeKVCacheManager
-    c._is_disagg = True
-    c._disable_overlap_scheduler = False
     c._is_encoder_decoder = Mock(return_value=False)
     c._should_create_separate_draft_kv_cache = Mock(return_value=True)
     c._get_num_draft_layers = Mock(return_value=5)
     mocker.patch(
         "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
-        return_value=ProbeKVCacheManager,
+        return_value=KVCacheManagerV2,
     )
 
-    cost = c._get_kv_size_per_token()
+    with _record_token_cost(get_cache_size_per_token):
+        cost = c._get_kv_size_per_token()
 
     assert len(seen) == 1
     args, kwargs = seen[0]
@@ -1126,10 +1157,13 @@ class TestBuildManagersBudgetGates:
     ):
         """A probe neither claims remote memory nor donates. The final draft manager gets the config for its host
         tier sizing only (TestRemoteLevelOwnership)."""
-        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 
-        monkeypatch.setattr(remote_donor, "start_donation", Mock())
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(
+            remote_donor,
+            "start_donation",
+            (Mock()),
+        )
+        monkeypatch.setattr(torch.cuda, "current_device", (lambda: 0))
         c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
         c._kv_cache_config = KvCacheConfig(
             max_gpu_total_bytes=10 * GB,
@@ -1148,16 +1182,15 @@ class TestBuildManagersBudgetGates:
 
     def _gen_style_donation(self, tmp_path, monkeypatch):
         """A donation-only (GEN-style) creator whose donation start and manager constructions are recorded in order."""
-        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 
         events = []
         donor = Mock()
         monkeypatch.setattr(
             remote_donor,
             "start_donation",
-            lambda config, device: events.append("donation") or donor,
+            (lambda config, device: events.append("donation") or donor),
         )
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "current_device", (lambda: 0))
         c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
         c._kv_cache_config = KvCacheConfig(
             max_gpu_total_bytes=10 * GB,
@@ -1210,12 +1243,11 @@ class TestBuildManagersBudgetGates:
     @staticmethod
     def _published_donor(directory: str):
         """A real donation published in `directory` by a transport that allocates nothing."""
-        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 
         class PublishingTransport(remote_donor.DonorTransport):
             kind = "test"
 
-            def start(self, donor):
+            def start(self, donor: remote_donor.RemoteMemDonor) -> None:
                 donor._publish([], ["segment 0 1"], "test")
 
         donor = remote_donor.RemoteMemDonor(
@@ -1227,10 +1259,9 @@ class TestBuildManagersBudgetGates:
     @staticmethod
     def _target_owning(donor):
         """A final target manager that owns `donor`, with the real shutdown()."""
-        target = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        target = make_host_cache_manager()
         target._remote_donor = donor
         target._shutdown_caches = Mock()
-        target.event_manager = None
         return target
 
     @pytest.mark.parametrize("estimation", [True, False], ids=["estimation", "no_estimation"])
@@ -1239,13 +1270,16 @@ class TestBuildManagersBudgetGates:
     ):
         """Peers waiting for expected_num_donors stop at the failure marker; an unmarked withdrawal makes them wait the
         full donor_wait_timeout_s. Without the estimation the target starts the donation itself."""
-        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 
         directory = str(tmp_path / "rendezvous")
         remote_donor.ensure_rendezvous_directory(directory)
         early = self._published_donor(directory) if estimation else None
-        monkeypatch.setattr(remote_donor, "start_donation", lambda config, device: early)
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(
+            remote_donor,
+            "start_donation",
+            (lambda config, device: early),
+        )
+        monkeypatch.setattr(torch.cuda, "current_device", (lambda: 0))
         c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
         c._skip_est = not estimation
         c.configure_kv_cache_capacity = Mock()
@@ -1338,7 +1372,7 @@ class TestBuildManagersBudgetGates:
         before the estimation takes 44 GiB of the node's host memory; started after it, it is 44 GiB short."""
         import contextlib
 
-        from tensorrt_llm._torch.pyexecutor.kv_cache import host_memory, remote_donor
+        from tensorrt_llm._torch.pyexecutor.kv_cache import host_memory
 
         node_gib = 176.0 + 176.0 + 24.0
         room = {0: node_gib - 176.0}  # the co-located rank's donation is placed already
@@ -1367,9 +1401,9 @@ class TestBuildManagersBudgetGates:
         monkeypatch.setattr(
             remote_donor,
             "start_donation",
-            lambda config, device: placed.append(place(176)) or Mock(),
+            (lambda config, device: placed.append(place(176)) or Mock()),
         )
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "current_device", (lambda: 0))
         c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
         c._kv_cache_config = KvCacheConfig(
             max_gpu_total_bytes=10 * GB,
@@ -1455,16 +1489,25 @@ class TestRemoteLevelOwnership:
 
     @staticmethod
     def _add_remote_level(is_draft, tmp_path, monkeypatch, transport="nixl"):
-        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_donor
+        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 
         transport_cls = Mock(options_from=remote_donor.DONOR_TRANSPORTS[transport].options_from)
         monkeypatch.setitem(remote_donor.DONOR_TRANSPORTS, transport, transport_cls)
         donor_cls = Mock()
         donor_cls.transport_cls = transport_cls
-        monkeypatch.setattr(remote_donor, "RemoteMemDonor", donor_cls)
-        monkeypatch.setattr(kv_cache_manager_v2, "RemoteCacheTierConfig", Mock())
+        monkeypatch.setattr(
+            remote_donor,
+            "RemoteMemDonor",
+            (donor_cls),
+        )
+        monkeypatch.setattr(
+            kv_cache_manager_v2,
+            "RemoteCacheTierConfig",
+            (Mock()),
+        )
         monkeypatch.setattr(kv_cache_manager_v2.torch.cuda, "current_device", lambda: 0)
-        manager = SimpleNamespace(is_draft=is_draft, _remote_donor=None)
+        manager = make_host_cache_manager()
+        manager.is_draft = is_draft
         config = RemoteCacheConfig(
             directory=str(tmp_path),
             level={"size": 4 * GB},
@@ -1472,7 +1515,7 @@ class TestRemoteLevelOwnership:
             transport={"kind": transport},
         )
         tiers = []
-        KVCacheManagerV2._add_remote_level(manager, config, tiers)
+        manager._add_remote_level(config, tiers)
         return manager, tiers, donor_cls
 
     def test_target_claims_and_donates(self, tmp_path, monkeypatch):
@@ -1495,18 +1538,27 @@ class TestRemoteLevelOwnership:
         assert donor_cls.call_args.args[2] is donor_cls.transport_cls.return_value
 
     def test_target_takes_over_a_donation_started_before_it(self, tmp_path, monkeypatch):
-        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_donor
+        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 
         start_donation = Mock()
-        monkeypatch.setattr(remote_donor, "start_donation", start_donation)
-        monkeypatch.setattr(kv_cache_manager_v2, "RemoteCacheTierConfig", Mock())
+        monkeypatch.setattr(
+            remote_donor,
+            "start_donation",
+            (start_donation),
+        )
+        monkeypatch.setattr(
+            kv_cache_manager_v2,
+            "RemoteCacheTierConfig",
+            (Mock()),
+        )
         early = Mock()
-        manager = SimpleNamespace(is_draft=False, _remote_donor=early)
+        manager = make_host_cache_manager()
+        manager._remote_donor = early
         config = RemoteCacheConfig(
             directory=str(tmp_path), level={"size": 4 * GB}, donor={"size": 4 * GB}
         )
         tiers = []
-        KVCacheManagerV2._add_remote_level(manager, config, tiers)
+        manager._add_remote_level(config, tiers)
         start_donation.assert_not_called()
         assert manager._remote_donor is early
         assert len(tiers) == 1
@@ -1539,7 +1591,7 @@ class TestExternalDrafterKvDtype:
     FP8_SLOPE = DRAFT_LAYERS * HEAD_DIM  # 2880 -- what the split wrongly charged
     BF16_SLOPE = FP8_SLOPE * 2  # 5760 -- what the pool actually costs
 
-    def _creator(self, mocker, draft_quant_config):
+    def _creator(self, mocker, fixture_request: pytest.FixtureRequest, draft_quant_config):
         class DraftModelConfig:
             quant_config = draft_quant_config
             sparse_attention_config = None
@@ -1566,60 +1618,52 @@ class TestExternalDrafterKvDtype:
         draft_model_config = DraftModelConfig()
         seen_draft_model_configs = []
 
-        class ProbeKVCacheManager(KVCacheManagerV2):
-            @staticmethod
-            def get_cache_size_per_token(model_config, *args, **kwargs):
-                if model_config is target_model_config:
-                    return 0
-                seen_draft_model_configs.append(model_config)
-                return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
+        original_get_cache_size_per_token = KVCacheManagerV2.get_cache_size_per_token
 
-        c = object.__new__(KvCacheCreator)
-        c._kv_cache_config = KvCacheConfig(dtype="fp8")
-        c._tokens_per_block = 64
-        c._max_seq_len = 16384
-        c._max_batch_size = 1
-        c._max_beam_width = 1
-        # Read by _build_managers on the draft path (_util.py); the cost
-        # assertions below are per-token, so the value only has to exist.
-        c._max_num_tokens = 8192
-        c._max_beam_width = 1
-        c._cache_transceiver_config = None
-        c._llm_args = SimpleNamespace(
-            kv_cache_compression_config=None, sleep_config=None, enable_locality_domains=False
+        def get_cache_size_per_token(model_config, *args, **kwargs):
+            if model_config is target_model_config:
+                return 0
+            seen_draft_model_configs.append(model_config)
+            return original_get_cache_size_per_token(model_config, *args, **kwargs)
+
+        mapping = Mock(cp_config={}, enable_attention_dp=True, tp_size=1)
+        mapping.has_cp_helix.return_value = False
+        mapping.pp_layers.return_value = list(range(self.DRAFT_LAYERS))
+        mapping.is_last_pp_rank.return_value = True
+        draft_model_config.mapping = mapping
+        c = _budget_creator(
+            KvCacheConfig(dtype="fp8"),
+            mapping=mapping,
+            max_num_tokens=8192,
+            max_seq_len=16384,
+            manager_cls=KVCacheManagerV2,
+            target_model_config=target_model_config,
+            draft_config=draft_model_config,
+            speculative_config=DSparkDecodingConfig(max_draft_len=4),
+            is_disagg=True,
         )
-        c._mapping = Mock(enable_attention_dp=True, tp_size=1)
-        c._mapping.has_cp_helix.return_value = False
-        c._mapping.pp_layers.return_value = list(range(self.DRAFT_LAYERS))
-        c._mapping.is_last_pp_rank.return_value = True
-        # The real config, not Mock() or SimpleNamespace: a bare Mock answers True
-        # to every predicate, and a SimpleNamespace needs a new attribute stubbed
-        # each time the cost path reads one more spec-config field.
-        c._speculative_config = DSparkDecodingConfig(max_draft_len=4)
-        c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
-        c._draft_config = draft_model_config
-        draft_model_config.mapping = c._mapping
-        c._kv_cache_manager_cls = ProbeKVCacheManager
-        c._is_disagg = True
-        c._disable_overlap_scheduler = False
-        c._cache_transceiver_config = None
         c._is_encoder_decoder = Mock(return_value=False)
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
         c._get_num_draft_layers = Mock(return_value=self.DRAFT_LAYERS)
         mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
-            return_value=ProbeKVCacheManager,
+            return_value=KVCacheManagerV2,
         )
+        recorder = _record_token_cost(get_cache_size_per_token)
+        recorder.start()
+        fixture_request.addfinalizer(recorder.stop)
         return c, draft_model_config, seen_draft_model_configs
 
-    def test_inherited_fp8_kv_algo_is_dropped_from_the_draft_cost(self, mocker):
+    def test_inherited_fp8_kv_algo_is_dropped_from_the_draft_cost(
+        self, mocker, request: pytest.FixtureRequest
+    ):
         from tensorrt_llm.models.modeling_utils import QuantConfig
         from tensorrt_llm.quantization.mode import QuantAlgo
 
         # What the args-level kv_cache_config.dtype sync puts on the drafter.
         inherited = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
         assert inherited.quant_mode.has_fp8_kv_cache()
-        c, draft_model_config, seen = self._creator(mocker, inherited)
+        c, draft_model_config, seen = self._creator(mocker, request, inherited)
 
         cost = c._get_kv_size_per_token()
 
@@ -1638,7 +1682,9 @@ class TestExternalDrafterKvDtype:
         assert draft_model_config.quant_config is inherited
         assert inherited.quant_mode.has_fp8_kv_cache()
 
-    def test_inherited_nvfp4_kv_algo_is_dropped_from_the_draft_cost(self, mocker):
+    def test_inherited_nvfp4_kv_algo_is_dropped_from_the_draft_cost(
+        self, mocker, request: pytest.FixtureRequest
+    ):
         """An NVFP4 target's KV algo must not reach a standalone drafter's pool.
 
         The drafter reads a BF16 pool; an NVFP4 pool sends it to the context
@@ -1649,7 +1695,7 @@ class TestExternalDrafterKvDtype:
 
         inherited = QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
         assert inherited.quant_mode.has_fp4_kv_cache()
-        c, draft_model_config, seen = self._creator(mocker, inherited)
+        c, draft_model_config, seen = self._creator(mocker, request, inherited)
 
         cost = c._get_kv_size_per_token()
 
@@ -1661,12 +1707,12 @@ class TestExternalDrafterKvDtype:
         assert draft_model_config.quant_config is inherited
         assert inherited.quant_mode.has_fp4_kv_cache()
 
-    def test_cost_and_allocation_paths_agree(self, mocker):
+    def test_cost_and_allocation_paths_agree(self, mocker, request: pytest.FixtureRequest):
         """Both call sites must resolve the draft config through one helper."""
         from tensorrt_llm.models.modeling_utils import QuantConfig
         from tensorrt_llm.quantization.mode import QuantAlgo
 
-        c, _, seen = self._creator(mocker, QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8))
+        c, _, seen = self._creator(mocker, request, QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8))
         c._get_kv_size_per_token()
 
         allocation_config = c._get_draft_kv_model_config()
@@ -1675,13 +1721,13 @@ class TestExternalDrafterKvDtype:
             == allocation_config.quant_config.quant_mode.has_fp8_kv_cache()
         )
 
-    def test_non_external_drafter_is_untouched(self, mocker):
+    def test_non_external_drafter_is_untouched(self, mocker, request: pytest.FixtureRequest):
         """MTP/Eagle3 share the target's layout, so nothing is neutralized."""
         from tensorrt_llm.models.modeling_utils import QuantConfig
         from tensorrt_llm.quantization.mode import QuantAlgo
 
         inherited = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
-        c, draft_model_config, _ = self._creator(mocker, inherited)
+        c, draft_model_config, _ = self._creator(mocker, request, inherited)
         # A real non-external config, not a patched predicate:
         # MTP_EAGLE_ONE_MODEL shares the target's KV layout, exactly the case
         # this asserts is untouched. Swapped whole rather than by assigning
@@ -1706,10 +1752,12 @@ class TestStandaloneDrafterPageSize:
 
     KEPT_AND_REPLACED = [(64, 64), (128, _STANDALONE_DRAFT_TOKENS_PER_BLOCK)]
 
-    def _creator(self, mocker, target_tokens_per_block):
+    def _creator(self, mocker, fixture_request: pytest.FixtureRequest, target_tokens_per_block):
         from tensorrt_llm.models.modeling_utils import QuantConfig
 
-        c, draft_model_config, _ = TestExternalDrafterKvDtype()._creator(mocker, QuantConfig())
+        c, draft_model_config, _ = TestExternalDrafterKvDtype()._creator(
+            mocker, fixture_request, QuantConfig()
+        )
         c._tokens_per_block = target_tokens_per_block
         # Read by the draft manager-class resolution on both the cost and the
         # allocation path; the resolution itself is not under test here.
@@ -1733,9 +1781,14 @@ class TestStandaloneDrafterPageSize:
         ],
     )
     def test_standalone_drafter_keeps_a_target_page_size_its_kernels_accept(
-        self, mocker, spec_config, target_tokens_per_block, draft_tokens_per_block
+        self,
+        mocker,
+        request: pytest.FixtureRequest,
+        spec_config,
+        target_tokens_per_block,
+        draft_tokens_per_block,
     ):
-        c, _ = self._creator(mocker, target_tokens_per_block)
+        c, _ = self._creator(mocker, request, target_tokens_per_block)
         c._speculative_config = spec_config
         assert c._get_draft_tokens_per_block() == draft_tokens_per_block
 
@@ -1749,18 +1802,22 @@ class TestStandaloneDrafterPageSize:
     )
     @pytest.mark.parametrize("target_tokens_per_block", [64, 128])
     def test_draft_layers_of_the_target_keep_the_target_page_size(
-        self, mocker, spec_config, target_tokens_per_block
+        self, mocker, request: pytest.FixtureRequest, spec_config, target_tokens_per_block
     ):
         """MTP/Eagle3 draft layers run on the target's attention metadata."""
-        c, _ = self._creator(mocker, target_tokens_per_block)
+        c, _ = self._creator(mocker, request, target_tokens_per_block)
         c._speculative_config = spec_config
         assert c._get_draft_tokens_per_block() == target_tokens_per_block
 
     @pytest.mark.parametrize("target_tokens_per_block, draft_tokens_per_block", KEPT_AND_REPLACED)
     def test_cost_charges_the_draft_page_size(
-        self, mocker, target_tokens_per_block, draft_tokens_per_block
+        self,
+        mocker,
+        request: pytest.FixtureRequest,
+        target_tokens_per_block,
+        draft_tokens_per_block,
     ):
-        c, _ = self._creator(mocker, target_tokens_per_block)
+        c, _ = self._creator(mocker, request, target_tokens_per_block)
         size_spy = mocker.spy(KVCacheManagerV2, "get_cache_size_per_token")
         bytes_spy = mocker.spy(KVCacheManagerV2, "get_cache_bytes_per_request")
         quota_spy = mocker.spy(KVCacheManagerV2, "get_cache_quota_per_request")
@@ -1777,9 +1834,13 @@ class TestStandaloneDrafterPageSize:
 
     @pytest.mark.parametrize("target_tokens_per_block, draft_tokens_per_block", KEPT_AND_REPLACED)
     def test_allocation_uses_the_page_size_the_cost_charged(
-        self, mocker, target_tokens_per_block, draft_tokens_per_block
+        self,
+        mocker,
+        request: pytest.FixtureRequest,
+        target_tokens_per_block,
+        draft_tokens_per_block,
     ):
-        c, draft_model_config = self._creator(mocker, target_tokens_per_block)
+        c, draft_model_config = self._creator(mocker, request, target_tokens_per_block)
         draft_model_config.sparse_attention_config = None
         c._model_engine.max_cuda_graph_batch_size = 1
         c._skip_est = False
@@ -2341,22 +2402,22 @@ class TestPerRequestWeightedSplit:
         """
         recorded = {}
 
-        class RecordingV2(KVCacheManagerV2):
-            @classmethod
-            def get_cache_size_per_token(cls, model_config, mapping, *args, **kwargs):
-                key = "draft_token" if kwargs.get("is_draft") else "target_token"
-                recorded[key] = KVCacheManagerV2.get_cache_size_per_token(
-                    model_config, mapping, *args, **kwargs
-                )
-                return recorded[key]
+        original_get_cache_size_per_token = KVCacheManagerV2.get_cache_size_per_token
+        original_get_cache_bytes_per_request = KVCacheManagerV2.get_cache_bytes_per_request
 
-            @classmethod
-            def get_cache_bytes_per_request(cls, model_config, mapping, *args, **kwargs):
-                key = "draft_req" if kwargs.get("is_draft") else "target_req"
-                recorded[key] = KVCacheManagerV2.get_cache_bytes_per_request(
-                    model_config, mapping, *args, **kwargs
-                )
-                return recorded[key]
+        def get_cache_size_per_token(model_config, mapping, *args, **kwargs):
+            key = "draft_token" if kwargs.get("is_draft") else "target_token"
+            recorded[key] = original_get_cache_size_per_token(
+                model_config, mapping, *args, **kwargs
+            )
+            return recorded[key]
+
+        def get_cache_bytes_per_request(model_config, mapping, *args, **kwargs):
+            key = "draft_req" if kwargs.get("is_draft") else "target_req"
+            recorded[key] = original_get_cache_bytes_per_request(
+                model_config, mapping, *args, **kwargs
+            )
+            return recorded[key]
 
         max_seq_len = 65536
         total_budget = 40 * GB
@@ -2367,7 +2428,7 @@ class TestPerRequestWeightedSplit:
         # windows exist only in the model's layer_types schedule. Both the
         # affine costing (via _derive_v2_layer_type_attention_windows) and the
         # per-request estimate derive them from there.
-        c._kv_cache_manager_cls = RecordingV2
+        c._kv_cache_manager_cls = KVCacheManagerV2
         c._max_seq_len = max_seq_len
         c._max_batch_size = 256
         c._max_num_tokens = 8192
@@ -2415,10 +2476,14 @@ class TestPerRequestWeightedSplit:
         mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
             autospec=True,
-            return_value=RecordingV2,
+            return_value=KVCacheManagerV2,
         )
 
-        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+        with (
+            _record_token_cost(get_cache_size_per_token),
+            _record_request_cost(get_cache_bytes_per_request),
+        ):
+            target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
         assert draft_config is not None
         assert target_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes == total_budget
@@ -2463,22 +2528,22 @@ class TestPerRequestWeightedSplit:
         """
         recorded = {}
 
-        class RecordingV2(KVCacheManagerV2):
-            @classmethod
-            def get_cache_size_per_token(cls, model_config, mapping, *args, **kwargs):
-                key = "draft_token" if kwargs.get("is_draft") else "target_token"
-                recorded[key] = KVCacheManagerV2.get_cache_size_per_token(
-                    model_config, mapping, *args, **kwargs
-                )
-                return recorded[key]
+        original_get_cache_size_per_token = KVCacheManagerV2.get_cache_size_per_token
+        original_get_cache_bytes_per_request = KVCacheManagerV2.get_cache_bytes_per_request
 
-            @classmethod
-            def get_cache_bytes_per_request(cls, model_config, mapping, *args, **kwargs):
-                key = "draft_req" if kwargs.get("is_draft") else "target_req"
-                recorded[key] = KVCacheManagerV2.get_cache_bytes_per_request(
-                    model_config, mapping, *args, **kwargs
-                )
-                return recorded[key]
+        def get_cache_size_per_token(model_config, mapping, *args, **kwargs):
+            key = "draft_token" if kwargs.get("is_draft") else "target_token"
+            recorded[key] = original_get_cache_size_per_token(
+                model_config, mapping, *args, **kwargs
+            )
+            return recorded[key]
+
+        def get_cache_bytes_per_request(model_config, mapping, *args, **kwargs):
+            key = "draft_req" if kwargs.get("is_draft") else "target_req"
+            recorded[key] = original_get_cache_bytes_per_request(
+                model_config, mapping, *args, **kwargs
+            )
+            return recorded[key]
 
         max_seq_len = 65536
         mirror_bytes = 67_174_400  # 1025 blocks * 64 tokens * 1024 B/token
@@ -2487,7 +2552,7 @@ class TestPerRequestWeightedSplit:
         del c._get_draft_cache_cost
         c._kv_cache_config.enable_block_reuse = False
         c._kv_cache_config.max_attention_window = [8192] * 23 + [max_seq_len]
-        c._kv_cache_manager_cls = RecordingV2
+        c._kv_cache_manager_cls = KVCacheManagerV2
         c._max_seq_len = max_seq_len
         c._max_batch_size = 64
         c._max_num_tokens = 8192
@@ -2532,12 +2597,12 @@ class TestPerRequestWeightedSplit:
         mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
             autospec=True,
-            return_value=RecordingV2,
+            return_value=KVCacheManagerV2,
         )
         # Size the budget so exactly slope_budget remains after the reserved
         # intercepts (the draft is a plain full-attention layer: intercept 0).
         _, target_intercept = KVCacheManagerV2.get_cache_size_per_token(
-            target_model_config,
+            (target_model_config),
             _v2_mapping(),
             tokens_per_block=64,
             max_seq_len=max_seq_len,
@@ -2549,7 +2614,11 @@ class TestPerRequestWeightedSplit:
         total_budget = target_intercept + slope_budget
         c._kv_cache_config.max_gpu_total_bytes = total_budget
 
-        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+        with (
+            _record_token_cost(get_cache_size_per_token),
+            _record_request_cost(get_cache_bytes_per_request),
+        ):
+            target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
         assert target_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes == total_budget
         _, draft_intercept = recorded["draft_token"]

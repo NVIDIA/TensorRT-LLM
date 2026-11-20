@@ -1645,11 +1645,11 @@ repos:
         files: >-
           ^(\.claude/skills/[^/]+/SKILL\.md|\.claude/agents/.*\.md|scripts/check_skill_naming_convention\.py)$
     -   id:  type-check
-        name: Record advisory Pyrefly type-check report
+        name: Record advisory Pyrefly and mock-interface report
         entry: scripts/run_pyrefly.sh
         language: script
         verbose: true
         require_serial: true
-        # Pass changed paths; the wrapper accepts product and test Python inputs.
+        # Type-check supplied files and verify all registered mock interfaces.
         pass_filenames: true
         files: (\.pyi?$|^pyproject\.toml$|^scripts/run_pyrefly\.sh$|^\.pre-commit-config\.yaml$)

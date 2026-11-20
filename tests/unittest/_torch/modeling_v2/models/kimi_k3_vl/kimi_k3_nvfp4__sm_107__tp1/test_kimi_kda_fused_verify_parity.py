@@ -196,7 +196,7 @@ def _reference_verify(rt, x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot
     the layer's own projections in front and its gated output RMSNorm behind. Each step's conv
     window and state go to ``layer_cache``'s intermediate buffers. Returns the normalized core
     ``[tokens, H, D]``."""
-    from fla.ops.kda import fused_recurrent_kda
+    from test_common.fla_utils import fused_recurrent_kda_reference as fused_recurrent_kda
 
     d, hd, heads = rt.proj_size, rt.head_dim, rt.num_heads
     batch = x2d.shape[0] // num_steps
@@ -440,10 +440,10 @@ def test_fused_vs_sequential_two_rounds(request, num_heads, large_state_stride, 
     cache_seq = _make_seq_layer_cache(B, num_heads=num_heads)
     cache_fused = _make_fused_layer_cache(B, conv_pool_fused, num_heads=num_heads)
     fused_slots = slot_indices
+    request_ids = list(range(101, 101 + B))
     replay_manager = _make_kvcm_replay_manager(num_heads) if kvcm_replay else None
     if replay_manager is not None:
         request.addfinalizer(replay_manager.shutdown)
-        request_ids = list(range(101, 101 + B))
         replay_manager.add_dummy_requests(request_ids, token_nums=[32] * B, is_gen=False)
         fused_slots = torch.tensor(
             replay_manager.get_state_indices(request_ids), dtype=torch.int32, device="cuda"

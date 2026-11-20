@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
+from test_common.host_executor import make_host_executor
 
 if TYPE_CHECKING:
     from tensorrt_llm.executor.worker import GenerationExecutorWorker
@@ -79,10 +80,9 @@ class TestV2KvCacheSleepRejection:
         ],
     )
     def test_validation_conditions(self, use_v2, tags, should_raise):
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
         executor._is_kv_manager_v2 = use_v2
         parsed_tags = [ExecutorMemoryType(tag) for tag in tags]
 
@@ -123,10 +123,9 @@ class TestV1PrefixCacheInvalidation:
         ],
     )
     def test_invalidation_conditions(self, use_v2, enable_reuse, tags, restore_mode, should_reset):
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
         executor._is_kv_manager_v2 = use_v2
         executor.enable_kv_cache_reuse = enable_reuse
         executor.llm_args = SimpleNamespace(
@@ -622,7 +621,7 @@ class TestMnnvlSleepWakeupCoordination:
         from unittest.mock import Mock
 
         from tensorrt_llm._torch.moe.fused_moe.communication.base import CheckpointableCommunication
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         class FutureCheckpointCommunication:
@@ -643,7 +642,7 @@ class TestMnnvlSleepWakeupCoordination:
             resources.append(resource)
             modules.append(SimpleNamespace(comm=resource))
 
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
         executor.model_engine = SimpleNamespace(model=SimpleNamespace(modules=lambda: modules))
         executor.draft_model_engine = None
 
@@ -682,10 +681,14 @@ class TestMnnvlSleepWakeupCoordination:
             ("local_mnnvl", action)
         )
 
+        def _record_release(*tags: str) -> int:
+            events.append(("local_vmm", "sleep"))
+            return 0
+
         with (
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=lambda *tags: events.append(("local_vmm", "sleep")),
+                side_effect=_record_release,
             ),
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
             patch("torch.cuda.synchronize"),
@@ -1292,9 +1295,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
                 sent_acks.append(payload)
 
         # Minimal PyExecutor shell — only the fields the listener loop touches.
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1338,7 +1340,7 @@ class TestListenerAbortAndShutdown:
         import threading
         from unittest.mock import patch
 
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
 
         sent_acks = []
         op_id = "prepare-only-op"
@@ -1361,7 +1363,7 @@ class TestListenerAbortAndShutdown:
             def send(self, payload, dest, tag):
                 sent_acks.append(payload)
 
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1401,7 +1403,7 @@ class TestListenerAbortAndShutdown:
         import threading
         from unittest.mock import patch
 
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
 
         sent_acks = []
         op_id = "abort-active-op"
@@ -1424,7 +1426,7 @@ class TestListenerAbortAndShutdown:
             def send(self, payload, dest, tag):
                 sent_acks.append(payload)
 
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1461,7 +1463,7 @@ class TestListenerAbortAndShutdown:
             CONTROL_REQUEST_ID,
             RequestQueueItem,
         )
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
 
         sent_acks = []
         op_id = "abort-before-barrier-op"
@@ -1484,7 +1486,7 @@ class TestListenerAbortAndShutdown:
             def send(self, payload, dest, tag):
                 sent_acks.append(payload)
 
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1, pp_size=1)
@@ -1523,7 +1525,7 @@ class TestListenerAbortAndShutdown:
         """Shutdown messages are acknowledged so rank-0 can drain them."""
         from unittest.mock import patch
 
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
 
         sent_acks = []
 
@@ -1534,7 +1536,7 @@ class TestListenerAbortAndShutdown:
             def send(self, payload, dest, tag):
                 sent_acks.append(payload)
 
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1558,11 +1560,7 @@ class TestListenerAbortAndShutdown:
     def test_rank0_shutdown_ack_drain_is_bounded(self, monkeypatch):
         """Rank 0 shutdown must not block forever if listener ACKs never arrive."""
         from tensorrt_llm._torch.pyexecutor import py_executor
-        from tensorrt_llm._torch.pyexecutor.py_executor import (
-            PyExecutor,
-            _SleepWakeupAction,
-            _SleepWakeupTag,
-        )
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction, _SleepWakeupTag
 
         sent_messages = []
 
@@ -1576,7 +1574,7 @@ class TestListenerAbortAndShutdown:
             def recv(self, source, tag):
                 raise AssertionError("shutdown ACK drain must probe before recv")
 
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
         executor._sleep_wakeup_comm = FakeComm()
         executor._sleep_wakeup_listener_thread = None
         executor.dist = SimpleNamespace(rank=0, world_size=3)

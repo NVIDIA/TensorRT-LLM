@@ -32,7 +32,18 @@ from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
 @pytest.fixture(params=(False, True), ids=("stock", "tiled"))
 def qkv_launch(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     # Exercise both kernels on every GPU, independently of production eligibility.
-    monkeypatch.setattr(_kernel_module, "_use_tiled_qkv_rope", lambda *args: request.param)
+
+    def _mock_use_tiled_qkv_rope(
+        qkv: torch.Tensor,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        rotary_dim: int,
+        enable_tiling: bool,
+    ) -> bool:
+        return request.param
+
+    monkeypatch.setattr(_kernel_module, "_use_tiled_qkv_rope", _mock_use_tiled_qkv_rope)
 
 
 def _make_cos_sin(max_positions: int, rotary_dim: int, theta: float = 1_000_000.0):
@@ -731,7 +742,8 @@ def _separate_gate_launch(output, attention, gate, scale):
             attention.stride(0),
             g_tok,
             g_head,
-            **common,
+            # num_warps is a Triton launch option, not a kernel parameter.
+            **common,  # pyrefly: ignore [unexpected-keyword]
             **pdl,
         )
     else:
@@ -744,7 +756,8 @@ def _separate_gate_launch(output, attention, gate, scale):
             attention.stride(0),
             g_tok,
             g_head,
-            **common,
+            # num_warps is a Triton launch option, not a kernel parameter.
+            **common,  # pyrefly: ignore [unexpected-keyword]
             **pdl,
         )
     return grid, common["block_size"], common["num_warps"]

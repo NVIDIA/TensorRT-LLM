@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
+from test_common.interface_checks import verify_instance
 
 from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -30,6 +31,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.prefix_wait_planner import (
     MAX_WAIT_PASSES,
     MIN_GAIN_BLOCKS,
@@ -56,6 +58,12 @@ def _manager_for_release(request_id: int, is_draft: bool = False):
     manager.sparse_metadata_batch = None
     manager.is_draft = is_draft
     manager.kv_connector_manager = None
+    manager.is_estimating_kv_cache = False
+    verify_instance(
+        manager,
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2:KVCacheManagerV2",
+        members=("is_estimating_kv_cache", "kv_connector_manager"),
+    )
     manager.conversation_manager = None
     manager._early_freed_index_requests = set()
     manager._deferred_closes = deque()
@@ -224,10 +232,21 @@ DISAGG_CTX_COMPLETE = LlmRequestState.DISAGG_CONTEXT_COMPLETE.value  # 22
 # ---------------------------------------------------------------------------
 # Mock factories
 # ---------------------------------------------------------------------------
+def _scheduler_request() -> Mock:
+    req = Mock()
+    req.kv_cache_retention_config = None
+    req.py_lora_ckpt_source = None
+    return verify_instance(
+        req,
+        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
+        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
+    )
+
+
 def make_gen_request(
     request_id, beam_width=1, num_draft_tokens=0, lora_task_id=None, is_first_context_chunk=False
 ):
-    req = Mock()
+    req = _scheduler_request()
     req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
@@ -256,7 +275,7 @@ def make_ctx_request(
     lora_task_id: int | None = None,
     encoder_output_len: int | None = None,
 ) -> Mock:
-    req = Mock()
+    req = _scheduler_request()
     req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
@@ -284,7 +303,7 @@ def make_ctx_request(
 
 
 def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
-    req = Mock()
+    req = _scheduler_request()
     req.py_ctx_sched_since_iter = None
     req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
@@ -305,7 +324,7 @@ def make_disagg_request(
     num_draft_tokens=0,
     prompt_len=None,
 ):
-    req = Mock()
+    req = _scheduler_request()
     req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
@@ -323,7 +342,7 @@ def make_disagg_request(
 
 
 def make_filtered_request(request_id, state_value=0):
-    req = Mock()
+    req = _scheduler_request()
     req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
@@ -1558,7 +1577,6 @@ class TestKVPagesLostToAFailedRemoteLevel:
 
     def test_the_executor_fails_lost_requests_under_the_multimodal_scheduler(self):
         """MultimodalScheduler forwards the wrapped scheduler's lost requests to PyExecutor._schedule."""
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
         from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import MultimodalScheduler
 
         class StopAfterLost(RuntimeError):
@@ -1571,6 +1589,13 @@ class TestKVPagesLostToAFailedRemoteLevel:
         for request in requests:
             request.py_mm_encoder_state = None
         executor = object.__new__(PyExecutor)
+        executor.model_engine = None
+        executor.dense_dwdp_manager = None
+        verify_instance(
+            executor,
+            "tensorrt_llm._torch.pyexecutor.py_executor:PyExecutor",
+            members=("model_engine", "dense_dwdp_manager"),
+        )
         executor.active_requests = requests
         executor.inflight_req_ids = set()
         executor.kv_cache_manager = mgr
@@ -3054,11 +3079,16 @@ class TestPEFT:
         self, retained_adapter, pending_termination
     ):
         """Do not reuse hidden adapter capacity before normal cancellation cleanup."""
-        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
         mgr = make_kv_cache_manager()
         peft = make_peft_cache_manager(max_device_pages=1, pages_per_task=1)
         engine = object.__new__(PyExecutor)
+        engine.model_engine = None
+        engine.dense_dwdp_manager = None
+        verify_instance(
+            engine,
+            "tensorrt_llm._torch.pyexecutor.py_executor:PyExecutor",
+            members=("model_engine", "dense_dwdp_manager"),
+        )
         engine.scheduler = make_scheduler(mgr, peft_cache_manager=peft)
         engine.kv_cache_manager = mgr
         engine._maybe_record_hang_diagnostic_phase = Mock()
@@ -3077,8 +3107,22 @@ class TestPEFT:
         )
         engine.active_requests = active.copy()
         engine._pending_response_terminations = [held] if pending_termination else []
-        engine.previous_batch = SimpleNamespace(
-            scheduled_requests=SimpleNamespace(context_requests=[held])
+        engine.previous_batch = verify_instance(
+            SimpleNamespace(
+                scheduled_requests=SimpleNamespace(context_requests=[held]),
+                sample_state=None,
+                iter_start_time=0,
+                iter_stats=None,
+                iter_id=None,
+                scheduled_batch_stats=None,
+                gpu_forward_start_event=None,
+                gpu_forward_end_event=None,
+                gpu_forward_events_from_perf_pool=False,
+                guided_batch_id=None,
+                guided_failures=None,
+            ),
+            "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
+            members_only=True,
         )
         engine._cancelled_disagg_model_request_ids = lambda: set() if pending_termination else {0}
 

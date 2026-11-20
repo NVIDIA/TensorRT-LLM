@@ -12,7 +12,11 @@ skip_pre_blackwell = pytest.mark.skipif(
 )
 
 
-def _problem(m, heads, k=256, *, seed=0, nan_padding=False):
+def _problem(
+    m, heads, k=256, *, seed=0, nan_padding=False
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import rms_norm_mxfp8
 
     gen = torch.Generator(device="cuda").manual_seed(seed)

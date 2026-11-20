@@ -540,7 +540,15 @@ class TestHelixZeroKvMask(unittest.TestCase):
             patch("tensorrt_llm._torch.attention.mla._helix_zero_kv_mask") as generic_mask,
             patch("tensorrt_llm._torch.attention.mla._helix_post_process") as post_process,
         ):
-            MLA._attn_forward_gen(mla, attn_backend, q, q, q, None, attn_metadata)
+            MLA._attn_forward_gen(
+                mla,
+                attn_backend,
+                q,
+                q,
+                q,
+                None,
+                attn_metadata,
+            )
 
         generic_mask.assert_not_called()
         actual_mask = post_process.call_args.kwargs["zero_kv_mask"]
@@ -559,7 +567,12 @@ class TestHelixZeroKvMask(unittest.TestCase):
             patch("tensorrt_llm._torch.attention.attention._helix_zero_kv_mask") as generic_mask,
             patch("tensorrt_llm._torch.attention.attention._helix_post_process") as post_process,
         ):
-            Attention._helix_post_process(attn, partial_o, softmax_stats, attn_metadata)
+            Attention._helix_post_process(
+                attn,
+                partial_o,
+                softmax_stats,
+                attn_metadata,
+            )
 
         generic_mask.assert_called_once_with(attn_metadata, num_tokens)
         assert post_process.call_args.kwargs["zero_kv_mask"] is generic_mask.return_value
@@ -659,7 +672,7 @@ class TestHelixNcclReformatCompile(unittest.TestCase):
     def _num_compiled(fn):
         return len(torch._dynamo.eval_frame._debug_get_cache_entry_list(fn.__code__))
 
-    def _make_partials(self, num_tokens):
+    def _make_partials(self, num_tokens) -> tuple[torch.Tensor, torch.Tensor]:
         partial_o = torch.randn(
             num_tokens, self.num_heads * self.kv_lora_rank, dtype=torch.bfloat16, device="cuda"
         )

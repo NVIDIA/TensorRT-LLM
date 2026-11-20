@@ -16,6 +16,7 @@ from unittest.mock import Mock, call
 
 import pytest
 from fake_dist import FakeDistGroup, FakeDistRank
+from test_common.interface_checks import verify_instance
 
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -84,6 +85,13 @@ def _request(
 def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     """Keep lifecycle methods real while replacing model, transport, and output effects."""
     engine = object.__new__(PyExecutor)
+    engine.model_engine = None
+    engine.dense_dwdp_manager = None
+    verify_instance(
+        engine,
+        "tensorrt_llm._torch.pyexecutor.py_executor:PyExecutor",
+        members=("model_engine", "dense_dwdp_manager"),
+    )
     engine.active_requests = []
     engine.canceled_req_ids = []
     engine.waiting_queue = FCFSWaitingQueue()
@@ -339,8 +347,22 @@ def test_previous_model_batch_defers_cancellation_until_post_forward(executor: P
     """The logical-result path cannot free resources owned by an outstanding model batch."""
     request = _request()
     executor.active_requests.append(request)
-    executor.previous_batch = SimpleNamespace(
-        scheduled_requests=SimpleNamespace(all_requests=lambda: [request])
+    executor.previous_batch = verify_instance(
+        SimpleNamespace(
+            scheduled_requests=SimpleNamespace(all_requests=lambda: [request]),
+            sample_state=None,
+            iter_start_time=0,
+            iter_stats=None,
+            iter_id=None,
+            scheduled_batch_stats=None,
+            gpu_forward_start_event=None,
+            gpu_forward_end_event=None,
+            gpu_forward_events_from_perf_pool=False,
+            guided_batch_id=None,
+            guided_failures=None,
+        ),
+        "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
+        members_only=True,
     )
     executor.canceled_req_ids = [11]
 

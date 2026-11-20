@@ -458,6 +458,7 @@ def test_dspark_scratch_preserves_reserved_pages(cache_config, monkeypatch):
         pool = manager.layer_to_pool_mapping_dict[encoder]
         converter = manager.impl.get_page_index_converter(encoder, CSA2CacheRole.SWA.role)
         buffer = manager.get_buffers(0, CSA2CacheRole.SWA)
+        reserved_page = reserved_index = None
         for offset in (0, 512):
             req.context_current_position = offset
             req.context_chunk_size = 512
@@ -521,7 +522,7 @@ def test_dspark_verification_retains_all_generation_rows(
     else:
         monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", replay_tokens)
     config.spec_config = SimpleNamespace(
-        spec_dec_mode=SimpleNamespace(is_dspark=lambda: True),
+        spec_dec_mode=(SimpleNamespace(is_dspark=lambda: True)),
         draft_is_embedded_in_target=True,
         target_layer_ids=[37, 38, 39],
     )

@@ -81,10 +81,10 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     spec = cell.spec
     args = _inputs(spec["rows"], spec["norm"], seed=zlib.crc32(cell.why.encode()) % 2**31)
     args += scalars(spec)
-    ref = op.reference(*args, big_fuse_block_size(spec["rows"]))
+    ref = op.reference(*args, block_size=big_fuse_block_size(spec["rows"]))
     first = None
     for block_size in BLOCK_SIZE_OPTIONS:
-        out = op(*args, block_size)
+        out = op(*args, block_size=block_size)
         _compare(out, ref, spec["norm"])
         if first is None:
             first = out
@@ -105,7 +105,8 @@ def test_scalars_reach_their_kernel_parameters() -> None:
     square is 2.5e-3, the size of ``norm_eps``; the references with either pair swapped must fail
     the band, and the op must pass it.
     """
-    args = _inputs(64, norm=True, seed=11, std=0.05)
+    mixes, sqrsum, residual, scale, base, weight = _inputs(64, norm=True, seed=11, std=0.05)
+    args = (mixes, sqrsum, residual, scale, base, weight)
     sinkhorn_iters, norm_eps, hc_eps, sinkhorn_eps, post_mult, layer_input_eps = (
         3,
         2.5e-3,
@@ -116,8 +117,8 @@ def test_scalars_reach_their_kernel_parameters() -> None:
     )
     right = (sinkhorn_iters, norm_eps, hc_eps, sinkhorn_eps, post_mult, layer_input_eps)
     with validating(op):
-        out = op(*args, *right, 256)
-    _compare(out, op.reference(*args, *right, 256), fused_norm=True)
+        out = op(*args, *right, block_size=256)
+    _compare(out, op.reference(*args, *right, block_size=256), fused_norm=True)
     swapped = {
         "norm_eps and layer_input_eps": (
             sinkhorn_iters,
@@ -139,7 +140,7 @@ def test_scalars_reach_their_kernel_parameters() -> None:
         "sinkhorn_iters": (20, norm_eps, hc_eps, sinkhorn_eps, post_mult, layer_input_eps),
     }
     for name, wrong in swapped.items():
-        assert not _matches(out, op.reference(*args, *wrong, 256), fused_norm=True), (
+        assert not _matches(out, op.reference(*args, *wrong, block_size=256), fused_norm=True), (
             f"the band cannot tell {name} apart"
         )
 
@@ -151,16 +152,16 @@ def test_cuda_graph_capture_and_replay() -> None:
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        op(*args, block_size)
+        op(*args, block_size=block_size)
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = op(*args, block_size)
+        out = op(*args, block_size=block_size)
     for captured, fresh in zip(args[:6], _inputs(4, norm=True, seed=32)):
         captured.copy_(fresh)
     graph.replay()
     torch.cuda.synchronize()
-    _compare(out, op.reference(*args, block_size), fused_norm=True)
+    _compare(out, op.reference(*args, block_size=block_size), fused_norm=True)
 
 
 def test_guard_refuses_what_the_kernel_misreads() -> None:

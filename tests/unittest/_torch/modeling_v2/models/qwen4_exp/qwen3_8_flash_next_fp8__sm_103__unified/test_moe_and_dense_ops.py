@@ -119,10 +119,13 @@ def _weights(hidden: int, inter: int, experts: int, seed: int):
     return _WEIGHTS[key]
 
 
-def _stack_window(offset: int, width: int):
+def _stack_window(
+    offset: int, width: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """`(w1, w1s, w2, w2s)` of experts `[offset, offset + width)` of the checkpoint-shape stack."""
     win = slice(offset, offset + width)
-    return tuple(t[win] for t in _weights(2560, 640, 512, seed=2560 + 640 + 512))
+    w1, w1s, w2, w2s = (t[win] for t in _weights(2560, 640, 512, seed=2560 + 640 + 512))
+    return w1, w1s, w2, w2s
 
 
 def _kwargs(hs, hs_scale, weights, offset, local, num_experts=512, top_k=10, inter=640, **routing):
@@ -434,7 +437,7 @@ def _check_front(cell):
     torch.cuda.synchronize()
     for got, want in zip(outs, moe_front_router_quant(x2, router)):
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8)), "second replay"
-    _front_check(x2, router, *[o.clone() for o in outs], f"{cell.why[:44]} (second replay)")
+    _front_check(x2, router, *[o.clone() for o in outs], label=f"{cell.why[:44]} (second replay)")
 
 
 def _coarse(logits: torch.Tensor) -> torch.Tensor:
@@ -815,7 +818,8 @@ def _tpb_blocks(rank: int):
                 f"{p}.{e}.down_proj.weight_scale_inv": w2s[e],
             })  # fmt: skip
         names = ("tpb_w1", "tpb_s1", "tpb_w2", "tpb_s2")
-        _TPB_BLOCKS[rank] = _tpb.BlockExperts(*_loaded(_tpb_dims(rank), fake, names), rank)
+        w1, s1, w2, s2 = _loaded(_tpb_dims(rank), fake, names)
+        _TPB_BLOCKS[rank] = _tpb.BlockExperts(w1, s1, w2, s2, rank)
     return _TPB_BLOCKS[rank]
 
 
@@ -982,7 +986,14 @@ def _moe_block_folds_shared(rows, monkeypatch):
             sh_gug=gug.t(),
             sh_dn=dn.t(),
         )
-        return M._moe_block(core, x, L, None, mm=M._decode_projection, defer=True)
+        return M._moe_block(
+            core,
+            x,
+            (L),
+            None,
+            mm=M._decode_projection,
+            defer=True,
+        )
 
     out = [block(r) for r in range(4)]
     torch.cuda.synchronize()

@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from test_common.host_executor import make_host_executor
 
 from tensorrt_llm._torch.pyexecutor import hang_detector as hang_detector_module
 from tensorrt_llm._torch.pyexecutor.hang_detector import (
@@ -36,7 +37,6 @@ from tensorrt_llm._torch.pyexecutor.hang_detector import (
     hard_kill_on_rank_crash,
     start_rank_crash_kill_watchdog,
 )
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 pytestmark = pytest.mark.cpu_only
 
@@ -243,15 +243,18 @@ def test_status_provider_errors_are_logged(monkeypatch):
     def failing_provider():
         raise RuntimeError("provider failed")
 
+    def _record_error(message: str) -> None:
+        return events.append(("log", message))
+
     monkeypatch.setattr(
         hang_detector_module,
         "_best_effort_log_error",
-        lambda message: events.append(("log", message)),
+        _record_error,
     )
     monkeypatch.setattr(
         hang_detector_module,
         "print_all_stacks",
-        lambda: events.append(("stacks", None)),
+        (lambda: events.append(("stacks", None))),
     )
 
     detector = HangDetector(timeout=1, on_detected=lambda: events.append(("detected", None)))
@@ -270,7 +273,9 @@ def test_status_provider_errors_are_logged(monkeypatch):
 @pytest.mark.parametrize("with_dwdp", [False, True], ids=["no_dwdp", "dwdp"])
 def test_control_request_wait_pauses_detector(with_dwdp, monkeypatch: pytest.MonkeyPatch):
     fired = []
-    executor = PyExecutor.__new__(PyExecutor)
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor.control_requests = [SimpleNamespace(control_requires_drain=False, control_id=None)]
     executor.active_requests = []
     executor.waiting_queue = []
@@ -349,14 +354,22 @@ def test_propagate_hard_kill_self_sigkills_without_mpi():
 def test_rank_crash_kill_single_rank_is_noop(monkeypatch):
     """No peers to unblock: the worker's own death already carries the error."""
     kills = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: kills.append(1)),
+    )
     assert hard_kill_on_rank_crash(world_size=1) is False
     assert kills == []
 
 
 def test_rank_crash_kill_fires_for_multi_rank(monkeypatch):
     kills = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: kills.append(1)),
+    )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
     assert hard_kill_on_rank_crash(world_size=4) is True
     assert kills == [1]
@@ -371,7 +384,11 @@ def test_rank_crash_kill_sleeps_grace_before_kill(monkeypatch):
     """The grace must elapse BEFORE the kill so cleaner error paths win the race."""
     grace = 2.5
     order = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: order.append("kill")),
+    )
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, str(grace))
     assert hard_kill_on_rank_crash(world_size=2) is True
@@ -380,7 +397,11 @@ def test_rank_crash_kill_sleeps_grace_before_kill(monkeypatch):
 
 def test_rank_crash_kill_disabled_by_negative_grace(monkeypatch):
     kills = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: kills.append(1)),
+    )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "-1")
     assert hard_kill_on_rank_crash(world_size=8) is False
     assert kills == []
@@ -389,7 +410,11 @@ def test_rank_crash_kill_disabled_by_negative_grace(monkeypatch):
 def test_rank_crash_kill_invalid_grace_uses_default(monkeypatch):
     """A malformed env value must not disable the kill (fail-safe default)."""
     order = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: order.append("kill")),
+    )
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "bogus")
     assert hard_kill_on_rank_crash(world_size=2) is True
@@ -408,7 +433,11 @@ def test_rank_crash_kill_non_finite_grace_uses_default(monkeypatch, raw):
     live thread. Both must fall back to the documented default.
     """
     order = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: order.append("kill")),
+    )
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, raw)
     assert hard_kill_on_rank_crash(world_size=2) is True
@@ -436,7 +465,11 @@ def test_rank_crash_kill_never_raises(monkeypatch):
 def test_watchdog_kills_while_caller_blocks(monkeypatch):
     """The kill fires from the watchdog thread with no help from the caller."""
     killed = threading.Event()
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", killed.set)
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (killed.set),
+    )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
 
     watchdog = start_rank_crash_kill_watchdog(world_size=2)
@@ -451,7 +484,11 @@ def test_watchdog_kills_while_caller_blocks(monkeypatch):
 
 def test_watchdog_not_armed_for_single_rank(monkeypatch):
     kills = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: kills.append(1)),
+    )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
     assert start_rank_crash_kill_watchdog(world_size=1) is None
     assert kills == []
@@ -459,7 +496,11 @@ def test_watchdog_not_armed_for_single_rank(monkeypatch):
 
 def test_watchdog_not_armed_when_disabled(monkeypatch):
     kills = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: kills.append(1)),
+    )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "-1")
     assert start_rank_crash_kill_watchdog(world_size=8) is None
     assert kills == []
@@ -474,7 +515,11 @@ def test_watchdog_cancel_disarms_this_timer(monkeypatch):
     `crashed` predicate in _event_loop_wrapper.
     """
     kills = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: kills.append(1))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: kills.append(1)),
+    )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
 
     watchdog = start_rank_crash_kill_watchdog(world_size=2)
@@ -515,7 +560,11 @@ def test_kill_keeps_original_deadline_on_handover(monkeypatch):
     elapsed = 29.5
     remaining = grace - elapsed
     order = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: order.append("kill")),
+    )
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
     monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, str(grace))
@@ -534,7 +583,11 @@ def test_kill_fires_immediately_when_deadline_already_passed(monkeypatch):
     now = 1000.0
     overdue = 100.0
     order = []
-    monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
+    monkeypatch.setattr(
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda: order.append("kill")),
+    )
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
     monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
@@ -565,6 +618,8 @@ def _bare_executor(pe, monkeypatch, world_size, is_shutdown=False):
     monkeypatch.setattr(pe, "host_profiler_context", lambda enable: contextlib.nullcontext())
     monkeypatch.setattr(pe, "customized_gc_thresholds", lambda threshold: contextlib.nullcontext())
     ex = pe.PyExecutor.__new__(pe.PyExecutor)
+    ex.kv_connector_manager = None
+    ex.dense_dwdp_manager = None
     ex.dist = types.SimpleNamespace(world_size=world_size)
     ex.garbage_collection_gen0_threshold = None
     # is_shutdown must NOT influence the crash decision -- _handle_errors sets
@@ -847,7 +902,11 @@ def test_event_loop_wrapper_kills_world_when_loop_never_started(monkeypatch):
         yield  # pragma: no cover
 
     ex = _bare_executor(pe, monkeypatch, world_size=4)
-    monkeypatch.setattr(pe, "host_profiler_context", lambda enable: failing_enter())
+    monkeypatch.setattr(
+        pe,
+        "host_profiler_context",
+        (lambda enable: failing_enter()),
+    )
     ex._executor_loop_cleanup = lambda: events.append("cleanup")
     ex.event_loop = lambda: pytest.fail("event_loop must not be reached")
 
@@ -874,7 +933,11 @@ def test_event_loop_wrapper_no_kill_when_enclosing_context_manager_raises(monkey
         raise RuntimeError("profiler teardown failed")
 
     ex = _bare_executor(pe, monkeypatch, world_size=4)
-    monkeypatch.setattr(pe, "host_profiler_context", lambda enable: exploding_ctx())
+    monkeypatch.setattr(
+        pe,
+        "host_profiler_context",
+        (lambda enable: exploding_ctx()),
+    )
     ex._executor_loop_cleanup = lambda: events.append("cleanup")
 
     def completed_loop():
@@ -1063,7 +1126,9 @@ def test_kill_is_skipped_once_the_error_reached_the_client(monkeypatch):
     """
     calls = []
     monkeypatch.setattr(
-        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda *a, **k: calls.append(1)),
     )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
 
@@ -1079,7 +1144,9 @@ def test_kill_still_fires_when_nothing_consumed_the_error(monkeypatch):
     """The stranded-peer case is unchanged: nothing consumes it, so kill."""
     calls = []
     monkeypatch.setattr(
-        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda *a, **k: calls.append(1)),
     )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
 
@@ -1093,7 +1160,9 @@ def test_kill_fires_when_no_delivery_event_is_supplied(monkeypatch):
     """Back-compat: callers that pass nothing get the old behaviour."""
     calls = []
     monkeypatch.setattr(
-        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda *a, **k: calls.append(1)),
     )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
 
@@ -1110,7 +1179,9 @@ def test_delivery_is_checked_after_the_grace_not_before(monkeypatch: pytest.Monk
     grace = 0.5
     calls = []
     monkeypatch.setattr(
-        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda *a, **k: calls.append(1)),
     )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, str(grace))
 
@@ -1124,7 +1195,11 @@ def test_delivery_is_checked_after_the_grace_not_before(monkeypatch: pytest.Monk
         return True
 
     wait = Mock(side_effect=deliver_during_grace)
-    monkeypatch.setattr(hang_detector_module, "_wait_out_kill_grace", wait)
+    monkeypatch.setattr(
+        hang_detector_module,
+        "_wait_out_kill_grace",
+        (wait),
+    )
     fired = hard_kill_on_rank_crash(4, error_delivered=delivered)
 
     wait.assert_called_once_with(grace, None)
@@ -1137,7 +1212,9 @@ def test_delivery_is_checked_after_the_grace_not_before(monkeypatch: pytest.Monk
 def test_watchdog_threads_the_delivery_event_through(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+        hang_detector_module,
+        "propagate_hard_kill",
+        (lambda *a, **k: calls.append(1)),
     )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
     monkeypatch.setattr(hang_detector_module.RankCrashKillWatchdog, "start", lambda self: None)
