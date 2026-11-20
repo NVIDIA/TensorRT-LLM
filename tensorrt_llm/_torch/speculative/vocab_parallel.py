@@ -93,12 +93,13 @@ _PAIR_LAYOUT_ARGS = ["stride_out", "slot0", "zero_lo", "zero_hi"]
 # already selected their greedy and temperature-only target tokens from the
 # shard.
 VOCAB_PARALLEL_ARGMAX_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_ARGMAX"
-# "0" turns off only the temperature-only part: those workers keep the greedy
-# argmax on the shard (the same tokens as the gathered logits) but sample
-# temperature-only batches from the gathered logits with the stock sampler.
-# The Gumbel-max draw on the shard follows the same distribution but consumes
-# random numbers differently, so an unseeded request gets different tokens than
-# from the stock sampler (a request with its own seed always takes the latter).
+# "1" also lets those workers draw the target tokens of temperature-only batches
+# on the shard (Gumbel-max in the TP key exchange); unset, "0" or any other value
+# keeps them on the gathered logits and the stock sampler. The Gumbel-max draw
+# follows the same distribution but consumes random numbers differently, so an
+# unseeded request gets different tokens than from the stock sampler (a request
+# with its own seed always takes the latter). The MTP-Eagle fast paths do not
+# read it: they draw temperature-only target tokens on the shard regardless.
 VOCAB_PARALLEL_TEMPERATURE_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE"
 
 
@@ -111,9 +112,9 @@ def vocab_parallel_argmax_enabled() -> bool:
 def vocab_parallel_temperature_enabled() -> bool:
     """Whether those workers also draw the target tokens of temperature-only
     batches from vocab-sharded logits by Gumbel-max
-    (``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE``, default on; it takes effect
+    (``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1``, default off; it takes effect
     only where :func:`vocab_parallel_argmax_enabled`)."""
-    return os.environ.get(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, "1").strip() != "0"
+    return os.environ.get(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, "0").strip() == "1"
 
 
 def _gathers_even_vocab_shards(lm_head: LMHead) -> bool:
