@@ -21,12 +21,17 @@ Scope: this directory and everything under it. Supplements the repo-root `AGENTS
 
 ## Test value and execution placement
 
-Before adding a test or parameterized variant, record in the PR:
+Use these questions when deciding whether to add a test or parameter value.
 
 - Which regression do its assertions catch?
 - What coverage does it add beyond existing tests?
 - Should it run in pre-merge CI, post-merge CI, QA, or only as a one-time local
   check, and why is that frequency worth its setup and execution cost?
+
+Summarize the rationale in the PR. One sentence can cover a small addition,
+such as another dtype, and cases with the same rationale can be described
+together. For a new CI entry, a larger parameter matrix or an expensive GPU
+stage, explain the extra coverage and why it warrants the recurring cost.
 
 Keep focused, reliable regression coverage in pre-merge CI; justify expensive
 or broad coverage there instead of registering every new test automatically.

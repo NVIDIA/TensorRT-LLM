@@ -22,13 +22,22 @@ Supplements the repository-root and `tests/AGENTS.md` guidance.
 
 ## Waive list
 
-For failing tests that should be retained and fixed, add a line to
-`tests/integration/test_lists/waives.txt` and keep their YAML registrations.
-Use `<test> SKIP (reason)`, with an explicit `SKIP` and a tracking bug or brief
-explanation. A matching waive skips the test body. If review instead establishes
-that a test is low-value or redundant and should be retired, remove the test,
-its registrations and obsolete waives together, explaining the retained or
-deliberately relinquished coverage in the PR.
+- Keep the YAML registration for a test you intend to fix. Add one
+  `<test> SKIP (reason)` line to `waives.txt` with a tracking bug or brief
+  explanation. For an outer entry, copy the exact selector and options,
+  omitting `ISOLATION`, `TIMEOUT (N)` and YAML comments.
+- Use an unprefixed selector across platforms or `full:<platform>/` for a
+  specific stage platform. For each added or broadened waive, check which cases
+  and platforms will skip and explain any unaffected coverage it disables.
+  Verify the skip reason in the run. Narrow or remove the waive as fixes land.
+- Keep entries sorted by the full line. The `file-contents-sorter` pre-commit
+  hook reorders `waives.txt` automatically. If it changes the file, stage it
+  again. The separate `waive list check` flags a repeated selector even when
+  its `SKIP` reason differs.
+- When retiring a low-value or redundant test, remove its registrations and
+  obsolete waives and explain the coverage decision in the PR.
+
+### Reference for matching and troubleshooting
 
 In PR CI, Jenkins normally merges the PR list with the latest target-branch
 list (tip of tree, or TOT), then applies exact-line removals from the PR diff.
@@ -36,7 +45,7 @@ Pytest receives this effective list via `--waives-file`: waives from the PR's
 target branch can therefore affect the run even when absent from the PR
 checkout, regardless of the target branch's name.
 
-### Writing a waive
+#### Writing a waive
 
 Copy the test path and command-line options, omitting `ISOLATION`, `TIMEOUT (N)`,
 and YAML comments. This metadata is not part of the collected node ID; leaving
@@ -59,7 +68,7 @@ including inside quotes or reasons. `-k "modeling_llama"` is valid, but
 remove the reason's closing parenthesis and break parsing of the whole file.
 Replace illustrative names and reasons with actual tests and bugs.
 
-### Matching: outer entries and inner unit tests
+#### Matching outer entries and inner unit tests
 
 Ordinary integration tests match exact node IDs. A `unittest/` test-db entry
 has two layers: an integration wrapper, then a separate pytest run for its
@@ -106,7 +115,7 @@ A file waive also skips its tests when collected through another outer entry
 method or case waive to keep the rest of that file running. Use collected node
 IDs and `unittest/` paths, not repository-root `tests/unittest/` paths.
 
-### Platform scope
+#### Platform scope
 
 Scope applies to runners receiving `--waives-file`, not automatically to every
 Jenkins stage or independent runner. CI passes `--test-prefix=<stage-name>` to
@@ -156,22 +165,12 @@ later by model workers or remote servers do not establish the detected SM.
   unmatched-waive error. SM detection is not guaranteed in every stage;
   use `full:CPU/` for standard CPU stages.
 
-### Choosing and checking a waive
+#### Choosing and checking a waive
 
-- Self-review every added or broadened waive before submitting the PR. Identify
-  the observed failure, tracking bug or reason, intended cases and platforms,
-  and the coverage being disabled. For a batch of waives, check each entry;
-  do not copy a broad list just to make CI pass.
-- Choose scope based on the failure and the cost of maintaining the waive.
-  Case/function or platform-specific waives suit isolated failures. Widespread
-  issues can justify a temporary whole-entry, file/class, multi-platform or
-  unprefixed all-platform waive rather than many narrow entries. Use the matching
-  rules above to choose outer versus inner scope; broader waives also disable
-  unaffected coverage, so explain that tradeoff. Track the bugs, prioritize
-  fixes, and narrow or remove waives as fixes are verified.
-- Verify the intended entry/case and platform against the run's effective
-  `--waives-file`, including target-branch waives. `--collect-only` helps identify
-  names but does not prove skipping: check the run's skip status and reason.
+Use case/function or platform-specific waives for isolated failures. Widespread
+issues can justify a temporary whole-entry, file/class, multi-platform or
+all-platform waive. Check the effective `--waives-file`, including target-branch
+waives. Use `--collect-only` to find node IDs and the actual run to verify skips.
 
 Implementation references:
 
@@ -228,7 +227,7 @@ retain their own case selectors and launch requirements.
   retry pass does not validate the proposed parallel batch. Report intentional
   coverage pruning separately from batching gains.
 
-### Additional GPU validation
+### Validating changes to GPU batches
 
 - Run the proposed grouping on representative target GPU types/counts with the
   intended worker and rank counts. Check peak device memory and state retained

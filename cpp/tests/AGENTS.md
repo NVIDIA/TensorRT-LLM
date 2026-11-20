@@ -26,34 +26,39 @@ coverage, CI placement and building helpers before the test stage.
 
 ## Build and execution
 
-New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
-`LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
-when the test needs the full TensorRT-LLM library; otherwise link only its needed
-components. Include `gpu` in `LABELS` for tests that need a GPU.
-CI controls test concurrency through `parallel_run_ctest`. `google-tests`
-continues to build all C++ tests; component aggregate targets build migrated tests.
-C++ source-build fallbacks build the collected tests with incremental native targets.
-`cpp-tests-<directory>` targets (for example `cpp-tests-common` or
-`cpp-tests-executor-bounce`) mirror recursive CTest directory coverage, including
-legacy and full-stack executables. OWNER aggregates are component subsets and
-are not interchangeable with these directory targets.
-The Linux Release source-build fixture reuses the installed CI library for the
-RNN formatter test. CI source and wheel use the same commit and image per
-architecture. Link/load errors fail the tests. Direct CMake builds use source
-libraries unless explicitly configured otherwise.
-`CONFIG_LINUX_X86_64_VANILLA` also builds `google-tests`
-and publishes the `cpp_test_bundle` CMake component as a separate
-`cpp-tests-<main-tar-name>` artifact. The main package does not include the test
-programs. Only `-CPP-` stages using this build configuration fetch and unpack
-the companion into `src/cpp/build`, including fat-image consumers. Build reuse
-requires both artifacts. Linux Release integration fixtures use this bundle
-directly, retaining CTest selection and retries. The two FMHA tests share a
-test-only library packaged next to their executables; other runtime libraries
-come from the matching installed wheel. Test artifacts keep symbols but omit
-BOLT's extra relocation records.
-CPP stages collect only `tests/integration/defs/cpp` and use the standard test
-environment setup. CTest discovers cases on the test node, so the build stage
-does not need a GPU.
+### Register a gtest
+
+Use `add_tllm_gtest` with explicit `SOURCES`, `LINK_LIBRARIES`, `OWNER`, and
+scheduling `LABELS`. Use `FULL_STACK` when the test needs the full TensorRT-LLM
+library. For a component test, link only the libraries it needs. Include `gpu`
+in `LABELS` for tests that need a GPU.
+
+### Choose a build target
+
+- `google-tests` builds all enabled native tests.
+- `cpp-tests-<directory>` mirrors recursive CTest discovery, including legacy
+  and full-stack executables. Examples include `cpp-tests-common` and
+  `cpp-tests-executor-bounce`.
+- An OWNER target such as `common-tests` builds the tests registered to that
+  component. Use the directory target when the next step runs a CTest directory.
+
+### Package the CI bundle
+
+`CONFIG_LINUX_X86_64_VANILLA` builds `google-tests` and publishes the
+`cpp_test_bundle` CMake component as a separate `cpp-tests-<main-tar-name>`
+artifact. Build reuse requires both the main and test archives. The test
+binaries retain symbols and omit BOLT's extra relocation records. The two FMHA
+tests share a test-only library packaged beside their executables. Other
+runtime libraries come from the matching installed wheel.
+
+### Run the CPP stage
+
+Only `-CPP-` stages using that build configuration fetch and unpack the test
+archive into `src/cpp/build`, including stages that use fat images. CPP stages
+use the standard test environment and collect `tests/integration/defs/cpp`.
+CTest discovers cases on the test node, so discovery needs no GPU on the build
+node. Bundle reuse preserves CTest selection and retries. CI controls CTest
+concurrency through `parallel_run_ctest`.
 
 ### Existing source-build fallback
 
@@ -74,3 +79,8 @@ targets: `selected_build_targets` for `build_google_tests`,
 the head-104 fixture. Preserve these bounded builds and bundle reuse. New helper
 requirements should extend build-stage packaging rather than introduce another
 test-node build path.
+
+For the RNN formatter test, the Linux Release source-build fixture reuses the
+installed CI library. CI source and wheel use the same commit and image per
+architecture. Link or load errors fail the tests. Direct CMake builds use
+source libraries unless explicitly configured otherwise.

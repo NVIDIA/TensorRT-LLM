@@ -146,10 +146,8 @@ a temporary whole-entry or multi-platform waive. Tests deliberately retired for
 low value or redundant coverage should be removed with their registrations and
 obsolete waives, rather than waived indefinitely.
 
-Before editing a waive, read the dedicated
-[Waive list guidance](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/integration/test_lists/AGENTS.md#waive-list)
-for syntax, exact outer-entry and inner-unit-test matching, platform/SM scope,
-PR/target-branch list merging, and verification steps.
+Before editing a waive, see **Waive list** in the
+[test-list guidance](source:tests/integration/test_lists/AGENTS.md).
 
 ## Multi-GPU Tests
 
