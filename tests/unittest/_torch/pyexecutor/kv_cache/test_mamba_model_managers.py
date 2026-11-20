@@ -221,6 +221,7 @@ def _shutdown_manager(manager, monkeypatch):
     if isinstance(manager, Qwen4ExpHybridCacheManager):
         manager._ple_conv_states = {42: object()}
         manager._ple_ngram_contexts = {42: object()}
+        manager._ple_speculative_records = {42: object()}
 
     def check_before_pool_shutdown():
         assert manager.intermediate_state_indices is None
@@ -231,6 +232,7 @@ def _shutdown_manager(manager, monkeypatch):
         assert not manager.all_ssm_states and not manager.all_conv_states
         if isinstance(manager, Qwen4ExpHybridCacheManager):
             assert not manager._ple_conv_states and not manager._ple_ngram_contexts
+            assert not manager._ple_speculative_records
         if isinstance(manager, InforwardSnapshotHost):
             assert manager.inforward_snapshot_rows == 0
             assert manager.inforward_snapshot_plan == {}

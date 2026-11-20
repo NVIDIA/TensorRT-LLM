@@ -11101,3 +11101,215 @@ def test_mtp_eagle_raises_both_phases_on_the_target_beside_a_separate_draft_cach
         (SpeculativeAcceptancePhase.BASE_STATE, 1, 2),
         (SpeculativeAcceptancePhase.AUXILIARY_STATE, 1, 2),
     ]
+
+
+def _build_ple_acceptance_manager(spec_config):
+    """A real Qwen4-Exp manager of a one-model layout whose first layer keeps PLE state."""
+    return _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2,
+        num_draft_layers=1,
+        spec_config=spec_config,
+        conv_state_layout="q_k_v",
+        model_manager_cls=Qwen4ExpHybridCacheManager,
+        pretrained_config=SimpleNamespace(
+            ple_layer_ids=[1],
+            num_hidden_layers=3,
+            hc_count=1,
+            hidden_size=4,
+            ple_conv_kernel_size=2,
+            ngram_size=3,
+            torch_dtype=torch.float32,
+        ),
+    )
+
+
+def _stage_ple_candidates(mgr, slots):
+    """Leave on the manager what the PLE layer's verification leaves: per generation request, the state after each of
+    three proposed tokens. Returns the candidates of the two PLE pools."""
+    slots = torch.tensor(slots, device="cuda")
+    record = mgr.ple_speculative_record(0)
+    staged = []
+    for pool, field in zip(mgr.ple_layer_cache(0), ("conv_states", "ngram_contexts")):
+        pool.zero_()
+        candidates = torch.randint(1, 100, (len(slots), 3, *pool.shape[1:]), device="cuda")
+        candidates = candidates.to(pool.dtype)
+        setattr(record, field, (pool, slots, pool[slots].clone(), candidates))
+        staged.append(candidates)
+    return staged
+
+
+def _assert_ple_slots(mgr, staged, kept, empty):
+    """kept maps a state slot to the (generation request, proposed token) whose PLE state it holds."""
+    for pool, candidates in zip(mgr.ple_layer_cache(0), staged):
+        for slot, (request, token) in kept.items():
+            assert torch.equal(pool[slot], candidates[request, token])
+        for slot in empty:
+            assert not pool[slot].any()
+
+
+_PLE_SLOTS = [3, 1]
+
+
+def _ple_layer_verification(mgr):
+    """A model's PLE layer and the tokens and values it verifies: three tokens for each of two requests.
+
+    Returns the verification forward, which takes the pools and the record from the manager it is given, and the
+    tokens and values.
+    """
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpModel
+    from tensorrt_llm._torch.modules.qwen4_exp.ple import PLEMetadata, Qwen4ExpPLE
+
+    conv_pool, context_pool = mgr.ple_layer_cache(0)
+    channels, state_len = conv_pool.shape[1:]
+    ple = object.__new__(Qwen4ExpPLE)
+    torch.nn.Module.__init__(ple)
+    ple.conv_channels, ple.short_conv_state_len = channels, state_len
+    ple.conv_state_shape, ple.ngram_context_len = (channels, state_len), context_pool.shape[1]
+    # A kernel of two taps: the state is one dilation long.
+    ple.short_conv_dilation = state_len
+    ple.conv1d = torch.nn.Conv1d(
+        channels, channels, 2, groups=channels, dilation=state_len, bias=False, device="cuda"
+    )
+    model = object.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+
+    tokens = torch.arange(100, 106, device="cuda")
+    values = torch.randn(6, channels, device="cuda")
+    metadata = PLEMetadata.build(
+        tokens,
+        torch.tensor([3, 3], device="cuda"),
+        torch.tensor(_PLE_SLOTS, device="cuda"),
+        is_decode=False,
+        eos_token_id=0,
+        use_spec_decoding=True,
+        host_seq_lens=[3, 3],
+    )
+
+    def verify(manager):
+        conv_state, ngram_context, record = model._resolve_ple_pools(
+            SimpleNamespace(kv_cache_manager=manager), ple, 0, 2, torch.device("cuda")
+        )
+        with torch.no_grad():
+            ple._short_conv(values, metadata, conv_state, record)
+        combined = torch.cat((ngram_context[metadata.state_indices], metadata.padded_tokens), dim=1)
+        ple._commit_ngram_context(combined, metadata, ngram_context, record)
+
+    return verify, tokens, values
+
+
+def _fill_ple_pools(mgr):
+    """Give every slot of the two PLE pools a state of its own. Returns a copy of the pools."""
+    conv_pool, context_pool = mgr.ple_layer_cache(0)
+    conv_pool.copy_(torch.randn(conv_pool.shape, device="cuda"))
+    context_pool.copy_(torch.randint(1, 100, context_pool.shape, device="cuda"))
+    return conv_pool.clone(), context_pool.clone()
+
+
+def _assert_ple_prefix_state(mgr, initial, tokens, values, accepted):
+    """Each request's slot holds the PLE state after the tokens it accepted; the other slots are as they were."""
+    conv_pool, context_pool = mgr.ple_layer_cache(0)
+    initial_conv, initial_context = initial
+    state_len, context_len = conv_pool.shape[2], context_pool.shape[1]
+    for row, (slot, keep) in enumerate(zip(_PLE_SLOTS, accepted)):
+        row_tokens = slice(3 * row, 3 * row + 3)
+        conv_history = torch.cat((initial_conv[slot], values[row_tokens].T), dim=1)
+        torch.testing.assert_close(conv_pool[slot], conv_history[:, keep : keep + state_len])
+        token_history = torch.cat((initial_context[slot], tokens[row_tokens]))
+        assert torch.equal(context_pool[slot], token_history[keep : keep + context_len])
+    for slot in (0, 2):
+        assert torch.equal(conv_pool[slot], initial_conv[slot])
+        assert torch.equal(context_pool[slot], initial_context[slot])
+
+
+@skip_no_cuda
+def test_ple_layer_verification_then_mtp_acceptance_keeps_the_accepted_prefix_state():
+    """The PLE layer verifies three tokens per request on the pools the model resolves from the manager. When MTPWorker
+    starts drafting, each request's slot holds the PLE state after the tokens it accepted."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        initial = _fill_ple_pools(mgr)
+        verify, tokens, values = _ple_layer_verification(mgr)
+        verify(mgr)
+
+        accepted = [2, 3]
+        worker = _acceptance_worker("mtp", torch.tensor(accepted, dtype=torch.int32).cuda())
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=_PLE_SLOTS)
+
+        _assert_ple_prefix_state(mgr, initial, tokens, values, accepted)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_acceptance_keeps_the_ple_state_on_a_rebuilt_manager():
+    """A model outlives a cache manager: one is built to size the memory and dropped. A verification after the rebuild
+    leaves its candidates with the new manager, whose acceptance keeps the accepted prefix state in its pools."""
+    spec_config = MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True)
+    first = _build_ple_acceptance_manager(spec_config)
+    try:
+        first._refresh_dummy_request_mask([False] * 2)
+        verify, tokens, values = _ple_layer_verification(first)
+        verify(first)
+    finally:
+        first.shutdown()
+
+    second = _build_ple_acceptance_manager(spec_config)
+    try:
+        second._refresh_dummy_request_mask([False] * 2)
+        initial = _fill_ple_pools(second)
+        verify(second)
+
+        accepted = [3, 1]
+        worker = _acceptance_worker("mtp", torch.tensor(accepted, dtype=torch.int32).cuda())
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, second, num_seqs=2, num_contexts=0, state_slots=_PLE_SLOTS)
+
+        _assert_ple_prefix_state(second, initial, tokens, values, accepted)
+    finally:
+        second.shutdown()
+
+
+def _run_whole_step(worker, mgr, draft_loop):
+    """Run a step of two generation requests to its end, the draft pass being one call over the target's KV cache."""
+    worker._uses_external_shared_target_kv = True
+    worker._forward_external_shared_target_kv_draft_loop = draft_loop
+    worker._prepare_next_new_tokens = lambda *args: None
+    _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=[3, 1])
+
+
+@skip_no_cuda
+def test_mtp_eagle_acceptance_keeps_the_accepted_ple_state_after_drafting():
+    """MTPEagleWorker has the PLE state committed once its draft pass is over, not before."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        staged = _stage_ple_candidates(mgr, slots=[3, 1])
+        worker = _acceptance_worker("mtp_eagle", torch.tensor([2, 3], dtype=torch.int32).cuda())
+        during_draft = []
+        _run_whole_step(
+            worker,
+            mgr,
+            lambda **kwargs: during_draft.extend(pool.clone() for pool in mgr.ple_layer_cache(0)),
+        )
+        assert len(during_draft) == 2 and not any(pool.any() for pool in during_draft)
+        _assert_ple_slots(mgr, staged, kept={3: (0, 1), 1: (1, 2)}, empty=[0, 2])
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_eagle3_acceptance_leaves_the_ple_state_as_verification_wrote_it():
+    """Qwen4-Exp keeps the accepted PLE state under one-model MTP only: an Eagle3 step commits none of it."""
+    mgr = _build_ple_acceptance_manager(
+        Eagle3DecodingConfig(max_draft_len=2, speculative_model="draft")
+    )
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        staged = _stage_ple_candidates(mgr, slots=[3, 1])
+        worker = _acceptance_worker("eagle3", torch.tensor([2, 3], dtype=torch.int32).cuda())
+        _run_whole_step(worker, mgr, lambda **kwargs: None)
+        _assert_ple_slots(mgr, staged, kept={}, empty=[0, 1, 2, 3])
+    finally:
+        mgr.shutdown()

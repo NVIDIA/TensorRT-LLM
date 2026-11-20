@@ -957,6 +957,45 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
 
 
+@dataclasses.dataclass(eq=False)
+class PLESpeculativeRecord:
+    """PLE state candidates of one verification forward, kept until acceptance is known.
+
+    Verification advances the PLE state through every proposed token. Each
+    field holds ``(state_pool, slots, state_before, candidates)`` for the
+    generation requests of that forward, where ``candidates[request, i]`` is
+    the state after ``i + 1`` tokens. :meth:`commit` restores the state of the
+    accepted prefix.
+    """
+
+    conv_states: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    ngram_contexts: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+    def commit(self, num_accepted_tokens: torch.Tensor, num_contexts: int) -> None:
+        """Keep the PLE state produced by the accepted verification prefix.
+
+        Args:
+            num_accepted_tokens: ``[batch]`` integer tensor on the device: the
+                accepted token count of every request, context requests first.
+            num_contexts: Context requests in the verification batch.
+        """
+        if self.conv_states is None and self.ngram_contexts is None:
+            return
+        # The decoder always accepts at least the target token. Candidate zero
+        # therefore represents one accepted token, hence the zero-based -1.
+        accepted = num_accepted_tokens[num_contexts:].to(torch.long) - 1
+        for entry in (self.conv_states, self.ngram_contexts):
+            if entry is None:
+                continue
+            state_pool, slots, _, candidates = entry
+            num_gens = slots.shape[0]
+            rows = torch.arange(num_gens, device=slots.device)
+            selected = candidates[rows, accepted[:num_gens]]
+            state_pool[slots] = selected.to(dtype=state_pool.dtype)
+        self.conv_states = None
+        self.ngram_contexts = None
+
+
 class Qwen4ExpPLE(nn.Module):
     """The Qwen4-Exp PLE n-gram short-convolution side path.
 
@@ -1039,15 +1078,6 @@ class Qwen4ExpPLE(nn.Module):
             bias=False,
             dtype=dtype,
         )
-        # Target verification advances through every proposed token. Retain the
-        # per-prefix candidates until rejection sampling reports the accepted
-        # length, then restore the accepted prefix state.
-        self._pending_conv_states: Optional[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = None
-        self._pending_ngram_contexts: Optional[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = None
         self._prefetch_stream = torch.cuda.Stream() if self.ple_embedding.host_offload else None
         self._graph_prefetch_buffers: dict[tuple[int, int], torch.Tensor] = {}
         self._eager_prefetch_buffer: Optional[torch.Tensor] = None
@@ -1182,13 +1212,18 @@ class Qwen4ExpPLE(nn.Module):
         return embeddings.flatten(start_dim=-2), combined
 
     def _short_conv(
-        self, x: torch.Tensor, metadata: PLEMetadata, conv_state: torch.Tensor
+        self,
+        x: torch.Tensor,
+        metadata: PLEMetadata,
+        conv_state: torch.Tensor,
+        speculative_record: PLESpeculativeRecord,
     ) -> torch.Tensor:
         """Dilated causal depthwise short conv with in-place conv-state update.
 
         ``x`` is ``[processed_tokens, conv_channels]``. ``conv_state`` is the
         caller-owned pool ``[num_slots, conv_channels, short_conv_state_len]``;
-        the consumed slots are advanced in place. Returns
+        the consumed slots are advanced in place. Verification rows leave their
+        per-token state candidates on ``speculative_record``. Returns
         ``silu(conv_output)[processed_tokens, conv_channels]``.
         """
         if x.shape[0] == 0:
@@ -1238,8 +1273,12 @@ class Qwen4ExpPLE(nn.Module):
                 context_tokens=0,
                 context_row_width=1,
             )
-            context_output = self._short_conv(x[:context_tokens], context_meta, conv_state)
-            generation_output = self._short_conv(x[context_tokens:], generation_meta, conv_state)
+            context_output = self._short_conv(
+                x[:context_tokens], context_meta, conv_state, speculative_record
+            )
+            generation_output = self._short_conv(
+                x[context_tokens:], generation_meta, conv_state, speculative_record
+            )
             return torch.cat((context_output, generation_output))
 
         conv_weight = self.conv1d.weight.to(dtype=x.dtype)
@@ -1311,7 +1350,7 @@ class Qwen4ExpPLE(nn.Module):
                 :, :, 1 : m.generation_row_width + 1
             ]
             candidates = candidates.permute(0, 2, 1, 3).contiguous()
-            self._pending_conv_states = (
+            speculative_record.conv_states = (
                 conv_state,
                 generation_slots,
                 conv_state[generation_slots].clone(),
@@ -1323,13 +1362,19 @@ class Qwen4ExpPLE(nn.Module):
         return F.silu(conv_output[m.req_indices, m.token_offsets])
 
     def _commit_ngram_context(
-        self, combined: torch.Tensor, metadata: PLEMetadata, ngram_context: torch.Tensor
+        self,
+        combined: torch.Tensor,
+        metadata: PLEMetadata,
+        ngram_context: torch.Tensor,
+        speculative_record: PLESpeculativeRecord,
     ) -> None:
         """Slide each sequence's n-gram history forward by its chunk length.
 
         The new history is the ``ngram_context_len`` columns of ``combined``
         starting at ``lengths``: the last ``ngram_size - 1`` tokens exposed by
         each chunk. It is written back into the caller's pool in place.
+        Verification rows leave their per-token candidates on
+        ``speculative_record``.
         """
         m = metadata
         context_len = combined.shape[1] - m.row_width
@@ -1342,7 +1387,7 @@ class Qwen4ExpPLE(nn.Module):
                 .unfold(1, context_len, 1)[:, 1 : m.generation_row_width + 1]
                 .contiguous()
             )
-            self._pending_ngram_contexts = (
+            speculative_record.ngram_contexts = (
                 ngram_context,
                 generation_slots,
                 ngram_context[generation_slots].clone(),
@@ -1351,34 +1396,13 @@ class Qwen4ExpPLE(nn.Module):
 
         ngram_context[m.state_indices] = next_context.to(dtype=ngram_context.dtype)
 
-    def commit_speculative_states(
-        self,
-        num_accepted_tokens: torch.Tensor,
-        state_indices: torch.Tensor,
-        num_contexts: int,
-    ) -> None:
-        """Keep the PLE state produced by the accepted verification prefix."""
-        del state_indices
-        # The decoder always accepts at least the target token. Candidate zero
-        # therefore represents one accepted token, hence the zero-based -1.
-        accepted = num_accepted_tokens[num_contexts:].to(torch.long) - 1
-        for entry in (self._pending_conv_states, self._pending_ngram_contexts):
-            if entry is None:
-                continue
-            state_pool, slots, _, candidates = entry
-            num_gens = slots.shape[0]
-            rows = torch.arange(num_gens, device=slots.device)
-            selected = candidates[rows, accepted[:num_gens]]
-            state_pool[slots] = selected.to(dtype=state_pool.dtype)
-        self._pending_conv_states = None
-        self._pending_ngram_contexts = None
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         metadata: PLEMetadata,
         conv_state: torch.Tensor,
         ngram_context: torch.Tensor,
+        speculative_record: PLESpeculativeRecord,
     ) -> torch.Tensor:
         """Compute the PLE contribution and advance both recurrent-state pools.
 
@@ -1390,6 +1414,9 @@ class Qwen4ExpPLE(nn.Module):
                 updated in place.
             ngram_context: ``[num_slots, ngram_size - 1]`` int64 token-history
                 pool, updated in place.
+            speculative_record: receives the per-token state candidates of a
+                verification forward; its owner commits it once acceptance is
+                known.
 
         Returns:
             ``[physical_tokens, hc_count * hidden]`` — the value to add into the
@@ -1455,9 +1482,9 @@ class Qwen4ExpPLE(nn.Module):
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
-        conv_output = self._short_conv(gated_value_normed, metadata, conv_state)
+        conv_output = self._short_conv(gated_value_normed, metadata, conv_state, speculative_record)
         output = gated_value + conv_output
         output = torch.where(m.valid_tokens.unsqueeze(-1), output, torch.zeros_like(output))
 
-        self._commit_ngram_context(combined, metadata, ngram_context)
+        self._commit_ngram_context(combined, metadata, ngram_context, speculative_record)
         return _pad_token_rows(output, m.physical_tokens)

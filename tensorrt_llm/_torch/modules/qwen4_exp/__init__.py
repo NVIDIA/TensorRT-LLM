@@ -15,11 +15,12 @@
 """Runtime modules owned by the Qwen4-Exp architecture."""
 
 from .hyper_connection import HCResidual, Qwen4ExpHyperConnection
-from .ple import PLEMetadata, Qwen4ExpPLE
+from .ple import PLEMetadata, PLESpeculativeRecord, Qwen4ExpPLE
 
 __all__ = [
     "HCResidual",
     "PLEMetadata",
+    "PLESpeculativeRecord",
     "Qwen4ExpHyperConnection",
     "Qwen4ExpPLE",
 ]

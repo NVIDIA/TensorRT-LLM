@@ -563,7 +563,7 @@ def test_model_forward_aborts_unconsumed_ple_prefetch(monkeypatch) -> None:
     monkeypatch.setattr(
         Qwen4ExpModel,
         "_prepare_ple_state",
-        lambda *args, **kwargs: (object(), object(), object()),
+        lambda *args, **kwargs: (object(), object(), object(), object()),
     )
 
     with pytest.raises(RuntimeError, match="simulated layer failure"):
@@ -830,6 +830,7 @@ def test_ple_states_use_v2_lifecycle_buffers(monkeypatch) -> None:
     manager._ple_conv_state_dtype = torch.bfloat16
     manager._ple_ngram_contexts = {}
     manager._ple_conv_states = {}
+    manager._ple_speculative_records = {}
     manager.layer_offsets = {1: 0}
 
     manager._setup_ple_states(num_state_slots=12)
@@ -1596,7 +1597,7 @@ def test_ple_prefill_reuses_prepared_device_metadata(monkeypatch) -> None:
     monkeypatch.setattr(
         Qwen4ExpModel,
         "_resolve_ple_pools",
-        lambda self, *args: (conv_state, ngram_context),
+        lambda self, *args: (conv_state, ngram_context, None),
     )
 
     seq_lens = torch.tensor([2, 3], dtype=torch.int32)

@@ -42,6 +42,7 @@ from tensorrt_llm._torch.modules.fla.inforward_snapshot import (
     InforwardSnapshots,
 )
 from tensorrt_llm._torch.modules.fla.replay_region import REPLAY_STATE_REGION, GDNReplayRegion
+from tensorrt_llm._torch.modules.qwen4_exp.ple import PLESpeculativeRecord
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
@@ -52,7 +53,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
-from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
+from tensorrt_llm._torch.pyexecutor.resource_manager import SpeculativeAcceptance, get_pp_layers
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -664,6 +665,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         self._ple_conv_state_dtype = default_state_dtype
         self._ple_conv_states: dict[int, torch.Tensor] = {}
         self._ple_ngram_contexts: dict[int, torch.Tensor] = {}
+        self._ple_speculative_records: dict[int, PLESpeculativeRecord] = {}
         if params is None:
             return
         if len(params.ple_layer_mask) != total_layers:
@@ -723,6 +725,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
                 )
             self._ple_conv_states[layer_id] = conv_state
             self._ple_ngram_contexts[layer_id] = ngram_context
+            self._ple_speculative_records[layer_id] = PLESpeculativeRecord()
         logger.info(
             "PLE state views bound to V2 lifecycle buffers for local layers "
             f"{sorted(self._ple_conv_states)}: conv "
@@ -789,6 +792,23 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
         if conv is None or ngram is None:
             return None
         return conv, ngram
+
+    def ple_speculative_record(self, layer_idx: int) -> PLESpeculativeRecord:
+        """Return the record a layer's verification forward leaves its state candidates on."""
+        return self._ple_speculative_records[layer_idx]
+
+    @cached_property
+    def _serves_one_model_mtp(self) -> bool:
+        spec_config = self.spec_config
+        return spec_config is not None and spec_config.spec_dec_mode.is_mtp_one_model()
+
+    @override
+    def _commit_auxiliary_speculative_state(self, acceptance: SpeculativeAcceptance) -> None:
+        """Keep the PLE state of the accepted tokens; only one-model MTP steps commit it."""
+        if not self._serves_one_model_mtp:
+            return
+        for record in self._ple_speculative_records.values():
+            record.commit(acceptance.num_accepted_tokens, acceptance.num_contexts)
 
     def _ple_buffer_configs(self) -> list[BufferConfig]:
         if not self._ple_layer_ids:
@@ -1007,6 +1027,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
             self._replay_region.shutdown()
         self._ple_conv_states.clear()
         self._ple_ngram_contexts.clear()
+        self._ple_speculative_records.clear()
         self._inforward_snapshots.shutdown()
         self._inforward_stage_ple = {}
         super().shutdown()
