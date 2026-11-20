@@ -289,46 +289,7 @@ travels in the same cache, in the drafter's layers, together with the drafter's 
 Set `TRTLLM_DISAGG_SHARED_DRAFT_KV=1` on both nodes to require the shared cache. Each worker
 checks at startup that it can provide the draft layers needed for this handoff.
 
-### Launch the workers
-
-On the context node, with the disaggregated context recipe (replace `<DRAFTER_CHECKPOINT>` in it):
-
-```bash
-export TRTLLM_DISAGG_SHARED_DRAFT_KV=1
-export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
-export TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES>
-
-trtllm-serve <TARGET_CHECKPOINT> \
-  --config beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml \
-  --chat_template <TARGET_CHECKPOINT>/chat_template.jinja \
-  --served_model_name beam-nvfp4 \
-  --server_role CONTEXT \
-  --host 0.0.0.0 --port 8001
-```
-
-On the generation node, with the disaggregated generation recipe:
-
-```bash
-export TRTLLM_DISAGG_SHARED_DRAFT_KV=1
-export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
-export TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES>
-
-trtllm-serve <TARGET_CHECKPOINT> \
-  --config beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml \
-  --chat_template <TARGET_CHECKPOINT>/chat_template.jinja \
-  --served_model_name beam-nvfp4 \
-  --server_role GENERATION \
-  --host 0.0.0.0 --port 8002
-```
-
-Wait until both workers answer `/health` with `200`.
-
-NIXL moves the KV cache with UCX, which must be able to register GPU memory. If your environment
-restricts UCX to TCP (`UCX_TLS=tcp`), add the CUDA transports before starting each worker, for
-example `export UCX_TLS=tcp,cuda_copy,cuda_ipc`. With TCP alone, every worker rank fails during
-startup with `VRAM memory is detected as host by UCX`.
-
-### Launch the router
+### Prepare the private serving configs
 
 Write the router configuration, replacing `<CONTEXT_HOST>` and `<GENERATION_HOST>` with the two
 nodes' addresses:
@@ -348,10 +309,81 @@ generation_servers:
     - "<GENERATION_HOST>:8002"
 ```
 
+The router and both workers need the same `internal_request_auth_key`. Generate one random
+secret for the deployment (for example with `openssl rand -hex 32`) and provide it as
+`BEAM_HANDOFF_KEY` through your secret manager on the machine preparing the configs.
+Save the router template above next to the two worker recipes and replace their checkpoint
+placeholders. From that directory, render private copies:
+
+```bash
+python3 - <<'PYTHON'
+import os
+from pathlib import Path
+
+import yaml
+
+key = os.environ["BEAM_HANDOFF_KEY"]
+if not key.strip():
+    raise ValueError("BEAM_HANDOFF_KEY must be non-empty")
+os.umask(0o077)
+out = Path("private")
+out.mkdir(exist_ok=False)
+for name in ("beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
+             "beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml", "disagg-router.yaml"):
+    config = yaml.safe_load(Path(name).read_text())
+    config["internal_request_auth_key"] = key
+    (out / name).write_text(yaml.safe_dump(config, sort_keys=False))
+PYTHON
+```
+
+Provision each private file to its serving node with owner-only access. The router signs
+handoffs with this key and the generation worker verifies them.
+
+### Launch the workers
+
+On the context node, use the prepared context config:
+
+```bash
+export TRTLLM_DISAGG_SHARED_DRAFT_KV=1
+export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
+export TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES>
+
+trtllm-serve <TARGET_CHECKPOINT> \
+  --config private/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml \
+  --chat_template <TARGET_CHECKPOINT>/chat_template.jinja \
+  --served_model_name beam-nvfp4 \
+  --server_role CONTEXT \
+  --host 0.0.0.0 --port 8001
+```
+
+On the generation node, with the disaggregated generation recipe:
+
+```bash
+export TRTLLM_DISAGG_SHARED_DRAFT_KV=1
+export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
+export TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES>
+
+trtllm-serve <TARGET_CHECKPOINT> \
+  --config private/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml \
+  --chat_template <TARGET_CHECKPOINT>/chat_template.jinja \
+  --served_model_name beam-nvfp4 \
+  --server_role GENERATION \
+  --host 0.0.0.0 --port 8002
+```
+
+Wait until both workers answer `/health` with `200`.
+
+NIXL moves the KV cache with UCX, which must be able to register GPU memory. If your environment
+restricts UCX to TCP (`UCX_TLS=tcp`), add the CUDA transports before starting each worker, for
+example `export UCX_TLS=tcp,cuda_copy,cuda_ipc`. With TCP alone, every worker rank fails during
+startup with `VRAM memory is detected as host by UCX`.
+
+### Launch the router
+
 Start the router on either node, or on a separate host that reaches both:
 
 ```bash
-trtllm-serve disaggregated -c disagg-router.yaml --request_timeout 86400
+trtllm-serve disaggregated -c private/disagg-router.yaml --request_timeout 86400
 ```
 
 `--request_timeout` is the router's limit, in seconds, for one request (default 180). When it
@@ -446,7 +478,8 @@ IDs only. Configure the frontend's text processing through the worker's registra
   flags are needed: Dynamo selects its Beam parser only when both name `beam`.
 
 Use the curated recipes as the worker's `--extra-engine-args`, with `<DRAFTER_CHECKPOINT>` replaced
-and the `reasoning_parser` line removed (reasoning parsing belongs to the frontend here). The commands
+and the `reasoning_parser` line removed (reasoning parsing belongs to the frontend here).
+Start from the curated engine configs so the private router key stays out of Dynamo's engine arguments. The commands
 below call the three prepared files `beam-dynamo-aggregated.yaml`, `beam-dynamo-disagg-ctx.yaml` and
 `beam-dynamo-disagg-gen.yaml`. Export the
 same environment variables as for `trtllm-serve` before starting each worker

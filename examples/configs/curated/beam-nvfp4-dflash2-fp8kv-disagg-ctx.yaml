@@ -6,10 +6,12 @@
 # behind `trtllm-serve disaggregated`. Steps, inputs, limits and requests:
 # docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md
 #
+#   # Prepare private/ as shown in the guide first: its worker YAML adds the top-level
+#   # internal_request_auth_key shared with the router and peer.
 #   export TRTLLM_DISAGG_SHARED_DRAFT_KV=1
 #   export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
 #   export TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES>
-#   trtllm-serve <TARGET_CHECKPOINT> --config beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml \
+#   trtllm-serve <TARGET_CHECKPOINT> --config private/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml \
 #     --chat_template <TARGET_CHECKPOINT>/chat_template.jinja --server_role CONTEXT
 #
 # Replace <DRAFTER_CHECKPOINT> below with the DFlash2 drafter directory. Both workers must use the
