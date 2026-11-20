@@ -5433,6 +5433,9 @@ def test_megamoe_runner_refuses_a_shared_workspace_smaller_than_its_kernel_needs
     runner = megamoe_op.Sm100MegaMoENvfp4Runner.__new__(megamoe_op.Sm100MegaMoENvfp4Runner)
     runner.world_size, runner.num_experts_per_rank, runner._profiling_scratch = 1, 18, None
     runner.ugpu_weight_layout = "none"
+    runner.num_topk = runner.hidden_size = runner.intermediate_size_per_partition = 1  # its key
+    runner.max_tokens_per_rank, runner.combine_format = 1, None
+    monkeypatch.setattr(megamoe_op, "_MEGAMOE_LAUNCHED_TACTICS", {})  # this launch's tactic only
     monkeypatch.setattr(
         runner, "_resolve_kernel_descriptor", lambda tactic, allow_fallback: (kernel, tactic)
     )
@@ -5446,7 +5449,7 @@ def test_megamoe_runner_refuses_a_shared_workspace_smaller_than_its_kernel_needs
     with pytest.raises(ValueError, match=r"has 4095 bytes, but the kernel for 18 experts"):
         runner.forward(
             inputs,
-            tactic=("not", "the", "default"),
+            tactic=megamoe_op._MEGAMOE_QUANTIZED_COMBINE_TACTIC,  # not the default
             peer_offsets=[0],
             shared_workspace=torch.empty(needed - 1, dtype=torch.uint8),
         )

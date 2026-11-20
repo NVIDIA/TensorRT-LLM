@@ -71,6 +71,7 @@ from __future__ import annotations
 import functools
 import math
 import os
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
@@ -1164,7 +1165,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         A slot that receives rows streams its expert's ``expert_bytes`` once, at ``rates[0]``
         bytes/s; a row costs its FC1 and FC2 FLOPs at ``rates[1]`` FLOP/s; every tile of
-        ``tile_rows`` rows (the M of the kernels' MMA tile, :meth:`decode_tile_rows`) of a slot
+        ``tile_rows`` rows (the M of the MMA tile of the bucket's tactic) of a slot
         beyond its first costs a tile of rows, and every such tile of the GPU's busiest slot half a
         tile more, the serial tail of that slot. Only this structure is the backend's: the rates,
         the scale and the read cost per slot come from a calibration on the GPU.
@@ -1183,14 +1184,29 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             tile_rows=int(tile_rows),
         )
 
-    def _decode_tactic(self, tokens: int) -> Tuple:
-        """The default tactic of a decode step of ``tokens`` tokens per GPU, found without a launch."""
-        from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
-            _default_megamoe_tactic_for_problem,
-        )
+    def _decode_tactic(self, tokens: int) -> Optional[Tuple]:
+        """The tactic of a decode step of ``tokens`` tokens per GPU: the one its bucket's last
+        launch ran, else the default tables', found without a launch; None when the autotuner
+        picks it and no launch has resolved it yet."""
+        from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 
         max_t = self._select_launch_max_tokens(tokens)
-        return _default_megamoe_tactic_for_problem(
+        top_k = int(self.routing_method.experts_per_token)
+        key = op.megamoe_launch_key(
+            self.ep_size,
+            top_k,
+            self.compute_slot_count,
+            self.hidden_size,
+            self.intermediate_size_per_partition,
+            max_t,
+            self.combine_format,
+        )
+        launched = op._MEGAMOE_LAUNCHED_TACTICS.get(key)
+        if launched is not None or self.tactic_autotune:
+            self._decode_tactic_source = "a launch" if launched is not None else "no launch yet"
+            return launched
+        self._decode_tactic_source = "the default tables, no launch yet"
+        return op._default_megamoe_tactic_for_problem(
             sm_version=get_sm_version(),
             max_tokens_per_rank=max_t,
             num_tokens=tokens,
@@ -1199,32 +1215,110 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             combine_format=self.combine_format,
         )
 
-    def decode_tile_rows(self, tokens: List[int]) -> int:
-        """Rows of one MMA tile (its M) of the decode kernels: the tactic of the largest decode bucket
-        of ``tokens`` tokens per GPU."""
-        return int(self._decode_tactic(max(int(t) for t in tokens))[0][0])
-
     def decode_calibration_identity(self, tokens: List[int]) -> Dict[str, object]:
         """What a calibration of :meth:`decode_time_model` holds for: the kernels' geometry and
-        combine format, and the tactic a decode step of each of ``tokens`` tokens per GPU resolves
-        to, found without a launch. A bucket of more tokens than the largest launch takes runs in
-        no single launch: it has none."""
-        tactics = {}
+        combine format, and per decode step of each of ``tokens`` tokens per GPU its launch bucket,
+        its tactic (:meth:`_decode_tactic`; ``autotune`` while unresolved) and that tactic's MMA
+        tile rows (the M of its tile; None while unresolved). A bucket of more tokens than the
+        largest launch takes runs in no single launch: it has none of them."""
+        tactics, buckets, tiles = {}, {}, {}
         for t in tokens:
             try:
-                self._select_launch_max_tokens(int(t))
+                buckets[str(int(t))] = int(self._select_launch_max_tokens(int(t)))
             except RuntimeError:
                 continue
             tactic = self._decode_tactic(int(t))
-            tactics[str(int(t))] = "autotune" if self.tactic_autotune else repr(tactic)
+            tactics[str(int(t))] = "autotune" if tactic is None else repr(tactic)
+            tiles[str(int(t))] = None if tactic is None else int(tactic[0][0])
+            chooser = "the autotuner" if self.tactic_autotune else "the default tables"
+            logger.info(
+                f"MegaMoE decode bucket of {t} tokens: tile rows {tiles[str(int(t))]}, tactic of "
+                f"{chooser} from {self._decode_tactic_source}"
+            )
         return dict(
             backend=type(self).__name__,
             combine_format=self.combine_format,
             hidden_size=int(self.hidden_size),
             intermediate_size=int(self.intermediate_size_per_partition),
+            expand_intermediate_size=int(self.expand_intermediate_size_per_partition),
+            num_experts=int(self.num_experts),
             top_k=int(self.routing_method.experts_per_token),
             tactics=tactics,
+            launch_buckets=buckets,
+            tile_rows=tiles,
         )
+
+    def time_decode_steps(
+        self, tokens: int, steps: List[Callable[[], torch.Tensor]], *, warmup: int, iters: int
+    ) -> Tuple[List[float], float]:
+        """Microseconds per launch of a decode step of ``tokens`` tokens per GPU, per step of
+        ``steps``, and the host microseconds one launch takes to enqueue. Collective over EP.
+
+        A step returns the slot ids (``[tokens, top_k]``) of its launch once the bucket hint is set,
+        as forced routes or through a route op writing :meth:`route_staging`. Each step's launches
+        (hint, routes, ``quantize_input``, ``run_moe`` on a fixed activation) run eagerly: a device
+        sleep covering their enqueue, ``warmup`` launches, then ``iters`` launches between two
+        events. They read the weights and write only this layer's staging and workspaces, which every
+        forward rewrites; the caller times every rank in the same order.
+        """
+        device = torch.device("cuda", torch.cuda.current_device())
+        top_k = int(self.routing_method.experts_per_token)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(self.ep_rank))
+        x = torch.randn((tokens, self.hidden_size), generator=generator, device=device)
+        x = x.to(torch.bfloat16)
+        scales = torch.full((tokens, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
+        dtype = self.dtype or torch.bfloat16
+
+        def launch(step: Callable[[], torch.Tensor]) -> None:
+            self.set_adaptive_launch_tokens(tokens, output_dtype=dtype)
+            ids = step()
+            x_fp4, x_sf = self.quantize_input(x)
+            context = MoERunContext(
+                token_selected_experts=ids,
+                token_final_scales=scales,
+                x=x_fp4,
+                x_sf=x_sf,
+                output_dtype=dtype,
+            )
+            self.run_moe(context)
+
+        with torch.inference_mode():  # as a forward: the staging is an inference tensor
+            return self._time_decode_launches(launch, steps, warmup, iters)
+
+    @staticmethod
+    def _time_decode_launches(
+        launch: Callable, steps: List[Callable], warmup: int, iters: int
+    ) -> Tuple[List[float], float]:
+        device = torch.device("cuda", torch.cuda.current_device())
+        launch(steps[0])  # builds the bucket's staging before the host time is taken
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(warmup + iters):
+            launch(steps[0])
+        host_us = (time.perf_counter() - start) * 1e6 / (warmup + iters)
+        torch.cuda.synchronize()
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device.index)
+        mhz = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM)
+        # Twice the enqueue time at the highest clock: the launches queue up behind the sleep.
+        cycles = int(2 * host_us * (warmup + iters) * mhz)
+        events = []
+        for step in steps:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda._sleep(cycles)
+            for _ in range(warmup):
+                launch(step)
+            start_event.record()
+            for _ in range(iters):
+                launch(step)
+            end_event.record()
+            events.append((start_event, end_event))
+        torch.cuda.synchronize()
+        return [a.elapsed_time(b) * 1e3 / iters for a, b in events], host_us
 
     def _supports_load_balancer(self) -> bool:
         # Both static and dynamic EPLB are supported: the four MegaMoE-

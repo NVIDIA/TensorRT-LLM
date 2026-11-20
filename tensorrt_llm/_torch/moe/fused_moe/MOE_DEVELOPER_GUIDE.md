@@ -326,7 +326,7 @@ with their ids, families and priorities, are the catalog generated into
 | Python-side kernels and ops | `tensorrt_llm/_torch/moe/kernels/` (CuTe DSL kernels by architecture, and the MegaMoE sources) and `tensorrt_llm/_torch/moe/custom_ops/`; the MoE ops among `tensorrt_llm/_torch/custom_ops/`; the Triton kernels some leaves call, at the top of this directory (`fused_moe_triton_fp8_block_scale.py`, `triton_dequant_nvfp4.py`) |
 | C++ kernels, ops and gtests | `cpp/tensorrt_llm/kernels/moe/`, `cpp/tensorrt_llm/thop/moe/`, `cpp/tests/unit_tests/kernels/moe/`; see [C++](#c-cpp) |
 | Python tests | `tests/unittest/_torch/moe/`; see [Tests](#tests) |
-| `adaptive_eplb/` | Adaptive EPLB, created by `maybe_create_moe_load_balancer`: model-level and per-layer `balancer`, decision `policy`, statistics windows and installs in `runtime`, expert weights in MNNVL memory in `transport`. A backend opts in with `supports_adaptive_eplb`, the methods of `transport.AdaptiveEplbBackend` and the structure of its kernels' decode time (`decode_time_model`), whose costs a calibration file gives (`time_model_file`) |
+| `adaptive_eplb/` | Adaptive EPLB, created by `maybe_create_moe_load_balancer`: model-level and per-layer `balancer`, decision `policy`, statistics windows and installs in `runtime`, expert weights in MNNVL memory in `transport`. A backend opts in with `supports_adaptive_eplb`, the methods of `transport.AdaptiveEplbBackend` and the structure of its kernels' decode time (`decode_time_model`), whose costs `adaptive_eplb/calibrate` measures on the GPUs through `time_decode_steps` |
 
 ### Inside a family package
 
