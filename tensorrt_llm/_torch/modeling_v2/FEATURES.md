@@ -65,7 +65,7 @@ before they are classified.
 
 | Feature | Turned on by | Status | Today |
 |---|---|---|---|
-| `SpeculativeDecoding` | `speculative_config` | planned | Every target serves one mode, checked in `route`: one-model MTP-Eagle (DeepSeek R1, Qwen3.8-Flash-Next, the four GLM-5.2 targets, GLM-5.3-Flash mtp_fused), one-model Eagle3 (MiniMax-M3), SA/DFlash/DSpark (Kimi K3 moetp4ep4), MTP or SA (GLM-5.3-Flash default), none (GPT-OSS, Kimi K3 moetp16ep1). Dynamic trees, `draft_len_schedule` and two-model drafting are refused everywhere; GLM-5.2 sm103 tp8 requires MTP. The feature would carry the `SpeculativeDecodingMode` (`speculative_config.spec_dec_mode`), linearity and draft length so targets state these limits with `when`. |
+| `SpeculativeDecoding` | `speculative_config` | planned | Every target serves one mode, checked in `route`: one-model MTP-Eagle (DeepSeek R1, Qwen3.8-Flash-Next, the four GLM-5.2 targets, GLM-5.3-Flash mtp_fused), one-model Eagle3 (MiniMax-M3), SA/DFlash/DSpark (Kimi K3 moetp4ep4), MTP or SA (GLM-5.3-Flash default), none (GPT-OSS, Kimi K3 moetp16ep1). Dynamic trees, `draft_len_schedule` and two-model drafting are refused everywhere; GLM-5.2 sm103 tp8 requires MTP. The feature would carry the `SpeculativeDecodingMode` (`speculative_config.spec_dec_mode`), linearity and draft length so targets state these limits with `when`, including the `cuda_graph_config.sampling_variants` a target's own draft loop samples with. |
 | `LoRA` | `enable_lora` / `lora_config` | planned | No target serves it. Qwen3.8-Flash-Next asserts and MiniMax-M3 raises at runtime; DeepSeek R1, GPT-OSS and GLM-5.2 sm103 tep4 ignore `lora_params` without a check. |
 | `BeamSearch` | `max_beam_width > 1` | planned | No target serves it. Qwen3.8-Flash-Next asserts width 1; DeepSeek R1 and GLM-5.2 sm103 tep4 assume width 1 without a check. |
 | `ReturnRoutedExperts` | `enable_return_routed_experts` | planned | |
@@ -78,8 +78,6 @@ before they are classified.
 |---|---|---|---|
 | `PrefillCudaGraph` | `prefill_cuda_graph_backend` | in code | Declared by GLM-5.2 sm103 tp8 and sm107 low_latency (all backends), Kimi K3 tp16 (breakable), MiniMax-M3 sm107 tp2 (breakable; decode left uncompiled), Qwen3.8-Flash-Next (breakable under attention TP; decode left uncompiled). MiniMax-M3 sm103 tp4/tp8 and sm107 tp4/tp8 raise at runtime under any prefill CUDA graph and need a refusal in `route`. |
 | `MoeLoadBalancer` | `moe_config.load_balancer` | planned | Qwen3.8-Flash-Next (with expert parallelism) and GLM-5.2 sm107 high_throughput refuse it because it would do nothing; a warning fits. |
-| `CudaGraphSamplingVariants`, `InGraphSampling` | `cuda_graph_config.sampling_variants`, `enable_in_graph_sampling` | to verify | |
-| `AttentionDpBalance` | `attention_dp_config` | to verify | |
 
 ### Kept in `route`
 
@@ -92,11 +90,12 @@ numerics a checkpoint is served with. `route` keeps checking them.
   format, `sparse_attention_config`, `kv_cache_compression_config`.
 
 The engine settings the model never sees (scheduler policy, `batch_wait_*`,
-`stream_interval`, statistics, tokenizer, the sampler's
-`batched_logits_processor` and `watermark_config`, and the KV cache transfers
-behind `cache_transceiver_config` and `kv_connector_config`) are neither
-features nor checked in `route`. A target that fuses sampling into its draft loop bypasses
-the sampler; `SpeculativeDecoding` states that limit with `when`.
+`stream_interval`, `attention_dp_config`, statistics, tokenizer, the sampler's
+`batched_logits_processor`, `watermark_config` and `enable_in_graph_sampling`,
+and the KV cache transfers behind `cache_transceiver_config` and
+`kv_connector_config`) are neither features nor checked in `route`. A target
+that fuses sampling into its draft loop bypasses the sampler;
+`SpeculativeDecoding` states that limit with `when`.
 
 Nor are the kernel choices a target makes for itself, such as
 `allreduce_strategy`, `moe_config.tactic`, `moe_config.backend`,
