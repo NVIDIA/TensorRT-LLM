@@ -52,6 +52,7 @@ from tensorrt_llm._torch.modeling_v2._router_index import (
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
+    DeepSeekSparseAttentionConfig,
     KvCacheConfig,
     MTPDecodingConfig,
     MultimodalConfig,
@@ -137,7 +138,12 @@ def _glm52_config(**overrides):
         q_lora_rank=2048,
         index_n_heads=32,
         first_k_dense_replace=3,
-        indexer_types=["full"] * 78,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=[
+            "full" if layer_idx < 3 or (layer_idx - 2) % 4 == 0 else "shared"
+            for layer_idx in range(78)
+        ],
     )
     fields.update(overrides)
     return PretrainedConfig(**fields)
@@ -173,6 +179,11 @@ def _model_config(
         mapping=mapping,
         spec_config=spec_config,
         quant_config=QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo),
+        sparse_attention_config=(
+            DeepSeekSparseAttentionConfig(index_n_heads=32, index_head_dim=128, index_topk=2048)
+            if pretrained_config.architectures[0] == "GlmMoeDsaForCausalLM"
+            else None
+        ),
     )
 
 

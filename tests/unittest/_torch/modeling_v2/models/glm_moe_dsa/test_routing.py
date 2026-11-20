@@ -82,6 +82,10 @@ _GLM52_TARGET = (
     "ModelingV2Glm52Nvfp4Sm107LowLatency"
 )
 _TP16 = dict(world_size=16, tp_size=16, moe_ep_size=1, moe_tp_size=16)
+_TEP4_TARGET = (
+    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.modeling.ModelingV2Glm52Nvfp4Sm103Tep4"
+)
+_TEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1)
 
 
 @pytest.fixture
@@ -278,7 +282,7 @@ def _load_tep4_quantization(
     exclude_modules: list[str],
     linear_overrides: dict[str, str] | None,
     kv_cache_quant_algo: str | None = "FP8",
-):
+) -> tuple[QuantConfig, dict[str, QuantConfig] | None]:
     """Parse synthetic checkpoint metadata with the production ModelOpt loader."""
     quant_path = tmp_path / "hf_quant_config.json"
     quantization: dict[str, object] = {
@@ -326,6 +330,19 @@ def _load_tep4_quantization(
             True,
             None,
             id="unquantized-dense-and-shared",
+        ),
+        pytest.param(
+            [
+                "model.layers.0*",
+                "model.layers.1.*",
+                "model.layers.2.*",
+                *[f"{name}*" for name in _TEP4_SHARED_MODULES],
+                "model.layers.78*",
+            ],
+            None,
+            True,
+            None,
+            id="checkpoint-shaped-wildcards",
         ),
         pytest.param(
             [
@@ -460,6 +477,10 @@ def test_tep4_uses_effective_checkpoint_quantization(
         tmp_path, exclude_modules, linear_overrides
     )
     if linear_overrides is None:
+        assert quant_config.quant_algo == QuantAlgo.NVFP4
+        for layer_idx in (10, 20):
+            routed_projection = f"model.layers.{layer_idx}.mlp.experts.0.up_proj"
+            assert not quant_config.is_module_excluded_from_quantization(routed_projection)
         for unpacked in (
             "model.layers.0.self_attn.q_a_proj",
             "model.layers.3.mlp.gate",
@@ -468,17 +489,26 @@ def test_tep4_uses_effective_checkpoint_quantization(
         ):
             assert quant_config.is_module_excluded_from_quantization(unpacked)
     model_config = ModelConfig(
-        pretrained_config=_glm52_config(first_k_dense_replace=3, indexer_types=["full"] * 78),
-        mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
+        pretrained_config=_glm52_config(
+            first_k_dense_replace=3,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+            indexer_types=[
+                "full" if layer_idx < 3 or (layer_idx - 2) % 4 == 0 else "shared"
+                for layer_idx in range(78)
+            ],
+        ),
+        mapping=Mapping(**_TEP4),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_n_heads=32, index_head_dim=128, index_topk=2048
+        ),
         quant_config=quant_config,
         quant_config_dict=quant_config_dict,
         spec_config=MTPDecodingConfig(max_draft_len=3) if mtp_enabled else None,
     )
     resolved = modeling_v2_resolve(model_config, _llm_args("auto"))
     if missed is None:
-        assert _qualified(resolved) == (
-            "models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.modeling.ModelingV2Glm52Nvfp4Sm103Tep4"
-        )
+        assert _qualified(resolved) == _TEP4_TARGET
         assert modeling_v2_resolve(model_config, _llm_args("require")) is resolved
     else:
         assert resolved is None
@@ -487,40 +517,45 @@ def test_tep4_uses_effective_checkpoint_quantization(
 
 
 @pytest.mark.parametrize(
-    "indexer_types,accepted",
+    "indexer_types,missed",
     [
-        pytest.param(None, False, id="missing"),
-        pytest.param(["full"] * 77, False, id="short"),
-        pytest.param(17, False, id="scalar"),
-        pytest.param(["shared"] * 78, False, id="all-shared"),
-        pytest.param(["shared"] + ["full"] * 77, False, id="shared-before-owner"),
-        pytest.param(["full"] + ["shared"] * 77, True, id="shared-after-owner"),
+        pytest.param(None, "indexer_types absent", id="missing"),
+        pytest.param(["full"] * 77, "indexer_types covers 77 of 78", id="short"),
+        pytest.param(17, "indexer_types is int", id="scalar"),
+        pytest.param(["shared"] * 78, "indexer_types[0]='shared'", id="all-shared"),
+        pytest.param(
+            ["shared"] + ["full"] * 77, "indexer_types[0]='shared'", id="shared-before-owner"
+        ),
+        pytest.param(["full"] + ["shared"] * 77, None, id="shared-after-owner"),
     ],
 )
-def test_tep4_requires_indexer_schedule(tmp_path: Path, indexer_types, accepted: bool):
+def test_tep4_requires_indexer_schedule(
+    tmp_path: Path, indexer_types: list[str] | int | None, missed: str | None
+) -> None:
     pretrained_config = _glm52_config(first_k_dense_replace=3)
     if indexer_types is not None:
         pretrained_config.indexer_types = indexer_types
     quant_config, quant_config_dict = _load_tep4_quantization(tmp_path, [], {})
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
-        mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
+        mapping=Mapping(**_TEP4),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_n_heads=32, index_head_dim=128, index_topk=2048
+        ),
         quant_config=quant_config,
         quant_config_dict=quant_config_dict,
     )
-    if accepted:
+    if missed is None:
         resolved = modeling_v2_resolve(model_config, _llm_args("auto"))
-        assert _qualified(resolved) == (
-            "models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.modeling.ModelingV2Glm52Nvfp4Sm103Tep4"
-        )
+        assert _qualified(resolved) == _TEP4_TARGET
         assert modeling_v2_resolve(model_config, _llm_args("require")) is resolved
         return
     assert modeling_v2_resolve(model_config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match="indexer_types"):
+    with pytest.raises(ValueError, match=re.escape(missed)):
         modeling_v2_resolve(model_config, _llm_args("require"))
 
 
-def test_non_tep4_ignores_indexer_schedule(tmp_path: Path):
+def test_non_tep4_ignores_indexer_schedule(tmp_path: Path) -> None:
     quant_config, quant_config_dict = _load_tep4_quantization(tmp_path, [], {})
     model_config = ModelConfig(
         pretrained_config=_glm52_config(first_k_dense_replace=3, indexer_types=17),
@@ -529,7 +564,7 @@ def test_non_tep4_ignores_indexer_schedule(tmp_path: Path):
         quant_config_dict=quant_config_dict,
     )
     assert modeling_v2_resolve(model_config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match=r"\btp=2\b"):
+    with pytest.raises(ValueError, match="tep4 checkpoint not read"):
         modeling_v2_resolve(model_config, _llm_args("require"))
 
 
@@ -566,7 +601,9 @@ def test_non_tep4_ignores_indexer_schedule(tmp_path: Path):
         ),
     ],
 )
-def test_tep4_requires_indexer_cache_pool(tmp_path: Path, sharing_config: dict, owns_cache: bool):
+def test_tep4_requires_indexer_cache_pool(
+    tmp_path: Path, sharing_config: dict, owns_cache: bool
+) -> None:
     pretrained_config = _glm52_config(
         first_k_dense_replace=3,
         indexer_types=["full" if layer_idx in (0, 6) else "shared" for layer_idx in range(78)],
@@ -587,7 +624,7 @@ def test_tep4_requires_indexer_cache_pool(tmp_path: Path, sharing_config: dict, 
     quant_config, quant_config_dict = _load_tep4_quantization(tmp_path, [], {})
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
-        mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
+        mapping=Mapping(**_TEP4),
         quant_config=quant_config,
         quant_config_dict=quant_config_dict,
         sparse_attention_config=sparse_config,
@@ -595,18 +632,53 @@ def test_tep4_requires_indexer_cache_pool(tmp_path: Path, sharing_config: dict, 
     )
     resolved = modeling_v2_resolve(model_config, _llm_args("auto"))
     if owns_cache:
-        assert _qualified(resolved) == (
-            "models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.modeling.ModelingV2Glm52Nvfp4Sm103Tep4"
-        )
+        assert _qualified(resolved) == _TEP4_TARGET
         assert modeling_v2_resolve(model_config, _llm_args("require")) is resolved
     else:
         assert resolved is None
-        with pytest.raises(ValueError, match="indexer_types layer 6 has no indexer K-cache"):
+        with pytest.raises(
+            ValueError,
+            match="indexer_types layer 6 has no indexer K-cache.*index_topk_pattern.*index_topk_freq",
+        ):
             modeling_v2_resolve(model_config, _llm_args("require"))
 
 
+@pytest.mark.parametrize(
+    "omitted_layer",
+    [None, 6, 78],
+    ids=["missing-config", "trunk-instance-policy", "mtp-instance-policy"],
+)
+def test_tep4_uses_deployment_sparse_config(tmp_path: Path, omitted_layer: int | None) -> None:
+    class SparseConfigWithoutPool(DeepSeekSparseAttentionConfig):
+        @staticmethod
+        def _is_full_indexer_layer(pretrained_config: object, layer_idx: int) -> bool:
+            return layer_idx != omitted_layer
+
+    quant_config, quant_config_dict = _load_tep4_quantization(tmp_path, [], {})
+    model_config = ModelConfig(
+        pretrained_config=_glm52_config(first_k_dense_replace=3, indexer_types=["full"] * 78),
+        mapping=Mapping(**_TEP4),
+        quant_config=quant_config,
+        quant_config_dict=quant_config_dict,
+        sparse_attention_config=SparseConfigWithoutPool(
+            index_n_heads=32, index_head_dim=128, index_topk=2048
+        )
+        if omitted_layer is not None
+        else None,
+        spec_config=MTPDecodingConfig(max_draft_len=3) if omitted_layer == 78 else None,
+    )
+    missed = (
+        f"layer {omitted_layer} has no indexer K-cache"
+        if omitted_layer is not None
+        else "sparse_attention_config absent"
+    )
+    assert modeling_v2_resolve(model_config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(model_config, _llm_args("require"))
+
+
 @pytest.mark.parametrize("mixed_precision", [False, True], ids=["homogeneous", "per-linear"])
-def test_tep4_preserves_kv_cache_override(tmp_path: Path, mixed_precision: bool):
+def test_tep4_preserves_kv_cache_override(tmp_path: Path, mixed_precision: bool) -> None:
     from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 
     packed = "model.layers.2.mlp.down_proj"
@@ -619,7 +691,10 @@ def test_tep4_preserves_kv_cache_override(tmp_path: Path, mixed_precision: bool)
     )
     model_config = ModelConfig(
         pretrained_config=_glm52_config(first_k_dense_replace=3, indexer_types=["full"] * 78),
-        mapping=Mapping(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1),
+        mapping=Mapping(**_TEP4),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_n_heads=32, index_head_dim=128, index_topk=2048
+        ),
         quant_config=quant_config,
         quant_config_dict=quant_config_dict,
     )
@@ -627,9 +702,10 @@ def test_tep4_preserves_kv_cache_override(tmp_path: Path, mixed_precision: bool)
     resolved = modeling_v2_resolve(model_config, args)
     validate_and_set_kv_cache_quant(model_config, args.kv_cache_config.dtype)
     assert model_config.quant_config.layer_quant_mode.has_fp8_kv_cache()
+    assert model_config.quant_config.quant_mode.has_fp8_kv_cache()
     if model_config.quant_config_dict is not None:
         assert all(
-            config.layer_quant_mode.has_fp8_kv_cache()
+            config.layer_quant_mode.has_fp8_kv_cache() and config.quant_mode.has_fp8_kv_cache()
             for config in model_config.quant_config_dict.values()
         )
     assert resolved is None
