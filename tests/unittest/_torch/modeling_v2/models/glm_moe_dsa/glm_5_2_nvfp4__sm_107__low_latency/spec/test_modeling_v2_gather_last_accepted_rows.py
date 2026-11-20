@@ -7,10 +7,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.gather_last_accepted_rows import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.gather_last_accepted_rows import (  # noqa: E501
         glm_gather_last_accepted_rows as op,
     )
 except NoTarget as exc:

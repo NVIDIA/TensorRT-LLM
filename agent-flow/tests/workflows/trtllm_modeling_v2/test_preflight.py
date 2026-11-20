@@ -15,9 +15,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
+from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import MODELING_V2_PACKAGE
 from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
     PROBE_SOURCE,
     RECEIPT_PASSED,
@@ -90,6 +90,24 @@ def test_run_preflight_resolves_identity(tmp_path):
     assert result.checkpoint_config["architectures"] == ["Qwen3MoeForCausalLM"]
 
 
+def test_a_routed_architecture_takes_the_directory_of_the_family_that_routes_it(tmp_path):
+    family = tmp_path / MODELING_V2_PACKAGE / "models" / "kimi_k3_vl"
+    family.mkdir(parents=True)
+    (family / "routing.py").write_text(
+        '# @routes("FooBarForCausalLM") was the old name\n'
+        '@routes("KimiK3ForConditionalGeneration")\ndef route(config, llm_args, cc):\n    pass\n'
+    )
+    task = _task(tmp_path, parallel="tp4")
+    routed, target = preflight.resolve_target_identity(
+        task, {"architectures": ["KimiK3ForConditionalGeneration"]}
+    )
+    assert routed == "kimi_k3_vl"
+    assert target == f"{MODELING_V2_PACKAGE}/models/kimi_k3_vl/ckpt__sm_103__tp4"
+    # An architecture no family routes yet (a comment is no registration) names a new family.
+    fresh, _ = preflight.resolve_target_identity(task, {"architectures": ["FooBarForCausalLM"]})
+    assert fresh == "foo_bar"
+
+
 def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_path):
     fp8 = {"llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}, "members": ["dep4"]}
     task = _task(
@@ -133,89 +151,21 @@ def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_
     assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []
 
 
-def _fake_boot(fails: dict[str, str], booted: list):
-    """A boot gate that fails the members named in ``fails`` with their detail."""
+def test_one_check_of_any_kind_covers_a_feature_and_a_bare_one_is_named():
+    from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
+    from agent_flow.workflows.trtllm_modeling_v2.run.validation import requirements
 
-    def run_boot_gate(environment, *, member=None, **_):
-        booted.append(member)
-        detail = fails.get(member)
-        return GateResult(
-            name="boot[off]", member=member, passed=detail is None, detail=detail or "generated"
+    task = {"features": ["mtp"], "variants": {"kv_fp8": {"llm_api_options": {}}}}
+    contract = c.Contract(
+        checks=(
+            c.Check("core", "accuracy[gsm8k]", "tp4", c.TIER_INNER),
+            c.Check("mtp", "boot", "tp1", c.TIER_INNER),
         )
-
-    return run_boot_gate
-
-
-def test_a_unified_substrate_is_proven_by_the_first_member_the_stock_path_serves(
-    tmp_path, monkeypatch
-):
-    task = _task(tmp_path, parallel="unified", members=["tp4", "tep4", "dep4"])
-    environment = SimpleNamespace(world_size=4)
-    booted, notes = [], []
-    misaligned = {"tp4": "AssertionError: M % 128 == 0"}
-    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot(misaligned, booted))
-    preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path, notes=notes)
-    assert booted == ["tp4", "tep4"]
-    assert "at `tep4`" in notes[0]
-    assert "could not serve `tp4` (AssertionError: M % 128 == 0)" in notes[1]
-
-    # Every member failing is still a stop, and names what each member said.
-    booted.clear()
-    every = {member: f"{member} broke" for member in ("tp4", "tep4", "dep4")}
-    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot(every, booted))
-    with pytest.raises(PreflightError, match="every member failed:\n  tp4: tp4 broke\n  tep4"):
-        preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path)
-    assert booted == ["tp4", "tep4", "dep4"]
-
-    # A concrete segment is booted once, as itself.
-    booted.clear()
-    task["parallel"] = "dep4"
-    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot({}, booted))
-    preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path, notes=notes)
-    assert booted == [None]
-
-
-def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environment(tmp_path):
-    """Sessions and spools are where jobs queue; every other environment field is the boot's."""
-    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
-        resolve_environment,
     )
-    from agent_flow.workflows.trtllm_modeling_v2.run.startup.bootstrap import (
-        substrate_inputs,
-        substrate_reuse,
-    )
-
-    def inputs(perf=None, **environment):
-        task = _task(tmp_path, environment=environment, perf=perf or {})
-        return substrate_inputs(task, resolve_environment(task, world_size=4))
-
-    gates = {"name": "gates", "spool": "/s/gates", "env": {"A": "1"}, "setup": ["source /e.sh"]}
-    block = {
-        "kind": "session_spool",
-        "python": "/venv/bin/python",
-        "container_image": "/images/trtllm.sqsh",
-        "mounts": ["/data:/data"],
-        "env": {"TMPDIR": _SCRATCH},
-        "sessions": [gates],
-    }
-    record = {"at": 0.0, "inputs": inputs(**block)}
-    perf = [
-        {**gates, "name": f"perf{n}", "spool": f"/s/perf{n}", "time_limit": "4h"} for n in (1, 2)
-    ]
-    resized = {**gates, "role": "gates", "nodes": 2, "gpus_per_node": 8, "handover_lead": "30m"}
-    grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *perf]}
-    assert substrate_reuse(record, inputs({"dev_spools": ["/s/perf2"]}, **grown), now=60.0)[0]
-    for changed in (
-        {"container_image": "/images/other.sqsh"},
-        {"mounts": ["/data:/data", "/models:/models"]},
-        {"env": {"TMPDIR": _SCRATCH, "NCCL_DEBUG": "INFO"}},
-        {"python": "/other/bin/python"},
-        {"sessions": [gates, {**gates, "name": "perf1", "setup": ["source /other.sh"]}]},
-        # A field no list names counts too.
-        {"gpu_memory_gib": 80},
-    ):
-        reusable, why = substrate_reuse(record, inputs(**{**block, **changed}), now=60.0)
-        assert not reusable and "environment" in why, changed
+    coverage = requirements.feature_checks(task, contract)
+    assert coverage == {"core": ["core:accuracy[gsm8k]@tp4"], "mtp": ["mtp:boot@tp1"], "kv_fp8": []}
+    assert requirements.uncovered(coverage) == ["kv_fp8"]
+    assert "| kv_fp8 | **no check** |" in requirements.render(coverage)
 
 
 def test_multirank_probe_launches_the_run_interpreter_on_claimed_devices():
@@ -272,7 +222,7 @@ def _entry_source(impl, archs):
     arch_set = ", ".join(f"Arch.{a}" for a in archs)
     cell_list = "".join(f"Cell(why='c{i}', spec={{}}), " for i in range(2))
     return (
-        "from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper\n\n\n"
+        "from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper\n\n\n"
         "class Entry(OpWrapper):\n"
         '    """Mentions torch.ops.trtllm.neighbour in prose, which is not the op."""\n\n'
         f"    ARCHS = frozenset({{{arch_set}}})\n"
@@ -291,7 +241,7 @@ def _fake_repo(tmp_path, entries, model_ops=()):
     ``catalog/``; ``model_ops`` are ``(family/target, category/name.py, impl,
     archs)`` kept in a target's ``ops/``.
     """
-    catalog = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
+    catalog = tmp_path / "tensorrt_llm/_torch/modeling_v2/catalog"
     catalog.mkdir(parents=True)
     (catalog / "_op.py").write_text("class OpWrapper:\n    pass\n", encoding="utf-8")
     for path, impl, archs in entries:
@@ -299,7 +249,7 @@ def _fake_repo(tmp_path, entries, model_ops=()):
         py.parent.mkdir(parents=True, exist_ok=True)
         (py.parent / "__init__.py").write_text("", encoding="utf-8")
         py.write_text(_entry_source(impl, archs), encoding="utf-8")
-    models = tmp_path / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+    models = tmp_path / "tensorrt_llm/_torch/modeling_v2/models"
     for scope, path, impl, archs in model_ops:
         py = models / scope / "ops" / path
         py.parent.mkdir(parents=True, exist_ok=True)

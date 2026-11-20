@@ -15,10 +15,10 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the vendored CuTe DSL kernel needs an sm_103 GPU", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.common import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.common import (  # noqa: E501
     self_attn_prefill_act_quant_mxf8 as quant,
 )  # noqa: E402, E501
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
     cute_dsl_projection_mxf8_decode as entry,
 )
 
@@ -82,7 +82,7 @@ def test_wide_is_the_context_gemm_bitwise() -> None:
     quant and on a producer's operand -- is the context MXF8 GEMM's (the path those rows
     took before), bit for bit, on a non-degenerate product; stale bytes in the operand's
     rows past the call's are never stored; 64 and 193 rows raise."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E501
         cute_dsl_projection_mxf8 as ctx,
     )
 

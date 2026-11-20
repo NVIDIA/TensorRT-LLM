@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,19 @@ ROOT = Path(__file__).resolve().parents[1]
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+def pytest_configure() -> None:
+    """Forget the repository the caller's environment names, before the suite runs git.
+
+    In a linked worktree git exports ``GIT_DIR`` to what it starts (``git rebase --exec``,
+    a commit hook): the fixtures' ``git init`` and ``git config`` would go there.
+    """
+    local = subprocess.run(
+        ["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True
+    )
+    for name in local.stdout.split():
+        os.environ.pop(name, None)
 
 
 def _git(repo: Path, *args: str) -> None:

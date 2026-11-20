@@ -171,6 +171,109 @@ def test_step0_epilogue_matches_stock(num_contexts, num_gens, k, rows):
     assert torch.all(tok[1:] == -5)  # draft rows untouched (written by the heads)
 
 
+@pytest.mark.parametrize(
+    "num_contexts,all_rank_num_seqs,all_rank_num_gens,expected",
+    [
+        (0, None, None, True),  # TP attention: this rank's batch decides
+        (2, None, None, False),
+        (0, [4, 6], [4, 6], True),  # attention DP, generation-only on every rank
+        (0, [4, 6], [4, 5], False),  # another rank holds a context request
+        (1, [5, 6], [4, 6], False),
+        (0, [4, 6], None, False),
+    ],
+)
+def test_kept_rows_only_when_every_rank_is_generation_only(
+    num_contexts, all_rank_num_seqs, all_rank_num_gens, expected
+):
+    """Pass 0 takes kept rows only when no rank of its MoE collectives holds a context request."""
+    from tensorrt_llm._torch.speculative.kept_rows import generation_only_on_every_rank
+
+    assert (
+        generation_only_on_every_rank(num_contexts, all_rank_num_seqs, all_rank_num_gens)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "num_contexts,num_gens,k", [(3, 5, 6), (0, 64, 6), (0, 1, 6), (2, 0, 7), (0, 128, 8)]
+)
+def test_kept_rows_match_the_step0_gather(num_contexts, num_gens, k):
+    """The draft loop's pass-0 kept rows, known before the pass (speculative/kept_rows.py): the ids equal the stock
+    step-0 gather ids, the two-tensor gather equals index_select, and the step-0 epilogue on the compact rows
+    (``hidden_compact``) gives the stock ids, positions and metadata with those rows as its hidden rows."""
+    from tensorrt_llm._torch.speculative.fused_accept import step0_epilogue
+    from tensorrt_llm._torch.speculative.kept_rows import gather_rows2, kept_row_ids
+
+    g = torch.Generator(device="cuda").manual_seed(num_contexts * 100 + num_gens + k)
+    b, H = num_contexts + num_gens, 4096
+    ctx_lens = torch.randint(1, 300, (num_contexts,), generator=g, device="cuda", dtype=torch.int32)
+    seq_lens = torch.cat(
+        [ctx_lens, torch.full((num_gens,), k + 1, device="cuda", dtype=torch.int32)]
+    )
+    num_acc = torch.randint(1, k + 2, (b,), generator=g, device="cuda", dtype=torch.int32)
+    batch_indices = torch.arange(b + 4, device="cuda", dtype=torch.int32)
+    num_ctx_tokens = int(ctx_lens.sum())
+    n_tok = num_ctx_tokens + num_gens * (k + 1)
+    # Stock: eagle3._forward_linear_draft_loop, i == 0 without the epilogue.
+    last = torch.cumsum(seq_lens, dim=0, dtype=torch.long) - 1
+    gen = (batch_indices[:num_gens] * (k + 1)).long() + num_acc[num_contexts:] - 1 + num_ctx_tokens
+    ids_ref = torch.concat([last[:num_contexts], gen], dim=0)
+    ids = kept_row_ids(seq_lens, batch_indices, num_acc, num_contexts, num_gens, k, num_ctx_tokens)
+    torch.cuda.synchronize()
+    assert ids.dtype == torch.int64 and torch.equal(ids, ids_ref)
+
+    hidden = torch.randn((n_tok, H), generator=g, device="cuda").to(torch.bfloat16)
+    residual = torch.randn((n_tok, H), generator=g, device="cuda").to(torch.bfloat16)
+    kept_h, kept_r = gather_rows2(hidden, residual, ids)
+    assert torch.equal(kept_h, hidden[ids_ref]) and torch.equal(kept_r, residual[ids_ref])
+
+    pos = torch.randint(0, 200000, (n_tok,), generator=g, device="cuda", dtype=torch.int32)
+    kv = torch.randint(1000, 5000, (b + 3,), generator=g, device="cuda", dtype=torch.int32)
+    outs = []
+    for compact in (False, True):
+        seq_live, kv_live = torch.full((b + 3,), 7, device="cuda", dtype=torch.int32), kv.clone()
+        ep = step0_epilogue(
+            seq_lens.clone(),
+            num_acc,
+            kept_h if compact else hidden,
+            pos,
+            seq_live,
+            kv_live,
+            num_contexts,
+            b,
+            k,
+            num_ctx_tokens,
+            hidden_compact=compact,
+        )
+        torch.cuda.synchronize()
+        assert ep is not None
+        outs.append((ep, seq_live, kv_live))
+    (ref, seq_ref, kv_ref), (got, seq_got, kv_got) = outs
+    assert torch.equal(got.gather_ids, ref.gather_ids)
+    assert got.hidden.data_ptr() == kept_h.data_ptr() and torch.equal(got.hidden, ref.hidden)
+    for j in range(1, k):
+        assert torch.equal(got.positions(j), ref.positions(j)), j
+    assert torch.equal(seq_got, seq_ref) and torch.equal(kv_got, kv_ref)
+    # Compact rows must be one per request.
+    assert (
+        step0_epilogue(
+            seq_lens.clone(),
+            num_acc,
+            hidden,
+            pos,
+            torch.zeros_like(seq_live),
+            kv.clone(),
+            num_contexts,
+            b,
+            k,
+            num_ctx_tokens,
+            hidden_compact=True,
+        )
+        is None
+        or n_tok == b
+    )
+
+
 def test_accept_kernels_compile_once_across_batch_splits():
     """One compiled accept / step-0 kernel per position layout serves every batch split."""
     import triton

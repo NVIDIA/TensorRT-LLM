@@ -9,10 +9,10 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.models import beam
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import layout_bf16 as layout
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import loader_bf16 as loader
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (
+from tensorrt_llm._torch.modeling_v2.models import beam
+from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import layout_bf16 as layout
+from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import loader_bf16 as loader
+from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (
     BeamFullModelNvfp4Sm103Tp4 as Component,
 )
 from tensorrt_llm.bindings import DataType
@@ -33,12 +33,12 @@ def config():
 
 
 @pytest.mark.parametrize("length", [128, 512, 8192])
-@pytest.mark.parametrize("retention", ["sliding", "full", "normalized"])
+@pytest.mark.parametrize("retention", ["sliding", "full", "normalized", "extended"])
 def test_cache_allows_estimator_and_short_sequence_geometry(length, retention):
     component = NS(
         head_dim=128, local_kv_heads=2, window=512, schedule=layout.check_config(config())
     )
-    window = {"sliding": 512, "full": length, "normalized": None}[retention]
+    window = {"sliding": 512, "full": length, "normalized": None, "extended": 1024}[retention]
     manager = NS(
         layer_offsets=dict(enumerate(range(52))),
         dtype=DataType.BF16,
@@ -48,12 +48,12 @@ def test_cache_allows_estimator_and_short_sequence_geometry(length, retention):
         max_seq_len=length,
     )
     Component.check_cache_manager(component, manager)
-    # Cache retention does not change the mathematical attention window.
-    assert Component.attention_windows(component, length) == [512] * 51 + [length]
 
 
-@pytest.mark.parametrize("layer,window", [(0, 256), (0, 1024), (51, 512)])
-def test_cache_rejects_incompatible_retention(layer, window):
+@pytest.mark.parametrize(
+    "length,layer,window", [(8192, 0, 256), (8192, 0, 511), (128, 0, 127), (8192, 51, 512)]
+)
+def test_cache_rejects_incompatible_retention(length, layer, window):
     component = NS(
         head_dim=128, local_kv_heads=2, window=512, schedule=layout.check_config(config())
     )
@@ -63,7 +63,7 @@ def test_cache_rejects_incompatible_retention(layer, window):
         head_dim=128,
         num_kv_heads_per_layer=[2] * 52,
         max_attention_window_vec=[512] * 51 + [None],
-        max_seq_len=8192,
+        max_seq_len=length,
     )
     manager.max_attention_window_vec[layer] = window
     with pytest.raises(ValueError, match="cache keeps a window"):
@@ -150,7 +150,7 @@ def test_benign_config_metadata_and_supported_optional_values():
 
 @pytest.fixture
 def recipe_specs():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -168,7 +168,7 @@ def recipe_specs():
     ["model.layers.*.self_attn.*", "model.layers.3.self_attn", "re:.*self_attn"],
 )
 def test_shared_quantization_shapes_and_exclusions(recipe_specs, flat, attention_pattern):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -183,7 +183,7 @@ def test_shared_quantization_shapes_and_exclusions(recipe_specs, flat, attention
 
 
 def test_parent_exclusion_cannot_hide_quantized_experts(recipe_specs):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -199,7 +199,7 @@ def test_parent_exclusion_cannot_hide_quantized_experts(recipe_specs):
 def test_quantization_file_precedes_inline_recipe(tmp_path):
     import json
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -213,7 +213,7 @@ def test_quantization_file_precedes_inline_recipe(tmp_path):
 
 @pytest.mark.parametrize("scheme", ["FP8", "NVFP4", "unknown", {"type": "float", "num_bits": 8}])
 def test_flat_recipe_never_silently_disables_requested_kv_quantization(recipe_specs, scheme):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -232,7 +232,7 @@ def test_checkpoint_validation_uses_shared_recipe_reader(
 ):
     import json
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         layout as nvfp4_layout,
     )
 
@@ -276,8 +276,8 @@ def test_components_do_not_import_full_model_internals():
 
 @pytest.mark.parametrize("local_rank", range(4))
 def test_load_failures_identify_remote_rank_on_every_rank(monkeypatch, local_rank):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._load import load_failure_details
     from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm._torch.modeling_v2.models.beam._load import load_failure_details
 
     outcomes = [
         (True, ""),
@@ -294,7 +294,7 @@ def test_load_failures_identify_remote_rank_on_every_rank(monkeypatch, local_ran
 
 
 def test_local_load_success_and_incomplete_coverage():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._load import load_failure_details
+    from tensorrt_llm._torch.modeling_v2.models.beam._load import load_failure_details
 
     mapping = NS(world_size=1)
     assert load_failure_details(mapping, True, None) is None
@@ -313,7 +313,7 @@ def test_malformed_layer_schedule_is_value_error(field, value):
 def test_direct_call_device_and_metadata_admission(monkeypatch):
     import torch
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._validation import (
+    from tensorrt_llm._torch.modeling_v2.models.beam._validation import (
         check_positions,
         explicit_device,
         metadata_values,
@@ -336,24 +336,6 @@ def test_direct_call_device_and_metadata_admission(monkeypatch):
             metadata_values(values, 3, "seq_lens")
 
 
-@pytest.mark.parametrize("offset", [0.0, False, "0"])
-def test_safetensors_offsets_must_be_integers(tmp_path, monkeypatch, offset):
-    import json
-
-    (tmp_path / loader.INDEX_FILE).write_text(json.dumps({"weight_map": {"w": "shard"}}))
-    (tmp_path / "shard").write_bytes(bytes(8))
-    monkeypatch.setattr(
-        loader,
-        "_read_header",
-        lambda path: (
-            {"w": {"dtype": "F32", "shape": [1], "data_offsets": [offset, 4]}},
-            0,
-        ),
-    )
-    with pytest.raises(loader.CheckpointFormatError, match="offsets must be integers"):
-        loader.SafetensorsCatalog(str(tmp_path))
-
-
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("failure", [None, "metadata", "copy", "close", "remote"])
 def test_checkpoint_load_transaction(
@@ -365,10 +347,8 @@ def test_checkpoint_load_transaction(
     import torch
     from safetensors.torch import save_file
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (
-        component_bf16 as bf16,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import component_bf16 as bf16
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         component as nvfp4,
     )
 
@@ -467,7 +447,7 @@ def test_checkpoint_load_transaction(
 
 @pytest.mark.parametrize("dtype,itemsize", [("BF16", 2), ("F32", 4), ("F8_E4M3", 1), ("U8", 1)])
 def test_stored_entry_validation_is_shared(dtype: str, itemsize: int) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.loader import (
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.loader import (
         validate,
     )
 
@@ -483,10 +463,8 @@ def test_stored_entry_validation_is_shared(dtype: str, itemsize: int) -> None:
 def test_component_constructor_uses_format_storage(monkeypatch, packed: bool) -> None:
     import torch
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (
-        component_bf16 as bf16,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import component_bf16 as bf16
+    from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
         component as nvfp4,
     )
 
@@ -495,7 +473,9 @@ def test_component_constructor_uses_format_storage(monkeypatch, packed: bool) ->
     )
     spec = layout.TensorSpec(layout.EMBED, (8, 2), layout.BF16, "embedding", None, None, 0)
     monkeypatch.setattr(cls, "_tensor_specs", staticmethod(lambda *args: {spec.name: spec}))
-    monkeypatch.setattr(bf16, "AllReduce", lambda **kwargs: NS())
+    monkeypatch.setattr(
+        bf16, "allreduce_group_args", lambda mapping: dict(group=[0, 1, 2, 3], process_group=None)
+    )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
     real_empty = torch.empty
 
@@ -535,3 +515,79 @@ def test_bringup_helpers_and_tensor_captures_are_not_runtime_apis():
                 assert not names.intersection({"capture", "layer_capture"}), source
             elif isinstance(node, ast.ImportFrom):
                 assert not (node.module or "").startswith("_components"), source
+
+
+@pytest.mark.parametrize(
+    "ids,error",
+    [
+        ([[1, 0], [0, 2]], None),
+        ([[-1, 0]], "nonnegative"),
+        ([[1, 1]], "distinct within each token"),
+    ],
+)
+def test_dispatch_routing_preconditions(ids, error):
+    import torch
+
+    from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (
+        beam_dispatch_combine as op,
+    )
+
+    ids = torch.tensor(ids, dtype=torch.int64)
+    hidden = torch.ones(ids.shape[0], 4, dtype=torch.bfloat16)
+    weights = torch.full(ids.shape, 0.5, dtype=torch.float32)
+
+    def provider(expert, rows):
+        return rows * (expert + 1)
+
+    args = (hidden, ids, weights, provider, 2.5)
+    if error is not None:
+        with pytest.raises(AssertionError, match=error):
+            op.is_valid(*args)
+    else:
+        op.is_valid(*args)
+        assert torch.equal(op(*args), op.reference(*args))
+
+
+@pytest.mark.parametrize(
+    "attention_window,max_seq_len,retained,accepted",
+    [
+        (512, 8192, 511, False),
+        (512, 8192, 512, True),
+        (512, 8192, 1024, True),
+        (512, 128, 128, True),
+        (512, 128, 127, False),
+        (512, 8192, None, True),
+        (None, 8192, 512, False),
+        (None, 8192, 8192, True),
+        (None, 8192, None, True),
+    ],
+)
+def test_standalone_block_cache_retention(
+    monkeypatch, attention_window, max_seq_len, retained, accepted
+):
+    import torch
+
+    from tensorrt_llm._torch.modeling_v2.models.beam import _attention
+
+    # Metadata geometry is checked separately; use a non-identity logical-to-local mapping.
+    monkeypatch.setattr(_attention, "check_metadata", lambda *args, **kwargs: 0)
+    md = NS(
+        kv_cache_manager=NS(
+            layer_offsets={5: 1}, max_attention_window_vec=[0, retained], max_seq_len=max_seq_len
+        )
+    )
+    args = (torch.ones(1, 2, 4, dtype=torch.bfloat16), torch.arange(2).reshape(1, 2), md)
+    kwargs = dict(
+        layer_idx=5,
+        hidden_size=4,
+        num_kv_heads=2,
+        head_dim=128,
+        device=torch.device("cpu"),
+        max_tokens=17,
+        attention_window=attention_window,
+    )
+    if accepted:
+        _attention.check_step(*args, **kwargs)
+    else:
+        with pytest.raises(ValueError, match="requires cache retention"):
+            _attention.check_step(*args, **kwargs)

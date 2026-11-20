@@ -56,13 +56,6 @@ def print_info(x, mode=LogMode.EACH):
         sys.stdout.flush()
 
 
-def print_warning(x, mode=LogMode.EACH):
-    """Function used to log warning messages."""
-    if _should_log(x, mode):
-        print("[warning] " + x)
-        sys.stdout.flush()
-
-
 def print_error(x, mode=LogMode.EACH):
     """Function used to log error messages."""
     if _should_log(x, mode):

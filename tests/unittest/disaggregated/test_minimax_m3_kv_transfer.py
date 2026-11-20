@@ -38,7 +38,12 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KV
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -50,6 +55,9 @@ HEAD_DIM = 128
 INDEX_DIM = 128
 TOKENS_PER_BLOCK = transfer_harness.TOKENS_PER_BLOCK
 SPARSE_LAYERS = [3]
+# A DSpark drafter's 4096-token window, scaled down to the harness's 512-token sequences.
+NUM_DRAFT_LAYERS = 2
+DRAFT_WINDOW = 256
 
 
 class _FakeKVCache:
@@ -208,6 +216,7 @@ def _create_manager(
     dtype: DataType,
     sparse_layers: list[int] | None = None,
     implementation: str = "triton",
+    layer_specs: tuple[KVCacheLayerSpec, ...] | None = None,
 ) -> MiniMaxM3KVCacheManagerV2:
     max_num_tokens = 2048
     kv_cache_dtype = {
@@ -239,6 +248,8 @@ def _create_manager(
             implementation=implementation,
             indexer_kv_dtype="bf16",
         ),
+        layer_specs=layer_specs,
+        is_disagg=layer_specs is not None,
     )
 
 
@@ -477,7 +488,7 @@ def _initialize_cache(
 
         for layer_idx in manager.pp_layers:
             kv = manager.get_buffers(layer_idx, kv_layout=manager._main_kv_layout_name())
-            if manager.dtype == DataType.NVFP4:
+            if manager.dtype == DataType.NVFP4 and layer_idx < NUM_LAYERS:
                 sparse = layer_idx in manager.sparse_layer_ids
                 assert kv.dtype == (torch.int8 if sparse else torch.float8_e4m3fn)
                 assert kv.shape[-1] == (HEAD_DIM // 2 if sparse else HEAD_DIM)
@@ -557,6 +568,13 @@ def _verify_cache(
                         ctx_indices = _valid_indices(
                             ctx_manager, ctx_request_ids[req_idx], layer_idx
                         )
+                        if layer_idx >= NUM_LAYERS:
+                            # A windowed draft lifecycle's receiver holds the trailing blocks
+                            # (at least a window's), which the sender may still keep after more.
+                            window_blocks = DRAFT_WINDOW // TOKENS_PER_BLOCK
+                            assert min(len(ctx_indices), window_blocks) <= len(gen_indices)
+                            assert len(gen_indices) <= len(ctx_indices)
+                            ctx_indices = ctx_indices[len(ctx_indices) - len(gen_indices) :]
                         ctx_kv = ctx_manager.get_buffers(
                             layer_idx, kv_layout=ctx_manager._main_kv_layout_name()
                         )
@@ -765,6 +783,92 @@ def test_minimax_m3_multi_sparse_layer_pp_transfer(
         manager_factory=lambda tp, pp, enable_dp: _create_managers(
             tp, pp, enable_dp, DataType.BF16, sparse_layers=MULTI_SPARSE_LAYERS
         ),
+        init_fn=_initialize_cache,
+        verify_fn=_verify_cache,
+    )
+
+
+def _create_unified_draft_managers(
+    tp: int, pp: int, enable_dp: bool
+) -> list[MiniMaxM3KVCacheManagerV2]:
+    """Hybrid NVFP4 MSA managers hosting a windowed BF16 drafter's layers as draft layer specs."""
+    assert pp == 1, "draft layer specs here cover every layer of one PP rank"
+    heads = NUM_KV_HEADS if enable_dp else NUM_KV_HEADS // tp
+    specs = tuple(
+        KVCacheLayerSpec(
+            global_layer_id=layer,
+            owner=KVCacheLayerOwner.TARGET,
+            dtype=DataType.NVFP4,
+            num_kv_heads=heads,
+            head_dim=HEAD_DIM,
+            buffer_roles=(Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE),
+        )
+        for layer in range(NUM_LAYERS)
+    ) + tuple(
+        KVCacheLayerSpec(
+            global_layer_id=NUM_LAYERS + layer,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            num_kv_heads=heads,
+            head_dim=HEAD_DIM,
+            buffer_roles=(Role.KEY, Role.VALUE),
+            sliding_window_size=DRAFT_WINDOW,
+        )
+        for layer in range(NUM_DRAFT_LAYERS)
+    )
+    managers = [
+        _create_manager(
+            Mapping(world_size=tp, rank=rank, tp_size=tp, pp_size=1, enable_attention_dp=enable_dp),
+            DataType.NVFP4,
+            implementation="msa",
+            layer_specs=specs,
+        )
+        for rank in range(tp)
+    ]
+    for manager in managers:
+        assert manager.draft_layer_ids == tuple(range(NUM_LAYERS, NUM_LAYERS + NUM_DRAFT_LAYERS))
+    return managers
+
+
+@pytest.mark.cuda
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_enable_dp,gen_tp,gen_enable_dp",
+    [
+        (1, False, 1, False),
+        (2, False, 2, False),
+        (2, True, 2, True),
+        (1, False, 2, False),
+        (2, False, 2, True),
+    ],
+    ids=["tp1_to_tp1", "tp2_to_tp2", "dep2_to_dep2", "tp1_to_tp2", "tp2_to_dep2"],
+)
+@pytest.mark.parametrize(
+    "update_before_transfer",
+    [True, False],
+    ids=["update_before", "update_after"],
+)
+def test_minimax_m3_unified_draft_layer_transfer(
+    ctx_tp: int,
+    ctx_enable_dp: bool,
+    gen_tp: int,
+    gen_enable_dp: bool,
+    update_before_transfer: bool,
+) -> None:
+    """Windowed BF16 draft layers of the NVFP4 manager reach the same pages as the target's.
+
+    Draft layers reshard across TP and attention DP like the target's, and are verified byte for
+    byte with the target's K/V, block scales and index-K.
+    """
+    transfer_harness.run_kv_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=1,
+        gen_tp=gen_tp,
+        gen_pp=1,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
+        update_before_transfer=update_before_transfer,
+        manager_factory=_create_unified_draft_managers,
         init_fn=_initialize_cache,
         verify_fn=_verify_cache,
     )
