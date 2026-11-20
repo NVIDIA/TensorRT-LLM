@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+from collections import Counter
 from typing import Optional, Tuple
 
 import torch
@@ -31,11 +32,13 @@ from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMod
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
+    ResidualNormMode,
     WanPerTokenAdaLN,
     WanPerTokenAdaLNRuntime,
     apply_fused_layernorm_adaln_quant,
     apply_fused_layernorm_affine_quant,
     get_nvfp4_input_scale,
+    residual_norm_quant,
 )
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -390,6 +393,14 @@ class WanBlock(nn.Module):
         self._norm2_fp4_scale: Optional[torch.Tensor] = None
         self._norm3_fp4_scale: Optional[torch.Tensor] = None
         self._fused_ln_supported = hidden_size == 5120
+        # Static-FP8 block fusions, decided by plan_fp8_fusions() after weights are loaded.
+        self._fp8_block = False
+        # Why plan_fp8_fusions() left this block unfused (empty when it fused or never ran).
+        self.fp8_fusion_blockers: list[str] = []
+        self._tp_size = tp_size
+        # expand_timesteps (e.g. TI2V-5B) always hands blocks a per-token [B, S, 6, H] temb,
+        # which the fused path does not take.
+        self._expand_timesteps = bool(getattr(config, "expand_timesteps", False))
 
         self._pertoken_adaln = WanPerTokenAdaLN(
             hidden_size,
@@ -505,6 +516,66 @@ class WanBlock(nn.Module):
             torch.empty(1, 6, hidden_size).normal_(std=hidden_size**-0.5)
         )
 
+    def plan_fp8_fusions(self, log: bool = False) -> bool:
+        """Enable the static-FP8 fusions when every site supports them; returns whether it did.
+
+        The sites: AdaLN1/LayerNorm2/AdaLN3 + FP8 quantization in one row kernel with the
+        preceding gated residual, the projection biases in GEMM epilogues or the next row kernel,
+        the FFN up-projection GELU with FP8 output, and FP8 attention output into to_out.
+        """
+        attn1, attn2, ffn = self.attn1, self.attn2, self.ffn
+        # Start from the unfused state, so a rejected or failed plan leaves no fusion enabled.
+        self._fp8_block = False
+        ffn._use_fp8_gelu_fusion = False
+        attn1._fp8_out_scale = None
+        for linear in (getattr(attn1, "qkv_proj", None), getattr(attn2, "to_q", None)):
+            if linear is not None:
+                linear._fp8_fuse_bias = False
+        linears = {
+            "attn1.qkv_proj": getattr(attn1, "qkv_proj", None),
+            "attn1.to_out": attn1.to_out[0],
+            "attn2.to_q": getattr(attn2, "to_q", None),
+            "attn2.to_out": attn2.to_out[0],
+            "ffn.up_proj": ffn.up_proj,
+            "ffn.down_proj": ffn.down_proj,
+        }
+        reasons = []
+        if not torch.ops.trtllm.fused_residual_norm_quant_supported(attn1.hidden_size):
+            reasons.append(f"no row kernel for hidden size {attn1.hidden_size}")
+        not_fp8 = [
+            name
+            for name, linear in linears.items()
+            if linear is None or not linear.quant_method.supports_cublas_epilogues(linear)
+        ]
+        if not_fp8:
+            reasons.append(f"not static FP8 on the cuBLAS path: {', '.join(not_fp8)}")
+        if self._tp_size > 1:
+            reasons.append(f"tensor parallelism (tp_size={self._tp_size})")
+        if self._expand_timesteps:
+            reasons.append("expand_timesteps (per-token temb)")
+        if self._use_async_ulysses:
+            reasons.append("async Ulysses")
+        if self.add_k_proj is not None:
+            reasons.append("image cross-attention")
+        if self.to_gate_compress is not None:
+            reasons.append("video sparse attention gates")
+        if not isinstance(self.norm2, LayerNorm) or self.norm2.weight is None:
+            reasons.append("norm2 without affine weights")
+        if not reasons and not ffn.enable_fp8_gelu_fusion():
+            reasons.append("FFN GELU epilogue unsupported")
+        self.fp8_fusion_blockers = reasons
+        if reasons:
+            if log:
+                logger.info(f"Wan FP8 block fusions off: {'; '.join(reasons)}.")
+            return False
+        linears["attn1.qkv_proj"].enable_fp8_bias_epilogue()
+        linears["attn2.to_q"].enable_fp8_bias_epilogue()
+        fp8_attention_out = attn1.enable_fp8_output()
+        self._fp8_block = True
+        if log:
+            logger.info(f"Wan FP8 block fusions on; FP8 attention output: {fp8_attention_out}.")
+        return True
+
     def _fused_adaln_quant(self, x, scale_msa, shift_msa, temb, fp4_scale, eps):
         """Shared norm1/norm3 path: flatten x to 2D, build the per-token or
         per-batch modulation rows, and run the fused LayerNorm+AdaLN+NVFP4 op.
@@ -576,7 +647,26 @@ class WanBlock(nn.Module):
                     self.scale_shift_table.float() + temb.float()
                 ).chunk(6, dim=1)
 
-        if self._fused_ln_supported:
+        # The fused row kernels take one modulation row per batch entry of x.
+        fp8_block = (
+            self._fp8_block
+            and pertoken_adaln is None
+            and temb.ndim == 3
+            and temb.shape[0] == x.shape[0]
+        )
+        seq_len = x.shape[1]
+        if fp8_block:
+            # AdaLN1 + static FP8 quantization for the QKV projection.
+            _, normed = residual_norm_quant(
+                x,
+                ResidualNormMode.ADA_LAYER_NORM,
+                seq_len,
+                weight=scale_msa,
+                bias=shift_msa,
+                eps=self.norm1.variance_epsilon,
+                inv_out_scale=self.attn1.qkv_proj.inv_input_scale,
+            )
+        elif self._fused_ln_supported:
             # x is [B, S, D]; flatten to 2D for the fused op, reshape output back.
             normed = self._fused_adaln_quant(
                 x, scale_msa, shift_msa, temb, self._norm1_fp4_scale, self.norm1.variance_epsilon
@@ -610,7 +700,9 @@ class WanBlock(nn.Module):
                 **attn1_kwargs,
             )
         else:
-            attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
+            attn1_out = self.attn1(
+                normed, freqs=freqs, timestep=timestep, defer_out_bias=fp8_block, **attn1_kwargs
+            )
 
         fused_norm2 = (
             self._pertoken_adaln.add_self_attention_and_normalize(
@@ -619,7 +711,21 @@ class WanBlock(nn.Module):
             if pertoken_adaln is not None
             else None
         )
-        if fused_norm2 is not None:
+        if fp8_block:
+            # to_out bias + gated residual + LayerNorm2 + FP8 quantization for the cross-attn Q.
+            x, norm_x = residual_norm_quant(
+                x,
+                ResidualNormMode.LAYER_NORM,
+                seq_len,
+                y=attn1_out,
+                y_bias=self.attn1.to_out[0].bias,
+                gate=gate_msa,
+                weight=self.norm2.weight,
+                bias=self.norm2.bias,
+                eps=self.norm2.variance_epsilon,
+                inv_out_scale=self.attn2.to_q.inv_input_scale,
+            )
+        elif fused_norm2 is not None:
             norm_x, x = fused_norm2
         else:
             if pertoken_adaln is not None:
@@ -682,11 +788,25 @@ class WanBlock(nn.Module):
             attn2_output = attn2_output + attn_img_output
 
         # Apply to_out once to the combined (text + image) attention output
-        attn2_proj = self.attn2.to_out[0](attn2_output)
+        to_out = self.attn2.to_out[0]
+        attn2_proj = (to_out.forward_without_bias if fp8_block else to_out)(attn2_output)
 
         # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
         # quant) reshaped back to [B, S, D]; self.ffn consumes it.
-        if self._fused_ln_supported:
+        if fp8_block:
+            # to_out bias + residual + AdaLN3 + FP8 quantization for the FFN up-projection.
+            x, normed = residual_norm_quant(
+                x,
+                ResidualNormMode.ADA_LAYER_NORM,
+                seq_len,
+                y=attn2_proj,
+                y_bias=self.attn2.to_out[0].bias,
+                weight=c_scale_msa,
+                bias=c_shift_msa,
+                eps=self.norm3.variance_epsilon,
+                inv_out_scale=self.ffn.up_proj.inv_input_scale,
+            )
+        elif self._fused_ln_supported:
             x = x + attn2_proj
             normed = self._fused_adaln_quant(
                 x,
@@ -708,6 +828,18 @@ class WanBlock(nn.Module):
             x = x + attn2_proj
             normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
             normed = normed.to(x.dtype)
+        if fp8_block:
+            # down_proj bias + gated residual.
+            ffn_out = self.ffn(normed, defer_down_bias=True)
+            x, _ = residual_norm_quant(
+                x,
+                ResidualNormMode.RESIDUAL_ONLY,
+                seq_len,
+                y=ffn_out,
+                y_bias=self.ffn.down_proj.bias,
+                gate=c_gate_msa,
+            )
+            return x
         ffn_out = self.ffn(normed)
 
         if pertoken_adaln is not None:
@@ -1113,3 +1245,23 @@ class WanTransformer3DModel(BaseDiffusionModel):
             block._norm1_fp4_scale = get_nvfp4_input_scale(attn1_qkv)
             block._norm2_fp4_scale = get_nvfp4_input_scale(getattr(block.attn2, "to_q", None))
             block._norm3_fp4_scale = get_nvfp4_input_scale(getattr(block.ffn, "up_proj", None))
+
+        if self.model_config.extra_attrs.get("enable_fp8_block_fusions", False):
+            blocks = [block for block in self.blocks if isinstance(block, WanBlock)]
+            planned = [block.plan_fp8_fusions() for block in blocks]
+            if all(planned):
+                logger.info(f"Wan FP8 block fusions on all {len(planned)} blocks.")
+            else:
+                blockers = Counter(
+                    reason
+                    for block, fused in zip(blocks, planned)
+                    if not fused
+                    for reason in block.fp8_fusion_blockers
+                )
+                details = "; ".join(
+                    f"{reason} ({count} blocks)" for reason, count in blockers.items()
+                )
+                logger.warning(
+                    f"enable_fp8_block_fusions is set, but {len(planned) - sum(planned)} of "
+                    f"{len(planned)} Wan blocks run unfused: {details or 'not planned'}."
+                )
