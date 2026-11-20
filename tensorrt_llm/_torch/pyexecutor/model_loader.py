@@ -1811,6 +1811,7 @@ class ModelLoader:
             replicate_embedding=self.llm_args.replicate_embedding,
             cuda_graph_batch_sizes=captured_cuda_graph_batch_sizes(
                 self.llm_args, self.max_num_tokens, self.spec_config),
+            max_batch_size=self.llm_args.max_batch_size,
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,

@@ -216,7 +216,7 @@ def test_recovery_retention_matches_static_sizing(
                 max_num_tokens=manager.max_num_tokens,
                 spec_config=spec,
                 kv_cache_config=KvCacheConfig(
-                    enable_block_reuse=True, enable_swa_scratch_reuse=True
+                    dtype=dtype, enable_block_reuse=True, enable_swa_scratch_reuse=True
                 ),
             )
             == expected

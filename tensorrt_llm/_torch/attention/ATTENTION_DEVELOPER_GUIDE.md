@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Attention Developer Guide
 
 ## Scope
@@ -217,13 +220,18 @@ registration alone.
 
 | Algorithm | Sparse backend | Metadata | Cache manager |
 |---|---|---|---|
-| `csa2` | `CSA2TrtllmAttention`, with hardware-selected Flash helpers | `CSA2TrtllmMetadata` | `CSA2CacheManager` (V2) |
+| `csa2` | `CSA2TrtllmAttention`, with hardware-selected PrimTS/Flash helpers | `CSA2TrtllmMetadata` | `CSA2CacheManager` (V2) |
 
 CSA2 implements DeepSeek-V4.1 compressed sparse MLA. Its module adapter owns
 compression and shared KV/index sources; per-phase query tiles feed selected
-rows to attention. See the [CSA2 implementation guide](backends/sparse/csa2/README.md)
+rows to attention. SM100, SM103 and SM107 default to PrimTS sparse MLA reading
+the persistent FP8 SWA / NVFP4 MAIN records directly;
+`TRTLLM_CSA2_COMPUTE_BACKEND=trtllm` selects native compute for A/B testing or
+rollback without changing the public backend configuration. PrimTS plans and
+their serialized scratch arenas belong to CSA2 metadata and must be warmed before
+CUDA Graph capture. See the [CSA2 implementation guide](backends/sparse/csa2/README.md)
 for SM90, SM100-family and SM120/121 routing (candidate-consumer layers need
-SM100-family GPUs), persistent cache formats, and replay.
+SM100-family GPUs), provider overrides, persistent cache formats, and replay.
 
 Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
 Algorithms lower their live routing state to an algorithm-neutral
@@ -472,7 +480,7 @@ reuse is enabled (Encoder SWA is `PRIVATE` when reuse is disabled):
 | Storage | Ownership and format | Reuse policy |
 |---|---|---|
 | GLOBAL main/index | KV-source layers; 288-byte main and 68-byte index records sharing physical pages | `REQUIRED` |
-| Encoder SWA | Per layer; 528-byte E4M3 rows | `REQUIRED`, or `OPTIONAL` with Encoder replay |
+| Encoder SWA | Per layer; 512-byte unit-scale E4M3 for explicit `fp8`, otherwise legacy 528-byte MXFP8 (`fp8_ds_mla`, `auto`, `bfloat16`) | `REQUIRED`, or `OPTIONAL` with Encoder replay |
 | Decoder SWA | Per layer; same row format | `PRIVATE` for eligible bounded replay; ordinary lifecycle for full prefill |
 | Ratio-two compressor state | Source owners; FP32 partial-group values/scores | Managed with the owner's page lifecycle |
 

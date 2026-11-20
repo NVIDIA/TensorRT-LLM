@@ -133,6 +133,63 @@ def l2_touch(tensors: tuple[torch.Tensor, ...], sink: torch.Tensor, block: int =
     _l2_touch_kernel[(sink.numel(),)](*args, sink, block, num_warps=8)
 
 
+_PREFETCH_COMPILED = {}
+# Per device: a word whose only use is to carry the TVM FFI stream into the prefetch launch.
+_PREFETCH_ANCHOR: dict[int, torch.Tensor] = {}
+
+
+def prefetch_output_weights(
+    o_a_weight: torch.Tensor,
+    o_b_weight: torch.Tensor,
+    ctas: int,
+    budget_ns: int,
+) -> bool:
+    """TMA-prefetch E4M3 O-A ``[groups, R, D]`` and O-B ``[hidden, groups*R]`` into L2 from
+    ``ctas`` CTAs; False if a capture would compile the kernel."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from tensorrt_llm._torch.kernels.blackwell.csa2_weight_prefetch import Csa2WeightPrefetch
+    from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
+
+    shapes = tuple(
+        (weight.numel() // weight.shape[-1], weight.shape[-1])
+        for weight in (o_a_weight, o_b_weight)
+    )
+    device = o_a_weight.device
+    key = (device.index, shapes)
+    compiled = _PREFETCH_COMPILED.get(key)
+    anchor = _PREFETCH_ANCHOR.get(device.index)
+    if compiled is None or anchor is None:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        if anchor is None:
+            anchor = _PREFETCH_ANCHOR[device.index] = torch.zeros(
+                1, device=device, dtype=torch.int32
+            )
+        if compiled is None:
+            pointers = (
+                make_ptr(
+                    cutlass.Float8E4M3FN,
+                    weight.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                for weight in (o_a_weight, o_b_weight)
+            )
+            compiled = _PREFETCH_COMPILED[key] = cute.compile(
+                Csa2WeightPrefetch(*shapes).run,
+                *pointers,
+                cute.runtime.from_dlpack(anchor),
+                ctas,
+                budget_ns,
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                options="--opt-level 2 --enable-tvm-ffi",
+            )
+    compiled(o_a_weight.data_ptr(), o_b_weight.data_ptr(), anchor, ctas, budget_ns)
+    return True
+
+
 # QUANTIZE is a runtime value, so both modes run one compiled kernel and write the same BF16
 # rows; it only masks the MXFP8 stores.
 @triton.jit(do_not_specialize=["M", "QUANTIZE"])
@@ -428,7 +485,7 @@ def dense_or_native_mxfp8_gemm(
         and linear.weight_scale.numel() == columns * depth // 32
         and (
             not torch.cuda.is_current_stream_capturing()
-            or dense_mxfp8_gemm_compiled(activation.device, columns, depth)
+            or dense_mxfp8_gemm_compiled(activation.device, columns, depth, activation.shape[0])
         )
     ):
         return dense_mxfp8_gemm(
@@ -848,6 +905,109 @@ def gptj_rope_small_m(
     )
 
 
+@triton.jit
+def _gptj_rope_e4m3_small_m_kernel(
+    Q,
+    POS,
+    CS,
+    Q8,
+    HEADS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PDL: tl.constexpr,
+):
+    """One token's ``BLOCK_H`` heads: GPT-J RoPE of the last 64 channels, then unit-scale E4M3.
+
+    The rotated channels round to BF16 exactly as ``_gptj_rope_small_m_kernel`` stores them; every
+    BF16 value then converts with ``cvt.rn.satfinite.e4m3x2.f32``, the conversion PrimTS's own
+    query staging applies, so ``Q8`` holds the bytes that staging would write.
+    """
+    token = tl.program_id(0)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    valid = (heads < HEADS)[:, None]
+    trig = tl.load(POS + token).to(tl.int64) * 64 + tl.arange(0, 32)
+    cosine = tl.load(CS + trig)[None, :]
+    sine = tl.load(CS + trig + 32)[None, :]
+    base = (token * HEADS + heads[:, None]).to(tl.int64) * HEAD_DIM
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+    plain = tl.load(Q + base + tl.arange(0, HEAD_DIM)[None, :], valid, 0.0).to(tl.float32)
+    rope = base + (HEAD_DIM - 64) + tl.arange(0, 64)[None, :]
+    x, y = tl.split(tl.reshape(tl.load(Q + rope, valid, 0.0).to(tl.float32), (BLOCK_H, 32, 2)))
+    if PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    rotated = tl.join(tl.fma(cosine, x, -(sine * y)), tl.fma(sine, x, cosine * y))
+    rotated = tl.reshape(rotated, (BLOCK_H, 64)).to(tl.bfloat16).to(tl.float32)
+    # Pair p of a head holds channels 2p (low byte) and 2p + 1; the first HEAD_DIM / 2 - 32
+    # pairs come from the loaded row, the last 32 from the rotated channels.
+    pair_base = base // 2
+    _store_e4m3_pairs(Q8 + pair_base, plain, valid, BLOCK_H, HEAD_DIM, HEAD_DIM // 2 - 32)
+    _store_e4m3_pairs(Q8 + pair_base + (HEAD_DIM // 2 - 32), rotated, valid, BLOCK_H, 64, 32)
+
+
+@triton.jit
+def _store_e4m3_pairs(PAIRS, values, valid, BLOCK_H: tl.constexpr, WIDTH: tl.constexpr, LIMIT):
+    """Store the first ``LIMIT`` RN/satfinite E4M3 pairs of each ``[BLOCK_H, WIDTH]`` row."""
+    low, high = tl.split(tl.reshape(values, (BLOCK_H, WIDTH // 2, 2)))
+    packed = tl.inline_asm_elementwise(
+        "cvt.rn.satfinite.e4m3x2.f32 $0, $2, $1;",
+        "=h,r,r",
+        [low, high],
+        dtype=tl.int16,
+        is_pure=True,
+        pack=1,
+    )
+    pair = tl.arange(0, WIDTH // 2)[None, :]
+    tl.store(PAIRS + pair, packed, valid & (pair < LIMIT))
+
+
+def gptj_rope_e4m3_small_m(
+    q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    q8: torch.Tensor,
+) -> None:
+    """Write the unit-scale E4M3 query of the RoPE'd ``q`` into ``q8``, leaving ``q`` as is.
+
+    ``q`` is the pre-RoPE BF16 ``[M, heads, D]`` projection output of a small decode step and
+    ``q8`` a contiguous ``[M, heads * D]`` E4M3 tensor viewed as int16 pairs. The bytes equal
+    ``gptj_rope_small_m`` (``mla_rope_inplace``) followed by PrimTS's RN/satfinite query staging,
+    in one PDL launch of one program per token and four heads.
+    """
+    rows, heads, depth = q.shape
+    if (
+        q.dtype != torch.bfloat16
+        or not q.is_contiguous()
+        or rows <= 0
+        or depth != 512
+        or positions.dtype not in (torch.int32, torch.int64)
+        or positions.numel() != rows
+        or not positions.is_contiguous()
+        or cos_sin.dtype != torch.float32
+        or not cos_sin.is_contiguous()
+        or q8.dtype != torch.float8_e4m3fn
+        or q8.shape != (rows, heads * depth)
+        or not q8.is_contiguous()
+        or q8.device != q.device
+    ):
+        raise ValueError("CSA2 small-M RoPE/E4M3 query got an unsupported input")
+    block_h = min(4, triton.next_power_of_2(heads))
+    pdl = _pdl()
+    _gptj_rope_e4m3_small_m_kernel[(rows, triton.cdiv(heads, block_h))](
+        q,
+        positions,
+        cos_sin,
+        q8.view(torch.int16),
+        heads,
+        block_h,
+        depth,
+        pdl,
+        num_warps=4,
+        enable_fp_fusion=False,
+        launch_pdl=pdl,
+    )
+
+
 def mxfp8_weight_scale(scale: torch.Tensor | None) -> torch.Tensor | None:
     """CUTLASS-swizzled UE8M0 ``[groups, R * D / 32]`` scales equal to power-of-two 128-block ones.
 
@@ -1059,6 +1219,12 @@ def _kernel_type() -> type:
 
 _COMPILED = {}
 
+# Rows from which the 2-CTA kernel walks each 256-row input block's output columns before the
+# next block (N-major), so the block stays in L2 rather than streaming the input once per column
+# tile. GB300, 8 groups, rank 1024, depth 4096, cold weights, MXFP8 output: 8K rows 195 -> 190 us,
+# 16K rows 407 -> 376 us, 32K rows 898 -> 834 us; equal at 2K and 4K.
+_MXFP8_N_MAJOR_MIN_ROWS = 4096  # 4K
+
 
 def grouped_output_mxfp8(
     output: torch.Tensor,
@@ -1070,6 +1236,7 @@ def grouped_output_mxfp8(
     *,
     quantize_output: bool = False,
     prequantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+    raster_along_m: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Grouped O-A of BF16 attention output with inverse RoPE, as MXFP8 GEMMs.
 
@@ -1080,6 +1247,8 @@ def grouped_output_mxfp8(
     ``[M, groups * R]``, or with ``quantize_output`` its MXFP8 E4M3 values and
     CUTLASS-swizzled UE8M0 scales as ``mxfp8_quantize`` lays them out. Returns None while
     a graph capture would have to compile the GEMM.
+    ``raster_along_m`` sets the persistent tile order of the 2-CTA kernel (same bits); by
+    default N-major from ``_MXFP8_N_MAJOR_MIN_ROWS`` rows.
     """
     import cutlass
     import cutlass.cute as cute
@@ -1111,12 +1280,15 @@ def grouped_output_mxfp8(
     ):
         raise ValueError("CSA2 grouped MXFP8 O-A projection got an unsupported input")
     # Measured on GB300: up to 128 rows the GEMM streams the weight, which one-CTA 128x64
-    # tiles spread over twice the SMs of 128x128 ones; 2-CTA 256x128 tiles beyond.
+    # tiles spread over twice the SMs of 128x128 ones; 2-CTA 256x128 tiles beyond. A plan
+    # of one M tile has no tile order to choose.
     if rows <= 128:
-        tile, cluster = (128, 64), (1, 1)
+        tile, cluster, raster_along_m = (128, 64), (1, 1), True
     else:
         tile, cluster = (256, 128), (2, 1)
-    key = (output.device.index, tile, rank, depth, groups, quantize_output)
+        if raster_along_m is None:
+            raster_along_m = rows < _MXFP8_N_MAJOR_MIN_ROWS
+    key = (output.device.index, tile, raster_along_m, rank, depth, groups, quantize_output)
     if key not in _COMPILED and torch.cuda.is_current_stream_capturing():
         return None
     sf_rows = triton.cdiv(rows, 128) * 128
@@ -1149,7 +1321,9 @@ def grouped_output_mxfp8(
             make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
             for tensor, dtype in zip(tensors, dtypes)
         ]
-        kernel = _kernel_type()(32, tile, cluster, mxfp8_out=quantize_output)
+        kernel = _kernel_type()(
+            32, tile, cluster, raster_along_m=raster_along_m, mxfp8_out=quantize_output
+        )
         active = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
         _COMPILED[key] = cute.compile(
             kernel.wrapper_grouped,
@@ -1169,16 +1343,28 @@ def grouped_output_mxfp8(
 
 
 _DENSE_TILE, _DENSE_CLUSTER = (256, 256), (2, 2)
+# From this many bytes of E4M3 input, the 2-CTA kernel walks each 256-row input block's output
+# columns before the next block (N-major, on 2x1 clusters), so the block stays in L2 rather than
+# streaming the input once per column tile (same bits). GB300, O-B (N 5120, K 8192), cold weights:
+# 16K rows 484 -> 460 us, 32K rows 982 -> 917 us; equal at 8K rows, slower at 4K.
+_DENSE_N_MAJOR_MIN_BYTES = 128 << 20  # 128 MiB
 
 
-def _dense_key(device: torch.device, columns: int, depth: int) -> tuple:
-    return ("dense", device.index, _DENSE_TILE, _DENSE_CLUSTER, columns, depth)
+def _dense_schedule(rows: int, depth: int) -> tuple:
+    """Tile, cluster shape and M-major tile order of ``dense_mxfp8_gemm`` for ``[rows, depth]``."""
+    if rows * depth >= _DENSE_N_MAJOR_MIN_BYTES:
+        return _DENSE_TILE, (2, 1), False
+    return _DENSE_TILE, _DENSE_CLUSTER, True
 
 
-def dense_mxfp8_gemm_compiled(device: torch.device, columns: int, depth: int) -> bool:
-    """Whether ``dense_mxfp8_gemm`` is compiled for an ``[N, K]`` weight, so a graph capture can
-    run it."""
-    return _dense_key(device, columns, depth) in _COMPILED
+def _dense_key(device: torch.device, columns: int, depth: int, rows: int) -> tuple:
+    return ("dense", device.index, *_dense_schedule(rows, depth), columns, depth)
+
+
+def dense_mxfp8_gemm_compiled(device: torch.device, columns: int, depth: int, rows: int) -> bool:
+    """Whether ``dense_mxfp8_gemm`` is compiled for ``rows`` rows and an ``[N, K]`` weight, so a
+    graph capture can run it."""
+    return _dense_key(device, columns, depth, rows) in _COMPILED
 
 
 def dense_mxfp8_gemm(
@@ -1223,8 +1409,8 @@ def dense_mxfp8_gemm(
         )
     ):
         raise ValueError("CSA2 dense MXFP8 GEMM got an unsupported input")
-    tile, cluster = _DENSE_TILE, _DENSE_CLUSTER
-    key = _dense_key(activation.device, columns, depth)
+    tile, cluster, raster_along_m = _dense_schedule(rows, depth)
+    key = _dense_key(activation.device, columns, depth, rows)
     sf_rows = triton.cdiv(rows, 128) * 128
     if (
         out is not None
@@ -1252,7 +1438,7 @@ def dense_mxfp8_gemm(
             for tensor, dtype in zip(tensors, dtypes)
         ]
         # One group of the grouped O-A kernel is a plain [M, N] GEMM.
-        kernel = _kernel_type()(32, tile, cluster)
+        kernel = _kernel_type()(32, tile, cluster, raster_along_m=raster_along_m)
         active = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
         _COMPILED[key] = cute.compile(
             kernel.wrapper_grouped,

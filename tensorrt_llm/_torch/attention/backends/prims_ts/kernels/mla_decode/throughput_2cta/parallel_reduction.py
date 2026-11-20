@@ -98,7 +98,9 @@ def _parallel_reduction_row_state(
     query_is_valid = query_is_valid & (tile_k > Int32(0))
     tile_k = cute.math.max(tile_k, Int32(0))
     row_k = tile_k
-    if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value):
+    if cutlass.const_expr(
+        not cfg.use_kv_bounds and cfg.mask_type == MaskType.CAUSAL.value
+    ):
         _, logical_seq_len_q = query_batch_bounds(
             cu_seqlens_q,
             batch_idx,

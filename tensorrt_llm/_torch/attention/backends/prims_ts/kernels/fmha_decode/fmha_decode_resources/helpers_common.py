@@ -938,3 +938,69 @@ def _route_is_proxy(route_flags: Int32) -> cutlass.Boolean:
     return cutlass.Boolean(
         (route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Int32(0)
     )
+
+
+@cute.jit
+def gather_byte_of_words(
+    w0: Int32, w1: Int32, w2: Int32, w3: Int32, byte_idx: Int32
+) -> Int32:
+    """Return byte ``byte_idx`` (0-3) of each word, packed w0 low to w3 high.
+
+    Two PRMTs pick the byte from (w0, w1) and (w2, w3); a third packs the
+    resulting halves.
+    """
+    pair_sel = byte_idx | ((byte_idx + Int32(4)) << Int32(4))
+    return cute.arch.inline_ptx(
+        "{ .reg .b32 lo, hi; "
+        "prmt.b32 lo, {$r0}, {$r1}, {$r4}; "
+        "prmt.b32 hi, {$r2}, {$r3}, {$r4}; "
+        "prmt.b32 {$w0}, lo, hi, 0x5410; }",
+        write_only_types=[Int32],
+        read_only_args=[w0, w1, w2, w3, pair_sel],
+    )
+
+
+@cute.jit
+def load_nvfp4_row_scale_words(
+    cfg: Constexpr[FmhaDecodeConfig],
+    src_sf_base: cutlass.Array,
+    row: Int32,
+    head_dim_stage_idx: Int32 | int,
+    *,
+    is_v: Constexpr[bool],
+) -> tuple[Int32, Int32]:
+    """Load eight E4M3 scales for one 128-value row slice as two words.
+
+    Scale rows sit at ``cfg.smem_kv_sf_row_offset``, which skips the padding
+    of page fragments below 128 bytes.
+    """
+    sf_tile_bytes = cfg.smem_kv_sf_tile_bytes
+    if cutlass.const_expr(not is_v):
+        scales = cutlass.Array(
+            src_sf_base.data_ptr(),
+            dtype=Int64,
+            shape=(sf_tile_bytes // 8,),
+            addrspace=3,
+        )
+        # Scale rows of D128+ are whole 8-byte words.
+        pair = scales[
+            (cfg.smem_kv_sf_row_offset(row) >> Int32(3)) + Int32(head_dim_stage_idx)
+        ]
+        return Int32(pair), Int32(pair >> Int64(32))
+    else:
+        # V interleaves four tokens: each lane gathers its byte from eight words.
+        scales = cutlass.Array(
+            src_sf_base.data_ptr(),
+            dtype=Int32,
+            shape=(sf_tile_bytes // 4,),
+            addrspace=3,
+        )
+        base = (cfg.smem_kv_sf_row_offset(row & Int32(~3)) >> Int32(2)) + Int32(
+            head_dim_stage_idx * 8
+        )
+        words = [scales[base + Int32(i)] for i in range(8)]
+        token = row & Int32(3)
+        return (
+            gather_byte_of_words(words[0], words[1], words[2], words[3], token),
+            gather_byte_of_words(words[4], words[5], words[6], words[7], token),
+        )

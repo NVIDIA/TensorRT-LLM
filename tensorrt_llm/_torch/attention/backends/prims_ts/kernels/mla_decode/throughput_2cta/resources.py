@@ -62,6 +62,7 @@ from ...task_compat import TS_TREE_WALKING_TASK
 from ...tensor_map import transform_ragged_coords
 
 from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
+from ..helpers.kv_bounds import query_kv_bound
 from ..helpers.gather import (
     gather4_cached,
     load_sparse_rows,
@@ -553,7 +554,9 @@ class MlaWorkQueue(WorkQueue):
             self.cu_seqlens_q,
             safe_b_idx,
         )
-        if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value):
+        if cutlass.const_expr(
+            not cfg.use_kv_bounds and cfg.mask_type == MaskType.CAUSAL.value
+        ):
             # Split partitioning owns the mask-visible CTA domain. The final
             # physical row resolves to the tile's latest valid Q
             # token. Row-causal softmax narrows earlier rows without changing
@@ -2467,6 +2470,7 @@ class TmemSResource(HighThroughputMlaResource):
     scale_softmax_log2: Any = None  # softmax_scale * log2(e)
     page_offsets: Any = None
     cache_seqs: Any = None  # per-batch valid K length
+    kv_bounds: Any = None  # per-logical-query prefix length
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
     split_kv: Any = None  # per-work-tile split count
     logical_num_heads_q: cutlass.Constexpr[int] = 128
@@ -2860,9 +2864,25 @@ class TmemSResource(HighThroughputMlaResource):
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
         tile_offset_k = k_index * Int32(cfg.mma_qk_tiler[1])
         needs_row_causal_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value
+            not cfg.use_kv_bounds and cfg.mask_type == MaskType.CAUSAL.value
         )
-        if cutlass.const_expr(needs_row_causal_mask):
+        row_kv_bound = Int32(0)
+        if cutlass.const_expr(cfg.use_kv_bounds):
+            row_in_tile = self.cta_rank * Int32(
+                cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
+            ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
+            flat_query_row = (
+                Int32(work_tile.tile_idx[1]) * Int32(cfg.mma_qk_tiler[0]) + row_in_tile
+            )
+            row_kv_bound = query_kv_bound(
+                self.kv_bounds,
+                self.cu_seqlens_q,
+                Int32(work_tile.tile_idx[2]),
+                flat_query_row // Int32(self.logical_num_heads_q),
+                self.logical_seq_len_q,
+            )
+            group_needs_mask = True
+        elif cutlass.const_expr(needs_row_causal_mask):
             batch_idx = Int32(work_tile.tile_idx[2])
             _, logical_seq_len_q = query_batch_bounds(
                 self.cu_seqlens_q,
@@ -2991,7 +3011,9 @@ class TmemSResource(HighThroughputMlaResource):
             ) << EPILOGUE_COLUMN_GROUP_SHIFT
             for i in cutlass.range_constexpr(64):
                 token_idx = tile_offset_k + tidx_col + Int32(i)
-                if cutlass.const_expr(needs_row_causal_mask):
+                if cutlass.const_expr(cfg.use_kv_bounds):
+                    token_is_visible = token_idx < row_kv_bound
+                elif cutlass.const_expr(needs_row_causal_mask):
                     mask_flat_row = Int32(self.logical_num_heads_q) * (
                         token_idx - K + logical_seq_len_q
                     )

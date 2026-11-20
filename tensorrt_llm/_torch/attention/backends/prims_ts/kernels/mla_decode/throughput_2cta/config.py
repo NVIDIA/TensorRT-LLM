@@ -287,6 +287,7 @@ class MlaDecodeConfig(Nvfp4KVConfig):
     # Causal is bottom-right aligned for speculative decode. Dense still masks
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
+    use_kv_bounds: bool = False
     # Threshold skip correction in log2 units (binades); 0 disables it.  A positive value
     # freezes the running row max while a K tile raises it by at most this
     # amount.  It is a compile-time constant: a runtime scalar stays live in
@@ -369,6 +370,7 @@ def make_mla_decode_config(
     is_var_seq: bool = False,
     is_var_split_kv: bool = False,
     mask_type: MaskType | str = MaskType.CAUSAL,
+    use_kv_bounds: bool = False,
     sparse_gather_warps: int = 1,
     sparse_kv_stages: int = 0,
     cache_uniform_sparse_pages: bool = False,
@@ -412,6 +414,7 @@ def make_mla_decode_config(
     cfg.is_var_seq = is_var_seq
     cfg.is_var_split_kv = is_var_split_kv
     cfg.mask_type = normalize_mask_type(mask_type)
+    cfg.use_kv_bounds = use_kv_bounds
     # Range-checked by MlaDecodeTs and plan().
     cfg.softmax_rescale_threshold_log2 = softmax_rescale_threshold_log2
     cfg.lse_base_on_e = lse_base_on_e
