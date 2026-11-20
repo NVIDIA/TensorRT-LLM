@@ -27,9 +27,9 @@ AttentionContextWorkspaceSizes AttentionWorkspaceManager::buildUnfusedContextSiz
     AttentionContextWorkspaceSizes sizes{};
     auto const paddedQueryTokens = params.batchSize * params.querySequenceLength;
     auto const paddedKvTokens = params.batchSize * params.kvSequenceLength;
-    auto const queryHiddenUnits = params.numAttnHeads * params.headSize;
+    auto const queryHiddenUnits = params.numQueryHeads * params.headSize;
     auto const kvHiddenUnits = params.numAttnKvHeads * params.headSize;
-    auto const scoreElements = paddedQueryTokens * params.numHeads * params.kvSequenceLength;
+    auto const scoreElements = paddedQueryTokens * params.numQueryHeads * params.kvSequenceLength;
     sizes.attentionMask = params.elementSize * paddedQueryTokens * params.kvSequenceLength;
     sizes.cuQSeqlens = sizeof(int) * (params.batchSize + 1);
     sizes.cuKvSeqlens = sizes.cuQSeqlens;

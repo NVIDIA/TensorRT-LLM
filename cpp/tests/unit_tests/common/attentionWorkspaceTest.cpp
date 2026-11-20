@@ -96,8 +96,7 @@ tcop::AttentionContextWorkspaceSizes getUnfusedContextSizes(bool crossAttention)
         .kvSequenceLength = static_cast<size_t>(crossAttention ? kCrossKvLength : kInputSequenceLength),
         .crossKvLength = static_cast<size_t>(crossAttention ? kCrossKvLength : 0),
         .packedTokenCount = kPackedTokenCount,
-        .numHeads = 1,
-        .numAttnHeads = 1,
+        .numQueryHeads = 1,
         .numAttnKvHeads = 1,
         .headSize = kHeadSize});
 }
@@ -128,8 +127,7 @@ TEST(AttentionWorkspaceManagerTest, UnfusedGroupedQuerySizesDistinguishQueryAndK
         .kvSequenceLength = 2,
         .crossKvLength = 2,
         .packedTokenCount = 7,
-        .numHeads = 4,
-        .numAttnHeads = 4,
+        .numQueryHeads = 4,
         .numAttnKvHeads = 1,
         .headSize = 8};
     auto const sizes = tcop::AttentionWorkspaceManager::buildUnfusedContextSizes(params);
