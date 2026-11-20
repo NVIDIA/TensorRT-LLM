@@ -153,8 +153,12 @@ def _compile(
     import cutlass
     import cutlass.cute as cute
 
-    from ...kernels.k3r_mla_decode.mla_decode_fp8 import MAX_SPLITS as MLA_DECODE_MAX_SPLITS
-    from ...kernels.k3r_mla_decode.mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
+    from tensorrt_llm._torch.kernels.blackwell.mla_decode_fp8 import (
+        MAX_SPLITS as MLA_DECODE_MAX_SPLITS,
+    )
+    from tensorrt_llm._torch.kernels.blackwell.mla_decode_fp8 import (
+        BlackwellMultiHeadLatentAttentionForwardFP8,
+    )
 
     logger.info(f"k3_mla_decode_fp8: compiling kernel variant {key}")
     clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(math.prod(CLUSTER_SHAPE_MNK))
@@ -174,6 +178,8 @@ def _compile(
         reducer_max_splits=MLA_DECODE_MAX_SPLITS if is_var_split_kv else 32,
         emit_softmax_stats=emit_softmax_stats,
         reduce_unroll=REDUCE_UNROLL,
+        # K3 supplies a page table covering the masked loads in a partial tile.
+        guard_partial_page_tile=False,
     )
     (q_latent, q_rope, c_latent, c_rope, page_table, o, lse, stats, split_ws, split_kv) = args[:10]
     cache_seqs, kv_bounds, block_split_kvs, softmax_scale, output_scale, stream = args[10:]

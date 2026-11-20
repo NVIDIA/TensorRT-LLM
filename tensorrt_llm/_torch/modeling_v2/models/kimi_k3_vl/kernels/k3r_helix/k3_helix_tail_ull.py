@@ -72,7 +72,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from ..k3r_fp4_mla.fp4_mla_mufu16_ull import LOG2_E
 from ..k3r_fp4_mla.fp4_mla_packed_reduce_ull import _reduce_packed_row
-from ..k3r_mla_decode.mla_helpers import LOG2_E as _MLA_LOG2_E
+from tensorrt_llm._torch.kernels.blackwell.mla_helpers import LOG2_E as _MLA_LOG2_E
 
 from .helix_a2a_fused import (
     _NEG_INF_BITS,

@@ -125,8 +125,8 @@ tensorrt_llm/_torch/custom_ops/torch_custom_ops.py
 tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py
 tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py
 tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp16.py
-tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp8.py
-tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py
+tensorrt_llm/_torch/kernels/blackwell/mla_decode_fp8.py
+tensorrt_llm/_torch/kernels/blackwell/mla_helpers.py
 tensorrt_llm/_torch/kernels/blackwell/custom_pipeline.py
 tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py
 tensorrt_llm/_torch/kernels/blackwell/utils.py

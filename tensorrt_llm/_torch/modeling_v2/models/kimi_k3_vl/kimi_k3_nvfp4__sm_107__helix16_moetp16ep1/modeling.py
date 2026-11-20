@@ -8153,7 +8153,7 @@ def cute_dsl_mla_decode_unavailability_reason() -> Optional[str]:
     try:
         import cutlass  # noqa: F401
 
-        from ..kernels.k3r_mla_decode import mla_decode_fp8  # noqa: F401
+        from tensorrt_llm._torch.kernels.blackwell import mla_decode_fp8  # noqa: F401
     except ImportError as error:
         return f"the cute-dsl kernels are not importable: {error}"
     return None
@@ -8619,7 +8619,7 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, nn.Module)
             return
         import cutlass
 
-        from ..kernels.k3r_mla_decode.mla_decode_fp8 import (
+        from tensorrt_llm._torch.kernels.blackwell.mla_decode_fp8 import (
             BlackwellMultiHeadLatentAttentionForwardFP8,
         )
 

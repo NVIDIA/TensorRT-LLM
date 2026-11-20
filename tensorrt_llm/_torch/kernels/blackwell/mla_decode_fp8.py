@@ -25,39 +25,6 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-import argparse
-import math
-import os
-import sys
-from types import SimpleNamespace
-from typing import Optional, Tuple, Type
-
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
-import cutlass.cute.nvgpu.cpasync as cpasync
-import cutlass.cute.testing as testing
-import cutlass.pipeline as pipeline
-import cutlass.utils as utils
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.arch import Arch
-from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
-from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import BaseDSL
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-
-from .mla_helpers import (LOG2_E, MAX_SPLITS, MLAStaticTileScheduler,
-                          MLAStaticTileSchedulerParams, ceil_div,
-                          compute_q_tile_layout,
-                          create_mla_static_tile_scheduler,
-                          create_mla_static_tile_scheduler_params,
-                          get_variable_query_tile_info)
-
-if __name__ == "__main__":
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, os.path.join(current_dir, "../.."))
 """
 A Multi-Head Latent Attention (MLA) example using fp8 as input/output for the NVIDIA Blackwell SM100 architecture using CUTE DSL
 
@@ -125,6 +92,35 @@ Constraints for this example:
 * Variable sequence length requires page table storage enabled
 """
 
+import argparse
+import math
+import os
+import sys
+from types import SimpleNamespace
+from typing import Optional, Tuple, Type
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import cutlass.cute.nvgpu.cpasync as cpasync
+import cutlass.cute.testing as testing
+import cutlass.pipeline as pipeline
+import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.arch import Arch
+from cutlass.cute.nvgpu import tcgen05
+from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import BaseDSL
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
+from .mla_helpers import (LOG2_E, MAX_SPLITS, MLAStaticTileScheduler,
+                          MLAStaticTileSchedulerParams, ceil_div,
+                          compute_q_tile_layout,
+                          create_mla_static_tile_scheduler,
+                          create_mla_static_tile_scheduler_params,
+                          get_variable_query_tile_info)
+
 
 class BlackwellMultiHeadLatentAttentionForwardFP8:
 
@@ -147,6 +143,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reducer_max_splits: int = MAX_SPLITS,
         emit_softmax_stats: bool = False,
         reduce_unroll: int = 1,
+        guard_partial_page_tile: bool = True,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -194,6 +191,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             row still sums its splits one after the other in split order, so
             the output is the same for any value.
         :type reduce_unroll: int
+        :param guard_partial_page_tile: Use page zero for loads beyond the page
+            table in a partial KV tile. A caller with a table covering every
+            issued load can disable this guard.
+        :type guard_partial_page_tile: bool
         """
 
         self.latent_dim = 512
@@ -226,6 +227,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.seq_len_q = seq_len_q
         self.emit_softmax_stats = emit_softmax_stats
         self.reduce_unroll = max(1, int(reduce_unroll))
+        self.guard_partial_page_tile = guard_partial_page_tile
         (
             self.total_q_rows,
             self.num_q_tiles,
@@ -2226,19 +2228,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 rAccO[j] += rBuf[u, j] * scale
                     for i in cutlass.range(full, local_split_kv, 1, unroll=1):
                         for j in cutlass.range_constexpr(elements_per_thread):
-                            element_idx = (
-                                d_tile_idx * self.reducer_d_tile + tidx +
-                                j * self.threads_per_warp *
-                                self.num_compute_warps)
-                            rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+                            element_idx = (d_tile_idx * self.reducer_d_tile +
+                                           tidx + j * self.threads_per_warp *
+                                           self.num_compute_warps)
+                            rAccO[j] += gAccO[i,
+                                              element_idx] * smem_lse_scale[i]
                 else:
                     for i in range(local_split_kv):
                         for j in cutlass.range_constexpr(elements_per_thread):
-                            element_idx = (
-                                d_tile_idx * self.reducer_d_tile + tidx +
-                                j * self.threads_per_warp *
-                                self.num_compute_warps)
-                            rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+                            element_idx = (d_tile_idx * self.reducer_d_tile +
+                                           tidx + j * self.threads_per_warp *
+                                           self.num_compute_warps)
+                            rAccO[j] += gAccO[i,
+                                              element_idx] * smem_lse_scale[i]
                 rO.store(rAccO.load().to(self.o_dtype))
                 for j in cutlass.range_constexpr(elements_per_thread):
                     element_idx = (
@@ -2665,10 +2667,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile),
                                       cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (common_params.mPT[k_index] if self.mma_qk_tiler[1] //
-                        self.page_size == 1 else common_params.mPT[
+            if cutlass.const_expr(self.guard_partial_page_tile):
+                page_idx = (k_index if self.mma_qk_tiler[1] //
+                            self.page_size == 1 else
                             (k_index * qk_params.tiled_mma_qk.thr_id.shape +
-                             common_params.blk_coord[0]) * page_per_tile + i])
+                             common_params.blk_coord[0]) * page_per_tile + i)
+                # Masked lanes still issue TMA loads in a partial K tile.
+                k_idx[i] = 0
+                if page_idx < common_params.mPT.shape[0]:
+                    k_idx[i] = common_params.mPT[page_idx]
+            else:
+                k_idx[i] = (common_params.mPT[k_index]
+                            if self.mma_qk_tiler[1] //
+                            self.page_size == 1 else common_params.mPT[
+                                (k_index * qk_params.tiled_mma_qk.thr_id.shape +
+                                 common_params.blk_coord[0]) * page_per_tile +
+                                i])
         # load q once at first iteration
         load_q_pipeline = common_params.load_q_pipeline
         if load_q:
@@ -2744,8 +2758,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile),
                                       cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (common_params.mPT[k_index] if page_per_tile == 1 else
-                        common_params.mPT[k_index * page_per_tile + i])
+            if cutlass.const_expr(self.guard_partial_page_tile):
+                page_idx = k_index * page_per_tile + i
+                k_idx[i] = 0
+                if page_idx < common_params.mPT.shape[0]:
+                    k_idx[i] = common_params.mPT[page_idx]
+            else:
+                k_idx[i] = (common_params.mPT[k_index] if page_per_tile == 1
+                            else common_params.mPT[k_index * page_per_tile + i])
         # get the mbar ptr from pipeline.
         tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
             load_v_producer_state)
@@ -5611,7 +5631,9 @@ def run(
     return avg_time_us  # Return execution time in microseconds
 
 
-if __name__ == "__main__":
+def _main():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(current_dir, "../.."))
 
     def parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
         try:
@@ -5841,3 +5863,7 @@ if __name__ == "__main__":
     )
 
     print("PASS")
+
+
+if __name__ == "__main__":
+    _main()
