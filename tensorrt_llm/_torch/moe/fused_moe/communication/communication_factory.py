@@ -34,7 +34,6 @@ from ..nccl_ep_utils import (
     nccl_ep_supports_group_timeout,
     nccl_ep_supports_version,
 )
-from ..wide_ep_ft import get_wide_ep_ft_options
 from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
 from .deep_ep import DeepEP
@@ -45,6 +44,32 @@ from .nvlink_two_sided import NVLinkTwoSided
 
 if TYPE_CHECKING:
     from tensorrt_llm.models.modeling_utils import QuantConfig
+
+# Settings of the removed all-to-all watchdog, which no MoE communication reads.
+_REMOVED_WATCHDOG_ENVS = (
+    "TRTLLM_ALLTOALL_WATCHDOG_TIMEOUT_S",
+    "TRTLLM_ALLTOALL_WATCHDOG_POLL_INTERVAL_S",
+)
+_FAULT_TOLERANCE_MODE_ENV = "TLLM_FAULT_TOLERANCE_MODE"
+
+
+def _warn_on_removed_fault_tolerance_envs() -> None:
+    """Warn once about each set variable of the earlier Wide-EP fault tolerance mode."""
+    for name in _REMOVED_WATCHDOG_ENVS:
+        if name in os.environ:
+            logger.warning_once(
+                f"{name} is no longer read: the all-to-all watchdog was removed. "
+                "Use enable_wide_ep_fault_tolerance for Wide-EP fault tolerance.",
+                key=f"removed_env_{name}",
+            )
+    if os.environ.get(_FAULT_TOLERANCE_MODE_ENV) == "1":
+        logger.warning_once(
+            f"{_FAULT_TOLERANCE_MODE_ENV}=1 no longer turns on Wide-EP fault tolerance for the "
+            "MoE layers; set enable_wide_ep_fault_tolerance=True. It only selects the MPI "
+            "signal-handler mode, which is deprecated and will be removed in a future release.",
+            key=f"removed_env_{_FAULT_TOLERANCE_MODE_ENV}",
+        )
+
 
 # Temporary NCCL-EP v0.1.0 limitation. The LL combine kernel derives its
 # warp-group count and dynamic-SMEM requirement here:
@@ -143,6 +168,7 @@ class CommunicationFactory:
         # Backend constructors apply these budgets, and auto-selection below treats a constructor
         # error as "backend unavailable", so an invalid variable must fail here instead.
         get_moe_comm_timeout_budgets()
+        _warn_on_removed_fault_tolerance_envs()
 
         # Extract parameters from model_config
         mapping = model_config.mapping
@@ -220,9 +246,6 @@ class CommunicationFactory:
 
         try:
             enable_eplb = model_config.moe_load_balancer is not None
-            ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
-                model_config
-            )
             strategy = NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -233,9 +256,7 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
-                ep_group_health=ep_group_health,
-                alltoall_watchdog_timeout_s=watchdog_timeout_s,
-                alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
+                enable_wide_ep_fault_tolerance=model_config.enable_wide_ep_fault_tolerance,
                 sentinel_payload_format=sentinel_format,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
@@ -245,6 +266,11 @@ class CommunicationFactory:
             # selecting another strategy.
             raise
         except Exception as e:
+            if model_config.enable_wide_ep_fault_tolerance:
+                raise ValueError(
+                    "enable_wide_ep_fault_tolerance requires the NVLinkOneSided all-to-all, "
+                    f"which is unavailable: {e}"
+                ) from e
             logger.info(f"NVLinkOneSided not available: {e}")
 
         # Non-divisible EP: NVLinkTwoSided and DeepEP require num_experts % ep_size == 0.
@@ -409,9 +435,6 @@ class CommunicationFactory:
             )
         elif method in ["NVLINK_ONE_SIDED"]:
             enable_eplb = model_config.moe_load_balancer is not None
-            ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
-                model_config
-            )
             return NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -422,9 +445,7 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
-                ep_group_health=ep_group_health,
-                alltoall_watchdog_timeout_s=watchdog_timeout_s,
-                alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
+                enable_wide_ep_fault_tolerance=model_config.enable_wide_ep_fault_tolerance,
                 sentinel_payload_format=sentinel_format,
             )
         elif method == "DEEPEP":

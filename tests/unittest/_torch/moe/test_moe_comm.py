@@ -229,11 +229,11 @@ def _safe_cpu(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 
 
 def _ep_mask_words(ep_size: int, dead_ranks: Set[int]) -> torch.Tensor:
-    """Build the CPU active-rank mask tensor expected by moe_a2a ops."""
+    """Build the device active-rank mask tensor that moe_a2a ops read when their kernels run."""
     health = EPGroupHealth(ep_size)
     for rank in dead_ranks:
         health.mark_failed(rank)
-    return torch.tensor(health.get_mask_words(), dtype=torch.uint64, device="cpu")
+    return torch.tensor(health.get_mask_words(), dtype=torch.uint64, device="cuda")
 
 
 def _make_rank_mask_payload(local_num_tokens: int, hidden_size: int, rank: int) -> torch.Tensor:
@@ -287,6 +287,9 @@ def _run_nvlink_rank_mask_dispatch(
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[List[torch.Tensor], int, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch with an optional active rank mask."""
+    # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
+    import torch
+
     recv_tensors, combine_payload_offset, _ = torch.ops.trtllm.moe_a2a_dispatch(
         token_selected_experts,
         [payload],
@@ -325,6 +328,9 @@ def _run_nvlink_rank_mask_combine(
     active_rank_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Run raw NVLink one-sided combine with an optional active rank mask."""
+    # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
+    import torch
+
     return torch.ops.trtllm.moe_a2a_combine(
         combine_payload,
         local_num_tokens,
@@ -1364,6 +1370,16 @@ def _worker_rank_mask_all_active_matches_no_mask(config: CommTestConfig) -> dict
                 enable_rank_mask=True,
                 active_rank_mask=None,
             )
+        # The kernels read the mask when they run, so it must be in device memory.
+        with pytest.raises(RuntimeError, match="must be on the workspace device"):
+            _run_nvlink_rank_mask_dispatch(
+                comm,
+                token_selected_experts,
+                payload,
+                local_num_tokens,
+                enable_rank_mask=True,
+                active_rank_mask=all_active_mask.cpu(),
+            )
 
         out_no_mask, topk_no_mask, _ = _run_nvlink_rank_mask_dispatch_combine(
             comm,
@@ -1448,7 +1464,9 @@ def _worker_rank_mask_one_rank_masked(
             dtype=torch.int32,
             device="cuda",
         )
-        _, _, masked_target_ranks, masked_send_indices = _run_nvlink_rank_mask_dispatch(
+        # Every dispatch needs its combine: the next round's flag values and
+        # receive-counter bank assume the two alternate.
+        _, masked_target_ranks, masked_send_indices = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             masked_routes,
             _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank),

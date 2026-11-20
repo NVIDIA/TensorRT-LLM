@@ -17,12 +17,9 @@
 
 This module provides :class:`EPGroupHealth`, a process-local, thread-safe data
 structure that records which Expert Parallel (EP) ranks the recovery coordinator
-has committed as included vs. excluded from the data plane. It is consumed by:
-
-  * AlltoAll communication backends (rank masking on dispatch / combine)
-  * The host-side AlltoAll watchdog (read-only expected-peer snapshot)
-  * The MoE load balancer (emergency-mask reconfiguration)
-  * The model engine and PyExecutor (degraded health reporting)
+has committed as included vs. excluded from the data plane. Its consumer is
+``MoeExecutionState``, which writes the active ranks into the device rank mask
+that the NVLinkOneSided all-to-all kernels read on dispatch and combine.
 
 Detected or suspected physical liveness is separate evidence. Higher-layer
 coordination reconciles that evidence and commits membership; detectors and

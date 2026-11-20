@@ -390,6 +390,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SleepConfig]
         default: null
         status: prototype
+      enable_wide_ep_fault_tolerance:
+        annotation: bool
+        default: False
+        status: prototype
       reorder_policy_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.ReorderRequestPolicyConfig]
         default: null
