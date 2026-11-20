@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -93,6 +93,43 @@ __device__ __forceinline__ uint64_t mbarrier_arrive_expect_tx(uint64_t* addr, co
     return state;
 #else
     return 0;
+#endif
+}
+
+// Arrives with an expected transaction count and discards the arrival state. The asm is volatile so that the arrival
+// is kept although no output is used.
+__device__ __forceinline__ void mbarrier_arrive_expect_tx_no_state(uint64_t* addr, const uint32_t txCount)
+{
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                 :
+                 : "r"(__as_ptr_smem(addr)), "r"(txCount)
+                 : "memory");
+#endif
+}
+
+// Spins until the mbarrier completes the phase of parity `phaseParity`, with acquire semantics at CTA scope, sleeping
+// `backoffNs` between polls. Unlike mbarrier_try_wait_parity, the wait is volatile, so the compiler cannot hoist it out
+// of the loop.
+__device__ __forceinline__ void mbarrierWaitParityVolatile(uint64_t* addr, uint32_t phaseParity, uint32_t backoffNs)
+{
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
+    uint32_t const barrier = __as_ptr_smem(addr);
+    uint32_t ready = 0;
+    do
+    {
+        asm volatile(
+            "{ .reg .pred p; "
+            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2; "
+            "selp.u32 %0, 1, 0, p; }"
+            : "=r"(ready)
+            : "r"(barrier), "r"(phaseParity)
+            : "memory");
+        if (!ready)
+        {
+            __nanosleep(backoffNs);
+        }
+    } while (!ready);
 #endif
 }
 

@@ -149,6 +149,21 @@ add_tllm_gtest(
   Threads::Threads
   LABELS
   "unit;kernels;moe-communication;gpu")
+add_tllm_gtest(
+  moeRebalanceHaloRTest
+  OWNER
+  kernel
+  SOURCES
+  moe/moeRebalanceHaloRTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  Threads::Threads
+  LABELS
+  "unit;kernels;moe-load-balance;host"
+  # A lane that skips a collective deadlocks the host warp; fail instead of
+  # stalling the kernels group.
+  TIMEOUT
+  120)
 
 add_tllm_gtest(
   routingKernelsTest

@@ -1894,7 +1894,8 @@ class DeepseekV4MoE(nn.Module):
         # The fused shared FC1/activation/FC2 kernel comes with the routed MegaMoE
         # backend; ask that backend for the capability instead of naming a concrete
         # implementation here. Per-layer dynamic EPLB is not a condition, but the
-        # kernel runs only in eager mode, which that load balancer requires.
+        # kernel runs only without decode CUDA graphs, as that load balancer
+        # requires; breakable prefill graphs (planner halo_r) capture it.
         use_fused_fc12 = (
             self._shared_fc12_backend_supported(rebalance_backend)
             and is_sm_100f()
@@ -2241,7 +2242,7 @@ class DeepseekV4MoE(nn.Module):
             return shared_output + routed_output
 
         # With per-layer dynamic EPLB, the route runs the shared experts after
-        # MAIN has enqueued both HALO-Q and the TMA copy on the high-priority
+        # MAIN has enqueued the replica planner and its copy on the high-priority
         # copy stream, so they overlap planning and the helper-weight copy.
         # Every rank installs the same function.
         if (

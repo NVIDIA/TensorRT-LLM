@@ -3330,14 +3330,27 @@ def test_megamoe_cutedsl_init_raises_bootstrap_failure(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
         PerLayerDynamicMoeLoadBalancer,
-        planner,
     )
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.registry import (
+        PER_LAYER_DYNAMIC_PLANNERS,
+    )
 
+    # The manager reads HALO-Q's group builder from the registry when it is built.
+    builder = MagicMock(
+        return_value=SimpleNamespace(
+            home_experts=4, helper_slots=2, forget_helper_residency=MagicMock()
+        )
+    )
+    monkeypatch.setitem(
+        PER_LAYER_DYNAMIC_PLANNERS,
+        "halo_q",
+        dataclasses.replace(PER_LAYER_DYNAMIC_PLANNERS["halo_q"], build_group=builder),
+    )
     config = SimpleNamespace(
         num_slots=24,
         auxiliary_sms=8,
@@ -3386,12 +3399,6 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
     monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "setup_quant_scales", lambda self, module: None)
     assert_aliases = MagicMock()
     monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "assert_live_weight_aliases", assert_aliases)
-    builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
-    monkeypatch.setattr(
-        planner,
-        "build_rebalance_slot_scheduler_group",
-        builder,
-    )
 
     moe.cache_derived_state()
     moe.cache_derived_state()
@@ -3410,6 +3417,8 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
         max_tokens_per_rank=128,
         layer_idx=5,
     )
+    # The second call rebinds the built producer, which resets its helper residency.
+    builder.return_value.forget_helper_residency.assert_called_once_with()
 
 
 @pytest.mark.cpu_only

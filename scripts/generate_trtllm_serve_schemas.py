@@ -335,6 +335,9 @@ def _serve_schema() -> dict:
     """The serve schema without ``_cross_field_rules``, so that later merges see unmodified definitions."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
     from tensorrt_llm.llmapi.llm_args import (
+        _HALO_Q_MAX_AUXILIARY_SMS,
+        _HALO_R_DEFAULT_AUXILIARY_SMS,
+        _HALO_R_MIN_AUXILIARY_SMS,
         SERVE_CONFIG_ALIASES,
         MoeLoadBalancerConfig,
         MoePerLayerDynamicLoadBalancerConfig,
@@ -367,6 +370,22 @@ def _serve_schema() -> dict:
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
+    # Mirror MoePerLayerDynamicLoadBalancerConfig.validate_planner_auxiliary_sms(),
+    # including the default that an unset auxiliary_sms resolves to with halo_r.
+    schema["$defs"][MoePerLayerDynamicLoadBalancerConfig.__name__].update(
+        {
+            "if": {"properties": {"planner": {"const": "halo_r"}}, "required": ["planner"]},
+            "then": {
+                "properties": {
+                    "auxiliary_sms": {
+                        "default": _HALO_R_DEFAULT_AUXILIARY_SMS,
+                        "minimum": _HALO_R_MIN_AUXILIARY_SMS,
+                    }
+                }
+            },
+            "else": {"properties": {"auxiliary_sms": {"maximum": _HALO_Q_MAX_AUXILIARY_SMS}}},
+        }
+    )
     # The model validator allows at most one non-null preemption bound.
     schema["$defs"]["GenPreemptionConfig"]["anyOf"] = [
         {"properties": {name: {"type": "null"}}} for name in ("tpot_budget", "target_output_tps")

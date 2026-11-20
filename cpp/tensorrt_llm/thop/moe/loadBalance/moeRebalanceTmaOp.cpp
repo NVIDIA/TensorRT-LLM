@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.h"
 #include "tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloQOp.h"
+#include "tensorrt_llm/thop/moe/loadBalance/moeRebalanceOpChecks.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -43,17 +44,8 @@ void checkTmaResult(int error, char const* operation)
     TORCH_CHECK(error == 0, operation, " failed: ", megamoe_tma_copy_error_string(error), " (", error, ")");
 }
 
-void checkCudaResult(cudaError_t error, char const* operation)
-{
-    TORCH_CHECK(error == cudaSuccess, operation, " failed: ", cudaGetErrorString(error));
-}
-
-int checkedInt(int64_t value, char const* name)
-{
-    TORCH_CHECK(value >= std::numeric_limits<int>::min() && value <= std::numeric_limits<int>::max(), name,
-        " is outside the int32 range");
-    return static_cast<int>(value);
-}
+using moeRebalanceOp::checkCudaResult;
+using moeRebalanceOp::checkedInt;
 
 uint64_t checkedUnsigned(int64_t value, char const* name)
 {

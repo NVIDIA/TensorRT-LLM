@@ -240,6 +240,7 @@ Several MoE communication kernels wait for their peers inside the kernel and tra
 - `moe_comm_timeout_guard.py` owns the process-wide `MoECommTimeoutGuard`. It resolves two budgets, `TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC` (default 1800 s) and `TRTLLM_MOE_COMM_TIMEOUT_SEC` (default: each library's native timeout), and on each transition pushes the current one to every registered `MoECommTimeoutProxy`. `CommunicationFactory.create_strategy` resolves the budgets before it tries any strategy, so an invalid value fails there instead of reading as an unavailable backend. The NVLinkOneSided-only names `TRTLLM_MOE_A2A_[WARMUP_]TIMEOUT_SEC` and `TRTLLM_NVLINK_ONE_SIDED_A2A_[WARMUP_]TIMEOUT_SEC` are deprecated aliases that now apply to every backend.
 - The model engine's outermost `warmup_scope()` calls `set_moe_comm_warmup` on entry and on exit. Captured graphs keep the timeouts that were current at capture, so every decode graph is captured with the serving timeouts: the decoder passes `moe_comm_serving_timeouts(quiet=True)` as `capture_scope` to `CUDAGraphRunner.capture()` (no scope by default), which enters it before each stream capture begins and leaves the eager forwards before it outside, and the two-pass capture also runs its whole capture pass inside `moe_comm_serving_timeouts()`. Switching while a CUDA graph is being captured raises.
 - With `TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1` the decoder captures in one pass: each shape's eager forward (its first in that executor) keeps the warmup timeouts, each capture switches to the serving ones (logged at DEBUG), and the ranks line up before each replay that follows a capture, since that replay waits for its peers under the serving timeouts.
+- One backend raises its bound locally inside the serving-timeout capture: per-layer dynamic EPLB with `planner: halo_r` under breakable prefill graphs. The breakable runner warms each bucket up eagerly (two forwards) before capturing it, inside the serving-timeout pass, and a peer's one-time work on that path (JIT compilation, module loading) can delay the first of them by minutes. So the first eager launch of each HALO-R layer at each routed-token count waits at least the warmup bound (`HaloRRelayEndpoint.submit_fused`, which takes the bound from `SchedulerSpinBound.warmup_cycles`). Captured launches, and so every replay, keep the serving bound, and launches outside a breakable region keep the guard's value. A change to the guard's capture pass or to the breakable runner's warmup must keep this exception in step.
 - Each backend with such a timeout registers a proxy when it is constructed. The guard holds proxies weakly, so the backend must keep its proxy alive:
 
 | Backend | Proxy applies the timeout through | Native serving timeout |
@@ -1316,6 +1317,50 @@ set wrong has a test that catches it:
   set, and the copy keeps a per-layer table of the expert each helper slot
   holds so that it skips experts a whole team already holds. Any other writer
   of those helper rows would invalidate the table.
+- `planner: halo_r` swaps HALO-Q and the TMA copy for HALO-R
+  (`per_layer_dynamic_eplb/halo_r_planner.py`). Its scheduler and unicast
+  relay copy run as one kernel on the `auxiliary_sms` CTAs
+  (`moeRebalanceHaloR.cu`; the planner is in `moeRebalanceHaloRPlanner.h`, the
+  relay device body in `moeRebalanceRelay.cuh`). It reuses the count exchange,
+  ordinal and route passes of `moeRebalanceHaloQKernel.cuh`, the plan field
+  layout and the `CudaPhysicalSlotScheduler` buffers. Its group subclasses
+  `RebalanceSlotSchedulerGroup`, so generations, the route hold, the deferred
+  route wait, the lent routes, the lease and `SchedulerSpinBound` are HALO-Q's;
+  `HaloRRelayEndpoint` replaces the TMA endpoint. `registry.py` maps each
+  `planner` value to its group builder and capabilities
+  (`PER_LAYER_DYNAMIC_PLANNERS`); the manager reads it, and `llm_args`
+  keeps the `planner` `Literal` and the `auxiliary_sms` bounds and imports
+  the map lazily.
+  HALO-R's helper sets get no multicast object (`helper_multicast=False` on
+  `SharedSlotArenaProvider`): the relay writes peers' helper rows through
+  `peer_helper_bases`, and the provider returns the layer's base
+  `LiveWeightArena`, whose helper planes have `mc_view=None` and no HALO
+  levels. Only the record pages keep their multicast objects: they hold the
+  READY cells and the small fp32 scale planes, whose views keep their
+  `mc_view`. Contract tests in
+  `test_halo_r_contracts.py` pin the attributes HALO-R sets for HALO-Q's
+  methods and the methods it overrides. Each CTA checks every status word and
+  then raises the route counter; a failure traps before that, so MegaMoE never
+  reads routes of a failed launch. With `per_layer_resident`, a per-layer
+  residency table (updated by the last CTA before READY, reset on a weight
+  rebind) lets the relay skip receivers that hold their expert and keeps a
+  resident expert in its slot. For breakable prefill graphs, which
+  `validate_per_layer_dynamic_eplb_cuda_graph` admits only for HALO-R, the
+  READY value and the route target a layer call hands the device are constant
+  (its spin bound is too, except for the first-launch bound described under
+  [Communication timeouts](#communication-timeouts)): READY is 1, drained and
+  reset by the next launch before its count exchange; the route wait waits for
+  the launch's completion event (nominally, every CTA has begun), which makes it a graph
+  successor of the kernel so that no schedule runs it first, then for
+  `auxiliary_sms`, and resets the counter in one batched stream memory
+  operation; MAIN may change between layer calls behind a MAIN-to-MAIN fence;
+  and `finish` joins COPY into MAIN. The fence sees only host layer calls:
+  after a capture the host's MAIN stays the capture stream while replays run on
+  the execution stream, so an eager call on the capture stream after a replay
+  must be ordered after it by the caller, as the breakable runner's
+  `wait_stream` before each warmup does.
+  `forget_helper_residency` is an EP collective that raises when the ranks
+  differ in which layer they reset or how often.
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
   `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original
@@ -1355,10 +1400,12 @@ set wrong has a test that catches it:
   `ep_process_group` and `max_tokens_per_rank_capacity`.
 - DeepSeek-V4 selects the fused shared FC12 kernel when the routed backend
   declares per-layer dynamic support, the final projection quantization and
-  hardware (SM100 family) support that kernel, and the model runs eagerly
-  (`cuda_graph_config: null`). Per-layer dynamic EPLB is not a condition, but it
-  requires eager mode, so an EPLB-off baseline runs the same shared kernel only
-  with `cuda_graph_config: null`. Other runs keep the model's existing shared-MLP
+  hardware (SM100 family) support that kernel, and the model runs without decode
+  CUDA graphs (`cuda_graph_config: null`). Per-layer dynamic EPLB is not a
+  condition, but it requires `cuda_graph_config: null`, so an EPLB-off baseline
+  runs the same shared kernel only with it. With `planner: halo_r` and
+  `prefill_cuda_graph_backend: breakable`, breakable prefill graphs capture the
+  kernel with the rest of the MoE layer. Other runs keep the model's existing shared-MLP
   backend. With per-layer dynamic EPLB, the active configuration supplies the
   fused kernel an SM budget that leaves the copy kernel its auxiliary SMs.
 
@@ -1488,7 +1535,7 @@ their real class name.
 - **Do NOT substitute a backend without recording it** — A degradation must be visible in the `MoEResolutionReport`, not only in a log line
 - **Do NOT pick `scheduler_kind` opportunistically** — Use `EXTERNAL_COMM` (default) unless your backend's fused kernel genuinely owns cross-rank exchange via SymmBuffer / equivalent in-kernel collective; `FUSED_COMM` brings hard invariants (no host comm, lockstep launches, no multi-stream overlap)
 - **Schedulers MUST NOT write `moe.repeat_idx`** — `repeat_idx` is wrapper state advanced once per `forward_impl` regardless of chunk count
-- **Do NOT set a communication kernel's timeout directly or through environment variables at runtime** — A backend whose kernels wait for peers under a timeout registers a `MoECommTimeoutProxy` with the timeout guard when it is constructed and unregisters it before releasing what the proxy controls; only the guard decides the value (see [Communication timeouts](#communication-timeouts)). Writing environment variables at runtime races with NCCL threads that read them
+- **Do NOT set a communication kernel's timeout directly or through environment variables at runtime** — A backend whose kernels wait for peers under a timeout registers a `MoECommTimeoutProxy` with the timeout guard when it is constructed and unregisters it before releasing what the proxy controls; only the guard decides the value, apart from the documented first-launch bound of HALO-R under breakable prefill graphs (see [Communication timeouts](#communication-timeouts)). Writing environment variables at runtime races with NCCL threads that read them
 - **Do NOT allocate symmetric memory from `run_moe` in `FUSED_COMM` backends** — Symmetric-memory rendezvous is a build-time collective and is unsafe under PP / layer-skip or CUDA graph capture; allocate from `create_weights()` after `ConfigurableMoE` has synchronized EPLB-derived attributes. See `mega_moe/mega_moe_deepgemm.py` for the DG pattern and `mega_moe/mega_moe_cute_dsl.py:_alloc_symm_provider` for the NVSHMEM-equivalent provider.
 - **Do NOT add a new `FUSED_COMM` backend without a zero-token `quantize_input` regression test** — `FusedCommMoEScheduler` calls `quantize_input` for every chunk (including zero-token chunks) so each backend must return its own empty-tensor layout.
 - **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the canonical 12-field tactic pattern (with legacy 11-, 10- and 8-field compatibility), including token-back READY granularity and combine dedup; `_unpack_tactic` is the single source of truth for field order and compatibility defaults. The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.

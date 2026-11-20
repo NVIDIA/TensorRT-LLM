@@ -734,6 +734,68 @@ _WARMUP_PLACEMENT = {"start_step": 0, "interval_steps": 4000}
         ({"mode": "per_layer_dynamic", "num_slots": 320, "layer_updates_per_iter": 1}, False),
         ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 9}, False),
         ({"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "private"}, False),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "helper_slot_mode": "shared_banks",
+                "planner": "halo_r",
+            },
+            True,
+        ),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "auxiliary_sms": 1,
+                "helper_slot_mode": "shared_banks",
+                "planner": "halo_r",
+            },
+            False,
+        ),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "auxiliary_sms": 16,
+                "helper_slot_mode": "shared_banks",
+                "planner": "halo_r",
+            },
+            True,
+        ),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "auxiliary_sms": 17,
+                "helper_slot_mode": "shared_banks",
+                "planner": "halo_r",
+            },
+            False,
+        ),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "planner": "halo_q",
+                "auxiliary_sms": 9,
+            },
+            False,
+        ),
+        # HALO-R keeps per-layer helper slots resident too, which is the default.
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "planner": "halo_r"}, True),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "helper_slot_mode": "per_layer_resident",
+                "planner": "halo_r",
+            },
+            True,
+        ),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "planner": "halo_m"}, False),
+        # The planner is a per-layer dynamic field; standard EPLB rejects it.
+        ({"num_slots": 320, "planner": "halo_r"}, False),
         ({"mode": "dynamic", "num_slots": 320}, False),
         ({"num_slots": 288, "warmup_placement": _WARMUP_PLACEMENT}, True),
         (
@@ -783,6 +845,22 @@ def test_load_balancer_schema_matches_runtime(
     else:
         with pytest.raises(ValueError):
             MoeConfig(load_balancer=load_balancer)
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("planner", ["halo_q", "halo_r"])
+def test_load_balancer_schema_defaults_match_runtime(
+    schemas: dict[str, dict], filename: str, planner: str
+) -> None:
+    """An editor completes the auxiliary_sms default that the runtime resolves for each planner."""
+    from tensorrt_llm.llmapi.llm_args import MoePerLayerDynamicLoadBalancerConfig
+
+    definition = schemas[filename]["$defs"][MoePerLayerDynamicLoadBalancerConfig.__name__]
+    default = definition["properties"]["auxiliary_sms"]["default"]
+    if planner == "halo_r":
+        default = definition["then"]["properties"]["auxiliary_sms"]["default"]
+    runtime = MoePerLayerDynamicLoadBalancerConfig(num_slots=320, planner=planner)
+    assert default == runtime.auxiliary_sms
 
 
 @pytest.mark.parametrize(

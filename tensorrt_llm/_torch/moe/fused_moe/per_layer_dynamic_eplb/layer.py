@@ -116,7 +116,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         self.finish_replica_plan()
 
     # The other hooks of the standard EPLB layer interface are intentionally
-    # empty: HALO-Q produces the routing and statistics on the GPU, and no CPU
+    # empty: the planner produces the routing and statistics on the GPU, and no CPU
     # stage migrates weights.
     def start_wait_gpu_stage(self) -> None:
         pass
@@ -234,10 +234,18 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                     f"per-layer dynamic EPLB layer {self.layer_idx} is already "
                     "bound to a different backend"
                 )
+            # A standard load binds every layer twice, as ConfigurableMoE and
+            # its backend each run ``post_load_weights`` and both end here;
+            # the second call finds the producer built. This backend has no
+            # weight reload (``pre_reload_weights`` raises), so the reset
+            # below runs on that second bind and covers a reload path added
+            # later: helper slots may then still hold copies of the old
+            # weights. HALO-R forgets what they hold; HALO-Q's hook is a
+            # no-op, since its table can be reset only when the producer is built.
+            self._scheduler_group.forget_helper_residency()
             return
 
         backend_ref = weakref.ref(backend)
-        from .planner import build_rebalance_slot_scheduler_group
 
         if bool(getattr(backend, "tactic_autotune", False)):
             # Synthetic profiling may visit every helper row before a real
@@ -251,7 +259,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
 
         # ``layer_idx`` is the backend's model layer index: shared-slot pools
         # compare producers across ranks by it.
-        scheduler_group = build_rebalance_slot_scheduler_group(
+        scheduler_group = self.manager.planner_spec.build_group(
             arena=arena,
             manager=self.manager,
             mapping=backend.mapping,
@@ -276,13 +284,13 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         *,
         overlap_fn: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
-        """Submit HALO-Q/TMA and return its physical routes without a host wait.
+        """Submit the replica planner and copy; return physical routes without a host wait.
 
         ``overlap_fn`` runs after the copy stream is submitted but before the
         physical routes are lent to the caller, so independent main-stream work
         such as shared experts overlaps planning and the helper-weight copy.
         """
-        del offset_by_ep_rank  # HALO-Q consumes global logical expert IDs.
+        del offset_by_ep_rank  # The planners consume global logical expert IDs.
         if overlap_fn is not None and not callable(overlap_fn):
             raise TypeError("overlap_fn must be callable")
         if self._scheduler_group is None or self._arena is None:
@@ -311,7 +319,9 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                         "rebalance generation cleanup failed and the group "
                         f"requires teardown: {cleanup_error!r}"
                     )
-                _append_note(error, "overlap_fn failed after HALO-Q/TMA enqueue; " + cleanup_note)
+                _append_note(
+                    error, "overlap_fn failed after the rebalance enqueue; " + cleanup_note
+                )
                 raise
             physical, generation = self._scheduler_group.plan_finish(part, defer_wait=True)
         generation = int(generation)

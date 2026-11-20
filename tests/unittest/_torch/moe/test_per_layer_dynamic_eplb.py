@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -16,6 +17,12 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     maybe_create_moe_load_balancer,
 )
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
+from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
+    RebalanceSlotSchedulerGroup,
+)
+from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.registry import (
+    PER_LAYER_DYNAMIC_PLANNERS,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -79,6 +86,7 @@ class _Group:
         self.wait_calls = 0
         self.finish_calls = []
         self.events = []
+        self.forget_calls = 0
 
     def plan(self, routes, *, defer_wait):
         assert defer_wait
@@ -102,6 +110,9 @@ class _Group:
 
     def finish(self, completion_event=None):
         self.finish_calls.append(completion_event)
+
+    def forget_helper_residency(self):
+        self.forget_calls += 1
 
     def close(self):
         pass
@@ -257,21 +268,24 @@ def test_layer_disables_standard_host_migration_and_checks_geometry():
         )
 
 
-def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
-    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
+def _patch_halo_q_builder(monkeypatch: pytest.MonkeyPatch, builder: MagicMock) -> None:
+    """Replace HALO-Q's group builder in the registry that a new manager reads."""
+    spec = dataclasses.replace(PER_LAYER_DYNAMIC_PLANNERS["halo_q"], build_group=builder)
+    monkeypatch.setitem(PER_LAYER_DYNAMIC_PLANNERS, "halo_q", spec)
+
+
+def test_bind_backend_is_idempotent_before_scheduler_construction(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    group = _Group()
+    builder = MagicMock(return_value=group)
+    _patch_halo_q_builder(monkeypatch, builder)
 
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     arena = _Arena()
     assert _allocate_arena(layer, monkeypatch, arena) is arena
     backend = _Backend()
-    group = _Group()
-    builder = MagicMock(return_value=group)
-    monkeypatch.setattr(
-        planner,
-        "build_rebalance_slot_scheduler_group",
-        builder,
-    )
 
     layer.bind_backend(backend)
     layer.bind_backend(backend)
@@ -291,22 +305,26 @@ def test_bind_backend_is_idempotent_before_scheduler_construction(monkeypatch):
     )
     assert layer._arena is arena
     assert layer._scheduler_group is group
+    # The second bind, as a standard load makes, calls the group's residency reset.
+    assert group.forget_calls == 1
+
+
+def test_halo_q_group_declares_a_no_op_helper_residency_reset() -> None:
+    """HALO-Q's group has the reset that the layer handle calls on a rebind, and it does nothing."""
+    group = object.__new__(RebalanceSlotSchedulerGroup)
+    assert group.forget_helper_residency() is None
+    assert vars(group) == {}
 
 
 def test_bind_backend_requires_the_layer_arena_and_rejects_another_backend(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
+    builder = MagicMock(return_value=_Group())
+    _patch_halo_q_builder(monkeypatch, builder)
 
     manager = _manager()
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     backend = _Backend()
-    builder = MagicMock(return_value=_Group())
-    monkeypatch.setattr(
-        planner,
-        "build_rebalance_slot_scheduler_group",
-        builder,
-    )
     with pytest.raises(RuntimeError, match="no live-weight arena"):
         layer.bind_backend(backend)
 
@@ -499,7 +517,8 @@ def test_per_layer_dynamic_manager_shares_the_base_lifecycle_only():
     assert not isinstance(manager, MoeLoadBalancer)
     assert manager.is_dynamic_routing()
     assert repr(manager) == (
-        "PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, num_slots=24, auxiliary_sms=8)"
+        "PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, num_slots=24, auxiliary_sms=8, "
+        "planner=halo_q)"
     )
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
     assert layer.produces_replica_plan
