@@ -1180,7 +1180,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             and (terminal is None or rid in terminal)
             and not (
                 recovery
-                and rid in sessions
+                and isinstance(sessions.get(rid), RxSession)
                 and sessions[rid].status == SessionStatus.CANCELLED
                 and sessions[rid].has_transferring_tasks()
             )

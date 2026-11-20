@@ -132,7 +132,9 @@ def test_deadlock_guard_preserves_inflight_and_complete_exclusions(
 
 
 @pytest.mark.parametrize("phase", [None, RemoteTailPhase.DECODE])
-def test_eligible_generation_kv_exhaustion_still_raises(phase: RemoteTailPhase | None) -> None:
+def test_eligible_generation_kv_exhaustion_fails_stalled_request(
+    phase: RemoteTailPhase | None,
+) -> None:
     manager = make_kv_cache_manager(try_allocate_generation_fn=lambda request: False)
     scheduler = make_scheduler(manager, enable_recompute_pause=False)
     scheduler._DEADLOCK_STALL_ITERS = 2
@@ -152,13 +154,10 @@ def test_eligible_generation_kv_exhaustion_still_raises(phase: RemoteTailPhase |
     assert scheduler._stalled_schedules == 1
     manager.try_allocate_generation.assert_called_once_with(generation)
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"V2 scheduler deadlock: 1 generation and 0 context request\(s\)",
-    ):
-        scheduler.schedule_request(active, set())
+    second = scheduler.schedule_request(active, set())
 
-    assert scheduler._stalled_schedules == 2
+    assert second.failed_requests == [generation]
+    assert scheduler._stalled_schedules == 0
     assert manager.try_allocate_generation.call_count == 2
     manager.try_allocate_generation.assert_called_with(generation)
     manager.suspend_request.assert_not_called()

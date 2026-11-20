@@ -2840,6 +2840,29 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     ]
 
 
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
+    class StopSchedule(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    executor.dist = types.SimpleNamespace(pp_size=pp_size)
+    held = types.SimpleNamespace(py_request_id=1, lora_task_id=7)
+    healthy = types.SimpleNamespace(py_request_id=2, lora_task_id=8)
+    executor.active_requests = [held, healthy]
+    executor.inflight_req_ids = set()
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+    executor.scheduler.schedule_request.side_effect = StopSchedule
+    executor._held_transfer_failures()[id(held)] = (held, "transfer failed")
+
+    with pytest.raises(StopSchedule):
+        executor._schedule()
+
+    expected = [healthy] if pp_size == 1 else [held, healthy]
+    executor.scheduler.schedule_request.assert_called_once_with(expected, set())
+
+
 class TestComputeScheduledTokens:
     """Tests for PyExecutor._compute_scheduled_tokens.
 

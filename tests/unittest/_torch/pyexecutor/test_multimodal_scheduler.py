@@ -1373,8 +1373,8 @@ def test_default_wrapper_forwards_live_retiring_receive_probe_to_v2() -> None:
     probe.return_value = False
     inner._detect_deadlock([request], set(), [request], set(), made_progress=False)
     assert inner._stalled_schedules == 1
-    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-        inner._detect_deadlock([request], set(), [request], set(), made_progress=False)
+    inner._detect_deadlock([request], set(), [request], set(), made_progress=False)
+    assert inner._failed_requests == [request]
 
 
 @pytest.mark.parametrize("scheduler_cls", [MultimodalScheduler, MultimodalEagerEncoderScheduler])

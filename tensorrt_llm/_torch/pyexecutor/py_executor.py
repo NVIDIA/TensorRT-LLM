@@ -10517,13 +10517,17 @@ class PyExecutor:
                 self.active_requests)
 
         cancelled_model_ids = self._cancelled_disagg_model_request_ids()
-        cancelled_model_ids.update(
-            req.py_request_id
-            for req, _ in self._held_transfer_failures().values())
+        excluded_model_ids = cancelled_model_ids
+        held_failures = self._held_transfer_failures()
+        if held_failures and self.dist.pp_size == 1:
+            excluded_model_ids = cancelled_model_ids | {
+                req.py_request_id
+                for req, _ in held_failures.values()
+            }
         scheduling_requests = [
             request for request in self.active_requests
-            if request.py_request_id not in cancelled_model_ids
-        ] if cancelled_model_ids else self.active_requests
+            if request.py_request_id not in excluded_model_ids
+        ] if excluded_model_ids else self.active_requests
         if any(request.py_request_id in cancelled_model_ids
                and request.lora_task_id is not None
                for request in self.active_requests) or any(
