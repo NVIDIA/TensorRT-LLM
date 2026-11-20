@@ -63,9 +63,13 @@ function(add_tllm_kernel_library target)
       PARENT_SCOPE)
 endfunction()
 
-add_tllm_kernel_library(
-  tllm_kernel_custom_all_reduce SOURCES customAllReduceKernels.cu
-  LINK_LIBRARIES tllm::common_environment)
+if(ENABLE_MULTI_DEVICE)
+  add_tllm_kernel_library(
+    tllm_kernel_custom_all_reduce SOURCES customAllReduceKernels.cu
+    LINK_LIBRARIES tllm::common_environment)
+else()
+  list(REMOVE_ITEM SRC_CU "${CMAKE_CURRENT_LIST_DIR}/customAllReduceKernels.cu")
+endif()
 
 add_tllm_kernel_library(tllm_kernel_rms_norm SOURCES rmsnormKernels.cu)
 
@@ -78,9 +82,7 @@ add_tllm_kernel_library(
   tllm::common_environment
   tllm::runtime_ipc)
 
-if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
-  list(APPEND TLLM_KERNEL_COMPONENT_TARGETS ar_gemm_src)
-else()
+if(NOT USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(tllm_kernel_gemm_all_reduce INTERFACE)
   add_library(tllm::kernel_gemm_all_reduce ALIAS tllm_kernel_gemm_all_reduce)
   target_link_libraries(tllm_kernel_gemm_all_reduce
@@ -218,8 +220,6 @@ target_link_libraries(
             tllm::kernel_lora
             tllm::kernel_pre_quant_scale
             tllm::common_environment)
-if(USING_OSS_CUTLASS_MOE_GEMM)
-  list(APPEND TLLM_KERNEL_COMPONENT_TARGETS moe_gemm_src)
-else()
+if(NOT USING_OSS_CUTLASS_MOE_GEMM)
   add_library(tllm::kernel_moe ALIAS tllm_kernel_moe_internal)
 endif()
