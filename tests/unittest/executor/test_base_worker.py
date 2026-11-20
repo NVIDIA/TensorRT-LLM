@@ -1032,6 +1032,7 @@ def _ipc_worker(monkeypatch, fault_tolerance=True):
         model="dummy",
         enable_wide_ep_fault_tolerance=fault_tolerance,
         enable_attention_dp=True,
+        tensor_parallel_size=2,
         max_seq_len=4096,
         moe_config={"load_balancer": {
             "num_slots": 4

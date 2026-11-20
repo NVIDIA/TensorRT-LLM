@@ -325,8 +325,31 @@ def test_release_keeps_filled_spare_slots_during_update(monkeypatch):
     monkeypatch.setattr(
         torch.ops.trtllm, "moe_unbacked_slots_set_backed", set_backed, raising=False
     )
-    assert load_balancer.expert_restore.release_empty_spare_slots() == 4 << 20
+    restore = load_balancer.expert_restore
+    assert restore.release_spare_slots(restore.empty_spare_slots()) == 4 << 20
     assert released == [3]
+
+
+def test_release_unmaps_a_few_layers_per_call(monkeypatch):
+    """Release empty spare slots a few layers per call, leaving the backed bytes to the caller."""
+    load_balancer, layer = _online_balancer(monkeypatch, _ONLINE)
+    monkeypatch.setattr(load_balancer, "single_layer_load_balancers", [layer] * 3)
+    monkeypatch.setattr(f"{_ER}._RELEASE_LAYERS_PER_CALL", 2)
+    calls = []
+
+    def set_backed(tensors, slots, slot_counts, backed):
+        assert not backed
+        calls.append(slot_counts)
+        return len(slots) * (4 << 20)
+
+    monkeypatch.setattr(
+        torch.ops.trtllm, "moe_unbacked_slots_set_backed", set_backed, raising=False
+    )
+    restore = load_balancer.expert_restore
+    assert restore.release_spare_slots([[2, 3], [], [3]]) == 3 * (4 << 20)
+    # The first call takes layers 0 and 1, the second layer 2.
+    assert calls == [[2], [1]]
+    assert restore.backed_spare_slot_bytes == 0
 
 
 def test_restore_reads_no_placement_while_an_update_may_swap_it(monkeypatch):

@@ -46,7 +46,7 @@ class MnnvlRanksError(RuntimeError):
         self.ranks = tuple(sorted(set(ranks)))
         super().__init__(message)
 
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[type["MnnvlRanksError"], tuple[tuple[int, ...], str]]:
         return type(self), (self.ranks, self.args[0])
 
 

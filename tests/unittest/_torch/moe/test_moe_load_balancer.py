@@ -4,9 +4,12 @@
 import functools
 import gc
 import os
+import threading
+import time
 import unittest
 from collections.abc import Iterator
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,6 +27,8 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
     get_moe_load_balancer, maybe_create_moe_load_balancer,
     moe_load_balancer_add_single_layer)
+from tensorrt_llm._torch.pyexecutor.rank_failure_memory import (RecoveryMemory,
+                                                                StartupMemory)
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -800,14 +805,39 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
         balancer.abandon_iterations()
         if layer_updates_per_iter:
             assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, 2, -1, -1]
+            # A newer membership change stops a rejoin restore once it loaded
+            # rank 0's active slots with the initial placement, before it
+            # installed that placement.
+            stopped = balancer.expert_restore.plan_expert_restore(
+                [True, True], [layer.get_old_rank_expert_ids()],
+                rejoining=[False, True])
+            with pytest.raises(RuntimeError, match="newer membership change"):
+                balancer.expert_restore.restore_lost_experts(
+                    stopped,
+                    progress=MagicMock(side_effect=[
+                        None, RuntimeError("a newer membership change")
+                    ]))
+            assert layer.get_old_rank_expert_ids()[0] == [3, 0, 1, 2, -1, -1]
+            assert_loaded([0, 1, 2])
+            # Rank 1 fails again. Rank 0's view names no expert in the slots
+            # the stopped restore wrote, so the next plan loads them again.
+            ((_, view), ) = balancer.expert_restore.current_placement()
+            retry = balancer.expert_restore.plan_expert_restore([True, False],
+                                                                [view])
+            balancer.expert_restore.restore_lost_experts(retry)
+            assert_loaded(layer.get_old_rank_expert_ids()[0][:4])
+            assert layer.get_old_rank_expert_ids()[0] == [0, 1, 3, 2, -1, -1]
+            assert route([0, 1, 3, 2]) == [0, 1, 2, 3]
+            balancer.abandon_iterations()
         rejoin = balancer.expert_restore.plan_expert_restore(
             [True, True], [layer.get_old_rank_expert_ids()],
             rejoining=[False, True])
         assert rejoin.device_bytes == 0
         assert balancer.expert_restore.restore_lost_experts(rejoin) == 0
         free = torch.cuda.mem_get_info()[0]
-        assert balancer.expert_restore.release_empty_spare_slots(
-        ) == plan.device_bytes
+        restore = balancer.expert_restore
+        assert restore.release_spare_slots(
+            restore.empty_spare_slots()) == plan.device_bytes
         assert torch.cuda.mem_get_info(
         )[0] - free >= plan.device_bytes - scratch
         # No spare slot is backed.
@@ -837,6 +867,7 @@ def test_lost_expert_restored_into_spare_slot(monkeypatch,
 
 
 _EXPERTS, _HIDDEN, _INTERMEDIATE = 4, 2048, 2048
+_RELEASE_TIMEOUT_S = 120
 
 
 def _vmm_granularity() -> int:
@@ -885,17 +916,13 @@ def test_unbacked_slots_back_and_unback():
     assert counters.gpu == before
 
 
-def _load_moe_layer(monkeypatch, fault_tolerance: bool,
-                    meta_init: bool) -> dict:
-    """Load one Cutlass BF16 MoE layer as the model loader does and measure its memory.
-
-    The memory counts the caching allocator's allocations and the unbacked slot
-    memory that VMM maps outside it.
-    """
+@contextmanager
+def _moe_layer(monkeypatch, fault_tolerance: bool,
+               meta_init: bool) -> Iterator[tuple]:
+    """Load one Cutlass BF16 MoE layer as the model loader does; yield its balancer and module."""
     from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
     from tensorrt_llm._torch.moe.fused_moe import (RenormalizeMoeRoutingMethod,
                                                    create_moe)
-    from tensorrt_llm.bindings import MemoryCounters
 
     # Two ranks on two nodes. With fault tolerance, rank 0 alone must hold the
     # four experts, two slots more than EPLB's two.
@@ -927,11 +954,6 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
         for expert_id in range(_EXPERTS)
         for name, shape in shapes.items()
     }
-    counters = MemoryCounters.instance()
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    allocated = torch.cuda.memory_allocated()
-    unbacked_before = counters.gpu
     balancer_cls = MoeLoadBalancer
     if fault_tolerance:
         balancer_cls = functools.partial(FaultTolerantMoeLoadBalancer,
@@ -953,6 +975,26 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
         moe.post_load_weights()
         balancer.register_weight_slots_after_to_cuda()
         balancer.finalize_model()
+        yield balancer, moe
+    finally:
+        balancer.shutdown()
+
+
+def _load_moe_layer(monkeypatch, fault_tolerance: bool,
+                    meta_init: bool) -> dict:
+    """Load one Cutlass BF16 MoE layer as the model loader does and measure its memory.
+
+    The memory counts the caching allocator's allocations and the unbacked slot
+    memory that VMM maps outside it.
+    """
+    from tensorrt_llm.bindings import MemoryCounters
+
+    counters = MemoryCounters.instance()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    allocated = torch.cuda.memory_allocated()
+    unbacked_before = counters.gpu
+    with _moe_layer(monkeypatch, fault_tolerance, meta_init) as (balancer, moe):
         torch.cuda.synchronize()
         unbacked = counters.gpu - unbacked_before
         peak = torch.cuda.max_memory_allocated() - allocated + unbacked
@@ -964,8 +1006,6 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
             "loaded": list(moe.backend.initial_local_expert_ids),
             "w2": moe.backend.w2_weight[:2].float().mean(dim=(1, 2)).tolist(),
         }
-    finally:
-        balancer.shutdown()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -996,6 +1036,77 @@ def test_spare_slots_unbacked_while_loading(monkeypatch, meta_init):
         assert abs(with_spares[key] -
                    without[key]) <= tolerance, (key, with_spares[key],
                                                 without[key])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_spare_slots_released_on_a_worker_during_forwards(monkeypatch):
+    """Release empty spare slots on a worker thread while MoE forwards over active slots run."""
+    torch.cuda.set_device(0)
+    with _moe_layer(monkeypatch, fault_tolerance=True,
+                    meta_init=False) as (balancer, _):
+        (layer, ) = balancer.single_layer_load_balancers
+        restore = balancer.expert_restore
+        spare_slots = list(layer.spare_slots)
+        # As after a rejoin: a restore backed the spare slots, and the placement leaves them empty.
+        assert restore.empty_spare_slots() == [spare_slots]
+        backed = restore.set_spare_slots_backed([spare_slots], True)
+        assert backed > 0
+        tokens = 256
+        hidden_states = torch.randn(tokens,
+                                    _HIDDEN,
+                                    dtype=torch.bfloat16,
+                                    device="cuda")
+        # Every token goes to the two active slots and none to a spare slot.
+        selected_slots = torch.tensor([[0, 1]] * tokens,
+                                      dtype=torch.int32,
+                                      device="cuda")
+        scales = torch.full((tokens, 2),
+                            0.5,
+                            dtype=torch.float32,
+                            device="cuda")
+
+        def forward() -> torch.Tensor:
+            return torch.ops.trtllm.fused_moe(
+                hidden_states, selected_slots, scales,
+                layer.unbacked_slot_tensors["w3_w1_weight"], None,
+                layer.unbacked_slot_tensors["w2_weight"], None, torch.bfloat16,
+                [])[0]
+
+        reference = forward()
+        set_backed = torch.ops.trtllm.moe_unbacked_slots_set_backed
+        in_op, op_done = threading.Event(), threading.Event()
+
+        def observed_set_backed(*args):
+            in_op.set()
+            try:
+                return set_backed(*args)
+            finally:
+                op_done.set()
+
+        monkeypatch.setattr(torch.ops.trtllm, "moe_unbacked_slots_set_backed",
+                            observed_set_backed)
+        memory = RecoveryMemory(SimpleNamespace(dist=SimpleNamespace(rank=0)),
+                                None, StartupMemory(0))
+        # Queued forwards keep the device busy, so the op's device synchronize waits for them.
+        outputs = [forward() for _ in range(64)]
+        memory.schedule_release(balancer)
+        assert in_op.wait(_RELEASE_TIMEOUT_S)
+        outputs.append(forward())
+        # This thread ran a forward while the worker was in the op, so the op released the GIL.
+        assert not op_done.is_set()
+        deadline_s = time.monotonic() + _RELEASE_TIMEOUT_S
+        while memory.release_pending():
+            assert time.monotonic() < deadline_s, "the release did not end"
+            time.sleep(0.01)
+        assert memory.wants_release(False)
+        memory.wait_for_release()
+        assert restore.backed_spare_slot_bytes == 0
+        assert all(
+            torch.ops.trtllm.moe_unbacked_slots_bytes_to_back(
+                tensor, spare_slots) > 0
+            for tensor in layer.unbacked_slot_tensors.values())
+        torch.cuda.synchronize()
+        assert all(torch.equal(output, reference) for output in outputs)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

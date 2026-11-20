@@ -282,10 +282,16 @@ class RankState:
     """Requests still sending KV to the generation server, which
     ``num_active_requests`` includes as routing load under
     ``kv_cache_routing_account_for_in_transfer``. They need no forward step."""
+    has_pending_context_retirement: bool = False
+    """Whether a context request on this rank awaits the retirement of its KV
+    send (see ``supports_logical_context_cancellation``). The rank keeps
+    stepping until the send retires."""
 
-    # Tags the (tag, num_in_transfer_requests) section appended to the
-    # message. The tag is negative where every older layout has a count or a
-    # -1 default, so older layouts decode unchanged without the section.
+    # Marks the (tag, num_in_transfer_requests, has_pending_context_retirement)
+    # section that serialize appends. Every rank of a fleet runs the same build,
+    # so every message carries it; the tag only tells deserialize where the
+    # section is, so that the shorter layouts it also parses stay readable. No
+    # field of those layouts is -4: each is a count or a -1 default.
     _IN_TRANSFER_TAG: ClassVar[int] = -4
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
@@ -307,6 +313,7 @@ class RankState:
             int(self.connector_poll_failed),
             self._IN_TRANSFER_TAG,
             self.num_in_transfer_requests,
+            int(self.has_pending_context_retirement),
         ]
 
     @classmethod
@@ -314,9 +321,11 @@ class RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
         num_in_transfer_requests = 0
-        if len(values) >= 2 and values[-2] == cls._IN_TRANSFER_TAG:
-            num_in_transfer_requests = values[-1]
-            values = values[:-2]
+        has_pending_context_retirement = False
+        if len(values) >= 3 and values[-3] == cls._IN_TRANSFER_TAG:
+            num_in_transfer_requests = values[-2]
+            has_pending_context_retirement = bool(values[-1])
+            values = values[:-3]
         prefix_field_count = 5
         rank_state_fields = fields(cls)[:prefix_field_count]
         if not values:
@@ -368,4 +377,5 @@ class RankState:
             if len(values) > stats_end + 3
             else False,
             num_in_transfer_requests=num_in_transfer_requests,
+            has_pending_context_retirement=has_pending_context_retirement,
         )

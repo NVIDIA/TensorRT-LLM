@@ -26,11 +26,11 @@ import contextlib
 import enum
 import os
 import pickle  # nosec B403
-import subprocess
+import subprocess  # nosec B404 - waits for the authority process that startup.py started, starts none
 import threading
 import time
 import traceback
-from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Callable, Iterator
 
 import numpy as np
 import torch
@@ -77,9 +77,9 @@ from .rank_failure_memory import (
     check_largest_failure_fits,
 )
 from .rank_failure_model_load import moe_comms
-from .resource_manager import KVCacheManager
 
 if TYPE_CHECKING:
+    from ..distributed.host_exchange import HostExchange
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
     from .llm_request import LlmRequest, PyResult
     from .py_executor import BatchState, PyExecutor
@@ -90,9 +90,9 @@ if TYPE_CHECKING:
 _AUTHORITY_TIMEOUT_S = 10.0
 
 # The context reuse commits of a step, held until the step is accepted.
-ContextCommits = List[Tuple["KVCacheManagerV2", Dict[int, int]]]
+ContextCommits = list[tuple["KVCacheManagerV2", dict[int, int]]]
 # Where the stored outputs of a step's requests end, rewound if the step is discarded.
-OutputsMarks = List[Tuple["LlmRequest", "PyResult.OutputsMark"]]
+OutputsMarks = list[tuple["LlmRequest", "PyResult.OutputsMark"]]
 
 
 class _MembershipRestarted(Exception):
@@ -135,7 +135,7 @@ _PHASE_TRANSITIONS = {
 _INSTALL_IN_PROGRESS = frozenset({_Phase.INSTALLING, _Phase.RESUMING, _Phase.JOINING})
 
 
-def _moe_load_balancer_of(executor: PyExecutor):
+def _moe_load_balancer_of(executor: PyExecutor) -> MoeLoadBalancer | None:
     balancer = executor.model_engine.moe_load_balancer
     return balancer if isinstance(balancer, MoeLoadBalancer) else None
 
@@ -147,8 +147,8 @@ def _admission_epoch_key(generation: int) -> str:
 class _PhaseTimer:
     """Record how long each membership change phase takes, in milliseconds."""
 
-    def __init__(self):
-        self.times_ms: Dict[str, float] = {}
+    def __init__(self) -> None:
+        self.times_ms: dict[str, float] = {}
         self._began_s = time.perf_counter()
 
     def begin(self) -> None:
@@ -165,12 +165,12 @@ class _PhaseTimer:
 
 
 # Per MoE layer, the expert in each of one rank's slots (-1 if empty).
-OwnSlots = List[List[int]]
+OwnSlots = list[list[int]]
 
 
 def agreed_placement(
-    own_slots: List[Optional[OwnSlots]], record: MembershipRecord
-) -> List[np.ndarray]:
+    own_slots: list[OwnSlots | None], record: MembershipRecord
+) -> list[np.ndarray]:
     """Return the per-layer placement that every active rank plans the restore from.
 
     Row r holds the slots that rank r gathered once it abandoned its EPLB iterations, because the
@@ -209,13 +209,13 @@ class RankFailureRecovery:
     def __init__(
         self,
         executor: PyExecutor,
-        exchange,
+        exchange: HostExchange,
         moe_state: MoeExecutionState,
         store: SignedStore,
         startup_memory: StartupMemory,
-        authority: Optional[subprocess.Popen] = None,
+        authority: subprocess.Popen | None = None,
         incarnation: int = 0,
-    ):
+    ) -> None:
         self._executor = executor
         self._exchange = exchange
         self._moe = moe_state
@@ -227,8 +227,8 @@ class RankFailureRecovery:
         self.incarnation = incarnation
         # On rank 0, maps request id to client id for the requests without a final response.
         # The executor worker attaches it before it reports READY, so before any request arrives.
-        self._outstanding_requests: Optional[Callable[[], Dict[int, int]]] = None
-        self._client: Optional[MembershipClient] = None
+        self._outstanding_requests: Callable[[], dict[int, int]] | None = None
+        self._client: MembershipClient | None = None
         self._record = MembershipRecord(
             generation=0, state=MembershipState.COMMITTED, active_mask=(1 << self.world_size) - 1
         )
@@ -237,17 +237,17 @@ class RankFailureRecovery:
         self._committed_mask = self._record.active_mask
         self._committed_generation = self._record.generation
         # The last record whose host exchange rows this rank mapped.
-        self._installed: Optional[MembershipRecord] = None
+        self._installed: MembershipRecord | None = None
         self._waiting_in_store = 0
         # Mask of the peers whose MNNVL handles the active ranks could not import.
         self._unimportable_peers = 0
         self._install_steps = 0
-        self._published_admissions: List[int] = []
+        self._published_admissions: list[int] = []
         # Store groups of the uncommitted changes, closed at the next commit.
-        self._change_groups: List[StoreGroup] = []
-        self._interrupted: List[LlmRequest] = []
+        self._change_groups: list[StoreGroup] = []
+        self._interrupted: list[LlmRequest] = []
         # Per request id, the outputs mark at the first step discarded since the last recompute.
-        self._discarded_marks: Dict[int, PyResult.OutputsMark] = {}
+        self._discarded_marks: dict[int, PyResult.OutputsMark] = {}
         exchange.set_interrupt_handler(self._membership_changing, self._on_exchange_interrupt)
 
     @classmethod
@@ -290,16 +290,6 @@ class RankFailureRecovery:
                 for manager in executor.resource_manager.resource_managers.values()
                 if isinstance(manager, KVCacheManagerV2)
             ]
-            + [
-                (
-                    False,
-                    f"the KV cache manager V2 (kv_cache_config.use_kv_cache_manager_v2=True, not "
-                    f"{type(manager).__name__}), because a step's reuse commits wait until the "
-                    "step is accepted, which only the V2 manager supports",
-                )
-                for manager in executor.resource_manager.resource_managers.values()
-                if isinstance(manager, KVCacheManager)
-            ]
         )
         balancer = _moe_load_balancer_of(executor)
         startup_memory = StartupMemory(executor.kv_cache_manager.gpu_quota)
@@ -329,7 +319,7 @@ class RankFailureRecovery:
         )
         return recovery
 
-    def set_outstanding_requests(self, outstanding_requests: Callable[[], Dict[int, int]]) -> None:
+    def set_outstanding_requests(self, outstanding_requests: Callable[[], dict[int, int]]) -> None:
         """Attach the executor worker's map from request id to client id of unfinished requests.
 
         After a membership change, rank 0 fails the ones that no active rank holds.
@@ -365,6 +355,12 @@ class RankFailureRecovery:
         registered later still run before it.
         """
         if completed:
+            # The load balancer's teardown, which follows, frees the spare slots' memory. A failed
+            # release does not keep this rank from shutting down with the others.
+            try:
+                self._memory.wait_for_release()
+            except RuntimeError as error:
+                logger.error(f"Rank {self.rank} could not release its empty spare slots: {error!r}")
             if self.rank == 0:
                 self._client.report(shutdown=True)
             with self._record_changed:
@@ -489,7 +485,7 @@ class RankFailureRecovery:
             )
 
     @contextlib.contextmanager
-    def _hang_detection_paused(self):
+    def _hang_detection_paused(self) -> Iterator[None]:
         """Pause the hang detector during a membership change. The authority bounds its duration."""
         detector = self._executor.hang_detector
         armed = not detector.paused()
@@ -582,7 +578,7 @@ class RankFailureRecovery:
         except (MnnvlMappingError, _ExpertsNotRestorable) as error:
             self._fail_install(record, error)
 
-    def _next_record(self, seen: Optional[MembershipRecord]) -> MembershipRecord:
+    def _next_record(self, seen: MembershipRecord | None) -> MembershipRecord:
         with self._record_changed:
             self._record_changed.wait_for(lambda: self._record != seen)
             return self._record
@@ -721,7 +717,7 @@ class RankFailureRecovery:
 
     def _prepare_install(
         self, record: MembershipRecord, timer: _PhaseTimer
-    ) -> Tuple[int, Dict[int, int]]:
+    ) -> tuple[int, dict[int, int]]:
         """Settle the interrupted steps and admit the joining ranks.
 
         Returns:
@@ -745,7 +741,7 @@ class RankFailureRecovery:
 
     def _gather_rank_state(
         self, record: MembershipRecord, timer: _PhaseTimer
-    ) -> Tuple[Set[int], List[Optional[OwnSlots]]]:
+    ) -> tuple[set[int], list[OwnSlots | None]]:
         """Return the request ids that the active ranks know and each rank's slots.
 
         A rank's slots are None without EPLB or if the rank is inactive. Rank 0 also hands its
@@ -792,8 +788,8 @@ class RankFailureRecovery:
         self,
         record: MembershipRecord,
         recomputed: int,
-        outstanding: Dict[int, int],
-        known: Set[int],
+        outstanding: dict[int, int],
+        known: set[int],
     ) -> None:
         """Resume serving after the commit and fail the requests that no active rank holds.
 
@@ -810,9 +806,9 @@ class RankFailureRecovery:
         for group in self._change_groups:
             group.close(active)
         self._change_groups.clear()
-        # Serving resumes first. Every rank returns the empty spare slots' memory to the KV cache
-        # at the step boundary that the next forward vote picks.
-        self._memory.schedule_release()
+        # Serving resumes first. Every rank releases its empty spare slots while it serves, and
+        # returns their memory to the KV cache at the step boundaries that the next votes pick.
+        self._memory.schedule_release(_moe_load_balancer_of(self._executor))
         still_outstanding = self._outstanding()
         lost = {r: c for r, c in outstanding.items() if r not in known and r in still_outstanding}
         self._executor.fail_requests_by_id(lost, RankFailureError())
@@ -826,7 +822,7 @@ class RankFailureRecovery:
                 "active rank holds"
             )
 
-    def _outstanding(self) -> Dict[int, int]:
+    def _outstanding(self) -> dict[int, int]:
         """Return, on rank 0, the client ids of the requests without a final response."""
         return {} if self._outstanding_requests is None else self._outstanding_requests()
 
@@ -844,7 +840,7 @@ class RankFailureRecovery:
             self._memory.release(_moe_load_balancer_of(self._executor), self._installed.generation)
 
     def _restore(
-        self, record: MembershipRecord, own_slots: List[Optional[OwnSlots]], timer: _PhaseTimer
+        self, record: MembershipRecord, own_slots: list[OwnSlots | None], timer: _PhaseTimer
     ) -> None:
         """Restore the all-to-all workspaces and the lost experts on every active rank.
 
@@ -855,6 +851,8 @@ class RankFailureRecovery:
             raise _MembershipRestarted
         started_s = time.perf_counter()
         balancer = _moe_load_balancer_of(self._executor)
+        # The plan, the KV cache shrink and the restore read and change the spare slots' memory.
+        self._memory.wait_for_release()
         plan, loaded_experts = None, 0
         if balancer is not None:
             plan, loaded_experts = self._plan_expert_restore(record, own_slots, balancer)
@@ -910,9 +908,9 @@ class RankFailureRecovery:
     def _plan_expert_restore(
         self,
         record: MembershipRecord,
-        own_slots: List[Optional[OwnSlots]],
+        own_slots: list[OwnSlots | None],
         balancer: MoeLoadBalancer,
-    ) -> Tuple[ExpertRestorePlan, int]:
+    ) -> tuple[ExpertRestorePlan, int]:
         """Plan the expert placement of ``record`` and count the experts this rank loads."""
         agreed = agreed_placement(own_slots, record)
         try:
@@ -976,7 +974,7 @@ class RankFailureRecovery:
         with self._record_changed:
             return self._phase in _INSTALL_IN_PROGRESS or self._change_not_installed()
 
-    def forward_vote(self, batch_size: int) -> Tuple[bool, bool]:
+    def forward_vote(self, batch_size: int) -> tuple[bool, bool]:
         """Run the attention-DP forward vote with the change and memory release flags.
 
         A rank whose forward a membership change pauses reports batch size 0, so no rank launches
@@ -1092,7 +1090,7 @@ class RankFailureRecovery:
         return len(requests)
 
     def fail_unservable_requests(
-        self, waiting_queue: WaitingQueue, rank_states: List[RankState]
+        self, waiting_queue: WaitingQueue, rank_states: list[RankState]
     ) -> None:
         """Fail the waiting requests pinned strictly to an attention-DP rank that does not serve.
 

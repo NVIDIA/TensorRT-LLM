@@ -1023,6 +1023,41 @@ def test_rendezvous_store_signs_with_shared_secret(monkeypatch):
         open_store(address, TIMEOUT_S, secret="cd" * 32).get("key")
 
 
+def test_rendezvous_store_requires_address(monkeypatch):
+    """Refuse to open the rendezvous store without an address, naming the variable."""
+    monkeypatch.delenv(RENDEZVOUS_ENV, raising=False)
+    with pytest.raises(ValueError, match=f"requires host:port in {RENDEZVOUS_ENV}"):
+        rendezvous_store(timeout_s=TIMEOUT_S)
+
+
+def test_failed_client_start_closes_connection(monkeypatch):
+    """Close the liveness connection when the first record does not arrive, and stop() returns.
+
+    The authority admits a replacement for the rank only once the connection closes.
+    """
+    monkeypatch.setattr(liveness, "HELLO_TIMEOUT_S", 0.2)
+    store = InMemoryStore()
+    closed = threading.Event()
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        store.set(membership.LIVENESS_KEY, f"127.0.0.1:{listener.getsockname()[1]}".encode())
+
+        def silent_authority():
+            connection, _ = listener.accept()
+            with connection:
+                while connection.recv(1 << 16):
+                    pass
+            closed.set()
+
+        thread = threading.Thread(target=silent_authority, daemon=True)
+        thread.start()
+        client = MembershipClient(0, store, lambda record: None)
+        with pytest.raises(TimeoutError):
+            client.start()
+        assert closed.wait(JOIN_TIMEOUT_S)
+        client.stop()
+        thread.join(JOIN_TIMEOUT_S)
+
+
 @pytest.mark.parametrize("shutdown", [False, True], ids=["idle", "shutdown"])
 def test_authority_heartbeats_keep_ranks_connected(monkeypatch, shutdown):
     """Keep the ranks of an idle or ending deployment connected with the authority's heartbeats."""

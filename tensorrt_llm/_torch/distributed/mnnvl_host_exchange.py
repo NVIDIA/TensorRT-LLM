@@ -67,7 +67,11 @@ class HostExchangeMnnvlMemory(MembershipMnnvlMemory):
 
     @classmethod
     def uses_fabric_handles(cls, dev_id: int) -> bool:
-        """Return whether device ``dev_id`` shares memory through fabric handles."""
+        """Return whether device ``dev_id`` shares memory through fabric handles.
+
+        ``MnnvlMemory.get_allocation_prop`` requests fabric handles on aarch64 hosts only, so this
+        tells the CPU architecture; it does not test that IMEX can export the handles.
+        """
         handle_type = cls.get_allocation_prop(dev_id).requestedHandleTypes
         return handle_type == mnnvl_memory.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
 
@@ -221,9 +225,10 @@ class MnnvlHostExchangeGroup:
         return [
             (
                 HostExchangeMnnvlMemory.uses_fabric_handles(torch.cuda.current_device()),
-                "MNNVL memory shared through fabric handles (GB200-class aarch64 nodes "
-                "with IMEX running and an IMEX channel in the container), because fault "
-                "tolerance remaps MNNVL memory and exchanges host values through fabric handles",
+                "an aarch64 host (such as a GB200 node), on which MNNVL memory is shared through "
+                "fabric handles, because fault tolerance remaps MNNVL memory and exchanges host "
+                "values through fabric handles; the fabric handles also need IMEX running and an "
+                "IMEX channel in the container, which this check does not test",
             )
         ]
 

@@ -24,7 +24,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import os
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -36,8 +36,12 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
 
 from ..distributed import Distributed
 from ..distributed.membership import HANG_TIMEOUT_S
-from ..moe.fused_moe.communication.execution_state import BindableCommunication, MoeExecutionState
-from ..moe.fused_moe.communication.nvlink_one_sided import SYNC_PROTOCOL_ENV, get_sync_protocol
+from ..moe.fused_moe.communication.execution_state import MoeExecutionState
+from ..moe.fused_moe.communication.nvlink_one_sided import (
+    SYNC_PROTOCOL_ENV,
+    NVLinkOneSided,
+    get_sync_protocol,
+)
 from ..moe.fused_moe.ep_group_health import EPGroupHealth
 from ..moe.fused_moe.eplb_expert_restore import FaultTolerantMoeLoadBalancer
 from ..moe.fused_moe.fused_moe_vanilla import VanillaMoE
@@ -108,10 +112,11 @@ def prepare_model(model: torch.nn.Module) -> None:
         ValueError: The model is not supported with fault tolerance.
     """
     check_model_architectures(model.model_config.pretrained_config.architectures)
+    # A model may run its MoE layers over an EP group other than its mapping's MoE parallelism;
+    # moe_comms checks that every layer runs over the same one.
     comms = moe_comms(model)
-    mapping = model.model_config.mapping
-    health = EPGroupHealth(mapping.moe_ep_size)
-    ep_rank = mapping.moe_ep_rank
+    health = EPGroupHealth(comms[0].ep_size)
+    ep_rank = comms[0].ep_rank
     if Distributed.startup_record.replacement:
         # A replacement starts alone. The change that admits it installs the active ranks.
         for rank in range(health.moe_world_size):
@@ -124,23 +129,36 @@ def prepare_model(model: torch.nn.Module) -> None:
         comm.bind_execution_state(moe_execution_state)
 
 
-def moe_comms(model: torch.nn.Module) -> List[BindableCommunication]:
-    """Return the communication strategies that ``model``'s MoE layers use.
+def moe_comms(model: torch.nn.Module) -> list[NVLinkOneSided]:
+    """Return the communication strategies that ``model``'s MoE layers use, each once.
 
     Raises:
-        ValueError: A MoE layer's communication cannot be bound to an execution state.
+        ValueError: A MoE layer's communication cannot be bound to an execution state, or two
+            MoE layers communicate over different EP groups.
     """
     comms = {}
+    first = None  # The name and communication of the first MoE layer.
     for name, layer in model.named_modules():
         if not isinstance(layer, (MoE, VanillaMoE)):
             continue
         comm = getattr(layer, "comm", None)
-        if not hasattr(comm, "bind_execution_state"):
+        if not isinstance(comm, NVLinkOneSided):
             uses = "no communication strategy" if comm is None else type(comm).__name__
             raise ValueError(
                 f"MoE layer {name} ({type(layer).__name__}) uses {uses}, but Wide-EP fault "
                 "tolerance requires NVLinkOneSided, the only MoE communication that can leave "
-                f"out a failed rank. Select it or {TURN_FAULT_TOLERANCE_OFF}."
+                f"out a failed rank. {_no_nvlink_one_sided_cause(layer.mapping)}; "
+                f"{TURN_FAULT_TOLERANCE_OFF}."
+            )
+        if first is None:
+            first = name, comm
+        first_name, first_comm = first
+        if (comm.ep_size, comm.ep_rank) != (first_comm.ep_size, first_comm.ep_rank):
+            raise ValueError(
+                f"MoE layer {name} communicates as EP rank {comm.ep_rank} of {comm.ep_size}, but "
+                f"MoE layer {first_name} as EP rank {first_comm.ep_rank} of {first_comm.ep_size}. "
+                "Wide-EP fault tolerance runs every MoE layer over one EP group; give the layers "
+                f"the same MoE parallelism or {TURN_FAULT_TOLERANCE_OFF}."
             )
         comms[id(comm)] = comm
     if not comms:
@@ -148,6 +166,25 @@ def moe_comms(model: torch.nn.Module) -> List[BindableCommunication]:
             f"Wide-EP fault tolerance requires a model with MoE layers; {TURN_FAULT_TOLERANCE_OFF}"
         )
     return list(comms.values())
+
+
+def _no_nvlink_one_sided_cause(mapping: Mapping) -> str:
+    """Name the setting with which a MoE layer of ``mapping`` gets no NVLinkOneSided."""
+    if not mapping.enable_attention_dp or mapping.dp_size == 1:
+        return (
+            "A MoE layer gets it only under attention DP over more than one rank "
+            "(enable_attention_dp=True and tensor_parallel_size above 1)"
+        )
+    if mapping.moe_tp_size != 1:
+        return (
+            "A MoE layer gets it only without MoE TP (moe_tensor_parallel_size=1, not "
+            f"{mapping.moe_tp_size})"
+        )
+    return (
+        "The layer's MoE backend, or the communication method that TRTLLM_FORCE_COMM_METHOD or "
+        "the model forces, selected another; use a MoE backend that supports NVLinkOneSided and "
+        "leave TRTLLM_FORCE_COMM_METHOD unset or set it to NVLINK_ONE_SIDED"
+    )
 
 
 def create_moe_load_balancer(

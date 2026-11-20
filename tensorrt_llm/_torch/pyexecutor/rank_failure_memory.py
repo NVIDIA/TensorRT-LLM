@@ -15,17 +15,19 @@
 """Move device memory between the KV cache pool and the rank failure restore.
 
 The restore shrinks the KV cache pool for the lost experts it loads into spare slots and for the
-workspace rows it remaps. Once the change is committed, every rank returns the empty spare slots
-to the pool, and the replaced workspace rows once no excluded process maps them.
+workspace rows it remaps. Once the change is committed, every rank releases the empty spare slots
+on a worker thread and grows the pool back into them, and into the replaced workspace rows once no
+excluded process maps them.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import math
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Iterator, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Iterator, NamedTuple
 
 import torch
 
@@ -34,11 +36,15 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 if TYPE_CHECKING:
     from ..moe.fused_moe.communication.execution_state import MoeExecutionState
+    from ..moe.fused_moe.eplb_expert_restore import EplbExpertRestore
     from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+    from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from .llm_request import LlmRequest
     from .py_executor import PyExecutor
 
 _RELEASE_RETRY_S = 1.0
+# The KV cache pool grows by at most this many bytes per release step, which bounds the step's stall.
+_KV_CACHE_GROW_CHUNK_BYTES = 1 << 30
 
 
 class KvCacheShrinkError(Exception):
@@ -68,7 +74,7 @@ class StartupMemory(NamedTuple):
 
     kv_cache_quota: int
 
-    def free_to_keep(self, kv_cache_manager, spare_slot_bytes: int) -> int:
+    def free_to_keep(self, kv_cache_manager: KVCacheManagerV2, spare_slot_bytes: int) -> int:
         """Return the free device memory less the pool's shortfall from its quota.
 
         The quota is the startup quota less ``spare_slot_bytes``, the backed spare slots' size.
@@ -78,7 +84,11 @@ class StartupMemory(NamedTuple):
         )
 
     def fit_kv_cache(
-        self, kv_cache_manager, spare_slot_bytes: int, needed: int, free_to_keep: int = 0
+        self,
+        kv_cache_manager: KVCacheManagerV2,
+        spare_slot_bytes: int,
+        needed: int,
+        free_to_keep: int = 0,
     ) -> int:
         """Resize the suspended KV cache pool and return its new quota.
 
@@ -99,7 +109,9 @@ class StartupMemory(NamedTuple):
         except OutOfPagesError:
             return kv_cache_manager.gpu_quota
 
-    def shortfall(self, kv_cache_manager, spare_slot_bytes: int, free_to_keep: int) -> int:
+    def shortfall(
+        self, kv_cache_manager: KVCacheManagerV2, spare_slot_bytes: int, free_to_keep: int
+    ) -> int:
         """Return the quota bytes the pool lacks and cannot take without ``free_to_keep``."""
         return max(0, free_to_keep - self.free_to_keep(kv_cache_manager, spare_slot_bytes))
 
@@ -113,9 +125,32 @@ class _ReleaseRetry:
     check_after_s: float
 
 
+class _SpareSlotRelease(NamedTuple):
+    """The worker thread of ``pool`` that releases empty spare slots of ``expert_restore``.
+
+    ``worker`` returns the bytes released and the seconds it took. It leaves
+    ``backed_spare_slot_bytes`` to the executor thread.
+    """
+
+    expert_restore: EplbExpertRestore
+    pool: concurrent.futures.ThreadPoolExecutor
+    worker: concurrent.futures.Future[tuple[int, float]]
+
+
+@dataclass
+class _ReleaseReport:
+    """What a release returned to the KV cache pool, over its worker and its grow steps."""
+
+    released: int = 0
+    release_s: float = 0.0
+    grown: int = 0
+    grow_steps: int = 0
+    grow_s: float = 0.0
+
+
 def check_largest_failure_fits(
     executor: PyExecutor,
-    balancer,
+    balancer: MoeLoadBalancer,
     startup_memory: StartupMemory,
     moe_execution_state: MoeExecutionState,
 ) -> None:
@@ -174,8 +209,9 @@ class RecoveryMemory:
     """Shrink the KV cache pool for a membership change's restore and release the memory after.
 
     The pool shrinks while the change is installed. Once serving resumes, every rank releases its
-    empty spare slots and replaced workspace rows at the same step boundary. The release resizes
-    the pool, which suspends requests, so a forward vote picks that boundary.
+    empty spare slots on a worker thread. The pool then grows back into them and into the replaced
+    workspace rows by at most ``_KV_CACHE_GROW_CHUNK_BYTES`` per step, at step boundaries that
+    forward votes pick, because a resize suspends requests.
     """
 
     def __init__(
@@ -183,19 +219,23 @@ class RecoveryMemory:
         executor: PyExecutor,
         moe_state: MoeExecutionState,
         startup_memory: StartupMemory,
-    ):
+    ) -> None:
         self._executor = executor
         self._moe = moe_state
         self._startup_memory = startup_memory
         self._rank = executor.dist.rank
         # Only the executor thread reads and writes the state below, so it takes no lock.
-        self._kv_cache_free_to_keep: Optional[int] = None
+        self._kv_cache_free_to_keep: int | None = None
         # Whether a remap replaced this rank's workspace rows while an excluded process may still
         # import them. Their pages return only once that process ended, which no event announces,
         # so the KV cache pool takes them back by measuring.
         self._workspace_rows_owed = False
         self._release_scheduled = False
-        self._release_retry: Optional[_ReleaseRetry] = None
+        self._spare_slot_release: _SpareSlotRelease | None = None
+        # What the release in progress returned to the KV cache pool, logged once the pool stops
+        # growing.
+        self._release_report: _ReleaseReport | None = None
+        self._release_retry: _ReleaseRetry | None = None
         self._release_requested = False
         # Whether a rank asked for a release in the last forward vote and no rank flagged a change.
         self._release_agreed = False
@@ -205,7 +245,7 @@ class RecoveryMemory:
         """Return whether the last forward vote agreed on a release."""
         return self._release_agreed
 
-    def check_restore_fits(self, restore_bytes: int, balancer: Optional[MoeLoadBalancer]) -> None:
+    def check_restore_fits(self, restore_bytes: int, balancer: MoeLoadBalancer | None) -> None:
         """Check that the KV cache pool can release ``restore_bytes``.
 
         The pool releases at most its startup quota less the backed spare slots, which hold the
@@ -228,7 +268,7 @@ class RecoveryMemory:
     def kv_cache_shrunk_by(
         self,
         restore_bytes: int,
-        balancer: Optional[MoeLoadBalancer],
+        balancer: MoeLoadBalancer | None,
         recomputable: Callable[[LlmRequest], bool],
     ) -> Iterator[str]:
         """Suspend the KV cache pool, shrink it by ``restore_bytes`` and yield the quota change.
@@ -281,18 +321,65 @@ class RecoveryMemory:
         """Record that a remap replaced this rank's workspace rows."""
         self._workspace_rows_owed = True
 
-    def schedule_release(self) -> None:
-        """Release the committed change's memory at the step boundary that the next vote picks."""
+    def schedule_release(self, balancer: MoeLoadBalancer | None) -> None:
+        """Release the committed change's memory.
+
+        The empty spare slots are released now on a worker thread, while serving continues. The KV
+        cache pool grows into them at the step boundaries that the next votes pick. The empty
+        slots are read on this thread, which alone installs placements.
+        """
         self._release_scheduled = True
+        if balancer is None:
+            return
+        expert_restore = balancer.expert_restore
+        layer_slots = expert_restore.empty_spare_slots()
+        if not any(layer_slots):
+            return
+
+        def release() -> tuple[int, float]:
+            start_s = time.perf_counter()
+            return expert_restore.release_spare_slots(layer_slots), time.perf_counter() - start_s
+
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="spare_slot_release"
+        )
+        self._spare_slot_release = _SpareSlotRelease(expert_restore, pool, pool.submit(release))
+
+    def release_pending(self) -> bool:
+        """Return whether a worker thread is still releasing empty spare slots."""
+        release = self._spare_slot_release
+        return release is not None and not release.worker.done()
+
+    def wait_for_release(self) -> None:
+        """Wait until the empty spare slots are released and the worker thread has ended.
+
+        Call it before anything that reads or changes the spare slots' memory: a restore and the
+        teardown. The released bytes leave ``backed_spare_slot_bytes`` here, on the executor
+        thread, and the next growth of the KV cache pool reports them.
+
+        Raises:
+            RuntimeError: The release on the worker thread failed.
+        """
+        release, self._spare_slot_release = self._spare_slot_release, None
+        if release is None:
+            return
+        release.pool.shutdown(wait=True)
+        released, release_s = release.worker.result()
+        release.expert_restore.backed_spare_slot_bytes -= released
+        report = self._release_report = self._release_report or _ReleaseReport()
+        report.released += released
+        report.release_s += release_s
 
     def wants_release(self, forward_paused: bool) -> bool:
         """Return whether this rank asks the forward vote for a release.
 
-        A rank whose forward a membership change pauses asks for none.
+        A rank whose forward a membership change pauses asks for none, and so does a rank whose
+        empty spare slots are still being released.
         """
         self._release_requested = not forward_paused and (
-            self._release_scheduled
-            or (self._release_retry is not None and self._release_retry_due())
+            not self.release_pending()
+            if self._release_scheduled
+            else self._release_retry is not None and self._release_retry_due()
         )
         return self._release_requested
 
@@ -306,32 +393,44 @@ class RecoveryMemory:
         requested, self._release_requested = self._release_requested, False
         return requested
 
-    def release(self, balancer: Optional[MoeLoadBalancer], generation: int) -> None:
-        """Release committed ``generation``'s memory, or retry a release that fell short.
+    def release(self, balancer: MoeLoadBalancer | None, generation: int) -> None:
+        """Grow the KV cache pool by one step into committed ``generation``'s memory, or retry.
 
-        Call it only after ``end_release_vote`` returned True.
+        The pool grows while its quota is below the startup quota less the backed spare slots,
+        whichever restore or release step took the released spare slots from the worker thread.
+        The release is logged once the pool stops growing. Call it only after ``end_release_vote``
+        returned True.
         """
         if self._release_scheduled:
             self._release_scheduled = False
-            start_s = time.perf_counter()
-            released = (
-                0 if balancer is None else balancer.expert_restore.release_empty_spare_slots()
-            )
+            self.wait_for_release()
             kept, self._kv_cache_free_to_keep = self._kv_cache_free_to_keep, None
-            if released or kept is not None:
-                quota, short = self._grow_kv_cache_pool(balancer, kept or 0)
-                logger.info(
-                    f"Rank {self._rank} returned the empty spare slots of membership generation "
-                    f"{generation} to the KV cache pool: released {released} "
-                    f"bytes, KV cache quota {quota} bytes, {short} bytes short until device memory "
-                    f"is freed, in {(time.perf_counter() - start_s) * 1e3:.0f} ms"
-                )
+            free_to_keep = kept or 0
+        else:
+            free_to_keep = self._release_retry.free_to_keep
+        backed = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
+        quota = self._executor.kv_cache_manager.gpu_quota
+        if quota >= self._startup_memory.kv_cache_quota - backed:
+            self._release_report, self._release_retry = None, None
             return
-        quota, short = self._grow_kv_cache_pool(balancer, self._release_retry.free_to_keep)
+        report = self._release_report = self._release_report or _ReleaseReport()
+        start_s = time.perf_counter()
+        quota_before, quota, short = self._grow_kv_cache_pool(backed, free_to_keep)
+        report.grown += quota - quota_before
+        report.grow_steps += 1
+        report.grow_s += time.perf_counter() - start_s
+        logger.debug(
+            f"Rank {self._rank} grew the KV cache quota from {quota_before} to {quota} bytes"
+        )
+        if self._release_scheduled:
+            return
+        self._release_report = None
         logger.info(
-            f"Rank {self._rank} grew the KV cache pool into device memory freed since membership "
-            f"generation {generation} was committed, KV cache quota {quota} bytes, "
-            f"{short} bytes short"
+            f"Rank {self._rank} returned memory to the KV cache pool after membership generation "
+            f"{generation}: released {report.released} bytes of empty spare slots in "
+            f"{report.release_s * 1e3:.0f} ms on a worker thread, grew the KV cache quota by "
+            f"{report.grown} to {quota} bytes in {report.grow_steps} steps and "
+            f"{report.grow_s * 1e3:.0f} ms, {short} bytes short until device memory is freed"
         )
 
     def _release_retry_due(self) -> bool:
@@ -346,23 +445,45 @@ class RecoveryMemory:
         retry.check_after_s = now_s + _RELEASE_RETRY_S
         return _free_plus_reserved_memory() - retry.free_seen >= self._moe.workspace_bytes() // 2
 
-    def _grow_kv_cache_pool(
-        self, balancer: Optional[MoeLoadBalancer], free_to_keep: int
-    ) -> Tuple[int, int]:
-        """Grow the KV cache pool towards its quota, retrying later while workspace rows are owed.
+    def _grow_kv_cache_pool(self, backed: int, free_to_keep: int) -> tuple[int, int, int]:
+        """Grow the KV cache pool towards its quota by at most ``_KV_CACHE_GROW_CHUNK_BYTES``.
+
+        The quota is the startup quota less ``backed``, the backed spare slots' bytes. While the
+        pool grows by whole chunks and more remains, the release stays scheduled, so that the next
+        vote grows it by the next chunk. A pool short of memory retries later while workspace rows
+        are owed.
 
         Returns:
-            The new quota and the bytes the pool lacks of it while ``free_to_keep`` stays free.
+            The quotas before and after, and the bytes the pool lacks while ``free_to_keep`` stays
+            free.
         """
-        backed = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
         with self._executor.kv_pools_suspended() as kv_cache_manager:
-            quota = self._startup_memory.fit_kv_cache(kv_cache_manager, backed, 0, free_to_keep)
-            short = self._startup_memory.shortfall(kv_cache_manager, backed, free_to_keep)
+            quota_before = kv_cache_manager.gpu_quota
+            # The quota beyond this step's chunk is held back like the backed spare slots, so the
+            # shortfall is measured against this step's quota.
+            later = max(
+                0,
+                self._startup_memory.kv_cache_quota
+                - backed
+                - quota_before
+                - _KV_CACHE_GROW_CHUNK_BYTES,
+            )
+            quota = self._startup_memory.fit_kv_cache(
+                kv_cache_manager, backed + later, 0, free_to_keep
+            )
+            short = self._startup_memory.shortfall(kv_cache_manager, backed + later, free_to_keep)
+        self._release_retry = None
+        if later and quota > quota_before and not short:
+            self._release_scheduled = True
+            self._kv_cache_free_to_keep = free_to_keep
+            return quota_before, quota, short
+        if later and quota == quota_before:
+            # The device could not back the chunk, so the pool lacks all the quota it is owed.
+            short = max(short, self._startup_memory.kv_cache_quota - backed - quota)
         if not short:
             self._workspace_rows_owed = False
-        self._release_retry = None
         if self._workspace_rows_owed:
             self._release_retry = _ReleaseRetry(
                 free_to_keep, _free_plus_reserved_memory(), time.monotonic() + _RELEASE_RETRY_S
             )
-        return quota, short
+        return quota_before, quota, short

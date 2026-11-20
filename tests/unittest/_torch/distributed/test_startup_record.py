@@ -561,6 +561,38 @@ def test_quota_without_fault_tolerance_gathers_nothing(monkeypatch):
     assert quota == 100
 
 
+def _ctx_mla_kv_len_cap(dist, cap):
+    return _util._agree_ctx_mla_kv_len_cap(cap, dist.mapping)
+
+
+@pytest.mark.parametrize("predecessor_cap", [1_210_000, None], ids=["capped", "uncapped"])
+def test_replacement_takes_predecessor_ctx_mla_kv_len_cap(distributed, predecessor_cap):
+    """Check that a replacement, whose budget lacks the measured activation peak, admits the
+    context-MLA KV length its predecessor recorded in the paused KV cache estimation."""
+    recorded_cap = _util._NO_CTX_MLA_KV_LEN_CAP if predecessor_cap is None else predecessor_cap
+    distributed.dist = _rank_0(lambda r, obj: recorded_cap if r == REPLACED else obj)
+    communicator.Distributed.pause_startup_record()
+    assert _ctx_mla_kv_len_cap(distributed.dist, 1_300_000) == 1_300_000
+    with patch.object(AutoTuner, "get", return_value=_new_autotuner()):
+        communicator.Distributed.resume_startup_record()
+    assert _record().values["fp8_ctx_mla_kv_len_cap"] == [
+        [1_300_000, 1_300_000, recorded_cap, 1_300_000]
+    ]
+    distributed.dist = _replacement(_publish())
+    assert _ctx_mla_kv_len_cap(distributed.dist, 1_580_000) == predecessor_cap
+    assert distributed.dist.host_exchange.calls == 0
+    _record().close()
+
+
+def test_ctx_mla_kv_len_cap_without_fault_tolerance_gathers_nothing(distributed, monkeypatch):
+    """Check that without fault tolerance each rank keeps its own cap, with no collective."""
+    monkeypatch.setattr(communicator.Distributed, "startup_record", None)
+    distributed.dist = _dist(1, FakeHostExchange(1))
+    assert _ctx_mla_kv_len_cap(distributed.dist, 1_580_000) == 1_580_000
+    assert _ctx_mla_kv_len_cap(distributed.dist, None) is None
+    assert distributed.dist.host_exchange.calls == 0
+
+
 def _new_autotuner():
     with (
         patch.dict(os.environ, TLLM_PROFILING_TIMER="cuda_event"),

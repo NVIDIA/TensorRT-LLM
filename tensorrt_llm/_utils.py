@@ -459,7 +459,7 @@ def set_mpi_comm(new_comm):
     comm = new_comm
 
 
-def set_mpi_world_comm(new_comm):
+def set_mpi_world_comm(new_comm) -> None:
     """Make ``new_comm`` this process's MPI world and ``mpi_comm()``."""
     global comm, world_comm
     comm = world_comm = new_comm

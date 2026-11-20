@@ -30,7 +30,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_ENV
 from tensorrt_llm.logger import logger
@@ -59,6 +59,7 @@ from .rendezvous import (
     RECORD_KEY,
     STALLED_SINCE_KEY,
     TRANSACTION_KEY,
+    rendezvous_address,
     rendezvous_host_port,
 )
 from .signed_store import SignedStore
@@ -88,9 +89,9 @@ class _Connection:
     accepted_s: float
     sent_s: float = 0.0
     received: bytes = b""
-    member: Optional[Tuple[int, int]] = None  # (rank, incarnation)
+    member: Optional[tuple[int, int]] = None  # (rank, incarnation)
     node: Optional[int] = None
-    node_ranks: Tuple[int, ...] = ()
+    node_ranks: tuple[int, ...] = ()
     lines: Optional[Lines] = None
     report: Optional[RankReport] = None
     node_report: Optional[NodeReport] = None
@@ -114,7 +115,7 @@ class AuthorityProcess:
         store: SignedStore,
         authority: Authority,
         parent: Optional[int] = None,
-    ):
+    ) -> None:
         """Prepare to serve. :meth:`run` listens and publishes the first record.
 
         Args:
@@ -133,13 +134,13 @@ class AuthorityProcess:
         self._parent_ended_s: Optional[float] = None
         self._changed = False
         self._incarnation = [0] * world_size
-        self._connections: Dict[socket.socket, _Connection] = {}
+        self._connections: dict[socket.socket, _Connection] = {}
         self._selector = selectors.DefaultSelector()
         self._record: Optional[MembershipRecord] = None
         # Ranks whose node supervisor connected, and when the authority started.
         self._supervised_mask = 0
         self._started_s = 0.0
-        self._sent_stalled_replacements: Tuple[int, ...] = ()
+        self._sent_stalled_replacements: tuple[int, ...] = ()
         self._sent_connected_mask = 0
         self._published_stalled_since_s: Optional[float] = None
         # The ranks that no replacement is started for, which every published record carries.
@@ -484,7 +485,7 @@ class AuthorityProcess:
             self._given_up_mask = given_up_mask
             self._changed = True
 
-    def _node_refusal(self, node: int, ranks: Tuple[int, ...]) -> Optional[str]:
+    def _node_refusal(self, node: int, ranks: tuple[int, ...]) -> Optional[str]:
         if not ranks or not all(0 <= rank < self.world_size for rank in ranks):
             return f"node {node}'s ranks {list(ranks)} are not all in the deployment"
         for c in self._connections.values():
@@ -554,10 +555,10 @@ class AuthorityProcess:
             self.world_size,
         )
 
-    def _reports(self) -> Dict[int, RankReport]:
+    def _reports(self) -> dict[int, RankReport]:
         return {c.member[0]: c.report for c in self._connections.values() if c.report is not None}
 
-    def _node_reports(self, now_s: float) -> List[NodeReport]:
+    def _node_reports(self, now_s: float) -> list[NodeReport]:
         """Return each node supervisor's latest report, and log when one goes stale or resumes.
 
         The authority ignores a report older than half the hang timeout, so the node's paused ranks
@@ -601,7 +602,7 @@ def log_from_own_thread() -> logging.handlers.QueueListener:
     return listener
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     """Run the authority process.
 
     Start the rendezvous store at the address in ``TLLM_FAULT_TOLERANCE_RENDEZVOUS``, then write
@@ -624,7 +625,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from torch.distributed import TCPStore
 
-    address = os.environ[RENDEZVOUS_ENV]
+    address = rendezvous_address()
     host, port = rendezvous_host_port(address)
     # Like the liveness listener, the store listens only on the address the deployment uses.
     listener = socket.create_server((host, port))

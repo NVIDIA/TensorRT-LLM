@@ -584,8 +584,8 @@ class WaitingState(NamedTuple):
     """The requests a rank has not scheduled yet, with their pending
     cancellations and the shutdown flag."""
 
-    queue: List[RequestQueueItem]
-    canceled_req_ids: List[int]
+    queue: list[RequestQueueItem]
+    canceled_req_ids: list[int]
     is_shutdown: bool
 
 
@@ -614,8 +614,8 @@ class BatchState:
     # None until then.
     guided_failures: Optional[List[Tuple[int, str]]] = None
     # Set only under rank failure recovery.
-    context_commits: Optional["ContextCommits"] = None
-    outputs_marks: Optional["OutputsMarks"] = None
+    context_commits: "ContextCommits | None" = None
+    outputs_marks: "OutputsMarks | None" = None
 
 
 @dataclasses.dataclass
@@ -781,8 +781,8 @@ class PyExecutor:
     _num_skipped_forward_ctx_chunks = 0
     _num_dropped_ctx_chunks = 0
     _num_reverted_ctx_tokens = 0
-    rank_failure_recovery: Optional["RankFailureRecovery"] = None
-    worker_thread: Optional[threading.Thread] = None
+    rank_failure_recovery: "RankFailureRecovery | None" = None
+    worker_thread: threading.Thread | None = None
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
     # Defaults for executors built without __init__ (test stubs); __init__ sets
@@ -1348,9 +1348,10 @@ class PyExecutor:
         self._remote_tail_phase = RemoteTailPhase.NONE
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
-        # Whether any attention-DP rank held a request to step or received one
-        # at the last routing allgather. An idle rank keeps stepping while it is
-        # set, so every rank leaves the executor loop on the same iteration.
+        # Whether any attention-DP rank held a request to step, received one or
+        # awaited a context retirement at the last routing allgather. An idle
+        # rank keeps stepping while it is set, so every rank leaves the
+        # executor loop on the same iteration.
         self._fleet_has_live_requests = False
         # Buffer for responses staged by rank-divergent paths (disagg transfer
         # completion, ADP error handling). With ADP, _enqueue_responses does a
@@ -2189,7 +2190,7 @@ class PyExecutor:
         for request in requests_to_terminate:
             self._terminate_request(request)
 
-    def fail_requests_by_id(self, client_ids: Dict[int, Optional[int]],
+    def fail_requests_by_id(self, client_ids: dict[int, int | None],
                             error: Union[str, "RequestError"]) -> None:
         """Fail requests that this rank holds no ``LlmRequest`` for.
 
@@ -5780,7 +5781,7 @@ class PyExecutor:
     def _update_v2_context_resources(
             self,
             scheduled_batch,
-            context_commits: Optional["ContextCommits"] = None) -> None:
+            context_commits: "ContextCommits | None" = None) -> None:
         """Update self, draft, and cross caches after a context forward.
 
         With ``context_commits``, each cache's reuse commits wait until the
@@ -6879,11 +6880,13 @@ class PyExecutor:
                 len(self.request_accumulated) +
                 self.executor_request_queue.get_request_queue_size())
         extra_ints = [n_error_ids, n_blocked_ids, has_kv_timeout]
+        context_retirement = self._has_pending_context_retirement()
         rank_states, vectors = self.adp_router.gather_all_rank_states_with_extras(
             self.active_requests,
             extra_ints,
             iter_stats_payload=iter_stats_payload,
-            num_pending_new_requests=num_pending_new_requests)
+            num_pending_new_requests=num_pending_new_requests,
+            has_pending_context_retirement=context_retirement)
         any_error = any(vector[0] > 0 for vector in vectors)
         any_timeout = any(vector[2] > 0 for vector in vectors)
 
@@ -7527,8 +7530,6 @@ class PyExecutor:
         if batch.gpu_forward_events_from_perf_pool:
             self.perf_manager.release_forward_timing_events(
                 batch.gpu_forward_start_event, batch.gpu_forward_end_event)
-        if self.drafter is not None and self.use_spec_decode:
-            self.drafter.cleanup_previous_draft_resources()
         if (self.capturable_guided_decoder is not None
                 and batch.guided_batch_id is not None):
             self.capturable_guided_decoder.discard_batch(batch.guided_batch_id)
@@ -7545,7 +7546,7 @@ class PyExecutor:
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
 
-    def known_request_ids(self) -> Set[int]:
+    def known_request_ids(self) -> set[int]:
         """Return the ids of the requests this rank holds, queued or active."""
         known = {
             request.py_request_id
@@ -8045,7 +8046,7 @@ class PyExecutor:
 
     def _suspend_for_rebalance(
         self, mgr: KVCacheManagerV2
-    ) -> Tuple[List[LlmRequest], List[Tuple[int, int, LlmRequest]]]:
+    ) -> tuple[list[LlmRequest], list[tuple[int, int, LlmRequest]]]:
         if self._defer_generation_only_release:
             # The pools move pages; a deferred close must not hold any.
             mgr.flush_deferred_closes()
@@ -8058,8 +8059,8 @@ class PyExecutor:
         return paused, self._suspend_padding_dummies_for_rebalance(mgr)
 
     def _resume_after_rebalance(
-            self, mgr: KVCacheManagerV2, paused: List[LlmRequest],
-            paused_dummies: List[Tuple[int, int, LlmRequest]]) -> None:
+            self, mgr: KVCacheManagerV2, paused: list[LlmRequest],
+            paused_dummies: list[tuple[int, int, LlmRequest]]) -> None:
         remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
         if remote_tail_adp:
             # Preserve the one execution-only row before real requests reclaim
@@ -9648,6 +9649,7 @@ class PyExecutor:
                         self.executor_request_queue.get_request_queue_size())
                 remote_tail_adp = getattr(self, "_enable_remote_tail_adp",
                                           False)
+                context_retirement = self._has_pending_context_retirement()
                 context_ids, generation_ids = (
                     self._snapshot_remote_tail_phase_work(active_requests)
                     if remote_tail_adp else (frozenset(), frozenset()))
@@ -9671,7 +9673,8 @@ class PyExecutor:
                     if remote_tail_adp else None,
                     num_pending_new_requests=num_pending_new_requests,
                     include_kv_cache_load=self._kv_load_tracker.enabled,
-                    iter_stats_enabled=self.enable_iter_perf_stats)
+                    iter_stats_enabled=self.enable_iter_perf_stats,
+                    has_pending_context_retirement=context_retirement)
                 if remote_tail_adp:
                     self._select_remote_tail_phase(all_rank_states, context_ids,
                                                    generation_ids)
@@ -9771,12 +9774,15 @@ class PyExecutor:
             ]
             # Fleet-wide snapshot for should_stop_processing. A rank-local
             # decision would let an idle rank stop while a peer still runs
-            # collectives. Requests still sending KV need no step, and the
-            # rank-local stop condition does not wait for them either.
+            # collectives. A request still sending KV needs no step, but a
+            # rank whose context request awaits the retirement of its send
+            # keeps stepping until the send retires, so its peers step too.
             num_requests_to_step = total_num_live_requests - sum(
                 s.num_in_transfer_requests for s in all_rank_states)
-            self._fleet_has_live_requests = (num_requests_to_step > 0
-                                             or len(all_new_flat) > 0)
+            self._fleet_has_live_requests = (
+                num_requests_to_step > 0 or len(all_new_flat) > 0
+                or any(s.has_pending_context_retirement
+                       for s in all_rank_states))
             if not self._enable_non_overlap_adp_forward_intent:
                 self._update_adp_dummy_role(all_new_flat)
 

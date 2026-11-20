@@ -34,6 +34,7 @@ from tensorrt_llm.bindings import internal
 
 # The abort state holds ``requested`` and ``status``, then the flag value awaited from each peer.
 _ABORT_WORDS = int(internal.thop.MOE_A2A_ABORT_STATE_WORDS)
+_WAITED_FLAG = int(internal.thop.MOE_A2A_ABORT_WAITED_FLAG_INDEX)
 
 
 def _offset(meta: torch.Tensor, name: str) -> int:
@@ -147,16 +148,18 @@ def test_no_peer_writes_after_incomplete_round(ep_size: int, rank: int) -> None:
     assert torch.equal(torch.cat([workspace[:rank], workspace[rank + 1 :]]), peers)
 
 
+@pytest.mark.parametrize("use_low_precision", [False, True], ids=["bf16_combine", "fp8_combine"])
 @pytest.mark.parametrize(
     "ep_size, rank, peer", [(2, 0, 1), (72, 34, 2)], ids=["two_ranks", "rank_34_of_72"]
 )
 def test_aborted_dispatch_uses_no_rows_of_unconfirmed_peers(
-    ep_size: int, rank: int, peer: int
+    ep_size: int, rank: int, peer: int, use_low_precision: bool
 ) -> None:
     """An aborted round uses no rows of a peer whose completion flag it did not see.
 
     The peer writes its receive count but never its flag, and again after the abort. Rank 34 of 72
-    waits on peer 2 and then on itself in the same lane, and keeps its own rows.
+    waits on peer 2 and then on itself in the same lane, and keeps its own rows. With
+    ``use_low_precision``, the combine stages and exchanges the rows in FP8.
     """
     workspace, meta, experts, payload = a2a_workspace(ep_size)
     torch.ops.trtllm.moe_a2a_initialize(workspace, meta, rank, ep_size, barrier=False)
@@ -179,15 +182,23 @@ def test_aborted_dispatch_uses_no_rows_of_unconfirmed_peers(
     assert torch.all(expert_ids[peer] == -1)
     assert torch.equal(expert_ids[rank], experts)
 
-    # The rows of the peer in this rank's combine input region, which the peer reads.
-    stride = HIDDEN * payload.element_size()
+    # The rows of the peer in this rank's combine input region, which the peer reads. A low-precision
+    # combine stages a payload outside the workspace there at one byte per element.
+    stride = HIDDEN * (1 if use_low_precision else payload.element_size())
     first = offset + peer * CAPACITY * stride
     peer_rows = workspace[rank, first : first + CAPACITY * stride]
     peer_rows.fill_(0x7F)
-    output = a2a_combine(workspace, meta, received[0], offset, controls, rank=rank)
+    combine_controls = {**controls, "use_low_precision": use_low_precision}
+    output = a2a_combine(workspace, meta, received[0], offset, combine_controls, rank=rank)
     _finish(abort, "the combine of the incomplete round waited for the peer")
     assert torch.all(peer_rows == 0x7F)
-    torch.testing.assert_close(output, payload, rtol=0, atol=0)
+    expected = payload
+    if use_low_precision:
+        # The FP8 conversion rounds to nearest and saturates, and every FP8 value is exact in bf16.
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        expected = payload.float().clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        expected = expected.to(payload.dtype)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 def _check_incomplete_round(workspace, meta, abort, rank=0) -> None:
@@ -274,15 +285,6 @@ def test_own_round_value_keeps_peer_rows() -> None:
     assert peer_abort[:2].tolist() == [0, 1]
 
 
-def test_abort_state_must_be_pinned() -> None:
-    """The kernels read the abort state at its host address, so the ops refuse pageable memory."""
-    workspace, meta, experts, payload = a2a_workspace(2)
-    controls, _ = _rank_mask_controls(3)
-    controls["abort_state"] = torch.zeros(_ABORT_WORDS, dtype=torch.int32)
-    with pytest.raises(RuntimeError, match="pinned"):
-        a2a_dispatch(workspace, meta, experts, controls, payload)
-
-
 def test_incomplete_dispatch_marks_active_peers() -> None:
     """A dispatch whose round is incomplete marks the rounds of the active peers incomplete."""
     workspace, meta, experts, payload = a2a_workspace(3)
@@ -295,37 +297,92 @@ def test_incomplete_dispatch_marks_active_peers() -> None:
     assert [_word(workspace, incomplete_round, row=r).item() for r in range(3)] == [5, 5, 0]
 
 
-def _fence_timeout() -> None:
+def _set_flag(word: torch.Tensor, value: int) -> None:
+    """Store the uint32 round flag ``value`` in an int32 workspace word."""
+    word.fill_(value - 2**32 if value >= 2**31 else value)
+
+
+@pytest.mark.parametrize("flag_val", [0, 2**32 - 2], ids=["first_round", "flag_wraps"])
+def test_aborted_combine_reduces_own_rows(flag_val: int) -> None:
+    """A combine that an abort request releases reduces only this rank's own rows.
+
+    Peer 1 completes the dispatch but never signals the combine. While the combine waits, it
+    publishes the flag value it waits for. The abort request ends the wait, withdraws that value and
+    marks the round incomplete. With ``flag_wraps``, the combine flag value wraps to 0.
+    """
+    workspace, meta, experts, payload = a2a_workspace(2)
+    controls, abort = _rank_mask_controls(3)
+    _set_flag(_word(workspace, _offset(meta, "FLAG_VAL")), flag_val)
+    dispatch_flag, combine_flag = (flag_val + 1) % 2**32, (flag_val + 2) % 2**32
+    # Peer 1's dispatch flag for rank 0, and the combine flag value of peer 1's previous round.
+    _set_flag(_word(workspace, _offset(meta, "DISPATCH_COMPLETION_FLAGS") + 4), dispatch_flag)
+    _set_flag(_word(workspace, _offset(meta, "COMBINE_COMPLETION_FLAGS") + 4), flag_val)
+    experts.copy_(torch.arange(CAPACITY, dtype=torch.int32).view(-1, 1) % 2)
+    received, offset, _ = a2a_dispatch(workspace, meta, experts, controls, payload)
+    _finish(abort, "the dispatch waited for peer 1 after its flag was set")
+    # Rank 0's rows in peer 1's combine input region, which peer 1 never prepared.
+    rows_bytes = CAPACITY * HIDDEN * payload.element_size()
+    workspace[1, offset : offset + rows_bytes].fill_(0x3F)
+
+    output = a2a_combine(workspace, meta, received[0], offset, controls)
+    waited = abort[_WAITED_FLAG + 1]
+    deadline = time.monotonic() + 10
+    while waited.item() == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    published = waited.item()
+    abort[0] = 1
+    _finish(abort, "the abort request did not release the combine's wait")
+    # A wrapped combine flag value of 0 publishes 1, as 0 means no wait.
+    assert published == max(combine_flag, 1)
+    assert waited.item() == 0
+    assert abort[:2].tolist() == [1, 1]
+    assert _word(workspace, _offset(meta, "FLAG_VAL")).item() % 2**32 == combine_flag
+    assert _word(workspace, _offset(meta, "INCOMPLETE_ROUND")).item() == combine_flag | 1
+    expected = torch.where(experts == 0, payload, torch.zeros_like(payload))
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def _fence_timeout(with_abort_state: bool) -> None:
     """Check that a fence wait on a silent peer still fails at the timeout."""
     torch.ops.trtllm.moe_a2a_set_timeout(1)
     workspace, meta, experts, payload = a2a_workspace(2)
-    controls, _ = _rank_mask_controls(3)
+    controls, abort = _rank_mask_controls(3)
+    if not with_abort_state:
+        del controls["abort_state"]
     a2a_dispatch(workspace, meta, experts, controls, payload)
     try:
         torch.cuda.synchronize()
     except RuntimeError:
         # Exit at once, flushing the device printf C stdio holds on a pipe.
         print("fence timeout trapped", flush=True)
+        if with_abort_state:
+            waited = abort[_WAITED_FLAG + 1].item()
+            print(f"abort state {abort[:2].tolist()} waited flag {waited}", flush=True)
         ctypes.CDLL(None).fflush(None)
         os._exit(0)
     raise AssertionError("dispatch completed without its peer")
 
 
-def test_fence_timeout_still_traps() -> None:
+@pytest.mark.parametrize("with_abort_state", [False, True], ids=["no_abort_state", "abort_state"])
+def test_fence_timeout_still_traps(with_abort_state: bool) -> None:
     # The child traps on purpose, in a fresh interpreter without the launcher's environment.
     launcher_prefixes = ("SLURM_", "PMIX_", "PMI_", "OMPI_")
     env = {k: v for k, v in os.environ.items() if not k.startswith(launcher_prefixes)}
     # The child imports the shared helpers of the unit tests, as pytest makes them importable.
     unittest_root = str(Path(__file__).resolve().parents[2])
     env["PYTHONPATH"] = os.pathsep.join(p for p in (unittest_root, env.get("PYTHONPATH")) if p)
+    mode = "abort_state" if with_abort_state else "no_abort_state"
     result = subprocess.run(
-        [sys.executable, __file__], env=env, capture_output=True, text=True, timeout=300
+        [sys.executable, __file__, mode], env=env, capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0, result.stdout + result.stderr
     # The kernel's own report, not just any device error.
     assert "dispatch: rank 0 timed out waiting for rank 1 flag=" in result.stdout, result.stdout
     assert "fence timeout trapped" in result.stdout, result.stdout
+    if with_abort_state:
+        # Nothing requested an abort, and the trap left the published flag value of the first dispatch.
+        assert "abort state [0, 0] waited flag 1" in result.stdout, result.stdout
 
 
 if __name__ == "__main__":
-    _fence_timeout()
+    _fence_timeout(with_abort_state=sys.argv[1:] == ["abort_state"])
