@@ -135,7 +135,12 @@ l0_b200:
   - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic
   - unittest/_torch/attention/sparse/dsa
   - unittest/_torch/attention/sparse/deepseek_v4 --ignore=unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py
-  - unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/sparse/dsa --ignore=unittest/_torch/attention/sparse/deepseek_v4 --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
+  - unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/sparse/dsa --ignore=unittest/_torch/attention/sparse/deepseek_v4 --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/sparse/csa2
+  # CSA2 (DeepSeek-V4.1 sparse attention) runs in three entries: its PrimTS producer and backend
+  # files compile many CuTe DSL kernels (about 30 and 20 minutes cold on B200).
+  - unittest/_torch/attention/sparse/csa2 --ignore=unittest/_torch/attention/sparse/csa2/test_backend.py --ignore=unittest/_torch/attention/sparse/csa2/test_prims_ts_fp8_producer.py
+  - unittest/_torch/attention/sparse/csa2/test_backend.py
+  - unittest/_torch/attention/sparse/csa2/test_prims_ts_fp8_producer.py
   - unittest/_torch/pyexecutor/kv_cache/test_mixed_precision_kv_cache.py
   # Run cold-JIT MSA coverage separately from the other attention batches.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
