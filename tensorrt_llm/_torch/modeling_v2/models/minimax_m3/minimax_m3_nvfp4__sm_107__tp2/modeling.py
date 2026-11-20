@@ -1367,7 +1367,7 @@ _VALUES: set = set()
 
 
 def _record(*meta: Hashable) -> None:
-    if _VALUE_DUMP:
+    if _VALUE_DUMP and not torch.compiler.is_compiling():
         _VALUES.add(meta)
 
 
@@ -2070,7 +2070,7 @@ def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
         uncovered(path, f"more than {max_rows} rows")
     elif params != (DENSE_ALPHA, DENSE_LIMIT, DENSE_BETA):
         uncovered(path, f"activation parameters {params}")
-    else:
+    elif not is_torch_compiling():
         act = m3_dense_swiglu(
             gu,
             core.swiglu_limit,
@@ -2927,7 +2927,7 @@ class PrefillTarget:
     def __init__(self, core: MiniMaxM3Tp2ModelingV2) -> None:
         self.core = core
         self._compiled_attention_key = register_prefill_core(
-            core, _sparse_qkv_producer, _msa_attention_live
+            core, _sparse_qkv_producer, _msa_attention_live, _fp8_index_qk_norm_rope
         )
         self._bcg_key = f"m3_tp2_core_{id(core)}"
         _BCG_CORES[self._bcg_key] = core
@@ -3048,7 +3048,8 @@ class PrefillTarget:
         core = self.core
         rows = h.shape[0] if h.dim() == 2 else 0
         if (
-            h.dim() == 2
+            not is_torch_compiling()
+            and h.dim() == 2
             and h.dtype == torch.bfloat16
             and 1 <= rows <= MOE_ENGINE_MAX_TOKENS
             and rows >= MOE_FOLD_MIN_TOKENS
@@ -3088,7 +3089,7 @@ class PrefillTarget:
         """A generic layer boundary: the multicast all-reduce + residual + RMSNorm on the rows it takes (with the
         shared + routed add folded in), else the built-in fused all-reduce."""
         core = self.core
-        if _can_mc(x, folded=x2 is not None):
+        if not is_torch_compiling() and _can_mc(x, folded=x2 is not None):
             fused = _mc_allreduce_norm(core, x, x2, residual, norm_w)
             if fused is not None:
                 return fused
@@ -3106,7 +3107,8 @@ class PrefillTarget:
             residual = hidden
             hidden = flashinfer_rmsnorm(hidden, core.w[f"l{i}_in_norm"], core.rms_eps)
         hidden, _ = self._attention(i, position_ids, hidden, step)
-        if _can_mc(hidden):
+        use_mc = not is_torch_compiling()
+        if use_mc and _can_mc(hidden):
             fused = _mc_allreduce_norm(core, hidden, None, residual, core.w[f"l{i}_post_norm"])
             hidden, residual = (
                 fused
@@ -3126,7 +3128,7 @@ class PrefillTarget:
                 if spec_metadata is not None and spec_metadata.is_layer_capture(i):
                     capture(spec_metadata, i, folded[1], None)
                 return folded
-            out, routed = self._moe(i, hidden, return_parts=_can_mc(hidden, folded=True))
+            out, routed = self._moe(i, hidden, return_parts=use_mc and _can_mc(hidden, folded=True))
         else:
             out = self._swiglu_mlp(hidden, f"l{i}_mlp", True, dense=True)
             routed = None
@@ -3221,25 +3223,36 @@ class PrefillTarget:
                 core, i, idx_qk, position_ids, step["msa_idx_k_cache"], step["msa_out_cache_loc"]
             )
 
-        (q, k, v), idx_q = maybe_execute_in_parallel(
-            _main,
-            _index,
-            core.attn_events[i][0],
-            core.attn_events[i][1],
-            core.aux_stream_attn,
-            disable_on_compile=True,
-        )
-        o = self._attention_core(i, q, k, v, idx_q, step)
+        if is_torch_compiling():
+            q, k, v = _main()
+            idx_qk = m3_bf16_linear(hidden, core.w[f"l{i}_idx_w"])
+            o = self._attention_core(
+                i, q, k, v, None, step, idx_qk=idx_qk, position_ids=position_ids
+            )
+        else:
+            (q, k, v), idx_q = maybe_execute_in_parallel(
+                _main,
+                _index,
+                core.attn_events[i][0],
+                core.attn_events[i][1],
+                core.aux_stream_attn,
+                disable_on_compile=True,
+            )
+            o = self._attention_core(i, q, k, v, idx_q, step)
         return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)
 
-    def _attention_core(self, i: int, q, k, v, idx_q, step) -> torch.Tensor:
+    def _attention_core(
+        self, i: int, q, k, v, idx_q, step, *, idx_qk=None, position_ids=None
+    ) -> torch.Tensor:
         """The attention core over the step's live tokens (a padded step's pad rows are left as allocated): the MSA
         backend (``m3_msa_attention``: the KV write unless a producer wrote the caches, the sparse layers' top-k block
         selection, the FMHA over the context rows and any generation rows beside them)."""
         core = self.core
         output = q.new_empty((q.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16)
         if is_torch_compiling():
-            prefill_attention(None, None, q, k, v, idx_q, output, self._compiled_attention_key, i)
+            prefill_attention(
+                None, position_ids, q, k, v, idx_qk, output, self._compiled_attention_key, i
+            )
             return output
         if not is_torch_compiling() and is_in_breakable_cuda_graph():
             # The live row count is a host value of the step: read at every replay inside the eager boundary.

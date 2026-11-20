@@ -1293,7 +1293,7 @@ _VALUES: set = set()
 
 
 def _record(*meta: Hashable) -> None:
-    if _VALUE_DUMP:
+    if _VALUE_DUMP and not torch.compiler.is_compiling():
         _VALUES.add(meta)
 
 
@@ -2690,7 +2690,7 @@ class PrefillTarget:
     def __init__(self, core: MiniMaxM3Tp4ModelingV2) -> None:
         self.core = core
         self._compiled_attention_key = register_prefill_core(
-            core, _sparse_qkv_producer, _msa_attention_live
+            core, _sparse_qkv_producer, _msa_attention_live, _fp8_index_qk_norm_rope
         )
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per forward.
         self._contract_pending = step_contract_enabled()
@@ -2808,7 +2808,8 @@ class PrefillTarget:
         core = self.core
         rows = h.shape[0] if h.dim() == 2 else 0
         if (
-            h.dim() == 2
+            not is_torch_compiling()
+            and h.dim() == 2
             and h.dtype == torch.bfloat16
             and 1 <= rows <= MOE_ENGINE_MAX_TOKENS
             and rows >= MOE_FOLD_MIN_TOKENS
@@ -2945,25 +2946,36 @@ class PrefillTarget:
                 core, i, idx_qk, position_ids, step["msa_idx_k_cache"], step["msa_out_cache_loc"]
             )
 
-        (q, k, v), idx_q = maybe_execute_in_parallel(
-            _main,
-            _index,
-            core.attn_events[i][0],
-            core.attn_events[i][1],
-            core.aux_stream_attn,
-            disable_on_compile=True,
-        )
-        o = self._attention_core(i, q, k, v, idx_q, step)
+        if is_torch_compiling():
+            q, k, v = _main()
+            idx_qk = m3_bf16_linear(hidden, core.w[f"l{i}_idx_w"])
+            o = self._attention_core(
+                i, q, k, v, None, step, idx_qk=idx_qk, position_ids=position_ids
+            )
+        else:
+            (q, k, v), idx_q = maybe_execute_in_parallel(
+                _main,
+                _index,
+                core.attn_events[i][0],
+                core.attn_events[i][1],
+                core.aux_stream_attn,
+                disable_on_compile=True,
+            )
+            o = self._attention_core(i, q, k, v, idx_q, step)
         return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)
 
-    def _attention_core(self, i: int, q, k, v, idx_q, step) -> torch.Tensor:
+    def _attention_core(
+        self, i: int, q, k, v, idx_q, step, *, idx_qk=None, position_ids=None
+    ) -> torch.Tensor:
         """The attention core over the step's live tokens (a padded step's pad rows are left as allocated): the MSA
         backend (``m3_msa_attention``: the KV write unless a producer wrote the caches, the sparse layers' top-k block
         selection, the FMHA over the context rows and any generation rows beside them)."""
         core = self.core
         output = q.new_empty((q.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16)
         if is_torch_compiling():
-            prefill_attention(None, None, q, k, v, idx_q, output, self._compiled_attention_key, i)
+            prefill_attention(
+                None, position_ids, q, k, v, idx_qk, output, self._compiled_attention_key, i
+            )
             return output
         _msa_attention_live(core, i, q, k, v, idx_q, step["metadata"], output)
         return output
