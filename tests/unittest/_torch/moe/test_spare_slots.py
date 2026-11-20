@@ -346,6 +346,17 @@ def test_restore_reads_no_placement_while_an_update_may_swap_it(monkeypatch):
     old_rank_expert_ids.assert_not_called()
 
 
+def test_current_placement_hides_invalid_slots(monkeypatch):
+    """Show no expert in a slot of this rank that a stopped restore may have written in part."""
+    load_balancer, _ = _online_balancer(monkeypatch, _ONLINE, ep_rank=2)
+    restore = load_balancer.expert_restore
+    assert restore.current_placement() == [(EXPERTS, _ONLINE.tolist())]
+    restore._invalid_slots[0] = {1}
+    expected = _ONLINE.copy()
+    expected[2, 1] = -1
+    assert restore.current_placement() == [(EXPERTS, expected.tolist())]
+
+
 class _SpareSlotOwner(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin):
     """A MoE layer's weight owner with the quantization method of the MoE backend ``leaf``."""
 

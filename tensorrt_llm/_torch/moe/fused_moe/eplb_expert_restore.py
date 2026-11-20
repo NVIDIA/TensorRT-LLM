@@ -287,6 +287,22 @@ class EplbExpertRestore:
         rank_0_node = node_ranks.pop(nodes[0], [])
         return list(node_ranks.values()) + [[rank] for rank in rank_0_node[1:]]
 
+    def current_placement(self) -> list[tuple[int, list[list[int]]]]:
+        """Return each layer's expert count and placement as this rank sees it."""
+        return [
+            (layer.expert_count, self._placement_view(i, layer).tolist())
+            for i, layer in enumerate(self.balancer.single_layer_load_balancers)
+        ]
+
+    def _placement_view(self, layer_idx: int, layer: SingleLayerMoeLoadBalancer) -> np.ndarray:
+        """Return ``layer``'s placement as this rank sees it, with no expert in invalid slots.
+
+        A restore that stopped before it installed its placement may have written part of a slot.
+        """
+        placement = np.array(layer.get_old_rank_expert_ids(), dtype=np.int32)
+        placement[self.balancer.ep_rank, sorted(self._invalid_slots.get(layer_idx, ()))] = -1
+        return placement
+
     def plan_expert_restore(
         self,
         active_ranks: Sequence[bool],
@@ -298,7 +314,8 @@ class EplbExpertRestore:
         Args:
             active_ranks: Whether each EP rank is active.
             current: The per-layer placement that the active ranks agreed on, so that every
-                active rank plans the same placement.
+                active rank plans the same placement. An active rank's row is its row of
+                ``current_placement``, so a slot that a stopped restore wrote loads again.
             rejoining: Whether each EP rank rejoins. If one does, the active slots of all active
                 ranks take the initial placement, which the rejoining rank loaded.
 
@@ -416,8 +433,9 @@ class EplbExpertRestore:
             plan: The plan that every active rank restores.
             times: Receives each phase's duration in milliseconds.
             progress: Called after the backing and each layer loaded, so that a long restore keeps
-                reporting progress. It may raise to stop the restore. The slots loaded so far then
-                hold no expert in this rank's view until the next restore.
+                reporting progress. It may raise to stop the restore. The slots that ``plan`` loads
+                on this rank then hold no expert in ``current_placement`` until a restore installs a
+                placement.
 
         Raises:
             RuntimeError: An iteration is active, or the online EPLB worker may still write the
