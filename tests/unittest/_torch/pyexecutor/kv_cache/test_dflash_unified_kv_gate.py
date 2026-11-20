@@ -130,6 +130,71 @@ def test_matching_draft_layout_unifies(is_disagg):
     assert [spec.dtype for spec in specs] == [DataType.BF16] * 4
 
 
+def test_swa_scratch_stays_on_the_target_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=False, target=layout, draft=layout)
+    creator._kv_cache_config = KvCacheConfig(enable_swa_scratch_reuse=True)
+    config = creator._kv_cache_config
+    assert "enable_swa_scratch_reuse" in creator._private_draft_kv_reason()
+    assert creator._build_unified_dflash_layer_specs(config) == ()
+    draft_config = creator._get_one_model_draft_kv_cache_config(config, creator._max_seq_len)
+    assert not draft_config.enable_swa_scratch_reuse
+    assert config.enable_swa_scratch_reuse
+
+    creator._is_disagg = True
+    for setting in ("auto", "1"):
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, setting)
+        with pytest.raises(ValueError, match="enable_swa_scratch_reuse"):
+            creator._should_unify_dflash_kv_cache()
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    assert not creator._should_unify_dflash_kv_cache()
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "0")
+    assert not creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize(
+    "ratio,draft_window,expected",
+    [
+        ([1.0], 69632, [None] * 4),  # Configured single full-window pool.
+        ([0.25, 0.75], 4096, []),  # Beam target only: 512 and full.
+        ([0.25, 0.75], 512, [512, None, 512, 512]),  # Draft joins the existing 512 group.
+        ([0.25, 0.5, 0.25], 4096, [512, None, 4096, 4096]),  # All three groups have a share.
+    ],
+)
+def test_beam_draft_pool_ratio_across_estimation_and_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+    ratio: list[float],
+    draft_window: int,
+    expected: list[int | None],
+) -> None:
+    target = _model_config(kv_heads=8, head_dim=128)
+    target.pretrained_config.layer_types = ["sliding_attention", "full_attention"]
+    target.pretrained_config.sliding_window = 512
+    creator = _creator(
+        is_disagg=False,
+        target=target,
+        draft=_model_config(kv_heads=8, head_dim=128),
+        draft_windows=[draft_window],
+    )
+    creator._max_seq_len = creator._unification_max_seq_len = 69632
+    creator._pool_ratio_in = ratio
+    config = creator._kv_cache_config
+    for live_ratio in (None, ratio):
+        config.pool_ratio = live_ratio
+        assert creator._should_unify_dflash_kv_cache() is bool(expected)
+        specs = creator._build_unified_dflash_layer_specs(config)
+        assert [spec.sliding_window_size for spec in specs] == expected
+        assert config.pool_ratio == live_ratio
+
+    if not expected:
+        creator._is_disagg = True
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "auto")
+        with pytest.raises(ValueError, match=r"pool_ratio has 2 entries.*3.*draft"):
+            creator._should_unify_dflash_kv_cache()
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "0")
+        assert not creator._should_unify_dflash_kv_cache()
+
+
 def _configure_manager_creation(creator, monkeypatch):
     creator._kv_cache_config = KvCacheConfig()
     creator._tokens_per_block = 32

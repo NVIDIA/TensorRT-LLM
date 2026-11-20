@@ -1492,7 +1492,10 @@ class KvCacheCreator:
                     kv_cache_config)
             extra_kwargs.update(
                 shared_draft_block_width=self._unified_drafter_block_width())
-        if not is_draft:
+        # Plain V2's explicit specs already carry every target and draft window.
+        # Applying the target-only ratio check here would warn about valid combined ratios.
+        if not is_draft and not (manager_cls is KVCacheManagerV2
+                                 and extra_kwargs.get("layer_specs")):
             derived_windows = _derive_v2_layer_type_attention_windows(
                 kv_cache_config, manager_cls, model_config, self._max_seq_len)
             if derived_windows is not None:
@@ -2821,11 +2824,12 @@ class KvCacheCreator:
         setting = get_shared_draft_kv_setting() if self._is_disagg else None
         blocker, worker_local = self._dflash_unify_blocker_and_scope()
         if blocker is not None:
-            if (worker_local and self._is_disagg and setting != "0"):
+            sharing_requested = setting in ("1", "auto") or (
+                setting is None and self._kv_cache_manager_hosts_draft_layers())
+            if worker_local and self._is_disagg and sharing_requested:
                 raise ValueError(
                     f"{self._unified_drafter_name()}: disaggregated workers "
-                    "keep the draft KV in the target's KV cache manager "
-                    "unless TRTLLM_DISAGG_SHARED_DRAFT_KV=0, but on this "
+                    "are configured to share draft KV, but on this "
                     f"worker {blocker}. Change that setting, or set "
                     "TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on every worker to keep "
                     "a separate draft KV cache.")
@@ -2915,8 +2919,23 @@ class KvCacheCreator:
         blocker = self._dflash_shared_unify_blocker(
             defer_worker_local=hosts_draft_layers,
             ignore_draft_schedule=ignore_draft_schedule)
-        if blocker is not None or not hosts_draft_layers:
+        if blocker is not None:
             return blocker, False
+        if getattr(self._kv_cache_config, "enable_swa_scratch_reuse", False):
+            return (
+                "enable_swa_scratch_reuse requires a separate draft KV cache "
+                "because managed draft context cannot read SWA scratch pages"
+            ), True
+        if not hosts_draft_layers:
+            # Hybrid managers size their own layer groups. The plain manager
+            # builds explicit target and draft specs with the same reuse policy.
+            if (self._kv_cache_manager_cls is KVCacheManagerV2
+                    and getattr(self, "_pool_ratio_in", None) is not None):
+                blocker = self._draft_pool_ratio_blocker(
+                    self._unified_target_windows(self._kv_cache_config,
+                                                 self._unification_max_seq_len),
+                    self._unified_draft_windows())
+            return blocker, blocker is not None
         blocker = self._hosting_worker_local_blocker()
         return blocker, blocker is not None
 
@@ -3089,6 +3108,31 @@ class KvCacheCreator:
                     "only with the HND K/V layout")
         return None
 
+    def _unified_target_windows(self, kv_cache_config: KvCacheConfig,
+                                max_seq_len: int) -> List[Optional[int]]:
+        target = self._model_engine.model.model_config
+        windows = kv_cache_config.max_attention_window
+        if windows is None:
+            if self._kv_cache_manager_cls is KVCacheManagerV2:
+                # A single configured pool keeps the target's full-window default,
+                # even while estimation clears pool_ratio. A multi-pool ratio
+                # sizes the combined specs; checking its arity on the target
+                # alone would discard valid SWA groups before adding the drafter.
+                ratio = getattr(self, "_pool_ratio_in", None)
+                target_ratio = ratio if ratio is not None and len(
+                    ratio) == 1 else None
+                if getattr(kv_cache_config, "pool_ratio", None) != target_ratio:
+                    kv_cache_config = copy.copy(kv_cache_config)
+                    kv_cache_config.pool_ratio = target_ratio
+            windows = _derive_v2_layer_type_attention_windows(
+                kv_cache_config, self._kv_cache_manager_cls, target,
+                max_seq_len)
+        local_layers = list(
+            self._mapping.pp_layers(
+                int(target.pretrained_config.num_hidden_layers)))
+        return _resolve_v2_max_attention_window_vec(windows, max_seq_len,
+                                                    local_layers)
+
     def _hosting_worker_local_blocker(self) -> Optional[str]:
         """Why a hosting manager would refuse this worker's own settings, or None."""
         blocker = self._parallelism_or_kv_format_blocker()
@@ -3097,30 +3141,26 @@ class KvCacheCreator:
         draft_windows = self._unified_draft_windows()
         if len(set(draft_windows)) > 1:
             return "the draft layers use different attention windows"
-        target_model_config = self._model_engine.model.model_config
-        target_window_config = self._kv_cache_config.max_attention_window
-        if target_window_config is None:
-            target_window_config = _derive_v2_layer_type_attention_windows(
-                self._kv_cache_config, self._kv_cache_manager_cls,
-                target_model_config, self._unification_max_seq_len)
-        target_windows = _resolve_v2_max_attention_window_vec(
-            target_window_config, self._unification_max_seq_len,
-            list(
-                self._mapping.pp_layers(
-                    int(target_model_config.pretrained_config.num_hidden_layers)
-                )))
+        target_windows = self._unified_target_windows(
+            self._kv_cache_config, self._unification_max_seq_len)
         # Layer specs carry no sinks and share one reuse policy, so equal
         # windows put draft and target layers in one lifecycle.
         if set(draft_windows) & set(target_windows):
             return ("the draft layers would share a KV cache lifecycle with "
                     "target layers")
+        return self._draft_pool_ratio_blocker(target_windows, draft_windows)
+
+    def _draft_pool_ratio_blocker(
+            self, target_windows: Sequence[Optional[int]],
+            draft_windows: Sequence[Optional[int]]) -> Optional[str]:
         # The configured ratio, not the one estimation may clear meanwhile.
         pool_ratio = getattr(self, "_pool_ratio_in", None)
-        num_lifecycles = len(set(target_windows)) + len(set(draft_windows))
+        num_lifecycles = len(set(target_windows).union(draft_windows))
         if pool_ratio is not None and len(pool_ratio) != num_lifecycles:
             return (
                 f"kv_cache_config.pool_ratio has {len(pool_ratio)} entries, "
-                f"not one per lifecycle ({num_lifecycles})")
+                f"not one per lifecycle ({num_lifecycles}) across target and draft layers"
+            )
         return None
 
     @staticmethod
@@ -3224,19 +3264,8 @@ class KvCacheCreator:
         target_heads, target_head_dim, target_dtype, target_k_only = (
             self._dflash_kv_layout(target_model_config,
                                    self._model_engine.model.config.torch_dtype))
-        target_window_config = kv_cache_config.max_attention_window
-        if target_window_config is None:
-            target_window_config = _derive_v2_layer_type_attention_windows(
-                kv_cache_config,
-                self._kv_cache_manager_cls,
-                target_model_config,
-                self._max_seq_len,
-            )
-        target_windows = _resolve_v2_max_attention_window_vec(
-            target_window_config,
-            self._max_seq_len,
-            target_local_ids,
-        )
+        target_windows = self._unified_target_windows(kv_cache_config,
+                                                      self._max_seq_len)
 
         specs = [
             KVCacheLayerSpec(
@@ -3582,7 +3611,12 @@ class KvCacheCreator:
         if estimating_kv_cache and uses_vswa_kv_cache_layout(
                 max_attention_window):
             max_attention_window = None
-        update = {"max_attention_window": max_attention_window}
+        # Scratch pages belong to target prefill; the private draft manager
+        # needs persistent pages for its managed context.
+        update = {
+            "max_attention_window": max_attention_window,
+            "enable_swa_scratch_reuse": False
+        }
         if (kv_cache_config.mixed_precision_kv is not None and
                 not self._speculative_config.spec_dec_mode.is_mtp_one_model()):
             # MTP layers use mixed-precision KV like the target; a drafter with
@@ -4795,7 +4829,9 @@ def _create_kv_cache_manager(
     # Keep estimation storage full-context unless distinct page layouts require
     # windowed storage (Gemma4). Enable automatic windowing for the final manager.
     derived_windows = None
-    if (not is_draft and kv_cache_type
+    if (not is_draft
+            and not (kv_cache_manager_cls is KVCacheManagerV2 and layer_specs)
+            and kv_cache_type
             == tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
             and (not estimating_kv_cache
                  or _has_variable_kv_cache_geometry(_model_config))):
