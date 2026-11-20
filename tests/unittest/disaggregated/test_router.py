@@ -1135,7 +1135,8 @@ async def test_kv_cache_aware_server_state_cancel_poll_task():
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_remove_stops_only_departed_poll() -> None:
+async def test_kv_cache_aware_remove_stops_only_departed_poll(
+        mock_aiohttp_session: aiohttp.ClientSession) -> None:
     """Removal cancels a real poll task without awaiting it under the router lock."""
     router = KvCacheAwareRouter(server_role=None,
                                 servers=["removed", "retained"],
@@ -1144,7 +1145,6 @@ async def test_kv_cache_aware_remove_stops_only_departed_poll() -> None:
     retained = router._server_state["retained"]
     entered_removed, entered_retained = asyncio.Event(), asyncio.Event()
     release, cancelled = asyncio.Event(), asyncio.Event()
-    session = mock.Mock(spec=aiohttp.ClientSession)
     tasks = []
 
     async def removed_events(
@@ -1169,17 +1169,18 @@ async def test_kv_cache_aware_remove_stops_only_departed_poll() -> None:
     try:
         with mock.patch.object(removed, "poll_events", side_effect=removed_events) as removed_poll, \
                 mock.patch.object(retained, "poll_events", side_effect=retained_events):
-            removed.schedule_poll_and_update(session)
-            retained.schedule_poll_and_update(session)
+            removed.schedule_poll_and_update(mock_aiohttp_session)
+            retained.schedule_poll_and_update(mock_aiohttp_session)
             tasks = [removed._poll_task, retained._poll_task]
             await asyncio.wait_for(asyncio.gather(entered_removed.wait(),
                                                   entered_retained.wait()),
                                    timeout=1)
             # An already coalesced refresh must not restart the departed poll.
-            removed.schedule_poll_and_update(session)
+            removed.schedule_poll_and_update(mock_aiohttp_session)
             await asyncio.wait_for(router.remove_server("removed"), timeout=1)
             await asyncio.wait_for(cancelled.wait(), timeout=1)
-            await asyncio.gather(tasks[0], return_exceptions=True)
+            done, _ = await asyncio.wait({tasks[0]}, timeout=1)
+            assert tasks[0] in done
             assert tasks[0].cancelled()
             assert removed._poll_pending is False
             assert router._server_state == {"retained": retained}

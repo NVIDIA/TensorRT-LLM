@@ -1342,7 +1342,7 @@ async def test_protected_replacement_keeps_original_load_owner(delegated: bool) 
             await router.get_next_server_by_key({}, req_id=1)
         else:
             await router.get_next_server(first)
-        assert old.num_active_requests() == 1
+        assert old._num_active_requests == 1
         assert await router.add_server("ctx:8000", registration_id="v2")
         new = router._server_state["ctx:8000"]
         assert new is not old
@@ -1352,13 +1352,13 @@ async def test_protected_replacement_keeps_original_load_owner(delegated: bool) 
         else:
             await router.get_next_server(second)
             await router.finish_request(first)
-        assert old.num_active_requests() == 0
-        assert new.num_active_requests() == 1
+        assert old._num_active_requests == 0
+        assert new._num_active_requests == 1
         if delegated:
             await router.finish_request_by_id(2)
         else:
             await router.finish_request(second)
-        assert new.num_active_requests() == 0
+        assert new._num_active_requests == 0
         assert not router._request_load_state
     finally:
         await router.close()
