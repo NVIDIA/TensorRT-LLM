@@ -14,7 +14,11 @@ are needed.
 import ast
 from pathlib import Path
 
+import pytest
+
 import tensorrt_llm
+
+pytestmark = pytest.mark.cpu_only
 
 _KERNEL = (
     Path(tensorrt_llm.__file__).parent
