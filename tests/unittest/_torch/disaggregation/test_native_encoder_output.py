@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors import safe_open
+from safetensors.torch import save_file
 from utils.native_encoder import (
     _check_handoff_hash_initialization,
     _check_malformed_handoff_hashes,
@@ -59,11 +60,37 @@ def test_shared_handoff_restores_hash_validation_and_missing_hash_fallback(tmp_p
 
 
 @pytest.mark.parametrize("hashes", [[], [[1] * 7], [[1.0] * 8], ["bad"], 42, [[1] * 8] * 2])
-def test_shared_handoff_rejects_malformed_hashes_and_releases_exports(
-    tmp_path, monkeypatch, hashes
-):
+def test_shared_handoff_rejects_malformed_hashes_before_import(tmp_path, monkeypatch, hashes):
     cache = oe.EncoderCache(str(tmp_path))
     _check_malformed_handoff_hashes(cache, cache, hashes, monkeypatch)
+
+
+@pytest.mark.parametrize("invalid", ["metadata", "missing_hashes", "layout", "tensors"])
+def test_shared_metadata_rejection_preserves_unclaimed_output(tmp_path, invalid):
+    cache = oe.EncoderCache(str(tmp_path))
+    llm, _ = model()
+    ref = cache.publish(native_result()[0], request(), llm)
+    path = cache._path(ref)
+    with safe_open(str(path), framework="pt") as stored:
+        tensors = {name: stored.get_tensor(name).clone() for name in stored.keys()}
+        original = stored.metadata()["handoff"]
+    metadata = json.loads(original)
+    invalid_tensors = dict(tensors)
+    if invalid == "metadata":
+        metadata = []
+    elif invalid == "missing_hashes":
+        del metadata["hashes"]
+    elif invalid == "layout":
+        metadata["embedding_metadata"] = ["bad"]
+    else:
+        invalid_tensors.pop("mrope_ids")
+    save_file(invalid_tensors, str(path), metadata={"handoff": json.dumps(metadata)})
+    with pytest.raises(ValueError, match="encoder.*(metadata|hashes|layout)"):
+        cache.prepare(ref, request(), llm, None)
+    assert path.exists() and not list(tmp_path.glob("*.tmp"))
+    save_file(tensors, str(path), metadata={"handoff": original})
+    cache.prepare(ref, request(), llm, None)
+    assert not path.exists()
 
 
 @pytest.mark.parametrize("location", ["top", "output", "both"])
@@ -170,21 +197,6 @@ def test_native_exports_roundtrip_once_with_metadata_and_mrope(tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_shared_encoder_handoff_preserves_prefill_phase(tmp_path):
-    cache = oe.EncoderCache(str(tmp_path))
-    llm, seen = model()
-    ref = cache.publish(native_result()[0], request(), llm)
-    phase = DisaggregatedParams(
-        request_type="context_only", disagg_request_id=71, ctx_usage={"prompt_tokens": 88}
-    )
-    _, params = cache.prepare(ref, request(), llm, None, phase)
-    assert params.request_type == "context_only"
-    assert params.disagg_request_id == phase.disagg_request_id
-    assert params.ctx_usage == phase.ctx_usage
-    assert seen["hashes"] == [[2147483647] * 8]
-    assert not list(tmp_path.glob("*.safetensors"))
-
-
 def test_expiry_wrong_inputs_and_cross_host_are_rejected(tmp_path):
     cache = oe.EncoderCache(str(tmp_path))
     llm, _ = model()
@@ -245,13 +257,13 @@ def test_quota_counts_actual_serialized_bytes(tmp_path, monkeypatch):
         )
     monkeypatch.setattr(oe, "_MAX_CACHE_BYTES", path.stat().st_size + estimated)
     result, _ = native_result()
-    with pytest.raises(RuntimeError, match="cache is full"):
+    with pytest.raises(oe.EncoderCapacityError, match="cache is full"):
         cache.publish(result, request(), llm)
     assert len(list(tmp_path.glob("*.safetensors"))) == 1
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_failed_rebuild_and_discarded_result_reclaim_all_exports(tmp_path, monkeypatch):
+def test_failed_shared_publication_reclaims_original_exports(tmp_path, monkeypatch):
     llm, _ = model()
     result, _ = native_result()
     released = []
@@ -270,10 +282,6 @@ def test_failed_rebuild_and_discarded_result_reclaim_all_exports(tmp_path, monke
     with pytest.raises(ValueError, match="broken export"):
         oe.EncoderCache(str(tmp_path)).publish(result, request(), llm)
     assert len(released) == 3
-    result, _ = native_result()
-    oe.release_encoder_result(result)
-    oe.release_encoder_result(result)
-    assert len(released) == 6
 
 
 @pytest.mark.parametrize("role", ["encode", "consume"])

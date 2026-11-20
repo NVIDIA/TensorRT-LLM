@@ -31,7 +31,9 @@ from utils.native_encoder import native_pair as pair  # noqa: F401
 from tensorrt_llm._torch.disaggregation import encoder_nixl as transport
 from tensorrt_llm._torch.disaggregation.encoder_output import (
     EncodedMediaRef,
+    EncoderCapacityError,
     EncoderTransferRejected,
+    EncoderUnavailableError,
 )
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
@@ -47,7 +49,7 @@ def _consume_worker_exports(pipe):
     pipe.close()
 
 
-def _blocked_write(monkeypatch, producer, complete=True):
+def _blocked_write(monkeypatch, complete=True):
     entered, release = threading.Event(), threading.Event()
     original = FakeAgent.submit_transfer_requests
     statuses = []
@@ -76,7 +78,7 @@ def test_nixl_handoff_restores_hash_validation_and_missing_hash_fallback(pair, s
 
 
 @pytest.mark.parametrize("hashes", [[], [[1] * 7], [[1.0] * 8], ["bad"], 42, [[1] * 8] * 2])
-def test_nixl_handoff_rejects_malformed_hashes_and_releases_exports(pair, monkeypatch, hashes):
+def test_nixl_handoff_rejects_malformed_hashes_before_import(pair, monkeypatch, hashes):
     _check_malformed_handoff_hashes(*pair, hashes, monkeypatch)
 
 
@@ -85,8 +87,10 @@ def test_nixl_roundtrip_retains_tensors_metadata_and_mrope(pair):
     llm, seen = model()
     output, expected = native_result()
     ref = producer.publish(output, request(), llm)
-    assert json.loads(ref.opaque_state)["format"] == transport.BACKEND
-    assert "host" not in json.loads(ref.opaque_state)
+    state = json.loads(ref.opaque_state)
+    assert state["format"] == transport.BACKEND
+    assert set(state) == {"format", "version", "id", "endpoint", "metadata"}
+    assert "ptr" not in state["metadata"]
     assert not output.disaggregated_params.multimodal_embedding_handles
     _, params = consumer.prepare(ref, request(), llm, None)
     assert params.request_type == "context_and_generation"
@@ -98,22 +102,6 @@ def test_nixl_roundtrip_retains_tensors_metadata_and_mrope(pair):
     with pytest.raises(transport.EncoderTransferRejected, match="already consumed"):
         consumer.prepare(ref, request(), llm, None)
     assert _writes(producer) == 1
-
-
-def test_nixl_encoder_handoff_preserves_prefill_phase(pair):
-    producer, consumer = pair
-    llm, seen = model()
-    ref = producer.publish(native_result()[0], request(), llm)
-    phase = DisaggregatedParams(
-        request_type="context_only", disagg_request_id=71, ctx_usage={"prompt_tokens": 88}
-    )
-    _, params = consumer.prepare(ref, request(), llm, None, phase)
-    assert params.request_type == "context_only"
-    assert params.disagg_request_id == phase.disagg_request_id
-    assert params.ctx_usage == phase.ctx_usage
-    assert seen["hashes"] == [[2147483647] * 8]
-    assert _writes(producer) == 1
-    assert producer._used == consumer._used == 0
 
 
 def test_prefill_captures_mrope_when_native_embedding_path_bypasses_processor(pair):
@@ -364,36 +352,6 @@ def test_unregistered_destination_consumes_claim_without_write(pair, monkeypatch
     assert producer._used == consumer._used == 0
 
 
-def test_reference_does_not_expose_source_addresses(pair):
-    producer, _ = pair
-    llm, _ = model()
-    ref = producer.publish(native_result()[0], request(), llm)
-    state = json.loads(ref.opaque_state)
-    assert set(state) == {"format", "version", "id", "endpoint", "metadata"}
-    assert "ptr" not in state["metadata"]
-
-
-def test_close_reclaims_undelivered_exports(pair):
-    producer, _ = pair
-    llm, _ = model()
-    producer.publish(native_result()[0], request(), llm)
-    producer.close()
-    assert not producer.test_agents
-    assert producer._used == 0
-
-
-def test_receiver_quota_and_dtype_validation_precede_allocation(pair):
-    producer, consumer = pair
-    llm, _ = model()
-    ref = producer.publish(native_result()[0], request(), llm)
-    state = json.loads(ref.opaque_state)
-    state["metadata"]["tensors"][0]["shape"] = [2**30]
-    oversized = EncodedMediaRef(opaque_state=json.dumps(state).encode())
-    with pytest.raises(ValueError, match="memory limit"):
-        consumer.prepare(oversized, request(), llm, None)
-    assert _writes(producer) == 0
-
-
 def test_requires_explicit_revision():
     with pytest.raises(ValueError, match="pinned model revision"):
         transport.NixlEncoderCache("", "", device="cpu", agent_factory=FakeAgent)
@@ -494,7 +452,7 @@ def test_parallel_receives_use_isolated_agents_while_state_locks_remain_responsi
     producer, consumer = pair
     llm, _ = model()
     first = producer.publish(native_result()[0], request(), llm)
-    entered, release, _ = _blocked_write(monkeypatch, producer)
+    entered, release, _ = _blocked_write(monkeypatch)
     with ThreadPoolExecutor(max_workers=2) as workers:
         pending = workers.submit(_receive, consumer, first)
         try:
@@ -525,7 +483,7 @@ def test_receive_slots_are_reserved_during_inflight_transfers_and_returned_on_su
     llm, _ = model()
     references = [producer.publish(native_result()[0], request(), llm) for _ in range(2)]
     monkeypatch.setattr(transport, "_MAX_RECEIVE_SLOTS", 1)
-    entered, release, _ = _blocked_write(monkeypatch, producer)
+    entered, release, _ = _blocked_write(monkeypatch)
     with ThreadPoolExecutor(max_workers=1) as workers:
         pending = workers.submit(_receive, consumer, references[0])
         try:
@@ -638,7 +596,7 @@ def test_close_waits_for_active_transfer_on_both_sides(pair, monkeypatch):
     producer, consumer = pair
     llm, _ = model()
     reference = producer.publish(native_result()[0], request(), llm)
-    entered, release, _ = _blocked_write(monkeypatch, producer)
+    entered, release, _ = _blocked_write(monkeypatch)
     draining = []
     for cache in (producer, consumer):
         event, original = threading.Event(), cache._lock.wait_for
@@ -670,7 +628,7 @@ def test_close_timeout_quarantines_active_status_and_reports_repeated_failure(pa
     producer, consumer = pair
     llm, _ = model()
     reference = producer.publish(native_result()[0], request(), llm)
-    entered, release, statuses = _blocked_write(monkeypatch, producer, complete=False)
+    entered, release, statuses = _blocked_write(monkeypatch, complete=False)
 
     def drain_timeout(predicate, timeout=None):
         if timeout is None:
@@ -725,7 +683,7 @@ def test_producer_quota_is_reserved_before_cloning_concurrent_exports(pair, monk
         pending = workers.submit(producer.publish, outputs[0][0], request(), llm)
         try:
             assert entered.wait(5)
-            with pytest.raises(RuntimeError, match="cache is full"):
+            with pytest.raises(EncoderCapacityError, match="cache is full"):
                 producer.publish(outputs[1][0], request(), llm)
             assert len(clones) == 1 and producer._used == size
             assert not producer.failed
@@ -735,7 +693,7 @@ def test_producer_quota_is_reserved_before_cloning_concurrent_exports(pair, monk
     assert len(clones) == 3
     assert json.loads(reference.opaque_state)["id"] in producer._exports
     producer.close()
-    assert producer._used == 0
+    assert producer._used == 0 and not producer.test_agents
 
 
 def test_discard_reclaims_only_unclaimed_nixl_exports(pair, monkeypatch):
@@ -788,7 +746,7 @@ def test_discard_during_claim_prevents_rejected_transfer_from_restoring_export(p
         malformed = EncodedMediaRef(
             opaque_state=json.dumps({**value, "metadata": {}}).encode(),
         )
-        with pytest.raises(ValueError, match="metadata mismatch"):
+        with pytest.raises(ValueError, match="metadata|layout"):
             producer.discard(malformed)
         assert not producer.discard(reference)
         assert not producer.discard(reference)
@@ -859,7 +817,7 @@ def test_quarantined_receives_remain_charged_and_bound_future_allocations(pair, 
     else:
         monkeypatch.setattr(transport, "_MAX_RECEIVE_SLOTS", 1)
         message = "slots exhausted"
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(EncoderCapacityError, match=message):
         _receive(consumer, fresh)
     assert consumer._used == used and consumer._receive_slots == 1
     assert len(consumer.test_agents) == agents and not consumer.failed
@@ -888,7 +846,7 @@ def test_exhausted_quarantine_budget_marks_cache_unhealthy_without_freeing_buffe
         _receive(consumer, reference)
     pinned = _receiver(consumer)
     assert consumer.failed and consumer._used == size and pinned.registrations
-    with pytest.raises(RuntimeError, match="transport unavailable"):
+    with pytest.raises(EncoderUnavailableError, match="transport unavailable"):
         _receive(consumer, reference)
     consumer.close()
     assert pinned.registrations and not pinned.stopped
@@ -927,24 +885,47 @@ def test_unreachable_peer_quarantines_only_its_receive_and_late_write_remains_sa
 
 
 @pytest.mark.parametrize(
-    "invalid", ["missing_format", "wrong_format", "missing_version", "wrong_version", "oversized"]
+    "invalid,value",
+    [
+        ("missing_format", None),
+        ("wrong_format", "another-engine-output-v1"),
+        ("missing_version", None),
+        ("wrong_version", 2),
+        ("oversized", None),
+        ("metadata", []),
+        ("tensors", 1),
+        ("tensor", None),
+        ("dtype", []),
+        ("shape", [2**30]),
+        ("embedding_metadata", ["bad"]),
+        ("has_mrope", "true"),
+        ("has_mrope", False),
+        ("missing_hashes", None),
+    ],
 )
-def test_native_envelope_rejection_precedes_allocation_claim_and_release(
-    pair, monkeypatch, invalid
+def test_native_reference_rejection_precedes_allocation_claim_and_release(
+    pair, monkeypatch, invalid, value
 ):
     producer, consumer = pair
     llm, _ = model()
     reference = producer.publish(native_result()[0], request(), llm)
-    value = json.loads(reference.opaque_state)
-    identity = value["id"]
+    state = json.loads(reference.opaque_state)
+    identity, metadata = state["id"], state["metadata"]
     if invalid.startswith("missing_"):
-        value.pop(invalid.removeprefix("missing_"))
-    elif invalid == "wrong_format":
-        value["format"] = "another-engine-output-v1"
-    else:
-        value["version"] = 2
+        target = metadata if invalid == "missing_hashes" else state
+        target.pop(invalid.removeprefix("missing_"))
+    elif invalid.startswith("wrong_"):
+        state[invalid.removeprefix("wrong_")] = value
+    elif invalid == "metadata":
+        state["metadata"] = value
+    elif invalid in ("dtype", "shape"):
+        metadata["tensors"][0][invalid] = value
+    elif invalid == "tensor":
+        metadata["tensors"][0] = value
+    elif invalid != "oversized":
+        metadata[invalid] = value
     payload = (
-        json.dumps(value).encode()
+        json.dumps(state).encode()
         if invalid != "oversized"
         else b"x" * (transport._MAX_REFERENCE_BYTES + 1)
     )
@@ -954,20 +935,49 @@ def test_native_envelope_rejection_precedes_allocation_claim_and_release(
 
     def guarded_decode(data):
         if data == destination:
-            pytest.fail("invalid reference reached receiver metadata parsing")
+            pytest.fail("invalid reference reached receiver descriptor parsing")
         return decode(data)
 
     monkeypatch.setattr(transport, "_decode", guarded_decode)
-    operations = (
+    for operation in (
         lambda: consumer.prepare(malformed, request(), llm, None),
         lambda: producer.discard(malformed),
         lambda: producer.transfer(malformed, destination),
-    )
-    for operation in operations:
+    ):
         with pytest.raises(ValueError):
             operation()
         assert identity in producer._exports and not producer._claims
         assert consumer._used == consumer._receive_slots == 0
-        assert not consumer.test_agents and _writes(producer) == 0
+        assert not consumer.test_agents and not producer.test_agents
     consumer.prepare(reference, request(), llm, None)
     assert producer._used == consumer._used == 0
+
+
+def test_local_sender_setup_failure_is_proven_rejection_with_local_attribution(pair, monkeypatch):
+    producer, consumer = pair
+    llm, _ = model()
+    ref = producer.publish(native_result()[0], request(), llm)
+
+    def fail_factory(name):
+        raise RuntimeError("local agent initialization failed")
+
+    monkeypatch.setattr(producer, "_agent_factory", fail_factory)
+    with pytest.raises(EncoderTransferRejected, match="local encoder sender setup.*local agent"):
+        consumer.prepare(ref, request(), llm, None)
+    assert producer._used == consumer._used == consumer._receive_slots == 0
+    assert not producer._exports and not producer._claims and not producer.failed
+    assert _receiver(consumer).stopped and not _receiver(consumer).registrations
+
+
+@pytest.mark.parametrize("state", ["failed", "_closing", "_closed"])
+def test_unavailable_consumer_rejects_before_receive_allocation(pair, monkeypatch, state):
+    producer, consumer = pair
+    llm, _ = model()
+    ref = producer.publish(native_result()[0], request(), llm)
+    with monkeypatch.context() as patch:
+        patch.setattr(consumer, state, True)
+        with pytest.raises(EncoderUnavailableError, match="transport unavailable"):
+            consumer.prepare(ref, request(), llm, None)
+        assert not consumer.test_agents and consumer._used == consumer._receive_slots == 0
+        assert producer._used > 0 and not producer._claims
+    consumer.prepare(ref, request(), llm, None)

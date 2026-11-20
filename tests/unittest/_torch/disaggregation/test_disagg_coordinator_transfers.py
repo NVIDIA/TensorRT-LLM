@@ -1055,11 +1055,10 @@ def test_native_send_keeps_idle_and_shutdown_polling_until_sampler_release(
     executor.waiting_queue = Mock()
     executor.kv_connector_manager = None
     executor.enable_attention_dp = single_rank_adp
-    executor.dist.tp_size = 1
-    executor.dist.world_size = 1
     executor.is_shutdown = False
     executor.control_requests = []
     executor._disable_mpi = False
+    executor.enable_iter_perf_stats = False
     executor.request_accumulated = []
     executor.canceled_req_ids = []
     executor.hang_detector = SimpleNamespace(pause=nullcontext)
@@ -1076,6 +1075,8 @@ def test_native_send_keeps_idle_and_shutdown_polling_until_sampler_release(
     executor.draft_model_engine = None
 
     harness = _Harness()
+    executor.kv_cache_transceiver = harness.transceiver
+    harness.transceiver.kv_transfer_poll_interval_ms = 25
     executor._disagg_coordinator = harness.coordinator
     executor.async_transfer_manager = harness.transfers
     harness.effects.terminate_request = MethodType(PyExecutor._free_request_resources, executor)
@@ -1088,12 +1089,18 @@ def test_native_send_keeps_idle_and_shutdown_polling_until_sampler_release(
     harness.send(request)
     harness.kv_cache_manager.reset_mock()
 
-    # No completion yet: neither idle input fetch nor shutdown may strand the send.
+    # Ordinary idle waits retain the configured poll interval. Shutdown drains actively.
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
+    timeout = executor.executor_request_queue.get_from_request_queue.call_args.args[0]
+    assert timeout.total_seconds() == 0.025
+    executor.is_shutdown = True
+    assert not executor.should_stop_processing
     executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
     timeout = executor.executor_request_queue.get_from_request_queue.call_args.args[0]
     assert timeout.total_seconds() == 0
-    executor.is_shutdown = True
-    assert not executor.should_stop_processing
+    assert not executor.executor_request_queue.get_from_request_queue.call_args.kwargs[
+        "wait_for_batch"
+    ]
     executor.disagg.poll_progress_when_idle()
     assert harness.in_transfer(request)
     assert 0 in handler._stop_word_allocations

@@ -71,6 +71,14 @@ class EncoderTransferRejected(ValueError):
     """Reject a transfer before WRITE; receiver buffers can be released."""
 
 
+class EncoderCapacityError(RuntimeError):
+    """Encoder output storage or receive capacity is temporarily exhausted."""
+
+
+class EncoderUnavailableError(RuntimeError):
+    """Encoder transport cannot accept work in its current health/lifecycle state."""
+
+
 def _input_digest(inputs: EncoderInput) -> str:
     digest = hashlib.sha256()
 
@@ -225,6 +233,25 @@ def _encoder_output_params(
         raise ValueError(f"invalid encoder handoff parameters: {error}") from error
 
 
+def _validate_handoff_metadata(metadata: Any) -> int:
+    """Validate portable item layout and native hashes before taking ownership."""
+    if not isinstance(metadata, dict):
+        raise ValueError("invalid encoder handoff metadata")
+    layouts = metadata.get("embedding_metadata")
+    if (
+        not isinstance(layouts, list)
+        or not layouts
+        or any(layout is not None and not isinstance(layout, dict) for layout in layouts)
+    ):
+        raise ValueError("invalid encoder embedding layout")
+    if "hashes" not in metadata:
+        raise ValueError("missing encoder handoff hashes")
+    # Reuse the native hash contract, retaining None's missing-hash fallback.
+    if metadata["hashes"] is not None:
+        _encoder_output_params(DisaggregatedParams(), [{}] * len(layouts), metadata["hashes"], {})
+    return len(layouts)
+
+
 def _capture_encoder_decode_state(llm: Any, inputs: Any, mrope: dict) -> None:
     capture = getattr(llm.input_processor, "_capture_prepared_decode", None)
     if not callable(capture) or not mrope:
@@ -330,7 +357,7 @@ class EncoderCache:
                 if size > _MAX_TENSOR_BYTES + _MAX_METADATA_BYTES:
                     raise ValueError("serialized encoder output exceeds the size limit")
                 if used + size > _MAX_CACHE_BYTES:
-                    raise RuntimeError("encoder shared cache is full")
+                    raise EncoderCapacityError("encoder shared cache is full")
                 temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
@@ -405,14 +432,24 @@ class EncoderCache:
                 if path.stat().st_size > _MAX_TENSOR_BYTES + _MAX_METADATA_BYTES:
                     raise ValueError("encoder handoff exceeds the size limit")
                 with safe_open(str(path), framework="pt", device="cpu") as stored:
-                    encoded_metadata = stored.metadata()["handoff"]
+                    encoded_metadata = (stored.metadata() or {}).get("handoff")
+                    if not isinstance(encoded_metadata, str):
+                        raise ValueError("missing encoder handoff metadata")
                     if len(encoded_metadata.encode()) > _MAX_METADATA_BYTES:
                         raise ValueError("encoder handoff metadata exceeds the size limit")
                     metadata = json.loads(encoded_metadata)
-                    if metadata["input_digest"] != _input_digest(request):
+                    count = _validate_handoff_metadata(metadata)
+                    if metadata.get("input_digest") != _input_digest(request):
                         raise ValueError("encoder handoff does not match the request inputs")
-                    if metadata["config_digest"] != _model_digest(llm):
+                    if metadata.get("config_digest") != _model_digest(llm):
                         raise ValueError("encoder handoff belongs to another model configuration")
+                    names = set(stored.keys())
+                    mrope = {"mrope_ids", "mrope_deltas"}
+                    expected = {f"embedding_{i}" for i in range(count)}
+                    if names & mrope:
+                        expected |= mrope
+                    if names != expected:
+                        raise ValueError("invalid encoder tensor layout")
                 path.rename(claimed)
                 opened = safe_open(str(claimed), framework="pt", device="cpu")
             with opened as stored:
