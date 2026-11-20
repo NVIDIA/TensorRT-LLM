@@ -33,10 +33,11 @@
    "import_edits": [
     "from .k3_fp8w_lowm_gemm import _bf16x2_inv_scale, _quant_bf16x8_to_e4m3, _ue8m0_of_amax -> from ..k3r_gemm.k3_fp8w_lowm_gemm_ull import _bf16x2_inv_scale, _quant_bf16x8_to_e4m3, _ue8m0_of_amax",
     "from .k3_route_tail import _griddepcontrol_launch_dependents, _griddepcontrol_wait -> from ..k3r_moe.k3_route_tail_ull import _griddepcontrol_launch_dependents, _griddepcontrol_wait",
-    "Bind the shared k3_fp8w_lowm_gemm quantization helpers."
+    "Bind the shared k3_fp8w_lowm_gemm quantization helpers.",
+    "Bind grid dependency helpers from the shared route-tail module."
    ],
    "local_edits": [],
-   "sha256": "d0f34c649b57033090945d74add76b41edfb3a756fb208a8b138d336e85a7bca",
+   "sha256": "78dfc8004b96445674b9a6106ea5feecb67f3dc413c170a1addca4f6a4237558",
    "target_path": "kernels/k3_latent_ar_norm.py"
   },
   "kernels/k3r_common/k3_launch_attrs.py": {
@@ -274,8 +275,10 @@
     "from .k3_fused_router import ( NUM_EXPERTS, TOP_K, _asm, _atom_add_relaxed_gpu, _div_rn_f32, _fence_acq_rel_gpu, _fv, _iv, _lds_b32, _lds_f32, _lv, _popc, _red_shared_or, _renormalize, _st_global_b32, _st_global_f32, _st_relaxed_b32, _sts_b32, _sts_v4_f32, _unit_scale_fast_path, _unpack, _warp_inclusive_sum, _warp_sum_f32, sort_buffer_sizes, ) -> from .k3_fused_router_ull import ( NUM_EXPERTS, TOP_K, _asm, _atom_add_relaxed_gpu, _div_rn_f32, _fence_acq_rel_gpu, _fv, _iv, _lds_b32, _lds_f32, _lv, _popc, _red_shared_or, _renormalize, _st_global_b32, _st_global_f32, _st_relaxed_b32, _sts_b32, _sts_v4_f32, _unit_scale_fast_path, _unpack, _warp_inclusive_sum, _warp_sum_f32, sort_buffer_sizes, )",
     "from .k3_fused_router_ull import ... -> from .k3_fused_router import ..."
    ],
-   "local_edits": [],
-   "sha256": "a71ae917f87c84abf304dc4f2dce7900dbb7a65f76900c9d7ed8b1e235395ff7",
+   "local_edits": [
+    "Reuse the family route-tail kernels and keep the ULL dispatcher schema and fake implementation."
+   ],
+   "sha256": "63ad5213e46653890183a07f5b38f3621f362fe9cbac2ead50c344d0898b5814",
    "target_path": "kernels/k3_route_tail.py"
   },
   "kernels/k3r_moe/k3_shared_persist.py": {
