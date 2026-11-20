@@ -16,6 +16,7 @@ import dataclasses
 import inspect
 import types
 from pathlib import Path
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -750,73 +751,65 @@ def test_executor_loop_cleanup_calls_at_shutdown_after_a_completed_loop(complete
     assert events.calls == (["at_shutdown"] if completed else [])
 
 
-class _StopLoop(Exception):
-    """Ends ``_executor_loop_overlap`` right after the head of its first iteration."""
-
-
-class _HangDetector(contextlib.nullcontext):
-    def __init__(self, log: list) -> None:
-        super().__init__()
-        self.log = log
-
-    def checkpoint(self) -> None:
-        self.log.append("checkpoint")
-
-
-def _overlap_loop_executor(monkeypatch, events, log: list):
-    """A ``PyExecutor`` that runs ``_executor_loop_overlap`` up to the iteration's first read after the
-    events' per-iteration call, logging what the loop head does."""
+@pytest.mark.parametrize("events", ["none", "without", "with"])
+def test_the_overlap_loop_calls_the_events_optional_per_iteration_call(monkeypatch, events):
     from tensorrt_llm._torch.pyexecutor import py_executor
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    class _LoopHead(PyExecutor):
-        @property
-        def enable_iter_perf_stats(self):
-            log.append("loop body")
-            raise _StopLoop
-
-    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
-    monkeypatch.setattr(py_executor, "CUASSERT", lambda result: None)
-    monkeypatch.setattr(py_executor.cudart, "cudaSetDevice", lambda device: None)
-    executor = _LoopHead.__new__(_LoopHead)
-    executor.device_id = 0
-    executor.iter_counter = 7
-    executor.is_benchmark_disagg = False
-    executor._executor_events = events
-    executor._overlap_loop_stream_scope = contextlib.nullcontext
-    executor._profiler = lambda: contextlib.nullcontext(lambda: log.append("profile step"))
-    executor.hang_detector = _HangDetector(log)
-    return executor
-
-
-class _IterationEvents(_Events):
-    def __init__(self, log: list) -> None:
-        self.log = log
-
-    def before_overlap_loop(self) -> None:
-        self.log.append("before_overlap_loop")
-
-    def on_iteration(self, iteration: int) -> None:
-        self.log.append(f"on_iteration {iteration}")
-
-
-@pytest.mark.parametrize("events", ["none", "without", "with"])
-def test_the_overlap_loop_calls_the_events_optional_per_iteration_call(monkeypatch, events):
-    """``ExecutorEvents.on_iteration`` is optional: an iteration calls it with the executor's iteration
-    counter when the events define it, and the loop runs as before when they do not."""
     log = []
-    declared = {"none": None, "without": _Events(), "with": _IterationEvents(log)}[events]
-    executor = _overlap_loop_executor(monkeypatch, declared, log)
-    with pytest.raises(_StopLoop):
-        executor._executor_loop_overlap()
-    head = ["checkpoint", "profile step"]
-    expected = {
-        "none": head,
-        "without": head,
-        "with": ["before_overlap_loop", *head, "on_iteration 7"],
-    }[events]
-    assert log == [*expected, "loop body"]
-    assert "on_iteration" not in vars(ExecutorEvents)
+    callbacks = types.SimpleNamespace(
+        before_overlap_loop=lambda: log.append("before_overlap_loop"),
+        on_iteration=lambda iteration: log.append(f"on_iteration {iteration}"),
+    )
+    declared = {"none": None, "without": _Events(), "with": callbacks}[events]
+
+    monkeypatch.setattr(torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(py_executor, "CUASSERT", Mock())
+    monkeypatch.setattr(py_executor.cudart, "cudaSetDevice", Mock())
+    executor = Mock(
+        spec=PyExecutor,
+        device_id=0,
+        iter_counter=7,
+        is_benchmark_disagg=False,
+        previous_batch=None,
+        kv_connector_manager=None,
+        _executor_events=declared,
+        _defer_generation_only_release=False,
+        enable_iter_perf_stats=False,
+        _resource_governor_enabled=False,
+        _is_kv_manager_v2=False,
+        _packed_sync_enabled=False,
+        _mm_encoder_item_scheduling_enabled=False,
+        _kv_connector_moves_kv=False,
+        enable_early_first_token_response=False,
+        enable_kv_cache_events=False,
+        enable_attention_dp=False,
+    )
+    executor._overlap_loop_stream_scope.return_value = contextlib.nullcontext()
+    executor._profiler.return_value = contextlib.nullcontext(lambda: log.append("profile step"))
+    executor.hang_detector = MagicMock()
+    executor.hang_detector.checkpoint.side_effect = [None, None, StopIteration]
+    executor.disagg.handle_errors_synced.return_value = False
+    executor._check_benchmark_disagg_gate.return_value = (True, False)
+    executor._can_queue.return_value = (False, False)
+    batch = types.SimpleNamespace(paused_requests=[], encoder_requests=[])
+
+    def schedule(**_):
+        log.append(f"schedule {executor.iter_counter}")
+        return batch, None
+
+    executor._prepare_and_schedule_batch.side_effect = schedule
+    with pytest.raises(StopIteration):
+        PyExecutor._executor_loop_overlap(executor)
+
+    expected = ["before_overlap_loop"] if events == "with" else []
+    for iteration in (7, 8):
+        expected.append("profile step")
+        if events == "with":
+            expected.append(f"on_iteration {iteration}")
+        expected.append(f"schedule {iteration}")
+    assert log == expected
+    assert executor.iter_counter == 9
 
 
 # -- a model's own step-input pack --------------------------------------------------------------
