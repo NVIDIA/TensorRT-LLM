@@ -145,12 +145,16 @@ class FusedMoEQuantScalesMXFP8(NamedTuple):
 
 def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
         dst_w3_w1_weight: torch.Tensor,
-        cache_permute_indices: Dict[tuple[tuple[int, int, int], str],
-                                    torch.Tensor],
+        cache_permute_indices: Dict[tuple, torch.Tensor],
         epilogue_tile_m: int,
         num_elts_per_sf: Union[None, int] = None,
         is_gated_act_gemm: bool = True) -> torch.Tensor:
-    key = (dst_w3_w1_weight.shape, "w31", int(num_elts_per_sf or -1))
+    # The gated flag is part of the key. The quant methods keep one cache per
+    # class, so a gated layer and a non-gated one with the same w3/w1 shape
+    # would otherwise share an entry, and the second would get the row order
+    # of the first.
+    gated = bool(is_gated_act_gemm)
+    key = (dst_w3_w1_weight.shape, "w31", int(num_elts_per_sf or -1), gated)
 
     if key not in cache_permute_indices:
         # Get permute indices and chain them together
@@ -887,8 +891,9 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
     block_k = 64
     use_shuffled_weight = True
     weight_layout = TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K
-    _cache_permute_indices: Dict[tuple[tuple[int, ...], str, int],
-                                 torch.Tensor] = {}
+    # One cache for the class, shared by every layer, keyed by shape (and, for
+    # w3/w1, by the gated flag).
+    _cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
     def create_weights(self, module: torch.nn.Module):
         super().create_weights(module)
@@ -928,9 +933,7 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
         """One expert's ``[M, K]`` weight in the kernel layout, as a view.
 
         Rows are shuffled by ``permute_indices``, then split into BlockMajorK
-        (``[K / 64, M, 64]``). The first load materializes it with
-        ``_prepare_bf16_weight_for_trtllm_gen``; an in-place refit copies it
-        straight into the expert's slot, so both write the same bytes.
+        (``[K / 64, M, 64]``).
         """
         if self.weight_layout != TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K:
             raise ValueError(
@@ -939,10 +942,25 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
         return self._block_major_k_view(weight[permute_indices.to(
             weight.device)])
 
-    def _prepare_bf16_weight_for_trtllm_gen(
-            self, weight: torch.Tensor,
-            permute_indices: torch.Tensor) -> torch.Tensor:
-        return self._kernel_layout_view(weight, permute_indices).contiguous()
+    def _w3_w1_to_kernel_layout(self, module: torch.nn.Module,
+                                expert: torch.Tensor) -> torch.Tensor:
+        """One expert's w3/w1 ``[M, K]`` in the kernel layout, as a view.
+
+        The single definition of that layout for the first load, an in-place
+        refit and the online-EPLB host copies, which must all hold the same
+        bytes. A gated activation also reorders the rows for its fused GEMM.
+        The permute indices are cached per shape, so a call per expert costs a
+        lookup.
+        """
+        permute_indices = self._get_w3_w1_permute_indices(
+            expert, is_gated_act_gemm=module.is_gated_activation)
+        return self._kernel_layout_view(expert, permute_indices)
+
+    def _w2_to_kernel_layout(self, expert: torch.Tensor) -> torch.Tensor:
+        """One expert's w2 ``[M, K]`` in the kernel layout, as a view. The w2
+        counterpart of ``_w3_w1_to_kernel_layout``."""
+        return self._kernel_layout_view(expert,
+                                        self._get_w2_permute_indices(expert))
 
     def _use_inplace_refit(self, module: torch.nn.Module) -> bool:
         """Whether a weight reload can write each expert straight into the
@@ -1029,10 +1047,7 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
                                                        dst_w3_w1_weight.device)
         super().load_expert_w3_w1_weight(module, w1_weight, w3_weight, expert,
                                          allow_partial_loading)
-        permute_indices = self._get_w3_w1_permute_indices(
-            expert, is_gated_act_gemm=module.is_gated_activation)
-        dst_w3_w1_weight.copy_(self._kernel_layout_view(expert,
-                                                        permute_indices))
+        dst_w3_w1_weight.copy_(self._w3_w1_to_kernel_layout(module, expert))
 
     def load_expert_w2_weight(self,
                               module: torch.nn.Module,
@@ -1055,17 +1070,17 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
                                                        dst_w2_weight.device)
         super().load_expert_w2_weight(module, w2_weight, expert,
                                       allow_partial_loading)
-        permute_indices = self._get_w2_permute_indices(expert)
-        dst_w2_weight.copy_(self._kernel_layout_view(expert, permute_indices))
+        dst_w2_weight.copy_(self._w2_to_kernel_layout(expert))
 
     def _transform_expert_stacks_for_trtllm_gen(
             self, module: torch.nn.Module, w3_w1: torch.Tensor,
             w2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Rewrite stacked expert weights into shuffled BlockMajorK.
 
-        The permute indices depend only on the per-expert shape, so they are
-        derived once from expert 0 and reused for the whole stack. An empty
-        stack (a rank that stages no shared experts) is returned unchanged.
+        Each expert goes through the per-expert conversion an in-place refit
+        uses (``_w3_w1_to_kernel_layout`` / ``_w2_to_kernel_layout``), so the
+        two cannot drift apart. An empty stack (a rank that stages no shared
+        experts) is returned unchanged.
         """
         if w3_w1.shape[0] == 0 or w2.shape[0] == 0:
             return w3_w1, w2
@@ -1075,22 +1090,20 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
         compute_device = module.w3_w1_weight.device
 
         def transform(weights: torch.Tensor,
-                      permute_indices: torch.Tensor) -> torch.Tensor:
+                      to_kernel_layout: Callable) -> torch.Tensor:
             # One expert at a time on the GPU: the gather is far cheaper there,
             # while a host-resident stack never needs a device-sized allocation
             # of its own. Each expert returns to the stack's original device.
             return torch.stack([
-                self._prepare_bf16_weight_for_trtllm_gen(
-                    expert.to(compute_device),
-                    permute_indices).to(weights.device) for expert in weights
+                to_kernel_layout(expert.to(compute_device)).contiguous().to(
+                    weights.device) for expert in weights
             ])
 
-        w3_w1_permute_indices = self._get_w3_w1_permute_indices(
-            w3_w1[0],
-            is_gated_act_gemm=getattr(module, "is_gated_activation", True))
-        w2_permute_indices = self._get_w2_permute_indices(w2[0])
-        return (transform(w3_w1, w3_w1_permute_indices),
-                transform(w2, w2_permute_indices))
+        def w3_w1_to_kernel_layout(expert: torch.Tensor) -> torch.Tensor:
+            return self._w3_w1_to_kernel_layout(module, expert)
+
+        return (transform(w3_w1, w3_w1_to_kernel_layout),
+                transform(w2, self._w2_to_kernel_layout))
 
     def process_weights_after_loading(self, module: torch.nn.Module):
         if module.w3_w1_weight.dim() == 4:

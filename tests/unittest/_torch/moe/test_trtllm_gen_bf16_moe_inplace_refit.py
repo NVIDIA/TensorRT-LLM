@@ -32,6 +32,7 @@ creation layout.
 
 import pytest
 import torch
+from _torch.moe.moe_test_utils import begin_moe_refit, finalize_moe_refit
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import getSMVersion
 
@@ -90,40 +91,21 @@ def _loaded_module(gated: bool, weights: Weights) -> torch.nn.Module:
     return module
 
 
-def _pre_reload(module: torch.nn.Module) -> None:
-    # Mirrors rlhf_utils.WorkerExtension.begin_weight_update.
-    for mod in module.modules():
-        if hasattr(mod, "pre_reload_weights") and not getattr(mod, "_weights_removed", False):
-            mod.pre_reload_weights()
-
-
-def _finalize(module: torch.nn.Module) -> None:
-    # Mirrors rlhf_utils.WorkerExtension.finalize_weight_update.
-    for mod in module.modules():
-        if getattr(mod, "_weights_removed", False):
-            continue
-        if hasattr(mod, "process_weights_after_loading"):
-            mod.process_weights_after_loading()
-        if hasattr(mod, "post_load_weights"):
-            mod.post_load_weights()
-    torch.cuda.synchronize()
-
-
 def _refit(
     module: torch.nn.Module, buckets: list[Weights], storage: tuple[int, int] | None = None
 ) -> None:
-    """One pre_reload walk, one partial load per bucket, then one finalize walk.
+    """The engine's begin walk, one partial load per bucket, then its finalize walk.
 
     With ``storage``, also assert that the refit stays in place: the
-    kernel-layout tensors are still registered after pre_reload and after
+    kernel-layout tensors are still registered after the begin walk and after
     finalize.
     """
-    _pre_reload(module)
+    begin_moe_refit(module)
     if storage is not None:
         _assert_kept_in_kernel_layout(module, storage)
     for bucket in buckets:
         module.load_weights([dict(bucket)], allow_partial_loading=True)
-    _finalize(module)
+    finalize_moe_refit(module)
     if storage is not None:
         _assert_kept_in_kernel_layout(module, storage)
 
@@ -229,11 +211,11 @@ def test_inplace_refit_matches_fresh_load(order: str) -> None:
 
     module = _loaded_module(False, initial)
     storage = _storage(module)
-    _pre_reload(module)
+    begin_moe_refit(module)
     _assert_kept_in_kernel_layout(module, storage)
     for bucket in _buckets(update, order):
         module.load_weights([dict(bucket)], allow_partial_loading=True)
-    _finalize(module)
+    finalize_moe_refit(module)
     _assert_matches(module, expected, order)
     _assert_kept_in_kernel_layout(module, storage)
 
@@ -283,7 +265,7 @@ def test_repeated_finalize_is_a_no_op(gated: bool) -> None:
     """A layer already in the kernel layout is not converted again."""
     module = _loaded_module(gated, _expert_weights(gated, seed=1))
     storage, before = _storage(module), _snapshot(module)
-    _finalize(module)
+    finalize_moe_refit(module)
     _assert_kept_in_kernel_layout(module, storage)
     _assert_matches(module, before, "second finalize")
 
@@ -294,10 +276,10 @@ def test_reload_before_the_first_finalize_loads_in_the_creation_layout() -> None
     writes its creation-layout tensors and finalize converts them."""
     update = _expert_weights(False, seed=2)
     module = _make_module(False)
-    _pre_reload(module)
+    begin_moe_refit(module)
     assert module.backend.w3_w1_weight.dim() == 3, "nothing to keep before the first finalize"
     module.load_weights([dict(update)])
-    _finalize(module)
+    finalize_moe_refit(module)
     _assert_matches(module, _fresh_load(False, update), "reload before the first finalize")
 
 
@@ -305,7 +287,7 @@ def test_reload_before_the_first_finalize_loads_in_the_creation_layout() -> None
 @pytest.mark.parametrize("projection", ["w3_w1", "w2"])
 def test_missing_expert_fails_a_non_partial_load(projection: str) -> None:
     module = _loaded_module(False, _expert_weights(False, seed=1))
-    _pre_reload(module)
+    begin_moe_refit(module)
     leaves = {"w1", "w3"} if projection == "w3_w1" else {"w2"}
     update = _expert_weights(False, seed=2)
     bucket = {
@@ -325,11 +307,11 @@ def test_gated_layer_takes_the_re_creating_path(order: str) -> None:
     initial, update = _expert_weights(True, seed=1), _expert_weights(True, seed=2)
     module = _loaded_module(True, initial)
     storage = _storage(module)
-    _pre_reload(module)
+    begin_moe_refit(module)
     assert module.backend.w3_w1_weight.dim() == 3, "a gated layer must take the re-creating path"
     for bucket in _buckets(update, order):
         module.load_weights([dict(bucket)], allow_partial_loading=True)
-    _finalize(module)
+    finalize_moe_refit(module)
     _assert_matches(module, _fresh_load(True, update), f"gated {order}")
     assert module.backend.w3_w1_weight.dim() == 4 and _storage(module) == storage, (
         "the re-creating path must copy back into the storage CUDA graphs captured"
