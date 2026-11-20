@@ -48,7 +48,7 @@ Choose the **role** from the behavior you are changing and the **owner** from th
 | --- | --- |
 | Pipeline | How a request moves through conditioning, denoising steps and decoding. The [family pipeline](pipeline.py) runs the joint audio/video loop. |
 | Component | A model block that composes ops and owns weights or execution state when needed. [H3 attention](components/attention.py) owns the projections and decides when to fuse Q/K normalization and RoPE. |
-| Operation | One tensor computation or collective with explicit inputs, outputs and observable mutations. Its reference specifies the expected result. The caller supplies any runner or workspace. |
+| Operation | A callable with an independently testable contract. Its reference defines the outputs and any buffer updates for the given inputs. An implementation can combine multiple tensor computations and collectives. The caller passes any required execution state explicitly. |
 | Kernel | The device implementation of an op, including launch geometry, tiling, memory access and fusion. An op can dispatch to one or more kernels or an existing library primitive. |
 
 ```text
@@ -98,7 +98,7 @@ Change H3's tile selection or coarse/fine merge in the [family VSA op](ops/vsa.p
 | --- | --- |
 | Change which projection channels a TP rank owns or when it sums partial results | [Linear](components/linear.py) owns projection shard bounds, quantization alignment and row-parallel output reduction. [MLP](components/mlp.py) uses the same bounds for gate/up and down. [Attention](components/attention.py) assigns complete Ulysses head groups to each TP rank. |
 | Change when transfers run relative to Q/K/V projections and local attention | The [Ulysses component](components/ulysses_attention.py) holds the process group and coordinates both execution paths. |
-| Change which rows or heads a rank receives, or how its receive buffers are laid out | The [H3 QKV ops](ops/ulysses_qkv.py) specify the exchange and local rearrangement. Each has an independent tensor reference. |
+| Change which rows or heads a rank receives, or how its receive buffers are laid out | The [H3 QKV ops](ops/ulysses_qkv.py) own these contracts. For example, `ulysses_qkv_all_to_all` returns the same per-rank heads and layout whether it packs Q/K/V for one all-to-all or exchanges the three tensors separately. |
 
 ```text
 Base H3 / H3UlyssesAttention (family component)
@@ -115,7 +115,7 @@ The [sequence sharder](components/sequence_sharder.py) pads, shards and gathers 
 
 ### How large is a catalog operation?
 
-Use **one testable tensor computation, collective or explicit state update** as the unit of sharing. An entry may launch one kernel or several. The [LLM catalog](../../../modeling_v2/catalog/) illustrates the range.
+Group steps into a catalog op when another model family could use their combined result and buffer updates unchanged. Define that behavior in a reference that takes only the explicit call arguments. The implementation may fuse the steps into one kernel or use several kernels and collectives. The [LLM catalog](../../../modeling_v2/catalog/) illustrates the range.
 
 | LLM example | Contract | VisualGen implication |
 | --- | --- | --- |
