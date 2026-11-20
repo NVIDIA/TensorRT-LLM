@@ -22,9 +22,8 @@ is a `PageTableSpec` (`pyexecutor/kv_cache/page_table.py`):
 - `retention_margins`: whether the manager keeps draft tokens, a rewind, or another margin
   beyond its attention window.
 
-A role layout (`RoleLayoutV2`, `sharing/role_layout.py`) describes which pieces of a role each
-rank holds. Managers import their layouts from `page_table.py`; the transfer layer re-exports the
-same classes from `disaggregation/base/role_layout.py`.
+A role layout (`RoleLayoutV2`, `disaggregation/base/role_layout.py`) describes which pieces of a
+role each rank holds. Managers import their layouts from `page_table.py`, which re-exports them.
 
 ## Current consumers
 

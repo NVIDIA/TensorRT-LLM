@@ -23,13 +23,13 @@ import types
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
-from .sharing.role_layout import ByHead as ByHead
-from .sharing.role_layout import Own as Own
-from .sharing.role_layout import RankTopology
-from .sharing.role_layout import Replicated as Replicated
-from .sharing.role_layout import RingSlots as RingSlots
-from .sharing.role_layout import RoleLayoutV2 as RoleLayoutV2
-from .sharing.role_layout import Sectioned as Sectioned
+from ...disaggregation.base.role_layout import ByHead as ByHead
+from ...disaggregation.base.role_layout import Own as Own
+from ...disaggregation.base.role_layout import RankTopology
+from ...disaggregation.base.role_layout import Replicated as Replicated
+from ...disaggregation.base.role_layout import RingSlots as RingSlots
+from ...disaggregation.base.role_layout import RoleLayoutV2 as RoleLayoutV2
+from ...disaggregation.base.role_layout import Sectioned as Sectioned
 
 QUANT_MODES = frozenset({"fp8", "nvfp4", "fp8_ds_mla", "csa2_packed"})
 """The ways a spec says a manager's KV data is quantized (``PageTableSpec.quant_mode``)."""
