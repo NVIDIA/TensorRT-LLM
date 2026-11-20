@@ -40,6 +40,7 @@ from ..distributed import (
     AllReduceParams,
     MoEAllReduce,
     MoEAllReduceParams,
+    allreduce_workspace_ipc_failed,
 )
 from ..model_config import ModelConfig
 from ..models.modeling_deepseekv3 import Deepseekv3MoE
@@ -239,6 +240,10 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
             )
             self.moe_allreduce = MoEAllReduce(self.mapping)
+            # MoEAllReduce has no NCCL path: skip the fused kernel without CUDA IPC.
+            self.is_p2p_supported = self.is_p2p_supported and not allreduce_workspace_ipc_failed(
+                self.mapping
+            )
 
         has_tp = mapping.has_tp()
         has_pp = mapping.has_pp()

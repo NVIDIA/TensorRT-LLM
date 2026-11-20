@@ -29,6 +29,7 @@ from ..distributed import (
     AllReduceParams,
     MoEAllReduce,
     MoEAllReduceParams,
+    allreduce_workspace_ipc_failed,
 )
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -550,6 +551,10 @@ class Glm4DecoderLayer(DecoderLayer):
             dtype=config.torch_dtype,
         )
         self.moe_allreduce = MoEAllReduce(self.mapping)
+        # MoEAllReduce has no NCCL path: skip the fused kernel without CUDA IPC.
+        self.is_p2p_supported = self.is_p2p_supported and not allreduce_workspace_ipc_failed(
+            self.mapping
+        )
 
         if config.n_routed_experts is not None and layer_idx >= config.first_k_dense_replace:
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
