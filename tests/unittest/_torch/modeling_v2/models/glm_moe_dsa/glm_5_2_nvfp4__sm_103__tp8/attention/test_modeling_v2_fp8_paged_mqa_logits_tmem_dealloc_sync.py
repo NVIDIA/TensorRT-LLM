@@ -19,9 +19,9 @@ TMEM, so a late load still returns the right data). These tests scan the kernels
 instead and fail if the rendezvous is removed, moved behind the free, or made to cover a
 different set of threads. No GPU, no CUDA and no cutlass import are needed.
 
-The five kernels are the GLM-5.2 copies of the base paged MQA-logits kernel: four in the
-``sm_103`` tensor-parallel target and the ``sm_107`` low-latency one, which shares the same
-math-warp tail and is checked here as well.
+The six kernels are the GLM-5.2 copies of the base paged MQA-logits kernel: four in the
+``sm_103`` tensor-parallel target and the ``sm_107`` low-latency and high-throughput ones,
+which share the same math-warp tail and are checked here as well.
 """
 
 import ast
@@ -31,9 +31,12 @@ import pytest
 
 import tensorrt_llm
 
+pytestmark = pytest.mark.cpu_only
+
 _MODELS = Path(tensorrt_llm.__file__).parent / "_torch" / "modeling_v2" / "models" / "glm_moe_dsa"
 _TP8 = "glm_5_2_nvfp4__sm_103__tp8/kernels"
 _LL = "glm_5_2_nvfp4__sm_107__low_latency/ops/dsa"
+_HT = "glm_5_2_nvfp4__sm_107__high_throughput/kernels/attention"
 
 # (kernel file relative to the GLM folder, kernel class).
 _KERNELS = [
@@ -42,6 +45,7 @@ _KERNELS = [
     (f"{_TP8}/indexer_topk/fp8_paged_mqa_logits_rowsplit.py", "FP8MQALogitsRowSplitKernel"),
     (f"{_TP8}/indexer_layer_front/fp8_paged_mqa_logits_cp.py", "FP8MQALogitsCPZ14Kernel"),
     (f"{_LL}/_fp8_paged_mqa_logits_kernel.py", "FP8MQALogitsKernel"),
+    (f"{_HT}/fp8_paged_mqa_logits.py", "FP8MQALogitsKernel"),
 ]
 
 _DEALLOC_BAR = "tmem_dealloc_barrier"
