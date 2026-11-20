@@ -493,14 +493,17 @@ class BlockHashMixin:
         return token_lists
 
     def _tokenize_responses_request(self, request: ResponsesRequest) -> list[int]:
-        """Return the token ids of the prompt a worker builds for a Responses request.
+        """Return routing-only prompt ids without changing the Responses request.
 
-        The worker runs the model's Responses hooks before it renders (the
-        request hook, then the history hooks on the converted conversation), so
-        they run here too, on a copy of the request: the ids only drive routing
-        and nothing is stored on the request, so the context worker still
-        prepares and renders the request itself. A hook that rejects the request
-        is answered by the worker; the router routes on the request as sent.
+        Relayed token ids are reused and native Harmony rendering bypasses the
+        Responses hooks here. For chat-template routing, the request hook and
+        the history-preparation hook run on a copy of the request. These ids
+        only select workers; each worker independently prepares and renders
+        the original request, including running its Responses hooks.
+
+        If a hook rejects the request, routing attempts the generic conversion
+        of the request as sent so the worker can report the preprocessing
+        error. If that conversion also fails, its error propagates.
         """
         token_ids = request.relayed_prompt_token_ids()
         if token_ids is not None:

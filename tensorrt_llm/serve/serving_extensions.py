@@ -139,10 +139,14 @@ class ServingExtension:
 
         The Responses counterpart of :meth:`apply_chat_extensions`: mutates
         ``request`` in place, typically deriving chat-template kwargs or
-        sampling fields from request-level fields. Called for every Responses
-        request of a model this extension is registered for, relayed
-        (pre-tokenized) prompts included, before ``to_sampling_params`` reads
-        the request. Any exception raised here rejects the request with a 400
+        sampling fields from request-level fields. Each worker calls it before
+        ``to_sampling_params``, including for relayed (pre-tokenized) prompts.
+        A KV-aware router also calls it on a separate request copy for
+        chat-template routing, but not when reusing relayed token ids or using
+        native Harmony rendering. Overrides must not rely on a single call
+        across the router, context worker and generation worker.
+
+        Any exception raised here rejects the request with a 400
         ``BadRequestError`` carrying its message, as the route answers every
         preprocessing error.
         """
@@ -158,6 +162,12 @@ class ServingExtension:
         stored unless it is an assistant message carrying ``reasoning``: the
         reasoning is not replayed, only the tool calls the message carries,
         which the tool results that follow answer.
+
+        Stored messages can contain output from an earlier
+        :meth:`prepare_responses_history` call. Treat ``message`` and its nested
+        values as read-only: they can be shared with the conversation store.
+        An override that changes a message returns a new dict and copies any
+        nested values it modifies.
         """
         if "reasoning" not in message:
             return message
@@ -174,8 +184,14 @@ class ServingExtension:
         ``messages`` is the whole conversation the chat template is about to
         render: the instructions, the replayed history and the request's
         input, in order. The returned list is what is rendered and stored;
-        the default returns ``messages`` unchanged. An override that changes
-        the conversation returns a new list rather than mutating this one.
+        the default returns ``messages`` unchanged. On a follow-up, stored
+        output passes through :meth:`replay_stored_turn` and this hook again,
+        so transformations must remain stable when reapplied.
+
+        Message dicts and their nested values can be shared with stored history
+        or request input. An override that changes the conversation returns a
+        new list and copies the messages and nested values it modifies, rather
+        than mutating the supplied objects.
         """
         return messages
 
