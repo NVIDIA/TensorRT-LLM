@@ -22,9 +22,9 @@ from ..model_config import ModelConfig
 from ..modules.bf16_draft_head import is_plain_mtp_shared_head
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.multi_stream_utils import do_multi_stream
-from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
+from ..pyexecutor.resource_manager import (BaseResourceManager, SlotManager,
+                                           SpeculativeAcceptance)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .fused_accept import step0_epilogue
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, DraftRowPick,
@@ -505,7 +505,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             spec_config._use_shared_kv_cache)
         self.spec_tree_manager = None
 
-        # MTP Eagle: lazily-resolved flag for Mamba hybrid cache support
+        # Workers under modeling_v2 that derive from this class cache their own
+        # manager class check here.
         self._is_mamba_hybrid_cache = None
 
         # Worker-side saved spec-dec params; initialized so that a failure
@@ -677,32 +678,24 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, attn_metadata, spec_metadata)
 
-        # Mamba hybrid models need state updates after token acceptance because
-        # the accepted token count affects which Mamba states are valid. The
-        # isinstance check below naturally no-ops on non-Mamba kv_cache_managers,
-        # so this is safe to run unconditionally regardless of spec mode (Eagle3
-        # over a Mamba-style draft is plausible, even if no such draft exists today).
-        if self._is_mamba_hybrid_cache is None:
-            self._is_mamba_hybrid_cache = isinstance(
-                attn_metadata.kv_cache_manager, MambaHybridCacheManager)
-        promoting = num_gens > 0 and self._is_mamba_hybrid_cache
+        # The accepted token count decides which recurrent states written by
+        # the verification are valid; the cache keeps those.
+        acceptance = SpeculativeAcceptance(
+            attn_metadata=attn_metadata,
+            num_accepted_tokens=num_accepted_tokens,
+            num_contexts=num_contexts,
+            num_gens=num_gens)
         # Beside the draft loop (multi-stream steps), which reads no target
         # recurrent state; its inputs are not written before the join.
-        beside = (promoting and self._promotion_stream is not None
+        beside = (num_gens > 0 and self._promotion_stream is not None
                   and do_multi_stream())
         if beside:
             self._promotion_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._promotion_stream):
-                attn_metadata.kv_cache_manager.update_mamba_states(
-                    attn_metadata=attn_metadata,
-                    num_accepted_tokens=num_accepted_tokens,
-                    state_indices=attn_metadata.mamba_metadata.state_indices)
+                self._commit_accepted_base_state(acceptance)
                 self._promotion_done.record()
-        elif promoting:
-            attn_metadata.kv_cache_manager.update_mamba_states(
-                attn_metadata=attn_metadata,
-                num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices)
+        else:
+            self._commit_accepted_base_state(acceptance)
 
         try:
             sa_manager = getattr(spec_metadata.spec_resource_manager,
@@ -782,15 +775,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         attn_metadata.use_spec_decoding = True
 
-        # Commit model-owned target state only after draft preparation has
-        # succeeded; SpecWorkerBase aborts the still-pending snapshots on any
-        # exception above this point.
-        if self._auxiliary_state_handlers:
-            self.commit_auxiliary_speculative_states(
-                num_accepted_tokens,
-                attn_metadata.mamba_metadata.state_indices[:batch_size],
-                num_contexts,
-            )
+        # The state kept beside the declared one is committed only once draft
+        # preparation has succeeded; a step that fails above leaves it staged.
+        self._commit_accepted_auxiliary_state(acceptance)
 
         return {
             'logits': raw_logits,

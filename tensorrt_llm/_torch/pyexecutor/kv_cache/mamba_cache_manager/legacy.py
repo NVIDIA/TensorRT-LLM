@@ -1462,11 +1462,11 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager, MambaHybri
             "mamba hybrid cache requires block reuse to be disabled in KV cache config"
         )
 
-        # Host-drafter spec modes (NGram) have no spec worker to call
-        # update_mamba_states; this manager promotes accepted states itself
-        # in update_resources. One-model modes (MTP/Eagle/DFlash) and the
-        # suffix-automaton worker promote from their spec workers and must
-        # NOT be promoted twice.
+        # Host-drafter spec modes (NGram) have no spec worker to raise the
+        # acceptance event; this manager promotes accepted states itself
+        # in update_resources. The workers of the one-model modes
+        # (MTP/Eagle/DFlash) and the suffix-automaton worker raise the event,
+        # and their states must NOT be promoted twice.
         self._promote_states_in_update_resources = (
             spec_config is not None and getattr(spec_config, "decoding_type", None) == "NGram"
         )
@@ -1550,8 +1550,9 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager, MambaHybri
         """Commit accepted verification states for host-drafter spec modes.
 
         One-model spec workers (MTP/Eagle/DFlash) and the suffix-automaton
-        worker call update_mamba_states themselves right after on-device
-        acceptance. Host-drafter modes (NGram) have no spec worker:
+        worker report the acceptance through ``on_speculative_acceptance``
+        right after it is decided on the device. Host-drafter modes (NGram)
+        have no spec worker:
         acceptance lands on the requests as
         ``py_num_accepted_draft_tokens`` during sampler update, and this
         hook — running right after, alongside the KV rewind — promotes the

@@ -40,7 +40,9 @@ from ..modules.bf16_draft_head import BF16DraftHead, build_bf16_draft_head
 from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor import device_copy, step_inputs
 from ..pyexecutor.device_copy import CopySite
-from ..pyexecutor.resource_manager import ResourceManagerType
+from ..pyexecutor.resource_manager import (ResourceManagerType,
+                                           SpeculativeAcceptance,
+                                           SpeculativeAcceptancePhase)
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -2184,6 +2186,29 @@ class SpecWorkerBase(nn.Module, ABC):
         for handler in self._auxiliary_state_handlers:
             handler.commit_speculative_states(num_accepted_tokens,
                                               state_indices, num_contexts)
+
+    def _commit_accepted_base_state(self,
+                                    acceptance: SpeculativeAcceptance) -> None:
+        """Have the cache keep the state written for the accepted tokens."""
+        manager = acceptance.attn_metadata.kv_cache_manager
+        if manager is not None and acceptance.num_gens > 0:
+            manager.on_speculative_acceptance(
+                acceptance, SpeculativeAcceptancePhase.BASE_STATE)
+
+    def _commit_accepted_auxiliary_state(
+            self, acceptance: SpeculativeAcceptance) -> None:
+        """Commit the state that registered handlers and the cache keep beside it."""
+        if self._auxiliary_state_handlers:
+            batch_size = acceptance.num_contexts + acceptance.num_gens
+            mamba_metadata = acceptance.attn_metadata.mamba_metadata
+            self.commit_auxiliary_speculative_states(
+                acceptance.num_accepted_tokens,
+                mamba_metadata.state_indices[:batch_size],
+                acceptance.num_contexts)
+        manager = acceptance.attn_metadata.kv_cache_manager
+        if manager is not None:
+            manager.on_speculative_acceptance(
+                acceptance, SpeculativeAcceptancePhase.AUXILIARY_STATE)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

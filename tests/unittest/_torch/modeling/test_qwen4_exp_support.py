@@ -1561,37 +1561,6 @@ def test_mtp3_reuses_one_checkpoint_layer(monkeypatch) -> None:
     assert created == [config.num_hidden_layers]
 
 
-def test_mtp_worker_commits_hybrid_target_state(monkeypatch) -> None:
-    from tensorrt_llm._torch.speculative import mtp as mtp_module
-
-    captured = {}
-
-    class _FakeMambaHybridCacheManager:
-        def update_mamba_states(self, **kwargs) -> None:
-            assert self is manager
-            captured.update(kwargs)
-
-    monkeypatch.setattr(mtp_module, "MambaHybridCacheManager", _FakeMambaHybridCacheManager)
-    manager = _FakeMambaHybridCacheManager()
-    worker = object.__new__(mtp_module.MTPWorker)
-    nn.Module.__init__(worker)
-    worker._auxiliary_state_handlers = []
-    worker._is_mamba_hybrid_cache = None
-    state_indices = torch.tensor([3], dtype=torch.int32)
-    accepted = torch.tensor([2], dtype=torch.int32)
-    attn_metadata = SimpleNamespace(
-        num_contexts=0,
-        kv_cache_manager=manager,
-        mamba_metadata=SimpleNamespace(state_indices=state_indices),
-    )
-
-    worker._commit_target_mamba_states(attn_metadata, accepted, batch_size=1)
-
-    assert captured["attn_metadata"] is attn_metadata
-    assert captured["num_accepted_tokens"] is accepted
-    assert captured["state_indices"] is state_indices
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_ple_prefill_reuses_prepared_device_metadata(monkeypatch) -> None:
     from tensorrt_llm._torch.models import modeling_qwen4_exp

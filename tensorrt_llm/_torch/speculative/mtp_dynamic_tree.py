@@ -15,19 +15,19 @@
 """MTP-Eagle one-model dynamic tree speculative decoding (greedy only)."""
 
 import math
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.resource_manager import BaseResourceManager, SpeculativeAcceptance
 from ..pyexecutor.scheduler import ScheduledRequests
 from .eagle3 import MTPEagleWorker
 
@@ -695,20 +695,20 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self._relocate_kv_eagerly(attn_metadata, batch_size)
 
         # Dynamic-tree Mamba states are stored by tree-node position.
-        if self._is_mamba_hybrid_cache is None:
-            self._is_mamba_hybrid_cache = isinstance(
-                attn_metadata.kv_cache_manager, MambaHybridCacheManager
-            )
-        if num_gens > 0 and self._is_mamba_hybrid_cache:
-            accepted_leaf_positions = self._accepted_leaf_intermediate_positions(
-                num_accepted_tokens, num_contexts, num_gens
-            )
-            attn_metadata.kv_cache_manager.update_mamba_states(
+        self._commit_accepted_base_state(
+            SpeculativeAcceptance(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
-                accepted_leaf_positions=accepted_leaf_positions,
+                num_contexts=num_contexts,
+                num_gens=num_gens,
+                leaf_positions=partial(
+                    self._accepted_leaf_intermediate_positions,
+                    num_accepted_tokens,
+                    num_contexts,
+                    num_gens,
+                ),
             )
+        )
 
         # Save attn/spec metadata before the draft loop mutates it. Stashed on
         # self so _ensure_spec_dec_state_restored can undo the mutation if the

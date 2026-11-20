@@ -12,9 +12,9 @@ from tensorrt_llm.logger import logger
 
 from ..attention.backends import AttentionMetadata
 from ..modules.bf16_draft_head import is_plain_mtp_shared_head
-from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
+from ..pyexecutor.resource_manager import (BaseResourceManager, SlotManager,
+                                           SpeculativeAcceptance)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import DraftRowPick, SpecMetadata, SpecWorkerBase
 from .sa_enhancer import SADraftEnhancer
@@ -275,7 +275,6 @@ class MTPWorker(SpecWorkerBase):
         self.mapping = mapping if mapping is not None else getattr(
             model_config, "mapping", None)
         self.is_thop = False
-        self._is_mamba_hybrid_cache = None
         self._row_pick = DraftRowPick("MTP layers")
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if spec_config.sa_config is not None:
@@ -310,30 +309,6 @@ class MTPWorker(SpecWorkerBase):
                 for layer in mtp_layers):
             return None
         return getattr(draft_model, "lm_head", None)
-
-    def _commit_target_mamba_states(
-        self,
-        attn_metadata: AttentionMetadata,
-        num_accepted_tokens: torch.Tensor,
-        batch_size: int,
-    ) -> None:
-        """Promote the target state at each generation request's accepted depth.
-
-        Target verification writes intermediate GDN/Mamba states for every
-        candidate position. The next draft pass must start from the accepted
-        candidate, rather than the last (possibly rejected) position.
-        """
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
-        if self._is_mamba_hybrid_cache is None:
-            self._is_mamba_hybrid_cache = isinstance(
-                attn_metadata.kv_cache_manager, MambaHybridCacheManager)
-        if num_gens > 0 and self._is_mamba_hybrid_cache:
-            attn_metadata.kv_cache_manager.update_mamba_states(
-                attn_metadata=attn_metadata,
-                num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
-            )
 
     def _forward_impl(
         self,
@@ -465,14 +440,14 @@ class MTPWorker(SpecWorkerBase):
 
         # Keep the state written for accepted draft tokens, undo the rest.
         # Must run before the draft pass below, which reads that state back.
-        self._commit_target_mamba_states(attn_metadata, num_accepted_tokens,
-                                         batch_size)
-        if self._auxiliary_state_handlers:
-            self.commit_auxiliary_speculative_states(
-                num_accepted_tokens,
-                attn_metadata.mamba_metadata.state_indices[:batch_size],
-                attn_metadata.num_contexts,
-            )
+        num_contexts = attn_metadata.num_contexts
+        acceptance = SpeculativeAcceptance(
+            attn_metadata=attn_metadata,
+            num_accepted_tokens=num_accepted_tokens,
+            num_contexts=num_contexts,
+            num_gens=batch_size - num_contexts)
+        self._commit_accepted_base_state(acceptance)
+        self._commit_accepted_auxiliary_state(acceptance)
 
         # Update MTP past hidden states
         self.update_mtp_hidden_states(input_ids=input_ids,

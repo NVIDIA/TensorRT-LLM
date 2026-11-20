@@ -30,7 +30,7 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
-from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
+from ..pyexecutor.resource_manager import SpeculativeAcceptance
 from .interface import SpecMetadata, SpecWorkerBase
 from .suffix_automaton import SuffixAutomatonManager
 
@@ -184,15 +184,16 @@ class SAWorker(SpecWorkerBase):
         # recurrent state from the verification scratch buffers into the
         # live pools — verification never writes the pools in place (a
         # rejected draft would corrupt them). Same call site as the other
-        # one-engine workers (dflash/eagle3); no-op for pure-attention
-        # models via the isinstance gate.
-        num_gens = batch_size - num_contexts
-        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
-            attn_metadata.kv_cache_manager.update_mamba_states(
+        # one-engine workers (dflash/eagle3); a cache without recurrent
+        # state ignores it.
+        self._commit_accepted_base_state(
+            SpeculativeAcceptance(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
+                num_contexts=num_contexts,
+                num_gens=batch_size - num_contexts,
             )
+        )
 
         # Step 3-4: Extend SA and generate next draft tokens using GPU kernel
         next_draft_tokens = self._generate_draft_tokens(

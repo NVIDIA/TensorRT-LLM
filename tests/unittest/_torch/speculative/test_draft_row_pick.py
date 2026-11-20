@@ -468,7 +468,6 @@ def _mtp_worker(mapping=None):
     w._auxiliary_state_handlers = []
     w._row_pick = DraftRowPick("test MTP layers")
     w._execute_guided_decoder_if_present = lambda logits: None
-    w._commit_target_mamba_states = lambda *args: None
     w.update_mtp_hidden_states = lambda **kwargs: None
     w.change_attn_metadata = lambda *args: None
     w.get_draft_kv_cache_manager = lambda resource_manager: None

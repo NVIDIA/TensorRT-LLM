@@ -15,7 +15,10 @@ from unittest import mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    CppMambaHybridCacheManager,
+    MixedMambaHybridCacheManager,
+)
 from tensorrt_llm._torch.speculative.sa_worker import SAWorker
 
 
@@ -58,9 +61,17 @@ def _run_forward(worker, attn_metadata, spec_metadata):
     )
 
 
-def test_hybrid_manager_promotes_accepted_states():
+def _make_hybrid_manager(manager_cls):
+    """A hybrid manager of the given class that records the promotion instead of running it."""
+    manager = object.__new__(manager_cls)
+    manager.update_mamba_states = mock.MagicMock()
+    return manager
+
+
+@pytest.mark.parametrize("manager_cls", [MixedMambaHybridCacheManager, CppMambaHybridCacheManager])
+def test_hybrid_manager_promotes_accepted_states(manager_cls):
     worker = _make_worker()
-    manager = mock.MagicMock(spec=MixedMambaHybridCacheManager)
+    manager = _make_hybrid_manager(manager_cls)
     attn_metadata, spec_metadata = _make_metadata(manager, num_seqs=2, num_contexts=0)
 
     result = _run_forward(worker, attn_metadata, spec_metadata)
@@ -75,18 +86,8 @@ def test_hybrid_manager_promotes_accepted_states():
 
 def test_hybrid_manager_context_only_batch_skips_promotion():
     worker = _make_worker()
-    manager = mock.MagicMock(spec=MixedMambaHybridCacheManager)
+    manager = _make_hybrid_manager(MixedMambaHybridCacheManager)
     attn_metadata, spec_metadata = _make_metadata(manager, num_seqs=2, num_contexts=2)
-
-    _run_forward(worker, attn_metadata, spec_metadata)
-
-    manager.update_mamba_states.assert_not_called()
-
-
-def test_pure_attention_manager_skips_promotion():
-    worker = _make_worker()
-    manager = mock.MagicMock()  # not a MambaHybridCacheManager
-    attn_metadata, spec_metadata = _make_metadata(manager, num_seqs=2, num_contexts=0)
 
     _run_forward(worker, attn_metadata, spec_metadata)
 
