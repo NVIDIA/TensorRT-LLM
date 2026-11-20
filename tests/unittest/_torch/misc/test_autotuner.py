@@ -2843,7 +2843,7 @@ def test_parallel_deal_start_is_stable_and_spread():
     assert set(starts) == set(range(group_size)), sorted(set(starts))
 
 
-def test_parallel_builds_set_aside_profiles_built_elsewhere(
+def test_shared_builds_set_aside_profiles_built_elsewhere(
         monkeypatch, tmp_path):
     """With DeepGEMM's builds shared across ranks, a rank runs the profiles it
     claims first. One whose kernel another rank is building is set aside rather
@@ -2880,10 +2880,10 @@ def test_parallel_builds_set_aside_profiles_built_elsewhere(
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    op = "autotuner_test::parallel_builds"
+    op = "autotuner_test::shared_builds"
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, (1, 2, 4, 8)), ),
-                          build_strategy=BuildStrategy.PARALLEL)
+                          build_strategy=BuildStrategy.SHARED)
     real_claim = jit_share.SharedSweep.claim
     # Another rank holds the claim on the last profile (M = 8) and has run it.
     monkeypatch.setattr(jit_share.SharedSweep, "claim",
@@ -2900,7 +2900,7 @@ def test_parallel_builds_set_aside_profiles_built_elsewhere(
     assert jit_share._DEADLINE_ENV not in os.environ
 
 
-def test_parallel_builds_set_aside_a_timed_profile_whose_kernel_is_busy(
+def test_shared_builds_set_aside_a_timed_profile_whose_kernel_is_busy(
         monkeypatch, tmp_path):
     """The ranks split a sweep by profile when its first profile has one tactic.
     A later profile with several tactics is timed, and a tactic whose kernel
@@ -2939,10 +2939,10 @@ def test_parallel_builds_set_aside_a_timed_profile_whose_kernel_is_busy(
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    op = "autotuner_test::parallel_builds_timed_busy"
+    op = "autotuner_test::shared_builds_timed_busy"
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, (1, 2, 4)), ),
-                          build_strategy=BuildStrategy.PARALLEL)
+                          build_strategy=BuildStrategy.SHARED)
     runners = [MixedTacticsRunner()]
     with autotune():
         tuner.choose_one(op, runners, config,
@@ -3351,7 +3351,7 @@ def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path,
     tuner.clear_cache()
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(0, 0,
                                                                   (2, 4)), ),
-                          build_strategy=BuildStrategy.PARALLEL,
+                          build_strategy=BuildStrategy.SHARED,
                           use_build_pool_in_warmup=workers_on)
     with tune_mode_workers.pass_scope(), autotune():
         tuner.choose_one("autotuner_test::build_across_ranks",
@@ -3543,7 +3543,7 @@ def test_default_parallel_jit_warmup_threads(monkeypatch, host_cpus, affinity,
 @pytest.mark.parametrize("sharing", [False, True])
 def test_the_warmup_pool_runs_the_profiles_this_process_claims(
         monkeypatch, tmp_path, sharing):
-    """An op with both parallel_jit_warmup and the PARALLEL build strategy runs
+    """An op with both parallel_jit_warmup and the SHARED build strategy runs
     its sweep on the warmup pool. When the processes share their JIT builds,
     the pool runs only the profiles this process claims; the profiling then
     runs every profile on the calling thread, a profile another process claimed
@@ -3564,7 +3564,7 @@ def test_the_warmup_pool_runs_the_profiles_this_process_claims(
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, buckets), ),
                           parallel_jit_warmup=4,
-                          build_strategy=BuildStrategy.PARALLEL)
+                          build_strategy=BuildStrategy.SHARED)
     x = torch.randn(128, 64, device="cuda")
     w = torch.randn(64, 128, device="cuda")
     caller = threading.get_ident()

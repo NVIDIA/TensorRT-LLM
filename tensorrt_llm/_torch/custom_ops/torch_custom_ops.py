@@ -2353,7 +2353,7 @@ class fp8SwapABGemmRunner(TunableRunner):
     # and inference falls back to a slower uncompiled path.
     # `exclude_from_cache=True` keeps the in-process cache working but
     # ensures the tuning (and the JIT warmup it triggers) repeats on
-    # every process startup. `build_strategy=BuildStrategy.PARALLEL` lets the
+    # every process startup. `build_strategy=BuildStrategy.SHARED` lets the
     # ranks split those builds, instead of each running them on its thread
     # pool, when they share JIT builds (TLLM_JIT_SHARE_DIR, or by default the
     # launch's directory on each node).
@@ -2362,7 +2362,7 @@ class fp8SwapABGemmRunner(TunableRunner):
             0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
-        build_strategy=BuildStrategy.PARALLEL,
+        build_strategy=BuildStrategy.SHARED,
         use_build_pool_in_rehearsal=True,
     )
 
@@ -2419,7 +2419,7 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
-        build_strategy=BuildStrategy.PARALLEL,
+        build_strategy=BuildStrategy.SHARED,
         use_build_pool_in_rehearsal=True,
     )
 

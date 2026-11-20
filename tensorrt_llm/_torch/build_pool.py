@@ -106,15 +106,16 @@ class BuildStrategy(enum.Enum):
     """How the processes of a launch split an op's kernel builds (the autotuner's
     ``TuningConfig.build_strategy``, KernelBuilder's ``BuildConfig.strategy``).
 
-    * ``INDEPENDENT``: each process builds every kernel it needs.
-    * ``PARALLEL``: the processes that share their JIT builds (``TLLM_JIT_SHARE_DIR``, or by
+    * ``PER_RANK``: each process builds every kernel it needs.
+    * ``SHARED``: the processes that share their JIT builds (``TLLM_JIT_SHARE_DIR``, or by
       default the launch's directory on each node; see ``tensorrt_llm._jit_share``) split the
-      builds: the process that claims a kernel builds it, and the others load it. Only for
-      kernels that the other processes can load from where the builder leaves them.
+      builds: the process that claims a kernel builds it, and the others load it. Without a
+      shared directory, as ``PER_RANK``. Only for kernels that the other processes can load
+      from where the builder leaves them.
     """
 
-    INDEPENDENT = "independent"
-    PARALLEL = "parallel"
+    PER_RANK = "per_rank"
+    SHARED = "shared"
 
 
 class Claim(NamedTuple):

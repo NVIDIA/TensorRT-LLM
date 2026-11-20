@@ -361,7 +361,7 @@ def test_a_flashinfer_module_build_goes_to_a_worker_process_in_a_rehearsal_only(
     # Not thread-safe, so a worker process takes it; the ranks that share FlashInfer's JIT
     # directory split the modules.
     assert not config.thread_safe
-    assert config.strategy is kernel_builder.BuildStrategy.PARALLEL
+    assert config.strategy is kernel_builder.BuildStrategy.SHARED
 
 
 @pytest.mark.parametrize(

@@ -52,7 +52,7 @@ def queue_flashinfer_module_build(name: str, gen_spec: Callable[[],
 
     ``gen_spec`` is a module-level function, which the worker imports. With
     shared JIT builds, the ranks that build into the same FlashInfer JIT
-    directory on this host split the modules (``BuildStrategy.PARALLEL``).
+    directory on this host split the modules (``BuildStrategy.SHARED``).
     """
     if not IS_FLASHINFER_AVAILABLE:
         return
@@ -63,7 +63,7 @@ def queue_flashinfer_module_build(name: str, gen_spec: Callable[[],
     if not builder.rehearsing():
         return
     # Not thread-safe: in a rehearsal the build goes to a worker process.
-    config = BuildConfig(strategy=BuildStrategy.PARALLEL,
+    config = BuildConfig(strategy=BuildStrategy.SHARED,
                          share_scope=_jit_dir_scope)
     task = BuildTask(f"{__name__}:build_flashinfer_module", (gen_spec, ))
     builder.build("flashinfer", [(name, task, config)])
