@@ -2348,12 +2348,8 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         # NOTE: Setting disable_fuse_rope to True to do mrope fusion in the model engine by pre-computing rotary_cos_sin in the model engine
         disable_fuse_rope = kwargs.get('disable_fuse_rope', False)
         model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
-        # transformers>=5 ``Qwen2VLTextConfig`` / ``Qwen2_5_VLTextConfig``
-        # define no ``tie_word_embeddings``, and real checkpoints set it only
-        # on the top-level config. The LM below is built from ``text_config``,
-        # so a tied checkpoint (no ``lm_head.weight``, e.g. Qwen2.5-VL-3B)
-        # would leave lm_head untied and unloaded. Mirror the top-level value
-        # onto ``text_config`` to stay aligned.
+        # Checkpoints set tie_word_embeddings only at the top level, but the LM
+        # is built from text_config, which lacks it in transformers>=5.
         text_config = getattr(model_config.pretrained_config, 'text_config',
                               None)
         if text_config is not None:
