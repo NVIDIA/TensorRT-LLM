@@ -1616,6 +1616,7 @@ class ModelLoader:
             # prior to zero-copy mapping, then refreshes derived state after
             # real GMS tensors are bound.
             if load_format != LoadFormat.GMS:
+                torch.cuda.empty_cache()
                 checkpoint_loader.post_load_apply(
                     model, weights_preloaded=weights_preloaded)
                 mx_loading.run_post_load_walks_and_publish(
