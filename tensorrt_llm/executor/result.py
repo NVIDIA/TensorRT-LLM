@@ -1563,7 +1563,7 @@ def _build_perf_metrics_dict(
 ) -> dict[RequestEventTiming, float]:
     if not (req_perf_metrics and req_perf_metrics.timing_metrics):
         return {}
-    return {
+    metrics = {
         RequestEventTiming.ARRIVAL_TIME:
         req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
         RequestEventTiming.FIRST_TOKEN_TIME:
@@ -1579,6 +1579,11 @@ def _build_perf_metrics_dict(
         RequestEventTiming.KV_CACHE_SIZE:
         req_perf_metrics.timing_metrics.kv_cache_size,
     }
+    local_size = getattr(req_perf_metrics.timing_metrics,
+                         "kv_cache_transfer_local_size", None)
+    if local_size is not None:
+        metrics[RequestEventTiming.KV_CACHE_TRANSFER_LOCAL_SIZE] = local_size
+    return metrics
 
 
 def get_metrics_dict(

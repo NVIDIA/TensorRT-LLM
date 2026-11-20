@@ -28,6 +28,7 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace tr = tensorrt_llm::runtime;
@@ -130,6 +131,29 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         // No speculative decoding config, draft tokens should be empty
         EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
     }
+}
+
+TEST_F(LlmRequestTest, parallelCacheReceiveAccumulatesBothByteCounts)
+{
+    tb::LlmRequest request(77, texec::Request(VecTokens{1, 2, 3}, 1));
+    auto const addBytes = [&request](size_t bytes)
+    {
+        for (int i = 0; i < 4096; ++i)
+        {
+            request.updateKvCacheSize(bytes);
+        }
+    };
+    addBytes(64);
+    addBytes(256);
+    auto const serialBytes = request.getKvCacheSize();
+    EXPECT_EQ(serialBytes, 4096 * (64 + 256));
+
+    request.setKvCacheSize(0);
+    {
+        std::jthread attention(addBytes, 64);
+        std::jthread recurrent(addBytes, 256);
+    }
+    EXPECT_EQ(request.getKvCacheSize(), serialBytes);
 }
 
 TEST_F(LlmRequestTest, extraIdsWithoutPromptTuning)

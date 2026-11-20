@@ -460,7 +460,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
 
     // Calibrate steady_clock across ranks so that cross-node allgather
-    // in batchUpdateKVCacheTransferBW can compare time points.
+    // in batchGenTransferSummary can compare time points.
     // globalSteadyClockOffset() reads a single process-global copy shared with
     // the nanobind module, so if the Python runtime already calibrated the offset
     // (PyExecutor::_set_global_steady_clock_offset) it is visible here and we skip;
@@ -934,6 +934,7 @@ void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequ
             requestId, contextRequestId);
         return;
     }
+    llmRequest->setKvCacheTransferLocalSize(llmRequest->getKvCacheSize());
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 }
 
@@ -988,7 +989,7 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     return retData;
 }
 
-std::vector<size_t> batchUpdateKVCacheTransferBW(
+std::vector<executor::DisServingRequestStats> batchGenTransferSummary(
     std::shared_ptr<CacheTransceiverComm> const& comm, std::vector<LlmRequest*> const& requests)
 {
     // Key-based merge: each rank serializes (requestId, start, end, size)
@@ -1080,18 +1081,17 @@ std::vector<size_t> batchUpdateKVCacheTransferBW(
         }
     }
 
-    // Update request timing. The byte totals across receivers belong to the CSV.
-    std::vector<size_t> summarySizes;
-    summarySizes.reserve(requests.size());
+    std::vector<executor::DisServingRequestStats> summary;
+    summary.reserve(requests.size());
     for (auto* req : requests)
     {
         auto reqId = req->getContextPhaseParams().value().getReqId();
         auto const& entry = merged.at(reqId);
-        req->setKvCacheTransferStart(entry.minStart);
-        req->setKvCacheTransferEnd(entry.maxEnd);
-        summarySizes.push_back(entry.totalSize);
+        req->setKvCacheSize(entry.totalSize);
+        auto const ms = std::chrono::duration<double, std::milli>(entry.maxEnd - entry.minStart).count();
+        summary.push_back({ms, entry.totalSize});
     }
-    return summarySizes;
+    return summary;
 }
 
 RequestStatuses CacheTransceiver::checkContextTransferStatus(
@@ -1349,6 +1349,10 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         if (requestIt == mSenderRequestsAwaitingConsensus.end())
         {
             continue;
+        }
+        if (mTimedOutSenderIds.count(requestId))
+        {
+            requestIt->second->setKvCacheTransferTimedOut();
         }
         requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
         requestsStatus.errorRequestIds.insert(requestId);
@@ -1612,6 +1616,10 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             requestIt->second->setKvCacheTransferTimedOut();
         }
+        else
+        {
+            requestIt->second->markKvCacheTransferFailed();
+        }
         requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
         mTimedOutRequesterIds.erase(requestId);
         mCancelRequestedRequesterIds.erase(requestId);
@@ -1629,6 +1637,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             continue;
         }
+        requestIt->second->setKvCacheTransferLocalSize(requestIt->second->getKvCacheSize());
         requestIt->second->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
         completedRequests.push_back(requestIt->second.get());
         mTimedOutRequesterIds.erase(requestId);
@@ -1642,12 +1651,12 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     // the gen-side transfer summary CSV.
     if (!completedRequests.empty() && !common::getEnvKVCacheTimeOutputPath().empty())
     {
-        writeGenTransferSummary(completedRequests, batchUpdateKVCacheTransferBW(syncComm, completedRequests));
+        writeGenTransferSummary(completedRequests, batchGenTransferSummary(syncComm, completedRequests));
     }
 }
 
 void CacheTransceiver::writeGenTransferSummary(
-    std::vector<LlmRequest*> const& completedRequests, std::vector<size_t> const& summarySizes)
+    std::vector<LlmRequest*> const& completedRequests, std::vector<executor::DisServingRequestStats> const& summary)
 {
     std::lock_guard<std::mutex> lock(mGenTransferSummaryMutex);
     if (!mGenTransferSummaryFile.is_open())
@@ -1666,7 +1675,8 @@ void CacheTransceiver::writeGenTransferSummary(
     {
         auto* req = completedRequests[i];
         auto reqId = req->getContextPhaseParams().value().getReqId();
-        mGenTransferSummaryFile << reqId << "," << req->getKvCacheTransferTimeMS() << "," << summarySizes[i] << '\n';
+        mGenTransferSummaryFile << reqId << "," << summary[i].kvCacheTransferMS << "," << summary[i].kvCacheSize
+                                << '\n';
     }
     mGenTransferSummaryFile << std::flush;
 }
@@ -1691,11 +1701,28 @@ bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
     }
     if (llmRequest->isContextOnlyRequest())
     {
-        return mCacheSender->cancelRequest(*llmRequest);
+        if (mCacheSender->cancelRequest(*llmRequest))
+        {
+            llmRequest->markKvCacheTransferCancelled();
+            return true;
+        }
     }
     else if (llmRequest->isGenerationOnlyRequest())
     {
-        return mCacheReceiver->cancelRequest(*llmRequest);
+        auto const requestId = llmRequest->mRequestId;
+        auto const future = std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
+            [requestId](auto const& entry) { return entry.first->mRequestId == requestId; });
+        if (mRequesterRequestsAwaitingConsensus.count(requestId)
+            || (future != mRequesterFutures.end()
+                && future->second.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready))
+        {
+            return false;
+        }
+        if (mCacheReceiver->cancelRequest(*llmRequest))
+        {
+            llmRequest->markKvCacheTransferCancelled();
+            return true;
+        }
     }
     return false;
 }

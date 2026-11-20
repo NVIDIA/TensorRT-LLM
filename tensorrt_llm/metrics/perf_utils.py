@@ -113,7 +113,10 @@ def process_req_perf_metrics(
         and math.isfinite(transfer_end)
     ):
         stat[MetricNames.KV_CACHE_TRANSFER_TIME] = transfer_end - transfer_start
-    transfer_bytes = req_perf_metrics_dict.get(RequestEventTiming.KV_CACHE_SIZE, 0)
+    transfer_bytes = req_perf_metrics_dict.get(
+        RequestEventTiming.KV_CACHE_TRANSFER_LOCAL_SIZE,
+        req_perf_metrics_dict.get(RequestEventTiming.KV_CACHE_SIZE, 0),
+    )
     if transfer_bytes > 0 and math.isfinite(transfer_bytes):
         stat[MetricNames.KV_CACHE_TRANSFER_BYTES] = transfer_bytes
 

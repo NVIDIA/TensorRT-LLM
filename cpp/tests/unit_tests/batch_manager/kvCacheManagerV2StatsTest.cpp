@@ -2129,9 +2129,30 @@ TEST(KvCacheManagerV2StatsTest, GpuOnlyCacheDoesNotCountHostDrops)
     auto config = makeHybridTieredConfig();
     config.cacheTiers.pop_back();
     auto manager = std::make_shared<KvCacheManager>(config);
-    auto [first, second] = evictFirstSequence(*manager, stream, 0);
+    auto const tokens = makeTokens(*manager, 0);
+    auto first = manager->createKvCache();
+    ASSERT_TRUE(first->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(first->resize(static_cast<int>(tokens.size())));
+    first->commit(toSpan(tokens));
+    first->close();
+    manager->getAndResetIterationStats();
+
+    auto countDrops = [&]
+    {
+        int64_t total = 0;
+        for (auto const& pool : manager->getStorageStatistics(kHotLevel))
+        {
+            total += pool.movement.capacityDroppedBlocks;
+        }
+        return total;
+    };
+    auto const before = countDrops();
+    auto second = manager->createKvCache();
+    ASSERT_TRUE(second->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(second->resize(static_cast<int>(tokens.size())));
 
     auto const dropped = manager->getAndResetIterationStats();
+    EXPECT_GT(countDrops(), before);
     ASSERT_FALSE(dropped.empty());
     for (auto const& [lifeCycle, stats] : dropped)
     {
@@ -2139,7 +2160,6 @@ TEST(KvCacheManagerV2StatsTest, GpuOnlyCacheDoesNotCountHostDrops)
         EXPECT_EQ(stats.iterHostDroppedBytes, 0) << "life cycle " << lifeCycle.value();
     }
     second->close();
-    first->close();
     EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 

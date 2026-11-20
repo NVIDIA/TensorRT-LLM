@@ -414,6 +414,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
                 totalBytesRecv += recvBuffers[t]->getSizeInBytes();
                 session.recv(connIdx, recvBuffers[t]->data(), recvBuffers[t]->getSizeInBytes());
             }
+            llmRequest.updateKvCacheSize(totalBytesRecv);
 
             // Split each recvBuffer into SSM and conv portions for concat kernels.
             std::vector<runtime::ITensor::SharedPtr> ssmInputBuffers(numSources);

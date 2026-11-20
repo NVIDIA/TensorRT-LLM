@@ -222,7 +222,8 @@ class TestRequestTransferMetrics:
         stats = {
             RequestEventTiming.KV_CACHE_TRANSFER_START: 10.0,
             RequestEventTiming.KV_CACHE_TRANSFER_END: 10.003,
-            RequestEventTiming.KV_CACHE_SIZE: 1024,
+            RequestEventTiming.KV_CACHE_SIZE: 2048,
+            RequestEventTiming.KV_CACHE_TRANSFER_LOCAL_SIZE: 1024,
         }
         for sequence_index in [0, 1]:
             result.record_stats(output, stats, sequence_index)
