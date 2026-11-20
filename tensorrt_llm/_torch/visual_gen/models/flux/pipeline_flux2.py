@@ -116,6 +116,9 @@ class Flux2Pipeline(BasePipeline):
 
     supports_image_edit = True
     derive_output_size_from_reference = True
+    # Text is padded to max_sequence_length, so a warmup shape covers its block graph keys
+    # (reference images add keys warmup does not cover; those run without graphs).
+    supports_blockwise_cuda_graphs = True
 
     @property
     def supports_dynamic_batching(self) -> bool:

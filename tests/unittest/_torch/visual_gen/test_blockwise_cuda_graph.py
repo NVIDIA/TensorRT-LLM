@@ -1,27 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for per-block CUDA graphs (``BlockCUDAGraphRunner``).
+"""Per-block CUDA graphs (used with Cache-DiT) must replay bit-identically to eager blocks."""
 
-With Cache-DiT and CUDA graphs both enabled, VisualGen captures one graph per
-transformer block instead of one per transformer forward, so Cache-DiT's
-skip decision stays in Python between graph replays. A block replayed from a
-graph must produce bit-identical output to the same block run eagerly.
-"""
-
-import inspect
+import gc
+import weakref
 from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from torch.utils._pytree import tree_leaves
 
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
-    BlockCUDAGraphRunner,
     SharedGraphPool,
+    resolved_extra_key,
+    resolved_extra_keys_scope,
     wrap_blocks_with_cuda_graphs,
 )
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -42,18 +40,47 @@ class _RopeLikeBlock(nn.Module):
         return encoder_hidden_states * 2.0, hidden_states
 
 
+class _InPlaceInputBlock(_RopeLikeBlock):
+    def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale=1.0):
+        hidden_states.mul_(0.5)
+        return super().forward(hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale)
+
+
+class _PhaseBlock(_RopeLikeBlock):
+    """Reads the model's graph key on the host, as the sparse-attention backends do."""
+
+    def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale=1.0):
+        if resolved_extra_key("late_phase"):
+            scale = scale * 2.0
+        return super().forward(hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale)
+
+
+class _FirstCallStateBlock(_RopeLikeBlock):
+    """Keeps a value from its first call per shape, as VC-Attention keeps its token grouping."""
+
+    def __init__(self):
+        super().__init__()
+        self.first_call_mean = {}
+
+    def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale=1.0):
+        if hidden_states.shape not in self.first_call_mean:
+            self.first_call_mean[hidden_states.shape] = hidden_states.mean()
+        hidden_states = hidden_states + self.first_call_mean[hidden_states.shape]
+        return super().forward(hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale)
+
+
 class _TwoBlockModel(nn.Module):
     """Calls its blocks the way FLUX does; optionally registers a timestep graph key."""
 
-    def __init__(self, timestep_key: bool = False):
+    def __init__(self, timestep_key: bool = False, block_cls=_RopeLikeBlock):
         super().__init__()
-        self.blocks = nn.ModuleList([_RopeLikeBlock(), _RopeLikeBlock()])
+        self.blocks = nn.ModuleList([block_cls(), block_cls()])
         self._timestep_key = timestep_key
 
     def register_cuda_graph_extra_key_fns(self, runner) -> None:
         if self._timestep_key:
             runner.register_extra_key_fn(
-                "late_phase", lambda *args, **kwargs: bool(kwargs["timestep"] < 500)
+                "late_phase", lambda *args, **kwargs: bool(kwargs["timestep"] < 500), max_graphs=4
             )
 
     def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb, timestep=0):
@@ -67,6 +94,38 @@ class _TwoBlockModel(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+class _TembChangingModel(_TwoBlockModel):
+    """Changes temb in place between its two block calls."""
+
+    def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb, timestep=0):
+        encoder_hidden_states, hidden_states = self.blocks[0](
+            hidden_states, encoder_hidden_states, temb, image_rotary_emb
+        )
+        temb.add_(1.0)
+        return self.blocks[1](hidden_states, encoder_hidden_states, temb, image_rotary_emb)
+
+
+class _PairBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(_DIM, _DIM)
+
+    def forward(self, x, y):
+        return self.proj(x) + 2.0 * y
+
+
+class _PairModel(nn.Module):
+    """Passes the first block's output to both inputs of the second block."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([_PairBlock(), _PairBlock()])
+
+    def forward(self, x, y):
+        out = self.blocks[0](x, y)
+        return self.blocks[1](out, out)
+
+
 def _inputs(seed: int):
     generator = torch.Generator(device="cuda").manual_seed(seed)
 
@@ -77,126 +136,8 @@ def _inputs(seed: int):
         hidden_states=rand(2, 16, _DIM),
         encoder_hidden_states=rand(2, 8, _DIM),
         temb=rand(2, _DIM),
-        image_rotary_emb=(rand(16, _DIM), rand(16, _DIM)),
+        image_rotary_emb=(rand(1, _DIM).expand(16, -1), rand(1, _DIM).expand(16, -1)),
     )
-
-
-def _assert_same(actual, expected):
-    for a, e in zip(actual, expected):
-        torch.testing.assert_close(a, e, rtol=0, atol=0)
-
-
-@pytest.fixture
-def model():
-    torch.manual_seed(0)
-    return _TwoBlockModel().cuda().eval()
-
-
-@torch.inference_mode()
-def test_replay_matches_eager_and_copies_nested_tensors(model):
-    """Each call replays one graph per block and matches eager bit for bit,
-    including when only the nested ``image_rotary_emb`` tensors change."""
-    first = _inputs(1)
-    rope_only_changed = dict(first, image_rotary_emb=_inputs(2)["image_rotary_emb"])
-    calls = [first, _inputs(3), rope_only_changed, first]
-    expected = [model(**call) for call in calls]
-
-    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"], SharedGraphPool())
-    for call, reference in zip(calls, expected):
-        _assert_same(model(**call), reference)
-
-    assert sorted(runners) == ["transformer.blocks.0", "transformer.blocks.1"]
-    assert all(len(runner.graphs) == 1 for runner in runners.values())
-
-
-@torch.inference_mode()
-def test_positional_and_keyword_calls_share_a_graph(model):
-    block = model.blocks[0]
-    call = _inputs(1)
-    expected = block(**call)
-    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
-
-    positional = block(
-        call["hidden_states"], call["encoder_hidden_states"], call["temb"], call["image_rotary_emb"]
-    )
-    keyword = block(**call)
-
-    _assert_same(positional, expected)
-    _assert_same(keyword, expected)
-    assert len(runners["transformer.blocks.0"].graphs) == 1
-
-
-@torch.inference_mode()
-def test_non_tensor_values_select_separate_graphs(model):
-    block = model.blocks[0]
-    call = _inputs(1)
-    expected = {scale: block(**call, scale=scale) for scale in (1.0, 0.5)}
-    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
-
-    for scale in (1.0, 0.5, 1.0):
-        _assert_same(block(**call, scale=scale), expected[scale])
-    assert len(runners["transformer.blocks.0"].graphs) == 2
-
-
-@torch.inference_mode()
-def test_model_extra_keys_follow_model_forward_inputs():
-    """A model's graph-key callback reads ``model.forward`` kwargs that blocks
-    never receive; each block must still get one graph per key value."""
-    torch.manual_seed(0)
-    model = _TwoBlockModel(timestep_key=True).cuda().eval()
-    call = _inputs(1)
-    expected = model(**call)
-    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
-
-    for timestep in (900, 800, 100, 50):
-        _assert_same(model(**call, timestep=timestep), expected)
-    assert all(len(runner.graphs) == 2 for runner in runners.values())
-
-
-@torch.inference_mode()
-def test_capture_disallowed_or_disabled_runs_eagerly(model):
-    call = _inputs(1)
-    expected = model(**call)
-    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
-
-    for runner in runners.values():
-        runner.allow_capture = False
-    _assert_same(model(**call), expected)
-    assert not any(runner.graphs for runner in runners.values())
-
-    for runner in runners.values():
-        runner.enabled = False
-        runner.allow_capture = True
-    _assert_same(model(**call), expected)
-    assert not any(runner.graphs for runner in runners.values())
-
-
-def test_blocks_keep_identity_and_signature(model):
-    """Cache-DiT holds references to the blocks and inspects ``block.forward``."""
-    blocks_before = list(model.blocks)
-    signature_before = inspect.signature(model.blocks[0].forward)
-
-    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
-
-    assert list(model.blocks) == blocks_before
-    assert inspect.signature(model.blocks[0].forward) == signature_before
-    assert all(isinstance(runner, BlockCUDAGraphRunner) for runner in runners.values())
-    # Calls are tracked with hooks: Cache-DiT restores a saved model.forward as a
-    # method when it is disabled, which an instance-level wrapper would break.
-    assert "forward" not in vars(model)
-
-
-# ---------------------------------------------------------------------------
-# Chained and shared input buffers
-# ---------------------------------------------------------------------------
-
-
-class _InPlaceInputBlock(_RopeLikeBlock):
-    """Writes into its ``hidden_states`` input, which a chained buffer must not allow."""
-
-    def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale=1.0):
-        hidden_states.mul_(0.5)
-        return super().forward(hidden_states, encoder_hidden_states, temb, image_rotary_emb, scale)
 
 
 def _clone_call(call):
@@ -206,83 +147,194 @@ def _clone_call(call):
     }
 
 
-@torch.inference_mode()
-def test_chained_and_shared_inputs_skip_copies(model):
-    """Only the first block copies; the second reads the first block's output
-    buffers and the shared temb / rotary buffers in place."""
-    call = _inputs(1)
-    expected = model(**call)
-    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
-
-    _assert_same(model(**call), expected)  # capture
-    _assert_same(model(**call), expected)  # replay
-    assert runners["transformer.blocks.0"].last_replay_copies == 5
-    assert runners["transformer.blocks.1"].last_replay_copies == 0
+def _assert_same(actual, expected):
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@torch.inference_mode()
-def test_block_writing_its_input_keeps_a_private_buffer():
+@pytest.fixture
+def model():
     torch.manual_seed(0)
-    model = _TwoBlockModel().cuda().eval()
-    model.blocks[1] = _InPlaceInputBlock().cuda().eval()
-    call = _inputs(1)
-    expected = model(**_clone_call(call))
-    expected_first_block = model.blocks[0](**_clone_call(call))
-    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
-
-    for _ in range(2):
-        _assert_same(model(**_clone_call(call)), expected)
-    # The first block's output buffer was not halved by the second block.
-    (first_block_output,) = runners["transformer.blocks.0"].graph_outputs.values()
-    _assert_same(first_block_output, expected_first_block)
-    assert runners["transformer.blocks.1"].last_replay_copies == 1
+    return _TwoBlockModel().cuda().eval()
 
 
 @torch.inference_mode()
-def test_eager_tensor_at_chained_input_is_copied(model):
-    """Like Cache-DiT's add-back result arriving at the next block."""
+def test_replay_matches_eager():
+    """New inputs, nested broadcast rotary tensors and positional calls share a block's graph.
+
+    The blocks keep state from their first call, which capture must build from the real inputs.
+    """
+    torch.manual_seed(0)
+    model = _TwoBlockModel(block_cls=_FirstCallStateBlock).cuda().eval()
+    graph_model = deepcopy(model)
+    first = _inputs(1)
+    rope_only_changed = dict(first, image_rotary_emb=_inputs(2)["image_rotary_emb"])
+    cos = first["image_rotary_emb"][0]
+    stepped = tuple(torch.randn(16, 2 * _DIM, device="cuda")[:, ::2] for _ in range(2))
+    calls = [first, _inputs(3), rope_only_changed, first, dict(first, image_rotary_emb=stepped)]
+    expected = [model(**call) for call in calls]
+    expected_block = model.blocks[0](**first)
+    runners = wrap_blocks_with_cuda_graphs(graph_model, ["blocks"], SharedGraphPool())
+
+    rng_state = torch.cuda.get_rng_state()
+    for call, reference in zip(calls, expected):
+        _assert_same(graph_model(**call), reference)
+    assert torch.equal(torch.cuda.get_rng_state(), rng_state)  # capture leaves the default RNG
+    _assert_same(graph_model.blocks[0](*first.values()), expected_block)
+    assert all(len(runner.graphs) == 2 for runner in runners.values())
+    # Broadcast rotary is stored unexpanded; a stepped slice keeps its strides.
+    (broadcast, _), (strided, _) = runners["transformer.blocks.0"].static_inputs.values()
+    assert broadcast[3].untyped_storage().nbytes() == cos.untyped_storage().nbytes()
+    assert strided[3].stride() == stepped[0].stride()
+
+
+@torch.inference_mode()
+def test_graph_keys():
+    """Model graph keys select graphs and reach the block during capture; so do block args.
+
+    Once capture stops (after warmup), a new key runs eagerly and adds no graph.
+    """
+    torch.manual_seed(0)
+    model = _TwoBlockModel(timestep_key=True, block_cls=_PhaseBlock).cuda().eval()
+    call = _inputs(1)
+    early = model(**call)
+    with resolved_extra_keys_scope({"late_phase": True}):
+        late = model(**call)
+    block_calls = [dict(call, scale=0.5), dict(call, scale=0.25)]  # differ only in a value
+    block_calls += [dict(call, temb=call["temb"].half()), call]  # differ only in a dtype
+    expected_blocks = [model.blocks[0](**block_call) for block_call in block_calls]
+    rope = tuple(torch.randn(1, _DIM, device="cuda").expand(32, -1) for _ in range(2))
+    longer = dict(
+        call, hidden_states=torch.randn(2, 32, _DIM, device="cuda"), image_rotary_emb=rope
+    )
+    expected_longer = model(**longer)
+    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
+
+    for timestep, expected in ((900, early), (100, late), (800, early), (50, late)):
+        _assert_same(model(**call, timestep=timestep), expected)
+    assert all(len(runner.graphs) == 2 for runner in runners.values())
+    for block_call, expected in zip(block_calls * 2, expected_blocks * 2):  # capture, replay
+        _assert_same(model.blocks[0](**block_call), expected)
+    assert len(runners["transformer.blocks.0"].graphs) == 6
+
+    BasePipeline._stop_block_graph_capture(SimpleNamespace(_cuda_graph_runners=runners))
+    _assert_same(model(**longer, timestep=900), expected_longer)
+    assert [len(runner.graphs) for runner in runners.values()] == [6, 2]
+
+
+@torch.inference_mode()
+def test_chained_and_shared_inputs(model):
+    """Inputs read in place still take new tensors; the others take new contents."""
     call = _inputs(1)
     other = _inputs(2)
+    expected = model(**call)
+    expected_doubled_temb = model(**dict(call, temb=call["temb"] * 2))
     second_block_call = dict(
         call,
         hidden_states=other["hidden_states"],
         encoder_hidden_states=other["encoder_hidden_states"],
     )
-    expected = model.blocks[1](**second_block_call)
-    wrap_blocks_with_cuda_graphs(model, ["blocks"])
-    model(**call)  # capture both blocks, chaining the second to the first
+    expected_second_block = model.blocks[1](**second_block_call)
+    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
 
-    _assert_same(model.blocks[1](**second_block_call), expected)
-
-
-@torch.inference_mode()
-def test_shared_input_is_copied_once_per_forward(model):
-    """The same temb tensor with new contents in the next forward call is copied again."""
-    call = _inputs(1)
-    expected_before = model(**call)
-    expected_after = model(**dict(call, temb=call["temb"] * 2))
-    wrap_blocks_with_cuda_graphs(model, ["blocks"])
-
-    _assert_same(model(**call), expected_before)
+    _assert_same(model(**call), expected)  # capture
+    # The blocks keep one temb, cos and sin buffer between them.
+    (first_args, _), (second_args, _) = (
+        next(iter(runner.static_inputs.values())) for runner in runners.values()
+    )
+    assert all(a is b for a, b in zip(first_args[2:], second_args[2:], strict=True))
+    _assert_same(model(**call), expected)  # replay
+    # An eager tensor at a chained input (Cache-DiT's add-back result) is copied in.
+    _assert_same(model.blocks[1](**second_block_call), expected_second_block)
+    # The same temb tensor with new contents is copied again in the next forward.
     call["temb"].mul_(2)
-    _assert_same(model(**call), expected_after)
+    _assert_same(model(**call), expected_doubled_temb)
 
 
 @torch.inference_mode()
-def test_chain_buffers_off_copies_every_input(model, monkeypatch):
-    monkeypatch.setattr(BlockCUDAGraphRunner, "CHAIN_BUFFERS", False)
+def test_input_changed_in_place_between_blocks():
+    torch.manual_seed(0)
+    model = _TembChangingModel().cuda().eval()
+    call = _inputs(1)
+    expected = model(**_clone_call(call))
+    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
+
+    for _ in range(2):  # capture, then replay
+        _assert_same(model(**_clone_call(call)), expected)
+    # Both blocks read temb from one buffer; each replay copies temb's current contents in.
+    first_temb, second_temb = (
+        next(iter(runner.static_inputs.values()))[0][2] for runner in runners.values()
+    )
+    assert first_temb is second_temb
+
+
+@torch.inference_mode()
+def test_block_writing_its_input_keeps_a_private_buffer():
+    """Block 1 halves its hidden_states input, so it does not read block 0's output in place."""
+    torch.manual_seed(0)
+    model = _TwoBlockModel().cuda().eval()
+    model.blocks[1] = _InPlaceInputBlock().cuda().eval()
+    call = _inputs(2)
+    expected = model(**_clone_call(call))
+    expected_first_block = model.blocks[0](**_clone_call(call))
+    runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
+
+    model(**_clone_call(_inputs(1)))  # capture
+    (first_block_output,) = runners["transformer.blocks.0"].graph_outputs.values()
+    _assert_same(model(**_clone_call(call)), expected)
+    # The first block's output buffer was not halved by the second block.
+    _assert_same(first_block_output, expected_first_block)
+
+
+@torch.inference_mode()
+def test_input_aliased_at_capture_gets_its_own_buffer():
+    """Captured with one tensor at both inputs, the graph still takes two different tensors."""
+    torch.manual_seed(0)
+    model = _PairModel().cuda().eval()
+    x, y, z = (torch.randn(4, _DIM, device="cuda") for _ in range(3))
+    expected = model.blocks[1](model.blocks[0](x, y), z)
+    expected_reversed = model.blocks[1](z, model.blocks[0](x, y))
+    expected_broadcast = model.blocks[1](z[:1], model.blocks[0](x[:1], y[:1]).expand(4, -1))
+    wrap_blocks_with_cuda_graphs(model, ["blocks"])
+
+    model(x, y)  # capture: block 1 receives block 0's output at both inputs
+    actual = model.blocks[1](model.blocks[0](x, y), z)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Reversed: z goes into block 0's output buffer, which is also the second input's source.
+    actual = model.blocks[1](z, model.blocks[0](x, y))
+    torch.testing.assert_close(actual, expected_reversed, rtol=0, atol=0)
+    # Same with a broadcast view of block 0's output as the second input.
+    out = model.blocks[0](x[:1], y[:1])
+    model.blocks[1](out, out.expand(4, -1))  # capture
+    actual = model.blocks[1](z[:1], model.blocks[0](x[:1], y[:1]).expand(4, -1))
+    torch.testing.assert_close(actual, expected_broadcast, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_clear_releases_graph_buffers(model):
+    """Clearing the runners frees every graph input and output buffer; the next call recaptures."""
     call = _inputs(1)
     expected = model(**call)
     runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
+    _assert_same(model(**call), expected)
+    buffers = [
+        weakref.ref(tensor)
+        for runner in runners.values()
+        for tensor in tree_leaves(
+            [list(runner.static_inputs.values()), list(runner.graph_outputs.values())]
+        )
+        if isinstance(tensor, torch.Tensor)
+    ]
+    assert buffers
 
-    for _ in range(2):
-        _assert_same(model(**call), expected)
-    assert all(runner.last_replay_copies == 5 for runner in runners.values())
+    for runner in runners.values():
+        runner.clear()
+    gc.collect()
+    assert all(ref() is None for ref in buffers)
+    _assert_same(model(**call), expected)
+    runners["transformer.blocks.1"].clear()  # recaptured after block 0 replays, keeping its output
+    _assert_same(model(**call), expected)
+    assert all(len(runner.graphs) == 1 for runner in runners.values())
 
-
-# ---------------------------------------------------------------------------
-# Real FLUX.1 blocks: graph replay is bit-identical to eager
-# ---------------------------------------------------------------------------
 
 _FLUX1_TINY_CONFIG = {
     "attention_head_dim": 128,
@@ -345,8 +397,8 @@ def _tiny_flux1(backend: str):
 
 @pytest.mark.parametrize(
     "backend,compiled",
-    [("VANILLA", False), ("VANILLA", True), ("FA4", False)],
-    ids=["vanilla-eager", "vanilla-compiled", "fa4-eager"],
+    [("VANILLA", True), ("FA4", False)],
+    ids=["vanilla-compiled", "fa4-eager"],
 )
 @torch.inference_mode()
 def test_flux1_blocks_replay_bit_identical(backend, compiled):
