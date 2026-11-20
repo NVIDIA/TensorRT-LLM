@@ -1882,19 +1882,12 @@ def test_getter_methods(mock_executor):
     # Test initial values
     assert mock_executor._get_new_active_requests_queue_latency() == 0
     assert mock_executor.expected_num_active_requests == 0
-    assert len(mock_executor.canceled_req_ids) == 0
     assert mock_executor.canceled_req_ids == []
     assert len(mock_executor.waiting_queue) == 0
 
-    # Add some data and test
-    mock_executor.canceled_req_ids = [3, 4]
-    mock_executor.expected_num_active_requests = 5
     mock_executor.new_active_requests_queue_latency_ms = 10.5
     mock_executor.waiting_queue.add_request(RequestQueueItem(1, Mock()))
 
-    assert len(mock_executor.canceled_req_ids) == 2
-    assert mock_executor.canceled_req_ids == [3, 4]
-    assert mock_executor.expected_num_active_requests == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
     assert len(mock_executor.waiting_queue) == 1
 

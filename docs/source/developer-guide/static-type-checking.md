@@ -79,9 +79,11 @@ each change:
    pre-commit run
    ```
 
-4. Review diagnostics and [the type-check report](#read-the-report), including
-   advisory findings from hooks that return success. Fix failures and repeat
-   until blocking checks pass and advisory findings have been reviewed.
+4. Review the hook diagnostics, including advisory findings from hooks that
+   return success. Read [the type-check report](#read-the-report) when the
+   current run prints its path. If the hook was skipped and you need a fresh
+   report, run `bash scripts/run_pyrefly.sh --full-project`. Fix failures and
+   rerun the checks.
 
 `pre-commit run` selects staged files. `pre-commit run --all-files` selects all
 tracked files. Pre-commit skips the `type-check` hook when none of the selected
