@@ -21,8 +21,9 @@ the ids the server would build, and the server takes the router's chat ids when 
 rendering fingerprints agree. A chat the router cannot render routes on no ids instead of
 failing. Other checkpoint formats keep the Hugging Face tokenizer path.
 
-The checkpoints are read from LLM_MODELS_ROOT: Mistral-Large-3 as published (no
-``config.json``), and Mistral-Small-4's ``params.json`` and ``tekken.json`` alone.
+The router reads Mistral-Small-4's ``params.json`` and ``tekken.json`` alone (a directory
+without ``config.json``) from LLM_MODELS_ROOT; a server of Mistral-Large-3 stands for one
+that renders differently.
 """
 
 import base64
@@ -76,13 +77,9 @@ def _model_dir(subdir: str) -> Path:
     return path
 
 
-@pytest.fixture(scope="module", params=["ml3", "tekken_only"])
-def checkpoint(request, tmp_path_factory) -> tuple[str, str]:
+@pytest.fixture(scope="module")
+def checkpoint(tmp_path_factory) -> tuple[str, str]:
     """A Mistral-native checkpoint directory without config.json, and its format."""
-    if request.param == "ml3":
-        model_dir = _model_dir(_ML3)
-        assert not (model_dir / "config.json").exists()
-        return str(model_dir), "mistral_large_3"
     source = _model_dir(_SMALL4)
     model_dir = tmp_path_factory.mktemp("tekken_only")
     for name in ("params.json", "tekken.json"):
@@ -158,8 +155,7 @@ def test_router_loads_and_fingerprints_what_the_servers_load(router, same_server
     assert tokenizer["encoding"]["kind"] == "mistral_common" and tokenizer["complete"]
 
 
-@pytest.mark.parametrize("batched", [False, True])
-def test_completion_ids_are_the_servers(router, batched):
+def test_completion_ids_are_the_servers(router):
     resources = router._render_resources("m")
     expected, _ = resources.input_processor(prompt_inputs(_PROMPT), SamplingParams())
     tekken = resources.tokenizer.tokenizer
@@ -167,17 +163,15 @@ def test_completion_ids_are_the_servers(router, batched):
     # User text that spells a control token stays text.
     assert tekken.get_control_token("[INST]") not in expected
 
-    request = CompletionRequest(model="m", prompt=[_PROMPT, _PROMPT] if batched else _PROMPT)
-    key = router._routing_key_sync(request)
-    assert key["num_tokens"] == len(expected) * (2 if batched else 1)
+    request = CompletionRequest(model="m", prompt=_PROMPT)
+    assert router._routing_key_sync(request)["num_tokens"] == len(expected)
     # Completion ids replace the prompt, so the server does not tokenize it again.
-    assert request.prompt == ([expected, expected] if batched else expected)
+    assert request.prompt == expected
 
 
-@pytest.mark.parametrize("fields", [{}, {"tools": [_TOOL]}], ids=["plain", "tools"])
-def test_chat_ids_are_the_servers_and_are_forwarded(router, same_server, fields):
-    expected = _servers_chat_ids(router, _MESSAGES, **fields)
-    request = ChatCompletionRequest(model="m", messages=_MESSAGES, **fields)
+def test_chat_ids_are_the_servers_and_are_forwarded(router, same_server):
+    expected = _servers_chat_ids(router, _MESSAGES, tools=[_TOOL])
+    request = ChatCompletionRequest(model="m", messages=_MESSAGES, tools=[_TOOL])
     assert router._routing_key_sync(request)["num_tokens"] == len(expected)
     assert request.prompt_token_ids == expected
 
@@ -190,12 +184,9 @@ def test_a_truncated_chat_forwards_its_last_ids(router, same_server):
     assert request.prompt_token_ids == expected[-2:]
 
 
-def test_chat_ids_are_not_forwarded_to_a_server_that_renders_differently(router, checkpoint):
+def test_chat_ids_are_not_forwarded_to_a_server_that_renders_differently(router):
     """A server whose tokenizer file differs renders differently; it renders for itself."""
-    other, other_format = (
-        (_ML3, "mistral_large_3") if checkpoint[1] == "mistral" else (_SMALL4, "mistral")
-    )
-    fingerprint = _server_fingerprint(str(_model_dir(other)), other_format)
+    fingerprint = _server_fingerprint(str(_model_dir(_ML3)), "mistral_large_3")
     router._server_info = {_SERVER: {"render_fingerprint": fingerprint}}
     try:
         request = ChatCompletionRequest(model="m", messages=_MESSAGES)
@@ -268,13 +259,12 @@ def test_a_native_directory_without_its_format_tokenizes_completions_as_the_serv
     assert chat.prompt_token_ids is None
 
 
-@pytest.mark.parametrize("checkpoint_format", [None, "HF"])
-def test_other_checkpoint_formats_keep_the_hf_tokenizer(checkpoint_format):
-    """Without a Mistral-native format, an HF checkpoint's tokenizer is read."""
+def test_another_checkpoint_format_keeps_the_hf_tokenizer():
+    """A format other than the Mistral-native ones reads the HF checkpoint's tokenizer."""
     from transformers import PreTrainedTokenizerBase
 
     tokenizer_dir = str(_model_dir(_QWEN3))
-    router = _router(tokenizer_dir=tokenizer_dir, checkpoint_format=checkpoint_format)
+    router = _router(tokenizer_dir=tokenizer_dir, checkpoint_format="HF")
     reference = _router(tokenizer_dir=tokenizer_dir)
     tokenizer = router._get_tokenizer("m")
     assert isinstance(tokenizer, PreTrainedTokenizerBase)

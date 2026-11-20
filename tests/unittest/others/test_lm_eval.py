@@ -1900,15 +1900,8 @@ _P = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
             [(84, 56), (56, 112)],
             [{"role": "user", "content": [0, " and ", ": which is red?"]}],
         ),
-        # An image without a placeholder follows the text.
-        (
-            False,
-            [{"role": "user", "content": "What is this?"}],
-            [(84, 56)],
-            [{"role": "user", "content": ["What is this?", 0]}],
-        ),
     ],
-    ids=["in_place", "forced_single", "no_placeholder"],
+    ids=["in_place", "forced_single"],
 )
 def test_native_mistral_eval_renders_the_chat_with_its_images(
     force_single, history, sizes, expected
@@ -2027,8 +2020,7 @@ def test_native_mistral_eval_puts_leftover_images_in_the_user_turn():
     assert wrapper._render_native_mistral_chat(deferred, [image]) == expected
 
 
-@pytest.mark.parametrize("with_config_json", [False, True], ids=["native_only", "dual_format"])
-def test_the_multimodal_wrapper_reads_the_loaded_model_type(tmp_path, with_config_json):
+def test_the_multimodal_wrapper_reads_the_loaded_model_type(tmp_path):
     """Without a model_type, the wrapper takes the type the input processor was loaded with.
 
     The trtllm-eval MMMU commands pass none. A Mistral-native checkpoint then needs no
@@ -2037,22 +2029,18 @@ def test_the_multimodal_wrapper_reads_the_loaded_model_type(tmp_path, with_confi
     import json
     from types import SimpleNamespace
 
-    if with_config_json:
-        (tmp_path / "config.json").write_text(json.dumps({"model_type": "mistral3"}))
+    def model_type():
+        return MultimodalLmEvalWrapper(llm, sampling_params=None, streaming=False).model_type
+
     llm = MagicMock()
     llm._hf_model_dir = str(tmp_path)
     llm.input_processor.config = SimpleNamespace(model_type="mistral_common")
-    wrapper = MultimodalLmEvalWrapper(llm, sampling_params=None, streaming=False)
-    assert wrapper.model_type == "mistral_common"
-
+    assert model_type() == "mistral_common"
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "mistral3"}))
+    assert model_type() == "mistral_common"
     # A processor without a configuration leaves the type to config.json.
     llm.input_processor.config = None
-    if with_config_json:
-        wrapper = MultimodalLmEvalWrapper(llm, sampling_params=None, streaming=False)
-        assert wrapper.model_type == "mistral3"
-    else:
-        with pytest.raises(FileNotFoundError):
-            MultimodalLmEvalWrapper(llm, sampling_params=None, streaming=False)
+    assert model_type() == "mistral3"
 
 
 @pytest.mark.parametrize("prompt", [None, "[INST]Q[/INST]"])

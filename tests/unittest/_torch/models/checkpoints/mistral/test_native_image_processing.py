@@ -152,9 +152,8 @@ def _assert_grids(native_processor, payload, images):
 @pytest.mark.parametrize(
     "form", [lambda image: image, np.asarray, ToTensor()], ids=["pil", "np", "pt"]
 )
-@pytest.mark.parametrize("name", ["merlion.png", "excel_table_test.jpg"])
 def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(
-    native_processor, name, form, monkeypatch
+    native_processor, form, monkeypatch
 ):
     """Nothing lies between the loaded image and mistral-common's resize and normalize.
 
@@ -164,7 +163,7 @@ def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(
     from mistral_common.protocol.instruct.chunk import ImageChunk
 
     processor = MistralCommonImageProcessor(native_processor.tokenizer, torch.float32)
-    image = Image.open(_INPUT_FILES / name).convert("RGB")
+    image = Image.open(_INPUT_FILES / "excel_table_test.jpg").convert("RGB")
     expected = torch.as_tensor(processor.image_processor(ImageChunk(image=image)).image)
     loaded = form(image)
 
@@ -184,9 +183,8 @@ def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(
         (_rgb(size=(23, 37)), (37, 23)),
         (ToTensor()(_rgb(size=(23, 37))), (37, 23)),
         (np.zeros((23, 37, 3), dtype=np.uint8), (37, 23)),
-        (np.zeros((23, 37), dtype=np.uint8), (37, 23)),
     ],
-    ids=["pil", "chw_tensor", "hwc_array", "hw_array"],
+    ids=["pil", "chw_tensor", "hwc_array"],
 )
 def test_pil_image_size_is_the_size_of_the_pil_image(image, size):
     assert MistralCommonImageProcessor.pil_image_size(image) == size

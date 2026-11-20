@@ -16,7 +16,7 @@
 
 ``bundled`` is the newest Tekken file mistral-common ships (v3, no reasoning tokens); ``v13``
 and ``v15`` are the files of Mistral-Large-3 and Mistral-Small-4 under LLM_MODELS_ROOT, with
-``[THINK]``; v15 also declares model settings (reasoning effort, response format).
+``[THINK]``; v15 also declares a model setting, the reasoning effort.
 """
 
 import json
@@ -26,7 +26,6 @@ import pytest
 
 from test_common.llm_data import llm_models_root
 
-TEKKEN_SOURCES = ("bundled", "v13", "v15")
 TEKKEN_CHECKPOINT_FILES = {
     "v13": "Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512/tekken.json",
     "v15": "Mistral-Small-4-119B-2603/Mistral-Small-4-119B-2603/tekken.json",

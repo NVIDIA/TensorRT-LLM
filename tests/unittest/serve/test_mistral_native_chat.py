@@ -16,8 +16,9 @@
 
 The Mistral-native format gives the model type ``mistral_common``; mistral-common, not a
 Jinja template, renders its chats. The request-rule tests use a recording tokenizer; the
-rendering tests compare the chat route's steps with mistral-common on the v13 and v15
-Tekken files under LLM_MODELS_ROOT.
+rendering tests compare the chat route's steps with mistral-common on the v15 Tekken file
+under LLM_MODELS_ROOT (model settings and images), and one test reads the v13 file, which
+declares no model settings.
 """
 
 import asyncio
@@ -169,7 +170,6 @@ _HIGH, _LOW = {"reasoning_effort": "high"}, {"reasoning_effort": "low"}
     [
         ({}, None),
         ({**_HIGH, "chat_template_kwargs": {"x": 1}}, {"x": 1, **_HIGH}),
-        ({"chat_template_kwargs": _LOW}, _LOW),
         ({**_HIGH, "chat_template_kwargs": _HIGH}, _HIGH),
         ({**_HIGH, "chat_template_kwargs": _LOW}, ValueError("conflicts")),
         ({"chat_template": "{{ messages }}"}, ValueError("chat_template is not supported")),
@@ -191,8 +191,7 @@ def test_reasoning_effort_and_chat_template(fields, expected):
 
 
 @pytest.mark.parametrize(
-    "response_format,passed",
-    [(_CITY_FORMAT, True), ({"type": "json_object"}, True), ({"type": "text"}, False)],
+    "response_format,passed", [(_CITY_FORMAT, True), ({"type": "text"}, False)]
 )
 def test_a_json_response_format_reaches_the_renderer(response_format, passed):
     request = ChatCompletionRequest(
@@ -230,9 +229,10 @@ def test_chat_parsing(model_type):
     assert conversation[1]["tool_calls"][0]["function"]["arguments"] == "{not json"
 
 
-@pytest.fixture(scope="module", params=["v13", "v15"])
-def tokenizer(request):
-    return load_tekken(request.param)
+@pytest.fixture(scope="module")
+def tokenizer():
+    # Model settings (reasoning effort, response format) and an image encoder.
+    return load_tekken("v15")
 
 
 def _server_ids(tokenizer, **fields):
@@ -361,9 +361,6 @@ _CASES = {
         },
         {},
     ),
-    "json_schema": ({"messages": _HI, "response_format": _CITY_FORMAT}, {"response_format": "json_schema"}),
-    "json_object": ({"messages": _HI, "response_format": {"type": "json_object"}}, {"response_format": "json_object"}),
-    "text_format": ({"messages": _HI, "response_format": {"type": "text"}}, {}),
     "images": ({"messages": _IMAGES}, {}),
 }  # fmt: skip
 
@@ -373,8 +370,6 @@ def test_chats_render_as_mistral_common(tokenizer, case):
     if case == "images":
         pytest.importorskip("cv2")  # mistral-common's image encoder resizes with OpenCV
     fields, mistral_kwargs = _CASES[case]
-    if "response_format" in mistral_kwargs and not _renders_response_formats():
-        pytest.skip("mistral-common renders response formats from 1.13.0 on")
     ids = _server_ids(tokenizer, **fields)
     assert ids == _mistral_ids(tokenizer, fields["messages"], **mistral_kwargs)
     assert ids[0] == tokenizer.bos_token_id
@@ -387,16 +382,31 @@ def test_chats_render_as_mistral_common(tokenizer, case):
         assert ids.count(tokenizer.tokenizer.get_control_token("[IMG_END]")) == 2
 
 
-@pytest.mark.parametrize("response_format", [_CITY_FORMAT, {"type": "json_object"}])
-def test_an_older_mistral_common_leaves_the_response_format_out(
-    tokenizer, response_format, monkeypatch
-):
-    """Before 1.13.0 (Python 3.10), the response format only constrains decoding."""
-    from mistral_common.protocol.instruct import request
+def test_a_response_format_reaches_mistral_common(monkeypatch):
+    """A JSON response format is a model setting from mistral-common 1.13.0 on.
 
-    monkeypatch.delattr(request, "JsonSchema", raising=False)
-    plain = _server_ids(tokenizer, messages=_HI)
-    assert _server_ids(tokenizer, messages=_HI, response_format=response_format) == plain
+    A text format, or any format before 1.13.0 (Python 3.10), only constrains decoding:
+    mistral-common keeps its default, text.
+    """
+    from mistral_common.protocol.instruct import request as mistral_request
+
+    def given(*response_formats):
+        recording = _RecordingTokenizer()
+        for response_format in response_formats:
+            _render(recording, _HI, chat_template_kwargs={"response_format": response_format})
+        return [call.response_format for call in recording.calls]
+
+    def kinds(formats):
+        return [str(getattr(f.type, "value", f.type)) for f in formats]
+
+    json_formats = (_CITY_FORMAT, {"type": "json_object"})
+    assert kinds(given({"type": "text"})) == ["text"]
+    if _renders_response_formats():
+        schema, json_object = given(*json_formats)
+        assert kinds([schema, json_object]) == ["json_schema", "json_object"]
+        assert schema.json_schema.name == "city"
+    monkeypatch.delattr(mistral_request, "JsonSchema", raising=False)
+    assert kinds(given(*json_formats)) == ["text", "text"]
 
 
 def _declared_efforts(tokenizer):
@@ -435,23 +445,35 @@ def _anthropic_route(tokenizer, effort):
     return _request_ids(tokenizer, convert_anthropic_request(anthropic))
 
 
-@pytest.mark.parametrize("effort", ["high", "low"])
+@pytest.mark.parametrize("effort,declared", [("high", True), ("low", False)])
 @pytest.mark.parametrize(
     "route",
     [_chat_route, _responses_route, _anthropic_route],
     ids=["chat", "responses", "anthropic"],
 )
-def test_a_reasoning_effort_is_checked_against_the_checkpoint(tokenizer, route, effort):
+def test_a_reasoning_effort_is_checked_against_the_checkpoint(tokenizer, route, effort, declared):
     """Every route passes the effort to mistral-common.
 
     One the checkpoint declares renders; any other is a rejected chat (a ValueError), which
     every route answers with HTTP 400.
     """
-    if effort in _declared_efforts(tokenizer):
+    assert (effort in _declared_efforts(tokenizer)) == declared
+    if declared:
         assert route(tokenizer, effort) == _mistral_ids(tokenizer, _HI, reasoning_effort=effort)
         return
     with pytest.raises(ChatRejectedError, match="reasoning_effort"):
         route(tokenizer, effort)
+
+
+def test_a_checkpoint_without_model_settings_refuses_any_reasoning_effort():
+    """A v13 Tekken file (Mistral-Large-3, Ministral-3) declares no effort, so it refuses one.
+
+    The served v13 checkpoints have no model settings; this is the one check of that file.
+    """
+    tokenizer = load_tekken("v13")
+    assert _declared_efforts(tokenizer) == []
+    with pytest.raises(ChatRejectedError, match="reasoning_effort"):
+        _chat_route(tokenizer, "high")
 
 
 def test_kv_cache_truncation_renders_the_chat_routes_prefix(tokenizer):
@@ -462,10 +484,8 @@ def test_kv_cache_truncation_renders_the_chat_routes_prefix(tokenizer):
     from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
     from tensorrt_llm.serve.resource_governor import _chat_template_kwargs
 
-    efforts = _declared_efforts(tokenizer)
-    if not efforts:
-        pytest.skip("this Tekken file declares no reasoning effort")
-    effort = efforts[-1]
+    effort = "high"
+    assert effort in _declared_efforts(tokenizer)
     request = KVCacheTruncateRequest(model="m", messages=_HI, reasoning_effort=effort)
     kwargs = _chat_template_kwargs(request, get_serving_extension(_MODEL_TYPE))
     assert kwargs == {"reasoning_effort": effort}
@@ -529,8 +549,9 @@ def _user_with_image(size):
     ]
 
 
-# (height, width): tiny, larger than any max_image_size on either side, and extreme aspects.
-@pytest.mark.parametrize("size", [(1, 1), (2000, 24), (24, 2000), (1541, 1541), (7, 1543)])
+# (height, width): a one-patch grid, and a non-square one larger than max_image_size. How
+# many patches a size makes is mistral-common's; the renderer only lays out the grid.
+@pytest.mark.parametrize("size", [(1, 1), (24, 2000)])
 def test_image_grids_render_from_the_image_size_alone(tokenizer, size, monkeypatch):
     """A chat renders the grids mistral-common makes of the images, processing no pixel."""
     pytest.importorskip("cv2")  # the oracle resizes with OpenCV

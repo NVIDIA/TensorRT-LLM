@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MistralTokenizer over Tekken vocabularies: pickling and streaming detokenization."""
+"""MistralTokenizer over a Tekken vocabulary: pickling, streaming detokenization and the
+vocabulary it describes for guided decoding."""
 
 import pickle
 
 import pytest
-from test_common.mistral_tekken import TEKKEN_SOURCES, load_tekken
+from test_common.mistral_tekken import load_tekken
 
 from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
 
@@ -26,9 +27,10 @@ pytestmark = pytest.mark.cpu_only
 PROMPT = "The capital of France is"
 
 
-@pytest.fixture(scope="module", params=TEKKEN_SOURCES)
-def tokenizer(request):
-    return load_tekken(request.param)
+# None of these paths depends on the Tekken version: the file mistral-common ships.
+@pytest.fixture(scope="module")
+def tokenizer():
+    return load_tekken("bundled")
 
 
 def _text(tokenizer, text):
@@ -80,3 +82,19 @@ def test_streaming_matches_decode(tokenizer, skip_special_tokens):
     assert text == expected
     tokens = tokenizer.convert_ids_to_tokens(_text(tokenizer, "🙂🙂"), skip_special_tokens)
     assert tokenizer.convert_tokens_to_string(tokens, skip_special_tokens) == "🙂🙂"
+
+
+def test_the_grammar_vocabulary_it_describes(tokenizer):
+    """xgrammar gets each token's raw bytes and control tokens as empty strings, which it never
+    selects; llguidance's tokenizer covers the model's padded vocabulary."""
+    tekken = tokenizer.tokenizer
+    assert tokenizer.describes_grammar_vocabulary
+    info = tokenizer.xgrammar_tokenizer_info()
+    vocab = info["encoded_vocab"]
+    assert info["stop_token_ids"] == [tokenizer.eos_token_id]
+    assert len(vocab) == tekken.n_words
+    assert set(vocab[: tekken.num_special_tokens]) == {""}
+    text = "巴黎 São Paulo 🙂"
+    assert b"".join(vocab[i] for i in _text(tokenizer, text)) == text.encode()
+    n_vocab = tekken.n_words + 96
+    assert tokenizer.llguidance_tokenizer(n_vocab).vocab_size == n_vocab

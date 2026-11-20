@@ -27,7 +27,6 @@ import pytest
 from test_common.mistral_tekken import (
     HF_TOKENIZER_IDS,
     HF_TOKENIZER_TEXT,
-    TEKKEN_SOURCES,
     bundled_tekken_file,
     load_tekken,
     write_hf_tokenizer,
@@ -54,14 +53,16 @@ _SCHEMA = json.dumps(
 _GUIDES = [("JSON_SCHEMA", _SCHEMA), ("JSON", None)]
 
 
-@pytest.fixture(scope="module", params=TEKKEN_SOURCES)
-def tokenizer(request):
-    return load_tekken(request.param)
-
-
+# The vocabulary paths do not depend on the Tekken version: the file mistral-common ships.
 @pytest.fixture(scope="module")
-def llg(tokenizer):
-    return tokenizer.llguidance_tokenizer(tokenizer.tokenizer.n_words)
+def tokenizer():
+    return load_tekken("bundled")
+
+
+# A tensor-parallel size that does not divide the vocabulary pads it.
+@pytest.fixture(scope="module")
+def n_vocab(tokenizer):
+    return tokenizer.tokenizer.n_words + 96
 
 
 def _text(tokenizer, text):
@@ -80,14 +81,14 @@ def _allowed(matcher, n_words):
     return {i for i in range(n_words) if (int(bitmask[0, i // 32]) >> (i % 32)) & 1}
 
 
-def _matcher(tokenizer, llg, backend, guide_type, guide):
-    """A matcher built as the executor builds it."""
+def _matcher(tokenizer, n_vocab, backend, guide_type, guide):
+    """A matcher built as the executor builds it, over a padded vocabulary."""
     config = get_guided_decoding_config(backend, tokenizer)
-    n_words = tokenizer.tokenizer.n_words
     if backend == "xgrammar":
-        factory = XGrammarMatcherFactory(config, n_words, max_num_draft_tokens=8)
+        factory = XGrammarMatcherFactory(config, n_vocab, max_num_draft_tokens=8)
     else:
-        factory = LLGuidanceMatcherFactory(config, n_words, tokenizer=llg)
+        llg = _llguidance_tokenizer(config, tokenizer, n_vocab)
+        factory = LLGuidanceMatcherFactory(config, n_vocab, tokenizer=llg)
     return factory.create(
         GuidedDecodingParams(getattr(GuidedDecodingParams.GuideType, guide_type), guide)
     )
@@ -135,24 +136,18 @@ _HF_TOKENIZER = "tensorrt_llm.tokenizer.TransformersTokenizer"
 @pytest.mark.parametrize(
     "llm_args,keep_tekken,expected",
     [
-        (_llm_args("mistral"), True, MistralTokenizer),
         (_llm_args("mistral_large_3"), True, MistralTokenizer),
         # Guided decoding masks Tekken vocabularies only; a SentencePiece checkpoint keeps HF's.
         (_llm_args("mistral"), False, TransformersTokenizer),
-        (_llm_args("mistral_large_3"), False, TransformersTokenizer),
         (_llm_args(), True, TransformersTokenizer),
-        (_llm_args("HF"), True, TransformersTokenizer),
         # An explicit custom tokenizer takes precedence over the format's.
         (_llm_args("mistral", custom_tokenizer=_HF_TOKENIZER), True, TransformersTokenizer),
         (_llm_args(custom_tokenizer="mistral_common"), True, MistralTokenizer),
     ],
     ids=[
-        "mistral",
-        "mistral_large_3",
-        "mistral_without_tekken",
-        "mistral_large_3_without_tekken",
+        "native_format",
+        "native_format_without_tekken",
         "default",
-        "HF",
         "custom_hf_tokenizer",
         "custom_mistral_common",
     ],
@@ -168,47 +163,34 @@ def test_a_rank_reloads_the_tokenizer_its_input_processor_encodes_with(
         assert tokenizer.encode(HF_TOKENIZER_TEXT) == HF_TOKENIZER_IDS
 
 
-def test_llguidance_masks_a_padded_vocabulary(tokenizer):
-    """The bitmask covers the model's padded vocabulary (a TP size that does not divide the
-    vocabulary pads it); a padded id is never allowed and is refused without an error."""
-    n_words = tokenizer.tokenizer.n_words
-    padded = n_words + 96
-    llg = tokenizer.llguidance_tokenizer(padded)
-    assert llg.vocab_size == padded
-    config = get_guided_decoding_config("llguidance", tokenizer)
-    factory = LLGuidanceMatcherFactory(config, padded, tokenizer=llg)
-    matcher = factory.create(
-        GuidedDecodingParams(GuidedDecodingParams.GuideType.JSON_SCHEMA, _SCHEMA)
-    )
-    allowed = _allowed(matcher, padded)
-    assert allowed and max(allowed) < n_words
-    assert not matcher.accept_token(padded - 1)
-    assert _consume(matcher, _text(tokenizer, '{"city": "Paris"}'))
-
-
 @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-@pytest.mark.parametrize("guide_type, guide", _GUIDES)
-def test_json_response(tokenizer, llg, backend, guide_type, guide):
+@pytest.mark.parametrize("guide_type, guide", _GUIDES, ids=["json_schema", "json_object"])
+def test_json_response(tokenizer, n_vocab, backend, guide_type, guide):
     """A valid answer is accepted and prose is not; a rejected draft rolls back; neither the
-    response's first token nor a JSON string is a control token."""
+    response's first token nor a JSON string is a control token or a padded id."""
     tekken = tokenizer.tokenizer
 
     def make():
-        return _matcher(tokenizer, llg, backend, guide_type, guide)
+        return _matcher(tokenizer, n_vocab, backend, guide_type, guide)
+
+    def allowed(matcher):
+        ids = _allowed(matcher, n_vocab)
+        assert ids and tekken.num_special_tokens <= min(ids) and max(ids) < tekken.n_words
+        return ids
 
     matcher = make()
-    assert min(_allowed(matcher, tekken.n_words)) >= tekken.num_special_tokens
+    allowed(matcher)
+    assert not matcher.accept_token(n_vocab - 1)
     assert _consume(matcher, _text(tokenizer, '{"city": "巴黎 São Paulo 🙂"}'))
     assert matcher.accept_token(tokenizer.eos_token_id)
     assert not _consume(make(), _text(tokenizer, 'Sure: {"city": "Paris"}'))
 
     matcher = make()
     assert _consume(matcher, _text(tokenizer, '{"city": '))
-    before = _allowed(matcher, tekken.n_words)
+    before = allowed(matcher)
     draft = _text(tokenizer, '"Paris"}')
     assert _consume(matcher, draft)
     matcher.rollback(len(draft))
-    assert _allowed(matcher, tekken.n_words) == before
+    assert allowed(matcher) == before
     assert _consume(matcher, _text(tokenizer, '"'))
-    allowed = _allowed(matcher, tekken.n_words)
-    assert allowed and min(allowed) >= tekken.num_special_tokens
+    allowed(matcher)

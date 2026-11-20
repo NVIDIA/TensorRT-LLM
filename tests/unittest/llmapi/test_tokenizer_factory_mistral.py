@@ -76,13 +76,9 @@ def _assert_reads_like_mistral_common(tokenizer, expected_ids):
     assert tokenizer.decode(expected_ids, skip_special_tokens=True) == PROMPT
 
 
-@pytest.mark.parametrize(
-    "load",
-    [lambda d: load_hf_tokenizer(str(d)), lambda d: tokenizer_factory(str(d)), tokenizer_factory],
-    ids=["load_hf_tokenizer", "tokenizer_factory_str", "tokenizer_factory_Path"],
-)
-def test_a_tekken_directory_reads_through_mistral_common(tekken_dir, mistral_common_ids, load):
-    _assert_reads_like_mistral_common(load(tekken_dir), mistral_common_ids)
+def test_a_tekken_directory_reads_through_mistral_common(tekken_dir, mistral_common_ids):
+    for tokenizer in (load_hf_tokenizer(str(tekken_dir)), tokenizer_factory(tekken_dir)):
+        _assert_reads_like_mistral_common(tokenizer, mistral_common_ids)
 
 
 @pytest.fixture

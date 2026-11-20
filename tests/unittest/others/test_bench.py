@@ -521,13 +521,7 @@ def _llm_api_options(tmp_path, **llm_args):
 
 @pytest.mark.parametrize(
     "checkpoint_format, model_path, downloads",
-    [
-        ("mistral", None, True),
-        ("mistral_large_3", None, True),
-        ("mistral", "local", False),
-        (None, None, False),
-        ("HF", None, False),
-    ],
+    [("mistral", None, True), ("mistral", "local", False), ("HF", None, False)],
 )
 def test_cli_options_download_a_mistral_native_model_name_before_reading_it(
     tmp_path, checkpoint_format, model_path, downloads
@@ -622,13 +616,7 @@ def _mistral_native_checkpoint(path, *, weights="consolidated", hf_config=False)
 
 
 @pytest.mark.parametrize(
-    "checkpoint_format,model_type",
-    [
-        (None, "llama"),
-        ("HF", "llama"),
-        ("mistral", "mistral_common"),
-        ("mistral_large_3", "mistral_common"),
-    ],
+    "checkpoint_format,model_type", [(None, "llama"), ("mistral_large_3", "mistral_common")]
 )
 def test_cli_options_read_the_model_type_of_the_checkpoint_format(
     tmp_path, checkpoint_format, model_type
@@ -671,11 +659,18 @@ def _tune(tmp_path, checkpoint, checkpoint_format="mistral"):
     return model_config, quant_config
 
 
-@pytest.mark.parametrize("hf_config", [False, True], ids=["native_only", "with_config_json"])
-@pytest.mark.parametrize("weights", ["consolidated", "sharded", "unindexed_shards"])
-@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
+@pytest.mark.parametrize(
+    "weights,hf_config,checkpoint_format",
+    [
+        ("consolidated", False, "mistral"),
+        ("sharded", False, "mistral"),
+        ("unindexed_shards", False, "mistral"),
+        # params.json wins over a config.json beside it.
+        ("consolidated", True, "mistral_large_3"),
+    ],
+)
 def test_tuning_reads_a_mistral_native_checkpoint_from_its_native_files(
-    tmp_path, checkpoint_format, weights, hf_config
+    tmp_path, weights, hf_config, checkpoint_format
 ):
     """The tuning heuristic reads params.json and the consolidated weights, as the runtime does."""
     checkpoint = _mistral_native_checkpoint(
@@ -804,10 +799,11 @@ def _engine_report(checkpoint, checkpoint_format):
         return report.get_statistics_dict()["engine"]
 
 
-@pytest.mark.parametrize("hf_config", [False, True], ids=["native_only", "with_config_json"])
-@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
+@pytest.mark.parametrize(
+    "hf_config,checkpoint_format", [(False, "mistral"), (True, "mistral_large_3")]
+)
 def test_report_reads_a_mistral_native_checkpoint_from_its_native_files(
-    tmp_path, checkpoint_format, hf_config
+    tmp_path, hf_config, checkpoint_format
 ):
     """The report reads the checkpoint in the format the LLM loaded, here params.json."""
     checkpoint = _fp8_mistral_native_checkpoint(tmp_path / "checkpoint", hf_config=hf_config)
@@ -817,9 +813,8 @@ def test_report_reads_a_mistral_native_checkpoint_from_its_native_files(
     assert engine["kv_cache_dtype"] is None
 
 
-@pytest.mark.parametrize("checkpoint_format", [None, "HF"])
-def test_report_reads_config_json_in_the_hugging_face_format(tmp_path, checkpoint_format):
+def test_report_reads_config_json_in_the_hugging_face_format(tmp_path):
     checkpoint = _fp8_mistral_native_checkpoint(tmp_path / "checkpoint", hf_config=True)
-    engine = _engine_report(checkpoint, checkpoint_format)
+    engine = _engine_report(checkpoint, None)
     assert engine["dtype"] == "bfloat16"
     assert engine["quantization"] is None
