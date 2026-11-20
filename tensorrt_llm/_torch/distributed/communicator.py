@@ -1495,10 +1495,14 @@ class TorchDist(Distributed):
         key = ("bcast_header", width)
         buffers = staging.get(key)
         if buffers is None:
-            buffers = (torch.empty(width, dtype=torch.int64, device="cuda"),
-                       torch.empty(width,
-                                   dtype=torch.int64,
-                                   pin_memory=prefer_pinned()))
+            # Persistent like the staging buffers and rewritten by every later
+            # broadcast of this width: never inference tensors (see
+            # _cuda_obj_staging_for).
+            with torch.inference_mode(False):
+                buffers = (torch.empty(width, dtype=torch.int64, device="cuda"),
+                           torch.empty(width,
+                                       dtype=torch.int64,
+                                       pin_memory=prefer_pinned()))
             staging[key] = buffers
         return buffers
 
