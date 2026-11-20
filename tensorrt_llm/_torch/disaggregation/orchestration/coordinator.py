@@ -1081,7 +1081,7 @@ class DisaggTransferCoordinator:
         ctx_status = self._transceiver.check_context_transfer_status(at_least)
         failed_req_ids = set(ctx_status.error_request_ids)
         succeeded_ids = set(ctx_status.completed_request_ids)
-        cancelled_ids = set(ctx_status.cancelled_request_ids)
+        cancelled_ids = set(getattr(ctx_status, "cancelled_request_ids", ()))
         completed_req_ids = succeeded_ids | failed_req_ids | cancelled_ids
         failed_req_ids -= self._context_cancellation_drains
 
