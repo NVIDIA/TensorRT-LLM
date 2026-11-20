@@ -2322,6 +2322,9 @@ def test_code_fingerprint_follows_modules_imported_in_a_function(fp_modules):
     fp_modules.load("fp_helpers", "def helper():\n    return 0\n")
     fp_modules.load("fp_backend_a", "def run():\n    return 0\n")
     fp_modules.load("fp_backend_b", "def run():\n    return 1\n")
+    fp_modules.load("fp_impl", "def select():\n    return 0\n")
+    # Only re-exports what another module defines.
+    fp_modules.load("fp_catalog", "from fp_impl import select\n")
     (fp_modules.root / "fp_moe").mkdir()
     fp_modules.write("fp_moe/__init__", "")
     fp_modules.write(
@@ -2364,28 +2367,51 @@ def test_code_fingerprint_follows_modules_imported_in_a_function(fp_modules):
                 else:
                     import fp_backend_b as backend
                 return backend.run()
+
+
+        class RebindsLocal(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import fp_backend_a as backend
+                first = backend.run()
+                import fp_backend_b as backend
+                return first + backend.run()
+
+
+        class PassesCatalog(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import fp_catalog
+                return run_with(fp_catalog)
         """)
     classes = (runners.UsesAttribute, runners.PassesModule,
-               runners.PicksBackend)
+               runners.PicksBackend, runners.RebindsLocal,
+               runners.PassesCatalog)
 
     before = fp_modules.fingerprints(*classes)
     # What the module's code uses counts, in another file too.
     fp_modules.edit("fp_helpers", "return 0", "return 42")
     after_helper = fp_modules.fingerprints(*classes)
-    assert _changed(before, after_helper) == [True, True, False]
+    assert _changed(before, after_helper) == [True, True, False, False, False]
     # A module used only through its attributes counts by those; one passed
     # on as a whole counts whole.
     fp_modules.edit("fp_moe/decode", "def unused():\n    return 0",
                     "def unused():\n    return 42")
     after_unused = fp_modules.fingerprints(*classes)
-    assert _changed(after_helper, after_unused) == [False, True, False]
-    # A local that either of two imports binds counts both modules.
+    assert _changed(after_helper,
+                    after_unused) == [False, True, False, False, False]
+    # A local that two imports bind, in two branches or one after the
+    # other, counts both modules.
     for backend in ("fp_backend_a", "fp_backend_b"):
         previous = fp_modules.fingerprints(*classes)
         fp_modules.edit(backend, "return ", "return 4")
         assert _changed(previous, fp_modules.fingerprints(*classes)) == [
-            False, False, True
+            False, False, True, True, False
         ]
+    # A module counted whole counts what it re-exports.
+    previous = fp_modules.fingerprints(*classes)
+    fp_modules.edit("fp_impl", "return 0", "return 42")
+    assert _changed(previous, fp_modules.fingerprints(*classes)) == [
+        False, False, False, False, True
+    ]
 
 
 def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
@@ -2430,22 +2456,38 @@ def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
             def get_valid_tactics(self, inputs, profile, **kwargs):
                 runner = torch.classes.fp_test.Runner_{op}()
                 return list(range(runner.get_num_configs()))
+
+
+        class ImportsClassesLocally(Base):
+            def get_valid_tactics(self, inputs, profile, **kwargs):
+                from torch import classes
+                runner = classes.fp_test.Runner_{op}()
+                return list(range(runner.get_num_configs()))
+
+
+        class ImportsTorchLocally(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                import torch as t
+                return t.ops.fp_test.native_{op}(inputs[0])
         """)
     build = {"id": "a"}
     monkeypatch.setattr(autotuner, "_native_build_id", lambda: build["id"])
     classes = (runners.UsesPythonOp, runners.UsesNativeOp,
-               runners.UsesNativeClass)
+               runners.UsesNativeClass, runners.ImportsClassesLocally,
+               runners.ImportsTorchLocally)
 
     before = fp_modules.fingerprints(*classes)
     fp_modules.edit("fp_ops", "return x.clone()", "return x.clone() + 0")
     after_edit = fp_modules.fingerprints(*classes)
-    assert _changed(before, after_edit) == [True, False, False]
+    assert _changed(before, after_edit) == [True, False, False, False, False]
     fp_modules.edit("fp_ops", "x.mul(1)", "x.mul(10)")
     after_kernel_edit = fp_modules.fingerprints(*classes)
-    assert _changed(after_edit, after_kernel_edit) == [True, False, False]
+    assert _changed(after_edit,
+                    after_kernel_edit) == [True, False, False, False, False]
     build["id"] = "b"
     after_rebuild = fp_modules.fingerprints(*classes)
-    assert _changed(after_kernel_edit, after_rebuild) == [False, True, True]
+    assert _changed(after_kernel_edit,
+                    after_rebuild) == [False, True, True, True, True]
 
 
 _CANDIDATE_RUNNERS = """

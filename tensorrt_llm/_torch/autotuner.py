@@ -632,6 +632,33 @@ def _load_module(name: str):
     return module
 
 
+def _torch_import_refs(target: str, fromlist, following):
+    """(local, name, module) for a function-local import of torch, or of its
+    ops or classes namespaces: the chains to native code a later load can
+    follow, as it does through a global `torch`. Nothing else of torch is
+    looked up, since a lookup there can import (PEP 562)."""
+    if target != "torch":
+        return
+    if fromlist is None:  # `import torch [as t]`
+        for ins in following:
+            if ins.opname.startswith("STORE"):
+                yield ins.argval, "torch", torch
+                return
+            if ins.opname not in ("IMPORT_FROM", "SWAP", "POP_TOP"):
+                return
+        return
+    attr = None
+    for ins in following:
+        if ins.opname == "IMPORT_FROM":
+            attr = ins.argval if ins.argval in ("ops", "classes") else None
+        elif ins.opname.startswith("STORE"):
+            if attr is not None:
+                yield ins.argval, f"torch.{attr}", getattr(torch, attr)
+            attr = None
+        else:
+            return
+
+
 def _import_refs(name: str, package: str, level: int, fromlist, following):
     """(local, name, object) for what an import statement binds (local is the
     variable it stores to, when one follows). A module outside the tracked
@@ -643,6 +670,7 @@ def _import_refs(name: str, package: str, level: int, fromlist, following):
         return
     if not _tracked(target):
         yield None, target, _External(target)
+        yield from _torch_import_refs(target, fromlist, following)
         return
     module = _load_module(target)
     if module is None:
@@ -1025,11 +1053,12 @@ class _FingerprintWalk:
             self.native = self.native or _is_extension(obj)
             return
         if inspect.ismodule(obj):
-            # Counted whole: with every definition of its own, and what those
-            # use (the names it imports count where its code uses them).
+            # Counted whole: with every definition of its own and every name
+            # it imports with `from` (a caller can reach both through the
+            # module), and what those use.
             self.sources[f"{module}:<module>"] = index.digest
             self.todo.extend((f"{module}.{k}", v) for k, v in vars(obj).items()
-                             if k in index.spans)
+                             if k in index.spans or k in index.imports)
             return
         self.sources[f"{module}:{obj.__qualname__}"] = _definition_digest(
             obj, index)
