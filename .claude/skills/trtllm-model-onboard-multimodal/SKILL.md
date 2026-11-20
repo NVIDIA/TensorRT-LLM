@@ -260,6 +260,30 @@ the selected items cross modality-run boundaries.
 
 ---
 
+## Required runtime features (P0/P1)
+
+P0 is the minimum eligibility for a new model. A P0 opt-out needs an entry in `APPROVED_EXCEPTIONS` in the conformance suite's `known_gaps.py`, reviewed by the multimodal owners. For a P1 opt-out, add the `MultimodalFeature` to the model's `multimodal_opt_outs` with one sentence and a TRTLLM issue or nvbug ID. The engine settings determine which eligible features run. A decoder that lacks a graph mode for text needs no multimodal exception for that mode, so do not list it in `multimodal_opt_outs`. Until their runtime gates land, the suite does not hold new models to the features listed in `STRUCTURAL_ONLY` in `tiers.py`, unless the model opts out of one itself. Encoder CUDA graphs count when the tower registered with `@register_vision_encoder` declares `encoder_cuda_graph_modality`. A text-only target of a vision-language architecture has one check: its `validate_multimodal_request_data` raises on media and attached rows.
+
+<!-- BEGIN multimodal-feature-tiers -->
+| Feature | Tier | What the model must provide |
+| --- | --- | --- |
+| `contract` | P0 | Expose the language model and tower. Supply item order, row counts and input partitions. |
+| `text_only` | P0 | With `disable_mm_encoder`, omit the tower and refuse raw media and attached rows at admission. |
+| `item_scheduling` | P0 | Encode whole items. Supply exact per-item costs, profiling inputs and encoder budgets. |
+| `encoder_cache` | P0 | Return whole-item encoder rows with exact row counts and stable media hashes. |
+| `chunked_prefill_media` | P0 | Fuse only the media rows in the current prefill chunk. |
+| `kv_reuse_media` | P0 | Supply stable media hashes and token counts for prefix reuse. |
+| `llm_breakable_cuda_graph` | P0 | Preserve decoder graph support for media. Use a `DecoderModelForCausalLM`, keep encoder attention out of its layer registry and prepare extra graph inputs. |
+| `llm_piecewise_cuda_graph` | P0 | Preserve the decoder's piecewise graph support. Scope compilation to the language model. |
+| `uint8_media` | P0 | Accept the loader's uint8 media and apply processor normalization. |
+| `disagg_p_to_d` | P0 | Preserve media hashes and export and restore mRoPE state when used. |
+| `encoder_dp` | P0 | Build the tower from the encoder config so replicas can encode whole items. |
+| `encoder_attention_backend` | P0 | Declare supported attention backends per tower in the model class body. |
+| `encoder_tp` | P1 | Shard tower weights under the encoder mapping. |
+| `encoder_cuda_graph` | P1 | Provide a graph capture adapter for the tower blocks. |
+| `disagg_e_to_p` | P1 | Accept attached rows with a complete item layout. Becomes P0 when the generic handoff lands. |
+<!-- END multimodal-feature-tiers -->
+
 ## Phases
 
 ### Phase 0 — Gather resources
@@ -276,6 +300,8 @@ Read `config.json`'s `architectures` and `model_type`. If a `_torch/models/model
 
 ### Phase 2 — Model wrapper
 
+Subclass `MultimodalModelMixin` today. When the shared composite base lands, subclass it or document why the target needs to implement the protocol as an adapter.
+
 Create `tensorrt_llm/_torch/models/modeling_{name}.py`. The default pattern below mirrors `modeling_llava_next.py` and `modeling_gemma3vl.py` — a single wrapper class that composes a multimodal encoder + an LLM resolved through `AutoModelForCausalLM.from_config(text_config)`. The `*ModelBase + *Model` Base/non-Base split in `modeling_qwen2vl.py` and `modeling_qwen3vl.py` is an implementation detail for sharing one wrapper between two variants of the same family (Qwen2-VL ↔ Qwen2.5-VL; Qwen3-VL ↔ Qwen3-VL-MoE) — keep the wrapper a single class unless you have the same multi-variant need.
 
 ```python
@@ -291,8 +317,8 @@ class {Name}VisionModel(nn.Module):
 class {Name}Model(MultimodalModelMixin, PreTrainedModel):
     config_class = {Name}Config
     supports_encoder_cache = True
-    # Enable after implementing and validating the Phase 3 atomic-item contracts.
-    supports_mm_encoder_item_scheduling = False
+    # P0: implement the Phase 3 atomic-item contracts.
+    supports_mm_encoder_item_scheduling = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config
@@ -406,11 +432,12 @@ Full-request models can leave unknown costs as `None`; grouped assembly still
 requires exact output row counts. Do not implement the removed
 `get_mm_encoder_item_metadata` hook: the registry rejects it at wrapper creation.
 
-**Atomic-item scheduling (optional).** Enable
-`supports_mm_encoder_item_scheduling` only when items can be encoded independently.
-Supply exact positive `encoder_token_lengths`, `output_embedding_lengths`, and
-item selection, and implement `get_max_mm_encoder_output_embeddings` to size
-the cache for one legal iteration. Missing scheduling metadata fails admission;
+**Atomic-item scheduling (P0).** Set
+`supports_mm_encoder_item_scheduling = True`. A model whose items cannot be encoded
+independently needs an `APPROVED_EXCEPTIONS` entry. Supply exact positive
+`encoder_token_lengths`, `output_embedding_lengths`, and item selection, and
+implement `get_max_mm_encoder_output_embeddings` to size the cache for one legal
+iteration. Missing scheduling metadata fails admission;
 it does not trigger a per-request fallback. Keep lengths and partitions on the
 host: `.cpu().tolist()` can synchronize and does not belong in a forward path.
 
@@ -465,6 +492,8 @@ def load_weights(self, weights, weight_mapper):
 Inherit from a related mapper for prefix surgery — don't write a one-off translator.
 
 ### Phase 5 — Tests
+
+Run `pytest tests/unittest/_torch/multimodal/conformance -k <Class>` with the registered architecture or routed target name.
 
 **Per-model unit test (the main one)** at `tests/unittest/_torch/modeling/test_modeling_<name>.py`. Subclass `TestModelingMultimodal` from `tests/unittest/_torch/modeling/test_modeling_multimodal.py` (an abstract `unittest.TestCase`) and implement six abstract methods: `get_model_config`, `get_trtllm_model_class`, `get_hf_model_class`, `get_weight_mapper_class`, `get_model_type`, `get_model_config_class`. The base class drives a `MultimodalScenario`-parameterized run (modality ∈ `image` / `multiple_image` / `video` / `text` / `mixture_text_image` / `audio`, with optional `use_cuda_graph` / `chunked_prefill` / `kv_cache_reuse`) — comparing TRT-LLM logits to HF reference, exercising the KV cache manager, attn metadata, mrope, fusion path, and CUDA graph capture in one harness. Override `get_scenarios` to declare which combinations apply to your model. Reference: `test_modeling_qwen3vl.py`, `test_modeling_qwen2_5vl.py`, `test_modeling_nemotron_h_multimodal.py`. Test data lives under `${LLM_MODELS_ROOT}/multimodals/test_data/`.
 
@@ -527,6 +556,7 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 ## Pre-PR checklist
 
 **Architecture & registration**
+- [ ] Every P0 opt-out has an owner-reviewed `APPROVED_EXCEPTIONS` entry. Every P1 opt-out has a reason and tracking ID in `multimodal_opt_outs`.
 - [ ] Decorator stack in correct order: `@support_multimodal_disaggregated` (outermost, optional) → `@register_vision_encoder` → `@register_auto_model` → `@register_input_processor` (innermost).
 - [ ] Model inherits `MultimodalModelMixin`; an overridden `forward` calls `prepare_multimodal_inputs` and takes no raw MM tensor args.
 - [ ] `multimodal_data_device_paths` lists every GPU-resident mm field.

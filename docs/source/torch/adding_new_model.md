@@ -11,6 +11,7 @@ Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 3. [Step-by-Step Guide](#step-by-step-guide)
     1. [Model Configuration](#model-configuration)
     2. [Model Definition](#model-definition)
+        1. [Multimodal Models](#multimodal-models)
     3. [Weight Loading](#weight-loading)
     4. [Model Registration](#model-registration)
         1. [Core Models](#core-models)
@@ -127,6 +128,36 @@ Optionally, you may replace the native PyTorch modules with our implementations 
 - `RMSNorm` (in `tensorrt_llm/_torch/modules/rms_norm.py`): Enables performant RMS norm.
 
 For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.
+
+#### Multimodal Models
+
+`tensorrt_llm._torch.models.multimodal.SupportsMultimodal` lists what the runtime
+reads from a multimodal model, and `MultimodalModelMixin` implements it. Subclass
+the mixin: the executor still checks for it until it reads the protocol. The
+`supports_multimodal = True` class marker declares the contract. It does not check
+method signatures and does not turn on any feature.
+
+- Declare encoder caching and item scheduling separately. Item scheduling also
+  needs the processor's item metadata and a runtime configuration that allows it.
+- List skipped `MultimodalFeature` values in `multimodal_opt_outs`, or in
+  `multimodal_feature_limits` when the skip depends on the deployment. The
+  [conformance suite](source:tests/unittest/_torch/multimodal/conformance) checks
+  them against the required features in the multimodal onboarding skill.
+- Declare attention backends in the `supported_encoder_attention_backends`
+  class attribute. Its empty default declares none.
+- Keep the existing `MultimodalParams` inputs and tensor outputs. Selected items
+  are prepared before they are copied to the GPU, and item outputs keep the
+  selection order.
+- `multimodal_data_device_paths` stays optional for every model. Read it through
+  `get_multimodal_data_device_paths()`; without it, every tensor in
+  `multimodal_data` moves to the device.
+- Expose the existing model-owned cache through `multimodal_encoder_cache` and
+  `initialize_multimodal_encoder_cache()`. Item scheduling and encoder output
+  reuse share this cache.
+
+`EncoderGroup` still describes the modalities that share an encoder call, and
+`MultimodalEncoderMixin` still provides encoder attention metadata and CUDA
+graphs. Prompt expansion and disaggregated serving keep their interfaces.
 
 ### Weight Loading
 

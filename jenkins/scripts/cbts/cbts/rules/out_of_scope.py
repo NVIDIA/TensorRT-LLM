@@ -14,12 +14,14 @@
 """OutOfScopeRule — claims changes outside product-test selection.
 
 Emits scope="noop" with no product-test contribution and sanity / perfsanity
-off. CBTS infrastructure edits select CPU scripts tests. Noop changes add no
-CPU stages. Build and repository checks run upstream.
+off. CBTS infrastructure edits select CPU scripts tests, and a file that a CPU
+test reads selects that test. Noop changes add no CPU stages. Build and
+repository checks run upstream.
 
 `is_out_of_scope` is the single source of truth for these path patterns;
 `TestsDefRule` imports it to skip the same paths, so out-of-scope claims
-are not overridden by a same-file narrow contribution.
+are not overridden by a same-file narrow contribution. A CPU test input
+outside those paths keeps the stages that other rules select.
 """
 
 from __future__ import annotations
@@ -31,7 +33,13 @@ from typing import Optional
 
 from cbts.blocks import Stage, YAMLIndex
 
-from ._helpers import reconstruct_diff_pre_image, resolve_affected_stages, stages_by_yaml_stem
+from ._helpers import (
+    covering_entry_filters,
+    merge_block_filters,
+    reconstruct_diff_pre_image,
+    resolve_affected_stages,
+    stages_by_yaml_stem,
+)
 from .base import PRInputs, Rule, RuleResult
 
 # Exact files that affect repository metadata or external gates, but not the
@@ -116,6 +124,20 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "tests/microbenchmarks/",
     "jenkins/scripts/cbts/",
 )
+
+# Files that a CPU test reads. DocsRule also selects the docs stage for the V2 skill.
+_V2_FEATURES = (
+    "agent-flow/agent_flow/workflows/trtllm_modeling_v2/agents/skills/trtllm-modeling-v2-features"
+)
+_TIER_TEST = "unittest/_torch/multimodal/conformance/test_skill_tiers.py"
+CPU_TEST_INPUTS: dict[str, str] = {
+    ".claude/skills/trtllm-model-onboard-multimodal/SKILL.md": _TIER_TEST,
+    f"{_V2_FEATURES}/SKILL.md": _TIER_TEST,
+    f"{_V2_FEATURES}/references/features.md": _TIER_TEST,
+    "jenkins/scripts/cbts/cbts/rules/modeling_v2_source.py": (
+        "unittest/_torch/multimodal/conformance"
+    ),
+}
 
 # Excluded on purpose:
 # - General `.md` / `.rst` matches: outside the exempt subtrees, DocsRule
@@ -203,28 +225,44 @@ class OutOfScopeRule(Rule):
         claimed = {
             path
             for path in pr.changed_files
-            if is_out_of_scope(path) or self._is_check_only_pyproject(path, pr)
+            if path in CPU_TEST_INPUTS
+            or is_out_of_scope(path)
+            or self._is_check_only_pyproject(path, pr)
         }
         if not claimed:
             return None
-        if any(path.startswith("jenkins/scripts/cbts/") for path in claimed):
-            # The scripts suite includes CBTS tests and the infrastructure
-            # consumers of its command-line interfaces and selection artifacts.
-            filters = {
-                (block.yaml_stem, block.block_index): {"unittest/scripts": {"unittest/scripts"}}
-                for block in self.yaml_index.blocks
-                if block.yaml_stem == "l0_cpu" and "unittest/scripts" in block.tests
-            }
-            scripts_registered = bool(filters)
+        cbts = any(path.startswith("jenkins/scripts/cbts/") for path in claimed)
+        inputs = sorted({CPU_TEST_INPUTS[path] for path in claimed if path in CPU_TEST_INPUTS})
+        if cbts or inputs:
+            filters: dict[tuple[str, int], dict[str, set[str]]] = {}
+            registered = True
+            if cbts:
+                # The scripts suite includes CBTS tests and the infrastructure
+                # consumers of its command-line interfaces and selection artifacts.
+                filters = {
+                    (block.yaml_stem, block.block_index): {"unittest/scripts": {"unittest/scripts"}}
+                    for block in self.yaml_index.blocks
+                    if block.yaml_stem == "l0_cpu" and "unittest/scripts" in block.tests
+                }
+                registered = bool(filters)
+            for test in inputs:
+                found = covering_entry_filters(self.yaml_index, "l0_cpu", test)
+                registered = registered and bool(found)
+                merge_block_filters(filters, found)
             stages = resolve_affected_stages(filters, self.yaml_index, self._stages_by_yaml)
+            reason = "CBTS infrastructure changes require CPU scripts tests"
+            if inputs:
+                reason = "files that CPU tests read require those tests"
+                if cbts:
+                    reason += " and CPU scripts tests"
             return RuleResult(
                 handled_files=claimed,
                 affected_stages=stages,
-                scope="testsonly" if scripts_registered and stages else None,
+                scope="testsonly" if registered and stages else None,
                 block_filters=filters,
                 sanity_relevant=False,
                 perfsanity_relevant=False,
-                reason="outofscope: CBTS infrastructure changes require CPU scripts tests",
+                reason=f"outofscope: {reason}",
             )
         return RuleResult(
             handled_files=claimed,

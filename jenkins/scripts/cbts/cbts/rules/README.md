@@ -17,11 +17,11 @@ for the overall CBTS architecture.
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), and the exact VisualGen serve schema |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
-| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per target or family for changes under `models/` and `catalog/<category>/`, from paths and imports |
+| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per target or family for changes under `models/` and `catalog/<category>/`, from paths and imports; the multimodal conformance suite for routes, shared files and targets that import the multimodal contract |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
+| `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure; a file in `CPU_TEST_INPUTS` selects the CPU test that reads it |
 
 ## PythonFormattingRule
 

@@ -96,6 +96,7 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 
 ## Rules that save hours
 
+- For a media architecture, check each routed target against the [multimodal requirements](references/features.md#6-multimodal-inputs), including text-only admission.
 - Start from the in-tree test that already runs the feature (each section of
   the reference names them) rather than writing a launcher, server, transport
   or harness: the engine moves state and serves, the flow deploys and measures,
