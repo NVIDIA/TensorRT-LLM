@@ -30,9 +30,9 @@ with warnings.catch_warnings():
     )
     from ._generated import (
         encoded_media_pb2,
-        encoding_pb2,
         encoder_transfer_pb2,
         encoder_transfer_pb2_grpc,
+        encoding_pb2,
         error_pb2,
         generation_pb2,
         kv_pb2,
