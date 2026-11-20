@@ -59,6 +59,7 @@ from tensorrt_llm.serve.coordinator_server import SHUTDOWN_POLL_S
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.kv_hints import KvHintsRoute
+from tensorrt_llm.serve.middleware.register import register_middlewares
 from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
                                               _server_base_url)
 from tensorrt_llm.serve.openai_disagg_service import (
@@ -69,10 +70,8 @@ from tensorrt_llm.serve.openai_protocol import (
     UCompletionResponse, ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
-                                             PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds,
+from tensorrt_llm.serve.responses_utils import (get_steady_clock_now_in_seconds,
                                                 guard_responses_stream,
                                                 stream_error_event)
 from tensorrt_llm.serve.router import Router
@@ -313,11 +312,12 @@ class OpenAIDisaggServer:
         self.app.router.route_class = KvHintsRoute
 
         if self._collect_perf_metrics:
-            self.app.add_middleware(
-                PerfMetricsMiddleware,
-                expose_headers=self._expose_perf_metrics,
-                writer=self._perf_metrics_writer)
-        self.app.add_middleware(ServerArrivalTimeMiddleware)
+            register_middlewares(self.app,
+                                 collect_perf_metrics=True,
+                                 expose_perf_metrics=self._expose_perf_metrics,
+                                 perf_metrics_writer=self._perf_metrics_writer)
+        else:
+            register_middlewares(self.app, collect_perf_metrics=False)
 
         # Log request-body validation failures so a client/server schema mismatch
         # shows up server-side. Throttled (first, then every 1000th) to avoid

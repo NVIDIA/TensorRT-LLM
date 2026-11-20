@@ -23,6 +23,7 @@ import pytest
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.perf_utils import _input_processing_observer
 from tensorrt_llm.serve import perf_metrics as perf_metrics_module
+from tensorrt_llm.serve.middleware.perf_metrics import PerfMetricsMiddleware
 from tensorrt_llm.serve.perf_metrics import (
     CTX_CHUNK_METRICS_HEADER,
     RETURN_METRICS_HEADER,
@@ -31,7 +32,6 @@ from tensorrt_llm.serve.perf_metrics import (
     START_END_TIME_HEADER,
     STEP_METRICS_HEADER,
     PerfMetricsJsonlWriter,
-    PerfMetricsMiddleware,
     _jsonl_record,
     build_metrics_headers,
     build_metrics_record_from_headers,
