@@ -42,7 +42,7 @@ class TextQkNormRope(OpWrapper):
             ),
         ),
         Cell(
-            "Partial rotation spanning twelve lane pairs",
+            "Partial YaRN rotation spanning twelve lane pairs",
             dict(
                 tokens=17,
                 num_heads_q=2,
@@ -51,6 +51,10 @@ class TextQkNormRope(OpWrapper):
                 rotary_dim=96,
                 eps=1e-6,
                 base=1e4,
+                factor=3.0,
+                low=15.0,
+                high=27.0,
+                attention_factor=1.1,
             ),
         ),
         Cell(

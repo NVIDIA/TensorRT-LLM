@@ -3,65 +3,83 @@
 
 import torch
 import triton
-import triton.language as tl
-from triton.language.extra.cuda import libdevice
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language._layouts import BlockedLayout, SliceLayout
+from triton.experimental.gluon.language.extra import libdevice
 
 
-@triton.jit
+@gluon.jit
 def _text_qk_norm_rope(
     QKV,
     Q_WEIGHT,
     K_WEIGHT,
     POSITIONS,
-    NUM_Q: tl.constexpr,
-    NUM_KV: tl.constexpr,
-    DIM: tl.constexpr,
-    ROTARY_DIM: tl.constexpr,
-    EPS: tl.constexpr,
-    BASE: tl.constexpr,
-    FACTOR: tl.constexpr,
-    LOW: tl.constexpr,
-    HIGH: tl.constexpr,
-    ATTENTION_FACTOR: tl.constexpr,
+    NUM_Q: gl.constexpr,
+    NUM_KV: gl.constexpr,
+    DIM: gl.constexpr,
+    ROTARY_DIM: gl.constexpr,
+    EPS: gl.constexpr,
+    BASE: gl.constexpr,
+    FACTOR: gl.constexpr,
+    LOW: gl.constexpr,
+    HIGH: gl.constexpr,
+    ATTENTION_FACTOR: gl.constexpr,
+    HEADS_PER_TILE: gl.constexpr,
 ):
-    token = tl.program_id(0)
-    head = tl.program_id(1)
-    offsets = tl.arange(0, DIM)
-    lanes = tl.arange(0, 32)
-    per_lane: tl.constexpr = DIM // 32
-    row = QKV + (token.to(tl.int64) * (NUM_Q + 2 * NUM_KV) + head) * DIM
-    x = tl.load(row + offsets).to(tl.float32)
-    weight = tl.load(tl.where(head < NUM_Q, Q_WEIGHT, K_WEIGHT) + offsets).to(tl.float32)
+    token = gl.program_id(0)
+    per_lane: gl.constexpr = DIM // 32
+    layout: gl.constexpr = BlockedLayout([1, per_lane], [1, 32], [4, 1], [1, 0])
+    head_layout: gl.constexpr = SliceLayout(1, layout)
+    heads = gl.program_id(1) * HEADS_PER_TILE + gl.arange(0, HEADS_PER_TILE, layout=head_layout)
+    offsets = gl.arange(0, DIM, layout=gl.constexpr(SliceLayout(0, layout)))
+    active = heads < NUM_Q + NUM_KV
+    rows = (token.to(gl.int64) * (NUM_Q + 2 * NUM_KV) + heads) * DIM
+    ptrs = QKV + rows[:, None] + offsets[None, :]
+    x = gl.load(ptrs, active[:, None], other=0).to(gl.float32)
+    q_weight = gl.load(Q_WEIGHT + offsets).to(gl.float32)
+    k_weight = gl.load(K_WEIGHT + offsets).to(gl.float32)
+    weight = gl.where(heads[:, None] < NUM_Q, q_weight[None, :], k_weight[None, :])
 
-    # Each lane accumulates a contiguous vector before the descending XOR reduction.
-    ss = tl.full((32,), 0, tl.float32)
-    for i in tl.static_range(per_lane):
-        element = tl.gather(x, lanes * per_lane + i, 0)
-        ss = tl.fma(element, element, ss)
-    for i in tl.static_range(5):
-        ss += tl.gather(ss, lanes ^ (16 >> i), 0)
-    inv_rms = tl.rsqrt(ss * (1.0 / DIM) + EPS)
-    normed = x * (tl.gather(inv_rms, offsets // per_lane, 0) * weight)
+    # Each lane accumulates adjacent channels in FP32 before the warp reduction.
+    columns, _ = gl.broadcast(offsets[None, :], x)
+    warp = gl.reshape(x, (HEADS_PER_TILE, 32, per_lane))
+    column = gl.reshape(columns, warp.shape) % per_lane
+    sum_squares = 0.0
+    for i in gl.static_range(per_lane):
+        element = gl.sum(gl.where(column == i, warp, 0.0), axis=2)
+        sum_squares = gl.fma(element, element, sum_squares)
+    inv_rms = gl.rsqrt(gl.sum(sum_squares, axis=1) * (1.0 / DIM) + EPS)
+    inv_rms = gl.convert_layout(inv_rms, head_layout)
+    normed = x * (inv_rms[:, None] * weight)
 
-    half: tl.constexpr = ROTARY_DIM // 2
-    # NeoX pairs lanes by XOR. This determines the pairing for partial spans
-    # whose half width contains a non-power-of-two number of lane vectors.
-    partner = tl.gather(normed, offsets ^ half, 0)
-    partner = tl.where(offsets < half, -partner, partner)
-    pair = (offsets % half).to(tl.float32)
-    exponent = (-2.0 * libdevice.fast_log2f(tl.full((), BASE, tl.float32))) / ROTARY_DIM
-    freq = tl.exp2(pair * exponent)
+    half: gl.constexpr = ROTARY_DIM // 2
+    # For a non-power-of-two partial span the text kernel pairs lanes by XOR.
+    partner = gl.inline_asm_elementwise(
+        "shfl.sync.bfly.b32 $0, $1, $2, 31, -1;",
+        constraints="=f,f,r",
+        args=[normed, half // per_lane],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    partner = gl.where(offsets[None, :] < half, -partner, partner)
+    pair = (offsets % half).to(gl.float32)
+    exponent = gl.div_rn(-2.0 * libdevice.fast_log2f(gl.full((), BASE, gl.float32)), ROTARY_DIM)
+    freq = gl.exp2(pair * exponent)
     if FACTOR != 1.0:
-        high = tl.full((), HIGH, tl.float32)
-        low = tl.full((), LOW, tl.float32)
-        high = tl.where(tl.abs(high - low) <= 1.0e-6, high + 0.001, high)
-        ramp = tl.minimum(tl.maximum((pair - low) / (high - low), 0.0), 1.0)
+        high = gl.full((), HIGH, gl.float32)
+        low = gl.full((), LOW, gl.float32)
+        high = gl.where(gl.abs(high - low) <= 1.0e-6, high + 0.001, high)
+        ramp = gl.minimum(gl.maximum(gl.div_rn(pair - low, high - low), 0.0), 1.0)
         extrapolation = 1.0 - ramp
-        freq = (freq / FACTOR) * (1.0 - extrapolation) + freq * extrapolation
-    angle = tl.load(POSITIONS + token).to(tl.float32) * freq
-    rotated = tl.fma(normed, libdevice.fast_cosf(angle), partner * libdevice.fast_sinf(angle))
-    output = tl.where(offsets < ROTARY_DIM, rotated * ATTENTION_FACTOR, normed)
-    tl.store(row + offsets, output.to(tl.bfloat16))
+        freq = gl.div_rn(freq, FACTOR) * (1.0 - extrapolation) + freq * extrapolation
+    angle = gl.load(POSITIONS + token).to(gl.float32) * freq
+    cos = libdevice.fast_cosf(angle)[None, :]
+    sin = libdevice.fast_sinf(angle)[None, :]
+    rotated = gl.fma(normed, cos, partner * sin)
+    output = gl.where(offsets[None, :] < ROTARY_DIM, rotated * ATTENTION_FACTOR, normed)
+    gl.store(ptrs, output.to(gl.bfloat16), active[:, None])
 
 
 def apply_text_qk_norm_rope(
@@ -121,7 +139,9 @@ def apply_text_qk_norm_rope(
         )
     if qkv.shape[0] and num_heads_q + num_heads_kv:
         with torch.cuda.device(qkv.device):
-            _text_qk_norm_rope[(qkv.shape[0], num_heads_q + num_heads_kv)](
+            heads_per_tile = 16
+            grid = (qkv.shape[0], triton.cdiv(num_heads_q + num_heads_kv, heads_per_tile))
+            _text_qk_norm_rope[grid](
                 qkv,
                 q_weight,
                 k_weight,
@@ -136,6 +156,6 @@ def apply_text_qk_norm_rope(
                 low,
                 high,
                 attention_factor,
-                num_warps=1,
+                HEADS_PER_TILE=heads_per_tile,
             )
     return qkv
