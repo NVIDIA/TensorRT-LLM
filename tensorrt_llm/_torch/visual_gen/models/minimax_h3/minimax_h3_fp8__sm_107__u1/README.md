@@ -82,21 +82,8 @@ two-timestep keys. Reclaiming these allocations across sleep/wake is unverified
 and remains follow-up work; this scenario does not clear a cache concurrently
 with inference.
 
-## Validation and attribution
+## Validation
 
 This native scenario integration requires its own GPU functional, LPIPS and
 performance qualification. Historical measurements of the separately frozen
-implementation do not qualify a changed integration. See the linked complete
-reports for exact configurations, video comparisons, accepted/rejected changes
-and the current validation status:
-
-- [English report](https://sc.talos.nvidia.com/view/home/scratch.taianz_inf/workspace/notes/rubin/runs/20261110-h3-static-fp8/report-en.html)
-- [中文报告](https://sc.talos.nvidia.com/view/home/scratch.taianz_inf/workspace/notes/rubin/runs/20261110-h3-static-fp8/report.html)
-
-Kanghwan supplied the H3/scenario foundation, QK/RoPE work, Attention backend
-choices and component/preloop work. Pamela's discussion and Chenghao's register
-epilogue examples informed GEMM fusion; Yiheng's discussion informed conditioning
-precomputation. Kernel Factory supplied scheduling ideas used by the GateUp
-kernel. The FP8 adaptations and retained fusion implementation are included here;
-search campaigns, rejected variants and experimental measurement harnesses are
-maintained with the local report evidence.
+implementation do not qualify a changed integration.

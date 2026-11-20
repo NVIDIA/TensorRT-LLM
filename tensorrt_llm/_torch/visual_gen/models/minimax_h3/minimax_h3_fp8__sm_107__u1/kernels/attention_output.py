@@ -1,10 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Natural-N attention-output BF16 GEMM + attention-gated residual, with mandatory GEMM BF16 round.
-
-Research derivative; no weight permutation, no activation precision change.
-See research/pamela-breuse-transfer.md for attribution and transfer rationale.
-"""
+"""Natural-N attention-output BF16 GEMM + attention-gated residual, with mandatory GEMM BF16 round."""
 
 from typing import Tuple
 

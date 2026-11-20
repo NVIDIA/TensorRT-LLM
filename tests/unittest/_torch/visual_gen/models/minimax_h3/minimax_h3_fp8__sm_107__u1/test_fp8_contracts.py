@@ -304,6 +304,58 @@ class RoutingContracts(unittest.TestCase):
             self.assertIs(namespace["route_fp8_sm_107_u1"](_config()), expected)
         self.assertEqual(calls, ["selected"])
 
+    def test_unavailable_selection_declines_and_auto_keeps_family(self):
+        namespace = _routing_namespace()
+        module = "_h3_fp8_cpu_contracts.minimax_h3_fp8__sm_107__u1"
+        config = ModuleType(module + ".config")
+
+        def unavailable():
+            raise RuntimeError("the conversion kernels are built at load and need nvcc")
+
+        config.select = unavailable
+        with patch.dict(sys.modules, {module + ".config": config}):
+            with self.assertRaisesRegex(namespace["NoScenario"], "need nvcc"):
+                namespace["route_fp8_sm_107_u1"](_config())
+            cfg = _config()
+            cfg.extra_attrs["visual_gen_scenario"] = "auto"
+            family = object()
+            self.assertIs(namespace["resolve_scenario"](family, cfg), family)
+
+    def test_selection_names_missing_build_tools(self):
+        for home, present, missing in (
+            ("/cuda", {"ninja", "cuobjdump", "/cuda/bin/nvcc"}, None),
+            (None, {"ninja", "cuobjdump"}, "nvcc"),
+            ("/cuda", {"ninja", "/cuda/bin/nvcc"}, "cuobjdump"),
+            ("/cuda", {"cuobjdump"}, "nvcc, ninja"),
+        ):
+            applied = []
+            namespace = _source_definitions(
+                FP8 / "config.py",
+                {"missing_build_tools", "select"},
+                {
+                    "os": SimpleNamespace(
+                        path=SimpleNamespace(
+                            isfile=lambda path, present=present: path in present,
+                            join=os.path.join,
+                        )
+                    ),
+                    "shutil": SimpleNamespace(
+                        which=lambda tool, present=present: tool if tool in present else None
+                    ),
+                    "CUDA_HOME": home,
+                    "PRESET": {"marker": 1},
+                    "shared_config": SimpleNamespace(apply=applied.append),
+                },
+            )
+            with self.subTest(home=home, present=sorted(present)):
+                if missing is None:
+                    namespace["select"]()
+                    self.assertEqual(applied, [{"marker": 1}])
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "need " + missing + "$"):
+                        namespace["select"]()
+                    self.assertEqual(applied, [])
+
     def test_uniform_non_main_exclusions_still_select_fp8(self):
         cfg = _config()
         cfg.model_configs["transformer"].quant_config.exclude_modules = _uniform_ignore_patterns()

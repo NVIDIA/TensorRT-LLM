@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Natural-N BF16 GEMM + gated residual, with mandatory GEMM BF16 round.
 
-Research derivative of the B-reuse gate-up kernel. Natural weight order;
 FP32 accumulation, mandatory BF16 GEMM round, then gated FP32 FMA residual.
 Qualified for the original static-FP8 H3 request at M=37820 on SM107.
 """

@@ -238,7 +238,10 @@ def route_fp8_sm_107_u1(config: "DiffusionPipelineConfig") -> Type["BasePipeline
         )
     from .minimax_h3_fp8__sm_107__u1.config import select
 
-    select()
+    try:
+        select()
+    except RuntimeError as error:
+        raise NoScenario(f"the static-FP8 fusion cannot run in this process: {error}") from error
     from .minimax_h3_fp8__sm_107__u1.pipeline import MiniMaxH3Fp8Sm107U1Pipeline
 
     return MiniMaxH3Fp8Sm107U1Pipeline
