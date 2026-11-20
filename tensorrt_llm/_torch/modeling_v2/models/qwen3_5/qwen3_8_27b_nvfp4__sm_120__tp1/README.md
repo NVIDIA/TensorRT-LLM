@@ -33,7 +33,8 @@ Where it differs from the built-in `Qwen3_5VLModel` at the same settings:
 
 The FP8 to NVFP4 requantization is lossy and is on whenever the target claims the deployment;
 SciCode scores 45.04 against 46.15 for the built-in path (bf16 recurrent state, otherwise the same settings). `modeling_v2='off'`
-keeps the built-in numerics. The Qwen3.8 deployment guide
+together with `kv_cache_config.mamba_ssm_cache_dtype='auto'` keeps the built-in numerics (the
+int8 state pool exists only under this target). The Qwen3.8 deployment guide
 (`docs/source/deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.md`) lists the
 settings that select the target and its measured accuracy.
 

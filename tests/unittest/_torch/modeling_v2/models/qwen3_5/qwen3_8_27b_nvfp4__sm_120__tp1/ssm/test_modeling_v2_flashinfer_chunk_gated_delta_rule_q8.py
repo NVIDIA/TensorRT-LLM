@@ -117,7 +117,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         get_device_name(device),
         get_compute_capability(device),
     )
-    if route != cell.spec["route"]:
+    if sms == 188:  # the RTX PRO 6000 the routes are written for: a wrong route is a failure
+        assert route == cell.spec["route"], (route, cell.spec["route"])
+    elif route != cell.spec["route"]:
         pytest.skip(
             f"the cell certifies the {cell.spec['route']!r} route, which plan() does not pick "
             f"at {sms} SMs ({route!r}); the routes are written for the 188-SM RTX PRO 6000"

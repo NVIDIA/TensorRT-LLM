@@ -502,6 +502,11 @@ class Qwen3827BTp1Weights:
     def load(self, model, weights) -> None:
         """Fill every declared parameter and assert coverage in both directions."""
         core = model.model
+        if getattr(core, "copies", None) is not None:
+            raise RuntimeError(
+                "this target loads its weights once: `derive` has already replaced the FP8 "
+                "projections with their decode/prefill copies, so a weight update is not supported"
+            )
         manifest = self.manifest(core)
         assert set(manifest) == set(core.w.keys()), (
             "manifest/parameter drift",
@@ -581,7 +586,8 @@ class Qwen3827BTp1Weights:
             w[f"l{i}_qkvz_w"].data = empty
             w[f"l{i}_out_w"].data = empty
         for i in _attn_layers(d):
-            kv = w[f"l{i}_qkv_w"].data[2 * d.q_width :].contiguous()
+            # A clone, not a view: the view would keep the Q/gate rows' storage alive.
+            kv = w[f"l{i}_qkv_w"].data[2 * d.q_width :].clone()
             w[f"l{i}_qkv_w"].data = kv
             w[f"l{i}_o_w"].data = empty
         torch.cuda.synchronize()

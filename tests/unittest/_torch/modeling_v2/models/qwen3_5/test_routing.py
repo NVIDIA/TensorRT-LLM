@@ -9,8 +9,8 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     KvCacheConfig,
@@ -63,9 +63,7 @@ _ROPE = dict(
     mrope_interleaved=True,
 )
 # The YaRN extension the model card gives for contexts past 262K tokens.
-_YARN_ROPE = dict(
-    _ROPE, rope_type="yarn", factor=4.0, original_max_position_embeddings=262144
-)
+_YARN_ROPE = dict(_ROPE, rope_type="yarn", factor=4.0, original_max_position_embeddings=262144)
 
 
 def _qwen38_config(**text_overrides):
@@ -86,12 +84,13 @@ def _qwen38_config(**text_overrides):
         vocab_size=248320,
         torch_dtype=torch.bfloat16,
         rope_parameters=dict(_ROPE),
+        max_position_embeddings=262144,
     )
     text.update(text_overrides)
     return PretrainedConfig(
         architectures=["Qwen3_5ForConditionalGeneration"],
         model_type="qwen3_5",
-        torch_dtype=torch.bfloat16,
+        torch_dtype=text_overrides.get("torch_dtype", torch.bfloat16),
         text_config=PretrainedConfig(**text),
     )
 
@@ -214,16 +213,18 @@ def test_other_recipe_does_not_match(recipe):
 @pytest.mark.parametrize(
     "rope, missed",
     [
-        (_YARN_ROPE, "rope type 'yarn' with factor 4.0"),
-        (dict(_ROPE, factor=4.0), "rope type 'default' with factor 4.0"),
-        (dict(_ROPE, mrope_interleaved=False), "not interleaved"),
-        (dict(_ROPE, mrope_section=[16, 16, 16]), "mrope_section"),
+        (dict(rope_parameters=_YARN_ROPE), "rope type 'yarn' with factor 4.0"),
+        (dict(rope_parameters=dict(_ROPE, factor=4.0)), "rope type 'default' with factor 4.0"),
+        (dict(rope_parameters=dict(_ROPE, mrope_interleaved=False)), "not interleaved"),
+        (dict(rope_parameters=dict(_ROPE, mrope_section=[16, 16, 16])), "mrope_section"),
+        (dict(rope_scaling=dict(_ROPE, factor=4.0)), "rope type 'default' with factor 4.0"),
     ],
-    ids=["yarn", "scaled-default", "not-interleaved", "wide-section"],
+    ids=["yarn", "scaled-default", "not-interleaved", "wide-section", "scaled-rope-scaling"],
 )
 def test_other_rope_does_not_match(rope, missed):
-    """A scaled rope would rotate every position by the factor in the target's table."""
-    config = _model_config(_qwen38_config(rope_parameters=rope))
+    """A scaled rope would rotate every position by the factor in the target's table, which
+    reads `rope_scaling` first: an unscaled `rope_parameters` does not cover a scaled one."""
+    config = _model_config(_qwen38_config(**rope))
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=missed):
         modeling_v2_resolve(config, _llm_args("require"))
@@ -265,6 +266,11 @@ def test_on_sm103_does_not_match(monkeypatch):
             "disaggregated serving",
         ),
         (
+            dict(_SERVED_KV, max_attention_window=[4096]),
+            dict(max_seq_len=8192),
+            "max_attention_window",
+        ),
+        (
             dict(_SERVED_KV, use_kv_cache_manager_v2=False),
             {},
             "use_kv_cache_manager_v2=False",
@@ -278,6 +284,7 @@ def test_on_sm103_does_not_match(monkeypatch):
         "lora",
         "skip-softmax",
         "disaggregated",
+        "sliding-window",
         "kv-manager-v1",
     ],
 )
@@ -286,6 +293,35 @@ def test_engine_choices_the_target_refuses(kv, kwargs, missed):
     assert modeling_v2_resolve(config, _llm_args("auto", kv=kv, **kwargs)) is None
     with pytest.raises(ValueError, match=missed):
         modeling_v2_resolve(config, _llm_args("require", kv=kv, **kwargs))
+
+
+def test_sparse_attention_on_the_model_config_is_refused():
+    """The check reads `ModelConfig.sparse_attention_config` too, not only the LLM args."""
+    for mode in ("auto", "require"):
+        config = _model_config(_qwen38_config())
+        config.sparse_attention_config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1.0)
+        if mode == "auto":
+            assert modeling_v2_resolve(config, _llm_args(mode)) is None
+        else:
+            with pytest.raises(ValueError, match="sparse_attention_config"):
+                modeling_v2_resolve(config, _llm_args(mode))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32], ids=["fp16", "fp32"])
+def test_other_activation_dtype_does_not_match(dtype):
+    config = _model_config(_qwen38_config(torch_dtype=dtype))
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="the target is bf16"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_full_context_window_still_matches():
+    kv = dict(_SERVED_KV, max_attention_window=[8192])
+    config = _model_config(_qwen38_config())
+    assert (
+        _qualified(modeling_v2_resolve(config, _llm_args("require", kv=kv, max_seq_len=8192)))
+        == _TARGET
+    )
 
 
 def test_off_never_imports_or_claims(monkeypatch):

@@ -585,6 +585,10 @@ def gemma_fused_add_rmsnorm_nvfp4_cute(
         fp4_out = torch.empty((M, H // 2), dtype=torch.uint8, device=input.device)
     if sf_out is None:
         sf_out = torch.empty((nvfp4_sf_buffer_numel(M, H),), dtype=torch.uint8, device=input.device)
+    sf_bytes = nvfp4_sf_buffer_numel(M, H)
+    assert sf_out.is_contiguous() and sf_out.nbytes >= sf_bytes, (
+        f"sf_out holds {sf_out.nbytes} bytes; the padded scale layout needs {sf_bytes}"
+    )
     if M == 0:
         return fp4_out, sf_out
     kernel_obj, kernel = _get_compiled_fused_add_rmsnorm_nvfp4_kernel(

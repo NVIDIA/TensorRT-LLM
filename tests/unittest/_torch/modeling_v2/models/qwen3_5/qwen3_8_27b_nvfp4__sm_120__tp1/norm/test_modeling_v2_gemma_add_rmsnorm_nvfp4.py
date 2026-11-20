@@ -159,6 +159,12 @@ def test_every_output_byte_is_written(rows) -> None:
     _, _, want_fp4, want_sf = _composition(x, residual, weight, eps, gs)
     fp4 = torch.full_like(want_fp4, 0xFF)
     sf = torch.full_like(want_sf, 0xFF)
+    residual_before = residual.clone()
+    with pytest.raises(AssertionError, match="padded scale layout"):
+        gemma_fused_add_rmsnorm_nvfp4_cute(
+            x, residual, weight, gs, eps, True, fp4_out=fp4, sf_out=sf[:-16]
+        )
+    assert torch.equal(residual, residual_before), "a refused call writes nothing"
     gemma_fused_add_rmsnorm_nvfp4_cute(x, residual, weight, gs, eps, True, fp4_out=fp4, sf_out=sf)
     assert torch.equal(fp4, want_fp4) and torch.equal(sf, want_sf)
 

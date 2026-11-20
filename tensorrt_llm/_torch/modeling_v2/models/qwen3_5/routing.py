@@ -84,6 +84,15 @@ def _check_runtime(model_config: ModelConfig, llm_args: TorchLlmArgs) -> None:
             "disaggregated serving (cache_transceiver_config.backend is set); the target's "
             "recurrent-state pool is not transferable"
         )
+    windows = llm_args.kv_cache_config.max_attention_window
+    if windows:
+        text = model_config.pretrained_config.text_config
+        max_seq_len = llm_args.max_seq_len or getattr(text, "max_position_embeddings", None)
+        if max_seq_len is None or min(windows) < max_seq_len:
+            raise NoTarget(
+                f"max_attention_window={list(windows)} below max_seq_len={max_seq_len}; the "
+                "target's attention runs full context only"
+            )
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
         raise NoTarget(
             "use_kv_cache_manager_v2=False; the target's recurrent-state pool exists only on "
@@ -140,25 +149,36 @@ def _mixed_precision_recipe(model_config: ModelConfig) -> bool:
 
 def _check_rope(text) -> None:
     """Unscaled interleaved mRoPE over ``2 * sum(mrope_section)`` rotary dims: the table the
-    target builds (`RopeParams.from_config` would apply a scaling factor to it)."""
-    rope = getattr(text, "rope_parameters", None) or getattr(text, "rope_scaling", None)
-    if not isinstance(rope, dict):
+    target builds (`RopeParams.from_config` would apply a scaling factor to it).
+
+    Both ``rope_parameters`` and ``rope_scaling`` are checked when present: the target's
+    table reads ``rope_scaling`` first, so a scale in either one would reach it."""
+    ropes = [
+        rope
+        for rope in (getattr(text, "rope_parameters", None), getattr(text, "rope_scaling", None))
+        if isinstance(rope, dict)
+    ]
+    if not ropes:
         raise NoTarget("the text config declares no rope parameters; the target runs mRoPE")
-    kind = rope.get("rope_type", rope.get("type", "default"))
-    factor = rope.get("factor")
-    if kind not in ("default", "mrope") or (factor is not None and float(factor) != 1.0):
-        raise NoTarget(
-            f"rope type {kind!r} with factor {factor}; the target runs unscaled interleaved mRoPE"
+    for rope in ropes:
+        kind = rope.get("rope_type", rope.get("type", "default"))
+        factor = rope.get("factor")
+        if kind not in ("default", "mrope") or (factor is not None and float(factor) != 1.0):
+            raise NoTarget(
+                f"rope type {kind!r} with factor {factor}; the target runs unscaled "
+                "interleaved mRoPE"
+            )
+        if not rope.get("mrope_interleaved", False):
+            raise NoTarget("the rope is not interleaved mRoPE (mrope_interleaved)")
+        section = rope.get("mrope_section") or ()
+        partial = float(
+            rope.get("partial_rotary_factor", getattr(text, "partial_rotary_factor", 1.0))
         )
-    if not rope.get("mrope_interleaved", False):
-        raise NoTarget("the rope is not interleaved mRoPE (mrope_interleaved)")
-    section = rope.get("mrope_section") or ()
-    partial = float(rope.get("partial_rotary_factor", getattr(text, "partial_rotary_factor", 1.0)))
-    if 2 * sum(section) != int(text.head_dim * partial):
-        raise NoTarget(
-            f"mrope_section {list(section)} does not cover the {int(text.head_dim * partial)} "
-            "rotary dims"
-        )
+        if 2 * sum(section) != int(text.head_dim * partial):
+            raise NoTarget(
+                f"mrope_section {list(section)} does not cover the "
+                f"{int(text.head_dim * partial)} rotary dims"
+            )
 
 
 def _check_layer_pattern(text) -> None:
