@@ -19,6 +19,7 @@ import dataclasses
 import importlib
 import itertools
 import logging
+import math
 import os
 import socket
 import sys
@@ -26,7 +27,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
@@ -6040,6 +6041,15 @@ def test_moe_backend(
                 ref_fused_moe.check_accuracy(output, ref_output)
 
 
+# Top k of the skewed routing tests.
+_SKEWED_TOP_K = 4
+# (token, expert) pairs of the skewed routing: each of these experts gets only this token's row.
+_SKEWED_SINGLE_ROW_TOKENS = ((7, 3), (15, 5))
+# EXPAND_THREADS_PER_BLOCK in moe_kernels.cu. expandPrequantizedFp4RowsKernel copies up to this
+# many rows per step, one per thread.
+_EXPAND_THREADS_PER_BLOCK = 256
+
+
 def _skewed_router_logits(num_tokens: int, num_experts: int, dtype: torch.dtype) -> torch.Tensor:
     """Router logits that send most rows to a few experts.
 
@@ -6052,10 +6062,32 @@ def _skewed_router_logits(num_tokens: int, num_experts: int, dtype: torch.dtype)
     hot = token % 8 != 7
     router_logits[hot.nonzero().flatten()[:, None], torch.tensor([0, 7, 8, 40])] += 20.0
     router_logits[(~hot).nonzero().flatten()[:, None], torch.arange(41, 64)] += 20.0
-    for single_token, expert in ((7, 3), (15, 5)):
+    for single_token, expert in _SKEWED_SINGLE_ROW_TOKENS:
         if single_token < num_tokens:
             router_logits[single_token, expert] += 40.0
     return router_logits
+
+
+def _nvfp4_two_step_num_tokens(top_k: int) -> int:
+    """A token count that makes every block of the NVFP4 row copy run two or more steps.
+
+    expandPrequantizedFp4RowsKernelLauncher starts at most sm_count * blocks_per_sm blocks, and
+    exactly that many here, as the expanded rows outnumber them. Each block copies a run of
+    ceil(expanded rows / blocks) rows, at most EXPAND_THREADS_PER_BLOCK rows per step.
+    blocks_per_sm comes from the occupancy API, so this count works for every value the thread
+    limit allows: the expanded rows split evenly over each such grid, with more than one step of
+    rows per block.
+    """
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    max_blocks_per_sm = props.max_threads_per_multi_processor // _EXPAND_THREADS_PER_BLOCK
+    grids = [props.multi_processor_count * blocks for blocks in range(1, max_blocks_per_sm + 1)]
+    row_unit = math.lcm(top_k, *grids)
+    expanded_rows = row_unit * (grids[-1] * _EXPAND_THREADS_PER_BLOCK // row_unit + 1)
+    for grid in grids:
+        rows_per_block = expanded_rows // grid
+        assert rows_per_block * grid == expanded_rows
+        assert rows_per_block > _EXPAND_THREADS_PER_BLOCK, (grid, rows_per_block)
+    return expanded_rows // top_k
 
 
 def _run_cutlass_skewed_routing(
@@ -6067,7 +6099,7 @@ def _run_cutlass_skewed_routing(
     boundaries, past experts that received no rows, and into experts that
     received one. Returns (output, reference output, reference module).
     """
-    num_experts, top_k, hidden_size, intermediate_size = 64, 4, 512, 512
+    num_experts, top_k, hidden_size, intermediate_size = 64, _SKEWED_TOP_K, 512, 512
     dtype = torch.bfloat16
     with torch.device("cuda"):
         torch.manual_seed(0)
@@ -6107,7 +6139,7 @@ def _run_cutlass_skewed_routing(
         with torch.inference_mode():
             token_selected_experts, token_final_scales = routing_method.apply(router_logits)
             counts = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)
-            if num_tokens == 8192:
+            if num_tokens >= 8192:
                 assert counts[[1, 2, 4, 6, *range(9, 40)]].sum() == 0
                 assert counts[3] == counts[5] == 1
                 assert counts.max() >= num_tokens * 7 // 8
@@ -6150,16 +6182,25 @@ def _skip_without_oss_cutlass_moe(what: str) -> None:
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("input_sf_swizzled", [True, False], ids=["swizzled_sf", "linear_sf"])
-@pytest.mark.parametrize("num_tokens", [1, 3, 8192])
-def test_cutlass_nvfp4_skewed_routing(num_tokens: int, input_sf_swizzled: bool):
+@pytest.mark.parametrize("num_tokens", [1, 3, 8192, "two_steps_per_block"])
+def test_cutlass_nvfp4_skewed_routing(
+    num_tokens: int | Literal["two_steps_per_block"], input_sf_swizzled: bool
+) -> None:
     """The pre-quantized NVFP4 row copy on skewed routing, for both input scale layouts."""
     if not input_sf_swizzled:
         _skip_without_oss_cutlass_moe("Linear input scale factors")
+    if num_tokens == "two_steps_per_block":
+        num_tokens = _nvfp4_two_step_num_tokens(_SKEWED_TOP_K)
     output, ref_output, ref_fused_moe = _run_cutlass_skewed_routing(
         QuantAlgo.NVFP4, num_tokens, input_sf_swizzled
     )
     assert torch.isfinite(output).all()
     ref_fused_moe.check_accuracy(output, ref_output)
+    # The check above lets 3% of the values differ, far more than the rows that go to an expert of
+    # their own, so check those rows on their own too.
+    for token, _ in _SKEWED_SINGLE_ROW_TOKENS:
+        if token < num_tokens:
+            ref_fused_moe.check_accuracy(output[token : token + 1], ref_output[token : token + 1])
 
 
 def _nvfp4_quantize_rows(rows: torch.Tensor, global_sf: torch.Tensor, swizzled: bool):
