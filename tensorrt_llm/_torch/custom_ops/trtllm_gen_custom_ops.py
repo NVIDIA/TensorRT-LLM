@@ -420,6 +420,13 @@ def calculate_tile_tokens_dim(
     return tile_tokens_dim
 
 
+def _moe_layout_key(runner, rank_local: bool = True) -> Tuple:
+    """The EP size, attention DP and (for per-rank tuning) the expert shard a
+    MoE runner profiles its dummy routing for; the input shapes show none."""
+    key = (runner.num_experts // runner.local_num_experts, runner.use_dp)
+    return key + (runner.local_expert_offset, ) if rank_local else key
+
+
 @dataclass(frozen=True)
 class FP4BlockScaleMoEInputs:
 
@@ -475,6 +482,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
         self.local_expert_offset = local_expert_offset
+        self.use_dp = use_dp
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
@@ -496,8 +504,10 @@ class FP4BlockScaleMoERunner(TunableRunner):
     # The unique_id is used by the autotuner to get the cache key, so we hash on members
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing type does not matter
     def unique_id(self):
+        # Decode tuning broadcasts rank 0's tactics, so it keys no shard.
         key = (self.top_k, self.intermediate_size, self.local_num_experts,
-               self.act_type)
+               self.act_type) + _moe_layout_key(
+                   self, rank_local=not self.decode_tuning)
         # Without decode tuning the key is the base tuple. With it, finalized and un-finalized calls run
         # different kernels (decode_moe.select), so they are tuned apart.
         return key + (True, self.do_finalize) if self.decode_tuning else key
@@ -1334,6 +1344,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
         self.local_expert_offset = local_expert_offset
+        self.use_dp = use_dp
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
@@ -1352,7 +1363,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
     # type does not matter
     def unique_id(self):
         return (self.top_k, self.num_fused_shared_experts,
-                self.intermediate_size, self.local_num_experts, self.act_type)
+                self.intermediate_size, self.local_num_experts,
+                self.act_type) + _moe_layout_key(self)
 
     def get_runner(self):
         instance_key = ()
@@ -1696,6 +1708,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.valid_hidden_size = valid_hidden_size
         self.valid_intermediate_size = valid_intermediate_size
         self.local_expert_offset = local_expert_offset
+        self.use_dp = use_dp
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
@@ -1717,7 +1730,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        )
+        ) + _moe_layout_key(self)
 
     def get_runner(self):
         instance_key = (self.act_type, True)
@@ -2037,6 +2050,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.valid_hidden_size = valid_hidden_size
         self.valid_intermediate_size = valid_intermediate_size
         self.local_expert_offset = local_expert_offset
+        self.use_dp = use_dp
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
@@ -2058,7 +2072,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        )
+        ) + _moe_layout_key(self)
 
     def get_runner(self):
         instance_key = (self.act_type, False)
@@ -2360,6 +2374,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         self.valid_hidden_size = valid_hidden_size
         self.valid_intermediate_size = valid_intermediate_size
         self.local_expert_offset = local_expert_offset
+        self.use_dp = use_dp
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
@@ -2381,7 +2396,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.valid_intermediate_size,
             self.local_num_experts,
             self.act_type,
-        ))
+        ) + _moe_layout_key(self))
 
     def get_runner(self):
         instance_key = (self.act_type, )
@@ -2671,6 +2686,7 @@ class Bf16MoERunner(TunableRunner):
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
         self.local_expert_offset = local_expert_offset
+        self.use_dp = use_dp
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
@@ -2682,9 +2698,9 @@ class Bf16MoERunner(TunableRunner):
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
 
-    def unique_id(self) -> Tuple[int, int, int, int]:
+    def unique_id(self) -> Tuple:
         return (self.top_k, self.intermediate_size, self.local_num_experts,
-                self.act_type)
+                self.act_type) + _moe_layout_key(self)
 
     def get_runner(self) -> torch.ScriptObject:
         instance_key = (self.act_type, )
@@ -2953,6 +2969,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
         self.local_expert_offset = local_expert_offset
+        self.use_dp = use_dp
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
@@ -2970,7 +2987,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             self.intermediate_size,
             self.local_num_experts,
             self.act_type,
-        )
+        ) + _moe_layout_key(self)
 
     def get_runner(self):
         instance_key = (self.act_type, )

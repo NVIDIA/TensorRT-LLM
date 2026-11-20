@@ -2346,6 +2346,52 @@ def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
     assert dst.cache[key][1] == _Tac.TRTLLM  # IntEnum compares equal to -1
 
 
+def test_cache_of_another_build_is_ignored_and_replaced(tmp_path):
+    key = ("op::x", "Runner", "(1,)")
+    src = autotuner.AutoTuner().profiling_cache
+    src.cache[key] = (0, 7, 1.0)
+    path = tmp_path / "cache.json"
+    src.save_cache(path, rank=0)
+    doc = json.loads(path.read_text())
+    doc["metadata"]["lib_version"] = "0.0.0"
+    path.write_text(json.dumps(doc))
+
+    dst = autotuner.AutoTuner().profiling_cache
+    dst.load_cache(path, rank=0)
+    assert key not in dst.cache
+    dst.cache[("op::y", "Runner", "(1,)")] = (0, 3, 1.0)
+    dst.save_cache(path, rank=0)
+    saved = json.loads(path.read_text())
+    assert saved["metadata"]["lib_version"] == tensorrt_llm.__version__
+    assert str(key) not in saved["rank_0"]
+
+
+def test_moe_runner_key_names_the_ep_layout():
+    from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops as G
+
+    def key(offset=0, use_dp=True, decode_tuning=False):
+        return G.FP4BlockScaleMoERunner(
+            256,
+            8,
+            None,
+            None,
+            512,
+            offset,
+            32,
+            None,
+            1,
+            True,
+            G.ActType_TrtllmGen.SwiGlu.value,
+            use_dp=use_dp,
+            decode_tuning=decode_tuning).unique_id()
+
+    assert key() != key(use_dp=False)
+    assert key() != key(offset=32)
+    # Decode tuning gives every rank rank 0's tactics under one key.
+    assert key(decode_tuning=True) == key(offset=32, decode_tuning=True)
+    assert key(decode_tuning=True) != key(use_dp=False, decode_tuning=True)
+
+
 def test_autotune_post_tune_merge_before_save(tmp_path):
     # autotune(post_tune_merge_dist=...) must merge across ranks and persist the
     # merged winner, then restore the singleton's prior distributed state.

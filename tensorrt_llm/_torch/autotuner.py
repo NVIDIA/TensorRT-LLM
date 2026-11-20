@@ -789,6 +789,12 @@ class AutoTunerProfilingCache:
 
             with _exclusive_cache_lock(lock_path):
                 current_cache = self._read_existing_cache(file_path)
+                mismatch = self._metadata_mismatch(
+                    current_cache.get("metadata", {}))
+                if mismatch:
+                    logger.warning(
+                        f"[AutoTuner] Replacing cache {file_path}: {mismatch}")
+                    current_cache = {"metadata": self._serialize_metadata()}
 
                 # Merge shared cache entries (non-INDEPENDENT ops)
                 if self.SHARED_CACHE_KEY not in current_cache:
@@ -874,8 +880,12 @@ class AutoTunerProfilingCache:
         try:
             with _exclusive_cache_lock(lock_path):
                 current_cache_contents = json.loads(_read_cache_text(file_path))
-            self._deserialize_metadata(
+            mismatch = self._metadata_mismatch(
                 current_cache_contents.get("metadata", {}))
+            if mismatch:
+                logger.warning(
+                    f"[AutoTuner] Ignoring cache {file_path}: {mismatch}")
+                return
 
             # Start with empty cache and independent ops set
             self.cache = {}
@@ -922,11 +932,19 @@ class AutoTunerProfilingCache:
             "device_capability": self.device_capability,
         }
 
-    def _deserialize_metadata(self, metadata: Dict[str, Any]) -> None:
-        self.lib_version = metadata["lib_version"]
-        self.creation_timestamp = metadata["creation_timestamp"]
-        self.device_name = metadata["device_name"]
-        self.device_capability = metadata["device_capability"]
+    def _metadata_mismatch(self, metadata: Dict[str, Any]) -> Optional[str]:
+        """Why a cache file with `metadata` does not apply here, or None.
+
+        A tactic indexes a candidate list that depends on the build and the GPU.
+        """
+        for name in ("lib_version", "device_name", "device_capability"):
+            ours = getattr(self, name)
+            theirs = metadata.get(name)
+            if name == "device_capability" and theirs is not None:
+                ours, theirs = tuple(ours), tuple(theirs)
+            if theirs != ours:
+                return f"{name} {theirs!r} != {ours!r}"
+        return None
 
     def _serialize_cache_data(self,
                               cache: Optional[Dict[Tuple, Tuple]] = None
