@@ -1089,7 +1089,7 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers(cp_size, tp_size) -> No
     )
 
     events = []
-    metadata = SimpleNamespace(max_total_draft_tokens=None)
+    metadata = SimpleNamespace(max_total_draft_tokens=5)
 
     def build_metadata(*args: object) -> SimpleNamespace:
         events.append("metadata")
@@ -1100,7 +1100,6 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers(cp_size, tp_size) -> No
         _config=SimpleNamespace(
             attention_backend=SimpleNamespace(Metadata=DeepseekV4TrtllmAttentionMetadata),
             spec_config=None,
-            max_total_draft_tokens=5,
         ),
         _metadata=SimpleNamespace(setup_attention=Mock(side_effect=build_metadata)),
         model=object(),
@@ -1128,7 +1127,7 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers(cp_size, tp_size) -> No
         else:
             owner.dist.tp_allgather.assert_called_once_with(1)
         assert metadata.cu_seq_lens.is_inference()
-        warm.assert_called_once_with(owner.model, metadata, max_total_draft_tokens=5)
+        warm.assert_called_once_with(owner.model, metadata)
         owner._metadata.setup_attention.assert_called_once_with(manager, None)
         events.clear()
         manager.context_swa_layer_limit = 1
