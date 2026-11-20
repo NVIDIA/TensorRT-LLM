@@ -349,7 +349,8 @@ private:
 
     // Append one row per completed request to the gen-side transfer summary CSV. Opens the file
     // lazily on first use; expects timing to already be synced across ranks by the caller.
-    void writeGenTransferSummary(std::vector<LlmRequest*> const& completedRequests);
+    void writeGenTransferSummary(
+        std::vector<LlmRequest*> const& completedRequests, std::vector<size_t> const& summarySizes);
     void publishStatusSnapshot() noexcept;
 
     std::unique_ptr<CacheSender> mCacheSender;

@@ -176,7 +176,9 @@ class DisaggTransferCoordinator:
         counts = self._transfer_outcomes
         return (counts[0], counts[1], counts[2]) if counts is not None else None
 
-    def _record_transfer_outcome(self, request: LlmRequest, outcome: str) -> None:
+    def _record_transfer_outcome(
+        self, request: LlmRequest, outcome: str, *, backend_failure: bool = False
+    ) -> None:
         """Count each transfer once across output candidates, chunks and repeated polls.
 
         An overall deadline breach wins over a later completion or cleanup error.
@@ -196,7 +198,7 @@ class DisaggTransferCoordinator:
         )
         if getattr(request, "py_kv_transfer_timed_out", False) is True:
             outcome = "timeout"
-        elif rid in canceled_ids and outcome == "error":
+        elif rid in canceled_ids and outcome == "error" and not backend_failure:
             return
         self._settled_transfer_ids.add(transfer_id)
         counts[("success", "error", "timeout").index(outcome)] += 1
@@ -1146,8 +1148,10 @@ class DisaggTransferCoordinator:
                 rid = get_unique_rid(req)
                 if rid in self._settled_transfer_ids:
                     continue
-                if rid in failed_ids:
-                    self._record_transfer_outcome(req, "error")
+                if getattr(req, "kv_cache_transfer_timed_out", False) is True:
+                    self._record_transfer_outcome(req, "timeout")
+                elif rid in failed_ids:
+                    self._record_transfer_outcome(req, "error", backend_failure=True)
                 elif rid in completed_ids or (
                     not benchmark and req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
                 ):

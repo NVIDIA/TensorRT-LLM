@@ -1319,6 +1319,16 @@ public:
         return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
     }
 
+    void setKvCacheTransferTimedOut() noexcept
+    {
+        mKvCacheTransferTimedOut = true;
+    }
+
+    [[nodiscard]] bool getKvCacheTransferTimedOut() const noexcept
+    {
+        return mKvCacheTransferTimedOut;
+    }
+
     [[nodiscard]] double getKvCacheTransferTimeMS() const
     {
         // get max with 0 in case this function is called while end time is not recorded
@@ -1599,6 +1609,7 @@ protected:
     // Performance metrics. Should be updatable even from a const LlmRequest reference.
     bool mReturnPerfMetrics{false};
     mutable executor::RequestPerfMetrics mPerfMetrics;
+    bool mKvCacheTransferTimedOut{false};
 
     // Timepoint at which the request started. Used for tracking the timeout
     std::chrono::steady_clock::time_point mStartTime;

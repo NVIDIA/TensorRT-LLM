@@ -988,7 +988,7 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     return retData;
 }
 
-void batchUpdateKVCacheTransferBW(
+std::vector<size_t> batchUpdateKVCacheTransferBW(
     std::shared_ptr<CacheTransceiverComm> const& comm, std::vector<LlmRequest*> const& requests)
 {
     // Key-based merge: each rank serializes (requestId, start, end, size)
@@ -1080,18 +1080,18 @@ void batchUpdateKVCacheTransferBW(
         }
     }
 
-    // --- Step 4: Update local requests ---
+    // Update request timing. The byte totals across receivers belong to the CSV.
+    std::vector<size_t> summarySizes;
+    summarySizes.reserve(requests.size());
     for (auto* req : requests)
     {
         auto reqId = req->getContextPhaseParams().value().getReqId();
-        auto it = merged.find(reqId);
-        if (it != merged.end())
-        {
-            req->setKvCacheTransferStart(it->second.minStart);
-            req->setKvCacheTransferEnd(it->second.maxEnd);
-            req->setKvCacheSize(it->second.totalSize);
-        }
+        auto const& entry = merged.at(reqId);
+        req->setKvCacheTransferStart(entry.minStart);
+        req->setKvCacheTransferEnd(entry.maxEnd);
+        summarySizes.push_back(entry.totalSize);
     }
+    return summarySizes;
 }
 
 RequestStatuses CacheTransceiver::checkContextTransferStatus(
@@ -1608,6 +1608,10 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             continue;
         }
+        if (consensusOutcome.timedOutRequestIds.count(requestId))
+        {
+            requestIt->second->setKvCacheTransferTimedOut();
+        }
         requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
         mTimedOutRequesterIds.erase(requestId);
         mCancelRequestedRequesterIds.erase(requestId);
@@ -1638,12 +1642,12 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     // the gen-side transfer summary CSV.
     if (!completedRequests.empty() && !common::getEnvKVCacheTimeOutputPath().empty())
     {
-        batchUpdateKVCacheTransferBW(syncComm, completedRequests);
-        writeGenTransferSummary(completedRequests);
+        writeGenTransferSummary(completedRequests, batchUpdateKVCacheTransferBW(syncComm, completedRequests));
     }
 }
 
-void CacheTransceiver::writeGenTransferSummary(std::vector<LlmRequest*> const& completedRequests)
+void CacheTransceiver::writeGenTransferSummary(
+    std::vector<LlmRequest*> const& completedRequests, std::vector<size_t> const& summarySizes)
 {
     std::lock_guard<std::mutex> lock(mGenTransferSummaryMutex);
     if (!mGenTransferSummaryFile.is_open())
@@ -1658,11 +1662,11 @@ void CacheTransceiver::writeGenTransferSummary(std::vector<LlmRequest*> const& c
             filePath.string().c_str());
         mGenTransferSummaryFile << "RequestID,gen_side_transfer_time(ms),kv_cache_size" << '\n';
     }
-    for (auto* req : completedRequests)
+    for (size_t i = 0; i < completedRequests.size(); ++i)
     {
+        auto* req = completedRequests[i];
         auto reqId = req->getContextPhaseParams().value().getReqId();
-        mGenTransferSummaryFile << reqId << "," << req->getKvCacheTransferTimeMS() << "," << req->getKvCacheSize()
-                                << '\n';
+        mGenTransferSummaryFile << reqId << "," << req->getKvCacheTransferTimeMS() << "," << summarySizes[i] << '\n';
     }
     mGenTransferSummaryFile << std::flush;
 }

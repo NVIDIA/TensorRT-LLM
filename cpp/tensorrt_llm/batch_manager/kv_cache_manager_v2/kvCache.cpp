@@ -1292,7 +1292,8 @@ void KvCache::_recordMigratedSlots(
 
 void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
 {
-    if (!_shouldRecordManagerStats() || pages.empty())
+    if (!_shouldRecordManagerStats() || pages.empty()
+        || mManager->storage().cacheTier(cacheLevel) != CacheTier::HOST_MEM)
     {
         return;
     }
