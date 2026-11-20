@@ -3,13 +3,11 @@
 """The Kimi K3 family copies of the FP4 MLA backend code are verbatim.
 
 ``ops/attention/_k3_fp4_mla_{cache,kernels}`` copy definitions of the FP4 MLA backend modules outside the
-KV-cache-manager contract; ``_k3_fp4_mla_v_repack`` copies a whole module. Copied
+KV-cache-manager contract; ``_k3_fp4_mla_{v_repack,cute_dsl_utils}`` copy whole modules. Copied
 definitions must be AST-identical to their source definitions (imports aside), apart from the explicitly
 listed target-specific divergences and the definitions the family owns (no backend definition matches
-them). Every name the copies import from the contract modules must exist there.
-``_k3_fp4_mla_cute_dsl_utils`` is no copy: it re-exports the backend's compile helpers, which
-serialize the CuTe DSL compilations of a process with one lock. Parsing only: no GPU, no imports of
-the modules.
+them). Every name the copies import from the contract modules must exist there. Parsing only: no GPU,
+no imports of the modules.
 """
 
 import ast
@@ -61,6 +59,7 @@ FAMILY_OWNED = {
 }
 WHOLE_COPIES = {
     "_k3_fp4_mla_v_repack": "fp4_mla_cutedsl_v_repack",
+    "_k3_fp4_mla_cute_dsl_utils": "cute_dsl_utils",
 }
 
 
