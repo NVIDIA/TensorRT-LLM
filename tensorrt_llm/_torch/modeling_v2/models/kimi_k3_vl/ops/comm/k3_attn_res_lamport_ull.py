@@ -13,7 +13,7 @@ from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.k3r_attn_res import k3_attn_res_ull as _kernel
 from ..norm.k3_attn_res_norm_ull import attn_res_rmsnorm_reference, mxfp8_rows_reference
-from .k3_lamport_finish_ull import lamport_sum_reference
+from .k3_lamport_finish import lamport_sum_reference
 
 
 class K3AttnResLamport(OpWrapper):

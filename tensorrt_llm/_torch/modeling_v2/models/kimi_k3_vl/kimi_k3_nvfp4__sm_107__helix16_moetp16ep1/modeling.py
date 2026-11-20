@@ -188,7 +188,7 @@ from ..kernels.k3r_spec.dspark_draft_gemm_push_ull import (
     validate_push_tactic,
 )
 from ..kernels.k3r_spec.dspark_ull2 import draft_helix_tail
-from ..kernels.k3r_spec.spec_decode_head_ull import spec_decode_head
+from ..kernels.k3r_spec.spec_decode_head import spec_decode_head
 from ..kernels.k3r_spec.spec_tail_kernels_ull import (
     TAIL_V2_MAX_GENS,
     dflash_ctx_positions,
@@ -895,7 +895,7 @@ def masked_embedding(ids: torch.Tensor, weight: torch.Tensor, start: int, end: i
 
 def gather_embedding(ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """:func:`masked_embedding` of a whole table in one Triton launch (PDL where enabled)."""
-    from ..ops.embedding.k3_embedding_gather_ull import k3_embedding_gather
+    from ..ops.embedding.k3_embedding_gather import k3_embedding_gather
 
     return k3_embedding_gather(ids, weight)
 
@@ -1150,7 +1150,7 @@ class LamportPending:
 
     def materialize(self) -> torch.Tensor:
         """Finish the all-reduce into a BF16 tensor (the finish kernel on the current stream)."""
-        from ..ops.comm.k3_lamport_finish_ull import k3_lamport_finish
+        from ..ops.comm.k3_lamport_finish import k3_lamport_finish
 
         return k3_lamport_finish(
             self.workspace,
@@ -1249,7 +1249,7 @@ def _mnnvl_finish(
     target: LamportPushTarget, deferred: bool = False
 ) -> Union[torch.Tensor, LamportPending]:
     """``MNNVLAllReduce.finish_lamport_push`` of the branch."""
-    from ..ops.comm.k3_lamport_finish_ull import k3_lamport_finish
+    from ..ops.comm.k3_lamport_finish import k3_lamport_finish
 
     if deferred:
         return LamportPending(target)
@@ -1310,7 +1310,7 @@ def lamport_push_tensor(allreduce: Any, target: LamportPushTarget, x: torch.Tens
     """Push the contiguous BF16 ``[num_tokens, hidden_dim]`` tensor ``x`` into ``target`` (a copy
     kernel), for a producer without the push epilogue."""
     del allreduce  # the target carries its workspace; kept for the branch's call shape
-    from ..ops.comm.k3_lamport_push_ull import k3_lamport_push
+    from ..ops.comm.k3_lamport_push import k3_lamport_push
 
     k3_lamport_push(target.workspace, x.contiguous(), target.one_shot, use_pdl=USE_PDL)
     target.pushed = True
@@ -3275,7 +3275,7 @@ class K3MLAAttention(nn.Module):
         norm = self.q_a_layernorm
         if _K3_MLA_Q_NORM_PDL and IS_FLASHINFER_AVAILABLE and USE_PDL:
             from ..kernels.k3r_mla_q.q_norm_pdl import can_use
-            from ..ops.attention.rmsnorm_release_at_launch_ull import rmsnorm_release_at_launch
+            from ..ops.attention.rmsnorm_release_at_launch import rmsnorm_release_at_launch
 
             if can_use(q, norm.weight):
                 return rmsnorm_release_at_launch(q, norm.weight, norm.variance_epsilon)

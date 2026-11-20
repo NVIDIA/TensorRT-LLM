@@ -4,9 +4,9 @@
 a 2- or 4-rank group, each call under ``validating`` and against the entry's reference, which takes
 every rank's input in rank order (the checks of ``kernels/k3r_comm/test_k3_lamport_ar.py``):
 
-* ``k3_lamport_push_ull``: the slots of this rank's buffer (one-shot: every token's ``W`` slots;
+* ``k3_lamport_push``: the slots of this rank's buffer (one-shot: every token's ``W`` slots;
   two-shot: the tokens this rank owns) hold every rank's sanitized rows, bit for bit;
-* ``k3_lamport_finish_ull``: the rank-order sum in the C++ kernel's order, bit for bit;
+* ``k3_lamport_finish``: the rank-order sum in the C++ kernel's order, bit for bit;
 * ``k3_attn_res_lamport_ull``: the updated prefix bit for bit, the normed mix within the family
   attn_res tests' cosine / relative-L2 band, the MXFP8 output bit for bit the low-M GEMM's
   quantization of the stored output.
@@ -32,8 +32,8 @@ _K3 = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 # tests/unittest/_torch/modeling_v2, where _validating lives (the MPI workers import it by path).
 _MV2_TESTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 _ENTRIES = (
-    "ops.comm.k3_lamport_push_ull",
-    "ops.comm.k3_lamport_finish_ull",
+    "ops.comm.k3_lamport_push",
+    "ops.comm.k3_lamport_finish",
     "ops.comm.k3_attn_res_lamport_ull",
 )
 
@@ -203,7 +203,7 @@ def _run_rank_cells(world_size):
 @skip_pre_blackwell
 @pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
 def test_k3_lamport_ull_entry_cells(mpi_pool_executor):
-    """The CELLS of k3_lamport_push_ull, k3_lamport_finish_ull and k3_attn_res_lamport_ull."""
+    """The CELLS of k3_lamport_push, k3_lamport_finish and k3_attn_res_lamport_ull."""
     from tensorrt_llm._torch.modeling_v2.catalog._op import Arch
 
     world_size = mpi_pool_executor.num_workers

@@ -34,8 +34,8 @@ BOUNDARY_FILES = (
     "../ops/norm/attn_res_fwd_ull.py",
     "../ops/norm/k3_attn_res_norm_ull.py",
     "../ops/comm/k3_attn_res_lamport_ull.py",
-    "../ops/comm/k3_lamport_finish_ull.py",
-    "../ops/comm/k3_lamport_push_ull.py",
+    "../ops/comm/k3_lamport_finish.py",
+    "../ops/comm/k3_lamport_push.py",
 )
 
 

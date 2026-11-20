@@ -48,7 +48,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .k3_fused_router_ull import (
+from .k3_fused_router import (
     NUM_EXPERTS,
     TOP_K,
     _asm,
