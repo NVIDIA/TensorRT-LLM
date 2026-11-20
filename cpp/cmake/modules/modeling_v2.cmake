@@ -19,7 +19,7 @@
 Native (C++/CUDA) code of modeling_v2 targets.
 
 A model family's native code lives with its Python code, under
-tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/:
+tensorrt_llm/_torch/modeling_v2/models/<family>/:
 
   csrc/CMakeLists.txt       declares the family, its shared code and its targets
   csrc/*.cu|*.h|*.cpp       code several targets of the family share
@@ -28,7 +28,7 @@ tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/:
 Each family builds into one torch-op library, libth_modeling_v2_<family>.so,
 installed next to libth_common.so. Nothing in it is linked into
 libtensorrt_llm.so or libth_common.so; the Python loader
-(tensorrt_llm/_torch/_experimental/modeling_v2/_native.py) opens it only when
+(tensorrt_llm/_torch/modeling_v2/_native.py) opens it only when
 routing picks one of the family's targets. cpp/tensorrt_llm/modeling_v2/README.md
 is the guide for authors; cpp/tensorrt_llm/modeling_v2/ holds only what every
 family shares (this discovery, the common/ macros).

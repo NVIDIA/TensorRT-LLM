@@ -95,6 +95,7 @@ from .multimodal_encoder_graph import (
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
+    from ..recurrent_state_spec import RecurrentStateSpec
 
 _VISION_WEIGHT_PREFIX = "model.visual"
 
@@ -647,6 +648,7 @@ class Glm5NextVisionModelBase(nn.Module):
         vlm_base_model: Optional[type[nn.Module]] = None,
     ) -> None:
         super().__init__()
+        model_config = model_config.with_encoder_attention_backend("vision")
         self.model_config = model_config
         self.model_dtype = _text_dtype(model_config)
         # The tower is excluded from checkpoint quantization (BF16 in
@@ -1028,6 +1030,8 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
     requests bypass the vision tower, which runs full attention without KV cache.
     """
 
+    supported_encoder_attention_backends = {"vision": frozenset({"TRTLLM"})}
+
     _supports_flash_attn = True
     _supports_sdpa = True
 
@@ -1077,6 +1081,18 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
     @classmethod
     def get_preferred_transceiver_runtime(cls, pretrained_config=None) -> str:
         return Glm5NextForCausalLM.get_preferred_transceiver_runtime(pretrained_config)
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> "RecurrentStateSpec":
+        """Return the text decoder's declaration; it is built from the composite config too."""
+        return Glm5NextForCausalLM.get_recurrent_state_spec(
+            pretrained_config, quant_config=quant_config
+        )
 
     @property
     def mamba_metadata_cls(self):

@@ -15,15 +15,15 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.mla_kv_half_append import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.mla_kv_half_append import (  # noqa: E501
         KV_LORA_RANK,
         LATENT_OFFSET,
         ROPE_DIM,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.mla_kv_half_append import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.attention.mla_kv_half_append import (  # noqa: E501
         mla_kv_half_append as op,
     )
 except NoTarget as exc:

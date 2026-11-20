@@ -16,10 +16,171 @@
 """Report and diff helpers used by the Pyrefly shell workflow."""
 
 import argparse
+import ast
+import glob
 import json
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from test_common.import_paths import declared_paths, resolve_entry  # noqa: E402
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+
+def load_native_config(path: Path) -> dict:
+    """Read either a standalone config or a pyproject Pyrefly section."""
+    config = tomllib.loads(path.read_text())
+    return config.get("tool", {}).get("pyrefly", config)
+
+
+def select_project_files(input_path: Path, output_path: Path, configs: list[Path]) -> None:
+    """Select filenames from configured project-includes instead of hardcoded roots."""
+    included = set()
+    for config_path in configs:
+        for pattern in load_native_config(config_path).get("project-includes", []):
+            included.update(
+                Path(path).resolve()
+                for path in glob.glob(str(config_path.parent / pattern), recursive=True)
+            )
+    candidates = [os.fsdecode(item) for item in input_path.read_bytes().split(b"\0") if item]
+    selected = []
+    for candidate in candidates:
+        path = Path(candidate).resolve()
+        if path in included or any(parent in included for parent in path.parents):
+            selected.append(candidate)
+    output_path.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in selected))
+
+
+def toml_value(value: object) -> str:
+    """Serialize the scalar, array, and table values used by Pyrefly overrides."""
+    if isinstance(value, dict):
+        return (
+            "{ " + ", ".join(f"{json.dumps(k)} = {toml_value(v)}" for k, v in value.items()) + " }"
+        )
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    return json.dumps(value)
+
+
+def test_import_path_sources(project_root: Path) -> list[Path]:
+    """Find declarations in tracked and untracked test files, or walk outside Git."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project_root),
+                "grep",
+                "--full-name",
+                "-l",
+                "-z",
+                "-F",
+                "--untracked",
+                "--no-exclude-standard",
+                "__extra_import_path__",
+                "--",
+                ":(glob)tests/**/*.py",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        result = None
+    if result is not None and result.returncode in (0, 1):
+        return sorted(
+            project_root / os.fsdecode(path) for path in result.stdout.split(b"\0") if path
+        )
+    return sorted((project_root / "tests").rglob("*.py"))
+
+
+def extra_test_import_paths(project_root: Path, *, skip_ancestor_paths: bool) -> list[str]:
+    """Collect resolved literal import paths; the config writer deduplicates them."""
+    paths = []
+    for source_path in test_import_path_sources(project_root):
+        try:
+            source = source_path.read_text(encoding="utf-8")
+            if "__extra_import_path__" not in source:
+                continue
+            module = ast.parse(source)
+            ancestors = source_path.resolve().parents if skip_ancestor_paths else ()
+        except (
+            OSError,
+            UnicodeError,
+            SyntaxError,
+            ValueError,
+            RecursionError,
+            MemoryError,
+            RuntimeError,
+        ) as error:
+            print(f"Skipping __extra_import_path__ in {source_path}: {error}", file=sys.stderr)
+            continue
+        for node in module.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if not any(
+                isinstance(target, ast.Name) and target.id == "__extra_import_path__"
+                for target in targets
+            ):
+                continue
+            try:
+                entries = declared_paths(ast.literal_eval(node.value), str(source_path))
+            except (ValueError, TypeError, RecursionError, MemoryError) as error:
+                print(
+                    f"Skipping __extra_import_path__ at {source_path}:{node.lineno}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+            for entry in entries:
+                try:
+                    path = Path(
+                        resolve_entry(entry, str(source_path.parent), str(project_root))
+                    ).resolve()
+                    if path not in ancestors and path.is_dir():
+                        paths.append(str(path))
+                except (OSError, ValueError, TypeError, RuntimeError, MemoryError) as error:
+                    print(
+                        f"Skipping __extra_import_path__ entry {entry!r} at {source_path}:{node.lineno}: {error}",
+                        file=sys.stderr,
+                    )
+    return paths
+
+
+def write_test_config(
+    source_path: Path, destination_path: Path, *, discover_import_paths: bool = True
+) -> None:
+    """Generate an isolated native test config from the wrapper's custom section."""
+    source_path = source_path.resolve()
+    config = tomllib.loads(source_path.read_text())["tool"]["pyrefly-tests"]
+    config["extends"] = str(source_path)
+    for key in ("project-includes", "project-excludes", "search-path"):
+        if key in config:
+            config[key] = [str(source_path.parent / path) for path in config[key]]
+    extra_paths = (
+        extra_test_import_paths(
+            source_path.parent,
+            skip_ancestor_paths=config.get("enable-fallback-search-path", False),
+        )
+        if discover_import_paths
+        else []
+    )
+    configured_paths = [
+        str(Path(path).resolve()) for path in config.get("search-path", [str(source_path.parent)])
+    ]
+    config["search-path"] = list(dict.fromkeys([*configured_paths, *extra_paths]))
+    destination_path.write_text(
+        "".join(f"{key} = {toml_value(value)}\n" for key, value in config.items())
+    )
 
 
 def report_status(report_path: Path) -> int:
@@ -67,9 +228,11 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
                 kind = error.get("name", "error")
                 message = (
                     error.get("description") or error.get("concise_description", "")
-                    if all_diagnostics
+                    if all_diagnostics and kind != "missing-import"
                     else error.get("concise_description") or error.get("description", "")
                 )
+                if kind == "missing-import":
+                    message = str(message).split("Looked in these locations", 1)[0].rstrip()
                 if not all_diagnostics:
                     message = str(message).replace("\n", " ")
                 print(f"{location}: [{kind}] {message}")
@@ -79,28 +242,74 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
 
 
 def clear_path_module_exclusions(source_path: Path, destination_path: Path) -> None:
-    """Write a Pyrefly config with configured path and import exclusions disabled."""
-    config = source_path.read_text()
-    headers = list(re.finditer(r"(?m)^\[([^\]\n]+)\][ \t]*$", config))
-    if not any(header[1] == "tool.pyrefly" for header in headers):
-        raise ValueError(f"{source_path} has no [tool.pyrefly] section")
-    # Explicit config files use Pyrefly's standalone TOML format.
-    sections = []
-    for index, header in enumerate(headers):
-        end = headers[index + 1].start() if index + 1 < len(headers) else len(config)
-        body = config[header.end() : end]
-        if header[1] == "tool.pyrefly":
-            sections.append(body)
-        elif header[1].startswith("tool.pyrefly."):
-            sections.append(f"[{header[1].removeprefix('tool.pyrefly.')}]" + body)
-    section = "".join(sections)
-    for key in ("project-excludes", "ignore-missing-imports", "replace-imports-with-any"):
-        section, count = re.subn(
-            rf"(?ms)^{re.escape(key)}\s*=\s*\[.*?^\]", f"{key} = []", section, count=1
-        )
-        if count != 1 and key != "replace-imports-with-any":
-            raise ValueError(f"{source_path} is missing [tool.pyrefly].{key}")
-    destination_path.write_text(section)
+    """Inherit a scope's config while disabling native path and import exclusions."""
+    source = source_path.resolve()
+    seen = set()
+    subconfigs = []
+    while source not in seen:
+        seen.add(source)
+        config = load_native_config(source)
+        if "sub-config" in config:
+            subconfigs = config["sub-config"]
+            for subconfig in subconfigs:
+                matches = subconfig.get("matches")
+                if isinstance(matches, str):
+                    subconfig["matches"] = str(source.parent / matches)
+                for key in (
+                    "project-excludes",
+                    "ignore-missing-imports",
+                    "replace-imports-with-any",
+                ):
+                    if key in subconfig:
+                        subconfig[key] = []
+            break
+        if "extends" not in config:
+            break
+        source = (source.parent / config["extends"]).resolve()
+    destination_path.write_text(
+        f"extends = {json.dumps(str(source_path.resolve()))}\n"
+        "project-excludes = []\n"
+        "ignore-missing-imports = []\n"
+        "replace-imports-with-any = []\n"
+        f"sub-config = {toml_value(subconfigs)}\n"
+    )
+
+
+def merge_reports(source_paths: list[Path], destination_path: Path) -> None:
+    """Combine isolated product/test passes, preserving failures from either pass."""
+    reports = [json.loads(path.read_text()) for path in source_paths]
+    errors = []
+    failures = []
+    statuses = []
+    stderr = []
+    excluded_count = 0
+    for path, report in zip(source_paths, reports):
+        status = report.get("pyrefly_exit_code", 0)
+        statuses.append(status)
+        if report.get("report_error"):
+            failures.append(f"{path.stem}: {report['report_error']}")
+        else:
+            result = report.get("result")
+            if not isinstance(result, dict) or not isinstance(result.get("errors"), list):
+                failures.append(f"{path.stem}: Pyrefly report must contain an errors array")
+            else:
+                errors.extend(result["errors"])
+        excluded_count += report.get("excluded_diagnostic_count", 0)
+        if report.get("stderr"):
+            stderr.append(f"[{path.stem}]\n{report['stderr']}")
+    status = next((value for value in statuses if value not in (0, 1)), int(1 in statuses))
+    merged = {
+        "tool": "pyrefly",
+        "pyrefly_exit_code": status,
+        "excluded_diagnostic_count": excluded_count,
+        "remaining_diagnostic_count": len(errors),
+        "result": {"errors": errors},
+    }
+    if failures:
+        merged["report_error"] = "; ".join(failures)
+    if stderr:
+        merged["stderr"] = "\n".join(stderr)
+    destination_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n")
 
 
 def wrap_unfiltered_report(
@@ -248,6 +457,20 @@ def main() -> int:
     config_parser.add_argument("source", type=Path)
     config_parser.add_argument("destination", type=Path)
 
+    tests_config_parser = subparsers.add_parser("write-test-config")
+    tests_config_parser.add_argument("source", type=Path)
+    tests_config_parser.add_argument("destination", type=Path)
+    tests_config_parser.add_argument("--no-extra-import-paths", action="store_true")
+
+    files_parser = subparsers.add_parser("select-project-files")
+    files_parser.add_argument("input", type=Path)
+    files_parser.add_argument("output", type=Path)
+    files_parser.add_argument("configs", type=Path, nargs="+")
+
+    merge_parser = subparsers.add_parser("merge-reports")
+    merge_parser.add_argument("destination", type=Path)
+    merge_parser.add_argument("sources", type=Path, nargs="+")
+
     wrap_parser = subparsers.add_parser("wrap-unfiltered-report")
     wrap_parser.add_argument("source", type=Path)
     wrap_parser.add_argument("destination", type=Path)
@@ -270,6 +493,14 @@ def main() -> int:
         return report_status(args.report)
     elif args.command == "clear-exclusions-config":
         clear_path_module_exclusions(args.source, args.destination)
+    elif args.command == "write-test-config":
+        write_test_config(
+            args.source, args.destination, discover_import_paths=not args.no_extra_import_paths
+        )
+    elif args.command == "select-project-files":
+        select_project_files(args.input, args.output, args.configs)
+    elif args.command == "merge-reports":
+        merge_reports(args.sources, args.destination)
     elif args.command == "wrap-unfiltered-report":
         wrap_unfiltered_report(args.source, args.destination, args.stderr, args.status)
     elif args.command == "filter-diff-lines":

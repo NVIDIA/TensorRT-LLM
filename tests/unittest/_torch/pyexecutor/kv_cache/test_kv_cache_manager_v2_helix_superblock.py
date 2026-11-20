@@ -24,6 +24,7 @@ sampler advances ``py_decoding_iter``.
 
 import math
 import types
+from collections import deque
 from types import SimpleNamespace
 from typing import Optional
 
@@ -239,6 +240,9 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         # No lender attached, so a resize has no one to tell.
         _sharing=None,
     )
+    mgr._generation_history_length = lambda request: (
+        KVCacheManagerV2._generation_history_length(mgr, request)
+    )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)
     assert resizes == [(100, None)]
@@ -402,9 +406,48 @@ def test_host_tier_allowed_under_agg_helix(host_cache_size: Optional[int]) -> No
     assert manager.has_cache_tier_below_gpu
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates real KV cache pools")
+def test_helix_dummy_min_tokens_applies_to_generation_only() -> None:
+    """Warmup splits a full max_num_tokens context batch as [n - 1, 1]. Under
+    helix only generation dummies are raised to 2 tokens, so a context batch
+    keeps its total and stays within max_num_tokens."""
+    from unittest.mock import Mock, patch
+
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import CpType, Mapping
+
+    distributed = Mock()
+    distributed.allreduce.side_effect = lambda value, op: value
+    distributed.local_world_size = 1
+    mapping = Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+    with patch.object(Distributed, "get", return_value=distributed):
+        manager = KVCacheManagerV2(
+            KvCacheConfig(max_tokens=512, enable_block_reuse=False),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=3,
+            mapping=mapping,
+            is_disagg=False,
+        )
+    ctx = manager.add_dummy_requests([0, 1], token_nums=[63, 1])
+    gen = manager.add_dummy_requests([2], token_nums=[1], is_gen=True)
+    try:
+        assert [req.get_num_tokens(0) for req in ctx] == [63, 1]
+        assert gen[0].get_num_tokens(0) == 2
+    finally:
+        for req in ctx + gen:
+            manager.free_resources(req)
+        manager.shutdown()
+
+
 def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
-    """Helix disables estimation; with a V2 manager it must also promote
-    _skip_est so build_managers() calls configure_kv_cache_capacity().
+    """Disaggregated helix disables estimation; with a V2 manager it must also
+    promote _skip_est so build_managers() calls configure_kv_cache_capacity().
     Other CP types must NOT be promoted: configure_kv_cache_capacity has no
     sizing path for them."""
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
@@ -413,6 +456,8 @@ def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     def creator(is_v2, cp_type=CpType.HELIX):
         return SimpleNamespace(
             _skip_est=False,
+            _is_disagg=True,
+            _is_agg_helix=False,
             _mapping=SimpleNamespace(cp_config={"cp_type": cp_type}),
             _is_kv_cache_manager_v2=is_v2,
             _model_engine=SimpleNamespace(
@@ -445,13 +490,16 @@ def _failing_gen_scheduler(
             try_allocate_generation=lambda req: False,
             is_request_active=lambda request_id: True,
             has_cache_tier_below_gpu=has_cache_tier_below_gpu,
+            flush_deferred_closes=lambda: False,
         ),
         draft_kv_cache_manager=None,
         enable_joint_kv_cache_reuse=False,
+        _joint_draft_manager=None,
     )
     sched._try_allocate_generation = types.MethodType(
         KVCacheV2Scheduler._try_allocate_generation, sched
     )
+    sched._admit_unpaired_draft = types.MethodType(KVCacheV2Scheduler._admit_unpaired_draft, sched)
     sched._try_evict_for_gen = lambda req, requests_list, req_it, req_it_end, *args: (
         ladder_calls.append("evict") or (req_it_end, False)
     )
@@ -512,6 +560,37 @@ def test_scheduler_allocation_failure_raises_under_disagg_helix(
     )
     with pytest.raises(RuntimeError, match="cannot preempt"):
         _schedule_failing_gen(sched, _gen_request())
+    assert ladder_calls == []
+
+
+@pytest.mark.parametrize("fits_after_close", [True, False], ids=["fits", "still_short"])
+def test_disagg_helix_allocation_failure_closes_deferred_releases_first(
+    fits_after_close: bool,
+) -> None:
+    """A finished generation-only request whose close is deferred
+    (defer_generation_only_release) still holds its pages. A disaggregated
+    helix generation server, which cannot preempt, closes it and retries before
+    raising."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import ScheduleAction
+
+    ladder_calls = []
+    sched = _failing_gen_scheduler(enable_recompute_pause=False, ladder_calls=ladder_calls)
+    closed = []
+    mgr = sched.kv_cache_manager
+    mgr._deferred_closes = deque([(9, SimpleNamespace(close=lambda: closed.append(9)))])
+    mgr._sharing = None
+    mgr.impl = SimpleNamespace(clear_stats_excluded=lambda request_id: None)
+    mgr.flush_deferred_closes = types.MethodType(KVCacheManagerV2.flush_deferred_closes, mgr)
+    mgr.try_allocate_generation = lambda req: fits_after_close and bool(closed)
+
+    if fits_after_close:
+        action, tokens, *_ = _schedule_failing_gen(sched, _gen_request())
+        assert action is ScheduleAction.SCHEDULED and tokens == 1
+    else:
+        with pytest.raises(RuntimeError, match="cannot preempt"):
+            _schedule_failing_gen(sched, _gen_request())
+    assert closed == [9]
+    assert not mgr._deferred_closes
     assert ladder_calls == []
 
 

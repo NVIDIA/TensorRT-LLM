@@ -1531,6 +1531,9 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
 
+    # The vision encoder uses the Hugging Face implementation.
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     @classmethod
     def get_preferred_kv_cache_manager_version(
         cls,

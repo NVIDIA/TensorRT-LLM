@@ -39,7 +39,7 @@ import yaml
 
 pytestmark = pytest.mark.cpu_only
 
-_PY = "tensorrt_llm/_torch/_experimental/modeling_v2"
+_PY = "tensorrt_llm/_torch/modeling_v2"
 _CPP = "cpp/tensorrt_llm/modeling_v2"
 _UNIT = "tests/unittest/_torch/modeling_v2"
 _ACC = "tests/integration/defs/accuracy/modeling_v2"
@@ -240,6 +240,11 @@ def test_accuracy_directories_are_targets(repo: Path = _REPO):
     assert not problems, "\n".join(problems)
 
 
+# Families that ship directly constructed components without a registered model.
+# An exemption is invalid as soon as routing or registry imports are introduced.
+_COMPONENT_ONLY_FAMILIES: set[str] = {"beam"}
+
+
 def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
     """Every class a family's ``route`` returns lives in a target with accuracy tests.
 
@@ -251,6 +256,15 @@ def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
     for family_dir in _families(repo):
         routing = family_dir / "routing.py"
         where = routing.relative_to(repo)
+        if family_dir.name in _COMPONENT_ONLY_FAMILIES:
+            registry = repo / _PY / "models/__init__.py"
+            prefix = f"{_MODELS_PACKAGE}.{family_dir.name}"
+            imported = any(
+                name == prefix or name.startswith(prefix + ".") for name in _imports(registry, repo)
+            )
+            if routing.exists() or imported:
+                problems.append(f"{where}: component-only exemption has routing or registration")
+            continue
         if not routing.is_file():
             problems.append(f"{where}: missing")
             continue
@@ -305,11 +319,11 @@ def _qa_entries(repo: Path) -> list[str]:
     """The QA list entries: the lines of each text list and the cases of each YAML case list."""
     entries = [
         line.strip()
-        for path in sorted((repo / _QA_LISTS).glob("*.txt"))
+        for path in sorted((repo / _QA_LISTS).rglob("*.txt"))
         for line in path.read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
-    for path in sorted((repo / _QA_LISTS).glob("*.yml")):
+    for path in sorted((repo / _QA_LISTS).rglob("*.yml")):
         data = yaml.safe_load(path.read_text())
         tests = data.get("tests") if isinstance(data, dict) else None
         if isinstance(tests, list):
@@ -327,10 +341,19 @@ _NO_CI_STAGE = {
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/comm": (
         "2 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/ops/comm": (
+        "2 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/comm": (
         "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/ops/comm": (
+        "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/comm": (
+        "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/ops/comm": (
         "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
 }

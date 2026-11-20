@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import yaml
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import Field
@@ -41,7 +41,7 @@ from .sparse_attention import (
 # Type aliases
 # =============================================================================
 
-CacheBackendName = Literal["teacache", "cache_dit"]
+CacheBackendName = Literal["teacache", "cache_dit", "seacache"]
 
 # =============================================================================
 # Sub-configuration classes for VisualGenArgs
@@ -685,8 +685,49 @@ class CacheDiTConfig(BaseCacheConfig):
     )
 
 
+class SeaCacheConfig(BaseCacheConfig):
+    """SeaCache step-caching acceleration config (https://arxiv.org/abs/2602.18993).
+
+    Skips the generator transformer stack on steps whose spectrally filtered
+    input latents changed little since the last computed step, and predicts the
+    stack's residual by linear extrapolation from the last two computed steps.
+    The first ``max(max_warmup_steps, 1)`` and the last denoising steps are always
+    computed.
+    """
+
+    cache_backend: Literal["seacache"] = Field(
+        "seacache", description="Selects the SeaCache backend in `cache_config`."
+    )
+    threshold: float = Field(
+        0.25,
+        gt=0.0,
+        status="prototype",
+        description=(
+            "Accumulated relative-L1 change of the filtered latents below which a step "
+            "reuses the cache; larger values skip more steps."
+        ),
+    )
+    max_warmup_steps: int = Field(
+        12,
+        ge=0,
+        status="prototype",
+        description=(
+            "Leading denoising steps that always run the full stack; the first step always does."
+        ),
+    )
+    max_continuous_cached_steps: int = Field(
+        2,
+        ge=-1,
+        status="prototype",
+        description=(
+            "Maximum number of consecutive cached steps before a full step is forced; "
+            "-1 removes the limit and 0 disables caching."
+        ),
+    )
+
+
 CacheConfig = Annotated[
-    Union[TeaCacheConfig, CacheDiTConfig],
+    Union[TeaCacheConfig, CacheDiTConfig, SeaCacheConfig],
     Field(discriminator="cache_backend"),
 ]
 
@@ -762,6 +803,38 @@ class CpuOffloadConfig(StrictBaseModel):
             "If omitted, the model chooses default stages."
         ),
     )
+
+
+class BatchingConfig(StrictBaseModel):
+    """Request-level dynamic batching of compatible text-to-image requests."""
+
+    max_batch_size: int = Field(
+        1,
+        ge=1,
+        status="prototype",
+        description=(
+            "Maximum generated images in a dynamic batch; 1 disables request merging. "
+            "A larger single request still runs independently."
+        ),
+    )
+    max_queue_delay_ms: float = Field(
+        0.0,
+        ge=0,
+        le=2_147_483_647,
+        allow_inf_nan=False,
+        status="prototype",
+        description=(
+            "Maximum milliseconds spent collecting compatible requests when a worker is ready; "
+            "0 merges only requests already queued."
+        ),
+    )
+
+    @field_validator("max_batch_size", mode="before")
+    @classmethod
+    def _reject_boolean_batch_size(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("max_batch_size must be an integer, not a boolean")
+        return value
 
 
 class CompilationConfig(StrictBaseModel):
@@ -898,6 +971,11 @@ class VisualGenArgs(StrictBaseModel):
             "DiffusionPipelineConfig.from_pretrained."
         ),
     )
+    batching_config: BatchingConfig = Field(
+        default_factory=BatchingConfig,
+        status="prototype",
+        description="Request batching limits shared by offline generation and serving.",
+    )
     compilation_config: CompilationConfig = Field(
         default_factory=CompilationConfig,
         status="prototype",
@@ -976,6 +1054,10 @@ class VisualGenArgs(StrictBaseModel):
     def cache_dit(self) -> Optional[CacheDiTConfig]:
         return self.cache_config if isinstance(self.cache_config, CacheDiTConfig) else None
 
+    @property
+    def seacache(self) -> Optional[SeaCacheConfig]:
+        return self.cache_config if isinstance(self.cache_config, SeaCacheConfig) else None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return self.model_dump()
@@ -1024,10 +1106,12 @@ __all__ = [
     "BaseCacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",
+    "SeaCacheConfig",
     "CacheConfig",
     "TorchCompileConfig",
     "CudaGraphConfig",
     "CompilationConfig",
+    "BatchingConfig",
     "RuntimeLoRAConfig",
     "VisualGenArgs",
 ]

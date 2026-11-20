@@ -512,13 +512,11 @@ common-files: &common_files |
         tests/integration/defs/test_e2e.py |
         tests/integration/defs/test_fmha.py |
         tests/integration/defs/test_list_parser.py |
-        tests/integration/defs/test_list_validation.py |
         tests/integration/defs/test_sanity.py |
         tests/integration/defs/test_unittests.py |
         tests/integration/defs/triton_server/__init__.py |
         tests/integration/defs/triton_server/common.py |
         tests/integration/defs/triton_server/conftest.py |
-        tests/integration/defs/triton_server/test_list_parser.py |
         tests/integration/defs/triton_server/trt_test_alternative.py |
         tests/integration/defs/trt_test_alternative.py |
         tests/integration/defs/utils/__init__.py |
@@ -1236,13 +1234,11 @@ legacy-files: &legacy_files |
         tests/integration/defs/test_e2e.py |
         tests/integration/defs/test_fmha.py |
         tests/integration/defs/test_list_parser.py |
-        tests/integration/defs/test_list_validation.py |
         tests/integration/defs/test_sanity.py |
         tests/integration/defs/test_unittests.py |
         tests/integration/defs/triton_server/__init__.py |
         tests/integration/defs/triton_server/common.py |
         tests/integration/defs/triton_server/conftest.py |
-        tests/integration/defs/triton_server/test_list_parser.py |
         tests/integration/defs/triton_server/trt_test_alternative.py |
         tests/integration/defs/trt_test_alternative.py |
         tests/integration/defs/utils/__init__.py |
@@ -1465,7 +1461,7 @@ legacy-files: &legacy_files |
     )$
 # <<<< END AUTO-GENERATED >>>>
 
-# Full-project Pyrefly scans use the file set in pyproject.toml. The pre-commit
+# Full-project Pyrefly scans use product/test settings in pyproject.toml. The pre-commit
 # hook passes changed paths to the script's default changed-file mode.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
@@ -1539,6 +1535,13 @@ repos:
         exclude: *legacy_files
 -   repo: local
     hooks:
+    -   id: check-cpp-licenses
+        name: check C++ license headers
+        entry: python scripts/check_cpp_licenses.py --files
+        language: python
+        files: ^cpp/(include|tensorrt_llm)/.*\.(h|cpp|cuh|cu|inl|map|py)$
+        types: []
+        types_or: [file, symlink]
     -   id: ruff-legacy
         name: ruff-legacy (baseline-gated lint for legacy files)
         entry: python scripts/legacy_utils.py lint-precommit
@@ -1604,6 +1607,12 @@ repos:
             scripts/check_binding_stubs.py|
             setup.py
           )$
+    -   id: qa-selection-rules
+        name: Check QA selection rules and markers still match the integration suite
+        entry: python scripts/check_qa_selection_rules.py
+        language: python
+        files: ^(tests/integration/defs/(.*\.py|pytest\.ini)|tests/qa_selection/core/.*\.(py|json)|scripts/check_qa_selection_rules\.py)$
+        pass_filenames: false
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
         entry: ./scripts/dco_check.py
@@ -1635,6 +1644,6 @@ repos:
         language: script
         verbose: true
         require_serial: true
-        # Pass changed paths; the wrapper skips non-product Python inputs.
+        # Pass changed paths; the wrapper accepts product and test Python inputs.
         pass_filenames: true
-        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(run_pyrefly\.sh|pyrefly_exclusion\.py)$|\.pre-commit-config\.yaml$)
+        files: (\.pyi?$|^pyproject\.toml$|^scripts/run_pyrefly\.sh$|^\.pre-commit-config\.yaml$)

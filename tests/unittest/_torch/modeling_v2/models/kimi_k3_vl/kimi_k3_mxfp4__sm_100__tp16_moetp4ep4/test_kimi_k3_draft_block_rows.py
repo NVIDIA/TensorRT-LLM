@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``KimiK3DFlashWorker._draft_block_hidden_states``: the block-output rows that produce the draft logits (host-side).
+"""``KimiK3DSparkWorker._draft_block_hidden_states``: the block-output rows that produce the draft logits (host-side).
 
 For every (num_gens, block, K, shift_label) shape the rows equal the stock gather of the clamped slot ids
 (``dflash_draft_slot_ids``). Where those ids are one run of rows (one request, or DSpark's shift_label convention
@@ -26,8 +26,7 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
-    KimiK3DFlashWorker,
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
     KimiK3DSparkWorker,
 )
 from tensorrt_llm._torch.speculative import dflash as dflash_module
@@ -52,9 +51,9 @@ def host_ids(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
 
-def _worker(cls=KimiK3DSparkWorker):
+def _worker():
     """A worker without ``__init__`` (it needs flashinfer and a drafter)."""
-    worker = cls.__new__(cls)
+    worker = KimiK3DSparkWorker.__new__(KimiK3DSparkWorker)
     nn.Module.__init__(worker)
     return worker
 
@@ -89,7 +88,7 @@ def _is_view(rows, out):
 def test_rows_equal_the_stock_gather(num_gens, k, block_extra, shift_label):
     block = k + block_extra
     worker = _worker()
-    drafter = SimpleNamespace(_dspark_shift_label=shift_label)
+    drafter = SimpleNamespace(shift_label=shift_label)
     out = _block(num_gens, block)
 
     rows = worker._draft_block_hidden_states(drafter, out, num_gens, block, k)
@@ -107,7 +106,7 @@ def test_rows_equal_the_stock_gather(num_gens, k, block_extra, shift_label):
 def test_dspark_decode_shape_is_a_view():
     """DSpark's shift_label drafter at a block of K = 7: every batch of the decode path reads its rows in place."""
     worker = _worker()
-    drafter = SimpleNamespace(_dspark_shift_label=True)
+    drafter = SimpleNamespace(shift_label=True)
     for num_gens in range(1, 9):
         out = _block(num_gens, 7)
         rows = worker._draft_block_hidden_states(drafter, out, num_gens, 7, 7)
@@ -116,17 +115,19 @@ def test_dspark_decode_shape_is_a_view():
 
 
 def test_dflash_slots_of_several_requests_are_gathered():
-    """Plain DFlash reads slots 1..K of each block of K + 1: a gap per request, so the rows are gathered."""
-    worker = _worker(KimiK3DFlashWorker)
+    """A drafter that declares ``shift_label`` False reads DFlash's slots 1..K of each block of K + 1: a gap per
+    request, so the rows are gathered."""
+    worker = _worker()
+    drafter = SimpleNamespace(shift_label=False)
     out = _block(3, 8)
-    rows = worker._draft_block_hidden_states(object(), out, 3, 8, 7)
+    rows = worker._draft_block_hidden_states(drafter, out, 3, 8, 7)
     assert not _is_view(rows, out)
     assert torch.equal(rows, _stock(out, 3, 8, 7, False))
 
 
 def test_slot_ids_are_built_once_per_shape(monkeypatch):
     worker = _worker()
-    drafter = SimpleNamespace(_dspark_shift_label=True)
+    drafter = SimpleNamespace(shift_label=True)
     built = []
     real = DSparkWorker._draft_slot_ids
     monkeypatch.setattr(
@@ -144,7 +145,7 @@ def test_capture_gathers_a_shape_it_has_not_seen(monkeypatch):
     """Under capture an unseen shape is gathered and not kept (building the run needs a host read); a shape seen
     before capture keeps its view."""
     worker = _worker()
-    drafter = SimpleNamespace(_dspark_shift_label=True)
+    drafter = SimpleNamespace(shift_label=True)
     seen, unseen = _block(2, 7), _block(3, 7)
     assert _is_view(worker._draft_block_hidden_states(drafter, seen, 2, 7, 7), seen)
 

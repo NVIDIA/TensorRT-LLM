@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the kda_prefill catalog entry."""
+"""GPU test for the kda_prefill op."""
 
+import importlib
 import math
 import zlib
 from typing import List
@@ -10,9 +11,7 @@ import _kda_reference as kr
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_prefill import (
-    kda_prefill,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_prefill import kda_prefill
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating
@@ -270,3 +269,36 @@ def test_preplanned_metadata_matches_automatic() -> None:
         )
     kr.assert_scaled_close(planned, automatic, atol=2e-2)
     _assert_state_close(planned_pool, inp.pool)
+
+
+def test_sm_reserve_changes_only_the_schedule(monkeypatch) -> None:
+    # Kimi K3's layer passes the engine's sm_reserve(). Auto mode gives the same bits with any reserve; the forced
+    # Small-BH grid shrinks by it (the kernel is launched with SM count minus the reserve) and still matches the
+    # reference; a reserve of every SM is refused.
+    small_bh = importlib.import_module(
+        "tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.kda_chunked_bt16_small_bh"
+    )
+    budgets, launch = [], small_bh.chunk_kda_fwd
+
+    def recording_launch(*args, **kwargs):
+        budgets.append(kwargs["max_active_clusters"])
+        return launch(*args, **kwargs)
+
+    inp = _Inputs(6, [37, 300], seed=11)
+    slots, fresh = [2, 5], [True, False]
+    plain_pool = inp.pool.clone()
+    plain = inp.call(slots, fresh, pool=plain_pool)
+    with validating(kda_prefill):
+        reserved = inp.call(slots, fresh, sm_reserve=8)
+    assert torch.equal(reserved, plain) and torch.equal(inp.pool, plain_pool)
+    small = _Inputs(6, [37, 300], seed=12, state_dtype=torch.bfloat16)
+    ref_pool = small.pool.clone()
+    ref_o = small.call(slots, fresh, reference=True, pool=ref_pool)
+    monkeypatch.setattr(small_bh, "chunk_kda_fwd", recording_launch)
+    with validating(kda_prefill):
+        o = small.call(slots, fresh, mode="small-bh", sm_reserve=8)
+    kr.assert_scaled_close(o, ref_o, atol=2e-2)
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    assert budgets == [sm_count - 8], budgets
+    with pytest.raises(ValueError, match="sm_reserve"):
+        inp.call(slots, fresh, sm_reserve=sm_count)
