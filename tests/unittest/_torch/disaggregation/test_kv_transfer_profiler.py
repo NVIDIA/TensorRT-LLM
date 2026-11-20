@@ -183,6 +183,27 @@ class _ScriptedTransceiver(FakeKvCacheTransceiver):
             raise self.shutdown_error
 
 
+class _NativeSendBoundary:
+    """Model the native sender's duplicate guard and destructive status channel."""
+
+    def __init__(self) -> None:
+        self.pending: set[int] = set()
+        self.completed: list[int] = []
+        self.failed: list[int] = []
+
+    def respond_and_send_async(self, req: SimpleNamespace) -> None:
+        if req.request_id in self.pending:
+            raise RuntimeError("Request already queued for KV cache transfer")
+        self.pending.add(req.request_id)
+
+    def check_context_transfer_status(
+        self, at_least_request_num: int | None, mark_complete: bool = False
+    ) -> tuple[list[int], list[int]]:
+        completed, failed = self.completed, self.failed
+        self.completed, self.failed = [], []
+        return completed, failed
+
+
 @pytest.mark.parametrize("regions", [frozenset(), frozenset({"workflow", "mpi"})])
 def test_disabled_wrapper_preserves_identity(
     monkeypatch: pytest.MonkeyPatch, regions: frozenset[str]
@@ -1010,6 +1031,84 @@ def test_submission_failure_preserves_partial_or_unknown_admission(
         wrapper.check_context_transfer_status(0)
         assert events[-1][0] == "trtllm::kv_transfer_failed"
         assert not wrapper._records and not backend.observed
+
+
+def test_shutdown_preserves_ready_v2_send_outcome_after_partial_poll_failure(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    """Keep a completed send's outcome when another send prevents poll return."""
+    owner = _v2_owner()
+    owner._ever_had_send_session = True
+    owner._ctx_need_tp_sync = owner._ctx_need_pp_sync = False
+    owner._dist = SimpleNamespace(tp_allgather=Mock(side_effect=AssertionError("collective")))
+    owner._shutdown_complete = False
+    owner._send_sessions, owner._send_reqs, owner._recv_sessions, owner._recv_reqs = {}, {}, {}, {}
+    owner._transfer_worker = Mock()
+    wrapper = _wrap(owner, monkeypatch)
+    first, second = _request(5, 17), _request(6, 18)
+    sessions = []
+    for req, failed in ((first, False), (second, True)):
+        session = Mock(
+            status=SessionStatus.ERROR if failed else SessionStatus.TRANSFERRED,
+            _enforce_physical_ownership=True,
+        )
+        session.is_completed.return_value = not failed
+        session.has_failed.return_value = failed
+        session.resources_drained.return_value = True
+        session.wait_complete.return_value = WaitResult.FAILED if failed else WaitResult.COMPLETED
+        session.has_transferring_tasks.return_value = False
+        session.close.return_value = not failed
+
+        def admit(request: SimpleNamespace, native_session: object = session) -> None:
+            owner._send_sessions[request.py_request_id] = native_session
+            owner._send_reqs[request.py_request_id] = request
+
+        monkeypatch.setattr(owner, "respond_and_send_async", admit)
+        wrapper.respond_and_send_async(req)
+        sessions.append(session)
+
+    with pytest.raises(RuntimeError, match="session close refused"):
+        wrapper.check_context_transfer_status(0)
+    assert owner.get_send_terminal_outcomes() == {17: "complete"}
+    assert len(wrapper._records) == 2
+    sessions[1].close.return_value = True
+    wrapper.shutdown()
+    wrapper.shutdown()
+
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_complete",
+        "trtllm::kv_transfer_cancelled",
+    ]
+    assert events[2][1] == events[0][1] and events[3][1] == events[1][1]
+    assert not wrapper._records and not owner.get_send_terminal_outcomes()
+    assert not owner._send_sessions and not owner._send_reqs
+    sessions[0].close.assert_called_once_with()
+    assert sessions[1].close.call_count == 2
+    owner._transfer_worker.shutdown.assert_called_once_with()
+    owner._dist.tp_allgather.assert_not_called()
+
+
+def test_native_noop_shutdown_drops_observation_without_claiming_retirement(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    """An inherited no-op shutdown supplies no evidence about native sends."""
+    backend = object.__new__(BindKvCacheTransceiver)
+    backend.impl = _NativeSendBoundary()
+    backend.kv_transfer_timeout_ms = None
+    wrapper = _wrap(backend, monkeypatch)
+    req = _request()
+    wrapper.respond_and_send_async(req)
+    assert BindKvCacheTransceiver.shutdown is KvCacheTransceiver.shutdown
+    assert backend.transfer_resource_ownership(req) is None
+
+    wrapper.shutdown()
+    wrapper.shutdown()
+
+    assert backend.impl.pending == {req.request_id}
+    assert [name for name, _ in events] == ["trtllm::kv_transfer_submit"]
+    assert not wrapper._records and not wrapper._records_by_status
 
 
 def test_shutdown_failure_preserves_observations_and_original_error_for_retry(
@@ -1850,6 +1949,66 @@ def test_uncertain_native_generation_cannot_consume_reused_status_id(
     # Keep the old object alive: weak-reference expiry cannot hide the collision.
     assert old.request_id == 5
     assert len(wrapper._records) == (0 if new_request_id == 5 else 1)
+
+
+@pytest.mark.parametrize("outcome", ["complete", "failed"])
+def test_uncertain_native_duplicate_cannot_consume_admitted_send_status(
+    monkeypatch: pytest.MonkeyPatch, events: list, outcome: str
+) -> None:
+    """A rejected later request cannot inherit the admitted send's terminal ID."""
+    backend = object.__new__(BindKvCacheTransceiver)
+    backend.impl = _NativeSendBoundary()
+    backend.kv_transfer_timeout_ms = None
+    wrapper = _wrap(backend, monkeypatch)
+    admitted, duplicate = _request(5, 17), _request(5, 18)
+    wrapper.respond_and_send_async(admitted)
+    with pytest.raises(RuntimeError, match="already queued"):
+        wrapper.respond_and_send_async(duplicate)
+    backend.impl.pending.remove(admitted.request_id)
+    terminal_ids = backend.impl.completed if outcome == "complete" else backend.impl.failed
+    terminal_ids.append(admitted.request_id)
+
+    result = wrapper.check_context_transfer_status(0)
+    wrapper.check_context_transfer_status(0)
+
+    assert result == (
+        CtxTransferStatus([5], []) if outcome == "complete" else CtxTransferStatus([], [5])
+    )
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_submit",
+        f"trtllm::kv_transfer_{outcome}",
+    ]
+    assert events[-1][1] == events[0][1]
+    assert duplicate.request_id == 5
+    assert not wrapper._records and not wrapper._records_by_status
+
+
+def test_uncertain_duplicate_keeps_the_admitted_send_outcome_observer(
+    monkeypatch: pytest.MonkeyPatch, events: list
+) -> None:
+    """Dropping an ambiguous admission must preserve the admitted send's observer."""
+    backend = _ScriptedTransceiver()
+    backend.status_request_id = lambda req: req.request_id
+    backend.owned = None
+    wrapper = _wrap(backend, monkeypatch)
+    admitted, duplicate = _request(5, 17), _request(5, 18)
+    wrapper.respond_and_send_async(admitted)
+    backend.submit_error = RuntimeError("unknown duplicate admission")
+    with pytest.raises(RuntimeError, match="unknown duplicate admission"):
+        wrapper.respond_and_send_async(duplicate)
+    assert backend.observed == {id(admitted)}
+    backend.send_terminal = "complete"
+
+    wrapper.check_context_transfer_status(0)
+
+    assert [name for name, _ in events] == [
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_submit",
+        "trtllm::kv_transfer_complete",
+    ]
+    assert events[-1][1] == events[0][1]
+    assert not backend.observed and not wrapper._records
 
 
 def test_uncertain_native_send_does_not_shadow_reused_receive_domain(
