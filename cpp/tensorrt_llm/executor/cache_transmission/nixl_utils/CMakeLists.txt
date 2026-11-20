@@ -32,10 +32,6 @@ if(NIXL_ROOT)
 
   # Add the NIXL wrapper target
   add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp)
-  target_link_libraries(
-    ${NIXL_WRAPPER_TARGET}
-    PRIVATE tllm::executor_transfer_agent tllm::common_cuda
-            tllm::common_environment tllm::common_ip tllm::runtime_distributed)
   target_compile_options(${NIXL_WRAPPER_TARGET} PRIVATE -Wno-error)
 
   # Add include directories
@@ -46,8 +42,13 @@ if(NIXL_ROOT)
   # Link against all NIXL libraries
   target_link_libraries(
     ${NIXL_WRAPPER_TARGET}
-    PRIVATE NIXL::nixl tllm::common_environment tllm::executor_transfer_agent
-            tllm::kv_cache_legacy tllm::runtime_distributed)
+    PRIVATE NIXL::nixl
+            tllm::common_environment
+            tllm::executor_transfer_agent
+            tllm::kv_cache_legacy
+            tllm::runtime_distributed
+            tllm::common_cuda
+            tllm::common_ip)
 
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
