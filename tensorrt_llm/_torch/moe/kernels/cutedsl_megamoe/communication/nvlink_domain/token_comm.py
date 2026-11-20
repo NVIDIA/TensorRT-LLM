@@ -2615,9 +2615,9 @@ class TokenCommNonDeterministic(KernelComponent):
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
-        if cutlass.const_expr(self.one_round_dispatch):
-            # The plane rows were written by peers' generic stores and are read below through TMA.
-            fence_proxy_async_global()
+        # The rows this flag publishes are pulled below with TMA (async proxy): the one-round plane rows that
+        # peers wrote with generic stores, or the peers' staged inputs that an earlier kernel on their stream wrote.
+        fence_proxy_async_global()
         iket.range_pop()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
@@ -2755,7 +2755,8 @@ class TokenCommNonDeterministic(KernelComponent):
                             cp_async_bulk_s2g(chunk_destination, warp_activation_stage.iterator, Int32(activation_bytes))
                         cute.arch.sync_warp()
                         cute.arch.cp_async_bulk_commit_group()
-                        # Drain before the stage is reused by the next chunk (and before the flag).
+                        # The next chunk reuses the stage once this store has read it; the flag below
+                        # waits for the stores themselves.
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                         cute.arch.sync_warp()
                 else:
@@ -2803,9 +2804,15 @@ class TokenCommNonDeterministic(KernelComponent):
                                 destination_sf_vectors[None, sf_vector_idx],
                             )
 
-                if cutlass.const_expr(not self.token_in_stage_split):
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    cute.arch.sync_warp()
+                # The FC1 GEMM TMA-loads a row once a flag covering it is visible. .read only means the
+                # bulk store has read the stage, so a row whose accumulate() publishes waits for the
+                # stores to complete, which also completes the batch's earlier rows.
+                if flag_tracker.publishes_on_accumulate(Int32(0), self.token_in_flag_batch):
+                    cute.arch.cp_async_bulk_wait_group(0)
+                else:
+                    if cutlass.const_expr(not self.token_in_stage_split):
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.sync_warp()
                 ready_address = (fc1_ready_counter + ready_slot_idx).toint()
                 flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
                 cute.arch.sync_warp()
@@ -2824,6 +2831,10 @@ class TokenCommNonDeterministic(KernelComponent):
             )
             local_expert = local_expert + Int32(1)
 
+        # The tail flush publishes a batch that never filled.
+        if cutlass.const_expr(self.token_in_flag_batch > 1):
+            cute.arch.cp_async_bulk_wait_group(0)
+            cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
         if cutlass.const_expr(self.tail_parity):
@@ -2991,6 +3002,9 @@ class TokenCommNonDeterministic(KernelComponent):
                 iket.range_push("token_back.wait_fc2")
                 while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
                     nanosleep(500)
+                # The FC2 epilogue writes the rows this counter publishes with ordinary stores
+                # (data rows on the non-bulk path, scale rows on every path); TMA reads them below.
+                cute.arch.fence_proxy("async.global")
                 iket.range_pop()
             chunk_total = token_count * Int32(chunk_count)
             pool_expert_base = pool_expert_bases[local_expert]
@@ -3217,6 +3231,9 @@ class TokenCommNonDeterministic(KernelComponent):
                     iket.range_push("token_back.wait_fc2")
                     while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
                         nanosleep(500)
+                    # The FC2 epilogue writes the rows this counter publishes with ordinary stores
+                    # (data rows on the non-bulk path, scale rows on every path); TMA reads them below.
+                    cute.arch.fence_proxy("async.global")
                     iket.range_pop()
 
             while next_dense_token < expert_valid_end:
@@ -3230,6 +3247,9 @@ class TokenCommNonDeterministic(KernelComponent):
                             self.fc2_done_signals_per_token_tile
                         ):
                             nanosleep(500)
+                        # The FC2 epilogue writes the rows this counter publishes with ordinary stores
+                        # (data rows on the non-bulk path, scale rows on every path); TMA reads them below.
+                        cute.arch.fence_proxy("async.global")
                         iket.range_pop()
                         last_ready_slot = ready_slot
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
