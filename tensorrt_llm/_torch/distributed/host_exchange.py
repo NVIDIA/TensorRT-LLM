@@ -412,8 +412,9 @@ class MnnvlDist(Distributed):
     """``Distributed`` whose host collectives go through MNNVL memory, over the active ranks.
 
     Object gathers return None for inactive ranks, reductions skip them, and ``tp_allgather_int64``
-    gives them zero rows. A gather with ``active_only`` returns the active ranks' values only. It
-    has no pipeline-parallel, context-parallel or point-to-point communication.
+    gives them zero rows. A gather with ``active_only`` returns the active ranks' values only. On a
+    replacement rank the startup collectives return the original ranks' results from the startup
+    record. It has no pipeline-parallel, context-parallel or point-to-point communication.
     """
 
     _REDUCE = {
@@ -478,14 +479,26 @@ class MnnvlDist(Distributed):
 
     @property
     def local_world_size(self) -> int:
-        """Return the number of ranks on this node.
+        """Return the number of ranks on this node that share its free memory as this rank starts.
 
-        ``local_mpi_size()`` counts them too.
+        An original rank counts all ranks on the node. A replacement rank counts only the node's
+        ranks outside the membership, because the active ranks already hold their memory.
+        ``local_mpi_size()`` still counts all ranks on the node.
         """
         mapping = self.mapping
-        return sum(
-            mapping.get_node_rank(rank) == mapping.node_rank for rank in range(self.world_size)
-        )
+        node_ranks = [
+            rank
+            for rank in range(self.world_size)
+            if mapping.get_node_rank(rank) == mapping.node_rank
+        ]
+        startup_record = Distributed.startup_record
+        if startup_record is not None and startup_record.replacement:
+            # The startup module imports this one.
+            from .membership.startup import membership_client
+
+            record = membership_client().record
+            node_ranks = [rank for rank in node_ranks if not record.is_active(rank)]
+        return len(node_ranks)
 
     @property
     def host_exchange(self) -> HostExchange:
@@ -518,12 +531,25 @@ class MnnvlDist(Distributed):
         exchange = self._host_exchange_owner._host_exchange
         return () if exchange is None else exchange.waited_epochs
 
-    def _exchange(self, obj, readers=None, recipients=None, idle=False, active_only=False) -> list:
+    def _exchange(
+        self, obj, readers=None, recipients=None, idle=False, reduce_op=None, active_only=False
+    ) -> list:
         """Exchange ``obj`` as ``HostExchange.exchange`` does, and unpickle the payloads.
 
-        ``active_only`` drops inactive ranks.
+        ``reduce_op`` (``min`` or ``max``) lets a replacement's startup replay check its own value
+        against the original ranks' reduced result. ``active_only`` drops inactive ranks.
         """
-        payloads = self.host_exchange.exchange(pickle.dumps(obj), readers, recipients, idle)
+        host_exchange = self.host_exchange
+        payload = pickle.dumps(obj)
+
+        def run() -> list[bytes | None]:
+            return host_exchange.exchange(payload, readers, recipients, idle)
+
+        record = Distributed.startup_record
+        if record is not None and record.active:
+            payloads = record.exchange(self.mapping.tp_rank, payload, readers, run, reduce_op)
+        else:
+            payloads = run()
         return [
             None if payload is None else pickle.loads(payload)  # nosec B301
             for payload in payloads
@@ -577,15 +603,28 @@ class MnnvlDist(Distributed):
 
     def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         _check_reduce_op(op)
-        values = self._exchange(obj, active_only=True)
+        reduce_op = self._REDUCE[op] if op in (ReduceOp.MIN, ReduceOp.MAX) else None
+        values = self._exchange(obj, reduce_op=reduce_op, active_only=True)
         return functools.reduce(self._REDUCE[op], values)
 
     def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         return self.allreduce(obj, op)
 
     def tp_allgather_int64(self, values: ArrayLike, *, active_only: bool = False) -> np.ndarray:
+        host_exchange = self.host_exchange
         values = np.asarray(values, dtype=np.int64)
-        return self.host_exchange.allgather_array(values, active_only)
+        record = Distributed.startup_record
+        if record is None or not record.active:
+            return host_exchange.allgather_array(values, active_only)
+        # The original ranks were all active at their startup.
+        rows = record.exchange(
+            self.mapping.tp_rank,
+            values.tobytes(),
+            None,
+            lambda: [row.tobytes() for row in host_exchange.allgather_array(values)],
+            decode=lambda row: np.frombuffer(row, dtype=np.int64).tolist(),
+        )
+        return np.stack([np.frombuffer(row, dtype=np.int64) for row in rows])
 
     def broadcast_int64(
         self, values: ArrayLike, root: int = 0, *, prefer_cpu: bool = False
@@ -595,3 +634,26 @@ class MnnvlDist(Distributed):
 
     def tp_cp_broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
         return self.broadcast_int64(values, root)
+
+
+class MnnvlDistFactory:
+    """Create a process's ``MnnvlDist`` communicators for ``Distributed.get``.
+
+    They share the first one's host exchange, so a membership change reaches all of them.
+    """
+
+    def __init__(self) -> None:
+        self._first: Optional[MnnvlDist] = None
+
+    def __call__(self, mapping: Mapping) -> MnnvlDist:
+        """Return a ``MnnvlDist`` for ``mapping`` after checking its requirements."""
+        MnnvlDist.check_requirements(mapping)
+        dist = MnnvlDist(mapping, self._first)
+        if self._first is None:
+            self._first = dist
+        return dist
+
+    @property
+    def waited_epochs(self) -> tuple[tuple[int, int], ...]:
+        """Return (rank, epoch) for each rank a running host collective lacks packets from."""
+        return () if self._first is None else self._first.waited_epochs

@@ -157,6 +157,21 @@ def test_pending_control_with_draining_connector_ignores_hint():
     assert not waiting_queue
 
 
+def test_drain_cancellations_skip_inactive_ranks():
+    # Under attention DP the drain fetch gathers every rank's request ids; an inactive rank
+    # (fault tolerance) is left out by the active-only gather instead of appearing as None.
+    cancel = RequestQueueItem(11, is_canceled_request=True)
+    stub = _make_stub_executor(queued_items=[cancel])
+    stub.enable_attention_dp = True
+    stub.dist.tp_allgather = Mock(
+        side_effect=lambda payload, active_only=False: (
+            [payload, ({11}, set())] if active_only else [payload, None, ({11}, set())]
+        )
+    )
+
+    assert stub._fetch_drain_cancellations(FCFSWaitingQueue()) == [cancel]
+
+
 def _with_tracked_transfers(stub, local_inflight, poll_interval_ms=5000):
     stub.kv_cache_transceiver = SimpleNamespace(kv_transfer_poll_interval_ms=poll_interval_ms)
     stub.async_transfer_manager = Mock()

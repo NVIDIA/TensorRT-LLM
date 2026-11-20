@@ -1957,6 +1957,7 @@ def test_estimation_mla_workspace_floor_fails_on_every_rank(
 ) -> None:
     """A floor that leaves no variable KV budget fails on every rank, before any manager collective."""
     distributed = Mock()
+    distributed.agree_per_process.side_effect = lambda name, gather: gather()
     distributed.get.return_value.allreduce.return_value = 1
     with (
         patch("tensorrt_llm._torch.pyexecutor._util.Distributed", distributed),
@@ -1981,6 +1982,7 @@ def test_estimation_workspace_failure_vote_includes_zero_rate_ranks(
     workspace_bytes_per_token: int,
 ) -> None:
     distributed = Mock()
+    distributed.agree_per_process.side_effect = lambda name, gather: gather()
     distributed.get.return_value.allreduce.return_value = 1
     with (
         patch("tensorrt_llm._torch.pyexecutor._util.Distributed", distributed),

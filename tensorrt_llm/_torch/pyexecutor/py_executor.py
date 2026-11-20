@@ -1265,7 +1265,8 @@ class PyExecutor:
             initial_sample = self._kv_load_tracker.sample(
                 self._kv_cache_capacity, force=True)
             if self.enable_attention_dp:
-                rank_loads = self.dist.tp_allgather(initial_sample)
+                with Distributed.rank_varying("KV cache load sample"):
+                    rank_loads = self.dist.tp_allgather(initial_sample)
                 if self.dist.rank == 0 and all(rank_loads):
                     self._kv_load_tracker.snapshot = aggregate_load(rank_loads)
             elif initial_sample:
@@ -2469,11 +2470,16 @@ class PyExecutor:
                 f"for rank {self.global_rank}")
             return
 
-        # Sync all ranks
-        self.dist.barrier()
-        # Immediately take the local steady clock timestamp
-        local_timestamp = get_steady_clock_now_in_seconds()
-        all_rank_timestamps = self.dist.allgather(local_timestamp)
+        def gather_timestamps() -> List[float]:
+            # Sync all ranks
+            self.dist.barrier()
+            # Immediately take the local steady clock timestamp
+            return self.dist.allgather(get_steady_clock_now_in_seconds())
+
+        # A replacement rank takes the offset of the rank it replaces.
+        all_rank_timestamps = Distributed.agree_per_process(
+            "steady_clock_timestamps", gather_timestamps)
+        local_timestamp = all_rank_timestamps[self.global_rank]
         if self.global_rank == 0:
             logger.info(
                 f"global_steady_clock_offset at each rank: {[local_timestamp - ts for ts in all_rank_timestamps]}"
@@ -7526,7 +7532,8 @@ class PyExecutor:
                 # the KV-transfer deadline is wall-clock, so they could cross it
                 # in different iterations. All ranks reach this point in every
                 # iteration while the control request is pending.
-                drained = all(self.dist.tp_allgather(int(drained)))
+                drained = all(
+                    self.dist.tp_allgather(int(drained), active_only=True))
             if not drained:
                 return
         self._control_drain_transfer_deadline = None
@@ -9021,7 +9028,8 @@ class PyExecutor:
         if self.enable_attention_dp:
             # Every bridge rank enters this fixed drain-fetch slot, including
             # empty ranks. Rank zero need not own the request being cancelled.
-            participants = self.dist.tp_allgather((request_ids, client_ids))
+            participants = self.dist.tp_allgather((request_ids, client_ids),
+                                                  active_only=True)
             request_ids = set().union(*(ids for ids, _ in participants))
             client_ids = set().union(*(ids for _, ids in participants))
         if self.dist.rank != 0:
@@ -9204,10 +9212,13 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
-    def _get_request_admission_capacity(self) -> int:
+    def _get_request_admission_capacity(
+            self, all_rank_states: Optional[List[RankState]] = None) -> int:
         """Return the maximum number of distinct requests admitted at once."""
         if self.enable_attention_dp:
-            return self.dist.tp_size * self.max_num_active_requests
+            num_ranks = (self.dist.tp_size
+                         if all_rank_states is None else len(all_rank_states))
+            return num_ranks * self.max_num_active_requests
         return self.max_num_active_requests
 
     def _configure_benchmark_req_queues_size(self) -> None:
@@ -9329,7 +9340,8 @@ class PyExecutor:
         Returns the requests and, with attention DP, the ranks the router
         planned for them (request id -> rank; empty when none are planned).
         """
-        admission_capacity = self._get_request_admission_capacity()
+        admission_capacity = self._get_request_admission_capacity(
+            all_rank_states)
 
         max_new_requests = admission_capacity - total_num_active_requests
 
@@ -9826,10 +9838,13 @@ class PyExecutor:
              for req in context_requests]) + num_scheduled_generation_requests
         # Note: We use tp_allgather instead of tp_cp_allgather because we want to
         # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_allgather_int64([
-            num_scheduled_context_requests, num_scheduled_generation_requests,
-            num_scheduled_tokens, num_real_generation_requests
-        ]).tolist()
+        responses_list = self.dist.tp_allgather_int64(
+            [
+                num_scheduled_context_requests,
+                num_scheduled_generation_requests, num_scheduled_tokens,
+                num_real_generation_requests
+            ],
+            active_only=True).tolist()
         all_ranks_num_real_generation_requests = [
             response[3] for response in responses_list
         ]

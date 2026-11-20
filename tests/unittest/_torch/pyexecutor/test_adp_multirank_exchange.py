@@ -85,7 +85,7 @@ class _GlooDist(Distributed):
     def allgather(self, obj, root=0):
         return self._gather(obj)
 
-    def tp_allgather(self, obj, *, small_payload=False):
+    def tp_allgather(self, obj, *, small_payload=False, active_only=False):
         return self._gather(obj)
 
     def cp_allgather(self, obj, *, small_payload=False):

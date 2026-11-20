@@ -3350,7 +3350,7 @@ class _StubADPExecutor:
         self.dist.tp_size = tp_size
         self.dist.cp_size = 1
         self.dist.tp_rank = 0
-        self.dist.tp_allgather.side_effect = lambda value: [value]
+        self.dist.tp_allgather.side_effect = lambda value, active_only=False: [value]
         self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
         self.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
 
@@ -5104,6 +5104,21 @@ class TestAdpBalanceExcludesPadDummies:
         gathered = executor.dist.tp_allgather_int64.call_args[0][0]
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
+
+    def test_absent_rank_row_is_ignored(self):
+        """Rank 2 left the group and its stale row would release the held context requests."""
+        executor = self._make_executor([(1, 4, 4), (0, 4, 4), (0, 0, 0), (1, 4, 4)], threshold=0)
+        rows = executor.dist.tp_allgather_int64.return_value
+        executor.dist.tp_allgather_int64 = Mock(
+            side_effect=lambda values, active_only: rows[[0, 1, 3]] if active_only else rows
+        )
+
+        balanced = executor._balance_adp_requests(
+            [self._make_context_request()], [self._make_generation_request(False)]
+        )
+
+        assert balanced == []
+        assert executor.adp_ctx_waiting_iters_count == 1
 
 
 def _make_pp_relay_executor(*, pp_size: int, is_last_pp_rank: bool) -> PyExecutor:

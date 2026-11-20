@@ -43,6 +43,7 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
@@ -801,6 +802,11 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
     most-constrained rank set the value for everyone, mirroring the device
     quota sync. A single-rank job needs no collective and is returned as-is.
 
+    A replacement rank takes the original ranks' quota. Its own quota is a share
+    of the host memory left after the ranks beside it, replacements included,
+    pinned theirs, so only its share of the node's memory and its RLIMIT_MEMLOCK
+    bound it.
+
     Args:
         host_quota: This rank's locally-computed host tier quota in bytes.
         mapping: Parallelism mapping; ``world_size`` selects whether a
@@ -810,8 +816,36 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
         The globally-agreed host tier quota in bytes (the fleet ``MIN``).
     """
     if mapping.world_size > 1:
-        host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
+        with Distributed.rank_varying("host cache tier quota"):
+            host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
+        record = Distributed.startup_record
+        if record is not None and record.replaying:
+            _check_replacement_host_tier(host_quota, mapping)
     return host_quota
+
+
+def _check_replacement_host_tier(host_quota: int, mapping: Mapping) -> None:
+    """Check that a replacement rank can pin the original ranks' host tier quota.
+
+    The node's available memory is shared with the replacements starting beside
+    it, so the quota must fit this rank's share of it.
+
+    Raises:
+        ReplacementCannotStart: The quota exceeds this rank's RLIMIT_MEMLOCK.
+        RuntimeError: The quota exceeds this rank's share of available host memory.
+    """
+    limits = get_host_memory_limits(mapping)
+    if host_quota > limits.memlock_limit:
+        raise ReplacementCannotStart(
+            f"The original ranks' host cache tier quota of {host_quota} bytes exceeds the "
+            f"RLIMIT_MEMLOCK of {int(limits.memlock_limit)} bytes of this replacement rank"
+        )
+    if host_quota > limits.rank_share:
+        raise RuntimeError(
+            f"The original ranks' host cache tier quota of {host_quota} bytes exceeds this "
+            f"replacement rank's {int(limits.rank_share)}-byte share of available host memory "
+            f"({limits.local_ranks} starting rank(s) on its node)"
+        )
 
 
 class _KVCacheManagerInitStatus(IntEnum):
@@ -3059,6 +3093,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 # against a bogus inflation (nvbugs/6418103).
                 synced_quota = self._gpu_quota_for_max_tokens(max_tokens, max_util_for_resume)
                 quota = min(quota, synced_quota)
+            # Warmup shapes follow the KV cache capacity, so a replacement rank keeps its
+            # predecessor's quota.
+            quota = Distributed.agree_rank_capacity(
+                "kv_cache_device_quota", mapping.rank, quota, lambda: dist.allgather(quota)
+            )
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 

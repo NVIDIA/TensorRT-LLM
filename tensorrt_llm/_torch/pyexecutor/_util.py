@@ -909,11 +909,39 @@ def get_mla_context_workspace_reserve(
 
 
 def _any_rank_failed(failed: bool, mapping: Mapping) -> bool:
-    """Whether ``failed`` holds on any rank; every rank gets the same answer."""
+    """Whether ``failed`` holds on any rank; every rank gets the same answer.
+
+    The original ranks vote in the KV cache estimation, which a replacement
+    rank skips, so a replacement takes their answer and adds its own ``failed``.
+    """
     if mapping.world_size > 1:
-        return bool(
-            Distributed.get(mapping).allreduce(int(failed), op=ReduceOp.MAX))
+        any_failed = Distributed.agree_per_process(
+            "kv_cache_budget_failed",
+            lambda: Distributed.get(mapping).allreduce(int(failed),
+                                                       op=ReduceOp.MAX))
+        return failed or bool(any_failed)
     return failed
+
+
+def _agree_ctx_mla_kv_len_cap(cap: Optional[int],
+                              mapping: Mapping) -> Optional[int]:
+    """Return this rank's FP8 context-MLA admission cap, None when uncapped.
+
+    A replacement rank skips the KV cache estimation, so its budget lacks the
+    measured activation peak and its own ``cap`` exceeds the one of the rank
+    it replaces. It takes that rank's recorded cap instead, including no cap
+    where the measured peak already covered the staging. The KV cache device
+    quota is replayed the same way, so the replacement leaves the same memory
+    free as its predecessor. Without a startup record, ``cap`` is returned
+    with no collective.
+    """
+    if Distributed.startup_record is None:
+        return cap
+    own_cap = _NO_CTX_MLA_KV_LEN_CAP if cap is None else cap
+    agreed_cap = Distributed.agree_per_process(
+        "fp8_ctx_mla_kv_len_cap",
+        lambda: Distributed.get(mapping).allgather(own_cap))[mapping.rank]
+    return None if agreed_cap >= _NO_CTX_MLA_KV_LEN_CAP else agreed_cap
 
 
 def _normalize_attention_windows(
@@ -2482,6 +2510,21 @@ class KvCacheCreator:
                                                       **reserve_kwargs))
             else:
                 self._fp8_ctx_mla_kv_len_cap = int(cap)
+        else:
+            cap = _agree_ctx_mla_kv_len_cap(self._fp8_ctx_mla_kv_len_cap,
+                                            mapping)
+            if cap != self._fp8_ctx_mla_kv_len_cap:
+                # This rank replaces another and reserves only the staging that
+                # the recorded cap needs. Where a rank that ran the estimation
+                # has a cap, a rank that skips it has one too, so the reserve
+                # inputs above are set.
+                if cap is None:
+                    workspace_reserve, self._fp8_ctx_mla_kv_len_cap = 0, None
+                else:
+                    workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
+                        get_mla_context_workspace_reserve(
+                            budget_before, k_bytes_per_token, w_bytes_per_token,
+                            cap, **reserve_kwargs))
         if w_bytes_per_token > 0 and kv_len_cap:
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)

@@ -22,6 +22,7 @@ from unittest import mock
 
 import pytest
 
+from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
@@ -633,3 +634,37 @@ def test_requires_lazy_safetensors_is_false_for_other_checkpoints(
 def test_requires_lazy_safetensors_is_false_without_a_config(tmp_path: Path) -> None:
     """A directory without config.json cannot opt in to lazy loading."""
     assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is False
+
+
+def test_load_reports_startup_progress_per_file(tmp_path, monkeypatch):
+    """Report each checkpoint file that a rank loads as a step of its startup."""
+    import safetensors.torch
+    import torch
+
+    record = mock.Mock()
+    monkeypatch.setattr(Distributed, "startup_record", record)
+    for index in range(2):
+        safetensors.torch.save_file(
+            {f"weight_{index}": torch.zeros(1)}, tmp_path / f"model-{index}.safetensors"
+        )
+    loader = HfWeightLoader()
+    with (
+        mock.patch.object(loader, "prefetch_files"),
+        mock.patch.object(wl, "local_mpi_barrier"),
+    ):
+        weights = loader.load_weights(str(tmp_path), mapping=Mapping())
+    assert sorted(weights.keys()) == ["weight_0", "weight_1"]
+    assert record.report_progress.call_count == 2
+
+
+def test_prefetch_reports_startup_progress(tmp_path, monkeypatch):
+    """Report each prefetch progress heartbeat as a step of the rank's startup."""
+    record = mock.Mock()
+    monkeypatch.setattr(Distributed, "startup_record", record)
+    monkeypatch.setattr(wl, "_PREFETCH_LOG_INTERVAL_SEC", 0.0)
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
+    file = tmp_path / "model.safetensors"
+    file.write_bytes(os.urandom(mmap.PAGESIZE))
+    node = mock.Mock(**{"Get_rank.return_value": 0, "Get_size.return_value": 1})
+    HfWeightLoader().prefetch_files([str(file)], node)
+    record.report_progress.assert_called_once_with()

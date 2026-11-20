@@ -317,6 +317,40 @@ class GraphKeyTestCase(unittest.TestCase):
         self.assertEqual(result, (graph_attn_metadata, graph_spec_metadata, key))
 
 
+def test_adp_graph_agreement_skips_inactive_ranks() -> None:
+    """Check that an inactive rank's stale row changes neither the graph vote nor the padding."""
+    inactive = [False, 8, SampleType.FULL.value]
+    rows = [[True, 3, SampleType.FULL.value], [True, 4, SampleType.FULL.value], inactive]
+    runner = Mock()
+    runner.enabled = True
+    runner._adp_graph_batch_hint = None
+    # Graphs keyed by neither the KV regime nor the packed split exchange three fields.
+    runner.kv_regime_resolver = runner.packed_split_resolver = None
+    runner.config = SimpleNamespace(
+        enable_attention_dp=True,
+        mapping=SimpleNamespace(tp_size=4),
+        dist=SimpleNamespace(
+            tp_allgather_int64=lambda row, active_only: np.array(
+                [*rows, row] if not active_only else [rows[0], rows[1], row], dtype=np.int64
+            ),
+        ),
+    )
+    runner._gather_adp_graph_batch_info = CUDAGraphRunner._gather_adp_graph_batch_info.__get__(
+        runner
+    )
+    runner._resolve_sample_type.return_value = SampleType.FULL
+
+    # Every serving rank pads to the widest serving rank's batch.
+    assert CUDAGraphRunner._get_padding_batch_size(runner, Mock(batch_size=2), True) == 4
+    rows[:2] = [[True, 4, SampleType.FULL.value]] * 2
+    assert CUDAGraphRunner._agree_graph_shape(runner, Mock(batch_size=4), True, frozenset()) == (
+        True,
+        SampleType.FULL,
+        None,
+        None,
+    )
+
+
 class CaptureStateTestCase(unittest.TestCase):
     def test_spec_decode_capture_restores_kv_lens_between_warmups(self) -> None:
         attn_metadata = Mock()
@@ -894,7 +928,7 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         runner = self._runner()
         exchanges = []
 
-        def allgather(values: list[int]) -> np.ndarray:
+        def allgather(values: list[int], active_only: bool) -> np.ndarray:
             exchanges.append(list(values))
             peer = list(values)
             if len(peer) > 3:
@@ -1113,7 +1147,7 @@ class PackedSplitGraphKeyTestCase(unittest.TestCase):
         exchanges = []
         peer_split = [1]
 
-        def allgather(values: list[int]) -> np.ndarray:
+        def allgather(values: list[int], active_only: bool) -> np.ndarray:
             exchanges.append(list(values))
             peer = list(values)
             peer[-1] = peer_split[0]

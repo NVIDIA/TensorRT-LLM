@@ -496,7 +496,7 @@ class CUDAGraphRunner:
                                      kv_regime: Optional[int] = None,
                                      packed_split: Optional[bool] = None):
         """Return ``[(can_run_cuda_graph, batch_size, sample_type, kv_regime,
-        packed_split)]`` per TP rank.
+        packed_split)]`` per active TP rank.
 
         One fixed-size exchange, entered by every rank unconditionally. The
         sampling tier rides along because it is part of the graph key: ranks
@@ -518,7 +518,8 @@ class CUDAGraphRunner:
             payload.append(-1 if packed_split is None else int(packed_split))
         if sampling_mode is not None:
             payload.append(sampling_mode)
-        gathered = self.config.dist.tp_allgather_int64(payload)
+        gathered = self.config.dist.tp_allgather_int64(payload,
+                                                       active_only=True)
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()
@@ -2061,7 +2062,7 @@ class CUDAGraphRunner:
 
     def take_sampling_modes(self,
                             batch: ScheduledRequests) -> Optional[List[int]]:
-        """Every attention-DP rank's ``sampling_mode`` from ``batch``'s padding exchange, once; None without one."""
+        """Every active attention-DP rank's ``sampling_mode`` from ``batch``'s padding exchange, once; None without one."""
         shared, self._sampling_modes = self._sampling_modes, None
         if shared is None or shared[0] is not batch:
             return None

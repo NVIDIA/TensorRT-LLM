@@ -25,6 +25,8 @@ import torch
 from _torch.moe.moe_a2a_test_utils import a2a_combine, a2a_dispatch, a2a_workspace
 
 import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.distributed.startup_record import StartupRecord
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, TritonFusedMoE, VanillaMoE
 from tensorrt_llm._torch.moe.fused_moe.communication import AllGatherReduceScatter, execution_state
 from tensorrt_llm._torch.moe.fused_moe.communication.execution_state import MoeExecutionState
@@ -525,6 +527,7 @@ def test_drafter_layers_bound_to_the_target_state(monkeypatch: pytest.MonkeyPatc
         lambda health, ep_rank, device: _bindable_state(ep_group_health=health, ep_rank=ep_rank),
     )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(Distributed, "startup_record", StartupRecord())
     target, drafter = _frontend(), _frontend()
     prepare_model(_target_with_drafter(target, drafter))
     assert target.execution_state is not None

@@ -21,6 +21,7 @@ rendezvous store it hosts.
 
 from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_ENV
 
+from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart
 from .authority import Authority
 from .authority_process import AuthorityProcess
 from .liveness import (
@@ -30,6 +31,7 @@ from .liveness import (
     open_store,
     rendezvous_store,
 )
+from .pause_word import open_pause_word, pause_word_path, read_pause_word
 from .records import (
     AUTHORITY_SILENCE_TIMEOUT_S,
     DEAD_TIMEOUT_S,
@@ -49,6 +51,7 @@ from .records import (
     has_rank,
     latest_epoch,
     next_epoch,
+    rank_env,
     rank_mask,
     remove_cpu_affinity_constraints,
 )
@@ -79,8 +82,10 @@ __all__ = [
     "RECORD_KEY",
     "RENDEZVOUS_ENV",
     "RENDEZVOUS_TIMEOUT_S",
+    "REPLACEMENT_CANNOT_START",
     "REPORT_INTERVAL_S",
     "RankReport",
+    "ReplacementCannotStart",
     "Reply",
     "ResumeState",
     "SHARED_SECRET_ENV",
@@ -96,9 +101,13 @@ __all__ = [
     "next_epoch",
     "open_liveness_connection",
     "open_node_supervisor_connection",
+    "open_pause_word",
     "open_store",
     "parse_shared_secret",
+    "pause_word_path",
+    "rank_env",
     "rank_mask",
+    "read_pause_word",
     "remove_cpu_affinity_constraints",
     "rendezvous_host_port",
     "rendezvous_store",

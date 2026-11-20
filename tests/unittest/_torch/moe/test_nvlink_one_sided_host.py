@@ -186,6 +186,83 @@ def test_workspace_layout_without_rank_mask_has_no_incomplete_round_word(args: t
     assert torch.equal(with_mask[unchanged], without_mask[unchanged])
 
 
+def test_replacement_rank_replays_the_sentinel_vote(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A replacement rank takes the sentinel vote that the original ranks recorded at startup.
+
+    It builds its layers without the other ranks, so the vote must issue no collective there. A
+    replacement whose own vote differs from its predecessor's cannot start. The layers are Wide-EP
+    fault tolerant, so every rank votes the sentinel transport off: its kernels take no active-rank
+    mask or abort state.
+    """
+    from tensorrt_llm._torch.distributed import communicator
+    from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
+    from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided
+
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_sentinel_available", lambda: True)
+    monkeypatch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+    monkeypatch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
+
+    def layer(ep_rank: int) -> NVLinkOneSided:
+        comm = NVLinkOneSided.__new__(NVLinkOneSided)
+        comm.mapping = None
+        comm.ep_rank, comm.ep_size, comm.top_k, comm.num_experts = ep_rank, 2, 2, 8
+        comm.max_num_tokens_per_rank = 16
+        comm.use_low_precision_combine = False
+        return comm
+
+    layout = NVLinkOneSided._make_workspace_layout(
+        2, 2, 16, 64, torch.bfloat16, None, 0, rank_mask=True
+    )
+
+    def vote(comm: NVLinkOneSided) -> tuple:
+        return comm._vote_sentinel(layout.clone(), 64, torch.bfloat16, "BF16", fault_tolerant=True)
+
+    gathered = []
+
+    def allgather(own_vote):
+        gathered.append(own_vote)
+        # The other rank's layer is fault tolerant as well, so it votes the sentinel transport off.
+        return [own_vote, (False, None, own_vote[2])]
+
+    def no_collective(own_vote):
+        raise AssertionError("a replacement rank must not run the sentinel vote collective")
+
+    def get_comm(allgather, rank):
+        # Like MnnvlMemory.get_comm, whose first call splits the startup group.
+        communicator.Distributed.agree_per_process("startup_group_split", lambda: [(0, 0)] * 2)
+        return SimpleNamespace(allgather=allgather, Get_rank=lambda: rank)
+
+    original = StartupRecord()
+    original.record()
+    monkeypatch.setattr(communicator.Distributed, "startup_record", original)
+    monkeypatch.setattr(
+        nvlink_one_sided.MnnvlMemory, "get_comm", lambda mapping: get_comm(allgather, 0)
+    )
+    expected = vote(layer(0))
+    original.close()
+    assert expected == (0, None, tuple(layout.tolist()))
+    assert len(gathered) == 1 and gathered[0][:2] == (False, None)
+
+    def replacement_record() -> StartupRecord:
+        replacement = StartupRecord()
+        replacement.replay(original.published())
+        monkeypatch.setattr(communicator.Distributed, "startup_record", replacement)
+        return replacement
+
+    monkeypatch.setattr(
+        nvlink_one_sided.MnnvlMemory, "get_comm", lambda mapping: get_comm(no_collective, 1)
+    )
+    replacement = replacement_record()
+    assert vote(layer(1)) == expected
+    # The replacement takes each startup value as often as the original ranks recorded it.
+    replacement.close()
+
+    replacement_record()
+    monkeypatch.setenv(SENTINEL_MAX_TOKENS_ENV, "64")
+    with pytest.raises(ReplacementCannotStart, match="nvlink_one_sided_sentinel_vote"):
+        vote(layer(1))
+
+
 def test_sentinel_row_geometry() -> None:
     hidden_size, top_k = 7168, 8
     # (hidden-state bytes, scale bytes, dispatch blocks per token) per row.

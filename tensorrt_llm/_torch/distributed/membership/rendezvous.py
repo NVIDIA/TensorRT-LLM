@@ -25,6 +25,8 @@ from tensorrt_llm._torch.modules.dwdp.rendezvous import StoreComm
 from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST
 from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV
 
+from ..communicator import Distributed
+from ..startup_record import diverged
 from .records import MAX_RANKS, REPORT_INTERVAL_S, rank_mask
 
 if TYPE_CHECKING:
@@ -85,7 +87,9 @@ class StoreGroup(StoreComm):
 
     Only the members in ``active`` take part, and the others' values are None. While a call waits,
     ``on_wait`` gets a mask of active members whose values are missing, and may raise to stop
-    waiting.
+    waiting. A replacement rank's ``startup`` group holds only itself until the change that admits
+    it. Until its startup ends, a collective on that group that needs the other members' values
+    raises, unless it gathers per-process values (``Distributed.rank_varying``).
     """
 
     def __init__(
@@ -97,6 +101,7 @@ class StoreGroup(StoreComm):
         on_wait: Callable[[int], None] = lambda waiting: None,
         active: Optional[Sequence[int]] = None,
         gpus_per_node: int = 1,
+        startup: bool = False,
     ) -> None:
         """Build the group's communicator over ``store``.
 
@@ -109,6 +114,8 @@ class StoreGroup(StoreComm):
                 are missing, and with 0 once the call has them.
             active: The members that take part, by default every member.
             gpus_per_node: The ranks per node, which ``Split_type`` groups by.
+            startup: Whether this is the world communicator of a rank's startup, on which a
+                replacement may not gather the original ranks' values.
         """
         self.membership = tuple(ranks)
         super().__init__(
@@ -123,13 +130,18 @@ class StoreGroup(StoreComm):
         self._on_wait = on_wait
         self._active = tuple(r for r in self.membership if active is None or r in active)
         self._gpus_per_node = gpus_per_node
+        self._startup = startup
         self._subgroups = 0
 
     def allgather(self, value: Any) -> list[Any]:
         """Return every member's value by communicator rank, with None for an inactive member.
 
         ``exchange_failed`` tells afterwards whether the exchange itself raised.
+
+        Raises:
+            ReplacementCannotStart: A replacement's startup gathers the original ranks' values.
         """
+        self._check_alone_at_startup("allgather")
         return self._gather_values(value)
 
     def _gather_values(self, value: Any) -> list[Any]:
@@ -153,18 +165,24 @@ class StoreGroup(StoreComm):
             raise
 
     def barrier(self) -> None:
+        """Wait for the active members.
+
+        A barrier gathers no values, so a replacement's startup may call it.
+        """
         self._gather_values(None)
 
     Barrier = barrier
 
     def bcast(self, obj: Any, root: int = 0) -> Any:
         """Return ``obj`` from communicator rank ``root``, or None if that rank is not active."""
+        self._check_alone_at_startup("bcast")
         return self._gather_values(obj if self.Get_rank() == root else None)[root]
 
     def allreduce(self, obj: Any, op: Optional["MPI.Op"] = None) -> Any:
         """Reduce the active members' ``obj`` by ``MPI.SUM`` (default), ``MIN`` or ``MAX``."""
         from mpi4py import MPI
 
+        self._check_alone_at_startup("allreduce")
         op = MPI.SUM if op is None else op
         for mpi_op, reduce in ((MPI.SUM, sum), (MPI.MIN, min), (MPI.MAX, max)):
             if op == mpi_op:
@@ -174,8 +192,49 @@ class StoreGroup(StoreComm):
     def Free(self) -> None:
         """Do nothing. The group's exchanges share this process's store client."""
 
+    def close(self, active: Sequence[int]) -> None:
+        """Delete the keys of this group's calls, once the ranks ``active`` made their last call.
+
+        Each call deletes this member's value of the call before it, so this member deletes its
+        values and the arrival counters of its last two calls. It also deletes the keys of the
+        members not in ``active``. Such a member failed and left the keys of its last two calls,
+        which are within one call of this member's last call, as a member enters a call only after
+        every active member set the call before it. Only a group that no rank in ``active`` built,
+        having skipped its change, keeps keys: its failed members' first call values and counter.
+        """
+        self._delete_calls(self._seq - 2, self._seq, [self.Get_rank()], counters=True)
+        failed_indices = [
+            i for i, r in enumerate(self.membership) if r in self._active and r not in active
+        ]
+        if failed_indices:
+            self._delete_calls(self._seq - 3, self._seq + 1, failed_indices, counters=True)
+
+    def Abort(self, errorcode: int = 0) -> None:
+        """End this process with ``errorcode``. The other members keep running."""
+        # The startup module imports this one.
+        from .startup import end_process
+
+        end_process(self.rank, errorcode, "MPI_Abort on its communicator")
+
+    def _check_alone_at_startup(self, collective: str) -> None:
+        """Raise if a replacement's startup makes ``collective`` on its startup group.
+
+        That group holds only the replacement, so the result would miss the original ranks' values.
+        """
+        if not self._startup or self._active != (self.rank,) or len(self.membership) == 1:
+            return
+        record = Distributed.startup_record
+        if record is not None and record.replaying and not record.gathers_rank_varying:
+            raise diverged(
+                f"A replacement's startup calls {collective} on mpi_comm(), which needs the "
+                "original ranks' values. Use a Distributed collective or Distributed.rank_varying"
+            )
+
     def subgroup(self, ranks: Sequence[int]) -> "StoreGroup":
-        """Return the subgroup of ``ranks``, which must include this rank."""
+        """Return the subgroup of ``ranks``, which must include this rank.
+
+        A replacement's subgroups hold only itself. Their exchanges are never startup collectives.
+        """
         ranks = tuple(ranks)
         digest = hashlib.sha256(repr(ranks).encode()).hexdigest()[:16]
         self._subgroups += 1
@@ -190,11 +249,23 @@ class StoreGroup(StoreComm):
         )
 
     def Split(self, color: int = 0, key: int = 0) -> "StoreGroup":
-        """Split as ``MPI.Comm.Split`` does.
+        """Split as ``MPI.Comm.Split`` does, a replacement taking the colors from the record.
 
         The subgroup leaves out the inactive members, whose colors are unknown.
+
+        Raises:
+            ReplacementCannotStart: A replacement's ``color`` or ``key`` differs from its
+                predecessor's.
         """
-        splits = self.allgather((color, key))
+
+        def gather() -> list[Any]:
+            return self.allgather((color, key))
+
+        # A process splits at whichever startup step first needs the communicator, even while the
+        # startup record is paused, such as in the KV cache estimation that a replacement skips.
+        splits = Distributed.agree_per_process(
+            "startup_group_split", gather, own=(self.Get_rank(), (color, key))
+        )
         ranks = sorted(
             (split[1], index, rank)
             for index, (rank, split) in enumerate(zip(self.membership, splits))
