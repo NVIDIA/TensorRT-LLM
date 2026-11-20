@@ -1479,6 +1479,19 @@ def test_workers_publish_cold_variants_for_jit_disabled_parent(monkeypatch) -> N
         with pytest.raises(PermissionError, match="unreadable object"):
             stale.load()
 
+    def invalidate_during_load():
+        new_marker = stale.meta_path.with_suffix(".new")
+        new_marker.write_text("{}")
+        new_marker.replace(stale.meta_path)
+        raise FileNotFoundError("object invalidated during load")
+
+    retained = object()
+    with (
+        patch.object(stale, "_compiled_kernel", retained),
+        patch.object(stale, "_load_from_disk", side_effect=invalidate_during_load),
+    ):
+        assert stale.load() is retained
+
     pp.precompile_payloads(payloads)
     assert not stale.object_path.exists()
     monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
