@@ -376,10 +376,10 @@ non-MoE consumers), the MoE files inside mixed directories (`marlin/`,
 
 ### Tests
 
-The MoE Module's Python tests live in `tests/unittest/_torch/moe/`, one file
-per layer of the architecture, so a change's test goes into the file of the
-layer it changes. ModelingV2 tests follow the
-[Staircase MoE test rules](#staircase-moe-test-rules) below.
+The Python tests of `tensorrt_llm/_torch/moe/` live in
+`tests/unittest/_torch/moe/`, one file per layer of the architecture, so a
+change's test goes into the file of the layer it changes. ModelingV2 MoE tests
+follow the [ModelingV2 MoE test rules](#modelingv2-moe-test-rules) below.
 
 | Layer | File |
 |-------|------|
@@ -408,11 +408,11 @@ and the tests of the models that re-point layers
 (`models/test_qwen3_next_moe_quant.py`,
 `modeling/test_musespark_open_moe_finalize_hook.py`).
 
-#### Staircase MoE test rules
+#### ModelingV2 MoE test rules
 
 Apply these rules when developing or reviewing ModelingV2 MoE code and tests,
-including fused steps, helpers and CI selection. Source paths are relative to
-`tensorrt_llm/_torch/modeling_v2/`; test paths below are relative to
+including model execution steps involving MoE, helpers and CI selection.
+All paths in these rules are relative to
 `tests/unittest/_torch/modeling_v2/`.
 
 Determine behavior and ownership from the call path and assertions, not
@@ -427,15 +427,15 @@ filenames, imports or op registration alone.
   wrapper behavior at its owning scope. Shared-op tests do not replace
   model-specific usage tests.
 - **ST-MOE-03 — Place helpers and mixed tests by ownership.** Keep cross-family
-  MoE helpers in `moe/` and family/target setup local; determine ownership from
-  consumers. Classify mixed files by case; independent components retain their
-  own test directories.
+  MoE helpers and their CPU tests in `moe/` and family/target setup local;
+  determine ownership from consumers. Classify mixed files by case; independent
+  components retain their own test directories.
 - **ST-MOE-04 — Cover changed behavior.** MoE behavior changes need direct test
   coverage. Existing tests may provide this coverage. Whole-model accuracy
   alone is insufficient.
-- **ST-MOE-05 — Ensure CI execution.** Ensure CI selects the intended tests and
-  runs them with the required hardware, device count and execution mode. Avoid
-  missed or duplicate runs.
+- **ST-MOE-05 — Ensure CI execution.** Register new test directories in CI.
+  Ensure CI selects the intended tests and runs them with the required hardware,
+  device/rank count and execution mode. Avoid missed or duplicate runs.
 
 ## Implementation Families
 
