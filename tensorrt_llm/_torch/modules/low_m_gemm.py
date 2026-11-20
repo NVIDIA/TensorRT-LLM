@@ -1161,6 +1161,9 @@ _MMA_SIGNATURES: Dict[Tuple[tuple, tuple], None] = {}
 _MMA_BUILT: Set[Tuple[int, Tuple[tuple, tuple]]] = set()
 # (M, arguments after M, decode-graph pass) -> (kernel, row count) of every call so far.
 _MMA_ROUTES: Dict[Tuple[int, Tuple[tuple, tuple], bool], Tuple[Any, int]] = {}
+# Serializes the updates of _MMA_BUILT and _MMA_ROUTES that follow a compile, so that host threads
+# routing one GEMM at once leave its exact kernel in place.
+_MMA_LOCK = threading.Lock()
 
 
 @functools.lru_cache(maxsize=None)
@@ -1194,11 +1197,15 @@ def _mma_kernel(m: int, *args, **kwargs) -> Tuple[Any, int]:
         if (m, signature) not in _MMA_BUILT:
             rows = next(rows for rows in _MMA_ROW_BUCKETS if rows >= m)
     fn = _compiled_mma(rows, *args, **kwargs)
-    if rows == m and (m, signature) not in _MMA_BUILT:
-        # Eager calls of this row count now run the new exact kernel.
-        _MMA_ROUTES.pop((m, signature, False), None)
-    _MMA_BUILT.add((rows, signature))
-    route = _MMA_ROUTES[(m, signature, graph_pass)] = (fn, rows)
+    with _MMA_LOCK:
+        if rows != m and (m, signature) in _MMA_BUILT:
+            # Another thread built the exact kernel while this one compiled the bucket's.
+            fn, rows = _compiled_mma(m, *args, **kwargs), m
+        elif rows == m and (m, signature) not in _MMA_BUILT:
+            # Eager calls of this row count now run the new exact kernel.
+            _MMA_ROUTES.pop((m, signature, False), None)
+        _MMA_BUILT.add((rows, signature))
+        route = _MMA_ROUTES[(m, signature, graph_pass)] = (fn, rows)
     return route
 
 
@@ -1239,7 +1246,7 @@ def _a_operand(x: torch.Tensor, rows: int) -> Tuple[torch.Tensor, Any]:
     if torch.cuda.is_current_stream_capturing():
         # Under capture the buffer comes from the graph's private pool: keep it to this capture.
         buf = x.new_zeros(shape)
-        buf[: x.shape[0]].copy_(x)
+        buf[: x.shape[0]].copy_(x.detach())
         return buf, graph_safe_from_dlpack(buf)
     staging = _staging_buffers()
     key = (torch.cuda.current_stream(x.device).cuda_stream, x.device, x.dtype, rows, x.shape[1:])
@@ -1248,23 +1255,29 @@ def _a_operand(x: torch.Tensor, rows: int) -> Tuple[torch.Tensor, Any]:
         # A normal tensor even under inference mode, so calls in and out of it can both write it.
         with torch.inference_mode(False):
             buf = staging[key] = x.new_zeros(shape)
-    buf[: x.shape[0]].copy_(x)
+    # Detached, so a reused buffer never joins the autograd graph of a caller's input.
+    buf[: x.shape[0]].copy_(x.detach())
     return buf, _cute_view(buf)
 
 
-def prewarm_mma_row_buckets() -> Tuple[int, int]:
-    """Compile every row bucket of the MMA GEMMs called so far outside decode CUDA graphs; return
-    how many kernels it compiled and for how many GEMMs.
+def prewarm_mma_row_buckets(max_rows: Optional[int] = None) -> Tuple[int, int]:
+    """Compile the row buckets of the MMA GEMMs called so far outside decode CUDA graphs, up to the
+    first bucket that holds ``max_rows`` rows (every bucket without a bound); return how many
+    kernels it compiled and for how many GEMMs.
 
     Run after the eager warmup forwards and before CUDA graph capture, it compiles the buckets they
     did not reach before a capture or a request can need them. A GEMM that no call outside a decode
     CUDA graph has run yet is not covered. A bucket that fails to compile is reported and left to
     its first call; the other buckets still compile.
     """
+    buckets = _MMA_ROW_BUCKETS
+    if max_rows is not None:
+        last = next((i for i, rows in enumerate(buckets) if rows >= max_rows), len(buckets) - 1)
+        buckets = buckets[: last + 1]
     compiled = 0
     signatures = list(_MMA_SIGNATURES)
     for args, kwargs in signatures:
-        for rows in _MMA_ROW_BUCKETS:
+        for rows in buckets:
             if (rows, (args, kwargs)) in _MMA_BUILT:
                 continue
             try:
@@ -1276,7 +1289,8 @@ def prewarm_mma_row_buckets() -> Tuple[int, int]:
                     f"{type(e).__name__}: {e}"
                 )
                 continue
-            _MMA_BUILT.add((rows, (args, kwargs)))
+            with _MMA_LOCK:
+                _MMA_BUILT.add((rows, (args, kwargs)))
             compiled += 1
         logger.debug(f"Low-M MMA GEMM row buckets compiled for {args} {dict(kwargs)}")
     return compiled, len(signatures)

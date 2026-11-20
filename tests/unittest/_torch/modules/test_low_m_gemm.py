@@ -903,6 +903,56 @@ def test_prewarm_compiles_every_row_bucket_of_eager_calls_only(
 
 
 @_skip_no_lowm_fp8
+def test_prewarm_stops_at_the_bucket_that_holds_the_most_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a row bound, the prewarm compiles the buckets up to the first one that holds it."""
+    compiled_mma = functools.lru_cache(maxsize=None)(_mod._compiled_mma.__wrapped__)
+    monkeypatch.setattr(_mod, "_compiled_mma", compiled_mma)
+    for name, fresh in (("_MMA_SIGNATURES", {}), ("_MMA_BUILT", set()), ("_MMA_ROUTES", {})):
+        monkeypatch.setattr(_mod, name, fresh)
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    bf16_lowm_linear(torch.zeros(3, 512, device="cuda", dtype=torch.bfloat16), w)
+    assert _mod.prewarm_mma_row_buckets(8) == (7, 1)
+    assert _mod.prewarm_mma_row_buckets(20) == (2, 1)
+    assert _mod.prewarm_mma_row_buckets() == (2, 1)
+    assert compiled_mma.cache_info().misses == 12
+
+
+@_skip_no_lowm_fp8
+def test_a_bucket_route_yields_to_an_exact_kernel_built_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An eager call that compiles its bucket's kernel while another thread builds the exact one
+    leaves later eager calls of its row count on the exact kernel."""
+    for name, fresh in (("_MMA_SIGNATURES", {}), ("_MMA_BUILT", set()), ("_MMA_ROUTES", {})):
+        monkeypatch.setattr(_mod, name, fresh)
+    compiled_mma = _mod._compiled_mma
+    compiling_bucket, exact_built = threading.Event(), threading.Event()
+
+    def bucket_after_exact(rows: int, *args: Any, **kwargs: Any) -> Any:
+        if rows == 16:
+            compiling_bucket.set()
+            assert exact_built.wait(timeout=60)
+        return compiled_mma(rows, *args, **kwargs)
+
+    monkeypatch.setattr(_mod, "_compiled_mma", bucket_after_exact)
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    x = torch.randn(13, 512, device="cuda").to(torch.bfloat16)
+    eager = threading.Thread(target=bf16_lowm_linear, args=(x, w))
+    eager.start()
+    try:
+        assert compiling_bucket.wait(timeout=60)
+        with flashinfer_mxfp8_decode_graph_capture():
+            bf16_lowm_linear(x, w)
+    finally:
+        exact_built.set()
+        eager.join(timeout=60)
+    routes = [r for (m, _, graph), (_, r) in _mod._MMA_ROUTES.items() if m == 13 and not graph]
+    assert routes == [13]
+
+
+@_skip_no_lowm_fp8
 def test_padded_calls_run_in_and_out_of_inference_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     """A padded call's staging buffer is a normal tensor: calls in and out of inference mode both
     write it, and both match the exact-row kernel."""
@@ -921,6 +971,28 @@ def test_padded_calls_run_in_and_out_of_inference_mode(monkeypatch: pytest.Monke
     with flashinfer_mxfp8_decode_graph_capture():
         exact = bf16_lowm_linear(x, w)
     assert torch.equal(inside, exact) and torch.equal(outside, exact)
+
+
+@_skip_no_lowm_fp8
+def test_padded_calls_keep_the_staging_buffer_out_of_autograd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A padded call copies its rows detached: the staging buffer it reuses never joins the autograd
+    graph of an input that requires gradients."""
+    for name, fresh in (
+        ("_A_STAGING", threading.local()),
+        ("_MMA_SIGNATURES", {}),
+        ("_MMA_BUILT", set()),
+        ("_MMA_ROUTES", {}),
+    ):
+        monkeypatch.setattr(_mod, name, fresh)
+    w = torch.randn(64, 512, device="cuda").to(torch.bfloat16)
+    with torch.enable_grad():
+        for _ in range(2):
+            x = torch.randn(13, 512, device="cuda").to(torch.bfloat16).requires_grad_()
+            bf16_lowm_linear(x, w)
+    (buf,) = _mod._staging_buffers().values()
+    assert not buf.requires_grad and buf.grad_fn is None
 
 
 @_skip_no_lowm_fp8

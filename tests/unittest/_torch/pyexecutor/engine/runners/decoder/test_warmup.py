@@ -1081,21 +1081,29 @@ def test_decode_prewarm_failure_still_reaches_barrier() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("cp_size,gather", [(1, "tp_allgather"), (2, "tp_cp_allgather")])
+@pytest.mark.parametrize(
+    "cp_size,gather,attention_dp,max_rows",
+    [(1, "tp_allgather", False, 8), (2, "tp_cp_allgather", True, 16)],
+)
 @pytest.mark.parametrize("fails", [False, True])
 def test_lowm_row_bucket_prewarm_always_meets_its_peers(
-    cp_size: int, gather: str, fails: bool
+    cp_size: int, gather: str, attention_dp: bool, max_rows: int, fails: bool
 ) -> None:
-    """A rank meets its TP (TP x CP) peers whether its prewarm compiled nothing or failed; a failure
-    is a warning, since it only defers the compiles to their first calls."""
-    owner = SimpleNamespace(mapping=SimpleNamespace(cp_size=cp_size, tp_size=2), dist=Mock())
+    """A rank prewarms the buckets up to a step's most rows (its tokens, gathered over the TP group
+    under attention DP), and meets its TP (TP x CP) peers whether its prewarm compiled nothing or
+    failed; a failure is a warning, since it only defers the compiles to their first calls."""
+    owner = SimpleNamespace(
+        _config=SimpleNamespace(max_num_tokens=8),
+        mapping=SimpleNamespace(cp_size=cp_size, tp_size=2, enable_attention_dp=attention_dp),
+        dist=Mock(),
+    )
     prewarm = Mock(side_effect=RuntimeError("no compiler")) if fails else Mock(return_value=(0, 0))
     with (
         patch("tensorrt_llm._torch.modules.low_m_gemm.prewarm_mma_row_buckets", prewarm),
         patch.object(decoder_warmup_module.logger, "warning") as warning,
     ):
         DecoderWarmup._prewarm_lowm_mma_row_buckets(owner)
-    prewarm.assert_called_once_with()
+    prewarm.assert_called_once_with(max_rows)
     getattr(owner.dist, gather).assert_called_once_with(1)
     assert warning.call_count == int(fails)
 
