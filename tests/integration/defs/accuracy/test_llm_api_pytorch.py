@@ -1277,11 +1277,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             (False, False, False, True, False),
             (True, False, True, True, False),
             (True, True, True, True, False),
-            # use_low_precision_moe_combine is read only by NVLinkOneSided.
-            # moe_tp_size is tp_size // moe_ep_size; pp is not part of it.
-            # Only ep4 has moe_tp_size == 1 and dp_size > 1. tp4 and tp2pp2
-            # take AllGatherReduceScatter. pp4 has dp_size == 1, so the
-            # factory returns None before that branch.
             (False, True, False, False, True),
             (True, True, True, True, True),
         ])
@@ -1295,13 +1290,27 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          overlap_scheduler, low_precision_combine, tp_size,
                          pp_size, ep_size, torch_compile, mtp_nextn,
                          moe_tactic):
-        # Only ep4 has moe_tp_size == 1 and dp_size > 1, which is the layout
-        # that can select NVLinkOneSided. Skip here instead of reporting a
-        # pass for a layout that never reads the flag.
-        if low_precision_combine and not (attention_dp and tp_size == ep_size
-                                          and pp_size == 1):
-            pytest.skip("use_low_precision_moe_combine requires ep4 "
-                        "(moe_tp_size == 1 and dp_size > 1)")
+        # create_strategy passes use_low_precision_moe_combine to
+        # NVLinkOneSided, NVLinkTwoSided, NcclEP, and DeepEPLowLatency. It
+        # returns None or AllGatherReduceScatter, without the flag, when
+        # attention DP is off or dp_size == 1, moe_tp_size != 1, or the tactic
+        # disallows all-to-all. dp_size is tp_size under attention_dp, and
+        # moe_tp_size is tp_size // ep_size.
+        tactic_allows_alltoall = moe_tactic != "cutlass"
+        if moe_tactic == "cutlass":
+            from tensorrt_llm._torch.moe.fused_moe.impl_environment import \
+                collect_moe_environment
+
+            # Cutlass NVFP4 issues the fused_moe op, which rejects all-to-all
+            # unless the build enables the OSS Cutlass MoE GEMM.
+            tactic_allows_alltoall = collect_moe_environment().oss_cutlass_moe
+        if low_precision_combine and not (attention_dp and tp_size > 1
+                                          and tp_size == ep_size
+                                          and tactic_allows_alltoall):
+            pytest.skip(
+                "use_low_precision_moe_combine is unused unless attention_dp, "
+                "dp_size > 1, moe_tp_size == 1, and the tactic allows all-to-all"
+            )
         skip_unless_moe_tactic_runs_here(moe_tactic)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
