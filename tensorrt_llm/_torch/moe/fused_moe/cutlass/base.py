@@ -54,8 +54,8 @@ class FusedMoeOpFlags:
     """
 
     #: Reinterpret the weight buffers as this dtype before the call. ``None``
-    #: keeps ``w3_w1_weight.dtype``; W4A8_AWQ and W4A16_MXFP4 name the dtype
-    #: the op reads their packed weights as.
+    #: keeps ``w3_w1_weight.dtype``; W4A8_AWQ, W4A16 and W4A16_MXFP4 name the
+    #: dtype the op reads their packed weights as.
     weight_dtype: torch.dtype | None = None
     #: Route FC1/FC2 through the DeepSeek block-scale GEMM runner instead of the
     #: CUTLASS grouped GEMM. Only the SM90 FP8-block-scale leaf sets this.
@@ -63,7 +63,9 @@ class FusedMoeOpFlags:
     #: Group-wise weight scales: with ``quint4x2`` weights the INT4 group-wise
     #: runner (W4A8_AWQ), with ``uint8`` weights the WFP4A16 one (W4A16_MXFP4).
     use_w4_group_scaling: bool = False
-    use_int8_woq_per_channel: bool = False
+    #: Per-channel weight-only scales: the INT8 runner (W8A16), or with
+    #: ``quint4x2`` weights the INT4 one (W4A16).
+    use_woq_per_channel: bool = False
     #: With packed MXFP4 weights, read ``quant_scales`` as the MXFP4 x MXFP8
     #: layout instead of MXFP4 x FP8. The activations themselves are quantized
     #: by the leaf's ``quantize_input``.
@@ -84,7 +86,7 @@ class CutlassFusedMoEBase(MoEImplBase):
     default ``quantize_input`` (pass-through) and ``run_moe`` (one
     ``torch.ops.trtllm.fused_moe`` call); the weight lifecycle comes from
     ``MoEWeightOwnerMixin``. Unregistered, because a descriptor is exactly one
-    identity and this class stands for twelve.
+    identity and this class stands for thirteen.
 
     A leaf declares:
 
