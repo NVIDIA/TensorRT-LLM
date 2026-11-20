@@ -33,15 +33,17 @@ import click
 
 import tensorrt_llm.usage as usage
 from tensorrt_llm.commands import _telemetry as _command_telemetry
+from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.logger import logger
 from tensorrt_llm.usage.config import UsageContext
 
 #: Both commands sit in the telemetry-aware `trtllm-serve` group, so they offer
 #: the same opt-out the group documents.
-_telemetry_option = click.option(
+_telemetry_option = stability_option(
     "--telemetry/--no-telemetry",
     default=True,
     help="Enable or disable anonymous usage telemetry collection.",
+    status="beta",
 )
 
 
@@ -88,29 +90,32 @@ def _signal_handoff():
 
 
 @click.command("mooncake_master")
-@click.option(
+@stability_option(
     "--rpc_port",
     type=int,
     default=50051,
     show_default=True,
     help="Port the store clients reach the master on.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--metrics_port",
     type=int,
     default=9004,
     show_default=True,
     help="Prometheus port. Pool occupancy and eviction are read "
     "from here or from the master's log.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--eviction_ratio",
     type=float,
     default=0.05,
     show_default=True,
     help="Fraction of the pool freed per eviction pass.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--pool_file",
     type=str,
     default=None,
@@ -119,8 +124,9 @@ def _signal_handoff():
     "file://<path>, which is how they reach a master whose host "
     "the scheduler chose. Removed on exit so a stale address is "
     "never dialed. One is written to --run_dir regardless.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--protocol",
     type=str,
     default="rdma",
@@ -128,30 +134,34 @@ def _signal_handoff():
     help="Transport every participant will use: 'rdma' or 'tcp'. "
     "Recorded in the manifest so the servers need not restate it. "
     "TCP is for bring-up only; it invalidates performance conclusions.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--metadata_server",
     type=str,
     default="P2PHANDSHAKE",
     show_default=True,
     help="Mooncake metadata service, recorded in the manifest. "
     "P2PHANDSHAKE keeps a separate metadata process out of the deployment.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--namespace",
     type=str,
     default="trtllm",
     show_default=True,
     help="Default key namespace for this pool, recorded in the manifest. A server may override it.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--run_dir",
     type=str,
     default=None,
     help="Where to keep the master's log and a copy of the "
     "manifest. Defaults to a temporary directory.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--binary",
     type=str,
     default="mooncake_master",
@@ -159,20 +169,23 @@ def _signal_handoff():
     help="The master executable to run, looked up on PATH. It "
     "ships with the Mooncake runtime that "
     "docker/common/install_mooncake.sh installs.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--timeout",
     type=float,
     default=60.0,
     show_default=True,
     help="Seconds to wait for the master to accept connections before giving up on it.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--heartbeat_seconds",
     type=int,
     default=300,
     show_default=True,
     help="Interval between liveness lines. 0 disables them.",
+    status="prototype",
 )
 @_telemetry_option
 def mooncake_master(
@@ -245,19 +258,21 @@ def mooncake_master(
 
 
 @click.command("mooncake_pool_report")
-@click.option(
+@stability_option(
     "--run_dir",
     type=str,
     required=True,
     help="Directory holding the pool manifest and the segments/ "
     "records each participating rank wrote.",
+    status="prototype",
 )
-@click.option(
+@stability_option(
     "--master_log",
     type=str,
     default=None,
     help="The master's log, for the block-placement table. "
     "Defaults to mooncake_master.log in --run_dir.",
+    status="prototype",
 )
 @_telemetry_option
 def mooncake_pool_report(run_dir: str, master_log: Optional[str], telemetry: bool):
