@@ -650,6 +650,12 @@ def anthropic_message_id(request_id: Optional[int]) -> str:
     return f"msg_{uuid.uuid4().hex}"
 
 
+# The request id a stream's message is named after: the id, or a callable asked
+# for it when ``message_start`` goes out, for a caller that learns the id only
+# after the stream has started.
+StreamRequestId = Union[Optional[int], Callable[[], Optional[int]]]
+
+
 def thinking_signature(thinking: str) -> str:
     """The signature of a thinking block this server generated.
 
@@ -779,9 +785,11 @@ class AnthropicStreamReframer:
     ``partial_json`` is exactly what upstream sent for it.
     """
 
-    def __init__(self, model: str, request_id: Optional[int] = None):
+    def __init__(self, model: str, request_id: StreamRequestId = None):
         self.model = model
-        self.message_id = anthropic_message_id(request_id)
+        self._request_id = request_id
+        # Set when message_start goes out.
+        self.message_id: Optional[str] = None
         self.message_started = False
         self.block_index = -1
         self.open_block_type: Optional[str] = None
@@ -986,6 +994,8 @@ class AnthropicStreamReframer:
         if self.message_started:
             return []
         self.message_started = True
+        request_id = self._request_id() if callable(self._request_id) else self._request_id
+        self.message_id = anthropic_message_id(request_id)
         skeleton = AnthropicMessagesResponse(
             id=self.message_id,
             model=self.model,
@@ -1233,11 +1243,12 @@ async def _with_ticks(
 
 
 async def reframe_openai_stream(
-    openai_sse: AsyncIterator[Union[str, bytes]], model: str, request_id: Optional[int] = None
+    openai_sse: AsyncIterator[Union[str, bytes]], model: str, request_id: StreamRequestId = None
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames.
 
-    ``request_id`` names the message as in ``convert_chat_response``.
+    ``request_id`` names the message as in ``convert_chat_response``; a callable
+    is asked for it once, when ``message_start`` goes out.
 
     Until [DONE], a ping goes out whenever no other event has for
     ``STREAM_PING_INTERVAL_S`` seconds, before ``message_start`` too: the message

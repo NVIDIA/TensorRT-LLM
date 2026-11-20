@@ -2201,3 +2201,58 @@ def test_streamed_message_id_carries_the_callers_request_id():
 def test_streamed_message_id_without_a_request_id_is_random():
     """The chunks' id is not read, even when it ends in digits."""
     assert re.fullmatch(r"msg_[0-9a-f]{32}", _streamed_message_id("chatcmpl-77", None))
+
+
+def test_streamed_message_id_from_a_callable_is_read_when_the_message_starts():
+    """A callable is asked once, for the id it has when message_start goes out."""
+    request_ids = {"current": None}
+    asked = []
+
+    def request_id():
+        asked.append(request_ids["current"])
+        return request_ids["current"]
+
+    reframer = AnthropicStreamReframer(model=MODEL, request_id=request_id)
+    # The caller learns the id only after the stream has started.
+    request_ids["current"] = 77
+    frames = reframer.process_chunk(chunk({"role": "assistant", "content": "hi"}))
+    request_ids["current"] = 78
+    frames += reframer.process_chunk(
+        chunk({}, finish_reason="stop", usage=UsageInfo(prompt_tokens=3, completion_tokens=1))
+    )
+    frames += reframer.finish()
+
+    events = parse_frames(frames)
+    message_id = next(payload for name, payload in events if name == "message_start")["message"][
+        "id"
+    ]
+    assert asked == [77]
+    assert re.fullmatch(r"msg_77_[0-9a-f]{16}", message_id)
+
+
+def test_reframed_stream_asks_a_callable_request_id_only_when_the_message_starts(monkeypatch):
+    """Pings before the first chunk do not name the message."""
+    monkeypatch.setattr(adapter, "STREAM_PING_INTERVAL_S", 0.01)
+    request_ids = {"current": None}
+
+    async def source():
+        await asyncio.sleep(0.05)
+        request_ids["current"] = 42
+        yield f"data: {chunk({'role': 'assistant', 'content': 'hi'}).model_dump_json()}\n\n"
+        last = chunk(
+            {}, finish_reason="stop", usage=UsageInfo(prompt_tokens=3, completion_tokens=1)
+        )
+        yield f"data: {last.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def collect():
+        stream = reframe_openai_stream(source(), MODEL, request_id=lambda: request_ids["current"])
+        return [frame async for frame in stream]
+
+    events = parse_frames(asyncio.run(asyncio.wait_for(collect(), 5)))
+
+    assert events[0][0] == "ping"
+    message_id = next(payload for name, payload in events if name == "message_start")["message"][
+        "id"
+    ]
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", message_id)
