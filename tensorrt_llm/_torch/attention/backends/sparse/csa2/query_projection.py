@@ -364,13 +364,25 @@ def fp8_query_gemm(
     import cutlass
     import cutlass.cute as cute
 
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
     from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
+    from tensorrt_llm._utils import get_sm_version
 
     _check_query_inputs(
         activation, activation_scale, weight, weight_scale, alpha, positions, cos_sin
     )
     m, k = activation.shape
     n = weight.shape[0]
+    # SM107 runs the prefill-sized DS-V4.1 Q-B on its K64 MXFP8 MMA with 256x256 tiles.
+    use_sm107_mma = (
+        IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        and get_sm_version() == 107
+        and 1024 <= m <= 2048
+        and n == 32768
+        and k == 1280
+    )
+    if use_sm107_mma:
+        tile = tile or (256, 256)
     if (
         quant_q.shape != (m, n)
         or quant_q.dtype != torch.float8_e4m3fn
@@ -392,6 +404,7 @@ def fp8_query_gemm(
         active = triton.cdiv(tiles, triton.cdiv(tiles, active))
     key = (
         "fp8",
+        use_sm107_mma,
         amax is not None,
         activation.device.index,
         tile,
@@ -443,6 +456,7 @@ def fp8_query_gemm(
             q_rope_fusion=True,
             q_fp8_amax=amax is not None,
             q_fp8_only=True,
+            use_sm107_mma=use_sm107_mma,
         )
         _COMPILED[key] = cute.compile(
             kernel.wrapper_query_fp8,

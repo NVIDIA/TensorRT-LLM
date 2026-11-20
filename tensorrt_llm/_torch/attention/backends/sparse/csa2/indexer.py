@@ -53,6 +53,7 @@ from .kernel import (
     mask_logits_,
     mask_packed_logits_,
     paged_finalize_sorts,
+    prefetch_candidate_blocks_,
 )
 from .metadata import CSA2IndexerGroup, CSA2TrtllmMetadata, block_select_batch, csa2_side_stream
 from .params import CSA2ForwardState, CSA2Layout, CSA2Mode, CSA2Params
@@ -73,8 +74,7 @@ _BATCHED_CANDIDATE_KEYS = 4 << 20  # 4M
 _CANDIDATE_CLUSTER_TOPK_MAX_ROWS = 64
 # CTAs per row of the attention-TP chain's self-sampling GVR: one 4-CTA cluster.
 _GVR_ROW_CTAS = 4
-# The self-sampling GVR decode engine runs one CTA per row. On the candidate source, whose rows
-# are twice as long, larger decode batches select with the exact radix Top-K.
+# Existing CSA2 candidate-source decode cutoff: larger batches keep exact radix Top-K.
 _DECODE_GVR_SOURCE_MAX_ROWS = 256
 # Candidate consumers' decode batches above this many rows rank 8-column groups first.
 _CONSUMER_BLOCK_TOPK_MIN_ROWS = 64
@@ -180,7 +180,9 @@ class CSA2Indexer(Indexer):
             sm_version=sm,
         )
         prefill_self_sampling = use_self_sampling_gvr(**self_sampling_kwargs, is_prefill=True)
-        decode_self_sampling = use_self_sampling_gvr(**self_sampling_kwargs, is_prefill=False)
+        decode_self_sampling = use_self_sampling_gvr(
+            **self_sampling_kwargs, is_prefill=False, sm107_decode=True
+        )
         if prefill_self_sampling:
             # The self-sampling engine is exact, so prefill uses it without heuristic decode.
             prefill = TopKImplementation.CUTE_DSL_GVR
@@ -435,7 +437,7 @@ class CSA2Indexer(Indexer):
             or not _HAS_SPARSE_MQA_LOGITS
             or self.head_dim != 128
             or heads not in (8, 16, 32, 64)
-            or get_sm_version() not in (100, 103)
+            or get_sm_version() not in (100, 103, 107)
         ):
             return None
         if torch.cuda.is_current_stream_capturing():
@@ -1447,6 +1449,38 @@ class CSA2Indexer(Indexer):
         stream while it projects, and its indexer then finds them current."""
         if self._native_decode(metadata, count)[1]:
             metadata.prepare_indexer(self.layer_idx, batch_queries=self._batch_paged_queries())
+
+    def prefetches_candidates(self, metadata: CSA2TrtllmMetadata, count: int) -> bool:
+        """Whether ``prefetch_candidate_pages`` applies to ``count`` decode rows: a candidate
+        consumer's attention-TP decode on SM100/SM103 within the fused select's row range."""
+        from .reindex_select import _FUSED_SELECT_MAX_ROWS
+
+        layer = self.layout.layer(self.layer_idx)
+        decode_start, native = self._native_decode(metadata, count)
+        return (
+            layer.consumes_candidates
+            and self.sparse_block > 0
+            and native
+            and decode_start == 0
+            and count <= _FUSED_SELECT_MAX_ROWS
+            and self._tp_selection_chain(metadata)
+            and metadata.csa2_candidate_blocks.get(layer.candidate_source) is not None
+            and metadata.csa2_candidate_counts.get(layer.candidate_source) is not None
+        )
+
+    def prefetch_candidate_pages(self, metadata: CSA2TrtllmMetadata) -> None:
+        """Start reading the index rows of the candidate blocks this consumer's decode rows score
+        into L2, once their source published them (``prefetches_candidates``)."""
+        source = self.layout.layer(self.layer_idx).candidate_source
+        metadata.wait_candidates(source)
+        metadata.prepare_indexer(self.layer_idx, batch_queries=self._batch_paged_queries())
+        prefetch_candidate_blocks_(
+            metadata.csa2_indexer_k_cache,
+            metadata.csa2_indexer_block_table,
+            metadata.csa2_candidate_blocks[source],
+            metadata.csa2_candidate_counts[source].reshape(-1),
+            self.sparse_block,
+        )
 
     def _sparse_schedule_unused(self, metadata: CSA2TrtllmMetadata) -> bool:
         """Whether every consumer recorded at this decode shape took the fused Reindex select."""

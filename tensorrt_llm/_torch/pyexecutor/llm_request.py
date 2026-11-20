@@ -410,6 +410,55 @@ class PyResult:
         self._encoder_output: Optional[torch.Tensor] = None
         self.diff = PyResult.Diff()
 
+    def snapshot(self, *, beam_width: int) -> "PyResult":
+        """Freeze output containers while sharing append-only tensor storage.
+
+        Single-sequence streaming logprobs move to the response, preserving
+        cumulative totals in fresh request storage. Beam search publishes full
+        histories, so it copies their lists instead of consuming them.
+        """
+        result = copy(self)
+        if self.context_prompt_logprob_rows is not None:
+            result.context_prompt_logprob_rows = self.context_prompt_logprob_rows.copy(
+            )
+        result.diff = PyResult.Diff()
+        if self._log_probs is not None:
+            if self._streaming and beam_width <= 1 and self.log_probs:
+                self._log_probs = LogProbStorage()
+                self._log_probs._init(result.log_probs)
+                self._log_probs.cum_log_probs = result.cum_log_probs.copy()
+            else:
+                result._log_probs = copy(self._log_probs)
+                if self.log_probs is not None:
+                    result._log_probs.log_probs = [
+                        probs.copy() for probs in self.log_probs
+                    ]
+                    result._log_probs.cum_log_probs = self.cum_log_probs.copy()
+        if self._context_logits is not None:
+            result._context_logits = copy(self._context_logits)
+            result._context_logits._logits_indices = self._context_logits._logits_indices.copy(
+            )
+        if self._generation_logits is not None:
+            result._generation_logits = copy(self._generation_logits)
+            result._generation_logits._logits_indices = (
+                self._generation_logits._logits_indices[-2:] if self._streaming
+                else self._generation_logits._logits_indices.copy())
+            if self._generation_logits.use_chunked_generation_logits:
+                result._generation_logits._device_fragments = self._generation_logits._device_fragments.copy(
+                )
+        if self._additional_context_outputs is not None:
+            result._additional_context_outputs = {
+                name: outputs.copy()
+                for name, outputs in self._additional_context_outputs.items()
+            }
+        if self._additional_generation_outputs is not None:
+            result._additional_generation_outputs = {
+                name: outputs.copy()
+                for name, outputs in
+                self._additional_generation_outputs.items()
+            }
+        return result
+
     def reset_diff(self):
         self.diff = PyResult.Diff()
 
@@ -1231,38 +1280,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         """
         result, is_final = super().create_serialized_result()
 
-        # When using beam search we cannot incrementically update the logprobs in the result.
-        # Instead we need to update all logprobs. In that case no deep copy is needed.
-        need_deep_copy_logprobs = self.py_result.log_probs and self.py_beam_width <= 1
-        need_deep_copy_generation_logits = self.py_result._generation_logits is not None
-        need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
-        # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
-        # that may occur between IPC communication and the overriding of newly generated log_probs
-        # or the updating of py_result._generation_logits._logits_indices in streaming mode.
-        if self.streaming and need_any_deep_copy:
-            py_result = copy(self.py_result)
-            # Move _log_probs to py_result and create a new empty LogProbStorage in self.py_result
-            # This avoids performing a deepcopy
-            if need_deep_copy_logprobs:
-                py_result._log_probs = self.py_result._log_probs
-                self.py_result._log_probs = LogProbStorage()
-                # Initialize the storage and adjust the cum_log_probs to the previous value
-                self.py_result._log_probs._init(py_result.log_probs)
-                self.py_result._log_probs.cum_log_probs = copy(
-                    py_result.cum_log_probs)
-
-            # Perform copies of py_result._generation_logits
-            if need_deep_copy_generation_logits:
-                # shallow copy of generation_logits to avoid copying the logits tensor
-                py_result._generation_logits = copy(
-                    self.py_result._generation_logits)
-                # deep copy the indices to avoid the race condition
-                # In streaming mode LogitsStorage only accesses either the last
-                # or second to last pair of indices. Therefore, copying only these two pairs is sufficient.
-                py_result._generation_logits._logits_indices = py_result._generation_logits._logits_indices[
-                    -2:]
-        else:
-            py_result = self.py_result
+        if len(result) == 0:
+            return None
+        py_result = self.py_result.snapshot(beam_width=self.py_beam_width)
 
         # Only include time_breakdown_metrics in the final response to avoid O(N²) overhead
         # during streaming (copying all step_metrics for every token is very expensive)
@@ -1286,8 +1306,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
-        if len(result) == 0:
-            return None
         llm_result = LlmResult(
             result,
             py_result,
