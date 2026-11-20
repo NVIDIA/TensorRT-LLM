@@ -2,33 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """``KernelBuilder``: kernels built on worker processes before the calls that need them.
 
-An op whose kernels compile on first use, and that does not go through the autotuner,
-registers them here, the way an op that does registers its tactics with the autotuner.
-KernelBuilder has two modes:
+For ops whose kernels compile on first use outside the autotuner. Two modes:
 
-* Inference, outside any build pass: an op runs as it is and compiles a kernel it lacks.
-* Build, inside a build pass (:meth:`KernelBuilder.build_pass`, which the memory-profiling
-  warmup opens, see :meth:`KernelBuilder.warmup_pass`): the first call of an op signature lists
-  the kernels of every shape the op's ``BuildConfig`` sweeps from the call's, as a
-  ``TuningConfig`` turns a call into tuning buckets, and builds them on the rank's worker
-  processes (``tensorrt_llm._torch.build_pool``), in parallel. The call goes on once they are
-  built, and the op's calls find them built.
+* Inference (outside a build pass): an op compiles a kernel it lacks on first use.
+* Build (inside :meth:`KernelBuilder.build_pass`, which the memory-profiling warmup opens): the
+  first call of an op signature lists the kernels of every shape its ``BuildConfig`` sweeps, as
+  tuning buckets do, builds them on the rank's workers (``tensorrt_llm._torch.build_pool``), and
+  goes on once they are built.
 
-Workers take only builds long enough to repay them (``BuildPool.worth_a_worker``): an op's builds
-go to workers once they are measured, or expected (``BuildConfig.build_seconds``), to take
-``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds; shorter ones are the op's own. With the PARALLEL
-strategy (``BuildConfig.strategy``), the ranks that share JIT builds (``tensorrt_llm._jit_share``)
-and the place the op's kernels land (``BuildConfig.share_scope``) split the builds: the worker
-that starts a build first makes it, and the other ranks wait for it.
-
-A build is a module-level function and picklable arguments (:class:`BuildTask`). The worker
-calls it; the kernel reaches this process through its compiler's disk cache or, for a CuTe DSL
-kernel, through the rank's store. An op that knows the CuTe DSL kernels it needs, such as a
-model's prewarm list, hands them to :meth:`KernelBuilder.build_kernels` as calls of its
-``process_built`` compile functions.
-
-``TLLM_KERNEL_BUILDER=0`` turns KernelBuilder and the worker processes off: every kernel compiles
-on first use.
+A build is a :class:`BuildTask`. Only builds that take ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds
+(measured, or ``BuildConfig.build_seconds``) go to workers. ``BuildConfig.strategy=PARALLEL``
+splits them across the ranks that share JIT builds and ``BuildConfig.share_scope``.
+:meth:`KernelBuilder.build_kernels` builds a list of ``process_built`` CuTe DSL compile calls,
+such as a model's prewarm list. ``TLLM_KERNEL_BUILDER=0`` turns KernelBuilder off.
 """
 
 from __future__ import annotations

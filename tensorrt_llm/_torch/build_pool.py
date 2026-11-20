@@ -2,47 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """``BuildPool``: worker processes that build this rank's kernels in parallel.
 
-KernelBuilder's build mode and the autotuner's tune mode build an op's kernels on these processes
-(:meth:`BuildPool.build`) and go on once the builds have ended. CUTLASS DSL keeps one compile
-session per process, so CuTe DSL kernels compile in parallel only in separate processes; the other
-compilers run there too, so every op builds the same way.
+KernelBuilder's build mode and the autotuner's tune mode run an op's builds on these processes
+(:meth:`BuildPool.build`) and go on once they have ended. CuTe DSL compiles in parallel only in
+separate processes, so every op's builds run there.
 
-* A build is a module-level function called with picklable positional arguments (:class:`Build`).
-  Its kernel reaches this process the way its compiler caches it: in the compiler's disk cache
-  (DeepGEMM, FlashInfer, Triton, fmha_sm100, PyTorch extensions), or, for a CuTe DSL kernel, as an
-  object file in the pool's store, which ``process_built`` functions and the runners' shared
-  ``kernel_cache`` dicts (``tensorrt_llm._jit_share``) load.
-* :func:`process_built` memoizes a CuTe DSL compile function whose kernels the workers build
-  several at a time (:meth:`BuildPool.build_kernels`, which ``KernelBuilder.build_kernels`` calls);
-  ``fn(*args)`` then loads a kernel a worker built.
-* The workers live inside a pass (:meth:`BuildPool.pass_scope`, which KernelBuilder's build pass
-  opens, in the memory-profiling warmup only): they start with the pass's first builds, while the
-  GPU keeps ``_MIN_FREE_GPU_BYTES`` free, and stop when the outermost pass ends. Each holds a CUDA
-  context while it runs, which must be gone before the KV cache estimation measures free memory; a
-  warmup with the final KV cache starts none. Outside a pass no worker takes a build, and the
-  caller builds in this process.
-* The ranks split a build that has a :class:`Claim`: the worker that starts it first claims it and
-  makes it, and the other ranks' workers find it claimed and skip it.
-* When the ranks share JIT builds (``TLLM_JIT_SHARE_DIR``, or by default the launch's directory on
-  each node; see ``tensorrt_llm._jit_share``), the store is ``<that directory>/cute``, and the ranks
-  split the CuTe DSL kernels built into it. Otherwise every rank builds each kernel into a store of
-  its own, removed when the process exits.
-* A worker takes a build only when builds of its kind take long enough to repay a worker
-  (:meth:`BuildPool.worth_a_worker`): ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds (default 5), as
-  measured so far in this process and its workers, or as the caller expects until one is measured.
-  Shorter builds are made in this process.
-* A build that runs a kernel to compile it allocates the kernel's inputs on the rank's GPU. A
-  worker frees what a build allocated once the build ends, and starts a build only while the GPU's
-  free memory covers it beside the builds running, plus ``_MIN_FREE_GPU_BYTES``: how much a build
-  takes is the most a build of its kind took so far in a worker, and a kind not measured yet builds
-  one at a time. A build that does not fit with no other build running is left to the caller.
-* The workers start with ``subprocess`` in an environment of their own: without the launcher's
-  MPI, PMIx and Slurm variables, since importing TensorRT-LLM initializes MPI, and with only this
-  rank's GPU visible.
+* A build (:class:`Build`) is a module-level function and picklable arguments. Its kernel reaches
+  the rank through its compiler's disk cache or, for a CuTe DSL kernel, through the pool's store
+  (:func:`process_built` functions and the runners' shared ``kernel_cache`` dicts load it).
+* The workers live only inside a pass (:meth:`BuildPool.pass_scope`: the memory-profiling warmup)
+  and exit when it ends, before the KV cache is sized.
+* A worker takes a build only when builds of its kind take ``TLLM_KERNEL_BUILDER_MIN_BUILD_S``
+  seconds (default 5) and the GPU has room for it; the others build in this process.
+* With shared JIT builds (``tensorrt_llm._jit_share``) the ranks split the builds that have a
+  :class:`Claim`, and share the store.
 
-``TLLM_KERNEL_BUILDER=0`` starts no worker: every kernel builds where it is first needed.
-``TLLM_KERNEL_BUILDER_WORKERS`` caps the workers of a rank (default: this rank's share of the
-CPUs, up to 8).
+``TLLM_KERNEL_BUILDER=0`` starts no worker. ``TLLM_KERNEL_BUILDER_WORKERS`` caps the workers of a
+rank (default: its share of the CPUs, up to 8).
 """
 
 from __future__ import annotations

@@ -168,44 +168,23 @@ class TuningConfig:
             rank is pinned to a subset, up to 32: neighbouring sweep points often select
             the same kernel and compile it twice, so more threads keep paying off.
             TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
-        build_strategy (BuildStrategy): How the processes of a launch split the op's kernel
-            builds. INDEPENDENT: each builds every kernel it needs. PARALLEL, for runners whose
-            kernels are DeepGEMM builds or CuTe DSL kernels kept in their class's
-            ``kernel_cache`` (or in another library's cache that the class shares, its
-            ``share_kernel_caches()``): when the processes share their JIT builds
-            (TLLM_JIT_SHARE_DIR, or by default the launch's directory on each node; see
-            tensorrt_llm._jit_share), each kernel is built by one process and loaded by the
-            others. They split the profiles not yet tuned through claims in that directory: for
-            a single tactic, each rank runs the profiles it claims first, setting aside one
-            whose kernel another rank is building, then the profiles other ranks claimed once
-            those have run; for several tactics under INDEPENDENT tuning, a build pass first
-            runs each (profile, runner, tactic) once on the rank that claims it, and the
-            profiling that follows finds the kernels built. The claims then take the place of
-            the ``parallel_jit_warmup`` thread pool, which does not run. Under PARALLEL tuning
-            a rank builds the kernels of the pairs dealt to it, and loads those it runs later
-            (another profile's deal, the winners it primes) where another rank built them.
+        build_strategy (BuildStrategy): How the ranks split the op's kernel builds. INDEPENDENT:
+            each rank builds every kernel it needs. PARALLEL: when the ranks share JIT builds
+            (tensorrt_llm._jit_share), each kernel is built by the rank that claims it and loaded
+            by the others. For DeepGEMM kernels and CuTe DSL kernels kept in the runner class's
+            ``kernel_cache`` (or in a library's cache its ``share_kernel_caches()`` shares).
         cold_l2_flush_bytes (int): When > 0, every timed repeat first reads a buffer of this many
             bytes (evicting the operands, weights included, from L2) and each repeat is timed alone
             with %globaltimer stamps inside one CUDA graph; the median repeat is the tactic's time.
             For decode-sized GEMMs whose weights never stay in L2 between uses.
-        build_in_workers (bool): Inside a build pass (``BuildPool.pass_scope``, the
-            memory-profiling warmup), tune mode builds the op's kernels on the rank's worker
-            processes (``tensorrt_llm._torch.build_pool``), and profiles once they are built: every
-            (profile, runner, tactic) the profiling times, through ``TunableRunner.build``,
-            on inputs of the profile's layout. A worker allocates its build's inputs and
-            outputs on the rank's GPU, and the pool starts a build only while the GPU has room
-            for it, unless the runner compiles from shapes alone
-            (``TunableRunner.builds_from_shapes``), whose build gets meta tensors. The runners
-            and their tactics must pickle, and must not be collective. Without the workers,
-            the op builds as it would without ``build_in_workers`` (``parallel_jit_warmup``
-            included).
-            The workers take a runner's builds only when they take long enough to repay a
-            worker (``BuildPool.worth_a_worker``): until a runner's builds are measured, tune
-            mode builds one of them itself, timed, unless ``build_seconds`` gives their time;
-            shorter ones build as the op profiles.
-        build_seconds (Optional[float]): How long one build of the op's runners takes, until
-            their builds are measured (``build_in_workers``): it decides whether the workers take
-            them, and tune mode measures none itself.
+        build_in_workers (bool): In a build pass (the memory-profiling warmup), tune mode first
+            builds every (profile, runner, tactic) on the rank's worker processes
+            (``TunableRunner.build``; tensorrt_llm._torch.build_pool), then profiles. The runners
+            and tactics must pickle and must not be collective. Only builds long enough to repay a
+            worker go there (``BuildPool.worth_a_worker``: measured on one build, or given by
+            ``build_seconds``); the others build as the op profiles.
+        build_seconds (Optional[float]): The expected time of one build of the op's runners, used
+            until builds are measured, in place of timing one (``build_in_workers``).
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
