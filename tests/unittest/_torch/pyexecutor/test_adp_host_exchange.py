@@ -159,11 +159,14 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
         runner._capture_packed_split = None
         runner.supported_batch_sizes = [4]
         runner.max_beam_width = 1
-        runner._sample_type_resolver = lambda *_: key.sample_type
-        runner.kv_regime_resolver = lambda *_: (key.kv_regime,)
-        runner.packed_split_resolver = SimpleNamespace(variants=lambda *_: (key.packed_split,))
+        runner._sample_type_resolver = Mock(return_value=key.sample_type)
+        runner.kv_regime_resolver = Mock(return_value=(key.kv_regime,))
+        runner.packed_split_resolver = SimpleNamespace(
+            variants=Mock(return_value=(key.packed_split,))
+        )
         runner._can_run_cuda_graph_batch = lambda _: True
-        runner.get_graph_key = Mock(return_value=key)
+        runner._get_seq_len_mode = Mock(return_value=False)
+        runner.get_graph_key = types.MethodType(CUDAGraphRunner.get_graph_key, runner)
         attention = SimpleNamespace(
             is_cuda_graph=True,
             get_adp_token_counts=lambda: [tokens],
@@ -183,6 +186,9 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
         runner.maybe_get_cuda_graph(
             batch, enable_spec_decode=True, attn_metadata=attention, spec_metadata=spec
         )
+        runner._sample_type_resolver.assert_called_once()
+        runner.kv_regime_resolver.assert_called_once()
+        runner.packed_split_resolver.variants.assert_called_once()
         inputs = SimpleNamespace(
             _config=runner.config,
             mapping=Mapping(world_size=2, tp_size=2, rank=rank, enable_attention_dp=True),

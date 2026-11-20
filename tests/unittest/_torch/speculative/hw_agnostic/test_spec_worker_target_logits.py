@@ -9,7 +9,6 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.distributed as distributed
-import tensorrt_llm._torch.models.modeling_speculative as modeling_speculative
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
@@ -205,7 +204,7 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
 
 @pytest.mark.parametrize("mode", ["identity", "context", "shorter"])
 def test_verify_row_gather_preserves_rows_and_only_bypasses_identity(
-    monkeypatch: pytest.MonkeyPatch, mode: str
+    mode: str,
 ) -> None:
     hidden = torch.arange(24).reshape(4, 6)
     gather_ids = torch.tensor(
@@ -221,7 +220,6 @@ def test_verify_row_gather_preserves_rows_and_only_bypasses_identity(
     )
     metadata = SimpleNamespace(gather_ids=gather_ids, skip_verify_row_gather=True)
     attention = SimpleNamespace(num_contexts=int(mode == "context"))
-    monkeypatch.setattr(modeling_speculative, "is_blackwell_datacenter", lambda: True)
 
     logits, sharded = SpecDecOneEngineForCausalLM._verify_logits(model, hidden, attention, metadata)
 

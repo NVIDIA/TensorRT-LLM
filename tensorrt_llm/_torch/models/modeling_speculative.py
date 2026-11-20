@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
-from tensorrt_llm._utils import is_blackwell_datacenter
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (MoeLoadBalancerConfigType,
                                           auto_moe_backend_for_load_balancer)
@@ -2298,8 +2297,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         gather_ids = spec_metadata.gather_ids
         if (spec_metadata.skip_verify_row_gather
                 and attn_metadata.num_contexts == 0
-                and gather_ids.shape[0] == hidden_states.shape[0]
-                and is_blackwell_datacenter()):
+                and gather_ids.shape[0] == hidden_states.shape[0]):
             # A generation-only step gathers every row in order.
             rows = hidden_states
         else:

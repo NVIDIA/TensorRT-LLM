@@ -1380,9 +1380,20 @@ def wait_event(event: torch.cuda.Event) -> None:
         event.synchronize()
 
 
-def current_cuda_stream() -> torch.cuda.Stream:
-    """``torch.cuda.current_stream()`` without the per-call device lookup."""
-    return torch.cuda.current_stream(torch.cuda.current_device())
+_current_cuda_streams: dict[tuple[int, int], torch.cuda.Stream] = {}
+
+
+def current_cuda_stream(
+        device_index: Optional[int] = None) -> torch.cuda.Stream:
+    """``torch.cuda.current_stream()`` without a per-call device lookup or Stream construction."""
+    if device_index is None:
+        device_index = torch._C._cuda_getDevice()
+    key = (device_index, torch._C._cuda_getCurrentRawStream(device_index))
+    stream = _current_cuda_streams.get(key)
+    if stream is None:
+        stream = _current_cuda_streams[key] = torch.cuda.current_stream(
+            device_index)
+    return stream
 
 
 class CudaStreamScope:

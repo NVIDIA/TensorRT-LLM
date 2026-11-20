@@ -22,7 +22,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.host_staging import HostUploader, current_stream
+from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
@@ -66,7 +66,7 @@ from tensorrt_llm._torch.utils import (
     helix_local_len,
     set_per_request_prefill_cuda_graph_flag,
 )
-from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
+from tensorrt_llm._utils import current_cuda_stream, maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
@@ -172,15 +172,15 @@ def _chunk_reads_prefetched_tensors(multimodal_params: MultimodalParams, use_mro
     )
 
 
-_TOKEN_IOTA = torch.empty(0, dtype=torch.int)
+_token_iota_cache = torch.empty(0, dtype=torch.int)
 
 
 def _token_iota(count: int) -> torch.Tensor:
     """Host int32 ``[0, count)``, sliced from one cached range."""
-    global _TOKEN_IOTA
-    if _TOKEN_IOTA.numel() < count:
-        _TOKEN_IOTA = torch.arange(max(count, 2 * _TOKEN_IOTA.numel()), dtype=torch.int)
-    return _TOKEN_IOTA[:count]
+    global _token_iota_cache
+    if _token_iota_cache.numel() < count:
+        _token_iota_cache = torch.arange(max(count, 2 * _token_iota_cache.numel()), dtype=torch.int)
+    return _token_iota_cache[:count]
 
 
 def _zero_fill_row_spans(buffer: torch.Tensor, spans: list[tuple[int, int]]) -> None:
@@ -3280,7 +3280,7 @@ class DecoderInputPreparer:
         """
         if self._prepare_inputs_event is None:
             self._prepare_inputs_event = torch.cuda.Event()
-        self._prepare_inputs_event.record(current_stream())
+        self._prepare_inputs_event.record(current_cuda_stream())
 
     def wait_for_input_copy(self) -> None:
         if self._prepare_inputs_event is not None:

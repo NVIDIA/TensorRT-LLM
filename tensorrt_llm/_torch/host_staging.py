@@ -8,23 +8,16 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import CUASSERT, cudart, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (
+    CUASSERT,
+    cudart,
+    current_cuda_stream,
+    maybe_pin_memory,
+    prefer_pinned,
+)
 
 _STAGING_RING = 2
 _COPY_BLOCK = 1024
-
-_CURRENT_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {}
-
-
-def current_stream(device_index: int | None = None) -> torch.cuda.Stream:
-    """``torch.cuda.current_stream()`` without a per-call device lookup or Stream construction."""
-    if device_index is None:
-        device_index = torch._C._cuda_getDevice()
-    key = (device_index, torch._C._cuda_getCurrentRawStream(device_index))
-    stream = _CURRENT_STREAMS.get(key)
-    if stream is None:
-        stream = _CURRENT_STREAMS[key] = torch.cuda.current_stream(device_index)
-    return stream
 
 
 def copy_host_to_device(store: dict, key, destination: torch.Tensor, value: torch.Tensor) -> None:
@@ -79,7 +72,7 @@ def copy_host_to_device(store: dict, key, destination: torch.Tensor, value: torc
     destination.copy_(view, non_blocking=True)
     if event is None:
         event = ring["events"][index] = torch.cuda.Event()
-    event.record(current_stream(destination.device.index))
+    event.record(current_cuda_stream(destination.device.index))
 
 
 @triton.jit(do_not_specialize=["count"], do_not_specialize_on_alignment=["count"])
@@ -141,7 +134,7 @@ class HostUploader:
                 destination = torch.empty(value.shape, dtype=value.dtype, device=device)
             destination.copy_(maybe_pin_memory(value), non_blocking=True)
             return destination
-        current = current_stream(self._stream.device_index)
+        current = current_cuda_stream(self._stream.device_index)
         ring = self._rings.get(key)
         if ring is None:
             ring = self._rings[key] = (_UploadSlot(), _UploadSlot())
