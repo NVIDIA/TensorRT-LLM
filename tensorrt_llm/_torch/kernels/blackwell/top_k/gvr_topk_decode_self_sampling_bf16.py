@@ -39,6 +39,7 @@ from cutlass.cutlass_dsl import T as mlir_types
 from cutlass.cutlass_dsl import dsl_user_op
 
 from . import gvr_topk_decode_self_sampling as gvr
+from .gvr_topk_decode_self_sampling_host import PCW_VECTOR_ELEMENTS
 
 # ---- small key-span refine ----
 
@@ -1749,7 +1750,7 @@ class GvrPackedClampWindowKernel:
         assert kv_lens.element_type == cutlass.Int32
         assert out.element_type == cutlass.Int32
         if cutlass.const_expr(cute.is_static(logits.shape[1])):
-            assert logits.shape[1] % 4 == 0
+            assert logits.shape[1] % PCW_VECTOR_ELEMENTS == 0
         if cutlass.const_expr(self.packed_sample_bf16):
             assert pre_idx.shape[1] % 4 == 0
         shared_bytes = self.required_smem_bytes
