@@ -92,6 +92,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancerIterContext,
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    BF16TRTLLMGenFusedMoEMethod,
     DeepSeekFP8BlockScalesFusedMoEMethod,
     DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
     FP8QDQFusedMoEMethod,
@@ -2223,10 +2224,13 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
     backend_str = backend_type.value if hasattr(backend_type, "value") else str(backend_type)
 
     if quant_algo is None:
-        # Unquantized - only CUTLASS supports it
-        if backend_str == "CUTLASS":
-            return UnquantizedFusedMoEMethod
-        return None
+        # Unquantized: the CUTLASS method, or the TRTLLM-Gen BF16 method that
+        # keeps the experts in its shuffled BlockMajorK layout.
+        method_map = {
+            "CUTLASS": UnquantizedFusedMoEMethod,
+            "TRTLLM": BF16TRTLLMGenFusedMoEMethod,
+        }
+        return method_map.get(backend_str)
 
     # CUTLASS backend
     # What each CUTLASS leaf's _get_quant_method() returns, for the formats

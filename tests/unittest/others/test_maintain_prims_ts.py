@@ -15,6 +15,7 @@ import runpy
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -35,6 +36,8 @@ b = importlib.import_module(f"{_SPEC.name}.bot")
 _VENDOR = "example-vendor"
 _CONSUMER = "NVIDIA/TensorRT-LLM"
 _UPSTREAM = "flashinfer-ai/flashinfer"
+# A non-ASCII scope: Git quotes such paths unless its output is NUL-separated.
+_SCOPED_LOCK = "models/démo/3rdparty/vendor_sources.lock.yaml"
 
 pytestmark = pytest.mark.cpu_only
 
@@ -73,9 +76,10 @@ def _commit(repo: Path, message: str) -> str:
 class World(m.GitHub):
     """GitHub facade whose immutable data comes from temporary Git repositories."""
 
-    def __init__(self, root: Path) -> None:
-        super().__init__(_CONSUMER, _VENDOR, _UPSTREAM)
+    def __init__(self, root: Path, lock: str = m._LOCK) -> None:
+        super().__init__(_CONSUMER, _VENDOR, _UPSTREAM, lock=lock)
         self.root = root
+        scope = Path(lock).parent.parent
         self.source = _init(root / "flashinfer")
         _write(self.source, "prims_ts/kernel.py", "VALUE = 0\n")
         self.upstream = _commit(self.source, "upstream baseline")
@@ -90,7 +94,7 @@ class World(m.GitHub):
             m.vendor.main(
                 [
                     "--lock",
-                    str(self.consumer / m._LOCK),
+                    str(self.consumer / lock),
                     "create",
                     _VENDOR,
                     "--url",
@@ -112,12 +116,12 @@ class World(m.GitHub):
             == 0
         )
         self.base = _commit(self.consumer, "previous vendor pin")
-        _write(self.consumer, "vendored/prims_ts/kernel.py", "VALUE = 3\n")
+        _write(self.consumer, str(scope / "vendored/prims_ts/kernel.py"), "VALUE = 3\n")
         assert (
             m.vendor.main(
                 [
                     "--lock",
-                    str(self.consumer / m._LOCK),
+                    str(self.consumer / lock),
                     "pin",
                     _VENDOR,
                     "--url",
@@ -192,8 +196,9 @@ class World(m.GitHub):
             "files": [
                 {"filename": f}
                 for f in _git(
-                    repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha
-                ).splitlines()
+                    repo, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha
+                ).split("\0")
+                if f
             ],
         }
 
@@ -327,7 +332,7 @@ class World(m.GitHub):
             return {"object": {"sha": result.stdout.strip()}}
         if route.startswith("contents/"):
             path, sha = route[len("contents/") :].split("?ref=")
-            content = _git(self.consumer, "show", f"{sha}:{path}") + "\n"
+            content = _git(self.consumer, "show", f"{sha}:{unquote(path)}") + "\n"
             return {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()}
         if route.startswith("commits/"):
             return self.commit_data(self.consumer, route.split("/")[1])
@@ -341,7 +346,7 @@ class World(m.GitHub):
                 ]
             return copy.deepcopy(list(self.prs.values()))
         if route.startswith("pulls/") and "/files?" in route:
-            return [{"filename": m._LOCK}]
+            return [{"filename": self.lock}]
         if route == "pulls" and method == "POST":
             if self.fail_create:
                 raise RuntimeError("simulated PR creation failure")
@@ -390,13 +395,19 @@ class World(m.GitHub):
 
 
 @pytest.fixture
-def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
-    instance = World(tmp_path)
+def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> World:
+    instance = World(tmp_path, getattr(request, "param", m._LOCK))
+
+    def github(*args, lock: str) -> World:
+        assert lock == instance.lock
+        return instance
+
     monkeypatch.setattr(m, "_git", instance.routed_git)
-    monkeypatch.setattr(m, "GitHub", lambda *args: instance)
+    monkeypatch.setattr(m, "GitHub", github)
     return instance
 
 
+@pytest.mark.parametrize("world", [_SCOPED_LOCK], ids=["scoped-vendor-lock"], indirect=True)
 def test_dry_run_has_no_writes_and_pins_merged_not_live_head(
     world: World, capfd: pytest.CaptureFixture
 ) -> None:
@@ -418,6 +429,8 @@ def test_dry_run_has_no_writes_and_pins_merged_not_live_head(
                 "4829",
                 "--repo",
                 str(world.consumer),
+                "--lock",
+                world.lock,
             ]
         )
         == 0
@@ -431,13 +444,16 @@ def test_dry_run_has_no_writes_and_pins_merged_not_live_head(
     assert plan.record["upstream_base"] == world.upstream
 
 
+@pytest.mark.parametrize(
+    "world", [m._LOCK, _SCOPED_LOCK], ids=["repository-lock", "scoped-vendor-lock"], indirect=True
+)
 def test_publish_signed_lock_only_and_repeat(world: World) -> None:
     args = world.args(publish=True)
     plan = m._make_plan(args, world)
     pr = m._publish(args, world, plan)
     assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.reviewed
     head = pr["head"]["sha"]
-    assert _git(world.consumer, "diff", "--name-only", f"{head}^", head) == m._LOCK
+    assert _git(world.consumer, "diff", "--name-only", "-z", f"{head}^", head) == world.lock + "\0"
     assert m._lock_at(world, _CONSUMER, head).to_mapping() == plan.promoted
     message = _git(world.consumer, "show", "-s", "--format=%B", head)
     assert m._record_from_message(message) == plan.record
@@ -979,7 +995,7 @@ def test_upstream_main_exception_is_narrow(world: World, failure: str) -> None:
         _git(world.source, "switch", "-q", "--detach", world.previous)
         _advance_canonical(world)
     elif failure == "selection":
-        data = m._local_lock_document(world.consumer)
+        data = m._local_lock_document(world.consumer, m._LOCK)
         data["vendors"][_VENDOR]["include"] = ["kernel.py"]
         _write(world.consumer, m._LOCK, m.yaml.safe_dump(data))
         _git(world.consumer, "add", "-A")
@@ -1475,8 +1491,19 @@ def test_github_repo_url_parsing(suffix: str) -> None:
     assert m._repo_name(f"https://github.com/owner/repo{suffix}") == "owner/repo"
 
 
-@pytest.mark.parametrize("flags", [["--auto-merge"], ["--wait"], ["--timeout", "0"]])
-def test_cli_invalid_flags(flags: list[str]) -> None:
+@pytest.mark.parametrize(
+    "flags,message",
+    [
+        (["--auto-merge"], "require --publish"),
+        (["--wait"], "require --publish"),
+        (["--timeout", "0"], "--timeout must be positive"),
+        (
+            ["--lock", "models/demo/vendor_sources.lock.yaml"],
+            "--lock must be <scope>/3rdparty/vendor_sources.lock.yaml",
+        ),
+    ],
+)
+def test_cli_invalid_flags(flags: list[str], message: str, capfd: pytest.CaptureFixture) -> None:
     with pytest.raises(SystemExit) as raised:
         m.main(
             [
@@ -1497,12 +1524,14 @@ def test_cli_invalid_flags(flags: list[str]) -> None:
             ]
         )
     assert raised.value.code == 2
+    assert message in capfd.readouterr().err
 
 
 def test_command_preserves_identity_and_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/test-gh-config")
     monkeypatch.setenv("GIT_AUTHOR_NAME", "Real Maintainer")
     monkeypatch.setenv("GIT_DIR", "/unrelated/git")
+    monkeypatch.setenv("GIT_LITERAL_PATHSPECS", "1")
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
         env = kwargs["env"]
@@ -1510,6 +1539,7 @@ def test_command_preserves_identity_and_config(monkeypatch: pytest.MonkeyPatch) 
         assert env["GIT_AUTHOR_NAME"] == "Real Maintainer"
         assert env["GIT_LFS_SKIP_SMUDGE"] == "1"
         assert "GIT_DIR" not in env
+        assert "GIT_LITERAL_PATHSPECS" not in env
         assert "shell" not in kwargs
         return subprocess.CompletedProcess(command, 0, "ok\n", "")
 
@@ -1767,8 +1797,16 @@ def test_completed_promotion_ignores_later_live_state(
     assert len(world.comments) == 1
 
 
-@pytest.mark.parametrize("phase", ["worktree_created", "before_commit", "after_commit"])
-@pytest.mark.parametrize("main_advances", [False, True])
+@pytest.mark.parametrize(
+    "world,phase,main_advances",
+    [
+        pytest.param(m._LOCK, phase, advances, id=f"{advances}-{phase}")
+        for advances in (False, True)
+        for phase in ("worktree_created", "before_commit", "after_commit")
+    ]
+    + [pytest.param(_SCOPED_LOCK, "before_commit", False, id="scoped-vendor-lock-before_commit")],
+    indirect=["world"],
+)
 def test_interrupted_preparation_resumes_without_extra_commits(
     world: World, monkeypatch: pytest.MonkeyPatch, phase: str, main_advances: bool
 ) -> None:
@@ -1933,10 +1971,25 @@ def test_mutating_git_commands_stream_output(monkeypatch: pytest.MonkeyPatch) ->
     assert m._git(Path("/test/repository"), "commit", "-s", "-F", "-", text="test") == ""
 
 
-@pytest.mark.parametrize("loss", ["sqlite", "workdir"])
 @pytest.mark.parametrize(
-    "phase",
-    ["worktree", "stage", "commit", "branch", "canonical", "pr", "comment", "auto_merge", "merged"],
+    "world,phase,loss",
+    [
+        pytest.param(m._LOCK, phase, loss, id=f"{phase}-{loss}")
+        for loss in ("sqlite", "workdir")
+        for phase in (
+            "worktree",
+            "stage",
+            "commit",
+            "branch",
+            "canonical",
+            "pr",
+            "comment",
+            "auto_merge",
+            "merged",
+        )
+    ]
+    + [pytest.param(_SCOPED_LOCK, "commit", "sqlite", id="scoped-vendor-lock")],
+    indirect=["world"],
 )
 def test_bot_recovers_publication_after_cache_loss(
     world: World,
@@ -1975,7 +2028,7 @@ def test_bot_recovers_publication_after_cache_loss(
             "worktree"
             if arguments[:2] == ("worktree", "add")
             else "stage"
-            if arguments[0] == "add"
+            if arguments[0] == "update-index"
             else "commit"
             if arguments[0] == "commit"
             else "branch"

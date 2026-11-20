@@ -72,6 +72,20 @@ assert torch.equal(out, x * SCALE + y)
 print("RESULT " + json.dumps({"digest": hashlib.sha256(out.cpu().numpy().tobytes()).hexdigest()}))
 """
 
+# The same kernel through a KernelCache: it prints whether the kernel was loaded or compiled.
+_COMPILE_LINE = 'compiled = cute.compile(axpy, *fake, stream, options="--enable-tvm-ffi")'
+assert _COMPILE_LINE in _CHILD
+_KERNEL_CACHE_CHILD = _CHILD.replace(
+    _COMPILE_LINE,
+    """from tensorrt_llm._torch.cute_dsl_file_cache import KernelCache
+
+cache = KernelCache("axpy", __file__)
+compiled = cache.get(SCALE)
+print("LOADED" if compiled is not None else "COMPILED")
+if compiled is None:
+    compiled = cache[SCALE] = cute.compile(axpy, *fake, stream, options="--enable-tvm-ffi")""",
+)
+
 _OUTCOME = re.compile(r"\[cute_dsl_file_cache\] (hit|miss) \S*axpy")
 _RESULT = re.compile(r"^RESULT (.*)$", re.MULTILINE)
 
@@ -153,3 +167,56 @@ def test_cute_compile_reused_across_processes(tmp_path):
     names = [p.name for p in cache.iterdir()]
     assert len(names) == 2, names
     assert all(re.fullmatch(r"cute_dsl_[0-9a-f]{64}\.mlir", name) for name in names), names
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="needs the CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_kernel_cache_loads_stored_kernels(tmp_path):
+    script = tmp_path / "axpy_kernel_cache.py"
+    script.write_text(_KERNEL_CACHE_CHILD)
+    cache = tmp_path / "cache"
+
+    (cold,) = _finish(_start(script, cache))
+    (warm,) = _finish(_start(script, cache))
+    assert "COMPILED" in cold[2], cold[2][-6000:]
+    assert "LOADED" in warm[2] and warm[0] == [], warm[2][-6000:]
+    assert warm[1] == cold[1]
+    assert sorted(p.suffix for p in (cache / "kernels").iterdir()) == [".json", ".o"]
+
+    # A broken entry is compiled again and replaced, and the next process loads the new one.
+    (obj,) = (cache / "kernels").glob("*.o")
+    obj.write_bytes(b"broken")
+    (repaired,) = _finish(_start(script, cache))
+    assert "COMPILED" in repaired[2], repaired[2][-6000:]
+    assert f"entry {obj.stem} unusable" in repaired[2], repaired[2][-6000:]
+    (reloaded,) = _finish(_start(script, cache))
+    assert "LOADED" in reloaded[2], reloaded[2][-6000:]
+    assert repaired[1] == reloaded[1] == cold[1]
+
+
+def test_kernel_cache_skips_requested_outputs(monkeypatch, tmp_path):
+    from tensorrt_llm._torch import cute_dsl_file_cache
+
+    for name in [k for k in os.environ if k.startswith("CUTE_DSL_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setattr(cute_dsl_file_cache, "_kernel_root", str(tmp_path))
+    monkeypatch.setattr(cute_dsl_file_cache, "_cute_identity", lambda: "identity")
+    cache = cute_dsl_file_cache.KernelCache("owner", __file__)
+
+    # Compile options that write files, spelled out or abbreviated, are never kept.
+    assert cache._paths(("--enable-tvm-ffi",)) is not None
+    for options in ("--keep-ptx", "--keep-cubin --dump-dir d", "--dump=d", "--flatten-locs=x.json"):
+        assert cache._paths((options,)) is None, options
+
+    # So are settings that ask for compile outputs or no caching, unless they are off.
+    for name, value in (
+        ("CUTE_DSL_KEEP", "ptx"),
+        ("CUTE_DSL_KEEP_PTX", "On"),
+        ("CUTE_DSL_NO_CACHE", "1"),
+    ):
+        monkeypatch.setenv(name, value)
+        assert cache._paths(("",)) is None, name
+        monkeypatch.delenv(name)
+    for value in ("0", "false", " OFF "):
+        monkeypatch.setenv("CUTE_DSL_DISABLE_FILE_CACHING", value)
+        assert cache._paths(("",)) is not None, value

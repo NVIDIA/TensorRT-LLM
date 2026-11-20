@@ -27,6 +27,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "Apertus1p5ForConditionalGeneration",
         "ApertusForCausalLM",
         "BartForConditionalGeneration",
+        "BeamForCausalLM",
         "BertForSequenceClassification",
         "CLIPVisionModel",
         "Cohere2ForCausalLM",
