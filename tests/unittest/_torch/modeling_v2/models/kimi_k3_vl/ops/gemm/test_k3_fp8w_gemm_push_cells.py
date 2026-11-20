@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The collective FP8-weight GEMM entries of the K3 default target over their certified cells, on a
+"""The collective FP8-weight GEMM entries of the K3 default and ULL targets over their certified cells, on a
 4-rank MNNVL group: ``k3_fp8w_lowm_gemm_push.CELLS``, ``k3_fp8w_mid_gemm_push.CELLS`` and
 ``k3_fp8w_lowm_mxfp8_push.CELLS``.
 
@@ -39,7 +39,9 @@ WORLD = 4
 #: One Lamport buffer: the largest cell (128 x 7168 two-shot over 4 ranks) needs 3.7 MB.
 BUFFER_BYTES = 8 << 20
 ELEMENT_ULP, RMS_ULP = 8, 2
-ENTRIES = ("k3_fp8w_lowm_gemm_push", "k3_fp8w_mid_gemm_push", "k3_fp8w_lowm_mxfp8_push")
+SHARED_ENTRIES = ("k3_fp8w_lowm_gemm_push", "k3_fp8w_mid_gemm_push")
+ENTRIES = (*SHARED_ENTRIES, "k3_fp8w_lowm_mxfp8_push")
+ULL_ENTRIES = (*SHARED_ENTRIES, "k3_fp8w_lowm_mxfp8_push_ull")
 
 
 def _weight(n, k, seed):
@@ -62,7 +64,7 @@ def _bf16(m, n, seed, scale=1.0):
     return (torch.randn(m, n, device="cuda", generator=gen) * scale).to(torch.bfloat16)
 
 
-def _run_rank(entry_name, world, mv2_tests):
+def _run_rank(entry_name, world, mv2_tests, ull=False):
     os.environ["TLLM_TEST_MNNVL"] = "1"
     os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     import importlib
@@ -75,9 +77,11 @@ def _run_rank(entry_name, world, mv2_tests):
     from tensorrt_llm.mapping import Mapping
 
     lowm = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_gemm")
-    mx = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_mxfp8")
+    suffix = "_ull" if ull else ""
+    mx = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_mxfp8{suffix}")
     lamport = importlib.import_module(f"{K3}.kernels.k3r_comm.k3_lamport_ar")
-    op = getattr(importlib.import_module(f"{K3}.ops.gemm.{entry_name}"), entry_name)
+    op_name = entry_name.removesuffix("_ull")
+    op = getattr(importlib.import_module(f"{K3}.ops.gemm.{entry_name}"), op_name)
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     torch.cuda.set_device(rank)
@@ -232,7 +236,7 @@ def _run_rank(entry_name, world, mv2_tests):
             "k3_fp8w_lowm_gemm_push": lowm_push,
             "k3_fp8w_mid_gemm_push": mid_push,
             "k3_fp8w_lowm_mxfp8_push": mxfp8_push,
-        }[entry_name]
+        }[op_name]
         for i, cell in enumerate(op.CELLS):
             if cell.spec.get("sm_107") and not sm107:
                 report["skipped"].append(cell.why)
@@ -250,16 +254,11 @@ def _run_rank(entry_name, world, mv2_tests):
     return report
 
 
-@skip_pre_blackwell
-@pytest.mark.parametrize("entry_name", ENTRIES)
-@pytest.mark.parametrize("mpi_pool_executor", [WORLD], indirect=True)
-def test_k3_fp8w_gemm_push_cells(mpi_pool_executor, entry_name):
-    """Drives ``k3_fp8w_lowm_gemm_push.CELLS``, ``k3_fp8w_mid_gemm_push.CELLS`` or
-    ``k3_fp8w_lowm_mxfp8_push.CELLS`` on every rank."""
+def _check_push_cells(mpi_pool_executor, entry_name, *, ull):
     world = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < world:
         pytest.skip(f"needs {world} GPUs")
-    args = [(entry_name, world, MV2_TESTS)] * world
+    args = [(entry_name, world, MV2_TESTS, ull)] * world
     reports = list(mpi_pool_executor.map(_run_rank, *zip(*args)))
     failed = [f"rank {r}: {msg}" for r, rep in enumerate(reports) for msg in rep["failed"]]
     assert not failed, "\n".join(failed)
@@ -267,3 +266,17 @@ def test_k3_fp8w_gemm_push_cells(mpi_pool_executor, entry_name):
     skipped = reports[0]["skipped"]
     if skipped:
         print(f"{entry_name}: skipped off SM107: {skipped}")
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("entry_name", ENTRIES)
+@pytest.mark.parametrize("mpi_pool_executor", [WORLD], indirect=True)
+def test_k3_fp8w_gemm_push_cells(mpi_pool_executor, entry_name):
+    _check_push_cells(mpi_pool_executor, entry_name, ull=False)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("entry_name", ULL_ENTRIES)
+@pytest.mark.parametrize("mpi_pool_executor", [WORLD], indirect=True)
+def test_k3_fp8w_gemm_push_ull_cells(mpi_pool_executor, entry_name):
+    _check_push_cells(mpi_pool_executor, entry_name, ull=True)
