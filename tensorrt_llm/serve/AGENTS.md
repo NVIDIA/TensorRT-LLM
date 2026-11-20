@@ -12,6 +12,14 @@ Name files and symbols here, never line numbers.
 
 ## Where code goes
 
+- New endpoint: a router and a serving class under `serve/api/<dialect>/<endpoint>/`
+  (`api_router.py` + `serving.py`). Create the router with `make_router()`
+  (`serve/_base/routing.py`) and add a `RouterSpec` to `ROUTERS`. Never add a method or a
+  route to `OpenAIServer`. Check: `tests/unittest/api_stability/test_serve_routes.py`.
+- Attach a router with `app.include_router(router)` and no `prefix=`; give the prefix to
+  `make_router(prefix=...)` instead. The composition root sets each serving object on
+  `app.state.<bucket>_serving_<endpoint>` before attaching; routers read it from
+  `request.app.state`, never from a closure.
 - Model-specific behavior: a hook on `ServingExtension` (`serve/serving_extensions.py`,
   `serve/extensions/`). Do not branch on a model name in a handler.
 - Prompt rendering: `serve/render/` only. Handlers do not call `apply_chat_template`.
@@ -33,6 +41,9 @@ Name files and symbols here, never line numbers.
 ## Moving code
 
 - A move PR only moves code: no reformatting, no logic change.
+- A move PR is redone on the latest `main` right before merge instead of being rebased,
+  and its PR body lists every moved definition with its old and new location, and every
+  definition the PR changes on purpose.
 - In the same PR update the multi-GPU file list (`getMultiGpuFileChanged` in
   `jenkins/L0_MergeRequest.groovy`), `.github/CODEOWNERS` and `legacy-files.txt`. A new file
   takes the formatting group of the file its code comes from.
@@ -63,6 +74,12 @@ Name files and symbols here, never line numbers.
 - The harmony tests guard whole files with try-imports. After renaming anything they import,
   run them with `pytest -rs` and check that nothing is skipped as "not importable": a green run
   can mean every test was skipped.
+
+## Checklists
+
+- Endpoint: package under `serve/api/`; `RouterSpec` in `ROUTERS`; regenerate the route
+  snapshot (API review); multi-GPU list entry if it runs on the disaggregated path; CPU test
+  registered in `tests/integration/test_lists/test-db/l0_cpu.yml`.
 
 ## Commands
 

@@ -1995,6 +1995,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/models/llama/",
         "tensorrt_llm/parameter.py",
         "tensorrt_llm/serve/__init__.py",
+        "tensorrt_llm/serve/_base/",
+        "tensorrt_llm/serve/api/ops/",
         "tensorrt_llm/serve/cluster_storage.py",
         "tensorrt_llm/serve/disagg_auto_scaling.py",
         "tensorrt_llm/serve/extensions/",
