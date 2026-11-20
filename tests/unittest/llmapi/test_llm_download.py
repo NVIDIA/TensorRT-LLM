@@ -1,9 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi.utils import (download_hf_model,
                                        download_hf_pretrained_config)
 
 # isort: off
-from .test_llm import llama_model_path
+from .model_paths import llama_model_path
 # isort: on
 
 prompts = ["A B C"]

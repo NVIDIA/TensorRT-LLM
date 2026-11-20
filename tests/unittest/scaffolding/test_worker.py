@@ -17,7 +17,7 @@ import asyncio
 
 import pytest
 from llmapi.apps.openai_server import RemoteOpenAIServer
-from llmapi.test_llm import get_model_path
+from llmapi.model_paths import get_model_path
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm.scaffolding import (ChatTask, GenerationTask, TaskStatus,

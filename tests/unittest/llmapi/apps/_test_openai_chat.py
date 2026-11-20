@@ -9,7 +9,7 @@ import openai
 import pytest
 import yaml
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
                     make_server_with_custom_sampler_fixture)

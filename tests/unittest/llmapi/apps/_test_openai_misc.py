@@ -6,7 +6,7 @@ import requests
 
 from tensorrt_llm.version import __version__ as VERSION
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 

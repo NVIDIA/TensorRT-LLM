@@ -21,7 +21,8 @@ import pytest
 import yaml
 from utils.util import skip_single_gpu
 
-from ..test_llm import get_model_path, prompts
+from ..llm_test_utils import prompts
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 

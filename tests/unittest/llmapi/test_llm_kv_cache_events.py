@@ -28,7 +28,7 @@ from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
-from .test_llm import get_model_path
+from .model_paths import get_model_path
 
 default_model_name = "Qwen3/Qwen3-0.6B"
 llama_model_path = get_model_path(default_model_name)

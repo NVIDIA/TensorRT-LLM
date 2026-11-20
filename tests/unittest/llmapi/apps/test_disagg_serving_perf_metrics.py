@@ -26,7 +26,7 @@ from tensorrt_llm.serve.perf_metrics import (
     STEP_METRICS_HEADER,
 )
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 
 
