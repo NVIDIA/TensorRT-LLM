@@ -9,8 +9,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace, context_logits_heads
-from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
-from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
+from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
+    ContextLogitsPlan,
+    store_context_logits,
+)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, PyResult, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.py_executor import _UNBOUNDED_PAUSE_MAX_INPUT_LEN
 from tensorrt_llm.executor.result import compute_prompt_logprobs
 
 
@@ -42,6 +46,7 @@ def make_request(
         context_chunk_size=length,
         context_current_position=0,
         py_prompt_len=length,
+        orig_prompt_len=length,
         py_return_context_logits=full or k is not None,
         py_context_logits_explicit=full,
         py_prompt_logprobs=k,
@@ -446,3 +451,49 @@ def test_short_compact_prompt_logprobs_fail_only_their_request() -> None:
     assert "all 4 prompt tokens, got 2" in wrapped.error_msg
     worker.abort_request.assert_called_once_with(7)
     assert worker._refused_client_ids == {7}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("explicit", [True, False], ids=["context_logits", "prompt_logprobs_only"])
+def test_recompute_stores_each_prompt_row_once(explicit: bool) -> None:
+    """A recompute that replays the prefill stores no context row a second time."""
+    prompt_len, vocab = 10, 31
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=4,
+        input_tokens=[(7 * i) % vocab for i in range(prompt_len)],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        return_context_logits=True,
+        context_logits_explicit=explicit,
+        prompt_logprobs=2,
+        return_logits_device_memory=False,
+    )
+    logits = torch.randn(prompt_len + 2, vocab, generator=torch.Generator().manual_seed(5))
+    # Prefill the prompt in three chunks, so the first pass is chunked too.
+    for size in (4, 4, 2):
+        request.context_chunk_size = size
+        begin = request.context_current_position
+        store_context_logits(request, logits[begin : begin + size])
+        request.move_to_next_context_chunk()
+    result = request.py_result
+    stored_logits = result.context_logits.clone() if explicit else None
+    stored_logprob_rows = torch.cat(result.context_prompt_logprob_rows)
+    stored_last_logprobs = result.context_prompt_last_logprobs
+    for token in (3, 4):
+        request.add_new_token(token, 0)
+
+    request.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
+    request.context_chunk_size = request.context_remaining_length
+    assert request.context_chunk_size == prompt_len + 2
+
+    store_context_logits(request, logits)
+
+    if explicit:
+        torch.testing.assert_close(result.context_logits, stored_logits, rtol=0, atol=0)
+    else:
+        assert result.context_logits is None
+    torch.testing.assert_close(
+        torch.cat(result.context_prompt_logprob_rows), stored_logprob_rows, rtol=0, atol=0
+    )
+    assert result.context_prompt_last_logprobs is stored_last_logprobs
