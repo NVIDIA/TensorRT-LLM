@@ -235,7 +235,7 @@ def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued(
 
     status = transceiver.check_context_transfer_status(at_least_request_num=1)
     assert isinstance(status, CtxTransferStatus)
-    completed, failed = status.completed_request_ids, status.error_request_ids
+    completed, failed = status
 
     assert completed == []
     assert failed == []
@@ -267,8 +267,7 @@ def test_context_transfer_status_bounded_poll_reaps_completion(monkeypatch) -> N
         sleep,
     )
 
-    status = transceiver.check_context_transfer_status(at_least_request_num=1)
-    completed, failed = status.completed_request_ids, status.error_request_ids
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
 
     assert completed == [14]
     assert failed == []
@@ -284,11 +283,10 @@ def test_context_transfer_status_block_all_uses_blocking_wait() -> None:
     req = _FakeRequest()
     transceiver = _make_transceiver({12: session}, {12: req})
 
-    status = transceiver.check_context_transfer_status(
+    completed, failed = transceiver.check_context_transfer_status(
         at_least_request_num=None,
         mark_complete=True,
     )
-    completed, failed = status.completed_request_ids, status.error_request_ids
 
     assert completed == [12]
     assert failed == []
@@ -311,8 +309,7 @@ def test_context_transfer_status_timeout_retains_session_and_request(monkeypatch
     )
 
     for _ in range(2):
-        status = transceiver.check_context_transfer_status(None)
-        completed, failed = status.completed_request_ids, status.error_request_ids
+        completed, failed = transceiver.check_context_transfer_status(None)
         assert completed == []
         assert failed == []
 
@@ -372,8 +369,7 @@ def test_context_timeout_snapshot_failure_does_not_release_session(monkeypatch) 
     monkeypatch.setattr("tensorrt_llm._torch.disaggregation.transceiver.logger.warning", warning)
 
     for _ in range(2):
-        status = transceiver.check_context_transfer_status(None)
-        completed, failed = status.completed_request_ids, status.error_request_ids
+        completed, failed = transceiver.check_context_transfer_status(None)
         assert completed == []
         assert failed == []
 
@@ -394,8 +390,7 @@ def test_context_transfer_status_zero_budget_processes_task_level_failure() -> N
     req = _FakeRequest()
     transceiver = _make_transceiver({13: session}, {13: req})
 
-    status = transceiver.check_context_transfer_status(at_least_request_num=0)
-    completed, failed = status.completed_request_ids, status.error_request_ids
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
 
     assert completed == []
     assert failed == [13]
@@ -428,8 +423,7 @@ def test_context_transfer_status_retains_terminal_session_during_write(
     req = _FakeRequest()
     transceiver = _make_transceiver({17: session}, {17: req})
 
-    status = transceiver.check_context_transfer_status(at_least_request_num=0)
-    completed, failed = status.completed_request_ids, status.error_request_ids
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
 
     assert completed == []
     assert failed == []
@@ -450,7 +444,8 @@ def test_context_transfer_status_retires_quiesced_cancelled_session() -> None:
     transceiver = _make_transceiver({18: session}, {18: req})
 
     status = transceiver.check_context_transfer_status(at_least_request_num=0)
-    completed, failed = status.completed_request_ids, status.error_request_ids
+    completed, failed = status
+    assert status.cancelled_request_ids == (18,)
 
     assert completed == []
     assert failed == []
@@ -471,8 +466,7 @@ def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._ctx_consensus = Mock(side_effect=AssertionError("consensus must be skipped"))
 
-    status = transceiver.check_context_transfer_status(at_least_request_num=0)
-    completed, failed = status.completed_request_ids, status.error_request_ids
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
 
     assert completed == []
     assert failed == []
@@ -492,9 +486,7 @@ def test_context_transfer_status_never_sent_no_sync_is_a_noop() -> None:
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._ctx_consensus = Mock(side_effect=AssertionError("consensus must be skipped"))
 
-    assert transceiver.check_context_transfer_status(at_least_request_num=0) == CtxTransferStatus(
-        [], []
-    )
+    assert transceiver.check_context_transfer_status(at_least_request_num=0) == ([], [])
     transceiver._ctx_consensus.assert_not_called()
     assert transceiver._transfer_worker.sweep_count == 0  # matches the original early-out exactly
 
@@ -614,8 +606,7 @@ def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._close_failed_sessions = Mock()
 
-    status = transceiver.check_context_transfer_status(at_least_request_num=0)
-    completed, failed = status.completed_request_ids, status.error_request_ids
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
 
     assert completed == [] and failed == []
     transceiver._dist.allreduce.assert_called_once()
@@ -1074,8 +1065,7 @@ def test_context_transfer_status_block_all_drains_wait_slices_before_close() -> 
     session = _make_tx_session([task])
     transceiver = _make_transceiver({15: session}, {15: _FakeRequest()})
 
-    status = transceiver.check_context_transfer_status(None)
-    completed, failed = status.completed_request_ids, status.error_request_ids
+    completed, failed = transceiver.check_context_transfer_status(None)
 
     assert completed == [15]
     assert failed == []

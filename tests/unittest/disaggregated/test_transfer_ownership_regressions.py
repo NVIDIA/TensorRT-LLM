@@ -1040,8 +1040,7 @@ def test_send_terminal_session_is_retained_when_close_refuses(
     assert transceiver._send_reqs == {rid: request}
 
     session.close.return_value = True
-    status = transceiver.check_context_transfer_status(None, mark_complete=mark_complete)
-    completed, failed = status.completed_request_ids, status.error_request_ids
+    completed, failed = transceiver.check_context_transfer_status(None, mark_complete=mark_complete)
 
     assert failed == ([rid] if status == SessionStatus.CANCELLED else [])
     assert completed == ([rid] if mark_complete else [])
@@ -1645,6 +1644,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
         py_request_id=rid,
         py_disaggregated_params=params,
         py_kv_send_session_retired=False,
+        py_kv_transfer_timed_out=False,
         state=LlmRequestState.CONTEXT_INIT,
         set_kv_cache_transfer_start=lambda _timestamp: None,
     )

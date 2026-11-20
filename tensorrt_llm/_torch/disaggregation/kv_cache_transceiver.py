@@ -233,13 +233,30 @@ def create_kv_cache_transceiver(
                                   mamba_cache_manager)
 
 
-class CtxTransferStatus(NamedTuple):
-    """Typed result of ``KvCacheTransceiver.check_context_transfer_status``."""
-    # Requests whose KV send settled successfully during this call.
+class _CtxTransferStatusFields(NamedTuple):
     completed_request_ids: List[int]
-    # Requests whose KV send failed during this call.
     error_request_ids: List[int]
+
+
+class CtxTransferStatus(_CtxTransferStatusFields):
+    """Settled context transfers with the legacy two-item tuple layout.
+
+    Physically settled cancellations carry separate metadata. Owned sends
+    can also appear in the error IDs for existing cleanup callers.
+    """
+
     cancelled_request_ids: tuple[int, ...] = ()
+
+    def __new__(
+            cls,
+            completed_request_ids: List[int],
+            error_request_ids: List[int],
+            cancelled_request_ids: tuple[int, ...] = (),
+    ) -> "CtxTransferStatus":
+        status = super().__new__(cls, completed_request_ids, error_request_ids)
+        if cancelled_request_ids:
+            status.cancelled_request_ids = cancelled_request_ids
+        return status
 
 
 class GenTransferStatus(NamedTuple):
