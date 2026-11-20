@@ -2192,6 +2192,96 @@ def test_owner_prompt_delivery_matches_full_broadcast(mpi_pool_executor) -> None
             assert tokens == prompts[request_id] and prompt_len == len(tokens)
 
 
+@pytest.mark.parametrize(
+    "prompt_lengths, payload_lengths",
+    [
+        ((7, 11, 13), (31,)),
+        ((524_288,) * 2, (1_048_576,)),
+        (
+            (524_289,) * 2,
+            (524_289,) * 2,
+        ),
+        (
+            (1_048_577, 3, 5),
+            (1_048_577, 8),
+        ),
+        ((), ()),
+    ],
+    ids=["packed", "exact-capacity", "capacity-boundary", "oversized-prompt", "empty-owner"],
+)
+def test_owner_prompt_delivery_batches_payloads(
+    prompt_lengths: tuple[int, ...], payload_lengths: tuple[int, ...]
+) -> None:
+    wire = {}
+    payloads = []
+    sent_lengths = []
+
+    class PromptDist:
+        world_size = 2
+        pp_size = 1
+        has_pp = False
+        supports_single_round_broadcast = False
+
+        def __init__(self, rank: int) -> None:
+            self.rank = rank
+
+        def broadcast_int64(
+            self, value: list[int], root: int = 0, prefer_cpu: bool = False
+        ) -> list[int]:
+            if self.rank == root:
+                wire["header"] = list(value)
+            return wire["header"]
+
+        def broadcast(self, value: object, root: int = 0) -> object:
+            if self.rank == root:
+                wire["requests"] = pickle.dumps(value)
+                return value
+            return pickle.loads(wire["requests"])
+
+        def isend(self, value: np.ndarray, dest: int, tag: int) -> SimpleNamespace:
+            assert dest == 1
+            payloads.append(value.copy())
+            sent_lengths.append(value.size)
+            return SimpleNamespace(Wait=lambda: None)
+
+        def recv(self, value: np.ndarray, source: int, tag: int) -> None:
+            assert source == 0
+            payload = payloads.pop(0)
+            assert value.shape == payload.shape
+            np.copyto(value, payload)
+
+    prompts = [
+        (np.arange(length, dtype=np.int32) + index) % 129280
+        for index, length in enumerate(prompt_lengths)
+    ]
+    queued = [
+        RequestQueueItem(index, trtllm.Request(input_token_ids=prompt, max_tokens=8))
+        for index, prompt in enumerate(prompts)
+    ]
+    root = RequestBroadcaster(PromptDist(0), MagicMock(), prompts_to_owners=True)
+    peer = RequestBroadcaster(PromptDist(1), MagicMock(), prompts_to_owners=True)
+    root_items = root.broadcast(queued)
+    peer_items = peer.broadcast([])
+    root.deliver_prompts({0: [], 1: root_items})
+    peer.deliver_prompts({0: [], 1: peer_items})
+    assert sent_lengths == list(payload_lengths)
+    assert not payloads
+    assert len(peer_items) == len(prompts)
+    for item, expected in zip(peer_items, prompts):
+        np.testing.assert_array_equal(item.prompt_token_ids, expected)
+    admitted = merge_requests(
+        peer_items,
+        cp_config={},
+        cp_rank=0,
+        cp_size=1,
+        exclude_last_generation_logits=False,
+        is_disagg=False,
+    )
+    assert len(admitted) == len(prompts)
+    for request, expected in zip(admitted, prompts):
+        np.testing.assert_array_equal(request.get_tokens(0), expected)
+
+
 @pytest.mark.parametrize("beam_width", [1, 2])
 @pytest.mark.parametrize("overlap", [False, True])
 def test_prepared_response_keeps_outputs_and_metadata_stable(

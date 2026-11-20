@@ -7,7 +7,7 @@ import dataclasses
 import os
 import time
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 if TYPE_CHECKING:
     from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
@@ -399,7 +399,21 @@ def merge_requests(
 
 # A tag of its own: other point-to-point traffic (PP, autotuner) shares the world communicator.
 _OWNER_PROMPT_TAG = 21000
+_PROMPT_BATCH_TOKEN_CAPACITY = 1 << 20
 _PROMPT_PLACEHOLDER = np.zeros(1, dtype=np.int32).tobytes()
+
+
+def _prompt_batch_slices(lengths: list[int]) -> Iterator[tuple[int, int, int]]:
+    start = 0
+    total_tokens = 0
+    for index, num_tokens in enumerate(lengths):
+        if index > start and total_tokens + num_tokens > _PROMPT_BATCH_TOKEN_CAPACITY:
+            yield start, index, total_tokens
+            start = index
+            total_tokens = 0
+        total_tokens += num_tokens
+    if start < len(lengths):
+        yield start, len(lengths), total_tokens
 
 
 def _request_without_prompt(request: ExecutorRequest) -> ExecutorRequest:
@@ -668,15 +682,24 @@ class RequestBroadcaster:
         if self.dist.rank == 0:
             prompts, sends = [], []
             for rank, items in all_ranks_new_requests.items():
-                if rank == 0:
+                if rank == 0 or not items:
                     continue
-                for item in items:
-                    prompts.append(item.request.get_input_token_ids_array())
+                lengths = [item.request.num_input_tokens for item in items]
+                for start, stop, _ in _prompt_batch_slices(lengths):
+                    batch = [item.request.get_input_token_ids_array() for item in items[start:stop]]
+                    prompts.append(batch[0] if len(batch) == 1 else np.concatenate(batch))
                     sends.append(self.dist.isend(prompts[-1], rank, _OWNER_PROMPT_TAG))
             for send in sends:
                 send.Wait()
             return
-        for item in all_ranks_new_requests[self.dist.rank]:
-            prompt = np.empty(item.num_input_tokens, dtype=np.int32)
+        items = all_ranks_new_requests[self.dist.rank]
+        if not items:
+            return
+        lengths = [cast(int, item.num_input_tokens) for item in items]
+        for start, stop, total_tokens in _prompt_batch_slices(lengths):
+            prompt = np.empty(total_tokens, dtype=np.int32)
             self.dist.recv(prompt, 0, _OWNER_PROMPT_TAG)
-            item.prompt_token_ids = prompt
+            offset = 0
+            for item, num_tokens in zip(items[start:stop], lengths[start:stop]):
+                item.prompt_token_ids = prompt[offset : offset + num_tokens]
+                offset += num_tokens
