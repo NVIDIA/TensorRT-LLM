@@ -854,7 +854,7 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         return {**self.content_channels, TEXT: self.context_in_dim}
 
     def apply_quant_config_exclude_modules(self) -> None:
-        """Unquantize Linears excluded by their own or their checkpoint module names."""
+        """Drop quantization from Linears the quant config excludes."""
         quant_config = self.model_config.quant_config
         if quant_config is None or quant_config.exclude_modules is None:
             return
