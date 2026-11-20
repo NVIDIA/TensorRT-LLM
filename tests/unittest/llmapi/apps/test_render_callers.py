@@ -500,7 +500,7 @@ class TestRouterWriteBack:
         assert rendered.token_ids == tokenize_harmony_chat_request(chat_request())
 
     def test_a_harmony_conversion_error_is_routed_on_no_ids(self, harmony_vocab) -> None:
-        # A tool without a description cannot be converted to Harmony.
+        # Tool-call arguments sent as an object, not a JSON string, cannot be converted to Harmony.
         from tensorrt_llm.serve.router import KvCacheAwareRouter
 
         router = KvCacheAwareRouter(
@@ -511,13 +511,24 @@ class TestRouterWriteBack:
             tokens_per_block=32,
             use_harmony=True,
         )
-        no_description = {
-            "type": "function",
-            "function": {"name": "f", "parameters": {"type": "object", "properties": {}}},
+        call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": {"city": "paris"}},
+                }
+            ],
         }
-        named = {"type": "function", "function": {"name": "f"}}
+        named = {"type": "function", "function": {"name": "get_weather"}}
         for tool_choice in (None, named):
-            request = chat_request(tools=[no_description], tool_choice=tool_choice)
+            request = chat_request(
+                messages=[{"role": "user", "content": "weather in paris?"}, call],
+                tools=[WEATHER_TOOL],
+                tool_choice=tool_choice,
+            )
 
             assert router._tokenize(request) == [[]]
             assert request.prompt_token_ids is None
@@ -709,17 +720,19 @@ class TestCountTokens:
         assert response.json() == {"input_tokens": len(expected)}
 
     def test_a_harmony_server_estimates_what_harmony_cannot_convert(
-        self, tokenizer, harmony_vocab
+        self, tokenizer, harmony_vocab, monkeypatch
     ) -> None:
-        # A tool without a description is rejected by Harmony; the count falls back to the
-        # template count.
-        body = {
-            **self.BODY,
-            "tools": [{"name": "f", "input_schema": {"type": "object", "properties": {}}}],
-        }
+        # When Harmony rejects the request, the count falls back to the template count.
+        from tensorrt_llm.serve.harmony_adapter import HarmonyAdapter
+        from tensorrt_llm.serve.render import HarmonyConversionError
+
+        def reject(*args, **kwargs):
+            raise HarmonyConversionError("cannot convert")
+
+        monkeypatch.setattr(HarmonyAdapter, "openai_to_harmony_tokens", reject)
 
         response = self._client(tokenizer, use_harmony=True).post(
-            "/v1/messages/count_tokens", json=body
+            "/v1/messages/count_tokens", json=self.BODY
         )
 
         assert response.status_code == 200, response.text

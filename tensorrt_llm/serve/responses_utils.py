@@ -549,7 +549,7 @@ def _get_developer_message(instructions: Optional[str] = None,
             function_tool_descriptions = [
                 ToolDescription.new(
                     name=tool.name,
-                    description=tool.description,
+                    description=tool.description or "",
                     parameters=tool.parameters,
                 ) for tool in function_tools
             ]
