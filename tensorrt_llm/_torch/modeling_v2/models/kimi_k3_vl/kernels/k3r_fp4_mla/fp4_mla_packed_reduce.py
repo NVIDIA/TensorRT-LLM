@@ -1721,6 +1721,7 @@ def reduce_packed_splits(
     stats: torch.Tensor | None = None,
     sm_count: int = 128,
     use_pdl: bool,
+    defer_with: type["DeferredPackedReduce"] | None = None,
 ) -> None:
     """Reduce ``[splits * requests, physical_m, 512]`` partials into ``output``.
 
@@ -1733,7 +1734,8 @@ def reduce_packed_splits(
     (max, sum) buffer. ``q_scale``/``kv_scale`` are the device FP4 global scales
     and ``plan`` the task plan written by ``launch_packed_plan`` for the same
     ``splits * requests`` slots the decode kernel ran. ``use_pdl`` launches it as a
-    programmatic dependent of the preceding (decode) kernel.
+    programmatic dependent of the preceding (decode) kernel. ``defer_with`` selects
+    the context used to defer a launch; by default it is the Helix8 context.
     """
     tasks = num_splits * num_requests
     total_rows = num_requests * valid_m
@@ -1780,7 +1782,7 @@ def reduce_packed_splits(
         _validate_tensor_pointer_alignment(name, tensor, alignment_bytes=32)
     if stats is not None:
         _validate_tensor_pointer_alignment("stats", stats, alignment_bytes=8)
-    deferred = DeferredPackedReduce.active()
+    deferred = (defer_with or DeferredPackedReduce).active()
     if deferred is not None and deferred.args is None:
         deferred.args = dict(
             partial=partial,
@@ -1857,8 +1859,9 @@ class DeferredPackedReduce:
 
     _stack: list["DeferredPackedReduce"] = []
 
-    def __init__(self) -> None:
+    def __init__(self, release_early: bool = True) -> None:
         self.args: dict | None = None
+        self.release_early = release_early
 
     @classmethod
     def active(cls) -> "DeferredPackedReduce | None":
@@ -1866,11 +1869,11 @@ class DeferredPackedReduce:
         return cls._stack[-1] if cls._stack else None
 
     def __enter__(self) -> "DeferredPackedReduce":
-        DeferredPackedReduce._stack.append(self)
+        type(self)._stack.append(self)
         return self
 
     def __exit__(self, *exc_info) -> None:
-        DeferredPackedReduce._stack.pop()
+        type(self)._stack.pop()
 
     def run(self) -> None:
         """Launch the recorded reduction (no-op without a recorded call), not as a programmatic
@@ -1883,5 +1886,19 @@ class DeferredPackedReduce:
         )
         q_scale, kv_scale = args.pop("q_scale"), args.pop("kv_scale")
         reduce_packed_splits(
-            partial, maxima, sums, output, q_scale, kv_scale, use_pdl=False, **args
+            partial,
+            maxima,
+            sums,
+            output,
+            q_scale,
+            kv_scale,
+            use_pdl=False,
+            defer_with=type(self),
+            **args,
         )
+
+
+class UllDeferredPackedReduce(DeferredPackedReduce):
+    """The Helix16 context records the ULL decoder's reduction."""
+
+    _stack: list[DeferredPackedReduce] = []

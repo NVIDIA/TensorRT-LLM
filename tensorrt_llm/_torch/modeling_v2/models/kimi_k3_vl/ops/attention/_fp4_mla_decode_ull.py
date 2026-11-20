@@ -120,13 +120,13 @@ _SUMS_WS = "_k3_fp4_mla_split_sums"
 
 
 def _kernel_module() -> Any:
-    from ...kernels.k3r_fp4_mla import fp4_mla_mufu16_ull as fp4_mla_mufu16
+    from ...kernels.k3r_fp4_mla import fp4_mla_mufu16
 
     return fp4_mla_mufu16
 
 
 def _reduce_module() -> Any:
-    from ...kernels.k3r_fp4_mla import fp4_mla_packed_reduce_ull as fp4_mla_packed_reduce
+    from ...kernels.k3r_fp4_mla import fp4_mla_packed_reduce
 
     return fp4_mla_packed_reduce
 
@@ -587,7 +587,7 @@ def _run_packed_decode(
     reduce = _reduce_module()
     # TRTLLM_FP4_MLA_REDUCE_PDL / TRTLLM_FP4_MLA_F16_PARTIALS in the served backend.
     reduce_pdl = _features().fp4_mla_reduce_pdl
-    deferred = reduce.DeferredPackedReduce.active()
+    deferred = reduce.UllDeferredPackedReduce.active()
     launch_dependents = reduce_pdl and (deferred is None or deferred.release_early)
     if deferred is not None and not deferred.release_early:
         launch_dependents = (
@@ -660,6 +660,7 @@ def _run_packed_decode(
         stats=stats_rows,
         sm_count=_get_sm_count(device),
         use_pdl=reduce_pdl,
+        defer_with=reduce.UllDeferredPackedReduce,
     )
 
 
