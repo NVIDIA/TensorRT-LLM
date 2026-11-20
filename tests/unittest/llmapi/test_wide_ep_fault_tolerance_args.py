@@ -340,6 +340,7 @@ def test_llmapi_import_skips_fault_tolerance():
     prefixes = (
         "tensorrt_llm._torch.distributed.membership",
         "tensorrt_llm.llmapi._llmapi_node_supervisor",
+        "tensorrt_llm.llmapi._mpirun_job",
         "tensorrt_llm.llmapi._node_supervised_mpi_session",
     )
     code = (

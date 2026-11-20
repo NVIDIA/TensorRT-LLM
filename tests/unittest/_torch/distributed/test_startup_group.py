@@ -181,6 +181,22 @@ def test_startup_reports_host_collective_waits(store, monkeypatch):
     )
 
 
+def test_host_weights_wait_reports_startup_progress(store, monkeypatch):
+    """Report each poll for the node's host weights as a step of the replacement's startup."""
+    monkeypatch.setattr(startup_module, "_HOST_WEIGHTS_CHECK_S", 0.0)
+    monkeypatch.setattr(Distributed, "startup_record", startup_module._state.record)
+    client = startup_module._state.client
+    client.record = MembershipRecord(
+        generation=1, state=MembershipState.COMMITTED, active_mask=0b1011
+    )
+    checks = iter([[2], [2], []])
+    startup_module.wait_for_node_host_weights(3, lambda: next(checks))
+    assert [call.kwargs for call in client.report.call_args_list] == [
+        dict(waiting_for=0, progress=1),
+        dict(waiting_for=0, progress=2),
+    ]
+
+
 def test_startup_ends_when_authority_fails():
     """Check that a wait for a peer ends at once when the authority hosting the store is gone."""
     authority = subprocess.Popen(  # nosec B603
@@ -648,7 +664,7 @@ def test_multi_node_launch_rejects_unresolvable_rendezvous(launched, monkeypatch
         ("rpc", 1, False, "orchestrator_type unset"),
         ("ray", 1, False, "orchestrator_type unset"),
         (None, 2, False, "not one on every rank of an MPI job"),
-        (None, 1, True, "does not support ranks launched by trtllm-llmapi-launch"),
+        (None, 1, True, f"without {SHARED_SECRET_ENV} and {RENDEZVOUS_ENV} exported"),
     ],
     # Not "ray": the conftest skips a test whose id is "ray" unless Ray tests run.
     ids=["rpc_executor", "ray_executor", "mpi_job", "llmapi_launch_without_supervisor"],
@@ -656,7 +672,7 @@ def test_multi_node_launch_rejects_unresolvable_rendezvous(launched, monkeypatch
 def test_rendezvous_refuses_unsupported_launch(
     monkeypatch, orchestrator_type, mpi_size, spawn_proxy, message
 ):
-    """Refuse another executor, a start on every rank of an MPI job, or ranks a launcher started."""
+    """Refuse another executor, a start on every rank of an MPI job, or ranks without the secret."""
     monkeypatch.delenv("TLLM_EXECUTOR_ATTACH_INFO", raising=False)
     monkeypatch.delenv(FAULT_TOLERANCE_RANK_ENV, raising=False)
     monkeypatch.setenv("TLLM_SPAWN_PROXY_PROCESS", "1" if spawn_proxy else "0")

@@ -98,6 +98,7 @@ Welcome to TensorRT LLM's Documentation!
    features/sparse-attention.md
    features/visual-generation.md
    features/prefix-tokenization-cache.md
+   features/wide-ep-fault-tolerance.md
 
 
 .. toctree::

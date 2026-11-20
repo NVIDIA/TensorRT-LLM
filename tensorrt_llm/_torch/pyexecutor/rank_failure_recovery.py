@@ -67,7 +67,7 @@ from ..distributed.membership.startup import (
     wait_for_every_rank,
 )
 from ..distributed.mnnvl_memory import MnnvlMappingError, MnnvlPeerHandleError
-from ..moe.fused_moe.eplb_expert_restore import ExpertRestorePlan
+from ..moe.fused_moe.eplb_expert_restore import ExpertRestorePlan, ExpertRestorePlanMismatchError
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .rank_failure_memory import (
@@ -891,9 +891,17 @@ class RankFailureRecovery:
                         raise _MembershipRestarted
                     self._install_step_done()
 
-                balancer.expert_restore.restore_lost_experts(
-                    plan, timer.times_ms, progress=restore_progress
-                )
+                # Experts are staged through the remapped workspace, which no former member writes.
+                try:
+                    balancer.expert_restore.restore_lost_experts(
+                        plan,
+                        self._moe.staging_workspace(),
+                        self._active_group(record, "expert_staging").allgather,
+                        timer.times_ms,
+                        progress=restore_progress,
+                    )
+                except ExpertRestorePlanMismatchError as error:
+                    raise _ExpertsNotRestorable(str(error)) from error
                 self._install_step_done()
         timer.begin()
         self._rearm(record)

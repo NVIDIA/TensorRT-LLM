@@ -26,6 +26,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict
 
+from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_ENV
 from tensorrt_llm.llmapi.utils import _set_affinity_all_threads
 
 # The active mask has room for as many ranks as the all-to-all kernels support.
@@ -59,6 +60,10 @@ RENDEZVOUS_TIMEOUT_S = 600.0
 # missing after this is a launch mistake.
 NODE_SUPERVISOR_TIMEOUT_S = 60.0
 
+NODE_SUPERVISOR_LAUNCH = (
+    "mpirun --enable-recovery -np <nodes> --map-by ppr:1:node --bind-to none "
+    f"-x {SHARED_SECRET_ENV} -x {RENDEZVOUS_ENV} trtllm-llmapi-launch <command>"
+)
 # A process started outside the launcher's job must not inherit these.
 _LAUNCHER_ENV_PREFIXES = ("OMPI_", "PMIX_", "PMI_", "PRTE_", "SLURM_")
 # The deployment's opt-in to running Open MPI as root, which a rank keeps.

@@ -54,6 +54,29 @@ function mpi_world_size {
     fi
 }
 
+# Prefer OMPI_*, since mpirun inside a Slurm allocation passes the batch step's SLURM_* variables.
+if [ -n "$TLLM_FAULT_TOLERANCE_SHARED_SECRET" ] && [ -z "$TLLM_FAULT_TOLERANCE_RANK" ]; then
+    launcher_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    node_options=(--node-rank "${OMPI_COMM_WORLD_RANK:-$mpi_rank}" --nodes "${OMPI_COMM_WORLD_SIZE:-$(mpi_world_size)}")
+    # An operator returns lost node <i> of <n> to its deployment: --rejoin-node <i> --nodes <n> <task>.
+    if [ "${task_with_command[0]}" = "--rejoin-node" ] || [ "${task_with_command[0]}" = "--nodes" ]; then
+        if [ "${task_with_command[0]}" != "--rejoin-node" ] || [ "${task_with_command[2]}" != "--nodes" ] \
+            || [ "${#task_with_command[@]}" -lt 5 ]; then
+            echo "usage: trtllm-llmapi-launch --rejoin-node <node rank> --nodes <node count> <task>" >&2
+            exit 2
+        fi
+        node_options=(--node-rank "${task_with_command[1]}" --nodes "${task_with_command[3]}" --rejoin)
+        task_with_command=("${task_with_command[@]:4}")
+    fi
+    exec python3 "$launcher_directory/_llmapi_node_supervisor.py" "${node_options[@]}" -- \
+        "$launcher_directory/$(basename -- "${BASH_SOURCE[0]}")" "${task_with_command[@]}"
+elif [ -z "$TLLM_FAULT_TOLERANCE_SHARED_SECRET" ] \
+    && { [ "${task_with_command[0]}" = "--rejoin-node" ] || [ "${task_with_command[0]}" = "--nodes" ]; }; then
+    echo "trtllm-llmapi-launch ${task_with_command[0]} returns a node to a fault-tolerant deployment: export the" \
+        "deployment's TLLM_FAULT_TOLERANCE_SHARED_SECRET and TLLM_FAULT_TOLERANCE_RENDEZVOUS" >&2
+    exit 2
+fi
+
 # A completed guard holds its workload leader unreaped until we retire the
 # registration. This pins the process group identity through the last signal.
 function command_running {
@@ -346,6 +369,10 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 
     function exec_without_mpi_environment {
         local var prefix
+        # A rank the node supervisor started is a one-process MPI world, and so
+        # is each child here: keep the supervisor's transport selection, which
+        # leaves no /dev/shm segment behind.
+        local supervisor_btl=${TLLM_FAULT_TOLERANCE_RANK:+$OMPI_MCA_btl}
         for var in $(compgen -e); do
             for prefix in "${mpi_blacklist[@]}"; do
                 if [[ "$var" == "$prefix"* ]]; then
@@ -354,6 +381,9 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
                 fi
             done
         done
+        if [ -n "$supervisor_btl" ]; then
+            export OMPI_MCA_btl="$supervisor_btl"
+        fi
         exec_child_command "$@"
     }
 
@@ -427,6 +457,12 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         if ! command_running "$server_pid"; then
             wait "$server_pid"
             server_exit_code=$?
+            # Under fault tolerance, the failure of rank 0's worker ends the deployment, so the
+            # task can never serve again.
+            if [ -n "$TLLM_FAULT_TOLERANCE_RANK" ] && [ "$server_exit_code" -ne 0 ]; then
+                log_stderr "MPI Comm server of rank 0 failed (status $server_exit_code), which ends the deployment; terminating the task"
+                exit "$server_exit_code"
+            fi
             log_stderr "MPI Comm server exited before the task (status $server_exit_code); waiting up to ${stop_timeout}s for task exit"
             # Even a successful server exit is a failure while its task is alive.
             [ "$server_exit_code" -eq 0 ] && server_exit_code=1
@@ -447,6 +483,8 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
             # Let the task report its own failure, including errors received
             # from the server, before falling back to the server's status.
             [ "$task_exit_code" -ne 0 ] && exit "$task_exit_code"
+            # Rank 0's worker stops the server after a fault-tolerant deployment shuts down.
+            [ -n "$TLLM_FAULT_TOLERANCE_RANK" ] && exit 0
             exit "$server_exit_code"
         fi
         sleep 0.1

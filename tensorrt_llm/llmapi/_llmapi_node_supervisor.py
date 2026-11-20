@@ -14,14 +14,16 @@
 # limitations under the License.
 """Start and replace the ranks of one node under Wide-EP fault tolerance.
 
-The node supervisor starts every rank on its node as a separate process, follows the record that the
-membership authority sends, and starts a replacement on the same GPU for a rank that the membership
-drops.
+``trtllm-llmapi-launch`` runs one node supervisor per node, as the task that
+``mpirun --enable-recovery`` starts there. The supervisor starts every rank on its node as a
+separate process, follows the record that the membership authority sends, and starts a
+replacement on the same GPU for a rank that the membership drops.
 """
 
 import argparse
 import concurrent.futures
 import contextlib
+import glob
 import os
 import selectors
 import shutil
@@ -33,12 +35,13 @@ import threading
 import time
 from dataclasses import dataclass
 from types import FrameType
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, Callable, NoReturn
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.membership import MembershipRecord, NodeView
     from tensorrt_llm._torch.distributed.membership.liveness import LivenessConnection
 
+_SHM_DIR = "/dev/shm"  # nosec B108 - the POSIX shared-memory directory, not a temporary file
 _CONNECT_TIMEOUT_S = 2.0
 _CONNECT_WARNING_INTERVAL_S = 30.0
 # How long the ranks may drain after a stop signal, and then end after SIGTERM. At a job end, mpirun
@@ -89,11 +92,15 @@ class NodeSupervisor:
     """Start, supervise and replace the ranks of one node.
 
     Every report interval, it reports to the authority which of its ranks are in a call that their
-    hang detector's pause covers. It unlinks its ranks' pause words once the deployment ends.
+    hang detector's pause covers. It unlinks the node's host weights and its ranks' pause words once
+    the deployment ends. On node 0 under ``mpirun``, it ends the job as failed.
 
     Args:
         command: The command that starts each rank process. With ``rank_0_in_session``, it
             starts every rank but 0.
+        end_job: The function that ends the whole job as failed. Set on node 0 under ``mpirun``.
+        rejoin: The node returns to a running deployment that lost it. The supervisor connects
+            until the authority's first view, and starts only replacements.
         parent: The process whose end stops the node, by default this process's parent. 0 for
             none.
     """
@@ -106,6 +113,8 @@ class NodeSupervisor:
         command: list[str],
         environ: dict[str, str],
         rank_0_in_session: bool = False,
+        end_job: Callable[[], None] | None = None,
+        rejoin: bool = False,
         parent: int | None = None,
     ) -> None:
         from tensorrt_llm._torch.distributed import membership
@@ -121,6 +130,7 @@ class NodeSupervisor:
         self._ranks = list(range(node * gpus_per_node, (node + 1) * gpus_per_node))
         self._command = command
         self._rank_0_in_session = rank_0_in_session
+        self._rejoin = rejoin
         self._environ = membership.rank_env(environ)
         self._parent = os.getppid() if parent is None else parent
         self._parent_ended = False
@@ -152,16 +162,22 @@ class NodeSupervisor:
         # Per rank, the failed replacements in a row and when the next one may start.
         self._failed_replacements: dict[int, int] = {}
         self._replacement_due_s: dict[int, float] = {}
+        # Per rank this supervisor has not started, since when a process runs on its GPU.
+        self._gpu_in_use_since_s: dict[int, float] = {}
         self._first_failure: int | None = None
         self._signum: int | None = None
         self._signal_handled = False
         self._shutdown_handled = False
+        # The shared-memory segments that the signal handler unlinked, for the loop to log.
+        self._unlinked_on_signal = 0
         # When the supervisor stops the ranks still running after SHUTDOWN, once the authority left.
         self._shutdown_grace_due_s: float | None = None
         self._signal_grace_due_s = 0.0
         # This process may have threads, so no Python code runs between a rank's fork and exec. A
         # new interpreter arms the rank's parent-death signal instead.
         self._exec_rank = [sys.executable, "-S", _SCRIPT, _EXEC_RANK, str(os.getpid())]
+        self._end_job_fn = end_job
+        self._host_weights_prefix = f"{membership.host_weights_name(node)}_"
         self._pause_word_paths = {rank: membership.pause_word_path(rank) for rank in self._ranks}
         # When the next report to the authority is due, and the part of the last one not sent yet.
         self._report_due_s = 0.0
@@ -169,13 +185,14 @@ class NodeSupervisor:
         self._warned_unreadable_state = False
 
     def on_signal(self, signum: int, frame: FrameType | None = None) -> None:
-        """Unlink the ranks' pause words, then stop the supervisor and signal rank 0 the same.
+        """Unlink the node's shared memory, then stop the supervisor and signal rank 0 the same.
 
         The unlink runs here, before the loop wakes, since the launcher may kill this process soon
-        after the signal.
+        after the signal (mpirun within a second). The loop logs it, since the handler may
+        interrupt a log write, and a log write from the handler would then fail as a reentrant call.
         """
         if self._signum is None:
-            self._unlink_shared_memory()
+            self._unlinked_on_signal = self._unlink_shared_memory()
             self._signal_grace_due_s = time.monotonic() + _STOP_GRACE_S
             # Last, since the loop acts on the signal once it sees it.
             self._signum = signum
@@ -190,10 +207,28 @@ class NodeSupervisor:
             self._watch_parent()
             self._selector.register(self._wake_read, selectors.EVENT_READ, _WAKE)
             self._connect()
-            # The first view tells whether the node starts its ranks.
+            # The first view tells whether the node starts its ranks. A rejoining node connects again
+            # until it has one, for up to DEAD_TIMEOUT_S: within that time the authority drops the
+            # connection of the node's previous supervisor once it ended (at once on a close, else
+            # through the keepalive), and an authority silent for that long counts as gone, as any
+            # silent peer does.
+            rejoin_due_s = time.monotonic() + self._membership.DEAD_TIMEOUT_S
             while self._signum is None and (
-                self._connecting is not None or self._connection_awaiting_view is not None
+                self._connecting is not None
+                or self._connection_awaiting_view is not None
+                or (
+                    self._rejoin
+                    and self._view is None
+                    and not self._refused_by_authority
+                    and not self._parent_ended
+                    and time.monotonic() < rejoin_due_s
+                )
             ):
+                if self._connecting is None and self._connection_awaiting_view is None:
+                    if time.monotonic() >= self._connect_due_s:
+                        self._connect()
+                    else:
+                        self._deadlines_s = [self._connect_due_s]
                 self._wait()
                 self._deadlines_s = []
                 self._take_connection()
@@ -201,6 +236,15 @@ class NodeSupervisor:
             if self._signum is not None or self._parent_ended:
                 return self._step(time.monotonic())
             if self._refused_by_authority:
+                return 1
+            if self._rejoin and self._view is None:
+                self._logger.error(
+                    "No membership authority at "
+                    f"{os.environ[self._membership.RENDEZVOUS_ENV]} admitted node {self._node} "
+                    f"within {self._membership.DEAD_TIMEOUT_S:.0f} s: the deployment ended, the "
+                    "node's previous supervisor still runs, or the node's ranks are not in this "
+                    "deployment (check --rejoin-node, --nodes and the step's GPUs)"
+                )
                 return 1
             if self._view is not None and self._view.record.state in (
                 self._membership.MembershipState.SHUTDOWN,
@@ -210,15 +254,26 @@ class NodeSupervisor:
                     "The deployment at the rendezvous address ended. Use a new shared secret."
                 )
                 return 1
+            if self._rejoin and not self._deployment_started:
+                self._logger.error(
+                    f"The deployment has not started, so start node {self._node} without --rejoin"
+                )
+                return 1
+            if self._rejoin and len(self._view.record.incarnations) != self._world_size:
+                self._logger.error(
+                    f"The deployment has {len(self._view.record.incarnations)} ranks, not "
+                    f"{self._world_size}: check --nodes and the step's GPUs"
+                )
+                return 1
             self._start_first_processes()
             while True:
                 status = self._step(time.monotonic())
                 if status is not None:
                     return status
                 self._wait()
-        except Exception:
-            # No step stops the node any more, so stop its ranks.
-            self._stop(1)
+        except Exception as error:
+            # No step stops the node any more, so stop its ranks and, on node 0, end the job.
+            self._stop(1, end_job_reason=f"the node supervisor failed: {error!r}")
             raise
         finally:
             for key in list(self._selector.get_map().values()):
@@ -326,6 +381,7 @@ class NodeSupervisor:
         """
         if not self._signal_handled:
             self._signal_handled = True
+            self._log_unlinked(self._unlinked_on_signal)
             rank_0 = self._processes.get(0)
             # Through the pidfd, which unlike Popen.send_signal never reaps the process.
             if rank_0 is not None and rank_0.status is None:
@@ -356,13 +412,15 @@ class NodeSupervisor:
         stopped. Rank 0 is never stopped here, since its end is the deployment's end, which its
         launcher bounds. Each rank's end wakes the supervisor.
 
-        The ranks' pause words are unlinked at once, since the launcher may kill this process soon
-        after the ranks ended. The ranks still map them, so the unlink only removes the names.
-        Nothing opens them by name after SHUTDOWN.
+        The node's host weights and pause words are unlinked at once. The ranks still map them, so
+        the unlink only removes the names, and the pages are freed once the last rank ends. After
+        the ranks ended, the unlink would free the pages, which takes seconds and may not finish
+        before the launcher kills this process at the job's end. Nothing opens them by name after
+        SHUTDOWN.
         """
         if not self._shutdown_handled:
             self._shutdown_handled = True
-            self._unlink_shared_memory()
+            self._log_unlinked(self._unlink_shared_memory())
         running = self._active_ranks_running(record)
         if not running:
             self._logger.info("The deployment shut down")
@@ -396,7 +454,7 @@ class NodeSupervisor:
         state = self._membership.MembershipState
         if record.state == state.ABORTED:
             self._logger.error(f"Deployment aborted: {record.reason}")
-            return self._stop(1)
+            return self._stop(1, end_job_reason=f"the deployment aborted: {record.reason}")
         return None
 
     def _all_ranks_ended(self) -> bool:
@@ -433,14 +491,17 @@ class NodeSupervisor:
         if process is None or process.status in (None, 0):
             return None
         self._logger.error(f"Rank {rank} failed before serving (status {process.status})")
-        return self._stop(_exit_status(process.status))
+        reason = f"rank 0 failed before serving (status {process.status})" if rank == 0 else None
+        return self._stop(_exit_status(process.status), end_job_reason=reason)
 
     def _check_rank_0(self, process: _Process | None) -> int | None:
         """Stop the node once rank 0 ended, which ends the deployment, and return its status."""
         if process is None or process.status is None:
             return None
         self._logger.error("Rank 0 ended, so the deployment ends with it")
-        return self._stop(_exit_status(process.status))
+        return self._stop(
+            _exit_status(process.status), end_job_reason=f"rank 0 ended (status {process.status})"
+        )
 
     def _check_running(
         self, rank: int, process: _Process, record: "MembershipRecord", now_s: float
@@ -535,12 +596,66 @@ class NodeSupervisor:
         )
 
     def _replace(self, rank: int, now_s: float) -> None:
+        if self._waits_for_gpu(rank, now_s):
+            return
         try:
             self._logger.warning(f"Starting a replacement of rank {rank}")
             self._start(rank, replacement=True)
         except (OSError, subprocess.SubprocessError) as error:
             self._logger.error(f"Cannot start a replacement of rank {rank}: {error!r}")
             self._count_failed_replacement(rank, f"it could not start: {error!r}", now_s)
+
+    def _waits_for_gpu(self, rank: int, now_s: float) -> bool:
+        """Return whether ``rank``'s replacement waits until no process runs on its GPU.
+
+        A rank's process that this supervisor started has ended once it is reaped. One that a
+        previous supervisor started ends through its parent-death signal, which proves nothing, so
+        wait for the GPU, up to the rendezvous timeout. Then give the rank up.
+
+        Any process on the GPU counts. Each rank holds a context only on its own GPU, and NVML may
+        report the PIDs of another PID namespace. A GPU that NVML cannot check counts as a
+        replacement that could not start.
+        """
+        if rank in self._processes:
+            return False
+        visible = self._environ.get("CUDA_VISIBLE_DEVICES")
+        if visible is None:
+            gpus = [str(index) for index in range(_local_gpu_count(self._environ))]
+        else:
+            gpus = [device for device in visible.split(",") if device]
+        if not gpus:
+            return False
+        # The GPU that the rank's worker selects, as BaseWorker._configure_device does.
+        gpu = gpus[rank % len(gpus)]
+        try:
+            pids = _gpu_compute_processes(gpu)
+        except RuntimeError as error:
+            self._logger.error(
+                f"Cannot start a replacement of rank {rank}: cannot check that no process runs on "
+                f"its GPU {gpu}: {error}"
+            )
+            self._count_failed_replacement(
+                rank, f"its GPU {gpu} could not be checked: {error}", now_s
+            )
+            return True
+        if not pids:
+            return False
+        timeout_s = self._membership.RENDEZVOUS_TIMEOUT_S
+        since_s = self._gpu_in_use_since_s.setdefault(rank, now_s)
+        if now_s >= since_s + timeout_s:
+            self._logger.error(
+                f"Processes {pids} still run on GPU {gpu} of rank {rank} after {timeout_s:.0f} s. "
+                f"The deployment serves without rank {rank}"
+            )
+            self._give_up(rank)
+            return True
+        if since_s == now_s:
+            self._logger.warning(
+                f"The replacement of rank {rank} waits until processes {pids} end on its GPU {gpu}"
+            )
+        self._replacement_due_s[rank] = min(now_s + _BACKOFF_S, since_s + timeout_s)
+        self._deadlines_s.append(self._replacement_due_s[rank])
+        return True
 
     def _give_up(self, rank: int) -> None:
         self._given_up.add(rank)
@@ -776,12 +891,13 @@ class NodeSupervisor:
                 for view in views:
                     self._on_view(view)
                 return
-        # Once the deployment has started, the authority has admitted this supervisor before. It then
-        # refuses a reconnect only while it still holds the previous connection, so connect again.
+        # Once the deployment has started, the authority has admitted this node's supervisor before.
+        # It then refuses a reconnect, or a rejoin, only while it still holds the previous
+        # connection, so connect again.
         if (
             data == b""
             and self._connection_awaiting_view is not None
-            and not self._deployment_started
+            and not (self._deployment_started or self._rejoin)
         ):
             self._logger.error(
                 f"The membership authority refused the supervisor of node {self._node}"
@@ -821,11 +937,21 @@ class NodeSupervisor:
             ):
                 process.left_out_reason = record.reason
 
-    def _stop(self, status: int) -> int:
-        """Stop the node's ranks, and return ``status``. Unlink the ranks' pause words."""
-        self._unlink_shared_memory()
+    def _stop(
+        self,
+        status: int,
+        end_job_reason: str | None = None,
+    ) -> int:
+        """Stop the node's ranks, and return ``status``.
+
+        With ``end_job_reason``, end the whole job as failed first. Unlink the node's shared memory.
+        """
+        # Before the job ends, since the launcher then kills this process.
+        self._log_unlinked(self._unlink_shared_memory())
         # A connect whose store client is still connecting then sends no hello.
         self._connecting = None
+        if end_job_reason is not None:
+            self._end_job(end_job_reason)
         # Every rank not reaped yet, even one whose leader exited, may leave helpers in its group.
         ranks = [p for p in self._processes.values() if p.status is None]
         for process in ranks:
@@ -833,8 +959,8 @@ class NodeSupervisor:
         self._wait_for(ranks)
         for process in ranks:
             self._signal_group(process.child.pid, signal.SIGKILL)
-        # A rank stopped above may have created its pause word after the first pass.
-        self._unlink_shared_memory()
+        # A rank stopped above may have created a segment after the first pass.
+        self._log_unlinked(self._unlink_shared_memory())
         return status
 
     def _wait_for(self, processes: list[_Process]) -> None:
@@ -850,18 +976,71 @@ class NodeSupervisor:
                 for key, _ in running.select(max(0.0, deadline_s - time.monotonic())):
                     running.unregister(key.fileobj)
 
-    def _unlink_shared_memory(self) -> None:
-        """Unlink the pause words of the node's ranks.
+    def _end_job(self, reason: str) -> None:
+        """End the whole job as failed on node 0 under ``mpirun``. Elsewhere, do nothing."""
+        if self._end_job_fn is None:
+            return
+        self._logger.error(f"Ending the job: {reason}")
+        try:
+            self._end_job_fn()
+        except OSError as error:
+            self._logger.error(f"Cannot end the job: {error!r}")
+
+    def _unlink_shared_memory(self) -> int:
+        """Unlink the node's host weights and pause words, and return the number of segments.
 
         Only a supervisor that the authority admitted, or that started a rank, owns them. One that
         the authority refuses, such as a second supervisor started for a node whose supervisor
         still runs, leaves them to the running ranks.
         """
         if self._view is None and not self._processes:
-            return
-        for path in self._pause_word_paths.values():
+            return 0
+        host_weights = [
+            os.path.join(_SHM_DIR, name)
+            for name in os.listdir(_SHM_DIR)
+            if name.startswith(self._host_weights_prefix)
+        ]
+        unlinked = 0
+        for path in [*host_weights, *self._pause_word_paths.values()]:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
+                unlinked += 1
+        return unlinked
+
+    def _log_unlinked(self, segments: int) -> None:
+        if segments:
+            self._logger.info(f"Unlinked the node's {segments} shared-memory segments")
+
+
+def _local_gpu_count(environ: dict[str, str]) -> int:
+    visible = environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        return len([device for device in visible.split(",") if device])
+    return len(glob.glob("/dev/nvidia[0-9]*"))
+
+
+def _gpu_compute_processes(gpu: str) -> list[int]:
+    """Return the PIDs of the compute processes on ``gpu``, an index or a UUID.
+
+    Raises:
+        RuntimeError: NVML cannot list them.
+    """
+    try:
+        import pynvml
+    except ImportError as error:
+        raise RuntimeError(f"cannot import pynvml: {error}") from error
+    try:
+        pynvml.nvmlInit()
+        try:
+            if gpu.isdigit():
+                handle = pynvml.nvmlDeviceGetHandleByIndex(int(gpu))
+            else:
+                handle = pynvml.nvmlDeviceGetHandleByUUID(gpu)
+            return [process.pid for process in pynvml.nvmlDeviceGetComputeRunningProcesses(handle)]
+        finally:
+            pynvml.nvmlShutdown()
+    except pynvml.NVMLError as error:
+        raise RuntimeError(f"NVML failed: {error}") from error
 
 
 def start_session_node_supervisor(n_workers: int, env: dict[str, str]) -> subprocess.Popen:
@@ -938,11 +1117,16 @@ def main(argv: list[str] | None = None) -> NoReturn:
     )
     parser.add_argument("--node-rank", type=int, required=True)
     parser.add_argument("--nodes", type=int, required=True)
-    parser.add_argument("--gpus-per-node", type=int, required=True)
+    parser.add_argument("--gpus-per-node", type=int, help="default: the GPUs this process sees")
     parser.add_argument(
         "--rank-0-in-session",
         action="store_true",
         help="start every rank but 0, which runs in the MpiPoolSession that starts this supervisor",
+    )
+    parser.add_argument(
+        "--rejoin",
+        action="store_true",
+        help="return this node to a running deployment that lost it, with replacements of its ranks",
     )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- <command of each rank>")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
@@ -950,21 +1134,55 @@ def main(argv: list[str] | None = None) -> NoReturn:
     if not command:
         parser.error("give the command of each rank after --")
     environ = dict(os.environ)
+    # A Slurm step of one task, such as one that starts a lost node's supervisor again, ends with
+    # that task alone.
+    if (
+        "SLURM_PROCID" in environ
+        and environ.get("SLURM_STEP_NUM_TASKS") != "1"
+        and "OMPI_COMM_WORLD_RANK" not in environ
+        and not args.rank_0_in_session
+    ):
+        parser.error(
+            "Wide-EP fault tolerance requires `mpirun --enable-recovery`, not srun, to start "
+            "trtllm-llmapi-launch, because Slurm's PMIx plugin cancels the job step when one of its "
+            "tasks exits"
+        )
+    visible_gpus = _local_gpu_count(environ)
+    gpus_per_node = args.gpus_per_node or visible_gpus
+    if gpus_per_node <= 0:
+        parser.error("this process sees no GPU: give --gpus-per-node")
+    # A replacement starts once no process runs on its rank's GPU, which a rank sharing it would hold.
+    if gpus_per_node > visible_gpus > 0:
+        parser.error(
+            f"--gpus-per-node {gpus_per_node} is more than the {visible_gpus} GPUs this process "
+            "sees: each rank needs a GPU of its own"
+        )
     # This process uses neither MPI nor a GPU, so it skips the library initialization (MPI_Init).
     os.environ.update(
         TRT_LLM_NO_LIB_INIT="1", MPI4PY_RC_INITIALIZE="false", CUDA_VISIBLE_DEVICES=""
     )
     from tensorrt_llm._torch.distributed.membership import (
+        NODE_SUPERVISOR_LAUNCH,
         RENDEZVOUS_ENV,
         SHARED_SECRET_ENV,
         parse_shared_secret,
         remove_cpu_affinity_constraints,
         rendezvous_host_port,
     )
+    from tensorrt_llm.llmapi._mpirun_job import end_job_function
 
+    local_size = environ.get("OMPI_COMM_WORLD_LOCAL_SIZE", "1")
+    if local_size != "1":
+        parser.error(
+            f"mpirun started {local_size} node supervisors on this node, so start one task per "
+            f"node: {NODE_SUPERVISOR_LAUNCH}"
+        )
     for name in (SHARED_SECRET_ENV, RENDEZVOUS_ENV):
         if not environ.get(name):
-            parser.error(f"export the same {name} on every node")
+            parser.error(
+                f"export the same {name} on every node and start one task per node: "
+                f"{NODE_SUPERVISOR_LAUNCH}"
+            )
     # Check both values before any rank starts. Every connect with a malformed value fails, and the
     # supervisor would keep retrying.
     try:
@@ -975,14 +1193,22 @@ def main(argv: list[str] | None = None) -> NoReturn:
         rendezvous_host_port(environ[RENDEZVOUS_ENV])
     except ValueError:
         parser.error(f"{RENDEZVOUS_ENV} must be host:port, not {environ[RENDEZVOUS_ENV]!r}")
+    end_job = None
+    if args.node_rank == 0:
+        try:
+            end_job = end_job_function(environ, args.nodes)
+        except ValueError as error:
+            parser.error(str(error))
     remove_cpu_affinity_constraints()
     supervisor = NodeSupervisor(
         args.node_rank,
         args.nodes,
-        args.gpus_per_node,
+        gpus_per_node,
         command,
         environ,
         rank_0_in_session=args.rank_0_in_session,
+        end_job=end_job,
+        rejoin=args.rejoin,
         parent=parent,
     )
     for signum in (signal.SIGTERM, signal.SIGINT):

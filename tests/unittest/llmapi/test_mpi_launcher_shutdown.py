@@ -431,6 +431,23 @@ def test_launcher_preserves_task_status_and_child_environment(
     _assert_exited(tmp_path)
 
 
+@pytest.mark.parametrize("supervised", [False, True])
+def test_launcher_keeps_the_node_supervisors_transport_selection(
+    tmp_path: Path, supervised: bool
+) -> None:
+    env = _launcher_env(tmp_path, "clean")
+    env["OMPI_MCA_btl"] = "^sm"
+    if supervised:
+        env["TLLM_FAULT_TOLERANCE_RANK"] = "0,1,1,0"
+    result = _run_launcher(tmp_path, env)
+    assert result.returncode == 0, result.stderr
+    records = _process_records(tmp_path)
+    assert records["server"]["btl"] == "^sm"
+    for role in ("task", "stop"):
+        assert records[role]["btl"] == ("^sm" if supervised else None)
+    _assert_exited(tmp_path)
+
+
 @pytest.mark.parametrize("mode", ["server_hangs", "stop_hangs"])
 @pytest.mark.parametrize("task_status", [0, 7])
 def test_launcher_deadline_covers_stop_helper_and_server(
@@ -510,6 +527,18 @@ def test_launcher_terminates_engine_and_child_when_server_exits(tmp_path: Path) 
     assert "task_child" in _process_records(tmp_path)
     assert "stop" not in _process_records(tmp_path)
     _assert_exited(tmp_path)
+
+
+def test_fault_tolerant_rank_0_terminates_task_when_server_fails(tmp_path: Path) -> None:
+    env = _launcher_env(tmp_path, "server_exits")
+    # Longer than _run_launcher waits, so only a launcher that does not wait for the task passes.
+    env["TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT"] = "120"
+    env["TLLM_FAULT_TOLERANCE_RANK"] = "0,1,1,0"
+    result = _run_launcher(tmp_path, env)
+    assert result.returncode == 17, result.stderr
+    assert "which ends the deployment; terminating the task" in result.stderr
+    assert (tmp_path / "task-term").exists(), result.stderr
+    assert "stop" not in _process_records(tmp_path)
 
 
 def test_fault_tolerant_rank_reuses_its_temporary_flashinfer_workspace(tmp_path: Path) -> None:

@@ -53,6 +53,7 @@ from .executor import GenerationExecutor
 from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
+from .rank_failure_requests import RankFailureRequests
 from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict,
@@ -94,6 +95,9 @@ _init_hf_modules()
 
 
 class BaseWorker(GenerationExecutor):
+
+    # Set under Wide-EP fault tolerance only.
+    _rank_failure_requests: Optional[RankFailureRequests] = None
 
     class WorkerExit(GeneratorExit):
         pass
@@ -151,6 +155,9 @@ class BaseWorker(GenerationExecutor):
         # Requests already answered with an error by _maybe_wrap_response and
         # aborted; their remaining engine responses are dropped.
         self._refused_client_ids: Set[int] = set()
+        if getattr(llm_args, "enable_wide_ep_fault_tolerance", False):
+            self._rank_failure_requests = RankFailureRequests(
+                weakref.proxy(self))
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._lora_config = llm_args.lora_config if llm_args is not None else None
@@ -334,6 +341,8 @@ class BaseWorker(GenerationExecutor):
         can_cancel = getattr(self.engine, "_can_enqueue_cancellation", None)
         if (can_cancel() if callable(can_cancel) else
                 self.engine.can_enqueue_requests()):
+            if self._rank_failure_requests is not None:
+                self._rank_failure_requests.stop_tracking(client_id)
             request_id = self._client_id_to_request_id.get(client_id, None)
             if request_id is None:
                 cancel_transfer = getattr(self.engine,
@@ -362,6 +371,24 @@ class BaseWorker(GenerationExecutor):
                 self._client_id_to_request_id).items()
             if client_id in self._results
         }
+
+    def resubmit(self, client_id: int, request: GenerationRequest) -> bool:
+        """Enqueue ``request`` again for ``client_id``, whose result is pending.
+
+        Returns:
+            Whether the request was enqueued. A request whose result is gone,
+            or whose first enqueue has not stored its request id yet, is not.
+        """
+        if (client_id not in self._results
+                or client_id not in self._client_id_to_request_id):
+            return False
+        try:
+            request_id = self._enqueue_request(request)
+        except RequestError as error:
+            logger.warning(f"Could not resubmit request {client_id}: {error}")
+            return False
+        self._client_id_to_request_id[client_id] = request_id
+        return True
 
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()
@@ -651,6 +678,8 @@ class BaseWorker(GenerationExecutor):
             logprob_params=logprob_params)
 
         self._results[client_id] = result
+        if self._rank_failure_requests is not None:
+            self._rank_failure_requests.add(client_id, request)
 
         enqueued = False
         try:
@@ -659,6 +688,8 @@ class BaseWorker(GenerationExecutor):
         finally:
             if not enqueued:
                 self._results.pop(client_id, None)
+                if self._rank_failure_requests is not None:
+                    self._rank_failure_requests.stop_tracking(client_id)
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
 
@@ -1626,6 +1657,10 @@ class AwaitResponseHelper:
             elif self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
             elif response.has_error():
+                rank_failure_requests = self.worker._rank_failure_requests
+                if (rank_failure_requests is not None
+                        and rank_failure_requests.withhold_error(response)):
+                    continue
                 # Convert to ErrorResponse, because tllm.Response cannot be
                 # serialized when it has error.
                 response = ErrorResponse(response.client_id, response.error_msg,
@@ -1828,6 +1863,8 @@ def _send_rsp(
     else:
         _send_rsp_to_postproc(worker, response, None)
 
+    if worker._rank_failure_requests is not None:
+        worker._rank_failure_requests.stop_tracking(response.client_id)
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.
     if is_llm_response(response):

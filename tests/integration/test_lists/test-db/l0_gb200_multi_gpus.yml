@@ -97,6 +97,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_graph_replay_follows_installed_mask
   - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_abort_releases_bound_collectives_waiting_on_a_stopped_rank
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_late_writes.py
+  - unittest/_torch/moe/multi_gpu/test_ring_restore_staging.py
   - unittest/_torch/multi_gpu/test_independent_rank_startup.py
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_rank_mask_all_active_matches_no_mask
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_rank_mask_one_rank_masked_completes
@@ -170,3 +171,23 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
   # WideEP fault tolerance: under load a rank crashes and its replacement rejoins.
   - test_wide_ep_rank_failure.py::TestRankFailures::test_rank_failure_sequence[crash] TIMEOUT (90)
+  # WideEP fault tolerance: a crash and then a hang, a rank stopped while the server is idle, refused joins, a second
+  # failure while a replacement is admitted or installed, a second failure during a failover that the spare slots
+  # cannot cover, rejoins under plain trtllm-serve, a rejoin through two frontends that each serve their own port, a
+  # rejoin on each other target, the loss of the authority, a shutdown while a replacement is admitted, and a
+  # shutdown after a rank was given up.
+  - test_wide_ep_rank_failure.py::TestRankFailures::test_rank_failure_sequence[crash-hang] TIMEOUT (90)
+  - test_wide_ep_rank_failure.py::TestRankFailures::test_rank_stopped_while_idle TIMEOUT (70)
+  - test_wide_ep_rank_failure.py::test_rejoin_on_target[nvfp4] TIMEOUT (70)
+  - test_wide_ep_rank_failure.py::test_rejoin_on_target[nvfp4_cutlass] TIMEOUT (70)
+  - test_wide_ep_rank_failure.py::test_rejoin_on_target[bf16_online_eplb] TIMEOUT (70)
+  - test_wide_ep_rank_failure.py::test_rejoin_on_target[bf16_static_eplb] TIMEOUT (70)
+  - test_wide_ep_rank_failure.py::TestAdmissionFailures::test_refused_joins_and_admission_kill TIMEOUT (110)
+  - test_wide_ep_rank_failure.py::TestAdmissionFailures::test_failure_during_admission TIMEOUT (90)
+  - test_wide_ep_rank_failure.py::TestAdmissionFailures::test_failure_during_install TIMEOUT (90)
+  - test_wide_ep_rank_failure.py::test_rejoin_when_server_spawns_ranks TIMEOUT (70)
+  - test_wide_ep_rank_failure.py::test_rejoin_through_two_frontends TIMEOUT (70)
+  - test_wide_ep_rank_failure.py::test_failure_during_failover_ends_deployment TIMEOUT (44)
+  - test_wide_ep_rank_failure.py::test_authority_loss_ends_deployment TIMEOUT (42)
+  - test_wide_ep_rank_failure.py::test_shutdown_during_admission TIMEOUT (70)
+  - test_wide_ep_rank_failure.py::test_shutdown_after_rank_given_up TIMEOUT (70)

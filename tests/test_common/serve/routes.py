@@ -195,6 +195,14 @@ CONFIGS: Tuple[SnapshotConfig, ...] = (
         "openai_server",
         AggConfig(multi_frontend_attached=True),
     ),
+    # The fault-tolerance status route and Prometheus metrics, on the launcher;
+    # an attached frontend forwards both to it.
+    SnapshotConfig("llm_fault_tolerance", "openai_server", AggConfig(fault_tolerance=True)),
+    SnapshotConfig(
+        "llm_fault_tolerance_multi_frontend_attached",
+        "openai_server",
+        AggConfig(fault_tolerance=True, multi_frontend_attached=True),
+    ),
     SnapshotConfig("mm_encoder", "openai_server", AggConfig(role=ServerRole.MM_ENCODER)),
     SnapshotConfig(
         "mm_encoder_rl_control",

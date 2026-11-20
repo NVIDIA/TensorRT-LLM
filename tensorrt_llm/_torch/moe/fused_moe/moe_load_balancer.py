@@ -7,7 +7,8 @@ import threading
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
+                    Tuple)
 
 import numpy as np
 import torch
@@ -61,6 +62,10 @@ class HostMoeTensorSharer:
     A class representing a host tensor sharer.
     """
 
+    # Bytes before the expert weights in each shared memory segment, where a
+    # subclass may keep a header.
+    data_offset = 0
+
     def __init__(self, layer_id: int, expert_count: int,
                  shared_mpi_comm: MPI.Comm):
         """
@@ -77,9 +82,7 @@ class HostMoeTensorSharer:
         self.local_rank = self.shared_mpi_comm.Get_rank()
         self.local_size = self.shared_mpi_comm.Get_size()
 
-        self.expert_start = self.local_rank * self.expert_count // self.local_size
-        self.expert_end = (self.local_rank +
-                           1) * self.expert_count // self.local_size
+        self.keep_experts(range(self.expert_count))
 
         self.name_info = {}  # key is weight name, value is (dtype, shape)
         self.host_weights = {}
@@ -91,6 +94,28 @@ class HostMoeTensorSharer:
         self.names = []
 
         self.loaded_shared_weights = []
+
+    def keep_experts(self, expert_ids: Iterable[int]) -> None:
+        """
+        Keep the host weights of only ``expert_ids``, split over the ranks of the node.
+
+        Args:
+            expert_ids: The experts whose host weights the node keeps
+        """
+        self.expert_ids = sorted(expert_ids)
+        self.own_expert_ids = self.rank_expert_ids(self.local_rank)
+
+    def rank_expert_ids(self, local_rank: int) -> list[int]:
+        """
+        Get the experts whose host weights a local rank loads and shares.
+
+        Args:
+            local_rank: The rank in the node
+        """
+        count = len(self.expert_ids)
+        return self.expert_ids[local_rank * count //
+                               self.local_size:(local_rank + 1) * count //
+                               self.local_size]
 
     def set_shared_memory_base_name(self, shared_memory_base_name):
         """
@@ -134,7 +159,7 @@ class HostMoeTensorSharer:
         assert len(tensor_shape
                    ) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert 0 <= expert_id < self.expert_count
-        assert expert_id < self.expert_start or expert_id >= self.expert_end
+        assert expert_id not in self.own_expert_ids
         if name not in self.name_info:
             self.name_info[name] = (dtype, tensor_shape)
         else:
@@ -158,7 +183,7 @@ class HostMoeTensorSharer:
             t.shape) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert t.is_contiguous() == True, "t.is_contiguous() must be True"
         assert (expert_id, name) not in self.shared_tensors.keys()
-        assert self.expert_start <= expert_id < self.expert_end
+        assert expert_id in self.own_expert_ids
         self.shared_tensors[(expert_id, name)] = t
         dtype = t.dtype
         tensor_shape = t.shape
@@ -182,27 +207,13 @@ class HostMoeTensorSharer:
         """
         self.loaded_shared_weights.extend(raw_weight_tensors)
 
-    def finalize_layer_weights(self):
-        self.names = list(sorted(self.name_info.keys()))
-        assert len(
-            self.shared_tensors.keys()) == (self.expert_end -
-                                            self.expert_start) * len(self.names)
-
-        total_size = 0
-        for name in self.names:
-            dtype, shape = self.name_info[name]
-            for expert_id in range(self.expert_start, self.expert_end):
-                t = self.shared_tensors[(expert_id, name)]
-                assert dtype == t.dtype and shape == t.shape
-                data_size = t.numel() * t.element_size()
-                aligned_size = self.align_size(data_size)
-                total_size += aligned_size
-
+    def _create_own_shm(self, size: int) -> shared_memory.SharedMemory:
+        """Create this rank's shared memory, replacing one an earlier process left."""
         shm_name = self.get_shared_memory_name()
         try:
             shm = shared_memory.SharedMemory(name=shm_name,
                                              create=True,
-                                             size=total_size)
+                                             size=size)
         except FileExistsError:
             tensorrt_llm.logger.warning(
                 f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
@@ -212,12 +223,34 @@ class HostMoeTensorSharer:
             existing_shm.unlink()
             shm = shared_memory.SharedMemory(name=shm_name,
                                              create=True,
-                                             size=total_size)
+                                             size=size)
+        return shm
+
+    def _open_peer_shm(self, rank: int) -> shared_memory.SharedMemory:
+        return shared_memory.SharedMemory(
+            name=self.get_shared_memory_name(rank))
+
+    def finalize_layer_weights(self):
+        self.names = list(sorted(self.name_info.keys()))
+        assert len(self.shared_tensors.keys()) == len(
+            self.own_expert_ids) * len(self.names)
+
+        total_size = self.data_offset
+        for name in self.names:
+            dtype, shape = self.name_info[name]
+            for expert_id in self.own_expert_ids:
+                t = self.shared_tensors[(expert_id, name)]
+                assert dtype == t.dtype and shape == t.shape
+                data_size = t.numel() * t.element_size()
+                aligned_size = self.align_size(data_size)
+                total_size += aligned_size
+
+        shm = self._create_own_shm(total_size)
         self.own_shm = shm
 
-        offset = 0
+        offset = self.data_offset
         for name in self.names:
-            for expert_id in range(self.expert_start, self.expert_end):
+            for expert_id in self.own_expert_ids:
                 t = self.shared_tensors[(expert_id, name)].contiguous().cpu()
                 data_size = t.numel() * t.element_size()
                 aligned_size = self.align_size(data_size)
@@ -252,36 +285,34 @@ class HostMoeTensorSharer:
             if rank == self.local_rank:
                 continue
 
-            shm_name = self.get_shared_memory_name(rank)
-            shm = shared_memory.SharedMemory(name=shm_name)
+            shm = self._open_peer_shm(rank)
             self.imported_shms.append(shm)
-
-            rank_expert_start = rank * self.expert_count // self.local_size
-            rank_expert_end = (rank + 1) * self.expert_count // self.local_size
-
-            offset = 0
-            for name in self.names:
-                dtype, shape = self.name_info[name]
-                elt_count = int(np.prod(shape))
-                data_size = torch.tensor([],
-                                         dtype=dtype).element_size() * elt_count
-                aligned_size = self.align_size(data_size)
-                for expert_id in range(rank_expert_start, rank_expert_end):
-                    t = torch.frombuffer(shm.buf,
-                                         dtype=dtype,
-                                         offset=offset,
-                                         count=elt_count).view(shape)
-                    key = (expert_id, name)
-                    assert key not in self.host_weights.keys(
-                    ), f"key={key} already exists"
-                    self.host_weights[key] = t
-                    offset += aligned_size
+            self._import_host_weights(shm, rank)
 
         if add_host_weight_fn is not None:
             for key, t in self.host_weights.items():
                 add_host_weight_fn(key[0], key[1], t)
 
         self.host_weights.clear()
+
+    def _import_host_weights(self, shm: shared_memory.SharedMemory, rank: int):
+        """Add the host weights that local ``rank`` wrote to ``shm``."""
+        offset = self.data_offset
+        for name in self.names:
+            dtype, shape = self.name_info[name]
+            elt_count = int(np.prod(shape))
+            data_size = torch.tensor([], dtype=dtype).element_size() * elt_count
+            aligned_size = self.align_size(data_size)
+            for expert_id in self.rank_expert_ids(rank):
+                t = torch.frombuffer(shm.buf,
+                                     dtype=dtype,
+                                     offset=offset,
+                                     count=elt_count).view(shape)
+                key = (expert_id, name)
+                assert key not in self.host_weights.keys(
+                ), f"key={key} already exists"
+                self.host_weights[key] = t
+                offset += aligned_size
 
     def pre_shutdown_cleanup(self):
         """
@@ -361,15 +392,6 @@ class SingleLayerMoeLoadBalancer:
         self.register_weight_fns = []
         self.to_migrate_weight_fns = []
 
-        shared_rank = shared_mpi_comm.Get_rank()
-        shared_size = shared_mpi_comm.Get_size()
-
-        load_expert_start = shared_rank * self.expert_count // shared_size
-        load_expert_end = min(
-            (shared_rank + 1) * self.expert_count // shared_size,
-            self.expert_count)
-        self.load_expert_ids = list(range(load_expert_start, load_expert_end))
-
         if self.updates_enabled:
             self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
             )
@@ -411,7 +433,7 @@ class SingleLayerMoeLoadBalancer:
     def get_load_expert_ids(self):
         assert self.need_load_shared_weights(
         ), "should not call get_load_expert_ids when using statistic routing"
-        return self.load_expert_ids
+        return self.host_tensor_sharer.own_expert_ids
 
     def get_repeat_count(self):
         return self.repeated_count

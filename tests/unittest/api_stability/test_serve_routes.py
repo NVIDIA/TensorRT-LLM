@@ -204,6 +204,25 @@ def test_launcher_forwarding_shadows_local_routes(live_snapshots):
     )
 
 
+def test_fault_tolerance_routes_follow_flag(live_snapshots):
+    """Only enable_wide_ep_fault_tolerance registers the fault-tolerance routes.
+
+    The launcher serves the status route and the Prometheus metrics; an attached
+    frontend forwards both to the launcher instead of serving them.
+    """
+    status = "GET /fault_tolerance_status _MsgspecRoute"
+    launcher = set(_routes_of(live_snapshots, "llm_fault_tolerance"))
+    assert launcher - set(_routes_of(live_snapshots, "llm")) == {
+        "MOUNT /prometheus/metrics Mount",
+        status,
+    }
+    attached = set(_routes_of(live_snapshots, "llm_fault_tolerance_multi_frontend_attached"))
+    assert attached - set(_routes_of(live_snapshots, "llm_multi_frontend_attached")) == {
+        status,
+        "GET /prometheus/metrics{rest:path} _MsgspecRoute",
+    }
+
+
 def test_metrics_shadowing_order(live_snapshots):
     records = _routes_of(live_snapshots, "llm_perf_metrics_enable_metrics_env")
     metrics = [r for r in records if _parse(r)[1] == "/metrics" and _parse(r)[0] == "GET"]
