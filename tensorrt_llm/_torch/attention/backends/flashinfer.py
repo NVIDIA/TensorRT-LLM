@@ -67,6 +67,11 @@ _FORCE_RAGGED_FA2 = False
 _MAX_CUDA_THREADS_PER_BLOCK = 1024
 
 
+def _softmax_scale(head_dim: int, q_scaling: Optional[float]) -> float:
+    return 1.0 / (math.sqrt(head_dim) *
+                  (1.0 if q_scaling is None else q_scaling))
+
+
 def _get_attention_layer_indices(kv_cache_manager: Any) -> list[int]:
     """Return layers that own key/value cache buffers."""
     layer_offsets = getattr(kv_cache_manager, 'layer_offsets', {})
@@ -2038,7 +2043,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         sm_scale = None
         if q_scaling is not None:
-            sm_scale = 1 / (math.sqrt(head_dim) * q_scaling)
+            sm_scale = _softmax_scale(head_dim, q_scaling)
 
         # FlashInfer decode accepts one q_len_per_req. Current paths keep generation widths
         # uniform (including padded speculative drafts); guard against malformed metadata or
@@ -2489,7 +2494,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
         sm_scale = None
         if self.q_scaling is not None:
-            sm_scale = 1 / (math.sqrt(qk_head_dim) * self.q_scaling)
+            sm_scale = _softmax_scale(qk_head_dim, self.q_scaling)
 
         ragged_params = RaggedPlanParams(
             num_heads=self.num_heads,
@@ -2557,10 +2562,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
         # sm_scale is based on qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        if self.q_scaling is not None:
-            sm_scale = 1.0 / (self.q_scaling * math.sqrt(qk_head_dim))
-        else:
-            sm_scale = 1.0 / math.sqrt(qk_head_dim)
+        sm_scale = _softmax_scale(qk_head_dim, self.q_scaling)
 
         plan_params = MLAPlanParams(
             num_heads=self.num_heads,
@@ -2621,10 +2623,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         q_pe = q_3d[..., self.kv_lora_rank:]
 
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        if self.q_scaling is not None:
-            sm_scale = 1.0 / (self.q_scaling * math.sqrt(qk_head_dim))
-        else:
-            sm_scale = 1.0 / math.sqrt(qk_head_dim)
+        sm_scale = _softmax_scale(qk_head_dim, self.q_scaling)
 
         plan_params = MLAPlanParams(
             num_heads=self.num_heads,
@@ -2859,9 +2858,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 max_len_extend=int(metadata.seq_lens[:num_contexts].max()),
-                sm_scale=1 /
-                (math.sqrt(self.head_dim) *
-                 (self.q_scaling if self.q_scaling is not None else 1.0)),
+                sm_scale=_softmax_scale(self.head_dim, self.q_scaling),
                 window_left=window_left,
             )
 

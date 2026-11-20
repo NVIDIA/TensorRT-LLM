@@ -991,14 +991,36 @@ class TestFlashInferAttention(unittest.TestCase):
                     q, k, v, attn_metadata, attention_window_size=window)
                 self.assertTrue(
                     flashinfer_attn.supports_variable_window(attn_metadata))
-                actual = flashinfer_attn.forward(
-                    q,
-                    k,
-                    v,
-                    attn_metadata,
-                    attention_window_size=window,
-                    variable_window_token_starts=starts,
-                    variable_window_token_ends=positions)
+                with mock.patch.object(
+                        triton_prefill,
+                        "triton_prefill_with_custom_mask",
+                        wraps=triton_prefill.triton_prefill_with_custom_mask
+                ) as compact:
+                    actual = flashinfer_attn.forward(
+                        q,
+                        k,
+                        v,
+                        attn_metadata,
+                        attention_window_size=window,
+                        variable_window_token_starts=starts,
+                        variable_window_token_ends=positions)
+                compact.assert_called_once()
+                self.assertIs(
+                    compact.call_args.kwargs["variable_window_token_starts"],
+                    starts)
+                self.assertIs(
+                    compact.call_args.kwargs["variable_window_token_ends"],
+                    positions)
+                with mock.patch.object(flashinfer_attn, "has_fp8_kv_cache",
+                                       True), self.assertRaisesRegex(
+                                           ValueError, "without FP8 KV"):
+                    flashinfer_attn.forward(
+                        q,
+                        k,
+                        v,
+                        attn_metadata,
+                        variable_window_token_starts=starts,
+                        variable_window_token_ends=positions)
                 torch.testing.assert_close(actual[:length],
                                            reference[:length],
                                            atol=1e-2,

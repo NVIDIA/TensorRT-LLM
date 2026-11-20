@@ -14,7 +14,7 @@
 # limitations under the License.
 """Triton prefill attention with custom mask support and paged KV cache.
 
-Used as a fallback when the FlashInfer trtllm-gen backend cannot handle custom
+Used for FlashInfer fa2/fa3 variable-window prefill and as a fallback when trtllm-gen cannot handle custom
 (non-causal) attention masks, e.g. for Gemma4 multimodal bidirectional attention
 on full attention layers with head_dim=512.
 
@@ -155,6 +155,7 @@ def _fwd_kernel(
     BLOCK_N: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     USE_VARIABLE_WINDOW: tl.constexpr,
+    WIDE_TOKEN_OFFSETS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
@@ -167,6 +168,9 @@ def _fwd_kernel(
     # Extend (query) range for this sequence
     cur_seq_extend_start = tl.load(qo_indptr + cur_seq)
     cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start
+
+    if WIDE_TOKEN_OFFSETS:
+        cur_seq_extend_start = cur_seq_extend_start.to(tl.int64)
 
     # Prefix range for this sequence
     cur_seq_prefix_start = tl.load(prefix_indptr + cur_seq)
@@ -566,6 +570,10 @@ def _extend_attention_fwd(
         BLOCK_N=BLOCK_N,
         USE_CUSTOM_MASK=custom_mask is not None,
         USE_VARIABLE_WINDOW=variable_window_token_starts is not None,
+        WIDE_TOKEN_OFFSETS=any(
+            tensor.shape[0] * tensor.stride(0) >= 2**31
+            for tensor in (q_extend, k_extend, v_extend, o_extend)
+        ),
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=skip_prefix_custom_mask,
         WINDOW_LEFT=-1 if variable_window_token_starts is not None else window_left,
@@ -599,6 +607,7 @@ def triton_prefill_with_custom_mask(
 ) -> None:
     """Triton prefill attention with optional custom mask and paged KV cache.
 
+    Handles fa2/fa3 prefill with per-token bounds.
     Replaces FlashInfer prefill for layers where trtllm-gen cannot handle:
     - Custom (bidirectional) masks for head_dim>256 multimodal layers.
     - Mixed Q/KV dtypes during prefill (FP8 KV cache with NVFP4 models).

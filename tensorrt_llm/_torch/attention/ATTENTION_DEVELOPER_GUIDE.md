@@ -296,6 +296,7 @@ The core contract is:
   - `support_fused_qkv()`
   - `support_mla()`
   - `support_fp4_kv_cache()`
+- Request-time capability hook `supports_variable_window(metadata)` (default `False`)
 - `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
   contract (default `0`); see below
 - `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
@@ -309,7 +310,7 @@ The core contract is:
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
 an explicit `forward_args`.
 
-FlashInfer also exposes `supports_variable_window(metadata)` as a request-time
+FlashInfer overrides `supports_variable_window(metadata)` as a request-time
 probe for its Triton prefill fallback. The inclusive per-query KV bounds use
 `AttentionForwardArgs.variable_window_token_starts/ends`; they replace prefill
 causal/window masking, while generation retains its normal sliding window.
@@ -319,7 +320,7 @@ mutable KV quantization settings.
 
 Text-only warmup does not exercise variable-window Triton prefill. If its JIT
 cache entry is absent, the first eligible image request compiles the variant
-synchronously. Steady-state measurements exclude this cost; this path does not
+synchronously. This path does not
 currently register an explicit startup precompile. Window sizes are encoded in
 the bounds, so local/global bounds share a kernel specialization when the other
 kernel parameters match.

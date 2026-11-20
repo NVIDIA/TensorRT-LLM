@@ -143,13 +143,23 @@ def _use_compact_image_mask_for_lengths(context_lengths: list[int]) -> bool:
 
 def build_gemma_context_variable_window(
     mm_token_type_ids: torch.Tensor,
-    effective_sliding_window: Optional[int] = None,
+    effective_sliding_window: int | None = None,
     prefix_len: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Build inclusive sequence-local KV bounds; vision types 1/2 form blobs.
 
     Call separately for each packed request so adjacent vision runs never cross
     request boundaries. Gemma3 maps its boolean image flags to type 1.
+
+    Args:
+        mm_token_type_ids: One-dimensional integer modality IDs for new tokens.
+        effective_sliding_window: Number of visible causal keys including the
+            query, or None for global attention.
+        prefix_len: Number of cached tokens preceding the new tokens.
+
+    Returns:
+        Two contiguous int32 vectors of inclusive start and end positions,
+        one entry per new token.
     """
     extend_len = mm_token_type_ids.numel()
     positions = torch.arange(
