@@ -59,7 +59,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ..k3r_gemm.k3_fp8w_lowm_gemm_ull import _bf16x2_inv_scale, _quant_bf16x8_to_e4m3, _ue8m0_of_amax
+from ..k3r_gemm.k3_fp8w_lowm_gemm import _bf16x2_inv_scale, _quant_bf16x8_to_e4m3, _ue8m0_of_amax
 from ..k3r_moe.k3_route_tail_ull import _griddepcontrol_launch_dependents, _griddepcontrol_wait
 
 #: Row width (the latent) and values per thread (one 16-byte access).

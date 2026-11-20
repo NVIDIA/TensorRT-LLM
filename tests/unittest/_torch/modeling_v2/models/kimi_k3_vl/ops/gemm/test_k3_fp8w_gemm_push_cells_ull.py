@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The ULL target's collective FP8-weight GEMM entries over their certified cells, on a 4-rank
-MNNVL group: ``k3_fp8w_lowm_gemm_push_ull.CELLS``, ``k3_fp8w_mid_gemm_push_ull.CELLS`` and
+MNNVL group: ``k3_fp8w_lowm_gemm_push.CELLS``, ``k3_fp8w_mid_gemm_push.CELLS`` and
 ``k3_fp8w_lowm_mxfp8_push_ull.CELLS``, each rank pushing under ``validating`` and checking its own
 ``k3_lamport_ar.run_lamport_finish`` output against the entry's collective ``reference`` (the
 recipe and band of ``test_k3_fp8w_gemm_push_cells.py``). A cell that only SM107 admits (``sm_107``
@@ -37,8 +37,8 @@ WORLD = 4
 BUFFER_BYTES = 8 << 20
 ELEMENT_ULP, RMS_ULP = 8, 2
 ENTRIES = (
-    "k3_fp8w_lowm_gemm_push_ull",
-    "k3_fp8w_mid_gemm_push_ull",
+    "k3_fp8w_lowm_gemm_push",
+    "k3_fp8w_mid_gemm_push",
     "k3_fp8w_lowm_mxfp8_push_ull",
 )
 
@@ -75,7 +75,7 @@ def _run_rank(entry_name, world, mv2_tests):
     from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
     from tensorrt_llm.mapping import Mapping
 
-    lowm = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_gemm_ull")
+    lowm = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_gemm")
     mx = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_mxfp8_ull")
     lamport = importlib.import_module(f"{K3}.kernels.k3r_comm.k3_lamport_ar")
     op = getattr(
@@ -232,8 +232,8 @@ def _run_rank(entry_name, world, mv2_tests):
             return got, op.reference(xqs, xss, ws_, scales, ws, one_shot)
 
         run = {
-            "k3_fp8w_lowm_gemm_push_ull": lowm_push,
-            "k3_fp8w_mid_gemm_push_ull": mid_push,
+            "k3_fp8w_lowm_gemm_push": lowm_push,
+            "k3_fp8w_mid_gemm_push": mid_push,
             "k3_fp8w_lowm_mxfp8_push_ull": mxfp8_push,
         }[entry_name]
         for i, cell in enumerate(op.CELLS):
@@ -257,7 +257,7 @@ def _run_rank(entry_name, world, mv2_tests):
 @pytest.mark.parametrize("entry_name", ENTRIES)
 @pytest.mark.parametrize("mpi_pool_executor", [WORLD], indirect=True)
 def test_k3_fp8w_gemm_push_ull_cells(mpi_pool_executor, entry_name):
-    """Drives ``k3_fp8w_lowm_gemm_push_ull.CELLS``, ``k3_fp8w_mid_gemm_push_ull.CELLS`` or
+    """Drives ``k3_fp8w_lowm_gemm_push.CELLS``, ``k3_fp8w_mid_gemm_push.CELLS`` or
     ``k3_fp8w_lowm_mxfp8_push_ull.CELLS`` on every rank."""
     world = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < world:

@@ -58,7 +58,7 @@ def _seed(cell) -> int:
 
 @functools.lru_cache(maxsize=1)
 def _weights():
-    lowm = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_gemm_ull")
+    lowm = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_gemm")
     fused = importlib.import_module(f"{K3}.kernels.k3r_mla_q.k3_mla_q_fused_ull")
     dev = torch.device("cuda")
     gen = torch.Generator().manual_seed(7)

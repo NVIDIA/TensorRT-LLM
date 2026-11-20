@@ -61,9 +61,9 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from . import k3_fp8w_lowm_gemm_ull as lowm
+from . import k3_fp8w_lowm_gemm as lowm
 from ..k3r_comm import k3_lamport_ar
-from .k3_fp8w_lowm_gemm_ull import (
+from .k3_fp8w_lowm_gemm import (
     _EVICT_FIRST,
     _SF_TMEM_COLS,
     _TMEM_COLS,

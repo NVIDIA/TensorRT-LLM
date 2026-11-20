@@ -76,7 +76,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import cuda as cuda_tma
 
 from ..k3r_helix.helix_a2a_fused import _fv, _lv, _pack_bf16x2, _unpack
-from ..k3r_gemm.k3_fp8w_lowm_gemm_ull import (
+from ..k3r_gemm.k3_fp8w_lowm_gemm import (
     _asm,
     _bf16x2_inv_scale,
     _griddepcontrol_launch_dependents,

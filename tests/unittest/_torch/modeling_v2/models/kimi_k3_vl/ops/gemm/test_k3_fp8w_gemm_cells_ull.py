@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The ULL target's single-GPU FP8-weight GEMM entries over their certified cells:
-``k3_fp8w_lowm_gemm_ull.CELLS``, ``k3_fp8w_mid_gemm_ull.CELLS`` and
+``k3_fp8w_lowm_gemm_ull.CELLS``, ``k3_fp8w_mid_gemm.CELLS`` and
 ``k3_fp8w_lowm_mxfp8_gemm_ull.CELLS``, each driven through ``validating`` and checked against the
 entry's own ``reference`` with the band of ``test_k3_fp8w_gemm_cells.py``.
 
@@ -26,14 +26,12 @@ pytestmark = pytest.mark.skipif(
     reason="the ULL low-M FP8-weight entries are certified on SM103 / SM107",
 )
 
-lowm = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_gemm_ull")
+lowm = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_gemm")
 mx = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_mxfp8_ull")
 k3_fp8w_lowm_gemm_ull = importlib.import_module(
     f"{K3}.ops.gemm.k3_fp8w_lowm_gemm_ull"
 ).k3_fp8w_lowm_gemm
-k3_fp8w_mid_gemm_ull = importlib.import_module(
-    f"{K3}.ops.gemm.k3_fp8w_mid_gemm_ull"
-).k3_fp8w_mid_gemm
+k3_fp8w_mid_gemm = importlib.import_module(f"{K3}.ops.gemm.k3_fp8w_mid_gemm").k3_fp8w_mid_gemm
 k3_fp8w_lowm_mxfp8_gemm_ull = importlib.import_module(
     f"{K3}.ops.gemm.k3_fp8w_lowm_mxfp8_gemm_ull"
 ).k3_fp8w_lowm_mxfp8_gemm
@@ -91,9 +89,9 @@ def test_k3_fp8w_lowm_gemm_ull_cells(cell):
     assert_within_ulp(got, want, ELEMENT_ULP, RMS_ULP)
 
 
-@pytest.mark.parametrize("cell", k3_fp8w_mid_gemm_ull.CELLS, ids=_ids(k3_fp8w_mid_gemm_ull.CELLS))
+@pytest.mark.parametrize("cell", k3_fp8w_mid_gemm.CELLS, ids=_ids(k3_fp8w_mid_gemm.CELLS))
 def test_k3_fp8w_mid_gemm_ull_cells(cell):
-    op = k3_fp8w_mid_gemm_ull
+    op = k3_fp8w_mid_gemm
     n, k, m = cell.spec["n"], cell.spec["k"], cell.spec["m"]
     plan = lowm.mid_prequant_plan(m, n, k)
     assert plan is not None, "a mid-M cell must be above the low-M cut-over"

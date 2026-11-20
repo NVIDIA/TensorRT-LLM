@@ -32,10 +32,11 @@
    "source_sha256": "f3c982e2da729a6635e26c043790d69843e853296622957e058290b82074f559",
    "import_edits": [
     "from .k3_fp8w_lowm_gemm import _bf16x2_inv_scale, _quant_bf16x8_to_e4m3, _ue8m0_of_amax -> from ..k3r_gemm.k3_fp8w_lowm_gemm_ull import _bf16x2_inv_scale, _quant_bf16x8_to_e4m3, _ue8m0_of_amax",
-    "from .k3_route_tail import _griddepcontrol_launch_dependents, _griddepcontrol_wait -> from ..k3r_moe.k3_route_tail_ull import _griddepcontrol_launch_dependents, _griddepcontrol_wait"
+    "from .k3_route_tail import _griddepcontrol_launch_dependents, _griddepcontrol_wait -> from ..k3r_moe.k3_route_tail_ull import _griddepcontrol_launch_dependents, _griddepcontrol_wait",
+    "Bind the shared k3_fp8w_lowm_gemm quantization helpers."
    ],
    "local_edits": [],
-   "sha256": "154bfa2c70ef9efaae2b611945076eba80c0975a4f905005a665a5fa6dc55951",
+   "sha256": "d0f34c649b57033090945d74add76b41edfb3a756fb208a8b138d336e85a7bca",
    "target_path": "kernels/k3_latent_ar_norm.py"
   },
   "kernels/k3r_common/k3_launch_attrs.py": {
@@ -118,8 +119,10 @@
     "from . import k3_lamport_ar -> from ..k3r_comm import k3_lamport_ar",
     "from .k3_latent_fp8_gemm import ( _abs_max_f32x16, _e2m1x8, _ldg_f32, _nvfp4_scales_x2, _rcp_approx_ftz, ) -> from .k3_latent_fp8_gemm_ull import ( _abs_max_f32x16, _e2m1x8, _ldg_f32, _nvfp4_scales_x2, _rcp_approx_ftz, )"
    ],
-   "local_edits": [],
-   "sha256": "b0bc6d39a28d4771475d3d30f356aece9b2b76c02d3573a007b470fa82506673",
+   "local_edits": [
+    "Reuse the family kernel and retain this dispatcher entry and fake implementation."
+   ],
+   "sha256": "f055473c9925d2e61b2df30a1ed4dd56ebfbe27e96b9f218ea5700e77c8f66e2",
    "target_path": "kernels/k3_fp8w_lowm_gemm.py"
   },
   "kernels/k3r_gemm/k3_fp8w_lowm_mxfp8_ull.py": {
@@ -128,10 +131,11 @@
    "import_edits": [
     "from . import k3_fp8w_lowm_gemm as lowm -> from . import k3_fp8w_lowm_gemm_ull as lowm",
     "from . import k3_lamport_ar -> from ..k3r_comm import k3_lamport_ar",
-    "from .k3_fp8w_lowm_gemm import ( _EVICT_FIRST, _SF_TMEM_COLS, _TMEM_COLS, CTA_K, MMA_M, N_ALIGN, SF_VEC, SUPPORTED_MMA_N, _abs_max_bf16x32, _add_bf16x2, _asm, _bf16x2_inv_scale, _ceil_div, _f32_to_bf16_bits, _griddepcontrol_launch_dependents, _griddepcontrol_wait, _iv, _ldg_v4_b32, _lds_v4_b32, _lds_v4_f32, _mbarrier_arrive_remote, _quant_bf16x8_to_e4m3, _s2t_partition_sf, _st_async_v4_f32, _stg_v4_b32, _sts_u16, _sts_v4_b32, _ue8m0_of_amax, ) -> from .k3_fp8w_lowm_gemm_ull import ( _EVICT_FIRST, _SF_TMEM_COLS, _TMEM_COLS, CTA_K, MMA_M, N_ALIGN, SF_VEC, SUPPORTED_MMA_N, _abs_max_bf16x32, _add_bf16x2, _asm, _bf16x2_inv_scale, _ceil_div, _f32_to_bf16_bits, _griddepcontrol_launch_dependents, _griddepcontrol_wait, _iv, _ldg_v4_b32, _lds_v4_b32, _lds_v4_f32, _mbarrier_arrive_remote, _quant_bf16x8_to_e4m3, _s2t_partition_sf, _st_async_v4_f32, _stg_v4_b32, _sts_u16, _sts_v4_b32, _ue8m0_of_amax, )"
+    "from .k3_fp8w_lowm_gemm import ( _EVICT_FIRST, _SF_TMEM_COLS, _TMEM_COLS, CTA_K, MMA_M, N_ALIGN, SF_VEC, SUPPORTED_MMA_N, _abs_max_bf16x32, _add_bf16x2, _asm, _bf16x2_inv_scale, _ceil_div, _f32_to_bf16_bits, _griddepcontrol_launch_dependents, _griddepcontrol_wait, _iv, _ldg_v4_b32, _lds_v4_b32, _lds_v4_f32, _mbarrier_arrive_remote, _quant_bf16x8_to_e4m3, _s2t_partition_sf, _st_async_v4_f32, _stg_v4_b32, _sts_u16, _sts_v4_b32, _ue8m0_of_amax, ) -> from .k3_fp8w_lowm_gemm_ull import ( _EVICT_FIRST, _SF_TMEM_COLS, _TMEM_COLS, CTA_K, MMA_M, N_ALIGN, SF_VEC, SUPPORTED_MMA_N, _abs_max_bf16x32, _add_bf16x2, _asm, _bf16x2_inv_scale, _ceil_div, _f32_to_bf16_bits, _griddepcontrol_launch_dependents, _griddepcontrol_wait, _iv, _ldg_v4_b32, _lds_v4_b32, _lds_v4_f32, _mbarrier_arrive_remote, _quant_bf16x8_to_e4m3, _s2t_partition_sf, _st_async_v4_f32, _stg_v4_b32, _sts_u16, _sts_v4_b32, _ue8m0_of_amax, )",
+    "Bind the shared k3_fp8w_lowm_gemm helpers."
    ],
    "local_edits": [],
-   "sha256": "0f1b208e8a5746e361f98369d516d41c6080697f00ab84cd2f3e10d63ee93861",
+   "sha256": "66dab1518f4cce7afaed9cb070cc7802a59f2efe3a5ff0b2c39bf4a10da130eb",
    "target_path": "kernels/k3_fp8w_lowm_mxfp8.py"
   },
   "kernels/k3r_gemm/k3_latent_fp8_gemm_ull.py": {
@@ -141,8 +145,10 @@
     "from . import k3_fp8w_lowm_gemm -> from . import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm",
     "from . import k3_fp8w_lowm_gemm -> from . import k3_fp8w_lowm_gemm_ull as k3_fp8w_lowm_gemm"
    ],
-   "local_edits": [],
-   "sha256": "c00fafcc128ec8d0908512c4c21804c9fd92c1f4cceac7715889b6bf098441e3",
+   "local_edits": [
+    "Reuse the family kernel and retain this dispatcher entry and fake implementation."
+   ],
+   "sha256": "a88aa5494b6826af2cd8641c0aeae4221d065f06de1239d21cc64bd2275950cf",
    "target_path": "kernels/k3_latent_fp8_gemm.py"
   },
   "kernels/k3r_gemm/low_m_bf16_splitk.py": {
@@ -173,10 +179,11 @@
     "from .fp4_mla_packed_reduce import _reduce_packed_row -> from ..k3r_fp4_mla.fp4_mla_packed_reduce_ull import _reduce_packed_row",
     "from .k3_fp8w_lowm_gemm import ( _bf16x2_inv_scale, _gate_mul_bf16x8, _quant_bf16x8_to_e4m3, _ue8m0_of_amax, ) -> from ..k3r_gemm.k3_fp8w_lowm_gemm_ull import ( _bf16x2_inv_scale, _gate_mul_bf16x8, _quant_bf16x8_to_e4m3, _ue8m0_of_amax, )",
     "from .k3_fp8w_lowm_mxfp8 import amax_bf16x8_words, amax_pair -> from ..k3r_gemm.k3_fp8w_lowm_mxfp8_ull import amax_bf16x8_words, amax_pair",
-    "from tensorrt_llm._torch.attention.kernels.blackwell.mla.mla_helpers import LOG2_E as _MLA_LOG2_E -> from ..k3r_mla_decode.mla_helpers import LOG2_E as _MLA_LOG2_E"
+    "from tensorrt_llm._torch.attention.kernels.blackwell.mla.mla_helpers import LOG2_E as _MLA_LOG2_E -> from ..k3r_mla_decode.mla_helpers import LOG2_E as _MLA_LOG2_E",
+    "Bind the shared k3_fp8w_lowm_gemm helpers."
    ],
    "local_edits": [],
-   "sha256": "97be2de47dc85fd1d233815f2f612b491de701123276cb9ea3ffeb63eee18a5f",
+   "sha256": "5a5b2590751fbe8039811c9eae1aae9bff771d92608cec01c22b9fef299336b8",
    "target_path": "kernels/k3_helix_tail.py"
   },
   "kernels/k3r_kda/k3_l2_prefetch.py": {
@@ -224,10 +231,11 @@
     "from .helix_a2a_fused import _fv, _lv, _pack_bf16x2, _unpack -> from ..k3r_helix.helix_a2a_fused import _fv, _lv, _pack_bf16x2, _unpack",
     "from .k3_fp8w_lowm_gemm import ( _asm, _bf16x2_inv_scale, _griddepcontrol_launch_dependents, _griddepcontrol_wait, _iv, _lds_v4_b32, _lds_v4_f32, _quant_bf16x8_to_e4m3, _sts_v2_b32, _sts_v4_b32, _sts_v4_f32, _ue8m0_of_amax, ) -> from ..k3r_gemm.k3_fp8w_lowm_gemm_ull import ( _asm, _bf16x2_inv_scale, _griddepcontrol_launch_dependents, _griddepcontrol_wait, _iv, _lds_v4_b32, _lds_v4_f32, _quant_bf16x8_to_e4m3, _sts_v2_b32, _sts_v4_b32, _sts_v4_f32, _ue8m0_of_amax, )",
     "from .k3_fp8w_lowm_mxfp8 import _amax_bf16x8_words, _amax_pair -> from ..k3r_gemm.k3_fp8w_lowm_mxfp8_ull import _amax_bf16x8_words, _amax_pair",
-    "from .k3_helix_tail import ( _globaltimer, _mbar_expect_tx, _mbar_init, _mbar_try_wait, _mma_bf16, _shfl_bfly_b32, _st_u64, ) -> from ..k3r_helix.k3_helix_tail_ull import ( _globaltimer, _mbar_expect_tx, _mbar_init, _mbar_try_wait, _mma_bf16, _shfl_bfly_b32, _st_u64, )"
+    "from .k3_helix_tail import ( _globaltimer, _mbar_expect_tx, _mbar_init, _mbar_try_wait, _mma_bf16, _shfl_bfly_b32, _st_u64, ) -> from ..k3r_helix.k3_helix_tail_ull import ( _globaltimer, _mbar_expect_tx, _mbar_init, _mbar_try_wait, _mma_bf16, _shfl_bfly_b32, _st_u64, )",
+    "Bind the shared k3_fp8w_lowm_gemm helpers."
    ],
    "local_edits": [],
-   "sha256": "919c4b83d0c70e0da59bdfb0d72748f596918f30e26c785a95f166b89fec41f5",
+   "sha256": "a6c71abcca5a2fe85c6478cc30e1c03d2c0b0bc1a494359bfd4e2b9e8e203661",
    "target_path": "kernels/k3_mla_q_fused.py"
   },
   "kernels/k3r_mla_q/q_norm_pdl.py": {
