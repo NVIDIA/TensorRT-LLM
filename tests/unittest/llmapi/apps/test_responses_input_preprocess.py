@@ -30,11 +30,9 @@ from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     _create_input_messages,
     _get_chat_completion_function_tools,
-    _render_developer_as_system,
     _response_output_item_to_chat_completion_message,
     _tool_resolution,
 )
-from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
 # test in the file is deselected, which pytest reports as exit code 5 and the
@@ -547,70 +545,6 @@ def test_calls_echoed_without_their_namespace_replay_under_the_offered_names():
     )
     calls = [call["function"]["name"] for m in messages for call in m.get("tool_calls") or []]
     assert calls == ["functions.exec", "collaboration.spawn_agent"]
-
-
-# ---------------------------------------------------------------------------
-# developer messages
-# ---------------------------------------------------------------------------
-
-
-class _TemplateTokenizer:
-    def __init__(self, template):
-        self.template = template
-
-    def get_chat_template(self, chat_template, tools=None):
-        return self.template
-
-
-_DEVELOPER_TURN = [{"role": "developer", "content": "brief"}, {"role": "user", "content": "q"}]
-
-
-def _template(body):
-    return _TemplateTokenizer("{% for m in messages %}" + body + "{% endfor %}")
-
-
-@pytest.mark.parametrize(
-    "tokenizer, role",
-    [
-        (_template("{% if m.role in ('system', 'user') %}{{ m.content }}{% endif %}"), "system"),
-        (
-            _template(
-                "{% if m.role in ('system', 'developer', 'user') %}{{ m.content }}{% endif %}"
-            ),
-            "developer",
-        ),
-        # Naming the role is not handling it.
-        (
-            _template(
-                "{% if m.role == 'developer' %}"
-                "{{ raise_exception('Unsupported role: developer') }}{% endif %}{{ m.content }}"
-            ),
-            "system",
-        ),
-        (
-            _TemplateTokenizer(
-                "{# developer messages are not supported #}{% for m in messages %}"
-                "{% if m.role != 'developer' %}{{ m.content }}{% endif %}{% endfor %}"
-            ),
-            "system",
-        ),
-        # A template that renders neither role tells nothing; the roles stay.
-        (_template("{{ m.content.missing.attribute }}"), "developer"),
-        (DeepseekV4Tokenizer.__new__(DeepseekV4Tokenizer), "developer"),
-    ],
-    ids=[
-        "no_developer_branch",
-        "developer_branch",
-        "rejects_developer",
-        "developer_only_in_a_comment",
-        "renders_neither",
-        "deepseek_v4",
-    ],
-)
-def test_developer_renders_as_system_only_where_the_template_lacks_it(tokenizer, role):
-    messages = _render_developer_as_system(_DEVELOPER_TURN, tokenizer, None, None)
-    assert [m["role"] for m in messages] == [role, "user"]
-    assert _DEVELOPER_TURN[0]["role"] == "developer"
 
 
 # ---------------------------------------------------------------------------

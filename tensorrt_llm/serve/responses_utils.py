@@ -18,7 +18,6 @@ from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
 
 import anyio
 from fastapi.responses import StreamingResponse
-from jinja2.exceptions import TemplateError
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
                                     ResponseContentPartDoneEvent,
@@ -52,7 +51,6 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             StreamState, SystemContent, TextContent,
                             ToolDescription, load_harmony_encoding)
 from transformers import AutoProcessor, PretrainedConfig
-from transformers.utils.chat_template_utils import render_jinja_template
 
 from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
@@ -63,8 +61,7 @@ from tensorrt_llm.inputs import PromptInputs, prompt_inputs
 from tensorrt_llm.inputs.chat_template_guard import \
     unreferenced_chat_template_kwargs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.inputs.utils import (rendered_hf_chat_template_source,
-                                       resolve_hf_chat_template)
+from tensorrt_llm.inputs.utils import rendered_hf_chat_template_source
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -102,8 +99,6 @@ from tensorrt_llm.serve.tool_parser.base_tool_parser import (
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.web_search import load_web_search_config
-from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
-from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
@@ -910,73 +905,6 @@ def _tool_output_content(output):
     return str(output)
 
 
-def _render_developer_as_system(
-    messages: list[ChatCompletionMessageParam],
-    tokenizer: Optional[TokenizerBase],
-    processor: Optional[AutoProcessor],
-    tools: Optional[list[dict[str, Any]]],
-    chat_template: Optional[str] = None,
-) -> list[ChatCompletionMessageParam]:
-    """Render ``developer`` messages as ``system`` where the template lacks them.
-
-    A chat template that does not render a ``developer`` message (it has no
-    branch for the role, or rejects it) loses that message unless it is sent
-    as ``system``. The DeepSeek tokenizers render ``developer`` themselves.
-    """
-    if not any(message.get("role") == "developer" for message in messages):
-        return messages
-    if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
-        return messages
-    template = resolve_hf_chat_template(getattr(tokenizer, "tokenizer",
-                                                tokenizer),
-                                        processor,
-                                        chat_template=chat_template,
-                                        tools=tools)
-    if not isinstance(template, str) or _template_renders(
-            template, "developer"):
-        return messages
-    if not _template_renders(template, "system"):
-        # The probe cannot tell what the template does; leave the roles alone.
-        return messages
-    return [{
-        **message, "role": "system"
-    } if message.get("role") == "developer" else message
-            for message in messages]
-
-
-_ROLE_PROBE = "trtllm-chat-template-role-probe"
-_TEMPLATE_RENDERS_ROLE: dict[tuple[str, str], bool] = {}
-
-
-def _template_renders(template: str, role: str) -> bool:
-    """Whether ``template`` renders the content of a message with ``role``.
-
-    Decided by rendering one such message rather than by searching the source
-    for the role's name: a template may name a role only to reject it. A
-    template that raises renders nothing. Cached per template and role.
-    """
-    key = (template, role)
-    renders = _TEMPLATE_RENDERS_ROLE.get(key)
-    if renders is None:
-        conversation = [{
-            "role": role,
-            "content": _ROLE_PROBE
-        }, {
-            "role": "user",
-            "content": "hi"
-        }]
-        try:
-            rendered, _ = render_jinja_template(conversations=[conversation],
-                                                chat_template=template,
-                                                add_generation_prompt=True)
-            renders = _ROLE_PROBE in rendered[0]
-        except (TemplateError, TypeError, KeyError, IndexError, ValueError,
-                AttributeError):
-            renders = False
-        _TEMPLATE_RENDERS_ROLE[key] = renders
-    return renders
-
-
 def _response_output_item_to_chat_completion_message(
     item: Union[dict, ResponseInputOutputItem],
     tool_resolution: Optional[_ToolResolution] = None,
@@ -1614,8 +1542,6 @@ async def _create_input_tokens(
         render_resources.extension.serialize_tool(tool)
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
-    messages = _render_developer_as_system(messages, tokenizer, processor,
-                                           flat_tool_dicts, chat_template)
     conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
         messages, model_config, multimodal_server_config)
     has_media = any(message.get("media") for message in conversation)
