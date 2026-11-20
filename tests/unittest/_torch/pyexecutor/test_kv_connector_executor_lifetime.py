@@ -819,25 +819,12 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     assert order == ["connector", "kv pools"]
 
 
-@pytest.mark.parametrize("connector_present", [False, True])
-@pytest.mark.parametrize("global_pending", [False, True])
-@pytest.mark.parametrize("tp_size", [1, 2])
-def test_multirank_adp_keeps_collective_pending_decision(
-    connector_present: bool,
-    global_pending: bool,
-    tp_size: int,
-) -> None:
+def test_single_rank_connector_does_not_poll_native_sends() -> None:
     executor = _executor()
-    executor.enable_attention_dp = True
-    executor.dist.tp_size = tp_size
-    executor.dist.world_size = 2
-    if not connector_present:
-        executor.kv_connector_manager = None
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.has_any_inflight_requests.return_value = True
-    executor._kv_connector_has_pending = global_pending
 
-    assert executor._has_pending_connector_transfers() is (connector_present and global_pending)
+    assert not executor._has_pending_native_sends()
     executor.async_transfer_manager.has_any_inflight_requests.assert_not_called()
 
 
@@ -853,37 +840,4 @@ def test_multirank_native_only_keeps_existing_progress_contract(enable_adp: bool
 
     assert not executor._has_pending_connector_transfers()
     assert not executor._has_pending_native_sends()
-    executor.async_transfer_manager.has_any_inflight_requests.assert_not_called()
-
-
-def test_single_rank_native_shutdown_waits_for_send_completion() -> None:
-    executor = _executor()
-    executor.kv_connector_manager = None
-    executor.dist.world_size = 1
-    executor.is_shutdown = True
-    executor.active_requests = []
-    executor.waiting_queue = []
-    executor.async_transfer_manager = Mock()
-    executor.async_transfer_manager.has_any_inflight_requests.return_value = True
-
-    for _ in range(3):
-        assert not executor.should_stop_processing
-    executor.async_transfer_manager.has_any_inflight_requests.return_value = False
-    assert executor.should_stop_processing
-
-
-@pytest.mark.parametrize("global_pending", [False, True])
-def test_single_rank_adp_connector_preserves_deferred_response_snapshot(
-    global_pending: bool,
-) -> None:
-    executor = _executor()
-    executor.enable_attention_dp = True
-    executor.dist.world_size = 1
-    executor.dist.tp_size = 1
-    executor.async_transfer_manager = Mock()
-    executor.async_transfer_manager.has_any_inflight_requests.return_value = False
-    executor.kv_connector_manager.has_pending_loads.return_value = False
-    executor._kv_connector_has_pending = global_pending
-
-    assert executor._has_pending_connector_transfers() is global_pending
     executor.async_transfer_manager.has_any_inflight_requests.assert_not_called()

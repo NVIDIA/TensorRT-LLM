@@ -9162,7 +9162,6 @@ class PyExecutor:
                 and len(waiting_queue) == 0 and not pending_cancel_holds_vote
                 and not self.is_shutdown
                 and not self._has_pending_connector_transfers()
-                and not self._has_pending_native_sends()
                 and not pending_retirement)
         # Only trust the hint on the busy path; `idle`, `control_pending` and
         # the hint are identical on all ranks, so every rank takes the same

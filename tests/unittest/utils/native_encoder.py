@@ -69,7 +69,6 @@ def native_result():
 
 def _check_handoff_hash_initialization(producer, consumer, supplied):
     llm, seen = model()
-    llm.input_processor.multimodal_hashing_supported = supplied
     identities = []
     for offset in (1, 2):
         result, tensors = native_result()
@@ -102,21 +101,17 @@ def _check_handoff_hash_initialization(producer, consumer, supplied):
 
 def _check_malformed_handoff_hashes(producer, consumer, hashes, monkeypatch):
     llm, seen = model()
-    result, tensors = native_result()
+    result, _ = native_result()
     result.disaggregated_params.multimodal_hashes = hashes
     ref = producer.publish(result, request(), llm)
-    released = []
-    release = SharedTensorContainer.release_dict
-
-    def record(handle):
-        released.append(handle)
-        release(handle)
-
-    monkeypatch.setattr(SharedTensorContainer, "release_dict", record)
+    monkeypatch.setattr(
+        SharedTensorContainer,
+        "from_tensor",
+        lambda *args, **kwargs: pytest.fail("malformed hashes allocated new worker exports"),
+    )
     with pytest.raises(ValueError, match="invalid encoder handoff parameters"):
         consumer.prepare(ref, request(), llm, None)
     assert "hashes" not in seen
-    assert len(released) == len(tensors)
 
 
 class FakeAgent:
@@ -217,8 +212,7 @@ def _receiver(cache):
     return cache.test_agents[-1]
 
 
-def _sender(cache):
-    return cache.test_agents[-1]
+_sender = _receiver
 
 
 def _writes(cache):

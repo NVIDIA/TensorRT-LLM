@@ -20,14 +20,17 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 from .encoder_output import (
     EncodedMediaRef,
+    EncoderCapacityError,
     EncoderInput,
     EncoderTransferRejected,
+    EncoderUnavailableError,
     _capture_encoder_decode_state,
     _config_digest,
     _encoder_input_params,
     _encoder_output_params,
     _input_digest,
     _release,
+    _validate_handoff_metadata,
     take_encoder_exports,
 )
 
@@ -147,7 +150,7 @@ class NixlEncoderCache:
         self._close_error = None
 
     @contextmanager
-    def _operation(self, *, unavailable_error=RuntimeError):
+    def _operation(self, *, unavailable_error=EncoderUnavailableError):
         with self._lock:
             self._healthy(unavailable_error=unavailable_error)
             self._active += 1
@@ -187,7 +190,7 @@ class NixlEncoderCache:
                 self._discard(item)
                 del self._exports[identity]
 
-    def _healthy(self, *, unavailable_error=RuntimeError):
+    def _healthy(self, *, unavailable_error=EncoderUnavailableError):
         if self.failed or self._closed or self._closing:
             raise unavailable_error("encoder NIXL transport unavailable; restart the engine")
 
@@ -217,7 +220,7 @@ class NixlEncoderCache:
                     self._healthy()
                     self._collect()
                     if self._used + total > _MAX_CACHE_BYTES:
-                        raise RuntimeError("encoder NIXL cache is full")
+                        raise EncoderCapacityError("encoder NIXL cache is full")
                     self._used += total
                     reserved = True
                 tensors = [view.detach().to(self.device).contiguous().clone() for view in views]
@@ -271,6 +274,7 @@ class NixlEncoderCache:
         endpoint = value.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint or "://" in endpoint or "/" in endpoint:
             raise ValueError("invalid encoder endpoint")
+        NixlEncoderCache._tensor_metadata(value.get("metadata"))
         return value
 
     def discard(self, reference):
@@ -349,12 +353,14 @@ class NixlEncoderCache:
             status = None
             registered = False
             submitted = False
+            stage = "local encoder sender setup"
             try:
                 name = f"{self.name}-send-{uuid.uuid4().hex}"
                 agent = self._agent_factory(name)
                 registration, source, _ = _descriptors(item.tensors, name)
                 agent.register_memory(registration)
                 registered = True
+                stage = "encoder receiver preflight"
                 agent.load_remote_agent(peer["name"], agent_desc)
                 target = MemoryDescs(
                     getattr(MemoryType, peer["memory_type"]), [tuple(d) for d in peer["descs"]]
@@ -391,24 +397,29 @@ class NixlEncoderCache:
                 with self._lock:
                     self._claims.pop(identity)
                     self._discard(item)
-                raise EncoderTransferRejected(f"invalid encoder receiver: {error}") from error
+                raise EncoderTransferRejected(f"{stage} failed before WRITE: {error}") from error
             finally:
                 with self._lock:
                     self._claims.pop(identity, None)
 
-    def _receive(self, reference, value):
-        metadata = value.get("metadata")
-        if not isinstance(metadata, dict):
-            raise ValueError("missing encoder tensor metadata")
+    @staticmethod
+    def _tensor_metadata(metadata):
+        count = _validate_handoff_metadata(metadata)
         specs = metadata.get("tensors")
         if not isinstance(specs, list) or not 0 < len(specs) <= _MAX_TENSORS:
             raise ValueError("invalid encoder tensor count")
+        if type(metadata.get("has_mrope")) is not bool or len(specs) != count + (
+            2 if metadata["has_mrope"] else 0
+        ):
+            raise ValueError("invalid encoder embedding layout")
         shapes = []
         total = 0
         for spec in specs:
             if not isinstance(spec, dict):
                 raise ValueError("invalid encoder tensor specification")
-            shape, dtype = spec.get("shape"), _DTYPES.get(spec.get("dtype"))
+            dtype_name = spec.get("dtype")
+            shape = spec.get("shape")
+            dtype = _DTYPES.get(dtype_name) if isinstance(dtype_name, str) else None
             if (
                 dtype is None
                 or not isinstance(shape, list)
@@ -416,16 +427,20 @@ class NixlEncoderCache:
                 or any(type(n) is not int or n <= 0 for n in shape)
             ):
                 raise ValueError("invalid encoder tensor shape or dtype")
-            total += math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+            total += math.prod(shape) * dtype.itemsize
             shapes.append((shape, dtype))
+        if total > _MAX_TENSOR_BYTES:
+            raise ValueError("encoder receive exceeds the memory limit")
+        return shapes, total
+
+    def _receive(self, reference, value):
+        shapes, total = self._tensor_metadata(value.get("metadata"))
         with self._lock:
             self._healthy()
-            if total > _MAX_TENSOR_BYTES:
-                raise ValueError("encoder receive exceeds the memory limit")
             if self._used + total > _MAX_CACHE_BYTES:
-                raise RuntimeError("encoder receive cache is full")
+                raise EncoderCapacityError("encoder receive cache is full")
             if self._receive_slots >= _MAX_RECEIVE_SLOTS:
-                raise RuntimeError(
+                raise EncoderCapacityError(
                     "encoder receive slots exhausted; restart if transfers are quarantined"
                 )
             self._used += total
@@ -459,14 +474,12 @@ class NixlEncoderCache:
                 }
             )
             if self._request_transfer is None:
-                raise RuntimeError("native encoder transfer transport is not configured")
+                raise EncoderUnavailableError("native encoder transfer transport is not configured")
             attempted = True
             self._request_transfer(value["endpoint"], reference, destination, _TIMEOUT_SECONDS + 10)
         except Exception as error:
             rejected = isinstance(error, EncoderTransferRejected)
             uncertain = (attempted and not rejected) or (registration_attempted and not registered)
-            if rejected:
-                raise
             raise
         finally:
             if uncertain:
@@ -496,17 +509,13 @@ class NixlEncoderCache:
     ):
         params = _encoder_input_params(disaggregated_params)
         value = self._reference(reference)
-        metadata = value.get("metadata", {})
+        metadata = value["metadata"]
         if metadata.get("input_digest") != _input_digest(request):
             raise ValueError("encoder handoff does not match the request inputs")
         if metadata.get("model_digest") != self._model_digest(llm):
             raise ValueError("encoder handoff belongs to another model revision or configuration")
         embedding_metadata = metadata.get("embedding_metadata")
-        count = len(embedding_metadata) if isinstance(embedding_metadata, list) else 0
-        if not count or len(metadata.get("tensors", [])) != count + (
-            2 if metadata.get("has_mrope") else 0
-        ):
-            raise ValueError("invalid encoder embedding layout")
+        count = len(embedding_metadata)
         # Reject lossy decoding before consuming the single-use handoff.
         prompt = request.prompt_text(llm.tokenizer)
         with self._operation():
