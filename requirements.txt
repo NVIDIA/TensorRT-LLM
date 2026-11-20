@@ -22,7 +22,6 @@ openai
 polygraphy
 psutil
 nvidia-ml-py>=13
-pulp
 pandas
 h5py==3.12.1
 StrEnum
