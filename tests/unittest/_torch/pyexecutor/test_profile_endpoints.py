@@ -448,10 +448,11 @@ def test_profile_step_collects_with_source_and_logging_gates(
     executor.dist = SimpleNamespace(rank=rank, pp_size=1)
     executor.model_engine = SimpleNamespace(model=None, iter_states="decode")
     executor.print_log = True
+    executor.enable_attention_dp = False
     executor.enable_iter_perf_stats = stats_enabled
     executor.is_warmup = False
     executor.num_scheduled_requests = 0
-    executor.num_fetch_requests_cur_rank = 2
+    executor.num_fetch_requests_cur_rank = 0
     executor.num_fetch_requests = 2
     executor.active_requests = []
     executor.num_dummy_requests = 0
@@ -487,9 +488,11 @@ def test_profile_step_collects_with_source_and_logging_gates(
     if stats_enabled:
         import json
 
-        from tensorrt_llm.executor.base_worker import BaseWorker
+        from prometheus_client import CollectorRegistry
 
-        executor.enable_attention_dp = False
+        from tensorrt_llm.executor.base_worker import BaseWorker
+        from tensorrt_llm.metrics.collector import MetricsCollector
+
         executor.disable_overlap_scheduler = True
         executor._latest_kv_iter_stats = None
         executor.stats = []
@@ -501,5 +504,14 @@ def test_profile_step_collects_with_source_and_logging_gates(
         wire = json.loads(BaseWorker._stats_serializer(executor.stats[0]))
         assert wire["executorLoop"]["per_iter"]["iter"] == 1
         assert wire["iter"] == 0
+        registry = CollectorRegistry()
+        labels = {"model_name": "test"}
+        MetricsCollector(labels, registry=registry).log_iteration_stats(wire)
+        assert (
+            registry.get_sample_value(
+                "trtllm_loop_requests_fetched_total", {**labels, "global_rank": "0"}
+            )
+            == 2
+        )
     assert reader.call_count == int(rank == 0 and not stats_enabled)
     assert any("iter = " in message for message in messages) == (rank == 0)

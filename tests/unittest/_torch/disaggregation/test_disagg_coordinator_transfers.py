@@ -16,7 +16,10 @@ from coordinator_harness import CoordinatorHarness as _Harness
 from coordinator_harness import TransferRequest as _Request
 from fake_dist import FakeDistGroup
 
-from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
+    CtxTransferStatus,
+    GenTransferStatus,
+)
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -710,6 +713,27 @@ def test_generation_error_consensus_fails_only_when_some_rank_needs_it(inflight_
     assert h.effects.failed == [
         ("Error in kv cache transfer for generation requests", [error_req], False)
     ]
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected"), [("timeout", (0, 0, 1)), ("error", (0, 1, 0)), ("cancel", (0, 0, 0))]
+)
+def test_receive_outcome_preserves_backend_failure_after_abort(cause, expected) -> None:
+    h = _Harness()
+    req = _receiving(h, 1, started_at=0.0)
+    h.coordinator._started_gen_receives[1] = req
+    h.registry.canceled = [1]
+    req.kv_cache_transfer_timed_out = cause == "timeout"
+    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+    status = GenTransferStatus(
+        [], [1] if cause == "error" else [], [req] if cause == "cancel" else []
+    )
+    h.transceiver.check_gen_transfer_status = Mock(return_value=status)
+
+    h.coordinator.reap_gen_receives()
+    h.coordinator.reap_gen_receives()
+
+    assert h.coordinator.transfer_outcomes == expected
 
 
 # -- settling cancellations and hangs ----------------------------------------

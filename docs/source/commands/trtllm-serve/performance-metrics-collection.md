@@ -75,7 +75,8 @@ Set request histogram buckets in seconds through `prometheus_metrics_config`.
   error, and timeout once per transfer on each reporting rank. CTX sends and GEN
   receives count their own endpoints. User cancellation alone is excluded.
   `trtllm_kv_cache_transfer_duration_seconds` and `trtllm_kv_cache_transfer_bytes_total`
-  use completed generation-side request observations.
+  use completed generation-side request observations. Bytes cover the receiving
+  rank that reports the request.
 - **Tier capacity and movement.** `trtllm_kv_cache_tier_{blocks,bytes}` reports
   free, evictable, and unavailable capacity per level and pool group. The exported
   unavailable remainder includes retained cold copies that can be reclaimed.

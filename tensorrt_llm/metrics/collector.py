@@ -458,7 +458,7 @@ class PrometheusExposure:
         self.kv_cache_transfer_bytes = Counter(
             name=self.metric_prefix + "kv_cache_transfer_bytes_total",
             documentation=
-            "KV bytes reported by completed-request performance metrics",
+            "KV bytes received by the generation rank that reports the request",
             labelnames=self.labels.keys())
 
         self._loop_gauges = {

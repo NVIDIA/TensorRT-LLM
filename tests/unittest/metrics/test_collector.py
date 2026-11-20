@@ -199,11 +199,16 @@ class TestKVCacheStats:
 
 
 class TestRequestTransferMetrics:
-    def test_transfer_perf_metrics_count_once_across_candidates(self, collector, scrape):
+    @pytest.mark.parametrize("request_type", ["generation_only", "context_only"])
+    def test_transfer_perf_metrics_count_once_across_candidates(
+        self, collector, scrape, request_type
+    ):
+        from tensorrt_llm.disaggregated_params import DisaggregatedParams
         from tensorrt_llm.executor.result import GenerationResultBase
         from tensorrt_llm.sampling_params import SamplingParams
 
         result = GenerationResultBase(id=1, sampling_params=SamplingParams())
+        result._disaggregated_params = DisaggregatedParams(request_type=request_type)
         result.prompt_token_ids = [1, 2]
         output = SimpleNamespace(
             finish_reason="end_id",
@@ -223,6 +228,10 @@ class TestRequestTransferMetrics:
             result.record_stats(output, stats, sequence_index)
         for candidate in result.candidate_metrics:
             collector.log_request_metrics_dict(candidate)
+        if request_type == "context_only":
+            assert not scrape("kv_cache_transfer_duration_seconds_count")
+            assert not scrape("kv_cache_transfer_bytes_total")
+            return
         assert _get_counter_value(collector, "kv_cache_transfer_bytes") == 1024
         assert _get_histogram_count(collector, "histogram_kv_cache_transfer_duration") == 1
         assert _get_histogram_sum(

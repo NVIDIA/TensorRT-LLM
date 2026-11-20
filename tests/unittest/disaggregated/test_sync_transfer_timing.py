@@ -67,9 +67,14 @@ def _make_transceiver(**overrides: Any) -> "KvCacheTransceiverV2":
 
 
 class TestSyncTransferTiming:
-    @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
-    def test_merges_correctly_two_ranks(self) -> None:
-        """Two simulated ranks — verify min(start), max(end), sum(size)."""
+    @pytest.mark.parametrize("csv_enabled", [False, True])
+    def test_two_rank_summary_preserves_reported_shard_bytes(
+        self, monkeypatch, csv_enabled
+    ) -> None:
+        if csv_enabled:
+            monkeypatch.setenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "/tmp/test")
+        else:
+            monkeypatch.delenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", raising=False)
         req = _FakeRequest(rid=1, start=10, end=20, kv_size=100)
 
         def fake_allgather(local_data):
@@ -78,11 +83,12 @@ class TestSyncTransferTiming:
             return [local_data, rank1_data]
 
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=fake_allgather)
-        tc._sync_transfer_timing([req])
+        sizes = tc._sync_transfer_timing([req])
 
-        assert req._start == 5  # min(10, 5)
-        assert req._end == 25  # max(20, 25)
-        assert req._kv_cache_size == 300  # 100 + 200
+        assert req._start == (5 if csv_enabled else 10)
+        assert req._end == (25 if csv_enabled else 20)
+        assert req.kv_cache_size == 100
+        assert sizes == {1: 300 if csv_enabled else 100}
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
     def test_multiple_requests_batched(self) -> None:
@@ -98,15 +104,16 @@ class TestSyncTransferTiming:
             return [local_data, rank1_data]
 
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=fake_allgather)
-        tc._sync_transfer_timing([req_a, req_b])
+        sizes = tc._sync_transfer_timing([req_a, req_b])
 
         assert req_a._start == 8
         assert req_a._end == 22
-        assert req_a._kv_cache_size == 250
+        assert req_a.kv_cache_size == 100
 
         assert req_b._start == 28
         assert req_b._end == 45
-        assert req_b._kv_cache_size == 450
+        assert req_b.kv_cache_size == 200
+        assert sizes == {1: 250, 2: 450}
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
     def test_all_ranks_updated(self) -> None:
@@ -117,12 +124,12 @@ class TestSyncTransferTiming:
             return [local_data, {1: (5, 25, 200)}]
 
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=fake_allgather)
-        tc._sync_transfer_timing([req])
+        sizes = tc._sync_transfer_timing([req])
 
-        # All fields should reflect the merged values
         assert req._start == 5
         assert req._end == 25
-        assert req._kv_cache_size == 300
+        assert req.kv_cache_size == 100
+        assert sizes == {1: 300}
 
     @patch.dict("os.environ", {}, clear=False)
     def test_skips_when_no_env(self) -> None:

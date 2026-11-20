@@ -2121,4 +2121,26 @@ TEST(KvCacheManagerV2StatsTest, HostDropIsRecordedForAttentionAndSsmLifeCycles)
     EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
+TEST(KvCacheManagerV2StatsTest, GpuOnlyCacheDoesNotCountHostDrops)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto config = makeHybridTieredConfig();
+    config.cacheTiers.pop_back();
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto [first, second] = evictFirstSequence(*manager, stream, 0);
+
+    auto const dropped = manager->getAndResetIterationStats();
+    ASSERT_FALSE(dropped.empty());
+    for (auto const& [lifeCycle, stats] : dropped)
+    {
+        EXPECT_EQ(stats.iterHostDroppedBlocks, 0) << "life cycle " << lifeCycle.value();
+        EXPECT_EQ(stats.iterHostDroppedBytes, 0) << "life cycle " << lifeCycle.value();
+    }
+    second->close();
+    first->close();
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
 } // namespace

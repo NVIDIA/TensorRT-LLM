@@ -970,7 +970,11 @@ class PyExecutorProfileManager:
                         "numScheduledRequests": executor.num_scheduled_requests,
                         "adpDummyCtxTokens": executor._iter_adp_dummy_ctx_tokens,
                         "adpDummyGenTokens": executor._iter_adp_dummy_gen_tokens,
-                        "numFetchedRequestsTotal": executor.num_fetch_requests_cur_rank,
+                        "numFetchedRequestsTotal": (
+                            executor.num_fetch_requests_cur_rank
+                            if executor.enable_attention_dp
+                            else executor.num_fetch_requests
+                        ),
                         "numFetchedRequestsAllRanks": executor.num_fetch_requests,
                         "hostStepTimeMS": host_step_time,
                         "prevDeviceStepTimeMS": prev_device_step_time,
