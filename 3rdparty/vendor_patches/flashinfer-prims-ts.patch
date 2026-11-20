@@ -1,5 +1,5 @@
 diff --git a/_compile_cache.py b/_compile_cache.py
-index c4ea76cb15fd78ab88627718fb2c3a69c3cff760..6b56ecf171fc2f4122c01b3638a5ebc849cbfc9e 100644
+index c4ea76cb15fd78ab88627718fb2c3a69c3cff760..94cdf7bebebe6230f5dc856b46562168c0765372 100644
 --- a/_compile_cache.py
 +++ b/_compile_cache.py
 @@ -1,3 +1,4 @@
@@ -7,15 +7,20 @@ index c4ea76cb15fd78ab88627718fb2c3a69c3cff760..6b56ecf171fc2f4122c01b3638a5ebc8
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -127,7 +128,7 @@ def build_and_load_attention_kernel(
+@@ -127,10 +128,9 @@ def build_and_load_attention_kernel(
      extra: tuple = (),
  ) -> Any:
      """Build or load under the caller's selected CUDA device context."""
 -    from ...jit.cute_dsl_core import (
-+    from flashinfer.jit.cute_dsl_core import (
-         build_and_load_cute_dsl_kernel,
-         cute_dsl_cache_disabled,
-     )
+-        build_and_load_cute_dsl_kernel,
+-        cute_dsl_cache_disabled,
+-    )
++    from flashinfer.jit.cute_dsl_core import cute_dsl_cache_disabled
++
++    from .._cute_dsl_compat import build_and_load_cute_dsl_kernel
+ 
+     if cute_dsl_cache_disabled():
+         return compile_fn()
 diff --git a/block_sparse.py b/block_sparse.py
 index 4769d6b6a8c6009b22abf1850fb7f2df68216f8e..5ac63fcca05d8668e4367d0843c4c6d53e46175d 100644
 --- a/block_sparse.py

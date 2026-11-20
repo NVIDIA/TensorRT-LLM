@@ -10,15 +10,18 @@ from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Any
 
-_VENDOR = "tensorrt_llm._torch.attention.backends.prims_ts"
+_BACKENDS = "tensorrt_llm._torch.attention.backends"
+_VENDOR = f"{_BACKENDS}.prims_ts"
 
 
 class _VendorPackages:
-    """Resolve just the vendored package under its canonical kernel-cache name."""
+    """Resolve PrimTS and its JIT helper without running TensorRT-LLM initialization."""
 
     def find_spec(self, fullname: str, path=None, target=None) -> ModuleSpec | None:
         if fullname == _VENDOR:
             locations = [str(Path(__file__).resolve().parents[1] / "prims_ts")]
+        elif fullname == _BACKENDS:
+            locations = [str(Path(__file__).resolve().parents[1])]
         elif _VENDOR.startswith(fullname + "."):
             # Empty namespace parents bypass TensorRT-LLM's MPI initialization.
             locations = []
