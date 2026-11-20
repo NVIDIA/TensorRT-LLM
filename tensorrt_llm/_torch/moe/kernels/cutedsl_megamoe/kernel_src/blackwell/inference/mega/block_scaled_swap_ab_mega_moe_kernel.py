@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Fused pull-dispatch MegaMoE kernel composition for Blackwell."""
 
 import hashlib
@@ -60,6 +63,19 @@ def _internode_component():
 # One-round push dispatch: EP width from which it pays (EP8 measured slower) and the largest bucket.
 _ONE_ROUND_MIN_WORLD_SIZE = 16
 _ONE_ROUND_MAX_TOKENS_PER_RANK = 256
+
+
+def one_round_dispatch_enabled(
+    world_size: int, max_tokens_per_rank: int, fc1_activation_per_token_scale: bool, apply_topk_at_fc1: bool
+) -> bool:
+    """Whether a kernel of this problem dispatches in one push round (``_OneRoundRouter``): the predicate the
+    kernel builds with, for callers that choose a path by it (an adaptive route needs the one-round router)."""
+    return (
+        _ONE_ROUND_MIN_WORLD_SIZE <= world_size <= _OneRoundRouter.max_world_size
+        and max_tokens_per_rank <= _ONE_ROUND_MAX_TOKENS_PER_RANK
+        and not fc1_activation_per_token_scale
+        and apply_topk_at_fc1
+    )
 
 _aot_symbol_prefix = "blackwell_mega_moe_aot"
 
@@ -140,6 +156,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "reduce_topk_in_kernel": bool,
             "skip_topk_reduce": OptionalRequirement(bool),
             "helper_expert_count": OptionalRequirement(int),
+            # > 0: the router maps this many experts' staged ids to slots and counts them (adaptive load balancer).
+            "adaptive_route_experts": OptionalRequirement(int),
             "total_helper_slots": OptionalRequirement(int),
             # Master switch of the internode code paths (False: main's NVLink-domain kernel), the
             # component selection it implies ("nvlink" / "internode_gin") and the internode
@@ -196,12 +214,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         # the same bytes. At EP8 the pushes cost more than the round trips they save. Its router does not carry
         # per-token activation scales. It is measured on the DeepSeek-V4 MoE only, the one that applies the top-k
         # weights at FC1.
-        self.one_round_dispatch = (
-            _ONE_ROUND_MIN_WORLD_SIZE <= self.world_size <= _OneRoundRouter.max_world_size
-            and self.max_tokens_per_rank <= _ONE_ROUND_MAX_TOKENS_PER_RANK
-            and not self.fc1_activation_per_token_scale
-            and self.apply_topk_at_fc1
+        self.one_round_dispatch = one_round_dispatch_enabled(
+            self.world_size,
+            self.max_tokens_per_rank,
+            self.fc1_activation_per_token_scale,
+            self.apply_topk_at_fc1,
         )
+        self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
         # The sorter waits on one counter per (source rank, source CTA), one thread each (512 per CTA).
         self.one_round_cta_count = max(1, min(32, 512 // max(self.world_size, 1)))
 
@@ -755,6 +774,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{'_weightevictfirst' if self._mainloop.weight_evict_first else ''}"
             f"{self._shared_name_suffix()}"
             f"{f'_oneround{self.one_round_cta_count}' if self.one_round_dispatch else ''}"
+            f"{f'_aroute{self.adaptive_route_experts}' if self.adaptive_route_experts else ''}"
             f"{'_tailpar' if self.token_comm.tail_parity else ''}"
             # Empty for the NVLink-domain component: the internode=False kernel keeps main's name.
             + (f"_{self.token_comm.name_token}" if self.token_comm.name_token else "")
@@ -844,6 +864,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     assumed_align=8,
                 ),
                 hot_expert_weight_ready_generation=cutlass.Uint64(1),
+            )
+        if self.adaptive_route_experts:
+            fake_arguments.update(
+                {
+                    f"adaptive_route_{name}": Int64(0)
+                    for name in ("tables", "rows", "forwards", "enabled", "live_word")
+                },
+                adaptive_route_num_tokens=Int32(0),
+                adaptive_route_first=Int32(1),
             )
         if self.topk_reduce_persistent:
             # The persistent reduce reads its token count from device memory, so
@@ -967,6 +996,16 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
         # Caller-owned int32[1] live-token count for persistent finalization.
         num_valid_tokens: Optional[cute.Tensor] = None,
+        # Adaptive route (iff adaptive_route_experts > 0; _OneRoundRouter.launch_router): device addresses of the
+        # layer's packed route table row, statistics row, forward count, recording flag and live-row word, then
+        # the forward's token rows and whether this is its first call.
+        adaptive_route_tables: Optional[Int64] = None,
+        adaptive_route_rows: Optional[Int64] = None,
+        adaptive_route_forwards: Optional[Int64] = None,
+        adaptive_route_enabled: Optional[Int64] = None,
+        adaptive_route_live_word: Optional[Int64] = None,
+        adaptive_route_num_tokens: Optional[Int32] = None,
+        adaptive_route_first: Optional[Int32] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
         # One constexpr bool: the DSL preprocessor only treats a plain ``const_expr(...)`` test as
@@ -1083,6 +1122,22 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             router_activation,
             router_activation_sf,
             fc1_activation_per_token_scale,
+            # Only an adaptive-route kernel passes the argument: every other router keeps its signature.
+            **(
+                dict(
+                    adaptive_route=(
+                        adaptive_route_tables,
+                        adaptive_route_rows,
+                        adaptive_route_forwards,
+                        adaptive_route_enabled,
+                        adaptive_route_live_word,
+                        adaptive_route_num_tokens,
+                        adaptive_route_first,
+                    )
+                )
+                if self.adaptive_route_experts > 0
+                else {}
+            ),
         )
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
