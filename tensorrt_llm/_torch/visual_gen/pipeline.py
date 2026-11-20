@@ -43,6 +43,7 @@ from tensorrt_llm.visual_gen.params import MediaRole
 from .cache import CacheDiTAccelerator, SeaCacheAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import (
+    BlockCUDAGraphRunner,
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
     SharedGraphPool,
@@ -122,6 +123,10 @@ class BasePipeline(nn.Module):
     supports_image_edit: bool = False
     # Opt in only after implementing per-request noise and batched media output.
     supports_dynamic_batching: bool = False
+    # With Cache-DiT + CUDA graphs, capture each transformer block as its own graph. Opt in
+    # only when the warmup shapes give every block graph key of a request (e.g. text padded
+    # to a fixed length): block graphs are not captured after warmup.
+    supports_blockwise_cuda_graphs: bool = False
 
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
@@ -182,9 +187,14 @@ class BasePipeline(nn.Module):
             anchor_fn = getattr(self, "_nccl_window_tensor_scope_anchor", None)
             anchor = anchor_fn() if anchor_fn is not None else None
             if anchor is None:
-                return self.infer(req)
-            with nccl_window_tensor_scope(anchor) as scope:
-                return scope.escape(self.infer(req))
+                output = self.infer(req)
+            else:
+                with nccl_window_tensor_scope(anchor) as scope:
+                    output = scope.escape(self.infer(req))
+        if not self._is_warmup:
+            # Without a warmup, block graphs are captured during the first request only.
+            self._stop_block_graph_capture()
+        return output
 
     def _profile_denoise_steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
         """Enumerate a denoise loop's steps within its profiling windows.
@@ -241,8 +251,7 @@ class BasePipeline(nn.Module):
         contains the optimized compiled kernels. (The ``LTX2Pipeline`` override
         relies on the same ordering.)
 
-        With Cache-DiT, the blocks are captured individually instead; see
-        ``_setup_blockwise_cuda_graphs``.
+        With Cache-DiT, blocks are captured individually (_setup_blockwise_cuda_graphs).
         """
         if not self.pipeline_config.cuda_graph.enable:
             return
@@ -254,11 +263,7 @@ class BasePipeline(nn.Module):
             )
 
         if self._uses_blockwise_cuda_graphs():
-            # Cache-DiT decides inside transformer.forward which blocks run, so a
-            # whole-forward graph would freeze one decision. The blocks are
-            # captured one graph per block once they are compiled; see
-            # _setup_blockwise_cuda_graphs, called from _setup_cache_acceleration.
-            return
+            return  # Cache-DiT: blocks are captured one by one in _setup_cache_acceleration
 
         if len(self.transformer_components) > 1:
             logger.info(
@@ -284,21 +289,27 @@ class BasePipeline(nn.Module):
             self._cuda_graph_runners[name] = runner
 
     def _uses_blockwise_cuda_graphs(self) -> bool:
-        """True when CUDA graphs must be captured per block instead of per forward.
-
-        Cache-DiT decides inside ``transformer.forward`` whether each block runs.
-        Per-block graphs keep that decision in Python between graph replays.
-        """
+        """Cache-DiT picks the blocks inside ``forward``, so graphs must be per block."""
         cfg = self.pipeline_config
-        return bool(cfg.cuda_graph.enable) and cfg.cache_backend == "cache_dit"
+        return (
+            self.supports_blockwise_cuda_graphs
+            and bool(cfg.cuda_graph.enable)
+            and cfg.cache_backend == "cache_dit"
+        )
+
+    def _stop_block_graph_capture(self) -> None:
+        """Run block graph keys first seen from now on eagerly.
+
+        Warmup decides the captured shapes, as batch sizes do for LLM CUDA graphs: a shape
+        it did not cover runs without graphs instead of adding graphs and input buffers to
+        every block for the rest of the process.
+        """
+        for runner in getattr(self, "_cuda_graph_runners", {}).values():
+            if isinstance(runner, BlockCUDAGraphRunner):
+                runner.allow_capture = False
 
     def _setup_blockwise_cuda_graphs(self) -> None:
-        """Capture each transformer block as its own CUDA graph.
-
-        Runs after ``torch_compile()`` has replaced the block lists, so blocks
-        are compiled before they are captured, and before Cache-DiT is enabled.
-        All block graphs share one memory pool: blocks run one after another.
-        """
+        """Capture each block as its own graph (after torch.compile, before Cache-DiT)."""
         if self.offloader.stages():
             raise NotImplementedError(
                 "CUDA graphs are not supported with visual generation offloading yet. "
@@ -1071,6 +1082,7 @@ class BasePipeline(nn.Module):
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
         )
+        self._stop_block_graph_capture()
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
 

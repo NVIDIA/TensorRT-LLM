@@ -55,6 +55,9 @@ class FluxPipeline(BasePipeline):
     Supports FLUX.1-dev (50 steps, guidance) and FLUX.1-schnell (4 steps, no guidance).
     """
 
+    # Text is padded to max_sequence_length, so a warmup shape covers all block graph keys.
+    supports_blockwise_cuda_graphs = True
+
     @property
     def supports_dynamic_batching(self) -> bool:
         if self.scheduler.config.get("stochastic_sampling", False):
