@@ -25,12 +25,6 @@ AttentionContextWorkspaceSizes AttentionWorkspaceManager::buildUnfusedContextSiz
     AttentionUnfusedContextWorkspaceParams const& params) noexcept
 {
     AttentionContextWorkspaceSizes sizes{};
-    if (params.packedTokenCount == 0)
-    {
-        sizes.cublasWorkspace = 0;
-        return sizes;
-    }
-
     auto const paddedQueryTokens = params.batchSize * params.querySequenceLength;
     auto const paddedKvTokens = params.batchSize * params.kvSequenceLength;
     auto const queryHiddenUnits = params.numAttnHeads * params.headSize;

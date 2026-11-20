@@ -114,20 +114,6 @@ TEST(AttentionWorkspaceManagerTest, RaggedUnfusedCrossAttentionUsesPaddedTokenCo
     EXPECT_EQ(getUnfusedContextWorkspace(true), expectedUnfusedContextWorkspace(true));
 }
 
-TEST(AttentionWorkspaceManagerTest, EmptyUnfusedContextNeedsNoWorkspace)
-{
-    auto const sizes = tcop::AttentionWorkspaceManager::buildUnfusedContextSizes({.elementSize = sizeof(half),
-        .batchSize = kBatchSize,
-        .querySequenceLength = kInputSequenceLength,
-        .kvSequenceLength = kCrossKvLength,
-        .packedTokenCount = 0,
-        .numHeads = 1,
-        .numAttnHeads = 1,
-        .numAttnKvHeads = 1,
-        .headSize = kHeadSize});
-    EXPECT_EQ(tcop::AttentionWorkspaceManager::buildContextLayout(sizes).totalSize, 0);
-}
-
 TEST(AttentionWorkspaceManagerTest, UnfusedGroupedQuerySizesDistinguishQueryAndKvHeads)
 {
     tcop::AttentionUnfusedContextWorkspaceParams params{.elementSize = sizeof(half),
