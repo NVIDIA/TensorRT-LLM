@@ -98,7 +98,9 @@ def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> 
     # even when the application script imports TensorRT-LLM at module scope.
     script = Path(__file__).with_name("_prims_ts_worker.py")
     timeout = float(os.environ.get("TLLM_PRIMTS_WARM_TIMEOUT", "1800"))
-    request = json.dumps({"sys_path": sys.path, "payloads": list(payloads)}).encode()
+    request = json.dumps(
+        {"parent_pid": os.getpid(), "sys_path": sys.path, "payloads": list(payloads)}
+    ).encode()
     with subprocess.Popen(  # nosec B603 - fixed interpreter and script, no shell
         [sys.executable, str(script), str(workers)],
         env=env,

@@ -4,7 +4,11 @@
 
 import json
 import multiprocessing
+import os
+import signal
 import sys
+import threading
+import time
 from concurrent.futures import ProcessPoolExecutor
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -47,13 +51,25 @@ def _plan(payload: dict[str, Any]) -> None:
 
     kwargs = payload["plan_kwargs"]
     kwargs["q_dtype"] = getattr(torch, kwargs["q_dtype"])
-    mla_decode.BatchSparseMLADecodePagedTSWrapper().plan(
-        device, payload["rows"], payload["heads"], **kwargs
-    )
+    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(device, payload["rows"], payload["heads"], **kwargs)
+    if not wrapper.is_kernel_cached():
+        raise RuntimeError(f"PrimTS worker did not persist its kernel for {payload!r}")
+
+
+def _watch_rank(parent_pid: int) -> None:
+    # The supervisor leads its own session. Its pool must also exit if the
+    # serving rank dies before its timeout/exception cleanup can run.
+    while os.getppid() == parent_pid:
+        time.sleep(1)
+    os.killpg(os.getpid(), signal.SIGKILL)
 
 
 if __name__ == "__main__":
     request = json.load(sys.stdin)
+    if os.getpgrp() != os.getpid():
+        raise RuntimeError("PrimTS precompile supervisor requires a dedicated process group")
+    threading.Thread(target=_watch_rank, args=(request["parent_pid"],), daemon=True).start()
     with ProcessPoolExecutor(
         max_workers=int(sys.argv[1]),
         mp_context=multiprocessing.get_context("spawn"),

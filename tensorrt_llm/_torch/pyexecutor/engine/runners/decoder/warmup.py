@@ -1082,7 +1082,9 @@ class DecoderWarmup:
                 kv_cache_manager,
                 get_draft_kv_cache_manager(self._config.spec_config, resource_manager),
             )
-            warmup_prims_ts_sparse_mla(self.model, metadata)
+            warmup_prims_ts_sparse_mla(
+                self.model, metadata, max_total_draft_tokens=self._config.max_total_draft_tokens
+            )
         torch.cuda.synchronize()
         # Compilation is local; align peers before the first collective-bearing forward.
         if self.dist is not None:
