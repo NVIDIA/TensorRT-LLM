@@ -193,17 +193,19 @@ defines its compressed format and implements the relevant APIs below.
 | `build_lifecycle_metadata()` | Define and validate the cold-page layout |
 | `encode_cold_pages()` | Encode a batch of KV Pages into the cold-page representation |
 | `decode_cold_pages()` | Decode a batch of cold Pages back into the hot KV representation |
-| `cold_page_codec_settings()` | What decides the encoded bytes, digested into `cold_page_codec_identity()` for stores outside KVCM; the default is every config field |
+| `cold_page_format_version` | Version of the encoded page format, required with a cold-page codec; raise it whenever the same settings start producing different bytes |
+| `cold_page_codec_settings()` | What decides the encoded bytes, digested with the format version into `cold_page_codec_identity()` for stores outside KVCM; the default is every config field |
 
 The codec KVCM retains also serves KV connectors that store pages outside it.
 KVCM exposes it through `encode_cold_pages` and `decode_cold_pages` on its native
 handle, and `build_kv_cache_layout_v2` hands it to the connector as
-`KvCacheLayout.page_codec`; the `mooncake-store` connector then keeps its pool in
-the method's encoding. A new method therefore needs no connector change. Extend
-`cold_page_codec_settings()` when the encoding depends on anything besides the
-config fields (calibration loaded at startup, flags adjusted for the model, a
-layout version fixed in code), keeping the result the same on every rank, so
-that servers with different encodings never share a stored page.
+`KvCacheLayout.page_codec` while no Host, Disk or remote tier of KVCM runs it;
+the `mooncake-store` connector then keeps its pool in the method's encoding. A
+new method therefore needs no connector change. Set `cold_page_format_version`,
+and extend `cold_page_codec_settings()` when the encoding depends on anything
+besides the config fields (calibration loaded at startup, flags adjusted for the
+model), keeping the result the same on every rank, so that servers with
+different encodings never share a stored page.
 
 ## Ownership and failure boundaries
 

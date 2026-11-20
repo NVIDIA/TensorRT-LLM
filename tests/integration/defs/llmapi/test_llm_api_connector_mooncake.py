@@ -365,7 +365,9 @@ def test_mooncake_e2e_cross_engine_prefix_reuse_through_the_page_codec(
     finally:
         cold.shutdown()
     assert codec_calls["encode"] > 0, "The engine published no page through the codec."
-    assert not any(matched_token_counts), "The first run was not a cold start."
+    assert matched_token_counts and not any(matched_token_counts), (
+        f"The first run was not a cold start (matched counts {matched_token_counts})."
+    )
     matched_token_counts.clear()
 
     warm = LLM(**llm_kwargs(mooncake_pool))
@@ -409,7 +411,9 @@ def test_mooncake_e2e_cross_engine_prefix_reuse_with_nvfp4_cold_pages(
     finally:
         cold.shutdown()
     assert codec_calls["encode"] > 0, "The engine published no page through the cold-page codec."
-    assert not any(matched_token_counts), "The first run was not a cold start."
+    assert matched_token_counts and not any(matched_token_counts), (
+        f"The first run was not a cold start (matched counts {matched_token_counts})."
+    )
 
     replays = []
     for _ in range(2):
@@ -451,16 +455,22 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool, c
     the others never saved.
 
     The leader runs in a spawned process here, so its matched-token answers are
-    not observable. What is observable is that both ranks joined the pool and
-    that the replayed tokens agree, and a rank whose saves failed reports the
-    error on the next connector call rather than silently writing nothing.
-    With NVFP4 cold pages, each rank encodes its own shard with its own codec.
+    not observable. What is observable is that both ranks joined the pool, that
+    each replay read part of its prompt back rather than computing it (the
+    iteration statistics count those tokens), and that the replayed tokens
+    agree. A rank whose saves failed reports the error on the next connector
+    call rather than silently writing nothing. With NVFP4 cold pages, each rank
+    encodes its own shard with its own codec, and a replay only reads a prefix
+    when every rank's encoded shard is found under the name it looks for.
     """
     sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
     overrides = {"tensor_parallel_size": 2}
     if cold_pages == "nvfp4":
         overrides["kv_cache_compression_config"] = ColdPageQuantizationCompressionConfig()
     kwargs = llm_kwargs(mooncake_pool, **overrides)
+    # Keep every iteration rather than the most recent 1000, so the sum below
+    # covers the whole replay.
+    warm_kwargs = dict(kwargs, enable_iter_perf_stats=True, iter_stats_max_iterations=-1)
 
     cold = LLM(**kwargs)
     try:
@@ -478,11 +488,20 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool, c
 
     replays = []
     for _ in range(2 if cold_pages else 1):
-        warm = LLM(**kwargs)
+        warm = LLM(**warm_kwargs)
         try:
             replays.append(list(warm.generate([PROMPT], sampling_params)[0].outputs[0].token_ids))
+            stats = warm.get_stats(timeout=30)
         finally:
             warm.shutdown()
+        assert stats, "The engine returned no iteration statistics to assert on."
+        reused = sum(
+            entry.get("inflightBatchingStats", {}).get("numCtxKvTokens", 0) for entry in stats
+        )
+        assert reused > 0, (
+            "A replaying TP 2 engine computed its whole prompt, so it read nothing back "
+            "from the pool and the comparison below would hold with the connector off."
+        )
 
     if cold_pages:
         # NVFP4 is lossy, so the replay is not held to the uncompressed run's

@@ -3008,6 +3008,11 @@ class KVCacheCompressionManager(BaseResourceManager):
 
     uses_iteration_lifecycle = True
     provides_cold_page_codec = False
+    #: Version of the page format this method's cold-page codec writes. A
+    #: method that provides a codec sets it, and raises it whenever the same
+    #: settings start producing different bytes, so a store shared across
+    #: releases never decodes one format as another.
+    cold_page_format_version: Optional[int] = None
 
     def __init__(
         self,
@@ -3105,11 +3110,22 @@ class KVCacheCompressionManager(BaseResourceManager):
         `mooncake-store` connector's pool), keys its pages by this name, so
         servers whose codecs would decode a page differently never read each
         other's pages. It is the algorithm plus a digest of
-        :meth:`cold_page_codec_settings`.
+        :attr:`cold_page_format_version` and :meth:`cold_page_codec_settings`.
         """
-        payload = json.dumps(self.cold_page_codec_settings(),
-                             sort_keys=True,
-                             default=str)
+        version = self.cold_page_format_version
+        if version is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} sets no cold_page_format_version, so the "
+                "pages its codec writes cannot be named for a store outside the "
+                "cache: a later release changing the format would reuse the name."
+            )
+        payload = json.dumps(
+            {
+                "format_version": version,
+                "settings": self.cold_page_codec_settings()
+            },
+            sort_keys=True,
+            default=str)
         digest = hashlib.blake2b(payload.encode("utf-8"),
                                  digest_size=8).hexdigest()
         return f"{self.config.algorithm}-{digest}"

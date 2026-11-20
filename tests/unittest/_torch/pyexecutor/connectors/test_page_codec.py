@@ -105,6 +105,20 @@ def test_a_negative_index_is_refused_before_the_codec_sees_it():
     assert cache.calls == []
 
 
+def test_a_hot_page_past_the_slot_count_is_refused_in_both_directions():
+    """Only the hot side is bounded here; the caller owns the slots at the base."""
+    cache = FakeCache({0: 96})
+    codec = make_codec(cache, num_slots={0: 8})
+    with pytest.raises(ValueError, match="past the 8 GPU page slots"):
+        codec.encode(0, 0x1000, [0, 1], [7, 8], stream=1)
+    with pytest.raises(ValueError, match="past the 8 GPU page slots"):
+        codec.decode(0, 0x1000, [8], [0], stream=1)
+    assert cache.calls == []
+    codec.encode(0, 0x1000, [100], [7], stream=1)
+    codec.decode(0, 0x1000, [7], [100], stream=1)
+    assert [call[0] for call in cache.calls] == ["encode", "decode"]
+
+
 def test_mismatched_lists_are_refused():
     cache = FakeCache({0: 96})
     with pytest.raises(ValueError, match="destination slots"):

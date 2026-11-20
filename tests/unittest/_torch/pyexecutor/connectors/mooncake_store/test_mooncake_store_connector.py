@@ -1889,6 +1889,32 @@ def test_codec_is_closed_when_the_worker_shuts_down(store_config, fake_store):
     assert codec.closed
 
 
+def test_codec_is_closed_when_a_worker_without_a_save_thread_shuts_down(store_config, fake_store):
+    """A consumer only loads, so it has no save thread, and its decodes must stop all the same."""
+    set_pool_setting(store_config, role="consumer")
+    codec = FakeCodec({0: 24})
+    with make_worker(fake_store, layout=codec_layout(codec)) as worker:
+        assert worker._save_thread is None
+    assert codec.closed
+
+
+@pytest.mark.parametrize("compression", [None, "configured"], ids=["plain", "compressed"])
+def test_the_worker_tells_the_node_check_whether_pages_may_be_encoded(
+    store_config, fake_store, monkeypatch, compression
+):
+    """The codec's arenas count against the node's memory only when compression can supply a codec."""
+    seen = []
+    monkeypatch.setattr(
+        worker_module, "validate_node_budget", lambda _config, **kwargs: seen.append(kwargs)
+    )
+    llm_args = make_llm_args()
+    llm_args.kv_cache_compression_config = compression
+    worker = MooncakeStoreConnectorWorker(llm_args)
+    fake_store.workers.append(worker)
+    worker.shutdown()
+    assert seen == [{"may_encode_pages": compression is not None}]
+
+
 def test_node_budget_counts_codec_arenas_without_stage_through_host():
     """A cold-page codec stages through pinned arenas whatever stage_through_host says."""
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import validation

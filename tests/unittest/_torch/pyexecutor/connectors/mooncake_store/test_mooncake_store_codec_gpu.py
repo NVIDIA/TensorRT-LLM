@@ -18,12 +18,14 @@ The store is replaced by an in-process one that keeps the bytes it is handed,
 so a page saved by the worker and loaded back goes through exactly the encode,
 store and decode a real pool would see, on one GPU and without a Mooncake
 master. The reference for every comparison is the cache manager's own codec,
-called directly: the worker must reproduce it bit for bit.
+called through its native bindings with page pairs built here rather than
+through the connectors' codec handle: the worker must reproduce it bit for bit.
 """
 
 import contextlib
 import ctypes
 import json
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -239,8 +241,8 @@ def page_bytes(layout, group, page):
     return torch.cat([region.slot_tensor(page).clone() for region in group.regions])
 
 
-def reference_round_trip(layout, sources, targets):
-    """The cache's codec, called directly: encode `sources`, decode into `targets`."""
+def codec_round_trip(layout, sources, targets):
+    """Through the connectors' codec handle: encode `sources`, decode into `targets`."""
     codec = layout.page_codec
     stream = torch.cuda.current_stream().cuda_stream
     for group in layout.groups:
@@ -250,6 +252,35 @@ def reference_round_trip(layout, sources, targets):
         codec.encode(group.layer_group_id, buffer.data_ptr(), slots, sources, stream)
         codec.decode(group.layer_group_id, buffer.data_ptr(), targets, slots, stream)
     torch.cuda.synchronize()
+
+
+def reference_round_trip(manager, layout, sources, targets):
+    """The cache's codec through its native bindings: encode `sources`, decode into `targets`.
+
+    The (dst, src) page pairs are built here, so a mistake in how the codec
+    handle the worker uses builds them cannot cancel out against the reference.
+    """
+    impl = manager.impl
+    stream = torch.cuda.current_stream().cuda_stream
+    for group in layout.groups:
+        layer_group_id = group.layer_group_id
+        size = impl.cold_page_bytes(layer_group_id)
+        buffer = torch.empty(size * len(sources), dtype=torch.uint8, device="cuda")
+        encode_pairs = torch.tensor(
+            [[slot, page] for slot, page in enumerate(sources)], dtype=torch.int32
+        )
+        decode_pairs = torch.tensor(
+            [[page, slot] for slot, page in enumerate(targets)], dtype=torch.int32
+        )
+        if impl.cold_page_index_location(layer_group_id) == 1:
+            encode_pairs, decode_pairs = encode_pairs.cuda(), decode_pairs.cuda()
+        assert impl.encode_cold_pages(
+            layer_group_id, buffer.data_ptr(), encode_pairs.data_ptr(), len(sources), stream
+        )
+        assert impl.decode_cold_pages(
+            layer_group_id, buffer.data_ptr(), decode_pairs.data_ptr(), len(targets), stream
+        )
+        torch.cuda.synchronize()
 
 
 @contextlib.contextmanager
@@ -266,13 +297,14 @@ def make_worker(store, layout):
 @needs_nvfp4
 @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8], ids=["bf16", "fp8"])
 def test_pages_through_the_pool_match_the_caches_own_codec(memory_store, dtype):
-    sources, targets, references = [0, 1, 2], [5, 6, 7], [9, 10, 11]
+    # Hot pages that are not their arena slots, so a slot and a page mixed up shows.
+    sources, targets, references = [3, 1, 2], [5, 6, 7], [9, 10, 11]
     hashes = [bytes([index]) * 16 for index in range(len(sources))]
     with make_cache(dtype) as manager:
         layout = build_kv_cache_layout_v2(manager)
         assert layout.page_codec is not None, "NVFP4 gives the cache a cold-page codec"
         fill_pages(layout, sources, dtype)
-        reference_round_trip(layout, sources, references)
+        reference_round_trip(manager, layout, sources, references)
 
         with make_worker(memory_store, layout) as worker:
             worker._put(
@@ -326,7 +358,7 @@ def test_decoded_pages_stay_close_to_the_originals():
     with make_cache(DataType.BF16) as manager:
         layout = build_kv_cache_layout_v2(manager)
         fill_pages(layout, sources, DataType.BF16, seed=7)
-        reference_round_trip(layout, sources, targets)
+        codec_round_trip(layout, sources, targets)
         for group in layout.groups:
             for source, target in zip(sources, targets):
                 original = page_bytes(layout, group, source).view(torch.bfloat16).float()
@@ -351,7 +383,7 @@ def test_every_layer_group_of_a_windowed_cache_round_trips():
             group.layer_group_id for group in layout.groups
         )
         fill_pages(layout, sources, DataType.BF16, seed=11)
-        reference_round_trip(layout, sources, targets)
+        codec_round_trip(layout, sources, targets)
         for group in layout.groups:
             assert layout.page_codec.page_bytes(group.layer_group_id) < group.bytes_per_page
             for source, target in zip(sources, targets):
@@ -382,12 +414,12 @@ def test_the_forward_stream_waits_for_the_decodes_on_the_device(memory_store):
     read on the forward stream that is not ordered after the decodes sees the
     pages as they were before the load.
     """
-    sources, targets, references = [0, 1], [5, 6], [9, 10]
+    sources, targets, references = [3, 1], [5, 6], [9, 10]
     hashes = [bytes([index + 40]) * 16 for index in range(len(sources))]
     with make_cache(DataType.BF16) as manager:
         layout = build_kv_cache_layout_v2(manager)
         fill_pages(layout, sources, DataType.BF16, seed=5)
-        reference_round_trip(layout, sources, references)
+        reference_round_trip(manager, layout, sources, references)
         with make_worker(memory_store, layout) as worker:
             worker._put(
                 [
@@ -448,6 +480,97 @@ def test_the_forward_stream_waits_for_the_decodes_on_the_device(memory_store):
                 ), "the forward stream read a page before its decode finished"
 
 
+@needs_nvfp4
+def test_one_page_batches_alternate_the_arena_halves_in_both_directions(memory_store, monkeypatch):
+    """Every page is its own batch, so the arena halves take turns on save and on load.
+
+    Each encode and decode is held back on its stream. A put that read a half
+    before its encode finished would store a stale page, and a get that
+    refilled a half the decode of two batches back still reads would decode
+    the wrong one; either shows as a page differing from the reference.
+    """
+    config_path = os.environ["MOONCAKE_CONFIG_PATH"]
+    with open(config_path) as handle:
+        raw = json.load(handle)
+    raw["transfer_batch_size"] = 1
+    with open(config_path, "w") as handle:
+        json.dump(raw, handle)
+
+    store_calls = {"put": 0, "get": 0}
+    put, get = memory_store.batch_put_from_multi_buffers, memory_store.batch_get_into_multi_buffers
+
+    def counted_put(*args, **kwargs):
+        store_calls["put"] += 1
+        return put(*args, **kwargs)
+
+    def counted_get(*args, **kwargs):
+        store_calls["get"] += 1
+        return get(*args, **kwargs)
+
+    monkeypatch.setattr(memory_store, "batch_put_from_multi_buffers", counted_put)
+    monkeypatch.setattr(memory_store, "batch_get_into_multi_buffers", counted_get)
+
+    sources, targets, references = [3, 1, 2, 7], [20, 21, 22, 23], [40, 41, 42, 43]
+    hashes = [bytes([index + 80]) * 16 for index in range(len(sources))]
+    with make_cache(DataType.BF16) as manager:
+        layout = build_kv_cache_layout_v2(manager)
+        fill_pages(layout, sources, DataType.BF16, seed=13)
+        reference_round_trip(manager, layout, sources, references)
+
+        codec = layout.page_codec
+
+        def held_back(call):
+            def run(layer_group_id, base, first, second, stream):
+                with torch.cuda.stream(torch.cuda.ExternalStream(stream)):
+                    torch.cuda._sleep(50_000_000)
+                return call(layer_group_id, base, first, second, stream)
+
+            return run
+
+        monkeypatch.setattr(codec, "encode", held_back(codec.encode))
+        monkeypatch.setattr(codec, "decode", held_back(codec.decode))
+
+        with make_worker(memory_store, layout) as worker:
+            worker._put(
+                [
+                    RequestTransfers(
+                        1,
+                        [
+                            PageTransfer(block_hash, group.layer_group_id, page)
+                            for block_hash, page in zip(hashes, sources)
+                            for group in layout.groups
+                        ],
+                    )
+                ]
+            )
+            assert store_calls["put"] == len(sources) * len(layout.groups)
+            worker.bind_connector_meta(
+                SimpleNamespace(
+                    loads=[
+                        RequestTransfers(
+                            2,
+                            [
+                                PageTransfer(block_hash, group.layer_group_id, page)
+                                for block_hash, page in zip(hashes, targets)
+                                for group in layout.groups
+                            ],
+                        )
+                    ],
+                    saves=[],
+                )
+            )
+            worker.bind_allocation_fence(lambda _request_ids: None)
+            worker.start_load_kv(torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            assert store_calls["get"] == len(targets) * len(layout.groups)
+
+        for group in layout.groups:
+            for target, reference in zip(targets, references):
+                assert torch.equal(
+                    page_bytes(layout, group, target), page_bytes(layout, group, reference)
+                ), f"page {target} decoded differently from the reference"
+
+
 def test_a_cache_without_compression_offers_no_codec():
     with make_cache(DataType.BF16, compression=False) as manager:
         assert manager.cold_page_codec_identity is None
@@ -488,6 +611,22 @@ def test_the_lossless_default_codec_round_trips_bit_exactly():
         assert not impl.encode_cold_pages(99, 0, 0, 0, stream)
 
 
+def allowed_numa_nodes():
+    """The NUMA nodes this process's cpuset lets it allocate on, or None when unknown."""
+    try:
+        with open("/proc/self/status") as handle:
+            for line in handle:
+                if line.startswith("Mems_allowed_list:"):
+                    nodes = set()
+                    for part in line.split(":", 1)[1].strip().split(","):
+                        low, _, high = part.partition("-")
+                        nodes.update(range(int(low), int(high or low) + 1))
+                    return nodes
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def test_staging_memory_sits_on_the_gpus_numa_node():
     """Staging through the far socket costs every encode and decode the socket link."""
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.codec_staging import (
@@ -499,6 +638,9 @@ def test_staging_memory_sits_on_the_gpus_numa_node():
     expected = gpu_host_numa_node(torch.cuda.current_device())
     if expected is None:
         pytest.skip("the driver reports no host NUMA node for this GPU")
+    allowed = allowed_numa_nodes()
+    if allowed is not None and expected not in allowed:
+        pytest.skip(f"this process may not place memory on node {expected} (allowed: {allowed})")
     buffer = PinnedHostBuffer(8 << 20)
     try:
         placed = resident_numa_nodes(buffer.address, buffer.nbytes)

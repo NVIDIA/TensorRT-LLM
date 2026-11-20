@@ -184,6 +184,12 @@ def validate_node_budget(
                 else "."
             )
         )
+    if may_encode_pages:
+        remedy += (
+            " The staging is counted because kv_cache_compression_config is set: its "
+            "method may give the cache a cold-page codec, whose pages pass through "
+            "pinned arenas whatever stage_through_host says."
+        )
     raise ValueError(
         f"mooncake-store: this node cannot afford what the pool is configured "
         f"to claim from it. {ranks_on_node} rank(s) here would lend "

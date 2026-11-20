@@ -63,6 +63,7 @@ class KvCachePageCodec:
         layer_group_ids: Iterable[int],
         raw_bytes_per_page: Optional[Dict[int, int]] = None,
         kv_dtype: Optional[str] = None,
+        num_slots: Optional[Dict[int, int]] = None,
     ):
         """Bind to a cache manager's native handle.
 
@@ -76,6 +77,8 @@ class KvCachePageCodec:
                 :meth:`encoding` so a geometry change is never read as a match.
             kv_dtype: Name of the hot cache's element type, folded into
                 :meth:`encoding`: pages of the same size can hold FP16 or BF16.
+            num_slots: GPU page slots per layer group. A hot page index at or
+                past it is refused, since the codec writes through it unchecked.
         """
         missing = [
             name
@@ -101,6 +104,7 @@ class KvCachePageCodec:
         self._index_on_device: Dict[int, bool] = {}
         self._raw_bytes = dict(raw_bytes_per_page or {})
         self._kv_dtype = kv_dtype
+        self._num_slots = {int(key): int(value) for key, value in (num_slots or {}).items()}
         self._closed = False
         for layer_group_id in layer_group_ids:
             layer_group_id = int(layer_group_id)
@@ -121,13 +125,18 @@ class KvCachePageCodec:
 
     @classmethod
     def from_manager(
-        cls, manager: "KVCacheManagerV2", raw_bytes_per_page: Dict[int, int]
+        cls,
+        manager: "KVCacheManagerV2",
+        raw_bytes_per_page: Dict[int, int],
+        num_slots: Optional[Dict[int, int]] = None,
     ) -> Optional["KvCachePageCodec"]:
         """The manager's codec, or None when it keeps the lossless default.
 
         Args:
             manager: The cache manager whose pages will be encoded.
             raw_bytes_per_page: Unencoded page size of each layer group to cover.
+            num_slots: GPU page slots of each layer group, bounding the hot
+                page indices a call may pass.
         """
         identity = getattr(manager, "cold_page_codec_identity", None)
         if identity is None:
@@ -138,6 +147,7 @@ class KvCachePageCodec:
             layer_group_ids=raw_bytes_per_page.keys(),
             raw_bytes_per_page=raw_bytes_per_page,
             kv_dtype=getattr(getattr(manager, "dtype", None), "name", None),
+            num_slots=num_slots,
         )
 
     @property
@@ -260,6 +270,13 @@ class KvCachePageCodec:
             # The codec addresses memory with these unchecked, so a negative
             # index (BAD_PAGE_INDEX) would be a wild write, not an error.
             raise ValueError("page and slot indices must be non-negative")
+        hot_limit = self._num_slots.get(layer_group_id)
+        hot = pairs[:, 1] if encode else pairs[:, 0]
+        if hot_limit is not None and int(hot.max()) >= hot_limit:
+            raise ValueError(
+                f"hot page index {int(hot.max())} is past the {hot_limit} GPU page slots "
+                f"of layer group {layer_group_id}"
+            )
         index_on_device = self._index_on_device.get(layer_group_id)
         if index_on_device is None:
             raise ValueError(

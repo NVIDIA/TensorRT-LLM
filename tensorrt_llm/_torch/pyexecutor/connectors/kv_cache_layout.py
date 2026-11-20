@@ -185,7 +185,8 @@ class KvCacheLayout:
     dtype: torch.dtype = torch.uint8
     #: The cache manager's cold-page codec, when a `kv_cache_compression_config`
     #: method gives it one. A connector that stores pages outside the cache can
-    #: keep them in that encoding; None means the cache keeps cold pages as-is.
+    #: keep them in that encoding. None when the cache keeps cold pages as-is,
+    #: or when a host, disk or remote tier of the cache runs the codec itself.
     page_codec: Optional[KvCachePageCodec] = None
 
     def group(self, layer_group_id: int) -> KvCacheLayerGroupLayout:
@@ -335,11 +336,24 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     except (AssertionError, KeyError, TypeError):
         dtype = torch.uint8
 
+    # The codec is the cache's own instance and need not be reentrant, so it is
+    # offered only while no tier below GPU runs it for the cache's migrations.
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+
+    runs_own_cold_tier = any(tier.tier != CacheTier.GPU_MEM for tier in init_config.cache_tiers)
+    page_codec = None
+    if not runs_own_cold_tier:
+        page_codec = KvCachePageCodec.from_manager(
+            manager,
+            {group.layer_group_id: group.bytes_per_page for group in groups},
+            num_slots={
+                group.layer_group_id: slots_by_group[group.layer_group_id] for group in groups
+            },
+        )
+
     return KvCacheLayout(
         tokens_per_block=int(manager.tokens_per_block),
         groups=tuple(groups),
         dtype=dtype,
-        page_codec=KvCachePageCodec.from_manager(
-            manager, {group.layer_group_id: group.bytes_per_page for group in groups}
-        ),
+        page_codec=page_codec,
     )

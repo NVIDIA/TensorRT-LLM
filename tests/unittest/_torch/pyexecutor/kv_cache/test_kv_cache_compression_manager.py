@@ -666,21 +666,25 @@ class TestColdPageCodecIdentity:
         assert self._identity().startswith("quantization_for_cold_page-")
 
     @pytest.mark.parametrize(
-        "fields",
+        "model_type, fields",
         [
-            {"skip_rope_quantization": True},
-            {"nvfp4_residual_dim": 0},
-            {"mixed_precision_last_n": 64},
+            ("qwen3_5", {"skip_rope_quantization": True}),
+            ("deepseek_v4", {"nvfp4_residual_dim": 0}),
+            ("qwen3_5", {"mixed_precision_last_n": 64}),
         ],
     )
-    def test_any_setting_that_changes_the_encoding_changes_the_identity(self, fields):
-        assert self._identity(**fields) != self._identity()
+    def test_any_setting_that_changes_the_encoding_changes_the_identity(self, model_type, fields):
+        assert self._identity(model_type=model_type, **fields) != self._identity(
+            model_type=model_type
+        )
 
-    def test_a_setting_the_model_ignores_leaves_the_identity(self):
-        """skip_rope_quantization is dropped for models it does not support, so their pages match."""
+    def test_settings_the_model_ignores_leave_the_identity(self):
+        """Dropped for models they do not apply to, so servers writing the same bytes share pages."""
         assert self._identity(model_type="llama", skip_rope_quantization=True) == self._identity(
             model_type="llama"
         )
+        # The residual dimension shapes only the DeepSeek-V4 layout.
+        assert self._identity(nvfp4_residual_dim=0) == self._identity()
 
     def test_scales_count_by_value_not_by_where_they_came_from(self, monkeypatch):
         from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import (
@@ -700,23 +704,32 @@ class TestColdPageCodecIdentity:
         assert provider.cold_page_codec_identity() != calibrated
 
     def test_the_encoded_format_version_is_part_of_the_identity(self, monkeypatch):
-        from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import (
-            nvfp4_quantization,
+        from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
+            Nvfp4ColdPageQuantizationCompression,
         )
 
         before = self._identity()
         monkeypatch.setattr(
-            nvfp4_quantization,
-            "_COLD_PAGE_FORMAT_VERSION",
-            nvfp4_quantization._COLD_PAGE_FORMAT_VERSION + 1,
+            Nvfp4ColdPageQuantizationCompression,
+            "cold_page_format_version",
+            Nvfp4ColdPageQuantizationCompression.cold_page_format_version + 1,
         )
         assert self._identity() != before
+
+    def test_a_codec_without_a_format_version_cannot_be_named(self):
+        """A later release changing the format would otherwise reuse the name."""
+        manager = SimpleNamespace(
+            config=ColdPageQuantizationCompressionConfig(), cold_page_format_version=None
+        )
+        manager.cold_page_codec_settings = lambda: {}
+        with pytest.raises(NotImplementedError, match="cold_page_format_version"):
+            KVCacheCompressionManager.cold_page_codec_identity(manager)
 
     def test_the_default_covers_every_config_field(self):
         """A method that derives nothing at runtime is named by its config alone."""
 
         def identity(config) -> str:
-            manager = SimpleNamespace(config=config)
+            manager = SimpleNamespace(config=config, cold_page_format_version=1)
             manager.cold_page_codec_settings = (
                 lambda: KVCacheCompressionManager.cold_page_codec_settings(manager)
             )
