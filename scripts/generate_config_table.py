@@ -106,6 +106,10 @@ MODEL_INFO = {
         "display_name": "MiniMax-M3 (MXFP8)",
         "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8",
     },
+    "MiniMaxAI/MiniMax-M3.1-Flash": {
+        "display_name": "MiniMax-M3.1-Flash (NVFP4)",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash",
+    },
 }
 
 
