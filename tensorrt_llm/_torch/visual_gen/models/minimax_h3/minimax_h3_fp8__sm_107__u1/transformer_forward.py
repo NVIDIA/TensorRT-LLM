@@ -1,8 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Executed in the pinned upstream module globals; preserve the generated compute AST.
-# ruff: noqa: F821, E501
-def _h3_shared_output_cast428_forward(
+"""The family Transformer forward with one shared input for the two FP32 heads."""
+
+from typing import Optional
+
+import torch
+
+from ..transformer_minimax_h3 import (
+    MINIMAX_H3_MODALITY_NUM,
+    MiniMaxH3StaticContext,
+    MiniMaxH3TransformerOutput,
+    _pad_rotary_emb,
+    _pad_tensor_dim,
+    _padding_to_multiple,
+)
+
+
+def shared_output_forward(
     self,
     hidden_states: torch.Tensor,
     audio_hidden_states: torch.Tensor,
@@ -79,7 +93,9 @@ def _h3_shared_output_cast428_forward(
     if pad or has_existing_padding:
         if not self._supports_key_padding_mask:
             raise NotImplementedError(
-                f"Padded packed sequences (negative token_tags) need an attention backend that honours key_padding_mask; the {self._attn_backend} backend cannot express it. Use VANILLA, FA4, TRTLLM, FLASHINFER or CUDNN."
+                "Padded packed sequences (negative token_tags) need an attention backend that honours "
+                f"key_padding_mask; the {self._attn_backend} backend cannot express it. "
+                "Use VANILLA, FA4, TRTLLM, FLASHINFER or CUDNN."
             )
         if self._attn_backend in ("FA4", "TRTLLM", "CUDNN") and bool(
             ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
@@ -113,11 +129,9 @@ def _h3_shared_output_cast428_forward(
     packed_hidden_states = self.sharder.gather(
         packed_hidden_states, dim=1, unpad_to=sequence_length
     )
-    _h3_shared_fp32_projection_input = self._projection_input(self.proj_out, packed_hidden_states)
-    video_output = self.proj_out(_h3_shared_fp32_projection_input).index_select(1, video_indices)
-    audio_output = self.audio_proj_out(_h3_shared_fp32_projection_input).index_select(
-        1, audio_indices
-    )
+    shared_projection_input = self._projection_input(self.proj_out, packed_hidden_states)
+    video_output = self.proj_out(shared_projection_input).index_select(1, video_indices)
+    audio_output = self.audio_proj_out(shared_projection_input).index_select(1, audio_indices)
     if not return_dict:
         return (video_output, audio_output)
     return MiniMaxH3TransformerOutput(sample=video_output, audio_sample=audio_output)

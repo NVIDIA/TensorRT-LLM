@@ -1,9 +1,0 @@
-{
-  "seed": 42,
-  "height": 768,
-  "width": 1344,
-  "num_frames": 124,
-  "frame_rate": 24,
-  "num_inference_steps": 50,
-  "prompt": "integrated_multimodal_description: A continuous tracking shot follows a cyclist in a bright red jacket through a leafy park. The cyclist pedals rapidly, leans around a bend, then rides through a shallow puddle that splashes toward the camera. The camera keeps pace beside the bicycle, with trees moving past in the background. Natural afternoon lighting, realistic motion. overall_soundscape: Bicycle chain rattling, tires rolling on gravel, wind through leaves, and a distinct splash when the bicycle crosses the puddle. non_diegetic_music: None."
-}

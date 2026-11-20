@@ -15,8 +15,9 @@ from types import ModuleType
 
 import cuda.bindings.driver as cuda
 import torch
-from round5_pdl_edges import prove as prove_pdl_edges
 from torch.utils.cpp_extension import load
+
+from .pdl import prove as prove_pdl_edges
 
 ROOT = Path(__file__).resolve().parent
 THREADS = 256
@@ -64,7 +65,7 @@ def build(name: str, cache: Path) -> ModuleType:
     folder.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MAX_JOBS", "1")
     return load(
-        name="h3_long5_" + name + "_" + digest[:16],
+        name="h3_fp8_" + name + "_" + digest[:16],
         sources=[str(p) for p in sources],
         extra_cflags=["-O3"],
         extra_cuda_cflags=flags + ["--keep", "--keep-dir=" + str(folder)],
@@ -95,7 +96,7 @@ def inspect_kernel(module: ModuleType, mode: int, *, pdl: bool, vector: bool = T
     assert 0 < observed["regs"] * THREADS <= 65536 and observed["max_threads"] >= THREADS
     tool = shutil.which("cuobjdump")
     if tool is None:
-        raise RuntimeError("cuobjdump is required before experimental GPU execution")
+        raise RuntimeError("cuobjdump is required before GPU execution")
     result = subprocess.run(
         [tool, "--dump-sass", module.__file__],
         check=True,
@@ -172,9 +173,6 @@ def prepare(scales: torch.Tensor, cache: Path) -> tuple[ModuleType, ModuleType, 
     ``scales`` is the frozen model's contiguous CUDA FP32 tensor of shape [50].
     This preparation runs before request timing and is repeated for each new process.
     """
-    manifest = json.loads((ROOT / "source_manifest.json").read_text())
-    for name, expected in manifest["files"].items():
-        assert sha(ROOT / name) == expected, name
     properties = torch.cuda.get_device_properties(0)
     assert (
         torch.cuda.get_device_capability(0) == (10, 7) and properties.multi_processor_count == 212
@@ -237,7 +235,6 @@ def prepare(scales: torch.Tensor, cache: Path) -> tuple[ModuleType, ModuleType, 
         assert same(c, tail.float()) and guards_ok(oq) and guards_ok(oc)
     torch.cuda.synchronize()
     proof = dict(
-        source_manifest_sha256=sha(ROOT / "source_manifest.json"),
         unary_qualified=True,
         scales=50,
         BF16_patterns_each_position=65536,
@@ -253,4 +250,16 @@ def prepare(scales: torch.Tensor, cache: Path) -> tuple[ModuleType, ModuleType, 
     )
     cache.mkdir(parents=True, exist_ok=True)
     (cache / "qualification.json").write_text(json.dumps(proof, indent=2) + "\n")
+    quant.pdl = pdl
+    _MODULES[scales.device.index] = (quant, cast)
     return quant, cast, factors, proof
+
+
+_MODULES: dict[int, tuple[ModuleType, ModuleType]] = {}
+
+
+def modules_for_device(device_index: int) -> tuple[ModuleType, ModuleType]:
+    """Return binaries already built and qualified before pipeline compilation."""
+    if device_index not in _MODULES:
+        raise RuntimeError("Initialize FP8 conversion kernels before inference")
+    return _MODULES[device_index]

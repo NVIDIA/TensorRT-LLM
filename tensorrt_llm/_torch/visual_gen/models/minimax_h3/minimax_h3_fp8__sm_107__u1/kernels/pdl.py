@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Validate launch PDL through capture edge data; no candidate kernel executes."""
+"""Validate launch PDL through capture edge data; no conversion kernel executes."""
 
 from types import ModuleType
 
@@ -77,7 +77,7 @@ def prove(
                     block=[threads, 1, 1],
                     poison_unchanged=True,
                     never_instantiated_or_replayed=True,
-                    candidate_kernel_launches=0,
+                    conversion_kernel_launches=0,
                 )
             )
         finally:

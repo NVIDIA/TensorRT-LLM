@@ -211,6 +211,8 @@ package_data += [
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
+    '_torch/visual_gen/models/minimax_h3/minimax_h3_fp8__sm_107__u1/kernels/*.cpp',
+    '_torch/visual_gen/models/minimax_h3/minimax_h3_fp8__sm_107__u1/kernels/*.cu',
 ]
 
 

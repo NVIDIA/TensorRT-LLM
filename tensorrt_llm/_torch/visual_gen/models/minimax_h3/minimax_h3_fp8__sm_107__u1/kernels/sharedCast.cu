@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: Apache-2.0
-// CPU-authored exact-copy experiment. Installed Torch GPU .float() is oracle.
+// Exact BF16-to-FP32 conversion, preserving Torch .float() bit patterns.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>

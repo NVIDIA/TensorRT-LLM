@@ -34,6 +34,7 @@ scenario's ``config.py``.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Type
 
 import torch
@@ -56,6 +57,12 @@ def _device_capability() -> Optional[tuple[int, int]]:
     if not torch.cuda.is_available():
         return None
     return tuple(torch.cuda.get_device_capability())
+
+
+def _device_multiprocessors() -> Optional[int]:
+    if not torch.cuda.is_available():
+        return None
+    return int(torch.cuda.get_device_properties(0).multi_processor_count)
 
 
 def _transformer_quant_algo(config: "DiffusionPipelineConfig") -> Optional[QuantAlgo]:
@@ -147,9 +154,65 @@ def route_nvfp4_sm_107_u1_u4(config: "DiffusionPipelineConfig") -> Type["BasePip
     return MiniMaxH3Nvfp4Sm107U1U4Pipeline
 
 
+def route_fp8_sm_107_u1(config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
+    """Uniform static per-tensor FP8, 212-SM Rubin, Ulysses=TP=1 and compile on.
+
+    Mixed checkpoints, asynchronous exchange, weight mutation/offload, cache
+    approximations and whole-model CUDA Graphs are outside this fixed scenario.
+    """
+    if _device_capability() != (10, 7) or _device_multiprocessors() != 212:
+        raise NoScenario("the static-FP8 fusion needs an SM 107 device with 212 SMs")
+    if os.environ.get("NVIDIA_TF32_OVERRIDE") != "0":
+        raise NoScenario("the static-FP8 fusion is qualified with NVIDIA_TF32_OVERRIDE=0")
+    if (
+        _transformer_quant_algo(config) != QuantAlgo.FP8
+        or _transformer_layer_quant(config) is not None
+        or config.dynamic_weight_quant
+        or config.force_dynamic_quantization
+    ):
+        raise NoScenario("the static-FP8 fusion needs a uniform pre-quantized FP8 checkpoint")
+    qac = getattr(config.attention, "quant_attention_config", None)
+    if (
+        str(config.attention.backend).upper() != "CUDNN"
+        or qac is None
+        or getattr(qac, "qk_dtype", None) != "fp8"
+        or getattr(qac, "v_dtype", None) != "fp8"
+    ):
+        raise NoScenario("the static-FP8 fusion needs CUDNN with qk_dtype=v_dtype='fp8'")
+    if (
+        _ulysses_size(config) != 1
+        or config.mapping.tp_size != 1
+        or config.parallel.parallel_vae_size != 1
+    ):
+        raise NoScenario("the static-FP8 fusion serves Ulysses=TP=parallel_vae_size=1")
+    if config.parallel.async_ulysses:
+        raise NoScenario("the static-FP8 fusion does not serve async_ulysses")
+    if not config.torch_compile.enable or config.cuda_graph.enable:
+        raise NoScenario("the static-FP8 fusion needs compile on and whole-model CUDA Graphs off")
+    if (
+        config.cpu_offload_config.enable
+        or config.runtime_lora is not None
+        or config.cache is not None
+    ):
+        raise NoScenario(
+            "the static-FP8 fusion needs immutable resident weights without a diffusion cache"
+        )
+    if config.extra_attrs.get("minimax_h3_scenario"):
+        raise NoScenario(
+            "the static-FP8 fusion uses fixed component settings without scenario overrides"
+        )
+    from .minimax_h3_fp8__sm_107__u1.config import select
+
+    select()
+    from .minimax_h3_fp8__sm_107__u1.pipeline import MiniMaxH3Fp8Sm107U1Pipeline
+
+    return MiniMaxH3Fp8Sm107U1Pipeline
+
+
 # Scenario routes in the order they are tried; the first that does not raise wins.
 ROUTES: tuple[Callable[["DiffusionPipelineConfig"], Type["BasePipeline"]], ...] = (
     route_nvfp4_sm_107_u1_u4,
+    route_fp8_sm_107_u1,
 )
 
 

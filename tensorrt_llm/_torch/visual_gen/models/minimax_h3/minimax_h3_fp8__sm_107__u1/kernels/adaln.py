@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Original exact norm tree with a precomputed RN reciprocal of frozen scale."""
 
+import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_adaln import _ld, _st
-
-STATE = {"adaln": False, "swiglu": False, "tile": 4096, "warps": 4}
 
 
 @triton.jit
@@ -105,3 +104,39 @@ def _adaln_fp8_kernel(
             n * (1.0 + _ld(sb, i * CH, D, CH)) + _ld(hb, i * CH, D, CH),
             CH,
         )
+
+
+def launch(x, a, w, mod, idx, scale, eps, gate_col, scale_col, shift_col):
+    width = x.shape[-1]
+    sequence = x.shape[-2]
+    x2 = x.reshape(-1, width)
+    has_res = a is not None
+    a2 = a.reshape_as(x2) if has_res else x2
+    assert x2.stride(-1) == 1 and a2.stride(-1) == 1 and mod.stride(-1) == 1
+    codes = torch.empty(x2.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    residual = torch.empty_like(x2) if has_res else x2
+    _adaln_fp8_kernel[(x2.shape[0],)](
+        x2,
+        a2,
+        residual,
+        codes,
+        scale,
+        w,
+        mod,
+        idx,
+        width,
+        x2.stride(0),
+        a2.stride(0),
+        residual.stride(0),
+        codes.stride(0),
+        mod.stride(0),
+        gate_col * width,
+        scale_col * width,
+        shift_col * width,
+        eps,
+        sequence,
+        HAS_RES=has_res,
+        CH=1024,
+        num_warps=4,
+    )
+    return residual.view(x.shape), codes.view(x.shape)

@@ -992,19 +992,3 @@ def pack_weight(weight):
     """[all gate; all up] rows -> per 256-row tile: [128 gate rows of tile t; 128 up rows of tile t]."""
     w = weight.view(2, D_HALF // HALF_TILE_N, HALF_TILE_N, K_DIM)
     return w.permute(1, 0, 2, 3).contiguous().view(N_TOT, K_DIM)
-
-
-def setup(context):
-    """Static weight prepack (weight rows only; activations/outputs never read here)."""
-    weight = context["setup_inputs"]["weight"]
-    packed = pack_weight(weight)
-    torch.cuda.synchronize()
-    return {"state": packed}
-
-
-def run(activation, weight, input_scale, weight_scale, sg_scale, state, out):
-    packed = state
-    while isinstance(packed, dict):
-        packed = packed["state"] if "state" in packed else packed["packed_weight"]
-    fn = _get_compiled(activation.device.index)
-    fn(activation, packed, input_scale, weight_scale, sg_scale, out)
