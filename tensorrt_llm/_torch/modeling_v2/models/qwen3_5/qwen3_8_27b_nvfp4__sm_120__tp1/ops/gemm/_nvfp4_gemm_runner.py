@@ -25,13 +25,19 @@ DRAM in serving, so L2-warm timings mis-rank small-M tactics); power-of-two row
 buckets plus "mixed-step" buckets for prefill chunks with a few decode rows riding
 along: rows in ``(p, p+32]`` for ``p >= 2048`` a power of two map to a bucket profiled
 at ``p + 32``, rows in ``[p-32, p)`` for ``p >= 4096`` to one profiled at ``p - 1``.
+Rows 9-15 map to the 16-row bucket (``cuda_core`` runs at most 8 rows), other rows to
+their power-of-two floor.
 
 `run(..., tune_rows)` picks the tactic of ``tune_rows`` rows for a call of fewer rows
 (the final decoder layer run on only the rows the logits read): outside tuning it
 looks the tactic up in the AutoTuner's profiling cache with the call's shapes and
 ``tune_rows`` in place of the row count -- the cache key ``choose_one`` would have
 built for the unsliced call -- and runs the runner with it. Inside tuning the call
-tunes as itself, as every other call does.
+tunes as itself, as every other call does. The kept rows are bitwise those of the
+unsliced call only for tactics whose kernel does not depend on M (``cutlass``,
+``fi_cutlass``, ``cuda_core``); a ``cublaslt`` tactic is a position in the heuristic list
+of the exact (M, N, K), so at the sliced M it names another algorithm (or the default)
+and the rows match within the GEMM's rounding, not bitwise.
 """
 
 from __future__ import annotations
@@ -111,7 +117,14 @@ def _nvfp4_gen_m_buckets(max_num_tokens: int) -> Tuple[int, ...]:
 
 def _nvfp4_map_m(m: int) -> int:
     mixed = _nvfp4_mixed_m_bucket(m)
-    return mixed if mixed is not None else last_positive_power_of_2(m)
+    if mixed is not None:
+        return mixed
+    if CUDA_CORE_MAX_M < m < 2 * CUDA_CORE_MAX_M:
+        # 9-15 rows take the 16-row bucket, not the 8-row one: the 8-row bucket may hold
+        # the cuda_core tactic, whose kernel runs at most CUDA_CORE_MAX_M rows, and a cache
+        # hit is not re-checked against the shape.
+        return 2 * CUDA_CORE_MAX_M
+    return last_positive_power_of_2(m)
 
 
 TUNING_CONFIG = TuningConfig(

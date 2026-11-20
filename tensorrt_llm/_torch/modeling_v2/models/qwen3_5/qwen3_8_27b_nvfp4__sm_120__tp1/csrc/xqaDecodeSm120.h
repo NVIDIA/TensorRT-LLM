@@ -45,8 +45,8 @@ size_t xqaSm120ScratchBytes();
 size_t xqaSm120SemaphoreWords(uint32_t maxBatch, int multiProcessorCount);
 
 // Sub-sequences per (request, KV head): TensorRT-LLM's computeMultiBlockCount for maxPastKvLength (the longest KV
-// length of the batch, including the new token), honoring TRTLLM_XQA_BLOCKS_PER_SEQUENCE, then capped at one CTA wave
-// (multiProcessorCount / (batch * kvHeads)) unless the environment variable is set.
+// length of the batch, including the new token), capped at one CTA wave
+// (multiProcessorCount / (batch * kvHeads)).
 uint32_t xqaSm120MultiBlockCount(uint32_t batch, uint32_t maxPastKvLength, int multiProcessorCount);
 
 struct XqaSm120DecodeArgs

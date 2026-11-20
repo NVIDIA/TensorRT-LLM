@@ -35,8 +35,9 @@ wave, shared-prefix (cascade) pass from batch 8 with FP8 prefix math).
 
 **The final layer of a long prefill step** (eager, at least 2048 rows, some context rows)
 runs its output gate, o_proj, post-attention norm, MLP and final norm only on the rows the
-logits processor reads; every op on those rows routes and tunes as the full step, so the
-rows are the ones an unsliced step computes.
+logits processor reads; every op on those rows routes and tunes as the full step. The rows
+are bitwise those of an unsliced step except where a W4A4 GEMM's tuned tactic is cuBLASLt,
+whose algorithm choice depends on the row count (see `ops/gemm/nvfp4_gemm_sm120`).
 
 Numerics relative to the built-in model: the FP8 projections run NVFP4 copies of their
 weights; attention reads an fp8 KV cache; the recurrent state is int16 rows; the context
@@ -79,8 +80,10 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModel
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.config_utils import SSMStatePoolGeometry
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 
 from . import weights as _weights
+from .cache_manager import Qwen3827BSm120Tp1CacheManager
 from .ops.activation.sigmoid_mul_nvfp4 import sigmoid_mul_nvfp4
 from .ops.activation.silu_mul_nvfp4_permuted import silu_mul_nvfp4_permuted
 from .ops.attention.attention_sm120 import AttentionSm120Buffers, attention_sm120
@@ -380,6 +383,12 @@ class Qwen3827BTp1ModelingV2(DecoderModel):
         assert not missing, f"mamba metadata fields missing: {missing}"
         for name in ("get_conv_states", "get_ssm_states", "layer_offsets"):
             assert hasattr(cm, name), f"{type(cm).__name__} has no {name}"
+        # The prefill writes only each chunk's final state: an in-forward snapshot would
+        # commit staging rows nothing wrote (see cache_manager.py).
+        assert getattr(cm, "inforward_snapshot_rows", 0) == 0, (
+            f"{type(cm).__name__} plans in-forward recurrent-state snapshots, which this "
+            "target does not implement"
+        )
         conv = {i: cm.get_conv_states(i) for i in self.gdn_layers}
         ssm = {i: cm.get_ssm_states(i) for i in self.gdn_layers}
         ssm0 = ssm[self.gdn_layers[0]]
@@ -1056,6 +1065,9 @@ def _carries_media(data) -> bool:
     )
 
 
+_RUNTIME_HOOKS = RuntimeHooks(kv_cache_manager_cls=Qwen3827BSm120Tp1CacheManager)
+
+
 class ModelingV2Qwen3827BNvfp4Sm120Tp1(
     DecoderModelForCausalLM[Qwen3827BTp1ModelingV2, PretrainedConfig]
 ):
@@ -1073,6 +1085,11 @@ class ModelingV2Qwen3827BNvfp4Sm120Tp1(
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
         """The quantized recurrent-state pool exists only on the V2 hybrid manager."""
         return "V2"
+
+    @property
+    def runtime_hooks(self) -> RuntimeHooks:
+        """The target's KV cache manager, which declares no in-forward snapshots."""
+        return _RUNTIME_HOOKS
 
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config

@@ -7,8 +7,9 @@ the CUTLASS default on a miss), and every tactic the AutoTuner could pick for th
 row count -- each against the reference of the dequantized operands, in the band
 `_compare` derives. The candidate set itself is pinned: FlashInfer alone exactly
 where its fill rule holds, the CUDA-core GEMM only up to 8 rows. Beyond the cells:
-a tuned row slice takes the tactic and the bytes of the unsliced call, the tuning
-buckets and their near-tie wiring, and the guards.
+a tuned row slice takes the tactic of the unsliced call (and its bytes for an
+M-independent tactic), the tuning buckets, 9-15 rows never reaching a cached cuda_core
+tactic, and the guards.
 """
 
 import pytest
@@ -143,8 +144,9 @@ def test_cuda_core_refuses_k_not_a_multiple_of_32(monkeypatch) -> None:
 def test_a_row_slice_takes_the_unsliced_tactic_and_bytes() -> None:
     """The final layer of a long prefill step runs only the rows the logits read, tuned
     as the whole step: after tuning at 2080 rows (a mixed bucket), 5 rows quantized with
-    the same global scale take the 2080-row tactic and return exactly those rows of the
-    2080-row call."""
+    the same global scale take the 2080-row tactic. For an M-independent tactic they are
+    exactly those rows of the 2080-row call; a cuBLASLt tactic indexes the heuristic list
+    of the exact M, so then they are checked against the reference instead."""
     n, k, full, rows = 5120, 6144, 2080, 5
     tuner = AutoTuner.get()
     tuner.clear_cache()
@@ -160,7 +162,10 @@ def test_a_row_slice_takes_the_unsliced_tactic_and_bytes() -> None:
         assert nvfp4_runner.lookup_tactic(runner, sliced, full) == want
         out_full = op(*inputs, torch.bfloat16, full)
         out_rows = op(*sliced, torch.bfloat16, full)
-        assert torch.equal(out_rows, out_full[:rows])
+        if want[0] == "cublaslt":
+            _compare(out_rows, op.reference(*sliced, torch.bfloat16, full))
+        else:
+            assert torch.equal(out_rows, out_full[:rows])
     finally:
         tuner.clear_cache()
 
@@ -171,11 +176,43 @@ def test_tuning_buckets() -> None:
     assert {1, 2, 4, 8, 2048, 2080, 4095, 4096, 4128, 8191, 8192} <= set(buckets)
     assert all(b <= 8192 for b in buckets)
     for m, bucket in (
-        (1, 1), (33, 32), (2048, 2048), (2049, 2080), (2080, 2080), (2081, 2048),
+        (1, 1), (8, 8), (9, 16), (15, 16), (16, 16), (33, 32), (2048, 2048), (2049, 2080), (2080, 2080), (2081, 2048),
         (4063, 2048), (4064, 4095), (4096, 4096), (4097, 4128), (8160, 8191), (8192, 8192),
     ):  # fmt: skip
         assert mapm(m) == bucket, (m, mapm(m), bucket)
     assert nvfp4_runner.TUNING_CONFIG.use_cold_l2_cache
+
+
+@pytest.mark.parametrize("m", [9, 15])
+def test_rows_above_the_cuda_core_cap_never_take_its_cached_tactic(m, monkeypatch) -> None:
+    """With cuda_core cached for the 8-row bucket, 9-15 rows (a decode batch the default
+    CUDA graphs capture) look up the 16-row bucket and run against the reference instead
+    of handing more than 8 rows to the cuda-core kernel."""
+    n, k = 5120, 17408  # the dense MLP's down_proj
+    runner = nvfp4_runner.runner_for(torch.bfloat16)
+    cls = type(runner)
+    offered = cls.get_valid_tactics
+
+    def cuda_core_alone_at_8_rows(self, inputs, profile, **kwargs):
+        tactics = offered(self, inputs, profile, **kwargs)
+        if inputs[0].shape[0] <= nvfp4_runner.CUDA_CORE_MAX_M:
+            return [t for t in tactics if t[0] == "cuda_core"]
+        return tactics
+
+    monkeypatch.setattr(cls, "get_valid_tactics", cuda_core_alone_at_8_rows)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    try:
+        tuned, _ = _operands(n, k, 8, seed_of("cuda-core-cap-8"))
+        with autotune():
+            op(*tuned, torch.bfloat16, 8)
+        assert nvfp4_runner.lookup_tactic(runner, tuned, 8) == ("cuda_core", 0)
+        inputs, _ = _operands(n, k, m, seed_of(f"cuda-core-cap-{m}"))
+        assert nvfp4_runner.lookup_tactic(runner, inputs, m) != ("cuda_core", 0)
+        out = op(*inputs, torch.bfloat16, m)
+        _compare(out, op.reference(*inputs, torch.bfloat16, m))
+    finally:
+        tuner.clear_cache()
 
 
 def test_guard_refuses_a_tune_rows_below_the_call() -> None:

@@ -45,7 +45,6 @@
 #include "qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1/csrc/xqaDecodeSm120.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/envUtils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -139,11 +138,6 @@ size_t xqaSm120SemaphoreWords(uint32_t maxBatch, int multiProcessorCount)
 
 uint32_t xqaSm120MultiBlockCount(uint32_t batch, uint32_t maxPastKvLength, int multiProcessorCount)
 {
-    auto const userSpecified = tensorrt_llm::common::getEnvXqaBlocksPerSequence();
-    if (userSpecified.has_value())
-    {
-        return static_cast<uint32_t>(userSpecified.value());
-    }
     int const batchSize = static_cast<int>(batch);
     int mb = static_cast<int>(maxPastKvLength) / kMinHistoryTokensPerBlock;
     mb = std::min(mb, static_cast<int>(std::round(std::sqrt(mb * 8.F))));
@@ -155,7 +149,7 @@ uint32_t xqaSm120MultiBlockCount(uint32_t batch, uint32_t maxPastKvLength, int m
         mb = static_cast<int>(std::floor(mb / adjFactor));
     }
     mb = std::max(mb, 1);
-    mb = std::max(std::min(mb, kMaxNbSubSeq / batchSize), 1);
+    mb = std::max(std::min(mb, kMaxNbSubSeq / (batchSize * static_cast<int>(kXqaSm120KvHeads))), 1);
     // One CTA wave: kernel_mha runs at one CTA per SM here, so all CTAs of a call stay co-resident.
     int const oneWave = std::max(1, multiProcessorCount / (batchSize * static_cast<int>(kXqaSm120KvHeads)));
     return static_cast<uint32_t>(std::min(mb, oneWave));
@@ -164,8 +158,14 @@ uint32_t xqaSm120MultiBlockCount(uint32_t batch, uint32_t maxPastKvLength, int m
 void xqaSm120Decode(XqaSm120DecodeArgs const& a, cudaStream_t stream)
 {
     TLLM_CHECK(a.batch >= 1 && a.multiBlock >= 1);
-    TLLM_CHECK_WITH_INFO(static_cast<size_t>(a.multiBlock) * a.batch <= kMaxNbSubSeq || a.multiBlock == 1,
-        "XQA multi-block count %u x batch %u exceeds the scratch budget", a.multiBlock, a.batch);
+    // kernel_mha lays out one sub-sequence per (block, KV head, request), each a row max, a row sum and a partial
+    // output tile (3328 bytes; kMhaBytesPerSubSeq bounds it with the segment alignment). xqaSm120MultiBlockCount keeps
+    // the count within one CTA wave, far below what the scratch holds.
+    size_t const nbSubSeq = static_cast<size_t>(a.multiBlock) * kXqaSm120KvHeads * a.batch;
+    TLLM_CHECK_WITH_INFO(a.multiBlock == 1 || nbSubSeq * kMhaBytesPerSubSeq <= kScratchBytes,
+        "XQA multi-block count %u x %u KV heads x batch %u needs %zu bytes of multi-block scratch, more than the %zu "
+        "reserved",
+        a.multiBlock, kXqaSm120KvHeads, a.batch, nbSubSeq * kMhaBytesPerSubSeq, kScratchBytes);
     KernelSmem const& smem = kernelSmem();
     KVCacheList<true> const cacheList{static_cast<GMemKVCacheHead*>(a.kvPool),
         reinterpret_cast<KVCachePageIndex const*>(a.kvPageList), a.seqLens, a.maxNbPagesPerSeq};

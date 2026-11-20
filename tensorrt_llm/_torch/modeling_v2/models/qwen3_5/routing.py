@@ -63,8 +63,14 @@ def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineC
     )
 
 
-def _check_runtime(llm_args: TorchLlmArgs) -> None:
+def _check_runtime(model_config: ModelConfig, llm_args: TorchLlmArgs) -> None:
     """Decline engine features the target does not implement, so ``auto`` falls back."""
+    sparse = model_config.sparse_attention_config or llm_args.sparse_attention_config
+    if sparse is not None:
+        raise NoTarget(
+            f"sparse_attention_config (algorithm {getattr(sparse, 'algorithm', None)!r}); the "
+            "target's attention kernels run dense attention only"
+        )
     if llm_args.attn_backend != "TRTLLM":
         raise NoTarget(
             f"attn_backend={llm_args.attn_backend!r}; the target's attention reads "
@@ -132,6 +138,29 @@ def _mixed_precision_recipe(model_config: ModelConfig) -> bool:
     return seen == {QuantAlgo.FP8, QuantAlgo.NVFP4}
 
 
+def _check_rope(text) -> None:
+    """Unscaled interleaved mRoPE over ``2 * sum(mrope_section)`` rotary dims: the table the
+    target builds (`RopeParams.from_config` would apply a scaling factor to it)."""
+    rope = getattr(text, "rope_parameters", None) or getattr(text, "rope_scaling", None)
+    if not isinstance(rope, dict):
+        raise NoTarget("the text config declares no rope parameters; the target runs mRoPE")
+    kind = rope.get("rope_type", rope.get("type", "default"))
+    factor = rope.get("factor")
+    if kind not in ("default", "mrope") or (factor is not None and float(factor) != 1.0):
+        raise NoTarget(
+            f"rope type {kind!r} with factor {factor}; the target runs unscaled interleaved mRoPE"
+        )
+    if not rope.get("mrope_interleaved", False):
+        raise NoTarget("the rope is not interleaved mRoPE (mrope_interleaved)")
+    section = rope.get("mrope_section") or ()
+    partial = float(rope.get("partial_rotary_factor", getattr(text, "partial_rotary_factor", 1.0)))
+    if 2 * sum(section) != int(text.head_dim * partial):
+        raise NoTarget(
+            f"mrope_section {list(section)} does not cover the {int(text.head_dim * partial)} "
+            "rotary dims"
+        )
+
+
 def _check_layer_pattern(text) -> None:
     """Every ``full_attention_interval``-th layer is full attention, the rest Gated-DeltaNet:
     the layout the target's constructor builds."""
@@ -195,7 +224,8 @@ def route(
     ):
         # Decline before the import: importing the target loads its native library.
         _check_layer_pattern(text)
-        _check_runtime(llm_args)
+        _check_rope(text)
+        _check_runtime(model_config, llm_args)
         _check_engine(kv_cache_quant_algo, engine_choices(model_config, llm_args))
 
         # One line on purpose: the claims suite reads the routed targets off

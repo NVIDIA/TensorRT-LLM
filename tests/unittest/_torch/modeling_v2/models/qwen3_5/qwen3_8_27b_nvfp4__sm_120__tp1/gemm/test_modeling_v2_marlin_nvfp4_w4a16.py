@@ -34,6 +34,19 @@ DEV = "cuda"
 LM_HEAD = (248320, 5120)
 
 
+def _skip_without_decode_tables() -> None:
+    """The rows 9-16 and 17-32 decode launch tables (and their pre-wait L2 prefetch) apply
+    only on 188-SM SM120 GPUs (marlinNvfp4Gemm.cu get_m16_launch / get_m32_launch); on
+    another SM count those rows run the stock dispatcher, so a test of the tables would
+    pass without reaching them."""
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms != 188:
+        pytest.skip(
+            f"the Marlin decode launch tables apply only on 188 SMs (this GPU has {sms}); "
+            "they are validated on the RTX PRO 6000"
+        )
+
+
 def _compare(out: torch.Tensor, ref: torch.Tensor, workspace_mode: int) -> None:
     """Same dequantized operands, BF16 x BF16 products exact in fp32; what differs is
     the summation order and, in mode 0, the split-K partials each rounded to BF16 as
@@ -96,6 +109,8 @@ def _args(c: recipes.MarlinNvfp4Weight, x: torch.Tensor, mode: int, hint: int):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     certifying(op)
     s = cell.spec
+    if s["launch_hint"] == 1 and 9 <= s["m"] <= 32:  # the rows 9-16 / 17-32 tables
+        _skip_without_decode_tables()
     c = _copy(s["n"], s["k"])
     x = _x(s["m"], s["k"], seed_of(cell.why))
     args = _args(c, x, s["workspace_mode"], s["launch_hint"])
@@ -124,6 +139,8 @@ def test_input_written_late_by_a_pdl_producer(n, k, m, mode) -> None:
     """The in-proj launches of `launch_hint=1` stream weights into L2 before
     `griddepcontrol.wait`. A producer that releases its dependents at once and writes
     `x` 30 us later must still be waited for: a read before the wait sees the NaN fill."""
+    if m > 8:
+        _skip_without_decode_tables()
     c = _copy(n, k)
     src = _x(m, k, seed=n + m)
     want = op(*_args(c, src, mode, 1)).clone()
@@ -148,6 +165,7 @@ def test_graph_replay_matches_eager() -> None:
     """Two decode copies back to back in one graph (the persistent lock workspace is
     shared per stream): every replay, with a new activation and poisoned outputs,
     equals eager."""
+    _skip_without_decode_tables()  # 9 rows: the rows 9-16 table launches
     a, b = _copy(16384, 5120), _copy(14336, 5120)
     x = _x(9, 5120, seed=3)
 

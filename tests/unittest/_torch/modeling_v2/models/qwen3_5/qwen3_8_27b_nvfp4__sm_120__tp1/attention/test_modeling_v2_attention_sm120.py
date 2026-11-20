@@ -42,6 +42,7 @@ from _torch.modeling_v2.attention.test_modeling_v2_thop_attention import (  # no
 
 from _torch.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.attention.test_modeling_v2_context_fmha_sm120 import (  # noqa: E402,E501
     _choose_num_pieces,
+    _split_q_len_or_skip,
 )
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Cell  # noqa: E402
@@ -225,12 +226,14 @@ CELLS = (
             num_contexts=1,
         ),
     ),
+    # The skip cells' context lengths are the shortest this GPU splits (`split_short_by`:
+    # each context's rows short of that length), so the skip runs on every CI part.
     Cell(
-        why="qwen3_5 last layer, one 2048-row context: leading q-tiles skipped",
+        why="qwen3_5 last layer, one context of the split length: leading q-tiles skipped",
         spec=dict(
             _QWEN35,
             cached=(0,),
-            new=(2048,),
+            split_short_by=(0,),
             num_contexts=1,
             skip_leading_q_tiles=True,
         ),
@@ -240,18 +243,19 @@ CELLS = (
         spec=dict(
             _QWEN35,
             cached=(0, 0, 0),
-            new=(1024, 1000, 970),
+            split_short_by=(0, 24, 54),
             num_contexts=3,
             skip_leading_q_tiles=True,
         ),
     ),
     Cell(
-        why="qwen3_5 last layer, a mixed step: contexts of 2048 and 2016 rows (the second "
-        "over a cached 64) and a decode row, leading q-tiles skipped",
+        why="qwen3_5 last layer, a mixed step: two contexts of the split length (the second "
+        "32 rows shorter over a cached 64) and a decode row, leading q-tiles skipped",
         spec=dict(
             _QWEN35,
             cached=(0, 64, 300),
-            new=(2048, 2016, 1),
+            split_short_by=(0, 32),
+            decode_rows=1,
             num_contexts=2,
             skip_leading_q_tiles=True,
         ),
@@ -296,9 +300,9 @@ def test_attention_sm120(cell, monkeypatch) -> None:
     `shared_prefix`, the first sequence's history first, then its leading pages become
     every other sequence's prefix); the checked call then appends `new` rows per
     sequence (`decode_steps` times, on one set of the op's buffers and semaphores). With
-    `skip_leading_q_tiles`, where the last q-tile split runs on this GPU, the context rows
-    before the batch's last q-tile must stay unwritten (the output starts as a sentinel) and
-    are not compared; where it does not, the op writes and is checked on every row."""
+    `skip_leading_q_tiles` (at the shortest context length this GPU splits), the context
+    rows before the batch's last q-tile must stay unwritten (the output starts as a
+    sentinel) and are not compared."""
     spec = cell.spec
     _seed(cell)
     skip = spec.get("skip_leading_q_tiles", False)
@@ -315,7 +319,12 @@ def test_attention_sm120(cell, monkeypatch) -> None:
         quant_mode=spec["quant_mode"],
         kv_scaling_factor=spec["kv_scale"],
     )
-    cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
+    cached, nc = spec["cached"], spec["num_contexts"]
+    if "split_short_by" in spec:
+        s = _split_q_len_or_skip(nc)
+        new = tuple(s - d for d in spec["split_short_by"]) + (1,) * spec.get("decode_rows", 0)
+    else:
+        new = spec["new"]
     assert all(n == 1 for n in new[nc:]), "one row per generation sequence"
     rids = list(range(len(new)))
     for rid in rids:
@@ -352,7 +361,8 @@ def test_attention_sm120(cell, monkeypatch) -> None:
         out = sentinel
         ref = _op_reference(env, qkv, list(new), rids, causal=True, e4m3=True)
         defined = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
-        if skip and _choose_num_pieces(nc, max(new[:nc])) > 0:
+        if skip:
+            assert _choose_num_pieces(nc, max(new[:nc])) > 0, "the skip runs only with the split"
             first_kept = FMHA_Q_TILE * ((max(new[:nc]) + FMHA_Q_TILE - 1) // FMHA_Q_TILE - 1)
             start = 0
             for n in new[:nc]:

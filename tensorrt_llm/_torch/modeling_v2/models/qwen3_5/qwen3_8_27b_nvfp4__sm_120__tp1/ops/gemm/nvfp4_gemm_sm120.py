@@ -9,14 +9,15 @@ the lm_head at 56 rows and more (FP32 logits). The AutoTuner picks one of four
 SM120 GEMMs per (N, K, row bucket) -- TRT-LLM's CUTLASS FP4 GEMM, cuBLASLt's FP4
 GEMM, the CUDA-core GEMM at up to 8 rows, and FlashInfer's SM120 CUTLASS GEMM alone
 on under-filled grids at 64-255 rows -- profiling with a cold L2, with extra row
-buckets for mixed prefill+decode steps picked near-tie-stably
-(``_nvfp4_gemm_runner`` has the candidates and the tuning configuration).
+buckets for mixed prefill+decode steps (``_nvfp4_gemm_runner`` has the candidates and
+the tuning configuration).
 
 ``tune_rows`` is the row count the tactic is chosen for. It is the call's own row
 count except in the final decoder layer of a long prefill step, which runs only the
-rows the logits read and must take the tactic -- the kernel and its summation order
--- the unsliced call would have taken, so the rows it keeps are bitwise those of the
-unsliced run.
+rows the logits read and takes the tactic the unsliced call would have taken. For a
+CUTLASS, FlashInfer or CUDA-core tactic that is the same kernel and summation order, so
+the rows it keeps are bitwise those of the unsliced run; a cuBLASLt tactic is tied to the
+exact row count, so its sliced rows match within the GEMM's rounding instead.
 """
 
 from __future__ import annotations
@@ -111,9 +112,8 @@ class Nvfp4GemmSm120(OpWrapper):
     `output_dtype`; the candidates differ in summation order only. `fi_cutlass` is offered
     only for BF16/FP16 output.
 
-    Tuning: cold L2; mixed buckets {p+32 for p >= 2048, p-1 for p >= 4096} with a 3%
-    near-tie band and the power-of-two parent preferred; cuBLASLt tactics above 1024
-    rows are algorithm identities. FlashInfer's module is JIT-built once per process;
+    Tuning: cold L2; mixed buckets {p+32 for p >= 2048, p-1 for p >= 4096}; rows 9-15
+    take the 16-row bucket (cuda_core runs at most 8 rows). FlashInfer's module is JIT-built once per process;
     if it cannot be built the other candidates serve its rows (a warning is logged).
 
     Hard limits

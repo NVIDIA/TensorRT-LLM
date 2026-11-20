@@ -61,15 +61,11 @@ def _fp32_matmul():
     torch.backends.cuda.matmul.allow_tf32 = prev
 
 
-def _choose_num_pieces(b: int, s: int, sms: int | None = None) -> int:
-    """contextFmhaLastTileSplit.cuh choose_num_pieces, 2 CTAs/SM (48 KB smem, 128 threads).
-
-    ``sms`` defaults to this GPU's SM count: the split runs only where dropping the last
-    q-tile saves a whole wave, so which shapes split depends on the GPU (e.g. RTX PRO 6000,
-    188 SMs, against an RTX PRO 6000D with fewer)."""
-    if sms is None:
-        sms = torch.cuda.get_device_properties(0).multi_processor_count
-    slots = sms * 2
+def _choose_num_pieces(b: int, s: int) -> int:
+    """contextFmhaLastTileSplit.cuh choose_num_pieces, 2 CTAs/SM (48 KB smem, 128 threads),
+    on this GPU: the split runs only where dropping the last q-tile saves a whole wave, so
+    which shapes split depends on the SM count."""
+    slots = torch.cuda.get_device_properties(0).multi_processor_count * 2
     if b <= 0 or b > 3:
         return 0
     q_tiles = (s + STEP_Q - 1) // STEP_Q
@@ -80,6 +76,25 @@ def _choose_num_pieces(b: int, s: int, sms: int | None = None) -> int:
         return 0
     k = min(slots // (H * b), 16, 384 // (H * b))
     return k if k >= 2 else 0
+
+
+def _split_q_len(b: int, max_s: int = 2048) -> int | None:
+    """The shortest query length (a whole number of q-tiles, at most ``max_s``) whose
+    ``b``-sequence prefill this GPU runs with the last q-tile split, or None. The split
+    depends on the SM count, so each split case takes its length from the device: every
+    CI part then runs the split, merge and skip kernels, not only a 188-SM one."""
+    for s in range(2 * STEP_Q, max_s + 1, STEP_Q):
+        if _choose_num_pieces(b, s) > 0:
+            return s
+    return None
+
+
+def _split_q_len_or_skip(b: int) -> int:
+    s = _split_q_len(b)
+    if s is None:
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        pytest.skip(f"no {b}-sequence prefill up to 2048 rows splits the last q-tile on {sms} SMs")
+    return s
 
 
 class _Case:
@@ -238,11 +253,16 @@ def _seq_shapes(nseq, q_len, prefix):
 
 
 @pytest.mark.parametrize("prefix", [0, 32768])
-@pytest.mark.parametrize("q_len", [1, 37, 64, 65, 2048])
+@pytest.mark.parametrize("q_len", [1, 37, 64, 65, 2048, "split"])
 @pytest.mark.parametrize("nseq", [1, 2, 3])
 def test_matches_reference(nseq, q_len, prefix):
+    """``split``: the shortest length this GPU splits, so the split path runs here."""
+    if q_len == "split":
+        q_len = _split_q_len_or_skip(nseq)
     q_lens, prefixes = _seq_shapes(nseq, q_len, prefix)
     case = _Case(q_lens, prefixes, seed=1000 * nseq + 7 * q_len + prefix)
+    if q_len == _split_q_len(nseq):
+        assert case.pieces(True) > 0
     outs = {}
     for split in (False, True):
         outs[split] = case.run(split)
@@ -256,12 +276,6 @@ def test_matches_reference(nseq, q_len, prefix):
         assert torch.equal(outs[True].view(torch.int16), outs[False].view(torch.int16))
 
 
-def test_split_runs_for_long_single_prefill():
-    # 1 x 2048 with 24 heads is 768 CTAs: a tail wave on 188 SMs x 2 (RTX PRO 6000).
-    assert _choose_num_pieces(1, 2048, sms=188) > 0
-    assert _choose_num_pieces(4, 2048, sms=188) == 0
-
-
 def test_batch_of_eight_mixed_lengths():
     q_lens = [1, 37, 64, 65, 300, 129, 2, 512]
     prefixes = [0, 5000, 31, 64, 0, 777, 1, 2048]
@@ -273,16 +287,12 @@ def test_batch_of_eight_mixed_lengths():
         _check(out, exact, emul, f"batch 8 split={split}")
 
 
-@pytest.mark.parametrize(
-    "q_lens,prefixes", [([2048], [32768]), ([2048, 2048, 2048], [0, 100, 32768])]
-)
-def test_skip_leading_writes_only_the_last_q_tile(q_lens, prefixes):
-    case = _Case(q_lens, prefixes, seed=5)
-    if case.pieces(True) == 0:
-        pytest.skip(
-            f"the last q-tile split does not run for these shapes on "
-            f"{torch.cuda.get_device_properties(0).multi_processor_count} SMs"
-        )
+@pytest.mark.parametrize("prefixes", [[32768], [0, 100, 32768]], ids=["one", "three"])
+def test_skip_leading_writes_only_the_last_q_tile(prefixes):
+    """At the shortest length this GPU splits (the skip applies only with the split)."""
+    s = _split_q_len_or_skip(len(prefixes))
+    case = _Case([s] * len(prefixes), prefixes, seed=5)
+    assert case.pieces(True) > 0
     full = case.run(split=True)
     skipped = case.run(split=True, skip_leading=True)
     lead = case.leading_mask()

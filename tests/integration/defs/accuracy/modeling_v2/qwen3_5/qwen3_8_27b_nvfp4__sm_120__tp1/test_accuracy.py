@@ -141,10 +141,18 @@ class TestModelingV2Qwen3827BNvfp4Sm120Tp1(LlmapiAccuracyTestHarness):
         ):
             GSM8K(self.MODEL_NAME).evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def test_shared_prefix_retrieval(self):
+    @pytest.mark.parametrize(
+        "offsets_from_end",
+        [[], [2]],
+        ids=["snapshot_at_prefix", "and_two_before_end"],
+    )
+    def test_shared_prefix_retrieval(self, offsets_from_end):
         """Every planted code is retrieved from one ~32K-token document.
 
-        48 questions are in flight at once after the prefix is cached.
+        48 questions are in flight at once after the prefix is cached. With a snapshot two
+        tokens before each prompt's end, the target's cache manager declares no in-forward
+        snapshot split, so the scheduler cuts each prompt there into two context steps; a
+        planned split would leave the decode state unwritten and the codes unretrieved.
         """
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
         prompts = _shared_prefix_prompts(tokenizer)
@@ -153,7 +161,10 @@ class TestModelingV2Qwen3827BNvfp4Sm120Tp1(LlmapiAccuracyTestHarness):
             mamba_ssm_cache_dtype="int8",
             enable_block_reuse=True,
             free_gpu_memory_fraction=0.8,
-            mamba_state_config=dict(additional_snapshot_offsets_from_start=[_PREFIX_TOKENS]),
+            mamba_state_config=dict(
+                additional_snapshot_offsets_from_start=[_PREFIX_TOKENS],
+                additional_snapshot_offsets_from_end=offsets_from_end,
+            ),
         )
         engine = dict(self.ENGINE, kv_cache_config=kv)
         params = SamplingParams(max_tokens=_ANSWER_TOKENS, temperature=0)

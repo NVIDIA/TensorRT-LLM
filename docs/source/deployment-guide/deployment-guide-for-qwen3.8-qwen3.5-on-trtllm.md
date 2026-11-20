@@ -184,6 +184,7 @@ On one RTX PRO 6000 Blackwell (SM120), Qwen3.8-27B NVFP4 can run on an experimen
 * An FP8 KV cache (`kv_cache_config.dtype: fp8`, or `auto` with a checkpoint that declares an FP8 KV cache) and `kv_cache_config.mamba_ssm_cache_dtype: int8`.
 * The model runs in bf16 (`dtype: auto` with this checkpoint, or `dtype: bfloat16`).
 * `attn_backend: TRTLLM`, KV cache manager V2, `prefill_cuda_graph_backend: disabled`, no LoRA, and no disaggregated serving.
+* The checkpoint's unscaled rope (no YaRN `factor`) and no `sparse_attention_config`.
 
 With `auto`, any other configuration falls back to the built-in implementation; with `require`, it raises an error. The built-in implementation does not accept `mamba_ssm_cache_dtype: int8`, so a configuration that keeps `int8` but misses another condition fails at startup instead of falling back: set `mamba_ssm_cache_dtype` to `auto` (or another supported dtype) whenever the target is not used. The target serves text only and refuses requests that carry images or video.
 

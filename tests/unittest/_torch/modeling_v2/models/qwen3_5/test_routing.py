@@ -16,6 +16,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     LoraConfig,
     MTPDecodingConfig,
+    SkipSoftmaxAttentionConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
@@ -53,6 +54,20 @@ def _llm_args(mode="auto", kv=None, **kwargs) -> TorchLlmArgs:
     )
 
 
+# The checkpoint's rope: interleaved mRoPE over a quarter of each 256-wide head, unscaled.
+_ROPE = dict(
+    rope_type="default",
+    rope_theta=10000000,
+    partial_rotary_factor=0.25,
+    mrope_section=[11, 11, 10],
+    mrope_interleaved=True,
+)
+# The YaRN extension the model card gives for contexts past 262K tokens.
+_YARN_ROPE = dict(
+    _ROPE, rope_type="yarn", factor=4.0, original_max_position_embeddings=262144
+)
+
+
 def _qwen38_config(**text_overrides):
     """The shape Qwen3.8-27B-NVFP4's config.json declares."""
     text = dict(
@@ -70,6 +85,7 @@ def _qwen38_config(**text_overrides):
         full_attention_interval=4,
         vocab_size=248320,
         torch_dtype=torch.bfloat16,
+        rope_parameters=dict(_ROPE),
     )
     text.update(text_overrides)
     return PretrainedConfig(
@@ -158,6 +174,17 @@ def test_claimed_target_declares_recurrent_pool_geometry(composite):
     assert params.get_states_bytes_per_layer(Mapping()) == 10240 * 3 * 2 + 48 * 260 * 128
 
 
+def test_claimed_target_declares_a_manager_without_inforward_snapshots():
+    """The target's prefill writes only each chunk's final state, so its cache manager must
+    not plan in-forward snapshots (the scheduler then cuts a prompt at the snapshot)."""
+    from tensorrt_llm._torch.modules.fla.cache_manager import Qwen35HybridCacheManager
+
+    target = modeling_v2_resolve(_model_config(_qwen38_config()), _llm_args("require"))
+    manager_cls = target.runtime_hooks.fget(None).kv_cache_manager_cls
+    assert issubclass(manager_cls, Qwen35HybridCacheManager)
+    assert manager_cls._supports_inforward_snapshot is False
+
+
 @pytest.mark.parametrize(
     "config, spec_config, mapping_kwargs, missed",
     [
@@ -181,6 +208,24 @@ def test_other_recipe_does_not_match(recipe):
     config = _model_config(_qwen38_config(), recipe=recipe)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match="not the FP8/NVFP4 MIXED_PRECISION recipe"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize(
+    "rope, missed",
+    [
+        (_YARN_ROPE, "rope type 'yarn' with factor 4.0"),
+        (dict(_ROPE, factor=4.0), "rope type 'default' with factor 4.0"),
+        (dict(_ROPE, mrope_interleaved=False), "not interleaved"),
+        (dict(_ROPE, mrope_section=[16, 16, 16]), "mrope_section"),
+    ],
+    ids=["yarn", "scaled-default", "not-interleaved", "wide-section"],
+)
+def test_other_rope_does_not_match(rope, missed):
+    """A scaled rope would rotate every position by the factor in the target's table."""
+    config = _model_config(_qwen38_config(rope_parameters=rope))
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
         modeling_v2_resolve(config, _llm_args("require"))
 
 
@@ -211,6 +256,11 @@ def test_on_sm103_does_not_match(monkeypatch):
         (_SERVED_KV, dict(lora_config=LoraConfig()), "LoRA"),
         (
             _SERVED_KV,
+            dict(sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=1.0)),
+            "sparse_attention_config",
+        ),
+        (
+            _SERVED_KV,
             dict(cache_transceiver_config=CacheTransceiverConfig(backend="NIXL")),
             "disaggregated serving",
         ),
@@ -226,6 +276,7 @@ def test_on_sm103_does_not_match(monkeypatch):
         "breakable-prefill-graph",
         "flashinfer-attention",
         "lora",
+        "skip-softmax",
         "disaggregated",
         "kv-manager-v1",
     ],
