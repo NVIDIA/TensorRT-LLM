@@ -17,8 +17,8 @@ kernels at that precision (``M3Eagle3Worker``).
 
 **The core** (``MiniMaxM3Tp2ModelingV2``) holds the weights (``weights.MODEL_WEIGHTS``) and the runtime resources the
 steps use -- one MSA attention backend per layer, the TP all-reduce communicator, the RoPE table, the MXFP8 GEMM
-dispatch state the engine tunes -- and dispatches each step, on the host, from its context count alone
-(``_select_target``):
+dispatch state the engine tunes. The shell passes the step's phase as ``has_context``. Direct core calls
+can derive it from the attention metadata:
 
 * ``DecodeTarget`` takes every pure generation step, of 1..``WIDE_MAX_TOKENS`` rows (up to 48 requests, each one token
   or a draft verify of 1 + 3 rows). Up to ``DECODE_MAX_TOKENS`` tokens with 1-D input ids it runs the decode-step
@@ -1369,6 +1369,7 @@ _VALUES: set = set()
 
 
 def _record(*meta: Hashable) -> None:
+    """Collect eager value dumps without specializing symbolic counts during tracing."""
     if _VALUE_DUMP and not torch.compiler.is_compiling():
         _VALUES.add(meta)
 
@@ -1673,7 +1674,7 @@ def _router_tc_fp4(core, i: int, h: torch.Tensor) -> Optional[tuple]:
     canon's router on these rows); None elsewhere (the caller routes on its fp32 router)."""
     rows = h.shape[0] if h.dim() == 2 else 0
     if not (
-        ROUTER_TC_GEN.covers(rows)
+        ROUTER_TC_GEN_MIN_ROWS <= rows <= ROUTER_TC_GEN_MAX_ROWS
         and core.router_tc_cluster16
         and h.dtype == torch.bfloat16
         and h.stride(1) == 1
@@ -2803,11 +2804,6 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
 
     # --------------------------------------------------------------------------------------------- the dispatch
 
-    def _select_target(self, attn_metadata: AttentionMetadata):
-        """Which target runs this step: one host-side integer, fixed per CUDA-graph capture. A step with context rows
-        (a mixed step included) is prefill's; every pure generation step is decode's, whatever its width."""
-        return self._decode if attn_metadata.num_contexts == 0 else self._prefill
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -2817,6 +2813,8 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         capture: Callable[..., None] = _plain_capture,
         capture_target: Optional[Callable[..., Optional[tuple]]] = None,
+        *,
+        has_context: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
         """``capture``: the Eagle3 hidden-state capture of a layer (the worker's, with its capture norm), and
@@ -2826,7 +2824,10 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if kwargs.get("lora_params") is not None:
             raise ValueError("this MiniMax-M3 target serves no LoRA adapters")
-        return self._select_target(attn_metadata).forward(
+        if has_context is None:
+            has_context = attn_metadata.num_contexts != 0
+        target = self._prefill if has_context else self._decode
+        return target.forward(
             attn_metadata,
             input_ids,
             position_ids,
@@ -2840,11 +2841,6 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
 # --------------------------------------------------------------------------------------------------------------------
 # The targets
 # --------------------------------------------------------------------------------------------------------------------
-
-
-#: The cores the breakable prefill graphs' eager attention boundary looks up by key: an ``eager_on_graph`` callable
-#: replays with weak references to its arguments, so they may be tensors or scalars only.
-_BCG_CORES: Dict[str, "MiniMaxM3Tp2ModelingV2"] = {}
 
 
 def _msa_attention_live(core, i: int, q, k, v, idx_q, md, output) -> None:
@@ -2869,39 +2865,9 @@ def _msa_attention_live(core, i: int, q, k, v, idx_q, md, output) -> None:
     )
 
 
-def _prefill_attention_boundary(
-    packed, position_ids, q, k, v, idx_q, output, core_key: str, i: int
-) -> None:
-    """The attention boundary of a prefill layer under a breakable prefill CUDA graph, run eagerly at every replay (as
-    the built-in model's MiniMax-M3 attention boundary is): everything that depends on the step's live row count. A
-    sparse layer passes its ``packed`` five-way projection: the horizontal producer runs here over the live rows
-    (K / V / index-K into the paged caches, Q / index-Q out), then the MSA backend; a dense layer passes q / k / v."""
-    core = _BCG_CORES[core_key]
-    md = get_model_extra_attrs()["attention_metadata"]()
-    live = int(md.num_tokens)
-    if packed is not None:
-        horizontal = _sparse_qkv_producer(
-            core,
-            i,
-            packed[:live],
-            position_ids[..., :live] if position_ids is not None else None,
-            md.kv_cache_manager,
-            md.msa_idx_k_cache,
-            md.msa_out_cache_loc,
-        )
-        if horizontal is None:
-            raise RuntimeError(
-                f"MiniMax-M3 sparse layer {i}: no horizontal producer takes this step's caches (an FP8 or NVFP4 HND "
-                "pool with an FP8 index-K cache)"
-            )
-        q, idx_q = horizontal
-        k = v = None
-    _msa_attention_live(core, i, q, k, v, idx_q, md, output)
+_prefill_attention_eager = eager_on_graph(prefill_attention)
 
-
-_prefill_attention_eager = eager_on_graph(_prefill_attention_boundary)
-
-#: The drafters the breakable prefill graphs' eager draft attention boundary looks up by key (``_BCG_CORES``'s rule).
+#: Breakable drafter attention passes a key because replay arguments must be tensors or scalars.
 _BCG_DRAFTS: Dict[str, "M3Eagle3Draft"] = {}
 
 
@@ -2928,11 +2894,9 @@ class PrefillTarget:
 
     def __init__(self, core: MiniMaxM3Tp2ModelingV2) -> None:
         self.core = core
-        self._compiled_attention_key = register_prefill_core(
+        self._attention_key = register_prefill_core(
             core, _sparse_qkv_producer, _msa_attention_live, _fp8_index_qk_norm_rope
         )
-        self._bcg_key = f"m3_tp2_core_{id(core)}"
-        _BCG_CORES[self._bcg_key] = core
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per forward.
         self._contract_pending = step_contract_enabled()
 
@@ -2948,16 +2912,8 @@ class PrefillTarget:
         self._contract_pending = False
 
     def step_args(self, md) -> dict:
-        """The one projection of the MSA metadata this target's forward reads, computed once per step.
-
-        Counts and per-step host scalars are read here; device tensors are the metadata's persistent buffers, held
-        by reference; ``msa_idx_k_cache`` is the metadata's per-layer index-K cache getter. ``metadata`` is the
-        prepared object itself: the MSA backend's step (``m3_msa_attention``) takes it as its argument.
-        """
+        """Borrow the metadata and cache handles used by eager prefill attention."""
         return dict(
-            num_contexts=md.num_contexts,
-            num_ctx_tokens=md.num_ctx_tokens,
-            num_tokens=md.num_tokens,
             kv_cache_manager=md.kv_cache_manager,
             msa_idx_k_cache=md.msa_idx_k_cache,
             msa_out_cache_loc=md.msa_out_cache_loc,
@@ -2978,7 +2934,8 @@ class PrefillTarget:
         core = self.core
         self._check_step_contract(attn_metadata)
         step = self.step_args(attn_metadata)
-        _record("prefill", int(step["num_tokens"]), int(step["num_contexts"]))
+        if _VALUE_DUMP and not torch.compiler.is_compiling():
+            _record("prefill", int(attn_metadata.num_tokens), int(attn_metadata.num_contexts))
         hidden = (
             m3_embedding(input_ids, core.w["embed"]) if inputs_embeds is None else inputs_embeds
         )
@@ -3062,7 +3019,7 @@ class PrefillTarget:
                 taken(MOE_ENGINE.path, rows)
                 folded = m3_moe_engine(h.contiguous(), engine, None, None)
                 return folded, None
-        if not return_parts and _triton_finalize_rows(core, h):
+        if not is_torch_compiling() and not return_parts and _triton_finalize_rows(core, h):
             routed_parts, shared_out = maybe_execute_in_parallel(
                 lambda: _routed_experts(core, i, h, None, _router_logits(core, i, h), False),
                 lambda: self._swiglu_mlp(h, f"l{i}_sh", False),
@@ -3156,6 +3113,7 @@ class PrefillTarget:
             o = self._attention_core(i, q, k, v, None, step)
             return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)
         if not core.fused_projection:
+            # Compiled prefill supports unfused projections inside a breakable context.
             if not is_torch_compiling() and is_in_breakable_cuda_graph():
                 raise RuntimeError(
                     "this MiniMax-M3 target runs a breakable prefill CUDA graph only with the five-way projection "
@@ -3175,16 +3133,16 @@ class PrefillTarget:
                 None,
                 None,
                 output,
-                self._compiled_attention_key,
+                self._attention_key,
                 i,
             )
             return _linear(core, output, f"l{i}_o_w", f"l{i}_o_s", True)
-        if not is_torch_compiling() and is_in_breakable_cuda_graph():
+        if is_in_breakable_cuda_graph():
             output = packed.new_empty(
                 (packed.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16
             )
             _prefill_attention_eager(
-                packed, position_ids, None, None, None, None, output, self._bcg_key, i
+                packed, position_ids, None, None, None, None, output, self._attention_key, i
             )
             return _linear(core, output, f"l{i}_o_w", f"l{i}_o_s", True)
         horizontal = _sparse_qkv_producer(
@@ -3252,13 +3210,11 @@ class PrefillTarget:
         core = self.core
         output = q.new_empty((q.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16)
         if is_torch_compiling():
-            prefill_attention(
-                None, position_ids, q, k, v, idx_qk, output, self._compiled_attention_key, i
-            )
+            prefill_attention(None, position_ids, q, k, v, idx_qk, output, self._attention_key, i)
             return output
-        if not is_torch_compiling() and is_in_breakable_cuda_graph():
+        if is_in_breakable_cuda_graph():
             # The live row count is a host value of the step: read at every replay inside the eager boundary.
-            _prefill_attention_eager(None, None, q, k, v, idx_q, output, self._bcg_key, i)
+            _prefill_attention_eager(None, None, q, k, v, None, output, self._attention_key, i)
         else:
             _msa_attention_live(core, i, q, k, v, idx_q, step["metadata"], output)
         return output
@@ -6246,6 +6202,7 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
             raise ValueError(
                 "this MiniMax-M3 target is text only; the request carries multimodal input"
             )
+        has_context = attn_metadata.num_contexts != 0
         worker = self.spec_worker
         capture = _plain_capture
         capture_target = None
@@ -6256,13 +6213,26 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
                 worker.arm_capture_norm(
                     attn_metadata, spec_metadata, self.lm_head, self.draft_model
                 )
+        capture_for_core = capture
+        if (
+            worker is not None
+            and spec_metadata is not None
+            and has_context
+            and is_torch_compiling()
+        ):
+            assert worker._m3_capture_norm is None and worker._m3_fc_early_drafter is None, (
+                "compiled prefill requires plain Eagle3 capture"
+            )
+            capture_for_core = _modeling_support._prepare_prefill_eagle3_capture(spec_metadata)
         hidden_states = self.model(
             attn_metadata=attn_metadata,
+            # Pass the local phase into the compiled core without tracing request counts.
+            has_context=has_context,
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             spec_metadata=spec_metadata,
-            capture=capture,
+            capture=capture_for_core,
             capture_target=capture_target,
             **kwargs,
         )

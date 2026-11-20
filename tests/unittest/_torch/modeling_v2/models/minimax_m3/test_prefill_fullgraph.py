@@ -13,6 +13,7 @@ from torch._dynamo.testing import CompileCounter
 
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.compilation.backend import Backend
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import modeling_support
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (
     modeling as tp2,
 )
@@ -101,6 +102,9 @@ class _AttentionStep:
     index_cache: torch.Tensor
     msa_out_cache_loc: torch.Tensor
     kv_cache_manager: object = None
+    num_contexts: int = 1
+    num_ctx_tokens: int = 0
+    padded_num_tokens: int | None = None
 
     def msa_idx_k_cache(self, layer: int) -> torch.Tensor:
         return self.index_cache
@@ -274,6 +278,49 @@ def test_small_prefill_fullgraph_uses_compile_safe_dispatch(
     assert counter.frame_count == 1
 
 
+@pytest.mark.parametrize("rows", [64, 128])
+def test_tp2_compiled_prefill_finalizes_inside_moe_runner(
+    monkeypatch: pytest.MonkeyPatch, make_cpu_model, rows: int
+) -> None:
+    core = make_cpu_model(tp2)
+    core.moe_max_num_tokens = 128
+    target = tp2.PrefillTarget(core)
+
+    def run_experts(core, layer, hidden, scales, logits, do_finalize):
+        assert do_finalize, "compiled prefill requested unfinalized FP4 output"
+        return hidden * 2
+
+    monkeypatch.setattr(tp2, "_routed_experts", run_experts)
+    monkeypatch.setattr(tp2, "_router_logits", lambda core, layer, hidden: hidden)
+    monkeypatch.setattr(target, "_swiglu_mlp", lambda hidden, *args: hidden.clone())
+
+    def forward(hidden: torch.Tensor) -> torch.Tensor:
+        output, _ = target._moe(1, hidden, return_parts=False)
+        return output
+
+    torch._dynamo.reset()
+    compiled = torch.compile(forward, fullgraph=True, backend="eager")
+    hidden = torch.ones((rows, core.hidden), dtype=torch.bfloat16)
+    with torch_compiling(True):
+        torch.testing.assert_close(compiled(hidden), hidden * 3)
+
+
+def test_tp2_large_prefill_rows_share_a_router_fallback_trace(make_cpu_model) -> None:
+    core = make_cpu_model(tp2)
+
+    def forward(hidden: torch.Tensor) -> torch.Tensor:
+        assert tp2._router_tc_fp4(core, 1, hidden) is None
+        return hidden + 1
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    compiled = torch.compile(forward, fullgraph=True, dynamic=True, backend=counter)
+    for rows in (64, 128, 256):
+        hidden = torch.ones((rows, 16), dtype=torch.bfloat16)
+        torch.testing.assert_close(compiled(hidden), hidden + 1)
+    assert counter.frame_count == 1
+
+
 @pytest.mark.parametrize("modeling", [tp2, tp4, tp8])
 def test_value_dump_skips_symbolic_counts_during_fullgraph_trace(
     monkeypatch: pytest.MonkeyPatch, modeling: ModuleType
@@ -314,6 +361,107 @@ class _Batch:
     num_tokens: int
     num_contexts: int
     padded_num_tokens: int | None = None
+
+
+@dataclass
+class _EagleCapture:
+    hidden_states: torch.Tensor
+    hidden_size: int
+    gather_ids: torch.Tensor
+    num_capture_tokens: int = 0
+    layers_to_capture: tuple[int, ...] = (0,)
+
+    def is_layer_capture(self, layer_id: int) -> bool:
+        return layer_id in self.layers_to_capture
+
+
+class _EagleWorker:
+    _m3_capture_norm = None
+    _m3_fc_early_drafter = None
+
+    def arm_capture_norm(self, *args) -> None:
+        pass
+
+    def capture_hidden_states(self, *args) -> None:
+        raise AssertionError("compiled prefill should use bucket capture")
+
+    def capture_target(self, *args) -> None:
+        raise AssertionError("prefill does not use decode boundary capture")
+
+    def tail_eligible(self, *args) -> bool:
+        return False
+
+    def __call__(self, *, hidden_states, **kwargs) -> torch.Tensor:
+        return hidden_states
+
+
+@pytest.mark.parametrize("modeling", [tp2, tp4, tp8], ids=["tp2", "tp4", "tp8"])
+@pytest.mark.parametrize("eagle3", [False, True], ids=["plain", "eagle3"])
+def test_prefill_trace_reuses_bucket_across_request_counts(
+    monkeypatch: pytest.MonkeyPatch, make_cpu_model, modeling: ModuleType, eagle3: bool
+) -> None:
+    shell = make_cpu_model(modeling, shell=True)
+    core = shell.model
+    core._prefill = modeling.PrefillTarget(core)
+    core._decode = modeling.DecodeTarget(core)
+    shell.logits_processor = _PassThroughLogits()
+    monkeypatch.setattr(core._prefill, "_attention", lambda layer, pos, x, step: (x, False))
+    monkeypatch.setattr(core._prefill, "_swiglu_mlp", lambda x, *args, **kwargs: x + 1)
+    monkeypatch.setattr(core._prefill, "_moe", lambda layer, x, **kwargs: (x + 1, None))
+    monkeypatch.setattr(modeling, "_native_allreduce_norm", lambda core, x, r, w: (x, x))
+    monkeypatch.setattr(modeling, "flashinfer_rmsnorm", lambda x, *args: x)
+
+    def decode(metadata, input_ids, positions, hidden, *args):
+        return hidden - 1
+
+    monkeypatch.setattr(core._decode, "forward", decode)
+    monkeypatch.setattr(
+        get_global_attrs(), "per_request_prefill_cuda_graph_flag", True, raising=False
+    )
+    args = TorchLlmArgs.model_construct(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+        torch_compile_config=TorchCompileConfig(),
+    )
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    model, prefill_only = model_setup.apply_torch_compile(
+        shell, counter, llm_args=args, fullgraph=True
+    )
+    caller = ModelCaller(model, prefill_compile_only=prefill_only, nccl_window_scopes_enabled=False)
+    hidden = torch.ones((8, core.hidden), dtype=torch.bfloat16)
+    metadata = _AttentionStep(0, torch.empty(0), torch.arange(8), padded_num_tokens=8)
+    spec_metadata = None
+    if eagle3:
+        shell.spec_worker = _EagleWorker()
+        spec_metadata = _EagleCapture(torch.empty_like(hidden), core.hidden, torch.arange(1))
+
+        def cpu_slice_copy(dest, src, start, end):
+            dest[: src.shape[0], start:end].copy_(src)
+
+        monkeypatch.setattr(modeling_support, "inplace_slice_copy", cpu_slice_copy)
+
+    with model_extra_attrs({}):
+        for contexts, live_tokens in ((1, 6), (4, 7), (1, 5)):
+            metadata.num_contexts = contexts
+            metadata.num_tokens = metadata.num_ctx_tokens = live_tokens
+            hidden.fill_(contexts + live_tokens)
+            if spec_metadata is not None:
+                spec_metadata.num_capture_tokens = live_tokens
+            output = caller(
+                attn_metadata=metadata, inputs_embeds=hidden, spec_metadata=spec_metadata
+            )
+            torch.testing.assert_close(output, hidden[:live_tokens] + core.num_layers)
+            if spec_metadata is not None:
+                torch.testing.assert_close(
+                    spec_metadata.hidden_states[:live_tokens], hidden[:live_tokens] + 1
+                )
+        assert counter.frame_count == 1
+
+        # An eligible call with zero local contexts still selects decode.
+        shell.spec_worker = None
+        metadata.num_contexts = metadata.num_ctx_tokens = 0
+        output = caller(attn_metadata=metadata, inputs_embeds=hidden)
+        torch.testing.assert_close(output, hidden[: metadata.num_tokens] - 1)
 
 
 @pytest.mark.parametrize(
