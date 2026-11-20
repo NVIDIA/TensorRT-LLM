@@ -1063,6 +1063,7 @@ def test_explicit_kv_cache_manager_v1_is_rejected_at_load(model_cls):
 def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel):
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextCacheManager
     from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+    from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
     from tensorrt_llm.bindings import DataType
     from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
     from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1114,6 +1115,12 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel
     allocate.assert_called_once()
     assert allocate.call_args.kwargs["dtype"] == (DataType.FP8 if fp8_kv_cache else DataType.BF16)
     assert allocate.call_args.kwargs["conv_state_layout"] == "q_k_v"
+    # The sparse MLA layers keep one key-only head of the latent width (kv_lora_rank 512, no
+    # RoPE part); an indexer row holds three fields of index_head_dim 128.
+    assert allocate.call_args.args[10] == CacheTypeCpp.SELFKONLY
+    assert allocate.call_args.kwargs["num_kv_heads"] == 1
+    assert allocate.call_args.kwargs["head_dim"] == 512
+    assert allocate.call_args.kwargs["index_state_dim"] == 384
     assert "kda_replay_num_spec" not in allocate.call_args.kwargs
     manager = object.__new__(Glm5NextCacheManager)
     manager._requested_num_spec = None

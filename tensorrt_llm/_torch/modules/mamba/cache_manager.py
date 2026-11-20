@@ -10,7 +10,7 @@ import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -41,6 +41,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 from .replay_metadata import ReplayMamba2Metadata
 from .replay_region import REPLAY_STATE_REGION, Mamba2ReplayRegion, ReplayLayout
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
 
 MIN_REPLAY_HISTORY_SIZE = 16
 # Per-layer replay history roles, in ReplayHistory attribute order.
@@ -606,6 +610,33 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
     mamba_metadata_cls = ReplayMamba2Metadata
     _replay_region: Mamba2ReplayRegion | None = None
     _context_only = False
+
+    @classmethod
+    @override
+    def family_init_kwargs(
+        cls,
+        *,
+        model_config: ModelConfig,
+        spec_config: object,
+        sparse_attention_config: object,
+        mamba_params: MambaKVCacheParams,
+        model: torch.nn.Module | None,
+    ) -> dict[str, object]:
+        stochastic_rounding = getattr(
+            model_config.quant_config, "mamba_ssm_stochastic_rounding", False
+        )
+        return {
+            "conv_state_layout": "x_b_c",
+            # The manager tells its draft layers apart by the model's layer count.
+            "pretrained_config": model_config.pretrained_config,
+            "use_replay_state_update": None,
+            # The manager keeps the rounding seeds whenever rounding can fire on the fp16 SSM
+            # cache, which is the condition the mixer applies (`_stochastic_rounding_for_flashinfer`
+            # and `_stochastic_rounding_for_replay` of `Mamba2Mixer`).
+            "mamba_ssm_stochastic_rounding": (
+                stochastic_rounding and mamba_params.mamba_ssm_cache_dtype == torch.float16
+            ),
+        }
 
     @override
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:

@@ -163,6 +163,7 @@ from tensorrt_llm.llmapi.llm_utils import (
     _resolve_transceiver_runtime_auto,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
@@ -463,6 +464,7 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
         torch.bfloat16,
         torch.float32,
     )
+    assert args[10] == CacheTypeCpp.SELFKONLY
     assert kwargs["num_layers"] == 2
     assert kwargs["layer_mask"] == [False, True, False, True]
     assert kwargs["num_kv_heads"] == 1
@@ -706,6 +708,7 @@ def test_kimi_v1_manager_receives_model_identity_for_replay_selection(
 
     class RecordingV1Manager(CppMambaHybridCacheManager):
         def __init__(self, *args: object, **kwargs: object) -> None:
+            captured["args"] = args
             captured["kwargs"] = kwargs
 
     model_config = _kimi_model_config()
@@ -731,6 +734,10 @@ def test_kimi_v1_manager_receives_model_identity_for_replay_selection(
         is_draft=False,
     )
     kwargs = captured["kwargs"]
+    # The MLA layers keep one key-only head of the latent and RoPE widths (32 + 8).
+    assert captured["args"][10] == CacheTypeCpp.SELFKONLY
+    assert kwargs["num_kv_heads"] == 1
+    assert kwargs["head_dim"] == 40
     assert "vocab_size" not in kwargs
     assert kwargs["model_type"] == "kimi_linear"
     assert "conv_state_layout" not in kwargs
@@ -773,7 +780,7 @@ def test_v2_manager_rejects_model_type_kwarg() -> None:
 def test_gdn_mtp_replay_leaves_the_fused_fp8_verify_alone(fused_verify, fp8_out, expected):
     """GDN layers of the PyTorch mixer can use GDN MTP replay unless they verify with the fused
     kernels into an FP8 out_proj input, which keep the cached replay history."""
-    from tensorrt_llm._torch.pyexecutor._util import _uses_gdn_mtp_replay
+    from tensorrt_llm._torch.modules.fla.cache_manager import uses_gdn_mtp_replay
 
     layers = []
     for _ in range(2):
@@ -782,8 +789,8 @@ def test_gdn_mtp_replay_leaves_the_fused_fp8_verify_alone(fused_verify, fp8_out,
         gdn.fused_verify = fused_verify
         gdn.norm = SimpleNamespace(fp8_scale=torch.tensor(0.5) if fp8_out else None)
         layers.append(gdn)
-    assert _uses_gdn_mtp_replay(torch.nn.ModuleList(layers)) is expected
-    assert _uses_gdn_mtp_replay(torch.nn.ModuleList([torch.nn.Linear(2, 2)])) is False
+    assert uses_gdn_mtp_replay(torch.nn.ModuleList(layers)) is expected
+    assert uses_gdn_mtp_replay(torch.nn.ModuleList([torch.nn.Linear(2, 2)])) is False
 
 
 @pytest.mark.parametrize(
@@ -856,7 +863,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         def __init__(self, *args, **kwargs):
             captured_mixed.update(kwargs)
 
-    class RecordingV2Manager(MambaHybridCacheManagerV2):
+    class RecordingV2Manager(Qwen35HybridCacheManager):
         def __init__(self, *args, **kwargs):
             captured_v2.update(kwargs)
 
@@ -868,6 +875,11 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         num_key_value_heads=2,
         num_hidden_layers=2,
         layer_types=["linear_attention", "full_attention"],
+        linear_key_head_dim=8,
+        linear_conv_kernel_dim=4,
+        linear_num_value_heads=4,
+        linear_num_key_heads=1,
+        linear_value_head_dim=8,
     )
     model_config = SimpleNamespace(
         pretrained_config=pretrained_config,
@@ -991,12 +1003,16 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert not any("RecordingV2Manager was selected" in log for log in fallback_logs)
 
 
-@pytest.mark.parametrize(
-    "manager_cls",
-    [CppMambaHybridCacheManager, MixedMambaHybridCacheManager, MambaHybridCacheManagerV2],
-)
-@pytest.mark.parametrize("nested_vocab_size", [False, True])
-def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls, nested_vocab_size):
+def _capture_nemotron_manager_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+    manager_cls: type,
+    *,
+    nested_vocab_size: bool = False,
+    quant_config: QuantConfig | None = None,
+    ssm_cache_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[SimpleNamespace, dict[str, object]]:
+    """Build ``manager_cls`` for a Nemotron-H config and return the config and the keyword
+    arguments its constructor received."""
     captured = {}
 
     class RecordingManager(manager_cls):
@@ -1006,6 +1022,11 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
     config = SimpleNamespace(
         architectures=["NemotronHForCausalLM"],
         hybrid_override_pattern="M*",
+        ssm_state_size=8,
+        conv_kernel=4,
+        mamba_num_heads=4,
+        n_groups=1,
+        mamba_head_dim=8,
         vocab_size=131072,
         hidden_size=32,
         num_attention_heads=4,
@@ -1026,7 +1047,7 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
         num_mamba_layers=1,
         num_draft_layers=0,
         dtype=torch.bfloat16,
-        mamba_ssm_cache_dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=ssm_cache_dtype,
     )
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor._util.extract_mamba_kv_cache_params",
@@ -1045,18 +1066,49 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
         max_num_tokens=256,
         max_beam_width=1,
         kv_connector_manager=None,
-        model_config=SimpleNamespace(pretrained_config=config, quant_config=None),
+        model_config=SimpleNamespace(pretrained_config=config, quant_config=quant_config),
         dtype=torch.bfloat16,
         is_draft=False,
     )
+    return config, captured
 
-    if manager_cls is MambaHybridCacheManagerV2:
+
+_NEMOTRON_MANAGER_CLASSES = [
+    CppMambaHybridCacheManager,
+    MixedMambaHybridCacheManager,
+    NemotronHybridCacheManager,
+]
+
+
+@pytest.mark.parametrize("manager_cls", _NEMOTRON_MANAGER_CLASSES)
+@pytest.mark.parametrize("nested_vocab_size", [False, True])
+def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls, nested_vocab_size):
+    config, captured = _capture_nemotron_manager_kwargs(
+        monkeypatch, manager_cls, nested_vocab_size=nested_vocab_size
+    )
+
+    assert captured["mamba_ssm_stochastic_rounding"] is False
+    if manager_cls is NemotronHybridCacheManager:
         assert captured["vocab_size"] == 131072
         # The manager tells its draft layers apart by the model's layer count.
         assert captured["pretrained_config"] is config
     else:
         assert "vocab_size" not in captured
         assert "pretrained_config" not in captured
+
+
+@pytest.mark.parametrize("manager_cls", _NEMOTRON_MANAGER_CLASSES)
+def test_nemotron_factory_keeps_rounding_seeds_on_an_fp16_ssm_cache(monkeypatch, manager_cls):
+    _, captured = _capture_nemotron_manager_kwargs(
+        monkeypatch,
+        manager_cls,
+        quant_config=QuantConfig(
+            mamba_ssm_cache_dtype="float16", mamba_ssm_stochastic_rounding=True
+        ),
+        ssm_cache_dtype=torch.float16,
+    )
+
+    assert captured["mamba_ssm_stochastic_rounding"] is True
 
 
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(

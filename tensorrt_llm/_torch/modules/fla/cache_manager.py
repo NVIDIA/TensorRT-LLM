@@ -53,6 +53,7 @@ from .inforward_snapshot import InforwardSnapshotHost, InforwardSnapshots
 from .replay_region import REPLAY_STATE_REGION, GDNReplayRegion, ReplayLayout
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 MIN_REPLAY_HISTORY_SIZE = 16
@@ -1345,6 +1346,19 @@ class Qwen35HybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV2)
     # kernels (modules/mamba/gdn_mixer.py) instead of the cached replay.
     gdn_mtp_replay = False
 
+    @classmethod
+    @override
+    def family_init_kwargs(
+        cls,
+        *,
+        model_config: ModelConfig,
+        spec_config: object,
+        sparse_attention_config: object,
+        mamba_params: object,
+        model: torch.nn.Module | None,
+    ) -> dict[str, object]:
+        return gdn_family_init_kwargs(model_config.pretrained_config, model)
+
     @override
     def __init__(
         self,
@@ -1570,6 +1584,53 @@ class Qwen35HybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV2)
         return isinstance(self._speculative_state, GDNMtpReplayState)
 
 
+def uses_gdn_fused_verify(model: torch.nn.Module) -> bool:
+    """Return whether a GDN layer of ``model`` verifies drafts with the fused kernels."""
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+
+    return any(
+        module.fused_verify
+        for module in model.modules()
+        if isinstance(module, Qwen3NextGatedDeltaNet)
+    )
+
+
+def uses_gdn_mtp_replay(model: torch.nn.Module) -> bool:
+    """Whether ``model``'s GDN layers can verify drafts with the GDN MTP replay kernels.
+
+    They must be the PyTorch GDN mixer, and none may verify with the fused
+    kernels into an FP8 out_proj input (gdn_verify_tcgen05 / trtllm::gdn_verify),
+    which keep the cached replay history.
+    """
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+
+    layers = [module for module in model.modules() if isinstance(module, Qwen3NextGatedDeltaNet)]
+    return bool(layers) and not any(
+        layer.fused_verify and layer.norm.fp8_scale is not None for layer in layers
+    )
+
+
+def gdn_family_init_kwargs(
+    pretrained_config: object, model: torch.nn.Module | None
+) -> dict[str, object]:
+    """Return the constructor keyword arguments of a V2 manager that holds GDN state.
+
+    Args:
+        pretrained_config: Config of the model the manager is created for.
+        model: The built model, or ``None`` when the manager is created without one.
+    """
+    init_kwargs: dict[str, object] = {
+        "conv_state_layout": "q_k_v",
+        # The manager tells its draft layers apart by the model's layer count.
+        "pretrained_config": pretrained_config,
+        "use_replay_state_update": None,
+    }
+    if model is not None:
+        init_kwargs["gdn_fused_verify"] = uses_gdn_fused_verify(model)
+        init_kwargs["gdn_mtp_replay"] = uses_gdn_mtp_replay(model)
+    return init_kwargs
+
+
 def get_gdn_cache_params(config, *, spec_config=None, quant_config=None):
     """Shared Qwen3.5/Qwen4 GDN geometry; attention and PLE stay model-owned."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -1602,5 +1663,8 @@ __all__ = [
     "estimate_gdn_replay_bytes_per_slot",
     "select_gdn_replay_state",
     "validate_gdn_layout",
+    "gdn_family_init_kwargs",
     "get_gdn_cache_params",
+    "uses_gdn_fused_verify",
+    "uses_gdn_mtp_replay",
 ]

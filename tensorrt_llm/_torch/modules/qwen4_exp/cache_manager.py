@@ -33,6 +33,7 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     ReplayStateUpdateMetadata,
     create_gdn_state,
     estimate_gdn_replay_bytes_per_slot,
+    gdn_family_init_kwargs,
     validate_gdn_layout,
 )
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
@@ -42,7 +43,7 @@ from tensorrt_llm._torch.modules.fla.inforward_snapshot import (
     InforwardSnapshots,
 )
 from tensorrt_llm._torch.modules.fla.replay_region import REPLAY_STATE_REGION, GDNReplayRegion
-from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
+from tensorrt_llm._torch.pyexecutor.config_utils import is_qwen4_exp, resolve_hf_torch_dtype
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
@@ -62,6 +63,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, Pag
 if TYPE_CHECKING:
     import transformers
 
+    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # Storage-layout constants; model geometry comes from QSASparseParams.
@@ -148,8 +150,6 @@ def _qwen4_exp_ple_state_bytes_per_rank(
     use_separate_draft_kv_cache: bool,
 ) -> int:
     """Bytes this rank needs for Qwen4-Exp PLE recurrent state; 0 otherwise."""
-    from tensorrt_llm._torch.pyexecutor.config_utils import is_qwen4_exp
-
     # The estimator is also called with minimal model-config stubs that carry no
     # `pretrained_config`; such a config is definitionally not Qwen4-Exp.
     pretrained_config = getattr(model_config, "pretrained_config", None)
@@ -217,6 +217,28 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
     # QSA_INDEX_POSITION page, unvalidated for cross-request reuse.
     # KvCacheCreator reads this off the class, so dense Qwen4-Exp opts out too.
     _supports_draft_reuse_match_backoff = False
+
+    @classmethod
+    @override
+    def family_init_kwargs(
+        cls,
+        *,
+        model_config: ModelConfig,
+        spec_config: object,
+        sparse_attention_config: object,
+        mamba_params: object,
+        model: torch.nn.Module | None,
+    ) -> dict[str, object]:
+        init_kwargs = gdn_family_init_kwargs(model_config.pretrained_config, model)
+        # QSA selects this manager for other GDN models too; they have no PLE
+        # state and no in-forward snapshot split of it.
+        if is_qwen4_exp(model_config.pretrained_config):
+            init_kwargs["sparse_attention_config"] = sparse_attention_config
+            if model is not None:
+                init_kwargs["inforward_snapshot_min_main"] = int(
+                    getattr(model, "inforward_snapshot_min_main", 0) or 0
+                )
+        return init_kwargs
 
     @override
     def page_table_spec(self) -> PageTableSpec:

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -18,9 +19,9 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
-from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     QSASparseAttentionConfig,
@@ -309,46 +310,43 @@ def test_qwen4_cache_manager_uses_only_qsa_index_geometry(
     monkeypatch,
     sparse_config,
 ) -> None:
-    from tensorrt_llm._torch.pyexecutor import _util
-
     checkpoint_config = SimpleNamespace(
+        architectures=["Qwen4ExpForCausalLM"],
         vocab_size=151936,
         hidden_size=2560,
         num_attention_heads=24,
         num_key_value_heads=2,
         head_dim=256,
         num_hidden_layers=2,
+        torch_dtype=torch.bfloat16,
+        layer_types=["linear_attention", "full_attention"],
+        linear_key_head_dim=128,
+        linear_conv_kernel_dim=4,
+        linear_num_value_heads=16,
+        linear_num_key_heads=16,
+        linear_value_head_dim=128,
+        ple_layer_ids=[1],
+        ple_conv_kernel_size=2,
+        ngram_size=3,
         indexer_n_heads=4,
         indexer_kv_heads=1,
         indexer_head_dim=96,
         indexer_budget=2048,
         indexer_compress_ratio=4,
     )
-    mamba_params = MambaKVCacheParams(
-        state_size=128,
-        conv_kernel=4,
-        num_heads=16,
-        n_groups=16,
-        head_dim=128,
-        mamba_layer_mask=[True, False],
-        target_full_attention_layer_mask=[False, True],
-        num_mamba_layers=1,
-        num_draft_layers=0,
-        dtype=torch.bfloat16,
-        mamba_ssm_cache_dtype=torch.bfloat16,
-    )
-    monkeypatch.setattr(_util, "is_kimi_linear", lambda config: False)
-    monkeypatch.setattr(_util, "is_mla", lambda config: False)
-    monkeypatch.setattr(_util, "is_nemotron_hybrid", lambda config: False)
-    monkeypatch.setattr(_util, "is_qwen3_hybrid", lambda config: False)
-    monkeypatch.setattr(_util, "is_qwen4_exp", lambda config: True)
-    monkeypatch.setattr(
-        _util, "extract_mamba_kv_cache_params", lambda *args, **kwargs: mamba_params
-    )
     monkeypatch.setattr(MambaHybridCacheManagerV2, "__init__", lambda self, *args, **kwargs: None)
+    # The built model names the fewest chunk tokens before an in-forward snapshot point.
+    model = torch.nn.Module()
+    model.inforward_snapshot_min_main = 65
+    model_engine = SimpleNamespace(
+        model=model,
+        attn_runtime_features=SimpleNamespace(chunked_prefill=False),
+        max_cuda_graph_batch_size=None,
+        input_processor=MagicMock(spec=BaseMultimodalInputProcessor),
+    )
 
     manager = _create_kv_cache_manager(
-        model_engine=None,
+        model_engine=model_engine,
         kv_cache_manager_cls=Qwen4ExpHybridCacheManager,
         mapping=SimpleNamespace(enable_attention_dp=False),
         kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
@@ -368,6 +366,7 @@ def test_qwen4_cache_manager_uses_only_qsa_index_geometry(
         is_draft=False,
     )
 
+    assert manager._inforward_min_main_request == 65
     qsa_enabled = isinstance(sparse_config, QSASparseAttentionConfig)
     assert manager._qsa_enabled == qsa_enabled
     assert manager.qsa_index_dim == (96 if qsa_enabled else 0)

@@ -94,6 +94,8 @@ from .common import (
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
@@ -147,6 +149,53 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         validated with a standalone drafter override this to append its layers
         (see ``_append_layers``)."""
         return False
+
+    @classmethod
+    def attention_cache_geometry(
+        cls,
+        pretrained_config: object,
+        *,
+        num_kv_heads: int | list[int],
+        head_dim: int | list[int],
+    ) -> tuple[CacheTypeCpp, int | list[int], int | list[int]]:
+        """Return the cache type, KV head counts and head dimension of the attention layers.
+
+        Args:
+            pretrained_config: Config of the model the manager is created for.
+            num_kv_heads: KV head counts that the config gives a plain attention layer.
+            head_dim: Head dimension that the config gives a plain attention layer.
+
+        Returns:
+            The values the constructor takes. A family whose attention layers store something
+            other than plain attention KV overrides this.
+        """
+        return CacheTypeCpp.SELF, num_kv_heads, head_dim
+
+    @classmethod
+    def family_init_kwargs(
+        cls,
+        *,
+        model_config: ModelConfig,
+        spec_config: DecodingBaseConfig | None,
+        sparse_attention_config: object,
+        mamba_params: MambaKVCacheParams,
+        model: torch.nn.Module | None,
+    ) -> dict[str, object]:
+        """Return the keyword arguments a family adds to the shared constructor call.
+
+        Args:
+            model_config: Config of the model the manager is created for.
+            spec_config: Speculative decoding config, if any.
+            sparse_attention_config: Sparse attention config, if any.
+            mamba_params: Geometry and dtypes that the model declares for its recurrent state.
+            model: The built model. ``None`` when the manager is created without one, as the
+                manager of a separate draft cache is.
+
+        Returns:
+            Keyword arguments for ``__init__``. They may not repeat one the caller passes for
+            every family.
+        """
+        return {}
 
     # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
     # cache manager __init__ coerces a positive spec recompute tail to a full
