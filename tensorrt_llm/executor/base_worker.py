@@ -537,6 +537,21 @@ class BaseWorker(GenerationExecutor):
                 return max_tokens
 
         try:
+            # Dense embedding bias uses C++ path, sparse bias uses Python path
+            embedding_bias = request.sampling_params.embedding_bias
+            sparse_embedding_bias = None
+            if embedding_bias is not None:
+                if isinstance(embedding_bias, torch.Tensor):
+                    embedding_bias = embedding_bias.detach().clone()
+                elif isinstance(embedding_bias, list):
+                    embedding_bias = torch.tensor(embedding_bias,
+                                                  dtype=torch.float32)
+                elif isinstance(embedding_bias, tuple):  # EmbeddingBias
+                    sparse_embedding_bias = embedding_bias
+                    embedding_bias = None
+                else:
+                    raise ValueError("Unsupported embedding bias type")
+
             executor_request = tllm.Request(
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
@@ -553,7 +568,7 @@ class BaseWorker(GenerationExecutor):
                 bad_words=request.sampling_params._get_bad_words(),
                 stop_words=[] if request.sampling_params.ignore_eos else
                 request.sampling_params._get_stop_words(),
-                embedding_bias=request.sampling_params.embedding_bias,
+                embedding_bias=embedding_bias,
                 lora_config=lora_config,
                 multimodal_input=multimodal_input,
                 mrope_config=None,
@@ -583,6 +598,7 @@ class BaseWorker(GenerationExecutor):
                     logprobs_mode=request.sampling_params.logprobs_mode,
                     logprobs_simple_format=request.sampling_params.
                     logprobs_simple_format,
+                    sparse_embedding_bias=sparse_embedding_bias,
                     return_routed_experts=request.sampling_params.
                     return_routed_experts,
                     disaggregated_params=request.disaggregated_params,
@@ -1851,7 +1867,13 @@ def _maybe_wrap_response(
             worker.abort_request(response.client_id)
         return ErrorResponse(response.client_id, str(error),
                              response.request_id)
-    req_perf_metrics = get_metrics_dict(response)
+    # Reading perf metrics deserializes the whole result, and the executor fills
+    # them only for requests that asked; an untracked request is always read.
+    generation_result = worker._results.get(response.client_id)
+    req_perf_metrics = None
+    if (generation_result is None
+            or generation_result.sampling_params.return_perf_metrics):
+        req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
     return response

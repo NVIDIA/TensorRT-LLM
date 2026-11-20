@@ -322,6 +322,34 @@ class TestDSparkTailResolution:
         spec.resolve_from_checkpoint()
         assert spec.context_recompute_tail == 4096
 
+    def test_resolve_from_checkpoint_fills_the_capture_layers(self, tmp_path: Path) -> None:
+        """A hub id has no config.json at validation, so the capture layers and the other drafter
+        fields must come from the downloaded checkpoint, or no target hidden states are captured."""
+        hub = tmp_path / "hub-id"
+        spec = _spec(hub, context_recompute_tail=None)
+        spec.resolve_draft_config_fields()  # what validation runs against the repo id
+        assert spec.target_layer_ids is None
+        hub.mkdir()
+        (hub / "config.json").write_text(json.dumps(_M31))
+        spec.resolve_from_checkpoint()
+        assert spec.target_layer_ids == [3, 17, 31, 45, 59]
+        assert spec.block_size == 7
+        assert spec.context_recompute_tail == 4096
+
+    def test_resolve_from_checkpoint_rejects_a_defaulted_block_size_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        hub = tmp_path / "hub-id"
+        spec = DSparkDecodingConfig(
+            max_draft_len=6, speculative_model=str(hub), context_recompute_tail=0
+        )
+        spec.block_size = 6  # what validation defaults while the hub config is unreadable
+        spec._block_size_defaulted = True
+        hub.mkdir()
+        (hub / "config.json").write_text(json.dumps(_M31))
+        with pytest.raises(ValueError, match="block_size must equal max_draft_len"):
+            spec.resolve_from_checkpoint()
+
     def test_remote_code_in_the_drafter_config_runs_only_when_trusted(self, tmp_path: Path) -> None:
         """Resolving ``None`` reads the drafter config under the user's ``trust_remote_code``."""
         sentinel = tmp_path / "sentinel"

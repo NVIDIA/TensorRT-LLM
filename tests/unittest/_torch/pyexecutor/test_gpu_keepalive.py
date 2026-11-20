@@ -270,6 +270,8 @@ def test_fill_gate_wiring():
             _check_benchmark_disagg_gate = pe.PyExecutor._check_benchmark_disagg_gate
 
         stub = Stub()
+        stub._benchmark_sweep = False
+        stub._benchmark_gate_rearm_pending = False
         stub.is_warmup = warmup
         stub._gpu_keepalive = Mock()
         stub._benchmark_gen_transfer_made_progress = lambda: False

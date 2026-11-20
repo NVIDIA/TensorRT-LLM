@@ -469,6 +469,7 @@ def test_fetch_preserves_admission_result_when_completing_queued_context_cancel(
     executor.dist = SimpleNamespace(rank=0, tp_size=1, cp_config=None, cp_rank=0, cp_size=1)
     executor._fetch_and_enqueue_requests = Mock()
     executor._should_exclude_last_generation_logits = Mock(return_value=False)
+    executor._num_embeddings = 1234
     # Keep the real queued cancellation and capacity admission. Conversion
     # is unrelated to the admission API's (requests, placement) return value.
     monkeypatch.setattr(

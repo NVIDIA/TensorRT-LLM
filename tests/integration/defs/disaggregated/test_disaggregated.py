@@ -830,6 +830,11 @@ def setup_disagg_cluster(
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir),
         where server_port is the port the disagg server bound
     """
+    ctx_env = (ctx_env or env or os.environ).copy()
+    gen_env = (gen_env or env or os.environ).copy()
+    for worker_env in (ctx_env, gen_env):
+        apply_pre_hopper_nccl_workaround(worker_env)
+
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
     for key, value in (config_overrides or {}).items():
@@ -1181,7 +1186,6 @@ def run_disaggregated_test(example_dir,
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
-    apply_pre_hopper_nccl_workaround(run_env)
     ctx_run_env = run_env.copy()
     if ctx_env:
         ctx_run_env.update(ctx_env)
@@ -4453,7 +4457,8 @@ def run_disaggregated_cancel_test(example_dir,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-@pytest.mark.skip_less_device(2)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,

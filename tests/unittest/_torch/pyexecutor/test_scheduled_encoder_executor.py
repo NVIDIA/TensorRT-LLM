@@ -181,6 +181,10 @@ class _Harness:
             self.closed = True
             self.runner.release.set()
             self.executor.shutdown()
+            # A crashed executor loop leaves its completion thread unjoined.
+            completion = self.executor._completion_thread
+            if completion is not None and completion.is_alive():
+                completion.join(timeout=30)
 
 
 @contextmanager
