@@ -2019,6 +2019,9 @@ class KVCacheManager:
     @property
     def need_adjustment(self) -> bool: ...
     @property
+    def adjust_needs_suspend(self) -> bool:
+        """False when adjust() may run with ACTIVE caches (in place, or a host-only re-split)."""
+    @property
     def commit_min_snapshot(self) -> bool: ...
 
 def exact_div(x: int, y: int) -> int: ...

@@ -3973,7 +3973,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             {
                 nb::gil_scoped_release release;
                 return self.needAdjustment();
-            });
+            })
+        .def_prop_ro(
+            "adjust_needs_suspend",
+            [](kv::KvCacheManager const& self)
+            {
+                nb::gil_scoped_release release;
+                return self.adjustNeedsSuspend();
+            },
+            "False when adjust() may run with ACTIVE caches: in-place relocation, or only host arena levels to adjust "
+            "and no ACTIVE cache locks a page there.");
 
     // ---- PageIndexConverter ------------------------------------------------
     nb::class_<kv::PageIndexConverter>(m, "PageIndexConverter")

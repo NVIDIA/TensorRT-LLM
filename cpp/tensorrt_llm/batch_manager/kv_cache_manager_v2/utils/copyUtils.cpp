@@ -25,16 +25,23 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
+#include <sched.h>
 #include <set>
+#include <string>
+#include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -200,14 +207,170 @@ CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
     }
 }
 
+// Host-to-host copies move whole pages within the host tier (defragmentation when a host-arena rebalance shrinks a
+// pool group) while the executor waits: 14-16 GiB per Gemma-3-27B host re-split (doc 40). Where the copying threads
+// run decides the speed: on a two-socket Vera host one thread on the memory's own NUMA node copies ~43 GB/s and 16
+// copy ~260 GB/s, while threads on the other socket are capped at ~16 GB/s together by the socket link (one thread,
+// the CUDA callback thread's usual lot: ~10 GB/s). So large copies are split into pieces and copied by threads pinned
+// to the CPUs of the node that holds the pages.
+constexpr size_t kHostCopyPieceBytes = size_t{4} << 20;
+// Each copying thread gets at least this much, so that starting it costs little next to its share.
+constexpr size_t kHostCopyBytesPerThread = size_t{32} << 20;
+
+size_t maxHostCopyThreads()
+{
+    static size_t const value = []
+    {
+        // TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_THREADS: threads per host-to-host copy; 0 copies on the CUDA callback
+        // thread itself, as before.
+        if (char const* env = std::getenv("TLLM_KV_CACHE_MANAGER_V2_HOST_COPY_THREADS");
+            env != nullptr && env[0] != '\0')
+        {
+            return static_cast<size_t>(std::strtoull(env, nullptr, 10));
+        }
+        return std::clamp<size_t>(std::thread::hardware_concurrency() / 8, 1, 16);
+    }();
+    return value;
+}
+
+//! NUMA node holding the page at `addr`, or -1 when the kernel does not say.
+int numaNodeOfAddress(void const* addr) noexcept
+{
+    constexpr unsigned long kMpolFNode = 1;
+    constexpr unsigned long kMpolFAddr = 2;
+    int node = -1;
+    if (::syscall(SYS_get_mempolicy, &node, nullptr, 0UL, addr, kMpolFNode | kMpolFAddr) != 0)
+    {
+        return -1;
+    }
+    return node;
+}
+
+//! CPUs of NUMA node `node` this process may run on (empty when unknown). Read once per node.
+std::optional<cpu_set_t> numaNodeCpus(int node) noexcept
+{
+    if (node < 0)
+    {
+        return std::nullopt;
+    }
+    static std::mutex mutex;
+    static std::map<int, std::optional<cpu_set_t>> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (auto it = cache.find(node); it != cache.end())
+    {
+        return it->second;
+    }
+    std::optional<cpu_set_t> result;
+    std::string const path = "/sys/devices/system/node/node" + std::to_string(node) + "/cpulist";
+    if (FILE* file = std::fopen(path.c_str(), "r"))
+    {
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        int first = 0;
+        int last = 0;
+        char sep = 0;
+        // "0-87,176-263": ranges or single CPUs separated by commas.
+        while (std::fscanf(file, "%d", &first) == 1)
+        {
+            last = first;
+            int const c = std::fgetc(file);
+            if (c == '-' && std::fscanf(file, "%d", &last) != 1)
+            {
+                break;
+            }
+            for (int cpu = first; cpu <= last && cpu < CPU_SETSIZE; ++cpu)
+            {
+                CPU_SET(cpu, &cpus);
+            }
+            if (c != '-')
+            {
+                sep = static_cast<char>(c);
+            }
+            else
+            {
+                sep = static_cast<char>(std::fgetc(file));
+            }
+            if (sep != ',')
+            {
+                break;
+            }
+        }
+        std::fclose(file);
+        cpu_set_t allowed;
+        if (::sched_getaffinity(0, sizeof(allowed), &allowed) == 0)
+        {
+            CPU_AND(&cpus, &cpus, &allowed);
+        }
+        if (CPU_COUNT(&cpus) > 0)
+        {
+            result = cpus;
+        }
+    }
+    cache.emplace(node, result);
+    return result;
+}
+
 CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
 {
-    // @TODO: enable multi-threading with a thread pool
     using Data = UserData<MemAddress, MemAddress>;
     auto const data = std::unique_ptr<Data>(static_cast<Data*>(userData));
-    for (auto const& t : data->tasks)
+    auto const numBytes = static_cast<size_t>(data->numBytes);
+    if (numBytes == 0 || data->tasks.empty())
     {
-        memcpy(reinterpret_cast<void*>(t.dst), reinterpret_cast<void const*>(t.src), data->numBytes);
+        return;
+    }
+    size_t const piecesPerTask = (numBytes + kHostCopyPieceBytes - 1) / kHostCopyPieceBytes;
+    size_t const numPieces = data->tasks.size() * piecesPerTask;
+    size_t const totalBytes = numBytes * data->tasks.size();
+    size_t const numThreads
+        = std::min({maxHostCopyThreads(), numPieces, std::max<size_t>(1, totalBytes / kHostCopyBytesPerThread)});
+    std::atomic<size_t> next{0};
+    auto const copyPieces = [&]() noexcept
+    {
+        for (size_t piece = next.fetch_add(1, std::memory_order_relaxed); piece < numPieces;
+             piece = next.fetch_add(1, std::memory_order_relaxed))
+        {
+            auto const& t = data->tasks[piece / piecesPerTask];
+            size_t const offset = (piece % piecesPerTask) * kHostCopyPieceBytes;
+            memcpy(reinterpret_cast<char*>(t.dst) + offset, reinterpret_cast<char const*>(t.src) + offset,
+                std::min(kHostCopyPieceBytes, numBytes - offset));
+        }
+    };
+    // Small copies stay on the callback thread: starting threads would cost more than it saves.
+    if (numThreads == 0 || totalBytes < kHostCopyBytesPerThread)
+    {
+        copyPieces();
+        return;
+    }
+    auto const cpus = numaNodeCpus(numaNodeOfAddress(reinterpret_cast<void const*>(data->tasks.front().src)));
+    std::vector<std::thread> workers;
+    try
+    {
+        workers.reserve(numThreads);
+        for (size_t i = 0; i < numThreads; ++i)
+        {
+            workers.emplace_back(
+                [&copyPieces, &cpus]() noexcept
+                {
+                    if (cpus.has_value())
+                    {
+                        ::sched_setaffinity(0, sizeof(*cpus), &*cpus);
+                    }
+                    copyPieces();
+                });
+        }
+    }
+    catch (std::exception const&)
+    {
+        // No thread to spare: the callback thread copies what the started workers do not.
+    }
+    if (workers.empty())
+    {
+        copyPieces();
+    }
+    for (auto& worker : workers)
+    {
+        worker.join();
     }
 }
 

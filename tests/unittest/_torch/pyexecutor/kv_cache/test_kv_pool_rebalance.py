@@ -58,6 +58,7 @@ def _make_executor(
     *,
     enable_kv_pool_rebalance: bool = True,
     in_place_relocation: bool = False,
+    adjust_needs_suspend=None,
     pp_size: int = 1,
     tp_size: int = 1,
     cp_size: int = 1,
@@ -137,6 +138,11 @@ def _make_executor(
     exe.kv_cache_manager.impl.need_adjustment = need_adjustment
     # A bare MagicMock attribute would be truthy and select the in-place path.
     exe.kv_cache_manager.impl.init_config.pool_rebalance.in_place_relocation = in_place_relocation
+    # The manager's own answer (in place, or a host-only re-split, needs no suspend); a bare MagicMock
+    # attribute would be truthy and select the suspend path.
+    exe.kv_cache_manager.impl.adjust_needs_suspend = (
+        not in_place_relocation if adjust_needs_suspend is None else adjust_needs_suspend
+    )
 
     # CUDA-graph runner holding the pre-allocated padding dummies.  A bare
     # MagicMock would be truthy and non-iterable in the suspend helper.
@@ -316,6 +322,20 @@ class TestMaybeRebalanceKvPools:
         PyExecutor._maybe_rebalance_kv_pools(exe)
 
         exe._consume_previous_batch_for_rebalance.assert_called_once()
+        exe.kv_cache_manager.impl.adjust.assert_called_once()
+        exe.kv_cache_manager.suspend_request.assert_not_called()
+        exe.kv_cache_manager.resume_request.assert_not_called()
+
+    def test_host_only_resplit_adjusts_without_suspending(self, monkeypatch):
+        # Copy-based rebalancing with only the host arena to re-split: the manager reports that adjust() needs
+        # no suspend, so the executor leaves every request active.
+        reqs = [_make_request(1), _make_request(2)]
+        exe = _make_executor(active_requests=reqs, adjust_needs_suspend=False)
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
         exe.kv_cache_manager.impl.adjust.assert_called_once()
         exe.kv_cache_manager.suspend_request.assert_not_called()
         exe.kv_cache_manager.resume_request.assert_not_called()

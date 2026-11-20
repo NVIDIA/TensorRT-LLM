@@ -7837,10 +7837,12 @@ class PyExecutor:
             # adjust() moves pages; a deferred close must not hold any.
             mgr.flush_deferred_closes()
 
-        if mgr.impl.init_config.pool_rebalance.in_place_relocation:
+        if not mgr.impl.adjust_needs_suspend:
             # Copy-based rebalancing, in place: adjust() copies the blocks of active requests on
-            # the execution stream's timeline and rewrites their block indices, so nothing is
-            # suspended. Quiescence is still required: no forward may be in flight.
+            # the execution stream's timeline and rewrites their block indices. Or only the host
+            # arena is re-split, which moves cached host pages and none an active request holds.
+            # Either way nothing is suspended. Quiescence is still required: no forward may be in
+            # flight.
             try:
                 mgr.impl.adjust()
             except OutOfPagesError as e:

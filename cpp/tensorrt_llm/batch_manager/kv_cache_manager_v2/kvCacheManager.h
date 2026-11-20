@@ -418,9 +418,13 @@ public:
     bool isStatsExcluded(std::optional<RequestIdType> kvCacheId) const;
 
     // Mirrors Python's need_adjustment property and adjust() method.
-    // All KvCaches must be suspended before calling adjust().
+    // All KvCaches must be suspended before calling adjust(), unless adjustNeedsSuspend() is false.
     bool needAdjustment() const;
     void adjust();
+    // False when adjust() may run with ACTIVE KvCaches: with in-place relocation, or when only host arena levels
+    // need adjusting (copy-based rebalancing) and no ACTIVE cache locks a page there. A host-only re-split moves
+    // cached host pages only; the GPU pages ACTIVE caches hold keep their slots.
+    bool adjustNeedsSuspend() const;
     // Raise the hot-level slot floors that pool rebalancing (tuner targets, adjust()) must respect to what
     // `batch` needs, capped at the current slot counts (see StorageManager::raiseHotMinSlots). Meant for the
     // executor right after it clamps max_seq_len to the initial split, so that rebalancing keeps one request
@@ -722,6 +726,7 @@ private:
 
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
+    bool _adjustNeedsSuspend() const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
     //! In-place relocation: the pages at `level` locked by ACTIVE caches, per pool group, each once.

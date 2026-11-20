@@ -1601,7 +1601,7 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLa
         // With in-place relocation ACTIVE caches stay active; their locked pages are gathered by
         // _gatherLockedPages() and only the pages they merely hold are persistent here.
         bool const active = kvc->isActive();
-        TLLM_CHECK_DEBUG(active ? mStorage->isInPlaceRelocation() : kvc->status() == KvCache::Status::SUSPENDED);
+        TLLM_CHECK_DEBUG(active ? !_adjustNeedsSuspend() : kvc->status() == KvCache::Status::SUSPENDED);
         for (auto const& sb : kvc->blocks())
         {
             for (auto const& beamPages : sb.pages)
@@ -1771,13 +1771,42 @@ TypedVec<PoolGroupIndex, SlotCount> KvCacheManager::raiseHotMinSlots(BatchDesc c
     return mStorage->raiseHotMinSlots(batch, tokensPerBlock());
 }
 
+bool KvCacheManager::_adjustNeedsSuspend() const
+{
+    if (mStorage->isInPlaceRelocation())
+        return false;
+    if (_needAdjustment(kHotLevel))
+        return true;
+    for (CacheLevel level{1}; level < mStorage->numCacheLevels(); ++level)
+    {
+        if (!_needAdjustment(level))
+            continue;
+        if (!mStorage->isArenaLevel(level))
+            return true;
+        // A cold page an ACTIVE cache locks (sparse attention history kept in host memory) may move.
+        for (auto const& pages : _gatherLockedPages(level))
+        {
+            if (!pages.empty())
+                return true;
+        }
+    }
+    return false;
+}
+
+bool KvCacheManager::adjustNeedsSuspend() const
+{
+    auto const apiLock = lockShared();
+    return _adjustNeedsSuspend();
+}
+
 void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     // In-place relocation rewrites the indices ACTIVE caches hold, so they may stay active; the
-    // caller must still be between iterations (no forward reading or writing their pages).
-    if (!mStorage->isInPlaceRelocation())
+    // caller must still be between iterations (no forward reading or writing their pages). So may
+    // a host-only re-split, which moves no page an ACTIVE cache locks (_adjustNeedsSuspend).
+    if (_adjustNeedsSuspend())
     {
         for (KvCache* kvc : mLivingKvCaches)
             TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
