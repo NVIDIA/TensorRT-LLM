@@ -80,6 +80,8 @@ DEFAULT_USAGE_PATHS = (
     REPO_ROOT / "cpp" / "tensorrt_llm" / "thop" / "attentionFeature.h",
     REPO_ROOT / "cpp" / "tensorrt_llm" / "thop" / "attentionVariant.h",
     REPO_ROOT / "cpp" / "tensorrt_llm" / "thop" / "attentionOp.cpp",
+    REPO_ROOT / "cpp" / "tensorrt_llm" / "thop" / "phasedFmha.h",
+    REPO_ROOT / "cpp" / "tensorrt_llm" / "thop" / "phasedFmha.cpp",
     REPO_ROOT / "cpp" / "tensorrt_llm" / "nanobind" / "thop" / "bindings.cpp",
 )
 

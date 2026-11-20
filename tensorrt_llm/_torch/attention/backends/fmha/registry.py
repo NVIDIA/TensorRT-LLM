@@ -16,9 +16,7 @@
 import os
 from typing import TypeAlias
 
-from .beam_shared_prefix import BeamSharedPrefixFmha
 from .cute_dsl_mla import CuteDslMlaFmha
-from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
@@ -35,7 +33,10 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     scope, so backends can import trtllm attention classes at module scope
     without an import cycle.
     """
+    from .beam_shared_prefix import BeamSharedPrefixFmha
+    from .flash_mla import FlashMlaFmha
     from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
+    from .fmha_v2 import FmhaV2Fmha
     from .gqa_decode import (
         GqaDecodeFmha,
         GqaKvReplicaFmha,
@@ -43,11 +44,15 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         GqaSegmentedFmha,
         GqaSplitKvFmha,
     )
+    from .mmha import MmhaFmha
     from .msa_decode import MsaDecodeFmha
     from .msa_prefill import MsaPrefillFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
     from .prims_ts_dsa_sparse_mla import PrimsTSDsaSparseMlaFmha
     from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
+    from .trtllm_gen import TrtllmGenFmha
+    from .unfused import UnfusedFmha
+    from .xqa import XqaFmha
 
     return {
         "fp4_mla": Fp4MlaFmha,
@@ -79,9 +84,16 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "gqa_decode": GqaDecodeFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         # Opt-in wide-beam generation path (TLLM_FMHA_LIBS=+beam_shared_prefix);
-        # takes generation-only beam-search batches ahead of the fallback.
+        # takes generation-only beam-search batches ahead of the native libraries.
         "beam_shared_prefix": BeamSharedPrefixFmha,
-        "fallback": FallbackFmha,
+        # The native attention op's libraries. One order serves MHA and MLA:
+        # fmha_v2 serves no MHA generation and XQA no context phase.
+        "trtllm_gen": TrtllmGenFmha,
+        "flash_mla": FlashMlaFmha,
+        "xqa": XqaFmha,
+        "fmha_v2": FmhaV2Fmha,
+        "mmha": MmhaFmha,
+        "unfused": UnfusedFmha,
     }
 
 
@@ -93,6 +105,19 @@ _OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts", "beam_shared_prefix"}
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
     name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
 )
+# Names in TLLM_FMHA_LIBS that stand for several libraries.
+FMHA_LIB_GROUPS: dict[str, tuple[str, ...]] = {
+    "fallback": ("trtllm_gen", "flash_mla", "xqa", "fmha_v2", "mmha", "unfused"),
+}
+
+
+def _expand_fmha_lib_name(name: str) -> tuple[str, ...]:
+    """The libraries one TLLM_FMHA_LIBS entry names: itself, or a group's members."""
+    if name in FMHA_LIB_GROUPS:
+        return FMHA_LIB_GROUPS[name]
+    if name not in FMHA_LIBS:
+        raise ValueError(f"Unknown FMHA library {name!r} in TLLM_FMHA_LIBS.")
+    return (name,)
 
 
 def _parse_fmha_libs_env() -> tuple[str, ...]:
@@ -118,20 +143,18 @@ def _parse_fmha_libs_env() -> tuple[str, ...]:
             name = token[1:].strip()
             if not name:
                 raise ValueError(f"Invalid empty FMHA library entry in {value!r}.")
-            if name not in FMHA_LIBS:
-                raise ValueError(f"Unknown FMHA library {name!r} in TLLM_FMHA_LIBS.")
+            members = _expand_fmha_lib_name(name)
             if sign == "+":
-                enabled_names.add(name)
+                enabled_names.update(members)
             else:
-                enabled_names.discard(name)
+                enabled_names.difference_update(members)
         names = [name for name in FMHA_LIBS if name in enabled_names]
     else:
         names = []
-        for name in tokens:
-            if name not in FMHA_LIBS:
-                raise ValueError(f"Unknown FMHA library {name!r} in TLLM_FMHA_LIBS.")
-            if name not in names:
-                names.append(name)
+        for token in tokens:
+            for name in _expand_fmha_lib_name(token):
+                if name not in names:
+                    names.append(name)
 
     return tuple(names)
 
@@ -147,6 +170,7 @@ def is_fmha_lib_enabled(name: str) -> bool:
 
 __all__ = [
     "DEFAULT_FMHA_LIBS",
+    "FMHA_LIB_GROUPS",
     "FMHA_LIBS",
     "FmhaCls",
     "get_enabled_fmha_lib_classes",

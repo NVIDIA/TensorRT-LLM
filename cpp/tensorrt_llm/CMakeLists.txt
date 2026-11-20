@@ -40,6 +40,8 @@ set(TRTLLM_FMHA_PARAMS_USAGE_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionFeature.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionVariant.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionOp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/phasedFmha.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/phasedFmha.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/nanobind/thop/bindings.cpp")
 set(TRTLLM_FMHA_PARAMS_SCHEMA_ARGS "")
 foreach(_schema ${TRTLLM_FMHA_PARAMS_SCHEMAS})

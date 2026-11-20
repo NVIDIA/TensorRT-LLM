@@ -20,27 +20,32 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/kernels/fmhaDispatcher.h"
+#include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
-#include "tensorrt_llm/kernels/xqaDispatcher.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <cassert>
 #include <concepts>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <tuple>
 
@@ -136,6 +141,49 @@ struct AttentionForwardArgs
                                                 : nullptr;
     }
 };
+
+struct KvCachePoolMapping
+{
+    int32_t poolIndex{0};
+    int32_t layerIdxInCachePool{0};
+};
+
+KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t layerIdx);
+
+namespace detail
+{
+
+/// Accessor over a CPU tensor, checked for device, dtype and rank.
+template <typename T, std::size_t N>
+at::TensorAccessor<T, N> hostAccessor(at::Tensor const& tensor, char const* name)
+{
+    TORCH_CHECK(tensor.device().is_cpu(), name, " must be a CPU tensor.");
+    return tensor.accessor<T, N>();
+}
+
+/// Elements [offset, offset + count) of a contiguous 1-D CPU int32 tensor.
+inline std::span<int32_t const> hostInt32Span(at::Tensor const& tensor, int64_t offset, int64_t count, char const* name)
+{
+    TORCH_CHECK(tensor.device().is_cpu() && tensor.dim() == 1 && tensor.is_contiguous(), name,
+        " must be a contiguous 1-D CPU tensor.");
+    TORCH_CHECK(offset >= 0 && count >= 0 && offset + count <= tensor.size(0), name, " range [", offset, ", ",
+        offset + count, ") is out of bounds for ", tensor.size(0), " elements.");
+    return {tensor.data_ptr<int32_t>() + offset, static_cast<std::size_t>(count)};
+}
+
+template <typename T>
+T* tensorPtr2D(at::Tensor const& tensor, int64_t const row, int64_t const col, char const* tensorName)
+{
+    TORCH_CHECK(tensor.dim() >= 2, tensorName, " must have at least 2 dimensions.");
+    TORCH_CHECK(row >= 0 && row < tensor.size(0), tensorName, " row is out of bounds.");
+    TORCH_CHECK(col >= 0 && col < tensor.size(1), tensorName, " column is out of bounds.");
+
+    using ValueType = std::remove_const_t<T>;
+    auto* data = static_cast<ValueType*>(tensor.data_ptr());
+    return data + row * tensor.stride(0) + col * tensor.stride(1);
+}
+
+} // namespace detail
 
 /// Parameters for phased attention, generated from fmha/phased.py.
 /// Device tensors are phase-local; host tensors, KV-cache block offsets and FP4
@@ -323,9 +371,12 @@ struct FmhaParams
     /// Block offsets for this phase's sequences; `seq_offset` is applied here.
     [[nodiscard]] kernels::KVBlockArray::DataType* getKvCacheBlockOffsets(int32_t poolIndex) const
     {
-        return meta.kv_cache_block_offsets.has_value() ? static_cast<kernels::KVBlockArray::DataType*>(
-                   meta.kv_cache_block_offsets.value().index({poolIndex, seq_offset}).data_ptr())
-                                                       : nullptr;
+        if (!meta.kv_cache_block_offsets.has_value())
+        {
+            return nullptr;
+        }
+        return detail::tensorPtr2D<kernels::KVBlockArray::DataType>(
+            meta.kv_cache_block_offsets.value(), poolIndex, seq_offset, "kv_cache_block_offsets");
     }
 
     // Quantization scales and output quantization.
@@ -367,7 +418,7 @@ struct FmhaParams
         {
             return 0;
         }
-        return meta.kv_lens_runtime.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
+        return std::ranges::max(detail::hostInt32Span(meta.kv_lens_runtime, seqOffset, numSeqs, "kv_lens_runtime"));
     }
 
     [[nodiscard]] int32_t getMaxHostContextLength(int64_t seqOffset, int64_t numSeqs) const
@@ -376,7 +427,8 @@ struct FmhaParams
         {
             return 0;
         }
-        return meta.prompt_lens_cpu_runtime.slice(0, seqOffset, seqOffset + numSeqs).max().item<int32_t>();
+        return std::ranges::max(
+            detail::hostInt32Span(meta.prompt_lens_cpu_runtime, seqOffset, numSeqs, "prompt_lens_cpu_runtime"));
     }
 
     /// Total attended-KV length for this phase. Prefer explicit phase totals when
@@ -389,9 +441,12 @@ struct FmhaParams
         }
         if (host_total_kv_lens.has_value())
         {
-            return host_total_kv_lens.value().select(0, isGen ? 1 : 0).item<int32_t>();
+            return detail::hostInt32Span(host_total_kv_lens.value(), isGen ? 1 : 0, 1, "host_total_kv_lens")[0];
         }
-        return meta.kv_lens_runtime.slice(0, seqOffset, seqOffset + numSeqs).sum().item<int32_t>();
+        auto const lens = detail::hostInt32Span(meta.kv_lens_runtime, seqOffset, numSeqs, "kv_lens_runtime");
+        int64_t const total = std::accumulate(lens.begin(), lens.end(), int64_t{0});
+        TORCH_CHECK(total <= std::numeric_limits<int32_t>::max(), "The total KV length ", total, " overflows int32.");
+        return static_cast<int32_t>(total);
     }
 
     [[nodiscard]] int getCacheIndirectionWindowSize(int defaultValue) const
@@ -431,14 +486,14 @@ struct FmhaParams
     [[nodiscard]] int32_t getKvCachePoolIndex(int64_t localLayerIdx) const
     {
         return meta.host_kv_cache_pool_mapping.has_value()
-            ? checkedPoolMapping(localLayerIdx).index({localLayerIdx, 0}).item<int32_t>()
+            ? readKvCachePoolMapping(checkedPoolMapping(localLayerIdx), localLayerIdx).poolIndex
             : 0;
     }
 
     [[nodiscard]] int32_t getLayerIdxInCachePool(int64_t localLayerIdx) const
     {
         return meta.host_kv_cache_pool_mapping.has_value()
-            ? checkedPoolMapping(localLayerIdx).index({localLayerIdx, 1}).item<int32_t>()
+            ? readKvCachePoolMapping(checkedPoolMapping(localLayerIdx), localLayerIdx).layerIdxInCachePool
             : 0;
     }
 
@@ -476,8 +531,11 @@ struct FmhaParams
             return nullptr;
         }
         auto const& poolPointers = meta.host_kv_cache_pool_pointers.value();
-        return reinterpret_cast<char*>(poolPointers.dim() == 3 ? poolPointers.index({poolIndex, 0, 0}).item<int64_t>()
-                                                               : poolPointers.index({poolIndex, 0}).item<int64_t>());
+        TORCH_CHECK(poolIndex >= 0 && poolIndex < poolPointers.size(0), "host_kv_cache_pool_pointers has no pool ",
+            poolIndex, ".");
+        return reinterpret_cast<char*>(poolPointers.dim() == 3
+                ? detail::hostAccessor<int64_t, 3>(poolPointers, "host_kv_cache_pool_pointers")[poolIndex][0][0]
+                : detail::hostAccessor<int64_t, 2>(poolPointers, "host_kv_cache_pool_pointers")[poolIndex][0]);
     }
 
     /// Kernel view of the sparse indices and the KV pools they address. The pool fields
@@ -529,7 +587,16 @@ struct FmhaParams
 [[nodiscard]] size_t contextMlaWorkspaceBytesPerToken(int32_t numAttnHeads, int32_t qkRopeHeadDim,
     int32_t qkNopeHeadDim, int32_t vHeadDim, bool fp8ContextMla, bool separateQAndKvInput, bool sparseMla) noexcept;
 
-/// Defined in attentionFeature.h; named here for the friend list of AttentionBase.
+/// Defined in attentionFeature.h and phasedFmha.h; named here for the friend list of AttentionBase.
+template <typename AttentionVariant>
+class TrtllmGenFmha;
+template <typename AttentionVariant>
+class FmhaV2Fmha;
+template <typename AttentionVariant>
+class XqaFmha;
+class FlashMlaFmha;
+class MmhaFmha;
+class UnfusedFmha;
 class PagedKVCacheFeature;
 class CustomMaskFeature;
 class SageAttnFeature;
@@ -552,10 +619,11 @@ class SparseMlaFeature;
 ///   of the key.
 ///
 /// For every phase call, the binding builds a key from the call's parameters, looks up
-/// the op for it, and runs the phase:
+/// the op for it, and runs the phase on the library the caller chose:
 ///
 ///     auto const key = AttentionBase::getCacheKey(params);
-///     AttentionBase::getCached(key)->runContext(params);
+///     auto& op = dynamic_cast<MHA&>(*AttentionBase::getCached(key));
+///     op.runContext(op.trtllmGen(), params);
 ///
 /// On a cache miss, `getCached()` constructs the concrete op (`MHA` or `MLA`, both built on
 /// `TrtllmAttention`) from the key. New objects are created only by `getCacheKey()` and by
@@ -584,11 +652,6 @@ public:
 
     [[nodiscard]] bool operator==(AttentionBase const& other) const;
 
-    /// Runs the context or generation phase of one call. Derived ops override both; on a
-    /// key built by `getCacheKey()` they throw.
-    virtual void runContext(FmhaParams& p);
-    virtual void runGeneration(FmhaParams& p);
-
     /// Builds the cache key of one call from its parameters. Reads tensor metadata (data
     /// type, device, presence and sizes), so call it while the tensors are still attached.
     [[nodiscard]] static AttentionBase getCacheKey(FmhaParams const& p);
@@ -612,6 +675,13 @@ public:
     [[nodiscard]] bool isRelativePosition() const
     {
         return position_embedding_type == PositionEmbeddingType::kRELATIVE;
+    }
+
+    /// The fused context kernels read the encoder K/V back from the paged cross cache and learn its element
+    /// type only with paged-context FMHA, so without it they read a quantized cache as the activation type.
+    [[nodiscard]] bool isQuantizedCrossCacheUnfused() const
+    {
+        return cross_attention && use_kv_cache && quant_mode.hasKvCacheQuant() && !paged_context_fmha;
     }
 
     [[nodiscard]] bool isALiBi() const
@@ -740,9 +810,19 @@ protected:
     bool mFMHAForceFP32Acc = false;
 
 private:
-    // These read the key members directly: the hash reads all of them, the features read
-    // the ones that configure them, and the NVFP4 support probe builds a key from scalars.
+    // These read the key members directly: the hash reads all of them, the features and the
+    // FMHA libraries read the ones that configure them, and the NVFP4 support probe builds a
+    // key from scalars.
     friend struct std::hash<AttentionBase>;
+    template <typename>
+    friend class TrtllmGenFmha;
+    template <typename>
+    friend class FmhaV2Fmha;
+    template <typename>
+    friend class XqaFmha;
+    friend class FlashMlaFmha;
+    friend class MmhaFmha;
+    friend class UnfusedFmha;
     friend class PagedKVCacheFeature;
     friend class CustomMaskFeature;
     friend class SageAttnFeature;
@@ -761,14 +841,6 @@ private:
         int64_t quant_mode, int64_t max_num_requests, int64_t max_context_length, int64_t max_seq_len,
         std::optional<int64_t> attention_chunk_size, bool use_kv_cache, bool use_paged_context_fmha);
 };
-
-struct KvCachePoolMapping
-{
-    int32_t poolIndex{0};
-    int32_t layerIdxInCachePool{0};
-};
-
-KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t layerIdx);
 
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
     int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache);

@@ -1856,11 +1856,12 @@ def test_prims_ts_rejects_vc_attention_with_kv_cache() -> None:
 
 
 def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
+    from tensorrt_llm._torch.attention.backends.fmha.phased import PhasedFmha
     from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 
     calls = {"fallback": 0, "prims_context": 0}
-    fallback_forward = FallbackFmha.forward
+    fallback_forward = PhasedFmha.forward
     prims_context = PrimsTSFmha.run_context
 
     def counted_fallback(self, *args, **kwargs):
@@ -1871,7 +1872,8 @@ def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch
         calls["prims_context"] += 1
         return prims_context(self, *args, **kwargs)
 
-    monkeypatch.setattr(FallbackFmha, "forward", counted_fallback)
+    for native_cls in NATIVE_FMHA_LIBS:
+        monkeypatch.setattr(native_cls, "forward", counted_fallback)
     monkeypatch.setattr(PrimsTSFmha, "run_context", counted_prims_context)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts,fallback")
     case = BackendCase(

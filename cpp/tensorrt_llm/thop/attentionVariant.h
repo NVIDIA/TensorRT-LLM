@@ -16,24 +16,33 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/attentionWorkspace.h"
 #include "tensorrt_llm/thop/attentionFeature.h"
+#include "tensorrt_llm/thop/phasedFmha.h"
 
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <memory>
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
 
-/// The shared algorithm of a TensorRT-LLM attention op. `Derived` supplies five hooks:
+/// The shared algorithm of a TensorRT-LLM attention op. `Derived` supplies the static
+/// `checkParams(p, isGen)`, checked before the op for a call's key is built, which ends with
+/// `checkFeatureParams()`, and four hooks:
 /// `initContext()` and `initGeneration()`, run once before that phase's first launch;
-/// `prepareInputs(p, isGen)`, `getRequiredWorkspaceSize(p, isGen)`, `enqueueContext(p)`
-/// and `enqueueGeneration(p)`, run every call. Features are private bases; the folds
-/// below call their generic hooks, and `applyFeatures()` calls whichever `apply`
-/// overload each feature has for a given kernel struct.
+/// `prepareInputs(p, isGen)`, `enqueueContext(p, fmha)` and `enqueueGeneration(p, fmha)`,
+/// run every call. It also holds one member per FMHA library it can use, built with
+/// `makeFmha<T>()` when the key admits the library, and lists them with `fmhas()`. The
+/// caller picks the library of each call with `isFmhaSupported()` and runs it with
+/// `runContext()` or `runGeneration()`. Features
+/// are private bases; the folds below call their generic hooks, and `applyFeatures()`
+/// calls whichever `apply` overload each feature has for a given kernel struct.
 template <typename Derived, AttentionFeature... Features>
 class TrtllmAttention : public AttentionBase, private Features...
 {
@@ -57,16 +66,44 @@ public:
         mFMHAForceFP32Acc = type == tensorrt_llm::DataType::kBF16;
     }
 
-    void runContext(FmhaParams& p) final
+    /// Whether \p fmha serves this call's phase; false when it is null, a library the key
+    /// does not admit. Prepares the call as a launch does, without growing the workspace.
+    [[nodiscard]] bool isFmhaSupported(PhasedFmha<Derived> const* fmha, FmhaParams& p, bool isGen)
     {
-        prepare(p, /*isGen=*/false);
-        derived().enqueueContext(p);
+        if (fmha == nullptr)
+        {
+            return false;
+        }
+        preparePhase(p, isGen);
+        return fmha->isSupported(p, isGen);
     }
 
-    void runGeneration(FmhaParams& p) final
+    /// Every phase call, launched or only queried: once-only phase initialization, feature
+    /// preparation, and the derived op's input validation and derived fields.
+    void preparePhase(FmhaParams& p, bool isGen)
     {
-        prepare(p, /*isGen=*/true);
-        derived().enqueueGeneration(p);
+        initPhase(isGen);
+        (Features::prepare(p, isGen), ...);
+        derived().prepareInputs(p, isGen);
+    }
+
+    /// Runs this call's context phase on \p fmha. The caller chose it with `isFmhaSupported()`,
+    /// possibly for an earlier call of the same shape.
+    void runContext(PhasedFmha<Derived>* fmha, FmhaParams& p)
+    {
+        TLLM_CHECK_WITH_INFO(fmha != nullptr,
+            "The attention op does not list the requested FMHA library for the key: %s", toString().c_str());
+        prepare(p, /*isGen=*/false, *fmha);
+        derived().enqueueContext(p, *fmha);
+    }
+
+    /// Runs this call's generation phase on \p fmha; see `runContext()`.
+    void runGeneration(PhasedFmha<Derived>* fmha, FmhaParams& p)
+    {
+        TLLM_CHECK_WITH_INFO(fmha != nullptr,
+            "The attention op does not list the requested FMHA library for the key: %s", toString().c_str());
+        prepare(p, /*isGen=*/true, *fmha);
+        derived().enqueueGeneration(p, *fmha);
     }
 
 protected:
@@ -78,6 +115,12 @@ protected:
     [[nodiscard]] Derived const& derived() const
     {
         return static_cast<Derived const&>(*this);
+    }
+
+    /// The checks every variant shares: the query dtype, then every feature's `checkParams()`.
+    [[nodiscard]] static bool checkFeatureParams(FmhaParams const& p, bool isGen)
+    {
+        return p.getQueryInput().scalar_type() != torch::kFloat8_e4m3fn && (Features::checkParams(p, isGen) && ...);
     }
 
     template <AttentionFeature F>
@@ -108,33 +151,80 @@ protected:
             "%s is not allowed during CUDA graph capture; run a warmup that covers this phase first.", what);
     }
 
-    /// Every forward phase: once-only phase initialization, feature preparation, the
-    /// derived op's input validation and derived fields, then workspace growth. A
-    /// context call that also carries generation tokens launches both phases from one
-    /// workspace, so it initializes both and reserves both phases' requirements before
-    /// the first launch.
-    void prepare(FmhaParams& p, bool isGen)
+    /// A \p Fmha for this op when its key check admits it, null otherwise.
+    template <typename Fmha>
+    [[nodiscard]] std::unique_ptr<Fmha> makeFmha() const
+    {
+        return Fmha::isAvailable(*this) ? std::make_unique<Fmha>(*this) : nullptr;
+    }
+
+    /// The phase's once-only initialization: the derived op's hook, then every library's.
+    void initPhase(bool isGen)
     {
         if (!isGen && !mContextInitialized)
         {
             checkNotCapturing("context initialization");
             derived().initContext();
+            for (auto* fmha : derived().fmhas())
+            {
+                if (fmha != nullptr)
+                {
+                    fmha->initContext(derived());
+                }
+            }
             mContextInitialized = true;
         }
-        if ((isGen || p.num_gen_tokens > 0) && !mGenerationInitialized)
+        if (isGen && !mGenerationInitialized)
         {
             checkNotCapturing("generation initialization");
             derived().initGeneration();
+            for (auto* fmha : derived().fmhas())
+            {
+                if (fmha != nullptr)
+                {
+                    fmha->initGeneration(derived());
+                }
+            }
             mGenerationInitialized = true;
         }
+    }
 
-        (Features::prepare(p, isGen), ...);
-        derived().prepareInputs(p, isGen);
+    /// Bytes the FMHA libraries need for this call: the context library's, and the largest
+    /// generation requirement among the libraries, so a generation call can switch library
+    /// without growing the workspace.
+    [[nodiscard]] std::size_t getFmhaWorkspaceSize(
+        FmhaParams const& p, bool isGen, PhasedFmha<Derived> const& fmha) const
+    {
+        std::size_t bytes = 0;
+        if (!isGen && p.num_tokens > 0)
+        {
+            bytes = fmha.getWorkspaceSize(derived(), p, /*isGen=*/false);
+        }
+        for (auto const* listed : derived().fmhas())
+        {
+            if (listed != nullptr)
+            {
+                bytes = std::max(bytes, listed->getWorkspaceSize(derived(), p, /*isGen=*/true));
+            }
+        }
+        return bytes;
+    }
 
+    /// Every launched phase: `preparePhase()`, then workspace growth. A context call that
+    /// also carries generation tokens launches both phases from one workspace, so it
+    /// initializes both and reserves both phases' requirements before the first launch.
+    void prepare(FmhaParams& p, bool isGen, PhasedFmha<Derived> const& fmha)
+    {
+        preparePhase(p, isGen);
         bool const mixed = !isGen && p.num_gen_tokens > 0;
+        if (mixed)
+        {
+            initPhase(/*isGen=*/true);
+        }
+
         std::size_t const featureBytes = (std::size_t{0} + ... + Features::getRequiredWorkspaceSize(isGen))
             + (mixed ? (std::size_t{0} + ... + Features::getRequiredWorkspaceSize(true)) : 0);
-        std::size_t const bytes = derived().getRequiredWorkspaceSize(p, isGen) + featureBytes;
+        std::size_t const bytes = getFmhaWorkspaceSize(p, isGen, fmha) + featureBytes;
         if (p.workspace.numel() < static_cast<int64_t>(bytes))
         {
             checkNotCapturing("workspace growth");
@@ -182,7 +272,8 @@ protected:
     return dTypeSize * 8;
 }
 
-/// Multi-head (and grouped-query) attention over the FMHA / XQA / MMHA runners.
+/// Multi-head (and grouped-query) attention. Context runs trtllm-gen, fmha_v2 or the unfused
+/// cuBLAS path; generation runs trtllm-gen, XQA or MMHA.
 class MHA : public TrtllmAttention<MHA, PagedKVCacheFeature, CustomMaskFeature, SageAttnFeature, OutputQuantFeature,
                 RopeFeature, RelativePositionFeature, CrossAttentionFeature, SpecDecodingFeature, SparseAttnFeature>
 {
@@ -193,18 +284,22 @@ public:
     using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
 
+    /// Whether this op serves the call's inputs. Static, so a call it declines builds no op.
+    /// Separate Q/K/V input is read only by cross attention and SageAttention.
+    [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
+    {
+        return (p.fwd.is_fused_qkv || p.is_cross || torch_ext::SageAttnFeature::isRequested(p))
+            && checkFeatureParams(p, isGen);
+    }
+
     // ---- hooks called by TrtllmAttention ----
-    /// Build the context FMHA runner and decide `mEnableContextFMHA`.
     void initContext();
-    /// Build the XQA runner and decide `mEnableXQA`.
+    /// Resolves the multi-block mode from the environment.
     void initGeneration();
     /// Validates the call and derives the per-call state into \p p.
     void prepareInputs(FmhaParams& p, bool isGen);
-    /// Bytes this call needs. A context call with generation tokens covers both phases,
-    /// sizing generation from the batch bound so the later generation call agrees.
-    [[nodiscard]] std::size_t getRequiredWorkspaceSize(FmhaParams const& p, bool isGen) const;
-    void enqueueContext(FmhaParams& p);
-    void enqueueGeneration(FmhaParams& p);
+    void enqueueContext(FmhaParams& p, PhasedFmha<MHA>& fmha);
+    void enqueueGeneration(FmhaParams& p, PhasedFmha<MHA>& fmha);
 
     /// Whether the fused context and generation kernels for this configuration exist;
     /// builds the runners if they have not been built yet.
@@ -212,49 +307,39 @@ public:
     /// Whether a variable-window context kernel exists for this configuration.
     [[nodiscard]] bool supportsVariableWindow();
 
-    [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize(FmhaParams const& p) const noexcept;
-    [[nodiscard]] int getMaxNumSeqLenTile(FmhaParams const& p, int batch_beam_size = 1) const;
-    /// Context-phase bytes from the prepared params: num_seqs, input_seq_length, num_tokens,
-    /// total_kv_len and the cross-KV extent.
-    [[nodiscard]] size_t getWorkspaceSizeForContext(FmhaParams const& p) const;
-    /// The context workspace layout for this call: the one place its slices are sized.
-    [[nodiscard]] tensorrt_llm::common::op::AttentionContextWorkspaceLayout contextWorkspaceLayout(
-        FmhaParams const& p) const;
-    /// Generation-phase bytes from the prepared params: the batch bound (sum of beam widths),
-    /// the attention window, num_gen_tokens and the block-table width.
-    [[nodiscard]] size_t getWorkspaceSizeForGeneration(FmhaParams const& p) const noexcept;
-
-    template <typename T, typename KVCacheBuffer>
-    int enqueueContext(FmhaParams const& p, cudaStream_t stream);
-
-    template <typename T, typename KVCacheBuffer>
-    int enqueueGeneration(FmhaParams const& p, cudaStream_t stream);
-
-    template <typename T>
-    [[nodiscard]] int getKvCacheElemSizeInBits(FmhaParams const& p) const
-    {
-        return kvCacheElemSizeInBits(quant_mode, sizeof(T));
-    }
-
-    /// Defaulted so the dtype dispatch can name this directly; paged KV is the only
-    /// layout the generation path prepares for.
-    template <typename T, typename KVCacheBuffer = kernels::KVBlockArray>
-    void prepareEnqueueGeneration(FmhaParams const& p);
-
-    template <typename T, typename KVCacheBuffer>
-    bool convertMMHAParamsToXQAParams(
-        tensorrt_llm::kernels::XQAParams& xqaParams, FmhaParams const& p, bool forConfigurePlugin);
-
     /// The op's own derived state, for debugging a dispatch decision.
     [[nodiscard]] std::string toString() const;
 
-    // ---------------------------------------------------------------------------
-    // Predicates over the runners chosen at initialization, and over the per-call
-    // state, which is passed explicitly. Config-only predicates are on AttentionBase.
-    // ---------------------------------------------------------------------------
-    [[nodiscard]] bool isUnfusedCrossAttention(FmhaParams const& p) const
+    // The FMHA libraries; null for a library the key does not admit.
+    [[nodiscard]] TrtllmGenFmha<MHA>* trtllmGen() const
     {
-        return !mEnableContextFMHA && p.is_cross;
+        return mTrtllmGen.get();
+    }
+
+    [[nodiscard]] FmhaV2Fmha<MHA>* fmhaV2() const
+    {
+        return mFmhaV2.get();
+    }
+
+    [[nodiscard]] XqaFmha<MHA>* xqa() const
+    {
+        return mXqa.get();
+    }
+
+    [[nodiscard]] MmhaFmha* mmha() const
+    {
+        return mMmha.get();
+    }
+
+    [[nodiscard]] UnfusedFmha* unfused() const
+    {
+        return mUnfused.get();
+    }
+
+    /// Every FMHA library in priority order, null for those the key does not admit.
+    [[nodiscard]] std::array<PhasedFmha<MHA>*, 5> fmhas() const
+    {
+        return {mTrtllmGen.get(), mFmhaV2.get(), mXqa.get(), mMmha.get(), mUnfused.get()};
     }
 
     [[nodiscard]] bool isCrossAttention(FmhaParams const& p) const
@@ -267,19 +352,9 @@ public:
         return p.hasKvCache();
     }
 
-    [[nodiscard]] bool usePackedCustomMask(FmhaParams const& p) const
-    {
-        return useCustomMask() && mEnableContextFMHA;
-    }
-
-    [[nodiscard]] bool useSparseAttention() const
-    {
-        return use_sparse_attention && mPagedKVCache && mEnableXQA;
-    }
-
     [[nodiscard]] bool useTllmGenSparseAttentionPaged(FmhaParams const& p) const
     {
-        return p.hasPagedSparseAttnIndices() && useSparseAttention();
+        return p.hasPagedSparseAttnIndices() && use_sparse_attention && mPagedKVCache;
     }
 
     [[nodiscard]] bool useTllmGenSparseAttention() const
@@ -298,15 +373,47 @@ public:
     }
 
 private:
-    /// One per phase, instantiated per activation dtype.
-    template <typename T>
-    void runContextImpl(FmhaParams& p);
-    template <typename T>
-    void runGenerationImpl(FmhaParams& p);
+    template <typename>
+    friend class TrtllmGenFmha;
+    template <typename>
+    friend class FmhaV2Fmha;
+    template <typename>
+    friend class XqaFmha;
+    friend class MmhaFmha;
+    friend class UnfusedFmha;
 
-    /// CUDA-side state both phases share (cuBLAS handle, env caches); runs once, from
-    /// whichever init hook comes first.
-    void initShared();
+    /// The fused context runners' fixed parameters: layout, data types, heads and features.
+    [[nodiscard]] kernels::MHARunnerFixedParams contextFixedParams() const;
+    /// Whether the fused context kernels read Q apart from K/V.
+    [[nodiscard]] bool isSeparateQAndKvInput() const;
+
+    /// The fused context workspace slices for this call: the one place they are sized.
+    [[nodiscard]] tensorrt_llm::common::op::AttentionContextWorkspaceSizes contextWorkspaceSizes(
+        FmhaParams const& p) const;
+    /// The fused context workspace layout for this call.
+    [[nodiscard]] tensorrt_llm::common::op::AttentionContextWorkspaceLayout contextWorkspaceLayout(
+        FmhaParams const& p) const;
+    [[nodiscard]] size_t getWorkspaceSizeForContext(FmhaParams const& p) const;
+
+    template <typename T>
+    [[nodiscard]] int getKvCacheElemSizeInBits() const
+    {
+        return kvCacheElemSizeInBits(quant_mode, sizeof(T));
+    }
+
+    /// The paged KV cache views for this call's rows.
+    template <typename T>
+    [[nodiscard]] KvCacheBuffers<kernels::KVBlockArray> getKvCacheBuffers(FmhaParams const& p, bool isGen) const;
+    /// cu_seqlens, tokens info, the FP8 scales, and the attention mask and padding offsets
+    /// where \p workspaceViews has slices for them.
+    template <typename T>
+    void buildContextDecoderInfo(FmhaParams const& p,
+        tensorrt_llm::common::op::AttentionContextWorkspaceViews<T> const& workspaceViews, cudaStream_t stream) const;
+    /// The fused context path: decoder info, QKV preprocessing or SageQuant, \p launch with
+    /// the filled runner parameters, then KV-cache postprocessing.
+    template <typename T>
+    void enqueueFusedContext(FmhaParams const& p, cudaStream_t stream,
+        std::function<void(kernels::MHARunnerParams const&)> const& launch) const;
 
     /// The FP8 output scale, which only FP8 context FMHA quantizes the output with.
     [[nodiscard]] float* getOutQuantScale(FmhaParams const& p) const
@@ -314,34 +421,23 @@ private:
         return mFP8ContextFMHA ? p.getOutQuantScale() : nullptr;
     }
 
+    std::unique_ptr<TrtllmGenFmha<MHA>> mTrtllmGen;
+    std::unique_ptr<FmhaV2Fmha<MHA>> mFmhaV2;
+    std::unique_ptr<XqaFmha<MHA>> mXqa;
+    std::unique_ptr<MmhaFmha> mMmha;
+    std::unique_ptr<UnfusedFmha> mUnfused;
     bool mPagedKVCache = true;
     bool mFP8ContextFMHA = false;
-
-    // fmha runner (enabled by default)
-    // flag: disabled = 0, enabled = 1, enabled with fp32 accumulation = 2
-    bool mEnableContextFMHA = true;
     bool mMultiBlockMode = true;
-    bool mEnableXQA = true;
-
-    using XqaPrepareProfile = std::tuple<bool, bool, bool, int64_t, bool>;
-    std::map<XqaPrepareProfile, int64_t> mXqaPreparedBeamWidths;
 
 #ifdef SKIP_SOFTMAX_STAT
     at::Tensor mDefaultSkipSoftmaxStat;
 #endif
-
-    static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
-
-    bool mForceMultiBlockWarned = false;
-    std::shared_ptr<CUDADriverWrapper> mDriver;
-    std::unique_ptr<tensorrt_llm::kernels::FmhaDispatcher> mFmhaDispatcher;
-    std::unique_ptr<tensorrt_llm::kernels::XqaDispatcher> mXqaDispatcher;
-    std::unique_ptr<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
 };
 
 /// Multi-head latent attention (DeepSeek). The MLA RoPE and FP8 staging kernels feed the
 /// separate-Q/K/V (or, for sparse MLA, paged-latent) context FMHA; generation runs the
-/// trtllm-gen MLA kernel, FlashMLA on Hopper, XQA on SM120, or the decoder FMHA over the
+/// trtllm-gen MLA kernel, FlashMLA on Hopper, XQA on SM120, or the fmha_v2 kernels over the
 /// paged latent cache.
 class MLA : public TrtllmAttention<MLA, PagedKVCacheFeature, OutputQuantFeature, RopeFeature, SpecDecodingFeature,
                 SparseMlaFeature>
@@ -351,17 +447,21 @@ public:
 
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
 
+    /// Whether this op serves the call's inputs. Static, so a call it declines builds no op.
+    [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
+    {
+        return static_cast<AttentionMaskType>(p.fwd.mask_type) != AttentionMaskType::CUSTOM_MASK
+            && checkFeatureParams(p, isGen);
+    }
+
     // ---- hooks called by TrtllmAttention ----
-    /// Build the context FMHA dispatcher with the latent (sparse) or separate-Q/K/V layout.
     void initContext();
-    /// Build the trtllm-gen MLA runner, the decoder FMHA runner or XQA, and decide `mEnableXQA`.
+    /// Resolves the multi-block mode from the environment.
     void initGeneration();
     /// Validates the call and derives the per-call state into \p p.
     void prepareInputs(FmhaParams& p, bool isGen);
-    /// Bytes this call needs: the MLA context staging buffers and the generation scratch.
-    [[nodiscard]] std::size_t getRequiredWorkspaceSize(FmhaParams const& p, bool isGen) const;
-    void enqueueContext(FmhaParams& p);
-    void enqueueGeneration(FmhaParams& p);
+    void enqueueContext(FmhaParams& p, PhasedFmha<MLA>& fmha);
+    void enqueueGeneration(FmhaParams& p, PhasedFmha<MLA>& fmha);
 
     /// The op's own derived state, for debugging a dispatch decision.
     [[nodiscard]] std::string toString() const;
@@ -371,49 +471,64 @@ public:
         return feature<torch_ext::SparseMlaFeature>().enabled();
     }
 
-    [[nodiscard]] int getFlashMlaNumSmParts(int s_q, int num_heads, int num_kv_heads, int head_size_v) const
+    // The FMHA libraries; null for a library the key does not admit.
+    [[nodiscard]] TrtllmGenFmha<MLA>* trtllmGen() const
     {
-        static constexpr int block_size_m = 64;
-        int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
-        int sm_cnt = mMultiProcessorCount;
-        int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
-        return num_sm_parts;
+        return mTrtllmGen.get();
     }
 
-    [[nodiscard]] static int getFlashMlaNumSmPartsStatic(int s_q, int num_heads, int num_kv_heads, int head_size_v)
+    [[nodiscard]] FlashMlaFmha* flashMla() const
     {
-        static constexpr int block_size_m = 64;
-        int num_heads_per_head_k = s_q * num_heads / num_kv_heads;
-        int device;
-        cudaGetDevice(&device);
-        int sm_cnt;
-        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, device);
-        int num_sm_parts = sm_cnt / num_kv_heads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
-        return num_sm_parts;
+        return mFlashMla.get();
+    }
+
+    [[nodiscard]] XqaFmha<MLA>* xqa() const
+    {
+        return mXqa.get();
+    }
+
+    [[nodiscard]] FmhaV2Fmha<MLA>* fmhaV2() const
+    {
+        return mFmhaV2.get();
+    }
+
+    /// Every FMHA library in priority order, null for those the key does not admit.
+    [[nodiscard]] std::array<PhasedFmha<MLA>*, 4> fmhas() const
+    {
+        return {mTrtllmGen.get(), mFlashMla.get(), mXqa.get(), mFmhaV2.get()};
     }
 
 private:
-    /// The context launch, per activation dtype: decoder info, MLA RoPE, FP8 K/V staging,
-    /// then the FMHA. The MlaParams it fills lives on its stack for the launch.
-    template <typename T>
-    int enqueueContext(FmhaParams const& p, cudaStream_t stream);
-    /// The generation launch, per activation dtype: trtllm-gen, FlashMLA, XQA or the
-    /// decoder FMHA.
-    template <typename T>
-    int enqueueGeneration(FmhaParams const& p, cudaStream_t stream);
+    template <typename>
+    friend class TrtllmGenFmha;
+    template <typename>
+    friend class FmhaV2Fmha;
+    template <typename>
+    friend class XqaFmha;
+    friend class FlashMlaFmha;
 
+    /// The context runners' fixed parameters: the latent (sparse) or separate-Q/K/V layout.
+    [[nodiscard]] kernels::MHARunnerFixedParams contextFixedParams() const;
+
+    /// The context launch, per activation dtype: decoder info, MLA RoPE, FP8 K/V staging,
+    /// then \p launch with the filled runner parameters.
     template <typename T>
-    void prepareEnqueueGeneration(FmhaParams const& p);
-    /// XQA parameters for the SM120 generation path; false when T has no XQA kernels.
+    void enqueueFusedContext(FmhaParams const& p, cudaStream_t stream,
+        std::function<void(kernels::MHARunnerParams const&)> const& launch) const;
+    /// The generation parameters every generation kernel reads.
     template <typename T>
-    bool fillXqaParams(tensorrt_llm::kernels::XQAParams& xqaParams, FmhaParams const& p, bool forConfigurePlugin) const;
+    [[nodiscard]] kernels::MlaParams<T> getGenerationParams(FmhaParams const& p) const;
+    /// The paged latent cache for this call's rows.
+    template <typename T>
+    [[nodiscard]] kernels::KVBlockArray getGenerationKvCacheBuffer(FmhaParams const& p) const;
 
     /// The context workspace layout for this call: the one place its slices are sized.
     [[nodiscard]] tensorrt_llm::common::op::AttentionContextWorkspaceLayout contextWorkspaceLayout(
         FmhaParams const& p) const;
     [[nodiscard]] size_t getWorkspaceSizeForContext(FmhaParams const& p) const;
-    [[nodiscard]] size_t getWorkspaceSizeForGeneration(FmhaParams const& p) const noexcept;
-    [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize() const noexcept;
+    /// Generation bytes of the trtllm-gen, fmha_v2 and FlashMLA kernels: the buffers they
+    /// share, then the \p kernelWorkspaceSize bytes of the calling library's own buffers.
+    [[nodiscard]] size_t getGenerationWorkspaceSize(FmhaParams const& p, size_t kernelWorkspaceSize) const noexcept;
 
     /// The FP8 output scale, which only FP8 context FMHA quantizes the output with.
     [[nodiscard]] float* getOutQuantScale(FmhaParams const& p) const
@@ -423,9 +538,12 @@ private:
         return fp8ContextFmha ? p.getOutQuantScale() : nullptr;
     }
 
+    std::unique_ptr<TrtllmGenFmha<MLA>> mTrtllmGen;
+    std::unique_ptr<FlashMlaFmha> mFlashMla;
+    std::unique_ptr<XqaFmha<MLA>> mXqa;
+    std::unique_ptr<FmhaV2Fmha<MLA>> mFmhaV2;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams{};
     bool mIsGenerationMLA = false;
-    bool mUseGenFlashMLA = false;
     // Static sparse MLA reads a separately dequantized FP8 scratch pool, so an NVFP4
     // paged cache still runs the FP8 kernels.
     bool mUseNvfp4MlaKvCache = false;
@@ -434,19 +552,10 @@ private:
     bool mFP8ContextMLA = false;
     bool mFP8GenerationMLA = false;
     bool mMultiBlockMode = true;
-    bool mEnableXQA = false;
-
-    using XqaPrepareProfile = std::tuple<bool, bool, bool, int64_t, bool>;
-    std::map<XqaPrepareProfile, int64_t> mXqaPreparedBeamWidths;
 
 #ifdef SKIP_SOFTMAX_STAT
     at::Tensor mDefaultSkipSoftmaxStat;
 #endif
-
-    std::unique_ptr<tensorrt_llm::kernels::FusedMHARunnerV2> mDecoderFMHARunner;
-    std::unique_ptr<tensorrt_llm::kernels::FmhaDispatcher> mFmhaDispatcher;
-    std::unique_ptr<tensorrt_llm::kernels::XqaDispatcher> mXqaDispatcher;
-    std::unique_ptr<tensorrt_llm::kernels::TllmGenFmhaRunner> mTllmGenFMHARunner;
 };
 
 } // namespace torch_ext
