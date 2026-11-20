@@ -325,6 +325,17 @@ def test_reference_slot_accepts_at_most_ten_images():
             id="ulysses16",
         ),
         pytest.param(
+            dict(
+                attention=SimpleNamespace(
+                    sparse_attention_config=SimpleNamespace(algorithm="sol_attn"),
+                    quant_attention_config=None,
+                ),
+                visual_gen_mapping=VisualGenMapping(world_size=2, rank=0, ulysses_size=2),
+            ),
+            "SOL-Attn routes 64-token blocks",
+            id="sol_ulysses2",
+        ),
+        pytest.param(
             dict(visual_gen_mapping=VisualGenMapping(world_size=2, rank=0, ring_size=2)),
             "Ring Attention or Attention2D",
             id="ring2",

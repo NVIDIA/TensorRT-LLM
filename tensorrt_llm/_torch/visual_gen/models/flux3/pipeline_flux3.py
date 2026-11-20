@@ -397,6 +397,12 @@ class Flux3Pipeline(BasePipeline):
                 "parallel_config.ring_size to 1 and attn2d_size to [1, 1]."
             )
         seq_size = vgm.seq_size if vgm is not None else 1
+        if seq_size > 1 and sparse is not None and sparse.algorithm == "sol_attn":
+            raise ValueError(
+                f"FLUX 3 SOL-Attn routes {SOL_BLOCK_SIZE}-token blocks of each sample's token "
+                "order, which Ulysses changes; set parallel_config.ulysses_size to 1 or remove "
+                "sparse_attention_config."
+            )
         num_heads = config.primary_pretrained_config.num_attention_heads
         # Ulysses splits attention heads, and every padded prompt window, across its ranks.
         max_size = math.gcd(TEXT_TOKEN_MULTIPLE, num_heads)
