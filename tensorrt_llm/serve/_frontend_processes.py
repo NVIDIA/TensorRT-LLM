@@ -3,6 +3,7 @@
 
 """Process attachment shared by HTTP and OpenEngine serving."""
 
+import asyncio
 import contextlib
 import json
 import os
@@ -370,6 +371,31 @@ def _watch_attached_frontends(children: list, interval_s: float = 1.0) -> thread
 
     threading.Thread(target=watch, name="attached-frontend-watch", daemon=True).start()
     return stopping
+
+
+async def _drain_attached_frontends(
+    children: list, drain_timeout_s: int | None, force_exit: Callable[[], bool]
+) -> None:
+    """Stop the group and wait, in the event loop, until every frontend exits.
+
+    SIGTERM starts each frontend's graceful shutdown. Frontends still running
+    drain_timeout_s plus a 10 s grace later, or once force_exit() is true, are
+    killed. Without drain_timeout_s the drain has no deadline, as each server's
+    own graceful shutdown waits for every request then: a frontend that never
+    exits is ended by a second Ctrl-C (force_exit()) or by the outer kill.
+    poll() reaps every frontend, killed ones included, so the event loop keeps
+    serving until the last one exits.
+    """
+    for child in children:
+        child.terminate()
+    deadline = None if drain_timeout_s is None else time.monotonic() + drain_timeout_s + 10
+    killed = False
+    while any(child.poll() is None for child in children):
+        if not killed and (force_exit() or (deadline is not None and time.monotonic() >= deadline)):
+            for child in children:
+                child.kill()
+            killed = True
+        await asyncio.sleep(0.1)
 
 
 def _terminate_attached_frontends(children: list) -> None:
