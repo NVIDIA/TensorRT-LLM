@@ -2129,6 +2129,34 @@ def test_recovery_cancel_before_writer_result_retains_gen_pages(monkeypatch) -> 
     assert rid not in receiver._sessions and rid not in gen._recv_sessions
 
 
+@pytest.mark.cpu_only
+def test_legacy_send_cancellation_waits_for_active_write() -> None:
+    rid = 129
+    params = DisaggregatedParams(disagg_request_id=rid)
+    sender = _make_sender_with_cleared_session(rid)
+    sender.setup_session = Mock()
+    sender.shutdown = Mock()
+    session = transfer_mod.TxSession(rid, params, sender)
+    task = transfer_mod.SendTaskBase(params)
+    task.status = transfer_mod.TaskStatus.TRANSFERRING
+    session.kv_tasks = [task]
+    request = SimpleNamespace(request_id=rid, py_disaggregated_params=params)
+    ctx = object.__new__(KvCacheTransceiverV2)
+    ctx._wait_reqs = {}
+    ctx._send_sessions = {rid: session}
+    ctx._send_reqs = {rid: request}
+    ctx._recv_sessions = {}
+
+    assert not ctx.cancel_request(request)
+    assert ctx._send_sessions == {rid: session}
+    assert session.wait_complete(blocking=False) == WaitResult.FAILED
+    assert not ctx._ownership_blocks_retirement(session)
+
+    task.status = transfer_mod.TaskStatus.TRANSFERRED
+    assert ctx.cancel_request(request)
+    assert ctx._send_sessions == {}
+
+
 def _two_writer_receive_failed_by_one(
     rid: int, timeout_s: float | None = None, *, first_result: bool = True, aux_buffer=None
 ):
@@ -2209,6 +2237,64 @@ def _two_writer_receive_failed_by_one(
     transceiver._recv_reqs = {rid: request}
     assert session.status == (SessionStatus.ERROR if first_result else SessionStatus.TRANSFERRING)
     return receiver, session, transceiver, request
+
+
+@pytest.mark.cpu_only
+def test_recovery_gen_cancellation_preserves_tp_retirement_vote(monkeypatch) -> None:
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    rid = 130
+    ranks = [_two_writer_receive_failed_by_one(rid, first_result=rank == 1) for rank in range(2)]
+    payloads = [None, None]
+    barrier = threading.Barrier(2, timeout=5)
+
+    def allgather(rank, value):
+        payloads[rank] = value
+        barrier.wait()
+        gathered = payloads.copy()
+        barrier.wait()
+        return gathered
+
+    def poll(expected):
+        results = queue.Queue()
+
+        def check(gen):
+            assert gen.check_gen_transfer_status(0) == expected
+
+        threads = [
+            _start_checked_thread(lambda gen=gen: check(gen), results) for _, _, gen, _ in ranks
+        ]
+        for thread in threads:
+            thread.join(timeout=15)
+            assert not thread.is_alive()
+        _raise_thread_errors(results, expected=2)
+
+    def finish_writer(session, rank):
+        session.process_kv_agent_result(
+            peer_rank=rank,
+            receiver_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        )
+
+    for rank, (receiver, _, gen, _) in enumerate(ranks):
+        receiver.send_cancel_to_senders = Mock()
+        gen._agent_recovery = gen._gen_need_sync = True
+        gen._gen_allgather = lambda value, rank=rank: allgather(rank, value)
+
+    _, cancelled_shard, gen, request = ranks[0]
+    finish_writer(cancelled_shard, 3)
+    finish_writer(cancelled_shard, 4)
+    assert not gen.cancel_request(request)
+    assert not cancelled_shard.has_transferring_tasks()
+    poll(([], [], []))
+    assert all(rid in gen._recv_sessions for _, _, gen, _ in ranks)
+
+    finish_writer(ranks[1][1], 4)
+    poll(([], [rid], []))
+    assert all(not gen.has_inflight_transfer(req) for _, _, gen, req in ranks)
+    assert all(req.state == LlmRequestState.DISAGG_TRANS_ERROR for _, _, _, req in ranks)
+    poll(([], [], []))
 
 
 @pytest.mark.cpu_only

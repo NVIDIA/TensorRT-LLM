@@ -1178,6 +1178,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for rid in candidates
             if not self._retirement_blocked(sessions.get(rid))
             and (terminal is None or rid in terminal)
+            and not (
+                recovery
+                and rid in sessions
+                and sessions[rid].status == SessionStatus.CANCELLED
+                and sessions[rid].has_transferring_tasks()
+            )
         ]
         outcome = self._consensus_outcome(
             candidates,
@@ -1395,8 +1401,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     @staticmethod
     def _ownership_blocks_retirement(session: object) -> bool:
         """Whether a session still holds physical transfer resources."""
-        if isinstance(session, TxSession) and not session.resources_drained():
-            return True
+        if isinstance(session, TxSession):
+            return session._close_requires_drain() and not session.resources_drained()
         if not getattr(session, "_enforce_physical_ownership", False):
             return False
         resources_drained = getattr(session, "resources_drained", None)
@@ -2488,9 +2494,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 session.cancel()
             if isinstance(session, RxSession) and (
                 session.recovery_failed
-                or (getattr(self, "_agent_recovery", False) and session.committed_failure)
+                or (
+                    getattr(self, "_agent_recovery", False)
+                    and (
+                        session.committed_failure
+                        or (
+                            self._gen_need_sync
+                            and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1"
+                        )
+                    )
+                )
             ):
-                # Let the outcome vote retire this failed receive on every rank.
+                # Keep the local retirement vote even if this shard drained first.
                 has_transferring = True
             elif session.has_transferring_tasks() or session.close() is False:
                 has_transferring = True

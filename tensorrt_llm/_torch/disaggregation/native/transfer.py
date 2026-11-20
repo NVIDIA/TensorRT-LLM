@@ -3039,9 +3039,6 @@ class TxSession(TxSessionBase):
             tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
             if any(getattr(task, "_native_inflight", 0) > 0 for task in tasks):
                 return False
-            sender = getattr(self, "_sender", None)
-            if getattr(sender, "_recover_agent", None) is None:
-                return True
             return not any(task.status == TaskStatus.TRANSFERRING for task in tasks)
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
@@ -3049,8 +3046,16 @@ class TxSession(TxSessionBase):
         tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
         return all(task.resources_drained for task in tasks)
 
+    def _close_requires_drain(self) -> bool:
+        return (
+            getattr(self, "_enforce_physical_ownership", False)
+            or getattr(getattr(self, "_sender", None), "_recover_agent", None) is not None
+        )
+
     def _failed_wait_result(self) -> Optional[WaitResult]:
-        return None if not self.resources_drained() else WaitResult.FAILED
+        if self._close_requires_drain() and not self.resources_drained():
+            return None
+        return WaitResult.FAILED
 
     def _completed_wait_result(self) -> Optional[WaitResult]:
         if getattr(self, "_retirement", None) is not None and not self.is_completed():
@@ -3260,7 +3265,7 @@ class TxSession(TxSessionBase):
         with self.lock:
             if self._closed:
                 return True
-            if not self.resources_drained():
+            if self._close_requires_drain() and not self.resources_drained():
                 return False
             retirement = getattr(self, "_retirement", None)
             if retirement is not None and not retirement.close():
