@@ -27,7 +27,6 @@ from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
                     AsyncIterator, Callable, Dict, List, Optional, Tuple,
                     TypeVar, Union)
 
-import msgspec
 import torch
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
@@ -76,6 +75,7 @@ from tensorrt_llm.metrics.perf_utils import (_record_input_processing,
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
@@ -116,12 +116,12 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
-    ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    RerankDocument, RerankRequest, RerankResponse, RerankResult,
-    RerankUsageInfo, RerankV2Request, RerankV2Response, RerankV2Result,
-    ResponseFormat, ResponsesRequest, ResponsesResponse,
-    RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo, VideoGenerationRequest,
+    ImageObject, MemoryUpdateRequest, PromptTokensDetails, RerankDocument,
+    RerankRequest, RerankResponse, RerankResult, RerankUsageInfo,
+    RerankV2Request, RerankV2Response, RerankV2Result, ResponseFormat,
+    ResponsesRequest, ResponsesResponse, RuntimeMemoryUpdateRequest,
+    StartProfileRequest, TokenizeRequest, TokenizeResponse,
+    UpdateWeightsRequest, UsageInfo, VideoGenerationRequest,
     ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
@@ -176,7 +176,6 @@ from .._utils import (AdjustedSteadyClock,
                       set_prometheus_multiproc_dir)
 from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
-from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -205,33 +204,6 @@ def _is_visual_gen_instance(obj) -> bool:
     return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 # yapf: enable
-
-_msgpack_decoder = msgspec.msgpack.Decoder()
-
-
-class _MsgspecRequest(KvHintsRequest):
-    """Request that decodes X-TRTLLM-Msgpack bodies with msgspec."""
-
-    async def json(self):
-        if not hasattr(self, "_json_body"):
-            body = await self.body()
-            if not body:
-                self._json_body = {}
-            elif self.headers.get("x-trtllm-msgpack") == "1":
-                try:
-                    self._json_body = _msgpack_decoder.decode(body)
-                except msgspec.DecodeError as e:
-                    raise json.JSONDecodeError(f"msgpack: {e}", "", 0) from e
-            else:
-                self._json_body = json.loads(body)
-        return self.filter_kv_hints(self._json_body)
-
-
-class _MsgspecRoute(KvHintsRoute):
-    """Parse msgpack/JSON and apply hint trust policy before model validation."""
-
-    request_type = _MsgspecRequest
-
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
@@ -1889,32 +1861,6 @@ class OpenAIServer(_VideoRoutesMixin):
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
 
-    async def health(self) -> Response:
-        if self._check_health():
-            return Response(status_code=200)
-        else:
-            # If the engine has a fatal error, trigger server shutdown so the
-            # pod doesn't linger as a zombie that accepts connections but never
-            # produces tokens.  Uses SIGINT (not SIGTERM) to match the
-            # existing CppExecutorError handlers and let uvicorn perform
-            # its graceful shutdown sequence.  The doing_shutdown guard
-            # ensures we only send SIGINT once — repeated health probes
-            # won't stack signals during an in-progress teardown.
-            executor = getattr(self.generator, '_executor', None)
-            if executor is not None and getattr(executor, '_fatal_error',
-                                                None) is not None:
-                if not getattr(executor, 'doing_shutdown', True):
-                    logger.error(
-                        "Health check detected fatal engine error, initiating "
-                        f"server shutdown: {executor._fatal_error}")
-                    _record_generator_termination(self.generator)
-                    signal.raise_signal(signal.SIGINT)
-            return Response(
-                status_code=503,
-                content=
-                "LLM is unavailable. Please check the server logs for more details."
-            )
-
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
         extra_args = {}
@@ -1963,14 +1909,6 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(f"Health generate check encountered exception: {e}")
             return Response(status_code=500,
                             content=f"Generation health check failed: {str(e)}")
-
-    async def version(self) -> JSONResponse:
-        ver = {"version": VERSION}
-        return JSONResponse(content=ver)
-
-    async def get_model(self) -> JSONResponse:
-        model_list = ModelList(data=[ModelCard(id=self.model)])
-        return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
         # Visual-gen deployments use a separate iteration-stats producer
