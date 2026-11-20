@@ -81,6 +81,7 @@ from .gdn_inforward_split import (
     split_core_ok,
     split_state_rows,
 )
+from .gdn_multi_snapshot import gather_conv_snapshot_windows, store_gdn_snapshots
 from .gdn_prefill_conv import (
     gdn_prefill_conv_eligible,
     gdn_prefill_conv_post,
@@ -2020,6 +2021,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         state_workspace = kwargs.get("state_workspace")
         cu_seqlens_cpu = kwargs.get("cu_seqlens_cpu")
         inforward_split = kwargs.get("inforward_split")
+        periodic_snapshot = kwargs.get("periodic_snapshot")
+        periodic_windows = None
+        if periodic_snapshot is not None:
+            if is_target_verify or inforward_split is not None:
+                raise RuntimeError(
+                    "Periodic GDN snapshots cannot be combined with verification or a split"
+                )
+            periodic_windows = gather_conv_snapshot_windows(
+                mixed_qkv,
+                periodic_snapshot.conv_indices,
+                periodic_snapshot.slots.numel(),
+                conv_states.shape[-1],
+            )
         # Gate convention of the resolved prefill scan (see _gdn_prefill_uses_flashinfer).
         g_linear = kwargs.get("g_linear")
         if g_linear is None:
@@ -2354,9 +2368,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 output_p = output[:, :num_prefill_tokens]
         # Plain chunked kernel with indexed pool I/O for short prefills (one
         # launch); FlashInfer's own heuristic above the threshold.
-        use_cp = _gdn_prefill_use_cp(num_prefill_tokens)
+        use_cp = (
+            "auto" if periodic_snapshot is not None else _gdn_prefill_use_cp(num_prefill_tokens)
+        )
         core_attn_out = None
-        if packed is not None and g_linear and use_cp is False and output_p is not None:
+        if (
+            periodic_snapshot is None
+            and packed is not None
+            and g_linear
+            and use_cp is False
+            and output_p is not None
+        ):
             # FlashInfer's layouts straight from the scratch views: the launch
             # only, none of the adapter's layout / dtype / validation work.
             if chunk_gated_delta_rule_indexed_direct(
@@ -2364,6 +2386,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             ):
                 core_attn_out = output_p
         if core_attn_out is None:
+            checkpoint_args = {}
+            if periodic_snapshot is not None:
+                checkpoint_args = dict(
+                    state_checkpoints=kwargs["periodic_snapshot_stage"],
+                    checkpoint_cu_starts=periodic_snapshot.checkpoint_cu_starts,
+                    checkpoint_every_n_tokens=periodic_snapshot.interval,
+                )
             core_attn_out, _ = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -2384,6 +2413,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 state_workspace=state_workspace,
                 cu_seqlens_cpu=cu_seqlens_cpu,
                 g_is_linear=g_linear,
+                **checkpoint_args,
+            )
+        if periodic_snapshot is not None:
+            store_gdn_snapshots(
+                ssm_states,
+                conv_states,
+                kwargs["periodic_snapshot_stage"].index_select(
+                    0, periodic_snapshot.checkpoint_rows
+                ),
+                periodic_windows,
+                periodic_snapshot.slots,
             )
         if decode_recurrent is not None:
             mixed_qkv_d, a_d, b_d = decode_recurrent
@@ -2764,6 +2804,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ):
             return None
         mamba_metadata = attn_metadata.mamba_metadata
+        if getattr(mamba_metadata, "periodic_snapshot", None) is not None:
+            return None
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         key = (
             num_contexts,
@@ -2947,6 +2989,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             kwargs["inforward_split"] = inforward_split
             kwargs["inforward_stage"] = (
                 attn_metadata.kv_cache_manager.inforward_snapshot_stage_views(self.layer_idx)
+            )
+        periodic_snapshot = getattr(mamba_metadata, "periodic_snapshot", None)
+        if periodic_snapshot is not None and num_prefills > 0:
+            kwargs["periodic_snapshot"] = periodic_snapshot
+            kwargs["periodic_snapshot_stage"] = (
+                attn_metadata.kv_cache_manager.periodic_snapshot_stage_view(
+                    self.layer_idx, periodic_snapshot.checkpoint_count
+                )
             )
         if num_prefills > 0:
             state_workspace = self._get_prefill_state_workspace(attn_metadata, ssm_states)

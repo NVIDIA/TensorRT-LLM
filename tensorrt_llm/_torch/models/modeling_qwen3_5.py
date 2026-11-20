@@ -772,6 +772,7 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
 
     supports_encoder_cache = True
+    _supports_periodic_snapshots = True
     # The inner Qwen3.5 decoder implements them (see Qwen3NextForCausalLM).
     model_specific_llm_args = Qwen3NextForCausalLM.model_specific_llm_args
     # The inner decoder's GDN layers read it.

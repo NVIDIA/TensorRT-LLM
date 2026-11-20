@@ -2206,9 +2206,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "acquire_ssm_snapshot_slot", &kv::KvCache::acquireSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
+        .def("acquire_ssm_snapshot_slots", &kv::KvCache::acquireSsmSnapshotSlots, nb::arg("count"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("acquire_ssm_snapshot_slots_without_eviction", &kv::KvCache::acquireSsmSnapshotSlotsWithoutEviction,
+            nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())
+        .def("try_resize_capacity_without_eviction", &kv::KvCache::tryResizeCapacityWithoutEviction,
+            nb::arg("capacity"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("pending_ssm_snapshot_slot", &kv::KvCache::pendingSsmSnapshotSlot)
         .def(
             "release_ssm_snapshot_slot", &kv::KvCache::releaseSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
+        .def("release_ssm_snapshot_slots", &kv::KvCache::releaseSsmSnapshotSlots,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx)

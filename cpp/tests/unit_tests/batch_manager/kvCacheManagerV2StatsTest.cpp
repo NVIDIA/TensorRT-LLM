@@ -1165,6 +1165,168 @@ TEST_F(ReplayCacheTest, PendingSsmSnapshotReleasePaths)
     manager->shutdown();
 }
 
+TEST_F(ReplayCacheTest, MultiplePendingSsmSnapshotsCommitInOrder)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    SsmLayerConfig ssm;
+    ssm.layerId = 1;
+    ssm.buffers.push_back(BufferConfig{"state", 4096, std::nullopt});
+    config.layers.emplace_back(ssm);
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const ssmLc = manager->lifeCycles().ssmLifeCycleIds().front();
+    auto const ssmPg = manager->getLifeCyclePoolGroupIndices(kHotLevel)[ssmLc];
+    auto const tokens = makeTokens(16);
+    auto cache = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(cache->resume(mStream));
+    ASSERT_TRUE(cache->resize(16));
+    auto const freeBefore = manager->getStorageStatistics(kHotLevel)[ssmPg].free;
+    auto const slots = cache->acquireSsmSnapshotSlots(3);
+    ASSERT_EQ(slots.size(), 3U);
+    EXPECT_EQ(manager->getStorageStatistics(kHotLevel)[ssmPg].free, freeBefore - 3);
+
+    for (int i = 0; i < 3; ++i)
+    {
+        int const point = 4 * (i + 1);
+        EXPECT_EQ(cache->pendingSsmSnapshotSlot(), slots[i]);
+        ASSERT_TRUE(cache->resize(16, point));
+        cache->commit(TokenSpan{tokens.data() + 4 * i, 4}, false, true);
+        auto const match = manager->radixTree().match({}, TokenSpan{tokens.data(), point});
+        ASSERT_EQ(match.numTokens, point);
+        auto const* snapshot = match.blocks.back()->storage.at(ssmLc);
+        ASSERT_NE(snapshot, nullptr);
+        EXPECT_EQ(slotIdToPageIndexValue(snapshot->slotId()), slots[i]);
+    }
+    EXPECT_FALSE(cache->pendingSsmSnapshotSlot().has_value());
+    EXPECT_EQ(manager->getStorageStatistics(kHotLevel)[ssmPg].free, freeBefore - 3);
+    ASSERT_TRUE(cache->resize(16, 16));
+    cache->stopCommitting();
+    cache->close();
+    auto reused = manager->createKvCache({}, TokenSpan{tokens.data(), 16}, 2);
+    EXPECT_EQ(reused->numCommittedTokens(), 12);
+    ASSERT_TRUE(reused->resume(mStream));
+    reused->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, MultiplePendingSsmSnapshotAllocationRollsBack)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    SsmLayerConfig ssm;
+    ssm.layerId = 1;
+    ssm.buffers.push_back(BufferConfig{"state", 4096, std::nullopt});
+    config.layers.emplace_back(ssm);
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const ssmLc = manager->lifeCycles().ssmLifeCycleIds().front();
+    auto& storage = manager->storage();
+    auto const ssmPg = manager->getLifeCyclePoolGroupIndices(kHotLevel)[ssmLc];
+    auto cache = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(cache->resume(mStream));
+    auto const freeBefore = manager->getStorageStatistics(kHotLevel)[ssmPg].free;
+    ASSERT_GT(freeBefore, 1);
+    auto held = storage.newSlotsForPoolGroup(kHotLevel, ssmPg, freeBefore - 1);
+    EXPECT_TRUE(cache->acquireSsmSnapshotSlots(2).empty());
+    EXPECT_FALSE(cache->pendingSsmSnapshotSlot().has_value());
+    EXPECT_EQ(manager->getStorageStatistics(kHotLevel)[ssmPg].free, 1);
+    for (auto& slot : held)
+    {
+        storage.releaseSlot(ssmLc, kHotLevel, std::move(slot));
+    }
+    auto slots = cache->acquireSsmSnapshotSlots(3);
+    ASSERT_EQ(slots.size(), 3U);
+    cache->releaseSsmSnapshotSlot();
+    EXPECT_EQ(cache->pendingSsmSnapshotSlot(), slots[1]);
+    cache->releaseSsmSnapshotSlots();
+    EXPECT_FALSE(cache->pendingSsmSnapshotSlot().has_value());
+    EXPECT_EQ(manager->getStorageStatistics(kHotLevel)[ssmPg].free, freeBefore);
+    cache->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, PendingSsmSnapshotReservationCanAvoidEviction)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    SsmLayerConfig ssm;
+    ssm.layerId = 1;
+    ssm.buffers.push_back(BufferConfig{"state", 4096, std::nullopt});
+    config.layers.emplace_back(ssm);
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const ssmLc = manager->lifeCycles().ssmLifeCycleIds().front();
+    auto& storage = manager->storage();
+    auto const ssmPg = manager->getLifeCyclePoolGroupIndices(kHotLevel)[ssmLc];
+    auto const tokens = makeTokens(8);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(8, 8));
+    source->commit(TokenSpan{tokens.data(), 8}, false);
+    source->stopCommitting();
+    source->close();
+
+    auto target = manager->createKvCache({}, {}, 2);
+    ASSERT_TRUE(target->resume(mStream));
+    auto const stats = manager->getStorageStatistics(kHotLevel)[ssmPg];
+    ASSERT_GT(stats.evictable, 0);
+    auto held = storage.newSlotsForPoolGroup(kHotLevel, ssmPg, stats.free);
+    EXPECT_TRUE(target->acquireSsmSnapshotSlotsWithoutEviction(1).empty());
+    EXPECT_FALSE(target->pendingSsmSnapshotSlot().has_value());
+    EXPECT_EQ(manager->getStorageStatistics(kHotLevel)[ssmPg].evictable, stats.evictable);
+    EXPECT_EQ(manager->radixTree().match({}, TokenSpan{tokens.data(), 8}).numTokens, 8);
+
+    for (auto& slot : held)
+    {
+        storage.releaseSlot(ssmLc, kHotLevel, std::move(slot));
+    }
+    auto slots = target->acquireSsmSnapshotSlotsWithoutEviction(1);
+    ASSERT_EQ(slots.size(), 1U);
+    target->releaseSsmSnapshotSlots();
+    target->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, SpeculativeCapacityExpansionCanAvoidEviction)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    auto const tokens = makeTokens(8);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(8, 8));
+    source->commit(TokenSpan{tokens.data(), 8}, false);
+    source->stopCommitting();
+    source->close();
+
+    auto target = manager->createKvCache({}, {}, 2);
+    ASSERT_TRUE(target->resume(mStream));
+    ASSERT_TRUE(target->resize(4));
+    auto& storage = manager->storage();
+    ASSERT_EQ(manager->lifeCycles().size().value(), 1);
+    auto const attentionLc = LifeCycleId{0};
+    auto const attentionPg = manager->getLifeCyclePoolGroupIndices(kHotLevel)[attentionLc];
+    auto const stats = manager->getStorageStatistics(kHotLevel)[attentionPg];
+    ASSERT_GT(stats.evictable, 0);
+    auto held = storage.newSlotsForPoolGroup(kHotLevel, attentionPg, stats.free);
+    EXPECT_FALSE(target->tryResizeCapacityWithoutEviction(8));
+    EXPECT_EQ(target->capacity(), 4);
+    EXPECT_EQ(target->historyLength(), 0);
+    EXPECT_EQ(manager->getStorageStatistics(kHotLevel)[attentionPg].evictable, stats.evictable);
+    EXPECT_EQ(manager->radixTree().match({}, TokenSpan{tokens.data(), 8}).numTokens, 8);
+
+    for (auto& slot : held)
+    {
+        storage.releaseSlot(attentionLc, kHotLevel, std::move(slot));
+    }
+    EXPECT_TRUE(target->tryResizeCapacityWithoutEviction(8));
+    EXPECT_EQ(target->capacity(), 8);
+    // A peer vetoes the expansion: return to the scheduled baseline without
+    // adding a second capacity sample on this rank.
+    ASSERT_TRUE(target->tryResizeCapacityWithoutEviction(4));
+    EXPECT_EQ(target->capacity(), 4);
+    EXPECT_EQ(target->historyLength(), 0);
+    target->close();
+    manager->shutdown();
+}
+
 TEST_F(ReplayCacheTest, ClosingScratchCacheReleasesEverySlotExactlyOnce)
 {
     auto config = makeConfig();

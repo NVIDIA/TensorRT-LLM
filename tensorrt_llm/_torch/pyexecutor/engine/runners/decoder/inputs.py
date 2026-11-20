@@ -3018,17 +3018,22 @@ class DecoderInputPreparer:
                     "compact decoder replay rows; using eager forward."
                 )
         unpadded_all_rank_num_tokens = attn_all_rank_num_tokens
+        # Periodic snapshot indices and writes are specific to this batch and
+        # are not part of the captured prefill graph.
         virtual_num_tokens = self.pad_tokens(
             attn_metadata,
             total_num_tokens,
             host.num_ctx_requests,
             attn_all_rank_num_tokens,
             allow_prefill_cuda_graph=(
-                breakable_prefill
-                or (
-                    not host.remote_tail_modes
-                    and scheduled_requests.attention_dp_phase
-                    not in (RemoteTailPhase.CONTEXT, RemoteTailPhase.MIXED)
+                getattr(attn_metadata.mamba_metadata, "periodic_snapshot", None) is None
+                and (
+                    breakable_prefill
+                    or (
+                        not host.remote_tail_modes
+                        and scheduled_requests.attention_dp_phase
+                        not in (RemoteTailPhase.CONTEXT, RemoteTailPhase.MIXED)
+                    )
                 )
             ),
         )

@@ -274,6 +274,8 @@ class ScheduledRequests:
     paused_in_place_ids: frozenset[int]
     """Generation requests paused in place or displaced by a forced resume:
     left out of this batch, but their drafter state must be kept."""
+    periodic_snapshot_tp: bool
+    """Whether TP ranks agreed to expand this batch for periodic snapshots."""
 
     def __init__(self):
         self.attention_dp_phase: RemoteTailPhase | None = None
@@ -287,6 +289,7 @@ class ScheduledRequests:
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
         self.paused_in_place_ids: frozenset[int] = frozenset()
+        self.periodic_snapshot_tp = False
 
     @property
     def is_generation_only(self) -> bool:

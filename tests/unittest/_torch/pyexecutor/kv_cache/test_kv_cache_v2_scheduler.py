@@ -280,6 +280,7 @@ def make_ctx_request(
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
     req.py_ctx_sched_since_iter = None
+    req.py_periodic_snapshot_fallback = False
     return req
 
 
@@ -524,6 +525,9 @@ def make_kv_cache_manager(
     mgr.can_evict = can_evict
     mgr._has_cp_helix = False
     mgr.inforward_snapshot_rows = 0
+    mgr.periodic_snapshot_capacity = 0
+    mgr.periodic_snapshot_requires_consensus = False
+    mgr.periodic_snapshot_alignment = 64
     mgr.is_vswa = is_vswa
     # Default: no request contributes a full new block, so the prefix-aware
     # skip never fires and tests that don't care about it are unaffected.
@@ -891,6 +895,32 @@ class TestInflightPrefixWait:
         reqs = [self.make_request(i) for i in range(2)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.context_requests) == [1]
+
+    def test_tp_periodic_budget_preserves_prefix_wait_once_per_pass(self):
+        mgr = self.make_manager()
+        mgr.periodic_snapshot_requires_consensus = True
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        sched.periodic_snapshot_tp_enabled = True
+        owner = self.make_request(0)
+        waiter = self.make_request(1)
+        other = self.make_request(2, shared=False)
+        for req in (owner, waiter, other):
+            req.expect_snapshot_points = list(range(256, self.PROMPT_LEN + 1, 256))
+            req.is_last_context_chunk = False
+
+        first = sched.schedule_request([owner, waiter, other], set())
+        assert ids(first.context_requests) == [0]
+        self.run_chunk(owner, 256)
+        second = sched.schedule_request([owner, waiter, other], set())
+
+        assert ids(second.context_requests) == [0]
+        assert mgr.count_prefix_waits.call_count == 2
+        assert mgr.request_prefix_snapshot.call_args.args[0] is owner
 
     def _owner_in_flight(self, sched):
         """An owner admitted earlier whose next chunk is in flight (pipeline parallel)."""
@@ -2060,8 +2090,8 @@ class TestKVCacheFailuresCtxChunked:
         managers = (mgr, draft_mgr, cross_mgr)
         for manager in managers:
             manager.kv_cache_map[0] = Mock(is_active=False)
-            manager.free_resources.side_effect = (
-                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            manager.free_resources.side_effect = lambda req, manager=manager: (
+                manager.kv_cache_map.pop(req.py_request_id)
             )
         sched = make_scheduler(
             mgr,
@@ -3466,8 +3496,8 @@ class TestCrossKVAllocationFailures:
         failed_cache = Mock(capacity=0)
         failed_cache.resize.return_value = failure != "resize"
         cross_mgr.kv_cache_map[0] = failed_cache
-        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: not (
-            failure == "resume" and cache is failed_cache
+        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: (
+            not (failure == "resume" and cache is failed_cache)
         )
 
         def prepare_context(req: Mock, reuse_limit: int | None = None) -> bool:
@@ -3476,8 +3506,8 @@ class TestCrossKVAllocationFailures:
 
         self_mgr.prepare_context.side_effect = prepare_context
         for manager in (self_mgr, cross_mgr):
-            manager.free_resources.side_effect = (
-                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            manager.free_resources.side_effect = lambda req, manager=manager: (
+                manager.kv_cache_map.pop(req.py_request_id)
             )
         sched = make_encoder_scheduler(
             self_mgr,
@@ -3944,6 +3974,325 @@ class TestChunkedContext:
 
         assert ids(out.context_requests) == [0]
         assert req.context_chunk_size == 256
+
+    @pytest.mark.parametrize("reserve_ok, expected_chunk", [(True, 1024), (False, 256)])
+    def test_periodic_snapshots_extend_chunk_only_when_slots_are_reserved(
+        self, reserve_ok, expected_chunk
+    ):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = reserve_ok
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        req = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        req.expect_snapshot_points = list(range(256, 2049, 256))
+        req.is_dummy_request = False
+        req.py_multimodal_data = None
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == expected_chunk
+        mgr.reserve_periodic_snapshots.assert_called_once_with(req, 1024, (256, 512, 768))
+
+    def test_periodic_snapshot_reservation_is_released_if_context_allocation_fails(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64, resize_context_fn=lambda *_: False)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        req = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        req.expect_snapshot_points = list(range(256, 2049, 256))
+        req.is_dummy_request = False
+        req.py_multimodal_data = None
+
+        out = sched.schedule_request([req], set())
+
+        assert not out.context_requests
+        mgr.release_periodic_snapshots.assert_called_once_with(req)
+
+    def test_periodic_chunk_allocation_failure_retries_at_old_boundary(self):
+        attempts = []
+
+        def resize(_req, tokens):
+            attempts.append(tokens)
+            return tokens <= 256
+
+        mgr = make_kv_cache_manager(tokens_per_block=64, resize_context_fn=resize)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        req = make_ctx_request(
+            0,
+            context_remaining_length=2048,
+            prompt_len=2304,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.context_current_position = 256
+        req.expect_snapshot_points = list(range(256, 2305, 256))
+        req.is_dummy_request = False
+        req.py_multimodal_data = None
+
+        assert not sched.schedule_request([req], set()).context_requests
+        assert req.py_periodic_snapshot_fallback
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 256
+        assert attempts == [1024, 256]
+        assert not req.py_periodic_snapshot_fallback
+        mgr.release_periodic_snapshots.assert_called_once_with(req)
+
+    def test_periodic_fallback_does_not_reenable_inforward_tail_extension(self):
+        attempts = []
+
+        def resize(_req, tokens):
+            attempts.append(tokens)
+            return tokens <= 256
+
+        mgr = make_kv_cache_manager(tokens_per_block=64, resize_context_fn=resize)
+        mgr.periodic_snapshot_capacity = 2
+        mgr.inforward_snapshot_rows = 1
+        mgr.inforward_snapshot_max_tail = 256
+        mgr.inforward_snapshot_min_main = 3
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = make_scheduler(
+            mgr, max_num_tokens=512, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        req = make_ctx_request(
+            0,
+            context_remaining_length=500,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.expect_snapshot_points = [256]
+        req.is_dummy_request = False
+        req.py_multimodal_data = None
+
+        assert not sched.schedule_request([req], set()).context_requests
+        assert req.py_periodic_snapshot_fallback
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 256
+        assert attempts == [500, 256]
+        assert not req.py_periodic_snapshot_fallback
+
+    def test_periodic_snapshot_batch_stays_single_context_with_remaining_budget(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = make_scheduler(
+            mgr, max_num_tokens=2048, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        first = make_ctx_request(0, context_remaining_length=4096, is_last_context_chunk=False)
+        first.expect_snapshot_points = list(range(256, 4097, 256))
+        first.is_dummy_request = False
+        first.py_multimodal_data = None
+        second = make_ctx_request(1, context_remaining_length=4096, is_last_context_chunk=False)
+        second.expect_snapshot_points = list(range(256, 4097, 256))
+        second.is_dummy_request = False
+        second.py_multimodal_data = None
+
+        out = sched.schedule_request([first, second], set())
+
+        assert ids(out.context_requests) == [0]
+        assert first.context_chunk_size == 1024
+
+    def test_periodic_snapshot_chunk_can_share_a_batch_with_decode(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr._periodic_snapshot_supports_mixed_decode = True
+        mgr.is_speculative.return_value = False
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = make_scheduler(
+            mgr, max_num_tokens=1025, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        context = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        context.expect_snapshot_points = list(range(256, 2049, 256))
+        context.is_dummy_request = False
+        context.py_multimodal_data = None
+        decode = make_gen_request(1)
+
+        out = sched.schedule_request([context, decode], set())
+
+        assert ids(out.generation_requests) == [1]
+        assert ids(out.context_requests) == [0]
+        assert context.context_chunk_size == 1024, context.context_chunk_size
+        mgr.reserve_periodic_snapshots.assert_called_once_with(context, 1024, (256, 512, 768))
+
+    def test_tp_periodic_snapshots_first_schedule_the_safe_baseline(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.periodic_snapshot_requires_consensus = True
+        mgr._periodic_snapshot_supports_mixed_decode = True
+        mgr.is_speculative.return_value = False
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        sched = make_scheduler(
+            mgr, max_num_tokens=1025, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        context = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        context.expect_snapshot_points = list(range(256, 2049, 256))
+        context.is_dummy_request = False
+        context.py_multimodal_data = None
+
+        out = sched.schedule_request([context, make_gen_request(1)], set())
+
+        assert ids(out.generation_requests) == [1]
+        assert ids(out.context_requests) == [0]
+        assert context.context_chunk_size == 256
+        assert sched.periodic_snapshot_extra_budget == 768
+        mgr.reserve_periodic_snapshots.assert_not_called()
+
+    def test_tp_periodic_snapshots_preserve_budget_for_one_context_with_decode(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.periodic_snapshot_requires_consensus = True
+        mgr._periodic_snapshot_supports_mixed_decode = True
+        mgr.is_speculative.return_value = False
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        sched = make_scheduler(
+            mgr, max_num_tokens=1025, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        sched.periodic_snapshot_tp_enabled = True
+        contexts = [
+            make_ctx_request(i, context_remaining_length=2048, is_last_context_chunk=False)
+            for i in range(2)
+        ]
+        for context in contexts:
+            context.expect_snapshot_points = list(range(256, 2049, 256))
+            context.is_dummy_request = False
+            context.py_multimodal_data = None
+
+        out = sched.schedule_request([*contexts, make_gen_request(2)], set())
+
+        assert ids(out.generation_requests) == [2]
+        assert ids(out.context_requests) == [0]
+        assert contexts[0].context_chunk_size == 256
+        assert sched.periodic_snapshot_extra_budget == 768
+        mgr.reserve_periodic_snapshots.assert_not_called()
+
+    def test_tp_periodic_snapshots_leave_budget_after_nonperiodic_boundary(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.periodic_snapshot_requires_consensus = True
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        sched.periodic_snapshot_tp_enabled = True
+        context = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        context.expect_snapshot_points = [128, *range(256, 2049, 256)]
+        following = make_ctx_request(1, context_remaining_length=128, is_last_context_chunk=True)
+
+        out = sched.schedule_request([context, following], set())
+
+        assert ids(out.context_requests) == [0, 1]
+        assert context.context_chunk_size == 128
+        assert following.context_chunk_size == 128
+        mgr.reserve_periodic_snapshots.assert_not_called()
+
+    def test_tp_periodic_snapshots_do_not_hold_budget_for_a_short_final_tail(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_requires_consensus = True
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        sched.periodic_snapshot_tp_enabled = True
+        tail = make_ctx_request(
+            0,
+            context_remaining_length=32,
+            prompt_len=2048,
+            is_first_context_chunk=False,
+            is_last_context_chunk=True,
+        )
+        tail.context_current_position = 2016
+        tail.expect_snapshot_points = [2048]
+        following = make_ctx_request(1, context_remaining_length=128, is_last_context_chunk=True)
+
+        out = sched.schedule_request([tail, following], set())
+
+        assert ids(out.context_requests) == [0, 1]
+        assert tail.context_chunk_size == 32
+
+    def test_sparse_snapshot_points_do_not_exceed_checkpoint_staging(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=64)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        context = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        context.expect_snapshot_points = list(range(128, 2049, 128))
+        context.is_dummy_request = False
+        context.py_multimodal_data = None
+
+        out = sched.schedule_request([context], set())
+
+        assert ids(out.context_requests) == [0]
+        assert context.context_chunk_size == 256, context.context_chunk_size
+        mgr.reserve_periodic_snapshots.assert_called_once_with(context, 256, (128,))
+
+    def test_mixed_decode_keeps_safe_chunking_for_unsupported_snapshots(self):
+        for kind, speculative in (("mamba", False), ("gdn", True)):
+            mgr = make_kv_cache_manager(tokens_per_block=64)
+            mgr.periodic_snapshot_capacity = 4
+            mgr._periodic_snapshot_supports_mixed_decode = kind == "gdn"
+            mgr.is_speculative.return_value = speculative
+            mgr.kv_cache_config = SimpleNamespace(
+                mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+            )
+            sched = make_scheduler(
+                mgr, max_num_tokens=1025, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+            )
+            context = make_ctx_request(
+                0, context_remaining_length=2048, is_last_context_chunk=False
+            )
+            context.expect_snapshot_points = list(range(256, 2049, 256))
+            context.is_dummy_request = False
+            context.py_multimodal_data = None
+
+            out = sched.schedule_request([context, make_gen_request(1)], set())
+
+            assert ids(out.generation_requests) == [1]
+            assert ids(out.context_requests) == [0]
+            assert context.context_chunk_size == 256
+            mgr.reserve_periodic_snapshots.assert_not_called()
 
     def test_force_chunk_defaults_to_remaining_context_without_snapshot_points(self):
         mgr = make_kv_cache_manager(tokens_per_block=32)

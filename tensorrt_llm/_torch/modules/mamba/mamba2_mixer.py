@@ -42,8 +42,10 @@ from .causal_conv1d_triton import \
     causal_conv1d_update as causal_conv1d_update_triton
 from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
+from .gdn_multi_snapshot import gather_conv_snapshot_windows
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
+from .mamba_multi_snapshot import store_mamba_snapshots
 from .replay_selective_state_update import replay_selective_state_update
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
@@ -537,6 +539,20 @@ class Mamba2Mixer(nn.Module):
             seq_idx = mamba_metadata.seq_idx
             has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
+            periodic_snapshot = getattr(mamba_metadata, "periodic_snapshot",
+                                        None)
+            periodic_windows = None
+            if periodic_snapshot is not None:
+                if num_prefills != 1 or num_decodes:
+                    raise RuntimeError(
+                        "Periodic Mamba snapshots require a single context-only batch"
+                    )
+                raw_conv = zxbcdt[:num_prefill_tokens,
+                                  self.tp_d_inner:self.tp_d_inner +
+                                  self.tp_conv_dim]
+                periodic_windows = gather_conv_snapshot_windows(
+                    raw_conv, periodic_snapshot.conv_indices,
+                    periodic_snapshot.slots.numel(), conv_states.shape[-1])
 
             if self._token_major_conv:
                 # in_proj emits token-major, and the SSD wants token-major, so
@@ -634,7 +650,16 @@ class Mamba2Mixer(nn.Module):
                 out=preallocated_ssm_out_p.view(1, num_prefill_tokens, -1,
                                                 self.head_dim),
                 state_dtype=self._mamba_ssm_cache_dtype,
+                checkpoint_chunks=(periodic_snapshot.positions //
+                                   self.chunk_size
+                                   if periodic_snapshot is not None else None),
             )
+
+            if periodic_snapshot is not None:
+                current_ssm_states, checkpoint_states = current_ssm_states
+                store_mamba_snapshots(checkpoint_states, ssm_states,
+                                      conv_states, periodic_windows,
+                                      periodic_snapshot.slots)
 
             # copy new ssm state
             ssm_states[state_indices_p] = current_ssm_states

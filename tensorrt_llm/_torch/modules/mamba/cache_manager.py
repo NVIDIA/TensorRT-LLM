@@ -601,6 +601,15 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
     ``Mamba2ReplayRegion``.
     """
 
+    _supports_periodic_snapshots = True
+
+    def _periodic_snapshot_compatible(self) -> bool:
+        return (
+            self._state_layout.conv_state_layout == "x_b_c"
+            and os.getenv("TRTLLM_USE_MAMBA_FI_SSD", "0") == "0"
+            and not self._mamba_ssm_stochastic_rounding
+        )
+
     _speculative_state: Mamba2State | ReplayHistory
     mamba_metadata_cls = ReplayMamba2Metadata
     _replay_region: Mamba2ReplayRegion | None = None

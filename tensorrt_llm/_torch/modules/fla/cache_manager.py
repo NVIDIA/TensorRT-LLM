@@ -1002,6 +1002,7 @@ class Qwen35HybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV2)
     plan ``InforwardSnapshots`` keeps.
     """
 
+    _supports_periodic_snapshots = True
     _skips_steady_state_index_upload = True
     mamba_metadata_cls = GDNMambaMetadata
     _replay_region: GDNReplayRegion | None = None

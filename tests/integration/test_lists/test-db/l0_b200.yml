@@ -137,6 +137,8 @@ l0_b200:
   - unittest/_torch/attention/sparse/deepseek_v4 --ignore=unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py
   - unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/sparse/dsa --ignore=unittest/_torch/attention/sparse/deepseek_v4 --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
   - unittest/_torch/pyexecutor/kv_cache/test_mixed_precision_kv_cache.py
+  - unittest/_torch/pyexecutor/test_tp_periodic_snapshot.py::test_two_process_native_cache_reservation_with_gloo
+  - unittest/_torch/modeling/test_qwen4_exp_support.py::test_periodic_ple_snapshots_bypass_prefill_graph
   # Run cold-JIT MSA coverage separately from the other attention batches.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
@@ -285,6 +287,7 @@ l0_b200:
   - unittest/_torch/modules/test_embedding_lookup.py
   - unittest/_torch/moe/test_draft_experts_nvfp4.py
   - unittest/_torch/modules/mamba
+  - unittest/_torch/modules/qwen4_exp/test_ple_snapshot.py
   - unittest/_torch/modules/tests_lora_modules
   # DWDP expert prefetch on real streams and copies; the peer-GPU gather
   # cases skip below 2 GPUs.

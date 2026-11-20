@@ -1,7 +1,7 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_combined.py
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 #
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -440,6 +440,7 @@ def mamba_chunk_scan_combined(
     return_final_states=False,
     return_varlen_states=False,
     state_dtype=None,
+    checkpoint_chunks=None,
 ):
     """
     Argument:
@@ -458,6 +459,14 @@ def mamba_chunk_scan_combined(
         dt_softplus: Whether to apply softplus to dt
         out: Preallocated output tensor
         state_dtype: The data type of the ssm state
+        checkpoint_chunks: Optional 1-D int32 or int64 indices into the Triton
+            chunk state array, on the same device as the state. Requires
+            return_varlen_states=True and return_final_states=False.
+
+    When checkpoint_chunks is provided, returns (varlen_states,
+    checkpoint_states), where checkpoint_states has shape
+    (num_checkpoints, nheads, headdim, dstate) and dtype state_dtype when
+    specified, otherwise C.dtype.
     """
 
     if not return_varlen_states:
@@ -472,6 +481,13 @@ def mamba_chunk_scan_combined(
     dstate = B.shape[-1]
     headdim = x.shape[-1]
     flashinfer_eligible = z is None and is_sm_100f() and _use_flashinfer_ssd()
+    if checkpoint_chunks is not None and (not return_varlen_states
+                                          or return_final_states):
+        raise ValueError(
+            "Mamba checkpoints require varlen states without separate final states"
+        )
+    if checkpoint_chunks is not None and flashinfer_eligible:
+        raise ValueError("Mamba checkpoints require the Triton SSD path")
     if flashinfer_eligible and _flashinfer_ssd_supported(
             chunk_size, dstate, headdim):
         return _mamba_chunk_scan_flashinfer_fwd(
@@ -532,5 +548,7 @@ def mamba_chunk_scan_combined(
             return final_states
     else:
         varlen_states = rest[0]
+        if checkpoint_chunks is not None:
+            return varlen_states, states[0].index_select(0, checkpoint_chunks)
         return ((varlen_states) if not return_final_states else
                 (final_states, varlen_states))

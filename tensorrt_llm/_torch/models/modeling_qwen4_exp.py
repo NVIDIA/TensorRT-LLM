@@ -682,6 +682,7 @@ class Qwen4ExpModel(DecoderModel):
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             is_cuda_graph=attn_metadata.is_cuda_graph,
         )
+        ple_meta.periodic_snapshot = getattr(mamba_metadata, "periodic_snapshot", None)
 
         conv_state, ngram_context = self._resolve_ple_pools(
             attn_metadata, ple_module, ple_layer_idx, num_seq, device
@@ -1149,6 +1150,7 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
 
     # The GDN layers' Mamba metadata, whichever cache manager serves the model.
     mamba_metadata_cls = GDNMambaMetadata
+    _supports_periodic_snapshots = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         _normalize_qwen35_exclude_modules(model_config)
@@ -1303,6 +1305,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLModelBase):
     supports_encoder_cache = True
     # The inner decoder's GDN layers read it.
     mamba_metadata_cls = Qwen4ExpForCausalLM.mamba_metadata_cls
+    _supports_periodic_snapshots = True
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:

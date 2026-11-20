@@ -2287,6 +2287,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # Staging rows per batch for recurrent-state snapshots taken inside the
     # forward (the GDN cache manager's in-forward snapshots); 0 = none.
     inforward_snapshot_rows: int = 0
+    periodic_snapshot_capacity: int = 0
+    periodic_snapshot_alignment: int = 64
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
     # Deferred KvCache closes of finished generation-only requests (enable_deferred_close);

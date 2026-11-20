@@ -19,6 +19,7 @@ l0_dgx_b200:
       orchestrator: mpi
   tests:
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
+  - unittest/_torch/pyexecutor/test_tp_periodic_snapshot.py::test_two_gpu_native_cache_reservation_with_nccl
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy

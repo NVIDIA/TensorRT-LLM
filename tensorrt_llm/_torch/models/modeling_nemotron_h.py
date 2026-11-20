@@ -798,6 +798,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
     # replay kernel reads, whichever cache manager serves the model.
     mamba_metadata_cls = ReplayMamba2Metadata
 
+    _supports_periodic_snapshots = True
+
     def __init__(
         self,
         model_config: NemotronHModelConfig,

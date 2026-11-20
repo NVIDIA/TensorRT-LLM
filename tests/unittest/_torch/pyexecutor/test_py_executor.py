@@ -1051,6 +1051,45 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
         executor._wait_for_model_engine_input_copy.assert_not_called()
 
 
+@pytest.mark.parametrize(("has_plan", "tp"), [(True, False), (True, True), (False, False)])
+def test_periodic_snapshot_commit_waits_for_input_copy(has_plan: bool, tp: bool) -> None:
+    events = []
+    request = types.SimpleNamespace(
+        py_request_id=9, context_chunk_size=256, is_last_context_chunk=False
+    )
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+    batch.periodic_snapshot_tp = tp
+    engine = types.SimpleNamespace(
+        route_capture=None, forward=lambda *_args, **_kwargs: events.append("forward")
+    )
+    executor = _forward_step_executor(engine)
+    executor.is_warmup = True
+    executor._is_kv_manager_v2 = True
+    executor._finish_periodic_snapshots = True
+    executor.dist = Mock()
+    executor.kv_cache_manager.periodic_snapshot_plan = {9: object()} if has_plan else {}
+    executor.kv_cache_manager.finish_periodic_snapshots.side_effect = lambda _batch: events.append(
+        "commit"
+    )
+    executor._wait_for_model_engine_input_copy = Mock(side_effect=lambda: events.append("wait"))
+    with (
+        patch("torch.cuda.current_stream", return_value=Mock()),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.finish_periodic_snapshots_tp",
+            side_effect=lambda requests, manager, _dist: manager.finish_periodic_snapshots(
+                requests
+            ),
+        ),
+    ):
+        PyExecutor._forward_step(executor, batch)
+
+    assert events == (["forward", "wait", "commit"] if has_plan else ["forward", "commit"])
+    executor._handle_errors.assert_not_called()
+
+
 class _InflightRequestIds:
     def __init__(self):
         self.ids = set()

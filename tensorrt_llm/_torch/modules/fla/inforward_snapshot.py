@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _host_slots_to_device
+from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -290,6 +291,25 @@ class InforwardSnapshotHost:
     # Whether the model's recurrent layers implement the split; a manager may
     # decide per instance.
     _supports_inforward_snapshot = True
+    _periodic_snapshot_requires_staging = True
+    _periodic_snapshot_supports_tp = True
+    _periodic_snapshot_supports_mixed_decode = True
+
+    def _periodic_snapshot_compatible(self) -> bool:
+        return (
+            self._state_layout.conv_state_layout == "q_k_v"
+            and self.ssm_state_shape[-2:] == [128, 128]
+            and os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
+            and is_flashinfer_gdn_prefill_supported_arch()
+        )
+
+    def _periodic_snapshot_staging_in_use_bytes(self) -> int:
+        snapshots = self._inforward_snapshots
+        return sum(
+            t.numel() * t.element_size()
+            for t in (snapshots._stage_ssm, snapshots._stage_conv)
+            if t is not None
+        )
 
     @property
     def inforward_snapshot_rows(self) -> int:
