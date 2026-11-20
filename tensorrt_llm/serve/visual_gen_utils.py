@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import os
 from collections.abc import Mapping
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -16,6 +15,7 @@ from PIL import Image, UnidentifiedImageError
 
 from tensorrt_llm.inputs.media_io import read_allowed_local_media, sniff_media_kind
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.openai_protocol import (
     ImageEditRequest,
     ImageGenerationRequest,
@@ -135,7 +135,7 @@ def path_response_is_disabled() -> bool:
     the server read a file, follows ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` instead
     (`_reference_transport`).
     """
-    return os.environ.get(_PATH_RESPONSE_DISABLED_ENV, "") not in ("", "0")
+    return envs.TRTLLM_MEDIA_DISABLE_PATH_RESPONSE not in ("", "0")
 
 
 def check_path_response_policy() -> None:
@@ -146,7 +146,7 @@ def check_path_response_policy() -> None:
     value other than ``0`` or empty. Logs a warning when the latter is ``0`` or
     empty, and logs when path responses are disabled.
     """
-    former = os.environ.get(_FORMER_PATH_RESPONSE_DISABLED_ENV)
+    former = envs.TRTLLM_DISALLOW_LOCAL_MEDIA_PATH
     if former in ("", "0"):
         logger.warning(
             f"{_FORMER_PATH_RESPONSE_DISABLED_ENV} is no longer read; unset it. "
@@ -157,7 +157,7 @@ def check_path_response_policy() -> None:
             f"{_FORMER_PATH_RESPONSE_DISABLED_ENV} has been renamed; unset it and "
             f"set {_PATH_RESPONSE_DISABLED_ENV}=1 to keep path responses off."
         )
-    raw = os.environ.get(_PATH_RESPONSE_DISABLED_ENV, "")
+    raw = envs.TRTLLM_MEDIA_DISABLE_PATH_RESPONSE
     if raw not in ("", "0", "1"):
         raise ValueError(
             f"Unrecognized value for {_PATH_RESPONSE_DISABLED_ENV}: {raw!r}. "

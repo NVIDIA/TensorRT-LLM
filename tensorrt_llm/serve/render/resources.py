@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.serving_extensions import ServingExtension, get_serving_extension
 
 from .fingerprint import compute_fingerprint
@@ -28,7 +28,7 @@ from .fingerprint import compute_fingerprint
 
 def harmony_enabled_for(model_type: Optional[str]) -> bool:
     """Whether prompts for ``model_type`` are rendered by the Harmony adapter."""
-    if os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1":
+    if envs.DISABLE_HARMONY_ADAPTER:
         return False
     return model_type == "gpt_oss"
 

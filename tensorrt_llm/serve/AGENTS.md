@@ -29,6 +29,8 @@ Name files and symbols here, never line numbers.
   Check: `tests/unittest/serve/test_layering.py`.
 - VisualGen serve tests live under a path that contains `visual_gen/`
   (`tests/unittest/serve/api/visual_gen/`), or CI selection misses them.
+- Environment variables: read them only through `serve/envs.py`, where each one is declared
+  once (name, kind, default, description, secret). Check: `tests/unittest/serve/test_envs.py`.
 
 ## Moving code
 

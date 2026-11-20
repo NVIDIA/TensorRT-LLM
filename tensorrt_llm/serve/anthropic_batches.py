@@ -35,12 +35,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicBatchRequestCounts,
     AnthropicBatchRequestItem,
@@ -73,7 +73,7 @@ def _rfc3339(value: datetime) -> str:
 
 
 def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
+    raw = getattr(envs, name)
     if not raw:
         return default
     try:

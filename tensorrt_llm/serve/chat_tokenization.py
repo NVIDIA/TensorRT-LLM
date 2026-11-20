@@ -15,11 +15,11 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Callable, Optional, cast
 
 from transformers import PretrainedConfig
 
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
 if TYPE_CHECKING:
@@ -40,7 +40,7 @@ def uses_harmony_tokenization(
     model_type: Optional[str] = None,
     model_type_resolver: Optional[Callable[[], Optional[str]]] = None,
 ) -> bool:
-    if os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1":
+    if envs.DISABLE_HARMONY_ADAPTER:
         return False
     if use_harmony is not None:
         return use_harmony

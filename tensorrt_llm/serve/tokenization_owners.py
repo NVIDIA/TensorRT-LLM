@@ -40,6 +40,7 @@ from typing import Optional
 from tensorrt_llm.inputs.prefix_token_cache import OffsetTokenizer, PrefixTokenCache, RouteFailed
 from tensorrt_llm.inputs.registry import prefix_token_cache_of
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.multi_frontend import (
     MultiFrontendServing,
     frontend_of_conversation,
@@ -63,7 +64,7 @@ def routing_enabled() -> bool:
     Raises:
         ValueError: if the switch is set to anything but ``0`` or ``1``.
     """
-    raw = os.environ.get(ENABLE_ENV_VAR)
+    raw = envs.TLLM_PREFIX_TOKEN_CACHE_ROUTE_BY_CONVERSATION
     if raw is None or raw == "0":
         return False
     if raw == "1":
