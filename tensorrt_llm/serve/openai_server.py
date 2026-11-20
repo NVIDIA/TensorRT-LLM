@@ -1207,6 +1207,13 @@ class OpenAIServer(_VideoRoutesMixin):
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
+        # The disaggregation coordinator's per-request transfer failures cross
+        # executor IPC as strings. A fresh request can use a healthy worker.
+        if status_code == HTTPStatus.BAD_REQUEST and message in (
+                "Error in kv cache transfer for context requests",
+                "Error in kv cache transfer for generation requests"):
+            status_code = HTTPStatus.SERVICE_UNAVAILABLE
+            err_type = "ServiceUnavailableError"
         # Over-length prompts are detected from the message text because they
         # cross the executor IPC boundary as plain strings (RequestError), so
         # no exception type survives to here.
