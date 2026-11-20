@@ -875,6 +875,7 @@ def test_internal_mtp_moe_backend_uses_isolated_layer_config(
     )
 
 
+@pytest.mark.cpu_only
 def test_internal_mtp_auto_resolves_from_layer_quantization() -> None:
     target_config = _draft_backend_test_model_config("CUTEDSL")
     target_config.spec_config = SimpleNamespace(moe_backend="AUTO")
