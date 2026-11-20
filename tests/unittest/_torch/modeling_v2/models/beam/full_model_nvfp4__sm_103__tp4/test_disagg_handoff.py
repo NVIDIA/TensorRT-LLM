@@ -730,7 +730,7 @@ def test_a_pending_receive_is_aborted_without_a_decode_once_safe_to_free():
     assert failures == []
 
 
-def test_an_expired_receive_fails_and_a_late_completion_is_not_decoded():
+def test_only_an_inflight_receive_can_fail_its_transfer_deadline():
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState as State
 
     in_flight = _gen_request(2, 16, 77, State.DISAGG_GENERATION_TRANS_IN_PROGRESS)
@@ -741,17 +741,17 @@ def test_an_expired_receive_fails_and_a_late_completion_is_not_decoded():
     transceiver = _Transceiver(drained=(3, 4))
     executor, failures = _executor([in_flight, late, on_time], transceiver)
     executor._cancel_pending_gen_receives()
-    # The completed-late receive fails; the in-flight one waits until its writer is fenced.
-    assert failures == [("Request 3 timed out", [3])]
-    assert executor.active_requests == [in_flight, on_time]
+    # Both completed receives remain eligible for handoff, even after local clock skew.
+    assert failures == []
+    assert executor.active_requests == [in_flight, late, on_time]
     assert in_flight.state == State.DISAGG_GENERATION_TRANS_IN_PROGRESS
-    assert late.state != State.DISAGG_GENERATION_TRANS_COMPLETE
+    assert late.state == State.DISAGG_GENERATION_TRANS_COMPLETE
     assert on_time.state == State.DISAGG_GENERATION_TRANS_COMPLETE
     transceiver.drained.add(2)
     executor._cancel_pending_gen_receives()
     assert failures[-1] == ("Request 2 timed out", [2])
     assert in_flight.state == State.DISAGG_TRANS_ERROR
-    assert transceiver.cancel_calls == [2, 3, 2]
+    assert transceiver.cancel_calls == [2, 2]
 
 
 @pytest.mark.parametrize(

@@ -306,6 +306,12 @@ class DisaggTransferCoordinator:
         for request in list(self._registry.active_requests()):
             if not request.is_generation_only_request or self._vote_id(request) in canceled_ids:
                 continue
+            if request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
+                # The receive poll agreed on completion across the replica. A
+                # deadline observed on just one rank cannot undo that decision.
+                request.py_kv_transfer_timed_out = False
+                self._legacy_retire_retry.pop(request.py_request_id, None)
+                continue
             if request.is_disagg_generation_transmission_in_progress:
                 self._flag_transfer_timeout(request, "generation", timeout_ms)
             if (

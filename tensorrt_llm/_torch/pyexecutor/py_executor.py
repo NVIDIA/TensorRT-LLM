@@ -11610,8 +11610,8 @@ class PyExecutor:
         receive completes and the request has decoded. The transceiver cancels
         the receive and notifies the sender. A request ends only once that
         reports its destination safe to free and is retried on the next
-        iteration until then. A receive that completed after its deadline is
-        failed rather than decoded. With in-flight cancellation enabled the
+        iteration until then. An agreed receive completion supersedes a local
+        timeout observation. With in-flight cancellation enabled the
         coordinator owns this instead.
         """
         if (self.kv_cache_transceiver is None
@@ -11627,7 +11627,8 @@ class PyExecutor:
             if req_id in canceled_ids:
                 if self._try_cancel_request(request):
                     cancelled.append(request)
-            elif request.py_kv_transfer_timed_out:
+            elif (request.py_kv_transfer_timed_out
+                  and request.is_disagg_generation_transmission_in_progress):
                 if self.disagg.request_cancellation(request):
                     # The receive is abandoned; leaving the in-transmission
                     # state lets the failure release the request at once.
@@ -13516,6 +13517,13 @@ class PyExecutor:
                         # cancellation won the race. Fail the request without
                         # touching the now-quiesced transfer buffer.
                         timed_out_requests.append(request)
+                    continue
+
+                if request.is_disagg_generation_transmission_complete:
+                    # Handoff owns the completed receive, including when it
+                    # waits another iteration for a runnable batch.
+                    request.py_kv_transfer_timed_out = False
+                    new_active_requests.append(request)
                     continue
 
                 # Retired by the coordinator's poll: its retry loop owns the

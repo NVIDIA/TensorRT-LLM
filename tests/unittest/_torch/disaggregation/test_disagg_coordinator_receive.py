@@ -630,6 +630,24 @@ def test_completed_gen_receives_reports_only_completed_requests_in_batch_order()
     assert [req.py_request_id for req in h.coordinator.completed_gen_receives(batch)] == [3]
 
 
+def test_completed_tp_receive_wins_over_one_ranks_timeout() -> None:
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = [CoordinatorHarness(dist=group.rank(i), kv_transfer_timeout_ms=1000) for i in range(2)]
+    requests = [_GenRequest(1, py_kv_transfer_timed_out=(i == 0)) for i in range(2)]
+    for rank, req in zip(ranks, requests):
+        rank.active.append(req)
+    def handoff(i):
+        coordinator = ranks[i].coordinator
+        coordinator.poll_gen_transfers()
+        assert coordinator.try_finish_gen_receive(requests[i])
+    group.run(handoff)
+    for rank, req in zip(ranks, requests):
+        assert req.state == LlmRequestState.GENERATION_IN_PROGRESS
+        assert not req.py_kv_transfer_timed_out
+        assert "cancel_request:1" not in rank.transceiver.call_log
+        assert not rank.effects.failed
+
+
 def test_try_finish_gen_receive_hands_a_completed_request_to_generation() -> None:
     """The request leaves the transfer state, its blocks are committed for
     reuse with the position already at the prompt end (the fake transceiver
