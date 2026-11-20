@@ -133,16 +133,20 @@ _FULL = SampleType.FULL.value
 
 
 @pytest.mark.parametrize(
-    "variant", ["same", "missing_capture", "tokens", "tier", "kv_regime", "packed_split"]
+    "variant", ["same", "missing_capture", "tokens", "tier", "kv_regime", "packed_split", "pard"]
 )
 def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str) -> None:
     dist = _LockstepDist()
 
     def iteration(runner: CUDAGraphRunner, batch: ScheduledRequests) -> tuple:
         rank = runner.config.mapping.tp_rank
+        runtime_draft_len = (
+            4 if variant == "pard" else 2 if rank == 1 and variant == "tokens" else 1
+        )
+        tokens_per_step = 2 * runtime_draft_len if variant == "pard" else runtime_draft_len + 1
         key = KeyType(
             batch_size=4,
-            draft_len=2 if rank == 1 and variant == "tokens" else 1,
+            draft_len=tokens_per_step - 1,
             sample_type=SampleType.FULL if rank == 1 and variant == "tier" else SampleType.FAST,
             kv_regime=16384 if rank == 1 and variant == "kv_regime" else 8192,
             packed_split=rank == 1 and variant == "packed_split",
@@ -176,7 +180,8 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
             dp_num_tokens=lambda: tokens,
             seq_lens=[key.draft_len + 1] * 4,
             num_generations=4,
-            runtime_draft_len=key.draft_len,
+            runtime_draft_len=runtime_draft_len,
+            runtime_tokens_per_gen_step=tokens_per_step,
         )
         runner.graph_metadata = (
             {}
@@ -197,7 +202,7 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
         )
         prepare = DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts
         first = prepare(inputs, attention, spec)
-        assert len(dist.calls[rank]) == (1 if variant == "same" else 2)
+        assert len(dist.calls[rank]) == (1 if variant in ("same", "pard") else 2)
         # Without another negotiation, the consumed agreement cannot skip this exchange.
         second = prepare(inputs, attention, spec)
         return first, second
@@ -209,12 +214,12 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
         run_iteration=iteration,
     )
 
-    counts = [8, 12] if variant == "tokens" else [8, 8]
-    draft_lens = [1, 2] if variant == "tokens" else [1, 1]
+    counts = [32, 32] if variant == "pard" else [8, 12] if variant == "tokens" else [8, 8]
+    draft_lens = [4, 4] if variant == "pard" else [1, 2] if variant == "tokens" else [1, 1]
     expected = (counts, [counts, [4, 4], [4, 4], draft_lens])
     assert results == ((expected, expected), (expected, expected))
     for calls in dist.calls.values():
-        assert len(calls) == (2 if variant == "same" else 3)
+        assert len(calls) == (2 if variant in ("same", "pard") else 3)
         assert len(calls[-1]) == 5
 
 

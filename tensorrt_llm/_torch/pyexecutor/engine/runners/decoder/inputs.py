@@ -670,10 +670,12 @@ class DecoderInputPreparer:
             cols = gathered.T.tolist()
         else:
             # Every rank replays a graph of the agreed size, which fixes these counts.
-            if counts[0] != runner.graph_num_tokens(replay_key) or spec_counts[1:] != (
-                replay_key.batch_size,
-                replay_key.batch_size,
-                replay_key.draft_len,
+            # The key uses the physical draft buffer: PARD's 2K-1 entries
+            # correspond to logical draft length K and 2K tokens per step.
+            if (
+                counts[0] != runner.graph_num_tokens(replay_key)
+                or spec_counts[1:3] != (replay_key.batch_size, replay_key.batch_size)
+                or spec_metadata.runtime_tokens_per_gen_step - 1 != replay_key.draft_len
             ):
                 raise RuntimeError(
                     f"Attention-DP counts {counts}, {spec_counts} do not match the agreed "
