@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Cross-package private accesses from tensorrt_llm/serve (without serve/scripts/),
+# tensorrt_llm/commands and tensorrt_llm/grpc, checked by test_private_access_lint.py.
+# This list only shrinks. When you remove an access, lower `count` (delete the entry
+# at 0) and lower MAX_TOTAL in the test. Never add an entry: add a public accessor on
+# the class that owns the member. A pure move changes `path` and `scope` only.
+# `owner` and `replacement` are for readers; the test uses path, scope, member, count.
+version: 1
+entries:
+- {path: tensorrt_llm/commands/serve.py, scope: _bind_launcher_uds, member: _executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: a public accessor for the multi-frontend IPC directory}
+- {path: tensorrt_llm/commands/serve.py, scope: _bind_launcher_uds, member: _multi_frontend_ipc_dir, count: 1, owner: executor/proxy.py GenerationExecutorProxy, replacement: a public accessor for the multi-frontend IPC directory}
+- {path: tensorrt_llm/commands/serve.py, scope: _run_fleet_worker_impl, member: _config, count: 2, owner: serve/openai_disagg_server.py OpenAIDisaggServer, replacement: OpenAIDisaggServer.address}
+- {path: tensorrt_llm/grpc/openengine/capabilities.py, scope: _loaded_model_type, member: _hf_model_config, count: 1, owner: llmapi/llm.py BaseLLM, replacement: BaseLLM.hf_model_config}
+- {path: tensorrt_llm/grpc/openengine/capabilities.py, scope: resolve_media_capabilities, member: _registered_model_type, count: 1, owner: inputs input-processor registry, replacement: a public registry accessor for the registered model type}
+- {path: tensorrt_llm/grpc/openengine/control.py, scope: OpenEngineControlServicer.GetServerInfo, member: _executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: "BaseLLM.get_kv_cache_capacity(), BaseLLM.get_openengine_discovery()"}
+- {path: tensorrt_llm/grpc/openengine/control.py, scope: OpenEngineControlServicer.GetServerInfo, member: _openengine_discovery, count: 1, owner: llmapi/llm_args.py BaseLlmArgs, replacement: BaseLlmArgs.openengine_discovery}
+- {path: tensorrt_llm/grpc/openengine/control.py, scope: OpenEngineControlServicer.__init__, member: _enable_routing_load, count: 1, owner: llmapi/llm_args.py BaseLlmArgs, replacement: BaseLlmArgs.enable_routing_load}
+- {path: tensorrt_llm/grpc/openengine/control.py, scope: OpenEngineControlServicer._get_kv_cache_load, member: _executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: BaseLLM.get_kv_cache_load()}
+- {path: tensorrt_llm/grpc/openengine/control.py, scope: OpenEngineControlServicer._requested_sources, member: _executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: BaseLLM.get_openengine_discovery()}
+- {path: tensorrt_llm/grpc/openengine/formatting.py, scope: _token_holdback, member: _stop_word_ids, count: 1, owner: sampling_params.py SamplingParams, replacement: SamplingParams.stop_word_ids}
+- {path: tensorrt_llm/grpc/openengine/node.py, scope: initialize_node_discovery, member: _openengine_discovery, count: 2, owner: "llmapi/llm_args.py BaseLlmArgs (read); _torch/pyexecutor/py_executor.py PyExecutor (write)", replacement: "BaseLlmArgs.openengine_discovery; PyExecutor.set_openengine_discovery()"}
+- {path: tensorrt_llm/grpc/openengine/node.py, scope: initialize_node_discovery, member: _openengine_node_server, count: 1, owner: _torch/pyexecutor/py_executor.py PyExecutor, replacement: PyExecutor.set_openengine_node_server()}
+- {path: tensorrt_llm/grpc/openengine/request_mapping.py, scope: sampling_params_from_request, member: _set_request_provided_fields, count: 1, owner: sampling_params.py SamplingParams, replacement: SamplingParams.set_request_provided_fields()}
+- {path: tensorrt_llm/grpc/openengine/server.py, scope: OpenEngineServer.start, member: _executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: BaseLLM.get_kv_cache_capacity()}
+- {path: tensorrt_llm/serve/_frontend_processes.py, scope: _spawn_attached_frontends, member: _executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: BaseLLM.multi_frontend_attach_info()}
+- {path: tensorrt_llm/serve/chat_utils.py, scope: parse_chat_message_content_part, member: _multimodal_server_config, count: 4, owner: inputs/utils.py MultimodalDataTracker, replacement: MultimodalDataTracker.multimodal_server_config}
+- {path: tensorrt_llm/serve/openai_protocol.py, scope: _record_sampling_params_request_fields, member: _set_request_provided_fields, count: 1, owner: sampling_params.py SamplingParams, replacement: SamplingParams.set_request_provided_fields()}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer._create_chat_response, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer._init_embedding_batcher, member: _encoder_executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: BaseLLM.encode_limits}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer._init_llm, member: _hf_model_dir, count: 1, owner: llmapi/llm.py BaseLLM, replacement: BaseLLM.hf_model_dir}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer._on_launcher_lost, member: _executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: public fatal-error recording on the LLM}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer._on_launcher_lost, member: _set_fatal_error, count: 1, owner: executor/executor.py GenerationExecutor, replacement: public fatal-error recording on the LLM}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.chat_harmony.create_streaming_generator, member: _postprocess_result, count: 2, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_chat.chat_stream_generator, member: _postprocess_result, count: 2, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_completion.completion_generator, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_completion.completion_response, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_image_generation, member: _save_bytes, count: 1, owner: visual_gen/output.py, replacement: public VisualGen output encoder}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_responses.create_response, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.openai_responses.create_streaming_generator, member: _postprocess_result, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.postprocess_result}
+- {path: tensorrt_llm/serve/openai_server.py, scope: OpenAIServer.register_routes, member: _executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: BaseLLM.resource_governor_queue}
+- {path: tensorrt_llm/serve/openai_server.py, scope: _record_generator_termination, member: _executor, count: 1, owner: llmapi/llm.py BaseLLM, replacement: BaseLLM.engine_in_worker_process}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: chat_harmony_streaming_post_processor, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: chat_response_post_processor, member: _spec_dec_counters, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.spec_dec_counters}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: chat_stream_post_processor, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: chat_stream_post_processor, member: _spec_dec_counters, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.spec_dec_counters}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: completion_response_post_processor, member: _spec_dec_counters, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.spec_dec_counters}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: completion_stream_post_processor, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: completion_stream_post_processor, member: _last_text_len, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.text_diff_offset}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: completion_stream_post_processor, member: _spec_dec_counters, count: 1, owner: executor/result.py CompletionOutput, replacement: CompletionOutput.spec_dec_counters}
+- {path: tensorrt_llm/serve/postprocess_handlers.py, scope: responses_api_streaming_post_processor, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/responses_utils.py, scope: ResponsesStreamingProcessor.process_single_output, member: _done, count: 1, owner: executor/result.py GenerationResultBase, replacement: GenerationResultBase.finished}
+- {path: tensorrt_llm/serve/router_utils.py, scope: BlockHashMixin._compute_block_hashes, member: _hash_cache_salt, count: 1, owner: runtime/kv_cache_manager_v2 KVCacheEventManager (nanobind), replacement: public hash_cache_salt binding}

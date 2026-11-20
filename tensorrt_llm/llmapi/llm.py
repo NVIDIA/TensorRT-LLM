@@ -347,6 +347,9 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
         llm_id (str): The unique ID of the LLM instance.
         disaggregated_params (dict): The disaggregated parameters of the LLM instance.
         startup_metrics (dict): The startup metrics reported by worker rank 0.
+        fatal_error (BaseException, optional): The unrecoverable engine error the executor recorded, or None.
+        shutdown_started (bool): Whether shutdown of the generation executor has begun.
+        engine_dead (bool): Whether the engine is known dead (a worker died or a fatal error was recorded).
 """
 
 
@@ -1848,11 +1851,20 @@ class BaseLLM:
         except Exception as exc:
             logger.debug(f"Usage telemetry shutdown tracking failed: {exc}")
 
-    def _check_health(self) -> bool:
-        """Check if the LLM is healthy.
+    @set_api_status("prototype")
+    def check_health(self) -> bool:
+        """Check whether the LLM can serve requests.
+
+        For ``encode_only=True`` the LLM is healthy while its encoder executor
+        exists. Otherwise this delegates to the generation executor's
+        ``check_health()``, which drains queued background errors (a fatal one
+        is recorded, see ``fatal_error``, and starts executor shutdown) and,
+        for the multi-process proxy, polls worker liveness. Without a
+        generation executor (never built, or after ``shutdown()``) the LLM is
+        unhealthy.
 
         Returns:
-            bool: True if the executor is running and healthy, False otherwise.
+            bool: True if the LLM is healthy, False otherwise.
         """
         if self._encode_only:
             return (hasattr(self, "_encoder_executor")
@@ -1861,6 +1873,46 @@ class BaseLLM:
             return self._executor.check_health()
 
         return False
+
+    # Kept for one release for out-of-tree callers that look this name up
+    # (ai-dynamo components/src/dynamo/trtllm/engine.py); use check_health().
+    _check_health = check_health
+
+    @property
+    @set_api_status("prototype")
+    def fatal_error(self) -> Optional[BaseException]:
+        """The unrecoverable engine error the executor recorded, if any.
+
+        None when no fatal error was recorded or the LLM has no generation
+        executor (``encode_only=True``, or after ``shutdown()``).
+        """
+        executor = getattr(self, "_executor", None)
+        return None if executor is None else executor.fatal_error
+
+    @property
+    @set_api_status("prototype")
+    def shutdown_started(self) -> bool:
+        """Whether shutdown of the generation executor has begun.
+
+        True once ``shutdown()`` was called or the executor started shutting
+        down after a fatal error. False for ``encode_only=True``, which has no
+        generation executor.
+        """
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            return not getattr(self, "_encode_only", False)
+        return executor.doing_shutdown
+
+    @property
+    @set_api_status("prototype")
+    def engine_dead(self) -> bool:
+        """Whether the engine is known dead (a worker died or a fatal error was recorded).
+
+        False when the LLM has no generation executor (``encode_only=True``,
+        or after ``shutdown()``).
+        """
+        executor = getattr(self, "_executor", None)
+        return False if executor is None else executor.engine_dead
 
     @staticmethod
     def _shutdown_wrapper(self_ref):
