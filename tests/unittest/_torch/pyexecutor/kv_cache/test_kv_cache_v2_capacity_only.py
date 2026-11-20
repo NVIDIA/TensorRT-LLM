@@ -29,6 +29,8 @@ def _manager(
     kv_reserve_draft_tokens: int = 0,
 ) -> KVCacheManagerV2:
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.kv_connector_manager = None
+    manager.is_estimating_kv_cache = False
     manager.enable_block_reuse = False
     manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
     manager.kv_cache_type = CacheType.SELF

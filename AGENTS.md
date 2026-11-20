@@ -206,12 +206,18 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 Pass product or test Python file paths to `scripts/run_pyrefly.sh` for a file-list static
 check; pre-commit supplies these paths with `pass_filenames: true`. If none are
-eligible, the script skips the check. `--full-project` requests a scan of all
+eligible, the script skips ordinary type checking. Checker/config-only inputs
+still run registered mock checks; no inputs skip both checks.
+`--full-project` requests a scan of all
 configured Python files under `tensorrt_llm/` and `tests/`. For supplied files,
 diagnostics are filtered to added and modified lines when Git provides them and
 retained at file level otherwise.
 File-list checks print every remaining diagnostic; full-project checks save the
 report and print its absolute path.
+The same hook checks all registered mock interfaces, including unchanged tests.
+Mock diagnostics bypass diff-line and path/module filters. Their evidence is
+stored under `mock_interfaces` in `pyrefly_final_report.json`, with diagnostics
+also included in `result.errors`. See `tests/test_common/interface_checks.md`.
 Jenkins runs a full-project check with path/module and symbol exclusions.
 Whole-project checks always return success; file-list checks can opt into
 `--strict`. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]`

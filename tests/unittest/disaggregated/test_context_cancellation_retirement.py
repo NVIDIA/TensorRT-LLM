@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from test_common.host_executor import make_host_executor
 
 __extra_import_path__ = ["../_torch/disaggregation"]
 
@@ -298,7 +299,7 @@ def _assert_transfer_only_progress(
     harness: SimpleNamespace, dist: FakeDistRank, monkeypatch: pytest.MonkeyPatch
 ) -> PyExecutor:
     """Exercise real idle and shutdown predicates against each rank's lifecycle state."""
-    executor = object.__new__(PyExecutor)
+    executor = make_host_executor()
     executor._disagg_coordinator = harness.coordinator
     executor.kv_cache_transceiver = harness.transceiver
     executor.async_transfer_manager = harness.transfers
@@ -343,7 +344,15 @@ def test_context_timeout_skew_retains_claims_until_tp_retirement(
     """One expired rank cannot leave the collective loop before its peer retires."""
     now = {"value": 100.0}
     monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now["value"])
-    monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
+
+    def _mock_is_disagg_inflight_cancel_enabled() -> bool:
+        return False
+
+    monkeypatch.setattr(
+        coordinator_mod,
+        "is_disagg_inflight_cancel_enabled",
+        _mock_is_disagg_inflight_cancel_enabled,
+    )
     group = FakeDistGroup(world_size=2, tp_size=2)
     ranks = []
     requests = []
@@ -389,6 +398,7 @@ def test_context_timeout_skew_retains_claims_until_tp_retirement(
         assert not harness.coordinator._context_cancellation_drains
         executors.append(_assert_transfer_only_progress(harness, group.rank(rank), monkeypatch))
 
+    rx = operation = None
     now["value"] = 104.0
     group.run(lambda rank: ranks[rank].coordinator.check_transfer_timeouts())
     group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())

@@ -102,11 +102,13 @@ def _tactics(rows: int) -> list:
 
 
 def _run(args: list, tactic):
-    return op(*args, tactic, *fused_hc_scratch(args[0].shape[0], tactic, _CUDA))
+    y, r, done = fused_hc_scratch(args[0].shape[0], tactic, _CUDA)
+    return op(*args, tactic=tactic, y_acc_ws=y, r_acc_ws=r, done_counter_ws=done)
 
 
 def _reference(args: list, tactic=DETERMINISTIC_TACTIC):
-    return op.reference(*args, tactic, *fused_hc_scratch(args[0].shape[0], tactic, _CUDA))
+    y, r, done = fused_hc_scratch(args[0].shape[0], tactic, _CUDA)
+    return op.reference(*args, tactic=tactic, y_acc_ws=y, r_acc_ws=r, done_counter_ws=done)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -172,15 +174,15 @@ def test_cuda_graph_capture_and_replay(all_in_one: bool) -> None:
     else:
         tactic = default_fused_hc_tactic(rows, HIDDEN, fused_hc_mma_enabled())
     args = _inputs(rows, spec["norm"], seed=31) + scalars(spec)
-    scratch = fused_hc_scratch(rows, tactic, _CUDA)
+    y, r, done = fused_hc_scratch(rows, tactic, _CUDA)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        op(*args, tactic, *scratch)
+        op(*args, tactic=tactic, y_acc_ws=y, r_acc_ws=r, done_counter_ws=done)
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = op(*args, tactic, *scratch)
+        out = op(*args, tactic=tactic, y_acc_ws=y, r_acc_ws=r, done_counter_ws=done)
     for seed in (32, 33):
         for captured, fresh in zip(args[:8], _inputs(rows, spec["norm"], seed=seed)):
             captured.copy_(fresh)

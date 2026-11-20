@@ -340,6 +340,7 @@ def _chunk_build(spec, seed):
 
 def _check_flashinfer_chunk_gated_delta_rule(cell) -> None:
     args, engine = _chunk_build(cell.spec, seed=zlib.crc32(cell.why.encode()))
+    pool = pool_before = None
     try:
         if engine is None:
             pool = args["initial_state"]
@@ -1149,7 +1150,11 @@ def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(
     `separate` the manager keeps the history at replay slots of its own: precompiled with
     `separate_replay_slots`, every step passes `replay_indices`. Kernels are recorded, not
     compiled or run."""
-    monkeypatch.setattr(_m, "get_env_enable_pdl", lambda: pdl)
+
+    def _mock_get_env_enable_pdl() -> bool:
+        return pdl
+
+    monkeypatch.setattr(_m, "get_env_enable_pdl", _mock_get_env_enable_pdl)
     monkeypatch.setattr(
         _m,
         "_GDN_REPLAY_HT_LAUNCH",
@@ -1158,10 +1163,22 @@ def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(
     launched = []
     # An empty cache: every launch reaches `_compile`, which records the key instead.
     monkeypatch.setattr(cr, "_COMPILED", {})
-    monkeypatch.setattr(cr, "_compile", lambda key, kern: launched.append(key) or (lambda *a: None))
+    monkeypatch.setattr(
+        cr,
+        "_compile",
+        (lambda key, kern: launched.append(key) or (lambda *a: None)),
+    )
     # The conv runs as its own kernel unless folded; the fold's operands are the engine's layout.
-    monkeypatch.setattr(_m, "causal_conv1d_token_major", lambda mq, *a, **k: mq.contiguous())
-    monkeypatch.setattr(_m, "gdn_conv_fold_supported", lambda *a: True)
+    monkeypatch.setattr(
+        _m,
+        "causal_conv1d_token_major",
+        (lambda mq, *a, **k: mq.contiguous()),
+    )
+    monkeypatch.setattr(
+        _m,
+        "gdn_conv_fold_supported",
+        (lambda *a: True),
+    )
     h, hv = GVR_GEOM[member]
     key_dim, value_dim = h * GVR_K, hv * GVR_V
     conv_dim = 2 * key_dim + value_dim
@@ -1423,6 +1440,7 @@ def test_separate_replay_slots_match_coupled(n, width, heads, certifying) -> Non
             act = coupled.inputs()
             a, b = _grc_gates(coupled, act, True)
             outs = []
+            ref = None
             for side in sides:
                 kw = dict(side.kwargs(layer, act), g=a, beta=b, launch_with_pdl=True)
                 if side is paged:
@@ -1768,6 +1786,6 @@ _VARIANTS = (
 def test_launch_variants_are_bitwise_the_plain_launch(helper, args, monkeypatch) -> None:
     """Launches no cell reaches, each bitwise its plain counterpart."""
     if helper is _variant_conv_seqs:
-        helper(*args, monkeypatch)
+        helper(*args, monkeypatch=monkeypatch)
     else:
         helper(*args)

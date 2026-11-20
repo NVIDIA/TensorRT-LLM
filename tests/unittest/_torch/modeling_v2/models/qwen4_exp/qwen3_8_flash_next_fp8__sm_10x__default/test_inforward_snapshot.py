@@ -107,7 +107,14 @@ def _fake_target(metadata, batch, pools, stage, input_ids=None):
     target = types.SimpleNamespace(core=core, _step=None)
     hi = torch.tensor([c for *_, c, _ in batch], dtype=torch.bool, device=DEV)
     total = sum(length for _, _, length, _, _ in batch)
-    split = _m.PrefillTarget._split_of(target, metadata, len(batch), 0, hi, total)
+    split = _m.PrefillTarget._split_of(
+        (target),
+        metadata,
+        len(batch),
+        0,
+        hi,
+        total,
+    )
     target._step = types.SimpleNamespace(split=split, input_ids=input_ids)
     return target
 
@@ -130,7 +137,9 @@ def _stage(gdn):
     )
 
 
-def _gdn_inputs(total, gen):
+def _gdn_inputs(
+    total, gen
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q = torch.randn(1, total, H, DK, generator=gen, device=DEV)
     k = torch.randn(1, total, H, DK, generator=gen, device=DEV)
     q = (q / q.norm(dim=-1, keepdim=True)).bfloat16()
@@ -295,7 +304,7 @@ def _padded_gdn_call(rows, padded, seqs, zero_pad) -> None:
     dev = torch.device(DEV)
     cp = fi._reaches_cp(seqs, HV, dev)
     keep = (torch.arange(padded, device=DEV) < rows).view(1, padded)
-    padded_in = [
+    padded_q, padded_k, padded_v, padded_g, padded_beta = [
         torch.where(keep.view(1, padded, *([1] * (t.dim() - 2))), t, 0) if zero_pad else t
         for t in (q, k, v, g, beta)
     ]
@@ -308,11 +317,26 @@ def _padded_gdn_call(rows, padded, seqs, zero_pad) -> None:
             out = torch.full((1, padded, HV, DV), -7.0, dtype=torch.bfloat16, device=DEV)
             if unpadded:
                 path(
-                    *(t[:, :rows] for t in (q, k, v, g, beta)), None, pool, slots, carry, cu,
+                    q[:, :rows], k[:, :rows], v[:, :rows], g[:, :rows], beta[:, :rows],
+                    None, pool, slots, carry, cu,
                     out[:, :rows], True,
                 )  # fmt: skip
             else:
-                path(*padded_in, None, pool, slots, carry, cu, out, True, fi_kwargs=fi_kwargs)
+                path(
+                    padded_q,
+                    padded_k,
+                    padded_v,
+                    padded_g,
+                    padded_beta,
+                    None,
+                    pool,
+                    slots,
+                    carry,
+                    cu,
+                    out,
+                    True,
+                    fi_kwargs=fi_kwargs,
+                )
             results.append((out[:, :rows].clone(), pool.clone()))
         torch.cuda.synchronize()
         assert torch.equal(results[0][0], results[1][0]), f"{path.__name__}: outputs"

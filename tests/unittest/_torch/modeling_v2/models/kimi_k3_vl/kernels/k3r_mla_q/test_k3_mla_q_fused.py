@@ -207,7 +207,6 @@ def _fp4_case(n, kv, seed):
         _paged_kv_indptr=indptr,
         paged_kv_indptr_decode=indptr.clone(),
         num_sequences=n,
-        num_blocks=None,
         num_context_blocks=n * stride,
         num_generation_blocks=0,
     )
@@ -235,7 +234,13 @@ def _fp4_case(n, kv, seed):
     state.positions = torch.cat([torch.arange(s, dtype=torch.int32, device=dev) for s in ctx_lens])
     latent = (torch.randn(sum(ctx_lens), LORA + ROPE, device=dev) * 0.5).clamp_(-3, 3).bfloat16()
     scatter_fp4_mla_kv_cache(
-        md, latent, layer_idx=0, token_offset=0, phase="context", local_layer=0, v_head_dim=LORA
+        (md),
+        latent,
+        layer_idx=0,
+        token_offset=0,
+        phase="context",
+        local_layer=0,
+        v_head_dim=LORA,
     )
     md.num_contexts = 0
     state.num_context_blocks = 0
@@ -590,7 +595,11 @@ def test_forward_gen_q_fused_matches_default_chain(n, monkeypatch):
 
         mla = _mla_stand_in(w, md, rot, qkv)
         decode = _DecodeAsAttention(md)
-        monkeypatch.setattr(generation, "attn_forward_gen", decode)
+        monkeypatch.setattr(
+            generation,
+            "attn_forward_gen",
+            (decode),
+        )
         k3_decode().begin_step(md)
         with with_multi_stream(True):
             out = generation.forward_gen_q_fused(mla, qkv, md)

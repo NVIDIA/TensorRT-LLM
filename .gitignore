@@ -134,3 +134,6 @@ examples/kimi_k3/.eval_dflash_runtime.*.yaml
 
 # Media a VisualGen server generates, when it is started from the checkout
 trtllm_generated/
+
+# Standalone static mock interface check output
+mock_interface_report.json

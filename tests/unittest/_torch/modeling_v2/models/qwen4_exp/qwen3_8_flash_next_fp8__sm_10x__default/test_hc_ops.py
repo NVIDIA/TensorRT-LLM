@@ -145,7 +145,20 @@ def _site_inputs(o, kind):
     return blk, inj, sh, gate
 
 
-def _first_args(o, site, cols):
+def _first_args(
+    o, site, cols
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    float,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     blk, inj, sh, gate = _site_inputs(o, site)
     return (o["hc"], blk, inj, o["norm"], o["first"], HC, cols, EPS, sh, gate)
 
@@ -249,7 +262,10 @@ def _tp_partial():
     x_lo = torch.zeros(lo, HIDDEN, dtype=torch.bfloat16, device=DEV)
     x16 = torch.zeros(16, HIDDEN, dtype=torch.bfloat16, device=DEV)
     off = SimpleNamespace(tp_sum=tp_sum)
-    on = SimpleNamespace(hc_ar_inject=SimpleNamespace(max_rows=1 << 30), tp_sum=tp_sum)
+    on = SimpleNamespace(
+        hc_ar_inject=(SimpleNamespace(max_rows=1 << 30)),
+        tp_sum=tp_sum,
+    )
     assert not isinstance(M._tp_partial(off, x_lo), M._TpPartial)
     assert isinstance(M._tp_partial(on, x_lo), M._TpPartial)
     assert not isinstance(M._tp_partial(on, x16), M._TpPartial)
@@ -268,7 +284,21 @@ def _inject_norm_launch(rows, kind):
     """`_hc_inject_norm_launch` against the family op: residual bitwise, normed stream within one
     rounding at the site's warps; all bitwise at eight, eager and replayed behind a producer."""
 
-    def inputs(seed):
+    def inputs(
+        seed,
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        tuple[
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor,
+            float,
+            int,
+            torch.Tensor | None,
+            torch.Tensor | None,
+        ],
+    ]:
         o = _operands(rows, seed)
         blk, inj, sh, gate = _site_inputs(o, kind)
         return o, (o["hc"], blk, inj, o["norm"], EPS, HC, sh, gate)

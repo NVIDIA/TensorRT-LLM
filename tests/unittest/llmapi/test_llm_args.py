@@ -14,7 +14,6 @@ from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
 from unittest.mock import create_autospec, patch
 
 import click
-import pydantic_core
 import pytest
 import torch
 import yaml
@@ -486,7 +485,12 @@ class TestMoeConfigPerLayerDynamicEplb:
         # delenv alone records nothing when the key is absent.
         monkeypatch.setenv("CUDA_SCALE_LAUNCH_QUEUES", "")
         monkeypatch.delenv("CUDA_SCALE_LAUNCH_QUEUES")
-        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+
+        def _mock_cuda_uninitialized() -> bool:
+            return False
+
+        monkeypatch.setattr(torch.cuda, "is_initialized",
+                            _mock_cuda_uninitialized)
 
         config = MoeConfig(load_balancer=str(config_path))
         overrides = configure_moe_launch_queues(config, {"KEEP": "value"})
@@ -496,7 +500,7 @@ class TestMoeConfigPerLayerDynamicEplb:
             "CUDA_SCALE_LAUNCH_QUEUES": "4x",
         }
         assert config.load_balancer.mode == "per_layer_dynamic"
-        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.cuda, "is_initialized", (lambda: True))
         assert configure_moe_launch_queues(config, overrides) == overrides
 
     def test_standard_yaml_does_not_configure_launch_queues(
@@ -507,7 +511,7 @@ class TestMoeConfigPerLayerDynamicEplb:
         config_path = tmp_path / "eplb.yaml"
         config_path.write_text("num_slots: 64\nlayer_updates_per_iter: 2\n")
         monkeypatch.delenv("CUDA_SCALE_LAUNCH_QUEUES", raising=False)
-        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.cuda, "is_initialized", (lambda: True))
 
         config = MoeConfig(load_balancer=str(config_path))
         original = {"KEEP": "value"}
@@ -872,7 +876,7 @@ def test_dflash_disagg_warns_about_degraded_acceptance(
         speculative_config = speculative_config.model_dump()
         cache_transceiver_config = cache_transceiver_config.model_dump()
 
-    with patch.object(llm_args_mod.logger, "warning") as warning:
+    with (patch.object(llm_args_mod.logger, "warning")) as warning:
         args = TorchLlmArgs(model=tmp_path,
                             gpus_per_node=1,
                             speculative_config=speculative_config,
@@ -892,7 +896,7 @@ def test_dflash_disagg_warns_about_degraded_acceptance(
 def test_dflash_aggregated_config_allowed(
         tmp_path: Path,
         cache_transceiver_config: CacheTransceiverConfig | dict | None) -> None:
-    with patch.object(llm_args_mod.logger, "warning") as warning:
+    with (patch.object(llm_args_mod.logger, "warning")) as warning:
         args = TorchLlmArgs(model=tmp_path,
                             gpus_per_node=1,
                             speculative_config=DFlashDecodingConfig(
@@ -910,7 +914,7 @@ def test_dflash_aggregated_config_allowed(
                          [None, NGramDecodingConfig(max_draft_len=2)])
 def test_disagg_config_without_dflash_allowed(
         tmp_path: Path, speculative_config: NGramDecodingConfig | None) -> None:
-    with patch.object(llm_args_mod.logger, "warning") as warning:
+    with (patch.object(llm_args_mod.logger, "warning")) as warning:
         args = TorchLlmArgs(
             model=tmp_path,
             gpus_per_node=1,
@@ -1828,7 +1832,7 @@ class TestKvCacheManagerV2AutoResolution:
         loader.load_config.return_value = config
         model_cls = self._PreferV2 if kind == "m3" else self._PreferV1
         monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM,
-                            "_resolve_class", lambda _: model_cls)
+                            "_resolve_class", (lambda _: model_cls))
         args = TorchLlmArgs(
             model="/tmp/dummy_model",
             attn_backend=backend,
@@ -2203,7 +2207,7 @@ def test_KvCacheConfig_offload_priority_compatibility():
     with pytest.raises(ValidationError, match="must match"):
         KvCacheConfig(cold_tier_offload_min_priority=50,
                       secondary_offload_min_priority=40)
-    with patch.object(llm_args_mod.logger, "warning") as warning:
+    with (patch.object(llm_args_mod.logger, "warning")) as warning:
         config = KvCacheConfig(cold_tier_offload_min_priority="50",
                                secondary_offload_min_priority=50)
     assert config.cold_tier_offload_min_priority == 50
@@ -2453,7 +2457,7 @@ def test_MambaStateConfig_branch_snapshot_is_orthogonal_to_periodic_interval(
 def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
     warnings_seen = []
     monkeypatch.setattr(llm_args_mod.logger, "warning",
-                        lambda message: warnings_seen.append(message))
+                        (lambda message: warnings_seen.append(message)))
 
     config = KvCacheConfig(mamba_state_cache_interval=64)
 
@@ -2470,7 +2474,7 @@ def test_KvCacheConfig_migrates_deprecated_mamba_branch_snapshot(
         monkeypatch, enable_block_reuse: bool) -> None:
     warnings_seen = []
     monkeypatch.setattr(llm_args_mod.logger, "warning",
-                        lambda message: warnings_seen.append(message))
+                        (lambda message: warnings_seen.append(message)))
 
     config = KvCacheConfig(
         enable_block_reuse=enable_block_reuse,
@@ -2498,7 +2502,7 @@ def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
         monkeypatch):
     warnings_seen = []
     monkeypatch.setattr(llm_args_mod.logger, "warning",
-                        lambda message: warnings_seen.append(message))
+                        (lambda message: warnings_seen.append(message)))
 
     config = KvCacheConfig(
         block_reuse_config=BlockReuseConfig(policy="per_conversation"),
@@ -3106,13 +3110,12 @@ class TestMultimodalConfig:
                        "_try_load_generation_config_explicit_values"):
             setattr(llm, method, lambda *args, **kwargs: None)
         module = "mm_encoder" if encoder_only else "llm"
-        with patch.object(BaseLLM, "_build_model"), patch(
+        with (patch.object(BaseLLM, "_build_model")), (patch(
                 "tensorrt_llm.llmapi.llm.check_quantization_compute_capability"
-        ), patch(
-                "tensorrt_llm.llmapi.llm.check_architecture_registered"), patch(
-                    f"tensorrt_llm.llmapi.{module}.create_input_processor",
-                    side_effect=ValueError(
-                        "input processor boundary")) as factory:
+        )), (patch("tensorrt_llm.llmapi.llm.check_architecture_registered")
+             ), patch(
+                 f"tensorrt_llm.llmapi.{module}.create_input_processor",
+                 side_effect=ValueError("input processor boundary")) as factory:
             with pytest.raises(ValueError, match="input processor boundary"):
                 llm._build_model()
         kwargs = factory.call_args.kwargs
@@ -4111,10 +4114,10 @@ class TestTorchLlmArgsCudaGraphSettings:
             pass
 
         llm = self._bucketless_encoder_llm(["T5ForConditionalGeneration"])
-        with patch(
+        with (patch(
                 "tensorrt_llm._torch.models.modeling_utils."
                 "get_registered_model_class",
-                return_value=_TokenEncoder):
+                return_value=_TokenEncoder)):
             with pytest.raises(ValueError, match="consumes packed tokens"):
                 llm._reject_token_encoder_config_without_buckets()
 
@@ -4130,10 +4133,10 @@ class TestTorchLlmArgsCudaGraphSettings:
                 return ((480000, ), torch.float32, 1500)
 
         llm = self._bucketless_encoder_llm(["WhisperForConditionalGeneration"])
-        with patch(
+        with (patch(
                 "tensorrt_llm._torch.models.modeling_utils."
                 "get_registered_model_class",
-                return_value=_FeatureEncoder):
+                return_value=_FeatureEncoder)):
             llm._reject_token_encoder_config_without_buckets()
 
     @pytest.mark.parametrize("architectures", [[], ["SomeUnregisteredArch"]])
@@ -4143,10 +4146,10 @@ class TestTorchLlmArgsCudaGraphSettings:
         # Out-of-tree models register in the worker, not here. Guessing would
         # reject a feature encoder the engine goes on to accept.
         llm = self._bucketless_encoder_llm(architectures)
-        with patch(
+        with (patch(
                 "tensorrt_llm._torch.models.modeling_utils."
                 "get_registered_model_class",
-                return_value=None):
+                return_value=None)):
             llm._reject_token_encoder_config_without_buckets()
 
     @pytest.mark.parametrize("field,value", [
@@ -4164,8 +4167,8 @@ class TestTorchLlmArgsCudaGraphSettings:
         # builds. The registry must not even be consulted.
         llm = self._bucketless_encoder_llm(["T5ForConditionalGeneration"])
         setattr(llm.args, field, value)
-        with patch("tensorrt_llm._torch.models.modeling_utils."
-                   "get_registered_model_class") as resolve:
+        with (patch("tensorrt_llm._torch.models.modeling_utils."
+                    "get_registered_model_class")) as resolve:
             llm._reject_token_encoder_config_without_buckets()
         resolve.assert_not_called()
 
@@ -4175,8 +4178,8 @@ class TestTorchLlmArgsCudaGraphSettings:
         # would only mislead, and skipping keeps the model import off this path.
         llm = self._bucketless_encoder_llm(["LlamaForCausalLM"],
                                            is_encoder_decoder=False)
-        with patch("tensorrt_llm._torch.models.modeling_utils."
-                   "get_registered_model_class") as resolve:
+        with (patch("tensorrt_llm._torch.models.modeling_utils."
+                    "get_registered_model_class")) as resolve:
             llm._reject_token_encoder_config_without_buckets()
         resolve.assert_not_called()
 
@@ -4575,7 +4578,7 @@ class TestTorchLlmArgs:
 
     @pytest.mark.cpu_only
     def test_dynamic_setattr(self):
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+        with pytest.raises(ValidationError):
             # pyrefly: ignore [unexpected-keyword]
             args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
 
@@ -4618,8 +4621,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_batch_size == 4
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             CudaGraphConfig(batch_sizes=[1, 2, 4], invalid_arg="should_fail")
         assert "invalid_arg" in str(exc_info.value)
 
@@ -4631,8 +4633,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_num_tokens == 1024
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             MoeConfig(backend="CUTLASS", unknown_field="should_fail")
         assert "unknown_field" in str(exc_info.value)
 
@@ -4644,8 +4645,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.calib_batches == 512
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             CalibConfig(device="cuda", extra_field="should_fail")
         assert "extra_field" in str(exc_info.value)
 
@@ -4656,8 +4656,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_draft_len == 10
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             DecodingBaseConfig(max_draft_len=10, random_field="should_fail")
         assert "random_field" in str(exc_info.value)
 
@@ -4670,8 +4669,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.enable_batch_size_tuning == True
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             DynamicBatchConfig(enable_batch_size_tuning=True,
                                enable_max_num_tokens_tuning=True,
                                dynamic_batch_moving_average_window=8,
@@ -4686,8 +4684,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.capacity_scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
                             MAX_UTILIZATION,
                             invalid_option="should_fail")
@@ -4702,8 +4699,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.num_device_module_layer == 1
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             PeftCacheConfig(num_host_module_layer=1,
                             unexpected_field="should_fail")
         assert "unexpected_field" in str(exc_info.value)
@@ -4716,8 +4712,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_tokens == 1024
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             KvCacheConfig(enable_block_reuse=True,
                           non_existent_field="should_fail")
         assert "non_existent_field" in str(exc_info.value)
@@ -4736,7 +4731,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.kv_cache_bounce_size_mb == 0
         assert CacheTransceiverConfig(
             kv_cache_bounce_size_mb=384).kv_cache_bounce_size_mb == 384
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+        with pytest.raises(ValidationError):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
 
         # The deprecated agent_bounce_buffer_enable defaults to False and is
@@ -4754,8 +4749,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert not any("bounce" in attr for attr in dir(pybind_config))
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             CacheTransceiverConfig(backend="UCX", invalid_config="should_fail")
         assert "invalid_config" in str(exc_info.value)
 
@@ -4775,11 +4769,11 @@ class TestStrictBaseModelArbitraryArgs:
         # Params with bounce disabled (capacity 0) are a contradiction: they
         # would be silently ignored, so validation rejects them outright. The
         # deprecated flag does not change that.
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+        with pytest.raises(ValidationError,
                            match="kv_cache_bounce_size_mb is 0"):
             CacheTransceiverConfig(
                 agent_bounce_params={"copy_stream_count": "2"})
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+        with pytest.raises(ValidationError,
                            match="kv_cache_bounce_size_mb is 0"):
             CacheTransceiverConfig(
                 agent_bounce_buffer_enable=True,
@@ -4787,7 +4781,7 @@ class TestStrictBaseModelArbitraryArgs:
 
         # Unknown keys (here the env-var-style typo WITH the trailing _bytes) are
         # rejected, and the message lists every valid key (spot-check one).
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+        with pytest.raises(ValidationError,
                            match="max_chunk_size_bytes.*min_descriptor_count"):
             CacheTransceiverConfig(
                 kv_cache_bounce_size_mb=512,
@@ -4795,8 +4789,7 @@ class TestStrictBaseModelArbitraryArgs:
 
         # Non-dict input fails cleanly in the coercion validator, not with a bare
         # AttributeError.
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
-                           match="must be a dict"):
+        with pytest.raises(ValidationError, match="must be a dict"):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
                                    agent_bounce_params="max_chunk_size=4096")
 
@@ -4804,9 +4797,9 @@ class TestStrictBaseModelArbitraryArgs:
             self, monkeypatch):
         """agent_bounce_buffer_enable is a deprecated no-op that warns only when True."""
         warnings_seen = []
-        monkeypatch.setattr(
-            llm_args_mod.logger, "warning_once",
-            lambda message, key: warnings_seen.append((message, key)))
+        monkeypatch.setattr(llm_args_mod.logger, "warning_once",
+                            (lambda message, key: warnings_seen.append(
+                                (message, key))))
 
         field = CacheTransceiverConfig.model_fields[
             "agent_bounce_buffer_enable"]
@@ -4860,8 +4853,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.enable_inductor == False
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             TorchCompileConfig(enable_fullgraph=True,
                                invalid_flag="should_fail")
         assert "invalid_flag" in str(exc_info.value)
@@ -4905,8 +4897,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert args.max_batch_size == 8
 
         # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             TorchLlmArgs(
                 model=llama_model_path,
                 # pyrefly: ignore [unexpected-keyword]
@@ -4916,16 +4907,14 @@ class TestStrictBaseModelArbitraryArgs:
     def test_nested_config_arbitrary_args(self):
         """Test that nested configurations also reject arbitrary arguments."""
         # Test with nested KvCacheConfig
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             KvCacheConfig(enable_block_reuse=True,
                           max_tokens=1024,
                           invalid_nested_field="should_fail")
         assert "invalid_nested_field" in str(exc_info.value)
 
         # Test with nested SchedulerConfig
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
                             MAX_UTILIZATION,
                             nested_invalid_field="should_fail")
@@ -4947,8 +4936,7 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.field2 == 100
 
         # Arbitrary field should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
+        with pytest.raises(ValidationError) as exc_info:
             TestConfig(field1="test", field2=100, extra_field="should_fail")
         assert "extra_field" in str(exc_info.value)
 
@@ -5090,9 +5078,9 @@ class TestServeDefaults:
         config_path.write_text("generation_config: auto\n", encoding="utf-8")
 
         with (
-                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
-                      return_value=False),
-                patch("tensorrt_llm.commands.serve.launch_server") as
+            (patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                   return_value=False)),
+            (patch("tensorrt_llm.commands.serve.launch_server")) as
                 mock_launch_server,
         ):
             serve_main(
@@ -5142,9 +5130,9 @@ class TestServeDefaults:
             "multimodal_config:\n  video_pruning_rate: 0.5\n", encoding="utf-8")
 
         with (
-                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
-                      return_value=False),
-                patch("tensorrt_llm.commands.serve.launch_server") as
+            (patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                   return_value=False)),
+            (patch("tensorrt_llm.commands.serve.launch_server")) as
                 mock_launch_server,
         ):
             serve_main(
@@ -5172,9 +5160,9 @@ class TestServeDefaults:
             args.extend(["--config", str(config_path)])
 
         with (
-                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
-                      return_value=False),
-                patch("tensorrt_llm.commands.serve.launch_server") as
+            (patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                   return_value=False)),
+            (patch("tensorrt_llm.commands.serve.launch_server")) as
                 mock_launch_server,
         ):
             serve_main(args=args, standalone_mode=False)
@@ -5186,9 +5174,9 @@ class TestServeDefaults:
 
     def test_serve_set_rejects_visual_gen(self) -> None:
         with (
-                patch("tensorrt_llm.commands.serve.launch_server") as
+            (patch("tensorrt_llm.commands.serve.launch_server")) as
                 mock_launch_server,
-                patch("tensorrt_llm.commands.serve.launch_visual_gen_server") as
+            (patch("tensorrt_llm.commands.serve.launch_visual_gen_server")) as
                 mock_launch_visual_gen_server,
                 pytest.raises(click.BadParameter, match="VisualGen"),
         ):
@@ -5206,8 +5194,8 @@ class TestServeDefaults:
     def test_serve_set_reserved_value_is_redacted(self) -> None:
         sentinel = "do-not-print-this-secret"
         with (
-                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
-                      return_value=False),
+            (patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                   return_value=False)),
                 pytest.raises(click.BadParameter,
                               match="not supported by --set") as raised,
         ):
@@ -5223,8 +5211,8 @@ class TestServeDefaults:
 
     def test_serve_set_grpc_checks_effective_frontend_count(self) -> None:
         with (
-                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
-                      return_value=False),
+            (patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                   return_value=False)),
                 pytest.raises(
                     click.UsageError,
                     match=
@@ -5240,9 +5228,9 @@ class TestServeDefaults:
 
     def test_serve_set_grpc_openengine_uses_multiple_frontends(self) -> None:
         with (
-                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
-                      return_value=False),
-                patch("tensorrt_llm.grpc.openengine.server.launch_server") as
+            (patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                   return_value=False)),
+            (patch("tensorrt_llm.grpc.openengine.server.launch_server")) as
                 mock_launch_server,
         ):
             serve_main(
@@ -6271,7 +6259,7 @@ class TestDeepSeekV4SparseAttentionConfig:
         assert config.compress_ratios == [1, 4, 128]
 
     def test_default_fp4_falls_back_to_fp8_before_blackwell(self, monkeypatch):
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "is_available", (lambda: True))
         monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
 
         config = DeepSeekV4SparseAttentionConfig()
@@ -6279,7 +6267,7 @@ class TestDeepSeekV4SparseAttentionConfig:
         assert config.indexer_k_dtype == "fp8"
 
     def test_explicit_fp4_is_rejected_before_blackwell(self, monkeypatch):
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "is_available", (lambda: True))
         monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
 
         with pytest.raises(ValidationError, match="requires SM>=100"):
@@ -6451,7 +6439,7 @@ class TestMambaSnapshotConfigResolution:
         monkeypatch.setattr(
             model_loader_mod.AutoModelForCausalLM,
             "_resolve_class",
-            staticmethod(lambda config: _NoModelDefaults),
+            (staticmethod(lambda config: _NoModelDefaults)),
         )
         fake_loader = MagicMock()
         fake_config = MagicMock()
@@ -6459,7 +6447,7 @@ class TestMambaSnapshotConfigResolution:
         fake_config.pretrained_config.hybrid_override_pattern = None
         fake_loader.load_config.return_value = fake_config
         return model_loader_mod.ModelLoader.load_config_and_apply_defaults(
-            "/tmp/dummy_model", args, fake_loader)
+            "/tmp/dummy_model", args, (fake_loader))
 
     @staticmethod
     def _capture_warnings(monkeypatch):
@@ -6469,8 +6457,8 @@ class TestMambaSnapshotConfigResolution:
         messages = []
         monkeypatch.setattr(
             model_loader_mod.logger, "warning",
-            lambda message, *args: messages.append(message % args
-                                                   if args else message))
+            (lambda message, *args: messages.append(message % args
+                                                    if args else message)))
         return messages
 
     @pytest.mark.parametrize(
@@ -6802,7 +6790,7 @@ class TestTransceiverRuntimeAutoResolution:
 
         monkeypatch.setattr(
             model_loader_mod.AutoModelForCausalLM, "_resolve_class",
-            staticmethod(lambda config: _PreferPythonTransceiverModel))
+            (staticmethod(lambda config: _PreferPythonTransceiverModel)))
         fake_loader = self._fake_checkpoint_loader(["NotInMappingForCausalLM"])
 
         args = self._disagg_args()
@@ -6823,9 +6811,9 @@ class TestTransceiverRuntimeAutoResolution:
             def get_model_defaults(cls, llm_args):
                 return {"attn_backend": "FLASHINFER"}
 
-        monkeypatch.setattr(model_loader_mod.AutoModelForCausalLM,
-                            "_resolve_class",
-                            staticmethod(lambda config: _PreferFlashinferModel))
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+            (staticmethod(lambda config: _PreferFlashinferModel)))
         fake_loader = self._fake_checkpoint_loader(["PplxDeciderForDecision"])
         model_kwargs = {"architectures": ["PplxDeciderForDecision"]}
         args = TorchLlmArgs(model="/tmp/dummy_model", model_kwargs=model_kwargs)
@@ -6855,7 +6843,7 @@ class TestTransceiverRuntimeAutoResolution:
 
         monkeypatch.setattr(
             model_loader_mod.AutoModelForCausalLM, "_resolve_class",
-            staticmethod(lambda config: _ArchSensitiveTransceiverModel))
+            (staticmethod(lambda config: _ArchSensitiveTransceiverModel)))
         fake_loader = self._fake_checkpoint_loader([arch])
 
         args = self._disagg_args()
@@ -6890,7 +6878,7 @@ class TestTransceiverRuntimeAutoResolution:
                             _PreferPythonTransceiverModel)
         monkeypatch.setattr(
             model_loader_mod.AutoModelForCausalLM, "_resolve_class",
-            staticmethod(lambda config: _MtpDraftExecutionModel))
+            (staticmethod(lambda config: _MtpDraftExecutionModel)))
         fake_loader = self._fake_checkpoint_loader(["FakeTargetForCausalLM"])
 
         args = self._disagg_args()
@@ -6906,7 +6894,7 @@ class TestTransceiverRuntimeAutoResolution:
 
         monkeypatch.setattr(
             model_loader_mod.AutoModelForCausalLM, "_resolve_class",
-            staticmethod(lambda config: _PreferPythonTransceiverModel))
+            (staticmethod(lambda config: _PreferPythonTransceiverModel)))
         fake_loader = self._fake_checkpoint_loader(["NotInMappingForCausalLM"])
 
         args = TorchLlmArgs(model="/tmp/dummy_model")

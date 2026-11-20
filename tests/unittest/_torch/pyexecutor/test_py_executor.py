@@ -25,6 +25,10 @@ import pytest
 import torch
 from _torch.disaggregation.fake_dist import FakeDistGroup
 from _torch.pyexecutor.executor_test_utils import make_partial_executor
+from engine_test_utils import DummyModel
+from test_common.host_cache_manager import make_host_cache_manager
+from test_common.host_executor import make_host_executor
+from test_common.interface_checks import mock_target, verify_instance
 from torch.multiprocessing.reductions import StorageWeakRef
 
 from tensorrt_llm._torch import models as torch_models
@@ -56,6 +60,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
+    BatchState,
     EncoderStepResult,
     PyExecutor,
     _ADPForwardIntent,
@@ -66,6 +71,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     NoFreeSlotsError,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.sampler import SampleState
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     KVCacheV2Scheduler,
@@ -79,8 +85,13 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.llmapi import DisaggScheduleStyle
-from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
-from tensorrt_llm.mapping import CpType
+from tensorrt_llm.llmapi.llm_args import (
+    EncodeCudaGraphConfig,
+    KvCacheConfig,
+    MTPDecodingConfig,
+    TorchLlmArgs,
+)
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -138,7 +149,7 @@ def _run_forward_step(executor, batch, new_tensors=None):
 )
 def test_shutdown_graph_lifecycle(shutdown_method: str, releases_model_owned_graphs: bool) -> None:
     engine = Mock()
-    executor = object.__new__(PyExecutor)
+    executor = make_host_executor()
     executor._closed = False
     executor._resources_released = False
     executor.worker_started = True
@@ -201,10 +212,22 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
     runner.forward.side_effect = lambda inputs, **kwargs: {
         "logits": logits if inputs.gather_context_logits else logits[2::3]
     }
-    engine = object.__new__(ModelEngine)
-    engine._runner = runner
-    engine._warmup_depth = 0
-    engine.route_capture = None
+    with (
+        patch("tensorrt_llm._torch.pyexecutor.model_engine.init_process_setup"),
+        patch("tensorrt_llm._torch.pyexecutor.model_engine.configure_autotuner_nvmmh"),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.model_engine.create_input_processor", return_value=None
+        ),
+        mock_target("tensorrt_llm._torch.pyexecutor.model_engine:ModelEngine._initialize_runner")(
+            patch.object(ModelEngine, "_initialize_runner", autospec=True, return_value=runner)
+        ),
+    ):
+        engine = ModelEngine(
+            model_path="dummy",
+            llm_args=TorchLlmArgs(model="dummy", cuda_graph_config=None),
+            mapping=Mapping(),
+            model=DummyModel(torch.float32),
+        )
     new_tensors = object()
     executor = _forward_step_executor(engine)
 
@@ -301,36 +324,46 @@ def test_scheduler_progress_requires_a_successful_real_forward(case):
     assert executor._scheduler_stall_rounds == (0 if case == "real" else 2)
 
 
+def _request_with_end_id(end_id: int | None) -> LlmRequest:
+    return LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=[1],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        end_id=end_id,
+    )
+
+
 @pytest.mark.parametrize("end_id", [None, -1, 0, 127])
 def test_validate_token_id_range_accepts_end_id(end_id) -> None:
     model = Mock(spec=DecoderModelForCausalLM)
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = types.SimpleNamespace(
-        model_engine=types.SimpleNamespace(model=model),
-        _num_embeddings=model.lm_head.num_embeddings,
-    )
-    request = types.SimpleNamespace(
-        py_end_id=end_id,
-        py_multimodal_data=None,
-        py_prompt_token_bound=None,
-        check_token_id_range=lambda _vocab_size: True,
-    )
+    executor = make_host_executor()
+    executor.model_engine = types.SimpleNamespace(model=model)
+    executor._num_embeddings = model.lm_head.num_embeddings
+    request = _request_with_end_id(end_id)
 
-    PyExecutor._validate_token_id_range(executor, request)
+    PyExecutor._validate_token_id_range(
+        executor,
+        request,
+    )
 
 
 @pytest.mark.parametrize("end_id", [-2, 128])
 def test_validate_token_id_range_rejects_end_id(end_id) -> None:
     model = Mock(spec=DecoderModelForCausalLM)
     object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
-    executor = types.SimpleNamespace(
-        model_engine=types.SimpleNamespace(model=model),
-        _num_embeddings=model.lm_head.num_embeddings,
-    )
-    request = types.SimpleNamespace(py_end_id=end_id)
+    executor = make_host_executor()
+    executor.model_engine = types.SimpleNamespace(model=model)
+    executor._num_embeddings = model.lm_head.num_embeddings
+    request = _request_with_end_id(end_id)
 
     with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
-        PyExecutor._validate_token_id_range(executor, request)
+        PyExecutor._validate_token_id_range(
+            executor,
+            request,
+        )
 
 
 @pytest.mark.parametrize(
@@ -350,7 +383,7 @@ def test_validate_token_id_range_accepts_encoder_decoder_end_id(model_class_name
         model_engine=types.SimpleNamespace(model=model),
         _num_embeddings=model.lm_head.num_embeddings,
     )
-    request = types.SimpleNamespace(py_end_id=end_id)
+    request = _request_with_end_id(end_id)
 
     executor._validate_token_id_range(request)
 
@@ -372,7 +405,7 @@ def test_validate_token_id_range_rejects_encoder_decoder_end_id(model_class_name
         model_engine=types.SimpleNamespace(model=model),
         _num_embeddings=model.lm_head.num_embeddings,
     )
-    request = types.SimpleNamespace(py_end_id=end_id)
+    request = _request_with_end_id(end_id)
 
     with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
         executor._validate_token_id_range(request)
@@ -484,7 +517,8 @@ def test_completed_remote_tail_receive_restarts_local_context(tail_start: int) -
         state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
         py_csa2_remote_tail_mode="source",
     )
-    executor = types.SimpleNamespace(active_requests=[destination, pending, source])
+    executor = make_host_executor()
+    executor.active_requests = [destination, pending, source]
 
     PyExecutor._activate_completed_remote_tails(executor)
 
@@ -539,8 +573,7 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
     from tensorrt_llm._torch.pyexecutor.llm_request import executor_request_to_llm_request
 
-    creator = object.__new__(KvCacheCreator)
-    creator._model_engine = types.SimpleNamespace(
+    model_engine = types.SimpleNamespace(
         model=types.SimpleNamespace(
             model_config=types.SimpleNamespace(
                 pretrained_config=types.SimpleNamespace(vocab_size=512)
@@ -548,9 +581,28 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
         ),
         use_mrope=False,
     )
-    creator._max_num_tokens = 256
-    creator._max_beam_width = 1
-    creator._mapping = types.SimpleNamespace(enable_attention_dp=False)
+    with patch.object(
+        KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManager
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            mapping=Mapping(),
+            net_max_seq_len=256,
+            kv_connector_manager=None,
+            max_num_tokens=256,
+            max_beam_width=1,
+            tokens_per_block=32,
+            max_seq_len=256,
+            max_batch_size=1,
+            kv_cache_config=KvCacheConfig(),
+            llm_args=types.SimpleNamespace(
+                cache_transceiver_config=None, disable_overlap_scheduler=False
+            ),
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
     (dummy,) = creator._create_dummy_context_requests(256)
     request = executor_request_to_llm_request(
         41, dummy, child_req_ids=[], exclude_last_generation_logits=False
@@ -699,9 +751,14 @@ def test_remote_tail_rejects_replay_window_larger_than_batch(limited_by: str) ->
 
 
 def test_model_without_remote_tail_does_not_inspect_request() -> None:
-    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=None))
+    executor = make_host_executor()
+    executor.model_engine.model = None
+    request = _request_with_end_id(None)
 
-    PyExecutor._configure_csa2_remote_tail(executor, types.SimpleNamespace())
+    with patch.object(
+        LlmRequest, "__getattribute__", side_effect=AssertionError("Request must not be read")
+    ):
+        executor._configure_csa2_remote_tail(request)
 
 
 def _make_admission_executor(model, requests):
@@ -730,12 +787,18 @@ def _make_admission_executor(model, requests):
 
 
 def _make_admission_request(request_id: int) -> types.SimpleNamespace:
-    return types.SimpleNamespace(
+    request = types.SimpleNamespace(
+        py_lora_ckpt_source=None,
         request_id=request_id,
         py_disaggregated_params=None,
         sampling_config=None,
         kv_cache_retention_config=None,
         raise_if_validation_failed=Mock(),
+    )
+    return verify_instance(
+        request,
+        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
+        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
     )
 
 
@@ -865,7 +928,7 @@ def test_model_validation_runs_after_the_sampler_and_before_the_budget() -> None
     "model",
     [
         types.SimpleNamespace(),
-        Mock(spec=DecoderModelForCausalLM),
+        (Mock(spec=DecoderModelForCausalLM)),
         types.SimpleNamespace(validate_request=None),
         None,
     ],
@@ -949,29 +1012,29 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(
     draft = types.SimpleNamespace(
         prepare_disagg_generation_request=lambda req: events.append(("draft", req))
     )
-    executor = types.SimpleNamespace(
-        model_engine=types.SimpleNamespace(model=target, max_total_draft_tokens=0),
-        enable_spec_decode=enable_spec_decode,
-        draft_model_engine=types.SimpleNamespace(model=draft),
-        resource_manager=types.SimpleNamespace(
-            resource_managers={
-                ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
-                ResourceManagerType.KV_CACHE_MANAGER: object.__new__(manager_cls)
-                if manager_cls is not None
-                else None,
-            }
-        ),
-        kv_cache_transceiver=None,
-        disagg=types.SimpleNamespace(
-            completed_gen_receives=lambda batch: batch.generation_requests,
-            try_finish_gen_receive=lambda req: True,
-        ),
-        _setup_sampler_step=Mock(),
-        _update_sampler_state_for_disagg_gen_request=Mock(return_value=accepted),
-        _maybe_prepend_logprobs_and_logits=Mock(),
+    executor = make_host_executor()
+    executor.model_engine = types.SimpleNamespace(model=target, max_total_draft_tokens=0)
+    executor.enable_spec_decode = enable_spec_decode
+    executor.draft_model_engine = types.SimpleNamespace(model=draft)
+    executor.resource_manager = types.SimpleNamespace(
+        resource_managers={
+            ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
+            ResourceManagerType.KV_CACHE_MANAGER: object.__new__(manager_cls)
+            if manager_cls is not None
+            else None,
+        }
     )
+    executor.kv_cache_transceiver = None
+    executor._disagg_coordinator = types.SimpleNamespace(
+        completed_gen_receives=lambda batch: batch.generation_requests,
+        try_finish_gen_receive=lambda req: True,
+    )
+    executor._setup_sampler_step = Mock()
+    executor._update_sampler_state_for_disagg_gen_request = Mock(return_value=accepted)
+    executor._maybe_prepend_logprobs_and_logits = Mock()
     PyExecutor._prepare_disagg_gen_transmission_complete(
-        executor, types.SimpleNamespace(generation_requests=[request])
+        executor,
+        types.SimpleNamespace(generation_requests=[request]),
     )
     if accepted:
         assert events == [("first_token", 17, 0), ("target", request), ("draft", request)]
@@ -1012,23 +1075,23 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward(
             ("rebuild", [req.py_request_id for req in requests])
         ),
     )
-    executor = types.SimpleNamespace(
-        enable_spec_decode=enable_spec_decode,
-        resource_manager=types.SimpleNamespace(
-            resource_managers={
-                ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
-                ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
-            }
-        ),
-        disagg=types.SimpleNamespace(
-            completed_gen_receives=lambda batch: batch.generation_requests,
-            try_finish_gen_receive=finish_gen_receive,
-        ),
-        _setup_sampler_step=setup_sampler_step,
+    executor = make_host_executor()
+    executor.enable_spec_decode = enable_spec_decode
+    executor.resource_manager = types.SimpleNamespace(
+        resource_managers={
+            ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
+            ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+        }
     )
+    executor._disagg_coordinator = types.SimpleNamespace(
+        completed_gen_receives=lambda batch: batch.generation_requests,
+        try_finish_gen_receive=finish_gen_receive,
+    )
+    executor._setup_sampler_step = setup_sampler_step
 
     PyExecutor._prepare_disagg_gen_transmission_complete(
-        executor, types.SimpleNamespace(generation_requests=[received, terminated])
+        executor,
+        types.SimpleNamespace(generation_requests=[received, terminated]),
     )
 
     transfer = [("transfer", [41, 42])] if enable_spec_decode else []
@@ -1044,20 +1107,29 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
     events = []
     sampler = Mock()
     sampler.release_request.side_effect = lambda request: events.append(request.py_seq_slot)
-    executor = types.SimpleNamespace(
-        sampler=sampler,
-        model_engine=types.SimpleNamespace(model=target),
-        draft_model_engine=types.SimpleNamespace(model=draft),
-        resource_manager=Mock(),
-        _prefetched_request_ids={41},
-        enable_attention_dp=False,
-        disagg=Mock(),
+    executor = make_host_executor()
+    executor.sampler = sampler
+    executor.model_engine = types.SimpleNamespace(model=target)
+    executor.draft_model_engine = types.SimpleNamespace(model=draft)
+    executor.resource_manager = Mock()
+    executor._prefetched_request_ids = {41}
+    executor.enable_attention_dp = False
+    executor._disagg_coordinator = Mock()
+    request = LlmRequest(
+        request_id=41,
+        max_new_tokens=1,
+        input_tokens=[1],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        seq_slot=3,
     )
-    request = types.SimpleNamespace(py_request_id=41, py_seq_slot=3)
     executor.resource_manager.free_resources.side_effect = lambda req: setattr(
         req, "py_seq_slot", None
     )
-    PyExecutor._free_request_resources(executor, request)
+    PyExecutor._free_request_resources(
+        executor,
+        request,
+    )
     sampler.release_request.assert_called_once_with(request)
     assert events == [3]
     target.release_request_state.assert_called_once_with(41)
@@ -1124,88 +1196,6 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
     else:
         kv_cache_manager.update_forward_resources.assert_not_called()
         executor._wait_for_model_engine_input_copy.assert_not_called()
-
-
-class MockPyExecutor:
-    """A mock PyExecutor class for testing request handling logic.
-
-    This mock contains only the attributes and methods needed to test
-    the _handle_special_queue_items functionality.
-    """
-
-    def __init__(self, dist):
-        self.dist = dist
-        self.canceled_req_ids = []
-        self.control_requests = []
-        self.request_accumulated = []
-        self.is_shutdown = False
-        self.expected_num_active_requests = 0
-        self.new_active_requests_queue_latency_ms = 0.0
-        self.waiting_queue = FCFSWaitingQueue()
-
-    def _handle_special_queue_items(self, new_requests):
-        """Handle special signals.
-
-        This method mirrors PyExecutor._handle_special_queue_items.
-        """
-        accepted_new_requests = []
-        for idx, req_item in enumerate(new_requests):
-            if req_item.is_shutdown_request:
-                self.is_shutdown = True
-                break
-            elif req_item.is_canceled_request:
-                self.canceled_req_ids.append(req_item.id)
-            elif req_item.is_control_request:
-                self.control_requests.append(req_item)
-                if self.dist.rank == 0:
-                    self.request_accumulated.extend(new_requests[idx + 1 :])
-                break
-            else:
-                accepted_new_requests.append(req_item)
-
-        return accepted_new_requests
-
-    def update_waiting_queue(self):
-        """Update waiting queue to remove canceled requests.
-
-        This method mirrors PyExecutor._handle_canceled_requests.
-        """
-        if self.canceled_req_ids:
-            canceled_set = set(self.canceled_req_ids)
-            self.waiting_queue.remove_by_ids(canceled_set)
-
-    def clear_canceled_req_ids(self):
-        """Clear the list of canceled request IDs."""
-        self.canceled_req_ids.clear()
-
-    def get_canceled_req_ids(self):
-        """Get the list of canceled request IDs."""
-        return self.canceled_req_ids
-
-    def get_canceled_req_ids_size(self):
-        """Get the number of canceled request IDs."""
-        return len(self.canceled_req_ids)
-
-    def get_expected_num_active_requests(self):
-        """Get the expected number of active requests."""
-        return self.expected_num_active_requests
-
-    def get_waiting_queue_size(self):
-        """Get the size of the waiting queue."""
-        return len(self.waiting_queue)
-
-    def _get_new_active_requests_queue_latency(self):
-        """Get the queue latency for new active requests."""
-        return self.new_active_requests_queue_latency_ms
-
-
-@pytest.fixture
-def mock_dist():
-    """Create a mock Distributed instance for testing."""
-    mock_dist = Mock()
-    mock_dist.rank = 0
-    mock_dist.tp_size = 1
-    return mock_dist
 
 
 def _make_encoder_step_executor(tp_size=1):
@@ -1285,7 +1275,9 @@ def test_warmup_scope_enters_every_engine_and_nests():
             finally:
                 events.append(("exit", self.name))
 
-    executor = object.__new__(PyExecutor)
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor.model_engine = _Engine("target")
     executor.draft_model_engine = _Engine("draft")
 
@@ -1830,9 +1822,9 @@ def test_request_terminated_before_first_context_releases_packed_output(recorded
 
 
 @pytest.fixture
-def mock_executor(mock_dist):
-    """Create a MockPyExecutor instance for testing."""
-    return MockPyExecutor(dist=mock_dist)
+def mock_executor() -> PyExecutor:
+    """Use a stopped executor to exercise queue handling."""
+    return make_host_executor()
 
 
 def test_handle_special_queue_items(mock_executor):
@@ -1861,7 +1853,7 @@ def test_clear_canceled_req_ids(mock_executor):
     mock_executor.canceled_req_ids = [1, 2, 3]
     assert len(mock_executor.canceled_req_ids) == 3
 
-    mock_executor.clear_canceled_req_ids()
+    mock_executor._handle_canceled_requests()
 
     assert len(mock_executor.canceled_req_ids) == 0
 
@@ -1876,7 +1868,7 @@ def test_update_waiting_queue(mock_executor):
     mock_executor.waiting_queue.add_requests(items)
     mock_executor.canceled_req_ids = [2]
 
-    mock_executor.update_waiting_queue()
+    mock_executor._handle_canceled_requests()
 
     assert len(mock_executor.waiting_queue) == 2
     remaining_ids = [item.id for item in mock_executor.waiting_queue]
@@ -1886,13 +1878,13 @@ def test_update_waiting_queue(mock_executor):
 
 
 def test_getter_methods(mock_executor):
-    """Test various getter methods."""
+    """Check the executor queue counters and queue-latency getter."""
     # Test initial values
     assert mock_executor._get_new_active_requests_queue_latency() == 0
-    assert mock_executor.get_expected_num_active_requests() == 0
-    assert mock_executor.get_canceled_req_ids_size() == 0
-    assert mock_executor.get_canceled_req_ids() == []
-    assert mock_executor.get_waiting_queue_size() == 0
+    assert mock_executor.expected_num_active_requests == 0
+    assert len(mock_executor.canceled_req_ids) == 0
+    assert mock_executor.canceled_req_ids == []
+    assert len(mock_executor.waiting_queue) == 0
 
     # Add some data and test
     mock_executor.canceled_req_ids = [3, 4]
@@ -1900,21 +1892,23 @@ def test_getter_methods(mock_executor):
     mock_executor.new_active_requests_queue_latency_ms = 10.5
     mock_executor.waiting_queue.add_request(RequestQueueItem(1, Mock()))
 
-    assert mock_executor.get_canceled_req_ids_size() == 2
-    assert mock_executor.get_canceled_req_ids() == [3, 4]
-    assert mock_executor.get_expected_num_active_requests() == 5
+    assert len(mock_executor.canceled_req_ids) == 2
+    assert mock_executor.canceled_req_ids == [3, 4]
+    assert mock_executor.expected_num_active_requests == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
-    assert mock_executor.get_waiting_queue_size() == 1
+    assert len(mock_executor.waiting_queue) == 1
 
 
 def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyExecutor:
-    executor = PyExecutor.__new__(PyExecutor)
-    executor.kv_cache_transceiver = None
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor.resource_manager = Mock()
     executor.resource_manager.resource_managers = {
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
     }
     executor.enable_attention_dp = False
+    executor.kv_cache_transceiver = None
     executor._kv_connector_deadlines = {}
     executor.adp_router = Mock(exclude_retiring_requests=False)
     executor._fetch_hint_enabled = False
@@ -2449,7 +2443,9 @@ class TestIdleDisaggLoopPacing:
         monkeypatch.setattr(
             "tensorrt_llm._torch.disaggregation.orchestration.coordinator.time.sleep", sleep
         )
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         executor.kv_cache_transceiver = Mock() if has_transceiver else None
         executor.async_transfer_manager = Mock()
         executor.async_transfer_manager.has_any_inflight_requests.return_value = ctx_inflight
@@ -2467,7 +2463,8 @@ class TestDeferUnreadyGenReceivesGate:
 
     @staticmethod
     def _build(*, kv_manager_v2: bool, overlap: bool, pp_size: int, kv_connector: bool):
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.dense_dwdp_manager = None
         executor.kv_cache_transceiver = Mock()
         executor._is_kv_manager_v2 = kv_manager_v2
         executor.disable_overlap_scheduler = not overlap
@@ -2493,7 +2490,9 @@ class TestDeferUnreadyGenReceivesGate:
     def test_unset_executor_attributes_keep_the_blocking_fence(self) -> None:
         """An executor assembled without the scheduler and cache-manager
         attributes falls back to the blocking fence."""
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        del executor.disable_overlap_scheduler
+        del executor._is_kv_manager_v2
         executor.kv_cache_transceiver = Mock()
 
         assert executor._build_disagg_coordinator()._defer_unready_gen_receives is False
@@ -2503,7 +2502,9 @@ class TestDisaggTransferAdmissionPP:
     def test_pp_schedule_serializes_the_admission_decision(self) -> None:
         """Rank 0 admits right after scheduling; the admitted subset and the
         backpressure flag are what it serializes for the other ranks."""
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         executor.dist = Mock(
             rank=0, is_first_pp_rank=True, is_last_pp_rank=True, tp_size=1, cp_size=1
         )
@@ -2515,7 +2516,8 @@ class TestDisaggTransferAdmissionPP:
         executor._schedule = Mock(return_value=(scheduled_batch, [candidate], 0))
 
         scheduled, fitting, num_fitting, wait_for_progress = PyExecutor._pp_schedule_and_propagate(
-            executor, microbatch_id=0
+            executor,
+            microbatch_id=0,
         )
 
         executor._disagg_coordinator.admit.assert_called_once_with([candidate])
@@ -2525,7 +2527,9 @@ class TestDisaggTransferAdmissionPP:
         assert wait_for_progress
 
     def test_pp_schedule_propagates_the_admission_decision_to_the_next_rank(self) -> None:
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         executor.dist = Mock(
             rank=0,
             is_first_pp_rank=True,
@@ -2545,7 +2549,8 @@ class TestDisaggTransferAdmissionPP:
         executor._schedule = Mock(return_value=(scheduled_batch, [candidate], 0))
 
         scheduled, fitting, num_fitting, wait_for_progress = PyExecutor._pp_schedule_and_propagate(
-            executor, microbatch_id=0
+            executor,
+            microbatch_id=0,
         )
 
         assert scheduled is scheduled_batch
@@ -2565,7 +2570,9 @@ class TestDisaggTransferAdmissionPP:
         assert sent.wait_for_disagg_gen_transfer_progress is True
 
     def test_pp_schedule_restores_propagated_gate_decision(self):
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         executor.dist = Mock(
             rank=1,
             is_first_pp_rank=False,
@@ -2592,7 +2599,8 @@ class TestDisaggTransferAdmissionPP:
         executor.dist.recv_object = Mock(return_value=serializable_schedule)
 
         _, fitting, _, wait_for_progress = PyExecutor._pp_schedule_and_propagate(
-            executor, microbatch_id=0
+            executor,
+            microbatch_id=0,
         )
 
         assert [req.py_request_id for req in fitting] == [2]
@@ -2626,7 +2634,9 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     class StopLocalSchedule(RuntimeError):
         pass
 
-    executor = object.__new__(PyExecutor)
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor._is_kv_manager_v2 = False
     executor.dist = Mock(pp_rank=1, rank=1, is_first_pp_rank=False)
     executor.device_id = 0
@@ -2693,6 +2703,8 @@ def test_each_pp_rank_schedules_once_per_iteration(
 
     executor = object.__new__(PyExecutor)
     executor._reset_scheduler_failure_state()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor._is_kv_manager_v2 = True
     executor._pp_rebalance_drain_iters = None
     executor._can_pause_for_rebalance = Mock(return_value=False)
@@ -2748,6 +2760,8 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
 
     executor = object.__new__(PyExecutor)
     executor._reset_scheduler_failure_state()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor.enable_attention_dp = False
     executor.dist = Mock(
         pp_rank=1, rank=1, tp_size=1, cp_size=1, pp_size=2, world_size=2, is_first_pp_rank=False
@@ -2813,7 +2827,9 @@ def test_schedule_prepares_snapshot_points_before_scheduling(manager_kind: str) 
     class StopSchedule(RuntimeError):
         pass
 
-    executor = object.__new__(PyExecutor)
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     request = Mock()
     executor.active_requests = [request]
     executor.inflight_req_ids = set()
@@ -3373,123 +3389,116 @@ def _make_adp_request(
     req.is_context_init_state = state == LlmRequestState.CONTEXT_INIT
     req.is_generation_in_progress_state = state == _STATE_GENERATION_IN_PROGRESS
     req.py_encoder_output_ready_event = None
-    return req
+    req.kv_cache_retention_config = None
+    req.py_lora_ckpt_source = None
+    return verify_instance(
+        req,
+        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
+        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
+    )
 
 
-class _StubADPExecutor:
-    _dspark_adp_shape_cache_enabled = PyExecutor._dspark_adp_shape_cache_enabled
-    _num_skipped_forward_ctx_chunks = 0
-    _num_reverted_ctx_tokens = 0
+def _make_adp_executor(
+    *,
+    enable_attention_dp: bool = True,
+    kv_cache_transceiver: object | None = object(),
+    max_num_tokens: int = 8192,
+    max_seq_len: int = 8192,
+    kv_manager_max_seq_len: int | None = None,
+    is_warmup: bool = False,
+    benchmark_req_queues_size: int = 0,
+    enable_adp_dummy_fixes: bool = True,
+    enable_scheduler_aware_adp_dummy: bool | None = None,
+    enable_non_overlap_adp_forward_intent: bool | None = None,
+    peer_forward_intent: _ADPForwardIntent = _ADPForwardIntent.GENERATION,
+    exclude_retiring_requests: bool = True,
+    tp_size: int = 2,
+) -> PyExecutor:
+    executor = make_host_executor()
+    executor.enable_attention_dp = enable_attention_dp
+    executor.kv_cache_transceiver = kv_cache_transceiver
+    executor.is_warmup = is_warmup
+    executor.benchmark_req_queues_size = benchmark_req_queues_size
+    executor._benchmark_fill_phase_active = False
+    executor.num_fetch_requests = 0
+    executor.active_requests = []
+    executor.expected_num_active_requests = 1
+    executor.max_num_active_requests = 8
+    executor.max_total_draft_tokens = 0
+    executor.enable_joint_kv_cache_reuse = False
+    executor.max_num_tokens = max_num_tokens
+    executor._adp_dummy_is_gen = True
+    executor._pending_adp_dummy_request = None
+    executor._enable_adp_dummy_fixes = enable_adp_dummy_fixes
+    executor._enable_scheduler_aware_adp_dummy = (
+        enable_adp_dummy_fixes
+        if enable_scheduler_aware_adp_dummy is None
+        else enable_scheduler_aware_adp_dummy
+    )
+    executor._enable_non_overlap_adp_forward_intent = (
+        enable_adp_dummy_fixes
+        if enable_non_overlap_adp_forward_intent is None
+        else enable_non_overlap_adp_forward_intent
+    )
+    executor.add_dummy_calls = []
+    executor.model_engine = Mock(
+        max_num_tokens=max_num_tokens,
+        max_seq_len=max_seq_len,
+        _dspark_confidence_enabled=False,
+    )
 
-    def __init__(
-        self,
-        *,
-        enable_attention_dp=True,
-        kv_cache_transceiver=object(),
-        max_num_tokens=8192,
-        max_seq_len=8192,
-        kv_manager_max_seq_len=None,
-        is_warmup=False,
-        benchmark_req_queues_size=0,
-        enable_adp_dummy_fixes=True,
-        enable_scheduler_aware_adp_dummy=None,
-        enable_non_overlap_adp_forward_intent=None,
-        peer_forward_intent=_ADPForwardIntent.GENERATION,
-        exclude_retiring_requests=True,
-        tp_size=2,
-    ):
-        self.enable_attention_dp = enable_attention_dp
-        self.kv_cache_transceiver = kv_cache_transceiver
-        self.is_warmup = is_warmup
-        self.benchmark_req_queues_size = benchmark_req_queues_size
-        self._benchmark_fill_phase_active = False
-        self.num_fetch_requests = 0
-        self.active_requests = []
-        self.expected_num_active_requests = 1
-        self.max_num_active_requests = 8
-        self.max_total_draft_tokens = 0
-        self.enable_joint_kv_cache_reuse = False
-        self.max_num_tokens = max_num_tokens
-        self._adp_dummy_is_gen = True
-        self._pending_adp_dummy_request = None
-        self._enable_adp_dummy_fixes = enable_adp_dummy_fixes
-        self._enable_scheduler_aware_adp_dummy = (
-            enable_adp_dummy_fixes
-            if enable_scheduler_aware_adp_dummy is None
-            else enable_scheduler_aware_adp_dummy
+    executor.dist = Mock()
+    # Peers are modeled through peer_forward_intent; tp_size only tells the
+    # executor whether attention DP has any peer at all.
+    executor.dist.tp_size = tp_size
+    executor.dist.cp_size = 1
+    executor.dist.tp_rank = 0
+    executor.dist.tp_allgather.side_effect = lambda value: [value]
+    executor.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
+    executor.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
+
+    executor.scheduler = Mock()
+    executor.scheduler.scheduling_state_range = (
+        LlmRequestState.CONTEXT_INIT,
+        LlmRequestState.GENERATION_TO_COMPLETE,
+    )
+    executor.scheduler.is_request_in_schedulable_state.side_effect = lambda request: (
+        RequestScheduler.is_request_in_schedulable_state(executor.scheduler, request)
+    )
+
+    kv_cache_manager = Mock()
+    kv_cache_manager.mapping.has_cp_helix.return_value = False
+    kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+    kv_cache_manager.is_linear_attention = False
+    kv_cache_manager.max_seq_len = (
+        max_seq_len if kv_manager_max_seq_len is None else kv_manager_max_seq_len
+    )
+    kv_cache_manager.num_extra_kv_tokens = 0
+    kv_cache_manager.tokens_per_block = 128
+    kv_cache_manager.is_context_only_cache = False
+
+    def _add_dummy(**kwargs):
+        executor.add_dummy_calls.append(kwargs)
+        state = _STATE_GENERATION_IN_PROGRESS if kwargs["is_gen"] else LlmRequestState.CONTEXT_INIT
+        req = _make_adp_request(
+            state,
+            request_id=kwargs["request_ids"][0],
+            is_dummy_request=True,
         )
-        self._enable_non_overlap_adp_forward_intent = (
-            enable_adp_dummy_fixes
-            if enable_non_overlap_adp_forward_intent is None
-            else enable_non_overlap_adp_forward_intent
-        )
-        self.add_dummy_calls = []
-        self.model_engine = Mock(
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-            _dspark_confidence_enabled=False,
-        )
+        if not kwargs["is_gen"]:
+            req.context_remaining_length = kwargs["token_nums"][0]
+        return [req]
 
-        self.dist = Mock()
-        # Peers are modeled through peer_forward_intent; tp_size only tells the
-        # executor whether attention DP has any peer at all.
-        self.dist.tp_size = tp_size
-        self.dist.cp_size = 1
-        self.dist.tp_rank = 0
-        self.dist.tp_allgather.side_effect = lambda value: [value]
-        self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
-        self.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
+    kv_cache_manager.add_dummy_requests.side_effect = _add_dummy
+    executor.kv_cache_manager = kv_cache_manager
 
-        self.scheduler = Mock()
-        self.scheduler.scheduling_state_range = (
-            LlmRequestState.CONTEXT_INIT,
-            LlmRequestState.GENERATION_TO_COMPLETE,
-        )
-        self.scheduler.is_request_in_schedulable_state.side_effect = lambda request: (
-            RequestScheduler.is_request_in_schedulable_state(self.scheduler, request)
-        )
-
-        kv_cache_manager = Mock()
-        kv_cache_manager.mapping.has_cp_helix.return_value = False
-        kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
-        kv_cache_manager.is_linear_attention = False
-        kv_cache_manager.max_seq_len = (
-            max_seq_len if kv_manager_max_seq_len is None else kv_manager_max_seq_len
-        )
-        kv_cache_manager.num_extra_kv_tokens = 0
-        kv_cache_manager.tokens_per_block = 128
-        kv_cache_manager.is_context_only_cache = False
-
-        def _add_dummy(**kwargs):
-            self.add_dummy_calls.append(kwargs)
-            state = (
-                _STATE_GENERATION_IN_PROGRESS if kwargs["is_gen"] else LlmRequestState.CONTEXT_INIT
-            )
-            req = _make_adp_request(
-                state,
-                request_id=kwargs["request_ids"][0],
-                is_dummy_request=True,
-            )
-            if not kwargs["is_gen"]:
-                req.context_remaining_length = kwargs["token_nums"][0]
-            return [req]
-
-        kv_cache_manager.add_dummy_requests.side_effect = _add_dummy
-        self.kv_cache_manager = kv_cache_manager
-
-        self.resource_manager = Mock()
-        self.resource_manager.get_resource_manager.return_value = None
+    executor.resource_manager = Mock()
+    executor.resource_manager.get_resource_manager.return_value = None
+    return executor
 
 
-def _run_pad(stub):
-    for helper in (
-        "_count_schedulable_active_requests",
-        "_get_non_overlap_adp_forward_intent",
-        "_has_adp_dummy_kv_capacity",
-        "_should_skip_dummy_for_benchmark_disagg",
-    ):
-        setattr(stub, helper, types.MethodType(getattr(PyExecutor, helper), stub))
-    PyExecutor._pad_attention_dp_dummy_request(stub)
+def _run_pad(stub: PyExecutor) -> None:
+    stub._pad_attention_dp_dummy_request()
 
 
 def _run_update_role(stub, candidates):
@@ -3503,7 +3512,7 @@ def _make_adp_queue_item(request_type: RequestType, request_id: int = 1) -> Requ
 
 def test_pad_dummy_skipped_for_single_rank_attention_dp():
     # tp1 attention DP (e.g. DWDP context workers) has no peer to keep in step.
-    stub = _StubADPExecutor(tp_size=1)
+    stub = _make_adp_executor(tp_size=1)
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
@@ -3516,7 +3525,7 @@ def test_pad_dummy_skipped_for_single_rank_attention_dp():
 def test_pad_dummy_single_rank_attention_dp_with_kv_connector(capacity_only: bool) -> None:
     # A connector that moves KV needs a forward pass to flush its finished
     # loads, so a tp1 rank still pads; a capacity-only connector does not.
-    stub = _StubADPExecutor(tp_size=1)
+    stub = _make_adp_executor(tp_size=1)
     stub.expected_num_active_requests = 1
     stub.kv_connector_manager = Mock(capacity_only=capacity_only)
 
@@ -3526,7 +3535,7 @@ def test_pad_dummy_single_rank_attention_dp_with_kv_connector(capacity_only: boo
 
 
 def test_adp_dummy_role_set_to_ctx_on_context_only_request():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     req = _make_adp_queue_item(RequestType.REQUEST_TYPE_CONTEXT_ONLY)
     _run_update_role(stub, [req])
 
@@ -3534,7 +3543,7 @@ def test_adp_dummy_role_set_to_ctx_on_context_only_request():
 
 
 def test_adp_dummy_role_set_to_gen_on_generation_only_request():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub._adp_dummy_is_gen = False
     req = _make_adp_queue_item(RequestType.REQUEST_TYPE_GENERATION_ONLY)
     _run_update_role(stub, [req])
@@ -3543,7 +3552,7 @@ def test_adp_dummy_role_set_to_gen_on_generation_only_request():
 
 
 def test_adp_dummy_role_flips_when_request_type_changes():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     ctx_req = _make_adp_queue_item(RequestType.REQUEST_TYPE_CONTEXT_ONLY)
     _run_update_role(stub, [ctx_req])
     assert stub._adp_dummy_is_gen is False
@@ -3554,7 +3563,7 @@ def test_adp_dummy_role_flips_when_request_type_changes():
 
 
 def test_adp_dummy_role_unchanged_for_non_disagg_worker():
-    stub = _StubADPExecutor(kv_cache_transceiver=None)
+    stub = _make_adp_executor(kv_cache_transceiver=None)
     req = _make_adp_queue_item(RequestType.REQUEST_TYPE_CONTEXT_ONLY)
     _run_update_role(stub, [req])
 
@@ -3562,7 +3571,7 @@ def test_adp_dummy_role_unchanged_for_non_disagg_worker():
 
 
 def test_adp_dummy_role_unchanged_when_attention_dp_disabled():
-    stub = _StubADPExecutor(enable_attention_dp=False)
+    stub = _make_adp_executor(enable_attention_dp=False)
     req = _make_adp_queue_item(RequestType.REQUEST_TYPE_CONTEXT_ONLY)
     _run_update_role(stub, [req])
 
@@ -3577,7 +3586,7 @@ def test_adp_dummy_role_unchanged_when_attention_dp_disabled():
     ],
 )
 def test_adp_dummy_role_prefers_context_for_mixed_queued_requests(request_types):
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     candidates = [
         _make_adp_queue_item(request_type, request_id)
         for request_id, request_type in enumerate(request_types, start=1)
@@ -3590,7 +3599,7 @@ def test_adp_dummy_role_prefers_context_for_mixed_queued_requests(request_types)
 
 @pytest.mark.parametrize("is_gen", [False, True])
 def test_adp_dummy_role_unchanged_for_empty_queue(is_gen):
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub._adp_dummy_is_gen = is_gen
 
     _run_update_role(stub, [])
@@ -3607,7 +3616,7 @@ def test_adp_dummy_role_unchanged_for_empty_queue(is_gen):
 )
 def test_disabled_adp_dummy_fix_gate_preserves_pp_behavior(state):
     # PP configurations remain on the established dummy path.
-    stub = _StubADPExecutor(enable_adp_dummy_fixes=False)
+    stub = _make_adp_executor(enable_adp_dummy_fixes=False)
     stub.active_requests = [_make_adp_request(state)]
     stub.expected_num_active_requests = 1
 
@@ -3622,7 +3631,7 @@ def test_pad_dummy_added_when_only_to_complete_requests_disagg():
     # MicroBatchScheduler (no_schedule_after_state). When a peer has real
     # generation work, a rank holding only terminal requests must receive a
     # pad dummy or can_queue goes False fleet-wide.
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
     stub.expected_num_active_requests = 2
 
@@ -3637,7 +3646,7 @@ def test_pad_dummy_tolerates_active_request_overshoot():
     # when disagg transfer-error requests linger a tick before cleanup) used to
     # trip a hard assert that crashed the gen loop on every ADP rank. It must now
     # warn and continue instead of raising.
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [
         _make_adp_request(_STATE_GENERATION_IN_PROGRESS),
         _make_adp_request(_STATE_GENERATION_IN_PROGRESS),
@@ -3657,7 +3666,7 @@ def test_pad_dummy_added_when_overshoot_has_no_schedulable_requests():
     # The branch that matters: overshoot AND nothing schedulable (all at
     # GENERATION_TO_COMPLETE) must still pad, or can_queue goes False
     # fleet-wide.
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [
         _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=1),
         _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=2),
@@ -3676,7 +3685,7 @@ def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
     # (no_schedule_until_state), so a rank holding only such requests
     # schedules batch=0. A peer's generation intent therefore requires a pad
     # dummy — the left-boundary mirror of the TO_COMPLETE case above.
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [_make_adp_request(LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER)]
     stub.expected_num_active_requests = 2
 
@@ -3694,7 +3703,7 @@ def test_pad_dummy_tolerates_surplus_over_expected_on_busy_rank() -> None:
     # gather_all_rank_states counts it. This used to trip a bare assert and
     # kill the executor event loop; a busy rank needs no dummy, so it must be
     # tolerated instead.
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS) for _ in range(3)]
     stub.expected_num_active_requests = 2
 
@@ -3711,7 +3720,7 @@ def test_pad_dummy_still_added_when_surplus_requests_are_unschedulable() -> None
     # more requests than expected AND have none of them schedulable (all parked
     # at GENERATION_TO_COMPLETE), in which case it still schedules batch=0 and
     # needs a dummy to stay in the forward-pass collectives.
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE) for _ in range(3)]
     stub.expected_num_active_requests = 2
 
@@ -3722,7 +3731,7 @@ def test_pad_dummy_still_added_when_surplus_requests_are_unschedulable() -> None
 
 
 def test_encoder_init_uses_encoder_decoder_scheduler_state_window():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.scheduler.scheduling_state_range = (
         LlmRequestState.ENCODER_INIT,
         LlmRequestState.GENERATION_TO_COMPLETE,
@@ -3745,7 +3754,7 @@ def test_encoder_init_uses_encoder_decoder_scheduler_state_window():
     ],
 )
 def test_encoder_decoder_disagg_wait_and_transfer_states_are_not_schedulable(state):
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.scheduler.scheduling_state_range = (
         LlmRequestState.ENCODER_INIT,
         LlmRequestState.GENERATION_TO_COMPLETE,
@@ -3760,7 +3769,7 @@ def test_encoder_decoder_disagg_wait_and_transfer_states_are_not_schedulable(sta
 
 
 def test_decoder_context_waiting_for_encoder_output_is_not_counted():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     request = _make_adp_request(LlmRequestState.CONTEXT_INIT)
     request.py_encoder_output_ready_event = Mock()
     request.py_encoder_output_ready_event.query.return_value = False
@@ -3774,7 +3783,7 @@ def test_decoder_context_waiting_for_encoder_output_is_not_counted():
 
 
 def test_pad_does_not_warn_when_surplus_is_only_retiring_requests():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [
         _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=1),
         _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=2),
@@ -3790,7 +3799,7 @@ def test_pad_does_not_warn_when_surplus_is_only_retiring_requests():
 
 
 def test_pad_still_warns_on_a_genuine_routable_surplus():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [
         _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=1),
         _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2),
@@ -3810,22 +3819,21 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     Returns the ``total_num_live_requests`` handed to the queue wait and the
     ``total_num_active_requests`` that admission subtracts from its capacity.
     """
-    stub = types.SimpleNamespace(
-        enable_attention_dp=False,
-        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
-        max_num_active_requests=max_num_active_requests,
-        canceled_req_ids=[],
-        enable_iter_perf_stats=False,
-        num_fetch_requests=0,
-        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0),
-        kv_cache_transceiver=None,
-        _should_exclude_last_generation_logits=lambda: False,
-        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
-        _kv_cache_capacity={},
-        track_unique_tokens=False,
-        _is_kv_manager_v2=False,
-        _num_embeddings=1234,
-    )
+    stub = make_host_executor()
+    stub.enable_attention_dp = False
+    stub.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
+    stub.max_num_active_requests = max_num_active_requests
+    stub.canceled_req_ids = []
+    stub.enable_iter_perf_stats = False
+    stub.num_fetch_requests = 0
+    stub.dist = Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0)
+    stub.kv_cache_transceiver = None
+    stub._should_exclude_last_generation_logits = lambda: False
+    stub._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
+    stub._kv_cache_capacity = {}
+    stub.track_unique_tokens = False
+    stub._is_kv_manager_v2 = False
+    stub._num_embeddings = 1234
     seen = {}
     stub._cancel_queued_context_requests = types.MethodType(
         PyExecutor._cancel_queued_context_requests, stub
@@ -3841,7 +3849,14 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     with patch(
         "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests", return_value=[]
     ) as merge:
-        assert PyExecutor._fetch_new_requests(stub, Mock(), active_requests) == []
+        assert (
+            PyExecutor._fetch_new_requests(
+                stub,
+                (Mock()),
+                active_requests,
+            )
+            == []
+        )
     merge.assert_called_once()
     return seen
 
@@ -3902,23 +3917,22 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
     retiring = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=i) for i in range(4)]
     waiting_queue = FCFSWaitingQueue()
     waiting_queue.add_requests(RequestQueueItem(10 + i) for i in range(4))
-    stub = types.SimpleNamespace(
-        enable_attention_dp=False,
-        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
-        max_num_active_requests=4,
-        is_benchmark_disagg=False,
-        canceled_req_ids=[],
-        enable_iter_perf_stats=False,
-        num_fetch_requests=0,
-        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1),
-        kv_cache_transceiver=None,
-        _should_exclude_last_generation_logits=lambda: False,
-        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
-        _kv_cache_capacity={},
-        track_unique_tokens=False,
-        _is_kv_manager_v2=False,
-        _num_embeddings=123,
-    )
+    stub = make_host_executor()
+    stub.enable_attention_dp = False
+    stub.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
+    stub.max_num_active_requests = 4
+    stub.is_benchmark_disagg = False
+    stub.canceled_req_ids = []
+    stub.enable_iter_perf_stats = False
+    stub.num_fetch_requests = 0
+    stub.dist = Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1)
+    stub.kv_cache_transceiver = None
+    stub._should_exclude_last_generation_logits = lambda: False
+    stub._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
+    stub._kv_cache_capacity = {}
+    stub.track_unique_tokens = False
+    stub._is_kv_manager_v2 = False
+    stub._num_embeddings = 123
     for name in (
         "_get_request_admission_capacity",
         "_pop_from_waiting_queue",
@@ -3932,7 +3946,11 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
         side_effect=lambda new_requests, **_: list(new_requests),
     ):
-        admitted = PyExecutor._fetch_new_requests(stub, waiting_queue, retiring)
+        admitted = PyExecutor._fetch_new_requests(
+            stub,
+            waiting_queue,
+            retiring,
+        )
 
     assert [item.id for item in admitted] == expected_admitted_ids
     assert [item.id for item in waiting_queue] == [10, 11, 12, 13][len(expected_admitted_ids) :]
@@ -3944,10 +3962,10 @@ def test_generic_disagg_adp_mixed_rank_states_stay_queueable():
     # The generic non-PP path must give both ranks a non-empty scheduled batch:
     # one rank schedules its real request, while the terminal-only rank
     # schedules the dummy inserted for the scheduler-excluded request.
-    busy_rank = _StubADPExecutor()
+    busy_rank = _make_adp_executor()
     busy_rank.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
     busy_rank.expected_num_active_requests = 2
-    terminal_rank = _StubADPExecutor()
+    terminal_rank = _make_adp_executor()
     terminal_rank.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
     terminal_rank.expected_num_active_requests = 2
 
@@ -3982,7 +4000,7 @@ def test_pad_dummy_allocation_failure_skips_padding():
     # resources for even a 1-token dummy (possible while non-schedulable
     # requests still hold theirs). Padding must degrade to a skipped
     # iteration, not crash on an unchecked [0].
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
     stub.expected_num_active_requests = 2
     stub.kv_cache_manager.add_dummy_requests.side_effect = None
@@ -4006,7 +4024,7 @@ def test_legacy_pad_dummy_allocation_failure_skips_padding(failure):
     # KV-saturated rank still has to survive a refused dummy allocation.
     # Crashing here kills the event-loop thread and hangs every peer in the
     # can_queue allgather until the hang detector fires.
-    stub = _StubADPExecutor(enable_adp_dummy_fixes=False)
+    stub = _make_adp_executor(enable_adp_dummy_fixes=False)
     stub.active_requests = [_make_adp_request(_STATE_DISAGG_GENERATION_INIT)]
     stub.expected_num_active_requests = 1
     stub.kv_cache_manager.add_dummy_requests.side_effect = None
@@ -4020,7 +4038,7 @@ def test_legacy_pad_dummy_allocation_failure_skips_padding(failure):
 
 
 def test_adp_pad_dummy_checks_minimal_context_capacity():
-    stub = _StubADPExecutor(
+    stub = _make_adp_executor(
         max_num_tokens=4096,
         peer_forward_intent=_ADPForwardIntent.CONTEXT,
     )
@@ -4036,7 +4054,7 @@ def test_adp_pad_dummy_checks_minimal_context_capacity():
 
 
 def test_adp_pad_dummy_ctx_preserves_helix_two_token_minimum():
-    stub = _StubADPExecutor(
+    stub = _make_adp_executor(
         max_num_tokens=4096,
         peer_forward_intent=_ADPForwardIntent.CONTEXT,
     )
@@ -4055,7 +4073,7 @@ def test_adp_pad_dummy_ctx_preserves_helix_two_token_minimum():
 
 
 def test_adp_pad_dummy_checks_full_generation_capacity():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.kv_cache_manager.get_num_available_tokens.return_value = 0
 
     _run_pad(stub)
@@ -4068,7 +4086,7 @@ def test_adp_pad_dummy_checks_full_generation_capacity():
 
 
 def test_adp_pad_dummy_capacity_includes_draft_reserve():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.max_total_draft_tokens = 3
     stub.kv_cache_manager.get_num_available_tokens.return_value = 3
 
@@ -4082,7 +4100,7 @@ def test_adp_pad_dummy_capacity_includes_draft_reserve():
 
 
 def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     terminal_request = _make_adp_request(_STATE_GENERATION_TO_COMPLETE)
     stub.active_requests = [terminal_request]
     stub.expected_num_active_requests = 2
@@ -4098,7 +4116,7 @@ def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate():
 
 
 def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     spec_resource_manager = Mock()
     stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
     terminal_request = _make_adp_request(_STATE_GENERATION_TO_COMPLETE)
@@ -4136,7 +4154,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
 
 
 def test_adp_dummy_rollback_only_frees_pending_candidate():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     prior_dummy = _make_adp_request(
         _STATE_GENERATION_IN_PROGRESS, request_id=10, is_dummy_request=True
     )
@@ -4155,7 +4173,7 @@ def test_adp_dummy_rollback_only_frees_pending_candidate():
 
 
 def test_adp_dummy_post_prepare_rollback_uses_normal_termination():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     dummy_request = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, is_dummy_request=True)
     dummy_request.is_attention_dp_dummy = True
     dummy_request.py_seq_slot = 3
@@ -4171,7 +4189,7 @@ def test_adp_dummy_post_prepare_rollback_uses_normal_termination():
 
 
 def test_pad_dummy_skips_when_active_request_present():
-    stub = _StubADPExecutor()
+    stub = _make_adp_executor()
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
     stub.expected_num_active_requests = 1
 
@@ -4196,7 +4214,7 @@ def test_pad_dummy_ctx_uses_minimal_prompt_independent_of_configured_limits(
 ):
     # max_num_tokens is a batch-wide scheduling limit, not a target length for
     # the single synthetic context request.
-    stub = _StubADPExecutor(
+    stub = _make_adp_executor(
         max_num_tokens=max_num_tokens,
         max_seq_len=model_max_seq_len,
         kv_manager_max_seq_len=manager_max_seq_len,
@@ -4214,7 +4232,7 @@ def test_pad_dummy_ctx_uses_minimal_prompt_independent_of_configured_limits(
 
 
 def test_pad_dummy_gen_keeps_default_token_nums():
-    stub = _StubADPExecutor(max_num_tokens=4096)
+    stub = _make_adp_executor(max_num_tokens=4096)
     stub._adp_dummy_is_gen = True
     stub.expected_num_active_requests = 1
 
@@ -4258,35 +4276,49 @@ def test_attention_dp_dummy_cleanup_preserves_real_requests():
 
 
 def test_update_request_states_uses_common_dummy_cleanup():
-    stub = Mock()
+    stub = make_host_executor()
+    stub._terminate_attention_dp_dummy_requests = Mock()
     scheduled_requests = Mock(context_requests=[])
 
-    PyExecutor._update_request_states_tp(stub, scheduled_requests)
+    PyExecutor._update_request_states_tp(
+        stub,
+        (scheduled_requests),
+    )
 
     stub._terminate_attention_dp_dummy_requests.assert_called_once_with()
 
 
 @pytest.mark.parametrize("cp_type", [CpType.ULYSSES, CpType.RING, CpType.HELIX])
 def test_update_request_states_single_cp_rank_takes_tp_path(cp_type):
-    stub = Mock(dist=Mock(cp_config={"cp_type": cp_type}, cp_size=1))
+    stub = make_host_executor()
+    stub.dist = Mock(cp_config={"cp_type": cp_type}, cp_size=1)
+    stub._update_request_states_tp = Mock()
     scheduled_requests = Mock(context_requests=[])
 
-    PyExecutor._update_request_states(stub, scheduled_requests)
+    PyExecutor._update_request_states(
+        stub,
+        (scheduled_requests),
+    )
 
     stub._update_request_states_tp.assert_called_once_with(scheduled_requests)
 
 
 def test_update_request_states_rejects_unsupported_cp_type_with_context_parallelism():
-    stub = Mock(dist=Mock(cp_config={"cp_type": CpType.ULYSSES}, cp_size=2))
+    stub = make_host_executor()
+    stub.dist = Mock(cp_config={"cp_type": CpType.ULYSSES}, cp_size=2)
+    stub._update_request_states_tp = Mock()
 
     with pytest.raises(NotImplementedError, match="Unsupported cp type ULYSSES"):
-        PyExecutor._update_request_states(stub, Mock(context_requests=[]))
+        PyExecutor._update_request_states(
+            stub,
+            (Mock(context_requests=[])),
+        )
 
     stub._update_request_states_tp.assert_not_called()
 
 
 def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():
-    stub = _StubADPExecutor(
+    stub = _make_adp_executor(
         max_num_tokens=4096,
         enable_scheduler_aware_adp_dummy=False,
         enable_non_overlap_adp_forward_intent=False,
@@ -4303,7 +4335,7 @@ def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():
 
 
 def test_pad_dummy_ctx_uses_minimal_prompt_when_max_num_tokens_missing():
-    stub = _StubADPExecutor(
+    stub = _make_adp_executor(
         max_num_tokens=None,
         peer_forward_intent=_ADPForwardIntent.CONTEXT,
     )
@@ -4316,7 +4348,7 @@ def test_pad_dummy_ctx_uses_minimal_prompt_when_max_num_tokens_missing():
 
 
 def test_pad_dummy_not_added_when_all_ranks_only_await_kv_transfer():
-    stub = _StubADPExecutor(
+    stub = _make_adp_executor(
         max_num_tokens=4096,
         peer_forward_intent=_ADPForwardIntent.NONE,
     )
@@ -4331,7 +4363,7 @@ def test_pad_dummy_not_added_when_all_ranks_only_await_kv_transfer():
 
 
 def test_pad_dummy_context_role_re_evaluated_while_local_rank_drains():
-    stub = _StubADPExecutor(
+    stub = _make_adp_executor(
         max_num_tokens=4096,
         peer_forward_intent=_ADPForwardIntent.CONTEXT,
     )
@@ -4370,14 +4402,14 @@ def test_compute_adp_dummy_tokens_splits_context_and_generation_work():
         ],
     )
 
-    ctx_tokens, gen_tokens = PyExecutor._compute_adp_dummy_tokens(scheduled_requests)
+    ctx_tokens, gen_tokens = PyExecutor._compute_adp_dummy_tokens((scheduled_requests))
 
     assert ctx_tokens == 1
     assert gen_tokens == 4
 
 
 def test_pad_dummy_no_op_when_attention_dp_disabled():
-    stub = _StubADPExecutor(enable_attention_dp=False)
+    stub = _make_adp_executor(enable_attention_dp=False)
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
     stub.expected_num_active_requests = 1
 
@@ -4403,7 +4435,7 @@ def _run_pad_empty(stub, scheduled_batch):
 
 def _unfittable_rank(**kwargs):
     """A rank holding one active request the capacity scheduler could not fit."""
-    stub = _StubADPExecutor(**kwargs)
+    stub = _make_adp_executor(**kwargs)
     stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
     stub.expected_num_active_requests = 1
     return stub, ScheduledRequests()
@@ -4455,7 +4487,7 @@ def test_pad_dummy_is_context_on_context_only_cache(
 ) -> None:
     # The default role and the peers' intent say generation, but a
     # context-only cache cannot run a generation row.
-    stub = _StubADPExecutor(
+    stub = _make_adp_executor(
         enable_non_overlap_adp_forward_intent=enable_non_overlap_adp_forward_intent,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
     )
@@ -4472,7 +4504,7 @@ def test_pad_dummy_is_context_on_context_only_cache(
 
 
 def test_pad_dummy_keeps_generation_role_on_full_cache():
-    stub = _StubADPExecutor(peer_forward_intent=_ADPForwardIntent.GENERATION)
+    stub = _make_adp_executor(peer_forward_intent=_ADPForwardIntent.GENERATION)
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
@@ -4662,7 +4694,9 @@ def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
 def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
     # The V2 scheduler grows both pools together, so a skipped batch hands both
     # back. Attention DP keeps one unified pool and never reaches this pairing.
-    stub = object.__new__(PyExecutor)
+    stub = make_host_executor()
+    stub.kv_connector_manager = None
+    stub.dense_dwdp_manager = None
     stub._is_kv_manager_v2 = True
     stub.kv_cache_manager = Mock()
     stub.draft_kv_cache_manager = Mock()
@@ -4671,19 +4705,24 @@ def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
     scheduled_batch = ScheduledRequests()
     scheduled_batch.generation_requests.append(gen_request)
 
-    PyExecutor._revert_unexecuted_alloc(stub, scheduled_batch)
+    PyExecutor._revert_unexecuted_alloc(
+        stub,
+        scheduled_batch,
+    )
 
     stub.kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
     stub.draft_kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
 
 
 def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
-    stub = object.__new__(PyExecutor)
+    stub = make_host_executor()
+    stub.kv_connector_manager = None
+    stub.dense_dwdp_manager = None
     stub.kv_cache_manager = Mock()
     stub.draft_kv_cache_manager = Mock()
     stub.enable_joint_kv_cache_reuse = True
 
-    PyExecutor.reset_prefix_cache(stub)
+    stub.reset_prefix_cache()
 
     stub.kv_cache_manager.reset_reuse_state.assert_called_once_with()
     stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
@@ -4691,11 +4730,10 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
 
 @pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear", "flush"])
 def test_reset_prefix_cache_preserves_routes_only_if_native_clear_fails(failure_stage):
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.kv_cache_events import StreamingKVCacheEventManager
     from tensorrt_llm._torch.route_capture import RouteCapture
 
-    manager = object.__new__(KVCacheManagerV2)
+    manager = make_host_cache_manager()
     manager.impl = Mock()
     manager.event_manager = None
     manager.conversation_manager = Mock()
@@ -4711,7 +4749,9 @@ def test_reset_prefix_cache_preserves_routes_only_if_native_clear_fails(failure_
     failing_step.side_effect = RuntimeError("reset failed")
     route_capture = RouteCapture(rank=0)
     route_capture._shared[1] = torch.ones((1, 1), dtype=torch.int16)
-    stub = object.__new__(PyExecutor)
+    stub = make_host_executor()
+    stub.kv_connector_manager = None
+    stub.dense_dwdp_manager = None
     stub.kv_cache_manager = manager
     stub.enable_joint_kv_cache_reuse = False
     stub.model_engine = types.SimpleNamespace(route_capture=route_capture)
@@ -4726,7 +4766,9 @@ def test_reset_prefix_cache_preserves_routes_only_if_native_clear_fails(failure_
 class TestPendingTransferResponseFlush:
     def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
         """A lone fatal rank must fail locally rather than desynchronize TP."""
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         executor._error_budget = Mock()
         executor._error_budget.consume.return_value = True
         executor._error_budget.budget = 0.0
@@ -4744,39 +4786,48 @@ class TestPendingTransferResponseFlush:
         executor._terminate_request = Mock()
 
         with pytest.raises(RuntimeError, match="Fatal error: local failure"):
-            PyExecutor._handle_errors(executor, "local failure")
+            PyExecutor._handle_errors(
+                executor,
+                "local failure",
+            )
 
         executor._enqueue_responses.assert_not_called()
         executor.executor_request_queue.enqueue_shutdown_request.assert_called_once_with()
 
     def test_adp_flush_participates_with_an_empty_response_list(self):
         """Ranks without an error still join the synchronized response gather."""
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         executor._pending_transfer_responses = []
         executor._pending_response_terminations = []
         executor.enable_attention_dp = True
         executor._enqueue_responses = Mock()
 
-        PyExecutor._flush_pending_transfer_responses(executor)
+        executor._flush_pending_transfer_responses()
 
         executor._enqueue_responses.assert_called_once_with([])
 
     def test_flush_delivers_and_clears_buffered_responses(self):
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         responses = [(7, Mock())]
         executor._pending_transfer_responses = responses
         executor._pending_response_terminations = []
         executor.enable_attention_dp = False
         executor._enqueue_responses = Mock()
 
-        PyExecutor._flush_pending_transfer_responses(executor)
+        executor._flush_pending_transfer_responses()
 
         executor._enqueue_responses.assert_called_once_with(responses)
         assert executor._pending_transfer_responses == []
 
     def test_rank_zero_keeps_result_queue_until_buffered_error_flushes(self):
         """A queued client receives a rank-0 ADP error before cleanup."""
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         request_id = 7
         response = LlmResponse(request_id=request_id)
         response.request_id = request_id
@@ -4796,7 +4847,7 @@ class TestPendingTransferResponseFlush:
             side_effect=lambda _: executor._response_channel.result_wait_queues.pop(request_id)
         )
 
-        PyExecutor._flush_pending_transfer_responses(executor)
+        executor._flush_pending_transfer_responses()
 
         result_queue.put_response.remote.assert_called_once_with(42, response)
         assert request_id not in executor._response_channel.result_wait_queues
@@ -4804,7 +4855,9 @@ class TestPendingTransferResponseFlush:
 
     @staticmethod
     def _make_executor_loop_stub() -> PyExecutor:
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         executor.enable_attention_dp = False
         executor.device_id = 0
         profiler = MagicMock()
@@ -4987,7 +5040,9 @@ class TestOneModelMTPDraftTokenScheduling:
         enable_attention_dp is False so _pad_empty_attention_dp_batch returns
         immediately instead of padding a batch this test does not exercise.
         """
-        ex = object.__new__(PyExecutor)
+        ex = make_host_executor()
+        ex.kv_connector_manager = None
+        ex.dense_dwdp_manager = None
         ex.drafter = None
         ex.max_total_draft_tokens = cls.MAX_TOTAL_DRAFT_TOKENS
         spec_config = MTPDecodingConfig(
@@ -5097,7 +5152,9 @@ class TestAdpBalanceExcludesPadDummies:
     @staticmethod
     def _make_executor(per_rank, threshold):
         """per_rank: list of (num_ctx, num_gen, num_real) as allgathered."""
-        executor = object.__new__(PyExecutor)
+        executor = make_host_executor()
+        executor.kv_connector_manager = None
+        executor.dense_dwdp_manager = None
         executor.dist = Mock()
         executor.dist.tp_allgather_int64 = Mock(
             return_value=np.array([[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank])
@@ -5175,7 +5232,9 @@ class TestAdpBalanceExcludesPadDummies:
 
 
 def _make_pp_relay_executor(*, pp_size: int, is_last_pp_rank: bool) -> PyExecutor:
-    executor = PyExecutor.__new__(PyExecutor)
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor.dist = Mock(pp_size=pp_size, is_last_pp_rank=is_last_pp_rank)
     executor.num_micro_batches = pp_size
     executor.send_handles = [object() for _ in range(pp_size)]
@@ -5213,7 +5272,9 @@ def test_non_last_pp_rank_drains_every_relay_send():
 
 @pytest.mark.parametrize("loop", ["overlap", "pp"])
 def test_v2_generation_update_runs_before_cancel_and_responses(loop):
-    executor = object.__new__(PyExecutor)
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     batch = ScheduledRequests()
     metadata = object()
     executor._is_kv_manager_v2 = True
@@ -5236,9 +5297,15 @@ def test_v2_generation_update_runs_before_cancel_and_responses(loop):
     )
 
     if loop == "overlap":
-        executor.previous_batch = types.SimpleNamespace(
-            scheduled_requests=batch, guided_batch_id=None, guided_failures=None
+        previous_batch = object.__new__(BatchState)
+        previous_batch.scheduled_requests = batch
+        previous_batch.sample_state = SampleState(requests=[])
+        verify_instance(
+            previous_batch,
+            "tensorrt_llm._torch.pyexecutor.py_executor:BatchState",
+            members_only=True,
         )
+        executor.previous_batch = previous_batch
         executor.enable_early_first_token_response = False
         executor._process_previous_batch()
     else:
@@ -5253,7 +5320,24 @@ def test_v2_generation_update_runs_before_cancel_and_responses(loop):
         executor._flush_iter_stats_synced = Mock()
         executor._disagg_pp_termination_handler = None
         executor._handle_executed_batch(
-            types.SimpleNamespace(scheduled_requests=batch, sample_state=None, guided_batch_id=None)
+            verify_instance(
+                types.SimpleNamespace(
+                    scheduled_requests=batch,
+                    sample_state=None,
+                    iter_start_time=0,
+                    iter_stats=None,
+                    iter_id=None,
+                    scheduled_batch_stats=None,
+                    gpu_forward_start_event=None,
+                    gpu_forward_end_event=None,
+                    gpu_forward_events_from_perf_pool=False,
+                    guided_batch_id=None,
+                    guided_failures=None,
+                    microbatch_id=-1,
+                ),
+                "tensorrt_llm._torch.pyexecutor.py_executor:BatchStatePP",
+                members_only=True,
+            )
         )
 
     assert events == ["target_update", "cancel", "responses", "other_updates"]
@@ -5289,12 +5373,20 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
         py_disaggregated_params=types.SimpleNamespace(**transferred),
     )
     request.create_response = lambda: LlmResponse(request_id=rid, result=LlmResult(b"", py_result))
-    return request
+    request.kv_cache_retention_config = None
+    request.py_lora_ckpt_source = None
+    return verify_instance(
+        request,
+        "tensorrt_llm._torch.pyexecutor.llm_request:LlmRequest",
+        members=("kv_cache_retention_config", "py_lora_ckpt_source"),
+    )
 
 
 def _first_token_executor(*, overlap: bool) -> PyExecutor:
     """Bare single-rank executor whose first-token response path runs for real."""
-    executor = object.__new__(PyExecutor)
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor.should_exclude_last_generation_logits = overlap
     executor.dist = types.SimpleNamespace(
         rank=0, world_size=1, mapping=types.SimpleNamespace(tp_group=[0])
@@ -5321,7 +5413,9 @@ def test_prefill_logprobs_lead_the_generation_logprobs_one_entry_per_token():
     the disaggregated params and is prepended before any decode step, so the
     generation side reports exactly one entry per generated token. Beam search
     does not carry per-beam first-token logprobs and prepends nothing."""
-    executor = object.__new__(PyExecutor)
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     py_result = PyResult(prompt_len=4, max_new_tokens=4, return_log_probs=True)
     first_token = {7: types.SimpleNamespace(logprob=-0.5, rank=None)}
     request = _prepared_gen_request(1, py_result, first_gen_log_probs=[first_token])
@@ -5395,7 +5489,9 @@ def _make_gen_only_stream_request(request_id, decoding_iter):
 
 
 def _make_stream_executor(requests):
-    executor = object.__new__(PyExecutor)
+    executor = make_host_executor()
+    executor.kv_connector_manager = None
+    executor.dense_dwdp_manager = None
     executor.active_requests = list(requests)
     executor.perf_manager = MagicMock()
     executor.iter_counter = 1
@@ -5434,7 +5530,8 @@ def test_dynamo_recompile_limit_is_reapplied_on_the_worker_thread():
     config = torch._dynamo.config
     original = config.cache_size_limit
     seen = {}
-    executor = types.SimpleNamespace(_uses_torch_compile=True)
+    executor = make_host_executor()
+    executor._uses_torch_compile = True
 
     def worker():
         seen["inherited"] = config.cache_size_limit

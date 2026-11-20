@@ -1258,7 +1258,7 @@ def _run_decoder_pass_graph() -> None:
     # The shared V4.1 model helpers import their siblings as top-level modules.
     sys.path.append(str(Path(__file__).resolve().parents[1] / "modeling"))
     from _torch.modeling._deepseek_v41_test_utils import _init_random_weights
-    from test_modeling_deepseekv41 import _tiny_v41_model_config
+    from _torch.modeling.test_modeling_deepseekv41 import _tiny_v41_model_config
 
     from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
     from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
@@ -1370,7 +1370,7 @@ def test_attention_dp_decoder_pass_graph(parallel_moe_executor: MPIPoolExecutor 
 def _dep2_engram_config(mapping: Mapping):
     """An 18-layer V4.1 with Engram on the released layers 1 and 14 and small tables, whose
     bounded replay starts at layer 15; None without the release tokenizer Engram hashes with."""
-    from test_modeling_deepseekv41 import RELEASE_CHECKPOINT, V41_TINY_TEXT_CONFIG
+    from _torch.modeling.test_modeling_deepseekv41 import RELEASE_CHECKPOINT, V41_TINY_TEXT_CONFIG
 
     from tensorrt_llm._torch.configs.deepseek_v41 import DeepseekV41Config
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -1502,6 +1502,7 @@ def _run_encoder_pass_graph() -> None:
             0: [full, ([384], [0], [384], 1), third[0], full],
             1: [([512], [0], [512], 1), ([300], [0], [1000], 1), third[1], full],
         }
+        first = None
         for step, case in enumerate(cases[rank]):
             image = step == len(cases[rank]) - 1
             # Graphed first: the first forward's decoder pass captures while the encoder pass's

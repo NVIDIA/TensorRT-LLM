@@ -1132,7 +1132,8 @@ def run_early_pdl_release_single_rank(tensor_parallel_size, input, residual,
             mapping,
             input.dtype,
             buffer_size_bytes=MNNVLAllReduce.get_required_workspace_size(
-                *input.shape, tensor_parallel_size, input.dtype))
+                input.shape[0], input.shape[1], tensor_parallel_size,
+                input.dtype))
         comm = (workspace["uc_buffer"].view(input.dtype).view(3, -1),
                 workspace["buffer_flags"])
 

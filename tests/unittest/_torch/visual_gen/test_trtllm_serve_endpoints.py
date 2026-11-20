@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from unittest.mock import patch
 
 import httpx
@@ -36,6 +36,7 @@ import torch
 from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import ValidationError
+from test_common.interface_checks import mock_target
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoJob
@@ -43,6 +44,14 @@ from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
+
+if TYPE_CHECKING:
+    from tensorrt_llm.serve.openai_protocol import (
+        ImageEditRequest,
+        VideoGenerationRequest,
+    )
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+    from tensorrt_llm.visual_gen import VisualGenParams
 from tensorrt_llm.visual_gen.params import prepare_reference_slots, validate_visual_gen_params
 
 pytestmark = pytest.mark.cpu_only
@@ -628,7 +637,13 @@ def _mock_video_encoding():
     ffmpeg availability so ``resolve_video_format`` always resolves to mp4.
     """
 
-    def _dummy_save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate=24000):
+    def _dummy_save_encoded_video(
+        video: torch.Tensor,
+        audio: torch.Tensor | None,
+        output_path: str,
+        frame_rate: float,
+        audio_sample_rate: int = 24000,
+    ) -> str:
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)
         with open(str(output_path), "wb") as f:
             f.write(b"\x00\x00\x00\x1cftypisom" + b"\x00" * 32)
@@ -728,7 +743,7 @@ def test_a_server_starts_from_a_working_directory_it_cannot_write_to(tmp_path, m
     # The fallback creates a real directory, so point it inside tmp_path for
     # pytest to remove. Setting TMPDIR would not reach it: tempfile caches the
     # directory on first use, and this process has already used it.
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", (str(tmp_path)))
     read_only = tmp_path / "read_only"
     read_only.mkdir()
     read_only.chmod(0o555)
@@ -1519,7 +1534,7 @@ class TestImageEdit:
         monkeypatch.setattr(
             visual_gen_utils.base64,
             "b64decode",
-            lambda *args, **kwargs: pytest.fail("oversized payload was decoded"),
+            (lambda *args, **kwargs: pytest.fail("oversized payload was decoded")),
         )
 
         resp = client.post(
@@ -3191,7 +3206,11 @@ class TestVideoEncoderFailsFast:
     def test_sync_route_fails_before_generate(self, video_client, monkeypatch, raiser):
         from tensorrt_llm.serve import openai_video_routes as routes
 
-        monkeypatch.setattr(routes, "resolve_video_format", raiser)
+        monkeypatch.setattr(
+            routes,
+            "resolve_video_format",
+            (raiser),
+        )
         # Record whether the generator was called so the assertion
         # locks in the fail-fast contract.
         video_client.mock_gen.last_inputs = None
@@ -3219,7 +3238,11 @@ class TestVideoEncoderFailsFast:
     def test_async_route_fails_before_queue(self, video_client, monkeypatch, raiser):
         from tensorrt_llm.serve import openai_video_routes as routes
 
-        monkeypatch.setattr(routes, "resolve_video_format", raiser)
+        monkeypatch.setattr(
+            routes,
+            "resolve_video_format",
+            (raiser),
+        )
         video_client.mock_gen.last_inputs = None
         resp = video_client.post(
             "/v1/videos",
@@ -3731,7 +3754,11 @@ async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
     release = threading.Event()
     submitted, started = [], []
 
-    async def counting_submit(self, request):
+    @mock_target("tensorrt_llm.serve.openai_server:OpenAIServer._parse_visual_gen_params")
+    async def counting_submit(
+        self: "OpenAIServer",
+        request: "ImageGenerationRequest | ImageEditRequest | VideoGenerationRequest",
+    ) -> "VisualGenParams":
         # Hands the parse to the pool before its first await.
         submitted.append(request)
         return await submit(self, request)
@@ -3845,7 +3872,8 @@ class TestPathResponseStartupCheck:
         class _ReachedLlmInit(Exception):
             pass
 
-        def _init_llm(self, chat_template=None):
+        @mock_target("tensorrt_llm.serve.openai_server:OpenAIServer._init_llm")
+        def _init_llm(self: "OpenAIServer", chat_template: str | None = None) -> None:
             raise _ReachedLlmInit
 
         monkeypatch.setattr(BaseMediaIO, "_executor", None)

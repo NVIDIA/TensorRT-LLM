@@ -55,6 +55,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from test_common.interface_checks import verify_instance
 
 from tensorrt_llm._torch.pyexecutor import _util as util_module
 from tensorrt_llm._torch.pyexecutor import seq_slot_manager as seq_slot_manager_module
@@ -347,6 +348,12 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(
         sparse_attention_config=None,
     )
     creator = object.__new__(KvCacheCreator)
+    creator._cache_transceiver_config = None
+    verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
     creator._max_beam_width = max_beam_width
     creator._kv_connector_manager = object() if has_kv_connector else None
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
@@ -391,6 +398,11 @@ def test_skip_softmax_selects_the_dense_manager_resolved_v2_predicts(
     creator._max_beam_width = max_beam_width
     creator._is_disagg = False
     creator._cache_transceiver_config = None
+    verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
     creator._speculative_config = None
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
 
@@ -411,6 +423,12 @@ def test_sparse_kv_cache_manager_v2_does_not_fall_back(max_beam_width, enable_sl
         sparse_attention_config=SimpleNamespace(algorithm="dsa"),
     )
     creator = object.__new__(KvCacheCreator)
+    creator._cache_transceiver_config = None
+    verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
     creator._max_beam_width = max_beam_width
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
 
@@ -437,6 +455,12 @@ def test_v2_fp4_mla_beam_compatibility(max_beam_width: int, mla: bool, fp4_kv_ca
         ),
     )
     creator = object.__new__(KvCacheCreator)
+    creator._cache_transceiver_config = None
+    verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
     creator._max_beam_width = max_beam_width
     creator._llm_args = SimpleNamespace(sleep_config=None)
 
@@ -470,6 +494,12 @@ def test_resolved_v2_respects_an_explicit_v1_request():
 )
 def test_sleep_rejects_v2_only_block_reuse_config(block_reuse_config):
     creator = object.__new__(KvCacheCreator)
+    creator._cache_transceiver_config = None
+    verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
     creator._max_beam_width = 1
     creator._llm_args = SimpleNamespace(sleep_config=SleepConfig())
     model_config = SimpleNamespace(
@@ -844,6 +874,12 @@ def test_sampler_uses_executor_slot_pool_capacity(slot_factor):
 def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) -> KvCacheCreator:
     """Minimal creator whose only job is to reach _create_kv_cache_manager."""
     c = object.__new__(KvCacheCreator)
+    c._cache_transceiver_config = None
+    verify_instance(
+        c,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
     c._mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
     c._kv_cache_config = Mock()
     c._tokens_per_block = 32
@@ -1093,6 +1129,12 @@ def test_kv_estimation_reserves_the_headroom_penalty_workspace(enable_overlap_he
         mapping, max_batch_size, False, enable_overlap_headroom=enable_overlap_headroom
     )
     creator = KvCacheCreator.__new__(KvCacheCreator)
+    creator._cache_transceiver_config = None
+    verify_instance(
+        creator,
+        "tensorrt_llm._torch.pyexecutor._util:KvCacheCreator",
+        members=("_cache_transceiver_config", "_get_draft_cache_cost"),
+    )
     creator._mapping = mapping
     creator._max_batch_size = max_batch_size
     creator._llm_args = SimpleNamespace(disable_overlap_scheduler=False)

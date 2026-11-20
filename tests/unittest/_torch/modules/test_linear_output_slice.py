@@ -134,7 +134,7 @@ def test_linear_output_slice_reload(backend):
         return runner(operands, tactic=0)
 
     # A small-M GEMM captured before the reload must read the reloaded weights and scales.
-    graph = None
+    graph = captured = None
     if getattr(linear, "weight_scale_block128", None) is not None:
         small_m()
         graph = torch.cuda.CUDAGraph()
@@ -211,8 +211,16 @@ def test_prepare_output_slice_dispatches_to_linear_method():
 @pytest.mark.cpu_only
 def test_fp8_block_scale_low_m_dispatch_uses_full_weight_only(monkeypatch):
     """A prepared row slice must not reuse the full projection's low-M range."""
-    monkeypatch.setattr(linear_module, "is_sm_100f", lambda: True)
-    monkeypatch.setattr(linear_module, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(
+        linear_module,
+        "is_sm_100f",
+        (lambda: True),
+    )
+    monkeypatch.setattr(
+        linear_module,
+        "get_sm_version",
+        (lambda: 103),
+    )
 
     weight = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
     scale = torch.empty((256, 1), dtype=torch.int32)
@@ -244,8 +252,8 @@ def test_fp8_block_scale_low_m_dispatch_uses_full_weight_only(monkeypatch):
     method = FP8BlockScalesLinearMethod()
     inputs = torch.empty((2, 128), dtype=torch.bfloat16)
 
-    assert torch.all(method.apply(module, inputs, None) == 1)
-    sliced = method.apply_slice(module, inputs, 129, 190)
+    assert torch.all(method.apply((module), inputs, None) == 1)
+    sliced = method.apply_slice((module), inputs, 129, 190)
     assert sliced.shape == (2, 61)
     assert torch.all(sliced == 0)
     assert calls == [("low_m", True, 256), ("regular", False, 128)]
@@ -256,7 +264,10 @@ def test_fp8_block_scale_low_m_dispatch_uses_full_weight_only(monkeypatch):
 def test_kimi_fp8_low_m_dispatch_uses_full_weight_only(monkeypatch, rubin):
     from tensorrt_llm._torch.models import modeling_kimi_linear as kimi_module
 
-    monkeypatch.setattr(kimi_module, "_rubin_mxfp8_is_available", lambda: rubin)
+    def _mock_rubin_mxfp8_is_available() -> bool:
+        return rubin
+
+    monkeypatch.setattr(kimi_module, "_rubin_mxfp8_is_available", _mock_rubin_mxfp8_is_available)
     weight = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
     scale = (
         torch.empty((256 * 4,), dtype=torch.uint8)
@@ -290,7 +301,7 @@ def test_kimi_fp8_low_m_dispatch_uses_full_weight_only(monkeypatch, rubin):
         monkeypatch.setattr(
             torch.ops.trtllm,
             "fp8_quantize_1x128_cutedsl_ue8m0",
-            lambda inputs: (inputs, torch.empty(0)),
+            (lambda inputs: (inputs, torch.empty(0))),
             raising=False,
         )
         monkeypatch.setattr(
