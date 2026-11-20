@@ -60,13 +60,9 @@ DEFAULT_WORKLOAD: dict[str, int] = {"isl": 4096, "osl": 1024, "max_batch_size": 
 #: Tokens between Mamba state snapshots on a hybrid checkpoint with block
 #: reuse: without a snapshot policy the engine turns reuse off.
 DEFAULT_SNAPSHOT_INTERVAL = 2048
-#: The boot gate's prompts when the site declares none: one whose answer any
-#: working target states, checked, and one open continuation.
+#: The boot gate's prompts when the site declares none: two short continuations.
 DEFAULT_BOOT: dict[str, Any] = {
-    "prompts": [
-        {"prompt": "The capital of France is", "keywords_any": ["Paris"]},
-        "In one sentence, photosynthesis is",
-    ],
+    "prompts": ["The capital of France is", "In one sentence, photosynthesis is"],
     "max_tokens": 32,
 }
 DEFAULT_BENCHMARK = "gsm8k"
@@ -623,17 +619,6 @@ def derive_spec(
     chosen = {u: p for u, p in goal.unit_profiles.items() if u in built}
     if chosen:
         spec["profile"] = {"default": spec.get("profile") or PROFILE_STANDARD, **chosen}
-    layout = spec["members"] if isinstance(spec.get("members"), dict) else {}
-    everywhere = list(dict.fromkeys(m for listed in layout.values() for m in listed))
-    left_out = [
-        f"{unit}@{member}"
-        for unit in ["core", *built]
-        for member in everywhere
-        if member not in layout.get(unit, layout.get("default", ()))
-    ]
-    if left_out:
-        # Where the goal gates a unit on fewer members, the rest is its choice, not a gap.
-        spec["coverage"] = {"accept": left_out}
     # The chunk size is the chunked variant's, not core's.
     params = {k: v for k, v in goal.params.items() if not (chunked and k == "chunk_tokens")}
     options = _llm_api_options(runtime, built, kv_dtype, params, snapshot, max_batch_size)
@@ -749,11 +734,11 @@ def disagg_layout(
     """``(devices per node, nodes)`` the disaggregated-serving test needs; ``None`` unknown.
 
     One context and one generation engine, each on the fewest devices that hold
-    the checkpoint's weights (``lint.engine_width``): on one node when both fit,
+    the checkpoint's weights (``sizing.engine_width``): on one node when both fit,
     as the tree's own disaggregated accuracy tests run (context and generation
     sharing a node); else one engine per node, or as many nodes as an engine needs.
     """
-    from .lint import engine_width
+    from .sizing import engine_width
 
     width = engine_width(weight_bytes, gpu_memory_gib)
     if width is None or not isinstance(gpus_per_node, int) or gpus_per_node <= 0:
@@ -786,7 +771,7 @@ def _disagg(
     if block:
         note("accuracy.disagg", dict(block), "site")
     if "devices" not in block and "nodes" not in block and checkpoint is not None:
-        from .lint import checkpoint_weight_bytes
+        from .sizing import checkpoint_weight_bytes
 
         environment = site.get("environment") or {}
         per_node = environment.get("gpus_per_node") or (site.get("device") or {}).get(

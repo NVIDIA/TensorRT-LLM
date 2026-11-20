@@ -219,6 +219,7 @@ class GraphOwnerTeardownTestCase(unittest.TestCase):
         cuda_runner = Mock()
         breakable_runner = Mock()
         decoder_runner = object.__new__(DecoderRunner)
+        decoder_runner._host_uploader = None
         decoder_runner._graphs = object.__new__(DecoderCudaGraphs)
         decoder_runner._graphs.cuda_graph_runner = cuda_runner
         decoder_runner._graphs.breakable_cuda_graph_runner = breakable_runner
@@ -809,6 +810,7 @@ class ModelEngineTestCase(unittest.TestCase):
     def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
         engine = object.__new__(ModelEngine)
         decoder = object.__new__(DecoderRunner)
+        decoder._host_uploader = None
         engine._runner = decoder
         engine._torch_compile_backend = None
         decoder._inputs = object.__new__(DecoderInputPreparer)

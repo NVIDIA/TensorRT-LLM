@@ -5,9 +5,8 @@
 
 ``intake derive`` writes the derived spec (:mod:`.derive`) and stops: no run,
 no GPU, and no ``site.yaml`` required (without one the environment is left as
-an open question). ``intake lint`` checks a spec, derived or hand-written
-(:mod:`.lint`). INTAKE.md, beside this module, is the procedure the operator follows
-between them.
+an open question). INTAKE.md, beside this module, is the procedure the
+operator follows from there.
 """
 
 from __future__ import annotations
@@ -19,16 +18,11 @@ from pathlib import Path
 import yaml
 
 from . import derive as derive_mod
-from . import lint as lint_mod
 
-#: The lint report ``intake derive`` writes beside the derived spec.
-REPORT_FILENAME = "intake.report.md"
+USAGE = """usage: trtllm-modeling-v2 intake derive ...
 
-USAGE = """usage: trtllm-modeling-v2 intake {derive,lint} ...
-
-  derive  derive a spec from --checkpoint, --goal and an optional --site; write it, its
-          derive.report.md and intake.report.md into --out, and stop
-  lint    lint a spec before launch (exit 1 while a finding stands)
+  derive  derive a spec from --checkpoint, --goal and an optional --site; write it and its
+          derive.report.md into --out, and stop
 
 spec/INTAKE.md in the workflow's package is the procedure.
 """
@@ -70,13 +64,7 @@ def derive_main(argv: list[str]) -> int:
             "replace it with the cluster's (session_spool, its sessions, image, mounts)"
         )
     path = derive_mod.write_derivation(args.out, derivation)
-    task = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    report = lint_mod.lint_task(
-        task, checkpoint=args.checkpoint, repo=site["trtllm_repo_path"], base=path.resolve().parent
-    )
-    (args.out / REPORT_FILENAME).write_text(report.render(), encoding="utf-8")
-    print(f"→ {path}\n→ {args.out / derive_mod.REPORT_FILENAME}\n→ {args.out / REPORT_FILENAME}")
-    print(f"lint: {report.summary()}")
+    print(f"→ {path}\n→ {args.out / derive_mod.REPORT_FILENAME}")
     for question in derivation.questions:
         print(f"  open: {question}")
     return 0
@@ -90,10 +78,8 @@ def main(argv: list[str] | None = None) -> int:
     command, rest = argv[0], argv[1:]
     if command == "derive":
         return derive_main(rest)
-    if command == "lint":
-        return lint_mod.main(rest)
     print(USAGE, file=sys.stderr)
     return 2
 
 
-__all__ = ["REPORT_FILENAME", "derive_main", "main"]
+__all__ = ["derive_main", "main"]

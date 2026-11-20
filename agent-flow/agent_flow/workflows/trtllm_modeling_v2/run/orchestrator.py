@@ -11,8 +11,8 @@ Each task's worker runs in a thread of its own, every check on one bounded
 pool, and the planner's turn in a thread beside them, one turn at a time.
 Only the loop's own thread changes the graph or writes it: a planner's
 revision is applied when its turn returns, against the graph as it is by
-then. Work whose shape no planner turn decides (the survey's kernel tasks,
-regression checks) the loop adds itself.
+then. Work whose shape no planner turn decides (the survey's kernel tasks)
+the loop adds itself.
 
 The workflow's services arrive as callables (:class:`Services`), so the loop
 runs under fakes on CPU exactly as it runs under the workflow.
@@ -30,7 +30,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ..agents import decisions as decision_table
 from ..agents.slots import AgentGate, Priority, run_at, turn_priority
@@ -72,15 +72,9 @@ DEFAULT_MAX_PARALLEL_CHECKS = 8
 INFRA_RETRIES = 1
 #: A state write that fails with one of these waits for room instead of ending the run.
 STORAGE_FULL = frozenset({errno.EDQUOT, errno.ENOSPC})
-#: How many stale checks run again, in the contract's order, beside running work each
-#: time the target changes; the rest wait for the graph to run out of work.
-RECHECKS_WHILE_BUSY = 4
 #: How long a task thread waiting on its soft dependencies sleeps between looks,
 #: past the wake-up each recorded outcome gives it.
 SOFT_POLL_S = 5.0
-#: Per workspace, the stop a run this process drives there answers (:func:`stoppable`).
-_STOPS: dict[Path, Future] = {}
-_STOPS_LOCK = threading.Lock()
 
 
 @dataclass
@@ -92,9 +86,6 @@ class PlannerTurn:
     refusals: list[str] = field(default_factory=list)
     #: The state of the target ``evaluation`` was read on.
     marker: str = ""
-    #: Where the regression checks stand: the batch the next one takes, and the
-    #: checks running and waiting. Empty when the run has no shared code to check.
-    regression: str = ""
 
 
 @dataclass
@@ -155,7 +146,7 @@ class Services:
     held_gpus: Callable[[graph_mod.Task], int] = lambda task: task.gpus
     checkpoint: Callable[[], None] = lambda: None
     log: Callable[[str], None] = lambda message: None
-    #: The target's identity now; a verdict recorded under another is stale.
+    #: The target's identity now: the state a verdict is recorded under.
     marker: Callable[[], str] = lambda: ""
     #: The loop has recorded how a task's turn ended (done, failed, abandoned, or pending
     #: again after a failure of the infrastructure): its answer is consumed.
@@ -187,10 +178,6 @@ class Services:
     #: Whether a verdict recorded on another state of the target holds on it as it
     #: is now: what it read of the tree is unchanged.
     holds: Callable[[contract_mod.Verdict], bool] | None = None
-    #: One regression check (no agent turn): run the package tests after its batch of
-    #: changes to shared code and return what failed, one line each (blocking; on the check
-    #: pool). ``None``: a regression check passes with nothing run.
-    regression: Callable[[graph_mod.Task], list[str]] | None = None
 
 
 #: What a ``check`` task ends with once its checks are in; no worker writes it.
@@ -290,15 +277,16 @@ class GraphOrchestrator:
                 "[resume] the tasks running when the last process stopped start again: "
                 + ", ".join(t.id for t in restarted)
             )
-        #: The feature units and variants (their ``ref``), and the core's boot checks: a
-        #: worker's task on one of them starts once any of those checks has passed.
-        refs, boots = after_core
-        self._feature_refs, self._core_boots = frozenset(refs), tuple(boots)
+        #: The feature units and variants (their ``ref``), and the core's checks: a
+        #: worker's task on one of them starts once any of those checks has shown the
+        #: engine answering (it passed, or it is a benchmark that came back with a score).
+        refs, core = after_core
+        self._feature_refs, self._core_checks = frozenset(refs), tuple(core)
         self.revision_cap = revision_cap
         #: How many worker runs one task gets (``graph.apply_revision``).
         self.max_attempts = max(1, max_attempts)
         self.max_parallel = max_parallel
-        #: Checks running at once, across every task and the re-checks of an idle run.
+        #: Checks running at once, across every task and the checks the loop runs itself.
         self.max_parallel_checks = max(1, max_parallel_checks)
         #: How long the loop waits between looks while ready work waits for devices.
         self.poll_s = poll_s
@@ -313,7 +301,6 @@ class GraphOrchestrator:
         #: The checkout a kernel task's files are named from: a multi-rank entry's op matrix.
         self.repo_root = str(repo_root)
         self.validation = {
-            "required_checks": [c.key for c in contract.required()],
             "allowed_paths": tuple(allowed_paths),
             "max_gpus": max_gpus,
             "own_paths": tuple(own_paths),
@@ -341,8 +328,7 @@ class GraphOrchestrator:
             for k, v in (saved.get("not_started_attempts") or {}).items()
         }
         #: Per task whose commits landed on the target, when its latest landing was (in
-        #: seconds since the epoch) and which attempt it was: a failed task's landing joins
-        #: a regression check's batch too, and the planner hears how long the batch waited.
+        #: seconds since the epoch) and which attempt it was.
         self._landings: dict[str, tuple[float, int]] = {
             str(k): (float(v[0]), int(v[1])) for k, v in (saved.get("landings") or {}).items()
         }
@@ -351,6 +337,12 @@ class GraphOrchestrator:
         self._receipts_landed: dict[str, int] = {
             str(k): int(v) for k, v in (saved.get("receipts_landed") or {}).items()
         }
+        #: Checks that were asked for and whose run recorded no verdict (its session
+        #: was lost): each runs again, though an earlier pass of it stands.
+        self._owed: set[str] = {str(k) for k in saved.get("owed") or ()}
+        #: Per owed check, how many times a landing claimed it: a run clears the claims
+        #: made before it started, not one that came while it ran on an earlier tree.
+        self._claims: dict[str, int] = {}
         #: An event that needs the planner's judgement waits: it wakes the planner
         #: at once. What a dead process left unread is read first.
         self._urgent = bool(self.events) or self.unread_reports
@@ -371,11 +363,9 @@ class GraphOrchestrator:
         #: The delivery files that last kept a holding contract from full support, per
         #: marker, as the planner heard them.
         self._files_said: tuple[str, tuple[str, ...]] | None = None
-        #: The target's marker and the landing the last re-checks beside running work
+        #: The target's marker and the landing the last checks beside running work
         #: were chosen on.
         self._rechecked_at: tuple[str, str] | None = None
-        #: Delivery-tier checks rehearsed in this process.
-        self._rehearsed: set[str] = set()
         #: The task threads in flight, by task id, as the loop drives them.
         self._running: dict[str, Future] = {}
         #: Tasks whose work finished but some of whose checks raised: why, until recorded.
@@ -396,7 +386,7 @@ class GraphOrchestrator:
         self._foreground_demand = 0
         #: When each ready task was first seen ready, for the order they start in.
         self._ready_since: dict[str, float] = {}
-        #: Re-checks of an idle run in flight: what the planner is told if one fails, and the checks.
+        #: The loop's own checks in flight: what the planner is told if one fails, and the checks.
         self._settling: tuple[str, list[tuple[str, Future]]] | None = None
         #: The task whose change landed on the target last, in this process, and the
         #: target's marker just after it.
@@ -413,9 +403,6 @@ class GraphOrchestrator:
         #: the task threads waiting on soft dependencies; ``_closing`` once the loop ends.
         self._ended = threading.Condition()
         self._closing = False
-        #: Done once the run is asked to stop (:func:`stoppable`); its result says why.
-        with _STOPS_LOCK:
-            self._stop: Future = _STOPS.get(self.workspace.resolve()) or Future()
 
     def _persist(self, what: str, write: Callable[[], None]) -> None:
         """``write`` now, or, when the filesystem is full, again until it lands."""
@@ -451,6 +438,7 @@ class GraphOrchestrator:
             "not_started_attempts": self.not_started_attempts,
             "landings": {k: list(v) for k, v in self._landings.items()},
             "receipts_landed": self._receipts_landed,
+            "owed": sorted(self._owed),
         }
         write_text_atomic(self.events_path, json.dumps(state, indent=1))
 
@@ -504,37 +492,61 @@ class GraphOrchestrator:
     def _run_check(self, check: contract_mod.Check) -> bool:
         """One check, in a pool thread, recorded under the target as it was when it started.
 
-        A check the contract already counts as passed on this very target (its
-        own verdict, or an equivalent check's) does not run again; that is
-        asked as the check starts, and the target is read then. A check that
+        A check that already passed on this very target does not run again;
+        that is asked as the check
+        starts, and the target is read then. A pass on an earlier state of the
+        target stands for the contract (``contract.evaluate``) and does not
+        stop the check from running here: whoever asks for it has a reason, a
+        task that claims it and has just landed, or the final tree. A check that
         needs another's verdict first (:attr:`Check.after`: a relative
         variant's benchmark, judged against its unit's) has it on this target
         before it starts, the other run here if it has none.
         """
-        first = self._check_by_key(check.after) if check.after else None
-        if first is not None:
-            with self._check_lock(first.key):
-                marker = self.s.marker()
-                with self._status_lock:
-                    had = contract_mod.verdict_on(self.status, first.key, marker, self.s.holds)
-                if had is None:
-                    self._run_check(first)
-        with self._check_lock(check.key):
-            return self._run_check_once(check)
+        try:
+            first = self._check_by_key(check.after) if check.after else None
+            if first is not None:
+                with self._check_lock(first.key):
+                    marker = self.s.marker()
+                    with self._status_lock:
+                        had = contract_mod.verdict_on(self.status, first.key, marker, self.s.holds)
+                    if had is None:
+                        self._run_check(first)
+            with self._check_lock(check.key):
+                return self._run_check_once(check)
+        except Exception:
+            # No verdict (its session was lost): whoever asked, the check is owed
+            # still, whatever an earlier pass of it says.
+            with self._status_lock:
+                self._owed.add(check.key)
+            raise
+
+    def _claim(self, keys: Iterable[str]) -> None:
+        """Owe ``keys`` from a landing on: a run that started before it does not clear them."""
+        with self._status_lock:
+            for key in keys:
+                self._owed.add(key)
+                self._claims[key] = self._claims.get(key, 0) + 1
 
     def _run_check_once(self, check: contract_mod.Check) -> bool:
+        # The claims are read before the target: one that lands after this read is not
+        # answered by a pass on the state read next, nor by the run that follows.
+        with self._status_lock:
+            claims = self._claims.get(check.key, 0)
         marker = self.s.marker()
-        if marker:
-            with self._status_lock:
-                evaluation = contract_mod.evaluate(
-                    self.contract, self.status, marker=marker, holds=self.s.holds
-                )
-            if check.key in {c.key for c in evaluation.passed}:
-                return True
+        with self._status_lock:
+            here = bool(marker) and contract_mod.passed_here(
+                self.contract, self.status, check, marker, self.s.holds
+            )
+            if here and self._claims.get(check.key, 0) == claims:
+                self._owed.discard(check.key)
+        if here:
+            return True
         result = self.s.check(check)
         reads = self.s.narrow(result) if self.s.narrow is not None else ("", "")
         with self._status_lock:
             self.status.record(check.unit, result, marker=marker, inputs=check.inputs, reads=reads)
+            if self._claims.get(check.key, 0) == claims:
+                self._owed.discard(check.key)
         return bool(result.passed)
 
     def _submit_checks(
@@ -553,7 +565,7 @@ class GraphOrchestrator:
         Safe to call from several task threads at once: their checks share one
         bounded pool. Each verdict is recorded under the target as it was when
         its check started: a check that overlapped another task's integration
-        is stale, not wrong.
+        measured the earlier state.
         """
         keys = list(keys)
         if self._check_pool is None:
@@ -565,8 +577,9 @@ class GraphOrchestrator:
     def _run_task(self, task: graph_mod.Task) -> tuple[str, list[str]]:
         """A task's worker, then, in the same thread, the checks it claims.
 
-        The delivery-tier checks it claims wait for the delivery tier, which
-        runs once on the target as it is delivered.
+        The delivery-tier checks it claims wait for the delivery tier. They are
+        owed from here on: an earlier pass of one does not answer for the tree
+        this task left.
         """
         try:
             with turn_priority(self._priority_of(task)):
@@ -576,12 +589,13 @@ class GraphOrchestrator:
         if decision.partition("\n")[0] not in FINISHED:
             return decision, []
         delivery = self._delivery_keys()
+        self._claim(k for k in task.satisfies if k in delivery)
         self._agentless.add(task.id)
         try:
             return decision, self._run_checks(k for k in task.satisfies if k not in delivery)
         except ChecksRaised as exc:
             # The work stands and has landed; only these checks' outcome is unknown.
-            # They are missing on the target, so they run again as re-checks.
+            # They are owed still (:meth:`_run_check`).
             self._inconclusive[task.id] = str(exc)
             return decision, exc.failed
         finally:
@@ -618,7 +632,7 @@ class GraphOrchestrator:
             self._integrated[task_id] = attempt
             task = self.graph.by_id().get(task_id)
             if task is not None:
-                # What landed last: stale checks run again beside the work once per landing.
+                # What landed last: the checks that are due run beside the work once per landing.
                 self._landed, self._landed_marker = task, self.s.marker()
             self._ended.notify_all()
 
@@ -647,9 +661,9 @@ class GraphOrchestrator:
         result = assess(
             evaluation,
             files=missing,
-            unreviewed=self._unreviewed_landings(),
             required_open=self._required_open(),
             unread_reports=self.unread_reports,
+            unconfirmed="" if self._confirmed(marker) else self.contract.confirm,
         )
         said = (marker, tuple(missing))
         if evaluation.holds and missing and said != self._files_said:
@@ -664,8 +678,13 @@ class GraphOrchestrator:
             self._save_events()
         return result
 
+    def _confirmed(self, marker: str) -> bool:
+        """Whether the target as it is was measured before delivery (``contract.confirmed``)."""
+        with self._status_lock:
+            return contract_mod.confirmed(self.contract, self.status, marker, self.s.holds)
+
     def completion(self, files: Sequence[str]) -> Completion:
-        """Final delivery re-evaluates current verdicts, graph and regression coverage."""
+        """Final delivery re-evaluates current verdicts and the graph."""
         return self._completion(*self._evaluated(), files=files)
 
     def _correctness(
@@ -707,23 +726,28 @@ class GraphOrchestrator:
         )
 
     def _waiting_for_core(self) -> set[str]:
-        """The pending feature-unit and variant tasks that build on the core and wait for it to boot.
+        """The pending feature-unit and variant tasks that build on the core and wait for it to run.
 
-        Until a boot of the core passes, a feature's work that builds on the
+        Until a check of the core shows its engine answering, a feature's work that builds on the
         core's code (its task reaches a task claiming a core boot through hard
         or soft dependencies) builds on a target nobody has seen run, and takes
         the slots the core's repair needs. A feature's work with no such edge
         (a test it owes, its processor) starts at once, and kernel and
         investigate tasks are not held: the core's own work needs them.
         """
-        if not self._feature_refs or not self._core_boots:
+        if not self._feature_refs or not self._core_checks:
             return set()
         with self._status_lock:
             latest = self.status.latest()
-        if any(latest[key].passed for key in self._core_boots if key in latest):
+        # The engine answered: a check passed, or a benchmark came back with a score.
+        if any(
+            latest[key].passed or (latest[key].measured is not None and not latest[key].void)
+            for key in self._core_checks
+            if key in latest
+        ):
             return set()
-        boots = set(self._core_boots)
-        core = {t.id for t in self.graph.tasks if boots & set(t.satisfies)}
+        checks = set(self._core_checks)
+        core = {t.id for t in self.graph.tasks if checks & set(t.satisfies)}
         tasks = self.graph.by_id()
         return {
             t.id
@@ -742,82 +766,74 @@ class GraphOrchestrator:
         )
 
     def _settle(self, busy: bool = False) -> None:
-        """Keep the target verified as it changes; then, with no required task open, the delivery tier.
+        """Run the checks that are due with no task to ask for them.
 
-        ``busy``, with work running: each time a change lands, the
-        first :data:`RECHECKS_WHILE_BUSY` stale checks in the contract's order
-        run again beside it, and the delivery tier of a member whose other
-        checks all hold is rehearsed once (:meth:`_rehearsal`). Otherwise every
-        stale check runs again; and once every other required check holds and
-        no required task is open, the delivery tier runs on the
-        target as it is. Both run on the check pool; :meth:`_settled` reads the
-        verdicts once they are all in, and tells the planner what failed.
+        A check that passed stands (``contract.evaluate``), and a task that
+        finishes runs the checks it claims, so what is left is:
 
-        A stale accuracy check runs again at a milestone only: once no required
-        task is open, or for the bring-up before it was named. Until then the
-        cheaper checks of each landing (the boots) stand watch.
+        - a check a finished task claims that has no verdict to stand on: it
+          failed and the target has changed since, or its run recorded none
+          (``_owed``: a run that recorded none is owed even where an earlier
+          pass stands);
+        - once no required task is open, any required check with no pass to
+          stand on (it failed and the target has changed since, or no landing
+          ran it): every required check passes once, whoever claimed it.
+          ``busy``, with foreground work running, these run once per landing;
+          otherwise at once. A benchmark among them waits until no required
+          task is open, unless the bring-up still needs it;
+        - with no required task open and every other required check passed,
+          the delivery tier: its checks with no pass, and those a task that
+          landed since claims;
+        - then, when no benchmark has scored the target as it is, the one check
+          that confirms the final tree (:attr:`~.contract.Contract.confirm`).
+
+        They run on the check pool; :meth:`_settled` reads the verdicts once
+        they are all in, and tells the planner what failed.
         """
+        open_work = self._required_open()
         claimed = {k for t in self.graph.tasks if t.status == "done" for k in t.satisfies}
         delivery = self._delivery_keys()
         marker, evaluation = self._evaluated()
-        stale = [c.key for c in evaluation.missing if c.key in claimed and c.key not in delivery]
-        if self._required_open():
+        with self._status_lock:
+            owed_tier = set(self._owed) & delivery
+            owed = set(self._owed) - delivery
+        if not open_work and self._landings:
+            # Every required check passes once: with the work done, one that has not
+            # (it failed, or no landing ran it) runs on what the work left.
+            claimed = {c.key for c in self.contract.required()}
+        due = [c.key for c in evaluation.missing if c.key in claimed and c.key not in delivery]
+        due += [c.key for c in self.contract.checks if c.key in owed - set(due)]
+        if open_work:
             bringup = (
                 {c.key for c in contract_mod.bringup_checks(self.contract)}
                 if contract_mod.bringup_milestone(self.workspace) is None
                 else set()
             )
-            stale = [k for k in stale if k not in self._accuracy_keys or k in bringup]
-        if busy or (not stale and self._required_open()):
-            keys: list[str] = []
+            due = [k for k in due if k not in self._accuracy_keys or k in bringup]
+        what = "checks that failed before failed again on the current target: "
+        keys: list[str] = []
+        if busy or (not due and open_work):
             # Once per landing the loop knows made the target what it is.
             landed = (marker, self._landed.id if self._landed is not None else "")
             known = self._landed is not None and self._landed_marker == marker
-            if stale and known and landed != self._rechecked_at:
+            if due and known and landed != self._rechecked_at:
                 self._rechecked_at = landed
-                keys = stale[:RECHECKS_WHILE_BUSY]
-            keys += self._rehearsal(evaluation)
-            what = "checks run beside the work in flight failed on the current target: "
+                keys = due
+        elif due:
+            keys = due
         else:
-            what, keys = (
-                "checks that held before failed on the current target: ",
-                stale,
-            )
-            if not stale:
-                # A check that already failed on this very target stays failed until
-                # the target changes; running it again would measure the same thing.
-                missing = {c.key for c in evaluation.missing}
-                failed_here = {c.key for c, _ in evaluation.failed}
-                if not missing or not (missing | failed_here) <= delivery:
-                    return
-                what, keys = "delivery checks failed: ", sorted(missing)
+            # A check that already failed on this very target stays failed until
+            # the target changes; running it again would measure the same thing.
+            missing = {c.key for c in evaluation.missing}
+            failed_here = {c.key for c, _ in evaluation.failed}
+            tier = missing | owed_tier
+            if tier and (missing | failed_here) <= delivery:
+                what, keys = "delivery checks failed: ", sorted(tier)
+            elif evaluation.holds and self.contract.confirm and not self._confirmed(marker):
+                what, keys = "the check of the final tree failed: ", [self.contract.confirm]
         submitted = self._submit_checks(self._check_pool, keys) if keys else []
         if submitted:
             self._settling = (what, submitted)
-
-    def _rehearsal(self, evaluation: contract_mod.Evaluation) -> list[str]:
-        """Delivery-tier checks to rehearse now, each once: those whose member is otherwise green.
-
-        A member whose every other required check passed on the target as it
-        is gets its delivery-tier checks run once, ahead of the final tree,
-        as advisory: a failure reaches the planner, and the final tree runs
-        them again whatever they found.
-        """
-        passed = {c.key for c in evaluation.passed}
-        required = self.contract.required()
-        due = []
-        for check in self.contract.by_tier(contract_mod.TIER_DELIVERY):
-            if check.key in self._rehearsed or check.key in passed:
-                continue
-            before = [
-                c
-                for c in required
-                if c.member == check.member and c.tier != contract_mod.TIER_DELIVERY
-            ]
-            if before and all(c.key in passed for c in before):
-                self._rehearsed.add(check.key)
-                due.append(check.key)
-        return due
 
     def _settled(self) -> None:
         what, submitted = self._settling
@@ -827,7 +843,7 @@ class GraphOrchestrator:
         except ChecksRaised as exc:
             # No verdict was recorded for these: they are still due and run again.
             failed = exc.failed
-            self.s.log(f"[settle] re-checks raised, to run again: {exc}")
+            self.s.log(f"[settle] checks raised, to run again: {exc}")
         if failed:
             self._note(what + ", ".join(failed), urgent=True)
             self._save_events()
@@ -848,7 +864,6 @@ class GraphOrchestrator:
             [event.text for event in self.events],
             list(refusals),
             marker=marker,
-            regression=self._regression_standing(),
         )
         self._planner = pool.submit(run_at, Priority.PLANNER, self.s.plan, turn)
 
@@ -856,8 +871,7 @@ class GraphOrchestrator:
         """Apply what the planner's thread returned; a final answer is the run's verdict.
 
         A refused graph goes back at once, up to :data:`MAX_REFUSALS` turns.
-        An admissible graph is adopted at once, and the regression checks its
-        changes to shared code need are added to it (:meth:`_follow_shared_changes`).
+        An admissible graph is adopted at once.
         The tasks the orchestrator added while the turn ran, which its graph
         could not name, are kept (:meth:`_added_during`). An adopted revision
         answers the events of its turn that it re-planned (:meth:`_drop_answered`).
@@ -1124,7 +1138,7 @@ class GraphOrchestrator:
                     else f"task {task.id} ({task.kind}) {decision}; "
                     + (f"checks failed: {', '.join(failed)}" if failed else "its checks passed")
                     + (
-                        f"; some checks could not run ({unknown}): they run again as re-checks"
+                        f"; some checks could not run ({unknown}): they run again"
                         if unknown
                         else ""
                     ),
@@ -1151,8 +1165,10 @@ class GraphOrchestrator:
         if task.status == "done" or landed or passed > self._passed_seen:
             self.revisions_since_progress = 0
         self._passed_seen = passed
-        self._save_graph()
+        # The events first: they hold the checks still owed, and a process that died
+        # between the two writes must not find the task done and nothing owed.
         self._save_events()
+        self._save_graph()
         self._correctness(marker, evaluation)
         self._persist("state", self.s.checkpoint)
         self.s.finished(task)
@@ -1266,7 +1282,7 @@ class GraphOrchestrator:
         """With no required task open, the pending ``nice_to_have`` tasks that would change the tree.
 
         The run is closing: what is left is checking the target as it is, and
-        a landing now would make every check stale again. They wait for a
+        a landing now would leave the final tree unchecked again. They wait for a
         planner turn to require them or for the run to end.
         """
         if self._required_open():
@@ -1299,26 +1315,10 @@ class GraphOrchestrator:
         devices on the check pool as every check does.
         The future holds what a worker's thread returns, :data:`CHECKED` and
         the keys that failed, once every check is in. Its delivery-tier checks
-        wait for the delivery tier, as any task's do. A regression check runs
-        the package tests instead (``Services.regression``), and what failed is
-        named the same way.
+        wait for the delivery tier, as any task's do.
         """
-        if task.regression:
-            outcome = Future()
-            if self.s.regression is None:
-                outcome.set_result((CHECKED, []))
-                return outcome
-            ran = self._check_pool.submit(self.s.regression, copy.deepcopy(task))
-
-            def tests_in(done: Future) -> None:
-                try:
-                    outcome.set_result((CHECKED, list(done.result())))
-                except Exception as exc:  # no verdict: the loop starts the task again, once
-                    outcome.set_exception(exc)
-
-            ran.add_done_callback(tests_in)
-            return outcome
         delivery = self._delivery_keys()
+        self._claim(k for k in task.satisfies if k in delivery)
         submitted = self._submit_checks(
             self._check_pool, [k for k in task.satisfies if k not in delivery]
         )
@@ -1344,132 +1344,6 @@ class GraphOrchestrator:
         for _, future in submitted:
             future.add_done_callback(one_in)
         return outcome
-
-    # ------------------------------------------------------------- regression
-    def _regression_step(self) -> set[str]:
-        """The ready regression checks to keep waiting; those with nothing to check close.
-
-        Only while the run has shared code to check (its own paths are
-        known). A regression check runs when the gates are idle: while a
-        task that owes contract checks (a check task, or one that ``satisfies``
-        some) runs or is ready to, it waits, so it never holds the devices a
-        gate needs. One regression check runs at a time: while one
-        runs, the others wait and what lands meanwhile joins the next batch.
-        With none running, a check whose batch is empty closes at once
-        (:meth:`_close_reviewed`), and of the rest the one on the longest
-        chain starts.
-        """
-        own = self.validation["own_paths"]
-        if not own:
-            return set()
-        ready_now = graph_mod.ready(self.graph, self._receipts_landed)
-        reviews = [t for t in ready_now if graph_mod.is_regression_check(t)]
-        if not reviews:
-            return set()
-        held = {t.id for t in reviews}
-        if any(
-            t.status == "running" and graph_mod.is_regression_check(t) for t in self.graph.tasks
-        ):
-            return held
-        gating = [
-            t
-            for t in [*ready_now, *(t for t in self.graph.tasks if t.status == "running")]
-            if (t.kind == graph_mod.CHECK_KIND or t.satisfies)
-            and not graph_mod.is_regression_check(t)
-        ]
-        if gating:
-            return held
-        batch = graph_mod.regression_batch(self.graph, own, self._landed_attempts())
-        if not batch:
-            for review in reviews:
-                self._close_reviewed(review)
-            return set()
-        path = graph_mod.critical_path_minutes(self.graph)
-        first = max(reviews, key=lambda t: path.get(t.id, 0))  # the first of equals, in graph order
-        return held - {first.id}
-
-    def _landed_attempts(self) -> dict[str, int]:
-        """Per task whose commits landed, the attempt that landed them last."""
-        return {tid: attempt for tid, (_, attempt) in self._landings.items()}
-
-    def _record_batch(self, review: graph_mod.Task) -> None:
-        """Record, as a regression check starts, the batch it covers (:attr:`~.graph.Task.covers`)."""
-        own = self.validation["own_paths"]
-        if not own or not graph_mod.is_regression_check(review):
-            return
-        tasks = self.graph.by_id()
-        batch = graph_mod.regression_batch(self.graph, own, self._landed_attempts())
-        review.covers = [graph_mod.landing(tasks[tid]) for tid in batch]
-        self.s.log(
-            f"[regression] {review.id} starts on the changes to shared code landed since the "
-            f"last check: {', '.join(batch) or 'none'}"
-        )
-
-    def _close_reviewed(self, review: graph_mod.Task) -> None:
-        """Close a regression check whose batch is empty: earlier ones covered everything.
-
-        Every change to shared code it follows landed and was covered by a
-        regression check that ran and passed; nothing runs for it.
-        """
-        tasks = self.graph.by_id()
-        follows = {graph_mod.landing(tasks[d]) for d in review.depends_on if d in tasks}
-        by = sorted(
-            t.id
-            for t in self.graph.tasks
-            if graph_mod.is_regression_check(t)
-            and t.status == "done"
-            and set(t.covers or ()) & follows
-        )
-        review.status, review.covers = "done", []
-        covered = f": {', '.join(by)} covered what it follows" if by else ""
-        self._note(
-            f"task {review.id} (regression check) closed: no change to shared code was left "
-            f"for it to check{covered}",
-            outcome=_Outcome(review.id, review.attempts, "done"),
-        )
-        self.revisions_since_progress = 0
-        self._save_graph()
-        self._save_events()
-        self._persist("state", self.s.checkpoint)
-        self.s.finished(review)
-        self._wake_soft_waiters()
-
-    def _regression_standing(self) -> str:
-        """Where the regression checks stand, for the planner; "" without own paths."""
-        own = self.validation["own_paths"]
-        if not own:
-            return ""
-        batch = graph_mod.regression_batch(self.graph, own, self._landed_attempts())
-        reviews = [t for t in self.graph.tasks if graph_mod.is_regression_check(t)]
-        running = [t.id for t in reviews if t.status == "running"]
-        waiting = [t.id for t in reviews if t.status == "pending"]
-        said = []
-        if batch:
-            landed = [self._landings[tid][0] for tid in batch if tid in self._landings]
-            minutes = (time.time() - min(landed)) / 60 if landed else None
-            since = f", the first landed {minutes:.0f} min ago" if minutes is not None else ""
-            said.append(
-                f"Landed changes to shared code no regression check covers yet, the batch the "
-                f"next one takes: {', '.join(batch)}{since}."
-            )
-        else:
-            said.append("Every landed change to shared code is covered by a regression check.")
-        if running:
-            said.append(f"Running: {', '.join(running)}; the others wait for it.")
-        if waiting:
-            said.append(
-                f"Not started: {', '.join(waiting)}. A regression check starts once its "
-                f"dependencies are done and no other runs; one whose batch is empty closes at "
-                f"once. The orchestrator adds and wires them: leave them as they are."
-            )
-        return " ".join(said)
-
-    def _unreviewed_landings(self) -> list[str]:
-        """The landed changes to shared code no regression check covers (none without own paths)."""
-        own = self.validation["own_paths"]
-        if not own:
-            return []
-        return graph_mod.regression_batch(self.graph, own, self._landed_attempts())
 
     def _add_kernel_tasks(self, survey: graph_mod.Task) -> None:
         """One kernel task per queue row of the vocabulary the survey wrote, with no planner turn.
@@ -1544,7 +1418,6 @@ class GraphOrchestrator:
             )
             if self._planner is not None:
                 self._added_in_turn |= {t.id for t in added}
-        shared = [t.id for t in added if graph_mod.shared_touches(t, own)] if own else []
         said = [f"task {survey.id} wrote {len(queue)} vocabulary queue row(s)"]
         if added:
             said.append(
@@ -1556,55 +1429,12 @@ class GraphOrchestrator:
                 f"rows {', '.join(unplaced)} name an entry it could not place (under a target "
                 f"it does not know, or outside the paths the run may change): give them tasks"
             )
-        if shared:
-            self._follow_shared_changes()
-            said.append(
-                f"{', '.join(shared)} change code other models run: a regression check follows them"
-            )
         # What asks the planner for nothing is answered by a revision that holds the tasks.
         self._note("; ".join(said), added=() if unplaced else tuple(t.id for t in added))
 
     def _admission(self) -> dict[str, Any]:
-        """What a planner's graph is validated against; its shared code is the loop's to follow."""
+        """What a planner's graph is validated against."""
         return {k: v for k, v in self.validation.items() if k != "own_paths"}
-
-    def _follow_shared_changes(self) -> None:
-        """Follow every change to shared code with a regression check (:func:`~.graph.add_regression_check`).
-
-        The loop's, not the planner's: a task that changes code other models
-        run is added to the pending regression check, or a new one is added
-        when none is pending. The planner hears of a check it did not write.
-        """
-
-        def wiring() -> list[tuple[str, tuple[str, ...]]]:
-            return [
-                (t.id, tuple(t.depends_on))
-                for t in self.graph.tasks
-                if graph_mod.is_regression_check(t)
-            ]
-
-        before = wiring()
-        added = graph_mod.add_regression_check(self.graph, self.validation["own_paths"])
-        if added is None:
-            if wiring() != before:
-                self._save_graph()
-            return
-        if self._planner is not None:
-            self._added_in_turn.add(added.id)
-        self.graph.revisions.append(
-            graph_mod.Revision(
-                len(self.graph.revisions) + 1,
-                f"orchestrator: {added.id} checks the changes to shared code "
-                f"{', '.join(added.depends_on) or 'that landed'} make",
-            )
-        )
-        self._note(
-            f"the orchestrator added {added.id}, a regression check with no agent turn: once "
-            f"{', '.join(added.depends_on) or 'it can'} land(s), it runs the modeling_v2 package "
-            f"tests on the changed shared code; a failure comes back to you",
-            added=(added.id,),
-        )
-        self._save_graph()
 
     def _timeout(self) -> float | None:
         """How long to wait for something in flight to end before looking again (None: until then)."""
@@ -1628,10 +1458,9 @@ class GraphOrchestrator:
     def run(self) -> str:
         """Drive the run to a verdict: delivered, escalated, ceiling, planner-stalled or planner-refused.
 
-        Or ``stopped: <reason>``, when :func:`stoppable` asked it to stop: it
-        then returns at once, and the turns and checks in flight are left to
-        end on their own. The loop's own failure, or Ctrl-C, records what
-        finished and raises at once, the same way; a resumed run starts them again.
+        The loop's own failure, or Ctrl-C, records what finished and raises at
+        once, and the turns and checks in flight are left to end on their own;
+        a resumed run starts them again.
         """
         checks = ThreadPoolExecutor(
             max_workers=self.max_parallel_checks, thread_name_prefix="mv2-check"
@@ -1656,12 +1485,12 @@ class GraphOrchestrator:
                 with self._ended:
                     self._closing = True
                     self._ended.notify_all()
-                stopped = crashed or self._stop.done()
+                stopped = crashed
                 planner.shutdown(wait=not stopped, cancel_futures=stopped)
                 tasks.shutdown(wait=not stopped, cancel_futures=stopped)
         finally:
             # After the tasks: a task still running submits its checks here.
-            stopped = crashed or self._stop.done()
+            stopped = crashed
             checks.shutdown(wait=not stopped, cancel_futures=stopped)
             self._check_pool = None
 
@@ -1686,12 +1515,9 @@ class GraphOrchestrator:
         # A resumed run whose contract held before it stopped keeps a milestone for it.
         self._correctness(*self._evaluated())
         completion = None
-        if not self.graph.tasks and not self._stop.done():
+        if not self.graph.tasks:
             self._wake_planner(planner)
         while True:
-            if self._stop.done():
-                self.s.log(f"[stop] {self._stop.result()}: nothing more starts")
-                return f"stopped: {self._stop.result()}"
             for tid, future in list(running.items()):
                 if future.done():
                     del running[tid]
@@ -1727,8 +1553,7 @@ class GraphOrchestrator:
             # One agent slot stays free for the planner (agents/slots.py).
             slots = max(AgentGate(self.max_parallel).task_slots - workers, 0)
             self._resumed &= {t.id for t in self.graph.tasks if t.status == "pending"}
-            self._follow_shared_changes()
-            waiting = self._regression_step() | self._closing_holds() | self._waiting_for_core()
+            waiting = self._closing_holds() | self._waiting_for_core()
             ready_now = {t.id for t in graph_mod.ready(self.graph, self._receipts_landed)}
             now = time.monotonic()
             self._ready_since = {tid: self._ready_since.get(tid, now) for tid in ready_now}
@@ -1745,7 +1570,6 @@ class GraphOrchestrator:
                 t for t in chosen if t.kind != graph_mod.CHECK_KIND
             ][:slots]
             for task in started:
-                self._record_batch(task)
                 task.status = "running"
                 self._resumed.discard(task.id)
                 if task.kind == graph_mod.CHECK_KIND:
@@ -1765,9 +1589,9 @@ class GraphOrchestrator:
                     ]
                 )
             )
-            # The target is kept verified as it changes: beside running work the
-            # riskiest stale checks and the delivery rehearsals, and once nothing
-            # runs the rest.
+            # What is due with no task to ask for it: a failed check once the target
+            # has changed, a check whose run was lost, and, once no required task is
+            # open, the delivery tier and the check of the final tree.
             if self._settling is None:
                 self._settle(busy=bool(running))
             spent = not running and self._settling is None and self._planner is None
@@ -1776,20 +1600,12 @@ class GraphOrchestrator:
                 holds = evaluation.holds and not self._required_open()
                 completion = self._completion(marker, evaluation)
                 self._correctness(marker, evaluation, completion)
-                unreviewed, gaps = completion.unreviewed, completion.gaps
+                gaps = completion.gaps
                 # A message the operator left is read before the run is delivered.
                 if completion.ready and not self._operator_waiting():
                     return "delivered"
                 # Standing complaints wake no turn while an escalation waits on the operator.
-                if unreviewed and not self._escalated:
-                    self.revisions_since_progress += 1
-                    self._note(
-                        "every required check holds, but no regression check covers "
-                        f"{', '.join(unreviewed)}, which landed changes to code other models "
-                        "run: the run is not delivered before one has passed",
-                        urgent=True,
-                    )
-                elif self._done_said and not holds:
+                if self._done_said and not holds:
                     self.revisions_since_progress += 1
                     self._note(
                         "planner said DONE, but the contract does not hold:\n"
@@ -1811,7 +1627,7 @@ class GraphOrchestrator:
                     # Ready work that cannot start with nothing running never will.
                     before_core = self._waiting_for_core()
                     reasons = ", ".join(
-                        f"{t.id} (waits for a core boot to pass)"
+                        f"{t.id} (waits for a check of the core to show it answering)"
                         if t.id in before_core
                         else f"{t.id} ({self._held(t)} GPUs)"
                         for t in blocked
@@ -1848,19 +1664,22 @@ class GraphOrchestrator:
             self._wait(running, self._timeout())
 
     def _wait(self, running: dict[str, Future], timeout: float | None) -> None:
-        """Until something in flight ends, the run is stopped, or ``timeout`` passes.
+        """Until something in flight ends or ``timeout`` passes.
 
         A bounded wait lets pending interpreter signals run during long turns.
         """
         in_flight = self._in_flight(running)
         timeout = self.poll_s if timeout is None else min(timeout, self.poll_s)
-        wait([*in_flight, self._stop], timeout=timeout, return_when=FIRST_COMPLETED)
+        if in_flight:
+            wait(in_flight, timeout=timeout, return_when=FIRST_COMPLETED)
+        else:
+            time.sleep(timeout)
 
     def _in_flight(self, running: dict[str, Future]) -> list[Future]:
-        """The tasks, re-checks and planner turn in flight, as futures to wait on.
+        """The tasks, the loop's own checks and the planner turn in flight, as futures to wait on.
 
         A task or planner turn that ended since the loop looked
-        ends the wait at once, and is recorded. A batch of re-checks is read
+        ends the wait at once, and is recorded. A batch of checks is read
         once all of it is in, so until then only its members still out are
         waited on: one already in would end every wait at once.
         """
@@ -1911,18 +1730,6 @@ def _kernel_task_id(item: vocab_mod.QueueItem, taken: Iterable[str]) -> str:
 
 def _check_task_event(task: graph_mod.Task, failed: Sequence[str]) -> str:
     """What the planner hears of a ``check`` task: its checks ran, with no agent turn."""
-    if task.regression:
-        said = (
-            f"task {task.id} (regression check) ran the package tests after the changes to "
-            f"shared code it covers ({', '.join(task.covers or ()) or 'none'})"
-        )
-        if not failed:
-            return f"{said}; they passed"
-        return (
-            f"{said}; what failed: {'; '.join(failed)}. No agent has looked: an `investigate` "
-            "task finds why; a fix that changes shared code is followed by the next regression "
-            "check, or retry this one (`status: pending`) once what it ran on has changed"
-        )
     said = f"task {task.id} (check) ran its checks with no agent turn"
     if not failed:
         return f"{said}; they passed"
@@ -1959,35 +1766,6 @@ def _answered(
     )
 
 
-@contextlib.contextmanager
-def stoppable(workspace: Path | str) -> Iterator[Callable[[str], None]]:
-    """While open, the callable it yields stops the run this process drives on ``workspace``.
-
-    Called with the reason, from any thread, it makes the loop start nothing
-    more and return ``stopped: <reason>`` at once; the turns and checks in
-    flight are left to end on their own and their outcomes are never read. A
-    loop that starts after it was called stops as it starts. For what runs
-    beside the run's first turns and can find the run cannot go on, such as
-    preflight's substrate gate.
-    """
-    key = Path(workspace).resolve()
-    stopped: Future = Future()
-
-    def stop(reason: str) -> None:
-        with _STOPS_LOCK:
-            if not stopped.done():
-                stopped.set_result(reason)
-
-    with _STOPS_LOCK:
-        _STOPS[key] = stopped
-    try:
-        yield stop
-    finally:
-        with _STOPS_LOCK:
-            if _STOPS.get(key) is stopped:
-                del _STOPS[key]
-
-
 __all__ = [
     "CEILING",
     "CHECKED",
@@ -2001,5 +1779,4 @@ __all__ = [
     "PlannerTurn",
     "Services",
     "seed",
-    "stoppable",
 ]
