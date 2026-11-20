@@ -2866,22 +2866,43 @@ class KvCacheCreator:
             and DFLASH_FOLDED_DECODE_LOWERING in lowerings())
 
     def _check_shared_draft_kv_request(self) -> None:
-        """Fail at startup when TRTLLM_DISAGG_SHARED_DRAFT_KV=1 cannot be honored."""
-        if (not self._is_disagg or get_shared_draft_kv_setting() != "1"
-                or self._speculative_config is None
-                or self._unified_drafter_attention_backend() is None):
+        """Fail when required sharing is impossible or a local schedule alone disables automatic sharing."""
+        if not self._is_disagg:
             return
-        blocker = self._dflash_unify_blocker()
-        if blocker is not None:
-            raise ValueError(
-                "TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires the target and draft "
-                f"KV layers to share one KV cache manager, but {blocker}.")
+        setting = get_shared_draft_kv_setting()
+        spec = self._speculative_config
+        if setting == "0" or spec is None or self._unified_drafter_attention_backend(
+        ) is None:
+            return
+        if setting == "1":
+            blocker = self._dflash_unify_blocker()
+            if blocker is not None:
+                raise ValueError(
+                    "TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires the target and draft "
+                    f"KV layers to share one KV cache manager, but {blocker}.")
+        elif (
+                spec.spec_dec_mode.is_dflash()
+                and spec.draft_len_schedule is not None and
+            (setting == "auto" or self._kv_cache_manager_hosts_draft_layers())):
+            # A peer without this schedule would share if the layout is otherwise eligible.
+            blocker, _ = self._dflash_unify_blocker_and_scope(
+                ignore_draft_schedule=True)
+            if blocker is None:
+                raise ValueError(
+                    "DFlash draft_len_schedule prevents sharing draft KV with the other "
+                    "disaggregated worker. Set TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on both "
+                    "workers to use private KV, or remove the schedule (including one "
+                    "derived from max_concurrency) and set TRTLLM_DISAGG_SHARED_DRAFT_KV=1 "
+                    "on both workers to require sharing.")
 
     def _dflash_unify_blocker(self) -> Optional[str]:
         """The reason target and drafter layers cannot share one manager, or None."""
         return self._dflash_unify_blocker_and_scope()[0]
 
-    def _dflash_unify_blocker_and_scope(self) -> tuple[Optional[str], bool]:
+    def _dflash_unify_blocker_and_scope(
+            self,
+            *,
+            ignore_draft_schedule: bool = False) -> tuple[Optional[str], bool]:
         """The unify blocker, and whether a worker-local setting causes it.
 
         For a manager hosting draft layers, settings every disaggregated worker
@@ -2892,14 +2913,16 @@ class KvCacheCreator:
         """
         hosts_draft_layers = self._kv_cache_manager_hosts_draft_layers()
         blocker = self._dflash_shared_unify_blocker(
-            defer_worker_local=hosts_draft_layers)
+            defer_worker_local=hosts_draft_layers,
+            ignore_draft_schedule=ignore_draft_schedule)
         if blocker is not None or not hosts_draft_layers:
             return blocker, False
         blocker = self._hosting_worker_local_blocker()
         return blocker, blocker is not None
 
-    def _dflash_shared_unify_blocker(self, *,
-                                     defer_worker_local: bool) -> Optional[str]:
+    def _dflash_shared_unify_blocker(
+            self, *, defer_worker_local: bool,
+            ignore_draft_schedule: bool) -> Optional[str]:
         """The unify blocker, skipping worker-local settings if deferred."""
         spec_config = self._speculative_config
         if spec_config is None:
@@ -2923,7 +2946,7 @@ class KvCacheCreator:
                     f"tokens_per_block={self._tokens_per_block}")
         if not spec_config._allow_separate_draft_kv_cache:
             return "a separate draft KV cache is not allowed for this configuration"
-        if spec_config.draft_len_schedule is not None:
+        if not ignore_draft_schedule and spec_config.draft_len_schedule is not None:
             return "draft_len_schedule is set"
         if self._draft_config is None:
             return "there is no draft model config"

@@ -3184,9 +3184,11 @@ def _drafter_reads_helix_sharded_context(
     return decoding_type == "DSpark" and attention_backend == "CUTEDSL"
 
 
-def _shared_draft_kv_blocker(server_configs: list[CtxGenServerConfig],
-                             *,
-                             check_attention_tp: bool = True) -> Optional[str]:
+def _shared_draft_kv_blocker(
+        server_configs: list[CtxGenServerConfig],
+        *,
+        check_attention_tp: bool = True,
+        defer_dflash_schedule: bool = False) -> Optional[str]:
     """What keeps the context and generation servers from sharing draft KV, or None.
 
     A config may list only one side: a DWDP context MPI world launches its
@@ -3225,8 +3227,10 @@ def _shared_draft_kv_blocker(server_configs: list[CtxGenServerConfig],
             return ("speculative_config to be DFlash with attention_backend "
                     "TRTLLM, or DSpark with attention_backend AUTO, TRTLLM "
                     "or CUTEDSL, in both sections")
-        if (spec.get("draft_len_schedule") is not None
-                or spec.get("max_concurrency") is not None):
+        if (not (defer_dflash_schedule
+                 and spec.get("decoding_type") == "DFlash")
+                and (spec.get("draft_len_schedule") is not None
+                     or spec.get("max_concurrency") is not None)):
             return "draft_len_schedule and max_concurrency to be unset in both sections"
         if str(cfg.other_args.get("attn_backend",
                                   "TRTLLM")).upper() != "TRTLLM":
@@ -3329,7 +3333,13 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
 
-    blocker = _shared_draft_kv_blocker(disagg_cfg.server_configs)
+    sides = {cfg.type for cfg in disagg_cfg.server_configs}
+    # A one-sided launch cannot choose private KV for its peer. With the
+    # setting unset, let the worker check the schedule against its actual manager.
+    blocker = _shared_draft_kv_blocker(
+        disagg_cfg.server_configs,
+        defer_dflash_schedule=shared_draft_kv is None
+        and sides != {"ctx", "gen"})
     if blocker is not None and shared_draft_kv == "1":
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
@@ -3338,7 +3348,6 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     # other managers keep a separate draft KV cache. That holds when the sides
     # differ only in attention TP, and for a one-sided config, whose other side
     # is launched separately and decides the same way.
-    sides = {cfg.type for cfg in disagg_cfg.server_configs}
     attention_tp_only = (blocker == _ATTENTION_TP_MISMATCH
                          and sides == {"ctx", "gen"}
                          and _shared_draft_kv_blocker(

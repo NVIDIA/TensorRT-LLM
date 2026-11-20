@@ -150,12 +150,15 @@ def _configure_manager_creation(creator, monkeypatch):
     "setting, restriction, role, disagg, estimating, shared, warning_reason",
     [
         ("auto", None, "generation", True, False, True, None),
-        ("auto", "schedule", "generation", True, False, False, "draft_len_schedule is set"),
+        ("auto", "schedule", "generation", True, False, None, None),
+        ("0", "schedule", "generation", True, False, False, "draft_len_schedule is set"),
+        (None, "schedule", "generation", True, False, False, "draft_len_schedule is set"),
+        ("auto", "schedule_and_pp", "generation", True, False, False, "draft_len_schedule is set"),
         ("auto", "page_size", "generation", True, False, False, "tokens_per_block=128"),
         ("0", None, "gen0", True, False, False, "TRTLLM_DISAGG_SHARED_DRAFT_KV='0'"),
         (None, None, None, True, False, False, "requires opting in"),
-        ("auto", "schedule", "context", True, False, False, None),
-        ("auto", "schedule", "generation", True, True, False, None),
+        ("auto", "schedule", "context", True, False, None, None),
+        ("auto", "schedule", "generation", True, True, None, None),
         ("auto", "schedule", None, False, False, False, None),
         ("1", "schedule", "generation", True, False, None, None),
     ],
@@ -174,7 +177,9 @@ def test_dflash_private_kv_warning_follows_allocated_layout(
     layout.is_generation = True
     creator = _creator(is_disagg=disagg, target=layout, draft=layout)
     spec = creator._speculative_config
-    if restriction == "schedule":
+    if restriction == "schedule_and_pp":
+        creator._mapping.pp_size = 2
+    if restriction in ("schedule", "schedule_and_pp"):
         spec.draft_len_schedule = {4: 2}
     spec.max_draft_len = 2
     spec._use_shared_kv_cache = False
@@ -189,7 +194,12 @@ def test_dflash_private_kv_warning_follows_allocated_layout(
     monkeypatch.setattr(_util.logger, "warning_once", warn_once)
 
     if shared is None:
-        with pytest.raises(ValueError, match="requires.*draft_len_schedule"):
+        error = (
+            "requires.*draft_len_schedule"
+            if setting == "1"
+            else "draft_len_schedule.*TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on both.*TRTLLM_DISAGG_SHARED_DRAFT_KV=1"
+        )
+        with pytest.raises(ValueError, match=error):
             creator._create_kv_cache_manager(estimating_kv_cache=estimating)
         allocate.assert_not_called()
     else:
@@ -912,9 +922,43 @@ def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
         assert not creator._should_unify_dflash_kv_cache()
 
 
+def test_independent_workers_with_schedule_only_on_generation(monkeypatch):
+    # This manager shares eligible draft layers by default even without the env setting.
+    class HostingManager(KVCacheManagerV2):
+        hosts_unified_draft_layers = True
+
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=8, head_dim=128)
+    draft.pretrained_config.sliding_window = 128
+    ctx, gen = (
+        _creator(is_disagg=True, target=target, draft=draft, draft_windows=[128]) for _ in range(2)
+    )
+    for worker in (ctx, gen):
+        worker._kv_cache_manager_cls = HostingManager
+        worker._kv_cache_config.max_attention_window = [1024]
+        worker._sparse_attention_config = None
+    gen._speculative_config.draft_len_schedule = {1: 7, 8: 3}
+    ctx._check_shared_draft_kv_request()
+    assert ctx._should_unify_dflash_kv_cache()
+    with pytest.raises(ValueError, match="draft_len_schedule.*TRTLLM_DISAGG_SHARED_DRAFT_KV=0"):
+        gen._check_shared_draft_kv_request()
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "0")
+    for worker in (ctx, gen):
+        worker._check_shared_draft_kv_request()
+        assert not worker._should_unify_dflash_kv_cache()
+
+
 @pytest.mark.parametrize("request_mode", [None, "auto"], ids=["unset", "auto"])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"decoding_type": "DSpark", "attention_backend": "TRTLLM"},
+        {"decoding_type": "DFlash", "attention_backend": "TRTLLM", "draft_len_schedule": {1: 7}},
+    ],
+)
 def test_launcher_leaves_a_one_sided_config_to_the_worker_gates(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None, spec: dict
 ) -> None:
     """A context-only config (a DWDP context world) cannot see how generation is launched.
 
@@ -925,7 +969,6 @@ def test_launcher_leaves_a_one_sided_config_to_the_worker_gates(
         monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
     else:
         monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
-    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
     with pytest.raises(_StopLauncher):
         _launch_from_disagg_config(monkeypatch, tmp_path, {"speculative_config": spec}, None)
 
