@@ -143,10 +143,12 @@ def _walk(doc: Any, path: str) -> Any:
 
 
 class CheckpointFiles:
-    """The checkpoint's JSON files, read on demand."""
+    """The checkpoint's JSON files, read on demand. ``log`` turns off the warnings
+    about files that disagree."""
 
-    def __init__(self, checkpoint_dir: str) -> None:
+    def __init__(self, checkpoint_dir: str, *, log: bool = True) -> None:
         self._dir = checkpoint_dir
+        self._log = log
         self._docs: dict[str, Any] = {}
 
     def doc(self, file: str) -> Any:
@@ -155,7 +157,10 @@ class CheckpointFiles:
             path = os.path.join(self._dir, file)
             if os.path.exists(path):
                 with open(path) as f:
-                    doc = json.load(f)
+                    try:
+                        doc = json.load(f)
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Cosmos3 config: {path} is not valid JSON: {e}") from e
             self._docs[file] = doc
         return self._docs[file]
 
@@ -194,7 +199,8 @@ class CheckpointFiles:
             )
             if conflict is Conflict.ERROR:
                 raise ValueError(message)
-            logger.warning(message)
+            if self._log:
+                logger.warning(message)
         return replace(winner, disagreeing=tuple(disagreeing))
 
 
@@ -279,15 +285,18 @@ REQUIRED_SETTINGS = ("prompt.use_system_prompt",)
 """Settings some checkpoint file must declare; nothing stands in for them."""
 
 
-def resolve_checkpoint(checkpoint_dir: str) -> Cosmos3CheckpointSettings:
-    """Read the checkpoint's files into a :class:`Cosmos3CheckpointSettings`. Raises on a required
-    setting no file declares, or on a disagreement between files that is an error."""
-    files = CheckpointFiles(checkpoint_dir)
+def resolve_checkpoint(checkpoint_dir: str, *, log: bool = True) -> Cosmos3CheckpointSettings:
+    """Read the checkpoint's files into a :class:`Cosmos3CheckpointSettings`. Raises on a
+    required setting no file declares, or on a disagreement between files that is an
+    error; a disagreement that is not one is logged as a warning unless ``log`` is off."""
+    files = CheckpointFiles(checkpoint_dir, log=log)
     resolved: dict[str, Resolved] = {}
+    keys_of: dict[str, tuple[str, ...]] = {}
 
     def setting(
         name: str, *keys: str, conflict: Conflict = Conflict.IGNORE, default: Any = None
     ) -> None:
+        keys_of[name] = keys
         r = files.read(name, *keys, conflict=conflict) or select(default=default)
         if r is not None:
             resolved[name] = r
@@ -319,7 +328,8 @@ def resolve_checkpoint(checkpoint_dir: str) -> Cosmos3CheckpointSettings:
     for name in REQUIRED_SETTINGS:
         if name not in resolved:
             raise ValueError(
-                f"Cosmos3 config: cannot resolve {name}; no checkpoint file declares it."
+                f"Cosmos3 config: cannot resolve {name}; {checkpoint_dir} declares none of "
+                f"{', '.join(keys_of[name])}."
             )
 
     def get(name: str) -> Any:
@@ -507,7 +517,7 @@ class ParameterResolver:
     ) -> "ParameterResolver":
         """Read the checkpoint's files. Raises on a required setting nothing declares,
         or on a disagreement between files that is an error."""
-        return cls(family, resolve_checkpoint(checkpoint_dir), log=log)
+        return cls(family, resolve_checkpoint(checkpoint_dir, log=log), log=log)
 
     def config(self) -> Cosmos3CheckpointSettings:
         """The checkpoint-level settings, defaults filled where the files are silent."""
@@ -586,9 +596,10 @@ class ParameterResolver:
         if self._log:
             for warning in warnings:
                 logger.warning(warning)
-            logger.debug(
-                "Cosmos3 request fields: " + ", ".join(f"{k} [{v}]" for k, v in origins.items())
-            )
+            if logger.is_debug_enabled():
+                logger.debug(
+                    "Cosmos3 request fields: " + ", ".join(f"{k} [{v}]" for k, v in origins.items())
+                )
         return resolved
 
     def _resolve(self, p: RequestParameters) -> tuple[RequestParameters, list[str], dict[str, str]]:

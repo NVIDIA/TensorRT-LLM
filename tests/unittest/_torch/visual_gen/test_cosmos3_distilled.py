@@ -220,15 +220,31 @@ class TestMalformedRecipeValidation:
     """Only two recipes are valid; everything else must fail at load."""
 
     @pytest.mark.parametrize("broken_fixed_step", [None, {}, {"t_list": []}])
-    def test_required_sigmas_missing_raises(self, broken_fixed_step):
+    def test_required_sigmas_missing_raises(self, tmp_path, broken_fixed_step):
+        """Through the checkpoint files: every shape of a missing ``t_list`` resolves to
+        no fixed sigmas, which a scheduler that requires them rejects at load."""
         config = {k: v for k, v in DISTILLED_SCHEDULER_CONFIG.items()}
         config.pop("fixed_step_sampler_config")
         if broken_fixed_step is not None:
             config["fixed_step_sampler_config"] = broken_fixed_step
-        scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
+        _write_scheduler_config(tmp_path, config)
+        _write_trained_config(tmp_path, False)
+        pipeline = _bare_pipeline(resolver=None)
+        pipeline._read_checkpoint_settings(str(tmp_path))
+        assert pipeline.resolver.config().sampling.fixed_sigmas is None
 
         with pytest.raises(ValueError, match="fixed_step_requires_explicit_sigmas"):
-            Cosmos3SamplingPolicy.from_scheduler(scheduler)
+            pipeline.load_standard_components(
+                str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
+            )
+
+    def test_diffusers_retains_unexpected_config_keys(self):
+        """Canary: the policy reads keys diffusers does not know from ``scheduler.config``.
+        If an upgrade drops unknown keys, the malformed-recipe checks stop firing."""
+        scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_SCHEDULER_CONFIG)
+        assert scheduler.config.fixed_step_requires_explicit_sigmas is True
+        assert scheduler.config.fixed_step_sampler_config["sample_type"] == "sde"
+        assert scheduler.config.stochastic_sampling is True
 
     def test_t_list_on_unipc_raises(self):
         """UniPC cannot honor the distilled policy (no seeded step noise,

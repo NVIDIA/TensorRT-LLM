@@ -1857,17 +1857,19 @@ class TestEdgeCheckpoint:
         assert edge_pipeline.transformer.recipe is NEMOTRON_DENSE_RECIPE
         assert edge_pipeline.use_native_flow_schedule is True
         assert edge_pipeline.sampling.native_flow_schedule is True
-        # Both modes run at the Edge override shift on the native flow schedule, so
-        # they resolve to the same recipe and share one cached scheduler rather than
-        # building two identical ones.
-        shift = edge_pipeline.resolver.flow_shift().value
-        assert shift == 3.0
-        schedulers = {
-            mode: edge_pipeline._scheduler_for(_native_flow_schedule(shift))
+        # Both modes resolve to the Edge override shift on the native flow schedule, so
+        # they share one cached scheduler rather than building two identical ones.
+        shifts = {
+            mode: edge_pipeline.resolver.request(RequestParameters(mode=mode)).flow_shift
             for mode in ("video", "image")
         }
+        assert shifts == {"video": 3.0, "image": 3.0}
+        schedulers = {
+            mode: edge_pipeline._scheduler_for(_native_flow_schedule(shift))
+            for mode, shift in shifts.items()
+        }
         for scheduler in schedulers.values():
-            assert float(scheduler.config.flow_shift) == shift
+            assert float(scheduler.config.flow_shift) == 3.0
             assert scheduler.config.use_karras_sigmas is False
         assert schedulers["video"] is schedulers["image"]
 

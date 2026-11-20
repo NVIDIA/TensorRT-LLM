@@ -111,6 +111,22 @@ class TestCheckpointFiles:
         ignored = files.read("a", *keys)
         assert ignored.value == 1 and ignored.disagreeing == ("model_index.json:a=2",)
 
+    @pytest.mark.parametrize("log", [True, False])
+    def test_disagreement_warning_follows_the_log_flag(self, tmp_path, monkeypatch, log):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3 import parameter_resolver
+
+        messages = []
+        monkeypatch.setattr(parameter_resolver.logger, "warning", messages.append)
+        write_checkpoint_files(tmp_path, {CONFIG_FILE: {"a": 1}, MODEL_INDEX_FILE: {"a": 2}})
+        files = CheckpointFiles(str(tmp_path), log=log)
+        files.read("a", f"{CONFIG_FILE}:a", f"{MODEL_INDEX_FILE}:a", conflict=Conflict.WARN)
+        assert len(messages) == (1 if log else 0)
+
+    def test_invalid_json_names_the_file(self, tmp_path):
+        (tmp_path / CONFIG_FILE).write_text("{not json")
+        with pytest.raises(ValueError, match=r"config\.json is not valid JSON"):
+            CheckpointFiles(str(tmp_path)).value(f"{CONFIG_FILE}:a")
+
 
 def _files() -> dict[str, dict]:
     """A distilled checkpoint whose training config and diffusers index disagree on
@@ -170,8 +186,10 @@ class TestCheckpoint:
         files = _files()
         del files[CONFIG_FILE]["model"]["config"]["vlm_config"]["use_system_prompt"]
         del files[MODEL_INDEX_FILE]["default_use_system_prompt"]
-        with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt"):
+        with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt") as error:
             _resolve(tmp_path, files)
+        assert "config.json:model.config.vlm_config.use_system_prompt" in str(error.value)
+        assert "model_index.json:default_use_system_prompt" in str(error.value)
 
     def test_vae_spatial_compression_is_optional(self, tmp_path):
         files = _files()
@@ -207,17 +225,17 @@ EXPECTED_DISAGREEMENTS = {
 }
 
 EXPECTED = {
-    # repo: (use_system_prompt, native_flow_schedule, distilled)
-    "nvidia/Cosmos3-Nano": (False, False, False),
-    "nvidia/Cosmos3-Super": (False, False, False),
-    "nvidia/Cosmos3-Edge": (False, True, False),
-    "nvidia/Cosmos3-Super-Image2Video": (False, False, False),
-    "nvidia/Cosmos3-Super-Image2Video-4Step": (False, False, True),
-    "nvidia/Cosmos3-Super-Text2Image": (False, False, False),
-    "nvidia/Cosmos3-Super-Text2Image-4Step": (False, False, True),
-    "nvidia/Cosmos3-Nano-Policy-DROID": (False, False, False),
-    "nvidia/Cosmos3-Edge-Policy-DROID": (False, True, False),
-    "nvidia/Cosmos3-Nano-Sim-Bimanual": (False, False, True),
+    # repo: (use_system_prompt, native_flow_schedule, distilled, scheduler flow_shift)
+    "nvidia/Cosmos3-Nano": (False, False, False, 1.0),
+    "nvidia/Cosmos3-Super": (False, False, False, 1.0),
+    "nvidia/Cosmos3-Edge": (False, True, False, 1.0),
+    "nvidia/Cosmos3-Super-Image2Video": (False, False, False, 1.0),
+    "nvidia/Cosmos3-Super-Image2Video-4Step": (False, False, True, None),
+    "nvidia/Cosmos3-Super-Text2Image": (False, False, False, 3.0),
+    "nvidia/Cosmos3-Super-Text2Image-4Step": (False, False, True, None),
+    "nvidia/Cosmos3-Nano-Policy-DROID": (False, False, False, 1.0),
+    "nvidia/Cosmos3-Edge-Policy-DROID": (False, True, False, 5.0),
+    "nvidia/Cosmos3-Nano-Sim-Bimanual": (False, False, True, None),
 }
 
 
@@ -225,10 +243,11 @@ EXPECTED = {
 def test_published_checkpoint_resolves(tmp_path, repo):
     files = json.loads(FIXTURE.read_text())[repo]
     cfg = _resolve(tmp_path, files)
-    system_prompt, native, distilled = EXPECTED[repo]
+    system_prompt, native, distilled, flow_shift = EXPECTED[repo]
     assert cfg.prompt.use_system_prompt is system_prompt
     assert cfg.sampling.native_flow_schedule is native
     assert (cfg.sampling.fixed_sigmas is not None) is distilled
+    assert cfg.sampling.flow_shift == flow_shift
     assert (cfg.vae.temporal_compression, cfg.vae.spatial_compression) == (4, 16)
     disagreeing = {name for name, r in cfg.resolved.items() if r.disagreeing}
     assert disagreeing == EXPECTED_DISAGREEMENTS.get(repo, set())

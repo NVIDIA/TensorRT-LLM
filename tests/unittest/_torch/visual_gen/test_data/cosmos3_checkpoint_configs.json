@@ -4,6 +4,9 @@
       "default_use_system_prompt": false,
       "use_native_flow_schedule": true
     },
+    "scheduler/scheduler_config.json": {
+      "flow_shift": 1.0
+    },
     "transformer/config.json": {
       "temporal_compression_factor": 4
     },
@@ -33,6 +36,9 @@
       "default_use_system_prompt": false,
       "use_native_flow_schedule": true
     },
+    "scheduler/scheduler_config.json": {
+      "flow_shift": 5.0
+    },
     "transformer/config.json": {
       "temporal_compression_factor": 4
     },
@@ -50,6 +56,9 @@
           }
         }
       }
+    },
+    "scheduler/scheduler_config.json": {
+      "flow_shift": 1.0
     },
     "transformer/config.json": {
       "position_embedding_type": "unified_3d_mrope",
@@ -70,6 +79,9 @@
           }
         }
       }
+    },
+    "scheduler/scheduler_config.json": {
+      "flow_shift": 1.0
     },
     "transformer/config.json": {
       "position_embedding_type": "unified_3d_mrope",
@@ -123,6 +135,9 @@
         }
       }
     },
+    "scheduler/scheduler_config.json": {
+      "flow_shift": 1.0
+    },
     "transformer/config.json": {
       "position_embedding_type": "unified_3d_mrope",
       "max_position_embeddings": 262144,
@@ -142,6 +157,9 @@
           }
         }
       }
+    },
+    "scheduler/scheduler_config.json": {
+      "flow_shift": 1.0
     },
     "transformer/config.json": {
       "position_embedding_type": "unified_3d_mrope",
@@ -187,6 +205,9 @@
           }
         }
       }
+    },
+    "scheduler/scheduler_config.json": {
+      "flow_shift": 3.0
     },
     "transformer/config.json": {
       "position_embedding_type": "unified_3d_mrope",
