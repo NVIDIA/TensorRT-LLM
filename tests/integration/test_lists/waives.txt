@@ -180,7 +180,6 @@ unittest/_torch/disaggregation/test_context_cancellation_executor.py::test_contr
 unittest/_torch/disaggregation/test_context_cancellation_executor.py::test_control_drain_delivers_accumulated_and_live_aborts_on_every_rank[None-True] SKIP (https://nvbugs/7118311)
 unittest/_torch/misc/test_guided_decoder_errors.py::test_executor_loop_fails_the_request_once_its_batch_is_synchronized SKIP (https://nvbugs/7068781)
 unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py::test_inforward_split SKIP (https://nvbugs/7117673)
-unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_weight_shards.py::test_load_unscaled_bf16_ngram_table[True] SKIP (https://nvbugs/7120584)
 unittest/_torch/moe/test_dynamic_eplb_contracts.py::test_on_autotune_builds_balanced_powerlaw_input SKIP (https://nvbugs/7034332)
 unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py::DecoderInputPreparerTestCase::test_prepare_inputs_with_helix_parallelism SKIP (https://nvbugs/6818710)
 unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_only_enables_multimodal_keys_when_needed[dense-encoder_disable_noop] SKIP (https://nvbugs/6818710)
