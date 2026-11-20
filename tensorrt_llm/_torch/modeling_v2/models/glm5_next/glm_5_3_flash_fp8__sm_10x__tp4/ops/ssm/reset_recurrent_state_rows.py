@@ -54,7 +54,7 @@ class ResetRecurrentStateRows(OpWrapper):
         has_initial_states: bool ``[N]``; a request with True keeps its row.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # GLM-5.3-Flash's KDA at TP4 (16 of 64 heads, K = V = 128), on pools whose slot stride is a whole per-slot
     # record, as the hybrid cache manager lays them out. The shapes the shipped target resets are in this entry's
     # test.

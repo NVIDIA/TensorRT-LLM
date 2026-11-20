@@ -17,7 +17,8 @@ from _glm53_mhc_inputs import block_output, coefficients, generator, streams  # 
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() != 100, reason="the glm5_next fp8 tp4 entries are certified on sm_100"
+    get_sm_version() not in (100, 103),
+    reason="the glm5_next fp8 tp4 entries are certified on sm_100 and sm_103",
 )
 
 

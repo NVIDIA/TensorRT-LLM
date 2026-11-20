@@ -38,7 +38,7 @@ class KdaPrefillConv(OpWrapper):
         ``(q, k, v)``, new contiguous bf16 ``[1, T, H, 128]`` tensors, unnormalized.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # GLM-5.3-Flash's KDA at TP4: 16 of 64 heads, 3D = 6144 channels. The op's own edges; the prefill steps the
     # shipped target runs are in this entry's test.
     CELLS: tuple[Cell, ...] = (

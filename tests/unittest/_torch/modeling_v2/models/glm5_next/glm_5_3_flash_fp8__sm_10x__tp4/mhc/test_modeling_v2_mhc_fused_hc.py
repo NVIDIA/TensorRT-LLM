@@ -40,7 +40,8 @@ from _glm53_mhc_inputs import (  # noqa: E402
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() != 100, reason="the glm5_next fp8 tp4 entries are certified on sm_100"
+    get_sm_version() not in (100, 103),
+    reason="the glm5_next fp8 tp4 entries are certified on sm_100 and sm_103",
 )
 
 #: Absolute band of the FP32 coefficients; see `_compare`.

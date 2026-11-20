@@ -47,7 +47,7 @@ class DecodeMoe(OpWrapper):
     Returns BF16 ``[M, H]``.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # GLM-5.3-Flash at moe_tp4: hidden 4096, intermediate 2048 / 4 = 512, 288 experts.
     CELLS: tuple[Cell, ...] = (

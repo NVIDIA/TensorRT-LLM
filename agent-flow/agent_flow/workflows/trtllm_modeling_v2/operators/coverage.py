@@ -137,29 +137,73 @@ def variant_target(target: str, site: str) -> str:
     return f"{MODEL_OPS_DIRNAME}/{category}/{name}{VARIANT_SEPARATOR}{site}"
 
 
+def collected_test_names(name: str) -> tuple[str, str]:
+    """The ordinary and multi-rank collected entry points for an op."""
+    return (f"test_modeling_v2_{name}.py", f"test_modeling_v2_{name}{OP_MATRIX_SUFFIX}.py")
+
+
+def shared_test_dirs(category: str) -> tuple[str, ...]:
+    """Preferred and compatible test directories for a shared category."""
+    base = f"{CATALOG_TESTS_DIR}/{category}"
+    return (f"{base}/ops", base) if category == "moe" else (base,)
+
+
 def _is_op_matrix(tests_dir: str, name: str, repo_root: Path | str | None) -> bool:
     if repo_root is None:
         return False
     folder = Path(repo_root) / tests_dir
-    return (
-        not (folder / f"test_modeling_v2_{name}.py").is_file()
-        and (folder / f"test_modeling_v2_{name}{OP_MATRIX_SUFFIX}.py").is_file()
-    )
+    ordinary, matrix = collected_test_names(name)
+    return not (folder / ordinary).is_file() and (folder / matrix).is_file()
 
 
 def _test_files(tests_dir: str, name: str, op_matrix: bool) -> tuple[str, ...]:
+    ordinary, matrix = collected_test_names(name)
     if not op_matrix:
-        return (f"{tests_dir}/test_modeling_v2_{name}.py",)
+        return (f"{tests_dir}/{ordinary}",)
     return (
-        f"{tests_dir}/test_modeling_v2_{name}{OP_MATRIX_SUFFIX}.py",
+        f"{tests_dir}/{matrix}",
         f"{tests_dir}/_{name}{OP_MATRIX_SUFFIX}.py",
     )
+
+
+def entry_tests_dir(
+    category: str,
+    name: str,
+    repo_root: Path | str | None = None,
+    *,
+    owner_rel: str = "",
+) -> str:
+    """Locate one entry's collected tests in its mirrored or category-only layout.
+
+    Family and target entries mirror ``ops/<category>``; shared MoE entries
+    use ``moe/ops``. Both layouts can coexist, so resolve each entry by its
+    collected test file first. New MoE entries always use the preferred layout.
+    Other new entries can use an existing candidate directory to follow that
+    component's current CI layout; when neither exists, use the preferred layout.
+    """
+    if owner_rel:
+        base = model_ops_tests_dir(owner_rel)
+        candidates = (f"{base}/ops/{category}", f"{base}/{category}")
+    else:
+        candidates = shared_test_dirs(category)
+    if repo_root is not None:
+        for directory in candidates:
+            if any(
+                (Path(repo_root) / directory / filename).is_file()
+                for filename in collected_test_names(name)
+            ):
+                return directory
+        if category != "moe":
+            for directory in candidates:
+                if (Path(repo_root) / directory).is_dir():
+                    return directory
+    return candidates[0]
 
 
 def shared_entry_paths(target: str, repo_root: Path | str | None = None) -> tuple[str, ...]:
     """A shared entry ``<category>/<name>``'s module and its GPU test files, repo-relative."""
     category, name = target.strip().strip("/").split("/")
-    tests = f"{CATALOG_TESTS_DIR}/{category}"
+    tests = entry_tests_dir(category, name, repo_root)
     return (
         f"{CATALOG_DIR}/{category}/{name}.py",
         *_test_files(tests, name, _is_op_matrix(tests, name, repo_root)),
@@ -551,7 +595,7 @@ def _own_paths(
     if not target_rel.strip():
         return None
     category, name = parts[1:]
-    tests = f"{model_ops_tests_dir(target_rel.strip())}/{category}"
+    tests = entry_tests_dir(category, name, repo_root, owner_rel=target_rel.strip())
     return (
         f"{target_rel.strip().rstrip('/')}/{MODEL_OPS_DIRNAME}/{category}/{name}.py",
         *_test_files(tests, name, op_matrix or _is_op_matrix(tests, name, repo_root)),
@@ -579,7 +623,7 @@ def entry_paths(
     if _is_shared(item.target):
         if item.variant is not None and target_rel.strip():
             category, name = item.target.strip().strip("/").split("/")
-            matrix = _is_op_matrix(f"{CATALOG_TESTS_DIR}/{category}", name, repo_root)
+            matrix = _is_op_matrix(entry_tests_dir(category, name, repo_root), name, repo_root)
             return _own_paths(item.variant, target_rel, repo_root, op_matrix=matrix)
         return shared_entry_paths(item.target, repo_root)
     return _own_paths(item.target, target_rel, repo_root)
@@ -643,17 +687,25 @@ def is_entry_file(path: str, target: str) -> bool:
             and file.name == "__init__.py"
             and path.endswith(f"/ops/{category}/__init__.py")
         )
-    if path.startswith("tests/") and file.parent.name == category:
+    in_shared_tests_dir = _is_shared(target) and file.parent in {
+        PurePosixPath(directory) for directory in shared_test_dirs(category)
+    }
+    in_owner_tests_dir = (
+        parts[0] == MODEL_OPS_DIRNAME and len(parts) > 2 and file.parent.name == category
+    )
+    if path.startswith("tests/") and (in_owner_tests_dir or in_shared_tests_dir):
         stem = file.stem
-        return stem == f"test_modeling_v2_{name}" or stem.startswith(
-            (f"test_modeling_v2_{name}_", f"_{name}_")
-        )
+        ordinary_stem = PurePosixPath(collected_test_names(name)[0]).stem
+        return stem == ordinary_stem or stem.startswith((f"{ordinary_stem}_", f"_{name}_"))
     return False
 
 
 __all__ = [
+    "collected_test_names",
+    "shared_test_dirs",
     "is_entry_file",
     "entry_module",
+    "entry_tests_dir",
     "model_ops_tests_dir",
     "MODEL_OPS_DIRNAME",
     "MODELING_V2_PACKAGE",

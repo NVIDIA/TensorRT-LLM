@@ -35,6 +35,36 @@ Pull requests do not start testing by themselves. Developers trigger the CI by c
 
 `stage` tags live in the YAML files under `tests/integration/test_lists/test-db/`. Searching those files for `stage: pre_merge` shows exactly which tests the merge-request pipeline covers.
 
+### C++ license checks
+
+The **Release Checks** GitHub Actions workflow checks C++ license headers through
+the `check-cpp-licenses` pre-commit hook, within the **Pre-commit Check** job. The
+hook checks changed source files under `cpp/include` and `cpp/tensorrt_llm`,
+including Python helpers, subject to pre-commit's global exclusions. It checks
+full Apache license headers using the filters and exceptions in
+`jenkins/license_cpp.json`. Jenkins Release-Check retains its Go license checker;
+the hook shares its policy configuration. All currently tracked LFS sources in
+these directories are excluded by pre-commit, so the workflow does not fetch LFS
+objects. Manual workflow runs and PRs with at least 2500 reported changed files
+retain the existing pre-commit fallback to all files.
+
+Run the checker locally without installing dependencies after materializing any
+LFS source files. With no arguments, it scans both source trees in full, including
+files excluded by pre-commit. Use `--files` to check specific files instead:
+
+```bash
+python3 scripts/check_cpp_licenses.py
+python3 scripts/check_cpp_licenses.py --files cpp/include/tensorrt_llm/executor/types.h
+```
+
+The workflow runs on pull requests and supports manual runs against a specified
+ref. A license failure fails the same job as a pre-commit failure. Before replacing
+the Jenkins skip checks with GHA alone, make **Pre-commit Check** and **Check Test
+List** required checks in the repository ruleset, and ensure the Check Test List
+workflow has landed. The bot implementation in `trtllm-github-ci` must be updated
+separately to stop triggering Jenkins ReleaseCheck_PR; changing the Release Checks
+workflow does not change the bot's skip behavior.
+
 ## Test definitions
 
 Integration tests are listed under `tests/integration/test_lists/test-db/`. Most YAML files are named after the GPU or configuration they run on (for example `l0_a100.yml`). Some files, like `l0_sanity_check.yml`, use wildcards and can run on multiple hardware types. Entries contain conditions and a list of tests. Two important terms in each entry are:

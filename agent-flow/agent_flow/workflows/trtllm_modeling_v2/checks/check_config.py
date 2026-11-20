@@ -19,6 +19,7 @@ import yaml
 
 from ..infra.compute.environment import RunEnvironment
 from ..infra.files import write_text_atomic
+from ..spec.derive import SPEC_DEC_ALGO
 from ..spec.task_schema import (
     TaskSchemaError,
     assembly_units,
@@ -306,7 +307,7 @@ def speculation_flags(features: Any, *, max_draft_len: int = 1) -> list[str]:
     weights drafts garbage that verification rejects, which passes accuracy.
     """
     names = {str(f).lower() for f in (features or ())}
-    for feature, algo in (("mtp", "MTP"), ("eagle3", "Eagle3"), ("dspark", "DSPARK")):
+    for feature, algo in SPEC_DEC_ALGO.items():
         if feature in names:
             return [f"--spec_decode_algo={algo}", f"--spec_decode_max_draft_len={max_draft_len}"]
     return []
@@ -688,10 +689,7 @@ def check_configuration(
             features_through(task_data, actual_unit) if actual_unit else task_data.get("features")
         )
     names = {str(f).lower() for f in features or ()}
-    algorithm = next(
-        (a for f, a in (("mtp", "MTP"), ("eagle3", "Eagle3"), ("dspark", "DSpark")) if f in names),
-        None,
-    )
+    algorithm = next((a for f, a in SPEC_DEC_ALGO.items() if f in names), None)
     if algorithm:
         speculative = options.setdefault("speculative_config", {})
         if speculative is None:

@@ -699,9 +699,10 @@ class MpiPoolSession(MpiSession):
                                           "flashinfer")
             workspace_managed |= env.get(
                 _FLASHINFER_WORKSPACE_ENV) == workspace_root
+        # Every pool is isolated, a single-worker one included, so concurrent
+        # instances on one node never share a FlashInfer workspace.
         isolate_workspace = (
-            (self.n_workers > 1 or workspace_managed)
-            and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
+            env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
             and (_FLASHINFER_WORKSPACE_ENV not in env or
                  (workspace_managed and not explicit_workspace_override)))
         python_args = ["-c", _WORKER_ENV_BOOTSTRAP + _WORKER_SERVER_MAIN]

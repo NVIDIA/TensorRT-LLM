@@ -562,11 +562,18 @@ def test_other_checkpoints_do_not_reach_the_fp8_target(quant_algo):
     assert _qualified(target) != _FP8
 
 
-@pytest.mark.parametrize("sm", [(9, 0), (10, 3), (12, 0)], ids=["sm90", "sm103", "sm120"])
+def test_fp8_on_sm103_routes_to_the_fp8_target(monkeypatch):
+    """The target has run on B300 / GB300 (sm_103) as well as on B200 / GB200."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
+    for mode in ("auto", "require"):
+        assert _qualified(modeling_v2_resolve(_fp8_config(_mtp3()), _fp8_llm_args(mode))) == _FP8
+
+
+@pytest.mark.parametrize("sm", [(9, 0), (12, 0)], ids=["sm90", "sm120"])
 def test_fp8_on_other_gpus_does_not_match(monkeypatch, sm):
-    """The target has run on B200 only; a B300 falls back."""
+    """The target has run on sm_100 and sm_103 only; other GPUs fall back."""
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: sm)
-    missed = rf"compute capability \({sm[0]}, {sm[1]}\) \(only sm_100\)"
+    missed = rf"compute capability \({sm[0]}, {sm[1]}\) \(only sm_100 or sm_103\)"
     _fp8_declined(_fp8_config(), _fp8_llm_args, missed)
 
 

@@ -795,6 +795,91 @@ def _glue_kernels():
                     clamped = Int32(1)
                 tensor1d(context, n)[q] = clamped
 
+    @dsl_user_op
+    def prefetch_l2_bulk(addr, nbytes, *, loc=None, ip=None):
+        llvm.inline_asm(
+            None,
+            [Int64(addr).ir_value(loc=loc, ip=ip), Int32(nbytes).ir_value(loc=loc, ip=ip)],
+            "cp.async.bulk.prefetch.L2.global [$0], $1;",
+            "l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    class CandidateBlockPrefetchKernel:
+        """L2 prefetch of each decode row's published candidate blocks (``block_rows`` index rows:
+        data, then scales) in its block table's native pages, over ``CTAS`` CTAs per row."""
+
+        THREADS = 128
+        CTAS = 16
+
+        def __init__(self, block_rows: int):
+            self.block_rows = block_rows
+
+        @cute.jit
+        def __call__(
+            self,
+            pages: cute.Pointer,  # uint8 index pages, ``page_stride`` bytes apart
+            table: cute.Pointer,  # int32 [rows, table_width] strided
+            blocks: cute.Pointer,  # int32 [rows, block_capacity] strided
+            counts: cute.Pointer,  # int32 [rows] candidate columns
+            rows: Int32,
+            table_width: Int32,
+            table_stride: Int64,
+            block_capacity: Int32,
+            blocks_stride: Int64,
+            page_stride: Int64,
+            stream: cuda.CUstream,
+        ):
+            self.kernel(
+                pages,
+                table,
+                blocks,
+                counts,
+                rows,
+                table_width,
+                table_stride,
+                block_capacity,
+                blocks_stride,
+                page_stride,
+            ).launch(grid=[rows, self.CTAS, 1], block=[self.THREADS, 1, 1], stream=stream)
+
+        @cute.kernel
+        def kernel(
+            self,
+            pages: cute.Pointer,
+            table: cute.Pointer,
+            blocks: cute.Pointer,
+            counts: cute.Pointer,
+            rows: Int32,
+            table_width: Int32,
+            table_stride: Int64,
+            block_capacity: Int32,
+            blocks_stride: Int64,
+            page_stride: Int64,
+        ):
+            tid, _, _ = cute.arch.thread_idx()
+            row, cta, _ = cute.arch.block_idx()
+            block_rows = self.block_rows
+            per_page = INDEX_PAGE_ROWS // block_rows
+            used = (Int32(tensor1d(counts, Int64(rows))[row]) + (block_rows - 1)) // block_rows
+            if used > block_capacity:
+                used = block_capacity
+            ids = tensor2d(blocks, Int64(rows), Int64(block_capacity), blocks_stride)
+            table_t = tensor2d(table, Int64(rows), Int64(table_width), table_stride)
+            base = pages.toint()
+            for j in cutlass.range(cta + self.CTAS * tid, used, self.CTAS * self.THREADS):
+                block = Int32(ids[row, j])
+                page = base + Int64(table_t[row, block // per_page]) * page_stride
+                offset = block % per_page
+                prefetch_l2_bulk(page + Int64(offset * block_rows * 64), block_rows * 64)
+                prefetch_l2_bulk(
+                    page + Int64(INDEX_PAGE_ROWS * 64 + offset * block_rows * 4), block_rows * 4
+                )
+
     # ------------------------------------- K4: map Top-K candidate offsets
 
     class MaskLogitsKernel:
@@ -2194,6 +2279,7 @@ def _glue_kernels():
     ns.TableCopyKernel = TableCopyKernel
     ns.OwnerSlotsKernel = OwnerSlotsKernel
     ns.IndexerDescriptorsKernel = IndexerDescriptorsKernel
+    ns.CandidateBlockPrefetchKernel = CandidateBlockPrefetchKernel
     ns.MaskLogitsKernel = MaskLogitsKernel
     ns.MaskPackedLogitsKernel = MaskPackedLogitsKernel
     ns.CandidateGatherKernel = CandidateGatherKernel
@@ -2688,6 +2774,53 @@ def fill_indexer_descriptors(
         int(blocks.stride(0)),
         int(valid.stride(0)),
         -(-page_capacity // per_cta),
+        _stream(blocks.device),
+    )
+
+
+def prefetch_candidate_blocks_(
+    pages: torch.Tensor,
+    table: torch.Tensor,
+    blocks: torch.Tensor,
+    counts: torch.Tensor,
+    block_rows: int,
+) -> None:
+    """Start reading into L2 the native index rows (data and scales) of each decode row's
+    published candidate ``blocks`` below its ``counts`` columns (``CandidateBlockPrefetchKernel``)."""
+    rows = int(blocks.shape[0])
+    if rows == 0:
+        return
+    _check(
+        pages.dim() == 4
+        and pages.shape[1] == INDEX_PAGE_ROWS
+        and pages.stride(1) == pages.shape[3]
+        and pages.stride(3) == 1
+        and pages.element_size() == 1
+        and pages.stride(0) % 16 == 0,
+        "native index pages",
+    )
+    # Whole 16-byte bulk copies: a block's rows of 64 data bytes, then of 4 scale bytes.
+    _check(block_rows in (4, 8, 16, 32, 64), "block rows")
+    _check(table.dtype == torch.int32 and table.stride(1) == 1 and table.shape[0] >= rows, "table")
+    _check(blocks.dtype == torch.int32 and blocks.stride(1) == 1, "blocks")
+    _check(
+        counts.dtype == torch.int32 and counts.is_contiguous() and counts.numel() >= rows,
+        "counts",
+    )
+    ns = _glue_kernels()
+    _launch(
+        ("candidate_block_prefetch", blocks.device.index, int(block_rows)),
+        lambda: ns.CandidateBlockPrefetchKernel(int(block_rows)),
+        _ptr(pages, torch.uint8, align=16),
+        _ptr(table),
+        _ptr(blocks),
+        _ptr(counts),
+        rows,
+        int(table.shape[1]),
+        int(table.stride(0)),
+        int(blocks.shape[1]),
+        int(blocks.stride(0)),
+        int(pages.stride(0)),
         _stream(blocks.device),
     )
 

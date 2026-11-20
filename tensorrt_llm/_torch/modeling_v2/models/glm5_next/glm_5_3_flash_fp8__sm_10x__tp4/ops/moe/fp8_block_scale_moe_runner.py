@@ -125,7 +125,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     (the result is then in `output`).
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     #: GLM-5.3-Flash's routed experts at TP4: hidden 4096, moe_intermediate_size 2048 split
     #: four ways (512), all 288 experts local, ungrouped DeepSeek-V3 top-8 routing scaled by
@@ -208,7 +208,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     Not certified: the pre-routed path (`topk_ids` given), grouped routing (`n_group > 1`),
     other routing methods, bf16 logits or bias, `num_fused_shared_experts > 0`,
     expert-parallel windows, `output=`, a warm autotuner cache, CUDA-graph capture, other
-    geometries, sm_103.
+    geometries.
     """
 
     def __call__(

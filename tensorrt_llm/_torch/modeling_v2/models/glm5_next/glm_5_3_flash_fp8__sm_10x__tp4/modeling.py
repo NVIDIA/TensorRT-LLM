@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5.3-Flash block-FP8 on sm_100, tp4: model construction and forward.
+"""GLM-5.3-Flash block-FP8 on sm_100 / sm_103, tp4: model construction and forward.
 
 The checkpoint is the composite ``Glm5NextForConditionalGeneration`` release, served text
 only (``disable_mm_encoder``). The engine builds ``ModelingV2Glm53FlashFp8Sm10xTp4``, a
@@ -683,7 +683,7 @@ def _normalize_top_config(config: PretrainedConfig, text: PretrainedConfig) -> N
 class ModelingV2Glm53FlashFp8Sm10xTp4(
     DecoderModelForCausalLM[Glm53FlashFp8Sm10xTp4Core, PretrainedConfig]
 ):
-    """GLM-5.3-Flash block-FP8, sm_100, tp4, text only."""
+    """GLM-5.3-Flash block-FP8, sm_100 / sm_103, tp4, text only."""
 
     #: The KDA layers reset a fresh request's recurrent state and conv window in their prefill
     #: only, so the engine must not run a one-token prompt as a decode row.

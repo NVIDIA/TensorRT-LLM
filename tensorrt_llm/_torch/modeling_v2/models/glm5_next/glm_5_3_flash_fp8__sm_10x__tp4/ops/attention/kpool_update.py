@@ -106,7 +106,7 @@ class KpoolUpdate(OpWrapper):
     Writes only the pool-key columns of each refreshed pool's first-member row; returns None.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # The indexer key is 128 wide (cache rows of 3 * 128 BF16), pools of 4 over 32-token
     # blocks. Generation cells give the requests' KV length after the step; request b's is
     # kv - b % 4, so draft rows straddle pools differently per request. Context cells give

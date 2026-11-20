@@ -19,7 +19,8 @@ from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x_
 from tensorrt_llm._utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() != 100, reason="the glm5_next fp8 tp4 entries are certified on sm_100"
+    get_sm_version() not in (100, 103),
+    reason="the glm5_next fp8 tp4 entries are certified on sm_100 and sm_103",
 )
 
 ROWS, MULT, HIDDEN = 4, boundary.MULT, boundary.HIDDEN

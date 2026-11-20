@@ -95,6 +95,7 @@ from .multimodal_encoder_graph import (
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
+    from ..recurrent_state_spec import RecurrentStateSpec
 
 _VISION_WEIGHT_PREFIX = "model.visual"
 
@@ -1080,6 +1081,18 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
     @classmethod
     def get_preferred_transceiver_runtime(cls, pretrained_config=None) -> str:
         return Glm5NextForCausalLM.get_preferred_transceiver_runtime(pretrained_config)
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> "RecurrentStateSpec":
+        """Return the text decoder's declaration; it is built from the composite config too."""
+        return Glm5NextForCausalLM.get_recurrent_state_spec(
+            pretrained_config, quant_config=quant_config
+        )
 
     @property
     def mamba_metadata_cls(self):

@@ -451,7 +451,7 @@ class MhcFusedHc(OpWrapper):
         ``mHC.fused_hc`` returns, ``post`` without its trailing unit dimension. All new tensors.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     _GLM = dict(mult=MULT, hidden=HIDDEN, **GLM_SCALARS)
     CELLS: tuple[Cell, ...] = (

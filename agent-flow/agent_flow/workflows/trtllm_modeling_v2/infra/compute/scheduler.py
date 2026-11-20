@@ -76,7 +76,8 @@ HAND-OVER
 for a successor until an ack names one. An ack is keyed by the allocation it follows, so a later
 ack for the next allocation never replaces it. A ready successor also starts hand-over before
 the alert window, so long jobs can use a fresh allocation. The old watcher admits nothing more
-and exits when its existing jobs are done.
+and exits when its existing jobs are done. Every pass judges the successor again: one that
+stopped heart-beating is dropped, and the watcher stays and admits again as if none had come.
 
 ADMISSION
 =========
@@ -1198,7 +1199,7 @@ class Scheduler:
     # -------------------------------------------------------------- hand-over
 
     def _plan_handover(self, now: float) -> None:
-        """Drain when the allocation is ending or a later-ending successor is ready."""
+        """Drain when the allocation is ending or a later-ending successor is live, judged every pass."""
         ends_at = self.config.ends_at
         if ends_at is None:
             return
@@ -1208,6 +1209,11 @@ class Scheduler:
             if peer.get("watcher") != self.watcher_id and _ends_after(peer, ends_at)
         ]
         if ends_at - now > self.config.handover_lead_s and not peers:
+            if self.handover:
+                self.handover = {}
+                self._append_status(
+                    f"watcher: no live successor; out of hand-over at {utc_iso(now)}"
+                )
             return
         if not self.handover:
             self.handover["since"] = utc_iso(now)
@@ -1217,6 +1223,8 @@ class Scheduler:
             if self.handover.get("successor") != successor:
                 self._append_status(f"watcher: successor {successor} is up")
             self.handover["successor"] = successor
+        elif self.handover.pop("successor", None):
+            self._append_status(f"watcher: no live successor at {utc_iso(now)}")
 
     def _handover_hold(self, spec: JobSpec, now: float) -> "Hold | None":
         ends_at = self.config.ends_at

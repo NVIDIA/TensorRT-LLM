@@ -60,7 +60,7 @@ class Fp8BlockwiseGemm(OpWrapper):
     rows.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # Only GLM-5.3-Flash calls this entry. Its own cells are the M-tile edges at GLM's widest
     # FFN projection; the projections and row counts the target runs are in the test.
@@ -105,7 +105,7 @@ class Fp8BlockwiseGemm(OpWrapper):
     captured and replayed). The other cells run the default tactic.
 
     Not certified: N or K not a multiple of 128 (the kernel needs K % 16 == 0 and N % 8 == 0
-    for its TMA alignment), sm_103.
+    for its TMA alignment).
     """
 
     def __call__(

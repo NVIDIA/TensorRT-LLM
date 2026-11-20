@@ -138,14 +138,14 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 ## Index
 
 `references/features.md`, one section each, every section in the same order
-(what; engine owns; target must honour; code and grep; tests to imitate; fast
-check; how the flow proves it; blind spots):
+(what; engine owns; target must honour; where in the code; tests to imitate,
+with a by-hand check; how the flow proves it; blind spots):
 
 0. Common machinery: enabling features in a spec, running one gate, reading
    engine evidence
 1. Block reuse (prefix KV-cache reuse), including side state and recurrent snapshots
 2. Chunked prefill
-3. Disaggregated serving: what crosses the hop, transceiver, one- and multi-node launch
+3. Disaggregated serving: what crosses the hop, transceiver, what not to build
 4. KV-cache dtype: fp8, nvfp4, mixed, and KV scales
 5. CUDA graphs and the overlap scheduler
 6. Multimodal inputs

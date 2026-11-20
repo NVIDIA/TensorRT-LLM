@@ -33,7 +33,7 @@ class SiluAndMul(OpWrapper):
     Fusion boundary: the clamp, SiLU, product and optional output quantization; no GEMM.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # Only GLM-5.3-Flash calls this entry: its dense MLP and shared expert, with the clamp on.
     # Its own cells are the kernel's tiling edges at those widths; the target's row counts are
@@ -68,7 +68,7 @@ class SiluAndMul(OpWrapper):
     no `scale`, at GLM's per-rank widths (2 x 512 and 2 x 3072) from 1 to 13,312 rows.
 
     Not certified: an fp8 output (`scale` + `dtype`), `swiglu_alpha` / `swiglu_beta`, other
-    input dtypes, CUDA-graph capture, sm_103.
+    input dtypes, CUDA-graph capture.
     """
 
     def __call__(

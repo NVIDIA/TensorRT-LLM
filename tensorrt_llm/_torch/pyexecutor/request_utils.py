@@ -249,6 +249,8 @@ def merge_requests_to_llm_requests(
     new_requests: list["RequestQueueItem"],
     exclude_last_generation_logits: bool,
     track_unique_tokens: bool = True,
+    *,
+    vocab_size: int | None = None,
 ) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests (basic case without CP).
 
@@ -269,6 +271,7 @@ def merge_requests_to_llm_requests(
             input_token_ids=req_item.prompt_token_ids,
             track_unique_tokens=track_unique_tokens,
             locality_domain_id=req_item.locality_domain_id,
+            vocab_size=vocab_size,
         )
         req_with_children.append(req)
         if req.child_requests:
@@ -282,6 +285,8 @@ def merge_helix_requests(
     cp_size: int,
     tokens_per_block: int,
     exclude_last_generation_logits: bool,
+    *,
+    vocab_size: int | None = None,
 ) -> list[LlmRequest]:
     """Merge requests for Helix CP.
 
@@ -315,6 +320,7 @@ def merge_helix_requests(
             input_token_ids=input_ids_this_rank,
             position_ids=position_ids_this_rank,
             locality_domain_id=req_item.locality_domain_id,
+            vocab_size=vocab_size,
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
@@ -340,6 +346,8 @@ def merge_requests(
     exclude_last_generation_logits: bool,
     is_disagg: bool,
     track_unique_tokens: bool = True,
+    *,
+    vocab_size: int | None = None,
 ) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
@@ -376,13 +384,16 @@ def merge_requests(
                     cp_size=cp_size,
                     tokens_per_block=cp_config["tokens_per_block"],
                     exclude_last_generation_logits=exclude_last_generation_logits,
+                    vocab_size=vocab_size,
                 )
-            return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
+            return merge_requests_to_llm_requests(
+                new_requests, exclude_last_generation_logits, vocab_size=vocab_size
+            )
         elif cp_size > 1:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
     return merge_requests_to_llm_requests(
-        new_requests, exclude_last_generation_logits, track_unique_tokens
+        new_requests, exclude_last_generation_logits, track_unique_tokens, vocab_size=vocab_size
     )
 
 

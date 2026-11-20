@@ -33,6 +33,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_5_MOE_VL_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -143,6 +144,14 @@ _MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
     moe_cluster_sizes=frozenset({1}),
     first_k_dense_replaces=frozenset({1}),
     moe_layer_freqs=frozenset({1}),
+)
+# The Qwen3.5 MoE vision-language root realizes the Qwen3.5 vision-language
+# runtime (interleaved M-RoPE through the fused QK-norm/RoPE kernel) over the
+# Qwen3 MoE CUTLASS backend and partition pins.
+_MX_QWEN3_5_MOE_VL_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+    rope_types=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS.rope_types,
+    rope_fusion=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS.rope_fusion,
 )
 
 
@@ -320,6 +329,19 @@ MX_POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
             transform_abi_id=DEEPSEEK_V3_MLA_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3_5-moe-for-conditional-generation-bf16-cutlass-complete-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_5", "Qwen3_5MoeVLModel"
+            ),
+            architecture="Qwen3_5MoeForConditionalGeneration",
+            model_type="qwen3_5_moe",
+            speculative_mode=None,
+            protocol_version=MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_5_MOE_VL_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
+            runtime_constraints=_MX_QWEN3_5_MOE_VL_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
         ),
     )
 )
