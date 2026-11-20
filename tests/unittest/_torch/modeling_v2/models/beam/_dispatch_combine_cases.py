@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import torch
 
+__extra_import_path__ = ["."]
+from _beam_component_support import bitwise_equal as bitwise_equal  # noqa: E402
+
 HIDDEN, EXPERTS, TOP_K, SCALE = 5120, 256, 8, 2.5
 SEEDS = (17, 41)
 TOKENS = (1, 17, 129)
@@ -214,13 +217,3 @@ def golden(x, ids, w, experts, fault: str | None = None, skip_slots=None) -> dic
     stages["product"] = torch.cat(stages["product"])
     stages["route"] = torch.cat(stages["route"])
     return stages
-
-
-def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """Same dtype, shape and bits (so -0.0 differs from +0.0)."""
-    if a.dtype != b.dtype or a.shape != b.shape:
-        return False
-    view = {BF16: torch.int16, FP32: torch.int32}.get(a.dtype)
-    if view is None:
-        return bool(torch.equal(a, b.to(a.device)))
-    return bool(torch.equal(a.contiguous().view(view), b.to(a.device).contiguous().view(view)))

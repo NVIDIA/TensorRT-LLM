@@ -491,7 +491,9 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
     decoder.mapping = kwargs["mapping"]
     decoder._attention_runtime_features = kwargs["attention_runtime_features"]
     decoder._buffers = SimpleNamespace(cache_indirection=None)
-    monkeypatch.setattr(decoder_metadata_module, "resolve_mamba_metadata_cls", lambda _model: None)
+    monkeypatch.setattr(
+        decoder_metadata_module, "resolve_mamba_metadata_cls", lambda _model, _manager=None: None
+    )
     kv = object()
 
     result = decoder.setup_attention(kv)

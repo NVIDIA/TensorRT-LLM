@@ -396,6 +396,7 @@ def test_overlap_close_out_stats_wait_for_a_deferred_previous_batch(
     executor._process_close_out_iter_stats = lambda stats, _start_time: calls.append(
         ("process_close_out_iter_stats", stats)
     )
+    executor._maybe_emit_quiescent_stats = Mock()
     deferred = previous_batch == "deferred"
     if deferred:
         executor.previous_batch = SimpleNamespace(

@@ -410,6 +410,55 @@ class PyResult:
         self._encoder_output: Optional[torch.Tensor] = None
         self.diff = PyResult.Diff()
 
+    def snapshot(self, *, beam_width: int) -> "PyResult":
+        """Freeze output containers while sharing append-only tensor storage.
+
+        Single-sequence streaming logprobs move to the response, preserving
+        cumulative totals in fresh request storage. Beam search publishes full
+        histories, so it copies their lists instead of consuming them.
+        """
+        result = copy(self)
+        if self.context_prompt_logprob_rows is not None:
+            result.context_prompt_logprob_rows = self.context_prompt_logprob_rows.copy(
+            )
+        result.diff = PyResult.Diff()
+        if self._log_probs is not None:
+            if self._streaming and beam_width <= 1 and self.log_probs:
+                self._log_probs = LogProbStorage()
+                self._log_probs._init(result.log_probs)
+                self._log_probs.cum_log_probs = result.cum_log_probs.copy()
+            else:
+                result._log_probs = copy(self._log_probs)
+                if self.log_probs is not None:
+                    result._log_probs.log_probs = [
+                        probs.copy() for probs in self.log_probs
+                    ]
+                    result._log_probs.cum_log_probs = self.cum_log_probs.copy()
+        if self._context_logits is not None:
+            result._context_logits = copy(self._context_logits)
+            result._context_logits._logits_indices = self._context_logits._logits_indices.copy(
+            )
+        if self._generation_logits is not None:
+            result._generation_logits = copy(self._generation_logits)
+            result._generation_logits._logits_indices = (
+                self._generation_logits._logits_indices[-2:] if self._streaming
+                else self._generation_logits._logits_indices.copy())
+            if self._generation_logits.use_chunked_generation_logits:
+                result._generation_logits._device_fragments = self._generation_logits._device_fragments.copy(
+                )
+        if self._additional_context_outputs is not None:
+            result._additional_context_outputs = {
+                name: outputs.copy()
+                for name, outputs in self._additional_context_outputs.items()
+            }
+        if self._additional_generation_outputs is not None:
+            result._additional_generation_outputs = {
+                name: outputs.copy()
+                for name, outputs in
+                self._additional_generation_outputs.items()
+            }
+        return result
+
     def reset_diff(self):
         self.diff = PyResult.Diff()
 
@@ -841,6 +890,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
             watermarking: Optional[bool] = None,
+            locality_domain_id: Optional[int] = None,
             **kwargs):
         # Cached by OneModelSamplingParams.of_request.
         self.py_spec_sampling_params: "OneModelSamplingParams | None" = None
@@ -936,6 +986,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Set once a received generation request's first token is found not
         # to end it, so the executor does not recheck it while it waits.
         self.py_first_token_checked = False
+        # Python-side locality domain ownership. ``None`` is used for non-localized
+        # execution; localized requests must pass a concrete value at creation.
+        self.py_locality_domain_id = locality_domain_id
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
 
@@ -1011,7 +1064,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_ctx_decoder_held = False
 
         # In-forward Mamba snapshot point P the scheduler let this context
-        # chunk run past (MambaHybridCacheManagerV2 consumes it).
+        # chunk run past (the GDN cache manager consumes it).
         self.py_mamba_inforward_snapshot_point: Optional[int] = None
         # Whether the first GEN step of a generation-only request was streamed.
         self.py_gen_first_emitted = False
@@ -1227,38 +1280,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         """
         result, is_final = super().create_serialized_result()
 
-        # When using beam search we cannot incrementically update the logprobs in the result.
-        # Instead we need to update all logprobs. In that case no deep copy is needed.
-        need_deep_copy_logprobs = self.py_result.log_probs and self.py_beam_width <= 1
-        need_deep_copy_generation_logits = self.py_result._generation_logits is not None
-        need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
-        # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
-        # that may occur between IPC communication and the overriding of newly generated log_probs
-        # or the updating of py_result._generation_logits._logits_indices in streaming mode.
-        if self.streaming and need_any_deep_copy:
-            py_result = copy(self.py_result)
-            # Move _log_probs to py_result and create a new empty LogProbStorage in self.py_result
-            # This avoids performing a deepcopy
-            if need_deep_copy_logprobs:
-                py_result._log_probs = self.py_result._log_probs
-                self.py_result._log_probs = LogProbStorage()
-                # Initialize the storage and adjust the cum_log_probs to the previous value
-                self.py_result._log_probs._init(py_result.log_probs)
-                self.py_result._log_probs.cum_log_probs = copy(
-                    py_result.cum_log_probs)
-
-            # Perform copies of py_result._generation_logits
-            if need_deep_copy_generation_logits:
-                # shallow copy of generation_logits to avoid copying the logits tensor
-                py_result._generation_logits = copy(
-                    self.py_result._generation_logits)
-                # deep copy the indices to avoid the race condition
-                # In streaming mode LogitsStorage only accesses either the last
-                # or second to last pair of indices. Therefore, copying only these two pairs is sufficient.
-                py_result._generation_logits._logits_indices = py_result._generation_logits._logits_indices[
-                    -2:]
-        else:
-            py_result = self.py_result
+        if len(result) == 0:
+            return None
+        py_result = self.py_result.snapshot(beam_width=self.py_beam_width)
 
         # Only include time_breakdown_metrics in the final response to avoid O(N²) overhead
         # during streaming (copying all step_metrics for every token is very expensive)
@@ -1282,8 +1306,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
-        if len(result) == 0:
-            return None
         llm_result = LlmResult(
             result,
             py_result,
@@ -1414,6 +1436,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                        is not None else None),
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
+            locality_domain_id=self.py_locality_domain_id,
         )
         child.py_bad_words = deepcopy(self.py_bad_words)
         child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
@@ -1747,7 +1770,8 @@ def executor_request_to_llm_request(
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
         position_ids: Optional[List] = None,
-        track_unique_tokens: bool = True) -> LlmRequest:
+        track_unique_tokens: bool = True,
+        locality_domain_id: Optional[int] = None) -> LlmRequest:
     envelope = ExecutorRequest.adapt(executor_request)
     inputs = envelope.inputs
     executor_request = envelope.request
@@ -1921,6 +1945,7 @@ def executor_request_to_llm_request(
         logprobs_simple_format=inputs.logprobs_simple_format,
         return_routed_experts=inputs.return_routed_experts,
         watermarking=inputs.watermarking,
+        locality_domain_id=locality_domain_id,
     )
 
     # Bad-words list for the TorchSampler path, kept in its native
