@@ -802,17 +802,26 @@ class TestCountTokens:
 
 class TestResponsesInputTokens:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("effort", ["none", "minimal"])
-    @pytest.mark.parametrize("client_effort", [None, "HIGH"])
+    @pytest.mark.parametrize(
+        ("effort", "client_effort", "reads_effort"),
+        [
+            ("none", None, True),
+            ("minimal", None, True),
+            ("none", "HIGH", True),
+            ("minimal", "HIGH", True),
+            pytest.param("none", None, False, id="template-without-effort"),
+        ],
+    )
     async def test_router_matches_worker_for_musespark_reasoning_effort(
-        self, effort: str, client_effort: str | None
+        self, effort: str, client_effort: str | None, reads_effort: bool
     ) -> None:
         from tensorrt_llm.serve.openai_protocol import ResponsesRequest
         from tensorrt_llm.serve.responses_utils import _create_input_tokens
 
+        effort_template = "{{ reasoning_effort | default('unset') }}|" if reads_effort else ""
         tokenizer = byte_level_tokenizer(
-            "{{ reasoning_effort | default('unset') }}|{{ thinking }}|"
-            "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
+            effort_template
+            + "{{ thinking }}|{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
         )
         request = ResponsesRequest(
             model="m",
@@ -843,9 +852,8 @@ class TestResponsesInputTokens:
                 processor=None,
             )
 
-            assert tokenizer.decode(worker_ids) == (
-                f"{client_effort or 'low'}|True|<user>hello world"
-            )
+            effort_prefix = f"{client_effort or 'low'}|" if reads_effort else ""
+            assert tokenizer.decode(worker_ids) == effort_prefix + "True|<user>hello world"
             assert router_ids == worker_ids
             assert request.model_dump(mode="json") == as_sent
         finally:
@@ -868,7 +876,9 @@ class TestResponsesInputTokens:
             responses_utils, "reasoning_chat_template_kwargs", lambda request, **kwargs: {}
         )
         monkeypatch.setattr(
-            responses_utils, "reasoning_injected_chat_template_keys", lambda request: set()
+            responses_utils,
+            "reasoning_injected_chat_template_keys",
+            lambda request, **kwargs: set(),
         )
         request = mock.Mock()
         request.tools = None

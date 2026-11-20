@@ -556,7 +556,9 @@ class BlockHashMixin:
                 prepared, model_type=res.model_type
             ),
             injected_chat_template_kwargs=list(
-                responses_utils.reasoning_injected_chat_template_keys(prepared)
+                responses_utils.reasoning_injected_chat_template_keys(
+                    prepared, model_type=res.model_type
+                )
             ),
         )
         return self._tokenize_prepared_chat(chat_request)

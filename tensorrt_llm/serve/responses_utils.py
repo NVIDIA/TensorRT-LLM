@@ -1675,7 +1675,7 @@ async def _create_input_tokens(
         tools=tools_dict,
         chat_template_kwargs=chat_template_kwargs or None,
         injected_chat_template_kwargs=reasoning_injected_chat_template_keys(
-            request),
+            request, model_type=model_type),
         # Media is rendered to text for the model's input processor to expand.
         tokenize=not has_media,
     )
@@ -1874,18 +1874,23 @@ def reasoning_chat_template_kwargs(request,
     return kwargs
 
 
-def reasoning_injected_chat_template_keys(request) -> frozenset[str]:
+def reasoning_injected_chat_template_keys(request,
+                                          model_type: Optional[str] = None
+                                          ) -> frozenset[str]:
     """Keys `reasoning_chat_template_kwargs` added on the caller's behalf.
 
     The unused-kwargs guard rejects caller controls the template never reads,
     but a Responses client only asked for `reasoning.effort`; it did not pick
     `reasoning_effort` / `thinking` and cannot drop them when a template (a
     Qwen3 one, say) reads neither. Keys the caller passed explicitly in
-    `chat_template_kwargs` stay subject to the guard.
+    `chat_template_kwargs` stay subject to the guard. `model_type` must match
+    the selector used to derive the kwargs so model-normalized keys retain
+    their server-injected provenance.
     """
     raw = getattr(request, "chat_template_kwargs", None)
     caller_keys = set(raw) if isinstance(raw, Mapping) else set()
-    return frozenset(set(reasoning_chat_template_kwargs(request)) - caller_keys)
+    kwargs = reasoning_chat_template_kwargs(request, model_type=model_type)
+    return frozenset(set(kwargs) - caller_keys)
 
 
 def _apply_reasoning_parser(
