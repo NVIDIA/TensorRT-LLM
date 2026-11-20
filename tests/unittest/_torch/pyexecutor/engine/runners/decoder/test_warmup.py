@@ -1088,7 +1088,7 @@ def test_decode_prewarm_failure_still_reaches_barrier() -> None:
         (2, "tp_cp_allgather", True, None, 16),
         (1, "tp_allgather", False, "DSPARK", None),
         (1, "tp_allgather", False, "NGRAM", 8),
-        (1, "tp_allgather", False, "USER_PROVIDED", 8),
+        (1, "tp_allgather", False, "USER_PROVIDED", None),
     ],
 )
 @pytest.mark.parametrize("fails", [False, True])
@@ -1100,11 +1100,11 @@ def test_lowm_row_bucket_prewarm_always_meets_its_peers(
     max_rows: int | None,
     fails: bool,
 ) -> None:
-    """Without a neural drafter a rank prewarms the buckets up to a step's most rows (its tokens,
-    gathered over the TP group under attention DP); lookup drafts add no projection. With a neural
-    drafter, every bucket, since it can project more rows than its target verifies. The rank meets
-    its TP (TP x CP) peers whether its prewarm compiled nothing or failed; a failure is a warning,
-    since it only defers the compiles to their first calls."""
+    """Without speculation, or with NGram's prefix-lookup drafts, a rank prewarms the buckets up to
+    a step's most rows (its tokens, gathered over the TP group under attention DP). With any other
+    drafter, a user-provided one included, every bucket, since it can run more rows than its target
+    verifies. The rank meets its TP (TP x CP) peers whether its prewarm compiled nothing or failed;
+    a failure is a warning, since it only defers the compiles to their first calls."""
     from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
     spec_config = (
