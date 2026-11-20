@@ -73,7 +73,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -83,6 +83,7 @@ import torch.distributed as dist
 # it is always importable. The provider / shared-workspace helpers used
 # in ``_alloc_symm_provider`` and ``_ensure_local_staging`` ARE inside
 # that gate and therefore stay lazy at the call site.
+from tensorrt_llm._torch.moe import live_rows
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,
 )
@@ -127,7 +128,6 @@ from .shared_expert import (
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from ....moe.kernels.blackwell.dsv4_route_quant import dsv4_route_nvfp4_quant
-    from ....moe.kernels.blackwell.megamoe_stage_inputs import stage_megamoe_inputs
 
 __all__ = [
     "MegaMoECuteDsl",
@@ -345,6 +345,29 @@ def _replica_slots(table: torch.Tensor, expert_ids: torch.Tensor, num_experts: i
     return table[num_experts + (meta & 0xFFFF) + copy].to(torch.int32)
 
 
+class _QuantizedRows(NamedTuple):
+    """The activation rows a quantization wrote into a bucket's staging for the next run_moe: the
+    views it returned, the staging they view, and their row count. A run_moe given these very
+    views needs no storage check."""
+
+    x: torch.Tensor
+    x_sf: torch.Tensor
+    activation: torch.Tensor
+    rows: int
+
+
+def _is_staging_view(view: torch.Tensor, staging: torch.Tensor, rows: int) -> bool:
+    """The bucket owns the complete row view, including an empty view with a zero data pointer."""
+    return (
+        view.shape == (rows, *staging.shape[1:])
+        and view.stride() == staging.stride()
+        and view.dtype == staging.dtype
+        and view.device == staging.device
+        and view.storage_offset() == staging.storage_offset()
+        and view.untyped_storage().data_ptr() == staging.untyped_storage().data_ptr()
+    )
+
+
 @functools.cache
 def _fp4_quantize_has_sm_budget() -> bool:
     if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
@@ -397,6 +420,17 @@ class MegaMoECuteDslWeightView:
     # (slots,) fp32; FC1-output (= FC2-input) NVFP4 quant norm_const, one
     # reciprocal raw w2.input_scale per local expert slot.
     fc1_norm_const: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _StagingKey:
+    """Key of one local staging set (``_ensure_local_staging``)."""
+
+    max_T: int
+    top_k: int
+    hidden: int
+    device: str
+    output_dtype: torch.dtype
 
 
 @dataclass(frozen=True)
@@ -488,6 +522,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     capabilities = descriptor.capabilities
 
     input_requirement = descriptor.input_requirement
+
+    # run_moe issues MoERunContext.before_launch itself: after staging and
+    # before the kernel, bucket priming included.
+    takes_before_launch = True
 
     _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
 
@@ -730,9 +768,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Launch buffers per (bucket, top_k, hidden, device, dtype, inference mode).
         self._launch_buffers: Dict[Tuple, _MegaMoeBuffers] = {}
         self._genphase_direct_input_buckets: set[int] = set()
+        # Buckets whose kernel masks routes with an invalid expert in its top-k reduce: their
+        # staging drops the rows of the forward's padding requests (moe/live_rows.py).
+        self._padding_drop_buckets: set[int] = set()
         # Lockstep per-chunk cross-rank max for the NEXT run_moe (set via
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
         self._active_launch_max_tokens: Optional[int] = None
+        self._active_launch_output_dtype: Optional[torch.dtype] = None
+        # (routes view, bucket route staging) the one-launch staging handed out to the next run_moe.
+        self._handed_out_route_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         # (bucket ids buffer, ids, weights, x, x_sf) written by the last fused route+quant launch.
         self._prestaged: Optional[Tuple[torch.Tensor, ...]] = None
         # Expert -> slot table of a static placement (built in create_weights), with copies a
@@ -740,6 +784,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._slot_of_expert: Optional[torch.Tensor] = None
         self._expert_of_slot: Optional[torch.Tensor] = None
         self._replicated = False
+        # The rows that ``quantize_input`` (or a fused staging) quantized into for the NEXT run_moe.
+        self._quantized_into: Optional[_QuantizedRows] = None
 
         # Resolve EP ProcessGroup at construction. Resolving at forward
         # time would be collective on a non-synchronous call stack and
@@ -789,9 +835,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._weights_loaded = False
         self._weights_created = False
         self.quant_method = None
-        # Per-instance staging cache (key -> {tensor name: tensor}); see
-        # ``_stage_inputs`` for the always-pad-to-max_T launch contract.
-        self._local_staging_cache: Dict[Tuple, Dict[str, torch.Tensor]] = {}
+        # Per-instance staging cache (key -> {tensor name: tensor}), one
+        # staging set per bucket max_T; ``_stage_inputs`` keeps the
+        # always-pad-to-max_T launch contract on every launch.
+        self._local_staging_cache: Dict[_StagingKey, Dict[str, torch.Tensor]] = {}
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -880,15 +927,126 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             f"reduce the per-rank chunk."
         )
 
-    def set_adaptive_launch_tokens(self, chunk_max_tokens: Optional[int]) -> None:
+    def set_adaptive_launch_tokens(
+        self, chunk_max_tokens: Optional[int], *, output_dtype: Optional[torch.dtype] = None
+    ) -> None:
         """Scheduler hook: record the lockstep per-chunk cross-rank max token
         count for the next ``run_moe``.
 
         MUST be ``max(all_rank_num_tokens)`` for the chunk (rank-identical) so
         all ranks select the same bucket; ``None`` -> full bucket. Consumed
-        and reset by the next ``_run_moe``.
+        and reset by the next ``_run_moe``. Set it before ``quantize_input``:
+        with the hint set, ``quantize_input`` may quantize into that bucket's
+        staging.
+        Supply ``output_dtype`` for direct preparation; otherwise preparation uses ordinary
+        tensors because the next launch's staging is not yet identified.
         """
         self._active_launch_max_tokens = chunk_max_tokens
+        self._active_launch_output_dtype = output_dtype
+
+    def _take_launch_preparation(self) -> Tuple[int, Optional[_QuantizedRows]]:
+        """The bucket of this launch and the rows ``quantize_input`` staged for it.
+
+        Every ``_run_moe`` path takes these first, which consumes the bucket hint, the output dtype
+        that lets ``quantize_input`` stage into that bucket, and the staged-rows record, so none
+        of them outlives its launch. Un-hinted callers get the full bucket.
+        """
+        launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
+        self._active_launch_max_tokens = None
+        self._active_launch_output_dtype = None
+        quantized_into, self._quantized_into = self._quantized_into, None
+        return launch_max_T, quantized_into
+
+    def _may_read_inputs_in_place(self, num_tokens: int, bucket: int) -> bool:
+        """Whether a launch of ``num_tokens`` rows into ``bucket`` may read its inputs where they
+        are (an exact-size generation-phase bucket across ranks) instead of staging them.
+
+        This is the bucket half of the rule: ``_run_moe`` also requires the inputs' shapes and
+        contiguity to match the bucket's buffers, so False means "staged", not True "not staged".
+        """
+        return (
+            self.ep_size > 1
+            and not self.tactic_autotune
+            and num_tokens == bucket
+            and bucket in self._genphase_direct_input_buckets
+        )
+
+    def _routes_staged(
+        self,
+        bufs: "_MegaMoeBuffers",
+        topk_idx: torch.Tensor,
+        num_tokens: int,
+        top_k: int,
+        replica_plan: Optional[object],
+    ) -> bool:
+        """Whether the routes of this launch are the live rows of the bucket's index staging, written
+        by the one-launch staging (:meth:`_stage_bf16_inputs`) together with the gate weights beside
+        them.
+
+        The launch then reads both from the staging, so routes found there without that hand-out
+        (gate weights possibly stale) and routes a replica plan would rewrite are refused."""
+        handed_out, self._handed_out_route_staging = self._handed_out_route_staging, None
+        # The view the one-launch staging returned, handed on as is, needs no storage check.
+        staged = (
+            handed_out is not None
+            and topk_idx is handed_out[0]
+            and handed_out[1] is bufs.topk_idx_local
+        ) or (
+            _is_staging_view(topk_idx, bufs.topk_idx_local, num_tokens)
+            and topk_idx.shape == (num_tokens, top_k)
+        )
+        if not staged:
+            if handed_out is not None:
+                raise ValueError(
+                    "routes the staging wrote must retain the bucket's row-view identity"
+                )
+            return False
+        if handed_out is None or (
+            handed_out[1] is not bufs.topk_idx_local
+            and handed_out[1].data_ptr() != bufs.topk_idx_local.data_ptr()
+        ):
+            raise ValueError(
+                "routes in the MegaMoE route staging must come from the one-launch staging, which writes "
+                "the gate weights beside them"
+            )
+        if replica_plan is not None:
+            raise ValueError(
+                "routes in the MegaMoE route staging cannot also follow a replica plan"
+            )
+        return True
+
+    def _staging_of_next_run(self, num_tokens: int, device) -> Optional[_MegaMoeBuffers]:
+        """The buffers the next ``run_moe`` stages ``num_tokens`` rows on ``device`` into.
+
+        Without a bucket hint (EP1, attention TP) the next run launches the full bucket on every
+        rank, so that bucket's staging is the one. None when ``quantize_input`` should not write
+        into the staging: tactic autotuning, a bucket whose inputs may be read in place, or a
+        staging set not built yet.
+        """
+        if self.tactic_autotune or not self._weights_created:
+            return None
+        bucket = self._select_launch_max_tokens(self._active_launch_max_tokens)
+        if num_tokens > bucket or self._may_read_inputs_in_place(num_tokens, bucket):
+            return None
+        output_dtype = self._active_launch_output_dtype
+        if output_dtype is None:
+            return None  # The next launch's output buffer, and hence staging, is not known.
+        key = _StagingKey(
+            bucket,
+            self.routing_method.experts_per_token,
+            self.hidden_size,
+            str(device),
+            output_dtype,
+        )
+        if key not in self._local_staging_cache:
+            return None
+        return self._acquire_buffers(
+            top_k=key.top_k,
+            hidden=key.hidden,
+            device=device,
+            output_dtype=key.output_dtype,
+            launch_max_T=bucket,
+        )
 
     def _supports_load_balancer(self) -> bool:
         # Both static and dynamic EPLB are supported: the four MegaMoE-
@@ -1164,10 +1322,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._profiling_scratch_provider_ref = None
         self._launch_buffers.clear()
         for max_T in self._maxt_buckets:
-            (
-                shared_workspace_bytes,
-                supports_direct_inputs,
-            ) = query_megamoe_kernel_properties(
+            properties = query_megamoe_kernel_properties(
                 world_size=self.ep_size,
                 num_topk=top_k,
                 num_experts_per_rank=self.compute_slot_count,
@@ -1192,8 +1347,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
-            if supports_direct_inputs:
+            shared_workspace_bytes = properties.shared_workspace_bytes
+            if properties.supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
+            if properties.masks_invalid_routes:
+                self._padding_drop_buckets.add(max_T)
             provider = get_megamoe_symm_provider(
                 process_group=self._ep_pg,
                 world_size=self.ep_size,
@@ -1374,6 +1532,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         bucket = self._route_quant_bucket(x.shape[0], self.routing_method.top_k, x.device, x.dtype)
         table = self._slot_of_expert
         shared_target = self._shared_activation_target(x.shape[0])
+        # A bucket whose kernel drops masked routes stages the padding requests' rows as -1 / 0,
+        # as megamoe_stage_routes does on the other paths.
+        word = None
+        if bucket is not None and bucket[0].shape[0] in self._padding_drop_buckets:
+            word = live_rows.current_word(x.device)
         ids, weights, x_fp4, x_sf, _ = dsv4_route_nvfp4_quant(
             router_logits,
             self.routing_method.e_score_correction_bias,
@@ -1387,19 +1550,27 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             replicas=bucket is not None and self._replicated,
             counters=route_counters,
             mxfp8=None if shared_target is None else shared_target[1:],
+            live_row_word=word,
         )
         if shared_target is not None:
             self._shared_quantized = (shared_target[0], x.shape[0])
         if bucket is not None:
             self._prestaged = (bucket[0], ids, weights, x_fp4, x_sf)
+            # The activation rows are in the bucket as quantize_input leaves them, so a launch
+            # given other routes (perfect router, calibrator replay) re-stages only the routes.
+            self._quantized_into = _QuantizedRows(x_fp4, x_sf, bucket[2], x.shape[0])
         return MoEFusedRouteQuant(
             ids, weights, x_fp4, x_sf, routes_counted=route_counters is not None
         )
 
     def _route_quant_bucket(self, num_tokens: int, top_k: int, device, output_dtype):
-        """The chosen launch bucket's (ids, weights, activation, scales) when the fused launch can
-        write them directly, else None."""
-        if self._active_launch_max_tokens is None or self.tactic_autotune or num_tokens == 0:
+        """The launch bucket's (ids, weights, activation, scales) when the fused launch can write them
+        directly, else None: the hinted bucket, or without a hint (EP1, attention TP) the full bucket,
+        which the next run launches on every rank."""
+        if self.tactic_autotune or num_tokens == 0:
+            return None
+        output_dtype = self._active_launch_output_dtype
+        if output_dtype is None:
             return None
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
         if num_tokens > launch_max_T or launch_max_T in self._genphase_direct_input_buckets:
@@ -1440,6 +1611,16 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         HALO-Q/TMA kernel of a replica plan; zero uses the default
         quantization overload.
 
+        With an SF row that needs no padding, the rows are quantized straight
+        into the staging of the bucket the next ``run_moe`` selects: the one
+        ``set_adaptive_launch_tokens`` hinted, or without a hint (EP1, attention
+        TP) the full bucket, once that staging is built (with the same SM
+        reservation), and the returned tensors are views of it. On EP>1 that staging is the
+        symmetric region every same-shape MegaMoE layer shares, so the views
+        hold these rows only until the next MegaMoE ``quantize_input`` or
+        ``run_moe``. That ``run_moe`` raises unless it launches exactly these
+        rows from that staging.
+
         Empty input (``x.shape[0] == 0``) short-circuits to empty NVFP4
         + empty SF without launching a quantization kernel, so the
         ``FusedCommMoEScheduler`` can call ``quantize_input`` uniformly
@@ -1455,19 +1636,34 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         hidden = x.shape[1]
         sf_cols = megamoe_activation_sf_bytes_per_row(hidden)
-        x_bf16 = x.to(torch.bfloat16).contiguous()
-        if x_bf16.shape[0] == 0:
-            empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x_bf16.device)
-            empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x_bf16.device)
+        if x.shape[0] == 0:
+            empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x.device)
+            empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x.device)
             return empty_x, empty_sf
-        x_routed = x_bf16
-        fc31_act_scale = getattr(self, "fc31_act_scale", None)
-        if fc31_act_scale is not None:
-            # Product stays bf16, which is what ``fp4_quantize`` below is given
-            # on every other route into it: ``_SUPPORTED_ACTIVATION_DTYPES``
-            # admits bf16 activations only, so ``fc31_act_scale``, created at
-            # ``module.dtype``, is bf16 as well.
-            x_routed = x_bf16 * fc31_act_scale
+        x_bf16 = x.to(torch.bfloat16).contiguous()
+        x_routed = self._activation_to_quantize(x)
+        raw_cols = ceil_div(hidden, 16)
+        # A forward that run_moe stages: quantize straight into the bucket's activation
+        # rows, which run_moe recognizes by address and does not copy again.
+        staged = (
+            self._staging_of_next_run(x_bf16.shape[0], x_bf16.device)
+            if sf_cols == raw_cols
+            else None
+        )
+        if staged is not None:
+            rows = x_bf16.shape[0]
+            x_fp4 = staged.activation[:rows]
+            x_sf = staged.activation_sf[:rows]
+            # Positional, linear scale factors, and the replica plan's SMs left to HALO-Q/TMA.
+            torch.ops.trtllm.fp4_quantize.into(
+                x_routed, self.fc31_input_scale, x_fp4, x_sf, False, reserved_sms
+            )
+            shared_target = self._shared_activation_target(rows)
+            if shared_target is not None:
+                mxfp8_quantize_megamoe(x_bf16, shared_target[1], shared_target[2])
+                self._shared_quantized = (shared_target[0], rows)
+            self._quantized_into = _QuantizedRows(x_fp4, x_sf, staged.activation, rows)
+            return x_fp4, x_sf
         # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The
         # default overload remains unchanged without a plan.
         if reserved_sms > 0 and _fp4_quantize_has_sm_budget():
@@ -1494,13 +1690,86 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # (== ``megamoe_activation_sf_bytes_per_row``), so
         # 32-aligned-but-not-64-aligned hidden sizes (1568, 1632, 2080)
         # come back 2 bytes short; pad the tail before returning.
-        raw_cols = ceil_div(hidden, 16)
         x_sf_raw = x_sf.view(x_bf16.shape[0], raw_cols)
         if sf_cols == raw_cols:
             return x_fp4, x_sf_raw
         padded_sf = torch.zeros((x_bf16.shape[0], sf_cols), dtype=torch.uint8, device=x_bf16.device)
         padded_sf[:, :raw_cols] = x_sf_raw
         return x_fp4, padded_sf
+
+    def _activation_to_quantize(self, x: torch.Tensor) -> torch.Tensor:
+        """``x`` as the NVFP4 quantization reads it: contiguous bfloat16, times a checkpoint's
+        per-channel pre-quant scale ``fc31_act_scale`` (``[1, hidden]``) if it has one, on which
+        ``fc31_input_scale`` was calibrated."""
+        x_bf16 = x.to(torch.bfloat16).contiguous()
+        fc31_act_scale = getattr(self, "fc31_act_scale", None)
+        if fc31_act_scale is not None:
+            # Product stays bf16, which is what the quantization is given on
+            # every route into it: ``_SUPPORTED_ACTIVATION_DTYPES`` admits bf16
+            # activations only, so ``fc31_act_scale``, created at
+            # ``module.dtype``, is bf16 as well.
+            x_bf16 = x_bf16 * fc31_act_scale
+        return x_bf16
+
+    def supports_fused_prepare(self) -> bool:
+        """Whether ``run_moe`` takes the BF16 activation (``x_sf`` None) and quantizes it in the
+        launch that stages the routes (:meth:`_stage_bf16_inputs`). A layer with a replica plan
+        keeps ``quantize_input``, which leaves SMs to the plan's concurrent HALO-Q/TMA kernel."""
+        balancer = self.layer_load_balancer
+        return hasattr(torch.ops.trtllm, "megamoe_stage_inputs") and (
+            balancer is None
+            or not (balancer.produces_replica_plan or balancer.is_dynamic_routing())
+        )
+
+    def _stage_bf16_inputs(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize ``x`` and stage the routes in one ``megamoe_stage_inputs`` launch, into the
+        staging of the bucket the next launch selects.
+
+        Returns the activation, its scale factors and the routes, which ``_run_moe`` finds staged.
+        Without a staging (inputs read in place, tactic autotuning, SF rows that need padding)
+        it quantizes alone and ``_run_moe`` stages the routes.
+        """
+        num_tokens, top_k = topk_idx.shape
+        hidden = x.shape[1]
+        staged = None
+        if megamoe_activation_sf_bytes_per_row(hidden) == ceil_div(hidden, 16):
+            staged = self._staging_of_next_run(num_tokens, x.device)
+        if staged is None:
+            return (*self.quantize_input(x), topk_idx)
+        bufs = staged
+        x_fp4, x_sf = bufs.activation[:num_tokens], bufs.activation_sf[:num_tokens]
+        quantize = (self._activation_to_quantize(x), self.fc31_input_scale, x_fp4, x_sf)
+        self._quantized_into = _QuantizedRows(x_fp4, x_sf, bufs.activation, num_tokens)
+        shared_target = self._shared_activation_target(num_tokens)
+        if shared_target is not None and num_tokens > 0:
+            mxfp8_quantize_megamoe(
+                x.to(torch.bfloat16).contiguous(), shared_target[1], shared_target[2]
+            )
+            self._shared_quantized = (shared_target[0], num_tokens)
+        if self._slot_of_expert is not None:
+            topk_idx = self.slots_of_experts(topk_idx)
+        torch.ops.trtllm.megamoe_stage_inputs(
+            *quantize,
+            topk_idx,
+            topk_weights,
+            bufs.topk_idx_local,
+            bufs.topk_weights,
+            live_rows.current_word(x.device)
+            if bufs.topk_idx_local.shape[0] in self._padding_drop_buckets
+            else None,
+        )
+        staged_routes = bufs.topk_idx_local[:num_tokens]
+        # The routes are staged with their gate weights: _routes_staged accepts them.
+        self._handed_out_route_staging = (staged_routes, bufs.topk_idx_local)
+        # Static IDs have already been mapped above; do not map the staged slots again.
+        if self._slot_of_expert is not None:
+            self._prestaged = (bufs.topk_idx_local, staged_routes, topk_weights, x_fp4, x_sf)
+        return x_fp4, x_sf, staged_routes
 
     def _replica_plan_launch_args(self, replica_plan):
         """Validate and unpack the caller-owned per-forward replica plan."""
@@ -1534,7 +1803,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
 
     def _wait_rebalance_routes(self, replica_plan=None) -> None:
-        """Order route consumers after HALO-Q while leaving setup overlapped."""
+        """Order route consumers after HALO-Q.
+
+        The activation, the gate weights and both tails stage before this wait, overlapping the
+        HALO-Q copy; only the live rows' slot ids stage after it."""
         if replica_plan is not None:
             replica_plan.wait_for_routes()
 
@@ -1558,7 +1830,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
-        if x_sf is None:
+        self._active_launch_output_dtype = output_dtype
+        if x_sf is None and not self.supports_fused_prepare():
             raise ValueError("MegaMoECuteDsl requires x_sf from quantize_input")
 
         # Surface a missing multi-rank symm provider BEFORE the weights
@@ -1590,9 +1863,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         topk_weights_f32 = token_final_scales
         if topk_weights_f32.dtype != torch.float32 or not topk_weights_f32.is_contiguous():
             topk_weights_f32 = topk_weights_f32.to(torch.float32).contiguous()
+        if x_sf is None:
+            x, x_sf, token_selected_experts = self._stage_bf16_inputs(
+                x, token_selected_experts, topk_weights_f32
+            )
 
-        # Routes stay as produced: the staging copy into the kernel's index
-        # buffer widens int32 to its dtype, and it is the first route reader.
+        # Routes stay as produced: the route staging widens int32 to the
+        # kernel's index dtype, and it is the first route reader.
         return self._run_moe(
             x=x,
             x_sf=x_sf,
@@ -1605,6 +1882,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             device=device,
             output_dtype=output_dtype,
             replica_plan=replica_plan,
+            before_launch=getattr(ctx, "before_launch", None),
         )
 
     def _ensure_local_staging(self, *, top_k: int, hidden: int, device, output_dtype, max_T: int):
@@ -1629,7 +1907,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         ``max_T`` so each bucket owns a distinct staging set.
         """
         max_T = int(max_T)
-        cache_key = (max_T, top_k, hidden, str(device), output_dtype)
+        cache_key = _StagingKey(max_T, top_k, hidden, str(device), output_dtype)
         cached = self._local_staging_cache
         if cache_key in cached:
             return cached[cache_key]
@@ -1672,7 +1950,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 query_megamoe_kernel_properties,
             )
 
-            shared_bytes, supports_direct_inputs = query_megamoe_kernel_properties(
+            properties = query_megamoe_kernel_properties(
                 world_size=1,
                 num_topk=top_k,
                 num_experts_per_rank=self.compute_slot_count,
@@ -1697,13 +1975,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
-            if supports_direct_inputs:
+            if properties.supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
+            if properties.masks_invalid_routes:
+                self._padding_drop_buckets.add(max_T)
             # zeros (not empty): the leading counter prefix is an atomic-add
             # target the kernel only tail-resets for the NEXT launch, so the
             # FIRST launch needs it pre-zeroed (one-time; cached per bucket).
             staging["shared_workspace"] = torch.zeros(
-                shared_bytes, dtype=torch.uint8, device=device
+                properties.shared_workspace_bytes, dtype=torch.uint8, device=device
             )
         cached[cache_key] = staging
         return staging
@@ -1807,46 +2087,67 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         top_k: int,
         stage_activation: bool,
         replica_plan=None,
+        live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         """Copy live rows of the user-domain inputs into the kernel's
-        pre-allocated buffers and refresh the padded tail.
+        pre-allocated buffers and reset the padded tail.
 
         Same code for single-rank (writes land in local CUDA) and
         multi-rank (writes land in symmetric heap regions visible to
         peers). The buffer source is selected upstream by
         :meth:`_acquire_buffers`.
 
-        Tail policy:
+        One op stages the routes of the whole bucket: rows ``[0,
+        num_tokens)`` of ``topk_idx_local`` and ``topk_weights`` get the
+        slot ids (widened to the kernel's index dtype) and gate weights,
+        rows ``[num_tokens, max_T)`` get ``-1`` and ``0.0``. The kernel
+        routes every row whose slot id is valid, and the combine writes
+        one cell per ``(token, k in [0, top_k))`` whatever the id, so
+        both tails are rewritten on every launch. The op depends on
+        ``num_tokens`` alone, so a CUDA graph replay resets rows that an
+        eager launch into the same bucket wrote after the capture.
 
-          * ``topk_idx_local``: always ``-1`` outside live rows, reset
-            over the whole tail on every call. A host-side record of the
-            rows a previous call wrote cannot be trusted: a CUDA graph
-            replays the reset range recorded at capture, after any other
-            graph or eager call. A valid route left in the tail is
-            dispatched, and the SM107 polled top-k reduce, whose grid
-            covers only the live rows, never consumes its combine cells;
-            a later call then reads them as already arrived.
-          * ``topk_weights``: always ``0.0`` outside live rows. The
-            combine kernel writes one cell per
-            ``(token, k in [0, top_k))`` regardless of the
-            ``topk_idx == -1`` mask, so a stale non-zero weight in
-            the tail could corrupt the combine reduction (especially
-            on peer ranks via NVLink). One cheap zero kernel covers
-            it.
+        With ``live_row_word`` (the forward's word, ``moe/live_rows.py``),
+        the op reads it on the device and stages only the leading live
+        rows' routes; the rows of padding requests get ``-1`` and ``0.0``
+        like the tail, so the kernel neither routes nor computes them.
+
+        With a ``replica_plan`` the staging splits around its route wait:
+        the gate weights and both tails before it, the live rows' slot ids
+        (at most ``num_tokens`` rows) after it.
         """
-        max_T = bufs.topk_idx_local.shape[0]
-        if num_tokens < max_T:
-            bufs.topk_idx_local[num_tokens:].fill_(-1)
-        if num_tokens > 0:
-            if stage_activation:
-                bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
-                bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
-            bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
-        if num_tokens < max_T:
-            bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
-        if num_tokens > 0:
-            self._wait_rebalance_routes(replica_plan)
-            bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
+        if topk_idx.shape[0] != num_tokens:
+            raise ValueError(
+                f"MegaMoECuteDsl staging got {topk_idx.shape[0]} route rows for {num_tokens} tokens"
+            )
+        if stage_activation and num_tokens > 0:
+            bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
+            bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
+        if replica_plan is None:
+            self._wait_rebalance_routes(replica_plan)  # nothing to wait for
+            torch.ops.trtllm.megamoe_stage_routes(
+                topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights, live_row_word
+            )
+            return
+        # A replica plan's HALO-Q kernel rewrites the routes: the gate weights and both tails
+        # stage while it runs, and only the live rows' slot ids wait for its routes.
+        torch.ops.trtllm.megamoe_stage_routes(
+            topk_idx,
+            topk_weights,
+            bufs.topk_idx_local,
+            bufs.topk_weights,
+            live_row_word,
+            live_ids=False,
+        )
+        self._wait_rebalance_routes(replica_plan)
+        torch.ops.trtllm.megamoe_stage_routes(
+            topk_idx,
+            topk_weights,
+            bufs.topk_idx_local,
+            bufs.topk_weights,
+            live_row_word,
+            rest=False,
+        )
 
     def _launch_megamoe_kernel(
         self,
@@ -1868,6 +2169,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         launch_max_T: int,
         replica_plan=None,
         staged_inputs: bool = False,
+        before_launch=None,
     ) -> torch.Tensor:
         """Launch the fused MegaMoE CuteDSL kernel and return its reduced output.
 
@@ -1878,7 +2180,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         :func:`_as_fp8_sf` helpers (the kernel rejects raw uint8 byte
         tensors). ``staged_inputs`` states that activation, activation_sf,
         topk_idx and topk_weights are this bucket's launch buffers, whose cute
-        views the op may then reuse.
+        views the op may then reuse. ``before_launch`` is
+        ``MoERunContext.before_launch``, issued right before the op.
         """
         # Hand the symmetric profiling scratch (or a deferred factory) to the
         # op for tuning-mode profiling launches; cleared in the ``finally`` so
@@ -1975,6 +2278,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Quantization, independent staging, output clears, and host setup
         # are already enqueued. The router inside this op first reads routes.
         self._wait_rebalance_routes(replica_plan)
+        if before_launch is not None:
+            before_launch()
         # Eager launches call the op's implementation directly: the custom-op
         # dispatch costs tens of microseconds of host time per layer.
         megamoe_op = (
@@ -2124,18 +2429,24 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 output_dtype=output_dtype,
                 launch_max_T=max_T,
             )
-            stage_megamoe_inputs(
-                torch.empty((0, top_k), dtype=torch.int32, device=device),
-                torch.empty((0, top_k), dtype=torch.float32, device=device),
-                bufs.topk_idx_local,
-                bufs.topk_weights,
+            # A launch without rows: empty routes, so the op writes -1 and 0 into every row of the
+            # bucket.
+            self._stage_inputs(
+                bufs=bufs,
+                x=None,
+                x_sf=None,
+                topk_idx=bufs.topk_idx_local.new_empty((0, top_k)),
+                topk_weights=bufs.topk_weights.new_empty((0, top_k)),
+                num_tokens=0,
+                top_k=top_k,
+                stage_activation=False,
             )
             # Bucket priming has no replica plan and therefore compiles the S=0 path.
             self._launch_megamoe_kernel(
                 activation=bufs.activation,
                 activation_sf=bufs.activation_sf,
                 topk_idx=bufs.topk_idx_local,
-                topk_weights=bufs.topk_weights[:, :top_k],
+                topk_weights=bufs.topk_weights,
                 weight_view=weight_view,
                 combine_output=bufs.combine_output,
                 shared_workspace=bufs.shared_workspace,
@@ -2164,6 +2475,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         device,
         output_dtype: torch.dtype,
         replica_plan=None,
+        before_launch=None,
     ) -> torch.Tensor:
         """Unified MegaMoE CuteDSL forward: acquire -> stage -> launch.
 
@@ -2181,10 +2493,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         single-rank short-circuits ``num_tokens == 0`` because no peer
         is waiting.
         """
-        # Pick and consume the adaptive bucket; un-hinted callers default to
-        # the full bucket.
-        launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
-        self._active_launch_max_tokens = None
+        launch_max_T, quantized_into = self._take_launch_preparation()
         if num_tokens > launch_max_T:
             # By construction num_tokens <= max(all_rank_num_tokens) <=
             # launch_max_T; fail loudly rather than desync the barrier.
@@ -2204,6 +2513,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     f"{num_tokens}); route + quantize or quantize_input must precede run_moe."
                 )
         if num_tokens == 0 and self.ep_size == 1:
+            self._prestaged = None
+            self._handed_out_route_staging = None
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
 
         if (
@@ -2212,6 +2523,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and _MEGAMOE_PRIME_LADDER
             and AutoTuner.get().is_tuning_mode
         ):
+            # The ladder launches the fused kernel too (MoERunContext.before_launch).
+            if before_launch is not None:
+                before_launch()
             self._prime_ladder(
                 live_T=launch_max_T,
                 weight_view=weight_view,
@@ -2236,16 +2550,20 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and prestaged[0] is bufs.topk_idx_local
             and all(a is b for a, b in zip((topk_idx, topk_weights, x, x_sf), prestaged[1:]))
         )
-        if replica_plan is None and (topk_idx.dtype != torch.int32 or not topk_idx.is_contiguous()):
-            topk_idx = topk_idx.to(torch.int32).contiguous()
-        if self._slot_of_expert is not None and not inputs_staged:
-            topk_idx = self.slots_of_experts(topk_idx)
+        # Validate the handed-out slot view before any conversion can discard its identity.
+        routes_staged = inputs_staged
+        if not inputs_staged or self._handed_out_route_staging is not None:
+            routes_staged = self._routes_staged(bufs, topk_idx, num_tokens, top_k, replica_plan)
+        if not routes_staged:
+            if replica_plan is None and (
+                topk_idx.dtype != torch.int32 or not topk_idx.is_contiguous()
+            ):
+                topk_idx = topk_idx.to(torch.int32).contiguous()
+            if self._slot_of_expert is not None:
+                topk_idx = self.slots_of_experts(topk_idx)
         use_direct_inputs = (
             not inputs_staged
-            and self.ep_size > 1
-            and not self.tactic_autotune
-            and num_tokens == launch_max_T
-            and launch_max_T in self._genphase_direct_input_buckets
+            and self._may_read_inputs_in_place(num_tokens, launch_max_T)
             and x.shape == bufs.activation.shape
             and x_sf.shape == bufs.activation_sf.shape
             and x.is_contiguous()
@@ -2264,8 +2582,41 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and topk_idx.data_ptr() % 16 == 0
             and topk_weights.data_ptr() % 16 == 0
         )
-        if replica_plan is not None and not use_direct_routing_inputs:
-            # HALO-Q writes a replica plan's routes on its own stream: only their copy waits for it.
+        # quantize_input already quantized into this bucket's staging: x and x_sf are its
+        # leading rows, so there is nothing to copy. The very views it returned need no storage
+        # check.
+        activation_staged = (
+            quantized_into is not None
+            and x is quantized_into.x
+            and x_sf is quantized_into.x_sf
+            and quantized_into.activation is bufs.activation
+        )
+        if not activation_staged:
+            activation_staged = _is_staging_view(
+                x, bufs.activation, num_tokens
+            ) and _is_staging_view(x_sf, bufs.activation_sf, num_tokens)
+            recorded = (
+                None
+                if quantized_into is None
+                else (quantized_into.activation.data_ptr(), quantized_into.rows)
+            )
+            # Both sides decide the bucket: a mismatch would copy the rows again, or launch stale
+            # ones.
+            if not inputs_staged and recorded != (
+                (bufs.activation.data_ptr(), num_tokens) if activation_staged else None
+            ):
+                raise RuntimeError(
+                    f"MegaMoECuteDsl: quantize_input quantized (staging address, rows) "
+                    f"{recorded}, but run_moe launches {num_tokens} rows at {x.data_ptr():#x} "
+                    f"into bucket {launch_max_T}, whose staging is at "
+                    f"{bufs.activation.data_ptr():#x}. Set the bucket hint before quantize_input "
+                    f"and run_moe on its output."
+                )
+        if routes_staged:
+            if not use_direct_inputs and not activation_staged and num_tokens > 0:
+                bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
+                bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
+        elif not use_direct_routing_inputs:
             self._stage_inputs(
                 bufs=bufs,
                 x=x,
@@ -2274,27 +2625,19 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 topk_weights=topk_weights,
                 num_tokens=num_tokens,
                 top_k=top_k,
-                stage_activation=not use_direct_inputs,
+                stage_activation=not use_direct_inputs and not activation_staged,
                 replica_plan=replica_plan,
-            )
-        elif not use_direct_routing_inputs and not inputs_staged:
-            stage_megamoe_inputs(
-                topk_idx,
-                topk_weights,
-                bufs.topk_idx_local,
-                bufs.topk_weights,
-                x=None if use_direct_inputs else x,
-                x_sf=None if use_direct_inputs else x_sf,
-                act_buffer=bufs.activation,
-                sf_buffer=bufs.activation_sf,
+                live_row_word=(
+                    live_rows.current_word(device)
+                    if launch_max_T in self._padding_drop_buckets
+                    else None
+                ),
             )
         return self._launch_megamoe_kernel(
             activation=x if use_direct_inputs else bufs.activation,
             activation_sf=x_sf if use_direct_inputs else bufs.activation_sf,
             topk_idx=topk_idx if use_direct_routing_inputs else bufs.topk_idx_local,
-            topk_weights=(
-                topk_weights if use_direct_routing_inputs else bufs.topk_weights[:, :top_k]
-            ),
+            topk_weights=topk_weights if use_direct_routing_inputs else bufs.topk_weights,
             weight_view=weight_view,
             combine_output=bufs.combine_output,
             shared_workspace=bufs.shared_workspace,
@@ -2309,6 +2652,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             replica_plan=replica_plan,
             # Direct routing inputs imply direct activation inputs.
             staged_inputs=not use_direct_inputs,
+            before_launch=before_launch,
         )
 
 

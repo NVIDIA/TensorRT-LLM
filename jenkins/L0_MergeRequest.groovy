@@ -1924,6 +1924,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/kernels/gptKernels.cu",
         "cpp/tensorrt_llm/kernels/gptKernels.h",
         "cpp/tensorrt_llm/kernels/moe/communication/",
+        // MegaMoE CuTe DSL staging kernels and ops: the 4-GPU padding-row drop test (l0_dgx_b200).
+        "cpp/tensorrt_llm/kernels/moe/cuteDsl/",
         "cpp/tensorrt_llm/kernels/moe/loadBalance/",
         "cpp/tensorrt_llm/kernels/moe/utils/moeAlignKernels",
         "cpp/tensorrt_llm/kernels/moeCommKernelsCommon.h",
@@ -1943,6 +1945,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/runtime/worldConfig.cpp",
         "cpp/tensorrt_llm/thop/allgatherOp.cpp",
         "cpp/tensorrt_llm/thop/allreduceOp.cpp",
+        "cpp/tensorrt_llm/thop/moe/cuteDsl/",
         "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
         "cpp/tests/unit_tests/multi_gpu/",
         "jenkins/L0_Test.groovy",
@@ -1966,6 +1969,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
+        // Writes the per-forward live-row word that MegaMoE's padding-row drop reads.
+        "tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/runner.py",
         // KVCM2 remote tier: its fabric-transport tests run only on GB300 (l0_gb300).
         "tensorrt_llm/_torch/pyexecutor/kv_cache/remote_donor.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
@@ -2034,6 +2039,8 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/_torch/attention/multi_gpu/",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/moe/multi_gpu/",
+        "tests/unittest/_torch/moe/test_megamoe_before_launch.py",
+        "tests/unittest/_torch/moe/test_megamoe_live_rows_gpu.py",
         "tests/unittest/kv_cache_manager_v2_tests/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/_torch/visual_gen/multi_gpu/",

@@ -686,7 +686,7 @@ class K3MegaMoE(nn.Module):
             )
         b = self.backend
         for max_t in self._buckets:
-            shared_workspace_bytes, direct_inputs = op.query_megamoe_kernel_properties(
+            properties = op.query_megamoe_kernel_properties(
                 world_size=self.ep_size,
                 num_topk=self.top_k,
                 num_experts_per_rank=b.expert_size_per_partition,
@@ -703,7 +703,7 @@ class K3MegaMoE(nn.Module):
                 in_kernel_fc2_reduce=False,
                 combine_format=COMBINE_FORMAT,
             )
-            if direct_inputs:
+            if properties.supports_direct_inputs:
                 self._direct_input_buckets.add(max_t)
             self._symm_providers[max_t] = op.get_megamoe_symm_provider(
                 process_group=self._ep_pg,
@@ -714,7 +714,7 @@ class K3MegaMoE(nn.Module):
                 num_topk=self.top_k,
                 output_dtype=self.dtype,
                 combine_format=COMBINE_FORMAT,
-                shared_workspace_bytes=shared_workspace_bytes,
+                shared_workspace_bytes=properties.shared_workspace_bytes,
             )
         if len(self._buckets) > 1 and self.ep_rank == 0:
             logger.info(

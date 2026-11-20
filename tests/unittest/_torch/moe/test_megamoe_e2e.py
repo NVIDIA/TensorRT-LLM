@@ -12,6 +12,7 @@ an epoch-shifted pass, one CUDA graph of the whole schedule, and the one-round p
 against the metadata push.
 """
 
+import importlib
 import pickle
 import sys
 from typing import Optional
@@ -36,7 +37,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4MoE
 from tensorrt_llm._torch.models.modeling_dspark_v41 import convert_draft_experts_to_nvfp4
 from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 from tensorrt_llm._torch.moe.fused_moe import SwigluActivation, create_moe
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, mega_moe_cute_dsl
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import get_sm_version, mpi_allgather, mpi_rank, mpi_world_size
@@ -87,6 +88,26 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 
 def _init_worker(paths: list[str]) -> None:
     sys.path[:] = paths
+
+
+def _count_separate_staging(patch: pytest.MonkeyPatch, staged: list) -> None:
+    """Record in ``staged`` every separate staging launch (not the DSV4 fused route+quant)."""
+    stage = MegaMoECuteDsl._stage_inputs
+    patch.setattr(
+        MegaMoECuteDsl,
+        "_stage_inputs",
+        lambda *a, **k: staged.append("_stage_inputs") or stage(*a, **k),
+    )
+    # Not the module's torch.ops: the worker is pickled by value, and that namespace does not pickle.
+    trtllm_ops = importlib.import_module("torch").ops.trtllm
+    for name in ("megamoe_stage_inputs", "megamoe_stage_routes"):
+        if hasattr(trtllm_ops, name):
+            staging_op = getattr(trtllm_ops, name)
+            patch.setattr(
+                trtllm_ops,
+                name,
+                lambda *a, _op=staging_op, _name=name, **k: staged.append(_name) or _op(*a, **k),
+            )
 
 
 def _assert_on_all_ranks(problem: Optional[str]) -> None:
@@ -516,7 +537,6 @@ def _run(one_round: bool) -> list:
             return f"{label}: {problems}" if problems else None
 
         staged, kernels = [], []
-        stage = mega_moe_cute_dsl.stage_megamoe_inputs
         resolve = op.Sm100MegaMoENvfp4Runner._resolve_kernel_descriptor
 
         def recording(self, *args, **kwargs):
@@ -541,18 +561,18 @@ def _run(one_round: bool) -> list:
             if label.endswith("base") and len(set(counts)) == 1:
                 _assert_on_all_ranks(check_reference(call))
             with pytest.MonkeyPatch.context() as patch:
-                patch.setattr(
-                    mega_moe_cute_dsl,
-                    "stage_megamoe_inputs",
-                    lambda *a, **k: staged.append(1) or stage(*a, **k),
-                )
+                _count_separate_staging(patch, staged)
                 patch.setattr(op.Sm100MegaMoENvfp4Runner, "_resolve_kernel_descriptor", recording)
                 staged.clear()
                 launched()
                 default = run(call).clone()
                 schedule = launched()
                 default_kinds.update(interleaved for interleaved, _ in schedule)
-                problem = f"{label}: default path staged" if staged and counts[rank] else None
+                problem = (
+                    f"{label}: default path staged by {sorted(set(staged))}"
+                    if staged and counts[rank]
+                    else None
+                )
                 _assert_on_all_ranks(problem)
                 # The plain path: the other scheduler, separate staging and no evict-first hint.
                 tactic = (
