@@ -86,7 +86,7 @@ void megaMoeStageInputs(MegaMoeQuantize const& quantize, IdT const* ids, float c
         = static_cast<int>(std::min((elements + kMegaMoeStageThreads - 1) / kMegaMoeStageThreads, kMaxBlocks));
     MegaMoeStageWriter<IdT, OutT> const writer{
         ids, weights, n, liveRowWord, idsOut, weightsOut, weightsRowStride, elements, topK, blocks};
-    launchMegaMoeStageInputs(quantize, writer, stream);
+    launchMegaMoeStageInputs(quantize, writer, /*sharedBytes=*/0, stream);
 }
 
 #define INSTANTIATE_MEGAMOE_STAGE_ROUTES(IdT, OutT)                                                                    \

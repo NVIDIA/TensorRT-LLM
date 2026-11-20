@@ -1276,6 +1276,7 @@
     },
     {
       "allowed_values": [
+        "adaptive",
         "standard",
         "per_layer_dynamic"
       ],
@@ -1287,6 +1288,11 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "moe_config.load_balancer.num_slots"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.rows_per_expert"
     },
     {
       "capture_policy": "int",

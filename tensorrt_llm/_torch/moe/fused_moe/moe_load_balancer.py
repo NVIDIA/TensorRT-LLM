@@ -5,9 +5,10 @@ import gc
 import os
 import threading
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import (TYPE_CHECKING, Callable, Dict, List, Optional, Protocol,
+                    Sequence, Tuple, runtime_checkable)
 
 import numpy as np
 import torch
@@ -306,6 +307,55 @@ class HostMoeTensorSharer:
             self.own_shm = None
 
 
+GenerationProgress = Callable[[int, int], Tuple[int, int, int]]
+"""``(start, stop)`` -> the tokens the generation requests ``[start, stop)`` still
+have to produce, how many of them are requests and the tokens they accept per
+step, each summed (``BaseMoeLoadBalancer.observe_scheduled_batch``)."""
+
+
+@runtime_checkable
+class MoeLayerLoadBalancer(Protocol):
+    """What every MoE module calls on its layer's load-balancer handle.
+
+    The host statistics, weight-migration and stage hooks of standard EPLB are called only while
+    ``is_dynamic_routing()``; the statistics hooks ``update_local_statistic`` and
+    ``update_statistic_with_local_ids`` only while ``records_statistics()``.
+    """
+
+    # The routes come with a per-forward replica plan (per-layer dynamic EPLB).
+    produces_replica_plan: bool
+    # route() takes token_final_scales and may write the routes into the backend's staging.
+    stages_routes: bool
+
+    def get_repeat_count(self) -> int:
+        ...
+
+    def is_static_routing(self) -> bool:
+        ...
+
+    def is_dynamic_routing(self) -> bool:
+        ...
+
+    def records_statistics(self) -> bool:
+        ...
+
+    def need_load_shared_weights(self) -> bool:
+        ...
+
+    def get_load_expert_ids(self) -> List[int]:
+        ...
+
+    def set_initial_weight_assignments(
+            self, initial_weight_assignments: Optional[Sequence[int]]) -> None:
+        ...
+
+    def route(self,
+              token_selected_experts: torch.Tensor,
+              offset_by_ep_rank: bool = False,
+              **kwargs) -> torch.Tensor:
+        ...
+
+
 class SingleLayerMoeLoadBalancer:
     """
     A class representing a single layer of the Mixture of Experts (MoE) load balancer.
@@ -314,6 +364,7 @@ class SingleLayerMoeLoadBalancer:
 
     # Standard EPLB routes to slot IDs and has no per-invocation replica plan.
     produces_replica_plan = False
+    stages_routes = False
 
     def __init__(
             self,
@@ -407,6 +458,9 @@ class SingleLayerMoeLoadBalancer:
 
     def is_dynamic_routing(self):
         return self.updates_enabled
+
+    def records_statistics(self) -> bool:
+        return self.is_dynamic_routing()
 
     def need_load_shared_weights(self):
         return self.is_dynamic_routing()
@@ -814,7 +868,8 @@ class BaseMoeLoadBalancer(ABC):
     ``start_iter``, and ``end_iter`` or, when the forward raises,
     ``abort_iter``), and workers release resources with a collective
     ``shutdown``. Subclasses initialize ``_previous_balancer``,
-    ``enable_statistic`` and ``enable_update_weights``.
+    ``enable_statistic``, ``enable_update_weights`` and
+    ``next_layer_repeated_count``.
     """
 
     @abstractmethod
@@ -827,6 +882,27 @@ class BaseMoeLoadBalancer(ABC):
     @abstractmethod
     def set_repeated_for_next_layer(self, repeated_count: int) -> None:
         """Set how many times the next added layer is invoked per forward."""
+
+    @contextmanager
+    def unbalanced_layer(self):
+        """Build the next MoE layer as plain EP, outside this balancer.
+
+        For a layer no implementation supporting this balancer's mode can
+        serve (``moe_resolution.resolve_moe_impl``). While the context is open
+        this balancer is not the current one, so the layer registers nothing:
+        no slots, statistics or decisions cover it. The repeat count set for
+        the next layer was meant for that layer and is dropped with it. The
+        balancer is current again afterwards, also on error.
+        """
+        if get_moe_load_balancer() is not self:
+            raise RuntimeError(
+                "only the current load balancer can build a layer outside it")
+        del _current_moe_load_balancer.instance
+        try:
+            yield
+        finally:
+            _current_moe_load_balancer.instance = self
+            self.next_layer_repeated_count = None
 
     @abstractmethod
     def add_layer(self,
@@ -863,6 +939,36 @@ class BaseMoeLoadBalancer(ABC):
     @abstractmethod
     def shutdown(self, local_safe: bool = True) -> bool:
         """Collectively release resources; return False if any rank is unsafe."""
+
+    def prepare_runtime(
+        self, model: torch.nn.Module,
+        decode_tokens: Sequence[int] = ()) -> None:
+        """Finish the setup that needs the loaded model, before the KV cache is sized.
+
+        ``decode_tokens`` are the tokens per GPU per forward of every CUDA graph
+        bucket the deployment decodes in. Every rank must call it. Nothing by
+        default.
+        """
+
+    def observe_scheduled_batch(
+            self, num_generation_requests: int, generation_only: bool,
+            is_warmup: bool, generation_progress: GenerationProgress) -> None:
+        """See the batch the executor is about to run. Nothing by default.
+
+        Args:
+            num_generation_requests: The generation requests of the batch.
+            generation_only: Whether the batch runs no context request.
+            is_warmup: Whether the executor is warming up.
+            generation_progress: ``generation_progress(start, stop)`` sums, over
+                the generation requests ``[start, stop)``, the tokens they
+                still have to produce, how many of them are requests and the
+                tokens they accept per step.
+        """
+
+    def iteration_stats(self) -> Optional[Dict[str, int]]:
+        """Counters the executor reports with its iteration statistics, under
+        ``moeLoadBalancerStats``. None by default."""
+        return None
 
     def set_iter_info(self, enable_statistic: Optional[bool],
                       enable_update_weights: Optional[bool]):
@@ -1172,18 +1278,17 @@ def maybe_create_moe_load_balancer(
                                               | None] = nullcontext()
     config = model_config.moe_load_balancer
     mode = getattr(config, "mode", "standard")
-    if config is not None and mode == "per_layer_dynamic":
+    if config is not None and mode in ("per_layer_dynamic", "adaptive"):
+        name = "per-layer dynamic" if mode == "per_layer_dynamic" else "adaptive"
         if not in_supported_model_arch:
-            raise ValueError(
-                "per-layer dynamic EPLB does not support model architecture "
-                f"{model_arch!r}")
+            raise ValueError(f"{name} EPLB does not support model architecture "
+                             f"{model_arch!r}")
         if not using_ep:
-            raise ValueError("per-layer dynamic EPLB requires expert "
+            raise ValueError(f"{name} EPLB requires expert "
                              "parallelism (moe_ep_size > 1)")
         if using_smart_router:
-            raise ValueError(
-                "per-layer dynamic EPLB is incompatible with smart routing "
-                "(moe_cluster_size > 1)")
+            raise ValueError(f"{name} EPLB is incompatible with smart routing "
+                             "(moe_cluster_size > 1)")
     if getattr(config, "warmup_placement", None) is not None:
         if not in_supported_model_arch:
             raise ValueError(
@@ -1220,6 +1325,15 @@ def maybe_create_moe_load_balancer(
                 config.num_slots,
                 getattr(config, "auxiliary_sms", 4),
             )
+        elif mode == "adaptive":
+            from .adaptive_eplb import AdaptiveMoeLoadBalancer
+
+            moe_load_balancer = AdaptiveMoeLoadBalancer(ep_rank=ep_rank,
+                                                        ep_size=ep_size,
+                                                        config=config,
+                                                        mapping=mapping)
+            logger.info("Created adaptive MoE LoadBalancer, num_slots=%s...",
+                        config.num_slots)
         elif mode == "standard":
             if config.layer_updates_per_iter > 0:
                 # TODO: remove this when supported.

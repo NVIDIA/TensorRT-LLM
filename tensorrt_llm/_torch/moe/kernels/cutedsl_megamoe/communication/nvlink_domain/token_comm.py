@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Metadata-push routing and fused non-deterministic token communication."""
 
 import dataclasses
@@ -35,6 +38,7 @@ from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div, round_up
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
+from .adaptive_route import AdaptiveRouteMixin
 from .one_round_router import _OneRoundRouter, fence_proxy_async_global
 from .symmetric_buffer import SymmetricBufferDevice
 
@@ -111,7 +115,7 @@ def _copy_atom(dtype, num_bits_per_copy: int):
     return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=num_bits_per_copy)
 
 
-class _MetadataPushRouter(KernelComponent):
+class _MetadataPushRouter(AdaptiveRouteMixin, KernelComponent):
     """Sort and push routing metadata into each destination rank's final pool."""
 
     router_smem_limit_bytes: ClassVar[int] = 227 * 1024
@@ -169,11 +173,15 @@ class _MetadataPushRouter(KernelComponent):
             # (one NVLink domain); the internode component sets its ranks_per_node so the size
             # exchange, the metadata push and the ready counters stay inside the node.
             "ranks_per_node": OptionalRequirement(int),
+            # > 0: the staged ids are this many experts' ids, mapped and counted by the adaptive route
+            # (adaptive_route.py).
+            "adaptive_route_experts": OptionalRequirement(int),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
 
+        self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
         self.world_size = problem_desc["world_size"]
         self.ranks_per_node = impl_desc.get("ranks_per_node", self.world_size)
         if self.ranks_per_node <= 0 or self.world_size % self.ranks_per_node != 0:
@@ -448,8 +456,13 @@ class _MetadataPushRouter(KernelComponent):
         activation: Optional[cute.Tensor] = None,  # (tokens, hidden) FP4 rows, relay payload source
         activation_sf: Optional[cute.Tensor] = None,  # (tokens, hidden // sf_vector) scale factors
         activation_scales: Optional[cute.Tensor] = None,  # (max_tokens_per_rank,) fp32, local
+        adaptive_route: Optional[tuple] = None,  # iff adaptive_route_experts > 0 (AdaptiveRouteMixin)
     ) -> None:
         """Launch counting-sort DATA, size-exchange HELPER, and metadata PUSH roles."""
+        if cutlass.const_expr((adaptive_route is not None) != (self.adaptive_route_experts > 0)):
+            raise ValueError("adaptive_route is passed iff the router is built with adaptive_route_experts")
+        if cutlass.const_expr(adaptive_route is None):
+            adaptive_route = (None,) * 7
         if cutlass.const_expr(self.apply_topk_at_fc1 and topk_scores is None):
             raise ValueError("apply_topk_at_fc1 requires router topk_scores.")
         if cutlass.const_expr(self.fc1_activation_per_token_scale != (activation_scales is not None)):
@@ -469,6 +482,7 @@ class _MetadataPushRouter(KernelComponent):
             gin_shared_window_offset,
             activation,
             activation_sf,
+            *adaptive_route,
         ).launch(
             grid=[self.router_grid_cta_count, 1, 1],
             block=[self.router_warps_per_cta * 32, 1, 1],
@@ -492,6 +506,13 @@ class _MetadataPushRouter(KernelComponent):
         gin_shared_window_offset,  # Optional[Int64]: None without GIN resources
         activation: Optional[cute.Tensor],
         activation_sf: Optional[cute.Tensor],
+        adaptive_tables: Optional[Int64],
+        adaptive_rows: Optional[Int64],
+        adaptive_forwards: Optional[Int64],
+        adaptive_enabled: Optional[Int64],
+        adaptive_live_word: Optional[Int64],
+        adaptive_num_tokens: Optional[Int32],
+        adaptive_first: Optional[Int32],
     ) -> None:
         # First statement on purpose: a by-value NCCL DevComm argument must be materialized where it
         # dominates the whole kernel (see the fused kernel); the base router rejects the handles.
@@ -526,6 +547,19 @@ class _MetadataPushRouter(KernelComponent):
         self._router_warp_idx = warp_idx
         self._router_lane_idx = lane_idx
         self._router_activation_scales = activation_scales
+        if cutlass.const_expr(self.adaptive_route_experts > 0):
+            self._router_adaptive = (
+                adaptive_tables,
+                adaptive_rows,
+                adaptive_forwards,
+                adaptive_enabled,
+                adaptive_live_word,
+                adaptive_num_tokens,
+                adaptive_first,
+            )
+            self._router_adaptive_rows = self._adaptive_counted_rows(
+                self._router_adaptive, linear_cta_idx, thread_idx
+            )
 
         if cutlass.const_expr(self.router_data_cta_count == 1):
             self._router_single_cta(topk_indices, topk_scores, smem_base)
@@ -553,6 +587,9 @@ class _MetadataPushRouter(KernelComponent):
         self._router_warp_idx = None
         self._router_lane_idx = None
         self._router_activation_scales = None
+        if cutlass.const_expr(self.adaptive_route_experts > 0):
+            self._router_adaptive = None
+            self._router_adaptive_rows = None
 
     @cute.jit
     def _router_single_cta(
@@ -1139,9 +1176,27 @@ class _MetadataPushRouter(KernelComponent):
             if cutlass.const_expr(topk_indices.dtype.width == 64):
                 expert_registers[register_idx] = raw_indices_i32[2 * register_idx]
             token_idx, _ = self._router_value_coordinate(register_idx, topk_indices.dtype)
-            is_invalid = (expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count)) | (
-                token_idx >= actual_token_count
-            )
+            if cutlass.const_expr(self.adaptive_route_experts > 0):
+                # Expert ids: count the live rows' picks and route each through the layer's tables; any other
+                # id becomes -1, which the slot test below drops.
+                in_range = (
+                    expert_registers_u32[register_idx] < cutlass.Uint32(self.adaptive_route_experts)
+                ) & (token_idx < actual_token_count)
+                if in_range:
+                    expert_registers[register_idx] = self._adaptive_pick(
+                        self._router_adaptive,
+                        self._router_adaptive_rows,
+                        expert_registers[register_idx],
+                        token_idx,
+                        self._router_local_rank,
+                    )
+                else:
+                    expert_registers[register_idx] = Int32(-1)
+                is_invalid = expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count)
+            else:
+                is_invalid = (expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count)) | (
+                    token_idx >= actual_token_count
+                )
             if is_invalid:
                 expert_registers[register_idx] = Int32(self.expert_count_padded)
         return expert_registers, score_registers
@@ -1709,6 +1764,7 @@ class TokenCommNonDeterministic(KernelComponent):
         activation: Optional[cute.Tensor] = None,
         activation_sf: Optional[cute.Tensor] = None,
         activation_scales: Optional[cute.Tensor] = None,
+        adaptive_route: Optional[tuple] = None,
     ) -> None:
         if cutlass.const_expr(self.one_round_dispatch):
             self._router.launch_router(
@@ -1722,6 +1778,7 @@ class TokenCommNonDeterministic(KernelComponent):
                 peer_rank_ptr_mapper_host,
                 device_workspace,
                 stream,
+                adaptive_route,
             )
         else:
             self._router.launch_router(
@@ -1739,6 +1796,8 @@ class TokenCommNonDeterministic(KernelComponent):
                 activation,
                 activation_sf,
                 activation_scales,
+                # Only an adaptive-route build passes it: every other router keeps its signature.
+                **({} if adaptive_route is None else {"adaptive_route": adaptive_route}),
             )
 
     # Pool-layout hooks. The NVLink-domain component consumes the router's tables directly; the
