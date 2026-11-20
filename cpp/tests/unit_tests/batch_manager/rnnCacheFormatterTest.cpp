@@ -202,15 +202,17 @@ TEST_F(RnnTargetIRanksTest, inquireSupport)
 
 TEST_F(RnnTargetIRanksTest, RejectsMissingRnnConfig)
 {
-    auto const rnnState = makeRnnCacheState(8, 2, 1, {8});
-    texec::kv_cache::CacheState const kvState(0, 1, 64, 32, 2, 1, 1, {0}, tensorrt_llm::DataType::kFLOAT);
+    auto const rnnState = makeRnnCacheState(8, /*tp=*/2, /*pp=*/1, {8});
+    texec::kv_cache::CacheState const kvState(/*nbAttentionLayers=*/0, /*nbKvHeads=*/1,
+        /*sizePerHead=*/64, /*tokensPerBlock=*/32, /*tensorParallelism=*/2, /*pipelineParallelism=*/1,
+        /*contextParallelism=*/1, /*attentionLayerNumPerPP=*/{0}, /*dataType=*/tensorrt_llm::DataType::kFLOAT);
     EXPECT_FALSE(tbm::rnn_cache_routing::inquireSupport(rnnState, kvState));
     EXPECT_FALSE(tbm::rnn_cache_routing::inquireSupport(kvState, rnnState));
 }
 
 TEST_F(RnnTargetIRanksTest, RejectsStateDataTypeMismatch)
 {
-    auto const selfState = makeRnnCacheState(8, 2, 1, {8});
+    auto const selfState = makeRnnCacheState(8, /*tp=*/2, /*pp=*/1, {8});
     auto destState = selfState;
     destState.setRnnConfig(
         selfState.getRnnModelConfig(), {8}, tensorrt_llm::DataType::kHALF, tensorrt_llm::DataType::kFLOAT);
@@ -222,7 +224,7 @@ TEST_F(RnnTargetIRanksTest, RejectsStateDataTypeMismatch)
 
 TEST_F(RnnTargetIRanksTest, RejectsModelConfigMismatch)
 {
-    auto const selfState = makeRnnCacheState(8, 2, 1, {8});
+    auto const selfState = makeRnnCacheState(8, /*tp=*/2, /*pp=*/1, {8});
     auto destState = selfState;
     auto modelConfig = selfState.getRnnModelConfig();
     ++modelConfig.mDState;
@@ -232,8 +234,10 @@ TEST_F(RnnTargetIRanksTest, RejectsModelConfigMismatch)
 
 TEST_F(RnnTargetIRanksTest, RejectsContextParallelism)
 {
-    auto const selfState = makeRnnCacheState(8, 2, 1, {8});
-    texec::kv_cache::CacheState destState(0, 1, 64, 32, 2, 1, 2, {0}, tensorrt_llm::DataType::kFLOAT);
+    auto const selfState = makeRnnCacheState(8, /*tp=*/2, /*pp=*/1, {8});
+    texec::kv_cache::CacheState destState(/*nbAttentionLayers=*/0, /*nbKvHeads=*/1,
+        /*sizePerHead=*/64, /*tokensPerBlock=*/32, /*tensorParallelism=*/2, /*pipelineParallelism=*/1,
+        /*contextParallelism=*/2, /*attentionLayerNumPerPP=*/{0}, /*dataType=*/tensorrt_llm::DataType::kFLOAT);
     destState.setRnnConfig(
         selfState.getRnnModelConfig(), {8}, tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kFLOAT);
     EXPECT_FALSE(tbm::rnn_cache_routing::inquireSupport(selfState, destState));
