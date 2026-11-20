@@ -48,7 +48,7 @@ from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
-                      NonNegativeInt, PositiveInt, field_validator,
+                      NonNegativeInt, PositiveInt, PrivateAttr, field_validator,
                       model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
@@ -58,10 +58,10 @@ from tensorrt_llm.kv_hints import KvHintsEnvelope
 from tensorrt_llm.kv_hints.protocol import admit_kv_hints
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
-                                 SamplingParams)
+from tensorrt_llm.llmapi import DisaggScheduleStyle, GuidedDecodingParams
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.sampling_params import (check_logprobs_limit,
+from tensorrt_llm.sampling_params import (EmbeddingBias, SamplingParams,
+                                          check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
 from tensorrt_llm.serve.serving_extensions import structured_output_format_for
@@ -101,8 +101,8 @@ def ensure_request_chat_template_allowed(request: Any,
 
 def _logit_bias_to_embedding_bias(
         logit_bias: Optional[Dict[str, float]],
-        vocab_size: Optional[int]) -> Optional[torch.Tensor]:
-    """Convert OpenAI logit_bias dict to embedding_bias tensor for sampling."""
+        vocab_size: Optional[int]) -> Optional[EmbeddingBias]:
+    """Convert OpenAI logit_bias dict to sparse embedding_bias for sampling."""
     if logit_bias is None:
         return None
     if vocab_size is None:
@@ -114,8 +114,7 @@ def _logit_bias_to_embedding_bias(
     elif vocab_size <= 0:
         raise ValueError("vocab_size must be positive when logit_bias is used")
 
-    # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
-    embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
+    embedding_bias_dict = {}
 
     # Apply biases for specified token IDs
     for token_str, bias in logit_bias.items():
@@ -144,9 +143,12 @@ def _logit_bias_to_embedding_bias(
             raise ValueError(
                 f"logit_bias value for token ID {token_id} must be in "
                 f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}]")
-        embedding_bias[token_id] = bias_value
+        embedding_bias_dict[
+            token_id] = bias_value  # if several keys resolve to same token_id, last one wins
 
-    return embedding_bias
+    return tuple(
+        sorted(embedding_bias_dict.items(),
+               key=lambda idx_and_val: idx_and_val[0]))
 
 
 class OpenAIBaseModel(BaseModel):
@@ -378,6 +380,21 @@ class ConversationParams(OpenAIBaseModel):
                      "affinity; forwarded to workers as a header, never in the "
                      "body."))
 
+    # The server generated conversation_id for one request; it never recurs.
+    _generated_for_one_request: bool = PrivateAttr(default=False)
+
+    @classmethod
+    def for_one_request(cls, conversation_id: str) -> "ConversationParams":
+        """Params with a ``conversation_id`` generated for one request."""
+        params = cls(conversation_id=conversation_id)
+        params._generated_for_one_request = True
+        return params
+
+    @property
+    def generated_for_one_request(self) -> bool:
+        """Whether ``conversation_id`` was generated for one request."""
+        return self._generated_for_one_request
+
     @field_validator("conversation_id", mode="before")
     @classmethod
     def validate_conversation_id(cls, value: Any) -> str:
@@ -529,6 +546,120 @@ class EmbeddingResponse(OpenAIBaseModel):
         description="The list of embeddings, one per input item.")
     usage: EmbeddingUsageInfo = Field(
         description="Token usage for the request.")
+
+
+class RerankDocument(OpenAIBaseModel):
+    text: str = Field(description="The document text.")
+
+
+class RerankRequest(OpenAIBaseModel):
+    """Request accepted by /rerank and /v1/rerank."""
+
+    model: str | None = Field(default=None,
+                              description="The model to use for reranking.")
+    query: str = Field(min_length=1,
+                       description="The search query to compare documents to.")
+    documents: list[str | RerankDocument] = Field(
+        min_length=1, description="The documents to rerank.")
+    top_n: NonNegativeInt | None = Field(
+        default=None,
+        description="Maximum number of results to return; zero returns all.")
+    return_documents: bool = Field(
+        default=False,
+        description="Whether each result should include its document text.")
+    max_tokens_per_doc: PositiveInt | None = Field(
+        default=None,
+        description="Maximum number of document tokens included in each prompt."
+    )
+    instruction: str | None = Field(
+        default=None,
+        description="Optional task-specific instruction for Qwen3-Reranker.")
+
+
+class RerankResult(OpenAIBaseModel):
+    index: NonNegativeInt = Field(
+        description="Index of the document in the request.")
+    relevance_score: float = Field(ge=0.0,
+                                   le=1.0,
+                                   description="Document relevance score.")
+    document: RerankDocument | None = Field(
+        default=None, description="The document, when requested.")
+
+
+class RerankUsageInfo(OpenAIBaseModel):
+    prompt_tokens: NonNegativeInt = Field(
+        default=0, description="Number of input tokens processed.")
+    total_tokens: NonNegativeInt = Field(
+        default=0,
+        description="Total tokens processed, equal to prompt_tokens.")
+
+
+class RerankResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"rerank-{uuid.uuid4().hex}")
+    model: str = Field(description="The model used for reranking.")
+    results: list[RerankResult] = Field(
+        description="Results ordered by descending relevance.")
+    usage: RerankUsageInfo = Field(description="Token usage for the request.")
+
+
+class RerankV2Request(OpenAIBaseModel):
+    """Cohere v2-compatible request accepted by /v2/rerank."""
+
+    model: str = Field(description="The model to use for reranking.")
+    query: str = Field(min_length=1,
+                       description="The search query to compare documents to.")
+    documents: list[str] = Field(min_length=1,
+                                 description="The documents to rerank.")
+    top_n: PositiveInt | None = Field(
+        default=None, description="Maximum number of results to return.")
+    max_tokens_per_doc: PositiveInt = Field(
+        default=4096,
+        description="Maximum number of document tokens included in each prompt."
+    )
+    priority: int = Field(
+        default=0,
+        ge=0,
+        le=999,
+        description=
+        "Request priority; TensorRT-LLM currently supports only zero.")
+    instruction: str | None = Field(
+        default=None,
+        description="TensorRT-LLM task-instruction extension for Qwen3-Reranker."
+    )
+
+
+class RerankV2Result(OpenAIBaseModel):
+    index: NonNegativeInt = Field(
+        description="Index of the document in the request.")
+    relevance_score: float = Field(ge=0.0,
+                                   le=1.0,
+                                   description="Document relevance score.")
+
+
+class RerankV2ApiVersion(OpenAIBaseModel):
+    version: Literal["2"] = Field(default="2", description="API version.")
+
+
+class RerankV2BilledUnits(OpenAIBaseModel):
+    search_units: PositiveInt = Field(
+        default=1, description="Number of billed search units.")
+
+
+class RerankV2Meta(OpenAIBaseModel):
+    api_version: RerankV2ApiVersion = Field(
+        default_factory=RerankV2ApiVersion,
+        description="Version metadata for the response.")
+    billed_units: RerankV2BilledUnits = Field(
+        default_factory=RerankV2BilledUnits,
+        description="Billing metadata for the response.")
+
+
+class RerankV2Response(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"rerank-{uuid.uuid4().hex}")
+    results: list[RerankV2Result] = Field(
+        description="Results ordered by descending relevance.")
+    meta: RerankV2Meta = Field(default_factory=RerankV2Meta,
+                               description="Response metadata.")
 
 
 def _response_format_to_guided_decoding_params(
@@ -1447,7 +1578,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def check_logprobs(cls, data):
         if (top_logprobs := data.get("top_logprobs")) is not None:
             check_logprobs_limit("top_logprobs", top_logprobs)
-            if not data.get("logprobs"):
+            if top_logprobs > 0 and not data.get("logprobs"):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")
         return data
@@ -2421,8 +2552,10 @@ class MediaReferenceItem(OpenAIBaseModel):
         description="The reference payload, in the form declared by ``format``."
     )
     format: Literal["path", "url", "base64"] = Field(description=(
-        "Wire form of ``content``: ``path`` (a file readable by the server; a "
-        "``file://`` URI is also accepted), ``url`` (``http(s)``, fetched "
+        "Wire form of ``content``: ``path`` (a server-side file under the "
+        "directory named by ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR``; a ``file://`` "
+        "URI is also accepted; at most 200 MiB per file and 512 MiB across "
+        "the ``path`` references of one request), ``url`` (``http(s)``, fetched "
         "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
         "also accepted). Raw bytes reach the server as a multipart upload, "
         "which carries no ``format`` of its own. Distinct from the top-level "
@@ -2664,7 +2797,7 @@ class StartProfileRequest(OpenAIBaseModel):
         default=None,
         description="Directory where chrome traces are written. Defaults "
         "to the TLLM_TORCH_PROFILER_DIR environment variable, "
-        "then /tmp.")
+        "then a temporary directory.")
     num_steps: Optional[PositiveInt] = Field(
         default=None,
         description="Number of iterations to profile. Must be >= 1 if "

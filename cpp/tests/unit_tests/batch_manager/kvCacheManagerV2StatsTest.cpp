@@ -1051,6 +1051,120 @@ TEST_F(ReplayCacheTest, FixedRegionCapacityRaisesASmallGpuQuota)
     manager->shutdown();
 }
 
+TEST_F(ReplayCacheTest, PendingSsmSnapshotMovesIntoTreeWithCachePriority)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    SsmLayerConfig ssm;
+    ssm.layerId = 1;
+    ssm.buffers.push_back(BufferConfig{"state", 4096, std::nullopt});
+    config.layers.emplace_back(ssm);
+    auto manager = std::make_shared<KvCacheManager>(config);
+    ASSERT_EQ(manager->lifeCycles().ssmLifeCycleIds().size(), 1U);
+    std::optional<LifeCycleId> const ssmLc = manager->lifeCycles().ssmLifeCycleIds().front();
+    auto const ssmPg = manager->storage().getPoolGroupIndex(kHotLevel, *ssmLc);
+    constexpr Priority kSsmPriority = 7;
+    KvCache::PriorityCb const priorityCb
+        = [ssmLc](BlockOrdinal, LifeCycleId lc) { return lc == *ssmLc ? kSsmPriority : kPriorityDefault; };
+
+    auto const tokens = makeTokens(12);
+    TokenSpan const tokenSpan{tokens.data(), static_cast<int>(tokens.size())};
+    auto cache = manager->createKvCache({}, {}, 1, priorityCb);
+    ASSERT_TRUE(cache->resume(mStream));
+    ASSERT_TRUE(cache->resize(12));
+    auto const freeBefore = manager->storage().getStatistics(kHotLevel, ssmPg).free;
+    auto const slot = cache->acquireSsmSnapshotSlot();
+    ASSERT_TRUE(slot.has_value());
+    EXPECT_EQ(cache->pendingSsmSnapshotSlot(), slot);
+    EXPECT_NE(*slot, cache->getSsmBlockBaseIndex(manager->getLayerGroupId(LayerId{1})));
+    EXPECT_EQ(manager->storage().getStatistics(kHotLevel, ssmPg).free, freeBefore - 1);
+
+    ASSERT_TRUE(cache->resize(12, 8));
+    cache->commit(TokenSpan{tokens.data(), 8}, /*isEnd=*/false, /*ssmFromPending=*/true);
+    EXPECT_FALSE(cache->pendingSsmSnapshotSlot().has_value());
+    // Moved, not copied: no further slot was taken and the tree block owns the pending slot.
+    EXPECT_EQ(manager->storage().getStatistics(kHotLevel, ssmPg).free, freeBefore - 1);
+    auto const match = manager->radixTree().match({}, TokenSpan{tokens.data(), 8});
+    ASSERT_EQ(match.numTokens, 8);
+    auto const* snapshot = match.blocks.back()->storage.at(*ssmLc);
+    ASSERT_NE(snapshot, nullptr);
+    EXPECT_EQ(slotIdToPageIndexValue(snapshot->slotId()), *slot);
+    EXPECT_EQ(snapshot->priority(), kSsmPriority);
+
+    ASSERT_TRUE(cache->resize(12, 12));
+    cache->stopCommitting();
+    cache->close();
+    auto reused = manager->createKvCache({}, tokenSpan, 2);
+    EXPECT_EQ(reused->numCommittedTokens(), 8);
+    ASSERT_TRUE(reused->resume(mStream));
+    reused->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, PendingSsmSnapshotReleasePaths)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    SsmLayerConfig ssm;
+    ssm.layerId = 1;
+    ssm.buffers.push_back(BufferConfig{"state", 4096, std::nullopt});
+    config.layers.emplace_back(ssm);
+    auto manager = std::make_shared<KvCacheManager>(config);
+    ASSERT_EQ(manager->lifeCycles().ssmLifeCycleIds().size(), 1U);
+    std::optional<LifeCycleId> const ssmLc = manager->lifeCycles().ssmLifeCycleIds().front();
+    auto const ssmPg = manager->storage().getPoolGroupIndex(kHotLevel, *ssmLc);
+    auto freeSlots = [&]() { return manager->storage().getStatistics(kHotLevel, ssmPg).free; };
+    auto const tokens = makeTokens(8);
+
+    auto suspended = manager->createKvCache({}, {}, 1);
+    EXPECT_THROW(suspended->acquireSsmSnapshotSlot(), LogicError);
+    ASSERT_TRUE(suspended->resume(mStream));
+    suspended->close();
+
+    auto cache = manager->createKvCache({}, {}, 2);
+    ASSERT_TRUE(cache->resume(mStream));
+    ASSERT_TRUE(cache->resize(8, 4));
+    auto const freeBefore = freeSlots();
+    // No pending page to commit from.
+    EXPECT_THROW(cache->commit(TokenSpan{tokens.data(), 4}, false, true), LogicError);
+
+    ASSERT_TRUE(cache->acquireSsmSnapshotSlot().has_value());
+    EXPECT_THROW(cache->acquireSsmSnapshotSlot(), LogicError);
+    EXPECT_THROW(cache->commit(TokenSpan{tokens.data(), 4}, /*isEnd=*/true, true), LogicError);
+    EXPECT_TRUE(cache->pendingSsmSnapshotSlot().has_value());
+    cache->releaseSsmSnapshotSlot();
+    EXPECT_FALSE(cache->pendingSsmSnapshotSlot().has_value());
+    EXPECT_EQ(freeSlots(), freeBefore);
+    cache->releaseSsmSnapshotSlot();
+
+    // An empty commit records no snapshot and releases the page.
+    ASSERT_TRUE(cache->acquireSsmSnapshotSlot().has_value());
+    cache->commit(TokenSpan{tokens.data(), 0}, false, true);
+    EXPECT_FALSE(cache->pendingSsmSnapshotSlot().has_value());
+    EXPECT_EQ(freeSlots(), freeBefore);
+
+    ASSERT_TRUE(cache->acquireSsmSnapshotSlot().has_value());
+    cache->suspend();
+    EXPECT_FALSE(cache->pendingSsmSnapshotSlot().has_value());
+    ASSERT_TRUE(cache->resume(mStream));
+    EXPECT_EQ(freeSlots(), freeBefore);
+
+    ASSERT_TRUE(cache->acquireSsmSnapshotSlot().has_value());
+    cache->stopCommitting();
+    EXPECT_FALSE(cache->pendingSsmSnapshotSlot().has_value());
+    EXPECT_EQ(freeSlots(), freeBefore);
+    EXPECT_FALSE(cache->acquireSsmSnapshotSlot().has_value());
+    cache->close();
+
+    auto other = manager->createKvCache({}, {}, 3);
+    ASSERT_TRUE(other->resume(mStream));
+    auto const otherFreeBefore = freeSlots();
+    ASSERT_TRUE(other->acquireSsmSnapshotSlot().has_value());
+    other->close();
+    EXPECT_EQ(freeSlots(), otherFreeBefore + 1);
+    manager->shutdown();
+}
+
 TEST_F(ReplayCacheTest, ClosingScratchCacheReleasesEverySlotExactlyOnce)
 {
     auto config = makeConfig();

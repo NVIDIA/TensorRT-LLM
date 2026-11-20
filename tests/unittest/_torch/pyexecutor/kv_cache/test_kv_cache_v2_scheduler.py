@@ -18,8 +18,9 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+from collections import deque
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
 
@@ -39,8 +40,172 @@ from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     ContextSchedulingPolicy,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _manager_for_release(request_id: int, is_draft: bool = False):
+    """A manager whose `free_resources` runs for real on one mock KvCache."""
+    manager = object.__new__(KVCacheManagerV2)
+    cache = Mock(beam_width=1)
+    manager.kv_cache_map = {request_id: cache}
+    manager.impl = Mock()
+    manager.index_mapper = Mock()
+    manager.num_pools = 1
+    manager.sparse_metadata_batch = None
+    manager.is_draft = is_draft
+    manager.kv_connector_manager = None
+    manager.conversation_manager = None
+    manager._early_freed_index_requests = set()
+    manager._deferred_closes = deque()
+    manager._pending_preemption = {}
+    manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
+    manager._request_stats_enabled_ids = set()
+    manager._fresh_pages_filled = {}
+    manager._disagg_receive_ready = {}
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
+    return manager, cache
+
+
+def _finished_request(request_id: int, generation_only: bool = True) -> Mock:
+    return Mock(
+        py_request_id=request_id, is_generation_only_request=generation_only, is_dummy=False
+    )
+
+
+@pytest.mark.parametrize("generation_only", [False, True])
+def test_release_closes_immediately_by_default(generation_only: bool) -> None:
+    manager, cache = _manager_for_release(7)
+
+    manager.free_resources(_finished_request(7, generation_only))
+
+    cache.close.assert_called_once_with()
+    manager.impl.clear_stats_excluded.assert_called_once_with(7)
+    manager.index_mapper.remove_sequence.assert_called_once_with(7)
+    assert 7 not in manager.kv_cache_map
+    assert not manager._deferred_closes
+
+
+def test_deferred_release_closes_generation_only_request_on_flush() -> None:
+    manager, cache = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+
+    manager.free_resources(_finished_request(7))
+
+    # Everything but the close happens now; the index slot is free already.
+    cache.close.assert_not_called()
+    manager.index_mapper.remove_sequence.assert_called_once_with(7)
+    assert 7 not in manager.kv_cache_map
+    assert len(manager._deferred_closes) == 1
+
+    assert manager.flush_deferred_closes() is True
+
+    cache.close.assert_called_once_with()
+    manager.impl.clear_stats_excluded.assert_called_once_with(7)
+    manager.index_mapper.remove_sequence.assert_called_once_with(7)
+    assert not manager._deferred_closes
+    assert not manager._early_freed_index_requests
+    assert manager.flush_deferred_closes() is False
+    cache.close.assert_called_once_with()
+
+
+def test_deferred_close_that_raises_still_forgets_its_request() -> None:
+    manager, cache = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+    manager.free_resources(_finished_request(7))
+    later = Mock()
+    manager._deferred_closes.append((8, later))
+    cache.close.side_effect = RuntimeError("close failed")
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        manager.flush_deferred_closes()
+
+    manager.impl.clear_stats_excluded.assert_called_once_with(7)
+    later.close.assert_not_called()
+    assert list(manager._deferred_closes) == [(8, later)]
+
+
+def test_an_id_reused_before_the_flush_keeps_its_own_early_free() -> None:
+    """The deferred request leaves nothing under its id, so a new request with the same id whose index slot was freed
+    early (a context-only worker) still skips the second slot release when it is removed."""
+    manager, _ = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+    manager.free_resources(_finished_request(7))
+    assert 7 not in manager._early_freed_index_requests
+
+    manager._early_freed_index_requests.add(7)  # the new request's early free
+    manager.flush_deferred_closes()
+
+    assert 7 in manager._early_freed_index_requests
+
+
+@pytest.mark.parametrize("defer", [False, True])
+def test_lender_hears_of_the_free_right_before_the_close(defer: bool) -> None:
+    manager, cache = _manager_for_release(7)
+    order = Mock()
+    manager._sharing = order.sharing
+    order.attach_mock(cache.close, "close")
+    manager.enable_deferred_close(defer)
+
+    manager.free_resources(_finished_request(7))
+    if defer:
+        # The pages are still held, so the lender must not count them free yet.
+        assert order.mock_calls == []
+        manager.flush_deferred_closes()
+
+    assert order.mock_calls == [call.sharing._on_free(7, cache), call.close()]
+
+
+def test_deferred_release_keeps_other_requests_immediate() -> None:
+    manager, cache = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+
+    manager.free_resources(_finished_request(7, generation_only=False))
+
+    cache.close.assert_called_once_with()
+    assert not manager._deferred_closes
+
+
+def test_disabling_deferred_release_flushes_pending_closes() -> None:
+    manager, cache = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+    manager.free_resources(_finished_request(7))
+
+    manager.enable_deferred_close(False)
+
+    cache.close.assert_called_once_with()
+    assert not manager._defer_close_enabled
+    assert not manager._deferred_closes
+
+
+def test_draft_manager_never_defers_release() -> None:
+    manager, cache = _manager_for_release(7, is_draft=True)
+    manager.enable_deferred_close(True)
+
+    manager.free_resources(_finished_request(7))
+
+    assert not manager._defer_close_enabled
+    cache.close.assert_called_once_with()
+
+
+def test_reuse_reset_closes_deferred_caches_first() -> None:
+    # A close after the clear would commit the request's pages for reuse again.
+    manager, cache = _manager_for_release(7)
+    manager._sharing = None
+    manager.event_manager = None
+    manager.enable_deferred_close(True)
+    manager.free_resources(_finished_request(7))
+    order = Mock()
+    order.attach_mock(cache.close, "close")
+    order.attach_mock(manager.impl.clear_reusable_blocks, "clear")
+
+    manager.reset_reuse_state()
+
+    assert order.mock_calls == [call.close(), call.clear()]
+    assert not manager._deferred_closes
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +275,7 @@ def make_ctx_request(
     req.lora_task_id = lora_task_id
     req.is_context_init_state = True
     req.is_generation_in_progress_state = False
+    req.is_context_only_request = False
     req.encoder_output_len = encoder_output_len
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
@@ -366,6 +532,10 @@ def make_kv_cache_manager(
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req, reuse_limit=None: True)
     mgr.prepare_context_cache.side_effect = lambda req, reuse_limit=None: 0
+    # The real cap, so it follows _spec_recompute_tail (zero: no cap).
+    mgr.context_reuse_claim_limit.side_effect = lambda req: (
+        KVCacheManagerV2.context_reuse_claim_limit(mgr, req)
+    )
     # The backoff lives in KVCacheManagerV2; the scheduler only clips the two
     # already-backed-off probe depths against each other.
     mgr.reuse_match_backoff = 0
@@ -407,6 +577,8 @@ def make_kv_cache_manager(
     mgr.preempt_request.side_effect = preempt_request
     # A bare Mock would answer truthily and suppress every stall check.
     mgr.has_pending_preemption.return_value = False
+    # No deferred close is pending unless a test queues one.
+    mgr.flush_deferred_closes.return_value = False
     return mgr
 
 
@@ -451,6 +623,8 @@ def make_scheduler(
     enable_recompute_pause: bool = True,
     context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
     context_starvation_iterations: int | None = None,
+    recover_lost_kv_per_rank: bool = True,
+    **scheduler_kwargs,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -459,7 +633,7 @@ def make_scheduler(
         "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.KVCacheManagerV2",
         new=type(kv_cache_manager),
     ):
-        kwargs = {}
+        kwargs = dict(scheduler_kwargs)
         if no_schedule_until_state is not None:
             kwargs["no_schedule_until_state"] = no_schedule_until_state
         if no_schedule_after_state is not None:
@@ -480,6 +654,7 @@ def make_scheduler(
             enable_recompute_pause=enable_recompute_pause,
             context_scheduling_policy=context_scheduling_policy,
             context_starvation_iterations=context_starvation_iterations,
+            recover_lost_kv_per_rank=recover_lost_kv_per_rank,
             **kwargs,
         )
 
@@ -681,6 +856,7 @@ class TestInflightPrefixWait:
         req.cache_salt = None
         req.multimodal_hashes = None
         req.is_dummy_request = False
+        req.is_dummy = False
         return req
 
     @staticmethod
@@ -722,6 +898,18 @@ class TestInflightPrefixWait:
         assert ids(sched.schedule_request([owner], set()).context_requests) == [0]
         self.run_chunk(owner)
         return owner
+
+    @pytest.mark.parametrize("tail", [-1, PROMPT_LEN - TOKENS_PER_BLOCK])
+    def test_request_does_not_wait_for_a_prefix_its_recompute_tail_cannot_claim(self, tail):
+        """The spec recompute tail caps the claim, so the request would gain
+        nothing by waiting for the owner's prefill."""
+        mgr = self.make_manager()
+        mgr._spec_recompute_tail = tail
+        sched = make_scheduler(mgr, max_num_tokens=100000)
+        owner = self._owner_in_flight(sched)
+        out = sched.schedule_request([owner, self.make_request(1)], {owner.request_id})
+        assert ids(out.context_requests) == [1]
+        mgr.request_prefix_snapshot.assert_not_called()
 
     def test_pass_where_every_request_waits_is_a_bounded_stall(self):
         """A pass in which every pending request waits for a prefilling owner
@@ -1171,6 +1359,287 @@ class TestKVCacheFailuresGen:
         assert 99 not in ids(out.paused_requests)
 
 
+def _remote_level_failed():
+    return RemoteMemError(
+        "KVCM2 remote level: a READ of 4 page(s) x 1048576 B timed out after 30000 ms"
+    )
+
+
+class TestKVPagesLostToAFailedRemoteLevel:
+    """A resume that raises RemoteMemError lost pages on a failed remote cache level: only that request is affected."""
+
+    @staticmethod
+    def _lose_pages_of(lost_id):
+        def alloc_fn(req):
+            if req.py_request_id == lost_id:
+                raise _remote_level_failed()
+            return True
+
+        return alloc_fn
+
+    def test_a_generation_request_recomputes(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=self._lose_pages_of(1))
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        lost = make_gen_request(1)
+
+        out = sched.schedule_request([make_gen_request(0), lost, make_gen_request(2)], set())
+
+        assert ids(out.generation_requests) == [0, 2]
+        assert ids(out.recompute_paused_requests) == [1]
+        assert out.paused_requests == []
+        mgr.free_resources.assert_called_once_with(lost)
+        assert sched.take_lost_kv_requests() == []
+
+    def test_a_request_that_cannot_recompute_is_failed_by_the_executor(self):
+        """A disaggregated server cannot replay a prefill."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=self._lose_pages_of(1))
+        sched = make_scheduler(mgr, max_num_tokens=100, enable_recompute_pause=False)
+        lost = make_gen_request(1)
+
+        out = sched.schedule_request([make_gen_request(0), lost, make_gen_request(2)], set())
+
+        assert ids(out.generation_requests) == [0, 2]
+        assert out.recompute_paused_requests == []
+        [(failed, message)] = sched.take_lost_kv_requests()
+        assert failed is lost and "failed remote cache level" in message
+        assert sched.take_lost_kv_requests() == []
+
+    def test_no_further_victim_is_taken_once_the_pages_are_known_lost(self):
+        """The first resume found no room; the one after a victim made room read the dead level."""
+        calls = []
+
+        def alloc_fn(req):
+            calls.append(req.py_request_id)
+            if req.py_request_id == 1:
+                if calls.count(1) == 1:
+                    return False
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(i) for i in (0, 1, 98, 99)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.paused_requests) == [99]
+        assert ids(out.recompute_paused_requests) == [1]
+        assert ids(out.generation_requests) == [0, 98]
+
+    def test_a_first_context_chunk_matches_again(self):
+        """It computed nothing: its caches go, and the next pass matches without the failed level's pages."""
+        calls = [0]
+
+        def prepare_fn(req):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        lost = make_ctx_request(0, context_remaining_length=100)
+        mgr.kv_cache_map[0] = Mock()
+        # Where the failed match left it: past the reused prefix.
+        lost.context_current_position = 64
+        lost.estimated_reusable_tokens = 64
+
+        out = sched.schedule_request(
+            [lost, make_ctx_request(1, context_remaining_length=100)], set()
+        )
+
+        assert ids(out.context_requests) == [1]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_called_once_with(lost)
+        assert lost.context_current_position == 0
+        assert lost.estimated_reusable_tokens == 0
+        lost.set_prepopulated_prompt_len.assert_called_once_with(0, mgr.tokens_per_block)
+        out = sched.schedule_request([lost], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_a_started_context_request_recomputes(self):
+        def prepare_fn(req):
+            if req.py_request_id == 0:
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        lost = make_ctx_request(0, context_remaining_length=100, is_first_context_chunk=False)
+
+        out = sched.schedule_request(
+            [lost, make_ctx_request(1, context_remaining_length=100)], set()
+        )
+
+        assert ids(out.context_requests) == [1]
+        assert ids(out.recompute_paused_requests) == [0]
+        mgr.free_resources.assert_called_once_with(lost)
+
+    def test_a_disagg_generation_init_request_matches_again(self):
+        """A generation-init admission whose prefix match resumed pages of a failed level costs only that request."""
+        calls = [0]
+
+        def prepare_fn(req):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000, enable_recompute_pause=False)
+        lost = make_disagg_request(0)
+        mgr.kv_cache_map[0] = Mock()
+
+        out = sched.schedule_request([lost, make_gen_request(1)], set())
+
+        assert ids(out.generation_requests) == [1]
+        assert out.fitting_disagg_gen_init_requests == []
+        mgr.free_resources.assert_called_once_with(lost)
+        assert sched.take_lost_kv_requests() == []
+        out = sched.schedule_request([lost], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0]
+
+    @pytest.mark.parametrize("path", ["generation", "context", "disagg_generation_init"])
+    def test_a_lockstep_rank_stops_instead_of_recovering_alone(self, path):
+        """TP/CP/PP peers did not see this rank's failure: recovering here alone would desynchronize them."""
+
+        def lose(req):
+            raise _remote_level_failed()
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lose if path == "generation" else None,
+            prepare_context_fn=lose if path == "context" else None,
+            prepare_disagg_gen_init_fn=lose if path == "disagg_generation_init" else None,
+        )
+        mgr.has_remote_cache_level = True
+        mgr.any_remote_level_failed = False
+        sched = make_scheduler(mgr, max_num_tokens=1000, recover_lost_kv_per_rank=False)
+        request = {
+            "generation": lambda: make_gen_request(0),
+            "context": lambda: make_ctx_request(0, context_remaining_length=100),
+            "disagg_generation_init": lambda: make_disagg_request(0),
+        }[path]()
+
+        with pytest.raises(RemoteMemError, match="lock step"):
+            sched.schedule_request([request], set())
+        mgr.free_resources.assert_not_called()
+        assert sched.take_lost_kv_requests() == []
+
+    @pytest.mark.parametrize("fails_during_pass", [False, True])
+    def test_a_lockstep_rank_stops_once_its_level_failed(self, fails_during_pass):
+        """A level that failed in an eviction WRITE, which the manager retried past, still diverged the reuse tree."""
+        mgr = make_kv_cache_manager()
+        mgr.has_remote_cache_level = True
+        failed = [not fails_during_pass]
+
+        def alloc_fn(req):
+            failed[0] = True
+            return True
+
+        mgr.try_allocate_generation.side_effect = alloc_fn
+        type(mgr).any_remote_level_failed = PropertyMock(side_effect=lambda: failed[0])
+        sched = make_scheduler(mgr, max_num_tokens=1000, recover_lost_kv_per_rank=False)
+
+        with pytest.raises(RemoteMemError, match="lock step"):
+            sched.schedule_request([make_gen_request(0)], set())
+        assert mgr.try_allocate_generation.called == fails_during_pass
+
+    def test_a_per_rank_scheduler_never_polls_the_level(self):
+        """TP1 and attention DP recover per request: no per-pass query."""
+        mgr = make_kv_cache_manager()
+        mgr.has_remote_cache_level = True
+        polled = PropertyMock(return_value=False)
+        type(mgr).any_remote_level_failed = polled
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+
+        sched.schedule_request([make_gen_request(0)], set())
+
+        polled.assert_not_called()
+
+    def test_the_executor_fails_lost_requests_under_the_multimodal_scheduler(self):
+        """MultimodalScheduler forwards the wrapped scheduler's lost requests to PyExecutor._schedule."""
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import MultimodalScheduler
+
+        class StopAfterLost(RuntimeError):
+            pass
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=self._lose_pages_of(1))
+        inner = make_scheduler(mgr, max_num_tokens=100, enable_recompute_pause=False)
+        lost = make_gen_request(1)
+        requests = [make_gen_request(0), lost]
+        for request in requests:
+            request.py_mm_encoder_state = None
+        executor = object.__new__(PyExecutor)
+        executor.active_requests = requests
+        executor.inflight_req_ids = set()
+        executor.kv_cache_manager = mgr
+        executor._maybe_record_hang_diagnostic_phase = Mock()
+        executor._cancelled_disagg_model_request_ids = Mock(return_value=set())
+        executor.scheduler = MultimodalScheduler(
+            inner,
+            max_batch_size=8,
+            max_num_tokens=100,
+            encoder_cache=Mock(),
+            get_item_cache_keys=lambda request: None,
+            bytes_per_encoder_embedding=2,
+            retain_cache_entries=False,
+        )
+        executor._handle_errors = Mock(side_effect=StopAfterLost)
+
+        with pytest.raises(StopAfterLost):
+            PyExecutor._schedule(executor)
+
+        executor._handle_errors.assert_called_once()
+        (message,), kwargs = executor._handle_errors.call_args
+        assert kwargs == {"requests": [lost], "charge_budget": False}
+        assert "failed remote cache level" in message
+
+
+class TestDeferredClosesBeforeEviction:
+    """Deferred closes (defer_generation_only_release) are flushed before any running request pays for room."""
+
+    @pytest.mark.parametrize("enable_recompute_pause", [True, False])
+    def test_a_flush_that_makes_room_pauses_nobody(self, enable_recompute_pause):
+        pending = [True]
+        room = [False]
+
+        def flush():
+            had, pending[0] = pending[0], False
+            room[0] = room[0] or had
+            return had
+
+        def alloc_fn(req):
+            return req.py_request_id != 0 or room[0]
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr.flush_deferred_closes.side_effect = flush
+        sched = make_scheduler(
+            mgr, max_num_tokens=100, enable_recompute_pause=enable_recompute_pause
+        )
+        reqs = [make_gen_request(i) for i in (0, 1, 2)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.generation_requests) == [0, 1, 2]
+        assert out.paused_requests == []
+        assert out.recompute_paused_requests == []
+        mgr.flush_deferred_closes.assert_called_once_with()
+
+    def test_without_pending_closes_the_ladder_runs_as_before(self):
+        def alloc_fn(req):
+            return req.py_request_id != 0 or mgr.kv_cache_map[2].is_active is False
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(i) for i in (0, 1, 2)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.paused_requests) == [2]
+        assert ids(out.generation_requests) == [0, 1]
+
+
 class TestUnpairedDraftAdmission:
     """A draft pool the scheduler suspends but never used to re-admit.
 
@@ -1430,7 +1899,9 @@ class TestKVCacheFailuresCtx:
         """Both pools claim the minimum of their backed-off probe depths.
 
         Pairing up front rather than claim-then-reconcile keeps the mismatch path
-        -- free the draft pages, re-claim shallower -- off the common case.
+        -- free the draft pages, re-claim shallower -- off the common case. The
+        draft's depth also goes to the target, whose capped lookup cannot see a
+        fork past the claim.
         """
         mgr = make_kv_cache_manager(tokens_per_block=64, enable_joint_kv_cache_reuse=True)
         draft_mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -1455,7 +1926,40 @@ class TestKVCacheFailuresCtx:
         assert ids(out.context_requests) == [0]
         assert draft_mgr.prepare_context_cache.call_args_list == [call(req, expected)]
         mgr.prepare_context_cache.assert_called_once_with(req, expected)
+        mgr.note_context_fork.assert_called_once_with(req, draft_probe)
         draft_mgr.free_resources.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("tail", "probe", "expected"),
+        [
+            pytest.param(128, 509, 448, id="tail_binds"),
+            pytest.param(128, 253, 253, id="match_binds"),
+            pytest.param(-1, 509, 0, id="full_re_prefill"),
+            pytest.param(128, None, 448, id="no_probe"),
+        ],
+    )
+    def test_paired_claims_leave_the_spec_recompute_tail(
+        self, tail: int, probe: int | None, expected: int
+    ) -> None:
+        """A paired first chunk claims through prepare_context_cache directly,
+        so the pair's limit carries the target's recompute tail as well."""
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_joint_kv_cache_reuse=True)
+        mgr._spec_recompute_tail = tail
+        draft_mgr = make_kv_cache_manager(tokens_per_block=64)
+        draft_mgr.probe_context_reuse.side_effect = lambda req: probe
+        mgr.probe_context_reuse.side_effect = lambda req: probe
+        draft_mgr.prepare_context_cache.side_effect = [expected]
+        mgr.prepare_context_cache.side_effect = [expected]
+        req = make_ctx_request(0, context_remaining_length=600, prompt_len=600)
+        req.context_chunk_size = 600
+        req.is_dummy = False
+
+        sched = make_scheduler(mgr, max_num_tokens=2000, draft_kv_cache_manager=draft_mgr)
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert draft_mgr.prepare_context_cache.call_args_list == [call(req, expected)]
+        mgr.prepare_context_cache.assert_called_once_with(req, expected)
 
     def test_paired_reuse_falls_back_to_zero_when_pools_disagree(self):
         mgr = make_kv_cache_manager(
@@ -2093,6 +2597,24 @@ class TestContextPreemption:
 
         assert ids(out.recompute_paused_requests) == [99]
         assert ids(out.context_requests) == []
+
+    def test_preemption_victim_must_share_the_locality_domain(self):
+        """Pages are per domain: a victim elsewhere frees nothing for the request."""
+        mgr = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        same = make_gen_request(1)
+        same.py_locality_domain_id = 0
+        # Newest, so it would be taken first without the domain filter.
+        other = make_gen_request(2)
+        other.py_locality_domain_id = 1
+        recompute_paused = []
+
+        assert sched._try_preempt_for_pages(
+            [same, other], set(), set(), recompute_paused, set(), 0, locality_domain_id=0
+        )
+
+        assert recompute_paused == [same]
+        mgr.preempt_request.assert_called_once_with(same)
 
     def test_a_failed_preemption_still_lets_the_pass_continue(self):
         """With nothing to give up there is no capacity to reserve."""
@@ -2734,13 +3256,6 @@ class TestEncoder:
         assert ids(out.encoder_requests) == [0]
         assert ids(out.context_requests) == []
 
-    def test_encoder_budget_overflow(self):
-        mgr = make_kv_cache_manager()
-        sched = make_encoder_scheduler(mgr, max_num_tokens=100)
-        reqs = [make_encoder_request(0, encoder_output_len=200)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.encoder_requests) == 0
-
     def test_encoder_exceeds_budget(self):
         """encoder_output_len > max_num_tokens → break (not scheduled)."""
         mgr = make_kv_cache_manager()
@@ -3298,6 +3813,45 @@ class TestDisagg:
 # ===========================================================================
 
 
+class TestMidchunkSnapshotBudget:
+    """A budget-capped FORCE_CHUNK step of a request whose cache manager takes snapshots
+    inside the step (py_midchunk_snapshot_alignment / py_midchunk_pass_point): the cap
+    is rounded down to the 128-token unit and ends before the next point it may not pass.
+    An aligned point inside the step is the manager's to snapshot."""
+
+    @pytest.mark.parametrize(
+        "budget,prompt_len,points,branch,expected",
+        [
+            # The last point merges into the final step; the cap ends before it.
+            (512, 1000, [896], None, 512),
+            # A point that is not a multiple of the unit: the capped step passes the
+            # aligned point 192 and the manager snapshots it inside the step.
+            (256, 300, [192], None, 256),
+            # A branch point is passed; the cap ends before the following point.
+            (1536, 2100, [1024, 2048], 1024, 1536),
+            # Enough budget: the step ends at the following point.
+            (4096, 2100, [1024, 2048], 1024, 2048),
+        ],
+    )
+    def test_capped_step(self, budget, prompt_len, points, branch, expected):
+        sched = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=budget,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 128),
+        )
+        req = make_ctx_request(0, context_remaining_length=prompt_len, is_last_context_chunk=False)
+        req.expect_snapshot_points = points
+        req.py_midchunk_snapshot_alignment = 64
+        req.py_midchunk_pass_point = branch
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == expected
+        # Every point strictly inside the step is aligned, so the manager can take it.
+        assert all(p % 64 == 0 for p in points if 0 < p < expected)
+
+
 class TestChunkedContext:
     def test_budget_enough_for_all(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -3642,17 +4196,6 @@ class TestDraftTokenFitting:
         # V2 does not trim drafts — full draft_len included
         req.discard_draft_tokens.assert_not_called()
 
-    def test_max_context_length_limits_draft(self):
-        """max_context_length=110, chunk=100, draft=20. V2 scheduler adds
-        full draft_len to chunk_tokens without trimming."""
-        mgr = make_kv_cache_manager(tokens_per_block=64)
-        sched = make_scheduler(mgr, max_num_tokens=110, ctx_chunk_config=(None, 64))
-        req = make_ctx_request(0, context_remaining_length=100, num_draft_tokens=20)
-        out = sched.schedule_request([req], set())
-        assert ids(out.context_requests) == [0]
-        # V2 does not trim drafts — full draft_len included
-        req.discard_draft_tokens.assert_not_called()
-
     def test_draft_tokens_add_to_batch_budget(self):
         """Last chunk with draft: batch_num_tokens += chunk_size + num_draft_tokens."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -3929,14 +4472,6 @@ class TestMixedOrdering:
         assert len(out.generation_requests) == 2
         assert len(out.context_requests) == 2
 
-    def test_ctx_fail_gen_after_succeeds(self):
-        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: False)
-        sched = make_scheduler(mgr, max_num_tokens=1000)
-        reqs = [make_ctx_request(0, 500), make_gen_request(1)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
-        assert ids(out.generation_requests) == [1]
-
     def test_gen_fail_self_evicts_then_breaks(self):
         """Gen fails → self-evicts → break. Ctx after is NOT tried."""
         mgr = make_kv_cache_manager(
@@ -3973,18 +4508,6 @@ class TestMixedOrdering:
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 1
         assert len(out.context_requests) == 1
-
-    def test_encoder_then_gen(self):
-        mgr = make_kv_cache_manager()
-        sched = make_encoder_scheduler(mgr, max_num_tokens=100)
-        reqs = [
-            make_encoder_request(0, encoder_output_len=50),
-            make_gen_request(1),
-        ]
-        out = sched.schedule_request(reqs, set())
-        assert ids(out.encoder_requests) == [0]
-        assert ids(out.context_requests) == []
-        assert ids(out.generation_requests) == [1]
 
     def test_ctx_fail_budget_preserved(self):
         """Failed ctx doesn't consume budget — gen gets full budget."""
@@ -5099,10 +5622,10 @@ def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
 
 
 @pytest.mark.parametrize("remote_mode", [None, "source", "destination"])
-def test_replay_only_batch_clears_deferred_generation_overlap_state(
+def test_remote_tail_source_defers_generation_and_destination_mixes(
     remote_mode: str | None,
 ) -> None:
-    """A resumed decode must not compensate for a token already harvested on CPU."""
+    """Only a source-only batch must clear the deferred decode's overlap state."""
     manager = make_kv_cache_manager()
     scheduler = make_scheduler(manager, max_num_tokens=256)
     decoding = make_gen_request(0)
@@ -5112,7 +5635,7 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
 
     first = scheduler.schedule_request([decoding, replay], set())
     assert ids(first.context_requests) == [1]
-    if remote_mode is None:
+    if remote_mode != "source":
         assert ids(first.generation_requests) == [0]
         assert decoding.py_batch_idx == 7
     else:
@@ -5121,10 +5644,11 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
         manager.try_allocate_generation.assert_not_called()
         manager.suspend_request.assert_not_called()
 
-    # After replay finishes, the deferred request resumes without losing KV.
-    resumed = scheduler.schedule_request([decoding], set())
-    assert ids(resumed.generation_requests) == [0]
-    manager.try_allocate_generation.assert_called_with(decoding)
+    if remote_mode == "source":
+        # The deferred request resumes from its host token count.
+        resumed = scheduler.schedule_request([decoding], set())
+        assert ids(resumed.generation_requests) == [0]
+        manager.try_allocate_generation.assert_called_with(decoding)
 
 
 @pytest.mark.parametrize("prompt_len", [0, 8])
@@ -5274,6 +5798,282 @@ class TestPregrownContextCapacity:
 # ===========================================================================
 # Long-prefill Demotion
 # ===========================================================================
+
+
+class TestLongContextDemotionExact:
+    """RuntimeHooks.exact_context_demotion: the demotion classifies by the prefix
+    cache. An estimate above the threshold is probed once against the radix
+    tree, a request whose cache is held is judged by its exact remainder, and
+    one ordered as short whose first prepare shows a long remainder is deferred."""
+
+    def _make(self, exact=True, reused=None, prepared_remaining=None, **demote):
+        """`reused`: probe result per request id. `prepared_remaining`: the exact
+        remainder prepare_context leaves per request id (its claimed reuse)."""
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_block_reuse=True)
+        reused = reused or {}
+        prepared_remaining = prepared_remaining or {}
+
+        def prepare(req, reuse_limit=None):
+            mgr.kv_cache_map[req.py_request_id]  # the request now holds a cache
+            if req.py_request_id in prepared_remaining:
+                req.context_remaining_length = prepared_remaining[req.py_request_id]
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.probe_context_reuse.side_effect = lambda req: reused.get(req.py_request_id)
+        demote.setdefault("context_demote_uncached_tokens", 1024)
+        demote.setdefault("context_demote_max_iters", 0)
+        with patch.dict("os.environ", {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "0"}):
+            sched = make_scheduler(
+                mgr,
+                max_num_tokens=1024,
+                ctx_chunk_config=(None, 64),
+                exact_context_demotion=exact,
+                **demote,
+            )
+        return sched, mgr
+
+    def _req(self, request_id, remaining, estimate, prompt_len=None):
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, prompt_len=prompt_len
+        )
+        req.py_uncached_prefill_tokens = estimate
+        req.py_uncached_prefill_probed = False
+        return req
+
+    def test_constructor_arguments_win_over_the_environment(self):
+        env = {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "4096", "TLLM_V2_CTX_DEMOTE_MAX_ITERS": "3"}
+        with patch.dict("os.environ", env):
+            from_env = make_scheduler(make_kv_cache_manager(), ctx_chunk_config=(None, 64))
+            from_fields = make_scheduler(
+                make_kv_cache_manager(),
+                ctx_chunk_config=(None, 64),
+                context_demote_uncached_tokens=16384,
+                context_demote_max_iters=8,
+            )
+            off = make_scheduler(
+                make_kv_cache_manager(),
+                ctx_chunk_config=(None, 64),
+                context_demote_uncached_tokens=0,
+                exact_context_demotion=True,
+            )
+        assert (from_env._ctx_demote_uncached_tokens, from_env._ctx_demote_max_iters) == (4096, 3)
+        assert (from_fields._ctx_demote_uncached_tokens, from_fields._ctx_demote_max_iters) == (
+            16384,
+            8,
+        )
+        assert not from_env._ctx_demote_exact
+        # Exact mode only refines a demotion that is on.
+        assert off._ctx_demote_uncached_tokens == 0 and not off._ctx_demote_exact
+
+    def test_off_without_the_declaration(self):
+        sched, mgr = self._make(exact=False, reused={1: 9_800})
+        long_req, forked = self._req(0, 10_000, 10_000), self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([long_req, forked], set())
+        assert ids(out.context_requests) == [0]
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_probe_releases_a_request_over_a_cached_prefix(self):
+        """A forked sub-agent: unseen conversation, so the router estimates the
+        whole prompt, but 9800 of its 10000 tokens are cached."""
+        sched, mgr = self._make(reused={0: 0, 1: 9_800}, prepared_remaining={1: 200})
+        long_req, forked = self._req(0, 10_000, 10_000), self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([long_req, forked], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert forked.py_uncached_prefill_tokens == 200
+        assert forked.context_chunk_size == 200
+        assert long_req.context_chunk_size == 768  # leftover 824, rounded to the chunk unit
+        # One probe per request: the second iteration reuses the refined estimates.
+        sched.schedule_request([long_req], set())
+        assert mgr.probe_context_reuse.call_count == 2
+
+    def test_held_cache_is_judged_by_its_exact_remainder(self):
+        """A continuing turn whose prefix was evicted: the router estimates 256,
+        but the cache it holds leaves 10000 tokens to prefill."""
+        sched, mgr = self._make()
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        mgr.kv_cache_map[0]
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert lost.context_chunk_size == 768
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_first_prepare_defers_a_request_found_long(self):
+        """Deferred to the tail of the iteration's context order; its released
+        first-chunk admission is prepared again there."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000})
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert short.context_chunk_size == 256
+        assert lost.context_chunk_size == 768
+        assert sched._ctx_demote_skips == {0: 1}  # counted as demoted for aging
+        assert mgr.prepare_context.call_count == 3  # lost twice (deferred, retried), short once
+        # The deferral released the first-chunk admission before the retry.
+        mgr.free_resources.assert_called_once_with(lost)
+
+    def test_starved_requests_found_long_run_on_their_shares(self):
+        """Starved requests ordered as short are not deferred when their first
+        prepare shows a long remainder: a deferral would not move them, and
+        every iteration would order and defer them again."""
+        sched, _ = self._make(
+            prepared_remaining={0: 10_000, 1: 10_000},
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+            context_starvation_iterations=8,
+        )
+        sched._sched_iter = 100
+        first, second = self._req(0, 10_000, 256), self._req(1, 10_000, 256)
+        for req in (first, second):
+            req.py_ctx_sched_since_iter = 0
+        for _ in range(2):
+            for req in (first, second):
+                req.py_uncached_prefill_tokens = 256
+            out = sched.schedule_request([first, second], set())
+            assert sorted(ids(out.context_requests)) == [0, 1]
+            # Each holds 1024 // 4 = 256 tokens; the oldest takes the leftover.
+            assert first.context_chunk_size + second.context_chunk_size == 1024
+            assert min(first.context_chunk_size, second.context_chunk_size) >= 256
+
+    def _run_behind_full_budgets(self, sched, mgr, lost, iterations):
+        """Schedule *lost* first in arrival order, each iteration behind a new
+        short request that takes the whole token budget. A first chunk that
+        is not scheduled releases its cache. Returns the iteration (1-based)
+        that scheduled *lost*, or None."""
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id, None)
+        for iteration in range(1, iterations + 1):
+            short = self._req(100 + iteration, 1024, 1024)
+            out = sched.schedule_request([lost, short], set())
+            if lost.py_request_id in ids(out.context_requests):
+                return iteration
+        return None
+
+    def test_request_found_long_at_first_prepare_ages_out(self):
+        """Found long only by its first prepare, behind short requests that fill
+        the budget: demoted at most context_demote_max_iters iterations, then
+        let through. Its exact remainder demotes it at the door from the second
+        iteration on, so it is not prepared again until it runs."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000}, context_demote_max_iters=2)
+        lost = self._req(0, 10_000, 256)
+        assert self._run_behind_full_budgets(sched, mgr, lost, 5) == 3
+        assert lost.py_request_id in sched._ctx_demote_released  # let through for good
+        prepared = [c.args[0] for c in mgr.prepare_context.call_args_list]
+        assert prepared.count(lost) == 2  # found long, then scheduled
+
+    def test_request_found_long_at_first_prepare_without_bound(self):
+        """context_demote_max_iters=0 sets no bound: the request stays demoted
+        while short requests fill the budget, demoted at the door after its
+        first prepare."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000})
+        lost = self._req(0, 10_000, 256)
+        assert self._run_behind_full_budgets(sched, mgr, lost, 5) is None
+        assert lost.py_uncached_prefill_tokens == 10_000
+        assert sched._ctx_demote_skips == {0: 5}
+        prepared = [c.args[0] for c in mgr.prepare_context.call_args_list]
+        assert prepared.count(lost) == 1
+
+    def test_request_found_short_is_not_deferred(self):
+        sched, _ = self._make(prepared_remaining={0: 512})
+        first, second = self._req(0, 512, 512), self._req(1, 256, 256)
+        out = sched.schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert sched._ctx_demote_skips == {}
+
+    def test_waiting_request_is_probed_again(self):
+        """A request waiting for a prefix another request prefills (PrefixWaitPlanner)
+        is probed again once it stops waiting: its first probe predates that prefix."""
+        reused = {1: 0}
+        sched, mgr = self._make(reused=reused, prepared_remaining={1: 200})
+        waits = {1: None}
+        sched._prefix_wait_planner = Mock()
+        sched._prefix_wait_planner.plan.side_effect = lambda reqs: dict(waits)
+        waiting = self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([waiting], set())
+        assert ids(out.context_requests) == []
+        assert waiting.py_uncached_prefill_tokens == 10_000
+        assert not waiting.py_uncached_prefill_probed
+        # The prefix owner committed 9800 shared tokens; the waiter is released.
+        reused[1] = 9_800
+        waits.clear()
+        out = sched.schedule_request([waiting], set())
+        assert ids(out.context_requests) == [1]
+        assert waiting.py_uncached_prefill_tokens == 200
+        assert waiting.context_chunk_size == 200
+        assert mgr.probe_context_reuse.call_count == 2
+        # Only the pass that kept it waiting counts a prefix wait.
+        mgr.count_prefix_waits.assert_called_once_with(1)
+
+    @pytest.mark.parametrize("on_crumbs", [False, True])
+    @pytest.mark.parametrize("exact", [True, False])
+    def test_request_without_estimate_waits_behind_a_started_demoted_prefill(
+        self, exact, on_crumbs
+    ):
+        """A request without an estimate does not overtake a demoted prefill that
+        has started, alone or on the budget a short request left. Otherwise it
+        runs ahead, the started one ages out of the demotion and, being older,
+        takes the budget back, and the overtaker is left parked mid-prefill
+        holding its pages: two started prefills that the pool cannot hold
+        together, neither of which can be suspended or preempted, stall the
+        scheduler until the deadlock detector raises."""
+        sched, mgr = self._make(
+            exact=exact, context_demote_max_iters=8, enable_recompute_pause=False
+        )
+        capacity, held = 12_000, {}
+
+        def resize(req, num_tokens):
+            if sum(held.values()) + num_tokens > capacity:
+                return False  # out of pages; a started chunk is not suspended
+            held[req.py_request_id] = held.get(req.py_request_id, 0) + num_tokens
+            return True
+
+        def free(req):
+            held.pop(req.py_request_id, None)
+            mgr.kv_cache_map.pop(req.py_request_id, None)
+
+        mgr.resize_context.side_effect = resize
+        mgr.free_resources.side_effect = free
+        older = self._req(0, 8_000, 8_000)  # long by its estimate
+        newer = self._req(1, 8_000, None)  # no estimate: never long
+        for req in (older, newer):
+            req.is_last_context_chunk = False
+        short = self._req(2, 512, 512)  # known short: runs ahead of `older`
+        active = [older, short] if on_crumbs else [older]
+
+        def run_iteration():
+            out = sched.schedule_request(list(active), set())
+            for req in out.context_requests:
+                req.context_current_position += req.context_chunk_size
+                req.context_remaining_length -= req.context_chunk_size
+                req.is_first_context_chunk = False
+                req.is_last_context_chunk = req.context_remaining_length <= 1024
+                if req.context_remaining_length == 0:
+                    active.remove(req)
+                    free(req)
+            return ids(out.context_requests)
+
+        # `older` starts while demoted: alone, or on what the short request leaves.
+        assert sorted(run_iteration()) == ([0, 2] if on_crumbs else [0])
+        active.append(newer)
+        order = [run_iteration() for _ in range(64) if active]
+        assert not active, f"both prefills should finish; order {order}"
+        # The started prefill keeps its place: the newer request takes only the
+        # budget its last chunk leaves.
+        last_older = max(i for i, scheduled in enumerate(order) if 0 in scheduled)
+        assert order[:last_older] == [[0]] * last_older, order
+
+    @pytest.mark.parametrize("exact", [True, False])
+    def test_held_request_goes_after_the_last_started_demoted_prefill(self, exact):
+        """Known-short requests first, then the demoted ones in arrival order,
+        with a not-yet-started request without an estimate right after the last
+        started demoted prefill that arrived before it."""
+        sched, _ = self._make(exact=exact)
+        unstarted = self._req(0, 8_000, 8_000)
+        started = self._req(1, 8_000, 8_000)
+        started.context_current_position = 1024
+        no_estimate = self._req(2, 4_000, None)
+        short = self._req(3, 512, 512)
+        order, demoted = sched._defer_long_context([unstarted, started, no_estimate, short])
+        assert ids(order) == [3, 0, 1, 2]
+        assert demoted == {0, 1}  # the held request is not demoted: it does not age
 
 
 class TestLongContextDemotion:
@@ -5442,6 +6242,20 @@ def test_shortest_first_reusable_prefix_is_probed_every_pass():
     assert sched._order_ctx_shortest_first([uncached, cached]) == [uncached, cached]
     mgr.prepare_context.assert_not_called()
     mgr.prepare_context_cache.assert_not_called()
+
+
+def test_shortest_first_counts_the_spec_recompute_tail_as_uncached() -> None:
+    """A cached prompt whose claim the recompute tail caps sorts by what it will compute."""
+    mgr = make_kv_cache_manager(tokens_per_block=64)
+    mgr.probe_context_reuse.side_effect = lambda req: {0: 0, 1: 9000}[req.py_request_id]
+    sched = _make_srpt_scheduler(mgr=mgr)
+    uncached, cached = _ctx_batch(0, [6000, 10000])
+    cached.is_dummy = False
+    assert sched._order_ctx_shortest_first([uncached, cached]) == [cached, uncached]
+    # A 7000-token tail caps the 9000-token claim at 2944: 7056 tokens to compute.
+    mgr._spec_recompute_tail = 7000
+    sched._reuse_probes.clear()
+    assert sched._order_ctx_shortest_first([uncached, cached]) == [uncached, cached]
 
 
 class TestShortestFirstStarvation:

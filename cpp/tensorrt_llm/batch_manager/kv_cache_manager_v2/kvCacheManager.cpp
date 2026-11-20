@@ -73,7 +73,7 @@ std::vector<int> PageIndexConverter::operator()(std::vector<int> const& baseIndi
     for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{static_cast<int>(baseIndices.size())}; ++ordinal)
     {
         int index;
-        if (scratchRange.contains(ordinal))
+        if (baseIndices[toSizeT(ordinal)] == kBadPageIndex.value() && scratchRange.contains(ordinal))
         {
             // Scratch block: its slot comes from the request's own scratch slots, not from
             // base_indices.
@@ -140,9 +140,10 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock, mEventSink);
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
-    mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
-        std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
-        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority);
+    mStorage
+        = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock, std::move(coldPageCodec),
+            mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio, mEventSink,
+            mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority, mConfig.coldTypicalStep);
     // The context the storage above lives in; teardown pushes it on threads that have none.
     cuCheck(cuCtxGetCurrent(&mCudaContext));
     TLLM_CHECK_WITH_INFO(mCudaContext != nullptr, "KVCacheManagerV2 requires a current CUDA context");
@@ -519,10 +520,23 @@ void KvCacheManager::clearReusableBlocks()
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats,
-    std::optional<executor::KvCacheRetentionConfig> retentionConfig)
+    std::optional<executor::KvCacheRetentionConfig> retentionConfig, bool inputKnownNoDigest,
+    std::optional<LocalityDomainId> localityDomainId)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    if (numLocalityDomains() > 1)
+    {
+        TLLM_CHECK_WITH_INFO(localityDomainId.has_value(),
+            "locality_domain_id is required when the KV cache manager has %d locality domains", numLocalityDomains());
+        TLLM_CHECK_WITH_INFO(*localityDomainId >= 0 && *localityDomainId < numLocalityDomains(),
+            "locality_domain_id %d out of range for %d locality domain(s)", localityDomainId->value(),
+            numLocalityDomains());
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(!localityDomainId.has_value(), "locality_domain_id is set but locality domains are off");
+    }
     if (!priorityCb)
     {
         priorityCb = [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; };
@@ -539,11 +553,80 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     std::optional<BlockRadixTree::ReuseMatch> reuseMatch;
     if (inputTokens.size() != 0)
     {
-        reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()));
+        _unlinkPagesOfFailedRemoteLevels();
+        reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()) || inputKnownNoDigest);
     }
 
-    return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
-        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig));
+    return std::make_shared<KvCache>(*this, std::move(reuseScope), localityDomainId, std::move(reuseMatch),
+        std::move(id), std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats,
+        std::move(retentionConfig));
+}
+
+void KvCacheManager::_unlinkPagesIfARemoteLevelFailed()
+{
+    if (mStorage->numFailedRemoteClients() <= mNumFailedRemoteClientsUnlinked.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    auto const apiLock = lockExclusive();
+    _unlinkPagesOfFailedRemoteLevels();
+}
+
+void KvCacheManager::_unlinkPagesOfFailedRemoteLevels()
+{
+    // Counted before the levels are taken: a client failing in between is unlinked by the next call.
+    auto const numFailed = mStorage->numFailedRemoteClients();
+    auto const levels = mStorage->takeNewlyFailedRemoteLevels();
+    mNumFailedRemoteClientsUnlinked.store(numFailed, std::memory_order_release);
+    if (levels.empty())
+    {
+        return;
+    }
+    // The evictable pages there are dropped already; the rest are held by requests. Collect first: unlinking can
+    // detach subtrees.
+    std::vector<std::pair<SharedPtr<Block>, LifeCycleId>> onFailedLevel;
+    std::vector<SharedPtr<Block>> pending;
+    for (auto const& [key, root] : mRadixTree->roots())
+    {
+        for (auto const& [childKey, child] : root->next)
+        {
+            pending.push_back(child);
+        }
+    }
+    auto const onFailed = [&levels](CommittedPage const* page)
+    { return page != nullptr && std::find(levels.begin(), levels.end(), page->cacheLevel) != levels.end(); };
+    while (!pending.empty())
+    {
+        auto block = std::move(pending.back());
+        pending.pop_back();
+        for (auto const& [childKey, child] : block->next)
+        {
+            pending.push_back(child);
+        }
+        for (LifeCycleId lc{0}; lc < block->numLifeCycles(); ++lc)
+        {
+            if (onFailed(block->getPage(lc)))
+            {
+                onFailedLevel.emplace_back(block, lc);
+            }
+        }
+    }
+    // Detached blocks stay alive until every unlink is done.
+    std::vector<SharedPtr<Block>> detached;
+    for (auto const& [block, lc] : onFailedLevel)
+    {
+        auto* const page = block->getPage(lc);
+        if (!onFailed(page))
+        {
+            continue;
+        }
+        block->unlinkPage(lc, page);
+        auto cleared = Block::clearStaleBlocksAfterPageUnlink(*block, lc, mStorage->lifeCycles().getLifeCycle(lc));
+        detached.insert(
+            detached.end(), std::make_move_iterator(cleared.begin()), std::make_move_iterator(cleared.end()));
+    }
+    TLLM_LOG_WARNING(
+        "KVCM2 remote level(s) failed: %zu page(s) requests hold there left the reuse tree", onFailedLevel.size());
 }
 
 void KvCacheManager::refreshRetention()
@@ -559,9 +642,10 @@ bool KvCacheManager::prefetchReuse(ReuseScope reuseScope, TokenSpan inputTokens,
     auto const apiLock = lockExclusive();
     if (target < kHotLevel || target >= mStorage->numCacheLevels())
         throw std::out_of_range("Prefetch target is outside the configured cache tiers");
+    _unlinkPagesOfFailedRemoteLevels();
     auto reuseMatch = matchReuse(reuseScope, inputTokens, knownNoDigest);
-    auto cache = std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::nullopt,
-        KvCache::PriorityCb{}, std::nullopt, knownNoDigest, false, std::nullopt, /*isPrefetch=*/true);
+    auto cache = std::make_shared<KvCache>(*this, std::move(reuseScope), std::nullopt, std::move(reuseMatch),
+        std::nullopt, KvCache::PriorityCb{}, std::nullopt, knownNoDigest, false, std::nullopt, /*isPrefetch=*/true);
     auto close = FuncGuard([&cache]() { cache->close(); });
     return cache->prefetch(target);
 }
@@ -573,17 +657,45 @@ BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
     return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff);
 }
 
-int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest)
 {
     KVCM2_REJECT_IF_POISONED();
+    _unlinkPagesIfARemoteLevelFailed();
     // Shared: the traversal is read-only and the matched Block* never escape this call.
     auto const apiLock = lockShared();
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
-std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
+std::vector<int> KvCacheManager::probeReuseDomains(
     ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = lockShared();
+    std::vector<int> counts(static_cast<size_t>(numLocalityDomains()), 0);
+    auto const match = matchReuse(reuseScope, inputTokens, knownNoDigest);
+    for (Block const* block : match.blocks)
+    {
+        for (LifeCycleId lifeCycle{0}; lifeCycle < block->storage.size(); ++lifeCycle)
+        {
+            CommittedPage const* page = block->getPage(lifeCycle);
+            if (page == nullptr || page->cacheLevel != kHotLevel)
+            {
+                continue;
+            }
+            if (auto const domain = page->localityDomainId(); domain.has_value())
+            {
+                ++counts.at(static_cast<size_t>(domain->value()));
+            }
+        }
+    }
+    return counts;
+}
+
+std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
+    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest)
+{
+    KVCM2_REJECT_IF_POISONED();
+    _unlinkPagesIfARemoteLevelFailed();
     // The matched Block* remain protected until the key has been copied out.
     // Call matchReuse directly: probeReuse would nest shared-lock acquisitions.
     auto const apiLock = lockShared();
@@ -658,7 +770,7 @@ size_t KvCacheManager::getPageIndexUpperBound(LayerId layerId, DataRole role) co
     auto const& attr = mStorage->getBufferAttr(layerId, role);
     LifeCycleId lc = attr.lifeCycleId;
     PoolGroupIndex pg = mStorage->getPoolGroupIndex(lc);
-    SlotCount const numSlots = mStorage->numSlots(pg, kHotLevel);
+    SlotCount const numSlots = mStorage->slotIndexUpperBound(pg, kHotLevel);
     auto slotSizes = mStorage->slotSize(pg);
     size_t slotSize = slotSizes.at(attr.poolIndex);
     return (exactDiv(slotSize, attr.size) * slotCountToSizeT(numSlots) - exactDiv(attr.offset, attr.size))
@@ -843,6 +955,29 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> KvCacheManager::poolGroupDescs() const
 int KvCacheManager::tokensPerBlock() const noexcept
 {
     return mRadixTree->tokensPerBlock();
+}
+
+int KvCacheManager::numLocalityDomains() const noexcept
+{
+    return mStorage->numLocalityDomains();
+}
+
+std::vector<std::pair<MemAddress, size_t>> KvCacheManager::getMappedBufferViews(LayerId layerId, DataRole role) const
+{
+    auto const apiLock = lockShared();
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    PoolGroupIndex const pg = mStorage->getPoolGroupIndex(attr.lifeCycleId);
+    size_t const slotSize = mStorage->slotSize(pg).at(attr.poolIndex);
+    MemAddress const base = mStorage->getMemPoolBaseAddress(pg, attr.poolIndex) + attr.offset;
+    std::vector<std::pair<MemAddress, size_t>> views;
+    for (auto const& [begin, end] : mStorage->slotRanges(pg))
+    {
+        size_t const numPages
+            = (exactDiv(slotSize, attr.size) * slotCountToSizeT(end - begin) - exactDiv(attr.offset, attr.size))
+            * static_cast<size_t>(attr.expansion);
+        views.emplace_back(MemAddress(base + slotSize * slotCountToSizeT(begin)), numPages);
+    }
+    return views;
 }
 
 bool KvCacheManager::enablePartialMatch() const noexcept

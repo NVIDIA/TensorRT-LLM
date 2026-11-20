@@ -18,6 +18,7 @@ from _torch.pyexecutor.engine_test_utils import (
     _create_request,
     _create_request_with_tokens,
     _make_request_stub,
+    create_model_engine_and_kvcache,
 )
 from _torch.pyexecutor.engine_test_utils import kv_cache_manager as managed_kv_cache
 from utils.util import skip_pre_blackwell_unittest, skip_ray
@@ -28,12 +29,14 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
+from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputBuffers,
     DecoderInputPreparer,
     HostInputs,
+    HostLists,
     _get_context_prompt_lookahead_token,
     _zero_fill_row_spans,
 )
@@ -56,7 +59,7 @@ from tensorrt_llm.llmapi import (
     SADecodingConfig,
     SamplingParams,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PrefillCudaGraphBackend
 from tensorrt_llm.mapping import CpType, Mapping
 
 if TYPE_CHECKING:
@@ -75,8 +78,8 @@ _SIDE_STREAM_DELAY_CYCLES = 2_000_000_000
 _ORDER_NOT_EXERCISED = "the delayed stream finished before the other stream read"
 
 
-def _input_preparer(*, spec_config: DecodingBaseConfig | None = None) -> DecoderInputPreparer:
-    return input_preparer(decoder_config(is_spec_decode=False, spec_config=spec_config), model=None)
+def _input_preparer(**config_changes: Any) -> DecoderInputPreparer:
+    return input_preparer(decoder_config(is_spec_decode=False, **config_changes), model=None)
 
 
 @pytest.mark.cpu_only
@@ -134,6 +137,42 @@ def test_input_preparer_without_config_keeps_confidence_disabled() -> None:
     assert inputs._dspark_device_windows is False
     assert inputs.previous_verify_lens is None
     assert inputs.has_previous_device_draft is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("chunked_prefill", [False, True])
+def test_pack_context_requests_orders_by_locality_domain(chunked_prefill: bool) -> None:
+    inputs = DecoderInputPreparer(
+        buffers=None,
+        config=None,
+        mapping=Mapping(),
+        dist=None,
+        model=None,
+        get_runtime_tokens_per_gen_step=None,
+        iter_states={},
+        lora=None,
+        use_beam_search=False,
+        steady_gen_cache_supported=True,
+        attention_runtime_features=AttentionRuntimeFeatures(chunked_prefill=chunked_prefill),
+    )
+    requests = [SimpleNamespace(py_locality_domain_id=1), SimpleNamespace(py_locality_domain_id=0)]
+    scheduled = Mock(num_context_requests=0, context_requests=[] if chunked_prefill else requests)
+    scheduled.reset_context_requests.side_effect = lambda _: setattr(
+        scheduled, "context_requests", []
+    )
+    host = SimpleNamespace(
+        lists=HostLists(),
+        extra_inputs=None,
+        context_prompt_lookahead=None,
+        locality_domain_reorder=True,
+    )
+
+    inputs._pack_context_requests(host, scheduled)
+
+    if chunked_prefill:
+        scheduled.reset_context_requests.assert_not_called()
+    else:
+        scheduled.reset_context_requests.assert_called_once_with([requests[1], requests[0]])
 
 
 @contextlib.contextmanager
@@ -274,32 +313,36 @@ def test_zero_fill_row_spans_without_spans_is_noop() -> None:
 
 class DecoderInputPreparerTestCase(unittest.TestCase):
     def test_prepare_inputs_returns_steady_gen_fast_inputs(self) -> None:
-        inputs = _input_preparer()
-        inputs.guided_decoder = Mock()
-        inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
-        fast_inputs = PreparedInputs({"prepared": True})
-        inputs._apply_steady_gen_fast_prepare = Mock(return_value=fast_inputs)
-        batch = ScheduledRequests()
-        new_tokens = torch.zeros(1)
+        for backend in PrefillCudaGraphBackend:
+            for maybe_graph in (False, True):
+                with self.subTest(backend=backend, maybe_graph=maybe_graph):
+                    inputs = _input_preparer(prefill_cuda_graph_backend=backend)
+                    inputs.guided_decoder = Mock()
+                    inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
+                    fast_inputs = PreparedInputs({"prepared": True})
+                    inputs._apply_steady_gen_fast_prepare = Mock(return_value=fast_inputs)
+                    batch = ScheduledRequests()
+                    new_tokens = torch.zeros(1)
 
-        result = inputs.prepare_inputs(
-            batch,
-            Mock(),
-            Mock(),
-            new_tensors_device=SimpleNamespace(new_tokens=new_tokens),
-            enable_spec_decode=False,
-            runtime_draft_len=3,
-            is_dummy=True,
-        )
+                    result = inputs.prepare_inputs(
+                        batch,
+                        Mock(),
+                        Mock(),
+                        new_tensors_device=SimpleNamespace(new_tokens=new_tokens),
+                        maybe_graph=maybe_graph,
+                        enable_spec_decode=False,
+                        runtime_draft_len=3,
+                        is_dummy=True,
+                    )
 
-        self.assertIs(result.kwargs, fast_inputs.kwargs)
-        self.assertEqual(result.runtime_draft_len, 3)
-        inputs.guided_decoder.add_batch.assert_called_once_with(
-            batch, new_tokens=new_tokens, runtime_draft_len=3
-        )
-        inputs._can_use_steady_gen_fast_prepare.assert_called_once_with(
-            batch, new_tokens, None, None, True
-        )
+                    self.assertIs(result.kwargs, fast_inputs.kwargs)
+                    self.assertEqual(result.runtime_draft_len, 3)
+                    inputs.guided_decoder.add_batch.assert_called_once_with(
+                        batch, new_tokens=new_tokens, runtime_draft_len=3, is_cuda_graph=maybe_graph
+                    )
+                    inputs._can_use_steady_gen_fast_prepare.assert_called_once_with(
+                        batch, new_tokens, None, None, True
+                    )
 
     def test_prepare_inputs_single_cp_rank_ignores_cp_type(self) -> None:
         for cp_type in (CpType.ULYSSES, CpType.RING):
@@ -609,6 +652,123 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         num_tokens = len(requests) * tokens_per_step
         expected_input_ids = previous.new_tokens[:, slots, 0].t().reshape(-1)
         self.assertEqual(kernel_path[0][:num_tokens].tolist(), expected_input_ids.tolist())
+
+    def test_staged_speculative_overlap_inputs_match_per_buffer_copies(self) -> None:
+        """One slab upload and one staging launch write the same inputs as the
+        per-buffer copies: a context row, a request without a previous step,
+        requests verifying in-flight drafts in permuted slots, and a dummy."""
+        model_engine, kv_cache_manager = self.enterContext(
+            create_model_engine_and_kvcache(spec_config=SADecodingConfig(max_draft_len=3))
+        )
+        preparer = model_engine._runner._inputs
+        buffers = preparer._buffers
+        resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+        tokens_per_step = 4
+        slots = 6
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        previous = SampleStateTensorsSpec(
+            new_tokens=torch.randint(
+                0,
+                1000,
+                (tokens_per_step, slots, 1),
+                dtype=torch.int32,
+                device="cuda",
+                generator=generator,
+            ),
+            new_tokens_lens=torch.randint(
+                1,
+                tokens_per_step + 1,
+                (slots,),
+                dtype=torch.int32,
+                device="cuda",
+                generator=generator,
+            ),
+            next_draft_tokens=torch.randint(
+                0,
+                1000,
+                (slots, tokens_per_step - 1),
+                dtype=torch.int32,
+                device="cuda",
+                generator=generator,
+            ),
+        )
+
+        def batch() -> ScheduledRequests:
+            context = _create_request_with_tokens(list(range(100, 107)), 1)
+            context.py_seq_slot = 0
+            fresh = _create_request_with_tokens([50, 51, 52, 53, 54], 2)
+            fresh.py_seq_slot = 1
+            fresh.py_draft_tokens = [7, 8, 9]
+            verifying = []
+            for request_id, (seq_slot, previous_slot) in enumerate(((2, 4), (3, 2)), start=3):
+                request = _create_request_with_tokens(list(range(20 + request_id)), request_id)
+                request.py_seq_slot = seq_slot
+                request.py_batch_idx = previous_slot
+                verifying.append(request)
+            dummy = _create_request_with_tokens([1, 1, 1], 6)
+            dummy.py_seq_slot = 5
+            dummy.py_draft_tokens = [1, 1, 1]
+            dummy.is_cuda_graph_dummy = True
+            scheduled = ScheduledRequests()
+            scheduled.context_requests_last_chunk = [context]
+            scheduled.generation_requests = [fresh, *verifying, dummy]
+            return scheduled
+
+        # The gather ids take their cached upload on both paths.
+        written = (
+            "input_ids_cuda",
+            "draft_tokens_cuda",
+            "previous_batch_indices_cuda",
+            "position_ids_cuda",
+            "previous_pos_id_offsets_cuda",
+            "previous_kv_lens_offsets_cuda",
+        )
+        # The staging runs for models that opt in (RuntimeHooks.stage_decode_inputs).
+        preparer._host_uploader = HostUploader()
+        results = []
+        for staging in (True, False):
+            preparer._spec_overlap_staging = staging
+            preparer._staged_previous_batch_indices = None
+            preparer._staged_previous_pos_indices = None
+            for name in written:
+                getattr(buffers, name).fill_(-7)
+            attn_metadata = AttentionMetadata(
+                max_num_requests=8, max_num_tokens=64, kv_cache_manager=kv_cache_manager
+            )
+            attn_metadata.is_cuda_graph = False
+            inputs = preparer.prepare_inputs(
+                scheduled_requests=batch(),
+                kv_cache_manager=kv_cache_manager,
+                attn_metadata=attn_metadata,
+                new_tensors_device=previous,
+                resource_manager=resource_manager,
+                enable_spec_decode=True,
+                runtime_draft_len=tokens_per_step - 1,
+                is_dummy=False,
+            ).kwargs
+            torch.cuda.synchronize()
+            results.append(
+                {
+                    "input_ids": inputs["input_ids"].cpu(),
+                    "position_ids": inputs["position_ids"].cpu(),
+                    "gather_ids": preparer._gather_ids_buffer.tensor.cpu(),
+                    "draft_tokens": buffers.draft_tokens_cuda[:9].cpu(),
+                    "previous_slots": buffers.previous_batch_indices_cuda[:2].cpu(),
+                    "position_offsets": buffers.previous_pos_id_offsets_cuda.cpu(),
+                    "kv_lens_offsets": buffers.previous_kv_lens_offsets_cuda.cpu(),
+                }
+            )
+        staged, plain = results
+        for name, expected in plain.items():
+            self.assertTrue(torch.equal(staged[name], expected), name)
+        # The verifying rows take the previous step's tokens and corrections.
+        lens = previous.new_tokens_lens.cpu()
+        self.assertEqual(staged["previous_slots"].tolist(), [4, 2])
+        self.assertEqual(staged["input_ids"][11:15].tolist(), previous.new_tokens[:, 4, 0].tolist())
+        self.assertEqual(
+            staged["kv_lens_offsets"][:4].tolist(),
+            [0, lens[4].item() - tokens_per_step, lens[2].item() - tokens_per_step, 0],
+        )
 
     @skip_ray
     def test_prepare_inputs_with_helix_parallelism(self) -> None:

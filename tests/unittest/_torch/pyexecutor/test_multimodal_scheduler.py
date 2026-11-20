@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     release_consumed_mm_items,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalEagerEncoderScheduler,
@@ -1014,6 +1015,23 @@ def test_mm_admission_respects_encoder_batch_size():
     assert [item.id for item in waiting] == [2]
 
 
+def test_mm_admission_marks_only_admitted_requests():
+    """A request the encoder budget defers goes back unadmitted, keeping its queue position."""
+    marked = []
+
+    class _RecordingQueue(FCFSWaitingQueue):
+        def mark_admitted(self, requests):
+            marked.append([item.id for item in requests])
+
+    waiting = _RecordingQueue([_waiting_item(1, [1, 1]), _waiting_item(2, [1])])
+    executor = _executor_for_mm_admission([], max_batch_size=1)
+
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
+
+    assert [item.id for item in admitted] == [1]
+    assert marked == [[1]]
+
+
 def test_item_encoder_slices_and_restores_selected_item_order():
     class _Model(MultimodalModelMixin):
         def encode_multimodal_inputs(self, multimodal_params):
@@ -1122,7 +1140,7 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently() -
     executor._disagg_coordinator = Mock()
     executor.gather_all_responses = False
     executor.dist = SimpleNamespace(rank=0)
-    executor.result_wait_queues = {}
+    executor._response_channel = ResponseChannel()
 
     executor._do_terminate_request(request)
 

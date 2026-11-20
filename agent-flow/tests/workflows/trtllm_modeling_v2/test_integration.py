@@ -35,7 +35,6 @@ from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import Executio
 from agent_flow.workflows.trtllm_modeling_v2.run.graph import Task
 from agent_flow.workflows.trtllm_modeling_v2.run.records.journal import Journal
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import runtime_facts as rf
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
 from agent_flow.workflows.trtllm_modeling_v2.run.workspace import snapshots as snapshots_mod
@@ -45,16 +44,7 @@ from agent_flow.workflows.trtllm_modeling_v2.run.workspace.integration import (
     Integration,
 )
 
-from ._helpers import (
-    Script,
-    _git,
-    _install,
-    _workflow,
-    passing_shell,
-    planner_graph_path,
-    unit_tasks,
-    write_graph,
-)
+from ._helpers import Script, _git, _install, _workflow, planner_graph_path, unit_tasks, write_graph
 
 _integration_ENV = {"GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@example.com"}
 
@@ -329,28 +319,10 @@ def test_a_finished_task_keeps_a_receipt_with_the_commits_it_integrated(tmp_path
     assert r.read(ws / "tasks", "core") is None
 
 
-_BIND = "modeling_v2 x: bound MambaHybridCacheManagerV2 #1: 897 recurrent slots, 32 per slot\n"
-
-
-def _binding_shell():
-    """Every command passes, and logs the recurrent pool its engine bound."""
-    inner = passing_shell()
-
-    def run(command, env=None, timeout=0):
-        result = inner(command, env, timeout)
-        return CommandResult(returncode=result.returncode, stdout=result.stdout + _BIND)
-
-    return run
-
-
-def test_a_dependent_starts_with_the_receipt_and_the_measured_facts(
-    tmp_path, task_file, monkeypatch
-):
-    planner_prompts: list[str] = []
+def test_a_dependent_starts_with_the_receipt(tmp_path, task_file, monkeypatch):
     dependent_prompts: list[str] = []
 
     def planner(turn, prompt):
-        planner_prompts.append(prompt)
         if turn > 1:
             return {"decision": "DONE", "summary": "the contract should hold"}
         tasks = unit_tasks(planner_graph_path(prompt).parent)
@@ -368,7 +340,7 @@ def test_a_dependent_starts_with_the_receipt_and_the_measured_facts(
         summary = "core at tp1.\n\nFor the planner: the conv pool binds 897 slots."
         return {"decision": "UNIT_READY", "summary": summary}
 
-    workflow = _workflow(tmp_path, shell_runner=_binding_shell())
+    workflow = _workflow(tmp_path)
     script = Script(None, planner=planner, assembler=assembler)
     _install(monkeypatch, workflow, script)
     with workflow:
@@ -379,13 +351,6 @@ def test_a_dependent_starts_with_the_receipt_and_the_measured_facts(
     assert receipt["decision"] == "UNIT_READY" and receipt["summary"] == "core at tp1."
     [prompt] = dependent_prompts
     assert r.HEADING in prompt and "### `core` (assemble): UNIT_READY" in prompt
-    assert rf.HEADING in prompt and "- core@tp1:" in prompt and "897 recurrent slots" in prompt
-    facts = yaml.safe_load((ws / rf.FACTS_FILENAME).read_text())
-    member = facts["members"]["core@tp1"]
-    assert member["facts"]["recurrent_slots_per_rank"] == 897
-    assert {e["gate"] for e in member["engines"]} == {"boot", "accuracy[gsm8k]"}
-    # The first graph is planned before any gate has measured an engine.
-    assert rf.HEADING not in planner_prompts[0]
     envelope = json.loads((ws / "tasks" / "why-core.json").read_text())
     assert envelope["receipts"][0]["task"] == "core"
 
@@ -569,7 +534,7 @@ def test_failed_receipt_integrates_only_entry_changes(tmp_path, monkeypatch):
     execution, _ = _planned_writer(tmp_path, monkeypatch)
     item = QueueItem(n=7, mode="onboard", target="norm/x")
     task = Task(id="kernel-x", kind="kernel", goal="Certify norm/x", ref="7")
-    paths = ["tensorrt_llm/_torch/_experimental/modeling_v2/catalog/norm/x.py"]
+    paths = ["tensorrt_llm/_torch/modeling_v2/catalog/norm/x.py"]
     integrated, closed = [], []
     execution._integration = SimpleNamespace(
         changed_paths=lambda task_id: paths,
