@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from test_common.host_executor import make_host_executor
 
 __extra_import_path__ = ["../_torch/disaggregation"]
 
@@ -299,7 +298,7 @@ def _assert_transfer_only_progress(
     harness: SimpleNamespace, dist: FakeDistRank, monkeypatch: pytest.MonkeyPatch
 ) -> PyExecutor:
     """Exercise real idle and shutdown predicates against each rank's lifecycle state."""
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor._disagg_coordinator = harness.coordinator
     executor.kv_cache_transceiver = harness.transceiver
     executor.async_transfer_manager = harness.transfers

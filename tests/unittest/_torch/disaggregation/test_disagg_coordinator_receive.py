@@ -27,7 +27,6 @@ import torch
 from _torch.pyexecutor.llm_request_factory import make_llm_request
 from coordinator_harness import CoordinatorHarness, TransferRequest
 from fake_dist import FakeDistGroup
-from test_common.host_executor import make_host_executor
 
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator,
@@ -677,7 +676,7 @@ def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyEx
     first-token logprobs step append to ``events`` in call order; the two
     batch-level steps record the request states they observed.
     """
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor._disagg_coordinator = coordinator
@@ -878,7 +877,7 @@ def _closing_executor(
     coordinator: DisaggTransferCoordinator, active, attention_dp=False, max_seq_len=64, cp_size=1
 ) -> PyExecutor:
     """Bare executor over ``coordinator`` whose response and termination sinks are mocks."""
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor._disagg_coordinator = coordinator
@@ -1472,7 +1471,7 @@ def _adp_stats_rank(
     """Bare attention-DP executor on fake rank ``rank`` holding queued iteration
     stats for ``pending_iters``; fanned-out rows reach ``_append_stats_rows``,
     a mock."""
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = None
     executor.dense_dwdp_manager = None
     executor.disable_overlap_scheduler = True

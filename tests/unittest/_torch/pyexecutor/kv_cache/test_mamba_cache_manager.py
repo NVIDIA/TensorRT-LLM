@@ -650,7 +650,7 @@ def test_kimi_explicit_v2_manager_kda_draft_records_follow_the_model(
     model_engine = SimpleNamespace(
         model=SimpleNamespace(model=backbone),
         max_cuda_graph_batch_size=4,
-        input_processor=(MagicMock(spec=BaseMultimodalInputProcessor)),
+        input_processor=MagicMock(spec=BaseMultimodalInputProcessor),
     )
 
     _, kwargs = _capture_kimi_v2_manager_ctor(
@@ -894,7 +894,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         model=torch.nn.ModuleList([gdn]),
         attn_runtime_features=SimpleNamespace(chunked_prefill=False),
         max_cuda_graph_batch_size=None,
-        input_processor=(MagicMock(spec=BaseMultimodalInputProcessor)),
+        input_processor=MagicMock(spec=BaseMultimodalInputProcessor),
     )
     mamba_params = MambaKVCacheParams(
         state_size=8,
@@ -2661,7 +2661,7 @@ def test_v2_hybrid_estimator_counts_dummy_states_without_attention_capacity(
     monkeypatch.setattr(
         KVCacheManager,
         "get_cache_size_per_token",
-        (lambda *args, **kwargs: 11),
+        lambda *args, **kwargs: 11,
     )
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common._get_local_mamba_cache_layout",
@@ -9297,11 +9297,7 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
 def _kda_cache_budget(monkeypatch, available, model, mapping, **kwargs):
     from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
 
-    monkeypatch.setattr(
-        _kda_kernels,
-        "is_kda_mtp_verify_available",
-        (lambda: available),
-    )
+    monkeypatch.setattr(_kda_kernels, "is_kda_mtp_verify_available", lambda: available)
 
     def _mock_max_num_spec() -> int:
         return 7
@@ -9736,12 +9732,12 @@ def test_gdn_replay_cache_estimate_matches_declared_buffers(
     monkeypatch.setattr(
         fla_cache_manager,
         "_get_local_mamba_cache_layout",
-        (lambda *args, **kwargs: (params, 2, 1)),
+        lambda *args, **kwargs: (params, 2, 1),
     )
     monkeypatch.setattr(
         fla_cache_manager,
         "_flashinfer_ring_replay_reason",
-        (lambda layout, spec_config, replay_enabled: (flashinfer_ring, None)),
+        lambda layout, spec_config, replay_enabled: (flashinfer_ring, None),
     )
     if manager_cls is Qwen4ExpHybridCacheManager:
         monkeypatch.setattr(

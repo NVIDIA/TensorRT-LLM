@@ -15,6 +15,7 @@
 
 from unittest.mock import Mock, patch
 
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -22,11 +23,12 @@ from tensorrt_llm.mapping import Mapping
 
 
 def make_host_cache_manager(*, max_batch_size: int = 1) -> KVCacheManagerV2:
-    """Initialize the Python cache manager without allocating device buffers."""
+    """Initialize the cache manager for tests without device or pinned host buffers."""
     native_cache = Mock(buffer_grouping=[], pool_group_descs=[])
     native_cache.get_layer_group_id.return_value = 0
     max_seq_len = 1024
     with (
+        patch.object(kv_cache_manager_v2, "IndexMapper", spec_set=True),
         patch.object(KVCacheManagerV2, "_allocate_cache_pools", return_value=native_cache),
         patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=max_seq_len),
         patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),

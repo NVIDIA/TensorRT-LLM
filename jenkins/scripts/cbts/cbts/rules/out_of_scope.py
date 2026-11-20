@@ -55,9 +55,12 @@ OUT_OF_SCOPE_EXACT_PATHS: tuple[str, ...] = (
     "legacy-files.txt",
     "ruff-legacy.toml",
     "ruff-legacy-baseline.json",
+    "scripts/check_mock_interfaces.py",
     "scripts/templates/precommit-legacy-files.j2",
     "scripts/templates/pyproject-format-exclude.j2",
     "scripts/templates/ruff-legacy.toml.j2",
+    "tests/test_common/interface_checks.py",
+    "tests/test_common/interface_checks.md",
 )
 
 # Git uses this exact basename at every repository depth.

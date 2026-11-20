@@ -4072,7 +4072,7 @@ def _adp_dummy_executor(
         cleanup.callback(manager.shutdown)
         managers[resource_type] = manager
 
-    executor = make_host_executor()
+    executor = object.__new__(PyExecutor)
     executor.resource_manager = ResourceManager(managers)
     executor.kv_cache_manager = managers[ResourceManagerType.KV_CACHE_MANAGER]
     executor.draft_kv_cache_manager = managers[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
@@ -6824,7 +6824,7 @@ def test_gen_init_without_sparse_offload_reserves_nothing() -> None:
 def test_request_larger_than_host_history_is_rejected_on_arrival() -> None:
     manager = _gen_init_manager(host_capacity_blocks=10)
     manager._host_history_capacity_blocks = 10
-    executor = make_host_executor()
+    executor = PyExecutor.__new__(PyExecutor)
     executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
 
     assert manager.kv_block_budget_applies()
@@ -8856,7 +8856,7 @@ class TestVetoedContextChunk:
         self._run(manager, scheduler.schedule_request([long_turn], set()))
         assert long_turn.context_current_position == 256
 
-        executor = make_host_executor()
+        executor = object.__new__(PyExecutor)
         executor.kv_cache_manager = manager
         executor.scheduler = scheduler
         executor.active_requests = [short_turn, long_turn]

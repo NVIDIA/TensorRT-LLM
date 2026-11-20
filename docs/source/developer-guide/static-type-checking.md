@@ -83,9 +83,15 @@ each change:
    advisory findings from hooks that return success. Fix failures and repeat
    until blocking checks pass and advisory findings have been reviewed.
 
-`pre-commit run` selects staged files; `pre-commit run --all-files` selects all
-tracked files. Registered mock interfaces are checked across all tests in either
-case. These commands run checks without creating a commit.
+`pre-commit run` selects staged files. `pre-commit run --all-files` selects all
+tracked files. Pre-commit skips the `type-check` hook when none of the selected
+files match its file pattern.
+
+When the hook runs, the wrapper scans all registered mocks if it receives a
+Python source or stub file under `tensorrt_llm/` or `tests/`, or a recognized
+checker or configuration file. An unrelated Python file outside those directories
+can trigger the hook without triggering a mock scan. To scan registered mocks
+regardless of the staged files, run `bash scripts/run_pyrefly.sh --full-project`.
 
 ## Other check modes
 
@@ -261,16 +267,21 @@ bash scripts/run_pyrefly.sh --no-path-module-filter --no-diff-filter tests/unitt
 
 ## Check mocks against production interfaces
 
-The same hook scans all registered mock interfaces, including unchanged tests.
-These diagnostics bypass ordinary diff-line and path/module filters because a
-production change can invalidate a test double elsewhere in the repository.
+When the [mock scan runs](#check-changed-files-before-committing), it checks all
+registered mock interfaces, including those in unchanged tests. These diagnostics
+bypass ordinary diff-line and path/module filters because a production change
+can invalidate a test double elsewhere in the repository.
 
 Use `@mock_target("module:ClassOrFunction")` for a named mock class or function.
 Use `verify_instance(value, "module:Class")` after setting up a namespace or an
 instance created without its real constructor. The mock check compares member
-names, initialization and callable signatures. Ordinary Pyrefly checks handle
-data types. For a check limited to direct member presence and initialization,
-use `members_only=True`.
+names, initialization, and callable signatures. For a check limited to direct
+member presence and initialization, use `members_only=True`.
+
+The configured Pyrefly diagnostics cover parse errors, missing imports, unknown
+and unbound names, incorrect argument counts, missing arguments, and unexpected
+keyword or positional arguments. Argument-type checking is disabled, so an
+incompatible mock member type can pass both checks.
 
 A missing field or incompatible signature should normally be fixed in the test
 double to reflect the real interface. Do not change production interfaces just
