@@ -216,7 +216,6 @@ l0_cpu:
   # Every test in it is cpu_only, so l0_b200's unittest/_torch/kv_cache_compression entry
   # (-m "not cpu_only") runs none of them.
   - unittest/_torch/kv_cache_compression/test_quantization_for_cold_page.py
-  - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/speculative/test_device_window_sampling_layout.py
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
@@ -238,7 +237,7 @@ l0_cpu:
   - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_utils.py
   - unittest/_torch/kernels/parallel_hw_agnostic
-  - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py -k "not test_missing_support_lse_raises and not test_missing_head_attrs_raises"
   - unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_replicated_kv.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py

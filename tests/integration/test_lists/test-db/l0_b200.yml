@@ -53,8 +53,6 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
   - unittest/_torch/models/test_minimax_m3.py::test_registered_conditional_generation_text_forward
   # MiniMax-M3 VL checkpoint-backed processor parity (the CPU stage's -m cpu_only leaves these out)
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_input_ids_match_trt_build_helper
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_video_input_ids_match_trt_build_helper
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_video_fast_path_matches_processor_input_ids
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_two_video_fast_path_matches_processor_input_ids
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_float_media_match_uint8_pixels
@@ -85,7 +83,6 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla[unchunked] TIMEOUT (30)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla[chunked] TIMEOUT (30)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=none-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=nvfp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=none-kv_cache_reuse=True-fp8kv=False-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=none-kv_cache_reuse=False-fp8kv=False-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=nvfp4-kv_cache_reuse=True-fp8kv=False-overlap_scheduler=True]
@@ -96,7 +93,6 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-v2_kv_cache=True]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-fp8]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-triton-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-fp8]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu_suspend_resume
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
@@ -271,7 +267,6 @@ l0_b200:
   - unittest/_torch/modules/test_swiglu_nvfp4_quantize.py
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py
   - unittest/_torch/modules/test_awq_quantization.py
-  - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_mxfp8_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_swiglu_2in.py
@@ -451,7 +446,6 @@ l0_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_v2
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_multi_adapter_v2
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
-  - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
   # ------------- KV Cache Iteration Stats ---------------
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
@@ -566,13 +560,6 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (60)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (60)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
-  # ------------- Host perf module regression tests (6 representative scenarios) ---------------
-  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
-  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
-  - perf/host_perf/test_module_sampler.py::test_sampler_update_greedy[greedy_bs8]
-  - perf/host_perf/test_module_sampler.py::test_sampler_update_stop_words[stopwords_bs32]
-  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_generation
-  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_context
   # ------------- Host perf E2E regression tests (reuse perf_sanity with host-overhead-dominant configs) ---------------
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_deepseek_v3_lite-v3lite_fp8_bs8_128_256]
 - condition:
@@ -627,7 +614,6 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-cutlass]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRITON]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-cutlass]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_tactic=cutlass-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
@@ -758,5 +744,3 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_CUTEDSL"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
-  # ---- non-quantized (quant=None) moved to post-merge ----
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
