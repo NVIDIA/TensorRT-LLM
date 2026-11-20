@@ -2421,6 +2421,7 @@ def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
     fp_modules.load(
         "fp_ops", f"""
         import torch
+        from tensorrt_llm._torch.custom_ops.fast_custom_op import fast_custom_op
 
         _lib = torch.library.Library("fp_test", "FRAGMENT")
         _lib.define("native_{op}(Tensor x) -> Tensor")
@@ -2434,6 +2435,12 @@ def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
         @python_op.register_kernel("cpu")
         def python_op_cpu(x):
             return x.mul(1)
+
+
+        # Registered through Library.define / impl, not torch.library.custom_op.
+        @fast_custom_op("fp_test::fast_{op}", mutates_args=(), device_types="CPU")
+        def fast_op(x: torch.Tensor) -> torch.Tensor:
+            return x.add(1)
         """)
     runners = fp_modules.load(
         "fp_runners", f"""
@@ -2469,25 +2476,37 @@ def test_code_fingerprint_follows_operators(fp_modules, monkeypatch):
             def forward(self, inputs, tactic=-1, **kwargs):
                 import torch as t
                 return t.ops.fp_test.native_{op}(inputs[0])
+
+
+        class UsesFastOp(Base):
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return torch.ops.fp_test.fast_{op}(inputs[0])
         """)
     build = {"id": "a"}
     monkeypatch.setattr(autotuner, "_native_build_id", lambda: build["id"])
     classes = (runners.UsesPythonOp, runners.UsesNativeOp,
                runners.UsesNativeClass, runners.ImportsClassesLocally,
-               runners.ImportsTorchLocally)
+               runners.ImportsTorchLocally, runners.UsesFastOp)
 
+    # Each change, and which of the runners above it must re-key.
+    def rebuild():
+        build["id"] = "b"
+
+    changes = [
+        (lambda: fp_modules.edit("fp_ops", "return x.clone()",
+                                 "return x.clone() + 0"), [1, 0, 0, 0, 0, 0]),
+        (lambda: fp_modules.edit("fp_ops", "x.mul(1)", "x.mul(10)"),
+         [1, 0, 0, 0, 0, 0]),
+        (lambda: fp_modules.edit("fp_ops", "x.add(1)", "x.add(10)"),
+         [0, 0, 0, 0, 0, 1]),
+        (rebuild, [0, 1, 1, 1, 1, 0]),
+    ]
     before = fp_modules.fingerprints(*classes)
-    fp_modules.edit("fp_ops", "return x.clone()", "return x.clone() + 0")
-    after_edit = fp_modules.fingerprints(*classes)
-    assert _changed(before, after_edit) == [True, False, False, False, False]
-    fp_modules.edit("fp_ops", "x.mul(1)", "x.mul(10)")
-    after_kernel_edit = fp_modules.fingerprints(*classes)
-    assert _changed(after_edit,
-                    after_kernel_edit) == [True, False, False, False, False]
-    build["id"] = "b"
-    after_rebuild = fp_modules.fingerprints(*classes)
-    assert _changed(after_kernel_edit,
-                    after_rebuild) == [False, True, True, True, True]
+    for change, expected in changes:
+        change()
+        after = fp_modules.fingerprints(*classes)
+        assert _changed(before, after) == [bool(e) for e in expected]
+        before = after
 
 
 _CANDIDATE_RUNNERS = """
@@ -3423,8 +3442,11 @@ def test_parallel_search_cache_picks_fastest_runner():
         config = TuningConfig(distributed_tuning_strategy=strategy)
         cache = autotuner.AutoTunerProfilingCache()
         for runner, tactic, ms in ((runners[0], 0, 2.0), (runners[1], 1, 1.0)):
-            cache[cache.get_cache_key("autotuner_test::parallel_lookup", runner,
-                                      shapes, config)] = (0, tactic, ms)
+            cache[cache.get_cache_key("autotuner_test::parallel_lookup",
+                                      runner,
+                                      shapes,
+                                      config,
+                                      candidates=runners)] = (0, tactic, ms)
         hit, runner_id, tactic, _ = cache.search_cache(
             "autotuner_test::parallel_lookup", runners, shapes, config)
         assert hit and runner_id == expected, (strategy, runner_id)

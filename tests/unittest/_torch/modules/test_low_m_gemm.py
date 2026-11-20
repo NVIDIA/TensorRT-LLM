@@ -495,6 +495,7 @@ def test_cached_direct_tactic_uses_exact_small_m_and_validates_large_m(
         input_shapes,
         tuning_config,
         apply_map_to_tuning_buckets=False,
+        candidates=[cublas, splitk, direct],
     )
     tuner.profiling_cache[cache_key] = (2, tactics[3], 0.0)
     cache_hit, runner_id, cached_tactic, _ = tuner.profiling_cache.search_cache(

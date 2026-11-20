@@ -926,7 +926,9 @@ def test_fp4_block_scale_decode_tactic_key_matches_tuning(
 
         def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
             shapes = tuple(AutoTuner._get_input_sizes(self, inputs))
-            key = cache.get_cache_key(custom_op, runners[0], shapes, tuning_config)
+            key = cache.get_cache_key(
+                custom_op, runners[0], shapes, tuning_config, candidates=runners
+            )
             cache[key] = (0, tuned_tactic, 1.0)
             raise _OpLookedUp
 

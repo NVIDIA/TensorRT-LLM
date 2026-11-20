@@ -372,6 +372,8 @@ _CLASS_METADATA = frozenset(
      "__static_attributes__", "__weakref__"))
 _OPERATOR_TYPES = (torch._ops.OpOverload, torch._ops.OpOverloadPacket)
 _SCRIPT_CLASS = getattr(torch._C, "ScriptClass", ())
+# Registers Python implementations of ops through Library.define/impl.
+_FAST_CUSTOM_OP_MODULE = "tensorrt_llm._torch.custom_ops.fast_custom_op"
 # torch.ops / torch.classes namespaces that torch itself registers.
 _TORCH_NAMESPACES = ("aten", "prim", "prims")
 # A source file changed after this may no longer hold the code this process
@@ -773,6 +775,14 @@ def _code_refs(code: types.CodeType, globals_: Dict[str, Any], outer=None):
             yield from _code_refs(const, globals_, modules)
 
 
+def _fast_custom_op_impl(qualname: str) -> Optional[Callable]:
+    """The Python implementation fast_custom_op registered for `qualname`, or
+    None. Ops it registers exist only once its module is loaded."""
+    lookup = _attribute(sys.modules.get(_FAST_CUSTOM_OP_MODULE),
+                        "registered_python_impl")
+    return lookup(qualname) if callable(lookup) else None
+
+
 def _closure_functions(fn) -> List[Callable]:
     """The functions a (possibly wrapped) function holds in its closure."""
     try:
@@ -1015,8 +1025,9 @@ class _FingerprintWalk:
             self.sources[f"<ref>:{name}"] = target
 
     def visit_operator(self, packet) -> None:
-        """A torch.ops operator: its Python implementations if it has them,
-        else the native library that registers it."""
+        """A torch.ops operator: its Python implementations if it has them
+        (from torch.library.custom_op or fast_custom_op), else the native
+        library that registers it."""
         qualname = getattr(packet, "_qualified_op_name", "")
         if qualname in self.seen_names:
             return
@@ -1033,6 +1044,8 @@ class _FingerprintWalk:
                             or {}).values():
                 self.todo.extend(
                     (qualname, f) for f in _closure_functions(wrapper))
+        elif callable(fast_impl := _fast_custom_op_impl(qualname)):
+            self.todo.append((qualname, fast_impl))
         elif qualname.partition("::")[0] in _TORCH_NAMESPACES:
             self.packages.add("torch")
         else:

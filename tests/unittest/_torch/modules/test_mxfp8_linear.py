@@ -25,7 +25,12 @@ import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops as flashinfer_ops_mo
 import tensorrt_llm._torch.custom_ops.mxfp8_gemm as mxfp8_gemm_module
 import tensorrt_llm._torch.custom_ops.torch_custom_ops as custom_ops_module
 import tensorrt_llm._torch.modules.linear as linear_module
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import (
+    AutoTuner,
+    AutoTunerProfilingCache,
+    _candidates_fingerprint,
+    autotune,
+)
 from tensorrt_llm._torch.custom_ops.mxfp8_gemm import (
     FlashInferMXFP8GemmRunner,
     MXFP8GemmUnifiedRunner,
@@ -512,6 +517,15 @@ def test_mxfp8_native_autotuner_dispatch(monkeypatch):
     assert native_gemm.call_count == 2
 
 
+def _mxfp8_profiling_cache(entries):
+    """A profiling cache holding ``entries`` (keys without the code fingerprint)
+    as tuning ``MXFP8GemmRunner`` alone under the current code keys them."""
+    cache = AutoTunerProfilingCache.__new__(AutoTunerProfilingCache)  # No device query.
+    fingerprint = _candidates_fingerprint((MXFP8GemmRunner,))
+    cache.cache = {(*key, fingerprint): value for key, value in entries.items()}
+    return cache
+
+
 def test_mxfp8_native_autotuner_syncs_all_profiles(monkeypatch):
     bf16_runner = Mock()
     fp16_runner = Mock()
@@ -563,9 +577,7 @@ def test_mxfp8_native_autotuner_syncs_all_profiles(monkeypatch):
             bf16_profile,
         ): (0, 31, 0.10),
     }
-    profiling_cache = Mock()
-    profiling_cache.get_specific_custom_op.return_value = cache
-    tuner = Mock(profiling_cache=profiling_cache)
+    tuner = Mock(profiling_cache=_mxfp8_profiling_cache(cache))
 
     MXFP8GemmRunner.sync_all_tactic_caches(tuner)
 
@@ -592,9 +604,7 @@ def test_mxfp8_native_autotuner_rejects_mismatched_k(monkeypatch):
             (1,),
         ),
     )
-    profiling_cache = Mock()
-    profiling_cache.get_specific_custom_op.return_value = {cache_key: (0, 17, 0.25)}
-    tuner = Mock(profiling_cache=profiling_cache)
+    tuner = Mock(profiling_cache=_mxfp8_profiling_cache({cache_key: (0, 17, 0.25)}))
     with pytest.raises(ValueError, match="mismatched K dimensions"):
         MXFP8GemmRunner.sync_all_tactic_caches(tuner)
 
