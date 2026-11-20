@@ -3584,12 +3584,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         local_layer_idx = self.get_local_layer_idx(metadata)
         if metadata.kv_cache_manager is None:
             return local_layer_idx
-        to_compact = getattr(fp4_mla_cache_layout(metadata.kv_cache_manager),
-                             "_fp4_mla_compact_layer_idx", None)
-        if not callable(to_compact):
+        layout = fp4_mla_cache_layout(metadata.kv_cache_manager)
+        if layout is None:
             raise RuntimeError(
                 "FP4 MLA requires a cache manager with compact layer mapping.")
-        return to_compact(local_layer_idx)
+        return layout._fp4_mla_compact_layer_idx(local_layer_idx)
 
     def use_nvfp4_output(
         self,

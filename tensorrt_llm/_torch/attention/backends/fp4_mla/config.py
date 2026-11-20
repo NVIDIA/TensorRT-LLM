@@ -7,11 +7,14 @@ import importlib.util
 import inspect
 import os
 import threading
-from typing import Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from .cache_layout import Fp4MlaCacheLayout
 
 HP_BLOCK_SIZE: int = 16
 
@@ -157,7 +160,7 @@ def _env_flag_not_disabled(name: str, default: bool) -> bool:
     )
 
 
-def fp4_mla_cache_layout(kv_cache_manager: object) -> Any:
+def fp4_mla_cache_layout(kv_cache_manager: object) -> Optional["Fp4MlaCacheLayout"]:
     """The FP4 MLA cache layout a KV cache manager holds; None for a manager without one."""
     return getattr(kv_cache_manager, "fp4_mla_layout", None)
 
