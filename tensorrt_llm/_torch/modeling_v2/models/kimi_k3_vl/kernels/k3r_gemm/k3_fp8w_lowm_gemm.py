@@ -100,6 +100,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 from ..k3r_comm import k3_lamport_ar
 from .k3_latent_fp8_gemm import (
@@ -1789,7 +1790,8 @@ class K3Fp8wLowMGemmKernel(_FusedStoreMixin):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         mbox_full, my_chunks * ((S - 1) * MMA_M * 16)
                     )
-                cute.arch.mbarrier_wait(mbox_full, 0)
+                # The peers' st.async complete-tx releases at cluster scope.
+                _mbar_wait_cluster_acquire(mbox_full, 0)
                 for c in cutlass.range_constexpr(nchunks):
                     _, col0 = tTR_cAcc[4 * c]
                     if col0 < m:
@@ -2101,6 +2103,23 @@ def _st_async_v4_f32(local_addr, v0, v1, v2, v3, local_mbar, peer, *, loc=None, 
         loc=loc,
         ip=ip,
     )
+
+
+@cute.jit
+def _mbar_wait_cluster_acquire(mbar_ptr: cute.Pointer, phase: Int32):
+    """Wait for ``phase`` of this CTA's mbarrier at ``mbar_ptr``, acquiring at cluster scope.
+
+    ``cute.arch.mbarrier_wait`` acquires at CTA scope. The peers' ``st.async ...
+    mbarrier::complete_tx`` that completes this barrier releases at cluster scope, and only a
+    cluster-scope acquire orders their payload before the reads that follow the wait: a relaxed
+    cluster-scope try_wait loop and an acquire fence restricted to shared::cluster (the ISA's
+    acquire pattern for it; unlike ``.acquire.cluster`` on the wait it adds no L1 invalidate).
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @dsl_user_op
@@ -2921,7 +2940,8 @@ class K3Fp8wMidMGemmKernel(_FusedStoreMixin):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         storage.mbox_full, my_chunks * ((S - 1) * MMA_M * 16)
                     )
-                cute.arch.mbarrier_wait(storage.mbox_full, 0)
+                # The peers' st.async complete-tx releases at cluster scope.
+                _mbar_wait_cluster_acquire(storage.mbox_full, 0)
                 for i in cutlass.range_constexpr(self.chunks_cap):
                     if i < my_chunks:
                         acc = [rOwn[i * 4 + v] for v in range(4)]

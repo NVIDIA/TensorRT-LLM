@@ -52,6 +52,7 @@ from cutlass.cutlass_dsl import (
     if_generate,
     new_from_mlir_values,
 )
+from cutlass.experimental import primitives as prims
 from cutlass.pipeline import (
     Agent,
     CooperativeGroup,
@@ -71,6 +72,23 @@ from tensorrt_llm._torch.utils import ActivationType
 # ============================================================================
 # Inline utility functions
 # ============================================================================
+
+
+@cute.jit
+def _mbar_wait_cluster_acquire(mbar_ptr: cute.Pointer, phase: cutlass.Int32):
+    """Wait for ``phase`` of this CTA's mbarrier at ``mbar_ptr``, acquiring at cluster scope.
+
+    ``cute.arch.mbarrier_wait`` acquires at CTA scope. The peers' ``st.async ...
+    mbarrier::complete_tx`` that completes this barrier releases at cluster scope, and only a
+    cluster-scope acquire orders their payload before the reads that follow the wait: a relaxed
+    cluster-scope try_wait loop and an acquire fence restricted to shared::cluster (the ISA's
+    acquire pattern for it; unlike ``.acquire.cluster`` on the wait it adds no L1 invalidate).
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @dataclass(frozen=True)
@@ -3464,7 +3482,14 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                     )
                                 )
                                 fc1_scheduler_producer_state.advance()
-                            fc1_scheduler_pipeline.consumer_wait(fc1_scheduler_consumer_state)
+                            # The leader's st.async into this CTA's response slot releases
+                            # at cluster scope: acquire at cluster scope before reading it.
+                            _mbar_wait_cluster_acquire(
+                                fc1_scheduler_pipeline.sync_object_full.get_barrier(
+                                    fc1_scheduler_consumer_state.index
+                                ),
+                                fc1_scheduler_consumer_state.phase,
+                            )
                             work_tile = fc1_tile_sched.get_published_work()
                             fc1_scheduler_pipeline.consumer_release(fc1_scheduler_consumer_state)
                             fc1_scheduler_consumer_state.advance()
@@ -3578,7 +3603,14 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                     )
                                 )
                                 fc2_scheduler_producer_state.advance()
-                            fc2_scheduler_pipeline.consumer_wait(fc2_scheduler_consumer_state)
+                            # The leader's st.async into this CTA's response slot releases
+                            # at cluster scope: acquire at cluster scope before reading it.
+                            _mbar_wait_cluster_acquire(
+                                fc2_scheduler_pipeline.sync_object_full.get_barrier(
+                                    fc2_scheduler_consumer_state.index
+                                ),
+                                fc2_scheduler_consumer_state.phase,
+                            )
                             fc2_work_tile = fc2_tile_sched.get_published_work()
                             fc2_scheduler_pipeline.consumer_release(fc2_scheduler_consumer_state)
                             fc2_scheduler_consumer_state.advance()
