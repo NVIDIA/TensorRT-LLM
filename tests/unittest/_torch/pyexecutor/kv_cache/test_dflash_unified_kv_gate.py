@@ -30,7 +30,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager impo
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -128,6 +128,26 @@ def test_matching_draft_layout_unifies(is_disagg):
     specs = creator._build_unified_dflash_layer_specs(creator._kv_cache_config)
     assert [spec.global_layer_id for spec in specs] == [0, 1, 2, 3]
     assert [spec.dtype for spec in specs] == [DataType.BF16] * 4
+
+
+def test_aggregated_nvfp4_target_builds_native_buffers_with_bf16_draft() -> None:
+    creator = _creator(
+        is_disagg=False,
+        target=_model_config(kv_heads=8, head_dim=128, kv_quant_algo=QuantAlgo.NVFP4),
+        draft=_model_config(kv_heads=8, head_dim=128),
+    )
+    specs = creator._build_unified_dflash_layer_specs(creator._kv_cache_config)
+    assert [spec.dtype for spec in specs] == [DataType.NVFP4] * 2 + [DataType.BF16] * 2
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_attention_window_vec = [creator._max_seq_len] * len(specs)
+    groups = []
+    for i, spec in enumerate(specs):
+        layer = manager._explicit_layer_config(i, spec, creator._tokens_per_block)
+        groups.append({buffer.role: buffer.coalescing_group for buffer in layer.buffers})
+    target_groups = {Role.KEY: 1, Role.VALUE: 1, Role.KEY_BLOCK_SCALE: 2, Role.VALUE_BLOCK_SCALE: 2}
+    draft_groups = {Role.KEY: 0, Role.VALUE: 0}
+    assert groups == [target_groups, target_groups, draft_groups, draft_groups]
 
 
 def test_swa_scratch_stays_on_the_target_only(monkeypatch: pytest.MonkeyPatch) -> None:
