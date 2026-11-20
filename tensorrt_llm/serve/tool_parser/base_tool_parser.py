@@ -288,6 +288,16 @@ class BaseToolParser(ABC):
                 # Might be partial bot_token, keep buffering
                 return StreamingParseResult()
 
+        # Text before the first tool call is content, as in detect_and_parse.
+        # A delta can carry it together with bot_token, so it is released here
+        # and the call is parsed from a buffer that starts at bot_token.
+        first_call_pos = current_text.find(self.bot_token)
+        if first_call_pos > 0 and self.current_tool_id == -1:
+            self._buffer = current_text[first_call_pos:]
+            result = BaseToolParser.parse_streaming_increment(self, "", tools)
+            result.normal_text = current_text[:first_call_pos] + result.normal_text
+            return result
+
         # Build tool indices if not already built
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)

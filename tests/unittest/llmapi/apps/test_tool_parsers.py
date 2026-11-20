@@ -1096,6 +1096,10 @@ class TestKimiK2StreamingMatchesWholeTextParse:
         assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
+_QWEN3_CALL_BODY = ('{"name": "get_weather", "arguments": {"location": "SF"}}'
+                    '\n</tool_call>')
+
+
 class TestQwen3ToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3ToolParser class."""
 
@@ -1516,6 +1520,37 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         # The completed call must also be consumed from the buffer, otherwise the
         # parser stays in the tool-call branch and swallows the rest of the output.
         assert "<tool_call>" not in parser._buffer
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            ["Let me check the weather.<tool_call>", "\n", _QWEN3_CALL_BODY],
+            ["Let me check", " the weather.<tool_call>\n", _QWEN3_CALL_BODY],
+            ["Let me check the weather.<tool_call>\n" + _QWEN3_CALL_BODY],
+        ],
+        ids=["prefix_with_partial_opener", "prefix_with_opener", "one_chunk"],
+    )
+    def test_streaming_keeps_text_sharing_a_chunk_with_the_opener(
+            self, sample_tools, parser, chunks):
+        """Stream text that shares a chunk with the start of a call.
+
+        A multi-token step can deliver the last words before a call together
+        with ``<tool_call>``. They are content, as detect_and_parse reports.
+        """
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in chunks
+        ]
+        results.append(parser.finish(sample_tools))
+
+        content = "".join(r.normal_text for r in results)
+        assert content == "Let me check the weather."
+        assert content == parser.detect_and_parse("".join(chunks),
+                                                  sample_tools).normal_text
+        assert [c.name for r in results for c in r.calls
+                if c.name] == ["get_weather"]
+        arguments = "".join(c.parameters for r in results for c in r.calls)
+        assert json.loads(arguments) == {"location": "SF"}
 
 
 class TestQwen3CoderRequiredTools:
