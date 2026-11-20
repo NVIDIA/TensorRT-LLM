@@ -43,6 +43,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_hybrid_linear,
     mamba_effective_tp_size,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import MambaRole
 from tensorrt_llm._torch.recurrent_state_spec import (
     LayerKind,
@@ -584,6 +585,54 @@ def test_v2_selection_returns_the_cache_manager_the_model_class_declares(
     )
 
 
+def _kv_cache_config() -> KvCacheConfig:
+    return KvCacheConfig(
+        use_kv_cache_manager_v2=True, enable_block_reuse=False, max_tokens=256, tokens_per_block=64
+    )
+
+
+def _create_manager(model_config: ModelConfig, manager_cls: type):
+    """Build ``manager_cls`` for ``model_config`` through the executor's construction."""
+    kv_cache_config = _kv_cache_config()
+    return _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=manager_cls,
+        mapping=model_config.mapping,
+        kv_cache_config=kv_cache_config,
+        tokens_per_block=kv_cache_config.tokens_per_block,
+        max_seq_len=2048,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=model_config.sparse_attention_config,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+
+@pytest.mark.parametrize("family", sorted(_TEXT_MODELS))
+def test_construction_rejects_a_model_without_a_recurrent_layer(family):
+    """The class selection gives such a model a manager that holds no recurrent state."""
+    model_config = ModelConfig(
+        pretrained_config=_text_config(family, recurrent=False), quant_config=QuantConfig()
+    )
+
+    with pytest.raises(ValueError, match="without a recurrent layer is not supported"):
+        _create_manager(model_config, KVCacheManagerV2)
+
+
+def test_construction_rejects_a_manager_class_that_holds_no_recurrent_state():
+    model_config = ModelConfig(
+        pretrained_config=_text_config("nemotron"), quant_config=QuantConfig()
+    )
+
+    with pytest.raises(ValueError, match="KVCacheManagerV2 holds no recurrent state"):
+        _create_manager(model_config, KVCacheManagerV2)
+
+
 @skip_no_cuda
 @pytest.mark.parametrize("family", sorted(_TEXT_MODELS))
 @pytest.mark.parametrize(
@@ -597,28 +646,11 @@ def test_manager_state_buffers_match_declaration(monkeypatch, family, mapping_kw
     model_config = ModelConfig(
         pretrained_config=config, mapping=mapping, quant_config=QuantConfig()
     )
-    kv_cache_config = KvCacheConfig(
-        use_kv_cache_manager_v2=True, enable_block_reuse=False, max_tokens=256, tokens_per_block=64
-    )
     spec = resolve_recurrent_state_spec(config, quant_config=model_config.quant_config)
     num_shards = mamba_effective_tp_size(mapping)
 
-    manager = _create_kv_cache_manager(
-        model_engine=None,
-        kv_cache_manager_cls=get_kv_cache_manager_cls(model_config, kv_cache_config),
-        mapping=mapping,
-        kv_cache_config=kv_cache_config,
-        tokens_per_block=kv_cache_config.tokens_per_block,
-        max_seq_len=2048,
-        max_batch_size=4,
-        spec_config=None,
-        sparse_attention_config=model_config.sparse_attention_config,
-        max_num_tokens=256,
-        max_beam_width=1,
-        kv_connector_manager=None,
-        model_config=model_config,
-        dtype=torch.bfloat16,
-        is_draft=False,
+    manager = _create_manager(
+        model_config, get_kv_cache_manager_cls(model_config, _kv_cache_config())
     )
     try:
         recurrent_layers = [

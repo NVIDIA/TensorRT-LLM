@@ -773,7 +773,7 @@ def test_v2_manager_rejects_model_type_kwarg() -> None:
 def test_gdn_mtp_replay_leaves_the_fused_fp8_verify_alone(fused_verify, fp8_out, expected):
     """GDN layers of the PyTorch mixer can use GDN MTP replay unless they verify with the fused
     kernels into an FP8 out_proj input, which keep the cached replay history."""
-    from tensorrt_llm._torch.pyexecutor._util import _uses_gdn_mtp_replay
+    from tensorrt_llm._torch.modules.fla.cache_manager import uses_gdn_mtp_replay
 
     layers = []
     for _ in range(2):
@@ -782,8 +782,8 @@ def test_gdn_mtp_replay_leaves_the_fused_fp8_verify_alone(fused_verify, fp8_out,
         gdn.fused_verify = fused_verify
         gdn.norm = SimpleNamespace(fp8_scale=torch.tensor(0.5) if fp8_out else None)
         layers.append(gdn)
-    assert _uses_gdn_mtp_replay(torch.nn.ModuleList(layers)) is expected
-    assert _uses_gdn_mtp_replay(torch.nn.ModuleList([torch.nn.Linear(2, 2)])) is False
+    assert uses_gdn_mtp_replay(torch.nn.ModuleList(layers)) is expected
+    assert uses_gdn_mtp_replay(torch.nn.ModuleList([torch.nn.Linear(2, 2)])) is False
 
 
 @pytest.mark.parametrize(
@@ -852,7 +852,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         def __init__(self, *args, **kwargs):
             captured_mixed.update(kwargs)
 
-    class RecordingV2Manager(MambaHybridCacheManagerV2):
+    class RecordingV2Manager(Qwen35HybridCacheManager):
         def __init__(self, *args, **kwargs):
             captured_v2.update(kwargs)
 
@@ -864,6 +864,11 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         num_key_value_heads=2,
         num_hidden_layers=2,
         layer_types=["linear_attention", "full_attention"],
+        linear_key_head_dim=8,
+        linear_conv_kernel_dim=4,
+        linear_num_value_heads=4,
+        linear_num_key_heads=1,
+        linear_value_head_dim=8,
     )
     model_config = SimpleNamespace(
         pretrained_config=pretrained_config,
@@ -989,7 +994,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
 
 @pytest.mark.parametrize(
     "manager_cls",
-    [CppMambaHybridCacheManager, MixedMambaHybridCacheManager, MambaHybridCacheManagerV2],
+    [CppMambaHybridCacheManager, MixedMambaHybridCacheManager, NemotronHybridCacheManager],
 )
 @pytest.mark.parametrize("nested_vocab_size", [False, True])
 def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls, nested_vocab_size):
@@ -1002,6 +1007,11 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
     config = SimpleNamespace(
         architectures=["NemotronHForCausalLM"],
         hybrid_override_pattern="M*",
+        ssm_state_size=8,
+        conv_kernel=4,
+        mamba_num_heads=4,
+        n_groups=1,
+        mamba_head_dim=8,
         vocab_size=131072,
         hidden_size=32,
         num_attention_heads=4,
@@ -1046,7 +1056,7 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
         is_draft=False,
     )
 
-    if manager_cls is MambaHybridCacheManagerV2:
+    if manager_cls is NemotronHybridCacheManager:
         assert captured["vocab_size"] == 131072
         # The manager tells its draft layers apart by the model's layer count.
         assert captured["pretrained_config"] is config

@@ -16,6 +16,8 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.pyexecutor._util as _util
+from tensorrt_llm._torch.modules.fla.cache_manager import Qwen35HybridCacheManager
+from tensorrt_llm._torch.modules.mamba.cache_manager import NemotronHybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_vocab_size
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -143,8 +145,8 @@ def _capture_manager_kwargs(
 @pytest.mark.parametrize(
     "config_factory, base_cls",
     [
-        pytest.param(_nemotron_hybrid_config, MambaHybridCacheManagerV2, id="nemotron_hybrid"),
-        pytest.param(_qwen3_5_hybrid_config, MambaHybridCacheManagerV2, id="qwen3_5_hybrid"),
+        pytest.param(_nemotron_hybrid_config, NemotronHybridCacheManager, id="nemotron_hybrid"),
+        pytest.param(_qwen3_5_hybrid_config, Qwen35HybridCacheManager, id="qwen3_5_hybrid"),
         pytest.param(_dense_config, KVCacheManagerV2, id="dense"),
     ],
 )
@@ -222,11 +224,10 @@ def test_hybrid_constructor_receives_its_own_index_slot_reservation(
 @pytest.mark.parametrize(
     "config_factory, base_cls",
     [
-        # The hybrid branches copy the shared kwargs dict instead of spreading
-        # it, once each, so both need a case of their own.
-        pytest.param(_nemotron_hybrid_config, MambaHybridCacheManagerV2, id="nemotron_hybrid"),
-        pytest.param(_qwen3_5_hybrid_config, MambaHybridCacheManagerV2, id="qwen3_5_hybrid"),
-        # Stands in for every branch that spreads the dict directly: Kimi, MLA, dense.
+        # The recurrent families share one branch; each adds its own keyword arguments.
+        pytest.param(_nemotron_hybrid_config, NemotronHybridCacheManager, id="nemotron_hybrid"),
+        pytest.param(_qwen3_5_hybrid_config, Qwen35HybridCacheManager, id="qwen3_5_hybrid"),
+        # Stands in for the branches without recurrent state: MLA, dense.
         pytest.param(_dense_config, KVCacheManagerV2, id="dense"),
     ],
 )
@@ -248,7 +249,7 @@ def test_util_resolves_vocab_size_instead_of_reading_the_attribute():
     config.vocab_size = None
     config.llm_config = SimpleNamespace(vocab_size=_VOCAB_SIZE)
 
-    kwargs = _capture_manager_kwargs(config, MambaHybridCacheManagerV2)
+    kwargs = _capture_manager_kwargs(config, NemotronHybridCacheManager)
     assert kwargs["vocab_size"] == _VOCAB_SIZE
 
 

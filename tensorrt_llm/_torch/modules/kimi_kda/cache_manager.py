@@ -10,6 +10,7 @@ import sys
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -52,6 +53,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 
 from .replay_region import REPLAY_STATE_REGION, KDAReplayRegion, ReplayLayout
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
 _MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
@@ -1095,6 +1099,39 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         # The DSpark MLA drafter keeps its context KV in this manager.
         return True
 
+    @classmethod
+    @override
+    def attention_cache_geometry(
+        cls,
+        pretrained_config: object,
+        *,
+        num_kv_heads: int | list[int],
+        head_dim: int | list[int],
+    ) -> tuple[CacheTypeCpp, int, int]:
+        # The MLA layers keep the absorbed latent cache: one head of the latent and RoPE widths.
+        return (
+            CacheTypeCpp.SELFKONLY,
+            1,
+            pretrained_config.kv_lora_rank + pretrained_config.qk_rope_head_dim,
+        )
+
+    @classmethod
+    @override
+    def family_init_kwargs(
+        cls,
+        *,
+        model_config: ModelConfig,
+        spec_config: object,
+        sparse_attention_config: object,
+        mamba_params: object,
+        model: torch.nn.Module | None,
+    ) -> dict[str, object]:
+        init_kwargs = kda_family_init_kwargs(spec_config, model)
+        # The manager reads the MLA geometry and the per-layer KV dtype policy from the model
+        # config when it composes the FP4 MLA cache layout.
+        init_kwargs["pretrained_config"] = model_config.pretrained_config
+        return init_kwargs
+
     @override
     def __init__(
         self,
@@ -1796,6 +1833,20 @@ def validate_kimi_state_cache_dtype(
         )
 
 
+def kda_family_init_kwargs(spec_config: object, model: torch.nn.Module | None) -> dict[str, object]:
+    """Return the constructor keyword arguments of a V2 manager that holds KDA state.
+
+    Args:
+        spec_config: Speculative decoding config, if any.
+        model: The built model, or ``None`` when the manager is created without one.
+    """
+    init_kwargs: dict[str, object] = {"conv_state_layout": "q_k_v"}
+    backbone = getattr(model, "model", None)
+    if spec_config is not None and getattr(backbone, "kda_draft_records", False):
+        init_kwargs["kda_draft_records"] = True
+    return init_kwargs
+
+
 def get_kimi_cache_params(config, *, spec_config=None, quant_config=None):
     """KDA uses equal Q/K/V sections and defaults to FP32 state alongside MLA."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -1830,6 +1881,7 @@ __all__ = [
     "allocate_kda_replay_fields",
     "get_kda_replay_num_spec",
     "get_kimi_cache_params",
+    "kda_family_init_kwargs",
     "resolve_kimi_ssm_cache_dtype",
     "select_kda_replay_state",
     "validate_kimi_state_cache_dtype",
