@@ -20,44 +20,57 @@ SWITCHES = ["FORCE_DETERMINISTIC", "FORCE_BATCH_INVARIANT"]
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("transposed", [False, True])
 @pytest.mark.parametrize("rows", ROW_COUNTS)
-def test_every_gemm_has_the_fixed_height(monkeypatch, rows):
-    real_linear = torch.nn.functional.linear
-    heights = []
+def test_every_gemm_has_the_fixed_height_and_layout(
+    monkeypatch: pytest.MonkeyPatch, rows: int, transposed: bool, with_bias: bool
+) -> None:
+    real_gemm = linear_module._fixed_height_gemm
+    gemm_inputs = []
 
-    def spy(chunk, weight, bias=None):
-        heights.append(chunk.shape[0])
-        return real_linear(chunk, weight, bias)
+    def spy(
+        chunk: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, out: torch.Tensor
+    ) -> None:
+        gemm_inputs.append((chunk.shape[0], chunk.is_contiguous()))
+        real_gemm(chunk, weight, bias, out)
 
-    monkeypatch.setattr(linear_module.F, "linear", spy)
-    inputs = torch.randn(rows, 8)
+    monkeypatch.setattr(linear_module, "_fixed_height_gemm", spy)
+    inputs = torch.randn(8, rows).t() if transposed else torch.randn(rows, 8)
     weight = torch.randn(4, 8)
-    bias = torch.randn(4)
+    bias = torch.randn(4) if with_bias else None
 
     outputs = _fixed_height_linear(inputs, weight, bias)
 
-    assert set(heights) == {FIXED_GEMM_HEIGHT}
-    torch.testing.assert_close(outputs, real_linear(inputs, weight, bias))
+    assert set(gemm_inputs) == {(FIXED_GEMM_HEIGHT, True)}
+    torch.testing.assert_close(outputs, torch.nn.functional.linear(inputs, weight, bias))
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("rows", ROW_COUNTS)
-def test_every_gemm_input_is_contiguous(monkeypatch, rows):
-    real_linear = torch.nn.functional.linear
-    contiguous = []
+def test_fake_matches_the_op(rows: int) -> None:
+    torch.library.opcheck(
+        _fixed_height_linear, (torch.randn(rows, 8), torch.randn(4, 8), torch.randn(4))
+    )
 
-    def spy(chunk, weight, bias=None):
-        contiguous.append(chunk.is_contiguous())
-        return real_linear(chunk, weight, bias)
 
-    monkeypatch.setattr(linear_module.F, "linear", spy)
-    inputs = torch.randn(8, rows).t()
+@pytest.mark.cpu_only
+def test_torch_compile_does_not_recompile_for_each_row_count() -> None:
     weight = torch.randn(4, 8)
+    bias = torch.randn(4)
 
-    outputs = _fixed_height_linear(inputs, weight, None)
+    def forward(inputs: torch.Tensor) -> torch.Tensor:
+        return _fixed_height_linear(inputs, weight, bias)
 
-    assert all(contiguous)
-    torch.testing.assert_close(outputs, real_linear(inputs, weight))
+    torch._dynamo.reset()
+    # The engine compiles with fullgraph=True and a recompile limit of 16.
+    with torch._dynamo.config.patch(recompile_limit=16):
+        compiled = torch.compile(forward, fullgraph=True, backend="eager")
+        for rows in range(1, 3 * FIXED_GEMM_HEIGHT, 7):
+            inputs = torch.randn(rows, 8)
+            torch.testing.assert_close(
+                compiled(inputs), torch.nn.functional.linear(inputs, weight, bias)
+            )
 
 
 @pytest.mark.cpu_only

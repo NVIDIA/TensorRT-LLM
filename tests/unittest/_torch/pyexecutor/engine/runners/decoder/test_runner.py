@@ -571,6 +571,7 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
             "declared_recurrent_state_on_the_multimodal_llm",
             "context_parallel",
             "context_only_cache",
+            "batch_shape_deterministic",
         )
         for case in cases:
             with self.subTest(case=case):
@@ -613,6 +614,8 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
                     resource_manager.get_resource_manager.side_effect = lambda _: SimpleNamespace(
                         context_swa_layer_limit=20
                     )
+                elif case == "batch_shape_deterministic":
+                    engine._graphs._batch_shape_deterministic = True
 
                 batch = ScheduledRequests()
                 batch.context_requests_last_chunk = [_make_request_stub(1)]

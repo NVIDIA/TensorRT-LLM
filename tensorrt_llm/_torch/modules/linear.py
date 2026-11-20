@@ -724,28 +724,53 @@ class LinearMethodBase(ABC):
 FIXED_GEMM_HEIGHT = 64
 
 
+def _fixed_height_gemm(rows: torch.Tensor, weight: torch.Tensor,
+                       bias: Optional[torch.Tensor], out: torch.Tensor) -> None:
+    """Write ``F.linear(rows, weight, bias)`` into ``out``.
+
+    ``F.linear`` runs a 2D input as this same ``addmm`` or ``mm``.
+    """
+    if bias is None:
+        torch.mm(rows, weight.t(), out=out)
+    else:
+        torch.addmm(bias, rows, weight.t(), out=out)
+
+
+@torch.library.custom_op("trtllm::fixed_height_linear", mutates_args=())
 def _fixed_height_linear(input: torch.Tensor, weight: torch.Tensor,
                          bias: Optional[torch.Tensor]) -> torch.Tensor:
     """Apply a linear layer with every GEMM at ``FIXED_GEMM_HEIGHT`` rows.
 
     cuBLAS picks its kernel from the matrix shape and kernels round differently,
-    so one row can produce different bits at different batch heights. Short
-    chunks are padded and the padding rows are dropped from the output.
+    so one row can produce different bits at different batch heights. A short
+    last chunk is padded. The output has room for the padding rows, so every
+    GEMM writes its rows in place. This is a custom op so that torch.compile
+    sees one op instead of a loop over the row count.
     """
     if input.numel() == 0:
         return F.linear(input, weight, bias)
-    # Padded chunks are new contiguous tensors, so full chunks must be
+    # The padded chunk is a new contiguous tensor, so the other chunks must be
     # contiguous too: cuBLAS takes its arguments from the strides.
     rows = input.reshape(-1, input.shape[-1]).contiguous()
-    outputs = []
-    for start in range(0, rows.shape[0], FIXED_GEMM_HEIGHT):
+    num_rows = rows.shape[0]
+    padded_rows = ((num_rows + FIXED_GEMM_HEIGHT - 1) // FIXED_GEMM_HEIGHT *
+                   FIXED_GEMM_HEIGHT)
+    output = rows.new_empty(padded_rows, weight.shape[0])
+    for start in range(0, num_rows, FIXED_GEMM_HEIGHT):
         chunk = rows[start:start + FIXED_GEMM_HEIGHT]
         count = chunk.shape[0]
         if count < FIXED_GEMM_HEIGHT:
             padding = chunk[-1:].expand(FIXED_GEMM_HEIGHT - count, -1)
             chunk = torch.cat((chunk, padding))
-        outputs.append(F.linear(chunk, weight, bias)[:count])
-    return torch.cat(outputs).view(*input.shape[:-1], -1)
+        _fixed_height_gemm(chunk, weight, bias,
+                           output[start:start + FIXED_GEMM_HEIGHT])
+    return output[:num_rows].view(*input.shape[:-1], -1)
+
+
+@_fixed_height_linear.register_fake
+def _(input: torch.Tensor, weight: torch.Tensor,
+      bias: Optional[torch.Tensor]) -> torch.Tensor:
+    return input.new_empty(*input.shape[:-1], weight.shape[0])
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
