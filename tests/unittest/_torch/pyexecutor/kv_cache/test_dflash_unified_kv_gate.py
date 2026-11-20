@@ -130,6 +130,79 @@ def test_matching_draft_layout_unifies(is_disagg):
     assert [spec.dtype for spec in specs] == [DataType.BF16] * 4
 
 
+def _configure_manager_creation(creator, monkeypatch):
+    creator._kv_cache_config = KvCacheConfig()
+    creator._tokens_per_block = 32
+    creator._max_batch_size = 4
+    creator._max_num_tokens = 4096
+    creator._max_beam_width = 1
+    creator._sparse_attention_config = None
+    creator._kv_connector_manager = None
+    creator._execution_stream = None
+    creator._disable_overlap_scheduler = True
+    creator._skip_est = True
+    creator._llm_args.kv_cache_config = creator._kv_cache_config
+    monkeypatch.setattr(creator, "_get_model_kv_cache_manager_cls", lambda *args: KVCacheManagerV2)
+    monkeypatch.setattr(creator, "_enable_kv_cache_stats", lambda: False)
+
+
+@pytest.mark.parametrize(
+    "setting, restriction, role, disagg, estimating, shared, warning_reason",
+    [
+        ("auto", None, "generation", True, False, True, None),
+        ("auto", "schedule", "generation", True, False, False, "draft_len_schedule is set"),
+        ("auto", "page_size", "generation", True, False, False, "tokens_per_block=128"),
+        ("0", None, "gen0", True, False, False, "TRTLLM_DISAGG_SHARED_DRAFT_KV='0'"),
+        (None, None, None, True, False, False, "requires opting in"),
+        ("auto", "schedule", "context", True, False, False, None),
+        ("auto", "schedule", "generation", True, True, False, None),
+        ("auto", "schedule", None, False, False, False, None),
+        ("1", "schedule", "generation", True, False, None, None),
+    ],
+)
+def test_dflash_private_kv_warning_follows_allocated_layout(
+    monkeypatch, setting, restriction, role, disagg, estimating, shared, warning_reason
+):
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    for key, value in ((_SHARED_DRAFT_KV_ENV, setting), ("TRTLLM_DISAGG_ROLE", role)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    layout.is_generation = True
+    creator = _creator(is_disagg=disagg, target=layout, draft=layout)
+    spec = creator._speculative_config
+    if restriction == "schedule":
+        spec.draft_len_schedule = {4: 2}
+    spec.max_draft_len = 2
+    spec._use_shared_kv_cache = False
+    spec.spec_dec_mode.use_one_engine = lambda: True
+    spec.spec_dec_mode.is_sa = lambda: False
+    _configure_manager_creation(creator, monkeypatch)
+    if restriction == "page_size":
+        creator._tokens_per_block = 128
+    allocate = Mock(return_value=SimpleNamespace(max_seq_len=4096))
+    warn_once = Mock()
+    monkeypatch.setattr(_util, "_create_kv_cache_manager", allocate)
+    monkeypatch.setattr(_util.logger, "warning_once", warn_once)
+
+    if shared is None:
+        with pytest.raises(ValueError, match="requires.*draft_len_schedule"):
+            creator._create_kv_cache_manager(estimating_kv_cache=estimating)
+        allocate.assert_not_called()
+    else:
+        creator._create_kv_cache_manager(estimating_kv_cache=estimating)
+        assert (allocate.call_args.kwargs["layer_specs"] is not None) is shared
+    if warning_reason is None:
+        warn_once.assert_not_called()
+    else:
+        warn_once.assert_called_once()
+        assert warning_reason in warn_once.call_args.args[0]
+        assert warn_once.call_args.kwargs["key"] == "dflash_disagg_private_draft_kv"
+
+
 @pytest.mark.parametrize("is_disagg", [False, True])
 @pytest.mark.parametrize("shift_label, expected_width", [(True, 7), (False, 8)])
 def test_dspark_checkpoint_width_reaches_shared_cache_cost_and_construction(
@@ -148,19 +221,7 @@ def test_dspark_checkpoint_width_reaches_shared_cache_cost_and_construction(
     creator._model_engine.model.draft_model = SimpleNamespace(
         shift_label=shift_label, reads_managed_ctx_pages=lambda tokens_per_block: True
     )
-    creator._kv_cache_config = KvCacheConfig()
-    creator._tokens_per_block = 32
-    creator._max_batch_size = 4
-    creator._max_num_tokens = 4096
-    creator._max_beam_width = 1
-    creator._sparse_attention_config = None
-    creator._kv_connector_manager = None
-    creator._execution_stream = None
-    creator._disable_overlap_scheduler = True
-    creator._skip_est = True
-    creator._llm_args.kv_cache_config = creator._kv_cache_config
-    monkeypatch.setattr(creator, "_get_model_kv_cache_manager_cls", lambda *args: KVCacheManagerV2)
-    monkeypatch.setattr(creator, "_enable_kv_cache_stats", lambda: False)
+    _configure_manager_creation(creator, monkeypatch)
 
     class RecordingManager(KVCacheManagerV2):
         get_cache_size_per_token = Mock(return_value=(1, 0))

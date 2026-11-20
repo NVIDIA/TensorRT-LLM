@@ -2605,11 +2605,15 @@ class KvCacheCreator:
             num_target_layers = self._model_engine.model.model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
+        final_build = not estimating_kv_cache
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         self._check_shared_draft_kv_request()
         unified_layer_specs = None
         shared_draft_block_width = None
-        if self._should_unify_dflash_kv_cache():
+        is_dflash = (self._speculative_config is not None
+                     and self._speculative_config.spec_dec_mode.is_dflash())
+        private_reason = self._private_draft_kv_reason()
+        if private_reason is None:
             unified_layer_specs = self._build_unified_dflash_layer_specs(
                 kv_cache_config)
             shared_draft_block_width = self._unified_drafter_block_width()
@@ -2618,15 +2622,14 @@ class KvCacheCreator:
                 "share one KV cache manager "
                 f"({len(unified_layer_specs)} layers, disagg={self._is_disagg})."
             )
-        elif (self._is_disagg and
+        elif (self._is_disagg and not is_dflash and
               os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in ("1", "auto")):
             # The request check above only rejects the variable set to 1 with a
             # drafter that can share; everything else resolves quietly.
             logger.info(
                 f"TRTLLM_DISAGG_SHARED_DRAFT_KV="
                 f"{os.environ['TRTLLM_DISAGG_SHARED_DRAFT_KV']} resolved to a "
-                f"separate draft KV cache, because {self._dflash_unify_blocker()}."
-            )
+                f"separate draft KV cache, because {private_reason}.")
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=self._model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -2672,6 +2675,18 @@ class KvCacheCreator:
             if kv_cache_manager is not None:
                 self._max_seq_len = kv_cache_manager.max_seq_len
 
+        if (final_build and kv_cache_manager is not None and self._is_disagg
+                and is_dflash and private_reason is not None
+                and not getattr(self._model_engine.model,
+                                "transfers_draft_kv_cache", False)):
+            # Standalone workers may accept generation requests without a declared role.
+            role = os.environ.get("TRTLLM_DISAGG_ROLE", "").lower()
+            if not role or role.startswith("gen"):
+                logger.warning_once(
+                    f"DFlash keeps the draft KV private because {private_reason}. "
+                    "The generation worker drafts without the prefill worker's "
+                    "prompt context, which can lower draft-token acceptance.",
+                    key="dflash_disagg_private_draft_kv")
         return kv_cache_manager
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
@@ -2791,8 +2806,10 @@ class KvCacheCreator:
                 else "DFlash")
 
     def _should_unify_dflash_kv_cache(self) -> bool:
-        """Whether this run can place target and DFlash or standalone DSpark
-        layers in one V2 manager.
+        return self._private_draft_kv_reason() is None
+
+    def _private_draft_kv_reason(self) -> Optional[str]:
+        """Return None for a unified layout or the reason for a private draft cache.
 
         Disaggregated serving shares only when TRTLLM_DISAGG_SHARED_DRAFT_KV
         is "1" or "auto". Unset, it is "auto" for a manager that hosts explicit
@@ -2818,11 +2835,16 @@ class KvCacheCreator:
                     f"{self._unified_drafter_name()}: keeping a separate draft "
                     f"KV cache: {blocker}.",
                     key="dflash_hosting_manager_blocker")
-            return False
+            return blocker
         default = "auto" if self._kv_cache_manager_hosts_draft_layers(
         ) else None
-        return not (self._is_disagg and os.environ.get(
-            "TRTLLM_DISAGG_SHARED_DRAFT_KV", default) not in ("1", "auto"))
+        if self._is_disagg:
+            setting = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV", default)
+            if setting not in ("1", "auto"):
+                if setting is None:
+                    return "this cache manager requires opting in to shared draft KV"
+                return f"TRTLLM_DISAGG_SHARED_DRAFT_KV={setting!r} does not enable sharing"
+        return None
 
     def _kv_cache_manager_hosts_draft_layers(self) -> bool:
         """Whether the target's specialized manager accepts explicit draft layer specs."""
