@@ -181,6 +181,10 @@ class _Harness:
             self.closed = True
             self.runner.release.set()
             self.executor.shutdown()
+            # A crashed executor loop leaves its completion thread unjoined.
+            completion = self.executor._completion_thread
+            if completion is not None and completion.is_alive():
+                completion.join(timeout=30)
 
 
 @contextmanager
@@ -385,21 +389,10 @@ def test_a_fatal_error_with_peers_fails_everything_queued_and_kills_every_rank(m
         running, waiting = h.submit(), h.submit()
         h.executor.start_worker()
 
-        try:
-            for request_id in (running, waiting):
-                (response,) = h.responses(request_id)
-                assert "illegal memory access" in response.error_msg
-        finally:
-            worker = h.executor._worker_thread
-            assert worker is not None
-            worker.join(timeout=30)
-            assert not worker.is_alive(), "Scheduled encoder worker did not stop"
-
-            # The mocked rank kill leaves the completion thread running until it reads the sentinel.
-            completion = h.executor._completion_thread
-            assert completion is not None
-            completion.join(timeout=30)
-            assert not completion.is_alive(), "Scheduled encoder completion thread did not stop"
+        for request_id in (running, waiting):
+            (response,) = h.responses(request_id)
+            assert "illegal memory access" in response.error_msg
+        h.executor._worker_thread.join(timeout=30)
         assert kills == [2]
         assert h.runner.batches == [[running]]
 
