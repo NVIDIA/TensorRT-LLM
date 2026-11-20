@@ -60,15 +60,20 @@ This command runs the tests specified in the test list and outputs the results t
 
 ## Check Test List (CI)
 
-Jenkins **Check Test List** runs
-`scripts/check_test_list.py --l0 --qa --waive --validate --parity`.
+Jenkins **Check Test List** and the GitHub Actions workflow
+`.github/workflows/check-test-list.yml` both run
+`scripts/check_test_list.py --l0 --qa --waive`.
+Neither needs `trt-test-db`: the L0 entries are read from `test-db/*.yml` directly.
 L0/QA/waive collection uses pure-Python stubs of the compiled modules
 (`tests/integration/defs/stubify_bindings.py`, loaded only via
 `-p stubify_bindings`), so no TensorRT-LLM wheel or C++
-compile or binary download is required. `--parity` asserts that statically
-verified parametrize IDs are a subset of what `pytest --co` collects.
-Pre-commit runs check_test_list.py with `--validate` and
-`--check-duplicate-waives`, plus `scripts/check_binding_stubs.py` to fail when
+compile or binary download is required.
+The `validate-test-lists` pre-commit hook runs
+`scripts/check_test_list.py --validate --check-duplicate-waives` in one invocation.
+Both Jenkins Release-Check and GHA Release Checks run this hook through
+`scripts/release_check.py`. The Check Test List jobs do not run the optional
+`--parity` audit between static validation and collection.
+A separate hook runs `scripts/check_binding_stubs.py` to fail when
 `stubify_bindings.py` `_STUB_ROOTS` misses a compiled extension listed in
 `setup.py` `package_data`. That last check does not require stubs or a wheel.
 
