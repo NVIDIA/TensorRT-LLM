@@ -37,6 +37,15 @@ InternalRequestAuthKey = _AuthKey | None
 _NON_EMPTY_STR_ADAPTER = TypeAdapter(Optional[_NonEmptyStr])
 
 
+def get_shared_draft_kv_setting() -> Optional[str]:
+    """Read the disaggregated draft KV policy before applying launcher or worker defaults."""
+    setting = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+    if setting not in (None, "0", "1", "auto"):
+        raise ValueError(f"Invalid TRTLLM_DISAGG_SHARED_DRAFT_KV={setting!r}: "
+                         "expected '0', '1', 'auto', or an unset variable.")
+    return setting
+
+
 def validate_config_bool(value: Any, field_name: str) -> bool:
     if isinstance(value, bool):
         return value

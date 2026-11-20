@@ -530,16 +530,57 @@ def test_launcher_rejects_shared_cache_for_ineligible_config(
         _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generation_servers)
 
 
-def test_launcher_accepts_eligible_shared_cache_config(monkeypatch, tmp_path):
-    spec = {"decoding_type": "DFlash", "attention_backend": "TRTLLM"}
-
+@pytest.mark.parametrize("target_backend", ["TRTLLM", "trtllm"])
+def test_launcher_accepts_eligible_shared_cache_config(monkeypatch, tmp_path, target_backend):
+    config = {
+        "speculative_config": {"decoding_type": "DFlash", "attention_backend": "TRTLLM"},
+        "enable_attention_dp": True,
+        "attn_backend": target_backend,
+    }
     with pytest.raises(_StopLauncher):
-        _launch_from_disagg_config(
-            monkeypatch,
-            tmp_path,
-            {"speculative_config": spec, "enable_attention_dp": True},
-            {"speculative_config": spec, "enable_attention_dp": True},
-        )
+        _launch_from_disagg_config(monkeypatch, tmp_path, config, config)
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "1"
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=True, target=layout, draft=layout)
+    creator._llm_args.attn_backend = target_backend
+    assert creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("setting", ["", "true", "2"])
+def test_invalid_shared_draft_setting_rejected_by_launcher_and_worker(
+    monkeypatch, tmp_path, setting
+):
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, setting)
+    config = {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "TRTLLM"}}
+    error = "TRTLLM_DISAGG_SHARED_DRAFT_KV=.*expected '0', '1', 'auto'"
+    with pytest.raises(click.UsageError, match=error):
+        _launch_from_disagg_config(monkeypatch, tmp_path, config, config)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=True, target=layout, draft=layout)
+    with pytest.raises(ValueError, match=error):
+        creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("setting", ["0", "1", "auto"])
+def test_asymmetric_pipeline_parallelism_respects_shared_draft_setting(
+    monkeypatch, tmp_path, setting
+):
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, setting)
+    gen = {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "TRTLLM"}}
+    ctx = {**gen, "pipeline_parallel_size": 2}
+    if setting == "1":
+        with pytest.raises(click.UsageError, match="pipeline_parallel_size 1"):
+            _launch_from_disagg_config(monkeypatch, tmp_path, ctx, gen)
+        assert os.environ[_SHARED_DRAFT_KV_ENV] == "1"
+        return
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, ctx, gen)
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "0"
+    layout = _model_config(kv_heads=8, head_dim=128)
+    for pp in (2, 1):
+        creator = _creator(is_disagg=True, target=layout, draft=layout)
+        creator._mapping.pp_size = pp
+        assert not creator._should_unify_dflash_kv_cache()
 
 
 def test_launcher_shares_attention_dp_mla_drafter_across_tp(monkeypatch, tmp_path):
@@ -583,6 +624,10 @@ def test_launcher_shares_the_cutedsl_drafter_with_helix_generation(monkeypatch, 
 def test_launcher_preserves_opt_out_and_allows_layout_fallback(
     monkeypatch, tmp_path, request_mode, draft_heads, expected_mode
 ) -> None:
+    from tensorrt_llm.commands import serve
+
+    warning = Mock()
+    monkeypatch.setattr(serve.logger, "warning_once", warning)
     if request_mode is None:
         monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
     else:
@@ -593,6 +638,10 @@ def test_launcher_preserves_opt_out_and_allows_layout_fallback(
         _launch_from_disagg_config(monkeypatch, tmp_path, config, config)
 
     assert os.environ[_SHARED_DRAFT_KV_ENV] == expected_mode
+    assert any(
+        call.kwargs.get("key") == "shared_draft_kv_launcher_opt_out"
+        for call in warning.call_args_list
+    ) is (request_mode == "0")
     creator = _creator(
         is_disagg=True,
         target=_model_config(kv_heads=8, head_dim=128),

@@ -27,6 +27,7 @@ from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.disagg_utils import get_shared_draft_kv_setting
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -2817,10 +2818,10 @@ class KvCacheCreator:
         manager's disaggregated workers must all decide alike, so a setting
         each worker sets on its own raises here instead of falling back.
         """
+        setting = get_shared_draft_kv_setting() if self._is_disagg else None
         blocker, worker_local = self._dflash_unify_blocker_and_scope()
         if blocker is not None:
-            if (worker_local and self._is_disagg
-                    and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "0"):
+            if (worker_local and self._is_disagg and setting != "0"):
                 raise ValueError(
                     f"{self._unified_drafter_name()}: disaggregated workers "
                     "keep the draft KV in the target's KV cache manager "
@@ -2836,14 +2837,12 @@ class KvCacheCreator:
                     f"KV cache: {blocker}.",
                     key="dflash_hosting_manager_blocker")
             return blocker
-        default = "auto" if self._kv_cache_manager_hosts_draft_layers(
-        ) else None
         if self._is_disagg:
-            setting = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV", default)
-            if setting not in ("1", "auto"):
-                if setting is None:
-                    return "this cache manager requires opting in to shared draft KV"
-                return f"TRTLLM_DISAGG_SHARED_DRAFT_KV={setting!r} does not enable sharing"
+            if setting == "0":
+                return "TRTLLM_DISAGG_SHARED_DRAFT_KV='0' does not enable sharing"
+            if setting is None and not self._kv_cache_manager_hosts_draft_layers(
+            ):
+                return "this cache manager requires opting in to shared draft KV"
         return None
 
     def _kv_cache_manager_hosts_draft_layers(self) -> bool:
@@ -2868,8 +2867,7 @@ class KvCacheCreator:
 
     def _check_shared_draft_kv_request(self) -> None:
         """Fail at startup when TRTLLM_DISAGG_SHARED_DRAFT_KV=1 cannot be honored."""
-        if (not self._is_disagg
-                or os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1"
+        if (not self._is_disagg or get_shared_draft_kv_setting() != "1"
                 or self._speculative_config is None
                 or self._unified_drafter_attention_backend() is None):
             return
@@ -2936,7 +2934,7 @@ class KvCacheCreator:
                          and self._unified_drafter_reads_helix_pages())):
             return (f"context_parallel_size is {self._mapping.cp_size} and the "
                     "drafter does not read a helix-sharded context")
-        if self._llm_args.attn_backend != "TRTLLM":
+        if self._llm_args.attn_backend.upper() != "TRTLLM":
             return f"the target attn_backend is {self._llm_args.attn_backend}, not TRTLLM"
         if _has_variable_kv_cache_geometry(
                 self._model_engine.model.model_config):

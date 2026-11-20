@@ -60,8 +60,9 @@ from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi.disagg_utils import (
     CtxGenServerConfig, DisaggClusterConfig, DisaggServerConfig,
     MetadataServerConfig, ServerRole, extract_disagg_cluster_config,
-    parse_disagg_config_file, parse_metadata_server_config_file,
-    validate_config_bool, validate_internal_request_auth_key)
+    get_shared_draft_kv_setting, parse_disagg_config_file,
+    parse_metadata_server_config_file, validate_config_bool,
+    validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
                                           CacheTransceiverConfig,
                                           KvCacheConnectorConfig, SleepConfig,
@@ -3227,7 +3228,8 @@ def _shared_draft_kv_blocker(server_configs: list[CtxGenServerConfig],
         if (spec.get("draft_len_schedule") is not None
                 or spec.get("max_concurrency") is not None):
             return "draft_len_schedule and max_concurrency to be unset in both sections"
-        if cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM":
+        if str(cfg.other_args.get("attn_backend",
+                                  "TRTLLM")).upper() != "TRTLLM":
             return "attn_backend TRTLLM in both sections"
         if cfg.other_args.get("pipeline_parallel_size", 1) != 1:
             return "pipeline_parallel_size 1 in both sections"
@@ -3322,22 +3324,15 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         )
     _refuse_dense_dwdp_on_generation_servers(disagg_cfg)
 
-    from tensorrt_llm._utils import mpi_rank
-    if os.environ.get(DisaggLauncherEnvs.
-                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
-        set_cuda_device()
-    # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
-    from mpi4py.futures import MPICommExecutor
-
-    from tensorrt_llm._utils import global_mpi_rank, set_mpi_comm
-    from tensorrt_llm.llmapi.disagg_utils import split_world_comm
+    try:
+        shared_draft_kv = get_shared_draft_kv_setting()
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
 
     blocker = _shared_draft_kv_blocker(disagg_cfg.server_configs)
-    if blocker is not None and os.environ.get(
-            "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1":
+    if blocker is not None and shared_draft_kv == "1":
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
-    shared_draft_kv = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
     # Left unset, each worker decides: a manager hosting draft layers shares
     # (its gate compares global KV heads and the peers reshard its views), and
     # other managers keep a separate draft KV cache. That holds when the sides
@@ -3368,6 +3363,12 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         logger.info(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV unset or 'auto' resolved to "
             f"'{resolved}': {reason}.")
+    elif (shared_draft_kv == "0" and blocker is None
+          and sides == {"ctx", "gen"}):
+        logger.warning_once(
+            "TRTLLM_DISAGG_SHARED_DRAFT_KV=0 keeps draft KV private even "
+            "though the context and generation configurations allow sharing.",
+            key="shared_draft_kv_launcher_opt_out")
     elif shared_draft_kv is None:
         why = ("the sections differ only in attention tensor parallelism"
                if attention_tp_only else
@@ -3377,6 +3378,16 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV left unset: {why}, so a manager "
             "hosting draft layers shares draft KV and other managers keep a "
             "separate draft KV cache.")
+
+    from tensorrt_llm._utils import mpi_rank
+    if os.environ.get(DisaggLauncherEnvs.
+                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
+        set_cuda_device()
+    # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
+    from mpi4py.futures import MPICommExecutor
+
+    from tensorrt_llm._utils import global_mpi_rank, set_mpi_comm
+    from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.
