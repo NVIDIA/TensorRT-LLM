@@ -27,8 +27,7 @@ cache allocates agree with the declaration;
 `tests/unittest/_torch/pyexecutor/kv_cache/test_recurrent_state_spec.py` holds the two together.
 
 Not unified, and not part of the contract: mixers and kernels, how a family recovers after a
-rejected draft, the layout of replay buffers, when a speculative worker reports acceptance, and
-the contents of per-step metadata.
+rejected draft, the layout of replay buffers, and the contents of per-step metadata.
 
 ## Where shared code gets its answers
 
@@ -149,7 +148,7 @@ it a state object, a `MambaState`, which the manager then calls at these points:
 | `bind()` | `_setup_model_state()`, once the layout, the pools and the slot capacity are final | Take the views of the SSM and convolution state. The pool keeps owning them |
 | `reset_slots()` | `prepare_resources()` and `add_dummy_requests()`, for the context requests of a batch | Reset the state those requests start from |
 | `make_layer_cache()` | `mamba_layer_cache(layer_idx)`, when speculative decoding is configured | Build the `MambaLayerCache` a mixer reads for one layer. Without a state the manager returns the convolution and SSM views alone |
-| `update(MambaAcceptanceBatch)` | `update_mamba_states()`, which a speculative worker calls after it accepts tokens | Apply the accepted tokens to the state |
+| `update(MambaAcceptanceBatch)` | `update_mamba_states()`, when a speculative worker reports the tokens it accepted (see "Speculative acceptance") | Apply the accepted tokens to the state |
 | `intermediate_indices`, `intermediate_ssm`, `intermediate_conv` | Read through the manager's `intermediate_state_indices`, `intermediate_ssm_states` and `intermediate_conv_states` | The intermediate views that mixers pass to their kernels; `None` when the state keeps none |
 | `shutdown()` | The manager's `shutdown()` | Release what the state holds |
 
@@ -189,6 +188,89 @@ places, both on V1 caches: the connector setup, which has no layout to ask, and 
 filters context requests by capacity for `MixedMambaHybridCacheManager` when a transceiver is
 present.
 
+## Speculative acceptance
+
+A one-engine speculative worker verifies the draft tokens in the target forward, and that forward
+writes state for every one of them. Once the worker knows how many tokens each request accepted,
+the cache manager keeps the state written for the accepted tokens.
+
+A main-tree worker does not look at the class of the manager. It raises one event on
+`attn_metadata.kv_cache_manager`, `on_speculative_acceptance(acceptance, phase)`, which
+`BaseResourceManager` answers by doing nothing. The record and the phases are defined in
+`pyexecutor/resource_manager.py`.
+
+| `SpeculativeAcceptance` | Meaning |
+|---|---|
+| `attn_metadata` | The metadata of the target forward. A hybrid manager takes the state slots from its `mamba_metadata.state_indices` |
+| `num_accepted_tokens` | The accepted token counts of the whole batch, context requests first |
+| `num_contexts`, `num_gens` | How the batch splits, read before the draft loop rewrites `attn_metadata` |
+| `leaf_positions` | Dynamic tree only: a callable that returns each generation request's accepted position in the intermediate state. Only a manager that needs the positions calls it |
+
+| `SpeculativeAcceptancePhase` | Commits | Answered by |
+|---|---|---|
+| `BASE_STATE` | The state the model declares | `MambaHybridCacheManager` (`common.py`), the base of the V1 and V2 hybrid managers: it calls `update_mamba_states()`. The V2 manager's ends in the family's `update(MambaAcceptanceBatch)`; the V1 managers promote the state themselves |
+| `AUXILIARY_STATE` | State a manager keeps beside it | `_commit_auxiliary_speculative_state()`, which does nothing unless a family manager overrides it. `Qwen4ExpHybridCacheManager` commits the records that its PLE layer and the QSA indexers of the target's layers left on it during the target forward |
+
+Which worker raises which phase:
+
+| Worker | `BASE_STATE` | `AUXILIARY_STATE` |
+|---|---|---|
+| `MTPWorker` | Before the draft pass | Before the draft pass |
+| `MTPEagleWorker`, `Eagle3OneModelWorker` | Before the draft pass | After the draft loop |
+| `Eagle3OneModelDynamicTreeWorker` | Before the draft pass, without `leaf_positions`: the manager derives the position from the accepted count | After the draft loop |
+| `MTPEagleDynamicTreeWorker` | Before the draft pass, with `leaf_positions` | Not raised |
+| `DFlashWorker`, `DSparkWorker`, `SAWorker` | Before the draft pass | Not raised |
+| `PARDWorker`, `DraftTargetOneModelWorker`, `DSv4DSparkWorker` | Not raised | Not raised |
+
+Raising `AUXILIARY_STATE` does not mean a manager commits anything. `Qwen4ExpHybridCacheManager`
+holds and commits its PLE and QSA records only under the two workers that restore that state after a
+rejection, `MTPWorker` and `MTPEagleWorker`. Under `Eagle3OneModelWorker` and
+`Eagle3OneModelDynamicTreeWorker` the phase arrives, the manager holds no records, and the state
+stays as the verification wrote it. Under `MTPEagleDynamicTreeWorker`, which raises no auxiliary
+phase, the manager holds no records either.
+
+A phase that is not raised leaves that state as the verification wrote it.
+
+Rules:
+
+- **The base state is committed before the draft pass.** A draft pass can read the target's state
+  back, so it has to find the accepted one. An MTP draft layer that reads no recurrent state
+  declares `promotes_target_state_beside`; `Eagle3OneModelWorker` then raises `BASE_STATE` on a
+  second stream beside the draft loop and joins it before the step ends. The declaration is for a
+  target that has recurrent state.
+- **`BASE_STATE` needs a generation request.** A batch of context requests raises only the
+  auxiliary phase, so a worker that raises no auxiliary phase sends no event for it. A worker that
+  skips drafting for a step (`runtime_draft_len == 0`) returns before the verification and raises
+  neither.
+- **Only the last pipeline-parallel rank raises the event.** The worker is part of the model's
+  epilogue, which the other ranks skip, so their managers keep the state as the verification
+  wrote it.
+- **Device operations only.** The event is raised inside the model's forward, which can be under
+  CUDA graph capture. A manager launches device operations on the tensors of the record and does
+  not synchronize with the host.
+- **Qwen4Exp stages only what an acceptance commits.** The manager decides it:
+  `ple_speculative_record()` returns a record, and `commits_qsa_speculative_record()` is true,
+  only under `MTPWorker` and `MTPEagleWorker`, and for QSA only in the target's layers. Anywhere
+  else the PLE layer and the QSA indexer stage nothing, so the manager commits every record it
+  holds. A layer's forward drops the record of its earlier one, and `shutdown()` clears what is
+  left.
+- **Handlers on the worker run first.** State that a model keeps on its own modules and registers
+  with `register_auxiliary_state_handler()` is committed right before the worker raises
+  `AUXILIARY_STATE`. No main-tree model registers a handler: the registry is kept for the
+  `modeling_v2` Qwen4Exp targets, and `_is_mamba_hybrid_cache` on the workers for the
+  `modeling_v2` workers described below. State of a main-tree model goes on the manager.
+
+A host drafter (NGram, user-provided) has no worker and raises no event. The executor hands the
+accepted tokens of such a step to the manager through `update_resources()`. For NGram, the V1
+`MixedMambaHybridCacheManager` commits the accepted state there with `update_mamba_states()`, and
+`KimiK3HybridCacheManager` and `Glm5NextCacheManager` record the accepted counts for their next
+replay.
+
+Workers under `modeling_v2` that replace the step of a main-tree worker still check for a hybrid
+manager and call `update_mamba_states()` and the registered handlers themselves, so a manager's
+`AUXILIARY_STATE` answer is not reached from them. A `modeling_v2` model whose kernels apply the
+acceptance themselves does not raise the event either.
+
 ## Adding a recurrent family
 
 1. Implement `get_recurrent_state_spec` on the model class. Declare one entry per target layer and
@@ -203,5 +285,9 @@ present.
    or memory of its own, and select the subclass in `get_kv_cache_manager_cls`
    (`pyexecutor/_util.py`).
 5. Declare memory beyond the base state as regions (`../REGIONS_DEVELOPER_GUIDE.md`).
-6. Add the family's configuration to `test_recurrent_state_spec.py`. The test compares the
+6. When a verification forward writes state beside the base state that a rejection has to undo,
+   hold what it staged on the family's manager and commit it in an override of
+   `_commit_auxiliary_speculative_state()` (see Speculative acceptance for the workers that raise
+   the phase).
+7. Add the family's configuration to `test_recurrent_state_spec.py`. The test compares the
    declaration with the geometry function and with the buffers the manager allocates.
