@@ -65,6 +65,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
+from ..attention.backends.fmha.registry import (fmha_step_stats,
+                                                reset_fmha_step_stats,
+                                                step_stats_fmha_lib_classes)
 from ..disaggregation import diagnostics as disagg_diagnostics
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import (
@@ -717,6 +720,9 @@ class PyExecutor:
     # Whether the model opted into running the overlap loop on the execution
     # stream (RuntimeHooks.loop_on_execution_stream); read once at construction.
     _execution_stream_loop_armed = False
+    # Whether an FMHA library that keeps per-step counters is enabled
+    # (TLLM_FMHA_LIBS); read once at construction, False by default.
+    _fmha_step_stats_enabled = False
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
@@ -1042,6 +1048,7 @@ class PyExecutor:
         self._intake_window = threading.Event()
         self._intake_window_started = 0.0
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
+        self._fmha_step_stats_enabled = bool(step_stats_fmha_lib_classes())
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.iter_perf_stats_interval = self.llm_args.iter_perf_stats_interval
         # Request counts not yet reported by an IterationStats record. They
@@ -1494,6 +1501,9 @@ class PyExecutor:
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
             self.kv_cache_manager.snapshot_warmup_baseline()
+        # Likewise drop the warmup steps from the FMHA libraries' step counters.
+        if self._fmha_step_stats_enabled:
+            reset_fmha_step_stats(self.kv_cache_manager)
 
         self.is_shutdown = False
         # Set at the executor loops' normal-exit `break` sites, and ONLY
@@ -4019,7 +4029,9 @@ class PyExecutor:
             scheduler_mode=scheduler_mode,
             gpu_forward_time_ms=gpu_forward_time_ms,
             mm_encoder_stats=mm_encoder_stats,
-            executor_loop=loop_metrics)
+            executor_loop=loop_metrics,
+            fmha_step_stats=(fmha_step_stats(self.kv_cache_manager)
+                             if self._fmha_step_stats_enabled else None))
 
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"

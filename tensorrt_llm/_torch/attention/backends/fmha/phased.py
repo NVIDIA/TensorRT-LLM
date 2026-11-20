@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, ClassVar, Optional, cast
 
 import torch
 
@@ -149,6 +149,20 @@ class PhasedFmha(Fmha):
     REQUIRES_PAGED_KV = True
     # Required by backends that construct tensor views over the KV pool.
     NEEDS_BLOCK_EXTENT = True
+    # Whether the manager may serve the generation rows of a mixed batch with this
+    # library while a phased library that supports the whole batch (e.g. the thop op)
+    # serves the context requests; see ``FmhaManager._select_non_mla``. Opt-in per
+    # library so that the selection of every other library is unchanged.
+    pairs_with_whole_batch_context: ClassVar[bool] = False
+    # Whether the library serves only generation rows that all carry the same number of query
+    # tokens; FmhaManager then keys its selection cache on that (``generation_rows_uniform``).
+    requires_uniform_generation_rows: ClassVar[bool] = False
+
+    def serves_mixed_generation_rows(self, metadata: "TrtllmAttentionMetadata") -> bool:
+        """Per-step choice of a library paired with a whole-batch context library: whether it
+        should serve this mixed batch's generation rows (else the whole-batch library serves
+        the whole batch). Host-side only; called on every layer of a mixed step."""
+        return True
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
