@@ -485,14 +485,16 @@ def test_generation_capture_runs_one_pass_per_packed_split_variant() -> None:
     assert pinned == [("packed_split", value) for value in (0, 1, 1, None)]
 
 
-def _kv_regimes(runner: DecoderCudaGraphs, resource_manager: Mock):
-    """The KV regimes of the FP4 MLA decode, resolved with what the graph component passes."""
+def _kv_regimes(
+    runner: DecoderCudaGraphs, resource_manager: Mock, four_x_unavailable: str | None = None
+):
+    """The KV regimes of the FP4 MLA decode on a device that can host the 4x kernel unless a reason says not."""
     return graph_resolvers.resolve_fp4_mla_kv_regimes(
         kv_cache_manager=resource_manager.get_resource_manager(None),
         model=runner.model,
         mapping=runner.mapping,
         sm_count_fn=runner._decode_sm_count,
-        four_x_unavailable_fn=runner._fp4_mla_4x_unavailable,
+        four_x_unavailable_fn=lambda: four_x_unavailable,
     )
 
 
@@ -588,6 +590,8 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
     resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
     with patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True) as enabled:
         assert _kv_regimes(runner, resource_manager) is None
+        # the graph component asks the attention backend, which declares no variant for such a cache
+        assert runner._decode_graph_variants(resource_manager) == []
     enabled.assert_not_called()
     resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
 
@@ -599,7 +603,6 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
         patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
         patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
         patch.object(runner, "_decode_sm_count", return_value=212),
-        patch.object(runner, "_fp4_mla_4x_unavailable", return_value=None),
     ):
         resolver = _kv_regimes(runner, resource_manager)
         # capacity = blocks per sequence x 128 tokens; the regimes of a shape follow its 4x KV floor: 128 requests
@@ -624,10 +627,7 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
         assert _kv_regimes(runner, resource_manager) is None
         model.modules.return_value = [mla_layer]
         # a device that cannot host the 4x kernel decodes every step on 2x: no regimes, as with Helix
-        with patch.object(
-            runner, "_fp4_mla_4x_unavailable", return_value="too little shared memory"
-        ):
-            assert _kv_regimes(runner, resource_manager) is None
+        assert _kv_regimes(runner, resource_manager, "too little shared memory") is None
     # the dispatcher runs only behind the packed-Q cutedsl decode
     with (
         patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),

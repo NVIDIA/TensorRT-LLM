@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """What the decode CUDA graphs of an FP4 MLA model are keyed by, besides their shape.
 
-The decoder graph runner asks ``resolve_fp4_mla_graph_variants`` once, at
-capture, when the KV cache exists. It gets a graph variant
-(``interface.GraphVariant``) for each thing the FP4 MLA decode decides
+The decoder graph runner asks the attention backend once, at capture, when the
+KV cache exists (``AttentionBackend.decode_graph_variants``), and the TRTLLM
+backend answers with ``resolve_fp4_mla_graph_variants``. It gets a graph
+variant (``interface.GraphVariant``) for each thing the FP4 MLA decode decides
 per step and a graph has to freeze: the KV regime the dispatcher chooses its
 kernel on, and whether the packed decode launches its KV split budget. A
 decode that needs neither gets none, which is every decode without an FP4 MLA

@@ -20,8 +20,8 @@ import os
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
-                    List, Optional, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet,
+                    Iterator, List, Optional, Tuple)
 
 import numpy as np
 import torch
@@ -67,9 +67,10 @@ from .fp4_mla import (can_fuse_fp4_mla_q_quant, fp4_mla_cache_layout,
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        AttentionRuntimeFeatures, KVCacheParams, MLAParams,
-                        PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams, merge_attention_forward_args)
+                        AttentionRuntimeFeatures, GraphVariant, KVCacheParams,
+                        MLAParams, PositionalEmbeddingParams,
+                        PredefinedAttentionMask, RopeParams,
+                        merge_attention_forward_args)
 from .mixed_precision_rows import store_mixed_precision_low_rows
 from .sparse.hooks import has_sparse_mla_hooks, prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
@@ -857,10 +858,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             state.update_for_spec_dec(self)
 
     def set_decode_graph_variant(self, name: str, value: Optional[int]) -> None:
-        # Only the FP4 MLA decode declares graph variants.
+        # Only the FP4 MLA decode serves graph variants.
         state = self.fp4_mla_state
-        if state is not None:
-            state.set_decode_graph_variant(name, value)
+        if state is None:
+            return super().set_decode_graph_variant(name, value)
+        state.set_decode_graph_variant(name, value)
 
     def decode_graph_variant(self, name: str) -> Optional[int]:
         state = self.fp4_mla_state
@@ -4633,6 +4635,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @classmethod
     def support_fp4_kv_cache(cls) -> bool:
         return True
+
+    @classmethod
+    def decode_graph_variants(
+            cls, *, kv_cache_manager: Any, model: torch.nn.Module,
+            mapping: "Mapping",
+            sm_count_fn: Callable[[], int]) -> List[GraphVariant]:
+        # Only the FP4 MLA decode declares graph variants. Any other KV cache
+        # gets none, before a switch is read or the device probed.
+        from .fp4_mla import graph_resolvers
+
+        return graph_resolvers.resolve_fp4_mla_graph_variants(
+            kv_cache_manager=kv_cache_manager,
+            model=model,
+            mapping=mapping,
+            sm_count_fn=sm_count_fn)
 
     def has_cached_kv_for_mla_context(
         self,

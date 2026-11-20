@@ -378,10 +378,12 @@ All backend metadata types inherit from `AttentionMetadata`. The base contract
 includes sequence-length and request-level state, KV-cache manager and
 parameters, runtime feature flags, and optional CUDA-graph buffer management.
 A backend may declare graph variants (`GraphVariant`), further dimensions its
-decode CUDA graphs are keyed by; the graph runner hands the value a graph
-serves to the graph's metadata through `set_decode_graph_variant`. Only the
-FP4 MLA decode declares any (the KV regime its 2x | 4x | two-stream dispatcher
-decides on, and the packed split decision); the default ignores the call.
+decode CUDA graphs are keyed by, by overriding
+`AttentionBackend.decode_graph_variants`; the graph runner hands the value a
+graph serves to the graph's metadata through `set_decode_graph_variant`, which
+raises for a variant the metadata does not serve. Only the FP4 MLA decode
+declares any (the KV regime its 2x | 4x | two-stream dispatcher decides on,
+and the packed split decision), through `TrtllmAttention`.
 Sparse metadata subtypes consume only `SparseMetadataParams`, not
 backend-owned `SparseParams`.
 

@@ -108,6 +108,8 @@ class Fp4MlaState:
             self.kv_regime_max_kv = value
         elif name == PACKED_SPLIT_VARIANT:
             self.packed_split = None if value is None else bool(value)
+        else:
+            raise ValueError(f"The FP4 MLA decode serves no graph variant {name!r}.")
 
     def decode_graph_variant(self, name: str) -> int | None:
         """The value last set for a decode graph variant; None when unset or unknown."""

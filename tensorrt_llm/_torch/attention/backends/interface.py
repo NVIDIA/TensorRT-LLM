@@ -75,6 +75,7 @@ class AttentionInputType(IntEnum):
 class GraphVariant(NamedTuple):
     """One more dimension the decode graphs are keyed by, declared by the attention backend.
 
+    The backend lists its variants in ``AttentionBackend.decode_graph_variants``.
     A decode step has one integer value of the variant, and graphs captured
     for different values are different graphs. The runner does not know what
     a value means: it captures the values a graph shape can take, keys every
@@ -627,18 +628,24 @@ class AttentionMetadata:
         """Fix a decode graph variant for the CUDA graph this metadata serves.
 
         A CUDA graph runner that keys its decode graphs by a variant the
-        backend declared (``cuda_graph_runner.GraphVariant``) passes the value
-        of the graph this metadata serves, so the decode captured in the graph
-        behaves as that value says instead of deciding on each call.
+        backend declared (``AttentionBackend.decode_graph_variants``) passes
+        the value of the graph this metadata serves, so the decode captured in
+        the graph behaves as that value says instead of deciding on each call.
 
         Args:
             name: The variant's name.
             value: Its value for this graph; None restores the per-call
-                decision. Backends that declare no such variant ignore it.
+                decision.
+
+        Raises:
+            ValueError: This metadata serves no variant of that name. The base
+                metadata serves none, as its backend declares none.
         """
+        raise ValueError(
+            f"{type(self).__name__} serves no decode graph variant {name!r}.")
 
     def decode_graph_variant(self, name: str) -> Optional[int]:
-        """The value set by ``set_decode_graph_variant``; None when unset or ignored."""
+        """The value set by ``set_decode_graph_variant``; None when unset."""
         return None
 
     def prepare_for_spec_dec(self, *fields) -> None:
@@ -1345,6 +1352,27 @@ class AttentionBackend(Generic[TMetadata]):
     def support_fp4_kv_cache(cls) -> bool:
         """Whether the backend can execute attention with an FP4 KV cache."""
         return False
+
+    @classmethod
+    def decode_graph_variants(
+            cls, *, kv_cache_manager: Any, model: torch.nn.Module,
+            mapping: Mapping, sm_count_fn: Callable[[],
+                                                    int]) -> List[GraphVariant]:
+        """Graph variants the decode CUDA graphs of this backend are keyed by, besides their shape.
+
+        The decoder graph runner asks once, at capture, when the KV cache
+        exists, and keys the graphs by what it gets. The backend's metadata
+        has to serve every variant returned here
+        (``AttentionMetadata.set_decode_graph_variant``). Default: none.
+
+        Args:
+            kv_cache_manager: The KV cache manager of the decode.
+            model: The model whose decode the graphs capture.
+            mapping: The parallel layout of this rank.
+            sm_count_fn: Streaming multiprocessors of the device the graphs
+                replay on, read only when a variant depends on it.
+        """
+        return []
 
     @classmethod
     def support_multi_item_scoring(cls) -> bool:

@@ -1002,33 +1002,19 @@ class DecoderCudaGraphs:
             torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         )
 
-    @staticmethod
-    def _fp4_mla_4x_unavailable() -> str | None:
-        """Why the device the decode graphs replay on cannot host the FP4 MLA 4x kernel; None when it can."""
-        from tensorrt_llm._torch.attention.backends.fp4_mla.graph_resolvers import (
-            fp4_mla_4x_unavailable,
-        )
-
-        return fp4_mla_4x_unavailable()
-
     def _decode_graph_variants(self, resource_manager: ResourceManager) -> list[GraphVariant]:
         """Graph variants the decode graphs are keyed by, besides their shape; none for most decodes.
 
-        Resolved at capture, once the KV cache exists. Only the FP4 MLA decode
-        declares variants (``graph_resolvers.resolve_fp4_mla_graph_variants``),
-        which returns none for any other KV cache before it reads a switch or
-        probes the device.
+        The attention backend declares them (``AttentionBackend.decode_graph_variants``),
+        asked at capture, once the KV cache exists.
         """
-        from tensorrt_llm._torch.attention.backends.fp4_mla import graph_resolvers
-
-        return graph_resolvers.resolve_fp4_mla_graph_variants(
+        return self._config.attention_backend.decode_graph_variants(
             kv_cache_manager=resource_manager.get_resource_manager(
                 ResourceManagerType.KV_CACHE_MANAGER
             ),
             model=self.model,
             mapping=self.mapping,
             sm_count_fn=self._decode_sm_count,
-            four_x_unavailable_fn=self._fp4_mla_4x_unavailable,
         )
 
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
