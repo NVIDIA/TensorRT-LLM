@@ -282,6 +282,8 @@ SLURM_JOB_LOG_EVIDENCE_QUERY_IDS = [
     "gpu-lost",
     "gpu-ecc-uncorrectable",
     "nvlink-fabric-failure",
+    "ffmpeg-apt-install-timeout",
+    "shared-fs-transport-shutdown",
 ]
 
 PYTEST_TIMEOUT_EVIDENCE_QUERIES = [
@@ -447,8 +449,8 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
 }
 
 // Stream-scan the complete remote job log for the source-safe catalog subset,
-// returning at most one occurrence of each signature. Matching policy and
-// query precedence remain in the shared libraries.
+// retaining bounded complete diagnostic lines. Matching policy and query
+// precedence remain in the shared library.
 def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
     def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.SLURM).findAll {
         SLURM_JOB_LOG_EVIDENCE_QUERY_IDS.contains(it.id)
@@ -461,9 +463,7 @@ def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
     try {
         def scanLog = "if [ -f '${remoteLogPath}' ]; then " +
             "grep -aFi ${grepPatterns} -- '${remoteLogPath}' 2>/dev/null " +
-            '''| awk 'index($0, ".py::") == 0' ''' +
-            "| grep -aFio ${grepPatterns} " +
-            '''| awk '{ key=tolower($0); if (seen[key]++ == 0) print }'; fi'''
+            '''| awk 'index($0, ".py::") == 0 && length($0) <= 8192' | tail -n 128; fi'''
         def candidateText = Utils.exec(
             pipeline,
             script: "timeout 300s " + Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(scanLog)),
@@ -479,6 +479,7 @@ def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
             matchedQueryId: match.matchedQueryId,
             matchedTerms: match.matchedTerms,
             matchedMessage: match.matchedMessage,
+            diagnosticText: candidateText,
         ]
     } catch (InterruptedException interruptedError) {
         throw interruptedError
@@ -3365,11 +3366,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         [[id: "slurm-sbatch-final-failure", anyOf: [sbatchFailureMarker]]]
                     )
                     if (diagnosticEvidence.collectionStatus == "MATCHED") {
-                        def finalFailure = new Exception(
-                            "SLURM job submission failed for ${stageName}: ${diagnosticEvidence.matchedMessage}",
-                            submitEx
-                        )
-                        throw FailureClassifier.classify(finalFailure, InfraFailure.SLURM)
+                        throw FailureClassifier.classify(submitEx, InfraFailure.SLURM, diagnosticEvidence)
                     }
                     throw submitEx
                 }
