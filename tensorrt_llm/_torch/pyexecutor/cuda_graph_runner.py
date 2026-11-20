@@ -485,11 +485,14 @@ class CUDAGraphRunner:
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()
         column = 3
-        rank_variants = [
-            tuple(None if value < 0 else int(value) for value in row)
-            for row in gathered[:, column:column + num_variants].tolist()
-        ]
-        column += num_variants
+        # Most models key their decode graphs by no variant.
+        rank_variants = [()] * len(flags)
+        if num_variants:
+            rank_variants = [
+                tuple(None if value < 0 else int(value) for value in row)
+                for row in gathered[:, column:column + num_variants].tolist()
+            ]
+            column += num_variants
         if sampling_mode is not None:
             self._sampling_modes = (batch, gathered[:, column].tolist())
         return list(zip(flags, sizes, tiers, rank_variants))
