@@ -4636,10 +4636,17 @@ def _uses_kda_mtp_replay(model: torch.nn.Module) -> bool:
     """Whether ``model``'s KDA layers can verify drafts with the KDA MTP replay kernels.
 
     They must be the PyTorch KDA mixer with a 4-tap convolution and the -5
-    gate lower bound the kernels fold in.
+    gate lower bound the kernels fold in. A modeling_v2 target runs its own
+    KDA verify and speculative step, so it keeps the fused verify, as does any
+    model when ``TRTLLM_USE_KDA_MTP_REPLAY=0``.
     """
     from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
-    if not isinstance(model, torch.nn.Module):
+    from ..utils import is_kda_mtp_replay_enabled
+    if not isinstance(model,
+                      torch.nn.Module) or not is_kda_mtp_replay_enabled():
+        return False
+    if getattr(getattr(model, "model_config", None), "modeling_v2_target",
+               None) is not None:
         return False
     layers = [
         module for module in model.modules()

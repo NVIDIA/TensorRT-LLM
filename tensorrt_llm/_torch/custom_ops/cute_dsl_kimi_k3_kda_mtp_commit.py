@@ -46,6 +46,7 @@ HIST_FIELDS = 6
 WI_POSITION = 0
 WI_STATE_SLOT = 1
 WI_HISTORY_LEN = 2
+WI_UNUSED = 3
 WI_REPLAY_SLOT = 4
 WI_MIN_WIDTH = 5
 CVEC = 3 * VEC  # bf16 elements one thread commits per conv unit

@@ -381,8 +381,8 @@ def build_kda_mtp_replay_work_items(
     """Snapshot the rows the KDA MTP commit processes, in one launch.
 
     Row ``i`` of ``work_items`` becomes (decode position ``i``, recurrent-state
-    slot, accepted history length at replay, 0, replay slot), the columns of
-    ``mamba2_metadata.REPLAY_WORK_*``. The launch shape depends only on the
+    slot, accepted history length at replay, 0, replay slot), the ``WI_*``
+    columns of the KDA MTP commit. The launch shape depends only on the
     host-side length, so the call is CUDA-graph capturable.
 
     Args:
@@ -390,15 +390,15 @@ def build_kda_mtp_replay_work_items(
         replay_indices: ``[batch]`` int32/int64 replay slots, contiguous.
         history_len: ``[replay_slots]`` int32, may be strided (a column of the
             per-slot replay count rows).
-        work_items: ``[>= batch, REPLAY_WORK_ITEM_WIDTH]`` contiguous int32.
+        work_items: ``[>= batch, WI_MIN_WIDTH]`` contiguous int32.
     """
-    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
-        REPLAY_WORK_CACHE_BUF_IDX,
-        REPLAY_WORK_CACHE_SLOT,
-        REPLAY_WORK_ITEM_WIDTH,
-        REPLAY_WORK_PNAT,
-        REPLAY_WORK_POSITION_IN_DECODE_BATCH,
-        REPLAY_WORK_REPLAY_SLOT,
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_commit import (
+        WI_HISTORY_LEN,
+        WI_MIN_WIDTH,
+        WI_POSITION,
+        WI_REPLAY_SLOT,
+        WI_STATE_SLOT,
+        WI_UNUSED,
     )
 
     device = history_len.device
@@ -413,7 +413,7 @@ def build_kda_mtp_replay_work_items(
         and work_items.dtype == torch.int32
         and work_items.dim() == 2
         and work_items.shape[0] >= num_requests
-        and work_items.shape[1] == REPLAY_WORK_ITEM_WIDTH
+        and work_items.shape[1] == WI_MIN_WIDTH
         and work_items.is_contiguous()
     ):
         raise ValueError("build_kda_mtp_replay_work_items: unsupported tensor layout")
@@ -429,12 +429,12 @@ def build_kda_mtp_replay_work_items(
             history_len,
             history_len.stride(0),
             num_requests,
-            POSITION=REPLAY_WORK_POSITION_IN_DECODE_BATCH,
-            CACHE_SLOT=REPLAY_WORK_CACHE_SLOT,
-            HISTORY_LEN=REPLAY_WORK_PNAT,
-            UNUSED=REPLAY_WORK_CACHE_BUF_IDX,
-            REPLAY_SLOT=REPLAY_WORK_REPLAY_SLOT,
-            WIDTH=REPLAY_WORK_ITEM_WIDTH,
+            POSITION=WI_POSITION,
+            CACHE_SLOT=WI_STATE_SLOT,
+            HISTORY_LEN=WI_HISTORY_LEN,
+            UNUSED=WI_UNUSED,
+            REPLAY_SLOT=WI_REPLAY_SLOT,
+            WIDTH=WI_MIN_WIDTH,
             BLOCK=_KDA_ACCEPTANCE_BLOCK,
         )
 

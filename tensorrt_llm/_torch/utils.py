@@ -54,6 +54,14 @@ def is_gdn_replay_enabled() -> bool:
     return os.environ.get("TRTLLM_USE_GDN_REPLAY", "1") == "1"
 
 
+def is_kda_mtp_replay_enabled() -> bool:
+    """Return whether KDA may verify drafts with the KDA MTP replay (default: enabled).
+
+    ``TRTLLM_USE_KDA_MTP_REPLAY=0`` keeps the fused KDA verify.
+    """
+    return os.environ.get("TRTLLM_USE_KDA_MTP_REPLAY", "1") == "1"
+
+
 def is_gdn_flashinfer_replay_enabled() -> bool:
     """Return whether GDN replay may use the FlashInfer ring kernel (default: disabled)."""
     return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY",

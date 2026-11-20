@@ -104,6 +104,7 @@ def _kda_kernel(
     BTB: cutlass.Constexpr,
     BTT: cutlass.Constexpr,
     I64: cutlass.Constexpr,
+    CI64: cutlass.Constexpr,
     PAIRED: cutlass.Constexpr,
     MULTI_ROW: cutlass.Constexpr,
 ):
@@ -235,7 +236,13 @@ def _kda_kernel(
         ckp = pST + (slot * SSS + h * KD * KD)
 
     # ---------------- slot-dependent global views ----------------
-    gCS = cute.make_tensor(pCS + slot * CSS, cute.make_layout((C, 3), stride=(CSC, 1)))
+    # V2 coalesces a rank's KDA layers in each slot, so a large Conv pool needs
+    # a 64-bit slot offset.
+    if cutlass.const_expr(CI64):
+        cs_off = cutlass.Int64(slot) * cutlass.Int64(CSS)
+    else:
+        cs_off = slot * CSS
+    gCS = cute.make_tensor(pCS + cs_off, cute.make_layout((C, 3), stride=(CSC, 1)))
     gOut = cute.make_tensor(
         pOut + b * (T * H * KD) + h * KD, cute.make_layout((T, KD), stride=(H * KD, 1))
     )
@@ -659,6 +666,7 @@ def _launch(
     BTB: cutlass.Constexpr,
     BTT: cutlass.Constexpr,
     I64: cutlass.Constexpr,
+    CI64: cutlass.Constexpr,
     PAIRED: cutlass.Constexpr,
     MULTI_ROW: cutlass.Constexpr,
     stream: cuda.CUstream,
@@ -705,6 +713,7 @@ def _launch(
         BTB,
         BTT,
         I64,
+        CI64,
         PAIRED,
         MULTI_ROW,
     )
@@ -873,6 +882,7 @@ def kda_mtp_replay(
     btb, btt, _ = raw_beta.stride()
 
     i64 = ((S - 1) * sss + H * KD * KD) >= 2**31
+    ci64 = ((conv_state.shape[0] - 1) * css + conv_state.shape[1] * csc) >= 2**31
     device_index = output.device.index
     key = (
         device_index,
@@ -895,6 +905,7 @@ def kda_mtp_replay(
         btb,
         btt,
         i64,
+        ci64,
         paired,
         multi_row,
     )
@@ -951,6 +962,7 @@ def kda_mtp_replay(
             btb,
             btt,
             i64,
+            ci64,
             paired,
             multi_row,
             stream,

@@ -1118,13 +1118,13 @@ class KDAMtpReplayState(KDAReplayState):
             dtype=torch.bfloat16,
             device=device,
         )
-        from tensorrt_llm._torch.modules.mamba.mamba2_metadata import REPLAY_WORK_ITEM_WIDTH
+        from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_commit import (
+            WI_MIN_WIDTH,
+            build_kda_mtp_history_descriptors,
+        )
 
         self._work_items = torch.zeros(
-            [context.max_batch_size, REPLAY_WORK_ITEM_WIDTH], dtype=torch.int32, device=device
-        )
-        from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_commit import (
-            build_kda_mtp_history_descriptors,
+            [context.max_batch_size, WI_MIN_WIDTH], dtype=torch.int32, device=device
         )
 
         self._history_descriptors = build_kda_mtp_history_descriptors(
