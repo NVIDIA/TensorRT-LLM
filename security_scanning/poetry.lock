@@ -1031,21 +1031,6 @@ test = ["Pillow", "contourpy[test-no-images]", "matplotlib", "pre-commit"]
 test-no-images = ["pytest", "pytest-cov", "pytest-rerunfailures (<16)", "pytest-xdist", "wurlitzer"]
 
 [[package]]
-name = "cpsat-logutils"
-version = "1.0.0"
-description = "Parse CP-SAT (OR-Tools) solver logs into line-anchored, JSON-serializable pydantic models."
-optional = false
-python-versions = ">=3.12"
-groups = ["main"]
-files = [
-    {file = "cpsat_logutils-1.0.0-py3-none-any.whl", hash = "sha256:02112cc460d30aeab3a591592bfa09cc5705fa3745d5d418a7339e8843c14e5d"},
-    {file = "cpsat_logutils-1.0.0.tar.gz", hash = "sha256:db8e0b5bf16fae203e08692088e9f8a248846e03934242367f7da5dab10322ee"},
-]
-
-[package.dependencies]
-pydantic = ">=2.10"
-
-[[package]]
 name = "cryptography"
 version = "50.0.2"
 description = "cryptography is a package which provides cryptographic recipes and primitives to Python developers."
@@ -4853,21 +4838,6 @@ files = [
 dev = ["black", "mypy", "pytest"]
 
 [[package]]
-name = "orloge"
-version = "1.0.0"
-description = "OR log extractor"
-optional = false
-python-versions = ">=3.12"
-groups = ["main"]
-files = [
-    {file = "orloge-1.0.0-py3-none-any.whl", hash = "sha256:e58cc1e15c7939fb8dc0b6ea6839c3c35805d31bbd7d3721dfc88ddc77f4b8e3"},
-    {file = "orloge-1.0.0.tar.gz", hash = "sha256:6c0bf7d2867fe22e60ef6425d7e99599938c0b1611d513a0baf972fa91b71c88"},
-]
-
-[package.dependencies]
-cpsat-logutils = ">=1.0.0"
-
-[[package]]
 name = "packaging"
 version = "26.3"
 description = "Core utilities for Python packages"
@@ -5455,121 +5425,6 @@ files = [
 [package.extras]
 dev = ["abi3audit", "black", "check-manifest", "colorama ; os_name == \"nt\"", "coverage", "packaging", "psleak", "pylint", "pyperf", "pypinfo", "pyreadline3 ; os_name == \"nt\"", "pytest", "pytest-cov", "pytest-instafail", "pytest-xdist", "pywin32 ; os_name == \"nt\" and implementation_name != \"pypy\"", "requests", "rstcheck", "ruff", "setuptools", "sphinx", "sphinx_rtd_theme", "toml-sort", "twine", "validate-pyproject[all]", "virtualenv", "vulture", "wheel", "wheel ; os_name == \"nt\" and implementation_name != \"pypy\"", "wmi ; os_name == \"nt\" and implementation_name != \"pypy\""]
 test = ["psleak", "pytest", "pytest-instafail", "pytest-xdist", "pywin32 ; os_name == \"nt\" and implementation_name != \"pypy\"", "setuptools", "wheel ; os_name == \"nt\" and implementation_name != \"pypy\"", "wmi ; os_name == \"nt\" and implementation_name != \"pypy\""]
-
-[[package]]
-name = "pulp"
-version = "4.3.1"
-description = "PuLP is an LP modeler written in python. PuLP can generate MPS or LP files and call GLPK, COIN CLP/CBC, CPLEX, and GUROBI to solve linear problems."
-optional = false
-python-versions = ">=3.12"
-groups = ["main"]
-files = [
-    {file = "pulp-4.3.1-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:310be8c8bac25c922c6ca3412ade1fb48b3a99cd99c79ef62eab4e127c89b6ec"},
-    {file = "pulp-4.3.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:494b3c0a8f026b5adbbe233c5975e71e6c1a8ae9cdeb490793adc87e27c44c0c"},
-    {file = "pulp-4.3.1-cp312-cp312-manylinux1_i686.manylinux_2_5_i686.whl", hash = "sha256:bc46949ec8967f5684d3268fe416ee67add48059f60133e2e42e53a92342ccf6"},
-    {file = "pulp-4.3.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:4715b90287aa8dcf485124cb485aab550ea563ed29c855bd57d4c629d9485a1b"},
-    {file = "pulp-4.3.1-cp312-cp312-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:129b145dcb46094f9aacdd92ceeb31f45a7f140af68dec6882104e35b35cf289"},
-    {file = "pulp-4.3.1-cp312-cp312-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:af039766a45e60f28b51528b3f92b79f2d8cf677d26043ed8a62550e9bf1ed2e"},
-    {file = "pulp-4.3.1-cp312-cp312-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:521c8d2e79fae3aec725ca354652ae73dcf132bedf59913a07e92482e99f46de"},
-    {file = "pulp-4.3.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:8692c832fb5407cfc770c10e52c20e12a07f9ad6b564349582f03a69003ff6db"},
-    {file = "pulp-4.3.1-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:0493afae12b989866c213f746f2bdcef96ff3e464d1cf686c59f9e17d5944219"},
-    {file = "pulp-4.3.1-cp312-cp312-musllinux_1_2_armv7l.whl", hash = "sha256:a45297d0ab4925864b81873033272281eb83283fb877b9aa66c75e8f06123c80"},
-    {file = "pulp-4.3.1-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:7d9e082fab93f5399c56461a6f19d201df106e4992c4a240bf4c9a7e603d7c31"},
-    {file = "pulp-4.3.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:842931e6013df348e441a812613ec4bd686cb4d25df413a1857d1ab7006004ee"},
-    {file = "pulp-4.3.1-cp312-cp312-win_amd64.whl", hash = "sha256:523e64e0c8cbbae4cbe837a0e856caf26bd6240ef2bd9d147264dfd5c778085a"},
-    {file = "pulp-4.3.1-cp312-cp312-win_arm64.whl", hash = "sha256:37827f14c75e447b076e368cf95433c921e528e96d108b7dcc5c5d6fa44fd9d9"},
-    {file = "pulp-4.3.1-cp313-cp313-macosx_10_12_x86_64.whl", hash = "sha256:bca78423570689c0f32981948e8721328f43e5398878d3f2c3041efcf1f732c4"},
-    {file = "pulp-4.3.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:ef0b0e35eaf915ec076c034702042c6062408d7cf90aeb1d954bce88ff89bb00"},
-    {file = "pulp-4.3.1-cp313-cp313-manylinux1_i686.manylinux_2_5_i686.whl", hash = "sha256:4151a8f1afdc10730f2d46ede501fcd2b08a97362e9e8e3f1b47ad5dad4f4754"},
-    {file = "pulp-4.3.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:63ac610edbf4afa73e2c5dcf196d9ed9b57cbafbc7e51a2377787ad164f81d41"},
-    {file = "pulp-4.3.1-cp313-cp313-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:c689e7b27afb45e6413a52583a5a15a8efa12a827d2ca373083d894b964ffba0"},
-    {file = "pulp-4.3.1-cp313-cp313-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:0d31356483636135a9d1c42a890cd0697179274fe00305db13cfde1b0c1713a0"},
-    {file = "pulp-4.3.1-cp313-cp313-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:72938504f3f281e444bf937e1623d9c5adca91b58186d766fa66123c70670d81"},
-    {file = "pulp-4.3.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:591448886cafd0310d0b286c2b0a324c906922366f3dd547435712cb701e0e28"},
-    {file = "pulp-4.3.1-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:0f28bd8cf6620e6fd01cef71a0f7e1530fbe06c7cfc5cd71e4b6e80f88c27898"},
-    {file = "pulp-4.3.1-cp313-cp313-musllinux_1_2_armv7l.whl", hash = "sha256:0842cddecdc17308f66fcb2c1c9b887d476e16417030718480bff89264928c8b"},
-    {file = "pulp-4.3.1-cp313-cp313-musllinux_1_2_i686.whl", hash = "sha256:7678128204ac3d73f480b5b40a5d3050c178fe87e2ce6b434aa8735bbbb2868a"},
-    {file = "pulp-4.3.1-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:fa7c2ede016d98eec65821736639f6cfeedcce958c8f294d3d91b37db8f7d569"},
-    {file = "pulp-4.3.1-cp313-cp313-win32.whl", hash = "sha256:d10b9cd12ca0b1bea852a13856b724f18d17a6460a08bb61300d4e5458bf3698"},
-    {file = "pulp-4.3.1-cp313-cp313-win_amd64.whl", hash = "sha256:aea0bfd8a97a978a53002916c9d8b4c814fb9c62e8da78ffd587d33c07ae214d"},
-    {file = "pulp-4.3.1-cp313-cp313-win_arm64.whl", hash = "sha256:747a4aff335128d14d922cab366c9857e9b4c05a1a2bbaca25a1cdcf33ae641e"},
-    {file = "pulp-4.3.1-cp314-cp314-macosx_10_12_x86_64.whl", hash = "sha256:652cff488a86aeb55b989ef059dd72ae133a8cb07b853fa63073b785f55378a5"},
-    {file = "pulp-4.3.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:785b7e859dd8ad3efecbdaa49caff47d3468963a34fdcc557b99f7ba7c95f6aa"},
-    {file = "pulp-4.3.1-cp314-cp314-manylinux1_i686.manylinux_2_5_i686.whl", hash = "sha256:d7a440f63b68ba318329c70c0e45030af4ebe7474d153873bd5d20268b1f266a"},
-    {file = "pulp-4.3.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:aabcf1b8150a6499ec981ba6ef68642cba629bba4f1a16e075fe767242ec22df"},
-    {file = "pulp-4.3.1-cp314-cp314-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:1307ec2f0231a0663cd81cb9525737512b287c2e63ff8908dd7f1d0bf23694cf"},
-    {file = "pulp-4.3.1-cp314-cp314-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:e380e28c465de8f28777b3c3c4d1348d31f8541f1e03f5d43ece29dbcbffaa64"},
-    {file = "pulp-4.3.1-cp314-cp314-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:384503623a1d381c908adddcb0dd8c3f805512e5651c751b6c7b06c541f09c75"},
-    {file = "pulp-4.3.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:89a55f155925d12294a5e1ebd12c13bcba59647633e99475b089292e5bc38815"},
-    {file = "pulp-4.3.1-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:2f6489e862b019e163eaba15f2e00156d7def4ecb0736d287d5124344e6640a3"},
-    {file = "pulp-4.3.1-cp314-cp314-musllinux_1_2_armv7l.whl", hash = "sha256:9aab65e7edae983715785efaad5b5738fa23bbacd35a712e4eda86949f4c1c52"},
-    {file = "pulp-4.3.1-cp314-cp314-musllinux_1_2_i686.whl", hash = "sha256:2a09728b95d3efde727f4bc47b6b8a5c83923de77c379f1a01fd84e3b18602df"},
-    {file = "pulp-4.3.1-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:d6277583896a0e101e756037f245608374da9685f3c6f05f8393ad08de362424"},
-    {file = "pulp-4.3.1-cp314-cp314-win_amd64.whl", hash = "sha256:3de8b0d3e0d84abf04257397698fdbb002775a342ecbc92fbb5e815864ad33c1"},
-    {file = "pulp-4.3.1-cp314-cp314-win_arm64.whl", hash = "sha256:829f4e3514c08bda860561f9e3e5fa7b18106fe548563eadb216f9577d5d9267"},
-    {file = "pulp-4.3.1-cp314-cp314t-manylinux1_i686.manylinux_2_5_i686.whl", hash = "sha256:493a8b12348fe4a8c773048396d25b78c0c36af4f8c3706e4c4aa0339ce695b9"},
-    {file = "pulp-4.3.1-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:16084086dbd4d5bfdcbe8162113dfc2caa4bfa188685b89167bde509992b7994"},
-    {file = "pulp-4.3.1-cp314-cp314t-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:dc247b18029802ac94a42b322bfb917239dd70a882739c42a5174c5dae4875be"},
-    {file = "pulp-4.3.1-cp314-cp314t-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:995953372ef5ee9e0651b3efefb14c91ad9484b440b565e96995f387acbc345f"},
-    {file = "pulp-4.3.1-cp314-cp314t-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:ac7fecbc31e75b4a9bc7db4aac1dba568c67f9afcf1851987637a803bd7676ee"},
-    {file = "pulp-4.3.1-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:a9252bd782d17838733af1b7e842fb6645b0c2697a89bd7609ddad2276eea831"},
-    {file = "pulp-4.3.1-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:1a2735cf0bb38d44452ded627caf384a2a7134e62d64bc0c3e1ff2b7330fc129"},
-    {file = "pulp-4.3.1-cp314-cp314t-musllinux_1_2_armv7l.whl", hash = "sha256:54161a590386de4d9fe17e0be2338886ed51cd1dfee8eb7d345da24358acc340"},
-    {file = "pulp-4.3.1-cp314-cp314t-musllinux_1_2_i686.whl", hash = "sha256:c8b781fab9531ae26ef5f20cbbeceb6b3355f94637c4e957000263b0c1f742df"},
-    {file = "pulp-4.3.1-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:5419727c6bd7ccb0e0a447d59bee5d00001208c257876143f997558662501408"},
-    {file = "pulp-4.3.1-cp315-cp315-macosx_11_0_arm64.whl", hash = "sha256:afc500ad91cfee83519af86ce1e2a7766087bd34786647d6cd60cb0542b0ea4f"},
-    {file = "pulp-4.3.1-cp315-cp315-manylinux1_i686.manylinux_2_5_i686.whl", hash = "sha256:a87f1a574e66ded56a610a5c2314ff3945221d23949af7df8d1b3883c141c015"},
-    {file = "pulp-4.3.1-cp315-cp315-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:2e3131ff9c131d2b372ddf1c6cdab267a86d5c52fc73c3eab53a371e7a3a45a2"},
-    {file = "pulp-4.3.1-cp315-cp315-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:8d85afe18a2a3a94574c648c978294acf9c2f5cac1f4bb1f29b6f8f9cd18a5f9"},
-    {file = "pulp-4.3.1-cp315-cp315-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:68780d300572364c030dbaf74aa5481c90d5593254dff0d15931f6022f1acb6e"},
-    {file = "pulp-4.3.1-cp315-cp315-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:9b2e2439ceefb2c6dcc0c24a25d0673b1cacf2cd956ab4d4243151719ee68c92"},
-    {file = "pulp-4.3.1-cp315-cp315-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:7701ba5b2029239d77e66e27e021b8c0552c4135117716c92f7d04cb23407e9c"},
-    {file = "pulp-4.3.1-cp315-cp315-musllinux_1_2_aarch64.whl", hash = "sha256:58ebd9039a6f1970616bd0cbdfb8c6ac66c01b435f0232c11371470e17e4052c"},
-    {file = "pulp-4.3.1-cp315-cp315-musllinux_1_2_armv7l.whl", hash = "sha256:202b152c6298e2c0975c210deddff6cf6ada61542efeedf456661d80172abb91"},
-    {file = "pulp-4.3.1-cp315-cp315-musllinux_1_2_i686.whl", hash = "sha256:bb023ad20c5df3d78b6e206f1d4b7d27b8b8c19540f4705b4c0a2afdfcba9f08"},
-    {file = "pulp-4.3.1-cp315-cp315-musllinux_1_2_x86_64.whl", hash = "sha256:5f993ec311080ef5073910bf5c1be1108be668f4cbd966c5774deacf63557965"},
-    {file = "pulp-4.3.1-cp315-cp315-win_amd64.whl", hash = "sha256:ebed10bda623064998e767ae1affbe4ebc69b825dd149470d5f9ec69526384ac"},
-    {file = "pulp-4.3.1-cp315-cp315-win_arm64.whl", hash = "sha256:f64a458c1bb9fe63dde74729d5ac88d34f2fc0c682b0462e2c99dd4f4b0e974c"},
-    {file = "pulp-4.3.1-cp315-cp315t-manylinux1_i686.manylinux_2_5_i686.whl", hash = "sha256:636eb72ac36ef077d87fe1efcf0ed025844c169ecf6a31ab737b70b106f45023"},
-    {file = "pulp-4.3.1-cp315-cp315t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:255a58aad8b69733eb7d9c95325c93c26fe5cafe3f71660563817c0f831fe7a6"},
-    {file = "pulp-4.3.1-cp315-cp315t-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:405dca00a14c81077387f42f4ccae5162b258b5369f4c5486475b1b440e18681"},
-    {file = "pulp-4.3.1-cp315-cp315t-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:acd082f6074697fbb73cdec438394470e60c56dc91d207ef3905253c30f38dff"},
-    {file = "pulp-4.3.1-cp315-cp315t-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:0d920f16f90a4beb1c47432a1edbc9a44d26c960424db84ee3af123c7bfa2888"},
-    {file = "pulp-4.3.1-cp315-cp315t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:86de5a1e8e9abf7b5d6a8f3ae1a54ab1faf663e78875d14160dd17ec34c6c1cc"},
-    {file = "pulp-4.3.1-cp315-cp315t-musllinux_1_2_aarch64.whl", hash = "sha256:99ce3f76bb2d2ad1033d8aeea51d3b911f2a5cc8daaf43f65406db0e48b61116"},
-    {file = "pulp-4.3.1-cp315-cp315t-musllinux_1_2_armv7l.whl", hash = "sha256:1b2845947c93e374e2e13578873cfff61f73ce3e59f2809951a597fcac5b0aa2"},
-    {file = "pulp-4.3.1-cp315-cp315t-musllinux_1_2_i686.whl", hash = "sha256:3f44cfc5ff36a71d4a8bfb3866b0d60b67d44a75e4cf0e9f7b5c6f7e749099d5"},
-    {file = "pulp-4.3.1-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:4ea6c65fa5d1a3810facfd2f426e8bdd03ce15a244f1970a99ce952f6cbeade7"},
-    {file = "pulp-4.3.1-pp312-pypy312_pp80-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:7ef84f8f44bed5a79199046e4a04b1f182bd68bfd8b2cdd510569751d36795a6"},
-    {file = "pulp-4.3.1-pp312-pypy312_pp80-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:ac2fffbbe7752af6b08f01788c526b5cc1e9fc74982e9379ebe144ee862ca2ac"},
-    {file = "pulp-4.3.1-pp312-pypy312_pp80-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:4580e2310f543c22927172dcdd0ccb45b470a1183f0bbe18a3a4468d5f8cfd15"},
-    {file = "pulp-4.3.1-pp312-pypy312_pp80-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:92f36a780dfaf6bf4b60f8e76781b163b53b74e8fffe69430ce91c3fd9a3331a"},
-    {file = "pulp-4.3.1-pp312-pypy312_pp80-musllinux_1_2_aarch64.whl", hash = "sha256:f5a228bb546cd060ab198e6512c3f27ded4f87e1bbf1eb9b4b9450dd18400d68"},
-    {file = "pulp-4.3.1-pp312-pypy312_pp80-musllinux_1_2_armv7l.whl", hash = "sha256:15e495da9c3404da9edcaeaaa7b2b81816c60deff1bf52ed2c0f13d3b9e0c724"},
-    {file = "pulp-4.3.1-pp312-pypy312_pp80-musllinux_1_2_i686.whl", hash = "sha256:3797676ba25b3aa9b5419d78f573f5f973a856a545a0d2b4851d8e7a1f4e12a8"},
-    {file = "pulp-4.3.1-pp312-pypy312_pp80-musllinux_1_2_x86_64.whl", hash = "sha256:a444f03e5749a56001b133550f15672871b2f34ac182dcdafd7d4e2c48b2965b"},
-    {file = "pulp-4.3.1.tar.gz", hash = "sha256:f0e909bc73ac6e2ed97aec186fc55da2ad70fbffac9c9cd4fdd464e4013e8a70"},
-]
-
-[package.dependencies]
-orloge = ">=1.0.0"
-
-[package.extras]
-cbc = ["cbcbox (<2.931)"]
-clarabel = ["clarabel", "numpy", "scipy"]
-copt = ["coptpy ; python_full_version < \"3.14.0\""]
-cplex = ["cplex ; python_full_version < \"3.15.0\" and (sys_platform != \"darwin\" or platform_machine == \"arm64\")"]
-cylp = ["cylp ; sys_platform != \"win32\"", "numpy ; sys_platform != \"win32\""]
-glpk = ["swiglpk ; python_full_version < \"3.15.0\""]
-gurobi = ["gurobipy ; python_full_version < \"3.15.0\""]
-highs = ["highspy", "numpy"]
-highs-cmd = ["highsbox"]
-mosek = ["mosek"]
-open-py = ["cbcbox (<2.931)", "clarabel", "highspy", "numpy", "pyscipopt", "scipy", "swiglpk ; python_full_version < \"3.15.0\""]
-ortools = ["ortools ; python_full_version < \"3.15.0\""]
-public-py = ["coptpy ; python_full_version < \"3.14.0\"", "cplex ; python_full_version < \"3.15.0\" and (sys_platform != \"darwin\" or platform_machine == \"arm64\")", "gurobipy ; python_full_version < \"3.15.0\"", "xpress"]
-scip = ["pyscipopt"]
-xpress = ["xpress"]
 
 [[package]]
 name = "pyarrow"
@@ -8140,4 +7995,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<3.13"
-content-hash = "5479612f898e90d6c2ab1c8ac12518dbbca073449c1fb9cd187a2c474821e366"
+content-hash = "0ad87a18fe1947d76149b17da4713870d636e60348122e41653ef118cbdb06d6"
