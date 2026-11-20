@@ -351,7 +351,7 @@ class KimiK3RouterLogitsKernel:
 # ---------------------------------------------------------------------------
 
 
-@process_built("kimi_k3_router_logits")
+@process_built("kimi_k3_router_logits", use_build_pool_in_rehearsal=True)
 def _compiled(use_pdl: bool = TRTLLM_ENABLE_PDL) -> object:
     """The kernel compiled for ``use_pdl`` (cached per variant)."""
     kernel = KimiK3RouterLogitsKernel(use_pdl)

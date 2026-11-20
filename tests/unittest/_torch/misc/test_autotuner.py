@@ -3740,14 +3740,13 @@ def test_the_build_state_queues_every_tactic_on_the_workers_and_times_none(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_in_the_build_state_short_builds_of_a_thread_safe_op_run_on_threads(
+def test_in_the_build_state_a_thread_safe_op_builds_on_threads(
         tune_mode_workers, tmp_path, monkeypatch):
     """An op whose compiles run outside the GIL (``parallel_jit_warmup``, as DeepGEMM's) has
-    its builds too short for a worker made on the pass's threads, in this process, each
-    admitted for twice its inputs' bytes."""
+    its builds made on the pass's threads, in this process, each admitted for twice its
+    inputs' bytes."""
     import autotuner_worker_targets as targets
 
-    tune_mode_workers.min_build_s = 5.0
     tuner = AutoTuner.get()
     tuner.clear_cache()
     runner = targets.RecordingRunner(str(tmp_path))

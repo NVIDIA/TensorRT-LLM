@@ -986,7 +986,7 @@ def _config(m: int) -> tuple[int, int]:
     return 1, 16
 
 
-@process_built("kimi_k3_routing")
+@process_built("kimi_k3_routing", use_build_pool_in_rehearsal=True)
 def _compiled_kernel(
     num_experts: int,
     num_warps: int,

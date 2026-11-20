@@ -2073,15 +2073,15 @@ class AutoTuner:
                          inputs: List[torch.Tensor], **kwargs) -> None:
         """In the build state, queue the builds of every (profile, runner, tactic) the op's
         tuning would time for ``inputs`` and the cache lacks, and return at once; for an op that
-        sets ``use_build_pool_in_rehearsal`` and whose runners are not collective (MERGE), while workers
-        take builds.
+        sets ``use_build_pool_in_rehearsal`` and whose runners are not collective (MERGE), while
+        workers take builds.
 
-        A runner's builds go to the worker processes (``BuildPool.worth_a_worker``); those too
-        short for a worker, of an op whose compiles run outside the GIL
-        (``TuningConfig.parallel_jit_warmup``), go to the pass's threads, each counted as
-        allocating twice its inputs' bytes; the others are left to the warmup's tuning. The
-        builds hold specs of the inputs, not the inputs. :meth:`join_builds` waits for the
-        workers'. A call with the runners and input shapes of an earlier one returns at once.
+        The builds go to the worker processes; those of an op whose compiles run outside the GIL
+        (``TuningConfig.parallel_jit_warmup``) go to the pass's threads instead, each counted as
+        allocating twice its inputs' bytes. Builds that do not go to a worker are left to the
+        warmup's tuning. The builds hold specs of the inputs, not the inputs.
+        :meth:`join_builds` waits for the workers'. A call with the runners and input shapes of an
+        earlier one returns at once.
         """
         pool = BuildPool.get()
         if (not tuning_config.use_build_pool_in_rehearsal
@@ -2099,14 +2099,9 @@ class AutoTuner:
             f"{custom_op}|{type(runner).__name__}" for runner in runners
         ]
         thread_safe = tuning_config.parallel_jit_warmup != 0
-        in_workers = {
-            r
-            for r in range(len(runners))
-            if pool.worth_a_worker(families[r], thread_safe=thread_safe)
-        }
         lane = pool.threads if thread_safe else None
-        on_threads = (set(range(len(runners))) -
-                      in_workers if lane is not None else set())
+        in_workers = set() if thread_safe else set(range(len(runners)))
+        on_threads = set(range(len(runners))) if lane is not None else set()
         keep_values = not all(r.builds_from_shapes for r in runners)
         kwarg_specs = {
             k: _TensorSpec.of(v, keep_values)

@@ -840,7 +840,7 @@ def cluster_size(num_tokens: int, num_candidates: int) -> int:
     return 8 if num_tokens <= 16 and num_candidates >= 4 else 4
 
 
-@process_built("kimi_k3_attn_res")
+@process_built("kimi_k3_attn_res", use_build_pool_in_rehearsal=True)
 def _compiled(
     num_candidates: int,
     add_mode: int,
@@ -919,9 +919,9 @@ def precompile(
     snapshots_after_wait: bool = False,
 ) -> None:
     """JIT-compile the variant :func:`run_attn_res` launches for these parameters (``cluster``
-    as :func:`cluster_size` picks it), so its first launch does not compile. In KernelBuilder's
-    build mode a worker process of the rank builds it if such compiles take long enough to repay
-    a worker (``BuildPool.worth_a_worker``)."""
+    as :func:`cluster_size` picks it), so its first launch does not compile. Listed through
+    :meth:`KernelBuilder.build_kernels`: its compiles are short and run in the rank, but in a
+    rehearsal the workers build them beside the checkpoint load."""
     KernelBuilder.get().build_kernels(
         [(_compiled, (num_candidates, add_mode, cluster, hidden, mxfp8, snapshots_after_wait))]
     )

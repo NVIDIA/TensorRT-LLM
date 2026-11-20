@@ -996,8 +996,6 @@ def test_a_rehearsal_has_the_kernels_of_every_batch_size_built_for_the_later_lau
 
     monkeypatch.setattr(triton.knobs.compilation, "listener", listener)
     pool = BuildPool(enabled=True)
-    # The compiles are too short for a worker process: they go to the pass's threads.
-    pool.min_build_s = 5.0
     monkeypatch.setattr(BuildPool, "_instance", pool)
     builder = kernel_builder.KernelBuilder(enabled=True, rehearse=True)
     monkeypatch.setattr(kernel_builder.KernelBuilder, "_instance", builder)

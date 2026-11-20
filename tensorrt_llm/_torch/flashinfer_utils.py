@@ -64,7 +64,8 @@ def queue_flashinfer_module_build(name: str, gen_spec: Callable[[],
         return
     # Not thread-safe: in a rehearsal the build goes to a worker process.
     config = BuildConfig(strategy=BuildStrategy.SHARED,
-                         share_scope=_jit_dir_scope)
+                         share_scope=_jit_dir_scope,
+                         use_build_pool_in_rehearsal=True)
     task = BuildTask(f"{__name__}:build_flashinfer_module", (gen_spec, ))
     builder.build("flashinfer", [(name, task, config)])
 

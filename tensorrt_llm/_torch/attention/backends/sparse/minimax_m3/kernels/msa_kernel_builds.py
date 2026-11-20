@@ -58,11 +58,13 @@ def _cache_scope() -> str:
     return f"{os.uname().nodename}:{os.path.realpath(str(_package.jit._jit_base()))}"
 
 
-# A variant or module takes 35-60 s to compile on GB300.
-_BUILD_SECONDS = 40.0
 _QUERY_LEN = DynamicSpec("qo_len", _query_len_buckets)
+# A variant or module takes 35-60 s to compile on GB300, which repays a worker.
 _SHARED = dict(
-    strategy=BuildStrategy.SHARED, share_scope=_cache_scope, build_seconds=_BUILD_SECONDS
+    strategy=BuildStrategy.SHARED,
+    share_scope=_cache_scope,
+    use_build_pool_in_warmup=True,
+    use_build_pool_in_rehearsal=True,
 )
 # A call's query segment lengths.
 _CONFIG = BuildConfig((_QUERY_LEN,), **_SHARED)
@@ -70,7 +72,7 @@ _CONFIG = BuildConfig((_QUERY_LEN,), **_SHARED)
 # (msa_indexer._proxy_kv_splits); a variant depends only on whether it splits.
 _PROXY_CONFIG = BuildConfig((_QUERY_LEN, DynamicSpec("num_kv_splits", (1, 2))), **_SHARED)
 # The k2q CSR extension builds into PyTorch's extension directory, under PyTorch's own lock.
-_K2Q_CONFIG = BuildConfig(build_seconds=_BUILD_SECONDS)
+_K2Q_CONFIG = BuildConfig(use_build_pool_in_warmup=True, use_build_pool_in_rehearsal=True)
 # Plan options a replay does not pass through: it plans its own lengths and offsets, and a
 # swept split count.
 _PLAN_SKIP = ("qo_offset", "device", "stream", "num_kv_splits")

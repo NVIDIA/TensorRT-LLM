@@ -1012,10 +1012,6 @@ _KERNEL_NAMES = {
     _merge_topk_attn_out_kernel: "merge",
 }
 _KERNELS = {name: kernel for kernel, name in _KERNEL_NAMES.items()}
-# One compile takes seconds, too few to repay a worker process. Triton's compiles of these
-# kernels allocate no GPU memory and may run on several threads at once, so in a rehearsal they
-# run on the pass's build threads.
-_BUILD_SECONDS = 2.0
 
 
 class _Operand(NamedTuple):
@@ -1314,7 +1310,9 @@ def _queue_builds(
         signature,
         BuildConfig(
             (DynamicSpec("local_batch", tuple(range(1, largest + 1))),),
-            build_seconds=_BUILD_SECONDS,
+            # A compile takes seconds, allocates no GPU memory and may run beside others on
+            # threads of this process: in a rehearsal they run on the pass's build threads.
+            use_build_pool_in_rehearsal=True,
             thread_safe=True,
         ),
         {"local_batch": local_batch},

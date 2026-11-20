@@ -3500,7 +3500,7 @@ def _compiled_quant(k: int, sf_blocks: int, use_pdl: bool):
     )
 
 
-@process_built("fp8_block_scale_mid_m_gemm")
+@process_built("fp8_block_scale_mid_m_gemm", use_build_pool_in_rehearsal=True)
 def _compiled_mid_kernel(
     n: int,
     k: int,

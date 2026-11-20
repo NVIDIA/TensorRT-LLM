@@ -68,12 +68,8 @@ def package(monkeypatch, tmp_path):
     msa_kernel_builds._route(module, api, msa_kernel_builds._Package(module, api, jit))
     builder = KernelBuilder(enabled=True)
     monkeypatch.setattr(KernelBuilder, "_instance", builder)
-    # The variants take long enough for a worker; none is started here.
-    monkeypatch.setattr(
-        BuildPool,
-        "worth_a_worker",
-        lambda self, family, expected_s=None, thread_safe=False: True,
-    )
+    # Workers take builds; none is started here.
+    monkeypatch.setattr(BuildPool, "accepting", lambda self: True)
     return types.SimpleNamespace(module=module, builder=builder, events=events, fail=fail)
 
 

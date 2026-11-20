@@ -24,12 +24,6 @@ _RECORD = f"{targets.__name__}:record"
 _HOLD = f"{targets.__name__}:hold"
 
 
-@pytest.fixture(autouse=True)
-def _every_build_to_a_worker(monkeypatch):
-    """Workers take every build, however short; the tests of that rule set it themselves."""
-    monkeypatch.setenv("TLLM_KERNEL_BUILDER_MIN_BUILD_S", "0")
-
-
 @pytest.fixture
 def worker_env(monkeypatch):
     """Worker processes that import build_pool_targets, started from a launcher's environment."""
@@ -222,25 +216,6 @@ def test_no_worker_starts_while_the_gpu_lacks_room(pool, monkeypatch):
     assert pool.counts() == {"refused": 1}
 
 
-def test_a_worker_takes_only_builds_long_enough_to_repay_it(pool):
-    pool.min_build_s = 5.0
-    with pool.pass_scope():
-        # Neither measured nor expected: the caller measures one first.
-        assert not pool.worth_a_worker("new") and pool.unmeasured("new")
-        assert pool.worth_a_worker("new", expected_s=30.0)
-        assert not pool.worth_a_worker("new", expected_s=1.0)
-        assert not pool.unmeasured("new", expected_s=1.0)
-        # Once measured, the measure decides.
-        pool.record_build("new", 0.5)
-        assert not pool.worth_a_worker("new", expected_s=30.0) and not pool.unmeasured("new")
-        pool.record_build("slow", 10.0)
-        assert pool.worth_a_worker("slow")
-    assert not pool.worth_a_worker("slow")
-    pool.min_build_s = 0.0
-    with pool.pass_scope():
-        assert pool.worth_a_worker("new") and not pool.unmeasured("other")
-
-
 _SPAN = f"{targets.__name__}:span"
 
 
@@ -325,20 +300,6 @@ def test_a_build_returns_the_value_of_its_function(pool):
         )
     assert (doubled.status, doubled.value) == ("built", 42)
     assert unpicklable.status == "failed" and "does not pickle" in unpicklable.error
-
-
-def test_an_overlapped_pass_sends_to_a_worker_every_build_its_threads_cannot_take(pool):
-    pool.min_build_s = 5.0
-    with pool.pass_scope(overlapped=True):
-        # A worker's cost is hidden behind the rank's other work, and nothing is measured here.
-        assert pool.worth_a_worker("new") and not pool.unmeasured("new")
-        assert pool.worth_a_worker("new", expected_s=1.0)
-        # A build the pass's threads can take goes to a worker only when long enough.
-        assert not pool.worth_a_worker("new", expected_s=1.0, thread_safe=True)
-        assert pool.worth_a_worker("new", expected_s=30.0, thread_safe=True)
-    with pool.pass_scope():
-        assert not pool.worth_a_worker("new") and pool.unmeasured("new")
-        assert not pool.worth_a_worker("new", expected_s=1.0)
 
 
 def test_in_an_overlapped_pass_a_build_waits_for_memory_until_the_pass_ends(pool, gpu, tmp_path):
@@ -426,12 +387,6 @@ def test_the_workers_and_the_threads_share_the_gpu_memory(pool, gpu, tmp_path):
         assert lane.join() == {"built": 1}
         assert [result.status for result in batch.wait()] == ["built"]
     assert not _overlap(_spans(paths))
-
-
-def test_a_build_in_a_worker_measures_its_kind(pool, tmp_path):
-    with pool.pass_scope():
-        pool.build([Build(_RECORD, (str(tmp_path / "r"), 1), "recorded")])
-    assert pool.build_seconds("recorded") is not None
 
 
 def test_arguments_that_do_not_pickle_are_built_here(pool):

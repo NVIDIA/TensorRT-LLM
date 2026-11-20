@@ -12,17 +12,17 @@ separate processes, so every op's builds run there.
   function may return a value, which its result carries.
 * The workers live only inside a pass (:meth:`BuildPool.pass_scope`: the memory-profiling warmup,
   or a rehearsal) and exit when it ends, before the KV cache is sized.
-* KernelBuilder sends an op's builds to the workers when builds of their kind take
-  ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds (default 5); the autotuner, for an op that sets
+* KernelBuilder sends an op's builds to the pool when the op sets
+  ``BuildConfig.use_build_pool_in_warmup`` (in a rehearsal, ``use_build_pool_in_rehearsal``), or
+  its compile function sets them in ``process_built``; the autotuner, when the op sets
   ``TuningConfig.use_build_pool_in_warmup`` (in a rehearsal, ``use_build_pool_in_rehearsal``). A
   build starts only while the GPU has room for it; the others build in this process.
 * :meth:`BuildPool.submit` queues builds and returns at once; its :class:`BuildBatch` waits for
   them.
 * In a pass beside other work of the rank (``pass_scope(overlapped=True)``: a rehearsal beside the
-  checkpoint load), a build that cannot run on the pass's in-process threads
-  (:attr:`BuildPool.threads`) goes to a worker whatever its time, and waits for GPU memory rather
-  than being left to the caller. The threads take short builds whose compilers run outside the
-  GIL, each on a CUDA stream of its own.
+  checkpoint load), a build waits for GPU memory rather than being left to the caller. The pass's
+  in-process threads (:attr:`BuildPool.threads`) take the builds of ops whose compilers run
+  outside the GIL, each on a CUDA stream of its own.
 * With shared JIT builds (``tensorrt_llm._jit_share``) the ranks split the builds that have a
   :class:`Claim`, and share the store.
 
@@ -69,10 +69,6 @@ __all__ = [
 
 ENABLE_ENV = "TLLM_KERNEL_BUILDER"
 _WORKERS_ENV = "TLLM_KERNEL_BUILDER_WORKERS"
-_MIN_BUILD_ENV = "TLLM_KERNEL_BUILDER_MIN_BUILD_S"
-# A build goes to a worker only when builds of its kind take at least this long: a worker
-# spends seconds starting and loading its compiler, which a short build does not repay.
-_MIN_BUILD_S = 5.0
 # Each worker holds a CUDA context (about a GiB) on the rank's GPU while the pass lasts.
 _MAX_DEFAULT_WORKERS = 8
 # Set in a worker: the store its CuTe DSL kernels go to, and whether the ranks share it.
@@ -131,9 +127,9 @@ class Claim(NamedTuple):
 
 class Build(NamedTuple):
     """One build for a worker process: ``function`` (``"module:qualname"`` of a module-level
-    function), called with ``args``, which must pickle. ``family`` names the kind of build, whose
-    seconds the pool measures (:meth:`BuildPool.worth_a_worker`). With a ``claim``, the ranks
-    split the build: the worker that starts it first makes it."""
+    function), called with ``args``, which must pickle. ``family`` names the kind of build: the
+    pool admits it by the most GPU memory a build of its kind allocated so far. With a ``claim``,
+    the ranks split the build: the worker that starts it first makes it."""
 
     function: str
     args: tuple = ()
@@ -155,17 +151,19 @@ class BuildResult(NamedTuple):
 
 
 class _Compiler(NamedTuple):
-    """A ``process_built`` function's name for its kernels, its ``"module:qualname"``, how long
-    a compile takes until one is measured, and its kernels compiled so far, by arguments."""
+    """A ``process_built`` function's name for its kernels, its ``"module:qualname"``, whether
+    KernelBuilder's build mode and its rehearsal build its kernels on the workers, and its kernels
+    compiled so far, by arguments."""
 
     name: str
     where: str
-    build_seconds: Optional[float]
+    use_build_pool_in_warmup: bool
+    use_build_pool_in_rehearsal: bool
     memo: Dict[tuple, Any]
 
 
 def process_built(
-    name: str, build_seconds: Optional[float] = None
+    name: str, use_build_pool_in_warmup: bool = False, use_build_pool_in_rehearsal: bool = False
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Memoize a CuTe DSL kernel compile function whose kernels worker processes can build.
 
@@ -179,8 +177,10 @@ def process_built(
 
     Args:
         name: Names the function's kernels in the store; unique per compile function.
-        build_seconds: How long one compile takes, until compiles of it are measured; it
-            decides whether the workers take them (:meth:`BuildPool.worth_a_worker`).
+        use_build_pool_in_warmup: In build mode, ``KernelBuilder.build_kernels`` builds the
+            function's kernels on the workers. For compiles long enough to repay a worker.
+        use_build_pool_in_rehearsal: In a rehearsal, ``KernelBuilder.build_kernels`` queues the
+            function's kernels for the workers, which build them beside the checkpoint load.
     """
 
     def decorate(raw: Callable[..., Any]) -> Callable[..., Any]:
@@ -199,9 +199,7 @@ def process_built(
                         pool = BuildPool.get()
                         kernel = pool.load(name, args)
                         if kernel is None:
-                            t0 = time.perf_counter()
                             kernel = raw(*args)
-                            pool.record_build(name, time.perf_counter() - t0)
                             pool.store(name, args, kernel)
                         memo[args] = kernel
                         return kernel
@@ -220,7 +218,11 @@ def process_built(
         compiled.cache_info = cache_info
         compiled.cache_clear = cache_clear
         compiled._compiler = _Compiler(
-            name, f"{raw.__module__}:{raw.__qualname__}", build_seconds, memo
+            name,
+            f"{raw.__module__}:{raw.__qualname__}",
+            use_build_pool_in_warmup,
+            use_build_pool_in_rehearsal,
+            memo,
         )
         return compiled
 
@@ -446,9 +448,6 @@ class BuildPool:
         # Builds queued on the workers that have not ended (wait_idle).
         self._outstanding = 0
         self._idle = threading.Condition(self._lock)
-        self.min_build_s = float(os.environ.get(_MIN_BUILD_ENV, _MIN_BUILD_S))
-        # family -> [builds measured, their seconds]
-        self._build_times: Dict[str, List[float]] = {}
         # family -> the most GPU memory a build of it allocated at once in a worker
         self._peak_bytes: Dict[str, int] = {}
 
@@ -518,53 +517,6 @@ class BuildPool:
         except (pickle.PicklingError, TypeError, AttributeError):
             return False
         return len(message) <= _MAX_MESSAGE_BYTES
-
-    def worth_a_worker(
-        self, family: str, expected_s: Optional[float] = None, thread_safe: bool = False
-    ) -> bool:
-        """Whether a worker should take a build of ``family`` now: while workers take builds,
-        when builds of the family take at least ``TLLM_KERNEL_BUILDER_MIN_BUILD_S`` seconds
-        (default 5; 0 sends every build to the workers). How long they take is their mean so far,
-        here or in a worker, or ``expected_s`` until one is measured; a family that has neither
-        builds in this process. In an overlapped pass, a build that cannot run on the pass's
-        threads (not ``thread_safe``) goes to a worker whatever its time."""
-        if not self.accepting():
-            return False
-        if self.min_build_s <= 0 or (self.overlapping() and not thread_safe):
-            return True
-        estimate = self.build_seconds(family)
-        if estimate is None:
-            estimate = expected_s
-        return estimate is not None and estimate >= self.min_build_s
-
-    def unmeasured(self, family: str, expected_s: Optional[float] = None) -> bool:
-        """Whether :meth:`worth_a_worker` cannot decide for ``family`` yet: while workers take
-        builds and the rule is on, before a build of the family is measured, without
-        ``expected_s``, outside an overlapped pass. The caller then makes one build here, timed
-        (:meth:`record_build`)."""
-        return (
-            self.accepting()
-            and not self.overlapping()
-            and self.min_build_s > 0
-            and expected_s is None
-            and self.build_seconds(family) is None
-        )
-
-    def build_seconds(self, family: str) -> Optional[float]:
-        """The mean of the builds of ``family`` measured so far, or None."""
-        with self._lock:
-            measured = self._build_times.get(family)
-        return measured[1] / measured[0] if measured else None
-
-    def record_build(self, family: str, seconds: float) -> None:
-        """Measure a build of ``family`` that took ``seconds`` here."""
-        with self._lock:
-            self._record_build(family, seconds)
-
-    def _record_build(self, family: str, seconds: float) -> None:
-        measured = self._build_times.setdefault(family, [0, 0.0])
-        measured[0] += 1
-        measured[1] += seconds
 
     def peak_bytes(self, family: Optional[str]) -> Optional[int]:
         """The most GPU memory a build of ``family`` allocated at once in a worker so far, or
@@ -783,7 +735,6 @@ class BuildPool:
             if result.status == BUILT:
                 self._build_s += result.seconds
                 if task.family is not None:
-                    self._record_build(task.family, result.seconds)
                     self._record_peak(task.family, result.peak_bytes)
         task.batch.settle(task.index, result)
 
@@ -1151,8 +1102,6 @@ class _ThreadLane:
                 finally:
                     self._admission.release(key)
                 seconds = time.perf_counter() - t0
-                if status == BUILT and item.family is not None:
-                    self._owner.record_build(item.family, seconds)
             item.status = status
             with self._cond:
                 self._counts[status] += 1
