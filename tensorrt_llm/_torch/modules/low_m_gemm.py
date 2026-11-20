@@ -671,12 +671,9 @@ class LowMGemmDispatcher:
                 if self.per_rank_tuning
                 else DistributedTuningStrategy.PARALLEL
             ),
-            # The race's FlashInfer and CuTe DSL kernels build in the rank's worker
-            # processes before the race is timed, when they take long enough to repay
-            # a worker.
-            build_in_workers=True,
-            # In a rehearsal the warp-MMA kernels build in worker processes while the
-            # checkpoint loads, and the race is timed there as well.
+            # In a rehearsal the race's kernels build on the build pool while the checkpoint
+            # loads, and the race is timed there as well.
+            use_build_pool_in_rehearsal=True,
             tune_in_rehearsal=True,
         )
         # Mark prepared only after all runners and the tuning config exist so the

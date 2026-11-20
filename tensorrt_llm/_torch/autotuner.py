@@ -175,41 +175,26 @@ class TuningConfig:
             rank is pinned to a subset, up to 32: neighbouring sweep points often select
             the same kernel and compile it twice, so more threads keep paying off.
             TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
-        build_strategy (BuildStrategy): How the processes of a launch split the op's kernel
-            builds. INDEPENDENT: each builds every kernel it needs. PARALLEL, for runners whose
-            kernels are DeepGEMM builds or CuTe DSL kernels kept in their class's
-            ``kernel_cache``: when the processes share their JIT builds (TLLM_JIT_SHARE_DIR, or
-            by default the launch's directory on each node; see tensorrt_llm._jit_share), each
-            kernel is built by one process and loaded by the others. They split the profiles
-            not yet tuned through claims in that directory: for a single tactic, each rank
-            runs the profiles it claims first, setting aside one whose kernel another rank is
-            building, then the profiles other ranks claimed once those have run; for several
-            tactics under INDEPENDENT tuning, a build pass first runs each (profile, runner,
-            tactic) once on the rank that claims it, and the profiling that follows finds the
-            kernels built. The claims then take the place of the ``parallel_jit_warmup``
-            thread pool, which does not run.
+        build_strategy (BuildStrategy): How the ranks split the op's kernel builds. INDEPENDENT:
+            each rank builds every kernel it needs. PARALLEL: when the ranks share JIT builds
+            (tensorrt_llm._jit_share), each kernel is built by the rank that claims it and loaded
+            by the others. For DeepGEMM kernels and CuTe DSL kernels kept in the runner class's
+            ``kernel_cache`` (or in a library's cache its ``share_kernel_caches()`` shares).
         cold_l2_flush_bytes (int): When > 0, every timed repeat first reads a buffer of this many
             bytes (evicting the operands, weights included, from L2) and each repeat is timed alone
             with %globaltimer stamps inside one CUDA graph; the median repeat is the tactic's time.
             For decode-sized GEMMs whose weights never stay in L2 between uses.
-        build_in_workers (bool): Inside a build pass (``BuildPool.pass_scope``, the
-            memory-profiling warmup), tune mode builds the op's kernels on the rank's worker
-            processes (``tensorrt_llm._torch.build_pool``), and profiles once they are built: every
-            (profile, runner, tactic) the profiling times, through ``TunableRunner.build``,
-            on inputs of the profile's layout. A worker allocates its build's inputs and
-            outputs on the rank's GPU, and the pool starts a build only while the GPU has room
-            for it, unless the runner compiles from shapes alone
-            (``TunableRunner.builds_from_shapes``), whose build gets meta tensors. The runners
-            and their tactics must pickle, and must not be collective. Without the workers,
-            the op builds as it would without ``build_in_workers`` (``parallel_jit_warmup``
-            included).
-            The workers take a runner's builds only when they take long enough to repay a
-            worker (``BuildPool.worth_a_worker``): until a runner's builds are measured, tune
-            mode builds one of them itself, timed, unless ``build_seconds`` gives their time;
-            shorter ones build as the op profiles.
-        build_seconds (Optional[float]): How long one build of the op's runners takes, until
-            their builds are measured (``build_in_workers``): it decides whether the workers take
-            them, and tune mode measures none itself.
+        use_build_pool_in_warmup (bool): In the memory-profiling warmup (a build pass), tune mode
+            first builds every (profile, runner, tactic) on the rank's build-pool worker processes
+            (``TunableRunner.build``; tensorrt_llm._torch.build_pool), then profiles. For ops whose
+            builds are long enough to repay a worker. The runners and tactics must pickle and must
+            not be collective. Warmups without a build pass build as without it.
+        use_build_pool_in_rehearsal (bool): In a rehearsal (the warmup's forwards on dummy weights,
+            beside the checkpoint load), queue every (profile, runner, tactic) build of the op on
+            the build pool: on its in-process threads when the op's compiles run outside the GIL
+            (``parallel_jit_warmup``) and are short, on its worker processes otherwise. The
+            warmup's tuning then finds the kernels built. The runners and tactics must pickle and
+            must not be collective.
         tune_in_rehearsal (bool): In a rehearsal's build state (``build_kernels``, beside the
             checkpoint load), time the op's profiles in a worker process of the rank's BuildPool
             once their kernels are built (``RehearsalTuner``), as the warmup's tuning would; the
@@ -228,8 +213,8 @@ class TuningConfig:
     parallel_jit_warmup: int = 0
     build_strategy: BuildStrategy = BuildStrategy.INDEPENDENT
     cold_l2_flush_bytes: int = 0
-    build_in_workers: bool = False
-    build_seconds: Optional[float] = None
+    use_build_pool_in_warmup: bool = False
+    use_build_pool_in_rehearsal: bool = False
     tune_in_rehearsal: bool = False
 
 
@@ -306,7 +291,7 @@ class FakeTensor:
 class TunableRunner(ABC):
 
     # Whether ``build`` compiles from its inputs' shapes, strides and dtypes alone: in a worker
-    # process (``TuningConfig.build_in_workers``) it then gets meta tensors of them.
+    # process (``TuningConfig.use_build_pool_in_warmup``) it then gets meta tensors of them.
     builds_from_shapes: bool = False
 
     @abstractmethod
@@ -395,7 +380,7 @@ class TunableRunner(ABC):
         """Compile the kernels ``tactic`` runs on ``inputs``; the result is discarded.
 
         Tune mode calls it in the rank's worker processes before it profiles
-        (``TuningConfig.build_in_workers``). This default runs the tactic
+        (``TuningConfig.use_build_pool_in_warmup``). This default runs the tactic
         once, which compiles what a first call compiles. A runner that ships
         its kernels, or can compile without launching, overrides it; one whose
         build needs only the inputs' shapes sets ``builds_from_shapes``.
@@ -1824,13 +1809,20 @@ class AutoTuner:
                 )[0]
 
             # Every rank profiles under MERGE / PARALLEL, so they agree on the profiles to tune.
+            # PARALLEL deals the tactics of a profile only when every rank of the group profiles
+            # it: ranks build profiles from their own input shapes (attention DP).
             agreed_hits = None
+            undealt = set()
             if (self._needs_rank_agreement(strategy)
                     and strategy != DistributedTuningStrategy.BROADCAST):
-                agreed_hits = dict(
-                    zip([p.get_opt_shapes() for p in profiles],
-                        self._profile_hits_on_all_ranks(
-                            profiles, [is_cached(p) for p in profiles])))
+                keys = [p.get_opt_shapes() for p in profiles]
+                hits, everywhere = self._profile_hits_on_all_ranks(
+                    profiles, [is_cached(p) for p in profiles])
+                agreed_hits = dict(zip(keys, hits))
+                undealt = {
+                    key
+                    for key, shared in zip(keys, everywhere) if not shared
+                }
 
             def is_pending(p: OptimizationProfile) -> bool:
                 if agreed_hits is not None:
@@ -1844,7 +1836,12 @@ class AutoTuner:
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
                         *_, has_tuning_failure_occurred = self._profile_runners(
-                            custom_op, runners, tensors, p, tuning_config,
+                            custom_op,
+                            runners,
+                            tensors,
+                            p,
+                            tuning_config,
+                            deal=p.get_opt_shapes() not in undealt,
                             **kwargs)
                     new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
@@ -1951,31 +1948,11 @@ class AutoTuner:
             len(r.get_valid_tactics(tensors, first, **kwargs))
             for r in runners) == 1
 
-    def _measure_build(self, family: str, runner: TunableRunner,
-                       tensors: List[torch.Tensor], tactic: Any, prepare: bool,
-                       **kwargs) -> bool:
-        """For a runner whose builds (``family``) are not measured yet: build ``tactic`` on a
-        profile's ``tensors`` here, timed, and tell whether its builds take long enough for the
-        rank's workers (``BuildPool.worth_a_worker``)."""
-        pool = BuildPool.get()
-        t0 = time.perf_counter()
-        try:
-            if prepare:
-                runner(tensors, tactic=-1, do_preparation=True, **kwargs)
-            runner.build(tensors, tactic=tactic, **kwargs)
-            torch.cuda.synchronize()
-        except Exception as e:  # noqa: BLE001 - the profiling reports a tactic that fails
-            logger.debug(f"[Autotuner] {family}: measuring a build failed: "
-                         f"{type(e).__name__}: {e}")
-            return False
-        pool.record_build(family, time.perf_counter() - t0)
-        return pool.worth_a_worker(family)
-
     def _builds_in_pool(self, tuning_config: TuningConfig) -> bool:
         """Whether tune mode builds the op's kernels in the rank's worker processes before it
-        profiles: an op that sets ``build_in_workers``, whose runners are not collective (MERGE),
-        while the workers take builds (inside a build pass, ``TLLM_KERNEL_BUILDER`` on)."""
-        return (tuning_config.build_in_workers
+        profiles: an op that sets ``use_build_pool_in_warmup``, whose runners are not collective
+        (MERGE), while the workers take builds (inside a build pass, ``TLLM_KERNEL_BUILDER`` on)."""
+        return (tuning_config.use_build_pool_in_warmup
                 and tuning_config.distributed_tuning_strategy
                 != DistributedTuningStrategy.MERGE
                 and BuildPool.get().accepting())
@@ -1994,30 +1971,14 @@ class AutoTuner:
         (``TunableRunner.build_key``). With shared JIT builds the ranks claim the items, and
         each builds the ones it claims; the profiling waits for the others.
         Returns False, before claiming any item, when the runners cannot go to a worker (they
-        do not pickle) and when every runner's builds are too short for one
-        (:meth:`_measure_build`), and the caller builds as without workers; the decision takes
-        no inputs when the runners' build times are measured or given (``build_seconds``), and
-        one profile's otherwise. The items of a runner whose builds are too short, and an item
-        whose inputs cannot go to a worker, are left to the profiling.
+        do not pickle), and the caller builds as without the pool. An item whose inputs cannot
+        go to a worker is left to the profiling.
         """
         pool = BuildPool.get()
-        # Each runner's builds are measured, and go to the workers, on their own: a runner
-        # whose kernels ship prebuilt (cuBLAS) says nothing of a JIT runner's.
+        # A runner's builds are a family of their own: the pool learns each family's memory.
         families = [
             f"{custom_op}|{type(runner).__name__}" for runner in runners
         ]
-        expected_s = tuning_config.build_seconds
-        in_workers = {
-            r
-            for r in range(len(runners))
-            if pool.worth_a_worker(families[r], expected_s)
-        }
-        unmeasured = [
-            r for r in range(len(runners))
-            if pool.unmeasured(families[r], expected_s)
-        ]
-        if not in_workers and not unmeasured:
-            return False
         pending = [p for p in profiles if is_pending(p)]
         if not pending:
             return True
@@ -2037,30 +1998,9 @@ class AutoTuner:
             "do_preparation" in inspect.signature(r.forward).parameters
             for r in runners
         ]
-        # An unmeasured runner builds a tactic of a profile here, timed. The ranks that share
-        # the builds start at different profiles and tactics, so that they measure different
-        # kernels rather than wait for one of them to build the same.
-        offset = jit_share.start_fraction() if share_builds else 0.0
-        first = int(offset * len(pending))
-        for p in pending[first:] + pending[:first]:
-            if not unmeasured:
-                break
-            tensors = self._tuning_tensors(p, inputs, tuning_config)
-            for r in list(unmeasured):
-                tactics = runners[r].get_valid_tactics(tensors, p, **kwargs)
-                if not tactics:
-                    continue
-                unmeasured.remove(r)
-                tactic = tactics[int(offset * len(tactics))]
-                if self._measure_build(families[r], runners[r], tensors, tactic,
-                                       prepares[r], **kwargs):
-                    in_workers.add(r)
-            del tensors
-        if not in_workers:
-            return False
         chosen, specs, sweep, n_items = self._pool_items(
             custom_op, runners, pending, inputs, tuning_config, keep_values,
-            share_builds, in_workers, **kwargs)
+            share_builds, set(range(len(runners))), **kwargs)
         if not n_items:
             return True
         builds = [
@@ -2133,7 +2073,7 @@ class AutoTuner:
                          inputs: List[torch.Tensor], **kwargs) -> None:
         """In the build state, queue the builds of every (profile, runner, tactic) the op's
         tuning would time for ``inputs`` and the cache lacks, and return at once; for an op that
-        sets ``build_in_workers`` and whose runners are not collective (MERGE), while workers
+        sets ``use_build_pool_in_rehearsal`` and whose runners are not collective (MERGE), while workers
         take builds.
 
         A runner's builds go to the worker processes (``BuildPool.worth_a_worker``); those too
@@ -2144,7 +2084,7 @@ class AutoTuner:
         workers'. A call with the runners and input shapes of an earlier one returns at once.
         """
         pool = BuildPool.get()
-        if (not tuning_config.build_in_workers
+        if (not tuning_config.use_build_pool_in_rehearsal
                 or tuning_config.distributed_tuning_strategy
                 == DistributedTuningStrategy.MERGE or not pool.accepting()):
             return
@@ -2161,8 +2101,8 @@ class AutoTuner:
         thread_safe = tuning_config.parallel_jit_warmup != 0
         in_workers = {
             r
-            for r in range(len(runners)) if pool.worth_a_worker(
-                families[r], tuning_config.build_seconds, thread_safe)
+            for r in range(len(runners))
+            if pool.worth_a_worker(families[r], thread_safe=thread_safe)
         }
         lane = pool.threads if thread_safe else None
         on_threads = (set(range(len(runners))) -
@@ -2491,8 +2431,12 @@ class AutoTuner:
         input_tensors: List[torch.Tensor],
         profile: OptimizationProfile,
         tuning_config: TuningConfig,
+        *,
+        deal: bool = True,
         **kwargs,
     ) -> float:
+        """``deal``: under PARALLEL, time this rank's share of the (runner, tactic) pairs; False
+        when another rank of the group does not profile ``profile``, to time them all."""
         # PARALLEL ranks profile different tactics, so window requests here would diverge the
         # per-rank pools and let a later request register a window collectively on some ranks only.
         window_guard = (nccl_window_allocation_suppressed()
@@ -2506,9 +2450,13 @@ class AutoTuner:
                 input_tensors = tuning_config.inputs_pre_hook(input_tensors)
             self._profiling_depth += 1
             try:
-                return self._profile_runners_impl(custom_op, runners,
-                                                  input_tensors, profile,
-                                                  tuning_config, **kwargs)
+                return self._profile_runners_impl(custom_op,
+                                                  runners,
+                                                  input_tensors,
+                                                  profile,
+                                                  tuning_config,
+                                                  deal=deal,
+                                                  **kwargs)
             finally:
                 self._profiling_depth -= 1
 
@@ -2519,6 +2467,8 @@ class AutoTuner:
         input_tensors: List[torch.Tensor],
         profile: OptimizationProfile,
         tuning_config: TuningConfig,
+        *,
+        deal: bool = True,
         **kwargs,
     ) -> float:
         """Profile runners and select the best tactic.
@@ -2620,10 +2570,10 @@ class AutoTuner:
             pair_offset = self._parallel_deal_start(
                 custom_op, profile, tuning_config.distributed_tuning_strategy)
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
-                valid_tactics = self._maybe_parallelize_tactics(
+                valid_tactics = (self._maybe_parallelize_tactics(
                     all_valid_tactics,
                     tuning_config.distributed_tuning_strategy,
-                    offset=pair_offset)
+                    offset=pair_offset) if deal else all_valid_tactics)
                 pair_offset += len(all_valid_tactics)
                 local_pairs += len(valid_tactics)
                 if "do_preparation" in runner_arg_names and len(
@@ -3548,19 +3498,24 @@ class AutoTuner:
         """Whether ``is_cache_hit`` holds on every rank (host all-gather)."""
         return all(self._dist.tp_cp_allgather(obj=bool(is_cache_hit)))
 
-    def _profile_hits_on_all_ranks(self, profiles: List[OptimizationProfile],
-                                   hits: List[bool]) -> List[bool]:
-        """Per profile, whether every rank that builds it has it cached (one host all-gather).
+    def _profile_hits_on_all_ranks(
+            self, profiles: List[OptimizationProfile],
+            hits: List[bool]) -> Tuple[List[bool], List[bool]]:
+        """Per profile, whether every rank that builds it has it cached, and whether every rank
+        builds it (one host all-gather).
 
         Ranks build their profiles from their own input shapes (attention DP), so the lists may differ.
         """
         keys = [p.get_opt_shapes() for p in profiles]
         missed = set()
+        everywhere = set(keys)
         for rank_keys, rank_hits in self._dist.tp_cp_allgather(
                 obj=(keys, [bool(hit) for hit in hits])):
             missed.update(key for key, hit in zip(rank_keys, rank_hits)
                           if not hit)
-        return [key not in missed for key in keys]
+            everywhere.intersection_update(rank_keys)
+        return ([key not in missed
+                 for key in keys], [key in everywhere for key in keys])
 
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
                              strategy: DistributedTuningStrategy) -> int:

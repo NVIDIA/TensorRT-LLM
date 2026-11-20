@@ -12,9 +12,17 @@ from typing import ClassVar
 
 import torch
 
+from tensorrt_llm import _jit_share as jit_share
 from tensorrt_llm.logger import logger
 
-from ..autotuner import AutoTuner, OptimizationProfile, TunableRunner, TuningConfig
+from ..autotuner import (
+    AutoTuner,
+    BuildStrategy,
+    DistributedTuningStrategy,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
 from ..modules.mxfp8_swapab import MXFP8SwapABGemmRunner
 
 MXFP8_DEFAULT_BACKENDS = (
@@ -35,6 +43,29 @@ def validate_mxfp8_backends(backends: tuple[str, ...]) -> tuple[str, ...]:
             f"expected a nonempty subset of {MXFP8_DEFAULT_BACKENDS!r}"
         )
     return tuple(dict.fromkeys(backends))
+
+
+class _FlashInferKernelCache(jit_share.SharedKernelCache):
+    """FlashInfer's CuTe DSL MXFP8 GEMM kernels, shared like a runner's ``kernel_cache``.
+
+    Keys are ``(device index, kernel key)`` and values ``(kernel, max active clusters)``. A kernel
+    is named by its device's SM count rather than the device's index, since it is compiled for
+    that many clusters, and its cluster count is kept beside it.
+    """
+
+    def _shared_text(self, key) -> str | None:
+        if not (isinstance(key, tuple) and len(key) == 2 and isinstance(key[0], int)):
+            return None
+        device_index, kernel_key = key
+        sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+        return super()._shared_text((sms, kernel_key))
+
+    def _export(self, value, obj: str, name: str, meta: str) -> None:
+        kernel, clusters = value
+        jit_share._export_kernel(kernel, obj, name, meta, extra=clusters)
+
+    def _load(self, obj: str, name: str, meta: str):
+        return jit_share._load_kernel(obj, name, meta), jit_share._exported_extra(meta)
 
 
 @lru_cache
@@ -163,8 +194,14 @@ class TrtllmMXFP8GemmRunner(TunableRunner):
 class MXFP8GemmUnifiedRunner(TunableRunner):
     """Compare concrete FlashInfer, TensorRT-LLM CUTLASS and Swap-AB configurations in one tuner."""
 
-    # Graph warmup visits each capture shape; cache and profiling use that exact M.
-    tuning_config = TuningConfig(cold_l2_flush_bytes=_COLD_L2_FLUSH_BYTES)
+    # Graph warmup visits each capture shape; cache and profiling use that exact M. The ranks of
+    # the tuning group time a share of the tactics each, and compile each FlashInfer CuTe DSL kernel
+    # once when they share JIT builds (share_kernel_caches).
+    tuning_config = TuningConfig(
+        cold_l2_flush_bytes=_COLD_L2_FLUSH_BYTES,
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+        build_strategy=BuildStrategy.PARALLEL,
+    )
     # Expose JIT participation so loaded winners are primed before graph capture.
     kernel_cache: ClassVar[dict] = MXFP8SwapABGemmRunner.kernel_cache
 
@@ -186,6 +223,21 @@ class MXFP8GemmUnifiedRunner(TunableRunner):
 
     def unique_id(self) -> tuple:
         return (self.output_dtype, self.allowed_backends)
+
+    @classmethod
+    def share_kernel_caches(cls) -> None:
+        """Share FlashInfer's cache of CuTe DSL MXFP8 kernels across the processes that share JIT
+        builds (``jit_share.share_kernel_caches``)."""
+        try:
+            import flashinfer
+            from flashinfer.gemm import gemm_base
+        except ImportError:
+            return
+        cache = getattr(gemm_base, "_CUTE_DSL_MM_MXFP8_KERNEL_CACHE", None)
+        if isinstance(cache, dict) and not isinstance(cache, jit_share.SharedKernelCache):
+            gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE = _FlashInferKernelCache(
+                f"flashinfer-{flashinfer.__version__}.mm_mxfp8.cute_dsl", cache
+            )
 
     def get_valid_tactics(
         self, inputs: list[torch.Tensor], profile: OptimizationProfile | None, **kwargs

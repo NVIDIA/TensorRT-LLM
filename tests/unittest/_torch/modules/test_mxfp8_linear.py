@@ -21,6 +21,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import tensorrt_llm._jit_share as jit_share
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops as flashinfer_ops_module
 import tensorrt_llm._torch.custom_ops.mxfp8_gemm as mxfp8_gemm_module
 import tensorrt_llm._torch.custom_ops.torch_custom_ops as custom_ops_module
@@ -1231,7 +1232,7 @@ def test_flashinfer_mxfp8_builds_are_queued_in_the_build_state_only(
     # The build state queues the GEMM's own builds, which its runner declares.
     [([runner], config)] = chosen
     assert type(runner) is custom_ops_module.FlashInferMXFP8GemmRunner
-    assert config.build_in_workers
+    assert config.use_build_pool_in_rehearsal
 
 
 @pytest.mark.cpu_only
@@ -1257,3 +1258,58 @@ def test_flashinfer_mxfp8_runner_builds_one_cutlass_module_for_every_shape(
     for tactic in (runner.CUTLASS, runner.CUTE_DSL):
         assert runner.build_key(Mock(), tactic) == runner.build_key(Mock(), tactic)
     assert runner.build_key(Mock(), runner.CUTLASS) != runner.build_key(Mock(), runner.CUTE_DSL)
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_mxfp8_kernels_are_named_by_sm_count(monkeypatch):
+    """FlashInfer keys a CuTe DSL MXFP8 kernel by device index; its shared name uses the device's
+    SM count instead, so ranks on GPUs of one kind share it, and a key of another layout stays in
+    the process."""
+    sms = {0: 148, 1: 148, 2: 132}
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda index: SimpleNamespace(multi_processor_count=sms[index]),
+    )
+    cache = mxfp8_gemm_module._FlashInferKernelCache("owner")
+    key = (32, (128, 64), (1, 1), True, False, True, torch.bfloat16, 1)
+    assert cache._shared_text((0, key)) == cache._shared_text((1, key)) is not None
+    assert cache._shared_text((2, key)) != cache._shared_text((0, key))
+    assert cache._shared_text(key) is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Needs SM100/SM103 and FlashInfer's CuTeDSL MXFP8 kernels",
+)
+@torch.inference_mode()
+def test_mxfp8_flashinfer_cute_dsl_kernels_are_shared(monkeypatch, tmp_path):
+    """With shared JIT builds, a FlashInfer CuTe DSL MXFP8 kernel one process compiled is exported
+    to the share directory; another process (a new, empty cache here) loads it instead of
+    compiling it, and the loaded kernel gives the same bits."""
+    from flashinfer.gemm import gemm_base
+
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(jit_share._LOG_ENV, "1")
+    monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_MXFP8_KERNEL_CACHE", {})
+    monkeypatch.setattr(MXFP8GemmUnifiedRunner, "kernel_cache", MXFP8GemmUnifiedRunner.kernel_cache)
+    inputs = _mxfp8_swapab_inputs(32, 256, 512)
+    runner = MXFP8GemmUnifiedRunner(torch.bfloat16, ("flashinfer_cute_dsl",))
+    tactic = runner.get_valid_tactics(inputs, None)[0]
+    with jit_share.sharing_kernels():
+        jit_share.share_kernel_caches([runner])
+        assert isinstance(gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE, jit_share.SharedKernelCache)
+        compiled = runner(inputs, tactic=tactic)
+        gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE = {}
+        jit_share.share_kernel_caches([runner])
+        loaded = runner(inputs, tactic=tactic)
+    torch.cuda.synchronize()
+    actions = [
+        line.split()[2]
+        for log in (tmp_path / "log").glob("*.txt")
+        for line in log.read_text().splitlines()
+    ]
+    assert actions == ["cute-built", "cute-loaded"], actions
+    assert torch.equal(loaded, compiled)

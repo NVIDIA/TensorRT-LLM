@@ -835,14 +835,14 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
     # build() reads nothing of its inputs: a worker process gets meta tensors.
     builds_from_shapes = True
 
-    # FlashInfer's CUTLASS MXFP8 module, which build() compiles, builds on the
-    # rank's worker processes (prebuild_flashinfer_mxfp8_gemm).
+    # In a rehearsal, FlashInfer's CUTLASS MXFP8 module, which build() compiles,
+    # builds on the build pool (prebuild_flashinfer_mxfp8_gemm).
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_power_of_2_num_tokens_buckets,
             next_positive_power_of_2), ),
         constraint_specs=(ConstraintSpec(1, 0, _mxfp8_scale_infer_shape), ),
-        build_in_workers=True,
+        use_build_pool_in_rehearsal=True,
     )
 
     def __init__(self, output_dtype: torch.dtype) -> None:
@@ -2341,10 +2341,6 @@ class Fp8QuantKernelRunner(TunableRunner):
 # autotuner drives the JIT of a sweep's distinct layouts on a thread pool
 # (TuningConfig.parallel_jit_warmup; -1 sizes it from this rank's CPUs).
 _DEEP_GEMM_JIT_WARMUP_THREADS = -1
-# One DeepGemm build: an nvcc compile of about 2 s on GB300. The BuildPool's
-# workers take the builds (TuningConfig.build_in_workers) only when that repays
-# a worker (TLLM_KERNEL_BUILDER_MIN_BUILD_S); otherwise the thread pool runs them.
-_DEEP_GEMM_BUILD_S = 2.0
 
 
 class fp8SwapABGemmRunner(TunableRunner):
@@ -2367,8 +2363,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
         build_strategy=BuildStrategy.PARALLEL,
-        build_in_workers=True,
-        build_seconds=_DEEP_GEMM_BUILD_S,
+        use_build_pool_in_rehearsal=True,
     )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
@@ -2425,8 +2420,7 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
         build_strategy=BuildStrategy.PARALLEL,
-        build_in_workers=True,
-        build_seconds=_DEEP_GEMM_BUILD_S,
+        use_build_pool_in_rehearsal=True,
     )
 
     def __init__(self, output_dtype: torch.dtype,
