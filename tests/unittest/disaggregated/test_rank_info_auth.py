@@ -350,6 +350,7 @@ def test_rank_info_admission_waits_for_asymmetric_receive_fences(
 
     for rank in range(2):
         tc = object.__new__(KvCacheTransceiverV2)
+        tc._init_receive_cancellation_state()
         tc.kv_transfer_timeout_ms = None
         tc._gen_need_sync = True
         tc._init_gen_idle_poll(idle_skip)
@@ -445,6 +446,7 @@ def test_receive_start_failure_preserves_collectives_and_ownership(
 
     def make_transceiver(rank):
         tc = object.__new__(KvCacheTransceiverV2)
+        tc._init_receive_cancellation_state()
         tc._gen_need_sync = True
         tc._init_gen_idle_poll(idle_skip)
         tc._gen_allgather = lambda payload: gather(rank, payload)
@@ -550,6 +552,7 @@ def test_receive_start_failure_preserves_collectives_and_ownership(
 
 def test_cancel_pending_rank_info_admission_does_not_publish():
     tc = object.__new__(KvCacheTransceiverV2)
+    tc._init_receive_cancellation_state()
     req = SimpleNamespace(py_request_id=7, request_id=7, py_disaggregated_params=None)
     tc._pending_rank_info_admissions = {7: (req, None)}
     tc._wait_reqs, tc._send_sessions, tc._recv_sessions = {}, {}, {}
@@ -593,12 +596,13 @@ def test_protected_cancel_joins_keyed_admission_and_retains_peer_access(
 
     for rank in range(2):
         tc = object.__new__(KvCacheTransceiverV2)
+        tc._init_receive_cancellation_state()
         tc._context_first_ownership = True
         tc._gen_need_sync = True
         tc._init_gen_idle_poll(True)
         tc._gen_allgather = lambda payload, rank=rank: gather(rank, payload)
         tc._recv_sessions, tc._recv_reqs = {}, {}
-        tc._cancelled_gen_receives, tc._cancelled_receive_fences = {}, {}
+        tc._cancelled_receive_fences = {}
         tc._transfer_worker = Mock(create_receive_retirement=Mock(return_value=owner))
         tc._start_async_receive = Mock()
         req = SimpleNamespace(
@@ -695,12 +699,13 @@ def test_protected_cancel_preserves_rejected_rank_info_outcome(entry_point):
 
     for rank in range(2):
         tc = object.__new__(KvCacheTransceiverV2)
+        tc._init_receive_cancellation_state()
         tc._context_first_ownership = True
         tc._gen_need_sync = True
         tc._gen_allgather = lambda payload, rank=rank: gather(rank, payload)
         tc._init_gen_idle_poll(True)
         tc._recv_sessions, tc._recv_reqs = {}, {}
-        tc._cancelled_gen_receives, tc._cancelled_receive_fences = {}, {}
+        tc._cancelled_receive_fences = {}
         req = SimpleNamespace(
             py_request_id=7,
             request_id=7,
@@ -871,12 +876,13 @@ def test_one_rank_timeout_enrolls_unpublished_peer_without_starting_its_clock(mo
 
     for rank in range(2):
         tc = object.__new__(KvCacheTransceiverV2)
+        tc._init_receive_cancellation_state()
         tc._context_first_ownership = True
         tc._gen_need_sync = True
         tc._init_gen_idle_poll(True)
         tc._gen_allgather = lambda payload, rank=rank: gather(rank, payload)
         tc._recv_sessions, tc._recv_reqs = {}, {}
-        tc._cancelled_gen_receives, tc._cancelled_receive_fences = {}, {}
+        tc._cancelled_receive_fences = {}
         tc._transfer_worker = Mock(create_receive_retirement=Mock(return_value=owner))
         tc._start_async_receive = Mock()
         tc.kv_transfer_timeout_ms = 1000

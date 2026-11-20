@@ -491,6 +491,7 @@ def test_context_transfer_status_never_sent_no_sync_is_a_noop() -> None:
 
 def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._ever_had_recv_session = False
     transceiver._gen_need_sync = True
     transceiver._init_gen_idle_poll(False)
@@ -1445,6 +1446,7 @@ def _make_gen_ranks(world_size: int, fail_fetch: bool = False):
     ranks = []
     for rank in range(world_size):
         transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._init_receive_cancellation_state()
         transceiver._ever_had_recv_session = True
         transceiver._gen_need_sync = True
         transceiver._gen_allgather = collective.allgather_for(rank)

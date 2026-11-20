@@ -38,7 +38,10 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorker,
 )
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_mod
-from tensorrt_llm._torch.disaggregation.orchestration.cancellation import ReceiveCancellation
+from tensorrt_llm._torch.disaggregation.orchestration.cancellation import (
+    ReceiveCancellation,
+    ReceiveCancellationVote,
+)
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
@@ -175,6 +178,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
         requests_in_transfer=lambda: {}, has_any_inflight_requests=lambda: False
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._fp4_mla_bridge_enabled = True
     transceiver._ever_had_recv_session = False
     transceiver._gen_need_sync = False
@@ -218,7 +222,6 @@ def _enable_context_first(executor: PyExecutor, request: LlmRequest) -> None:
     transceiver = executor.kv_cache_transceiver
     transceiver._fp4_mla_bridge_enabled = False
     transceiver._context_first_ownership = True
-    transceiver._cancelled_gen_receives = {}
 
 
 def _abort(executor: PyExecutor, request: LlmRequest, *, repeats: int = 1) -> None:
@@ -2134,6 +2137,7 @@ def test_legacy_tp_cancel_reaches_multimodal_model_generation_work(
         engine._mm_encoder_item_scheduling_enabled = mm_item_scheduling
         transceiver = object.__new__(KvCacheTransceiverV2)
         transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._init_receive_cancellation_state()
         transceiver._fp4_mla_bridge_enabled = False
         transceiver._dist = engine.dist
         transceiver._recv_reqs = {}
@@ -2223,6 +2227,7 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
         engine._pending_response_terminations = []
         transceiver = object.__new__(KvCacheTransceiverV2)
         transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._init_receive_cancellation_state()
         transceiver._fp4_mla_bridge_enabled = False
         transceiver._dist = engine.dist
         engine.kv_cache_transceiver = transceiver
@@ -2303,6 +2308,7 @@ def test_legacy_tp_cancel_with_request_missing_on_peer(
         engine.previous_batch = None
         transceiver = object.__new__(KvCacheTransceiverV2)
         transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._init_receive_cancellation_state()
         transceiver._fp4_mla_bridge_enabled = False
         transceiver._dist = engine.dist
         if rank == 1 and peer_owns_receive:
@@ -2351,6 +2357,7 @@ def test_legacy_tp_cancel_propagates_to_peer_with_active_request(executor: PyExe
         engine.previous_batch = None
         transceiver = object.__new__(KvCacheTransceiverV2)
         transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._init_receive_cancellation_state()
         transceiver._fp4_mla_bridge_enabled = False
         transceiver._dist = engine.dist
         engine.kv_cache_transceiver = transceiver
@@ -2400,6 +2407,7 @@ def test_legacy_tp_cp_cancel_vote_covers_cp_ranks_with_missing_replica(
         engine.dist = group.rank(rank)
         transceiver = object.__new__(KvCacheTransceiverV2)
         transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._init_receive_cancellation_state()
         transceiver._fp4_mla_bridge_enabled = False
         transceiver._dist = engine.dist
         transceiver._recv_reqs = {}
@@ -2491,6 +2499,7 @@ def test_legacy_tp_cancel_with_capacity_connector_completes_consensus(
         engine.dist = group.rank(rank)
         transceiver = object.__new__(KvCacheTransceiverV2)
         transceiver.__dict__.update(executor.kv_cache_transceiver.__dict__)
+        transceiver._init_receive_cancellation_state()
         transceiver._fp4_mla_bridge_enabled = False
         transceiver._context_first_ownership = context_first_runtime
         transceiver._dist = engine.dist
@@ -3183,6 +3192,58 @@ def test_latched_timeout_wins_before_first_user_cancel_vote(
     assert request.py_kv_receive_cancel_outcome is ReceiveCancellation.FAILED
     executor.resource_manager.free_resources.assert_called_once_with(request)
     aux.free_slot.assert_called_once_with(0)
+
+
+def test_taking_peer_cancel_intents_detaches_the_previous_poll(executor: PyExecutor) -> None:
+    """Taking peer intent detaches the old map from subsequent receive polls.
+
+    Args:
+        executor: Executor fixture with isolated receive ownership state.
+    """
+    tc = executor.kv_cache_transceiver
+    tc._progress_cancelled_gen_receives([{17: ReceiveCancellationVote(True, False)}])
+    first = tc.take_receive_cancellation_intents()
+    assert tc.take_receive_cancellation_intents() == {}
+    tc._progress_cancelled_gen_receives([{23: ReceiveCancellationVote(False, False)}])
+    assert first == {17: True}
+    assert tc.take_receive_cancellation_intents() == {23: False}
+
+
+def test_post_poll_alignment_uses_this_iterations_global_cancel_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both ranks recheck a one-sided abort, then skip the next empty recheck.
+
+    Args:
+        monkeypatch: Fixture used to construct the two independent executor ranks.
+    """
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    engines = [executor.__wrapped__(monkeypatch) for _ in range(2)]
+    for rank, engine in enumerate(engines):
+        _enable_context_first(engine, _request(1))
+        engine.dist = engine.disagg._dist = group.rank(rank)
+        engine._release_unused_connector_reservations = Mock()
+        engine._poll_encoder_steps = Mock()
+        engine._fetch_and_activate_new_requests = Mock(return_value=[])
+        engine._handle_control_request = Mock()
+        engine.kv_cache_transceiver.prepare_context_requests = Mock()
+        engine.disagg.poll_gen_transfers = Mock()
+        engine._activate_completed_remote_tails = Mock(side_effect=_ReachedScheduler)
+
+    def prepare(rank: int) -> None:
+        """Run one rank up to the scheduling boundary."""
+        with pytest.raises(_ReachedScheduler):
+            engines[rank]._prepare_and_schedule_batch()
+
+    # The ID has no active replica. The first pass consumes it before the
+    # second pass, so even rank 0's local list cannot stand in for the vote.
+    _abort(engines[0], _request(17))
+    for expected in (2, 1):
+        group.run(prepare)
+        for engine in engines:
+            assert [op for op, _ in engine.dist.calls] == ["tp_allgather"] * expected
+            assert not engine.canceled_req_ids
+            engine.dist.calls.clear()
 
 
 def test_protected_tp_cancel_with_capacity_connector_never_enters_receive_admission(

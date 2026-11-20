@@ -162,6 +162,7 @@ def main() -> None:
 
     # Execute the real consensus path with no physical receive sessions.
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = True
     transceiver._gen_idle_agreed = False

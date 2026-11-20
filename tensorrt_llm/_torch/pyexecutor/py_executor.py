@@ -6196,9 +6196,8 @@ class PyExecutor:
         new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
-        if self.disagg.supports_group_receive_cancellation:
-            # The symmetric receive poll commits TP-wide logical decisions.
-            # Apply them before GEN_INIT can enter this iteration's scheduler.
+        if self.disagg.needs_post_poll_gen_cancellation:
+            # Apply same-iteration decisions without a second empty TP vote.
             new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self._activate_completed_remote_tails()
         self.disagg.check_transfer_timeouts()
