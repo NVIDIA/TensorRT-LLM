@@ -21,7 +21,7 @@ import pytest
 import torch
 from diffusers import AutoencoderKLMiniMaxH3
 
-from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.parallel.vae import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.components.tiled_vae import (
     TiledAutoencoderKLMiniMaxH3,
 )
 

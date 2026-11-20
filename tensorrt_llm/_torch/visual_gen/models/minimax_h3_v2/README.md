@@ -7,7 +7,7 @@
 
 ## Run a target
 
-Set `TLLM_VISUALGEN_MODELING2_H3=1` before starting the Python process or server. Use the same setting on every worker. Unset or `0` selects V1. Set `H3_CHECKPOINT` to your base H3 checkpoint directory and run this example from the repository root.
+Set `TLLM_VISUALGEN_MODELING2_H3=1` before starting the Python process or server. Use the same setting on every worker. An unset switch or any value other than `1` selects V1. Set `H3_CHECKPOINT` to your base H3 checkpoint directory and run this example from the repository root.
 
 ```bash
 TLLM_VISUALGEN_MODELING2_H3=1 python examples/visual_gen/models/minimax_h3.py \
@@ -30,6 +30,8 @@ Split out a sibling target when the differences need to evolve and be tested tog
 
 Choose the boundary case by case. A target can specialize only the transformer and denoising loop while reusing encoding and decoding. Include an encoder or decoder when its inputs, layout or execution order also diverge. For a deployment specialization, use `<checkpoint-and-quantization>__<sm>__<parallel>/`. In `route(config, checkpoint_dir)`, check the specialization's effective precision, device capabilities, topology and required features and return its imported pipeline class by name so CI can identify the target. On a mismatch, return the functional target for the same checkpoint. A check deferred to the constructor can fail after selection. Test both the match and fallback through [`AutoPipeline.resolve_class`](../../pipeline_registry.py). The selected pipeline handles per-request and per-step decisions.
 
+Wire a specialization during construction. For example, [FastH3](fasth3/pipeline.py) passes `attention_cls=MiniMaxH3VSAAttention` to the [family transformer](components/transformer.py), which instantiates that class in its trunk blocks. A target with a different attention implementation can pass its own `target/components/attention.py` class at that same point. If its communication schedule also changes, that class imports `target/components/ulysses_attention.py`. Add `target/ops/` or `target/kernels/` only for computations or kernels the target owns. A target reuses family implementations through ordinary imports.
+
 ## Where to put code
 
 ### Choose the implementation layer
@@ -40,11 +42,20 @@ Place a change according to the decision it makes. Then choose its [sharing scop
 | --- | --- | --- |
 | Pipeline | How a request moves through conditioning, denoising and decoding, including which components run at each step. | The [family pipeline](pipeline.py) advances the joint audio/video denoising loop. The [FastH3 target](fasth3/pipeline.py) supplies its trained schedule. |
 | Component | How a model block computes its output. It composes operations and holds the parameters or other instance state that block needs. | [H3 attention](components/attention.py) owns its projections and normalization weights and chooses when to apply fused Q/K norm and RoPE. |
-| Parallel | Define rank-local shard ranges and schedule collectives on the participating process group. Components use those ranges to construct paired projections and load weights. | [H3 Ulysses](parallel/ulysses.py) schedules V, Q, K on the asynchronous path and waits for the transfers before attention. |
 | Operation | The inputs, outputs and observable buffer mutations of one tensor computation or collective. The caller supplies any runner, workspace or other execution state. | The [Q/K norm and RoPE op](ops/rope.py) takes packed QKV, norm weights and rotation tables. Its PyTorch reference defines the expected Q and K. |
 | Kernel | How the device executes the operation, including fusion, tiling, memory access and launch configuration. | The [fused Triton kernel](kernels/fused_rope.py) loads the Q/K head data, computes RMS normalization and rotates the leading channels in one launch. |
 
-Changing the fused RoPE tile size belongs in `kernels/`. Changing the rotation from the leading channels to the trailing channels changes the contract in `ops/` and its reference tests. In asynchronous Ulysses, [parallel/ulysses.py](parallel/ulysses.py) determines when the V/Q/K transfers run. [ops/ulysses.py](ops/ulysses.py) determines how the three received buffers map to the attention layout.
+Changing the fused RoPE tile size belongs in `kernels/`. Changing which channels rotate changes the contract in `ops/` and its reference tests.
+
+### Where parallel behavior belongs
+
+| Change | Where to start |
+| --- | --- |
+| Change which projection channels each TP rank owns, or when its partial results are summed | [Linear](components/linear.py) owns the projection shard bounds, quantization alignment and row-parallel output reduction. [MLP](components/mlp.py) uses the same bounds for gate/up and down. [Attention](components/attention.py) assigns complete Ulysses head groups to each TP rank. |
+| Change how projection, communication and attention overlap | [Ulysses attention](components/ulysses_attention.py) runs both paths. The synchronous path exchanges projected Q/K/V. The asynchronous path starts each transfer after its V, Q or K projection and waits before local attention. Both exchange the output back to sequence shards. |
+| Change which Q/K/V rows or heads a rank receives, or the layout of its receive buffers | The [H3 QKV ops](ops/ulysses_qkv.py) specify the exchange and local buffer rearrangement. Each has a tensor reference independent of the attention schedule. |
+
+The [sequence sharder](components/sequence_sharder.py) pads, shards and gathers DiT and refiner rows. The [tiled VAE](components/tiled_vae.py) distributes video decode tiles. Base H3 uses these parallel paths. FastH3 runs on one GPU. The V1 [token-sharded TP layout](../../parallel/token_sharded_tp.py) is a separate feature used by Wan.
 
 ### Choose the sharing scope
 
@@ -80,11 +91,9 @@ FlashInfer uses *prefill* for attention over a sequence of query rows. H3 calls 
 
 The [H3 attention component](components/dense_attention.py) adapts model inputs to these contracts. The [gated VSA computation](ops/vsa.py) serves both base checkpoints with gate weights and explicit VSA configuration and the FastH3 target.
 
-**H3 communication.** Base H3 uses the [family Ulysses implementation](parallel/ulysses.py) for projection order, streams and barriers. FastH3 runs on one GPU. The [Ulysses ops](ops/ulysses.py) exchange Q/K/V or convert receive buffers to H3 attention layouts. Models can call the same native communication kernel with different schedules and layouts.
-
 Use the public operation or runner exported by the catalog entry. For example, H3 creates `FlashInferPrefillRunner` from [flashinfer_prefill.py](../../catalog/attention/flashinfer_prefill.py) and supplies the per-model plan cache. The [FA4 entry](../../catalog/attention/flash_attention_4.py) owns compatibility with the provider's `_flash_attn_fwd` binding. Keep mask conversion, layer selection and denoising policy with the model. Use the [Modeling V2 operation contract](../../../modeling_v2/README.md#writing-operations) for new entries.
 
-The H3 pilot still has adapter-specific dependencies. [H3 uncached attention](ops/uncached_attention.py) calls `FallbackFmha.attention`, the [H3 PrimTS adapter](components/trtllm_attention_prims.py) calls the private `_validate_block_sparse_static_profile` helper, and the [H3 SOL path](components/dense_attention.py) checks CuTe availability through `_cute_fmha_kernel`. These implementation details belong to their adapters. New consumers should use a public kernel or runner interface, or expose a model-independent operation with a tested contract. See the [LLM V2 dependency rule](../../../modeling_v2/README.md#modeling-v1-code).
+H3 keeps backend-specific adapters in the model. [Uncached attention](ops/uncached_attention.py) calls `FallbackFmha.attention`. [H3 PrimTS](components/trtllm_attention_prims.py) calls `_validate_block_sparse_static_profile`. The [TRTLLM SOL adapter](components/trtllm_attention.py) calls the [VisualGen SOL predictor](../../attention/backends/sparse/sol/predictor.py), and the [CuTe SOL path](components/dense_attention.py) checks availability through `_cute_fmha_kernel`. Treat these as implementation dependencies. New consumers should use an exported kernel or runner interface, or introduce a model-independent operation with a reference. See the [LLM V2 dependency rule](../../../modeling_v2/README.md#modeling-v1-code).
 
 ## File map
 
@@ -114,23 +123,22 @@ Paths below are relative to this directory. The root [\_\_init\_\_.py](__init__.
 | [components/transformer.py](components/transformer.py) | Assemble the token refiner, DiT blocks and joint audio/video outputs. |
 | [components/cudnn_runner.py](components/cudnn_runner.py) | Build dense cuDNN plans for H3. |
 | [components/skip_softmax_threshold.py](components/skip_softmax_threshold.py) | Resolve the current threshold for H3 CuTe attention. |
-| [components/attention.py](components/attention.py) | Build H3 projections, per-head normalization, three-axis RoPE and dense or gated attention. |
-| [components/linear.py](components/linear.py) | Own rank-local projection parameters and dispatch their GEMM. |
+| [components/attention.py](components/attention.py) | Partition heads across TP ranks and construct H3 projections, per-head normalization, three-axis RoPE and dense or gated attention. |
+| [components/linear.py](components/linear.py) | Compute projection shard bounds, own rank-local weights, dispatch GEMM and reduce row-parallel outputs. |
 | [components/projection_weights.py](components/projection_weights.py) | Partition, pack and quantize checkpoint tensors and scales for those projections. |
 | [components/mlp.py](components/mlp.py) | Compose gate/up projections, SwiGLU and down projection. |
 | [components/norm.py](components/norm.py) | Own H3 RMSNorm and per-head RMSNorm weights. |
 | [components/text_encoder.py](components/text_encoder.py) | Extract H3 conditioning from the required Qwen3-VL hidden layer. |
 | [components/vae.py](components/vae.py) | Prepare the video decoder and decode video and audio latents. |
-| [parallel/tp.py](parallel/tp.py) | Compute TP shard bounds and head partitions compatible with Ulysses. |
-| [parallel/sequence_sharder.py](parallel/sequence_sharder.py) | Pad and shard refiner and DiT inputs, prepare padding masks, and gather and trim output rows. |
-| [parallel/ulysses.py](parallel/ulysses.py) | Compose head/sequence exchanges, projection ordering and CUDA stream synchronization. |
-| [parallel/vae.py](parallel/vae.py) | Partition video decode tiles across the participating VAE ranks and combine their results. |
+| [components/sequence_sharder.py](components/sequence_sharder.py) | Pad and shard refiner and DiT inputs, prepare padding masks, and gather and trim output rows. |
+| [components/ulysses_attention.py](components/ulysses_attention.py) | Compose head/sequence exchanges, projection ordering and CUDA stream synchronization. |
+| [components/tiled_vae.py](components/tiled_vae.py) | Partition video decode tiles across the participating VAE ranks and combine their results. |
 
 | Operations and kernels | Responsibility |
 | --- | --- |
 | [ops/uncached_attention.py](ops/uncached_attention.py) | Issue uncached TRTLLM attention for packed H3 rows. |
 | [kernels/sol_attention.py](kernels/sol_attention.py) | Launch SOL attention or invoke the supplied dense fallback. |
-| [ops/ulysses.py](ops/ulysses.py) | Exchange Q/K/V for synchronous H3 attention and convert asynchronous receive buffers into its attention layout. |
+| [ops/ulysses_qkv.py](ops/ulysses_qkv.py) | Exchange Q/K/V for synchronous H3 attention and convert asynchronous receive buffers into its attention layout. |
 | [ops/activation.py](ops/activation.py) | Define the H3 SwiGLU operation. |
 | [ops/adaln.py](ops/adaln.py) | Define adaptive normalization/modulation and its gated residual variant. |
 | [ops/quantized_gemm.py](ops/quantized_gemm.py) | Define FP8 scaled and block GEMMs and FP4 activation quantization. |
@@ -143,8 +151,8 @@ Use the `trtllm::minimax_h3_v2_` prefix for H3 V2 Python-registered Triton ops s
 
 ## Test a change
 
-Mirror family and target code in the [unit tests](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/) and give each routed target a [whole-pipeline quality case](../../../../../tests/integration/defs/visual_gen/minimax_h3_v2/). Mirror [family operations](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/ops/) and [catalog entries](../../../../../tests/unittest/_torch/visual_gen/catalog/attention/) at their respective scopes. Compare outputs and buffer mutations against each operation’s reference on its declared cells. Register each new test by file or directory in the [CI test lists](../../../../../tests/integration/test_lists/test-db/) for the required hardware and rank count. A target's quality case can also run on an [owned QA schedule](../../../../../tests/integration/test_lists/qa/). Change-based test selection operates on registered entries.
+Mirror family and target code in the [unit tests](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/) and give each routed target a [whole-pipeline quality case](../../../../../tests/integration/defs/visual_gen/minimax_h3_v2/). Mirror [family operations](../../../../../tests/unittest/_torch/visual_gen/models/minimax_h3_v2/ops/) and [catalog entries](../../../../../tests/unittest/_torch/visual_gen/catalog/attention/) at their respective scopes. Compare outputs and buffer mutations against each operation’s reference on its declared cells. Register pre-merge tests by file or directory in the [CI test lists](../../../../../tests/integration/test_lists/test-db/) for the required hardware and rank count. FastH3's real-checkpoint quality cases run on the [functional QA schedule](../../../../../tests/integration/test_lists/qa/functional/llm_function_core.txt). Change-based test selection operates on registered entries.
 
 A target change exercises that target. A shared family change exercises its consumers. Registry changes exercise both checkpoint targets and both switch settings. A catalog change runs its mirrored contract tests and the V2 targets that import the operation. V1 paths retain their existing tests.
 
-For each deployment tested, run the same request in separate V1 and V2 processes on the same GPUs. Fix the checkpoint revision, conditioning inputs, seed, weight and attention precision, backend, parallel layout, compilation settings and sigma schedule. Compare the two decoded videos and audio waveforms directly. A multi-GPU run against one GPU measures topology sensitivity. A Diffusers comparison measures reference quality. Report these separately from refactor parity. Use 50 points for the base-H3 quality reference and test omitted defaults separately. Before retiring V1 and the opt-in switch, qualify generated video and audio, supported parallel paths, warmed latency and peak memory against V1 on representative deployments.
+For each deployment tested, run the same request in separate V1 and V2 processes on the same GPUs. Fix the checkpoint revision, conditioning inputs, seed, weight and attention precision, backend, parallel layout, compilation settings and sigma schedule. Compare the two decoded videos and audio waveforms directly. A multi-GPU run against one GPU measures topology sensitivity. A Diffusers comparison measures reference quality. Report these separately from refactor parity. If the V1 reference has a reproducible defect, record the original comparison and show that V2 matches the checkpoint or an independent numerical reference for the affected computation. Use that reference to qualify the correction. Use 50 points for the base-H3 quality reference and test omitted defaults separately. Before retiring V1 and the opt-in switch, qualify generated video and audio, supported parallel paths, warmed latency and peak memory against V1 on representative deployments.

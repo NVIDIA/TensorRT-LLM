@@ -9,12 +9,12 @@ import pytest
 import torch
 from diffusers import AutoencoderKLMiniMaxH3
 
-import tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.parallel.vae as parallel_vae
+from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.components import tiled_vae
+from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.components.tiled_vae import (
+    TiledAutoencoderKLMiniMaxH3,
+)
 from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.default_pipeline.pipeline import (
     MiniMaxH3Pipeline,
-)
-from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.parallel.vae import (
-    TiledAutoencoderKLMiniMaxH3,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3_v2.pipeline import _prepare_vae_decoder
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
@@ -105,10 +105,10 @@ def test_calibration_sizes_the_batches_from_the_free_memory(monkeypatch):
         expected = _reference_decode_clip(vae, z)
         for budget_tiles, batches in [(2.9, [2, 2, 2, 2, 1]), (0.4, [1] * 9), (100.0, [9])]:
             monkeypatch.setattr(
-                parallel_vae,
+                tiled_vae,
                 "available_device_bytes",
                 lambda device, per_tile=per_tile, k=budget_tiles: int(
-                    per_tile * k / parallel_vae.TILE_DECODE_MEMORY_FRACTION
+                    per_tile * k / tiled_vae.TILE_DECODE_MEMORY_FRACTION
                 ),
             )
             calls.clear()
@@ -121,7 +121,7 @@ def test_calibration_sizes_the_batches_from_the_free_memory(monkeypatch):
 def test_upper_bound_caps_the_batches_whatever_the_free_memory(monkeypatch):
     vae = _tiny_vae()
     _prepare_vae_decoder(vae)
-    monkeypatch.setattr(parallel_vae, "available_device_bytes", lambda device: 2**60)
+    monkeypatch.setattr(tiled_vae, "available_device_bytes", lambda device: 2**60)
     vae.max_tiles_per_decoder_call = 4
     z = _latent(vae, frames=2, tiles=2)  # 3 x 3 tiles
     calls = _count_decoder_batches(monkeypatch, vae)
@@ -178,10 +178,10 @@ def test_distributed_decode_batches_each_ranks_tiles_and_gathers_once(monkeypatc
     """A group of two: each rank decodes its every-second tile in one batch; one gather per clip."""
     vae = _tiny_vae()
     _prepare_vae_decoder(vae)
-    monkeypatch.setattr(parallel_vae, "available_device_bytes", lambda device: 2**60)
-    monkeypatch.setattr(parallel_vae.dist, "get_world_size", lambda g: 2)
-    monkeypatch.setattr(parallel_vae.dist, "get_rank", lambda g: rank)
-    monkeypatch.setattr(parallel_vae.dist, "all_reduce", lambda t, op, group: None)
+    monkeypatch.setattr(tiled_vae, "available_device_bytes", lambda device: 2**60)
+    monkeypatch.setattr(tiled_vae.dist, "get_world_size", lambda g: 2)
+    monkeypatch.setattr(tiled_vae.dist, "get_rank", lambda g: rank)
+    monkeypatch.setattr(tiled_vae.dist, "all_reduce", lambda t, op, group: None)
     z = _latent(vae, frames=2, tiles=2)  # 3 x 3 tiles -> rank 0 owns 5, rank 1 owns 4
     with torch.inference_mode(), torch.autocast("cuda", torch.float16):
         expected = _reference_decode_clip(vae, z)
@@ -199,7 +199,7 @@ def test_distributed_decode_batches_each_ranks_tiles_and_gathers_once(monkeypatc
                 index = wave * 2 + offset
                 slot.copy_(reference_tiles[index] if index < 9 else torch.zeros_like(slot))
 
-    monkeypatch.setattr(parallel_vae.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(tiled_vae.dist, "all_gather", fake_all_gather)
     vae.tile_parallel_group = object()
     calls = _count_decoder_batches(monkeypatch, vae)
     with torch.inference_mode(), torch.autocast("cuda", torch.float16):
@@ -215,14 +215,14 @@ def test_distributed_decode_splits_batches_by_the_group_minimum(monkeypatch, ran
     """The agreed count bounds every rank's batch so the gathered tensors have equal shapes."""
     vae = _tiny_vae()
     _prepare_vae_decoder(vae)
-    monkeypatch.setattr(parallel_vae, "available_device_bytes", lambda device: 2**60)
-    monkeypatch.setattr(parallel_vae.dist, "get_world_size", lambda g: 2)
-    monkeypatch.setattr(parallel_vae.dist, "get_rank", lambda g: rank)
+    monkeypatch.setattr(tiled_vae, "available_device_bytes", lambda device: 2**60)
+    monkeypatch.setattr(tiled_vae.dist, "get_world_size", lambda g: 2)
+    monkeypatch.setattr(tiled_vae.dist, "get_rank", lambda g: rank)
 
     def peer_has_memory_for_two(t, op, group):
         t.fill_(2)
 
-    monkeypatch.setattr(parallel_vae.dist, "all_reduce", peer_has_memory_for_two)
+    monkeypatch.setattr(tiled_vae.dist, "all_reduce", peer_has_memory_for_two)
     gathers = []
 
     def fake_all_gather(gathered, local, group):
@@ -230,7 +230,7 @@ def test_distributed_decode_splits_batches_by_the_group_minimum(monkeypatch, ran
         for out in gathered:
             out.copy_(local)
 
-    monkeypatch.setattr(parallel_vae.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(tiled_vae.dist, "all_gather", fake_all_gather)
     vae.tile_parallel_group = object()
     z = _latent(vae, frames=2, tiles=2)  # rank 0 owns tiles 0, 2, 4, 6, 8; rank 1 owns 1, 3, 5, 7
     calls = _count_decoder_batches(monkeypatch, vae)
@@ -244,7 +244,7 @@ def test_distributed_decode_splits_batches_by_the_group_minimum(monkeypatch, ran
 @requires_cuda
 def test_group_of_one_and_small_canvases_take_the_batched_path(monkeypatch):
     vae = _tiny_vae()
-    monkeypatch.setattr(parallel_vae.dist, "get_world_size", lambda g: 1)
+    monkeypatch.setattr(tiled_vae.dist, "get_world_size", lambda g: 1)
     vae.tile_parallel_group = object()
     z = _latent(vae, frames=2, tiles=2)
     calls = _count_decoder_batches(monkeypatch, vae)
@@ -254,7 +254,7 @@ def test_group_of_one_and_small_canvases_take_the_batched_path(monkeypatch):
         assert torch.equal(vae._decode_clip(z), expected)
         assert calls == [9]
         # Fewer tiles than ranks: a group of sixteen decodes the nine tiles locally.
-        monkeypatch.setattr(parallel_vae.dist, "get_world_size", lambda g: 16)
+        monkeypatch.setattr(tiled_vae.dist, "get_world_size", lambda g: 16)
         calls.clear()
         actual = vae._decode_clip(z)
         assert calls == [9]

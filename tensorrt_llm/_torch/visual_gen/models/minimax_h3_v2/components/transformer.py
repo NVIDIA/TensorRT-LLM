@@ -34,7 +34,6 @@ from ..kernels.fused_adaln import h3_adaln_supported
 from ..ops.adaln import gate_res_norm_mod as h3_gate_res_norm_mod
 from ..ops.adaln import norm_mod as h3_norm_mod
 from ..ops.vsa import H3VSAMetadata
-from ..parallel.sequence_sharder import H3SequenceSharder, shard_dit_inputs, shard_refiner_inputs
 from ..weights import load_transformer_weights
 from .attention import (
     MiniMaxH3Attention,
@@ -45,6 +44,7 @@ from .attention import (
 from .linear import Linear
 from .mlp import GatedMLP
 from .norm import RMSNorm
+from .sequence_sharder import H3SequenceSharder, shard_dit_inputs, shard_refiner_inputs
 
 MINIMAX_H3_MODALITY_NUM = 3
 

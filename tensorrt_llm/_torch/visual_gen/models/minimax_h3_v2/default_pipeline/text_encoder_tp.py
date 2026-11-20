@@ -23,9 +23,8 @@ from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flas
 from tensorrt_llm._utils import get_hf_rope_theta
 from tensorrt_llm.mapping import Mapping, MpiTopology
 
-from ..components.linear import Linear
+from ..components.linear import Linear, shard_bounds
 from ..packing import MINIMAX_H3_TEXT_ENCODER_LAYER
-from ..parallel.tp import shard_bounds
 from .ops.text_attention import text_causal_attention
 from .ops.text_qk_norm_rope import text_qk_norm_rope
 

@@ -461,10 +461,16 @@ def _visualgen_selection(changed):
 
 @pytest.mark.parametrize(
     "op",
-    ["block_sparse_attention", "cute_fmha", "flash_attention_4", "flashinfer_prefill", "ulysses"],
+    [
+        "block_sparse_attention",
+        "cute_fmha",
+        "flash_attention_4",
+        "flashinfer_prefill",
+        "ulysses_qkv",
+    ],
 )
 def test_visualgen_ops_select_only_importing_families(op):
-    scope = "models/minimax_h3_v2/ops" if op == "ulysses" else "catalog/attention"
+    scope = "models/minimax_h3_v2/ops" if op == "ulysses_qkv" else "catalog/attention"
     selected = _visualgen_selection(f"tensorrt_llm/_torch/visual_gen/{scope}/{op}.py")
     unit = "unittest/_torch/visual_gen/models/minimax_h3_v2"
     mirror = f"unittest/_torch/visual_gen/{scope}/test_{op}.py"

@@ -26,16 +26,24 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
 from ..ops.rope import apply_minimax_h3_qk_norm_rope_bf16, apply_minimax_h3_rotary_emb
 from ..ops.vsa import H3VSAMetadata, h3_vsa_attention
-from ..parallel.tp import head_bounds
-from ..parallel.ulysses import wrap_parallel_attention
 from .dense_attention import create_h3_attention
-from .linear import Linear
+from .linear import Linear, shard_bounds
 from .norm import PerHeadRMSNorm
+from .ulysses_attention import wrap_parallel_attention
 
 
 class QKVMode(str, Enum):
     FUSE_QKV = "fuse_qkv"
     SEPARATE_QKV = "separate"
+
+
+def _head_bounds(num_kv_heads: int, tp_size: int, rank: int, ulysses_size: int) -> tuple[int, int]:
+    """Partition KV heads across TP ranks in complete Ulysses groups."""
+    assert num_kv_heads % ulysses_size == 0
+    groups = num_kv_heads // ulysses_size
+    assert groups >= tp_size
+    start, end = shard_bounds(groups, tp_size, rank)
+    return start * ulysses_size, end * ulysses_size
 
 
 def _dense_attention_model_config(model_config: DiffusionModelConfig) -> DiffusionModelConfig:
@@ -96,7 +104,7 @@ class MiniMaxH3Attention(nn.Module):
         vgm = model_config.visual_gen_mapping
         u = vgm.ulysses_size if vgm is not None else 1
         tp = mapping.tp_size if mapping else 1
-        start, end = head_bounds(num_attention_heads, tp, mapping.tp_rank if mapping else 0, u)
+        start, end = _head_bounds(num_attention_heads, tp, mapping.tp_rank if mapping else 0, u)
         self.local_num_attention_heads = self.local_num_key_value_heads = end - start
         self.local_q_dim = self.local_kv_dim = (end - start) * attention_head_dim
         self.use_async_ulysses = bool(u > 1 and model_config.parallel.async_ulysses)

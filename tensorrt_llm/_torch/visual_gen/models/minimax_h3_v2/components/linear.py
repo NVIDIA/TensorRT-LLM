@@ -35,8 +35,33 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 )
 
 from ..ops.quantized_gemm import fp8_block_gemm, fp8_scaled_gemm, tunable_fp4_quantize
-from ..parallel.tp import projection_shard_bounds
 from .projection_weights import load_projection
+
+
+def shard_bounds(size: int, tp_size: int, rank: int) -> tuple[int, int]:
+    chunk, extra = divmod(size, tp_size)
+    start = rank * chunk + min(rank, extra)
+    return start, start + chunk + (rank < extra)
+
+
+def projection_shard_bounds(
+    width: int, tp_size: int, rank: int, quant_algo: QuantAlgo | None, deferred: bool
+) -> tuple[int, int]:
+    if tp_size == 1:
+        return 0, width
+    if deferred:
+        if width % tp_size:
+            raise ValueError(
+                f"Deferred H3 projection width {width} must divide across {tp_size} ranks"
+            )
+        return shard_bounds(width, tp_size, rank)
+    alignment = {QuantAlgo.FP8_BLOCK_SCALES: 128, QuantAlgo.NVFP4: 32}.get(quant_algo, 1)
+    if width % alignment:
+        raise ValueError(
+            f"TP projection width {width} must be divisible by quantization alignment {alignment}"
+        )
+    start, end = shard_bounds(width // alignment, tp_size, rank)
+    return start * alignment, end * alignment
 
 
 class Linear(nn.Module):

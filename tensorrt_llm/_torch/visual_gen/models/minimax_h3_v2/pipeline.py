@@ -38,6 +38,7 @@ from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
 from .components.text_encoder import encode_text_tokens
+from .components.tiled_vae import TiledAutoencoderKLMiniMaxH3
 from .components.vae import _prepare_vae_decoder, decode_audio, decode_video
 from .ops.vsa import build_h3_vsa_metadata
 from .packing import (
@@ -62,7 +63,6 @@ from .packing import (
     resolve_canvas_size,
     video_latent_num_frames,
 )
-from .parallel.vae import TiledAutoencoderKLMiniMaxH3
 
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode

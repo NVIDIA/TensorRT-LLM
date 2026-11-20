@@ -12,8 +12,7 @@ from tensorrt_llm._torch.modules.gate_up_swiglu_quack import (
 from tensorrt_llm._utils import get_sm_version
 
 from ..ops.activation import swiglu
-from ..parallel.tp import projection_shard_bounds
-from .linear import Linear
+from .linear import Linear, projection_shard_bounds
 
 
 class GatedMLP(nn.Module):

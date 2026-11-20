@@ -23,7 +23,7 @@ from ..packing import (
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )
-from ..parallel.vae import TiledAutoencoderKLMiniMaxH3
+from .tiled_vae import TiledAutoencoderKLMiniMaxH3
 
 
 def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3) -> None:
