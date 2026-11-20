@@ -364,7 +364,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     length_ticket = await self._output_length_priority.assign(
                         gen_req, placed_later=not gen_server
                     )
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 if gen_server:
                     await self._gen_router.finish_request(
                         request, success=False, req_id=gen_reservation_id
