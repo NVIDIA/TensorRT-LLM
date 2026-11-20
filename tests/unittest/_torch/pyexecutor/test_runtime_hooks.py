@@ -754,15 +754,10 @@ class _StopLoop(Exception):
     """Ends ``_executor_loop_overlap`` right after the head of its first iteration."""
 
 
-class _HangDetector:
+class _HangDetector(contextlib.nullcontext):
     def __init__(self, log: list) -> None:
+        super().__init__()
         self.log = log
-
-    def __enter__(self) -> "_HangDetector":
-        return self
-
-    def __exit__(self, *exc) -> bool:
-        return False
 
     def checkpoint(self) -> None:
         self.log.append("checkpoint")
@@ -845,122 +840,24 @@ def not_capturing(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
 
-def test_the_stock_pack_is_issued_at_the_replay():
-    from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
-
-    assert DEFAULT_RUNTIME_HOOKS.step_input_pack_factory is None
-    assert StepInputPack.issue_after_prepare is False
-
-
-@pytest.mark.parametrize("issue_after_prepare", [None, False], ids=["no_pack", "replay_pack"])
-def test_a_metadata_upload_is_a_plain_copy_unless_the_pack_is_issued_after_prepare(
-    issue_after_prepare, not_capturing
-):
-    from tensorrt_llm._torch.pyexecutor import step_inputs
-
-    dst, src = torch.zeros(4, dtype=torch.int32), torch.arange(4, dtype=torch.int32)
-    pack = None if issue_after_prepare is None else _RecordingPack(issue_after_prepare)
-    with step_inputs.active(pack):
-        step_inputs.copy_metadata_(dst, src)
-    assert torch.equal(dst, src)
-    if pack is not None:
-        assert pack.staged_copies == []
-
-
-def test_a_metadata_upload_joins_a_pack_issued_after_prepare(not_capturing):
-    from tensorrt_llm._torch.pyexecutor import step_inputs
-
-    dst, src = torch.zeros(4, dtype=torch.int32), torch.arange(4, dtype=torch.int32)
-    pack = _RecordingPack(True)
-    with step_inputs.active(pack):
-        step_inputs.copy_metadata_(dst, src)
-    assert len(pack.staged_copies) == 1 and pack.staged_copies[0][0] is dst
-    assert torch.equal(dst, torch.zeros(4, dtype=torch.int32))  # written when the pack is issued
-
-
-@pytest.mark.parametrize("issue_after_prepare", [False, True])
-def test_a_pool_shared_upload_without_a_skip_cache_follows_the_pack(
-    issue_after_prepare, not_capturing
-):
-    """``copy_h2d_pool_shared(pack=True)`` without an H2D skip cache is a metadata upload."""
+@pytest.mark.parametrize(
+    ("issue_after_prepare", "allow_pack"),
+    [(None, True), (False, True), (True, True), (True, False)],
+    ids=["no_pack", "replay_pack", "early_pack", "packing_disabled_for_copy"],
+)
+def test_pool_shared_copy_without_skip_cache(issue_after_prepare, allow_pack, not_capturing):
     from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 
-    dst, src = torch.zeros(3, dtype=torch.int32), torch.tensor([5, 6, 7], dtype=torch.int32)
-    pack = _RecordingPack(issue_after_prepare)
+    dst, src = torch.zeros(3, dtype=torch.int32), torch.arange(1, 4, dtype=torch.int32)
+    pack = None if issue_after_prepare is None else _RecordingPack(issue_after_prepare)
     with h2d_cache.active(None), step_inputs.active(pack):
-        assert h2d_cache.copy_h2d_pool_shared(dst, src, pack=True)
-    assert len(pack.staged_copies) == (1 if issue_after_prepare else 0)
-    assert torch.equal(dst, src if not issue_after_prepare else torch.zeros(3, dtype=torch.int32))
-
-
-def _runner_function(name: str) -> ast.FunctionDef:
-    root = Path(tensorrt_llm.__file__).resolve().parent / "_torch"
-    tree = ast.parse((root / "pyexecutor/engine/runners/decoder/runner.py").read_text())
-    return next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name == name
-        and any(
-            isinstance(cls, ast.ClassDef) and cls.name == "DecoderRunner" and node in cls.body
-            for cls in tree.body
-        )
-    )
-
-
-def test_the_runner_builds_the_models_pack_in_place_of_the_stock_one():
-    """With pack_step_inputs, the factory's pack replaces the stock one; without it, no pack."""
-    init = _runner_function("__init__")
-    branch = next(
-        node
-        for node in ast.walk(init)
-        if isinstance(node, ast.If)
-        and ast.unparse(node.test) == "not self.runtime_hooks.pack_step_inputs"
-    )
-    assert [ast.unparse(stmt) for stmt in branch.body] == ["self._step_pack = None"]
-    pack_device, pack_factory, model_pack = branch.orelse
-    assert ast.unparse(pack_device) == (
-        "pack_device = torch.device('cuda', torch.cuda.current_device())"
-    )
-    assert ast.unparse(pack_factory) == "pack_factory = self.runtime_hooks.step_input_pack_factory"
-    assert ast.unparse(model_pack.test) == "pack_factory is not None"
-    assert [ast.unparse(stmt) for stmt in model_pack.body] == [
-        "self._step_pack = pack_factory(pack_device)"
-    ]
-    (stock,) = model_pack.orelse
-    assert ast.unparse(stock).startswith("self._step_pack = StepInputPack(pack_device,")
-
-
-def test_a_pack_issued_after_prepare_is_flushed_between_the_preparation_and_the_input_copy_event():
-    forward = _runner_function("_forward_decoder")
-
-    def lines(predicate):
-        return [node.lineno for node in ast.walk(forward) if predicate(node)]
-
-    def calls(attr):
-        return lines(
-            lambda node: isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == attr
-            and ast.unparse(node.func.value) == "self._inputs"
-        )
-
-    (prepare,) = calls("prepare_inputs")
-    (input_copy_event,) = calls("record_input_copy")
-    flushes = [
-        node
-        for node in ast.walk(forward)
-        if isinstance(node, ast.If) and "issue_after_prepare" in ast.unparse(node.test)
-    ]
-    assert len(flushes) == 1
-    (flush,) = flushes
-    assert (
-        ast.unparse(flush.test)
-        == "self._step_pack is not None and self._step_pack.issue_after_prepare"
-    )
-    assert [ast.unparse(stmt) for stmt in flush.body] == ["step_inputs.flush()"]
-    assert not flush.orelse
-    assert prepare < flush.lineno < input_copy_event
+        assert h2d_cache.copy_h2d_pool_shared(dst, src, pack=allow_pack)
+    should_stage = bool(issue_after_prepare and allow_pack)
+    if pack is not None:
+        assert len(pack.staged_copies) == int(should_stage)
+        if should_stage:
+            assert pack.staged_copies[0][0] is dst
+    assert torch.equal(dst, torch.zeros_like(src) if should_stage else src)
 
 
 class _M3PlainModel(torch.nn.Module):

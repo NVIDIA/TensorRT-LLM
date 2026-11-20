@@ -23,6 +23,7 @@ import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_r
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
@@ -31,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import Prefill
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInputs, ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import (
@@ -54,6 +56,7 @@ def _make_decoder_runner(
     graph_key: KeyType | None,
     runner_enabled: bool = True,
     private_decoder: bool = False,
+    runtime_hooks: RuntimeHooks | None = None,
     **config_changes: Any,
 ) -> tuple[DecoderRunner, Mock, Mock, Mock, dict[str, object]]:
     config = decoder_config(
@@ -73,6 +76,8 @@ def _make_decoder_runner(
         model = torch.nn.Module()
         model.extra_attrs = {}
         model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None))
+    if runtime_hooks is not None:
+        model.runtime_hooks = runtime_hooks
     outputs = {"logits": object()}
     backend = Mock()
     backend.enabled = runner_enabled
@@ -144,6 +149,61 @@ def _make_decoder_runner(
 
     resources.get_resource_manager.side_effect = get_resource_manager
     return decoder, backend, resources, metadata, outputs
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", ["disabled", "stock", "early"])
+def test_step_pack_is_issued_at_the_declared_point(mode: str) -> None:
+    early = mode == "early"
+    pack = Mock(
+        issue_after_prepare=early or step_inputs.StepInputPack.issue_after_prepare,
+        parallel_scatter=False,
+        in_graph=False,
+        early_copy=False,
+        epoch=None,
+        prologue_op=None,
+    )
+    factory = Mock(return_value=pack)
+    hooks = RuntimeHooks(
+        pack_step_inputs=mode != "disabled",
+        step_input_pack_factory=None if mode == "stock" else factory,
+    )
+    with (
+        patch.object(torch.cuda, "current_device", return_value=0) as current_device,
+        patch.object(decoder_runner_module, "StepInputPack", return_value=pack) as stock,
+    ):
+        engine, graph, resources, _, outputs = _make_decoder_runner(
+            KeyType(batch_size=1, draft_len=0), runtime_hooks=hooks
+        )
+    assert current_device.call_count == int(mode != "disabled")
+    assert factory.call_count == int(early)
+    assert stock.call_count == int(mode == "stock")
+    assert engine._step_pack is (None if mode == "disabled" else pack)
+
+    prepared = engine._inputs.prepare_inputs.return_value
+
+    def prepare(*args, **kwargs):
+        assert pack.begin.call_count == int(mode != "disabled")
+        pack.flush.assert_not_called()
+        return prepared
+
+    def record_input_copy():
+        engine._inputs.prepare_inputs.assert_called_once()
+        assert pack.flush.call_count == int(early)
+
+    def replay(*args, **kwargs):
+        engine._inputs.record_input_copy.assert_called_once()
+        assert pack.flush.call_count == int(early)
+        return outputs
+
+    engine._inputs.prepare_inputs.side_effect = prepare
+    engine._inputs.record_input_copy.side_effect = record_input_copy
+    graph.replay.side_effect = replay
+    batch = ScheduledRequests()
+    batch.generation_requests = [_make_request_stub(1)]
+    with patch.object(torch.cuda, "Event", return_value=Mock()):
+        engine.forward(ScheduledInputs(batch=batch), resource_manager=resources)
+    graph.replay.assert_called_once()
 
 
 @pytest.mark.cpu_only
