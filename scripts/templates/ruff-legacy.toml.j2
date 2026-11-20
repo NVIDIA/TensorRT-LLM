@@ -30,6 +30,8 @@ include = [
 #   F401 (unused imports) → autoflake
 #   F841 (unused variables) → autoflake
 select = [
+    "TID251",
+
     # Bug detection (pyflakes) — NOT covered by autoflake
     "F402",   # import shadowed by loop var
     "F403",   # import star used
@@ -78,3 +80,6 @@ max-line-length = 120  # For comments and docstrings
 
 [lint.pydocstyle]
 convention = "google"
+
+[lint.flake8-tidy-imports.banned-api]
+"tests".msg = "Import test helpers through __extra_import_path__ (tests/test_common/magic_import.py)"
