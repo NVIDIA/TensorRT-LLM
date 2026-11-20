@@ -864,7 +864,16 @@ class _PersistentLoRAWeightCache:
         requantize_fp4: bool = False,
         lora_compute_dtype: Optional[torch.dtype] = None,
     ) -> "_PersistentLoRAWeightCache":
-        """Prepare resident original/merged weights, optionally retaining FP4 inference."""
+        """Prepare resident original and LoRA-merged parameter storage.
+
+        Args:
+            module: Transformer whose parameter storage is switched between stages.
+            deltas: Dense LoRA deltas keyed by target parameter name.
+            requantize_fp4: Requantize merged NVFP4 weights instead of using the
+                default BF16 refinement weights and unquantized Linear method.
+            lora_compute_dtype: Optional dtype for FP8 weight/delta addition;
+                ``None`` preserves the dequantizer's existing computation dtype.
+        """
         state, module_dict = cls._module_state(module)
         entries: List[_PersistentLoRAParamState] = []
 
@@ -1238,6 +1247,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         distilled_lora_path: str,
         lora_future,
     ) -> None:
+        """Load the upsampler and consume precomputed LoRA deltas for refinement."""
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
             logger.info(f"Loading spatial upsampler from {spatial_upsampler_path}...")

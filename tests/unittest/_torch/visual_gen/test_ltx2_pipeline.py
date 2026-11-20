@@ -1559,6 +1559,7 @@ class TestLTX2TwoStageLoRAHelpers:
         requantize = ltx2_two_stages._requantize_fp8_weight
 
         def verify_requantize(weight, **kwargs):
+            """Require LoRA addition to use the selected dtype before FP8 quantization."""
             assert weight.dtype == (lora_compute_dtype or torch.float32)
             return requantize(weight, **kwargs)
 
@@ -1618,6 +1619,7 @@ class TestLTX2TwoStageLoRAHelpers:
 
         class TinyModule(torch.nn.Module):
             def __init__(self):
+                """Create a packed NVFP4 Linear with independently tracked scale storage."""
                 super().__init__()
                 self.linear = Linear(
                     2,
@@ -1670,6 +1672,7 @@ class TestLTX2TwoStageLoRAHelpers:
         )
 
         def fake_requantize_fp4_weight(weight):
+            """Check the BF16 LoRA merge before returning known NVFP4 weights and scales."""
             assert requantize_fp4
             assert weight.dtype == torch.bfloat16
             assert torch.equal(weight, torch.ones_like(delta) + delta)

@@ -62,6 +62,7 @@ def test_auto_pipeline_detects_registered_ltx23_class_name(tmp_path: Path, class
     ],
 )
 def test_ltx23_routes_workflow_variants(extra_attrs: dict, expected: type) -> None:
+    """Keep plain generation and Retake on their registered workflow variants."""
     config = SimpleNamespace(
         extra_attrs=extra_attrs,
         primary_pretrained_config=SimpleNamespace(_name_or_path=""),
@@ -96,17 +97,28 @@ def test_ltx23_retake_rejects_two_stage_paths(monkeypatch, path_key) -> None:
 
 @pytest.mark.parametrize("quant_algo", [None, "FP8_BLOCK_SCALES", "NVFP4"])
 @pytest.mark.parametrize("force_one_stage", [False, True])
-def test_ltx23_discovers_two_stage_components(
-    tmp_path, monkeypatch, quant_algo, force_one_stage
+@pytest.mark.parametrize("explicit_paths", [False, True])
+def test_ltx23_selects_two_stage_components(
+    tmp_path, monkeypatch, quant_algo, force_one_stage, explicit_paths
 ) -> None:
-    """Auxiliary discovery promotes every supported precision unless explicitly forced off."""
+    """Explicit or discovered assets select two-stage unless single-stage is forced."""
     monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1" if force_one_stage else "0")
     (tmp_path / "model.safetensors").touch()
-    (tmp_path / "ltx-2.3-spatial-upscaler-x2.safetensors").touch()
-    (tmp_path / "ltx-2.3-distilled-lora.safetensors").touch()
+    upsampler = tmp_path / (
+        "custom-video.safetensors" if explicit_paths else "ltx-2.3-spatial-upscaler-x2.safetensors"
+    )
+    lora = tmp_path / (
+        "custom-adapter.safetensors" if explicit_paths else "ltx-2.3-distilled-lora.safetensors"
+    )
+    upsampler.touch()
+    lora.touch()
     config = SimpleNamespace(
         cache_backend=None,
-        extra_attrs={},
+        extra_attrs=(
+            {"spatial_upsampler_path": str(upsampler), "distilled_lora_path": str(lora)}
+            if explicit_paths
+            else {}
+        ),
         primary_pretrained_config=SimpleNamespace(
             _name_or_path=str(tmp_path / "model.safetensors")
         ),
@@ -114,6 +126,9 @@ def test_ltx23_discovers_two_stage_components(
     )
     expected = LTX23Pipeline if force_one_stage else LTX23TwoStagesPipeline
     assert LTX23Pipeline.resolve_variant(config) is expected
+    if not force_one_stage:
+        assert config.extra_attrs["spatial_upsampler_path"] == str(upsampler)
+        assert config.extra_attrs["distilled_lora_path"] == str(lora)
 
 
 @pytest.mark.parametrize("explicit", [False, True])

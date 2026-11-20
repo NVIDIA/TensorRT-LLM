@@ -197,6 +197,12 @@ class LTX23Pipeline(BasePipeline):
     _TRANSFORMER_EXCLUDE_PREFIXES = LTX2Pipeline._TRANSFORMER_EXCLUDE_PREFIXES
 
     def __init__(self, pipeline_config: "DiffusionPipelineConfig") -> None:
+        """Validate CFG/cache compatibility before initializing model components.
+
+        Args:
+            pipeline_config: Resolved generation configuration. Cache-DiT requires
+                full-transformer CUDA Graph replay to be disabled.
+        """
         if pipeline_config.parallel.cfg_size != 1:
             raise NotImplementedError("LTX-2.3 generation requires parallel.cfg_size=1.")
         if pipeline_config.cache_backend == "cache_dit" and pipeline_config.cuda_graph.enable:
@@ -208,6 +214,7 @@ class LTX23Pipeline(BasePipeline):
 
     @classmethod
     def resolve_variant(cls, config):
+        """Select Retake, cached single-stage or auxiliary-backed two-stage generation."""
         workflow = config.extra_attrs.get("workflow", "generation")
         if workflow == "retake":
             if any(
@@ -252,6 +259,7 @@ class LTX23Pipeline(BasePipeline):
     _cuda_graph_runner_class = _LTX23CUDAGraphRunner
 
     def post_load_weights(self) -> None:
+        """Finish cache setup and register the LTX-2.3 TeaCache timestep extractor."""
         super().post_load_weights()
         if self.pipeline_config.cache_backend == "teacache":
             self._apply_teacache_coefficients()
@@ -497,6 +505,7 @@ class LTX23Pipeline(BasePipeline):
         output_type: str = "pt",
         max_sequence_length: int = 1024,
     ) -> PipelineOutput:
+        """Encode conditions and denoise video/audio before refinement or decoding."""
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -715,11 +724,13 @@ class LTX23Pipeline(BasePipeline):
         logger.info("Decoding video and audio...")
 
         def decode_video_fn(vid_latents):
+            """Decode the packed video stream or return its unpacked latents."""
             return self._decode_video(
                 vid_latents, video_shape, TilingConfig.default(), generator, output_type
             )
 
         def decode_audio_fn(aud_latents):
+            """Unpack the audio stream and optionally decode its waveform."""
             aud_latents = self.audio_patchifier.unpatchify(aud_latents, audio_shape)
             if output_type == "latent":
                 return aud_latents

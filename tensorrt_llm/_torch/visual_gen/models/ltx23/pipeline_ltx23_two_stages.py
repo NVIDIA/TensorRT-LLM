@@ -57,6 +57,12 @@ class LTX23TwoStagesPipeline(LTX23Pipeline):
     """Full-dev-model two-stage generation with BF16, FP8, or NVFP4 weights."""
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
+        """Initialize resident BF16/FP8/NVFP4 weights with BF16 activations.
+
+        Args:
+            pipeline_config: Generation configuration with fixed distilled LoRA
+                and upsampler paths, without caching, CPU offload or runtime LoRA.
+        """
         if pipeline_config.extra_attrs.get("workflow", "generation") != "generation":
             raise ValueError("LTX-2.3 two-stage supports generation only.")
         if pipeline_config.quant_config.quant_algo not in (
@@ -88,6 +94,7 @@ class LTX23TwoStagesPipeline(LTX23Pipeline):
         super().__init__(pipeline_config)
 
     def _setup_cuda_graphs(self) -> None:
+        """Keep original and LoRA-merged weight states in separate CUDA Graphs."""
         if not self.pipeline_config.cuda_graph.enable:
             return
         super()._setup_cuda_graphs()
@@ -103,6 +110,14 @@ class LTX23TwoStagesPipeline(LTX23Pipeline):
         skip_components: list | None = None,
         **kwargs,
     ) -> None:
+        """Load base components, the upsampler and resident LoRA weight states.
+
+        Args:
+            checkpoint_dir: Directory containing the base model checkpoint.
+            device: Device on which the inference components are loaded.
+            skip_components: Base components excluded from this load.
+            **kwargs: Additional arguments forwarded to the base loader.
+        """
         extra = self.pipeline_config.extra_attrs
         upsampler_path = extra.get("spatial_upsampler_path")
         lora_path = extra.get("distilled_lora_path")
@@ -155,6 +170,12 @@ class LTX23TwoStagesPipeline(LTX23Pipeline):
         output_type: str = "pt",
         max_sequence_length: int = 1024,
     ) -> PipelineOutput:
+        """Generate video at the requested resolution using two denoising stages.
+
+        Stage 1 uses half the requested height and width with CFG. Stage 2
+        upsamples and refines video with distilled LoRA while preserving audio.
+        ``output_type`` selects decoded tensors (``pt``) or final latents.
+        """
         if height <= 0 or width <= 0:
             raise ValueError("LTX-2.3 two-stage height and width must be positive.")
         _assert_resolution(height, width, is_two_stage=True)
@@ -192,6 +213,13 @@ class LTX23TwoStagesPipeline(LTX23Pipeline):
         frame_rate: float,
         output_type: str,
     ) -> PipelineOutput:
+        """Upsample and refine stage-1 latents, restore weights, then decode.
+
+        ``latents`` and ``audio_latents`` are BF16 patch sequences with layout
+        ``[batch, tokens, channels]``. The shape objects describe their unpacked
+        layouts; contexts and their mask are reused as conditioning in stage 2.
+        Original transformer weights are restored even if refinement fails.
+        """
         stage_1 = _LTX23LatentOutput(
             video=latents,
             audio=audio_latents,
@@ -236,6 +264,17 @@ class LTX23TwoStagesPipeline(LTX23Pipeline):
         video: torch.Tensor,
         frame_rate: float,
     ) -> _LTX23LatentOutput:
+        """Denoise upsampled video while retaining stage-1 audio and conditions.
+
+        Args:
+            stage_1: Original audio latents, text conditions and noise generator.
+            video: BF16 upsampled latents in ``[batch, channels, frames, height,
+                width]`` layout; the input tensor is not modified in place.
+            frame_rate: Frame rate used to express video positions in seconds.
+
+        Returns:
+            Stage state with refined video and its updated latent shape.
+        """
         shape = VideoLatentShape.from_torch_shape(video.shape)
         positions = self.video_patchifier.get_patch_grid_bounds(shape, device=self.device)
         positions = get_pixel_coords(positions.float(), VIDEO_SCALE_FACTORS, causal_fix=True)

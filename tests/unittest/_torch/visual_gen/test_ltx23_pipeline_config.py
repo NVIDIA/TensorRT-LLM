@@ -45,6 +45,7 @@ def ltx23_checkpoint(tmp_path: Path) -> str:
 
 
 def test_ltx23_pipeline_config_defaults(ltx23_checkpoint: str) -> None:
+    """Expose unset auxiliary paths without modifying the caller's pipeline config."""
     args = VisualGenArgs(model=ltx23_checkpoint)
     resolved = PipelineLoader(args, device="cpu")._resolve_pipeline_config(ltx23_checkpoint)
 
@@ -59,6 +60,7 @@ def test_ltx23_pipeline_config_defaults(ltx23_checkpoint: str) -> None:
 
 
 def test_ltx23_pipeline_config_user_overrides(ltx23_checkpoint: str) -> None:
+    """Retain supplied workflow/text-encoder options alongside auxiliary defaults."""
     overrides = {"workflow": "retake", "text_encoder_path": "/local/gemma"}
     args = VisualGenArgs(model=ltx23_checkpoint, pipeline_config=overrides)
 
@@ -148,7 +150,9 @@ def test_ltx23_cache_dit_requires_cuda_graph_disabled(
             initialize.assert_called_once_with(config)
 
 
-@pytest.mark.parametrize("quant_algo", [None, "FP8_BLOCK_SCALES", "NVFP4"])
+@pytest.mark.parametrize(
+    "quant_algo", [None, "FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN", "NVFP4"]
+)
 def test_ltx23_two_stage_accepts_weight_quantization(ltx23_checkpoint: str, quant_algo) -> None:
     """Supported weight quantization keeps BF16 activations and the two-stage class."""
     args = VisualGenArgs(

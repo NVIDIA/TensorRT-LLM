@@ -1465,6 +1465,12 @@ class LTX2CacheDiTPattern0BlockWrapper(nn.Module):
         perturbations=None,
         **kwargs: Any,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Run the wrapped block with the parent's modality and text-cache state.
+
+        The video/audio hidden states use ``[batch, tokens, channels]`` layout
+        and the parent model's compute dtype. Returns the updated latent streams,
+        leaving an absent modality as ``None``.
+        """
         p = object.__getattribute__(self, "_ltx_parent")
         inner_mod = object.__getattribute__(self, "_inner_module")
         va_src = p._cache_dit_video_args
