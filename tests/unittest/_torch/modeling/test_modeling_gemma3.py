@@ -527,6 +527,31 @@ class TestGemma3(unittest.TestCase):
                                          dim=0)
         torch.testing.assert_close(causal_mask, expected_causal_mask)
 
+        with patch(
+                "tensorrt_llm._torch.models.modeling_gemma3._MIN_COMPACT_IMAGE_MASK_EFFECTIVE_TOKENS",
+                1), patch.object(gemma3.config,
+                                 "sliding_window", 2), patch.object(
+                                     gemma3.model,
+                                     "forward") as packed, patch.object(
+                                         gemma3.logits_processor, "forward"):
+            gemma3.forward(attn_metadata,
+                           input_ids=input_ids,
+                           image_token_mask=image_token_mask)
+        bounds = packed.call_args.kwargs
+        offset = 0
+        for length in context_sequence_lengths:
+            rows = slice(offset, offset + length)
+            keys = torch.arange(length, device=device)[None, :]
+            ends = bounds["variable_window_token_ends"][rows, None]
+            for kind, window in (("local", 2), ("global", None)):
+                starts = bounds[f"{kind}_variable_window_token_starts"][rows,
+                                                                        None]
+                expected = gemma3.get_context_mask(image_token_mask[rows],
+                                                   window)
+                torch.testing.assert_close((keys >= starts) & (keys <= ends),
+                                           expected)
+            offset += length
+
     def single_image_mask_test_helper(
             self, effective_sliding_window: int) -> torch.Tensor:
         config_dict = deepcopy(GEMMA3_1B_CONFIG)

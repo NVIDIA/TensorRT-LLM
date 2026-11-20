@@ -337,24 +337,24 @@ class TestTritonPrefillNoPrefix:
     def test_batch_bidirectional_mixed(self, device):
         """Batch with some seqs having image tokens, some text-only."""
         torch.manual_seed(42)
-        num_heads, num_kv_heads, head_dim = 8, 4, 512
-        sm_scale = 1.0
-        seq_lens = [48, 64]
+        num_heads, num_kv_heads, head_dim = 8, 4, 256
+        sm_scale = head_dim**-0.5
+        seq_lens = [48, 512]
         total = sum(seq_lens)
 
         q = torch.randn(total, num_heads, head_dim, dtype=torch.bfloat16, device=device)
         k = torch.randn(total, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
         v = torch.randn(total, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
 
-        # Seq 0: pure causal, Seq 1: image tokens at 5-25
+        # Seq 0: pure causal, Seq 1: image tokens at 120-160
         masks = [
             _make_causal_mask(48).to(device),
-            _make_bidirectional_mask(64, 5, 25).to(device),
+            _make_bidirectional_mask(512, 120, 160).to(device),
         ]
         mask_flat = _flatten_masks(masks)
 
         output = torch.zeros_like(q)
-        qo_indptr = torch.tensor([0, 48, 112], dtype=torch.int32, device=device)
+        qo_indptr = torch.tensor([0, 48, total], dtype=torch.int32, device=device)
         num_ctx = 2
         prefix_lens = torch.zeros(num_ctx, dtype=torch.int32, device=device)
         page_table_indptr = torch.zeros(num_ctx + 1, dtype=torch.int32, device=device)
@@ -380,7 +380,7 @@ class TestTritonPrefillNoPrefix:
 
         # Reuse the image/text batch to check compact global and sliding-window
         # masks against the dense kernel and the same independent SDPA reference.
-        for window_left in (-1, 7):
+        for window_left in (-1, 63):
             window_masks = []
             for length, mask in zip(seq_lens, masks):
                 positions = torch.arange(length, device=device)
@@ -483,6 +483,43 @@ class TestTritonPrefillNoPrefix:
         ref = _sdpa_reference(q, k, v, mask=[mask], sm_scale=sm_scale)
 
         torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
+
+        # Check a request whose V rows begin beyond the signed int32 offset limit.
+        packed_start = 2**18
+        rows = packed_start + seq_len
+        packed_v = torch.empty_strided(
+            (rows, num_kv_heads, head_dim), (8192, head_dim, 1), dtype=v.dtype, device=device
+        )
+        packed_v[packed_start:].copy_(v)
+        # The first request attends only to itself, keeping this check linear.
+        positions = torch.arange(rows, dtype=torch.int32, device=device)
+        starts = positions.clone()
+        starts[packed_start:] = 0
+        positions[packed_start:] -= packed_start
+        packed_q = q[:1].expand(rows, -1, -1).clone()
+        packed_q[packed_start:] = q
+        packed_k = torch.empty_like(packed_q)
+        packed_k[:packed_start].zero_()
+        packed_k[packed_start:] = k
+        packed_out = torch.empty_like(packed_q)
+        triton_prefill_with_custom_mask(
+            q=packed_q,
+            k=packed_k,
+            v=packed_v,
+            output=packed_out,
+            qo_indptr=torch.tensor([0, packed_start, rows], dtype=torch.int32, device=device),
+            kv_cache=None,
+            prefix_lens=positions.new_zeros(2),
+            page_table_indptr=positions.new_zeros(3),
+            page_table_indices=positions.new_zeros(1),
+            page_size=1,
+            custom_mask=None,
+            variable_window_token_starts=starts,
+            variable_window_token_ends=positions,
+            max_len_extend=packed_start,
+            sm_scale=sm_scale,
+        )
+        torch.testing.assert_close(packed_out[packed_start:], output, atol=1e-2, rtol=1e-2)
 
 
 # ===========================================================================
