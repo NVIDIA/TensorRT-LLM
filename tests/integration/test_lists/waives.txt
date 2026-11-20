@@ -188,7 +188,6 @@ unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_
 unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_vocab_size.py::test_unresolvable_vocab_size_only_warns_when_multimodal_keys_are_needed[False] SKIP (https://nvbugs/6818710)
 unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_vocab_size.py::test_unresolvable_vocab_size_only_warns_when_multimodal_keys_are_needed[True] SKIP (https://nvbugs/6818710)
 unittest/_torch/pyexecutor/test_idle_iter_stats.py::test_idle_fetch_requires_all_ranks_to_drain[control] SKIP (https://nvbugs/7117789)
-unittest/_torch/pyexecutor/test_py_executor.py::test_early_response_suppresses_repeat_and_leaves_terminal_for_normal_pass SKIP (https://nvbugs/7125734)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6517836)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_write_transfer_gpu_tensor SKIP (https://nvbugs/6517836)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_write_transfer_multiple_chunks SKIP (https://nvbugs/6517836)
