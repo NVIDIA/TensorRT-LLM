@@ -948,96 +948,6 @@ def test_prims_ts_raw_selections_match_compacted(
 
 
 @skip_prims_ts_unsupported
-@pytest.mark.parametrize("has_main", [True, False], ids=["main", "swa-only"])
-@pytest.mark.parametrize("heads,count", [(8, 6), (16, 12)])
-@torch.inference_mode()
-def test_prims_ts_runahead_matches_ordered(
-    heads: int, count: int, has_main: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A raw-selection kernel that runs ahead of its preceding launch attends as an ordered one.
-
-    It rotates its BF16 Q before the wait, then reads SWA rows after it; its MAIN selections
-    and rows either before it (``main_ready``) or after it. Where it waits changes no
-    arithmetic, so both MAIN orders give the same bits, and both match a kernel that reads
-    a Q the projection rotated.
-    """
-    from tensorrt_llm._torch.attention.backends.interface import (
-        AttentionForwardArgs,
-        AttentionInputType,
-    )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import gptj_rope_small_m
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
-
-    _forbid_prims_ts_staging(monkeypatch)
-    monkeypatch.setattr(CSA2PrimsTS, "raw_selections", True)
-    g = torch.Generator(device="cuda").manual_seed(5110 + heads + count)
-    attn = _backend(heads, compute_backend="prims_ts", kv_cache_dtype="fp8")
-    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16, generator=g)
-    swa_rows = 3 * count + 160
-    swa_pool = pack_rows(
-        torch.randn(swa_rows, 512, device="cuda", generator=g).bfloat16(), attn.swa_cache_format
-    )
-    swa = torch.stack(
-        [torch.randperm(swa_rows, device="cuda", generator=g)[:128] for _ in range(count)]
-    )
-    main_pool = logical = mapping = None
-    if has_main:
-        page, pages = 16, 40
-        table = torch.randperm(pages, device="cuda", generator=g).view(1, pages).int()
-        main_pool = pack_rows(
-            torch.randn(pages * page, 512, device="cuda", generator=g).bfloat16(), "main"
-        )
-        logical = torch.stack(
-            [torch.randperm(pages * page, device="cuda", generator=g)[:512] for _ in range(count)]
-        ).int()
-        mapping = (
-            table,
-            page,
-            pages * page,
-            torch.zeros(count, device="cuda", dtype=torch.int64),
-            torch.full((count,), pages * page, device="cuda", dtype=torch.int64),
-        )
-    positions = torch.randint(0, 4096, (count,), device="cuda", generator=g, dtype=torch.int32)
-    angle = torch.rand(4096, 32, device="cuda", generator=g) * 6.2831853
-    cos_sin = torch.cat((angle.cos(), angle.sin()), 1).view(4096, 2, 32).contiguous()
-    sink = torch.linspace(-1.25, 1.5, heads, device="cuda")
-    metadata = CSA2TrtllmMetadata.for_query_tile(q, 512 if has_main else 0, kv_input_mode="packed")
-
-    def forward(kernel_rope: bool, inputs_final: bool = False, main_ready: bool = True):
-        monkeypatch.setattr(CSA2PrimsTS, "_inputs_final", lambda self, raw, rope: inputs_final)
-        monkeypatch.setattr(CSA2PrimsTS, "_main_ready", lambda self: main_ready)
-        query = q.clone()
-        if not kernel_rope:
-            gptj_rope_small_m(query, positions, cos_sin)
-        args = AttentionForwardArgs(
-            attention_input_type=AttentionInputType.generation_only,
-            attention_sinks=sink,
-            output=torch.full_like(q, torch.nan).flatten(1),
-            sparse_backend_args=CSA2BackendForwardArgs(
-                swa_cache_format=attn.swa_cache_format,
-                swa_pool=swa_pool,
-                swa_indices=swa.contiguous(),
-                main_pool=main_pool,
-                topk_indices=logical,
-                main_logical_indices=logical,
-                main_mapping=mapping,
-                query_rope=(positions, cos_sin) if kernel_rope else None,
-            ),
-        )
-        return _helper_forward(attn, query.flatten(1), metadata, args).view_as(q).clone()
-
-    rotated = forward(False)
-    runahead = forward(True, inputs_final=True)
-    torch.testing.assert_close(runahead, rotated, atol=2e-2, rtol=2e-2)
-    if has_main:
-        main_after_wait = forward(True, inputs_final=True, main_ready=False)
-        torch.testing.assert_close(main_after_wait, runahead, atol=0, rtol=0)
-
-
-@skip_prims_ts_unsupported
 @pytest.mark.parametrize(
     "main_bank", ["", "all", "selected"], ids=["in-kernel-decode", "main-bank", "selected-rows"]
 )
@@ -1671,9 +1581,6 @@ def test_prims_ts_precompiles_once_per_arena(monkeypatch: pytest.MonkeyPatch) ->
                 valid_prefix=True,
                 output_groups=None,
                 raw_selections=False,
-                query_rope=False,
-                inputs_final=False,
-                main_ready=True,
             ),
         )
         for swa_cache_format, main_cache_format in (
@@ -1683,45 +1590,6 @@ def test_prims_ts_precompiles_once_per_arena(monkeypatch: pytest.MonkeyPatch) ->
         )
     ]
     assert records[3] is not records[2] and records[3]["arena"] is records[2]["arena"]
-
-
-@skip_prims_ts_unsupported
-@torch.inference_mode()
-def test_prims_ts_plans_ignore_main_ready_without_runahead(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
-
-    calls = []
-    monkeypatch.setattr(
-        packed,
-        "precompile_packed_sparse_mla",
-        lambda *args, **kwargs: calls.append((kwargs["inputs_final"], kwargs["main_ready"])) or 1,
-    )
-    monkeypatch.setattr(packed, "_compile_packed", lambda spec: spec)
-    monkeypatch.setattr(packed, "_get_compiled_mla_decode", lambda spec: spec)
-    monkeypatch.setattr(packed.UnitScaleQuery, "plan", lambda *_, **__: None)
-    q = torch.zeros((2, 3, 512), device="cuda", dtype=torch.bfloat16)
-    metadata = CSA2TrtllmMetadata.for_query_tile(q, 0, kv_input_mode="packed")
-    metadata._csa2_prims_ts_max_queries = 6
-    helper = CSA2PrimsTS(_backend(3, compute_backend="prims_ts"))
-
-    def plan(inputs_final: bool, main_ready: bool) -> dict:
-        return helper._get_plan(
-            q.flatten(1),
-            metadata,
-            "swa_fp8",
-            "main",
-            inputs_final=inputs_final,
-            main_ready=main_ready,
-        )
-
-    # Only a kernel that runs ahead of its preceding launch reads MAIN before the wait.
-    assert plan(False, False) is plan(False, True)
-    assert plan(True, False) is not plan(True, True)
-    assert calls == [(False, True), (True, False), (True, True)]
 
 
 class _Forgetful(dict):
@@ -1752,19 +1620,9 @@ class _Forgetful(dict):
             64,
             dict(max_extra_topk=0, swa_cache_format="swa_fp8", valid_prefix=True, output_groups=8),
         ),
-        # Split-KV producer plans, and runahead raw-selection plans that rotate Q.
+        # Split-KV producer plans, and raw-selection plans.
         (16, dict(max_extra_topk=512)),
-        (
-            16,
-            dict(
-                max_extra_topk=512,
-                swa_cache_format="swa_fp8",
-                raw_selections=True,
-                query_rope=True,
-                inputs_final=True,
-                main_ready=False,
-            ),
-        ),
+        (16, dict(max_extra_topk=512, swa_cache_format="swa_fp8", raw_selections=True)),
     ],
 )
 @torch.inference_mode()

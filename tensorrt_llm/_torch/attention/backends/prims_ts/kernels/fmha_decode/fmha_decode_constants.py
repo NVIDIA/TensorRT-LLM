@@ -33,7 +33,6 @@ BYTES_PER_KIB = 1024
 # metadata and scratch) must fit it; TOTAL_SMEM_BUDGET_KIB sizes the Q and
 # K/V pipelines below it.
 SMEM_CAPACITY_KIB = 227
-
 # The M64N256 profile stages one 256-row K or V tile per shared-ring slot. A
 # 16-bit tile is 64 KiB, so three stages, the 16-KiB Q stage, the tail
 # exchange and the metadata fill the SM100 carveout. A byte-wide tile is
@@ -50,6 +49,11 @@ KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES = 4
 # (0, 2, 1, 3) lets P alias S unchanged with V in natural order. The score
 # column mapping undoes the permutation for masking and Sage scales.
 KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
+
+# A fast SMEM conversion row has 128 FP4 values: sixteen packed 32-bit words.
+# Its register payload appends eight E4M3 scales packed into two more words.
+NVFP4_ROW_PACKED_WORDS = 16
+NVFP4_ROW_PACKET_WORDS = NVFP4_ROW_PACKED_WORDS + 2
 
 # Keep the old maximum as the exponent reference while a new maximum is at
 # most eight log2 units larger. This avoids an output-correction round without
@@ -130,6 +134,12 @@ AUTO_LAUNCH_TILE_SIZE_KV = 128
 # enough K/V work to amortize GMEM reduction. The B200-qualified
 # crossover is 2,048 tokens: 16 KV128 tiles or 8 KV256 tiles.
 SPLIT_KV_MIN_TOKENS_PER_CTA = 2_048
+
+# Splitting a grid that already fills a wave only trims its partial final
+# wave, so each split must keep enough K/V work to repay the extra waves and
+# reduction. GB300 NVFP4 TileQ8 at B128/Hkv2: four splits lose 7% at 16K KV
+# tokens (4,096 per split), tie at 32K and win 4-8% at 64K.
+FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA = 8_192
 
 # Two interleaved K/V instances form the decode cadence: instance 0 is the
 # first K/P/V stream in each loop iteration and instance 1 is the second. These

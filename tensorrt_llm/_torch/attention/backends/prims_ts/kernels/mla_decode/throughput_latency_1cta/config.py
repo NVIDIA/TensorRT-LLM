@@ -118,6 +118,7 @@ class MlaConfig(Nvfp4KVConfig):
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
+    use_kv_bounds: bool = False
     # Threshold skip correction in log2 units (binades; 0 disables it): freeze
     # the running row max while a K tile raises it by at most this
     # compile-time amount and skip that tile's O rescale.  E4M3 P then uses
@@ -227,14 +228,6 @@ class MlaConfig(Nvfp4KVConfig):
     fuse_sparse_epilogue: bool = False
     fuse_sparse_cluster_epilogue: bool = False
     fuse_sparse_reduction: bool = False
-    # With fuse_sparse_reduction: the last-arriving CTA of a query tile merges the
-    # splits in the attention kernel; no reducer kernel is launched.
-    fuse_split_finisher: bool = False
-    # With fuse_sparse_reduction: each query tile and V partition's splits launch as one
-    # cluster whose first CTA merges them; no reducer kernel is launched.
-    cluster_split_finisher: bool = False
-    # See SparseMlaProfile.inputs_final.
-    sparse_inputs_final: bool = False
     sparse_direct: bool = False
     # Keep-AB direct BF16 output staged through SMEM for full-line stores.
     coalesce_keeps_output: bool = False
@@ -250,7 +243,12 @@ class MlaConfig(Nvfp4KVConfig):
     # whose loaders bind sparse sources without reading them waits after its
     # prologue (TMA descriptor prefetch, shared-memory carve-out and barrier
     # initialization, TMEM allocation) instead of at entry, so that prologue
-    # overlaps the preceding grid. Other grids keep the entry wait.
+    # overlaps the preceding grid. Other grids keep the entry wait
+    # (ThroughputLatencyMlaDecodeTs.waits_after_prologue). Like use_pdl, it is
+    # set on the kernel object by callers that launch it directly with PDL,
+    # such as TensorRT-LLM's DeepSeek-V4.1 CSA2 decode. No FlashInfer entry
+    # point enables it: the sparse MLA wrapper launches without PDL, and the
+    # DeepSeek-V4.1 backend binds a KV producer, which keeps the entry wait.
     pdl_wait_after_prologue: bool = False
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
@@ -269,8 +267,6 @@ class MlaConfig(Nvfp4KVConfig):
     correction_regs: int = 64
     mma_load_regs: int = 96
     scheduler_regs: int = 96
-    # Load-warp budget when it differs from mma_load_regs (0: the same).
-    kv_loader_regs: int = 0
 
     # Feature mode flags consumed by config and schedule construction.  They are
     # integer flags because many branches are passed as Constexpr values into
@@ -312,15 +308,13 @@ class MlaConfig(Nvfp4KVConfig):
 
     @property
     def kv_load_regs(self) -> int:
-        """Register budget of the K/V loader warps.
+        """Give raw-record loaders 96 registers without raising the MMA warp budget.
 
-        Raw-record loaders get 96 registers without raising the MMA warp budget: they retain
-        packed values/scales across raw-buffer release, and raising both exceeds the CTA
-        budget. Other layouts use ``kv_loader_regs`` when set, else ``mma_load_regs``.
+        Loader warps retain packed values/scales across raw-buffer release.
+        MMA/page warps keep mma_load_regs; raising both exceeds the CTA budget.
+        This is derived from the existing pipeline choice, not a tuning field.
         """
-        if self.async_nvfp4_kv_gather:
-            return 96
-        return self.kv_loader_regs or self.mma_load_regs
+        return 96 if self.async_nvfp4_kv_gather else self.mma_load_regs
 
     @property
     def nvfp4_row_bytes(self) -> int:
@@ -362,7 +356,11 @@ class MlaConfig(Nvfp4KVConfig):
         extra pool's NVFP4 records size it.
         """
         if self.tma_fp8_primary_tiles:
-            return (cache_record_size(self.extra_kv_cache_format, self.rope_dim) + 31) // 32 * 32
+            return (
+                (cache_record_size(self.extra_kv_cache_format, self.rope_dim) + 31)
+                // 32
+                * 32
+            )
         return Nvfp4KVConfig.raw_record_stride.fget(self)
 
     def raw_record_ring_fits(self) -> bool:
@@ -566,26 +564,6 @@ class MlaConfig(Nvfp4KVConfig):
     def cluster_reduction_slices(self) -> int:
         return ceil(self.tile_size_q / self.cluster_reduction_rows_per_slice)
 
-    @property
-    def cluster_split_rows(self) -> int:
-        """Rows of a query tile that hold a logical query (the rows a split merge covers)."""
-        rows = self.tile_size_q
-        if isinstance(self.logical_seq_len_q, int):
-            rows = min(rows, self.logical_num_heads_q * self.logical_seq_len_q)
-        return rows
-
-    @property
-    def cluster_split_push_bytes(self) -> int:
-        """Shared memory in which a cluster split finisher's first CTA gathers the splits.
-
-        Every split's BF16 partial O of the CTA's V columns for each covered row, then its
-        FP32 LSE per row.
-        """
-        if not self.cluster_split_finisher:
-            return 0
-        rows = self.cluster_split_rows * self.num_ctas_per_seq_kv
-        return rows * (self.head_dim_per_cta_v * self.partial_o_dtype_bytes + 4)
-
     def cluster_reduction_smem_bytes_for(self, num_ctas_kv: int) -> int:
         """Return multi-CTA KV cluster reduction SMEM footprint."""
         if num_ctas_kv <= 1:
@@ -707,10 +685,8 @@ def compute_workspace_size(
     if split_kv == 1 or cfg.use_cluster_reduction == 1:
         return 0
     partial_rows = cfg.batch_size * cfg.seq_len_q * cfg.num_heads_q * split_kv
-    counters = cfg.batch_size * cfg.seq_len_q * 4 if cfg.fuse_split_finisher else 0
-    return (
-        partial_rows * (cfg.head_dim_v * partial_o_dtype.width // 8 + lse_dtype.width // 8)
-        + counters
+    return partial_rows * (
+        cfg.head_dim_v * partial_o_dtype.width // 8 + lse_dtype.width // 8
     )
 
 
@@ -2146,21 +2122,7 @@ def configure_sparse_mla(
         fuse_sparse_epilogue=direct_finish,
         fuse_sparse_cluster_epilogue=cluster_finish,
         fuse_sparse_reduction=separate_finish,
-        fuse_split_finisher=separate_finish and profile.fused_split_finish,
-        # Every query tile must cover the same live rows (the push barrier's byte count).
-        cluster_split_finisher=separate_finish
-        and profile.cluster_split_finish
-        and not profile.fused_split_finish
-        and splits <= 8
-        and not cfg.use_persistent_scheduler
-        and (
-            cfg.logical_num_heads_q * cfg.logical_seq_len_q <= cfg.tile_size_q
-            or cfg.logical_num_heads_q * cfg.logical_seq_len_q % cfg.tile_size_q == 0
-        ),
         load_num_warps=issuers,
-    )
-    cfg = dataclass_replace(
-        cfg, sparse_inputs_final=cfg.cluster_split_finisher and profile.inputs_final
     )
     short = cfg.short_merged_softmax
     if (
@@ -2180,6 +2142,11 @@ def configure_sparse_mla(
         cfg.has_nvfp4_kv and keep and issuers == 8 and reuse
     ) or whole_nvfp4_kv
     ws_mma = retained_nvfp4_kv and keep
+    if ws_mma and cfg.num_ctas_per_head_dim != 1:
+        # One WS N256 PV pass reads two adjacent D128 slices and the tail stores
+        # 256 columns, so a V owner would read and write its neighbor's slices.
+        # Only the non-WS Keep-AB PV (one D128 slice per pass) splits V.
+        raise ValueError("retained NVFP4 Keep-AB KV (WS MMA) requires one V owner")
     # Retained native FP8 K tiles feed the same WS QK/PV, with Q copied to TMEM.
     ws_fp8 = profile.ws_mma
     if ws_fp8 and not (
@@ -2258,7 +2225,10 @@ def configure_sparse_mla(
     raw_record_ring = (
         2
         if retained_nvfp4_kv
-        and (fp8_primary_tiles or (cfg.raw_record_ring_fits() and cfg.kv_cache_format != "fp8"))
+        and (
+            fp8_primary_tiles
+            or (cfg.raw_record_ring_fits() and cfg.kv_cache_format != "fp8")
+        )
         and cfg.use_persistent_scheduler
         else 1
     )
@@ -2304,14 +2274,6 @@ def configure_sparse_mla(
             correction_regs=160 if issuers == 8 else 192,
             mma_load_regs=96 if uniform and issuers == 4 else 64,
         )
-        # The WS and retained NVFP4 layouts keep these budgets: 48 MMA registers slow them
-        # (GB300, 64 heads, 1024 rows: NVFP4 MAIN 92.7 against 104.2 us, WS gather 94.3
-        # against 105.2 us).
-        if issuers == 8 and not ws_fp8 and not retained_nvfp4_kv:
-            # Eight loader warps decode a whole sparse K tile record by record; the extra
-            # registers keep more records in flight. 640 threads launch with 96 registers
-            # each: 4 x 128 + 4 x 144 + 4 x 48 + 8 x 80 warps' budgets fill 61,440.
-            roles.update(correction_regs=144, mma_load_regs=48, kv_loader_regs=80)
         if ws_fp8:
             # Q NoPE is read from TMEM; the MMA warp copies each prefetched SMEM
             # stage into it, in tcgen05 order after the previous tile's QK.
@@ -2374,12 +2336,7 @@ def configure_sparse_mla(
         **roles,
         kv_stages=kv_stages,
         page_offsets_stages=page_stages,
-        # A nonpersistent sparse CTA runs one work tile, so one Q stage serves it.
         q_stages=1
-        if retained_nvfp4_kv
-        or ws_fp8
-        or single
-        or (reuse and profile.reuse_kv_stages)
-        or (direct_inputs and not cfg.use_persistent_scheduler)
+        if retained_nvfp4_kv or ws_fp8 or single or (reuse and profile.reuse_kv_stages)
         else cfg.q_stages,
     )

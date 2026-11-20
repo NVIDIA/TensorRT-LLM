@@ -23,6 +23,7 @@ with rows padded to 128, ``D = (heads / groups) * 512``.
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
@@ -172,6 +173,9 @@ class MXFP8OutputQuant:
 
     # Shared bytes per warp for one token's inverse-RoPE table: 32 cos, then 32 sin.
     rotary_scratch_bytes: int = 256
+    # ``store`` writes each lane's 128 E4M3 channels into its 128-byte row of a TMA SW128
+    # staging box and takes ``rotary_scratch``, so the WS TMA output path may use it.
+    stages_ws_sw128_rows: ClassVar[bool] = True
 
     @cute.jit
     def prefetch(self, args, row, phase: cutlass.Constexpr[int], state=None):

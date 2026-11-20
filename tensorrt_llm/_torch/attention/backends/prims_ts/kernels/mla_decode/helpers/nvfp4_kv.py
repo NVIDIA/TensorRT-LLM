@@ -226,6 +226,11 @@ def nvfp4_row_bytes(rope_dim: int) -> int:
     return NVFP4_DATA_BYTES + rope_dim + NVFP4_SCALE_BYTES
 
 
+# Probed once at import: the converter selection below is traced inside task
+# bodies, where CuTe DSL 4.9 rejects calls to memoized functions.
+_RUBIN_CUTE_DSL_AVAILABLE = is_rubin_cute_dsl_available()
+
+
 def is_sm107_target() -> bool:
     """Whether the CuTe DSL compile target is SM107 itself (``sm_107``
     through ``sm_107f``), so SM107-only resources such as its 327 KiB of SMEM
@@ -233,7 +238,7 @@ def is_sm107_target() -> bool:
     is excluded: it also builds for SM100/SM103.
     """
     arch = BaseDSL._get_dsl().get_arch_enum()
-    return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f
+    return _RUBIN_CUTE_DSL_AVAILABLE and Arch.sm_107 <= arch <= Arch.sm_107f
 
 
 def use_sm107_nvfp4_converter() -> bool:
@@ -891,7 +896,9 @@ def convert_nvfp4_record(
 
 
 @cute.jit
-def gather_fp8_tile(dst, panel_map, barrier, cached, base, warp, *, rows: cutlass.Constexpr[int]):
+def gather_fp8_tile(
+    dst, panel_map, barrier, cached, base, warp, *, rows: cutlass.Constexpr[int]
+):
     """TMA-gather this warp's rows of unchanged FP8 primary bytes into four retained panels.
 
     Warp ``warp`` owns rows ``[warp * rows, (warp + 1) * rows)`` of the tile, whose

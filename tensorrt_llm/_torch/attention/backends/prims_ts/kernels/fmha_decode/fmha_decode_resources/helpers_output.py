@@ -37,7 +37,7 @@ def _keeps_p_smem_block_offset_bytes(
     cfg: Constexpr[FmhaDecodeConfig], row_idx: Int32, col_idx: Int32
 ) -> Int32:
     """JIT form of the Keeps P SWIZZLE_128B vector-block address."""
-    dtype_bytes = cfg.v_dtype_bytes
+    dtype_bytes = cfg.pv_dtype_bytes
     chunk_cols = 128 // dtype_bytes
     chunk_idx = col_idx // Int32(chunk_cols)
     col_in_chunk = col_idx - chunk_idx * Int32(chunk_cols)
@@ -61,12 +61,11 @@ def _fp8_stsm_smem_dst(
     # Compute the swizzled SMEM address used by transposed 8-bit STSM. The
     # mapping writes lane fragments in the same layout the later vector GMEM
     # copy expects.
-    num_rows = Int32(num_trans_rows)
     num_bytes_per_row = Int32(num_trans_cols)
     num_rows_per_128b = Int32(128) // num_bytes_per_row
     num_segs_per_warp_per_row = num_bytes_per_row // Int32(16 * 4)
-    num_stsm_per_row = max(8 // 32, 1)
-    num_mtx_per_col = num_rows // Int32(8)
+    num_stsm_per_row = max(num_trans_rows // 32, 1)
+    num_mtx_per_col = Int32(min(num_trans_rows // 8, 4))
     warp_idx = warp_grp_thread_idx >> Int32(5)
     lane_idx = warp_grp_thread_idx & Int32(0x1F)
     thr_row_idx = lane_idx & Int32(0x7)
@@ -181,7 +180,7 @@ def _store_transposed_smem8b(
     band_cols = min(num_trans_cols, 128)
     assert num_regs % num_col_bands == 0
     regs_per_band = num_regs // num_col_bands
-    assert regs_per_band in (1, 2, 4, 8)
+    assert regs_per_band in (1, 2, 4, 8, 16, 32)
     for band_idx in cutlass.range_constexpr(num_col_bands):
         band_smem_base = smem_base_i32.subview(
             band_idx * num_trans_rows * band_cols // 4
@@ -205,27 +204,17 @@ def _store_transposed_smem8b(
                 band_cols,
             )
         else:
-            _store_transposed_smem8b_x4(
-                band_smem_base,
-                regs[reg_base],
-                regs[reg_base + 1],
-                regs[reg_base + 2],
-                regs[reg_base + 3],
-                warp_grp_thread_idx,
-                num_trans_rows,
-                band_cols,
-            )
-            if cutlass.const_expr(regs_per_band > 4):
+            for store_idx in cutlass.range_constexpr(regs_per_band // 4):
                 _store_transposed_smem8b_x4(
                     band_smem_base,
-                    regs[reg_base + 4],
-                    regs[reg_base + 5],
-                    regs[reg_base + 6],
-                    regs[reg_base + 7],
+                    regs[reg_base + store_idx * 4],
+                    regs[reg_base + store_idx * 4 + 1],
+                    regs[reg_base + store_idx * 4 + 2],
+                    regs[reg_base + store_idx * 4 + 3],
                     warp_grp_thread_idx,
                     num_trans_rows,
                     band_cols,
-                    1,
+                    store_idx,
                 )
 
 

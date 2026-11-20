@@ -942,10 +942,9 @@ class DeepseekV41Attention(nn.Module):
         """Whether this forward is a PrimTS decode step below the fused FP8 Q projection's size,
         of at most ``_PRIMS_TS_SMALL_STEP_HEADS`` heads per rank.
 
-        Such a step's attention reads either the BF16 Q before its RoPE, which its launch
-        rotates and rounds (``_prims_ts_kernel_rope``), or the unit-scale E4M3 Q that
-        ``gptj_rope_e4m3_small_m`` writes from it, in place of the RoPE and PrimTS's query
-        staging.
+        Such a step's attention reads only the unit-scale E4M3 Q that
+        ``gptj_rope_e4m3_small_m`` writes from the BF16 Q, in place of the RoPE and PrimTS's
+        query staging.
         """
         rows = q.shape[0]
         return (
@@ -964,14 +963,6 @@ class DeepseekV41Attention(nn.Module):
             and positions.is_contiguous()
             and is_sm_100f()
         )
-
-    def _prims_ts_kernel_rope(self, positions: torch.Tensor) -> bool:
-        """Whether a small PrimTS step's attention launch rotates its Q itself.
-
-        The launch's load warps rotate and round Q before its keys arrive; they read INT32
-        positions, so INT64 ones take the separate E4M3 launch.
-        """
-        return positions.dtype == torch.int32
 
     def _rope_query(
         self, q: torch.Tensor, positions: torch.Tensor, amax: torch.Tensor | None = None
@@ -2011,20 +2002,18 @@ class DeepseekV41Attention(nn.Module):
                 quant_q = fp8_query.quant_q
                 q_amax = fp8_query.word
                 q = torch.empty(quant_q.shape, dtype=self.dtype, device=quant_q.device)
-        # A small PrimTS decode step reads either the BF16 Q before its RoPE, rotated by its
-        # attention launch, or only the unit-scale E4M3 Q, which one launch rotates and
-        # converts; the BF16 Q stays as projected.
+        # A small PrimTS decode step reads only the unit-scale E4M3 Q, which one launch rotates
+        # and converts; the BF16 Q stays as projected.
         small_step = not (
             fused_query or quant_q is not None or direct
         ) and self._prims_ts_small_step(q, positions, attn_metadata)
-        kernel_rope = small_step and self._prims_ts_kernel_rope(positions)
         small_q = (
             torch.empty(
                 (q.shape[0], self.num_heads_tp * self.qk_head_dim),
                 dtype=torch.float8_e4m3fn,
                 device=q.device,
             )
-            if small_step and not kernel_rope
+            if small_step
             else None
         )
         # CSA2 never applies V4's projected-Q per-head normalization.
@@ -2037,7 +2026,7 @@ class DeepseekV41Attention(nn.Module):
                     q, positions.reshape(-1), self.rotary_emb.rotary_cos_sin, small_q
                 )
                 quant_q = small_q
-            elif not fused_query and quant_q is None and not direct and not kernel_rope:
+            elif not fused_query and quant_q is None and not direct:
                 word = (
                     self._q_amax_word(q.device)
                     if self._stages_native_fp8_generation(attn_metadata)
@@ -2244,11 +2233,6 @@ class DeepseekV41Attention(nn.Module):
                     ),
                     projected_q_unit_scale=unit_q,
                     projected_q_amax=q_amax,
-                    query_rope=(
-                        (positions.reshape(-1)[start:end], self.rotary_emb.rotary_cos_sin)
-                        if kernel_rope
-                        else None
-                    ),
                 ),
             )
             if fused:

@@ -15,6 +15,7 @@
 """Final sparse MLA output: conjugate RoPE and block E4M3 quantization."""
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
@@ -53,12 +54,24 @@ class MlaOutputQuant:
     from its extent); positions are INT32; cos/sin is FP32; scales are a
     token-major logical view of column-major FP32 or packed INT32 storage.
     Rows are token * H + head and columns are channels within the D512 head.
+
+    ``shared_output`` follows the two-CTA epilogue layout (see ``store``), so
+    this quantizer does not serve the WS TMA output stage; see
+    ``stages_ws_sw128_rows``.
     """
 
     block_size: int
     ue8m0: bool
     num_heads: int
     num_groups: int
+
+    # A quantizer that sets this writes each lane's 128 E4M3 channels into its
+    # 128-byte row of a 32-row SW128 WS slice (``shared_output`` is the slice
+    # address) and accepts ``store(..., rotary_scratch=...)``. Only such a
+    # quantizer may take the WS TMA output path; it may also provide the
+    # optional hooks that path uses (prefetch/stage_rotary with
+    # rotary_scratch_bytes, store_scales, round_words/store_words).
+    stages_ws_sw128_rows: ClassVar[bool] = False
 
     @cute.jit
     def rotate(self, args, values, row, column):

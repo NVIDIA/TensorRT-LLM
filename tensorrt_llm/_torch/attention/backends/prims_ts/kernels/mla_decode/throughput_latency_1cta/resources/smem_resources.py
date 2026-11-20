@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
 from cutlass.experimental import primitives as prims
+from ....task_compat import consumer_work_stage
 from ....tensor_map import transform_ragged_coords
 
 import cutlass
@@ -298,7 +299,9 @@ class SmemQResource(MlaResource):
             == qk_stage_idx % self.cfg.load_num_warps
         ):
             smem_offset = Int32(q_stage_smem_element_offset(self.cfg, qk_stage_idx))
-            if cutlass.const_expr(self.cfg.q_nope_tmem and not self.cfg.q_tmem_mma_copy):
+            if cutlass.const_expr(
+                self.cfg.q_nope_tmem and not self.cfg.q_tmem_mma_copy
+            ):
                 smem_offset = Int32(0)
             prims.cp_async_bulk_tensor_shared_cta_global(
                 stage_base.data_ptr(smem_offset),
@@ -586,12 +589,16 @@ class SmemQResource(MlaResource):
         if cutlass.const_expr(self.cfg.q_nope_tmem):
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             cache = decode_gen_task_cache(stage_info)
-            tmem_q = cache[_TASK_CACHE_TMEM_BASE_OFFSET] + Int32(self._tmem_alloc.offset)
+            tmem_q = cache[_TASK_CACHE_TMEM_BASE_OFFSET] + Int32(
+                self._tmem_alloc.offset
+            )
             if cutlass.const_expr(self.cfg.q_tmem_mma_copy):
                 # The MMA thread issues the copy after the previous tile's QK and
                 # before this tile's; tcgen05 executes its operations in order.
                 if prims.elect_sync():
-                    copy_q_fp8_to_tmem(stage_base.data_ptr(Int32(0)), tmem_q, cta_group=1)
+                    copy_q_fp8_to_tmem(
+                        stage_base.data_ptr(Int32(0)), tmem_q, cta_group=1
+                    )
             desc_q = Int64(tmem_q)
         return desc_q, desc_q_rope
 
@@ -781,7 +788,7 @@ class SmemPageOffsetsResource(MlaResource):
     @cute.jit
     def page_id(self, page_fragment_idx: int):
         """Return one cached logical page id from the consumer stage."""
-        offset = self.consumer_work_stage * Int32(
+        offset = consumer_work_stage(self) * Int32(
             self.cfg.page_offsets_entries_per_stage
         ) + Int32(page_fragment_idx)
         return Int32(self._smem_page_offsets[offset])
@@ -1011,9 +1018,19 @@ class SmemPageOffsetsResource(MlaResource):
                     3,
                     cutlass.Int32,
                 )
-                prims.cp_async_shared_global(
-                    smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
-                )
+                if cutlass.const_expr(cfg.use_kv_bounds):
+                    if seq_len_kv == Int32(0):
+                        # An empty rank need not own any valid physical pages.
+                        # A negative page selects TMA's out-of-bounds zero fill.
+                        self._smem_page_offsets.data_ptr(smem_offset).store(Int32(-1))
+                    else:
+                        prims.cp_async_shared_global(
+                            smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
+                        )
+                else:
+                    prims.cp_async_shared_global(
+                        smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
+                    )
 
     @producer_work
     @cute.jit
@@ -1069,7 +1086,7 @@ class SmemPageOffsetsResource(MlaResource):
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
                 self.cfg.load_warp_idx
             )
-            row_base = self.consumer_work_stage * Int32(
+            row_base = consumer_work_stage(self) * Int32(
                 self.cfg.page_offsets_entries_per_stage
             ) + warp * Int32(4 * quads)
             for quad in cutlass.range_constexpr(quads):
@@ -1092,7 +1109,7 @@ class SmemPageOffsetsResource(MlaResource):
             if lane < groups_per_warp:
                 quad = warp * groups_per_warp + lane
                 offset = (
-                    self.consumer_work_stage * self.cfg.page_offsets_entries_per_stage
+                    consumer_work_stage(self) * self.cfg.page_offsets_entries_per_stage
                     + quad * 4
                 )
                 values = self._smem_page_offsets.data_ptr(offset).load(
@@ -1620,7 +1637,11 @@ class SmemKvResource(MlaResource):
                     # this tile's raw slot before the KV acquire.
                     if self._tma_fp8_tile(cached_page_ids, page_id_slot):
                         self._gather_fp8_tile(
-                            destinations[0], stage_info, cached_page_ids, page_id_slot, warp
+                            destinations[0],
+                            stage_info,
+                            cached_page_ids,
+                            page_id_slot,
+                            warp,
                         )
                     else:
                         store_nvfp4_record(
@@ -1647,7 +1668,11 @@ class SmemKvResource(MlaResource):
                         # The raw slot carried no bytes for this tile.
                         release_raw_record(raw_empty)
                         self._gather_fp8_tile(
-                            destinations[0], stage_info, cached_page_ids, page_id_slot, warp
+                            destinations[0],
+                            stage_info,
+                            cached_page_ids,
+                            page_id_slot,
+                            warp,
                         )
                     elif source_is_fp8(
                         cfg,
@@ -2069,7 +2094,14 @@ class SmemKvResource(MlaResource):
                         tile_idx * Int32(pages_per_tile) + Int32(page_frag),
                         last_valid_page,
                     )
-                    page_id = Int32(self.page_offsets[logical_page_idx, batch_idx])
+                    if cutlass.const_expr(cfg.use_kv_bounds):
+                        page_id = Int32(-1)
+                        if seq_len_kv > Int32(0):
+                            page_id = Int32(
+                                self.page_offsets[logical_page_idx, batch_idx]
+                            )
+                    else:
+                        page_id = Int32(self.page_offsets[logical_page_idx, batch_idx])
                 page_base = Int32(page_frag * first_page_elems)
                 smem_page_offset = page_base
                 if prims.elect_sync():

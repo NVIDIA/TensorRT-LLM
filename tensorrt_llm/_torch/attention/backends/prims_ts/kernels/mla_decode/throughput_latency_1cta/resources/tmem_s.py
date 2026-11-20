@@ -75,7 +75,7 @@ from ...helpers.math import (
     u32_to_float_for_atomic_max,
 )
 from ...helpers.mask import MaskType
-from ...helpers.gather import CachedSparseMask, invalid_sparse_token, cache_sparse_mask
+from ...helpers.gather import invalid_sparse_token, cache_sparse_mask
 from ...helpers.ops import (
     float_to_u32_bits,
     freeze_smem_descriptor,
@@ -99,24 +99,6 @@ from .common import (
     MlaResource,
 )
 
-def prefetches_sparse_mask(cfg) -> bool:
-    """Whether the single-pipe Keep-AB softmax caches each tile's sparse mask before its S wait.
-
-    Sparse-direct masks read the tile's selections (and mapped rows' page-table entries) from
-    global memory. Read in a step before the wait, those round trips overlap the QK MMA
-    instead of following it.
-    """
-    return bool(
-        cfg.sparse_direct
-        and cfg.kernel_variant == "keeps_mma_ab"
-        and cfg.single_kv_pipe
-        and cfg.num_tokens_per_page == 1
-        and not cfg.sparse_d576_reload
-        and cfg.fixed_seqlen
-        and cfg.logical_seq_len_q == 1
-    )
-
-
 # =====================================================================
 # TmemSResource — S scores in TMEM, UmmaProducerAsync pipeline
 # =====================================================================
@@ -138,6 +120,7 @@ class TmemSResource(MlaResource):
     p_ref: Optional[MemoryResource] = None
     global_ref: Optional[MemoryResource] = None
     cache_seqs: object = None
+    kv_bounds: object = None
     page_offsets: object = None
     head_idx: object = None
     batch_idx: object = None
@@ -152,9 +135,6 @@ class TmemSResource(MlaResource):
     _ws_bridge_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
     _softmax_scratch: object = None
     _p_local_sum_arr: object = None
-    # The words prefetch_sparse_mask cached for the next score tile.
-    _mask_low: object = None
-    _mask_high: object = None
     old_max_arr: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
@@ -225,10 +205,6 @@ class TmemSResource(MlaResource):
     def _make_initial_softmax_vars(self):
         """Create fresh softmax state arrays for the current work tile."""
         self._reset_softmax_state()
-        if cutlass.const_expr(prefetches_sparse_mask(self.cfg)):
-            # Seed the cached mask so its values dominate every use.
-            self._mask_low = Int32(0)
-            self._mask_high = Int32(0)
         num_scale_groups = num_softmax_scale_groups(self.cfg)
         num_s_regs = num_s_regs_per_thread(self.cfg)
         self._p_local_sum_arr = cutlass.Array(
@@ -470,87 +446,6 @@ class TmemSResource(MlaResource):
                             else TCGEN05_DESC_NEXT_K_BLOCK_UNITS
                         )
 
-    @cute.jit
-    def _sparse_mask(self, stage_info: StageInfo):
-        """The cached sparse mask of the score tile this loop iteration consumes."""
-        cfg = self.cfg
-        task_cache = decode_gen_task_cache(stage_info)
-        batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
-        cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
-        seq_len_kv = runtime_seq_len_kv_from_task_cache(
-            cfg,
-            task_cache,
-            cta_idx_q,
-            self.cu_seqlens_q,
-            batch_idx,
-        )
-        tile_idx = global_kv_tile_idx(
-            cfg,
-            softmax_kv_tile_idx(cfg, stage_info, self.inst_id),
-            seq_len_kv,
-            cta_idx_kv,
-            requested_splits=self.runtime_split_kv,
-            task_cache=task_cache,
-        )
-        tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
-        return cache_sparse_mask(
-            self.page_offsets.select_source_tile(tile_offset_k, batch_idx, for_mask=True),
-            tile_offset_k,
-            seq_len_kv,
-            batch_idx,
-            swaps=False,
-            tile_size_kv=cfg.tile_size_kv,
-            column_half=(cute.arch.thread_idx()[0] // Int32(64)) if cfg.ws_native_e else None,
-        )
-
-    @cute.jit
-    def _mask_routes(self, cfg, tile_offset_k, seq_len_kv, batch_idx, warp_grp_thread_idx):
-        """The routes update_softmax masks one score tile with."""
-        raw_mask_routes = (
-            self.page_offsets.select_source_tile(
-                tile_offset_k, batch_idx, for_mask=True
-            )
-            if cutlass.const_expr(cfg.sparse_direct)
-            else self.page_offsets
-        )
-        return (
-            cache_sparse_mask(
-                raw_mask_routes,
-                tile_offset_k,
-                seq_len_kv,
-                batch_idx,
-                swaps=cfg.kernel_variant != "keeps_mma_ab",
-                tile_size_kv=cfg.tile_size_kv,
-                column_half=(warp_grp_thread_idx // Int32(64))
-                if cfg.ws_native_e
-                else None,
-            )
-            # D576 query rows of one CTA are heads of one token: one mask.
-            if cutlass.const_expr(
-                (
-                    cfg.num_tokens_per_page == 1
-                    and not cfg.sparse_d576_reload
-                    and cfg.fixed_seqlen
-                    and cfg.logical_seq_len_q == 1
-                )
-                or cfg.sparse_d576_reload
-            )
-            else raw_mask_routes
-        )
-
-    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
-    @cute.jit
-    def prefetch_sparse_mask(self, stage_info: StageInfo):
-        """Cache the sparse mask of the score tile the following wait releases.
-
-        Runs before that wait, so the mask's global reads overlap the QK MMA; update_softmax
-        then applies the cached words.
-        """
-        mask = self._sparse_mask(stage_info)
-        self._mask_low = mask.low
-        self._mask_high = mask.high
-
     @consumer_work(returns=(old_max_arr, sum_arr, new_max_arr, local_sum_arr, s_arr))
     @cute.jit
     def update_softmax(
@@ -631,12 +526,37 @@ class TmemSResource(MlaResource):
         )
         tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
         next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
-        if cutlass.const_expr(prefetches_sparse_mask(cfg)):
-            mask_routes = CachedSparseMask((self._mask_low, self._mask_high), False)
-        else:
-            mask_routes = self._mask_routes(
-                cfg, tile_offset_k, seq_len_kv, batch_idx, warp_grp_thread_idx
+        raw_mask_routes = (
+            self.page_offsets.select_source_tile(
+                tile_offset_k, batch_idx, for_mask=True
             )
+            if cutlass.const_expr(cfg.sparse_direct)
+            else self.page_offsets
+        )
+        mask_routes = (
+            cache_sparse_mask(
+                raw_mask_routes,
+                tile_offset_k,
+                seq_len_kv,
+                batch_idx,
+                swaps=cfg.kernel_variant != "keeps_mma_ab",
+                tile_size_kv=cfg.tile_size_kv,
+                column_half=(warp_grp_thread_idx // Int32(64))
+                if cfg.ws_native_e
+                else None,
+            )
+            # D576 query rows of one CTA are heads of one token: one mask.
+            if cutlass.const_expr(
+                (
+                    cfg.num_tokens_per_page == 1
+                    and not cfg.sparse_d576_reload
+                    and cfg.fixed_seqlen
+                    and cfg.logical_seq_len_q == 1
+                )
+                or cfg.sparse_d576_reload
+            )
+            else raw_mask_routes
+        )
 
         # Normalize both score layouts into one local S register array before
         # masking: keeps-MMA-AB reads a single TMEM panel, swaps-MMA-AB reads
@@ -701,11 +621,14 @@ class TmemSResource(MlaResource):
         should_apply_dense_mask = (
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)
-        needs_row_causal_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value
-            and (not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1)
+        needs_row_prefix_mask = cutlass.const_expr(
+            cfg.use_kv_bounds
+            or (
+                cfg.mask_type == MaskType.CAUSAL.value
+                and (not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1)
+            )
         )
-        if cutlass.const_expr(needs_row_causal_mask):
+        if cutlass.const_expr(needs_row_prefix_mask):
             min_seq_len_kv = runtime_seq_len_kv_for_query_row(
                 cfg,
                 self.cache_seqs,
@@ -713,6 +636,7 @@ class TmemSResource(MlaResource):
                 cta_idx_q,
                 Int32(0),
                 self.cu_seqlens_q,
+                self.kv_bounds,
             )
             should_apply_dense_mask = should_apply_dense_mask or (
                 next_tile_offset_k > min_seq_len_kv
@@ -729,8 +653,8 @@ class TmemSResource(MlaResource):
             else:
                 should_apply_dense_mask = True
         if should_apply_dense_mask:
-            # The CTA domain follows the latest logical query row in the flat
-            # tile. Earlier rows can have a narrower bottom-right causal limit.
+            # Each row's causal or explicit prefix can be narrower than the
+            # shared CTA domain used by the producer and split reduction.
             warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
             lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
             if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
@@ -740,7 +664,7 @@ class TmemSResource(MlaResource):
                     local_row_idx = warp_grp_thread_idx % Int32(64)
                     local_col_base = (warp_grp_thread_idx // Int32(64)) * Int32(64)
                 row_seq_len_kv = seq_len_kv
-                if cutlass.const_expr(needs_row_causal_mask):
+                if cutlass.const_expr(needs_row_prefix_mask):
                     row_seq_len_kv = runtime_seq_len_kv_for_query_row(
                         cfg,
                         self.cache_seqs,
@@ -748,6 +672,7 @@ class TmemSResource(MlaResource):
                         cta_idx_q,
                         local_row_idx,
                         self.cu_seqlens_q,
+                        self.kv_bounds,
                     )
                 for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                     token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
@@ -777,7 +702,7 @@ class TmemSResource(MlaResource):
                     row_in_tile_1 = row_in_tile_0 + Int32(1)
                     seq_len_kv_0 = seq_len_kv
                     seq_len_kv_1 = seq_len_kv
-                    if cutlass.const_expr(needs_row_causal_mask):
+                    if cutlass.const_expr(needs_row_prefix_mask):
                         seq_len_kv_0 = runtime_seq_len_kv_for_query_row(
                             cfg,
                             self.cache_seqs,
@@ -785,6 +710,7 @@ class TmemSResource(MlaResource):
                             cta_idx_q,
                             row_in_tile_0,
                             self.cu_seqlens_q,
+                            self.kv_bounds,
                         )
                         seq_len_kv_1 = runtime_seq_len_kv_for_query_row(
                             cfg,
@@ -793,6 +719,7 @@ class TmemSResource(MlaResource):
                             cta_idx_q,
                             row_in_tile_1,
                             self.cu_seqlens_q,
+                            self.kv_bounds,
                         )
                     s_base = repeat_idx * 4
                     s_second_panel_base = q_repeats * 4 + s_base

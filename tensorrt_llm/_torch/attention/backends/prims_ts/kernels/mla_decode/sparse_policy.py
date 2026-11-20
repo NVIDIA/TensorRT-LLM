@@ -55,19 +55,6 @@ class SparseMlaProfile:
     # dedicated 32 KB stage (the MMA warp still copies it to TMEM), so the ring
     # can retain more K/V slices.
     ws_q_in_kv: bool = False
-    # Split-KV plans with a final sparse output: the last CTA of a query tile's
-    # splits merges them in the attention kernel instead of a separate reducer
-    # launch (same arithmetic, so the same output).
-    fused_split_finish: bool = False
-    # Split-KV plans with a final sparse output: the splits of each query tile and V
-    # partition form one thread-block cluster whose first CTA merges them after a cluster
-    # barrier, instead of a separate reducer launch (same arithmetic, so the same output).
-    cluster_split_finish: bool = False
-    # The query, both selection lists, the page table and the MAIN rows were final before
-    # the launch preceding this one; that launch may still write this step's SWA rows.
-    # With the cluster merge, the kernel then releases its dependents and runs the MAIN
-    # splits before waiting on the preceding grid: only SWA rows and the outputs wait.
-    inputs_final: bool = False
 
 
 def base_fp8_profile(rows, heads, capacity, sm_count, rope_dim):
@@ -891,7 +878,10 @@ def resolve_sparse_mla_profile(
             if remaining * 4 <= sm_count
             else 2
         )
-    # Retaining K through PV requires a single owner of the V dimension.
+    # This policy retains K through PV only with one V owner. configure_sparse_mla
+    # also accepts non-WS Keep-AB V owners reading their own slices of a retained
+    # K tile (the DS4.1 decode uses that), but no generic shape has been measured
+    # with it; Swap-AB and the WS NVFP4 retained schedule need one owner.
     reuse = profile.reuse_kv and v_ctas == 1
     if profile.family == "2cta" and kv_cache_format != "native":
         # Convert each CTA's64 K rows once, then exchange the peer's V

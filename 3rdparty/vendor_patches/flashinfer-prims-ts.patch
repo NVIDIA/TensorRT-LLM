@@ -193,6 +193,24 @@ index b374a65311402982d818d80e9145ab40ed9727a1..cdfa76294f2d854117db62ad36724254
      return build_and_load_cute_dsl_kernel(
          f"prims_ts_{family}",
          f"{kind}_sm{major}{minor}_{key}",
+diff --git a/_hardware.py b/_hardware.py
+index b146453ea5bb781d00815981efcc0d86c928ae53..438420f23e16cd65977153677b502534fbd5973e 100644
+--- a/_hardware.py
++++ b/_hardware.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -45,7 +46,7 @@ def is_sm107_compile_target() -> bool:
+     """Whether generated code may use resources exclusive to native SM107."""
+     from cutlass.base_dsl.arch import Arch
+     from cutlass.cutlass_dsl import BaseDSL
+-    from ...cute_dsl.availability import is_rubin_cute_dsl_available
++    from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
+ 
+     arch = BaseDSL._get_dsl().get_arch_enum()
+     return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f
 diff --git a/block_sparse.py b/block_sparse.py
 index 4769d6b6a8c6009b22abf1850fb7f2df68216f8e..5ac63fcca05d8668e4367d0843c4c6d53e46175d 100644
 --- a/block_sparse.py
@@ -256,7 +274,7 @@ index 4769d6b6a8c6009b22abf1850fb7f2df68216f8e..5ac63fcca05d8668e4367d0843c4c6d5
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index 1c84d982574d7edf31e62eb4e8ebf8575b0b674d..9feef94adb43ba3e9f608952ddbd40ad570f906f 100644
+index 92904a9b22d119bd00aa6e8f95570fed02a7753b..3be474abc910f72c94786031367ef7a99afc6a48 100644
 --- a/context.py
 +++ b/context.py
 @@ -61,7 +61,7 @@ from .vc_attention import (
@@ -268,7 +286,7 @@ index 1c84d982574d7edf31e62eb4e8ebf8575b0b674d..9feef94adb43ba3e9f608952ddbd40ad
  from .decode import (
      _validate_native_hnd_tma_strides,
      prepare_lse,
-@@ -577,7 +577,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -612,7 +612,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -278,7 +296,7 @@ index 1c84d982574d7edf31e62eb4e8ebf8575b0b674d..9feef94adb43ba3e9f608952ddbd40ad
          require_cute_dsl_arch(device_index)
      return device_index
 diff --git a/decode.py b/decode.py
-index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335aa4b29886 100644
+index 3029065b8ed19dd59cef62bb4ed269675929836c..1379427c8af1e16bf8b36c892413f911970f245c 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -305,7 +323,7 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
  
  from . import _q_token_kv_block_sparse_policy as _sparse_policy
  from ._block_sparse.common import _num_sparse_pattern_heads
-@@ -805,7 +802,7 @@ def _validate_runtime_device(device: torch.device) -> None:
+@@ -813,7 +810,7 @@ def _validate_runtime_device(device: torch.device) -> None:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -314,7 +332,7 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
  
          require_cute_dsl_arch(device_index)
  
-@@ -4457,7 +4454,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4670,7 +4667,7 @@ class BatchDecodePagedTSWrapper:
          # previous complete plan revision usable.
          self._plan_state = candidate
  
@@ -323,7 +341,7 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
      def run(
          self,
          q: torch.Tensor,
-@@ -4668,7 +4665,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4881,7 +4878,7 @@ class BatchDecodePagedTSWrapper:
          return (result, lse) if return_lse else result
  
  
@@ -333,7 +351,7 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
-index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd8317c22b 100644
+index c9811f30d5341adb16689ac4533147c36f75bbb9..ab6eb4052d28630329a0ec4a43577068543e0162 100644
 --- a/kernels/fmha_context/fmha_resources.py
 +++ b/kernels/fmha_context/fmha_resources.py
 @@ -1,3 +1,4 @@
@@ -341,7 +359,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -1454,8 +1455,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1455,8 +1456,6 @@ class GmemQKVResource(MemoryResource):
                  if cutlass.const_expr(self.cfg.has_uniform_varlen):
                      seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                  else:
@@ -350,7 +368,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
                      seqlen_k = _load_runtime_seq_len_kv(
                          self.seqlens_kv, self.max_seq_len_kv, batch_coord
                      )
-@@ -1478,8 +1477,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1479,8 +1478,6 @@ class GmemQKVResource(MemoryResource):
                      kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
                      kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
                  else:
@@ -359,7 +377,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
                      kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                          Int32(self.block_table_row_stride),
                          self.cfg,
-@@ -1566,13 +1563,9 @@ class GmemQKVResource(MemoryResource):
+@@ -1567,13 +1564,9 @@ class GmemQKVResource(MemoryResource):
              kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
              kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
          else:
@@ -373,7 +391,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
              kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                  Int32(self.block_table_row_stride),
                  self.cfg,
-@@ -7822,3 +7815,13 @@ class GmemOResource(MemoryResource):
+@@ -7855,3 +7848,13 @@ class GmemOResource(MemoryResource):
                  prims.cp_async_bulk_commit_group()
                  if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
                      prims.cp_async_bulk_wait_group(0, read=True)
@@ -388,7 +406,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
 +    _load_runtime_seq_len_kv,
 +)
 diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
-index 6787e8ab5b566849ccc5ba228da220ed55898ea7..c11e9d211020c646a5a71cd309074d6bb70da119 100644
+index 7527aaf770386772185f7992cda2f2ba3a7fc83a..1d3a010d79965c7a3e4b12b10cc28fe061cc9044 100644
 --- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 +++ b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 @@ -1,3 +1,4 @@
@@ -396,17 +414,17 @@ index 6787e8ab5b566849ccc5ba228da220ed55898ea7..c11e9d211020c646a5a71cd309074d6b
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -36,7 +37,7 @@ from cutlass.experimental.task_scheduling.resources import (
-     producer_work,
+@@ -37,7 +38,7 @@ from cutlass.experimental.task_scheduling.resources import (
  )
  
+ from ...task_compat import consumer_work_stage
 -from ......cute_dsl.availability import is_rubin_cute_dsl_available
 +from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
+ from ...placeholder_helpers import _placeholder_local_array
  from ..fmha_decode_config import FmhaDecodeConfig
- from .helpers_common import (
-     _TASK_CACHE_TMEM_BASE_OFFSET,
+ from ..fmha_decode_constants import KV_KIND_V
 diff --git a/kernels/mla_decode/helpers/nvfp4_kv.py b/kernels/mla_decode/helpers/nvfp4_kv.py
-index 8b2e8a43e5553ed33b67603273e0cc1fbd3585ae..fd3f735ede1f723f66d76f45a6490921ca77d3c3 100644
+index aa48aa861aceda5c6d60a248495ed18f836d5ebf..14b8ad3e911826ee72959a10ed4d3c97ecbb712a 100644
 --- a/kernels/mla_decode/helpers/nvfp4_kv.py
 +++ b/kernels/mla_decode/helpers/nvfp4_kv.py
 @@ -28,7 +28,7 @@ from cutlass.base_dsl.arch import Arch
@@ -418,89 +436,8 @@ index 8b2e8a43e5553ed33b67603273e0cc1fbd3585ae..fd3f735ede1f723f66d76f45a6490921
  from ...tensor_map import create_tensor_map_tiled_from_view
  from .gather import _address, gather4, select_gather_map
  from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
-diff --git a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
-index c084dde7ed8feacb1423a2ff9a6571a907883be4..980419545032202e5e346b80cc2440a90387630c 100644
---- a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
-+++ b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
-@@ -415,17 +415,17 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
-                     cutlass.const_expr(lane_slot_i == 0)
-                     or Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES) < split_limit
-                 ):
--                    stats_split_idx = lane_idx + Int32(
-+                    weight_split_idx = lane_idx + Int32(
-                         lane_slot_i * GMEM_REDUCTION_WARP_LANES
-                     )
--                    if stats_split_idx < split_limit:
-+                    if weight_split_idx < split_limit:
-                         stats_weight = normalized_lse_weight(
-                             lane_lse[lane_slot_i], global_lse
-                         )
-                         if cutlass.const_expr(finalize_attention):
-                             stats_weight *= stats_sink_scale
-                         smem_scale[
--                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + stats_split_idx
-+                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + weight_split_idx
-                         ] = stats_weight
- 
-     prims.barrier_cta_sync(
-diff --git a/kernels/mla_decode/throughput_latency_1cta/tasks.py b/kernels/mla_decode/throughput_latency_1cta/tasks.py
-index 5276885bbeda5941d3edb1eb10cd5131ae656890..b7ef6d64c4bf768b39363ed2219d00d4609c8412 100644
---- a/kernels/mla_decode/throughput_latency_1cta/tasks.py
-+++ b/kernels/mla_decode/throughput_latency_1cta/tasks.py
-@@ -120,10 +120,9 @@ class MlaDecodeTask(Task):
-         else:
-             return Int32(pointer.load())
- 
-+    @cute.jit
-     def make_task_cache(self):
--        """Snapshot the compact task state at the tracing call site."""
--        # get_domain updates _seq_len_kv in Python; under FrontendNext a jitted
--        # getter can read the old staged slot before that mutation is committed.
-+        """Return the compact tuple of cached per-task thread values."""
-         return (
-             self._tmem_base_offset,
-             self._warp_grp_thread_idx,
-@@ -135,9 +134,10 @@ class MlaDecodeTask(Task):
-             Int32(0),
-         )
- 
-+    @cute.jit
-     def get_domain(self, tile_coord):
-         """Return the runtime loop domain for the current 1CTA work tile."""
--        if self.cfg is None:
-+        if cutlass.const_expr(self.cfg is None):
-             return self.domain
-         if cutlass.const_expr(self.seqlens_kv is None and self.cfg.seq_len_kv is None):
-             # Padding and scheduler tasks have no K/V metadata or mainloop.
-@@ -145,14 +145,14 @@ class MlaDecodeTask(Task):
- 
-         # Persistent 1CTA coordinates combine batch and head tile in z;
-         # non-persistent grids keep z as batch. cache_seqs remains batch-owned.
--        if isinstance(tile_coord[2], int):
--            if self.cfg.use_persistent_scheduler == 1:
-+        if cutlass.const_expr(isinstance(tile_coord[2], int)):
-+            if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
-                 batch_idx = tile_coord[2] // self.cfg.num_ctas_for_all_heads
-             else:
-                 batch_idx = tile_coord[2]
-         else:
-             batch_idx = Int32(tile_coord[2])
--            if self.cfg.use_persistent_scheduler == 1:
-+            if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
-                 batch_idx = batch_idx // Int32(self.cfg.num_ctas_for_all_heads)
- 
-         # Task-domain ownership must match K/V, softmax, and reduction: dense
-@@ -193,7 +193,7 @@ class MlaDecodeTask(Task):
-             self.cu_seqlens_q,
-             batch_idx,
-         )
--        if self.cfg.fixed_sparse_kv_tiles > 0:
-+        if cutlass.const_expr(self.cfg.fixed_sparse_kv_tiles > 0):
-             return Int32(self.domain_bias)
-         total_kv_tiles = runtime_local_kv_tiles(
-             self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv
 diff --git a/mla_decode.py b/mla_decode.py
-index 94547ed86f7365df3638215daa0762ff1344741f..4647b0c70174151f43046a2eeb4bb27ec76f56cb 100644
+index cf086083ad5d6abd6092cdd68e5cd6d0395c222d..9e645416e22180e0e8aca1e5a6e2bcf1878ef48d 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -522,7 +459,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..4647b0c70174151f43046a2eeb4bb27e
  
  
  from .decode import (
-@@ -1196,11 +1193,35 @@ def _make_mla_decode_compile_spec(
+@@ -1255,11 +1252,35 @@ def _make_mla_decode_compile_spec(
  _cached_mla_decode_compile_spec = functools.cache(_make_mla_decode_compile_spec)
  
  
@@ -563,8 +500,8 @@ index 94547ed86f7365df3638215daa0762ff1344741f..4647b0c70174151f43046a2eeb4bb27e
  
      import cutlass
      import cutlass.cute as cute
-@@ -1897,7 +1918,7 @@ class BatchMLADecodePagedTSWrapper:
-             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+@@ -2007,7 +2028,7 @@ class BatchMLADecodePagedTSWrapper:
+             zero_empty_rows=zero_empty_rows,
          )
  
 -    @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
@@ -572,7 +509,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..4647b0c70174151f43046a2eeb4bb27e
      def run(
          self,
          query: torch.Tensor,
-@@ -2013,7 +2034,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -2138,7 +2159,7 @@ class BatchMLADecodePagedTSWrapper:
          return (result, lse) if return_lse else result
  
  
@@ -581,7 +518,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..4647b0c70174151f43046a2eeb4bb27e
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2379,6 +2400,7 @@ def _prepare_sparse_output_quant(
+@@ -2522,6 +2543,7 @@ def _prepare_sparse_output_quant(
      )
  
  
@@ -589,7 +526,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..4647b0c70174151f43046a2eeb4bb27e
  def _resolve_sparse_mla_plan(
      device,
      batch_size,
-@@ -2411,17 +2433,17 @@ def _resolve_sparse_mla_plan(
+@@ -2554,17 +2576,17 @@ def _resolve_sparse_mla_plan(
      affect geometry or workspace sizing.
      """
      import cutlass
@@ -612,7 +549,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..4647b0c70174151f43046a2eeb4bb27e
      )
  
 diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
-index 8ca2ea99c7ccd323a1823df104b12a39de9bb25f..c8748c231c2f47c763d6235f76fbd0f7fd5a150d 100644
+index df8632895f556ad786e8c7373d002ff01fcd415f..b5234844790d7c922a8bbd3d45cc90e7ad64ecb1 100644
 --- a/q_token_kv_block_sparse_metadata.py
 +++ b/q_token_kv_block_sparse_metadata.py
 @@ -1,3 +1,4 @@
@@ -621,7 +558,7 @@ index 8ca2ea99c7ccd323a1823df104b12a39de9bb25f..c8748c231c2f47c763d6235f76fbd0f7
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
 @@ -41,9 +42,9 @@ from dataclasses import dataclass, replace
- from typing import Any, Literal, Optional
+ from typing import TYPE_CHECKING, Any, Literal, Optional
  
  import torch
 -from flashinfer.api_logging import flashinfer_experimental_api
@@ -632,7 +569,7 @@ index 8ca2ea99c7ccd323a1823df104b12a39de9bb25f..c8748c231c2f47c763d6235f76fbd0f7
  from ._block_sparse.common import _num_sparse_pattern_heads
  from ._scales import GlobalScale, normalize_scale, resolve_scale, scale_types
  
-@@ -64,7 +65,7 @@ _Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT = 256
+@@ -67,7 +68,7 @@ _Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT = 256
  def _get_prims_ts_q_token_kv_block_sparse_metadata_module() -> Any:
      """Build and cache the CUDA C++ QToken-KvBlock-Sparse-Attention metadata implementation."""
  
@@ -641,83 +578,3 @@ index 8ca2ea99c7ccd323a1823df104b12a39de9bb25f..c8748c231c2f47c763d6235f76fbd0f7
  
      return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
  
-@@ -276,9 +277,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
-                 self.sparse_block_size,
-                 self.max_seq_len_kv,
-                 self.release_attention_pdl,
--                self.locator_head_multiplier,
--                self.count_current_block_in_topk,
--                self.fixed_query_len,
-             )
-         else:
-             self.metadata_run(
-@@ -294,9 +292,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
-                 self.sparse_block_size,
-                 self.max_seq_len_kv,
-                 self.release_attention_pdl,
--                self.locator_head_multiplier,
--                self.count_current_block_in_topk,
--                self.fixed_query_len,
-             )
- 
- 
-@@ -1133,13 +1128,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
-         split_kv,
-         share_pattern_across_kv_heads,
-     )
--    # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
--    # Other profiles and the standalone metadata API retain page-byte masks.
--    query_major_memberships = (
--        sparse_block_size == 4
--        and spec.config.use_fp8_qkv
--        and replace(spec.config, fixed_seqlen=True).supports_query_major_memberships
--    )
-+    # flashinfer-python 0.7.2 ships the pre-#5351 metadata module without the
-+    # run_*_query_major entry points, so every profile keeps page-byte masks.
-+    query_major_memberships = False
-     if query_major_memberships:
-         page_capacity = (page_capacity + 31) // 32 * 32
-     membership_words = (
-@@ -1510,9 +1501,6 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
-             sparse_block_size,
-             max_seq_len_kv,
-             release_attention_pdl,
--            1,
--            count_current_block_in_topk,
--            0,
-         )
-     else:
-         metadata_module.run_fixed(
-@@ -1528,9 +1516,6 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
-             sparse_block_size,
-             max_seq_len_kv,
-             release_attention_pdl,
--            1,
--            count_current_block_in_topk,
--            0,
-         )
-     return outputs
- 
-@@ -1929,7 +1914,9 @@ def _prepare_q_token_kv_block_sparse_attention(
-         ),
-         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
-         direct_q1_fixed_query_len=fixed_query_len,
--        allow_head_aware_locators=group_size > 1,
-+        # flashinfer-python 0.7.2 ships the pre-#5351 metadata module: no
-+        # locator_head_multiplier argument and head-stride-1 locators only.
-+        allow_head_aware_locators=False,
-         softmax_scale=scale_qk,
-         output_scale=scale_v,
-     )
-@@ -2300,6 +2287,11 @@ def _validate_inputs(
-     fixed_query_len: int = 0,
- ) -> None:
-     """Validate tensor structure without copying live metadata values to the host."""
-+    if count_current_block_in_topk is not True or fixed_query_len != 0:
-+        raise ValueError(
-+            "The installed metadata extension requires count_current_block_in_topk=True "
-+            "and explicit token_to_request/query_positions tensors"
-+        )
-     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
-     for name, tensor in (
-         ("block_indices", block_indices),

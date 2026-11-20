@@ -287,9 +287,6 @@ class CSA2BackendForwardArgs(SparseBackendForwardArgs):
     query_start: int = 0
     output_position_ids: torch.Tensor | None = None
     output_rotary_cos_sin: torch.Tensor | None = None
-    # (INT32 positions, FP32 [P, 2, 32] cos/sin) when Q is the BF16 projection before its
-    # GPT-J RoPE: a PrimTS raw-selection generation kernel rotates and rounds it itself.
-    query_rope: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)

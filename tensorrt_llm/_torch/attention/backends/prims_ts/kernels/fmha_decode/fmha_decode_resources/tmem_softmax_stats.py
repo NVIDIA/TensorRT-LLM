@@ -402,59 +402,20 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
 
     @cute.jit
     def _stats_vector(self, first_arr: cutlass.Array, second_arr: cutlass.Array):
-        """Pack the two stats halves into the tcgen05 vector store layout."""
+        """Pad each stats half to a native power-of-two TMEM vector."""
         cfg = self.cfg
-        if cutlass.const_expr(cfg.num_softmax_scale_groups == 8):
-            return cutlass.Vector.from_elements(
-                (
-                    first_arr[0],
-                    first_arr[1],
-                    first_arr[2],
-                    first_arr[3],
-                    first_arr[4],
-                    first_arr[5],
-                    first_arr[6],
-                    first_arr[7],
-                    second_arr[0],
-                    second_arr[1],
-                    second_arr[2],
-                    second_arr[3],
-                    second_arr[4],
-                    second_arr[5],
-                    second_arr[6],
-                    second_arr[7],
-                ),
-                Float32,
+        groups = cfg.softmax_stats_payload_groups
+        return cutlass.Vector.from_elements(
+            tuple(
+                first_arr[idx] if idx < cfg.num_softmax_scale_groups else Float32(0.0)
+                for idx in range(groups)
             )
-        elif cutlass.const_expr(cfg.num_softmax_scale_groups == 4):
-            return cutlass.Vector.from_elements(
-                (
-                    first_arr[0],
-                    first_arr[1],
-                    first_arr[2],
-                    first_arr[3],
-                    second_arr[0],
-                    second_arr[1],
-                    second_arr[2],
-                    second_arr[3],
-                ),
-                Float32,
-            )
-        elif cutlass.const_expr(cfg.num_softmax_scale_groups == 1):
-            return cutlass.Vector.from_elements(
-                (first_arr[0], second_arr[0]),
-                Float32,
-            )
-        else:
-            return cutlass.Vector.from_elements(
-                (
-                    first_arr[0],
-                    first_arr[1],
-                    second_arr[0],
-                    second_arr[1],
-                ),
-                Float32,
-            )
+            + tuple(
+                second_arr[idx] if idx < cfg.num_softmax_scale_groups else Float32(0.0)
+                for idx in range(groups)
+            ),
+            Float32,
+        )
 
     @cute.jit
     def _stats_smem_ptr(self, stage_info: StageInfo):
@@ -520,7 +481,7 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
         loaded = prims.tcgen05_ld(
             "32x32b",
             stats_ptr,
-            num=self.cfg.num_softmax_scale_groups * 2,
+            num=self.cfg.softmax_stats_payload_groups * 2,
         )
         cute.arch.fence_view_async_tmem_load()
         return loaded
@@ -665,7 +626,7 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
         # rescale the live O accumulator before the next PV MMA wave.
         loaded = self._load_stats_vector(stage_info)
         for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
-            loaded_new_max = loaded[cfg.num_softmax_scale_groups + scale_idx]
+            loaded_new_max = loaded[cfg.softmax_stats_payload_groups + scale_idx]
             new_max_arr[scale_idx] = loaded_new_max
             # Loop stats carry old max for in-place O rescaling.
             loaded_old_max = loaded[scale_idx]
@@ -709,7 +670,7 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
         # per-instance arrays consumed by correction_tail_epilogue.
         loaded = self._load_stats_vector(stage_info)
         for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
-            loaded_new_max = loaded[cfg.num_softmax_scale_groups + scale_idx]
+            loaded_new_max = loaded[cfg.softmax_stats_payload_groups + scale_idx]
             loaded_sum = loaded[scale_idx]
             new_max_arr[scale_idx] = loaded_new_max
             sum_arr[scale_idx] = loaded_sum
@@ -816,4 +777,9 @@ class TmemSoftmaxGlobalResource(DecodeGenResourceBase):
             for pair_idx in cutlass.range_constexpr(pair_width):
                 scale_idx = scale_base + pair_idx
                 sum_arr[scale_idx] = updated_sums[pair_idx]
-                self.tmem_s_ref.store_global_sum(scale_idx, updated_sums[pair_idx])
+                if cutlass.const_expr(cfg.streams_scores_in_q32_bands):
+                    # P has consumed its local sums. Reuse that carrier for
+                    # corrected sums instead of keeping a second Q128 array.
+                    self.tmem_s_ref.store_p_local_sum(scale_idx, updated_sums[pair_idx])
+                else:
+                    self.tmem_s_ref.store_global_sum(scale_idx, updated_sums[pair_idx])

@@ -145,7 +145,8 @@ def run_reduction_kernel(
     tile_k = cute.math.max(tile_k, Int32(0))
     row_k = tile_k
     if cutlass.const_expr(
-        cfg.mask_type == MaskType.CAUSAL.value
+        not cfg.use_kv_bounds
+        and cfg.mask_type == MaskType.CAUSAL.value
         and (not kernel.fixed_seqlen or seq_len_q > 1)
     ):
         _, logical_seq_len_q = query_batch_bounds(
