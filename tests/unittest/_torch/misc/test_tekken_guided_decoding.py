@@ -100,9 +100,10 @@ def test_guided_decoding_configs(tokenizer):
     assert xgrammar.stop_token_ids == [tokenizer.eos_token_id]
     assert len(xgrammar.encoded_vocab) == n_words
 
+    # The guided decoder gets the llguidance tokenizer itself, so the config carries none.
     llguidance = get_guided_decoding_config("llguidance", tokenizer)
     assert llguidance.tokenizer_str is None and llguidance.encoded_vocab is None
-    assert llguidance.stop_token_ids == [tokenizer.eos_token_id]
+    assert llguidance.stop_token_ids is None
     assert _llguidance_tokenizer(llguidance, tokenizer, n_words) is not None
     assert _llguidance_tokenizer(xgrammar, tokenizer, n_words) is None
     assert get_guided_decoding_config(None, tokenizer) is None

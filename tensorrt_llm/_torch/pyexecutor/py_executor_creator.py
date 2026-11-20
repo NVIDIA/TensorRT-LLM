@@ -490,38 +490,33 @@ def _extend_full_attention_windows_for_spec_decode(
     kv_cache_config.max_attention_window = adjusted_max_attention_window
 
 
+def _describes_grammar_vocabulary(tokenizer: Optional[TokenizerBase]) -> bool:
+    """Whether `tokenizer` describes the vocabulary grammars are matched
+    against (see `TokenizerBase.describes_grammar_vocabulary`), rather than
+    guided decoding reading it from the Hugging Face tokenizer."""
+    return isinstance(tokenizer,
+                      TokenizerBase) and tokenizer.describes_grammar_vocabulary
+
+
 def get_guided_decoding_config(guided_decoding_backend: str,
                                tokenizer: Optional[TokenizerBase] = None):
     guided_decoding_config = None
-    if (guided_decoding_backend is not None and getattr(
-            type(tokenizer), "xgrammar_tokenizer_info", None) is not None):
-        # A tokenizer with no Hugging Face tokenizer JSON describes its own
-        # vocabulary (Mistral's Tekken: bytes, with separate control tokens).
-        # xgrammar takes it as the byte vocabulary; llguidance takes the
-        # tokenizer itself, which the guided decoder gets from
-        # `_llguidance_tokenizer`.
-        if guided_decoding_backend == 'xgrammar':
-            guided_decoding_config = GuidedDecodingConfig(
-                backend=GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
-                **tokenizer.xgrammar_tokenizer_info())
-        elif guided_decoding_backend == 'llguidance':
-            guided_decoding_config = GuidedDecodingConfig(
-                backend=GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
-                stop_token_ids=[tokenizer.eos_token_id])
-        else:
-            raise ValueError(
-                f"Unsupported guided decoding backend {guided_decoding_backend}"
-            )
-    elif guided_decoding_backend == 'xgrammar':
+    if guided_decoding_backend == 'xgrammar':
         assert tokenizer is not None
         guided_decoding_config = GuidedDecodingConfig(
             backend=GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
-            **_xgrammar_tokenizer_info(tokenizer))
+            **(tokenizer.xgrammar_tokenizer_info()
+               if _describes_grammar_vocabulary(tokenizer) else
+               _xgrammar_tokenizer_info(tokenizer)))
     elif guided_decoding_backend == 'llguidance':
         assert tokenizer is not None
+        # A tokenizer that describes its own vocabulary hands the guided
+        # decoder a ready llguidance tokenizer (see `_llguidance_tokenizer`),
+        # so the config carries none.
         guided_decoding_config = GuidedDecodingConfig(
             backend=GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
-            **_llguidance_tokenizer_info(tokenizer))
+            **({} if _describes_grammar_vocabulary(tokenizer) else
+               _llguidance_tokenizer_info(tokenizer)))
     elif guided_decoding_backend is not None:
         raise ValueError(
             f"Unsupported guided decoding backend {guided_decoding_backend}")
@@ -531,12 +526,11 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 def _llguidance_tokenizer(guided_decoding_config: GuidedDecodingConfig,
                           tokenizer: Optional[TokenizerBase],
                           vocab_size_padded: int):
-    """The ready llguidance tokenizer of a vocabulary with no Hugging Face
-    tokenizer JSON (Mistral's Tekken), or None to build it from the config's
-    `tokenizer_str`."""
+    """The ready llguidance tokenizer of a tokenizer that describes its own
+    vocabulary, or None to build it from the config's `tokenizer_str`."""
     if (guided_decoding_config.backend
             != GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
-            or getattr(type(tokenizer), "llguidance_tokenizer", None) is None):
+            or not _describes_grammar_vocabulary(tokenizer)):
         return None
     return tokenizer.llguidance_tokenizer(vocab_size_padded)
 

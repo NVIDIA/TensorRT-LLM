@@ -18,13 +18,16 @@ import importlib
 import os
 import pickle  # nosec B403
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
+
+if TYPE_CHECKING:
+    import llguidance
 
 # Transformers 5.x moved ``bytes_to_unicode`` out of
 # ``transformers.models.gpt2.tokenization_gpt2`` into
@@ -67,6 +70,35 @@ except ImportError:
 
 class TokenizerBase(PreTrainedTokenizerBase):
     ''' This is a protocol for the tokenizer. Users can implement their own tokenizer by inheriting this class.  '''
+
+    # Guided decoding reads the vocabulary grammars are matched against from the
+    # Hugging Face tokenizer. A tokenizer with no Hugging Face tokenizer JSON
+    # describes it itself: it sets this and implements `xgrammar_tokenizer_info`
+    # and `llguidance_tokenizer`.
+    describes_grammar_vocabulary: bool = False
+
+    def xgrammar_tokenizer_info(self) -> Dict[str, Any]:
+        """The vocabulary xgrammar matches grammars against.
+
+        Called only when `describes_grammar_vocabulary` is set.
+
+        Returns:
+            The `encoded_vocab` and `stop_token_ids` of a guided decoding config.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not describe its grammar vocabulary")
+
+    def llguidance_tokenizer(self, n_vocab: int) -> "llguidance.LLTokenizer":
+        """The tokenizer llguidance compiles grammars against.
+
+        Called only when `describes_grammar_vocabulary` is set.
+
+        Args:
+            n_vocab: The vocabulary size the token bitmask covers (the model's
+                padded vocabulary size).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not describe its grammar vocabulary")
 
     def __repr__(self) -> str:
         # PreTrainedTokenizerBase.__repr__ reads properties (e.g.

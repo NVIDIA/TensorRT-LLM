@@ -45,6 +45,11 @@ class _ImageGridEncoder(ImageEncoder):
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/8e67b2557aae7204c697d7a5c61e00754da465be/vllm/transformers_utils/tokenizers/mistral.py#L166
 class MistralTokenizer(TransformersTokenizer):
+    # Tekken's vocabulary is bytes, with separate control tokens, and has no Hugging Face
+    # tokenizer JSON: guided decoding takes it from xgrammar_tokenizer_info and
+    # llguidance_tokenizer.
+    describes_grammar_vocabulary = True
+
     def __init__(self, tokenizer: "TransformersMistralTokenizer"):
         self.transformers_tokenizer = tokenizer
         self.mistral = tokenizer.tokenizer
