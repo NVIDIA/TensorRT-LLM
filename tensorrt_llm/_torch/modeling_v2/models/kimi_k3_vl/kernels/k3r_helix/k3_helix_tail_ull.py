@@ -70,8 +70,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ..k3r_fp4_mla.fp4_mla_mufu16_ull import LOG2_E
-from ..k3r_fp4_mla.fp4_mla_packed_reduce_ull import _reduce_packed_row
+from ..k3r_fp4_mla.fp4_mla_mufu16 import LOG2_E
+from ..k3r_fp4_mla.fp4_mla_packed_reduce import _reduce_packed_row
 from tensorrt_llm._torch.kernels.blackwell.mla_helpers import LOG2_E as _MLA_LOG2_E
 
 from .helix_a2a_fused import (

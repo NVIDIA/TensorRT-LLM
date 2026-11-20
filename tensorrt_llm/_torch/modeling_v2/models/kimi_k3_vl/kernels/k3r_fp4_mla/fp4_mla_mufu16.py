@@ -3,8 +3,7 @@
 """Kimi K3 variant of the packed FP4 MLA CuTe DSL decode kernel (SM107).
 
 The same kernel interface as ``attention/backends/fp4_mla/fp4_mla_cutedsl_mufu16.py``; the K3 MLA
-layers run it with its own plan and split reduction (``ops/attention/_fp4_mla_decode.py``,
-``fp4_mla_packed_reduce``). Differences from the shared kernel:
+layers use this kernel with the family's packed plan and split reduction.
 
 - QK and PV are issued by two warps; QK runs two KV tiles ahead of PV, a score bank is refilled
   once every producer warp of both CTAs has read it (``SCORE_CONSUMED``), and the PV issuer waits
@@ -20,6 +19,9 @@ layers run it with its own plan and split reduction (``ops/attention/_fp4_mla_de
   normalized FP16 split output (``SPLIT_PARTIAL_DTYPES``).
 - Optional programmatic launch: ``launch_dependents`` (the split reduction or a fused consumer
   launches early) and ``pdl_wait`` (the decode waits for the kernel that writes its query).
+- Optional KV-ready flag (packed decode, ``kv_ready``): the KV tiles that may hold this step's
+  tokens (those reaching the last ``query_len`` keys of the request) are loaded only once an
+  int32 flag reads nonzero (acquire), so the decode need not join the grid that appends them.
 """
 
 import math
@@ -38,23 +40,13 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import torch
 from cutlass._mlir.dialects import llvm
-from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx as cute_inline_ptx
 from cutlass.cute.runtime import make_ptr
+from cutlass.cutlass_dsl import T
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
 
-
-def _compile_cutedsl(*args: object, **kwargs: object) -> Callable[..., object]:
-    """Compile with the PyIR frontend the FP4 MLA kernels require."""
-    with BaseDSL.enable_pyir():
-        return cute.compile(*args, **kwargs)
-
-
-def _current_cu_stream() -> cuda.CUstream:
-    """The caller's stream, for launch ordering and CUDA graph capture."""
-    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
+from ...ops.attention._k3_fp4_mla_cute_dsl_utils import _compile_cutedsl, _current_cu_stream
 
 nvvm_add_packed_f32x2 = partial(prims.add_packed_f32x2, rnd=prims.FPRoundingMode.RN)
 nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd=prims.FPRoundingMode.RN)
@@ -75,6 +67,11 @@ SPLIT_PARTIAL_DTYPES = (torch.float32, torch.float16)
 # slot, so the plan kernel may list the tasks in any grid order (the wave and makespan plans of
 # fp4_mla_packed_reduce).
 SUPPORTS_ORDERED_PLAN = True
+# ``run_trtllm_fp4_mla_decode_packed(..., kv_ready=flag)``: the K / V load warps poll ``flag``
+# (int32, acquire at GPU scope) before the KV tiles that may hold the step's new tokens; the
+# writer of those tokens sets it after its stores (release). Everything else the decode reads is
+# the caller's to order as before.
+SUPPORTS_KV_READY = True
 # ``launch_dependents`` modes of the packed decode (``True`` is LAUNCH_DEPENDENTS_ENTRY): release
 # the programmatic dependent grid at entry, or once the producer warps have finished the last KV
 # tile (LAUNCH_DEPENDENTS_EPILOGUE), so that the dependent's prologue overlaps the end of this
@@ -1068,6 +1065,7 @@ def fused_fp4_mla_decode_ctm(
     page_indptr_ptr: cute.Pointer,
     q_global_scale_ptr: cute.Pointer,
     kv_global_scale_ptr: cute.Pointer,
+    kv_ready_ptr,
     problem_size: tuple,
     runtime_m: ctm.Int32,
     runtime_l: ctm.Int32,
@@ -1100,6 +1098,7 @@ def fused_fp4_mla_decode_ctm(
     packed_query_heads: ctm.Constexpr = 0,
     launch_dependents: ctm.Constexpr = False,
     pdl_wait: ctm.Constexpr = False,
+    kv_ready_wait: ctm.Constexpr = False,
 ) -> None:
     n, k = problem_size
     m = runtime_m
@@ -1139,6 +1138,12 @@ def fused_fp4_mla_decode_ctm(
         cute.recast_ptr(kv_global_scale_ptr, dtype=cutlass.Float32),
         cute.make_layout((1,), stride=(1,)),
     )
+    kv_ready_tensor = None
+    if cutlass.const_expr(kv_ready_wait):
+        kv_ready_tensor = cute.make_tensor(
+            cute.recast_ptr(kv_ready_ptr, dtype=cutlass.Int32),
+            cute.make_layout((1,), stride=(1,)),
+        )
     valid_k_tensor = cute.make_tensor(
         cute.recast_ptr(valid_k_ptr, dtype=cutlass.Int32),
         cute.make_layout((num_sequences,), stride=(1,)),
@@ -1413,7 +1418,7 @@ def fused_fp4_mla_decode_ctm(
         tma_format=cuda_tma.TensorMapDataFormat.B4X16,
     )
     tma_sfb_desc = tma_vsf_stage_desc
-    # features.ull2_mla_decode_pdl: launched as a programmatic dependent (the launch attribute is
+    # TRTLLM_K3_ULL2_MLA_DEC_PDL: launched as a programmatic dependent (the launch attribute is
     # only passed then).
     pdl_launch = {}
     if cutlass.const_expr(pdl_wait):
@@ -1426,6 +1431,7 @@ def fused_fp4_mla_decode_ctm(
         plan_tensor,
         q_global_scale_tensor,
         kv_global_scale_tensor,
+        kv_ready_tensor,
         tma_q_desc,
         tma_k_page_desc,
         tma_q_tail_desc,
@@ -1466,6 +1472,7 @@ def fused_fp4_mla_decode_ctm(
         packed_query_heads,
         launch_dependents,
         pdl_wait,
+        kv_ready_wait,
     ).launch(
         grid=(
             cute.ceil_div(c_tensor.shape[0], SMEM_P4_CTA_GROUP_M) * CLUSTER_SHAPE_MNK[0],
@@ -6249,6 +6256,63 @@ def _griddepcontrol_wait(*, loc=None, ip=None) -> None:
     )
 
 
+@ctm.dsl_user_op
+def _ld_acquire_gpu_u32(addr, *, loc=None, ip=None) -> ctm.Int32:
+    return ctm.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [ctm.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@ctm.dsl_user_op
+def _fence_proxy_async_global(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async.global;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def _wait_kv_ready(
+    mKvReady,
+    kv_tile_idx: ctm.Int32,
+    kv_wait_tile: ctm.Int32,
+    kv_ready_wait: ctm.Constexpr,
+) -> None:
+    """Before loading KV tile ``kv_tile_idx``: if it may hold this step's tokens
+    (``kv_tile_idx >= kv_wait_tile``), poll the KV-ready flag until it is nonzero (acquire at GPU
+    scope), then order the TMA loads that follow after it (proxy fence). Every lane of the
+    calling warp polls; the flag is set long before the last tiles are reached, so this is one
+    load in the steady state."""
+    if cutlass.const_expr(kv_ready_wait):
+        if kv_tile_idx >= kv_wait_tile:
+            flag_addr = mKvReady.iterator.toint()
+            ready = _ld_acquire_gpu_u32(flag_addr)
+            while ready == ctm.Int32(0):
+                cute_inline_ptx(
+                    "nanosleep.u32 {$r0};",
+                    read_only_args=[ctm.Int32(SMEM_P4_LOAD_WAIT_SLEEP_NS)],
+                )
+                ready = _ld_acquire_gpu_u32(flag_addr)
+            _fence_proxy_async_global()
+
+
 @cute.jit
 def _stage_smem_p4_page_id_plan(
     mPageTable_pl: cute.Tensor,
@@ -6320,6 +6384,7 @@ def _run_mla_decode_body(
     mPlan_i: cute.Tensor,
     mQGlobalScale: cute.Tensor,
     mKvGlobalScale: cute.Tensor,
+    mKvReady,
     tma_q_ptr,
     tma_k_page_ptr,
     tma_q_tail_ptr,
@@ -6360,6 +6425,7 @@ def _run_mla_decode_body(
     packed_query_heads: ctm.Constexpr = 0,
     pdl_wait: ctm.Constexpr = False,
     launch_dependents: ctm.Constexpr = False,
+    kv_ready_wait: ctm.Constexpr = False,
 ) -> None:
     pv_psf_rescale = ctm.Float32(FP4_MLA_P_GLOBAL_SCALE) * pv_output_scale
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -6477,6 +6543,21 @@ def _run_mla_decode_body(
         csr_page_count = ctm.max(csr_page_count - split_page_begin, ctm.Int32(0))
     raw_kv_tiles = (valid_k_for_l + ctm.Int32(KV_TILE - 1)) // ctm.Int32(KV_TILE)
     kv_tiles = ctm.max(raw_kv_tiles, ctm.Int32(1))
+    # KV-ready flag: this step's tokens are at most the last query_len_per_seq keys of the
+    # request's (Helix: this rank's) cache, and no row of this tile reads past tile_max_bound, so
+    # the new keys it reads lie at or after tile_max_bound - query_len_per_seq: only the KV tiles
+    # reaching that position wait for the flag.
+    kv_wait_tile = ctm.Int32(INT32_MAX)
+    if cutlass.const_expr(kv_ready_wait):
+        if cutlass.const_expr(packed_query_heads <= 0):
+            raise ValueError("the KV-ready flag needs the packed decode")
+        kv_wait_tile = cute.arch.make_warp_uniform(
+            ctm.max(
+                (tile_max_bound - ctm.Int32(query_len_per_seq) - split_base_k)
+                // ctm.Int32(KV_TILE),
+                ctm.Int32(0),
+            )
+        )
     planned_page_count = kv_tiles * ctm.Int32(SMEM_P4_PAGES_PER_KV_TILE)
     if cutlass.const_expr(page_size != TRTLLM_PAGE_SIZE):
         raise ValueError(
@@ -6793,6 +6874,7 @@ def _run_mla_decode_body(
                     qk0_page0, qk0_page1 = _load_global_page_native_tile_pair(
                         mPageTable_pl, ctm.Int32(0), csr_page_begin, csr_page_count
                     )
+                _wait_kv_ready(mKvReady, ctm.Int32(0), kv_wait_tile, kv_ready_wait)
                 _load_runtime_t336_qk_tile(
                     mPageTable_pl,
                     tma_k_page_ptr,
@@ -6866,6 +6948,7 @@ def _run_mla_decode_body(
                         qk_prefix_page0, qk_prefix_page1 = _load_global_page_native_tile_pair(
                             mPageTable_pl, qk_prefix_li_idx, csr_page_begin, csr_page_count
                         )
+                    _wait_kv_ready(mKvReady, qk_prefix_li_idx, kv_wait_tile, kv_ready_wait)
                     _load_runtime_t336_qk_tile(
                         mPageTable_pl,
                         tma_k_page_ptr,
@@ -6911,6 +6994,7 @@ def _run_mla_decode_body(
                         qk_steady_page0, qk_steady_page1 = _load_global_page_native_tile_pair(
                             mPageTable_pl, kv_tile_idx, csr_page_begin, csr_page_count
                         )
+                    _wait_kv_ready(mKvReady, kv_tile_idx, kv_wait_tile, kv_ready_wait)
                     _load_runtime_t336_qk_tile(
                         mPageTable_pl,
                         tma_k_page_ptr,
@@ -6945,6 +7029,7 @@ def _run_mla_decode_body(
                         qk_rank1_page0, qk_rank1_page1 = _load_global_page_native_tile_pair(
                             mPageTable_pl, kv_tile_idx, csr_page_begin, csr_page_count
                         )
+                    _wait_kv_ready(mKvReady, kv_tile_idx, kv_wait_tile, kv_ready_wait)
                     _load_runtime_t336_qk_tile_rank1(
                         mPageTable_pl,
                         tma_k_page_ptr,
@@ -6976,6 +7061,7 @@ def _run_mla_decode_body(
                         qk15_page0, qk15_page1 = _load_global_page_native_tile_pair(
                             mPageTable_pl, ctm.Int32(15), csr_page_begin, csr_page_count
                         )
+                    _wait_kv_ready(mKvReady, ctm.Int32(15), kv_wait_tile, kv_ready_wait)
                     _load_runtime_t336_qk_tile(
                         mPageTable_pl,
                         tma_k_page_ptr,
@@ -7017,6 +7103,7 @@ def _run_mla_decode_body(
                 )
                 v_tma_mbar = ctm.Array(v_handle.barrier, shape=1)
                 v_stage = kv_tile_idx % ctm.Int32(SMEM_P4_V_PIPELINE_STAGES)
+                _wait_kv_ready(mKvReady, kv_tile_idx, kv_wait_tile, kv_ready_wait)
                 _load_v_tile_stage(
                     mPageTable_pl,
                     sPageIdPlan,
@@ -7678,6 +7765,7 @@ def kernel(
     mPlan_i: cute.Tensor,
     mQGlobalScale: cute.Tensor,
     mKvGlobalScale: cute.Tensor,
+    mKvReady,
     tma_q_desc: ctm.GridConstant[cuda_tma.TensorMap],
     tma_k_page_desc: ctm.GridConstant[cuda_tma.TensorMap],
     tma_q_tail_desc: ctm.GridConstant[cuda_tma.TensorMap],
@@ -7718,6 +7806,7 @@ def kernel(
     packed_query_heads: ctm.Constexpr = 0,
     launch_dependents: ctm.Constexpr = False,
     pdl_wait: ctm.Constexpr = False,
+    kv_ready_wait: ctm.Constexpr = False,
 ) -> None:
     if cutlass.const_expr(launch_dependents == LAUNCH_DEPENDENTS_ENTRY):
         # The split reduction waits for this grid with griddepcontrol.wait; letting
@@ -7740,6 +7829,7 @@ def kernel(
             mPlan_i,
             mQGlobalScale,
             mKvGlobalScale,
+            mKvReady,
             tma_q_desc.get_ptr(),
             tma_k_page_desc.get_ptr(),
             tma_q_tail_desc.get_ptr(),
@@ -7781,6 +7871,7 @@ def kernel(
             pdl_wait,
             # The body releases the dependents itself in the late modes.
             launch_dependents,
+            kv_ready_wait,
         )
 
 
@@ -7813,7 +7904,8 @@ def _make_fused_ptrs(
     output_dtype: torch.dtype = torch.float16,
     row_state_align: int = 32,
     split_partial_dtype: torch.dtype = torch.float32,
-) -> tuple[cute.Pointer, ...]:
+    kv_ready_data_ptr: int | None = None,
+) -> tuple[cute.Pointer | None, ...]:
     accum_dtype = cutlass.Float16 if split_partial_dtype == torch.float16 else cutlass.Float32
     return (
         make_ptr(cutlass.Float4E2M1FN, q_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
@@ -7853,6 +7945,10 @@ def _make_fused_ptrs(
             cute.AddressSpace.gmem,
             assumed_align=4,
         ),
+        # None is a compile-time operand and contributes no runtime argument.
+        make_ptr(cutlass.Int32, kv_ready_data_ptr, cute.AddressSpace.gmem, assumed_align=4)
+        if kv_ready_data_ptr is not None
+        else None,
     )
 
 
@@ -8052,6 +8148,8 @@ def _compile_fused(
     launch_dependents: bool = False,
     split_partial_dtype: torch.dtype = torch.float32,
     pdl_wait: bool = False,
+    kv_ready_data_ptr: int | None = None,
+    kv_ready_wait: bool = False,
 ) -> Callable:
     if type(kv) is not int:
         raise TypeError(f"runtime-KV compile K must be an int, got {type(kv).__name__}")
@@ -8087,6 +8185,7 @@ def _compile_fused(
         launch_dependents,
         split_partial_dtype,
         pdl_wait,
+        kv_ready_wait,
     )
     cached = _FUSED_COMPILE_CACHE.get(cache_key)
     if cached is not None:
@@ -8113,6 +8212,7 @@ def _compile_fused(
         output_dtype,
         row_state_align,
         split_partial_dtype,
+        kv_ready_data_ptr=kv_ready_data_ptr,
     )
     compiled = _compile_cutedsl(
         fused_fp4_mla_decode_ctm,
@@ -8149,6 +8249,7 @@ def _compile_fused(
         packed_query_heads=packed_query_heads,
         launch_dependents=launch_dependents,
         pdl_wait=pdl_wait,
+        kv_ready_wait=kv_ready_wait,
         options="--opt-level 2 --ptxas-options '--uumn'",
     )
     _FUSED_COMPILE_CACHE[cache_key] = compiled
@@ -8192,6 +8293,7 @@ def run_trtllm_fp4_mla_decode_page_native(
     softmax_stats: torch.Tensor | None = None,
     launch_dependents: bool = False,
     pdl_wait: bool = False,
+    kv_ready: torch.Tensor | None = None,
 ) -> None:
     if type(v_pack_block) is not int:
         raise TypeError(f"v_pack_block must be an int, got {type(v_pack_block).__name__}")
@@ -8214,6 +8316,13 @@ def run_trtllm_fp4_mla_decode_page_native(
             "packed queries require 1-128 heads, positive query length, request "
             "and split counts, and no folded queries"
         )
+    if kv_ready is not None and (
+        not packed
+        or kv_ready.dtype != torch.int32
+        or kv_ready.numel() != 1
+        or kv_ready.device != output.device
+    ):
+        raise ValueError("the KV-ready flag is one int32 on the output's device (packed decode)")
     if not math.isfinite(sm_scale) or sm_scale <= 0.0:
         raise ValueError(f"sm_scale must be finite and positive, got {sm_scale}")
     _validate_output_dtype(output.dtype)
@@ -8617,6 +8726,7 @@ def run_trtllm_fp4_mla_decode_page_native(
     page_indptr_data_ptr = paged_kv_indptr_decode.data_ptr()
     q_global_scale_data_ptr = q_global_scale.data_ptr()
     kv_global_scale_data_ptr = kv_global_scale.data_ptr()
+    kv_ready_data_ptr = kv_ready.data_ptr() if kv_ready is not None else None
     kv_page_stride_bytes = cache_layout.stride_page
     ksf_page_stride_bytes = int(sf_cache.stride(0))
     vsf_page_stride_bytes = int(v_sf.stride(0))
@@ -8663,6 +8773,8 @@ def run_trtllm_fp4_mla_decode_page_native(
         launch_dependents=launch_dependents,
         split_partial_dtype=split_partial_dtype,
         pdl_wait=pdl_wait,
+        kv_ready_data_ptr=kv_ready_data_ptr,
+        kv_ready_wait=kv_ready is not None,
     )
     supports_prepared = _class_defines_callables(
         fused, "to", "generate_execution_args", "run_compiled_program"
@@ -8689,6 +8801,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         page_indptr_data_ptr,
         q_global_scale_data_ptr,
         kv_global_scale_data_ptr,
+        kv_ready_data_ptr,
         physical_m,
         l_batch,
         q_batch_capacity,
@@ -8737,6 +8850,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         output.dtype,
         row_state_align,
         split_partial_dtype,
+        kv_ready_data_ptr=kv_ready_data_ptr,
     )
     runtime_args = (
         *ptrs,
@@ -8833,6 +8947,7 @@ def run_trtllm_fp4_mla_decode_packed(
     split_kv_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     launch_dependents: bool = False,
     pdl_wait: bool = False,
+    kv_ready: torch.Tensor | None = None,
 ) -> None:
     """Packed decode: ``q_fp4``/``q_sf`` hold ``num_requests`` entries of
     ``physical_m`` rows ([query token, head] pairs, 128-padded), ``output`` is
@@ -8850,7 +8965,10 @@ def run_trtllm_fp4_mla_decode_packed(
     ``pdl_wait`` launches this grid as a programmatic dependent of the previous
     kernel on the stream: everything but the query load (barriers, TMEM, plan,
     page table, the first KV tile) runs before ``griddepcontrol.wait``, so the
-    caller guarantees that only the query is written by that previous kernel."""
+    caller guarantees that only the query is written by that previous kernel. ``kv_ready`` (one
+    int32, ``SUPPORTS_KV_READY``): the KV tiles that may hold the last ``query_len`` keys of a
+    request are loaded only once it reads nonzero, so the grid appending those keys may still be
+    running when this one starts; the caller orders everything else."""
     valid_m, physical_m = packed_query_rows(num_heads, query_len)
     if num_requests <= 0 or num_splits <= 0:
         raise ValueError("packed decode needs positive request and split counts")
@@ -8910,6 +9028,7 @@ def run_trtllm_fp4_mla_decode_packed(
         softmax_stats=softmax_stats,
         launch_dependents=launch_dependents,
         pdl_wait=pdl_wait,
+        kv_ready=kv_ready,
     )
 
 

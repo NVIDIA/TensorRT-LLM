@@ -69,7 +69,7 @@
    "sha256": "0e18d5d12f5a29ba96d98e6545ac6c95b9c7041d2bd0627618ba3d5fdf26149c",
    "target_path": "kernels/fp4_mla_kernels.py"
   },
-  "kernels/k3r_fp4_mla/fp4_mla_mufu16_ull.py": {
+  "kernels/k3r_fp4_mla/fp4_mla_mufu16.py": {
    "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/fp4_mla_mufu16.py@6904cd9672",
    "source_sha256": "e92e50f1ab4479fbe7ebe9743822daf272e87f2ad9d9cfef87dcdd3599f87563",
    "import_edits": [
@@ -79,12 +79,13 @@
     "from .fp4_mla_cute_dsl_utils import ... -> from ...ops.attention._k3_fp4_mla_cute_dsl_utils import ..."
    ],
    "local_edits": [
-    "the internal CuTe DSL scheduling hints removed: 15 dsl_hints.cfence() / dsl_hints.warp_switch() calls (three of them the only statement of an `if is_compute_warp:` block, dropped with it) and the module docstring's paragraph on them; the public nvidia-cutlass-dsl provides none of the hints, so they emitted nothing"
+    "the internal CuTe DSL scheduling hints removed: 15 dsl_hints.cfence() / dsl_hints.warp_switch() calls (three of them the only statement of an `if is_compute_warp:` block, dropped with it) and the module docstring's paragraph on them; the public nvidia-cutlass-dsl provides none of the hints, so they emitted nothing",
+    "The family shares the FP4 decode. An absent KV-ready flag supplies no runtime pointer; a present flag enables the ULL acquire and proxy fence."
    ],
-   "sha256": "e417f1a83ab278d9bc85374c37c4e5612564e8ae7f2613544705eaaa743703f7",
+   "sha256": "c635b820a15d5389d26ac7c4d2d476c7fe805001f00a5051ad3392995c94c845",
    "target_path": "kernels/fp4_mla_mufu16.py"
   },
-  "kernels/k3r_fp4_mla/fp4_mla_packed_reduce_ull.py": {
+  "kernels/k3r_fp4_mla/fp4_mla_packed_reduce.py": {
    "source": "tensorrt_llm/_torch/attention/backends/fp4_mla/fp4_mla_packed_reduce.py@6904cd9672",
    "source_sha256": "4366526865b233fc77e872a5c6a3613974ef6a7d66b16806bc6519e657aa791c",
    "import_edits": [
@@ -96,9 +97,10 @@
    "local_edits": [
     "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS=1 (1007804's GEN env) -> True",
     "TRTLLM_FP4_MLA_REDUCE_PDL=1 (1007804's GEN env) -> True",
-    "TRTLLM_FP4_MLA_F16_PARTIALS=1 (1007804's GEN env) -> True"
+    "TRTLLM_FP4_MLA_F16_PARTIALS=1 (1007804's GEN env) -> True",
+    "Share plan and reduce kernels with the Helix8 targets. Keep separate deferred contexts and keep runtime PDL and FP16 partial choices in the callers."
    ],
-   "sha256": "af5eb86010439a288b24cb61c912b264a00d2ad34101205ada3a36560523b291",
+   "sha256": "1d2e69d75c0725f4347189489de297eef744421775eaf61a3b788d6915b77217",
    "target_path": "kernels/fp4_mla_packed_reduce.py"
   },
   "kernels/k3r_gemm/k3_dense0.py": {
@@ -184,10 +186,11 @@
     "from .k3_fp8w_lowm_mxfp8 import amax_bf16x8_words, amax_pair -> from ..k3r_gemm.k3_fp8w_lowm_mxfp8_ull import amax_bf16x8_words, amax_pair",
     "from tensorrt_llm._torch.attention.kernels.blackwell.mla.mla_helpers import LOG2_E as _MLA_LOG2_E -> from ..k3r_mla_decode.mla_helpers import LOG2_E as _MLA_LOG2_E",
     "Bind the shared k3_fp8w_lowm_gemm helpers.",
-    "Import LOG2_E from the shared Blackwell MLA helpers."
+    "Import LOG2_E from the shared Blackwell MLA helpers.",
+    "Use the shared FP4 decode constants and packed split reduction."
    ],
    "local_edits": [],
-   "sha256": "a2db2cb72a82609cc5f8aa2c62d8fe0b511f177ed56e930c34e6e2305803adc1",
+   "sha256": "e0d14bb0421527bc9dea75f6a3e8ea8c8a6f6ac57267483a020edfa770f552e4",
    "target_path": "kernels/k3_helix_tail.py"
   },
   "kernels/k3r_kda/k3_l2_prefetch.py": {

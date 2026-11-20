@@ -2264,7 +2264,7 @@ def _helix_gen_fused_tail(
     ``_attn_forward_gen_fused_tail``). With the side gate forked early (gate place other than
     "exchange") the tail also stores o_proj's MXFP8 operand ``bf16(out * gate)`` where o_proj's
     gated MXFP8 GEMM takes it. The FP8 decode records no reduction: the tail reads its rows."""
-    from ..kernels.k3r_fp4_mla.fp4_mla_packed_reduce_ull import DeferredPackedReduce
+    from ..kernels.k3r_fp4_mla.fp4_mla_packed_reduce import UllDeferredPackedReduce
 
     num_tokens = q.shape[0]
     softmax_stats = torch.empty(
@@ -2273,7 +2273,7 @@ def _helix_gen_fused_tail(
     gate_early = hooks is not None and hooks.gate_place != "exchange"
     if gate_early:
         hooks.pre_exchange_fn()
-    with DeferredPackedReduce(release_early=decode_releases_tail_early(num_tokens)) as deferred:
+    with UllDeferredPackedReduce(release_early=decode_releases_tail_early(num_tokens)) as deferred:
         partial_o = gen_attention(layer, q, md, softmax_stats, quant_q)
     assert partial_o.shape[-1] == layer.num_heads_tp * layer.kv_lora_rank
     fold = fold_inputs_of(deferred, partial_o, softmax_stats)

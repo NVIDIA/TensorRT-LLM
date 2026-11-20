@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _modules():
-    reduce_mod = importlib.import_module(f"{K3}.kernels.k3r_fp4_mla.fp4_mla_packed_reduce_ull")
+    reduce_mod = importlib.import_module(f"{K3}.kernels.k3r_fp4_mla.fp4_mla_packed_reduce")
     tail_mod = importlib.import_module(f"{K3}.kernels.k3r_helix.k3_helix_tail_ull")
     return reduce_mod, tail_mod
 
