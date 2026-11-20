@@ -24,6 +24,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_multimodal_utils, modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_cosmos3_edge import Cosmos3EdgeVisionEncoder
+from tensorrt_llm._torch.models.modeling_exaone4_5 import Exaone4_5InputProcessor
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     VisionNormalization,
     normalize_vision_pixels,
@@ -945,16 +946,19 @@ def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
 
 
 def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
-    """Return a small Qwen2.5-VL or Qwen3-VL input processor and its embedding width."""
+    """Return a small Qwen-VL family input processor and its embedding width."""
     hidden_size = 8
     vision_config = SimpleNamespace(
         spatial_merge_size=2, temporal_patch_size=2, tokens_per_second=2
     )
     if model == "qwen3":
         vision_config.deepstack_visual_indexes = [0]
-        processor_cls = Qwen3VLInputProcessorBase
-    else:
-        processor_cls = modeling_qwen2vl.Qwen2_5VLInputProcessorBase
+    processor_cls = {
+        "qwen2": modeling_qwen2vl.Qwen2VLInputProcessorBase,
+        "qwen2.5": modeling_qwen2vl.Qwen2_5VLInputProcessorBase,
+        "qwen3": Qwen3VLInputProcessorBase,
+        "exaone4_5": Exaone4_5InputProcessor,
+    }[model]
     config = SimpleNamespace(
         torch_dtype=torch.float32,
         text_config=SimpleNamespace(hidden_size=hidden_size, vocab_size=100, dtype=torch.float32),
@@ -1092,6 +1096,17 @@ def test_qwen_vl_embeddings_with_wrong_image_grid_raise(grid):
             {"prompt": "p"},
             {"image": [{"mm_embeddings": torch.zeros(6, width), "image_grid_thw": grid}]},
             SamplingParams(),
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2", "exaone4_5"])
+def test_qwen_vl_embeddings_on_model_without_support_raise(model):
+    """A model that takes no embeddings says so; it does not ask for a grid."""
+    processor, width = _make_qwen_vl_embedding_processor(model, [7, 12, 8])
+    with pytest.raises(NotImplementedError, match="does not support external multimodal"):
+        processor.attach_multimodal_embeddings(
+            {"prompt": "p"}, {"image": [torch.zeros(6, width)]}, SamplingParams()
         )
 
 
