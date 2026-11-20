@@ -285,11 +285,12 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         if ownership is False:
             self._finish(record, "failed")
         elif ownership is None:
-            indexed = self._records_by_status.get((record.direction, record.status_id), {})
-            if any(other is not record for other in indexed.values()):
-                # A numeric terminal ID cannot distinguish this failed admission.
-                self._discard(record)
-                return
+            with self._records_lock:
+                indexed = self._records_by_status.get((record.direction, record.status_id), {})
+                if any(other is not record for other in indexed.values()):
+                    # A numeric terminal ID cannot distinguish this failed admission.
+                    self._discard(record)
+                    return
             record.admission_uncertain = True
             # Keep no strong failed-request owner when native admission is unknown.
             # Native owners/callers still determine release and request lifetime.
