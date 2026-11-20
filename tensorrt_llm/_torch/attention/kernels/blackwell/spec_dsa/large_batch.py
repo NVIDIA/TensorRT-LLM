@@ -1379,11 +1379,14 @@ def _issue_kv_tile(slot_base, mbar_base, tma_swa, tma_cmp, use_swa, gidx_t, wl, 
 
 
 class AttentionTail:
-    def __init__(self, config: SpecDsaConfig | None = None):
+    def __init__(self, config: SpecDsaConfig | None = None, exit_early: bool = False):
         require_built_for(
             config, SPEC_FP4 if config is not None and config.index_k_dtype == "fp4" else SPEC
         )
         self.threads = 288  # warps 0-3 loader, 4-7 softmax/epilogue, 8 MMA issue
+        # exit_early: the "last CTA to leave resets the ready queue" accounting runs on the loader thread right
+        # after the CTA's final claim, not behind the last row's epilogue (where its fence waits for the output stores)
+        self.exit_early = bool(exit_early)
 
     @cute.jit
     def __call__(
@@ -1531,6 +1534,15 @@ class AttentionTail:
                     t = t + Int32(1)
                 n = n + Int32(1)
                 b = self._claim(tid, aq_base, nrows, sRow, sLd, abar, n)
+            if cutlass.const_expr(self.exit_early):
+                if tid == Int32(0):
+                    L.fence_acq_rel_gpu()
+                    d_e = L.atom_add_i32(aq_base + Int64(L.AQ_DONE * 4), Int32(1))
+                    if d_e == Int32(gdim) - Int32(1):
+                        L.fence_acq_rel_gpu()
+                        L.st_relaxed_i32(aq_base + Int64(L.AQ_PUB * 4), Int32(0))
+                        L.st_relaxed_i32(aq_base + Int64(L.AQ_CLAIM * 4), Int32(0))
+                        L.st_relaxed_i32(aq_base + Int64(L.AQ_DONE * 4), Int32(0))
         elif tid < Int32(256):
             rtid = tid - Int32(128)
             scale_log2 = softmax_scale * Float32(LOG2_E)
@@ -1577,13 +1589,14 @@ class AttentionTail:
         if tid == Int32(0):
             # Every CTA has made its final claim; the last one to leave resets the counters for the next call.
             # All rows were published before they could be claimed, so the indexer no longer touches the queue.
-            L.fence_acq_rel_gpu()
-            d = L.atom_add_i32(aq_base + Int64(L.AQ_DONE * 4), Int32(1))
-            if d == Int32(gdim) - Int32(1):
+            if cutlass.const_expr(not self.exit_early):
                 L.fence_acq_rel_gpu()
-                L.st_relaxed_i32(aq_base + Int64(L.AQ_PUB * 4), Int32(0))
-                L.st_relaxed_i32(aq_base + Int64(L.AQ_CLAIM * 4), Int32(0))
-                L.st_relaxed_i32(aq_base + Int64(L.AQ_DONE * 4), Int32(0))
+                d = L.atom_add_i32(aq_base + Int64(L.AQ_DONE * 4), Int32(1))
+                if d == Int32(gdim) - Int32(1):
+                    L.fence_acq_rel_gpu()
+                    L.st_relaxed_i32(aq_base + Int64(L.AQ_PUB * 4), Int32(0))
+                    L.st_relaxed_i32(aq_base + Int64(L.AQ_CLAIM * 4), Int32(0))
+                    L.st_relaxed_i32(aq_base + Int64(L.AQ_DONE * 4), Int32(0))
             # Do not complete before the indexer grid: the next call's indexer reuses its workspaces.
             cute.arch.griddepcontrol_wait()
 
@@ -1652,6 +1665,7 @@ DEFER_LONG = 512
 ST_SCHED = 1
 ST_ROW = 2
 ST_DQFULL = 4
+COV_CAP = 32  # capacity of the list of the other pieces of a row (merge1)
 
 
 @dsl_user_op
@@ -1900,6 +1914,7 @@ def _compact_approx(
     seg=None,
     tiebin: cutlass.Constexpr = False,
     sTb=None,
+    fast_cmp: cutlass.Constexpr = False,
 ):
     lane = tid & Int32(31)
     tp0 = Int64(0)
@@ -1925,13 +1940,28 @@ def _compact_approx(
             prof[0] = prof[0] + (tp1 - tp0)
             tp0 = tp1
     ev = [Uint64(0)] * EPT
-    for k in cutlass.range_constexpr(EPT):
-        i = tid + Int32(k * nthr)
-        if i < C:
-            ev[k] = Uint64(sMain[i])
-            cute.arch.atomic_add(
-                sHist.iterator + L._vbin(ev[k], lo, sc, nb), Int32(1), sem="relaxed", scope="cta"
-            )
+    i = tid
+    if cutlass.const_expr(fast_cmp):
+        # all loads first, then the bins, then the histogram atomics
+        for k in cutlass.range_constexpr(EPT):
+            ev[k] = Uint64(sMain[cutlass.min(tid + Int32(k * nthr), C - Int32(1))])
+        hb = []
+        for k in cutlass.range_constexpr(EPT):
+            hb.append(L._vbin(ev[k], lo, sc, nb))
+        for k in cutlass.range_constexpr(EPT):
+            if tid + Int32(k * nthr) < C:
+                cute.arch.atomic_add(sHist.iterator + hb[k], Int32(1), sem="relaxed", scope="cta")
+    else:
+        for k in cutlass.range_constexpr(EPT):
+            i = tid + Int32(k * nthr)
+            if i < C:
+                ev[k] = Uint64(sMain[i])
+                cute.arch.atomic_add(
+                    sHist.iterator + L._vbin(ev[k], lo, sc, nb),
+                    Int32(1),
+                    sem="relaxed",
+                    scope="cta",
+                )
     L.bar(bar_id, nthr)
     if cutlass.const_expr(prof is not None):
         if tid == Int32(0):
@@ -2035,24 +2065,41 @@ def _compact_approx(
         fmn = Uint32(4294967295)
         kmask = [Int32(0)] * EPT
         wtot = Int32(0)
-        for k in cutlass.range_constexpr(EPT):
-            i = tid + Int32(k * nthr)
-            kp = False
-            bb = Int32(-1)
-            if i < C:
-                bb = L._vbin(ev[k], lo, sc, nb)
-                if bb >= B:
-                    kp = True
+        if cutlass.const_expr(fast_cmp):
+            kpl = []
+            ceq = []
+            for k in cutlass.range_constexpr(EPT):
+                bbk = L._vbin(ev[k], lo, sc, nb)
+                kpk = (tid + Int32(k * nthr) < C) & (bbk >= B)
                 if cutlass.const_expr(tiebin):
-                    if bb == B:
-                        if Int32(Uint32(ev[k] >> Uint64(32))) > idx_thr:
-                            kp = False
-            if kp & (bb == B):
-                fk = L.fkey_bits(L.entry_bits(ev[k]))
-                if fk < fmn:
-                    fmn = fk
-            kmask[k] = Int32(cute.arch.vote_ballot_sync(kp))
-            wtot = wtot + Int32(cute.arch.popc(kmask[k]))
+                    kpk = kpk & ((bbk != B) | (Int32(Uint32(ev[k] >> Uint64(32))) <= idx_thr))
+                kpl.append(kpk)
+                ceq.append(kpk & (bbk == B))
+            for k in cutlass.range_constexpr(EPT):
+                fkk = L.fkey_bits(L.entry_bits(ev[k]))
+                fcand = Uint32(cutlass.select_(ceq[k], fkk, Uint32(4294967295)))
+                fmn = Uint32(cutlass.select_(fcand < fmn, fcand, fmn))
+                kmask[k] = Int32(cute.arch.vote_ballot_sync(kpl[k]))
+                wtot = wtot + Int32(cute.arch.popc(kmask[k]))
+        else:
+            for k in cutlass.range_constexpr(EPT):
+                i = tid + Int32(k * nthr)
+                kp = False
+                bb = Int32(-1)
+                if i < C:
+                    bb = L._vbin(ev[k], lo, sc, nb)
+                    if bb >= B:
+                        kp = True
+                    if cutlass.const_expr(tiebin):
+                        if bb == B:
+                            if Int32(Uint32(ev[k] >> Uint64(32))) > idx_thr:
+                                kp = False
+                if kp & (bb == B):
+                    fk = L.fkey_bits(L.entry_bits(ev[k]))
+                    if fk < fmn:
+                        fmn = fk
+                kmask[k] = Int32(cute.arch.vote_ballot_sync(kp))
+                wtot = wtot + Int32(cute.arch.popc(kmask[k]))
         base = Int32(0)
         if lane == Int32(0):
             if wtot > Int32(0):
@@ -2107,6 +2154,50 @@ def _parts_of_row(q, cta, sched, num_sms, lane):
                         v = True
         bv = Int32(cute.arch.vote_ballot_sync(v))
         bl = Int32(cute.arch.vote_ballot_sync(v & (c < cta)))
+        P = P + Int32(cute.arch.popc(bv))
+        p = p + Int32(cute.arch.popc(bl))
+        it = it + Int32(1)
+    return (P, p)
+
+
+@cute.jit
+def _parts_cov(q, cta, sched, num_sms, lane, s_cov):
+    # _parts_of_row that also lists the other pieces of the row: s_cov[j] = slot (cta * 2 + side)
+    # of the j-th other covering CTA in CTA order, side 0 when the row is the first row of that
+    # CTA's range, else 1 (the slot its piece of the row was written to).
+    P = Int32(0)
+    p = Int32(0)
+    ncov = Int32(0)
+    lm = Int32(cute.arch.lanemask_lt())
+    nit = (num_sms + Int32(31)) // Int32(32)
+    it = Int32(0)
+    while it < nit:
+        c = lane + it * Int32(32)
+        v = False
+        side = Int32(1)
+        if c < num_sms:
+            sq0 = sched[c, 0]
+            skv0 = sched[c, 1]
+            sq1 = sched[c + 1, 0]
+            skv1 = sched[c + 1, 1]
+            hi = sq1
+            if skv1 == Int32(0):
+                hi = sq1 - Int32(1)
+            if (sq0 != sq1) | (skv0 != skv1):
+                if sq0 <= q:
+                    if q <= hi:
+                        v = True
+                        if sq0 == q:
+                            side = Int32(0)
+        bv = Int32(cute.arch.vote_ballot_sync(v))
+        bl = Int32(cute.arch.vote_ballot_sync(v & (c < cta)))
+        vx = v & (c != cta)
+        bx = Int32(cute.arch.vote_ballot_sync(vx))
+        if vx:
+            pos = ncov + Int32(cute.arch.popc(bx & lm))
+            if pos < Int32(COV_CAP):
+                s_cov[pos] = c * Int32(2) + side
+        ncov = ncov + Int32(cute.arch.popc(bx))
         P = P + Int32(cute.arch.popc(bv))
         p = p + Int32(cute.arch.popc(bl))
         it = it + Int32(1)
@@ -2311,6 +2402,11 @@ def _finalize_seg(
     rel_keep=None,
     rsort: cutlass.Constexpr = False,
     rel_bar=None,
+    merge1: cutlass.Constexpr = 0,
+    sBig=None,
+    sCov=None,
+    big_cap: cutlass.Constexpr = 0,
+    sel_fast: cutlass.Constexpr = False,
 ):
     NT: cutlass.Constexpr[int] = SEL_NTHR
     if cutlass.const_expr(stamps):
@@ -2322,7 +2418,20 @@ def _finalize_seg(
     nout = Int32(0)
     if fast == Int32(0):
         nout, kth_, m_, inf_ = L.select_topk_list(
-            sMb, cbuf, Int32(K_TOP), sHand, sHistS, sCkS, sResS, sRedS, sWcS, tid, False, NT, bar_id
+            sMb,
+            cbuf,
+            Int32(K_TOP),
+            sHand,
+            sHistS,
+            sCkS,
+            sResS,
+            sRedS,
+            sWcS,
+            tid,
+            False,
+            NT,
+            bar_id,
+            fast_loops=sel_fast,
         )
     # Keep this parity slot until all raw segment unions have been selected.
     # The 2048-entry source buffer is also our bounded <=1024-entry merge list.
@@ -2389,6 +2498,55 @@ def _finalize_seg(
             na = nout
             rlane = tid & Int32(31)
             nit = (Int32(num_sms) + Int32(31)) // Int32(32)
+            if cutlass.const_expr(merge1 > 0):
+                # One-shot merge (last segment of the CTA, K stages idle): the lists of the other
+                # pieces, merge1 sources in flight at a time, go densely into sBig and one selection
+                # runs over the union (its top-512 set is unique: entries are totally ordered by key
+                # and position). More pieces than sBig holds: the serial merge below.
+                ncov = P - Int32(1)
+                if P * Int32(K_TOP) <= Int32(big_cap):
+                    i0 = tid
+                    while i0 < na:
+                        sBig[i0] = Uint64(sHand[i0])
+                        i0 = i0 + Int32(NT)
+                    off = na
+                    j0 = Int32(0)
+                    while j0 < ncov:
+                        es = []
+                        nbs = []
+                        for g in cutlass.range_constexpr(merge1):
+                            jj = cutlass.min(j0 + Int32(g), ncov - Int32(1))
+                            slot = Int32(sCov[jj])
+                            src = ws_seg_base + Int64(slot) * Int64(SEGW * 8)
+                            nbs.append(L.ld_cg_i32(src + Int64(512 * 8)))
+                            for k in cutlass.range_constexpr(K_TOP // NT):
+                                es.append(L.ld_cg_u64(src + Int64(tid + k * NT) * Int64(8)))
+                        for g in cutlass.range_constexpr(merge1):
+                            nb = cutlass.select_(j0 + Int32(g) < ncov, nbs[g], Int32(0))
+                            for k in cutlass.range_constexpr(K_TOP // NT):
+                                if tid + Int32(k * NT) < nb:
+                                    sBig[off + tid + Int32(k * NT)] = es[g * (K_TOP // NT) + k]
+                            off = off + nb
+                        j0 = j0 + Int32(merge1)
+                    L.bar(bar_id, NT)
+                    nm1, kth_m1, m_m1, inf_m1 = L.select_topk_list(
+                        sBig,
+                        off,
+                        Int32(K_TOP),
+                        sHand,
+                        sHistS,
+                        sCkS,
+                        sResS,
+                        sRedS,
+                        sWcS,
+                        tid,
+                        False,
+                        NT,
+                        bar_id,
+                        fast_loops=sel_fast,
+                    )
+                    na = nm1
+                    nit = Int32(0)
             it = Int32(0)
             while it < nit:
                 bv = _cover_ballot(q, cta, mSched, Int32(num_sms), rlane, it)
@@ -2423,6 +2581,7 @@ def _finalize_seg(
                         False,
                         NT,
                         bar_id,
+                        fast_loops=sel_fast,
                     )
                     na = nm
                     bv = bv ^ low
@@ -2519,8 +2678,26 @@ class IndexerKernel:
         dq_cap: int = DQ_CAP,
         validate: bool = True,
         tiebin: bool = True,
+        merge1: int = 0,
+        fast_verdict: bool = False,
+        sel_fast: bool = False,
+        cmp_fast: bool = False,
+        sel_hand2: bool = False,
         config: SpecDsaConfig | None = None,
     ):
+        # merge1 = G > 0: the last piece of a split row merges the other pieces in one selection, G
+        # sources gathered at a time (see _finalize_seg); fast_verdict: the schedule verdict issues
+        # its global loads before the first branch
+        self.merge1 = int(merge1)
+        if not 0 <= self.merge1 <= 8:
+            raise ValueError("merge1")
+        self.fast_verdict = bool(fast_verdict)
+        self.sel_fast = bool(sel_fast)
+        self.cmp_fast = bool(cmp_fast)
+        # sel_hand2: the selector warps finalize the last segment into their own 512-entry result list and do not
+        # wait for the row warps to finish the segment before it (a two-segment CTA made the call 5 - 12 us slower at
+        # 40 - 92 rows)
+        self.sel_hand2 = bool(sel_hand2)
         self.fp4 = config is not None and config.index_k_dtype == "fp4"
         require_built_for(config, SPEC_FP4 if self.fp4 else SPEC)
         self.block_kv = block_kv
@@ -2621,6 +2798,10 @@ class IndexerKernel:
             self.sf_dtype = Float8E8M0FNU
             self.sf_vec_size = 32
             self.umma_inst_k = 64
+        # entries of the idle K-stage smem of the first group (merge1 gathers the pieces' lists)
+        self.merge_cap = (
+            self.num_kv_stages * self.block_kv * self.head_dim * (4 if self.fp4 else 8) // 64
+        )
 
     def _epi_half(self, tTR_rAcc, w_cache, head_start, s0x, s0y, s1x, s1y):
         # The same four FMA chains continue across the two 32-head TMEM loads.
@@ -2767,6 +2948,55 @@ class IndexerKernel:
                 bad = Int32(1)
             r = r + Int32(32)
         if mSched[0, 1] != Int32(0):
+            bad = Int32(1)
+        v = Int32(0)
+        if Int32(cute.arch.vote_ballot_sync(bad != Int32(0))) != Int32(0):
+            v = Int32(ST_SCHED)
+        return v
+
+    @cute.jit
+    def _sched_verdict_fast(self, mSched, mContextLens, batch_size, lane):
+        # The verdict of _sched_verdict with every global load issued before the first branch.
+        G = self.num_sms
+        n_it = (G + 1 + 31) // 32
+        qs = []
+        ks = []
+        q1s = []
+        k1s = []
+        for it in cutlass.range_constexpr(n_it):
+            s = lane + Int32(it * 32)
+            sc = cutlass.min(s, Int32(G))
+            s1 = cutlass.min(s + Int32(1), Int32(G))
+            qs.append(mSched[sc, 0])
+            ks.append(mSched[sc, 1])
+            q1s.append(mSched[s1, 0])
+            k1s.append(mSched[s1, 1])
+        us = []
+        for it in cutlass.range_constexpr(n_it):
+            qc = cutlass.min(cutlass.max(qs[it], Int32(0)), batch_size - Int32(1))
+            us.append((mContextLens[qc] + Int32(255)) // Int32(256))
+        q00 = mSched[0, 0]
+        k00 = mSched[0, 1]
+        bad = Int32(0)
+        for it in cutlass.range_constexpr(n_it):
+            s = lane + Int32(it * 32)
+            q = qs[it]
+            k = ks[it]
+            q1 = q1s[it]
+            k1 = k1s[it]
+            b1 = (q < Int32(0)) | (q > batch_size) | (k < Int32(0))
+            b2 = (q == batch_size) & (k != Int32(0))
+            b3 = (q >= Int32(0)) & (q < batch_size) & (k > Int32(0)) & (k >= us[it])
+            b4 = (s < Int32(G)) & ((q1 < q) | ((q1 == q) & (k1 < k)))
+            b5 = (s == Int32(G)) & (q != batch_size)
+            bad = cutlass.select_((s <= Int32(G)) & (b1 | b2 | b3 | b4 | b5), Int32(1), bad)
+        q0 = cutlass.min(cutlass.max(q00, Int32(0)), batch_size)
+        r = lane
+        while r < q0:
+            if mContextLens[r] != Int32(0):
+                bad = Int32(1)
+            r = r + Int32(32)
+        if k00 != Int32(0):
             bad = Int32(1)
         v = Int32(0)
         if Int32(cute.arch.vote_ballot_sync(bad != Int32(0))) != Int32(0):
@@ -3217,7 +3447,12 @@ class IndexerKernel:
         end_kv_half = mScheduleMeta[sm_idx + 1, 1]
         refused = Int32(0)
         if cutlass.const_expr(self.validate):
-            refused = self._sched_verdict(mScheduleMeta, mContextLens, batch_size, tidx % 32)
+            if cutlass.const_expr(self.fast_verdict):
+                refused = self._sched_verdict_fast(
+                    mScheduleMeta, mContextLens, batch_size, tidx % 32
+                )
+            else:
+                refused = self._sched_verdict(mScheduleMeta, mContextLens, batch_size, tidx % 32)
             if refused != Int32(0):
                 start_q = batch_size
                 start_kv_half = Int32(0)
@@ -3418,6 +3653,11 @@ class IndexerKernel:
         sHand = smem.allocate_tensor(
             element_type=Uint64, layout=cute.make_layout(K_TOP), byte_alignment=128
         )
+        sHand2 = sHand
+        if cutlass.const_expr(self.sel_hand2):  # the selector warps' own result list (4 KB)
+            sHand2 = smem.allocate_tensor(
+                element_type=Uint64, layout=cute.make_layout(K_TOP), byte_alignment=128
+            )
         sHB = smem.allocate_tensor(
             element_type=Uint64, layout=cute.make_layout(K_TOP), byte_alignment=128
         )
@@ -3531,6 +3771,11 @@ class IndexerKernel:
         sRowBar = smem.allocate_tensor(
             element_type=Int64, layout=cute.make_layout(6), byte_alignment=16
         )
+        sCov = None
+        if cutlass.const_expr(self.merge1 > 0):
+            sCov = smem.allocate_tensor(
+                element_type=Int32, layout=cute.make_layout(COV_CAP + 8), byte_alignment=16
+            )
         if tidx == 0:
             for i in cutlass.range_constexpr(5):
                 prims.mbarrier_init(sRowBar.iterator.raw_ptr() + i, 128)
@@ -4575,6 +4820,8 @@ class IndexerKernel:
                     sTb,
                     sRowBar,
                     sRingBar,
+                    sCov,
+                    sHand2,
                 )
         elif is_row_warp:
             if cutlass.const_expr(self.row_regs >= 96):
@@ -4687,6 +4934,8 @@ class IndexerKernel:
         sTb,
         sRowBar,
         sRingBar,
+        sCov=None,
+        sHand2=None,
     ):
         NT: cutlass.Constexpr[int] = SEL_NTHR
         lane = sel_tid & Int32(31)
@@ -4736,7 +4985,10 @@ class IndexerKernel:
                 Pq = Int32(1)
                 pq_ = Int32(0)
                 if (q == start_q) | (q == qb):
-                    Pq, pq_ = _parts_of_row(q, cta, mSched, Int32(self.num_sms), lane)
+                    if cutlass.const_expr(self.merge1 > 0):
+                        Pq, pq_ = _parts_cov(q, cta, mSched, Int32(self.num_sms), lane, sCov)
+                    else:
+                        Pq, pq_ = _parts_of_row(q, cta, mSched, Int32(self.num_sms), lane)
                 if lane == Int32(0):
                     sScal[0] = Pq
                     sScal[1] = pq_
@@ -4825,6 +5077,7 @@ class IndexerKernel:
                             seg,
                             self.tiebin,
                             sTb,
+                            fast_cmp=self.cmp_fast,
                         )
                         if kept < Int32(0):
                             no_, kth, m_, inf_ = L.select_topk_list(
@@ -4993,11 +5246,17 @@ class IndexerKernel:
                                 sHI.iterator + Int32(1), Int32(1), sem="release", scope="cta"
                             )
                 if cutlass.const_expr(self.sel_fin):
-                    if seg > Int32(0):
-                        # One-shot transfer after every earlier row finalizer.
-                        _wait(sRowBar.iterator.raw_ptr() + Int32(4), Int32(0))
+                    # sHand is the only buffer this finalize shares with the row warps' finalize of the earlier segment
+                    # (sAttB / sAttO are not used by it), so with sHand2 there is nothing to wait for.
+                    if cutlass.const_expr(not self.sel_hand2):
+                        if seg > Int32(0):
+                            # One-shot transfer after every earlier row finalizer.
+                            _wait(sRowBar.iterator.raw_ptr() + Int32(4), Int32(0))
                     L.bar(SEL_BAR, NT)
                     pref = Int32(1)
+                    sHand_f = sHand
+                    if cutlass.const_expr(self.sel_hand2):
+                        sHand_f = sHand2
                     sdone, s0, s1, s2, s3, s4 = _finalize_seg(
                         sel_tid,
                         SEL_BAR,
@@ -5010,7 +5269,7 @@ class IndexerKernel:
                         sMb,
                         cfin,
                         None,
-                        sHand,
+                        sHand_f,
                         sAttB,
                         sAttO,
                         sHist,
@@ -5042,6 +5301,16 @@ class IndexerKernel:
                         0,
                         None,
                         self.rsort,
+                        merge1=self.merge1,
+                        sBig=cute.make_tensor(
+                            cute.recast_ptr(sKV_0.iterator, dtype=Uint64),
+                            cute.make_layout(self.merge_cap),
+                        )
+                        if self.merge1 > 0
+                        else None,
+                        sCov=sCov,
+                        big_cap=self.merge_cap,
+                        sel_fast=self.sel_fast,
                     )
                     if sdone != Int32(0):
                         sGv[sel_tid] = s0
@@ -5499,11 +5768,13 @@ class IndexerKernel:
                         keep,
                         self.rsort,
                         sRowBar.iterator.raw_ptr() + Int32(2) + bsel,
+                        sel_fast=self.sel_fast,
                     )
                 if work == Int32(1):
                     if nh + Int32(2) == nseg_r:
                         # The selector takes sHand/sAttB/sAttO only for its last
-                        # segment, after all 128 row threads finish the prior one.
+                        # segment, after all 128 row threads finish the prior one
+                        # (not awaited with sel_hand2).
                         prims.mbarrier_arrive(sRowBar.iterator.raw_ptr() + Int32(4))
                 if cutlass.const_expr(self.attn):
                     if done_row != Int32(0):

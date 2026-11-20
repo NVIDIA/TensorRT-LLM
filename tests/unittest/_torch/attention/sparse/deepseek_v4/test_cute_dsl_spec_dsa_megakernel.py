@@ -27,6 +27,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa.config import DS_V4_FLASH as SPEC
+from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa.config import (
+    DS_V4_FLASH_FP4 as SPEC_FP4,
+)
 from tensorrt_llm._utils import get_sm_version
 
 # The shapes under test are those of the spec (``config.py``); test_cute_dsl_spec_dsa_config.py pins its values.
@@ -497,45 +500,76 @@ def test_rejects_unsupported_shapes():
         )
 
 
-FP4_CASES = [  # (rows' specs, attention mode)
-    pytest.param([{"n": 262127}], "gather_exact", id="b1-max"),
-    pytest.param([{"n": 8000, "ties": 9}], "gather_exact", id="b1-ties"),
-    pytest.param([{"n": 512}], "realistic", id="b1-select-all"),
-    pytest.param([{"n": 131071}, {"n": 65543, "ties": 7}], "gather_exact", id="b2-ties"),
-    pytest.param(
-        [{"n": 262127}, {"n": 700, "ties": 5}, {"n": 98309, "flat": True}],
-        "gather_exact",
-        id="b3-short-ties-flat",
-    ),
-    pytest.param(
-        [{"n": 131071}, {"n": 98309}, {"n": 50021}, {"n": 32771, "ties": 77}],
-        "realistic",
-        id="b4-mixed",
-    ),
-    pytest.param(
-        [{"n": 262127 - 4099 * r, "ties": 31 if r == 3 else 0} for r in range(8)],
-        "realistic",
-        id="b8-mixed-ties",
-    ),
-    pytest.param([{"n": 262127 - 7001 * r} for r in range(9)], "gather_exact", id="b9-mixed"),
-    pytest.param(
-        [{"n": 262127 - 4093 * r, "ties": 29 if r == 11 else 0} for r in range(16)],
-        "realistic",
-        id="b16-mixed-ties",
-    ),
-    pytest.param([{"n": 262127 - 5003 * r} for r in range(20)], "realistic", id="b20-mixed"),
-    pytest.param(
-        [
-            {
-                "n": 262127 - 3989 * r if r % 3 else 700 + 17 * r,
-                "ties": 3 if r == 5 else 0,
-                "flat": r == 18,
-            }
-            for r in range(22)
-        ],
-        "gather_exact",
-        id="b22-mixed-short-ties-flat",
-    ),
+def _fp4_rows(batch, step=4093, short=(), ties=None, flat=(), base=262127):
+    """Specs of ``batch`` rows: lengths ``base - step * r``, the rows in ``short`` 700 + 17 r long, planted ties
+    {row: count}, all-equal rows ``flat``."""
+    ties = ties or {}
+    return [
+        {
+            "n": 700 + 17 * r if r in short else base - step * r,
+            "ties": ties.get(r, 0),
+            "flat": r in flat,
+        }
+        for r in range(batch)
+    ]
+
+
+# The knob sets of the FP4 megakernel: 1 row, 2 rows, 3 to 4 rows (one team of 4 CTAs per row), 5 to 8 rows and 9 up to
+# megakernel_max_batch rows (the ring of logits slots); from 5 rows four shared teams, two dedicated T-server CTAs and
+# rotated split ranges. Odd and in-between sizes, the largest size, short rows (most stream CTAs have an empty split
+# range) and rows of the longest length are all part of it.
+FP4_N = SPEC_FP4.megakernel_max_batch
+FP4_CASES = [
+    pytest.param(specs, attn, id=f"b{len(specs)}-{name}")
+    for name, specs, attn in [
+        ("max", [{"n": 262127}], "gather_exact"),
+        ("ties", [{"n": 8000, "ties": 9}], "gather_exact"),
+        ("select-all", [{"n": 512}], "realistic"),
+        ("ties", [{"n": 131071}, {"n": 65543, "ties": 7}], "gather_exact"),
+        (
+            "short-ties-flat",
+            [{"n": 262127}, {"n": 700, "ties": 5}, {"n": 98309, "flat": True}],
+            "gather_exact",
+        ),
+        (
+            "mixed",
+            [{"n": 131071}, {"n": 98309}, {"n": 50021}, {"n": 32771, "ties": 77}],
+            "realistic",
+        ),
+        ("mixed", _fp4_rows(5, step=7001), "realistic"),
+        ("max", [{"n": 262127}] * 5, "gather_exact"),
+        ("short-ties", _fp4_rows(6, short=(1, 4), ties={2: 13}), "gather_exact"),
+        ("flat", _fp4_rows(7, step=5003, flat=(4,)), "gather_exact"),
+        ("mixed-ties", _fp4_rows(8, step=4099, ties={3: 31}), "realistic"),
+        ("mixed", _fp4_rows(9, step=7001), "gather_exact"),
+        ("mixed-ties", _fp4_rows(10, step=5501, ties={9: 41}), "gather_exact"),
+        ("short-ties", _fp4_rows(11, short=(3, 9), ties={5: 17}), "realistic"),
+        ("flat", _fp4_rows(13, step=3001, flat=(9,)), "gather_exact"),
+        ("short-flat", _fp4_rows(14, short=(0, 7), flat=(11,)), "realistic"),
+        ("mixed", _fp4_rows(15, step=6101), "gather_exact"),
+        ("mixed-ties", _fp4_rows(16, ties={11: 29}), "realistic"),
+        ("mixed", _fp4_rows(17, step=6007), "gather_exact"),
+        ("short-ties", _fp4_rows(18, short=(4, 13), ties={8: 600}), "realistic"),
+        (
+            "short-ties-flat",
+            _fp4_rows(19, short=(6, 12, 18), ties={0: 6000, 15: 77}, flat=(10,)),
+            "gather_exact",
+        ),
+        ("mixed", _fp4_rows(20, step=5003), "realistic"),
+        # rows of fewer than 8,192 positions: only the first stream CTAs have a split range
+        ("all-short", [{"n": n} for n in (512, 700, 1500, 4097, 513, 8000, 2049)], "gather_exact"),
+        ("all-short", [{"n": 512 + 331 * r} for r in range(12)], "realistic"),
+        ("max", [{"n": 262127}] * FP4_N, "realistic"),
+        (
+            "mixed-short-ties-flat",
+            _fp4_rows(
+                FP4_N, step=3989, short=(2, 5, 8, 11, 14, 17), ties={5: 3, 7: 77}, flat=(18,)
+            ),
+            "gather_exact",
+        ),
+        ("all-short", [{"n": 512 + 97 * r} for r in range(FP4_N)], "gather_exact"),
+    ]
+    if len(specs) <= FP4_N
 ]
 
 

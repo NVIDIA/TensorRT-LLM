@@ -76,6 +76,13 @@ SCHED_MIN_UNITS = 128
 # costs about 60 us of host time per call.
 SCHED_ALIGN_BATCH = 80
 SCHED_ALIGN_SLACK_PCT = 3
+# A CTA that streams pieces of several rows pays a fresh start of the selection (floor learning, four compactions) for
+# every row it touches, on top of its stream time: about 6 us (BS 32) to 15 us (BS 256) per extra row segment, i.e.
+# 14 to 41 schedule units. ``_balance_cuts`` moves the cuts so that stream units plus this cost are even over the CTAs.
+# Per spec: (batch size, cost of a row segment in units) points, linear in between; no entry = the even split.
+_SEG_UNITS: dict = {
+    DS_V4_FLASH_FP4.kernel_key: ((1, 14), (64, 14), (100, 24), (128, 38), (256, 28), (1024, 28))
+}
 SELECT_BINS = 512
 SEGMENT_WORDS = 520  # int64 words per CTA and slot of the selection scratch
 # int32 words per row of the ready queue; word AQ_ENTRY + k holds the k-th finished row.
@@ -102,11 +109,40 @@ _KERNEL_CONFIG = dict(
 )
 
 # The knobs of the indexer kernel per spec (kernel_key). An FP4 K tile is half the bytes of an FP8 one: twice the
-# stages keep the same bytes in flight.
+# stages keep the same bytes in flight. merge1: the last piece of a split row merges its row's
+# pieces in one selection (two sources gathered at a time), not in one two-way selection per
+# piece; fast_verdict: the schedule verdict at kernel entry issues its loads before its first branch;
+# trig0: the first compaction of a segment waits for 1536 candidates; sel_fast / cmp_fast: the exact selection of the
+# finalization and the in-stream compaction issue the independent work of an iteration together; sel_hand2: the selector
+# warps finalize the last segment of a CTA into their own result list instead of waiting for the row warps to finish the
+# earlier segment (the wait made the call 5 - 12 us slower at 40 - 92 rows).
 _KNOBS = {
     DS_V4_FLASH.kernel_key: _KERNEL_CONFIG,
-    DS_V4_FLASH_FP4.kernel_key: dict(_KERNEL_CONFIG, kv_stages=8),
+    DS_V4_FLASH_FP4.kernel_key: dict(
+        _KERNEL_CONFIG,
+        kv_stages=8,
+        merge1=2,
+        fast_verdict=True,
+        trig0=1536,
+        sel_fast=True,
+        cmp_fast=True,
+        sel_hand2=True,
+    ),
 }
+
+# Batch-size ranges that run the indexer kernel with other knobs: (first batch size, overrides), the last range whose
+# first batch size is not above the batch size wins. A range is a second compile of the same kernel class. The four
+# selector warps poll the candidate rings every sel_idle_ns: from 60 rows on the polls compete with the TMA / MMA
+# barriers of the SM and with the power budget (a 1.5 us sleep is 1 - 2 % faster at 100 - 150 rows and 4 - 7 % from 192
+# rows on), and six K stages (12 tiles in flight instead of 16) share the HBM more evenly between the SMs (the slowest
+# SMs set the end of the call). Below that the longer sleep delays the drain at the end of a piece.
+_VARIANTS = {
+    DS_V4_FLASH_FP4.kernel_key: ((60, dict(sel_idle_ns=1536, kv_stages=6)),),
+}
+
+# Knobs of the attention kernel per spec (kernel_key); no entry = the shipped kernel. exit_early: the "last CTA to leave
+# resets the ready queue" accounting runs right after the CTA's final claim, off the critical path of the last row.
+_TAIL_KNOBS: dict = {DS_V4_FLASH_FP4.kernel_key: dict(exit_early=True)}
 
 _lock = threading.Lock()
 _engines: dict[tuple, dict] = {}
@@ -152,15 +188,31 @@ def _engine(device: torch.device, config: SpecDsaConfig | None = None) -> dict:
     with _lock:
         if key not in _engines:
             lb, _ = _kernel_modules()
+            knobs = _KNOBS[config.kernel_key]
             _engines[key] = {
-                "indexer": lb.IndexerKernel(
-                    num_sms=NUM_SMS, config=config, **_KNOBS[config.kernel_key]
-                ),
+                "indexer": lb.IndexerKernel(num_sms=NUM_SMS, config=config, **knobs),
                 "indexer_fn": None,
-                "tail": lb.AttentionTail(config=config),
+                # [first batch size, kernel, compiled function]
+                "variants": [
+                    [
+                        first,
+                        lb.IndexerKernel(num_sms=NUM_SMS, config=config, **{**knobs, **over}),
+                        None,
+                    ]
+                    for first, over in _VARIANTS.get(config.kernel_key, ())
+                ],
+                "tail": lb.AttentionTail(config=config, **_TAIL_KNOBS.get(config.kernel_key, {})),
                 "tail_fn": None,
             }
         return _engines[key]
+
+
+def _not_compiled(e: dict) -> bool:
+    return (
+        e["indexer_fn"] is None
+        or e["tail_fn"] is None
+        or any(v[2] is None for v in e.get("variants", ()))
+    )
 
 
 def precompile(device: torch.device, config: SpecDsaConfig | None = None) -> None:
@@ -172,7 +224,7 @@ def precompile(device: torch.device, config: SpecDsaConfig | None = None) -> Non
     lb, _ = _kernel_modules()
     e = _engine(device, config)
     with _lock:
-        if e["indexer_fn"] is None or e["tail_fn"] is None:
+        if _not_compiled(e):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "spec_dsa (large batch): compile the kernels (precompile) before "
@@ -180,6 +232,9 @@ def precompile(device: torch.device, config: SpecDsaConfig | None = None) -> Non
                 )
             if e["indexer_fn"] is None:
                 e["indexer_fn"] = lb.compile_indexer(e["indexer"])
+            for v in e.get("variants", ()):
+                if v[2] is None:
+                    v[2] = lb.compile_indexer(v[1])
             if e["tail_fn"] is None:
                 e["tail_fn"] = lb.compile_tail(e["tail"])
 
@@ -210,12 +265,47 @@ class SpecDsaLargeBatchState:
     config: SpecDsaConfig
 
 
-def _schedule(ctx_lens: list[int], num_ctas: int) -> np.ndarray:
+def _seg_units(config: SpecDsaConfig, batch_size: int) -> int:
+    """Cost of one row segment of a CTA in schedule units for ``batch_size`` rows (0 = not modelled)."""
+    points = _SEG_UNITS.get(config.kernel_key)
+    if not points:
+        return 0
+    xs, ys = zip(*points)
+    return int(round(float(np.interp(batch_size, xs, ys))))
+
+
+def _balance_cuts(prefix: np.ndarray, num_ctas: int, seg_units: int) -> np.ndarray:
+    """CTA cuts (positions in the concatenated unit space, ``num_ctas + 1`` of them) that make the stream units of a CTA
+    plus ``seg_units`` per row it touches even over the CTAs.
+
+    A CTA that covers ``[a, b)`` touches the row boundaries strictly inside plus one row, so its cost is
+    ``G(b) - G(a) + seg_units`` with ``G(x) = x + seg_units * #{row starts below x}``: an even split of ``G`` is the
+    balanced one. A cut that falls into the jump of ``G`` at a row start is placed on that row start.
+    """
+    total = int(prefix[-1])
+    inner = prefix[1:-1]  # starts of rows 1..B-1
+    s = np.arange(num_ctas + 1, dtype=np.float64)
+    y = s * ((total + seg_units * inner.size) / num_ctas)
+    if inner.size == 0:
+        x = y
+    else:
+        g_left = inner + seg_units * np.arange(inner.size)  # G just below the start of row j + 1
+        m = np.searchsorted(g_left + seg_units, y, side="left")  # starts passed completely
+        x = y - seg_units * m
+        mc = np.minimum(m, inner.size - 1)
+        x = np.where((m < inner.size) & (y > g_left[mc]), inner[mc], x)
+    cuts = np.rint(x).astype(np.int64)
+    cuts[0], cuts[-1] = 0, total
+    return np.maximum.accumulate(cuts)
+
+
+def _schedule(ctx_lens: list[int], num_ctas: int, seg_units: int = 0) -> np.ndarray:
     """CTA schedule: CTA ``s`` starts at unit ``s * quota + min(s, rem)`` of the rows' concatenated unit ranges.
 
     Row ``r`` spans ``max(ceil(n_r / SCHED_UNIT), SCHED_MIN_UNITS)`` units; entry ``s`` is ``(row, unit offset in
     the row)`` of that start (offset 0 for rows with fewer than ``SCHED_MIN_UNITS`` real units, which are never
-    split) and entry ``num_ctas`` is ``(batch_size, 0)``.
+    split) and entry ``num_ctas`` is ``(batch_size, 0)``. With ``seg_units`` > 0 the cuts are moved by
+    ``_balance_cuts`` so that a CTA that touches more rows gets fewer units.
 
     With fewer than ``SCHED_ALIGN_BATCH`` rows the even split cuts rows at arbitrary units, and every extra piece of
     a row is one more candidate list for the last finisher of the row to merge. ``_aligned_schedule`` then cuts the
@@ -230,6 +320,8 @@ def _schedule(ctx_lens: list[int], num_ctas: int) -> np.ndarray:
     quota, rem = divmod(int(prefix[-1]), num_ctas)
     s = np.arange(num_ctas + 1, dtype=np.int64)
     start = s * quota + np.minimum(s, rem)
+    if seg_units > 0:
+        start = _balance_cuts(prefix, num_ctas, seg_units)
     row = np.searchsorted(prefix[1:], start, side="right")
     inside = row < batch
     row_c = np.minimum(row, batch - 1)
@@ -244,8 +336,8 @@ def _schedule(ctx_lens: list[int], num_ctas: int) -> np.ndarray:
     next_row, next_off = sched[1:, 0], sched[1:, 1]
     moved = (next_row != first_row) | (next_off != first_off)
     even_pieces = int(((next_row - first_row) + (next_off > 0))[moved].sum())
-    busiest_aligned = _busiest_cta_units(units, aligned)
-    busiest_even = _busiest_cta_units(units, sched)
+    busiest_aligned = _busiest_cta_units(units, aligned, seg_units)
+    busiest_even = _busiest_cta_units(units, sched, seg_units)
     if pieces < even_pieces and busiest_aligned * 100 <= busiest_even * (
         100 + SCHED_ALIGN_SLACK_PCT
     ):
@@ -253,10 +345,16 @@ def _schedule(ctx_lens: list[int], num_ctas: int) -> np.ndarray:
     return sched
 
 
-def _busiest_cta_units(units: np.ndarray, sched: np.ndarray) -> int:
-    """Stream units (``SCHED_UNIT`` positions of the rows, without the minimum cost) of the busiest CTA of ``sched``."""
+def _busiest_cta_units(units: np.ndarray, sched: np.ndarray, seg_units: int = 0) -> int:
+    """Stream units (``SCHED_UNIT`` positions of the rows, without the minimum cost) of the busiest CTA of ``sched``,
+    plus ``seg_units`` for every row segment of the CTA."""
     work = np.concatenate([[0], np.cumsum(units)])
-    return int(np.diff(work[sched[:, 0]] + sched[:, 1]).max())
+    pos = work[sched[:, 0]] + sched[:, 1]
+    cost = np.diff(pos)
+    if seg_units > 0:
+        rows = (np.diff(sched[:, 0]) + (sched[1:, 1] > 0)).clip(min=0)
+        cost = cost + seg_units * np.where(cost > 0, rows, 0)
+    return int(cost.max())
 
 
 def _aligned_schedule(units: np.ndarray, num_ctas: int) -> np.ndarray:
@@ -353,7 +451,10 @@ def prepare(
             status=torch.full((4,), -7, dtype=torch.int32, device=device),
             config=config,
         )
-    state.sched.copy_(torch.from_numpy(_schedule(ctx_host, NUM_SMS)), non_blocking=True)
+    state.sched.copy_(
+        torch.from_numpy(_schedule(ctx_host, NUM_SMS, _seg_units(config, batch_size))),
+        non_blocking=True,
+    )
     state.sinks.copy_(sinks.reshape(1, config.attn_heads).expand(batch_size, config.attn_heads))
     return state
 
@@ -467,13 +568,17 @@ def run(
             f"k_cache must hold {config.index_page_bytes} bytes per page, got {tuple(k_cache.shape)}"
         )
     e = _engine(q_idx.device, config)
-    if e["indexer_fn"] is None or e["tail_fn"] is None:
+    if _not_compiled(e):
         precompile(q_idx.device, config)
+    indexer_fn = e["indexer_fn"]
+    for first, _, fn in e.get("variants", ()):
+        if b >= first:
+            indexer_fn = fn
     q_att8 = q_att.view(torch.uint8).view(b, config.attn_heads, config.kv_dim)
     swa8 = swa_pool.view(torch.uint8).view(-1, config.kv_dim)
     c8 = c_pool.view(torch.uint8).view(-1, config.kv_dim)
     out3 = out.view(b, config.attn_heads, config.kv_dim)
-    e["indexer_fn"](
+    indexer_fn(
         k_cache.view(pages, -1),
         q_idx.reshape(-1)
         .as_strided(
@@ -512,5 +617,13 @@ def run(
         ),
     )
     e["tail_fn"](
-        q_att8, swa8, c8, state.gidx, state.sinks, out3, state.ready_queue, softmax_scale, NUM_SMS
+        q_att8,
+        swa8,
+        c8,
+        state.gidx,
+        state.sinks,
+        out3,
+        state.ready_queue,
+        softmax_scale,
+        NUM_SMS,
     )

@@ -54,15 +54,16 @@ def _or_reduce(v):
     return Int32(cute.arch.warp_redux_sync(v, "or"))
 
 
-@cute.kernel
-def _desc_kernel(
+@cute.jit
+def _desc_body(
     mCtx: cute.Tensor,
     mBt: cute.Tensor,
     mDesc: cute.Tensor,
     ns_ctas: cutlass.Constexpr[int],
-    rot: cutlass.Constexpr[int] = 0,
-    zlast: cutlass.Constexpr[bool] = False,
-    zc: cutlass.Constexpr[int] = -1,
+    rot: cutlass.Constexpr[int],
+    zlast: cutlass.Constexpr[bool],
+    zc: cutlass.Constexpr[int],
+    ladder_words: cutlass.Constexpr[bool],
 ):
     c, _, _ = cute.arch.block_idx()
     lane, _, _ = cute.arch.thread_idx()
@@ -83,6 +84,10 @@ def _desc_kernel(
             cz_ = c
             if c > Int32(zc):
                 cz_ = c - Int32(1)
+            if cutlass.const_expr(rot % (ns_ctas - 1) != 0):
+                # rows rotate which CTA holds which range (knob drot): the CTAs that hold the dense end of the
+                # sequence differ from row to row
+                cz_ = (cz_ + Int32(rot)) % Int32(ns_ctas - 1)
             s0 = cz_ * nsplit // Int32(ns_ctas - 1)
             s1 = (cz_ + Int32(1)) * nsplit // Int32(ns_ctas - 1)
             if c == Int32(zc):
@@ -90,8 +95,11 @@ def _desc_kernel(
                 s1 = nsplit
         if cutlass.const_expr(zlast):
             # ranges over ns_ctas - 1 CTAs; CTA ns_ctas - 1 (the early T server) gets an empty range
-            s0 = c * nsplit // Int32(ns_ctas - 1)
-            s1 = (c + Int32(1)) * nsplit // Int32(ns_ctas - 1)
+            cl_ = c
+            if cutlass.const_expr(rot % (ns_ctas - 1) != 0):
+                cl_ = (c + Int32(rot)) % Int32(ns_ctas - 1)
+            s0 = cl_ * nsplit // Int32(ns_ctas - 1)
+            s1 = (cl_ + Int32(1)) * nsplit // Int32(ns_ctas - 1)
             if c == Int32(ns_ctas - 1):
                 s0 = nsplit
                 s1 = nsplit
@@ -176,12 +184,47 @@ def _desc_kernel(
         elif lane == Int32(5):
             out = nW
         elif lane == Int32(6):
-            out = nv_
+            if cutlass.const_expr(ladder_words):
+                out = SMP
+            else:
+                out = nv_
         elif lane == Int32(7):
-            out = Int32(MAGIC) | Int32(ns_ctas << 16)
+            if cutlass.const_expr(ladder_words):
+                out = SS2
+            else:
+                out = Int32(MAGIC) | Int32(ns_ctas << 16)
         else:
             out = page
     mDesc[c * Int32(DESC_WORDS) + lane] = out
+
+
+# The descriptor kernel of the FP8 spec and the one of the FP4 spec (``ladder_words``: words 6 / 7 hold SMP / SS2 of the
+# sampling ladder) are two kernels over one body, so that the FP8 kernel keeps its signature and the code it generated
+# before the FP4 spec existed.
+@cute.kernel
+def _desc_kernel(
+    mCtx: cute.Tensor,
+    mBt: cute.Tensor,
+    mDesc: cute.Tensor,
+    ns_ctas: cutlass.Constexpr[int],
+    rot: cutlass.Constexpr[int] = 0,
+    zlast: cutlass.Constexpr[bool] = False,
+    zc: cutlass.Constexpr[int] = -1,
+):
+    _desc_body(mCtx, mBt, mDesc, ns_ctas, rot, zlast, zc, False)
+
+
+@cute.kernel
+def _desc_kernel_fp4(
+    mCtx: cute.Tensor,
+    mBt: cute.Tensor,
+    mDesc: cute.Tensor,
+    ns_ctas: cutlass.Constexpr[int],
+    rot: cutlass.Constexpr[int] = 0,
+    zlast: cutlass.Constexpr[bool] = False,
+    zc: cutlass.Constexpr[int] = -1,
+):
+    _desc_body(mCtx, mBt, mDesc, ns_ctas, rot, zlast, zc, True)
 
 
 @cute.jit
@@ -201,11 +244,36 @@ def _launch_desc(
     )
 
 
+@cute.jit
+def _launch_desc_fp4(
+    ctx: cute.Tensor,
+    bt: cute.Tensor,
+    desc: cute.Tensor,
+    num_sms: cutlass.Constexpr[int],
+    ns_ctas: cutlass.Constexpr[int],
+    rot: cutlass.Constexpr[int],
+    zlast: cutlass.Constexpr[bool],
+    zc: cutlass.Constexpr[int],
+    stream: cuda_driver.CUstream,
+):
+    _desc_kernel_fp4(ctx, bt, desc, ns_ctas, rot, zlast, zc).launch(
+        grid=(num_sms, 1, 1), block=[32, 1, 1], stream=stream
+    )
+
+
 _COMPILED_DESC = {}
 
 
-def compile_desc(num_sms: int, ns_ctas: int, rot: int = 0, zlast: bool = False, zc: int = -1):
-    key = (num_sms, ns_ctas, rot, zlast, zc)
+def compile_desc(
+    num_sms: int,
+    ns_ctas: int,
+    rot: int = 0,
+    zlast: bool = False,
+    zc: int = -1,
+    ladder_words: bool = False,
+):
+    # the FP8 call (ladder_words False) has the signature, the cache key and the symbol it had before the FP4 spec
+    key = (num_sms, ns_ctas, rot, zlast, zc) + ((True,) if ladder_words else ())
     if key not in _COMPILED_DESC:
         rt = cute.runtime
         s = cute.sym_int
@@ -215,7 +283,7 @@ def compile_desc(num_sms: int, ns_ctas: int, rot: int = 0, zlast: bool = False, 
             rt.make_fake_compact_tensor(cutlass.Int32, (s(),), stride_order=(0,)),
         ]
         _COMPILED_DESC[key] = cute.compile(
-            _launch_desc,
+            _launch_desc_fp4 if ladder_words else _launch_desc,
             *fk,
             num_sms,
             ns_ctas,
@@ -237,12 +305,15 @@ def build_desc_device(
     rot: int = 0,
     zlast: bool = False,
     zc: int = -1,
+    ladder_words: bool = False,
 ):
     """Write one row's split descriptor into ``desc`` on the device from its compressed length and indexer
-    block-table row.
+    block-table row; ``ladder_words``: words 6 / 7 hold SMP / SS2 of the sampling ladder (FP4 megakernel).
     """
     assert desc.numel() >= num_sms * DESC_WORDS and desc.dtype == torch.int32
-    compile_desc(num_sms, ns_ctas, rot % ns_ctas, bool(zlast), int(zc))(ctx_lens[0:1], bt_row, desc)
+    compile_desc(num_sms, ns_ctas, rot % ns_ctas, bool(zlast), int(zc), bool(ladder_words))(
+        ctx_lens[0:1], bt_row, desc
+    )
 
 
 def build_desc_host(
@@ -1227,6 +1298,7 @@ class SpecDsaMegakernel:
         ring: bool = False,
         ring_w12: bool = False,
         team4: bool = False,
+        tcta: int = 0,
         config: SpecDsaConfig | None = None,
     ):
         self.fp4 = config is not None and config.index_k_dtype == "fp4"
@@ -1242,6 +1314,11 @@ class SpecDsaMegakernel:
         assert ladder_max_smp() * 8 <= min(BOARD_CAP, RMAX * 128 * 2), "board capacity"
         self.full_attention_tiles = bool(full_attention_tiles)
         self.swag = bool(swag)
+        # tcta: dedicated T-server CTAs (the last tcta CTAs of the grid, even) compute the threshold line of every row
+        # (rows t, t + tcta, ...) instead of the stream CTAs with an empty split range, whose math warps block in the T
+        # wait and then run a few us behind the other stream CTAs for the rest of the launch (needs the shared-team T
+        # server layout: tsz01 / tsz2 / tsz / tszall)
+        self.tcta = int(tcta)
         self.nohoist = bool(nohoist)
         self.rs24 = bool(rs24)
         self.rs24_t4split = bool(rs24_t4split)
@@ -1260,7 +1337,7 @@ class SpecDsaMegakernel:
         self.team4 = bool(team4)
         self.team_ctas = 4 if self.team4 else NTEAM
         assert not self.team4 or (
-            3 <= self.nrows <= 24
+            3 <= self.nrows <= 32
             and self.rs24
             and (not self.rs24_dry)
             and (not self.rs24_f32)
@@ -1277,7 +1354,11 @@ class SpecDsaMegakernel:
         # teams of 8 CTAs; nteams < nrows shares them (team t serves rows t, t + nteams, ...)
         self.nteams = min(int(nteams), self.nrows) if nteams else self.nrows
         assert 1 <= self.nteams <= self.nrows
-        self.ns = num_sms - self.team_ctas * self.nteams
+        self.ns = num_sms - self.team_ctas * self.nteams - self.tcta
+        assert self.tcta in (0, 2) and self.ns % 2 == 0
+        assert not self.tcta or (
+            self.nteams < self.nrows and tsz01 and tsz2 and tsz and tszall and self.rs24
+        ), "tcta needs shared teams with the stream T-server layout (tsz01 tsz2 tsz tszall)"
         self.npmax = (self.nrows + self.nteams - 1) // self.nteams
         assert self.npmax <= (MAXP if self.nrows <= 32 else MAXP48)  # pass entry words in T_OFF_PW
         assert self.ns * CAPR >= NB_INITIAL * BUCKET_CAP
@@ -3695,16 +3776,21 @@ class SpecDsaMegakernel:
                     ord1 = cute.arch.shuffle_sync(desc_lane, 4)
                     nwin = cute.arch.shuffle_sync(desc_lane, 5)
                     n = n_desc
-                    SMP, SS2, TGT, TGT2 = L.gvr_ladder(
-                        n,
-                        Int32(K_TOP),
-                        Int32(PLAN["aim_base"]),
-                        Int32(PLAN["sfac"]),
-                        Int32(PLAN["amin"]),
-                        Int32(PLAN["sd_en"]),
-                        PLAN["r_const"],
-                        PLAN["scap"],
-                    )
+                    if cutlass.const_expr(self.fp4):
+                        # the descriptor kernel computed the ladder: words 6 / 7 hold SMP / SS2
+                        SMP = cute.arch.shuffle_sync(desc_lane, 6)
+                        SS2 = cute.arch.shuffle_sync(desc_lane, 7)
+                    else:
+                        SMP, SS2, TGT, TGT2 = L.gvr_ladder(
+                            n,
+                            Int32(K_TOP),
+                            Int32(PLAN["aim_base"]),
+                            Int32(PLAN["sfac"]),
+                            Int32(PLAN["amin"]),
+                            Int32(PLAN["sd_en"]),
+                            PLAN["r_const"],
+                            PLAN["scap"],
+                        )
                     wst = Int32(8) * SS2
                     t_lo = s0 * Int32(SPLIT_TOK)
                     nwin0 = (nwin + Int32(1)) // Int32(2)
@@ -3881,7 +3967,7 @@ class SpecDsaMegakernel:
                     if cutlass.const_expr(self.stamps):
                         if tidx == 0:
                             (mStR_.iterator + cta * NSTAMP + ST_STREAM_END).store(Int64(L.gtimer()))
-                    if cutlass.const_expr(self.nteams < self.nrows):
+                    if cutlass.const_expr(self.nteams < self.nrows and self.tcta == 0):
                         srv_ = Int32(0)
                         if r_ == Int32(self.nrows - 1):
                             # T server of the last row (CTA 0, warps 0-3; scratch in the idle K stage buffer)
@@ -5964,7 +6050,123 @@ class SpecDsaMegakernel:
         return v
 
     @cute.jit
+    def _tserver_cta(self, arena, cta, tidx, ws0, mCtxA, mHistA, mBoardA, mStampsA, mCtlA, tt):
+        # dedicated T-server CTA tt (of tcta): the threshold line of the rows tt, tt + tcta, ... in order,
+        # computed by warps 0-3 (128 threads, as the stream T server): the board of a row is awaited (spin),
+        # T / HIC / T3 / SMAX published after the row's histogram clear. The other warps have nothing to do.
+        if tidx < Int32(128):
+            rs_ = self.row_sizes()
+            nrk_ = (Int32(self.nrows) - tt + Int32(self.tcta - 1)) // Int32(self.tcta)
+            for k_ in cutlass.range(nrk_, unroll=1):
+                r_ = tt + k_ * Int32(self.tcta)
+                ws_r_ = ws0 + Int64(r_) * Int64(rs_["ws"] * 8)
+                n_ = mCtxA[r_]
+                if n_ < Int32(0) or n_ > Int32(N_MAX):
+                    n_ = Int32(0)
+                g1_ = Uint64(0)
+                g2_ = Uint64(0)
+                g3_ = Uint64(0)
+                if tidx == Int32(0):
+                    g1_, g2_, g3_ = self._entry_loads(ws_r_)
+                mStT_ = cute.make_tensor(
+                    mStampsA.iterator + (Int32(24) + r_) * Int32(self.num_sms * NSTAMP),
+                    mStampsA.layout,
+                )
+                self._block_a_lead(
+                    arena,
+                    cta,
+                    tidx,
+                    ws_r_,
+                    n_,
+                    _flat(mBoardA, r_, rs_["board"]),
+                    mStT_,
+                    g1_,
+                    g2_,
+                    g3_,
+                    _flat(mCtlA, r_, rs_["ctl"]),
+                    Int32(0),
+                    _flat(mHistA, r_, rs_["hist"]),
+                )
+
+    @cute.jit
     def _team_cta_mr(
+        self,
+        arena,
+        cta,
+        tidx,
+        ws0,
+        tma_q,
+        tma_swa,
+        tma_cmp,
+        mOutA,
+        mCtxA,
+        mSwaLocalA,
+        mBtSwaA,
+        mBtCA,
+        mSinks,
+        mSwaLensA,
+        mTopkA,
+        mGidxA,
+        mHistA,
+        mBoardA,
+        mRegionA,
+        mStampsA,
+        mCtlA,
+        softmax_scale,
+        mDescA,
+        mCPool,
+        tm,
+    ):
+        # tcta > 0: the CTAs after the shared teams (kernel(): their tm is nteams, cta = ns + their index among the last
+        # team_ctas CTAs) are the dedicated T servers; their server index is (tm - nteams) * team_ctas + cta - ns
+        args_ = (
+            arena,
+            cta,
+            tidx,
+            ws0,
+            tma_q,
+            tma_swa,
+            tma_cmp,
+            mOutA,
+            mCtxA,
+            mSwaLocalA,
+            mBtSwaA,
+            mBtCA,
+            mSinks,
+            mSwaLensA,
+            mTopkA,
+            mGidxA,
+            mHistA,
+            mBoardA,
+            mRegionA,
+            mStampsA,
+            mCtlA,
+            softmax_scale,
+            mDescA,
+            mCPool,
+            tm,
+        )
+        if cutlass.const_expr(self.tcta > 0):
+            if tm >= Int32(self.nteams):
+                self._tserver_cta(
+                    arena,
+                    cta,
+                    tidx,
+                    ws0,
+                    mCtxA,
+                    mHistA,
+                    mBoardA,
+                    mStampsA,
+                    mCtlA,
+                    (tm - Int32(self.nteams)) * Int32(self.team_ctas) + cta - Int32(self.ns),
+                )
+            else:
+                self._team_cta_mr_body(*args_)
+        else:
+            self._team_cta_mr_body(*args_)
+
+    @cute.jit
+    def _team_cta_mr_body(
         self,
         arena,
         cta,

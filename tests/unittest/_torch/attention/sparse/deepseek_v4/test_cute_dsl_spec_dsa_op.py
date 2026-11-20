@@ -26,10 +26,17 @@ import dataclasses
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.kernels.blackwell.spec_dsa import large_batch_op as _lbo
+
 from . import test_cute_dsl_spec_dsa_large_batch as H
 
 pytestmark = H.pytestmark
 idx = H.idx
+# The batch sizes at which the FP4 spec switches: its megakernel's last size, and the first size that runs the second
+# compile of the large-batch indexer kernel (``large_batch_op._VARIANTS``).
+FP4_LAST = H.SPEC_FP4.megakernel_max_batch
+FP4_VARIANT = min((first for first, _ in _lbo._VARIANTS.get(H.SPEC_FP4.kernel_key, ())), default=64)
+SWITCHES = {FP4_LAST, FP4_LAST + 1, FP4_VARIANT - 1, FP4_VARIANT}
 
 
 def _op():
@@ -85,7 +92,8 @@ def test_implementation_for(idx):
 
 
 @pytest.mark.parametrize(
-    "batch", [1, 2, 3, 4, 5, 8, 9, 13, 16, 17, 24, 32, 33, 40, 47, 48, 49, 64, 149, 1024]
+    "batch",
+    sorted({1, 2, 3, 4, 5, 8, 9, 13, 16, 17, 24, 32, 33, 40, 47, 48, 49, 64, 149, 1024} | SWITCHES),
 )
 def test_matches_reference(batch, idx):
     op = _op()
@@ -100,7 +108,7 @@ def test_matches_reference(batch, idx):
     H._check_rows(inp, bases, topk, out, "realistic")
 
 
-@pytest.mark.parametrize("batch", [4, 5, 24, 40, 47, 48, 60])
+@pytest.mark.parametrize("batch", sorted({4, 5, 8, 13, 24, 40, 47, 48, 60} | SWITCHES))
 def test_refresh_in_place_and_cuda_graph(batch, idx):
     op = _op()
     ns = H.LENGTHS[:batch] if batch <= len(H.LENGTHS) else H.LENGTHS
@@ -133,6 +141,26 @@ def test_refresh_in_place_and_cuda_graph(batch, idx):
         torch.cuda.synchronize()
         H._check_rows(inp2, bases2, topk, out, "realistic")
     assert int(op.error_bits(state).max()) == 0
+
+
+@pytest.mark.parametrize("batch", sorted({1, 3, 9, 64} | SWITCHES))
+def test_negative_logits(batch, idx):
+    """Rows whose logits are all <= 0 through the op: the megakernel sizes and the large-batch sizes of both specs."""
+    op = _op()
+    ns = H.LENGTHS[:batch] if batch <= len(H.LENGTHS) else H.LENGTHS
+    inp, bases = H._make_case(batch, [{"n": n, "neg": True} for n in ns], seed=170 + batch, idx=idx)
+    state = _prepare(op, inp, idx=idx)
+    assert state.implementation == op.implementation_for(batch, H._spec_of(idx))
+    topk, out = H._new_outputs(batch)
+    for launch in range(3):
+        topk.fill_(-5)
+        _launch(op, state, inp, topk, out)
+        torch.cuda.synchronize()
+        assert int(op.error_bits(state).max()) == 0
+        if launch == 0:
+            H._check_rows(inp, bases, topk, out, "realistic")
+        else:
+            H._check_selection(bases, topk)
 
 
 def test_rejects_bad_arguments():

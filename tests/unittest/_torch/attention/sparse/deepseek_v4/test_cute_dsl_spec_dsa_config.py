@@ -67,7 +67,9 @@ def test_ds_v4_flash_fp4_values():
         == FLASH
     )
     assert (s.index_k_dtype, s.large_batch, s.max_batch) == ("fp4", True, 1024)
-    assert s.megakernel_max_batch == 22
+    # The FP4 K stream is twice as fast per byte, the megakernel row cost is not: the large-batch kernels are faster
+    # from 21 rows (nsys, megakernel against large batch at 17 to 28 rows).
+    assert s.megakernel_max_batch == 20
     assert s.index_page_bytes == 32 * (128 // 2 + 128 // 32)
     assert s.shape_key == FLASH.shape_key and s.kernel_key != FLASH.kernel_key
 
@@ -197,6 +199,17 @@ def test_require_built_for():
         C.require_built_for(PRO, FLASH)
 
 
+def test_readme_table_lists_the_batch_sizes_of_every_spec():
+    """The README's spec table (megakernel and large-batch ranges) is the one of ``SUPPORTED_SPECS``."""
+    readme = (Path(C.__file__).parent / "README.md").read_text()
+    for spec in C.SUPPORTED_SPECS.values():
+        rows = [ln for ln in readme.splitlines() if ln.startswith(f"| {spec.name} |")]
+        assert len(rows) == 1, f"{spec.name}: no row in the README table"
+        cells = [c.strip() for c in rows[0].strip().strip("|").split("|")]
+        assert cells[-2] == f"1 to {spec.megakernel_max_batch} rows", spec.name
+        assert cells[-1] == f"{spec.megakernel_max_batch + 1} to {spec.max_batch:,} rows", spec.name
+
+
 def test_op_routes_batch_sizes_by_spec():
     assert op.implementation_for(1) == "megakernel"
     assert op.implementation_for(47) == "megakernel"
@@ -220,6 +233,24 @@ def test_op_routes_batch_sizes_by_spec():
         op.implementation_for(48, no_large)
     assert list(megakernel_op.supported_batch_sizes()) == list(range(1, 48))
     assert list(megakernel_op.supported_batch_sizes(small)) == list(range(1, 9))
+
+
+def test_op_routes_fp4_batch_sizes():
+    """The FP4 spec switches to the large-batch kernels one row after its megakernel's last row (20)."""
+    last = FLASH_FP4.megakernel_max_batch
+    assert last == 20
+    assert (op.implementation_for(1, FLASH_FP4), op.implementation_for(last, FLASH_FP4)) == (
+        "megakernel",
+        "megakernel",
+    )
+    assert (op.implementation_for(last + 1, FLASH_FP4), op.implementation_for(1024, FLASH_FP4)) == (
+        "large_batch",
+        "large_batch",
+    )
+    assert list(megakernel_op.supported_batch_sizes(FLASH_FP4)) == list(range(1, last + 1))
+    # the FP8 spec keeps its own switch
+    assert op.implementation_for(47, FLASH) == "megakernel"
+    assert op.implementation_for(48, FLASH) == "large_batch"
 
 
 def test_unsupported_spec_is_refused_before_any_device_work():

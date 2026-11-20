@@ -186,20 +186,24 @@ def _open_gap(lg, sc, gap_rel, above=False):
 
 
 @torch.no_grad()
-def _make_base(n, seed, ties=0, flat=False, idx="fp8"):
+def _make_base(n, seed, ties=0, flat=False, idx="fp8", neg=False):
     """One distinct row: indexer query and weights, K pages (whole 128-row tiles) with their fp64 logits.
 
     ties: copies the K-th position's K row onto ``ties`` losers (an exact tie group at the K-th value, with the gap
     above it opened as well).
     flat: every position shares one K row (every logit equal).
+    neg: every head weight is negative, so every logit is <= 0 (the K-th logit and the boundary of every in-stream
+    compaction of the kernels lie below zero).
     """
     if idx == "fp4":
-        return _make_base_fp4(n, seed, ties, flat)
+        return _make_base_fp4(n, seed, ties, flat, neg)
     dev = torch.device("cuda")
     gh = torch.Generator().manual_seed(seed)
     gd = torch.Generator(device=dev).manual_seed(seed + 1)
     q = _e4m3(torch.randn(H_IDX, D_IDX, generator=gd, device=dev) * 2.0)
     w = (torch.randn(H_IDX, generator=gd, device=dev) * (D_IDX * H_IDX) ** -0.5).float()
+    if neg:
+        w = -(w.abs() + 0.25 * (D_IDX * H_IDX) ** -0.5)
     pg = _cdiv(n, 128) * (128 // TPB_C)
     npad = pg * TPB_C
     kf = torch.randn(npad, D_IDX, generator=gd, device=dev) * torch.exp(
@@ -242,7 +246,7 @@ def _make_base(n, seed, ties=0, flat=False, idx="fp8"):
 
 
 @torch.no_grad()
-def _make_base_fp4(n, seed, ties=0, flat=False):
+def _make_base_fp4(n, seed, ties=0, flat=False, neg=False):
     """_make_base for the FP4 cache: E2M1 K rows and queries with UE8M0 scales; the gap opening and the planted ties
     act on the scale exponents.
     """
@@ -251,6 +255,8 @@ def _make_base_fp4(n, seed, ties=0, flat=False):
     gd = torch.Generator(device=dev).manual_seed(seed + 1)
     q_codes, q_sf, q_deq = _fp4_quantize(torch.randn(H_IDX, D_IDX, generator=gd, device=dev) * 2.0)
     w = (torch.randn(H_IDX, generator=gd, device=dev) * (D_IDX * H_IDX) ** -0.5).float()
+    if neg:
+        w = -(w.abs() + 0.25 * (D_IDX * H_IDX) ** -0.5)
     pg = _cdiv(n, 128) * (128 // TPB_C)
     npad = pg * TPB_C
     kf = torch.randn(npad, D_IDX, generator=gd, device=dev) * torch.exp(
@@ -300,13 +306,15 @@ def _make_base_fp4(n, seed, ties=0, flat=False):
 
 @torch.no_grad()
 def _make_case(batch, specs, seed, attn="realistic", idx="fp8"):
-    """Inputs for ``batch`` rows; row b uses base ``b % len(specs)``. specs: dicts of n, ties, flat."""
+    """Inputs for ``batch`` rows; row b uses base ``b % len(specs)``. specs: dicts of n, ties, flat, neg."""
     dev = torch.device("cuda")
     gh = torch.Generator().manual_seed(seed)
     gd = torch.Generator(device=dev).manual_seed(seed + 7)
     nb = len(specs)
     bases = [
-        _make_base(s["n"], seed + 100 * j, s.get("ties", 0), s.get("flat", False), idx)
+        _make_base(
+            s["n"], seed + 100 * j, s.get("ties", 0), s.get("flat", False), idx, s.get("neg", False)
+        )
         for j, s in enumerate(specs)
     ]
     k_off, off = [], 0
@@ -414,7 +422,8 @@ def _launch(op, state, inp, topk, out, scale=SM_SCALE):
     )
 
 
-def _check_rows(inp, bases, topk, out, attn, scale=SM_SCALE):
+def _check_selection(bases, topk):
+    """Every row's top-512: inside [0, n), no duplicate, the reference set (the value multiset for rows with ties)."""
     nb = len(bases)
     for b in range(topk.shape[0]):
         base = bases[b % nb]
@@ -428,7 +437,12 @@ def _check_rows(inp, bases, topk, out, attn, scale=SM_SCALE):
             assert torch.equal(got, base["ref_v"]), f"row {b}: top-512 value multiset differs"
         else:
             assert torch.equal(s, base["ref_sel"]), f"row {b}: top-512 set differs"
-        ref = _ref_attention(inp, b, sel, scale)
+
+
+def _check_rows(inp, bases, topk, out, attn, scale=SM_SCALE):
+    _check_selection(bases, topk)
+    for b in range(topk.shape[0]):
+        ref = _ref_attention(inp, b, topk[b].long(), scale)
         o = out[b].view(H_ATT, D_ATT).double()
         assert bool(torch.isfinite(o).all()), f"row {b}: non-finite output"
         if attn == "gather_exact":
@@ -505,6 +519,27 @@ def test_ties_and_all_equal_rows(idx):
     _launch(op, state, inp, topk, out)
     torch.cuda.synchronize()
     _check_rows(inp, bases, topk, out, "realistic")
+
+
+@pytest.mark.parametrize("batch", [32, 100, 256])
+def test_negative_logits(batch, idx):
+    """Rows whose logits are all <= 0: the selection must not depend on the sign of the K-th logit (a compaction whose
+    boundary bin lies below zero used to give a floor of 0xFFFFFFFF when the order-preserving float keys were reduced
+    with a signed minimum: the rest of the stream was dropped)."""
+    op = _op()
+    inp, bases = _make_case(batch, [{"n": n, "neg": True} for n in LENGTHS], seed=57, idx=idx)
+    state = op.prepare(inp["ctx_lens"].cpu(), inp["sinks"], config=_spec_of(idx))
+    topk, out = _new_outputs(batch)
+    # which part of the stream the signed minimum drops depends on the timing of the compactions: several launches
+    for launch in range(6):
+        topk.fill_(-5)
+        _launch(op, state, inp, topk, out)
+        torch.cuda.synchronize()
+        assert int(op.error_bits(state)[0]) == 0
+        if launch < 2:
+            _check_rows(inp, bases, topk, out, "realistic")
+        else:
+            _check_selection(bases, topk)
 
 
 def test_state_reuse_across_steps(idx):

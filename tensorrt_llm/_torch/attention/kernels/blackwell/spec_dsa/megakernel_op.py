@@ -128,10 +128,24 @@ _CONFIGS: dict[int, dict] = {
     **{b: _BS16 for b in range(9, 48)},
 }
 
-# The knob sets of the megakernel per spec (kernel_key) and batch size: the base knobs plus the set of the batch size.
+# FP4 spec, 5 or more rows: the shared teams are four teams of 4 CTAs (team4: more rows in flight than two teams of 8),
+# the candidate publisher batches 3 atomics per lane, the row's split ranges rotate over the stream CTAs (drot: the CTAs
+# that hold the dense end of the sequence, and with it the heavy candidate publication, differ from row to row) and two
+# dedicated CTAs compute the thresholds (tcta: no stream CTA with an empty range blocks in the threshold wait).
+_FP4_SHARED = dict(team4=True, nteams=4, rs24_dry=False, b1l_upub=3, drot=37, tcta=2)
+_FP4_OVERRIDES = {b: _FP4_SHARED for b in range(5, 33)}
+
+# The knob sets of the megakernel per spec (kernel_key) and batch size: the base knobs plus the set of the batch size
+# (and, for the FP4 spec, its overrides).
 _KNOBS = {
     spec.kernel_key: {
-        b: {**_BASE, **knobs} for b, knobs in _CONFIGS.items() if b <= spec.megakernel_max_batch
+        b: {
+            **_BASE,
+            **knobs,
+            **(_FP4_OVERRIDES.get(b, {}) if spec.index_k_dtype == "fp4" else {}),
+        }
+        for b, knobs in _CONFIGS.items()
+        if b <= spec.megakernel_max_batch
     }
     for spec in (DS_V4_FLASH, DS_V4_FLASH_FP4)
 }
@@ -198,15 +212,17 @@ def _engine(device: torch.device, batch_size: int, config: SpecDsaConfig | None 
 
 def _desc_params(kernel, batch_size: int, row: int) -> tuple[int, bool, int]:
     """(rot, zlast, zc) of row ``row``'s split descriptor; they select the descriptor kernel variant."""
-    shared = batch_size > int(kernel.nteams)
-    # With shared teams one stream CTA gets an empty range in some rows and computes that row's threshold early.
+    shared = batch_size > int(kernel.nteams) and not kernel.tcta
+    # With shared teams one stream CTA gets an empty range in some rows and computes that row's threshold early
+    # (not with dedicated T-server CTAs: every stream CTA has a range in every row).
     zlast = shared and (
         (kernel.tsz and row == batch_size - 1) or (kernel.tsz2 and row >= batch_size - 2)
     )
     zc = -1
     if shared and kernel.tsz01 and (row < 2 or (kernel.tszall and row < batch_size - 2)):
         zc = (kernel.ns - 2) if row < 2 else (kernel.ns - 2 - row // 2)
-    return (row * int(kernel.drot)) % kernel.ns, bool(zlast), int(zc)
+    # drot: the ranges of row r rotate by (r mod 8) * drot CTAs (8 distinct descriptor-kernel variants per layout)
+    return ((row % 8) * int(kernel.drot)) % kernel.ns, bool(zlast), int(zc)
 
 
 def precompile(device: torch.device, batch_size: int, config: SpecDsaConfig | None = None) -> None:
@@ -226,7 +242,7 @@ def precompile(device: torch.device, batch_size: int, config: SpecDsaConfig | No
         kernel = e["kernel"]
         for r in range(batch_size):
             rot, zlast, zc = _desc_params(kernel, batch_size, r)
-            mk.compile_desc(NUM_SMS, kernel.ns, rot, zlast, zc)
+            mk.compile_desc(NUM_SMS, kernel.ns, rot, zlast, zc, kernel.fp4)
 
 
 @dataclass
@@ -358,6 +374,7 @@ def prepare(
                 rot=rot,
                 zlast=zlast,
                 zc=zc,
+                ladder_words=kernel.fp4,
             )
     return state
 

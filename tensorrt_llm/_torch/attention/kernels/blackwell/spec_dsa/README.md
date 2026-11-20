@@ -21,6 +21,7 @@ differ between models live and how to add a model.
 | `megakernel_op.py`, `large_batch_op.py` | host side of each implementation (state, argument checks, engine cache); import-safe without CuTe DSL |
 | `megakernel.py`, `megakernel_attention.py`, `megakernel_lib.py` | megakernel: kernel and row descriptors, attention (KV gather, MMA, softmax), PTX helpers and selection primitives |
 | `large_batch.py`, `large_batch_lib.py` | large-batch kernels: indexer kernel and attention tail, selection routines and the ready queue |
+| `tail_attention.py`, `tail_op.py` | tail attention: the decode sparse MLA of up to 26 rows behind any exact top-K kernel, the KV tiles of a row split over a cluster of 5 CTAs with the combine inside the cluster (host side: `run_attention`, `run_hybrid`) |
 
 ## Implementations and specs
 
@@ -28,10 +29,16 @@ differ between models live and how to add a model.
 - Large-batch kernels: a persistent indexer kernel and an attention kernel behind it (programmatic dependent launch),
   every batch size up to `max_batch`; one compile serves all of them.
 
+- Tail attention (decomposed hybrid): the production indexer kernel and the production top-K kernel, then one kernel
+  that replaces the local-to-global mapping, the sparse MLA and its reduction kernel of the unfused chain. A cluster of
+  5 CTAs serve a row (up to 26 rows, the clusters of 5 that fit one wave at one CTA per SM):
+  every CTA runs the attention of its KV tiles with a local softmax maximum, the partial outputs are combined through
+  distributed shared memory. Plain stream-ordered launch (the production top-K kernel never triggers a dependent launch).
+
 | Spec | Indexer (heads x dim, K dtype) | Top-K | Compression | KV rows | Megakernel | Large batch |
 | --- | --- | --- | --- | --- | --- | --- |
 | DS-V4-Flash | 64 x 128, fp8 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 47 rows | 48 to 1,024 rows |
-| DS-V4-Flash-FP4 | 64 x 128, fp4 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 22 rows | 23 to 1,024 rows |
+| DS-V4-Flash-FP4 | 64 x 128, fp4 | 512 | 4 | E4M3 rows, window 128, sink | 1 to 20 rows | 21 to 1,024 rows |
 
 `is_supported(device, config)` and `implementation_for(batch_size, config)` answer from this table. For a config that is
 not in it `is_supported` returns `(False, reason)` and `precompile`, `prepare` and `implementation_for` raise

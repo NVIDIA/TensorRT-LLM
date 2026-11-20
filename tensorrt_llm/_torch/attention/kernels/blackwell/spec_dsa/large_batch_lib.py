@@ -1004,6 +1004,7 @@ def select_topk_list(
     rng_lo=None,
     rng_hi=None,
     hist_ready: cutlass.Constexpr = False,
+    fast_loops: cutlass.Constexpr = False,
 ):
     NW = nthr // 32
     lane = tid & Int32(31)
@@ -1035,16 +1036,25 @@ def select_topk_list(
             kmx = Uint32(0)
             i4 = (tid >> Int32(5)) * Int32(128) + lane
             while i4 < C:
-                for q in cutlass.range_constexpr(4):
-                    iq = i4 + Int32(32 * q)
-                    icl = iq
-                    if icl > C - Int32(1):
-                        icl = C - Int32(1)
-                    kbq = fkey_bits(entry_bits(ld_entry(lst, icl, src_gmem)))
-                    if kbq < kmn:
-                        kmn = kbq
-                    if kbq > kmx:
-                        kmx = kbq
+                if cutlass.const_expr(fast_loops):
+                    kbs = []
+                    for q in cutlass.range_constexpr(4):
+                        icl = cutlass.min(i4 + Int32(32 * q), C - Int32(1))
+                        kbs.append(fkey_bits(entry_bits(ld_entry(lst, icl, src_gmem))))
+                    for q in cutlass.range_constexpr(4):
+                        kmn = Uint32(cutlass.select_(kbs[q] < kmn, kbs[q], kmn))
+                        kmx = Uint32(cutlass.select_(kbs[q] > kmx, kbs[q], kmx))
+                else:
+                    for q in cutlass.range_constexpr(4):
+                        iq = i4 + Int32(32 * q)
+                        icl = iq
+                        if icl > C - Int32(1):
+                            icl = C - Int32(1)
+                        kbq = fkey_bits(entry_bits(ld_entry(lst, icl, src_gmem)))
+                        if kbq < kmn:
+                            kmn = kbq
+                        if kbq > kmx:
+                            kmx = kbq
                 i4 = i4 + Int32(nthr * 4)
             gmn, gmx = _block_min_max_u32(kmn, kmx, s_red, tid, nthr, bar_id)
             lo = invkey(gmn)
@@ -1116,16 +1126,28 @@ def select_topk_list(
         cc = Int32(0)
         i4 = c0 + lane
         while i4 < c1:
-            for q in cutlass.range_constexpr(4):
-                icl = i4 + Int32(32 * q)
-                if icl > C - Int32(1):
-                    icl = C - Int32(1)
-                bb = _vbin(ld_entry(lst, icl, src_gmem), lo, sc, NB_SEL)
-                if i4 + Int32(32 * q) < c1:
-                    if bb > Bw:
-                        cw = cw + Int32(1)
-                    elif bb == B:
-                        cc = cc + Int32(1)
+            if cutlass.const_expr(fast_loops):
+                bbs = []
+                for q in cutlass.range_constexpr(4):
+                    icl = cutlass.min(i4 + Int32(32 * q), C - Int32(1))
+                    bbs.append(_vbin(ld_entry(lst, icl, src_gmem), lo, sc, NB_SEL))
+                for q in cutlass.range_constexpr(4):
+                    vq = i4 + Int32(32 * q) < c1
+                    cw = cw + cutlass.select_(vq & (bbs[q] > Bw), Int32(1), Int32(0))
+                    cc = cc + cutlass.select_(
+                        vq & (bbs[q] == B) & (bbs[q] <= Bw), Int32(1), Int32(0)
+                    )
+            else:
+                for q in cutlass.range_constexpr(4):
+                    icl = i4 + Int32(32 * q)
+                    if icl > C - Int32(1):
+                        icl = C - Int32(1)
+                    bb = _vbin(ld_entry(lst, icl, src_gmem), lo, sc, NB_SEL)
+                    if i4 + Int32(32 * q) < c1:
+                        if bb > Bw:
+                            cw = cw + Int32(1)
+                        elif bb == B:
+                            cc = cc + Int32(1)
             i4 = i4 + Int32(128)
         wcw = Int32(cute.arch.warp_redux_sync(cw, "add"))
         wcc = Int32(cute.arch.warp_redux_sync(cc, "add"))
@@ -1150,15 +1172,27 @@ def select_topk_list(
                 if icl > C - Int32(1):
                     icl = C - Int32(1)
                 ed.append(ld_entry(lst, icl, src_gmem))
+            fws = []
+            fcs = []
+            if cutlass.const_expr(fast_loops):
+                for q in cutlass.range_constexpr(4):
+                    vq = base0 + Int32(32 * q) + lane < c1
+                    bdf_ = _vbin(ed[q], lo, sc, NB_SEL)
+                    fws.append(cutlass.select_(vq & (bdf_ > Bw), Int32(1), Int32(0)))
+                    fcs.append(cutlass.select_(vq & (bdf_ == B) & (bdf_ <= Bw), Int32(1), Int32(0)))
             for q in cutlass.range_constexpr(4):
                 fw = Int32(0)
                 fc = Int32(0)
-                if base0 + Int32(32 * q) + lane < c1:
-                    bd_ = _vbin(ed[q], lo, sc, NB_SEL)
-                    if bd_ > Bw:
-                        fw = Int32(1)
-                    elif bd_ == B:
-                        fc = Int32(1)
+                if cutlass.const_expr(fast_loops):
+                    fw = fws[q]
+                    fc = fcs[q]
+                else:
+                    if base0 + Int32(32 * q) + lane < c1:
+                        bd_ = _vbin(ed[q], lo, sc, NB_SEL)
+                        if bd_ > Bw:
+                            fw = Int32(1)
+                        elif bd_ == B:
+                            fc = Int32(1)
                 mw = Int32(cute.arch.vote_ballot_sync(fw != Int32(0)))
                 mc = Int32(cute.arch.vote_ballot_sync(fc != Int32(0)))
                 if fw != Int32(0):
