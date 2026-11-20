@@ -246,6 +246,8 @@ class LogitEditState:
         ban_valid: list[list[bool]] = []
         tail_slots: list[int] = []
         tails: list[list[int]] = []
+        # (slot, owner, has_bias, has_bans) of the slots that change occupant.
+        loaded: list[tuple[int, Callable[[], object], bool, bool]] = []
 
         for request in requests:
             slot = getattr(request, "py_seq_slot", None)
@@ -261,14 +263,12 @@ class LogitEditState:
                 continue
 
             if not is_owner:
-                self._slot_owner[slot] = _owner_ref(request)
                 ids, values = self._bias_entries(request)
                 if ids or self._slot_has_bias[slot]:
                     pad = MAX_BIAS_TOKENS - len(ids)
                     bias_slots.append(slot)
                     bias_ids.append(ids + [0] * pad)
                     bias_values.append(values + [0.0] * pad)
-                    self._slot_has_bias[slot] = bool(ids)
                 prefixes, tokens = self._ban_rules(request)
                 if tokens or self._slot_has_bans[slot]:
                     pad = MAX_BAD_WORDS - len(tokens)
@@ -276,7 +276,7 @@ class LogitEditState:
                     ban_prefixes.append(prefixes + [[_ANY_TOKEN] * _TAIL_LEN] * pad)
                     ban_tokens.append(tokens + [0] * pad)
                     ban_valid.append([True] * len(tokens) + [False] * pad)
-                    self._slot_has_bans[slot] = bool(tokens)
+                loaded.append((slot, _owner_ref(request), bool(ids), bool(tokens)))
 
             # Only rules with a prefix read the tail; skip the token-history copy otherwise.
             if any(len(word) > 1 for word in getattr(request, "py_bad_words", None) or ()):
@@ -289,6 +289,14 @@ class LogitEditState:
                 self.tail.device, non_blocking=True
             )
 
+        # A slot's bookkeeping follows its device rows. Until the uploads below are through,
+        # the slot counts as unowned and holding edits, so that if one of them raises (the
+        # step fails, the executor keeps serving) the next occupant reloads every row.
+        for slot, _, _, _ in loaded:
+            self._slot_owner[slot] = None
+            self._slot_has_bias[slot] = True
+            self._slot_has_bans[slot] = True
+
         if bias_slots:
             slots = upload(bias_slots, torch.int64)
             self.bias_ids.index_copy_(0, slots, upload(bias_ids, torch.int64))
@@ -300,6 +308,11 @@ class LogitEditState:
             self.ban_valid.index_copy_(0, slots, upload(ban_valid, torch.bool))
         if tail_slots:
             self.tail.index_copy_(0, upload(tail_slots, torch.int64), upload(tails, torch.int32))
+
+        for slot, owner, has_bias, has_bans in loaded:
+            self._slot_owner[slot] = owner
+            self._slot_has_bias[slot] = has_bias
+            self._slot_has_bans[slot] = has_bans
 
 
 def apply_embedding_bias(

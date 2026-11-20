@@ -2899,15 +2899,22 @@ class SpecWorkerBase(nn.Module, ABC):
             # The caller's row layout is not the one this mapping describes (tree
             # modes); editing against it would charge the wrong request.
             return logits
+        edit_state = getattr(spec_metadata, "logit_edit_state", None)
+        if edit_state is not None and logits.size(-1) != edit_state.vocab_size:
+            # The token tables are sized by the model config's vocabulary.
+            # Admission accepts embedding_bias and bad_words on this deploy, so
+            # decoding without them here would drop them silently.
+            raise ValueError(
+                f"The target logits have {logits.size(-1)} columns, but "
+                "'enable_penalty: true' sized the embedding_bias and bad_words "
+                f"tables for a vocabulary of {edit_state.vocab_size} tokens "
+                "(the model config's vocab_size). Disable enable_penalty in "
+                "the speculative decoding config for this model.")
         # Copy first: the edits rewrite in place, and the caller keeps this
         # tensor as the step's reported logits. Editing it directly would feed
         # the edited scores back to logprobs and to the next step's consumers.
         # fp32 whatever the logits' dtype.
         edited = logits.to(torch.float32, copy=True)
-        edit_state = getattr(spec_metadata, "logit_edit_state", None)
-        if edit_state is not None and edited.size(-1) != edit_state.vocab_size:
-            # A vocab-sharded logits view cannot index the full-vocab token tables.
-            edit_state = None
         if edit_state is not None:
             logit_edits.apply_embedding_bias(edited, edit_state, row_slots)
         penalty_ops.apply_penalties(edited, spec_metadata, row_slots,
