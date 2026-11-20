@@ -12,6 +12,7 @@
 
 #include <random>
 #include <tuple>
+#include <utility>
 
 namespace texec = tensorrt_llm::executor;
 namespace tbm = tensorrt_llm::batch_manager;
@@ -225,11 +226,20 @@ TEST_F(RnnTargetIRanksTest, RejectsStateDataTypeMismatch)
 TEST_F(RnnTargetIRanksTest, RejectsModelConfigMismatch)
 {
     auto const selfState = makeRnnCacheState(8, /*tp=*/2, /*pp=*/1, {8});
-    auto destState = selfState;
-    auto modelConfig = selfState.getRnnModelConfig();
-    ++modelConfig.mDState;
-    destState.setRnnConfig(modelConfig, {8}, tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kFLOAT);
-    EXPECT_FALSE(tbm::rnn_cache_routing::inquireSupport(selfState, destState));
+    ASSERT_TRUE(tbm::rnn_cache_routing::inquireSupport(selfState, selfState));
+
+    using RnnModelConfig = texec::kv_cache::CacheState::RnnModelConfig;
+    for (auto const& [fieldName, member] : {std::pair{"mDState", &RnnModelConfig::mDState},
+             std::pair{"mHeadDim", &RnnModelConfig::mHeadDim}, std::pair{"mDConv", &RnnModelConfig::mDConv},
+             std::pair{"mNGroups", &RnnModelConfig::mNGroups}, std::pair{"mNumLayers", &RnnModelConfig::mNumLayers}})
+    {
+        SCOPED_TRACE(fieldName);
+        auto destState = selfState;
+        auto modelConfig = selfState.getRnnModelConfig();
+        ++(modelConfig.*member);
+        destState.setRnnConfig(modelConfig, {8}, tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kFLOAT);
+        EXPECT_FALSE(tbm::rnn_cache_routing::inquireSupport(selfState, destState));
+    }
 }
 
 TEST_F(RnnTargetIRanksTest, RejectsContextParallelism)
