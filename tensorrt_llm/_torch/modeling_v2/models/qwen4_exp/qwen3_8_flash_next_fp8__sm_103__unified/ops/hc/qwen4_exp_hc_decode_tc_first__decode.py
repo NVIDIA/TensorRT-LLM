@@ -25,6 +25,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
@@ -115,6 +116,24 @@ def _lds_v4_f32(addr, *, loc=None, ip=None):
         side_effects=True,
     )
     return [cutlass.Float32(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@cute.jit
+def _mbar_wait_cluster_acquire(mbar_ptr: cute.Pointer, phase: cutlass.Int32):
+    """Wait for ``phase`` of this CTA's mbarrier at ``mbar_ptr``, acquiring at cluster scope.
+
+    ``cute.arch.mbarrier_wait`` acquires at CTA scope. The peers' ``cp.async.bulk ...
+    mbarrier::complete_tx`` (``_bulk_to_peer``) that completes this barrier releases at cluster
+    scope, and only a cluster-scope acquire orders their payload before the reads that follow
+    the wait: a relaxed cluster-scope try_wait loop and an acquire fence restricted to
+    shared::cluster (the ISA's acquire pattern for it; unlike ``.acquire.cluster`` on the wait
+    it adds no L1 invalidate).
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @dsl_user_op
@@ -539,7 +558,8 @@ class HcDecodeTcFirstKernel:
 
         # Every K slice's partial of this CTA's rows is local once `recv_full` completes;
         # no DSMEM access follows (a CTA may exit once its own copies have read their source).
-        cute.arch.mbarrier_wait(storage.recv_full, 0)
+        # The peers' bulk copies complete it with a cluster-scope release: acquire at cluster scope.
+        _mbar_wait_cluster_acquire(storage.recv_full, 0)
 
         # This CTA's rows [kr * rows_per, ...) of the tile's real rows, in 4-column groups,
         # all 6 warps; an element's `KS` partials summed in K-slice order (deterministic).
