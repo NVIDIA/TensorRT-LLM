@@ -69,8 +69,6 @@ before they are classified.
 | `LoRA` | `enable_lora` / `lora_config` | planned | No target serves it. Qwen3.8-Flash-Next asserts and MiniMax-M3 raises at runtime; DeepSeek R1, GPT-OSS and GLM-5.2 sm103 tep4 ignore `lora_params` without a check. |
 | `BeamSearch` | `max_beam_width > 1` | planned | No target serves it. Qwen3.8-Flash-Next asserts width 1; DeepSeek R1 and GLM-5.2 sm103 tep4 assume width 1 without a check. |
 | `ReturnRoutedExperts` | `enable_return_routed_experts` | to verify | |
-| `DisaggregatedServing` | `cache_transceiver_config` | to verify | KV transfer planners already declare the deployments they serve (`supports_deployment`) |
-| `KvConnector` | `kv_connector_config` | to verify | |
 | `GuidedDecoding` | `guided_decoding_backend` | planned | GLM-5.3-Flash mtp_fused refuses it in `route`. |
 | `ReturnGenerationLogits` | `gather_generation_logits` | planned | |
 
@@ -94,9 +92,10 @@ numerics a checkpoint is served with. `route` keeps checking them.
   format, `sparse_attention_config`, `kv_cache_compression_config`.
 
 The engine settings the model never sees (scheduler policy, `batch_wait_*`,
-`stream_interval`, statistics, tokenizer, and the sampler's
-`batched_logits_processor` and `watermark_config`) are neither features nor
-checked in `route`. A target that fuses sampling into its draft loop bypasses
+`stream_interval`, statistics, tokenizer, the sampler's
+`batched_logits_processor` and `watermark_config`, and the KV cache transfers
+behind `cache_transceiver_config` and `kv_connector_config`) are neither
+features nor checked in `route`. A target that fuses sampling into its draft loop bypasses
 the sampler; `SpeculativeDecoding` states that limit with `when`.
 
 Nor are the kernel choices a target makes for itself, such as
