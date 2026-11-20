@@ -1292,6 +1292,15 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         ``{"mm_embeddings": tensor, "image_grid_thw": [t, h, w]}``, with the
         grid from the model's image processor.
         """
+        # Check support first, so models without it (such as Qwen2-VL) raise
+        # this error instead of asking for a grid.
+        build_disagg_prefill_multimodal_inputs = getattr(
+            self, "build_disagg_prefill_multimodal_inputs", None)
+        if not callable(build_disagg_prefill_multimodal_inputs):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support external multimodal embeddings"
+            )
+
         if not isinstance(multimodal_embedding, dict):
             raise ValueError("multimodal_embedding must be a dictionary")
         if set(multimodal_embedding) != {"image"}:
@@ -1331,13 +1340,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     f"an image), h and w must be multiples of {merge_size}, "
                     f"and h * w / {merge_size}**2 must equal its {rows} rows.")
             image_grid_thw.append(grid)
-
-        build_disagg_prefill_multimodal_inputs = getattr(
-            self, "build_disagg_prefill_multimodal_inputs", None)
-        if not callable(build_disagg_prefill_multimodal_inputs):
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support external multimodal embeddings"
-            )
 
         mm_handles = [{
             "tensor_size": tuple(image_embedding.shape)
