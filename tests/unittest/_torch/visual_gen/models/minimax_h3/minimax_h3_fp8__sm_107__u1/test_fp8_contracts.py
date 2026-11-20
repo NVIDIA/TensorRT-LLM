@@ -413,5 +413,286 @@ class ForwardContract(unittest.TestCase):
         )
 
 
+class _LayoutTensor:
+    """Allocation-free tensor metadata for dispatch tests, not a numerical model."""
+
+    def __init__(self, shape, dtype="BF16"):
+        self.shape, self.dtype = tuple(shape), dtype
+        self.ndim = len(self.shape)
+        self.device = "cpu"
+
+    def dim(self):
+        return self.ndim
+
+    def numel(self):
+        result = 1
+        for size in self.shape:
+            result *= size
+        return result
+
+    def reshape(self, *shape):
+        if -1 in shape:
+            known = 1
+            for size in shape:
+                known *= size if size != -1 else 1
+            shape = tuple(self.numel() // known if size == -1 else size for size in shape)
+        return _LayoutTensor(shape, self.dtype)
+
+    def reshape_as(self, other):
+        return self.reshape(*other.shape)
+
+    def t(self):
+        return _LayoutTensor(self.shape[::-1], self.dtype)
+
+    def index_select(self, dim, indices):
+        shape = list(self.shape)
+        shape[dim] = indices.numel()
+        return _LayoutTensor(shape, self.dtype)
+
+    def __getitem__(self, slices):
+        shape = [len(range(*s.indices(n))) for s, n in zip(slices, self.shape)]
+        return _LayoutTensor(shape, self.dtype)
+
+    def __add__(self, other):
+        return self if self.ndim >= other.ndim else other
+
+    __mul__ = __add__
+
+
+def _length_fallback_namespace():
+    """Execute actual scenario and family methods; replace only CUDA/linear math."""
+    calls = []
+    tree = ast.parse((FP8 / "ops.py").read_text())
+    lengths = ast.literal_eval(
+        next(
+            n.value
+            for n in tree.body
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "FULL_SEQUENCE_LENGTHS" for t in n.targets)
+        )
+    )
+
+    def mark(name, result):
+        def call(*args, **kwargs):
+            calls.append(name)
+            return result(*args, **kwargs)
+
+        return call
+
+    def qk(qkv, *args, **kwargs):
+        projected = _LayoutTensor((*qkv.shape[:2], 7168), "FP8")
+        return projected, projected, projected, _LayoutTensor((3,), "FP32")
+
+    def dedicated(name, result):
+        def call(first, *args):
+            rows = first.numel() // first.shape[-1]
+            if rows not in lengths:
+                raise AssertionError(f"Unqualified rows reached {name}: {rows}")
+            calls.append(name)
+            return result(first, *args)
+
+        return call
+
+    ops = SimpleNamespace(
+        FULL_SEQUENCE_LENGTHS=lengths,
+        qkv_gemm=dedicated("qkv_gemm", lambda a, w, *s: _LayoutTensor((a.shape[0], w.shape[0]))),
+        norm=dedicated("norm", lambda h, *a: _LayoutTensor(h.shape, "FP8")),
+        attention_projection=dedicated(
+            "attention_projection", lambda raw, w, si, sw, h, *a: (h, _LayoutTensor(h.shape, "FP8"))
+        ),
+        gate_up=dedicated("gate_up", lambda a, *w: _LayoutTensor((a.shape[0], 14336), "FP8")),
+        down=dedicated("down", lambda a, w, si, sw, h, *rest: h),
+    )
+    torch = SimpleNamespace(
+        Tensor=_LayoutTensor,
+        bfloat16="BF16",
+        float8_e4m3fn="FP8",
+        ops=SimpleNamespace(
+            tensorrt_llm=SimpleNamespace(
+                static_quantize_e4m3_per_tensor=mark(
+                    "producer_quantize", lambda a, s: (_LayoutTensor(a.shape, "FP8"),)
+                )
+            ),
+            trtllm=SimpleNamespace(
+                cublas_scaled_mm=mark(
+                    "family_qkv", lambda a, w, **kw: _LayoutTensor((a.shape[0], w.shape[1]))
+                )
+            ),
+            h3_lever8=SimpleNamespace(qk_norm_rope_fp8=mark("family_qk_norm", qk)),
+        ),
+    )
+
+    def gate_res_norm(hidden, projected, *args):
+        if projected.shape != hidden.shape:
+            raise AssertionError(f"Family block needs OutProj, got {projected.shape}")
+        calls.append("family_gate_res_norm")
+        return hidden, hidden
+
+    namespace = dict(
+        torch=torch,
+        _DispatchModule=type(
+            "_DispatchModule", (), {"__call__": lambda self, *a, **kw: self.forward(*a, **kw)}
+        ),
+        Optional=Optional,
+        Linear=SimpleNamespace,
+        BufferKind=SimpleNamespace(DEFAULT=0, NCCL_WINDOW=1),
+        _should_apply_low_m_gemm=lambda *args: False,
+        _fp8_per_tensor_uses_cute_dsl_sm107=lambda: False,
+        _static_quantize_e4m3_per_tensor=mark(
+            "family_quantize", lambda a, s: _LayoutTensor(a.shape, "FP8")
+        ),
+        h3_norm_mod=mark("family_norm", lambda h, *a: h),
+        h3_gate_res_norm_mod=gate_res_norm,
+        OUT_QUANT_ENABLED=False,
+        Fp4QuantizedTensor=type("Fp4QuantizedTensor", (), {}),
+        fusion_mode=lambda: "qkstatic",
+        qk_static_descale=lambda *a: _LayoutTensor((3,), "FP32"),
+        fused_fp8_qk=SimpleNamespace(qk_static_descale=lambda *a: _LayoutTensor((3,), "FP32")),
+        qk_norm_rope=mark("qk_norm_rope", qk),
+        ops=ops,
+    )
+    sources = [
+        (
+            REPO / "tensorrt_llm/_torch/modules/linear.py",
+            {"FP8QDQLinearMethod": {"get_static_input_scale", "apply"}},
+        ),
+        (
+            MODEL / "transformer_minimax_h3.py",
+            {"MiniMaxH3TransformerBlock": {"_forward_fused_adaln"}},
+        ),
+        (
+            MODEL / "minimax_h3_nvfp4__sm_107__u1_u4/modeling.py",
+            {"ScenarioAttention": {"forward", "_out_proj"}},
+        ),
+        (FP8 / "modeling.py", {"Fp8QkvMethod": None, "Fp8Attention": None, "Fp8Block": None}),
+    ]
+    for path, names in sources:
+        classes = []
+        for node in ast.parse(path.read_text()).body:
+            if not isinstance(node, ast.ClassDef) or node.name not in names:
+                continue
+            selected = names[node.name]
+            if selected is not None:
+                node.bases = [ast.Name(id="_DispatchModule", ctx=ast.Load())]
+                node.body = [
+                    n
+                    for n in node.body
+                    if (isinstance(n, ast.FunctionDef) and n.name in selected)
+                    or isinstance(n, ast.AnnAssign)
+                ]
+                for index, item in enumerate(node.body):
+                    if isinstance(item, ast.AnnAssign):
+                        node.body[index] = ast.Assign(targets=[item.target], value=item.value)
+            classes.append(node)
+        module = ast.fix_missing_locations(ast.Module(body=classes, type_ignores=[]))
+        exec(compile(module, str(path), "exec"), namespace)
+    return namespace, calls
+
+
+class LengthFallbackContracts(unittest.TestCase):
+    def _block(self, namespace, calls):
+        tensor = _LayoutTensor
+
+        class Projection:
+            def __init__(self, shape):
+                self.weight, self.dtype = tensor(shape, "FP8"), "BF16"
+                self.input_scale = self.weight_scale = tensor((1,), "FP32")
+                self.force_dynamic_quantization = self.enable_cuda_core = False
+                self.all_reduce = self.bias = None
+
+            def __call__(self, hidden):
+                if self.weight.shape[0] == 21504:
+                    return namespace["Fp8QkvMethod"]().apply(self, hidden, None)
+                calls.append("out_projection")
+                if hidden.shape[-1] != 7168:
+                    raise AssertionError("Attention output projection requires width 7168")
+                return tensor((*hidden.shape[:-1], 5376))
+
+        class FeedForward:
+            gate_up_proj = Projection((28672, 5376))
+            down_proj = Projection((5376, 14336))
+
+            def __call__(self, hidden):
+                calls.append("family_ffn")
+                return tensor(hidden.shape)
+
+        attention = namespace["Fp8Attention"]()
+        attention.qkv_proj = Projection((21504, 5376))
+        attention.to_out = [Projection((5376, 7168))]
+        attention.use_async_ulysses = False
+        attention.attn = SimpleNamespace(world_size=1)
+        attention.on_fp8_path = lambda: True
+        attention._use_fused_fp8_qk = lambda *args: True
+        attention._use_packed_a2a = lambda *args: False
+        attention.head_dim, attention.local_num_attention_heads, attention.layer_idx = 128, 56, 0
+        attention.norm_q = attention.norm_k = SimpleNamespace(
+            weight=tensor((128,)), variance_epsilon=1e-6
+        )
+        attention._attn_impl = lambda q, *a, **kw: tensor(q.shape)
+        block = namespace["Fp8Block"]()
+        block.attn, block.ff = attention, FeedForward()
+        block.norm1 = block.norm2 = SimpleNamespace(weight=tensor((5376,)), variance_epsilon=1e-6)
+        block.adaln_proj = SimpleNamespace(table=lambda temb: tensor((3, 6 * 5376)))
+        block._fp8_qkv_reciprocal = block._fp8_gate_up_reciprocal = tensor((1,), "FP32")
+        block._fp8_output_quant_factor = tensor((1,), "FP32")
+        block._fp8_packed_gate_up = tensor((28672, 5376), "FP8")
+        return block
+
+    def _run_block(self, shape, dtype="BF16"):
+        namespace, calls = _length_fallback_namespace()
+        self.assertEqual(namespace["ops"].FULL_SEQUENCE_LENGTHS, (37776, 37820, 38169))
+        block = self._block(namespace, calls)
+        rows = shape[-2]
+        output = block._forward_fused_adaln(
+            _LayoutTensor(shape, dtype),
+            _LayoutTensor((1, 5376)),
+            _LayoutTensor((rows,), "INT64"),
+            (_LayoutTensor((rows, 64)), _LayoutTensor((rows, 64))),
+            None,
+            None,
+            None,
+        )
+        return output, calls
+
+    def test_loader_warmup_and_other_unknown_lengths_use_complete_family_math(self):
+        for rows in (37712, 38170):
+            with self.subTest(rows=rows):
+                output, calls = self._run_block((1, rows, 5376))
+                self.assertEqual(output.shape, (1, rows, 5376))
+                self.assertEqual(
+                    calls,
+                    [
+                        "family_norm",
+                        "family_quantize",
+                        "family_qkv",
+                        "family_qk_norm",
+                        "out_projection",
+                        "family_gate_res_norm",
+                        "family_ffn",
+                    ],
+                )
+
+    def test_qualified_request_keeps_dedicated_fusions_and_raw_attention_output(self):
+        for rows in (37776, 37820, 38169):
+            with self.subTest(rows=rows):
+                output, calls = self._run_block((1, rows, 5376))
+                self.assertEqual(output.shape, (1, rows, 5376))
+                self.assertEqual(
+                    calls,
+                    ["norm", "qkv_gemm", "qk_norm_rope", "attention_projection", "gate_up", "down"],
+                )
+
+    def test_invalid_batch_width_rank_and_dtype_still_fail_before_dispatch(self):
+        for shape, dtype in [
+            ((2, 37712, 5376), "BF16"),
+            ((1, 37712, 5375), "BF16"),
+            ((37712, 5376), "BF16"),
+            ((1, 37712, 5376), "FP16"),
+        ]:
+            with self.subTest(shape=shape, dtype=dtype):
+                with self.assertRaisesRegex(ValueError, "qualified BF16"):
+                    self._run_block(shape, dtype)
+
+
 if __name__ == "__main__":
     unittest.main()

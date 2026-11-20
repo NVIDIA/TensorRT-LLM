@@ -41,8 +41,15 @@ match. No new public argument or separate benchmark command is introduced.
 - All 200 main DiT Linears must be static per-tensor FP8 with the original H3
   shapes. BF16 or mixed checkpoints, including EarlyTop8, are not admitted.
 - The fused block serves batch one and packed lengths 37776, 37820 or 38169,
-  covering the fixed 1344×768×124 Waiter/Cycling workloads and their warmup.
-  Unsupported layouts fail before the GEMM kernels launch.
+  including the fixed 1344×768×124 Waiter/Cycling workloads. Other packed lengths
+  use the existing family AdaLN and FFN math, complete scenario Attention with
+  its output projection, and stock FP8QDQ QKV GEMM. They do not enter the
+  scenario's dedicated GEMM kernels. Batch, hidden width and dtype requirements
+  remain enforced.
+- The default loader warmup uses the prompt `"warmup"`, producing packed length
+  37712 at 1344×768×124. It takes this fallback; normal requests at the listed
+  lengths select the fused kernels independently. Skipping loader warmup is not
+  required. The fallback and fused requests require separate GPU qualification.
 - Ulysses, TP and parallel VAE are one. GB300 and four-GPU inference keep their
   separately qualified family routes.
 - Compile is on; whole-model CUDA Graphs, LoRA, CPU weight offload and diffusion

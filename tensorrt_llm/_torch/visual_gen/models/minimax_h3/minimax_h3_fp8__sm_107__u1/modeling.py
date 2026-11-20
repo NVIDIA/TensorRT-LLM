@@ -68,7 +68,7 @@ def _qk_fake(
 
 
 class Fp8QkvMethod(FP8QDQLinearMethod):
-    """Use the framework FP8 GEMM only for the scenario's QKV projections."""
+    """Use the selected framework GEMM for qualified full-sequence QKV projections."""
 
     def apply(self, module, input: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         if (
@@ -76,6 +76,7 @@ class Fp8QkvMethod(FP8QDQLinearMethod):
             or module.dtype != torch.bfloat16
             or self.get_static_input_scale(module) is None
             or getattr(module, "all_reduce", None) is not None
+            or input.numel() // input.shape[-1] not in ops.FULL_SEQUENCE_LENGTHS
         ):
             return super().apply(module, input, bias)
         shape = input.shape
@@ -91,7 +92,7 @@ class Fp8QkvMethod(FP8QDQLinearMethod):
 
 
 class Fp8Attention(ScenarioAttention):
-    """FP8 QKV attention returning BF16 before the block's fused output GEMM."""
+    """Raw attention for FP8 producers; projected family attention for BF16 inputs."""
 
     def forward(
         self,
@@ -101,6 +102,14 @@ class Fp8Attention(ScenarioAttention):
         timestep=None,
         valid_seq_len=None,
     ) -> torch.Tensor:
+        if hidden_states.dtype == torch.bfloat16:
+            return super().forward(
+                hidden_states,
+                rotary_emb,
+                key_padding_mask,
+                timestep,
+                valid_seq_len,
+            )
         if rotary_emb is None or not self.on_fp8_path():
             raise ValueError("The FP8 scenario needs rotary embeddings and FP8 QKV attention")
         if self.use_async_ulysses or getattr(self.attn, "world_size", 1) != 1:
@@ -153,11 +162,20 @@ class Fp8Block(MiniMaxH3TransformerBlock):
         if (
             hidden_states.ndim != 3
             or hidden_states.shape[0] != 1
-            or hidden_states.shape[1] not in ops.FULL_SEQUENCE_LENGTHS
             or hidden_states.shape[2] != 5376
             or hidden_states.dtype != torch.bfloat16
         ):
             raise ValueError("The fused FP8 block needs a qualified BF16 [1,S,5376] packed layout")
+        if hidden_states.shape[1] not in ops.FULL_SEQUENCE_LENGTHS:
+            return super()._forward_fused_adaln(
+                hidden_states,
+                temb,
+                adaln_indices,
+                rotary_emb,
+                key_padding_mask,
+                timestep,
+                valid_seq_len,
+            )
         modulation = self.adaln_proj.table(temb)
         codes = ops.norm(
             hidden_states,
