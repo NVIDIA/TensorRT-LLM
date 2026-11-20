@@ -424,8 +424,8 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
         side_effect=[
             [[], []],
             [
-                [[], [rid], [], [rid], []],
-                [[], [], [], [], []],
+                [[], [rid], [], [rid], [], []],
+                [[], [], [], [], [], []],
             ],
         ]
     )
@@ -441,8 +441,8 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
         side_effect=[
             [[rid], [rid]],
             [
-                [[], [rid], [], [rid], []],
-                [[], [rid], [], [rid], []],
+                [[], [rid], [], [rid], [], []],
+                [[], [rid], [], [rid], [], []],
             ],
         ]
     )
@@ -1053,6 +1053,20 @@ def test_send_terminal_session_is_retained_when_close_refuses(
 
 
 @pytest.mark.cpu_only
+def test_gen_outcome_uses_peer_timeout_for_locally_completed_shard() -> None:
+    rid = 90
+    req = SimpleNamespace()
+    tc = object.__new__(KvCacheTransceiverV2)
+    tc._gen_need_sync = True
+    tc._recv_sessions = {rid: SimpleNamespace(timed_out=False)}
+    tc._recv_reqs = {rid: req}
+    tc._gen_allgather = lambda local: [local, [[], [rid], [], [rid], [], [rid]]]
+
+    assert tc._gen_consensus_outcome([rid], [], [], [rid], [rid]) == ([], [rid], [], set())
+    assert req.py_kv_transfer_timed_out
+
+
+@pytest.mark.cpu_only
 def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
     rid = 90
     initial_state = object()
@@ -1060,6 +1074,7 @@ def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
         state=initial_state,
         py_kv_cache_xfer_bytes=0,
         set_kv_cache_size=Mock(),
+        set_kv_cache_transfer_local_size=Mock(),
     )
     session = SimpleNamespace(
         status=SessionStatus.TRANSFERRED,

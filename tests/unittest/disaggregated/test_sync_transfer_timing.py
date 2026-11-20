@@ -34,6 +34,7 @@ class _FakeRequest:
         self._start = start
         self._end = end
         self._kv_cache_size = kv_size
+        self.kv_cache_transfer_local_size = kv_size
 
     def get_kv_cache_transfer_start(self) -> int:
         return self._start
@@ -83,12 +84,12 @@ class TestSyncTransferTiming:
             return [local_data, rank1_data]
 
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=fake_allgather)
-        sizes = tc._sync_transfer_timing([req])
+        summary = tc._sync_transfer_timing([req])
 
-        assert req._start == (5 if csv_enabled else 10)
-        assert req._end == (25 if csv_enabled else 20)
+        assert req._start == 10
+        assert req._end == 20
         assert req.kv_cache_size == 100
-        assert sizes == {1: 300 if csv_enabled else 100}
+        assert summary == {1: (5, 25, 300) if csv_enabled else (10, 20, 100)}
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
     def test_multiple_requests_batched(self) -> None:
@@ -104,32 +105,31 @@ class TestSyncTransferTiming:
             return [local_data, rank1_data]
 
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=fake_allgather)
-        sizes = tc._sync_transfer_timing([req_a, req_b])
+        summary = tc._sync_transfer_timing([req_a, req_b])
 
-        assert req_a._start == 8
-        assert req_a._end == 22
+        assert req_a._start == 10
+        assert req_a._end == 20
         assert req_a.kv_cache_size == 100
 
-        assert req_b._start == 28
-        assert req_b._end == 45
+        assert req_b._start == 30
+        assert req_b._end == 40
         assert req_b.kv_cache_size == 200
-        assert sizes == {1: 250, 2: 450}
+        assert summary == {1: (8, 22, 250), 2: (28, 45, 450)}
 
     @patch.dict("os.environ", {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "/tmp/test"}, clear=False)
-    def test_all_ranks_updated(self) -> None:
-        """Every request object should be updated, not just rank-0."""
+    def test_summary_is_available_on_each_rank(self) -> None:
         req = _FakeRequest(rid=1, start=10, end=20, kv_size=100)
 
         def fake_allgather(local_data):
             return [local_data, {1: (5, 25, 200)}]
 
         tc = _make_transceiver(gen_need_sync=True, gen_allgather=fake_allgather)
-        sizes = tc._sync_transfer_timing([req])
+        summary = tc._sync_transfer_timing([req])
 
-        assert req._start == 5
-        assert req._end == 25
+        assert req._start == 10
+        assert req._end == 20
         assert req.kv_cache_size == 100
-        assert sizes == {1: 300}
+        assert summary == {1: (5, 25, 300)}
 
     @patch.dict("os.environ", {}, clear=False)
     def test_skips_when_no_env(self) -> None:

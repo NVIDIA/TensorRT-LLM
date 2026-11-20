@@ -999,6 +999,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         locally_quiesced=None,
         locally_verified=None,
         local_session_count: Optional[int] = None,
+        locally_timed_out=None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         # Quiescence and write-verification, when requested, also require
@@ -1014,6 +1015,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             local_outcome.append(list(locally_verified))
         if local_session_count is not None:
             local_outcome.append([local_session_count])
+        if locally_timed_out is not None:
+            local_outcome.append(list(locally_timed_out))
         if not need_sync:
             packed = [local_outcome]
         else:
@@ -1049,6 +1052,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             result.append({rid for rid in to_process if rid in global_verified})
         if local_session_count is not None:
             result.append(all(p[idx][0] == 0 for p in packed))
+            idx += 1
+        if locally_timed_out is not None:
+            result.append(self._union([p[idx] for p in packed]))
         return tuple(result)
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
@@ -1075,12 +1081,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             local_session_count=(
                 len(self._recv_sessions) + deferred + pending_admissions if idle_skip else None
             ),
+            locally_timed_out=[
+                rid
+                for rid in to_process
+                if getattr(self._recv_sessions.get(rid), "timed_out", False) is True
+            ],
         )
         new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
         if idle_skip:
             # Every rank derives this from the same gathered payload.
             self._gen_idle_agreed = outcome[5]
         retirable = set(globally_retirable)
+        for rid in outcome[-1] & retirable:
+            req = self._recv_reqs.get(rid)
+            if req is not None:
+                req.py_kv_transfer_timed_out = True
         return (
             [rid for rid in new_cancelled if rid in retirable],
             [rid for rid in new_failed if rid in retirable],
@@ -1105,20 +1120,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             c, f, d, q = self._consensus_outcome(to_process, c, f, d, pp_allgather, True, q)
         return c, f, d, q
 
-    def _sync_transfer_timing(self, reqs: list) -> dict[int, int]:
-        """Sync timing and return receiver totals for the transfer CSV."""
-        if not reqs or not os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH") or not self._gen_need_sync:
-            return {get_unique_rid(req): req.kv_cache_size for req in reqs}
-
-        # Pack local timing for all completed requests into one dict.
+    def _sync_transfer_timing(self, reqs: list):
+        """Return the rank-group timing envelope and bytes for the transfer CSV."""
         local_data = {
             get_unique_rid(req): (
                 req.get_kv_cache_transfer_start(),
                 req.get_kv_cache_transfer_end(),
-                req.kv_cache_size,
+                req.kv_cache_transfer_local_size,
             )
             for req in reqs
         }
+        if not reqs or not os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH") or not self._gen_need_sync:
+            return local_data
 
         # Single allgather for the whole batch.
         all_data = self._gen_allgather(local_data)
@@ -1137,14 +1150,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 else:
                     merged[rid] = (start, end, size)
 
-        # Every rank updates its own local requests.
-        rid_to_req = {get_unique_rid(r): r for r in reqs}
-        for rid, (min_start, max_end, _) in merged.items():
-            req = rid_to_req.get(rid)
-            if req is not None:
-                req.set_kv_cache_transfer_start(min_start)
-                req.set_kv_cache_transfer_end(max_end)
-        return {rid: merged[rid][2] for rid in rid_to_req}
+        return merged
 
     def _collect_done(self, sessions: dict, reqs: dict):
         """Scan sessions and return (completed_rids, failed_rids)."""
@@ -1555,7 +1561,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # blocking path has no cross-rank outcome consensus).
                 req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
-                req.set_kv_cache_size(session.kv_cache_size_bytes)
+                req.set_kv_cache_transfer_local_size(session.kv_cache_size_bytes)
+                req.set_kv_cache_size(self._request_kv_bytes(req, paged_bytes, state_bytes))
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
@@ -1953,7 +1960,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req = self._recv_reqs[rid]
                 if session.transfer_end_time is not None:
                     req.set_kv_cache_transfer_end(session.transfer_end_time)
-                req.set_kv_cache_size(session.kv_cache_size_bytes)
+                req.set_kv_cache_transfer_local_size(session.kv_cache_size_bytes)
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 # RxSession.wait_complete() already withholds FAILED while an
@@ -1992,15 +1999,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Log gen-side transfer summary after consensus.
         if completed and os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH"):
             # Batch-sync timing for all completed requests in one allgather.
-            summary_sizes = self._sync_transfer_timing([self._recv_reqs[rid] for rid in completed])
+            summary = self._sync_transfer_timing([self._recv_reqs[rid] for rid in completed])
             for rid in completed:
-                req = self._recv_reqs[rid]
+                start, end, total_size = summary[rid]
                 perf_log_manager.log_gen_transfer_summary(
                     unique_rid=rid,
                     instance_name=self._instance_name,
                     instance_rank=self._mapping.rank,
-                    gen_side_transfer_time_ms=req.kv_cache_transfer_time_ms,
-                    kv_cache_size=summary_sizes[rid],
+                    gen_side_transfer_time_ms=max(0, (end - start).total_seconds() * 1000),
+                    kv_cache_size=total_size,
                 )
 
         for rid in completed:
@@ -2010,6 +2017,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # session is closed and dropped: commit_blocks_for_reuse runs
             # later (batch preparation) and gates reuse admission on it.
             req.py_kv_transfer_verified = rid in verified
+            req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
             self._assert_disagg_history_declared(req)

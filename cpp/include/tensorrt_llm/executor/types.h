@@ -527,6 +527,7 @@ struct RequestPerfMetrics
         TimePoint kvCacheTransferEnd;
         /// @brief KV Cache size transfer for disaggregated serving
         size_t kvCacheSize = 0;
+        std::optional<size_t> kvCacheTransferLocalSize;
     };
 
     struct KvCacheMetrics

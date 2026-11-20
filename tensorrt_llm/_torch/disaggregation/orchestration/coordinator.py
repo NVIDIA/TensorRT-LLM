@@ -196,7 +196,10 @@ class DisaggTransferCoordinator:
             if getattr(request, "is_child", False) is True
             else request.py_request_id
         )
-        if getattr(request, "py_kv_transfer_timed_out", False) is True:
+        if (
+            getattr(request, "py_kv_transfer_timed_out", False) is True
+            or getattr(request, "kv_cache_transfer_timed_out", False) is True
+        ):
             outcome = "timeout"
         elif rid in canceled_ids and outcome == "error" and not backend_failure:
             return
@@ -1097,7 +1100,12 @@ class DisaggTransferCoordinator:
                     self._settled_transfer_ids.add(request_id)
                 request.py_kv_transfer_start_time = None
             if request_id in failed_req_ids:
-                self._record_transfer_outcome(request, "error")
+                self._record_transfer_outcome(
+                    request,
+                    "error",
+                    backend_failure=getattr(request, "kv_cache_transfer_cancelled", False)
+                    is not True,
+                )
                 # Past the context phase: writing the error state here is safe.
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             elif request_id in succeeded_ids:
@@ -1150,7 +1158,7 @@ class DisaggTransferCoordinator:
                     continue
                 if getattr(req, "kv_cache_transfer_timed_out", False) is True:
                     self._record_transfer_outcome(req, "timeout")
-                elif rid in failed_ids:
+                elif rid in failed_ids or getattr(req, "kv_cache_transfer_failed", False) is True:
                     self._record_transfer_outcome(req, "error", backend_failure=True)
                 elif rid in completed_ids or (
                     not benchmark and req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE

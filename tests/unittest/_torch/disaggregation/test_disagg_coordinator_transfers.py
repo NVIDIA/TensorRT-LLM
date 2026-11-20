@@ -130,7 +130,15 @@ def test_send_skips_requests_that_must_not_send() -> None:
 
 
 @pytest.mark.parametrize(
-    "outcome", ["success", "local_cancel", "legacy_peer_cancel", "owned_peer_cancel"]
+    "outcome",
+    [
+        "success",
+        "local_cancel",
+        "legacy_peer_cancel",
+        "owned_peer_cancel",
+        "backend_error",
+        "native_timeout",
+    ],
 )
 def test_settled_send_releases_blocks_and_terminates_a_departed_request(outcome) -> None:
     """A request already out of active_requests (PP>1 early path) terminates
@@ -143,6 +151,10 @@ def test_settled_send_releases_blocks_and_terminates_a_departed_request(outcome)
         h.transceiver.finish_send(req, outcome="error")
     elif outcome == "success":
         h.transceiver.finish_send(req)
+    elif outcome in ("backend_error", "native_timeout"):
+        h.registry.canceled = [req.py_request_id]
+        req.kv_cache_transfer_timed_out = outcome == "native_timeout"
+        h.transceiver.finish_send(req, outcome="error")
     else:
         errors = [req.py_request_id] if outcome == "owned_peer_cancel" else []
         h.transceiver.check_context_transfer_status = Mock(
@@ -151,7 +163,11 @@ def test_settled_send_releases_blocks_and_terminates_a_departed_request(outcome)
 
     h.coordinator.reap_context_sends(0)
 
-    assert h.coordinator.transfer_outcomes == (int(outcome == "success"), 0, 0)
+    assert h.coordinator.transfer_outcomes == (
+        int(outcome == "success"),
+        int(outcome == "backend_error"),
+        int(outcome == "native_timeout"),
+    )
     assert not h.in_transfer(req)
     h.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(1)
     assert h.effects.terminated == [req]
@@ -716,7 +732,13 @@ def test_generation_error_consensus_fails_only_when_some_rank_needs_it(inflight_
 
 
 @pytest.mark.parametrize(
-    ("cause", "expected"), [("timeout", (0, 0, 1)), ("error", (0, 1, 0)), ("cancel", (0, 0, 0))]
+    ("cause", "expected"),
+    [
+        ("timeout", (0, 0, 1)),
+        ("error", (0, 1, 0)),
+        ("native_error", (0, 1, 0)),
+        ("cancel", (0, 0, 0)),
+    ],
 )
 def test_receive_outcome_preserves_backend_failure_after_abort(cause, expected) -> None:
     h = _Harness()
@@ -724,6 +746,7 @@ def test_receive_outcome_preserves_backend_failure_after_abort(cause, expected) 
     h.coordinator._started_gen_receives[1] = req
     h.registry.canceled = [1]
     req.kv_cache_transfer_timed_out = cause == "timeout"
+    req.kv_cache_transfer_failed = cause == "native_error"
     req.state = LlmRequestState.DISAGG_TRANS_ERROR
     status = GenTransferStatus(
         [], [1] if cause == "error" else [], [req] if cause == "cancel" else []

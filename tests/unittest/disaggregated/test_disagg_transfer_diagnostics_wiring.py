@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 from types import SimpleNamespace
@@ -45,9 +46,15 @@ from tensorrt_llm._torch.disaggregation.orchestration.admission import (
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    LlmRequestType,
+    SamplingConfig,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler, ScheduleAction
 
 pytestmark = pytest.mark.cpu_only
@@ -794,6 +801,7 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     operations = []
     session = SimpleNamespace(
         status=session_status,
+        kv_cache_size_bytes=64,
         _kv_tasks=[],
         wait_complete=Mock(side_effect=lambda blocking: operations.append("wait") or wait_result),
         has_transferring_tasks=Mock(return_value=False),
@@ -809,7 +817,16 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     session.receive = Mock(side_effect=receive)
     request = _disagg_request(41, 4041)
     request.state = LlmRequestState.DISAGG_GENERATION_INIT
-    request.set_kv_cache_size = Mock()
+    stats_request = LlmRequest(
+        request_id=41,
+        max_new_tokens=1,
+        input_tokens=[0],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    request.set_kv_cache_size = Mock(wraps=stats_request.set_kv_cache_size)
+    request.set_kv_cache_transfer_local_size = Mock()
     transceiver = _diagnostic_transceiver()
     transceiver._validate_bridge_req = Mock(return_value=True)
     transceiver._recv_sessions = {}
@@ -862,9 +879,16 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     )
     session.wait_complete.assert_called_once_with(blocking=True)
     if wait_result == WaitResult.COMPLETED:
+        request.set_kv_cache_transfer_local_size.assert_called_once_with(64)
         request.set_kv_cache_size.assert_called_once_with(128)
+        executor = object.__new__(PyExecutor)
+        executor.executor_request_queue = Mock()
+        executor.executor_request_queue.get_request_queue.return_value = queue.Queue()
+        [stats] = executor._populate_req_stats([stats_request], [], ScheduledRequests())
+        assert json.loads(stats.to_json_str())["disServingStats"]["kvCacheSize"] == 128
         transceiver._assert_disagg_history_declared.assert_called_once_with(request)
     else:
+        request.set_kv_cache_transfer_local_size.assert_not_called()
         request.set_kv_cache_size.assert_not_called()
         transceiver._assert_disagg_history_declared.assert_not_called()
 
@@ -1372,6 +1396,7 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     )
     request = _disagg_request(5, request_id)
     request.set_kv_cache_size = Mock()
+    request.set_kv_cache_transfer_local_size = Mock()
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_idle_agreed = False

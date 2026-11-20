@@ -43,6 +43,8 @@ void compareRequestPerfMetrics(texec::RequestPerfMetrics const& lh, texec::Reque
     EXPECT_EQ(lh.timingMetrics.lastTokenTime, rh.timingMetrics.lastTokenTime);
     EXPECT_EQ(lh.timingMetrics.kvCacheTransferStart, rh.timingMetrics.kvCacheTransferStart);
     EXPECT_EQ(lh.timingMetrics.kvCacheTransferEnd, rh.timingMetrics.kvCacheTransferEnd);
+    EXPECT_EQ(lh.timingMetrics.kvCacheSize, rh.timingMetrics.kvCacheSize);
+    EXPECT_EQ(lh.timingMetrics.kvCacheTransferLocalSize, rh.timingMetrics.kvCacheTransferLocalSize);
 
     EXPECT_EQ(lh.kvCacheMetrics.numTotalAllocatedBlocks, rh.kvCacheMetrics.numTotalAllocatedBlocks);
     EXPECT_EQ(lh.kvCacheMetrics.numNewAllocatedBlocks, rh.kvCacheMetrics.numNewAllocatedBlocks);
@@ -362,6 +364,8 @@ TEST(SerializeUtilsTest, RequestPerfMetrics)
         generateTimePoint(x++),
         generateTimePoint(x++),
         generateTimePoint(x++),
+        128,
+        64,
     };
 
     texec::RequestPerfMetrics::KvCacheMetrics kvCacheMetrics{1, 2, 3, 4, 5};
