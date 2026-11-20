@@ -119,7 +119,9 @@ def test_fmha_lib_env_prepends_registered_names_in_written_order(
 def test_delta_fmha_lib_env_removes_default_library(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{PRIMS_TS}")
 
-    assert _enabled_names() == tuple(name for name in registry.DEFAULT_FMHA_LIBS if name != PRIMS_TS)
+    assert _enabled_names() == tuple(
+        name for name in registry.DEFAULT_FMHA_LIBS if name != PRIMS_TS
+    )
 
 
 def test_mixed_exact_and_delta_fmha_lib_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -168,7 +170,11 @@ class _LocalFmha(Fmha):
             [
                 "fallback",
                 PRIMS_TS,
-                *(name for name in registry.DEFAULT_FMHA_LIBS if name not in ("fallback", PRIMS_TS)),
+                *(
+                    name
+                    for name in registry.DEFAULT_FMHA_LIBS
+                    if name not in ("fallback", PRIMS_TS)
+                ),
             ],
         ),
         # Removing and re-adding a class places it at its new position in the prefix.
