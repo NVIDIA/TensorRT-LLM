@@ -79,12 +79,9 @@ before they are classified.
 | Feature | Turned on by | Status | Today |
 |---|---|---|---|
 | `PrefillCudaGraph` | `prefill_cuda_graph_backend` | in code | Declared by GLM-5.2 sm103 tp8 and sm107 low_latency (all backends), Kimi K3 tp16 (breakable), MiniMax-M3 sm107 tp2 (breakable; decode left uncompiled), Qwen3.8-Flash-Next (breakable under attention TP; decode left uncompiled). MiniMax-M3 sm103 tp4/tp8 and sm107 tp4/tp8 raise at runtime under any prefill CUDA graph and need a refusal in `route`. |
-| `TorchCompile` | `torch_compile_config` | planned | No target is written for torch.compile; targets that fail under it need a refusal in `route` as well. |
 | `MoeLoadBalancer` | `moe_config.load_balancer` | planned | Qwen3.8-Flash-Next (with expert parallelism) and GLM-5.2 sm107 high_throughput refuse it because it would do nothing; a warning fits. |
-| `MoeBackend` | `moe_config.backend` | to verify | Qwen3.8-Flash-Next and GLM-5.2 sm107 high_throughput restrict it. |
 | `CudaGraphSamplingVariants`, `InGraphSampling` | `cuda_graph_config.sampling_variants`, `enable_in_graph_sampling` | to verify | |
 | `AttentionDpBalance` | `attention_dp_config` | to verify | |
-| `UserBuffers`, `CuteDslBlockscaling`, `MinLatency` | `torch_compile_config.enable_userbuffers`, `use_cute_dsl_blockscaling_mm/bmm`, `enable_min_latency` | to verify | |
 
 ### Kept in `route`
 
@@ -103,8 +100,10 @@ checked in `route`. A target that fuses sampling into its draft loop bypasses
 the sampler; `SpeculativeDecoding` states that limit with `when`.
 
 Nor are the kernel choices a target makes for itself, such as
-`allreduce_strategy` and `moe_config.tactic`: they are Modeling V1 settings, and
-a Modeling V2 target picks its own kernels.
+`allreduce_strategy`, `moe_config.tactic`, `moe_config.backend`,
+`use_cute_dsl_blockscaling_mm/bmm`, `enable_min_latency` and
+`torch_compile_config.enable_userbuffers`: they are Modeling V1 settings, and a
+Modeling V2 target picks its own kernels.
 
 ## Known gaps
 
