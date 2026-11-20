@@ -47,7 +47,7 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
 
-from .fp4_mla_cute_dsl_utils import (
+from ...ops.attention._k3_fp4_mla_cute_dsl_utils import (
     _compile_cutedsl,
     _current_cu_stream,
 )

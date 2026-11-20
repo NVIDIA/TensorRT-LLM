@@ -23,7 +23,7 @@ import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_ptr
 
-from .fp4_mla_cute_dsl_utils import _compile_cutedsl, _current_cu_stream
+from ...ops.attention._k3_fp4_mla_cute_dsl_utils import _compile_cutedsl, _current_cu_stream
 from .fp4_mla_mufu16_ull import (
     KV_TILE,
     LOG2_E,

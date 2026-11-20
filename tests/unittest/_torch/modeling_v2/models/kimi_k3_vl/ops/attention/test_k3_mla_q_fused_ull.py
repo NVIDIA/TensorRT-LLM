@@ -7,8 +7,7 @@
   rows untouched (the band of ``kernels/k3r_mla_q/test_k3_mla_q_fused.py``);
 * ``k3_mla_latent_row_ull``: the norm within one BF16 rounding of the FP32 reference, the K-pe
   columns copied exactly, and the row bitwise the family sibling ``k3_mla_latent_row``;
-* ``rmsnorm_release_at_launch_ull``: within one BF16 rounding of its FP32 reference and bitwise the
-  family sibling ``rmsnorm_release_at_launch``.
+* ``rmsnorm_release_at_launch``: within one BF16 rounding of the FP32 reference.
 """
 
 import functools
@@ -34,8 +33,8 @@ k3_mla_q_fused_ull = q_fused_module.k3_mla_q_fused
 k3_mla_latent_row_ull = importlib.import_module(
     f"{K3}.ops.attention.k3_mla_latent_row_ull"
 ).k3_mla_latent_row
-rmsnorm_release_at_launch_ull = importlib.import_module(
-    f"{K3}.ops.attention.rmsnorm_release_at_launch_ull"
+rmsnorm_release_at_launch = importlib.import_module(
+    f"{K3}.ops.attention.rmsnorm_release_at_launch"
 ).rmsnorm_release_at_launch
 
 _ARCH = {(10, 0): Arch.SM_100, (10, 3): Arch.SM_103, (10, 7): Arch.SM_107}
@@ -190,14 +189,10 @@ def test_k3_mla_latent_row_ull_cells(cell, use_pdl):
     assert torch.equal(out.view(torch.int16), want.view(torch.int16)), cell.why
 
 
-@_certified(rmsnorm_release_at_launch_ull)
-@_cells(rmsnorm_release_at_launch_ull)
+@_certified(rmsnorm_release_at_launch)
+@_cells(rmsnorm_release_at_launch)
 def test_rmsnorm_release_at_launch_ull_cells(cell):
-    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.rmsnorm_release_at_launch import (  # noqa: E501
-        rmsnorm_release_at_launch as sibling,
-    )
-
-    op = rmsnorm_release_at_launch_ull
+    op = rmsnorm_release_at_launch
     spec = cell.spec
     gen = torch.Generator(device="cuda").manual_seed(_seed(cell))
     rows = torch.randn(spec["tokens"], spec["row_stride"], device="cuda", generator=gen)
@@ -208,6 +203,3 @@ def test_rmsnorm_release_at_launch_ull_cells(cell):
         y = op(x, weight, eps)
     assert y.is_contiguous() and y.shape == x.shape and y.dtype == torch.bfloat16
     assert_within_ulp(y, op.reference(x, weight, eps), element_ulp=1, rms_ulp=0.5)
-    want = sibling(x, weight, eps)
-    torch.cuda.synchronize()
-    assert torch.equal(y.view(torch.int16), want.view(torch.int16)), cell.why

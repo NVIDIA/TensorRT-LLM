@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The ULL target's one-kernel speculative decode step head (``k3_spec_decode_head_ull``) on its
-``.CELLS``, armed with ``certifying``: every tensor the head writes equals the entry's reference
-and the family sibling ``k3_spec_decode_head``'s on the same step, nothing past the ranges is
-written, and the offsets it reads are untouched."""
+"""The shared one-kernel speculative decode step head on its ``.CELLS``.
+
+Every tensor it writes matches the reference, including the ranges outside the active
+step, and the input offsets are untouched.
+"""
 
 import importlib
 import zlib
@@ -17,15 +18,13 @@ __extra_import_path__ = ["../../../.."]
 from _validating import certifying  # noqa: E402, F401 — path above; fixture by name
 
 _OPS = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec"
-k3_spec_decode_head_ull = importlib.import_module(
-    f"{_OPS}.k3_spec_decode_head_ull"
-).k3_spec_decode_head
+k3_spec_decode_head = importlib.import_module(f"{_OPS}.k3_spec_decode_head").k3_spec_decode_head
 
 _ARCH = {(10, 0): Arch.SM_100, (10, 3): Arch.SM_103, (10, 7): Arch.SM_107}
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or _ARCH.get(torch.cuda.get_device_capability()) not in k3_spec_decode_head_ull.ARCHS,
-    reason="k3_spec_decode_head_ull is certified on its ARCHS",
+    or _ARCH.get(torch.cuda.get_device_capability()) not in k3_spec_decode_head.ARCHS,
+    reason="k3_spec_decode_head is certified on its ARCHS",
 )
 
 
@@ -76,24 +75,17 @@ def _written(args, kwargs):
 
 
 @pytest.mark.parametrize(
-    "cell", k3_spec_decode_head_ull.CELLS, ids=[c.why[:48] for c in k3_spec_decode_head_ull.CELLS]
+    "cell", k3_spec_decode_head.CELLS, ids=[c.why[:48] for c in k3_spec_decode_head.CELLS]
 )
 def test_k3_spec_decode_head_ull_cells(cell, certifying):  # noqa: F811 — fixture by name
-    sibling = importlib.import_module(f"{_OPS}.k3_spec_decode_head").k3_spec_decode_head
-    op = k3_spec_decode_head_ull
+    op = k3_spec_decode_head
     certifying(op)
     args, kwargs = _step(cell)
     expected = op.reference(*args, **kwargs)
     pos_offsets, kv_offsets = args[1].clone(), args[4].clone()
     op(*args, **kwargs)
-    sib_args, sib_kwargs = _step(cell)
-    sibling(*sib_args, **sib_kwargs)
     torch.cuda.synchronize()
     written = _written(args, kwargs)
     for name, value in expected.items():
         assert torch.equal(written[name], value), name
     assert torch.equal(args[1], pos_offsets) and torch.equal(args[4], kv_offsets)
-    sib_written = _written(sib_args, sib_kwargs)
-    for name, value in sib_written.items():
-        if isinstance(value, torch.Tensor):
-            assert torch.equal(written[name], value), f"{name} differs from the family sibling"
