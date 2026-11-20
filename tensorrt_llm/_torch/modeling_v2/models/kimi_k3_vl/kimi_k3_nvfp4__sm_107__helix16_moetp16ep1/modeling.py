@@ -175,6 +175,7 @@ from ..common.spec_positions import _slice_spec_position_ids
 from ..kernels.k3r_attn_res import k3_attn_res_ull as k3_attn_res
 from ..kernels.k3r_gemm.low_m_bf16_splitk import SplitKTactic, run_splitk_dense
 from ..kernels.k3r_mla_decode.cute_dsl_mla import launch_mla_split_kv_plan
+from ..kernels.k3r_moe import k3_route_tail_ull  # noqa: F401 - registers the dispatcher op
 from ..kernels.k3r_spec.dspark_draft3 import draft_qhead, fold_rmsnorm_weight
 from ..kernels.k3r_spec.dspark_draft_ar_ull import (
     ELTS,
