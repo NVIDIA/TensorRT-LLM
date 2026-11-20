@@ -107,9 +107,15 @@ def _workspace_size(device: torch.device, rows: int, heads: int, **plan_kwargs) 
     return int(get_prims_ts_sparse_mla_decode_workspace_size(device, rows, heads, **plan_kwargs))
 
 
-def _max_warmup_rows(metadata: "TrtllmAttentionMetadata") -> int:
+def _max_warmup_rows(
+    metadata: "TrtllmAttentionMetadata", max_total_draft_tokens: int | None = None
+) -> int:
     requests = int(metadata.max_num_requests or 0)
-    draft = int(metadata.max_total_draft_tokens or 0)
+    draft = (
+        int(metadata.max_total_draft_tokens or 0)
+        if max_total_draft_tokens is None
+        else max_total_draft_tokens
+    )
     tokens = int(metadata.max_num_tokens or 0)
     rows = requests * (1 + draft)
     return min(rows, tokens) if rows and tokens else rows or tokens
@@ -827,13 +833,18 @@ class _WarmupProfile:
         )
 
 
-def _warmup_profiles(profiles: list[_WarmupProfile], metadata: "TrtllmAttentionMetadata") -> None:
+def _warmup_profiles(
+    profiles: list[_WarmupProfile],
+    metadata: "TrtllmAttentionMetadata",
+    *,
+    max_total_draft_tokens: int | None = None,
+) -> None:
     """Precompile missing kernels in parallel and prepare all plans locally."""
     if not profiles:
         return
     from . import prims_ts_precompile
 
-    candidates = range(1, _max_warmup_rows(metadata) + 1)
+    candidates = range(1, _max_warmup_rows(metadata, max_total_draft_tokens) + 1)
     local_ranks = prims_ts_precompile.local_rank_count(metadata.mapping)
     payloads = []
     plans = []
@@ -868,7 +879,10 @@ def _warmup_profiles(profiles: list[_WarmupProfile], metadata: "TrtllmAttentionM
 
 
 def warmup_prims_ts_sparse_mla(
-    model: torch.nn.Module, metadata: "DeepseekV4TrtllmAttentionMetadata"
+    model: torch.nn.Module,
+    metadata: "DeepseekV4TrtllmAttentionMetadata",
+    *,
+    max_total_draft_tokens: int,
 ) -> None:
     """Warm enabled DeepSeek-V4 generation profiles before the first model forward."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
@@ -909,7 +923,7 @@ def warmup_prims_ts_sparse_mla(
                         fused_groups=layer.n_local_groups if fused else None,
                     )
                 )
-    _warmup_profiles(profiles, metadata)
+    _warmup_profiles(profiles, metadata, max_total_draft_tokens=max_total_draft_tokens)
 
 
 __all__ = [

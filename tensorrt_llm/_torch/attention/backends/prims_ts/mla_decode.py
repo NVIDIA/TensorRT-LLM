@@ -214,7 +214,7 @@ class _TensorViewCache:
     zero-copy views belong here; changing tensor contents must remain visible.
     """
 
-    __slots__ = ("source", "key", "views")
+    __slots__ = ("source", "key", "views", "__weakref__")
 
     def __init__(self):
         self.clear()
@@ -249,7 +249,11 @@ class _TensorViewCache:
             tensor.is_conj(),
             tensor.is_neg(),
         )
-        if key == self.key:
+        if (
+            self.views is not None
+            and key == self.key
+            and self.views[0].data_ptr() == pointer
+        ):
             return self.views
         self.views = None
         self.key = (
@@ -262,8 +266,23 @@ class _TensorViewCache:
         return None
 
     def put(self, views):
-        if self.key is not None:
-            self.views = views
+        if self.key is None:
+            return
+        source = self.source()
+        if source is None:
+            self.clear()
+            return
+        slot = weakref.ref(self)
+
+        def release(ref):
+            cache = slot()
+            if cache is not None and cache.source is ref:
+                cache.clear()
+
+        # Detached aliases share storage without keeping a caller's base tensor
+        # alive. Release those aliases when the observed tensor goes away.
+        self.views = tuple(view.detach() for view in views)
+        self.source = weakref.ref(source, release)
 
 
 def _resolve_cached_mla_scale(value, state, name):
@@ -3121,7 +3140,8 @@ class BatchSparseMLADecodePagedTSWrapper:
 
         Call after `plan`, including `plan(compile=False)`. This scheduling hint
         neither loads nor builds a kernel. An executable plan still requires
-        `plan(compile=True)`, which handles concurrent cache changes.
+        `plan(compile=True)`. A process-local executable remains usable if its
+        disk export is later evicted; this query only describes the disk cache.
         """
         state = self._state
         if state is None:
@@ -3473,6 +3493,8 @@ class BatchSparseMLADecodePagedTSWrapper:
                     state["empty_source_views"] = cached
                 return cached[1], cached[2]
             return state["dummy_indices"][:rows], state["default_cl"][:rows]
+        if indices is None or lengths is None:
+            raise ValueError(f"{name} indices and lengths are required by the plan")
         if validate:
             if not isinstance(indices, torch.Tensor) or (
                 indices.shape != (rows, capacity)
@@ -3579,6 +3601,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         remain included. Caller-owned LSE must be contiguous FP32 and 16-byte
         aligned, including with validate=False.
 
+        Reused native views release their storage when the observed caller tensor
+        dies, when the input switches to plan scratch, or when this wrapper is replanned.
+
         With output quantization enabled, ``token_positions`` is contiguous
         INT32 with the query's batch/token prefix; ``cos_sin_cache`` is aligned
         contiguous FP32[P,64] containing forward [cos(32), sin(32)] rows. Use
@@ -3663,6 +3688,8 @@ class BatchSparseMLADecodePagedTSWrapper:
                 or extra_lengths is not None
             ):
                 raise ValueError("extra pool and indices are required by the plan")
+            if views is not None:
+                views["extra_kv_cache"].clear()
             extra = state["dummy_cache"]
             extra_view = state["dummy_cache_view"]
         else:
@@ -3741,6 +3768,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             )
         plan_lse = lse is None and not state["return_lse"] and views is not None
         if plan_lse:
+            views["lse"].clear()
             cached_lse = state["lse_views"]
             if cached_lse is None or cached_lse[0] != prefix:
                 lse = state["buffers"]["public_lse"][:rows].view(

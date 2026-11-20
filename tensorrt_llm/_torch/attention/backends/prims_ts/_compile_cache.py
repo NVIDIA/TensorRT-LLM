@@ -98,10 +98,11 @@ def is_attention_kernel_cached(
     extra: tuple = (),
 ) -> bool:
     from flashinfer.jit.cute_dsl_core import (
-        JitSpecCuteDsl,
         _hash_source_files,
         cute_dsl_cache_disabled,
     )
+
+    from .._cute_dsl_compat import JitSpecCuteDsl
 
     if cute_dsl_cache_disabled():
         return False
@@ -130,14 +131,14 @@ def build_and_load_attention_kernel(
     """Build or load under the caller's selected CUDA device context."""
     from flashinfer.jit.cute_dsl_core import cute_dsl_cache_disabled
 
-    from .._cute_dsl_compat import build_and_load_cute_dsl_kernel
+    from .._cute_dsl_compat import _compile_in_process, build_and_load_cute_dsl_kernel
 
     if cute_dsl_cache_disabled():
-        return compile_fn()
+        return _compile_in_process(compile_fn)
 
     name = _attention_kernel_name(kind, spec, options, extra)
     if name is None:
-        return compile_fn()
+        return _compile_in_process(compile_fn)
     return build_and_load_cute_dsl_kernel(
         f"prims_ts_{family}",
         name,

@@ -1081,14 +1081,15 @@ def test_decode_prewarm_failure_still_reaches_barrier() -> None:
 
 
 @pytest.mark.cpu_only
-def test_prims_ts_prewarm_prepares_metadata_and_barriers() -> None:
+@pytest.mark.parametrize("cp_size,tp_size", [(1, 4), (2, 1)])
+def test_prims_ts_prewarm_prepares_metadata_and_barriers(cp_size, tp_size) -> None:
     from tensorrt_llm._torch.attention.backends.fmha import prims_ts_sparse_mla
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
         DeepseekV4TrtllmAttentionMetadata,
     )
 
     events = []
-    metadata = SimpleNamespace()
+    metadata = SimpleNamespace(max_total_draft_tokens=None)
 
     def build_metadata(*args: object) -> SimpleNamespace:
         events.append("metadata")
@@ -1099,11 +1100,15 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers() -> None:
         _config=SimpleNamespace(
             attention_backend=SimpleNamespace(Metadata=DeepseekV4TrtllmAttentionMetadata),
             spec_config=None,
+            max_total_draft_tokens=5,
         ),
         _metadata=SimpleNamespace(setup_attention=Mock(side_effect=build_metadata)),
         model=object(),
-        mapping=SimpleNamespace(cp_size=1, tp_size=4),
-        dist=SimpleNamespace(tp_allgather=Mock(side_effect=lambda *args: events.append("barrier"))),
+        mapping=SimpleNamespace(cp_size=cp_size, tp_size=tp_size),
+        dist=SimpleNamespace(
+            tp_allgather=Mock(side_effect=lambda *args: events.append("tp")),
+            tp_cp_allgather=Mock(side_effect=lambda *args: events.append("cp")),
+        ),
     )
     resources, manager = object(), SimpleNamespace(context_swa_layer_limit=None)
     with (
@@ -1111,14 +1116,19 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers() -> None:
         patch.object(
             prims_ts_sparse_mla,
             "warmup_prims_ts_sparse_mla",
-            side_effect=lambda *args: events.append("kernels"),
+            side_effect=lambda *args, **kwargs: events.append("kernels"),
         ) as warm,
         patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("sync")),
     ):
         DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
-        assert events == ["metadata", "kernels", "sync", "barrier"]
+        assert events == ["metadata", "kernels", "sync", "cp" if cp_size > 1 else "tp"]
+        if cp_size > 1:
+            owner.dist.tp_cp_allgather.assert_called_once_with(1)
+            owner.dist.tp_allgather.assert_not_called()
+        else:
+            owner.dist.tp_allgather.assert_called_once_with(1)
         assert metadata.cu_seq_lens.is_inference()
-        warm.assert_called_once_with(owner.model, metadata)
+        warm.assert_called_once_with(owner.model, metadata, max_total_draft_tokens=5)
         owner._metadata.setup_attention.assert_called_once_with(manager, None)
         events.clear()
         manager.context_swa_layer_limit = 1
