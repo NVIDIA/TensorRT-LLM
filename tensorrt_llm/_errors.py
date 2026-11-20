@@ -62,6 +62,11 @@ ERROR_HINTS = {
         "the /dev/shm size (--shm-size) and `ulimit -n`."
     ),
     "disk": "The disk is full. Free space in the Hugging Face cache (HF_HOME) or move it.",
+    "kv_cache_disk": (
+        "The KV cache disk tier could not be created or grown: the filesystem at "
+        "kv_cache_config.disk_cache_path is full or not writable. Free space there, point "
+        "disk_cache_path at another filesystem, or lower kv_cache_config.disk_cache_size."
+    ),
     "port": "The listen address is not available. Use another --port or stop the process using it.",
     "no_gpu": (
         "No GPU is usable. Check that the container has GPUs (docker --gpus, or nvidia.com/gpu "
