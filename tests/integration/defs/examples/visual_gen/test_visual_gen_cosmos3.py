@@ -49,7 +49,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
 )
 
 # Cosmos3-Nano (text-to-video + text-to-image) — default-setting LPIPS golden.
-# Params are the Cosmos3 720P defaults (cosmos3/defaults.py:COSMOS3_720P_PARAMS).
+# Params are the Nano/Super video defaults (cosmos3/defaults.py: COSMOS3_DEFAULTS, qwen3.video).
 # Cosmos3 requires VANILLA attention and guardrails disabled in CI.
 COSMOS3_NANO_MODEL_SUBPATH = "Cosmos3-Nano"
 COSMOS3_LPIPS_PROMPT = "A serene mountain landscape with snow-capped peaks and a flowing river"
@@ -174,7 +174,7 @@ def _run_cosmos3_lpips_pipeline(
     ``output_type="image"`` selects the real text-to-image path and returns
     ``(B, H, W, C)`` instead. It is not the same as ``num_frames=1``: the
     pipeline keys T2I off ``output_type``, which also swaps in
-    ``COSMOS3_T2I_PARAMS``, the T2I system prompt and the image resolution
+    the Nano/Super image defaults, the T2I system prompt and the image resolution
     template, so a one-frame video run exercises none of that.
 
     ``model_subpath`` selects the checkpoint under ``LLM_MODELS_ROOT`` and is a

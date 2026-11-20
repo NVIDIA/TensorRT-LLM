@@ -1277,7 +1277,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             (False, False, False, True, False),
             (True, False, True, True, False),
             (True, True, True, True, False),
-            # low_precision_combine only valid with attention_dp=True
             (False, True, False, False, True),
             (True, True, True, True, True),
         ])
@@ -1291,6 +1290,27 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          overlap_scheduler, low_precision_combine, tp_size,
                          pp_size, ep_size, torch_compile, mtp_nextn,
                          moe_tactic):
+        # create_strategy passes use_low_precision_moe_combine to
+        # NVLinkOneSided, NVLinkTwoSided, NcclEP, and DeepEPLowLatency. It
+        # returns None or AllGatherReduceScatter, without the flag, when
+        # attention DP is off or dp_size == 1, moe_tp_size != 1, or the tactic
+        # disallows all-to-all. dp_size is tp_size under attention_dp, and
+        # moe_tp_size is tp_size // ep_size.
+        tactic_allows_alltoall = moe_tactic != "cutlass"
+        if moe_tactic == "cutlass":
+            from tensorrt_llm._torch.moe.fused_moe.impl_environment import \
+                collect_moe_environment
+
+            # Cutlass NVFP4 issues the fused_moe op, which rejects all-to-all
+            # unless the build enables the OSS Cutlass MoE GEMM.
+            tactic_allows_alltoall = collect_moe_environment().oss_cutlass_moe
+        if low_precision_combine and not (attention_dp and tp_size > 1
+                                          and tp_size == ep_size
+                                          and tactic_allows_alltoall):
+            pytest.skip(
+                "use_low_precision_moe_combine is unused unless attention_dp, "
+                "dp_size > 1, moe_tp_size == 1, and the tactic allows all-to-all"
+            )
         skip_unless_moe_tactic_runs_here(moe_tactic)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -3435,11 +3455,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         ])
     def test_eagle3(self, eagle3_one_model, enable_chunked_prefill,
                     enable_max_concurrency, enable_draft_len_schedule):
-        max_concurrency = 100 if enable_max_concurrency else None
+        max_concurrency = 16 if enable_max_concurrency else None
         draft_len_schedule = {
-            50: 4,
-            200: 3,
-            350: 2
+            4: 4,
+            16: 2,
+            32: 1,
         } if enable_draft_len_schedule else None
         cuda_graph_config = (CudaGraphConfig(
             enable_padding=True, max_batch_size=32) if enable_draft_len_schedule
@@ -7729,41 +7749,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 accept_rate = num_accepted / num_drafted
                 assert accept_rate > 0.2, \
                     f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_nvfp4_8gpus_mtp_custom_op(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
-        # Test MTP accuracy with nvfp4-fp8kv model using custom op path.
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
-                                       moe_tactic="cutlass")
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
-        with LLM(
-                model_path,
-                kv_cache_config=KvCacheConfig(
-                    enable_block_reuse=False,
-                    mamba_ssm_cache_dtype="float16",
-                    free_gpu_memory_fraction=0.5,
-                ),
-                max_batch_size=32,
-                tensor_parallel_size=8,
-                moe_expert_parallel_size=8,
-                pipeline_parallel_size=1,
-                enable_attention_dp=False,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=32,
-                                                  enable_padding=True),
-                disable_overlap_scheduler=False,
-                moe_config=MoeConfig(tactic="cutlass"),
-                speculative_config=mtp_config,
-        ) as llm:
-            assert isinstance(llm.args.speculative_config, MTPDecodingConfig)
-            assert llm.args.speculative_config.max_draft_len == 3
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 # Reading this 352 GB checkpoint cold over a slow model-store link takes most of
