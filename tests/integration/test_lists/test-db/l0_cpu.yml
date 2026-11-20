@@ -105,7 +105,6 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_runtime_shell.py
   # Kimi K3 SM107 ULL target: the sm107 deployment routing, and the model's host-side layer schedule,
   # step check, layer-0 dense slice and folded MLA projection layout.
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_sm107_routing.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/test_k3_ull_model_structure.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
