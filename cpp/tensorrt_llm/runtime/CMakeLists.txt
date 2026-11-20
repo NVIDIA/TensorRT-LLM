@@ -95,7 +95,8 @@ add_library(tllm::runtime_ipc ALIAS tllm_runtime_ipc)
 target_link_libraries(
   tllm_runtime_ipc
   PUBLIC tllm::runtime_buffers tllm::runtime_distributed
-  PRIVATE tllm::common_environment tllm::kernel_custom_all_reduce)
+         tllm::kernel_custom_all_reduce
+  PRIVATE tllm::common_environment)
 target_compile_features(tllm_runtime_ipc PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_ipc PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
