@@ -1770,10 +1770,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 ):
                     self._emit_transfer_settled("gen", rid, req, session, settlement_outcome)
             else:
+                self._recv_sessions[rid] = session
+                self._recv_reqs[rid] = req
                 logger.error(
                     f"request_and_receive_sync: retaining rid={rid} because receive "
                     "resources remain active"
                 )
+
+    def reap_sync_receives(self) -> bool:
+        """Retry close for synchronous receives left open by the blocking call."""
+        retired = False
+        for rid, session in list(self._recv_sessions.items()):
+            if self._retirement_blocked(session) or session.close() is False:
+                continue
+            req = self._recv_reqs.pop(rid)
+            del self._recv_sessions[rid]
+            retired = True
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                self._emit_transfer_settled("gen", rid, req, session, "failed")
+        return retired
 
     def _open_peer_source(self, req: LlmRequest) -> PeerFetch:
         """The paired backend: pull this request's cache from the worker that ran its context."""

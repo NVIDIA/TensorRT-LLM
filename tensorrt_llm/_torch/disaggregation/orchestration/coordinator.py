@@ -283,6 +283,8 @@ class DisaggTransferCoordinator:
             # request retires, so recovery can reopen context admission while idle.
             self.reap_context_sends(0)
         if not uses_async_gen_transfer():
+            if self._transceiver.reap_sync_receives():
+                self._check_transfer_errors("generation requests")
             return
         if self._defer_unready_gen_receives:
             self._publish_ready_gen_receives()
@@ -1541,10 +1543,14 @@ class DisaggTransferCoordinator:
         ]
 
     def _is_error_cleanup_blocked(self, request: LlmRequest) -> bool:
-        """Whether a failed request must wait: the cancel path owns it, or a
-        transfer owner still holds its context blocks."""
+        """Whether cancellation or transfer resources still hold a failed request."""
         if self._vote_id(request) in self._registry.canceled_request_ids():
             return True
+        if (
+            getattr(request, "is_generation_only_request", False) is True
+            and not uses_async_gen_transfer()
+        ):
+            return self._transceiver.has_inflight_transfer(request)
         return (
             getattr(request, "is_context_only_request", False) is True
             and request.py_request_id in self._transfers.requests_in_transfer()

@@ -1928,7 +1928,7 @@ def test_request_data_for_a_cleared_session_is_failed_not_parked(retried: bool) 
     )
 
     sender._save_peer_req_info.assert_not_called()
-    sender._send_failed_result_to_receiver.assert_called_once_with(info)
+    sender._send_failed_result_to_receiver.assert_called_once_with(info, include_aux=False)
 
 
 @pytest.mark.cpu_only
@@ -1980,25 +1980,20 @@ def test_retried_request_data_for_a_live_session_is_failed_not_parked() -> None:
     )
 
     sender._save_peer_req_info.assert_not_called()
-    sender._send_failed_result_to_receiver.assert_called_once_with(info)
+    sender._send_failed_result_to_receiver.assert_called_once_with(info, include_aux=False)
     assert sender._sessions[ctx_rid] is live_session
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("retried", [False, True])
+@pytest.mark.parametrize("attempt", ["cleared", "retry-cleared", "retry-live"])
+@pytest.mark.parametrize("generation_first", [False, True])
 def test_cleared_session_failure_reaches_the_waiting_receive(
-    retried: bool, monkeypatch: pytest.MonkeyPatch
+    attempt: str, generation_first: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The FAILED reply for a cleared session resolves the peer's receive end to end.
-
-    Real Sender reply, real Receiver dispatch and real RxSession: the published
-    receive turns terminal without waiting for its own timeout or a forward
-    pass, holds no destination access, and the transceiver retires it exactly
-    once. A retried generation request is answered under its own fresh id.
-    """
+    """A refused attempt settles each published destination under its own id."""
     monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
     ctx_rid = 112
-    gen_rid = ctx_rid + 1000 if retried else ctx_rid
+    gen_rid = ctx_rid if attempt == "cleared" else ctx_rid + 1000
 
     receiver = object.__new__(Receiver)
     receiver._enforce_physical_ownership = False
@@ -2006,7 +2001,19 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
     receiver._sessions = {}
     receiver._pre_cancelled_rids = {}
     receiver._shutdown = False
-    session = _make_rx_session(receiver, gen_rid)
+    aux = None
+    if generation_first:
+        aux = transfer_mod.AuxBuffer(max_slot_num=1, beam_width=1, max_draft_len=1)
+        session = RxSession(
+            request_id=gen_rid,
+            params=DisaggregatedParams(
+                disagg_request_id=gen_rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+            ),
+            receiver=receiver,
+            aux_buffer=aux,
+        )
+    else:
+        session = _make_rx_session(receiver, gen_rid)
 
     def publish(task: KVRecvTask) -> None:
         task.expected_transfers = 1
@@ -2018,6 +2025,9 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
     assert session.has_transferring_tasks()
 
     sender = _make_sender_with_cleared_session(ctx_rid)
+    if attempt == "retry-live":
+        sender._retired_rids.clear()
+        sender._sessions[ctx_rid] = object()
     del sender._send_failed_result_to_receiver  # use the real reply path
     sender._instance_rank = 3
     sender._registrar = SimpleNamespace(
@@ -2032,15 +2042,25 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
         block_ids_per_layer_groups=[],
         unique_rid=gen_rid,
         slice_id=0,
+        aux_slot=session.aux_slot,
+        context_first=not generation_first,
     )
 
     sender._respond_with_kv(
         b"gen", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
     )
-    (reply,) = [call.args[0] for call in dealer.send.call_args_list]
-    receiver._process_kv_agent_result(b"ctx", reply)
+    replies = [call.args[0] for call in dealer.send.call_args_list]
+    assert len(replies) == (2 if generation_first else 1)
+    if generation_first:
+        receiver._handle_cancel_session(
+            [MessageType.CANCEL_SESSION, str(gen_rid).encode("ascii"), b"FAILED"]
+        )
+    receiver._process_kv_agent_result(b"ctx", replies[0])
+    if generation_first:
+        assert session.failed_receive_awaits_writers()
+        receiver._process_aux_agent_result(b"ctx", replies[1])
 
-    assert session.status == SessionStatus.ERROR
+    assert session.status == (SessionStatus.CANCELLED if generation_first else SessionStatus.ERROR)
     assert not session.has_transferring_tasks()
 
     request = SimpleNamespace(request_id=gen_rid)
@@ -2057,6 +2077,8 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert gen_rid not in receiver._sessions
     assert transceiver.check_gen_transfer_status(None) == ([], [], [])
+    if aux is not None:
+        assert aux.alloc_slot().id == 0
 
 
 @pytest.mark.cpu_only
@@ -2122,6 +2144,9 @@ def _two_writer_receive_failed_by_one(
     receiver._sessions = {}
     receiver._pre_cancelled_rids = {}
     receiver._shutdown = False
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
+    )
     session = RxSession(
         request_id=rid,
         params=(
@@ -2246,6 +2271,87 @@ def test_recovery_failure_retains_aux_slot_after_kv_settles(monkeypatch) -> None
         requests=[request],
         charge_budget=False,
     )
+    assert aux.alloc_slot().id == 0
+
+
+@pytest.mark.cpu_only
+def test_sync_recovery_failure_retires_after_delayed_aux_result(monkeypatch) -> None:
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    aux = transfer_mod.AuxBuffer(max_slot_num=1, beam_width=1, max_draft_len=1)
+    rid = 121
+    receiver, session, gen, request = _two_writer_receive_failed_by_one(
+        rid, first_result=False, aux_buffer=aux
+    )
+    gen._recv_sessions.clear()
+    gen._recv_reqs.clear()
+    gen._pending_rank_info_admissions = None
+    gen._page_table = None
+    gen._create_cache_extent = Mock(return_value=SimpleNamespace(local=_sole_piece()))
+    request.is_child = request.is_context_only_request = False
+    request.is_generation_only_request = True
+    request.py_client_id = 0
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = gen
+    executor.active_requests = [request]
+    executor.canceled_req_ids = []
+    executor.dist = SimpleNamespace(cp_size=1, world_size=1)
+    executor.enable_attention_dp = False
+    executor._fatal_error = None
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor._prepare_disagg_gen_resources = Mock()
+    executor._wait_for_model_engine_input_copy = Mock()
+    executor._enqueue_responses = Mock()
+    executor._terminate_request = Mock()
+
+    def fetch(*args, **kwargs):
+        for peer in (3, 4):
+            receiver._process_kv_agent_result(
+                b"ctx",
+                transfer_mod._make_kv_result_msg(
+                    peer,
+                    rid,
+                    0,
+                    True,
+                    AgentResult.SUCCESS,
+                    kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+                ),
+            )
+        receiver._process_aux_agent_result(
+            b"ctx", transfer_mod._make_aux_result_msg(3, rid, AgentResult.SUCCESS)
+        )
+        receiver._handle_cancel_session(
+            [MessageType.CANCEL_SESSION, str(rid).encode("ascii"), b"FAILED"]
+        )
+
+    gen._open_peer_source = Mock(return_value=SimpleNamespace(session=session, fetch=fetch))
+    executor.disagg.receive_gen_init([request])
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    executor.disagg.poll_gen_transfers()
+    assert gen.has_inflight_transfer(request)
+    assert all(not call.args[0] for call in executor._enqueue_responses.call_args_list)
+    executor._terminate_request.assert_not_called()
+    with pytest.raises(ValueError, match="No free auxiliary buffer slots"):
+        aux.alloc_slot()
+
+    receiver._process_aux_agent_result(
+        b"ctx", transfer_mod._make_aux_result_msg(4, rid, AgentResult.FAILED)
+    )
+    executor.disagg.poll_gen_transfers()
+    executor.disagg.poll_gen_transfers()
+    ((response_id, response),) = [
+        response for call in executor._enqueue_responses.call_args_list for response in call.args[0]
+    ]
+    assert response_id == rid
+    assert response.error_msg == "Error in kv cache transfer for generation requests"
+    executor._terminate_request.assert_called_once_with(request)
+    gen._gen_allgather.assert_not_called()
+    assert rid not in receiver._sessions
+    assert rid not in gen._recv_sessions and rid not in gen._recv_reqs
+    assert not gen.has_inflight_transfer(request)
     assert aux.alloc_slot().id == 0
 
 

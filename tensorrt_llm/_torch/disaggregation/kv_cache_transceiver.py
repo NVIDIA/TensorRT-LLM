@@ -341,6 +341,10 @@ class KvCacheTransceiver(ABC):
         """
         raise NotImplementedError
 
+    def reap_sync_receives(self) -> bool:
+        """Retire deferred synchronous receives locally and report any progress."""
+        return False
+
     @abstractmethod
     def request_and_receive_async(self, req: LlmRequest) -> None:
         """Start receiving ``req``'s KV cache without blocking.

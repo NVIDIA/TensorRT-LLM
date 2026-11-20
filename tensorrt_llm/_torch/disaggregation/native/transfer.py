@@ -2439,7 +2439,9 @@ class Sender(SenderBase):
                     f"failing REQUEST_DATA for peer rid={info.unique_rid} "
                     f"rank={info.instance_rank}"
                 )
-                self._send_failed_result_to_receiver(info)
+                self._send_failed_result_to_receiver(
+                    info, include_aux=info.aux_slot is not None and info.slice_id == 0
+                )
             return
         with session.lock:
             with self._sessions_lock:
