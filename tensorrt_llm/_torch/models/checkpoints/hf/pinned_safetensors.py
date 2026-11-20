@@ -3,11 +3,19 @@
 
 """Read SafeTensors tensors with ``preadv`` into pinned host memory.
 
-``PinnedSafetensorsFile`` provides the ``keys`` / ``get_tensor`` subset of
-``safe_open(path, framework="pt", device="cpu")``. Each tensor is read with
-large ``preadv`` calls into its own block; blocks of 64 KiB or more come from
-PyTorch's pinned host allocator when pinning is preferred. Every returned tensor
-owns its memory.
+``PinnedSafetensorsFile`` provides the ``keys`` / ``get_tensor`` / ``get_slice``
+subset of ``safe_open(path, framework="pt", device="cpu")``. Each tensor is read
+with large ``preadv`` calls into its own block; blocks of 64 KiB or more come
+from PyTorch's pinned host allocator when pinning is preferred. Every returned
+tensor owns its memory.
+
+``get_slice(key)`` returns a lazy ``PinnedSafetensorsSlice`` with ``get_shape``,
+``get_dtype`` and ``__getitem__``. Indexing reads only the rows of the leading
+dimension that the index covers (one block per call) and applies the remaining
+indexing in memory. The slice is valid only while the file is open.
+
+The generic Hugging Face checkpoint loader does not use this module by itself;
+callers opt in per loader.
 """
 
 import json
@@ -47,8 +55,108 @@ _READ_BYTES = 64 * 1024 * 1024
 _MAX_HEADER_BYTES = 100 * 1000 * 1000
 
 
+def _torch_dtype(key: str, dtype_name: str) -> torch.dtype:
+    dtype = getattr(torch, _DTYPE_ATTRS.get(dtype_name, ""), None)
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(
+            f"{key!r}: safetensors dtype {dtype_name} not supported by PinnedSafetensorsFile"
+        )
+    return dtype
+
+
+def _check_slice_bound(value: object, what: str) -> None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        raise TypeError(f"unsupported slice {what} {value!r}: expected int or None")
+
+
+def _normalize_index(index: object, ndim: int) -> tuple[int | slice, ...]:
+    """Expand ``index`` to one ``int`` or ``slice`` per dimension.
+
+    Accepts an int, a slice, ``Ellipsis`` or a tuple of them; anything else
+    (lists, tensors, ``None``, bools) raises ``TypeError``.
+    """
+    items = index if isinstance(index, tuple) else (index,)
+    ellipsis_at = None
+    for pos, item in enumerate(items):
+        if item is Ellipsis:
+            if ellipsis_at is not None:
+                raise IndexError("an index can only have a single ellipsis ('...')")
+            ellipsis_at = pos
+        elif isinstance(item, slice):
+            for name in ("start", "stop", "step"):
+                _check_slice_bound(getattr(item, name), name)
+        elif isinstance(item, bool) or not isinstance(item, int):
+            raise TypeError(
+                f"unsupported index type {type(item).__name__} ({item!r}): "
+                "only int, slice and Ellipsis are supported"
+            )
+    given = len(items) - (ellipsis_at is not None)
+    if given > ndim:
+        raise IndexError(f"too many indices for a tensor of {ndim} dimensions: {given}")
+    fill = (slice(None),) * (ndim - given)
+    if ellipsis_at is None:
+        return (*items, *fill)
+    return (*items[:ellipsis_at], *fill, *items[ellipsis_at + 1 :])
+
+
+class PinnedSafetensorsSlice:
+    """Lazy view of one tensor, like the ``PySafeSlice`` of ``safe_open(...).get_slice``.
+
+    Valid only while the ``PinnedSafetensorsFile`` that made it is open; reads
+    after ``__exit__`` raise ``ValueError``. ``get_shape`` and ``get_dtype`` come
+    from the header and keep working.
+    """
+
+    def __init__(self, file: "PinnedSafetensorsFile", key: str) -> None:
+        self._file = file
+        self._key = key
+        self._dtype_name, self._shape, self._offset, self._nbytes = file._entries[key]
+
+    def get_shape(self) -> list[int]:
+        return list(self._shape)
+
+    def get_dtype(self) -> str:
+        """The SafeTensors dtype name, e.g. ``"BF16"``."""
+        return self._dtype_name
+
+    def __getitem__(self, index: object) -> torch.Tensor:
+        if self._file._fd < 0:
+            raise ValueError(f"{self._file._path}: slice of {self._key!r} used after file close")
+        index = _normalize_index(index, len(self._shape))
+        dtype = _torch_dtype(self._key, self._dtype_name)
+        if not self._shape:
+            return self._file.get_tensor(self._key)
+        rows = self._shape[0]
+        lead, rest = index[0], index[1:]
+        if isinstance(lead, int):
+            first = lead + rows if lead < 0 else lead
+            if not 0 <= first < rows:
+                raise IndexError(f"index {lead} is out of bounds for dimension 0 with size {rows}")
+            count, local = 1, 0
+        else:
+            start, stop, step = lead.indices(rows)
+            if step < 0:
+                raise ValueError("slice step must be positive")
+            n = len(range(start, stop, step))
+            # Read the covering row range; ``step`` is applied in memory.
+            first, count = (start, (n - 1) * step + 1) if n else (0, 0)
+            local = slice(None, None, step)
+        row_bytes = self._nbytes // rows if rows else 0
+        buf = self._file._read_block(self._key, self._offset + first * row_bytes, count * row_bytes)
+        out = buf.view(dtype).reshape(count, *self._shape[1:])[(local, *rest)]
+        if (
+            out.is_contiguous()
+            and out.storage_offset() == 0
+            and out.untyped_storage().nbytes() == out.numel() * out.element_size()
+        ):
+            return out
+        # A strided or partial view of the block: copy into a fresh block.
+        pin = out.numel() * out.element_size() >= _PIN_MIN_BYTES and prefer_pinned()
+        return torch.empty(tuple(out.shape), dtype=dtype, pin_memory=pin).copy_(out)
+
+
 class PinnedSafetensorsFile:
-    """Context manager with the ``keys`` / ``get_tensor`` subset of ``safe_open``."""
+    """Context manager with the ``keys`` / ``get_tensor`` / ``get_slice`` subset of ``safe_open``."""
 
     def __init__(self, path: str) -> None:
         self._path = path
@@ -100,11 +208,14 @@ class PinnedSafetensorsFile:
 
     def get_tensor(self, key: str) -> torch.Tensor:
         dtype_name, shape, offset, nbytes = self._entries[key]
-        dtype = getattr(torch, _DTYPE_ATTRS.get(dtype_name, ""), None)
-        if not isinstance(dtype, torch.dtype):
-            raise TypeError(
-                f"{key!r}: safetensors dtype {dtype_name} not supported by PinnedSafetensorsFile"
-            )
+        dtype = _torch_dtype(key, dtype_name)
+        return self._read_block(key, offset, nbytes).view(dtype).reshape(shape)
+
+    def get_slice(self, key: str) -> PinnedSafetensorsSlice:
+        return PinnedSafetensorsSlice(self, key)
+
+    def _read_block(self, key: str, offset: int, nbytes: int) -> torch.Tensor:
+        """``nbytes`` file bytes at ``offset`` in a new uint8 block (pinned when large)."""
         pin = nbytes >= _PIN_MIN_BYTES and prefer_pinned()
         buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=pin)
         view = memoryview(buf.numpy()).cast("B")
@@ -116,7 +227,7 @@ class PinnedSafetensorsFile:
             if n <= 0:
                 raise OSError(f"{self._path}: short read of {key!r} at byte {offset + done}")
             done += n
-        return buf.view(dtype).reshape(shape)
+        return buf
 
     def _pread(self, n: int, offset: int) -> bytes:
         data = b""
