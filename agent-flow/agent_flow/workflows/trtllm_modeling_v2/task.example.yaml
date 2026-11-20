@@ -119,13 +119,17 @@ environment:
   # --- session_spool ------------------------------------------------------
   # REQUIRED with session_spool: the gate spool, a directory a running session watches.
   # spool: /path/to/scratch/spool
-  # gpus_per_node: 4
+  # gpus_per_node: 4                        # a member or a deployment wider than this spans nodes
   # gpu_memory_gib: 288                     # per device: engines and disagg are sized by it
   # time_limit: "04:00:00"                  # the bare spool's own session
   # The image the GPU jobs run in, if any, and how host paths appear inside it. How the image is
   # started is yours.
   # container_image: /path/to/image
   # mounts: [/data:/data]
+  # The site's words that enter the session's container on a step across nodes: the image, the
+  # container's name, and where the site needs them its mounts and an account (README).
+  # step_args: [--container-image=/path/to/image, --container-name=mv2flow,
+  #             "--container-mounts=/data:/data"]
   #
   # The sessions the run stands on, each a process on a GPU node whose main process is the spool
   # scheduler (a bare `spool` is one, `default`); `trtllm-modeling-v2 session render --task
@@ -133,7 +137,9 @@ environment:
   # work. With a `time_limit` it is in hand-over `handover_lead` before its end: start the next
   # session on the same spool before then and it takes the jobs that no longer fit.
   # `nodes: N` runs the entry once on each of N nodes, each a watcher of the spool: a job submitted
-  # with `--nodes N` holds them all. No check of this workflow needs more than one node.
+  # with `--nodes N` holds them all. A member wider than `gpus_per_node` (dep16 on 4-GPU nodes)
+  # or a disaggregated deployment across nodes needs a gates session of that many nodes, started
+  # with its lead (README, "anything wider than one node"); otherwise one node is enough.
   # sessions:
   #   - name: a
   #     spool: /path/to/scratch/spool          # the gate spool above; absolute, one per session
@@ -196,12 +202,27 @@ accuracy:
   # the untagged row: for a quantized checkpoint the bf16 number. Flat, or per unit:
   # discriminators: {core: {quant_algo: NVFP4}, mtp: {quant_algo: NVFP4, spec_dec_algo: MTP}}
 
-  # The DISAGG gate: disaggregation is proven by the tree's own kind of test, a pytest node that
-  # serves the model through `trtllm-serve disaggregated` (a context and a generation engine, the
-  # KV hand-off between them) and scores a benchmark across that hop. The run writes it beside the
-  # tree's tests that already do so for other models; the gate runs it from its pytest root, as CI
-  # does, and passes only when every test the node id selects passed (a skip fails it). REQUIRED
-  # with the disagg feature.
+  # The DISAGG gate: a benchmark scored across the hop of disaggregated serving. REQUIRED with the
+  # disagg feature, in one of two forms.
+  #
+  # The deployment, stated with the tree's own three files (`examples/kimi_k3/disagg/`), which
+  # the flow serves itself: one `trtllm-serve --config <its side's file>` per instance with its
+  # role, `trtllm-serve disaggregated -c` over them, then the disagg unit's benchmark through the
+  # proxy, held to the floor the accuracy gate holds that unit to. The flow reads from
+  # the files only how many servers a side has (`<side>_servers.num_instances`) and a server's
+  # ranks (`tensor_parallel_size` x `pipeline_parallel_size`), one device a rank: one job on one
+  # node when it fits, else a job of whole nodes (2 x DEP4 + 3 x TEP4 on 4-GPU nodes: 5 nodes).
+  # disagg:
+  #   config: disagg_config.yaml                     # trtllm-serve disaggregated -c
+  #   context: ctx_config.yaml                       # trtllm-serve --config of every context server
+  #   generation: gen_config.yaml                    # ... of every generation server
+  #   env: {UCX_TLS: "^cuda_ipc"}                    # what the servers need
+  #   timeout: 7200
+  #
+  # Or the tree's own kind of test: a pytest node that serves the model through `trtllm-serve
+  # disaggregated` and scores a benchmark across that hop. The run writes it beside the tree's
+  # tests that already do so for other models; the gate runs it from its pytest root, as CI does,
+  # and passes only when every test the node id selects passed (a skip fails it).
   # disagg:
   #   test: tests/integration/defs/accuracy/test_disaggregated_serving.py::TestMyModel::test_auto_dtype
   #   env: {LLM_MODELS_ROOT: /path/to/models}   # what the test reads

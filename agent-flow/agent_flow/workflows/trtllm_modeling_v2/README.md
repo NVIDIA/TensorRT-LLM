@@ -80,7 +80,36 @@ a container runtime, a shell). The run needs:
 - a session with a `time_limit` to be followed before its end: from `handover_lead` before then it
   starts only jobs that fit, and the next session started on the same spool takes the rest;
 - one orchestrator per workspace (a new one resumes from it), on a host that sees the run
-  directory, checkout and checkpoints at the same paths as every session.
+  directory, checkout and checkpoints at the same paths as every session;
+- for anything wider than one node (`environment.gpus_per_node`), a gates session of that many
+  nodes (`nodes: N`, a watcher on each) **and its lead**. A member wider than a node (`dep16` on
+  4-GPU nodes) and a disaggregated deployment across nodes are jobs of whole nodes. A watcher
+  runs inside the container on one node and nothing it starts reaches another, so the lead runs
+  such a job once: the same scheduler with no devices, on the allocation's batch host, outside
+  the container. `session render` writes its entry beside the session's (`session_lead.sh`):
+  run it once there, beside the step that runs the entry on each node. The run's paths are the
+  same inside and outside the container: the lead enters a job's tree by its path.
+  Each world of such a job is a **step** of the allocation: `srun --overlap` (it shares its
+  nodes with the watchers' step) `--mpi=pmix`, with the counts and the hosts, which are the
+  flow's. `environment.step_args` states the site's words, whatever a step needs to see what
+  the watchers' step sees: `--container-image=...`, `--container-name=...`, and where the site
+  needs them the mounts (a step without them dies at once: `cd: <the job's tree>: No such file
+  or directory`) and an account. A step's shell is a fresh one, so `session render` also
+  writes `session_env.sh`, the entry's exports and setup lines, which every step reads first:
+  render again after changing either. Every step keeps its Triton cache under its node's
+  `TMPDIR` when the run declares one, so that is a directory of each node. This is Slurm with
+  a named container; the flow starts a world across nodes no other way.
+
+**Disaggregation.** `accuracy.disagg` states one of two things. A deployment, as the tree
+states one, with three files: `config` for `trtllm-serve disaggregated -c` and the LLM-API
+options of the `context` and of the `generation` servers (`trtllm-serve --config`), as in
+`examples/kimi_k3/disagg/`. The flow serves it itself, one `trtllm-serve` per instance behind
+`trtllm-serve disaggregated`, and scores the unit's benchmark through the proxy, held to the
+floor the accuracy gate holds that unit to. It reads from the files only how many servers a
+side has and how many ranks one has; each server gets its side's file as it is. On one node
+its job starts the servers there; across nodes it is one step per instance. Or a `test`: the node id of
+a disaggregated-serving accuracy test the run writes beside the tree's own, which the gate runs
+as CI does. State the deployment unless the request needs a test of its own.
 
 `trtllm-modeling-v2 monitor status` shows each session, and raises `SESSION_ENDING` while one is in
 hand-over with no newer session on its spool. A gate or test job the run has

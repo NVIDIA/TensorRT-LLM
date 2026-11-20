@@ -75,20 +75,23 @@ class CheckRunner:
         return list(features_through(self.task_data, unit))
 
     def _member_env(self, member: str | None) -> RunEnvironment:
-        """The run's environment at ``member``'s own world size.
+        """The run's environment at ``member``'s own world size, on the nodes it spans.
 
         Members of one unified target may differ in width (tp1 beside tep4)
         when a scheduler hands each gate job its own devices.
         """
         env = self.workflow._gate_env()
         size = parse_parallel_segment(member)[1] if member else None
-        return replace(env, world_size=size) if size else env
+        return env.at_width(size) if size else env
 
-    def _member_runner(self, member: str | None, gpus: str | None = None, *, nodes: int = 1) -> Any:
+    def _member_runner(
+        self, member: str | None, gpus: str | None = None, *, nodes: int = 1, lead: bool = False
+    ) -> Any:
         """The gate runner for ``member``: under a scheduler, a job asking for its world size.
 
         ``gpus`` overrides the request, for a check that starts more engines
-        than one member's worth (the disaggregated-serving test's two).
+        than one member's worth (the disaggregated-serving test's two). ``lead``:
+        the session's lead runs the job.
         """
         env = self._member_env(member)
         if self.workflow._shell_runner_override is not None:
@@ -101,7 +104,7 @@ class CheckRunner:
         # A session's spool starts a check of a higher class first (job_priority).
         priority = current_job_priority()
         cache = self._member_runners
-        key = (want, priority, nodes)
+        key = (want, priority, nodes, *(("lead",) if lead else ()))
         if key not in cache:
             executor = select_command_executor(
                 env,
@@ -109,6 +112,7 @@ class CheckRunner:
                 gpus=want,
                 priority=priority,
                 nodes=nodes,
+                lead=lead,
                 note=lambda said: self.journal.event("waiting", said),
             )
             cache[key] = self._noting_session_loss(shell_runner_for(executor))
@@ -334,10 +338,11 @@ class CheckRunner:
     def _with_dataset(self, spec: Any, gate: str) -> Any:
         """``spec`` with the staged dataset its gate reads (``startup/datasets.py``), once ready.
 
-        A benchmark gets it as ``accuracy.dataset_path`` (``trtllm-eval --dataset_path``);
-        the disaggregated test, which reads it under ``$LLM_MODELS_ROOT``, a models root
-        that holds it. A dataset still being staged is waited for; one that could not be is
-        left out, and the gate runs as it would without it.
+        A benchmark (a stated disaggregated deployment's too) gets it as
+        ``accuracy.dataset_path`` (``trtllm-eval --dataset_path``); the disaggregated test, which
+        reads it under ``$LLM_MODELS_ROOT``, a models root that holds it. A dataset still
+        being staged is waited for; one that could not be is left out, and the gate runs as
+        it would without it.
         """
         accuracy = dict(spec.get("accuracy") or {})
         benchmark = gate[len("accuracy[") : -1] if gate.startswith("accuracy[") else "gsm8k"
@@ -346,7 +351,7 @@ class CheckRunner:
         path = datasets_mod.wait(self.workspace, benchmark)
         if not path:
             return spec
-        if gate == disagg.GATE_NAME:
+        if gate == disagg.GATE_NAME and (accuracy.get("disagg") or {}).get("test"):
             block = dict(accuracy.get("disagg") or {})
             env = dict(block.get("env") or {})
             outer = (spec.get("environment") or {}).get("env") or {}
@@ -474,14 +479,10 @@ class CheckRunner:
     def _gate(self, check: contract_mod.Check, log) -> Any:
         """Run ``check``'s gate on the target this workflow sees, journal it, and return its result."""
         call = self._gate_call(check)
-        disagg_spec = (
-            disagg.DisaggSpec.from_task(self._spec_for(check.unit)[0])
-            if check.gate == disagg.GATE_NAME
-            else None
+        nodes, lead = disagg.job_span(
+            self._spec_for(check.unit)[0], check.gate, self._member_env(check.member).nodes
         )
-        runner = self._member_runner(
-            check.member, self._gate_gpus(check), nodes=disagg_spec.nodes if disagg_spec else 1
-        )
+        runner = self._member_runner(check.member, self._gate_gpus(check), nodes=nodes, lead=lead)
         result = self._gate_until_verdict(lambda: call(runner), log)
         self.gate_log.record(result)
         self.journal.event("gate", result.summary())

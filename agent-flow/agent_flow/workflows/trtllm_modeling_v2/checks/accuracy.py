@@ -275,16 +275,6 @@ def run_accuracy_gate(
     _verdict = verdict_factory(inspect_tree(task_data))
     planned, _ = resolve_floor(accuracy, unit, benchmark, reference, relative=relative)
 
-    def floor_fields(floor: accuracy_policy.Floor | None) -> dict[str, Any]:
-        if floor is None:
-            return {}
-        return {
-            "floor": floor.value,
-            "se": floor.se,
-            "samples": floor.samples,
-            "floor_rule": floor.describe(),
-        }
-
     name = f"accuracy[{benchmark}]"
     common = dict(name=name, member=member, reference=reference, tolerance=tolerance)
     config = check_configuration(
@@ -326,37 +316,60 @@ def run_accuracy_gate(
     if failure:
         return _verdict(passed=False, detail=failure, **ran, **floor_fields(planned))
 
-    pattern = resolve_per_unit(accuracy, "score_pattern", unit)
-    measured = parse_eval_score(combined, pattern)
-    if measured is None:
-        return _verdict(
-            passed=False,
-            detail=unparsed_score_detail(combined, pattern),
-            **ran,
-            **floor_fields(planned),
-        )
+    judged = judge_score(
+        accuracy, unit, benchmark, reference, combined, relative=relative,
+        note="; score validation only; eval cache reuse was not probed (zero hits are not a failure)",
+    )  # fmt: skip
+    return _verdict(**({} if "measured" in judged else floor_fields(planned)), **judged, **ran)
 
-    floor, source = resolve_floor(accuracy, unit, benchmark, reference, combined, relative)
+
+def judge_score(
+    accuracy: Mapping[str, Any],
+    unit: str | None,
+    benchmark: str,
+    reference: float,
+    output: str,
+    *,
+    relative: bool = False,
+    said: str = "measured",
+    note: str = "",
+) -> dict[str, Any]:
+    """A verdict's fields for a benchmark's ``output``: its score against the unit's floor.
+
+    Shared with the disagg gate, whose detail opens with ``said``.
+    """
+    pattern = resolve_per_unit(accuracy, "score_pattern", unit)
+    measured = parse_eval_score(output, pattern)
+    if measured is None:
+        return dict(passed=False, detail=unparsed_score_detail(output, pattern))
+    floor, source = resolve_floor(accuracy, unit, benchmark, reference, output, relative)
     if floor is None:
-        return _verdict(
+        return dict(
             passed=False,
-            detail=f"measured {measured:.4f}, but the statistical floor needs the sample "
+            detail=f"{said} {measured:.4f}, but the statistical floor needs the sample "
             f"count and there is {source}. A floor that cannot be computed is not a pass",
             measured=measured,
-            **ran,
         )
     passed = measured >= floor.value
-    return _verdict(
+    return dict(
         passed=passed,
-        detail=(
-            f"measured {measured:.4f} {'>=' if passed else '<'} {floor.value:.4f} "
-            f"({floor.describe()}; count from {source}); score validation only; "
-            "eval cache reuse was not probed (zero hits are not a failure)"
-        ),
+        detail=f"{said} {measured:.4f} {'>=' if passed else '<'} {floor.value:.4f} "
+        f"({floor.describe()}; count from {source}){note}",
         measured=measured,
-        **ran,
         **floor_fields(floor),
     )
+
+
+def floor_fields(floor: accuracy_policy.Floor | None) -> dict[str, Any]:
+    """A verdict's fields of ``floor``."""
+    if floor is None:
+        return {}
+    return {
+        "floor": floor.value,
+        "se": floor.se,
+        "samples": floor.samples,
+        "floor_rule": floor.describe(),
+    }
 
 
 def resolve_reference(
@@ -401,6 +414,7 @@ __all__ = [
     "ACCURACY_TIMEOUT_S",
     "eval_command",
     "eval_harness_command",
+    "judge_score",
     "load_reference_score",
     "parse_eval_score",
     "resolve_discriminators",

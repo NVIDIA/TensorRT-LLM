@@ -57,12 +57,14 @@ goal words cannot say.
 | the request says | the spec | why |
 |---|---|---|
 | members, e.g. "TP4, TEP4, ADP4" | `members: [tp4, tep4, dep4]` (ADP = attention DP + EP = `dep`) | |
+| a member wider than one node, e.g. "DEP16 on GB300" (4 GPUs a node) | `members: [dep16]`, `environment.gpus_per_node: 4`, a gates session of `nodes: 4` started with its lead, and `environment.step_args` (README, "anything wider than one node"); a width that fills whole nodes | the member is **one engine across nodes**: each of its checks is a job of whole nodes that the session's lead runs once |
 | "X needs full validation" | X takes every unit and **one variant per feature axis** at X: the variant's `members: [X]`, `gates: [accuracy]` | a cross product of axes (KV dtype x chunking x reuse ...) multiplies the contract; add a combination only when the request names it |
 | "Y only aggregate / text-only" | Y in `members.default` for core alone | |
 | "<feature> smoke" | the feature in `features`, `profile: {<feature>: smoke}`, its members narrowed | |
 | a KV cache dtype list | base `kv_cache_config.dtype: auto`; one variant per other dtype (`llm_api_options.kv_cache_config.dtype`, `gates: [accuracy]`) | |
 | chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `runtime: {kv_cache_reuse: true}` (the runtime switch decides: `kv_cache_config.enable_block_reuse` alone is overwritten by it), each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined unless the request names the combination |
-| disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
+| disagg, the deployment known ("context 2 x DEP4, generation 3 x TEP4") | the tree's own three files, as `examples/kimi_k3/disagg/` has them: `accuracy.disagg.config` (the proxy's, for `trtllm-serve disaggregated -c`: `context_servers.num_instances`, `generation_servers.num_instances`), `.context` and `.generation` (the LLM-API options a server of that side takes with `--config`: its own layout, limits, transceiver); the servers' environment in `accuracy.disagg.env` (`UCX_TLS` ...) | **the flow serves it**: one `trtllm-serve` per instance behind `trtllm-serve disaggregated`, the disagg unit's benchmark (the tree's own `trtllm-eval` command of it, with the unit's `benchmark_args`) scored through the proxy and held to that unit's anchor. A server gets its side's file as it is (the gate adds `modeling_v2: require`), nothing of the unit's options. The flow reads only the instances and a server's ranks (`tensor_parallel_size` x `pipeline_parallel_size`), one device a rank. It is one job on one node when its ranks fit; else a job across a gates session's nodes, as a wide member's is |
+| disagg, proven by a test of its own | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
 | any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
 | workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192) | |
 
@@ -85,8 +87,13 @@ the checks behind each (`coverage.yaml`):
 
 `--dry-run` journals the contract's checks per unit and variant; past ~30 deserves a second look.
 
-**The disagg test.** The run writes it; the flow deploys nothing of its own. Name the node id it
-will have, say in `notes` which task writes it, and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
+**Disagg: the deployment or a test.** State the deployment whenever the request says how it is
+served: no agent then writes serving or test code, and the check is the same for every model.
+It needs an anchor row for the disagg unit and its benchmark's data where the gates run (`accuracy.dataset_path`
+or the offline caches).
+
+A `test` is the other way: the run writes it; the flow deploys nothing of its own. Name the node
+id it will have, say in `notes` which task writes it, and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
 devices, a missing model root) fails the gate: set `accuracy.disagg.devices` when it needs more
 than two engines at its member's width.
 
@@ -150,6 +157,11 @@ built), and say so in `notes`; a benchmark you start by hand runs captured too.
   before launch.
 - Gate jobs go to `environment.spool` and every `gates` or `any` session; a `work` session gets
   only what a worker submits to it.
+- `environment.gpus_per_node` (or a session's) is what tells a member or a deployment wider
+  than one node from one that fits: without it everything is launched on one node. What spans
+  nodes needs a gates session of that many nodes (`nodes: N`) started with its lead,
+  `environment.step_args`, and a `TMPDIR` that is a directory of each node: README, "anything
+  wider than one node". Preflight refuses a spec whose gates sessions hold too few nodes.
 
 ## 7. Agents: yours
 
