@@ -309,8 +309,17 @@ def fused_topk_routing_rep_kernel(
         )
     if rank == cutlass.Int32(0) and tidx < cutlass.Int32(_EXPERTS):
         # One global expert e = tidx per thread; warps 2r, 2r+1 cover EP rank r's 64 experts.
-        while not prims.mbarrier_try_wait_parity(count_bar.subview(0), 0):
+        # The peers' st.async complete-tx releases at cluster scope; a CTA-scope
+        # acquire does not order the all_counts reads below after it. A relaxed
+        # cluster-scope wait plus an acquire fence restricted to shared::cluster does.
+        while not prims.mbarrier_try_wait_parity(
+            count_bar.subview(0),
+            0,
+            scope=prims.MBarrierScope.CLUSTER,
+            order=prims.MemOrder.RELAXED,
+        ):
             pass
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
         rank_prefix = cutlass.Array(cutlass.Int32, CLUSTER_CTAS)
         total = cutlass.Int32(0)
         for r in cutlass.range_constexpr(CLUSTER_CTAS):
@@ -438,8 +447,16 @@ def fused_topk_routing_rep_kernel(
             num_non_exiting_tiles[0] = active_tiles
             total_num_padded_tokens[0] = active_tiles * cutlass.Int32(_TILE)
     if (valid and lane < cutlass.Int32(_TOP_K)) or tidx == cutlass.Int32(0):
-        while not prims.mbarrier_try_wait_parity(base_bar.subview(0), 0):
+        # Rank 0's st.async completes base_bar at cluster scope: same acquire as above
+        # before the base reads below.
+        while not prims.mbarrier_try_wait_parity(
+            base_bar.subview(0),
+            0,
+            scope=prims.MBarrierScope.CLUSTER,
+            order=prims.MemOrder.RELAXED,
+        ):
             pass
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
     if valid and lane < cutlass.Int32(_TOP_K):
         expanded = token * cutlass.Int32(_TOP_K) + lane
         permuted = cutlass.Int32(-1)
