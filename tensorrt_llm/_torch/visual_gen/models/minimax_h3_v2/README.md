@@ -102,10 +102,14 @@ Change H3's tile selection or coarse/fine merge in the [family VSA op](ops/vsa.p
 
 ```text
 Base H3 / H3UlyssesAttention (family component)
-  sync   exchange projected Q/K/V ------------------------------+
-                                                                +-> local attention -> output all-to-all
-  async  project/push V, Q, K -> wait -> restore Q/K/V layout --+
+  sync   pack Q/K/V by rank -> all-to-all -> arrange received Q/K/V
+  async  project/pack/push V, Q, K -> wait -> arrange received Q/K/V
+
+  both   local attention (full sequence, local heads)
+         -> output all-to-all -> local sequence shard
 ```
+
+The synchronous exchange returns packed QKV when the backend accepts it. Otherwise it arranges separate Q/K/V tensors in the backend's sequence-major (NHD) or head-major (HND) order. The asynchronous path calls `ulysses_unscatter_qkv` on the receive buffers after all three pushes complete.
 
 The [sequence sharder](components/sequence_sharder.py) pads, shards and gathers DiT and refiner rows. The [tiled VAE](components/tiled_vae.py) distributes video decode tiles. Base H3 uses these parallel paths. FastH3 runs on one GPU. The V1 [token-sharded TP layout](../../parallel/token_sharded_tp.py) is a separate feature used by Wan.
 
