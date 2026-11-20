@@ -265,6 +265,21 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality() -> None:
     with pytest.raises(ValueError, match="token tags"):
         attn.forward(q, k, v, token_tags=token_tags[:-1])
 
+    # A group short of its half gives all its tokens and the other group fills the draw, so a
+    # mostly-text sequence still draws the full count; a sequence of padding draws nothing, which
+    # the preparation rejects instead of running on no rows.
+    mostly_text = torch.ones(seq_len, dtype=torch.int32, device=device)
+    mostly_text[:5] = 0
+    rows = deco_attention.sample_rows(seq_len, device, mostly_text)
+    assert rows.numel() == deco_attention.inputs.sample_count(seq_len)
+    assert int((mostly_text[rows.long()] == 0).sum()) == 5
+    padding = torch.full((seq_len,), -1, dtype=torch.int32, device=device)
+    assert deco_attention.sample_rows(seq_len, device, padding).numel() == 0
+    with pytest.raises(ValueError, match="at least one token"):
+        deco_attention.prepare(
+            q, k, v, workspace, "fp8", rows=torch.empty(0, dtype=torch.int32, device=device)
+        )
+
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
 def test_deco_valid_seq_len_attends_the_prefix(v_dtype: str) -> None:
