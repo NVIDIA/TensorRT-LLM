@@ -63,9 +63,10 @@ class TimeModel:
     tile beyond the first of the GPU's busiest slot. A layer takes its busiest GPU's time, and
     ``route_us`` more while it holds a replica: the route op's path that spreads an expert's rows.
     With ``time_shares``, :func:`solve_shares` minimizes the busiest GPU's time, not its rows.
-    ``scales`` holds ``(rows, scale, per_active_slot_us, route_us, time_shares)`` per calibrated
-    CUDA graph bucket, ascending by the rows a GPU's tokens route per forward in it (:meth:`at`);
-    empty, the fields hold at every size.
+    ``scales`` holds ``(rows, scale, per_active_slot_us, route_us, time_shares[, tile_rows[,
+    trusted]])`` per calibrated CUDA graph bucket, ascending by the rows a GPU's tokens route per
+    forward in it (:meth:`at`), a bucket's tile rows those of its kernels' tactic; an untrusted bucket
+    failed its hold-out check, so nothing is decided there. Empty, the fields hold at every size.
     """
 
     per_active_slot_us: float
@@ -74,9 +75,10 @@ class TimeModel:
     hot_slot_extra_tile_us: float
     scale: float
     tile_rows: int
-    scales: tuple[tuple[float, float, float, float, bool], ...] = ()
+    scales: tuple[tuple, ...] = ()
     route_us: float = 0.0
     time_shares: bool = False
+    trusted: bool = True  # False: the bucket failed its calibration's hold-out check
 
     def at(self, rows: float) -> TimeModel:
         """The model of the smallest bucket of at least ``rows`` rows per GPU per forward, the
@@ -84,8 +86,13 @@ class TimeModel:
         if not self.scales:
             return self
         i = bisect.bisect_left([size for size, *_ in self.scales], rows)
-        _, scale, read, route, timed = self.scales[min(i, len(self.scales) - 1)]
+        _, scale, read, route, timed, *rest = self.scales[min(i, len(self.scales) - 1)]
         bucket = dict(per_active_slot_us=read, route_us=route, time_shares=timed)
+        tile = rest[0] if rest else self.tile_rows
+        bucket["trusted"] = rest[1] if len(rest) > 1 else True
+        k = tile / self.tile_rows  # a tile costs its rows
+        bucket.update(tile_rows=tile, per_extra_tile_us=k * self.per_extra_tile_us)
+        bucket.update(hot_slot_extra_tile_us=k * self.hot_slot_extra_tile_us)
         return replace(self, scale=scale, scales=(), **bucket)
 
     @property

@@ -38,7 +38,7 @@ import dataclasses
 import functools
 import math
 import weakref
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -1090,6 +1090,32 @@ def _default_megamoe_tactic_for_key(
     if combine_dedup and _sm107_default_combine_dedup(problem_key):
         return _with_combine_dedup(tactic)
     return tactic
+
+
+_MEGAMOE_LAUNCHED_TACTICS: Dict[Tuple, Tuple] = {}
+"""The tactic the last launch (not a profiling one) of each problem ran, by
+:func:`megamoe_launch_key`: the default tables' or the autotuner's choice, as the launch resolved it."""
+
+
+def megamoe_launch_key(
+    world_size: int,
+    num_topk: int,
+    num_experts_per_rank: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    max_tokens_per_rank: int,
+    combine_format: str,
+) -> Tuple:
+    """The key of :data:`_MEGAMOE_LAUNCHED_TACTICS`: a layer geometry and its launch bucket."""
+    return (
+        int(world_size),
+        int(num_topk),
+        int(num_experts_per_rank),
+        int(hidden_size),
+        int(intermediate_size_per_partition),
+        int(max_tokens_per_rank),
+        str(combine_format),
+    )
 
 
 def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
@@ -3295,6 +3321,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tactic_t,
                 allow_fallback=use_default_tactic,
             )
+            if self._profiling_scratch is None:  # a real launch, not an autotuner candidate
+                key = megamoe_launch_key(
+                    self.world_size,
+                    self.num_topk,
+                    self.num_experts_per_rank,
+                    self.hidden_size,
+                    self.intermediate_size_per_partition,
+                    self.max_tokens_per_rank,
+                    self.combine_format,
+                )
+                _MEGAMOE_LAUNCHED_TACTICS[key] = _unpack_tactic(tactic_t)
             if shared_workspace is not None:
                 _require_megamoe_shared_workspace(
                     kernel, shared_workspace, self.num_experts_per_rank

@@ -30,6 +30,8 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
 from ..moe_load_balancer import BaseMoeLoadBalancer
+from . import calibrate
+from .calibrate import CALIBRATION
 from .policy import (
     ExpertGeometry,
     ExpertStatistics,
@@ -80,8 +82,6 @@ def time_layer_copy(
     return max(transport.allgather(start.elapsed_time(end))) / max(1, replicas)
 
 
-CALIBRATION = ("tensorrt_llm.adaptive_eplb.decode_time_model", 1)
-"""Schema and version of a calibration file of the decode time model."""
 TERMS = ("per_active_slot_us", "route_us")  # a calibration file's optional costs per bucket (us)
 
 
@@ -140,7 +140,6 @@ def load_time_model(
     ``path`` names (per CUDA graph bucket a scale and, where it gives them, :data:`TERMS`);
     ``(None, why)`` when it does not hold for the ``identity`` of this run or a decode bucket of
     ``tokens`` tokens per GPU. ``ValueError`` when the file is malformed."""
-    tile_rows = backend.decode_tile_rows(list(tokens))
     doc = json.loads(Path(path).read_text() if text is None else text)
     if not isinstance(doc, dict) or (doc.get("schema"), doc.get("version")) != CALIBRATION:
         return None, f"{path} is not a calibration file of version {CALIBRATION[1]}"
@@ -154,16 +153,20 @@ def load_time_model(
         and all(isinstance(bucket, dict) for bucket in buckets)
     ):
         raise ValueError(f"{path} does not have the layout of a calibration file")
+
+    def real(x, low=0.0):  # a finite number, above 0 or at least low
+        return type(x) in (int, float) and (x > 0 or x >= low) and x < math.inf
+
     reals = {f"rates.{k}": parts[1].get(k) for k in ("hbm_bytes_per_s", "fp4_dense_flops_per_s")}
-    reals.update({f"buckets[{i}].scale": b.get("scale") for i, b in enumerate(buckets)})
-    bad = [key for key, x in reals.items() if type(x) not in (int, float) or not 0 < x < math.inf]
-    terms = [(f"buckets[{i}].{k}", b[k]) for i, b in enumerate(buckets) for k in TERMS if k in b]
-    bad += [key for key, x in terms if type(x) not in (int, float) or not 0 <= x < math.inf]
+    bad = [key for key, x in reals.items() if not real(x, math.inf)]
     sizes = {f"buckets[{i}].tokens": b.get("tokens") for i, b in enumerate(buckets)}
     bad += [key for key, x in sizes.items() if type(x) is not int or x <= 0]
-    if bad:  # rates and scales positive, the per-bucket costs non-negative, tokens integers
+    if bad:  # the rates positive and the tokens integers, or the file is malformed
         raise ValueError(f"{path}: {', '.join(bad)} out of range")
-    theirs, per_bucket = doc["identity"], ("tactics",)
+    for b in buckets:  # a scale not positive or a cost negative: no model there, as when refused
+        if not (real(b.get("scale"), math.inf) and all(real(b[k]) for k in TERMS if k in b)):
+            b.update(held=False, scale=1.0, **{k: 0.0 for k in TERMS if k in b})
+    theirs, per_bucket = doc["identity"], ("tactics", "launch_buckets", "tile_rows")
     wrong = [key for key in identity if key not in per_bucket and theirs.get(key) != identity[key]]
     bucket_of = {b["tokens"]: b for b in buckets}
     wrong += [f"bucket {t}" for t in tokens if t not in bucket_of]
@@ -177,18 +180,24 @@ def load_time_model(
     if wrong:
         return None, f"{path} does not hold for this run: {', '.join(wrong)} differ or are missing"
     rates = (doc["rates"]["hbm_bytes_per_s"], doc["rates"]["fp4_dense_flops_per_s"])
-    fields = backend.decode_time_model(expert_bytes, rates, tile_rows=tile_rows)
+    known = identity.get("tile_rows", {})
+    tiles = {t: b.get("tile_rows") or known.get(str(t)) for t, b in bucket_of.items()}
+    if not all(tiles.values()):
+        raise ValueError(
+            f"{path}: no tile rows for buckets {[t for t, n in tiles.items() if not n]}"
+        )
+    fields = backend.decode_time_model(expert_bytes, rates, tile_rows=tiles[max(tiles)])
     own = dict(zip(TERMS, (fields["per_active_slot_us"], 0.0)))  # a bucket without them keeps these
     by_rows = tuple(  # a bucket with its measured read cost solves the shares by time
         (t * identity["top_k"], float(b["scale"]), *(float(b.get(k, x)) for k, x in own.items()))
-        + (TERMS[0] in b,)
+        + (TERMS[0] in b, tiles[t], b.get("held", True) is not False)
         for t, b in sorted(bucket_of.items())
     )
     if doc["measurement"].get("trtllm_version") != tensorrt_llm.__version__:
         logger.warning(
             f"{path} was measured with TensorRT LLM {doc['measurement'].get('trtllm_version')}"
         )
-    _, scale, read, route, timed = by_rows[-1]
+    _, scale, read, route, timed, *_ = by_rows[-1]
     fields.update(scale=scale, per_active_slot_us=read)
     return TimeModel(**fields, scales=by_rows, route_us=route, time_shares=timed), None
 
@@ -455,6 +464,8 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         self._flag_value = 0
         self._route_tables: torch.Tensor | None = None
         self._statistics: dict[str, torch.Tensor] | None = None
+        # What before_capture calibrates and starts the runtime with, if prepare_runtime found none.
+        self._pending: tuple | None = None
 
     def is_static_routing(self) -> bool:
         return False
@@ -504,10 +515,12 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         ``decode_tokens`` are the tokens per GPU per forward of every decode bucket the deployment
         runs. Every rank checks, without a kernel launch, that it balances a layer, that the EP
         group is one NVLink domain (:func:`nvlink_domain_error`), that it can copy experts from
-        every EP rank (:meth:`platform_gap`) and that the calibration file ``time_model_file``
-        holds for this run (:func:`load_time_model`); the ranks vote, and where any check fails on
-        any rank, or the ranks balance different layers, every rank logs why and keeps adaptive EPLB
-        off: the layers serve their home layouts and record no statistics.
+        every EP rank (:meth:`platform_gap`) and, under ``time_model`` ``file``, that the file holds
+        for this run (:func:`load_time_model`); the ranks vote, and where any check fails on any
+        rank, or the ranks balance different layers, every rank logs why and keeps adaptive EPLB
+        off: the layers serve their home layouts and record no statistics. Under ``auto``, rank 0's
+        cached calibration of this run serves every rank; without one, :meth:`before_capture`
+        calibrates the time model and starts the runtime.
         """
         backends = find_backends(model, self.layers)
         first = self.layers[0].layer_idx if self.layers else None
@@ -516,26 +529,23 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         prepare_layers(backends, self.layers, device)
         transport = PeerSlotTransport(self.mapping)
         why, hosts = nvlink_domain_error(transport)
-        path, digest = self.config.time_model_file, ""
+        mode, path, digest = self.config.time_model, self.config.time_model_file, ""
         time_model, identity, tokens = None, {}, list(decode_tokens)
         try:  # this rank's checks; whatever they raise becomes its vote, so every rank votes
             why = why or (self.platform_gap(backend) if self.layers else NO_LAYER)
-            if why is None and path is None:
-                why = "no time_model_file, so no time model prices the installs"
+            if why is None and mode == "off":
+                why = "time_model is off, so no time model prices the installs"
             if why is None:
                 expert_bytes = _plan_layer(first, backend).expert_bytes
-                identity = calibration_identity(
-                    backend, self.ep_size, hosts, tokens, self.num_slots
-                )
-                tokens = [t for t in tokens if str(t) in identity["tactics"]]  # one launch each
+            if why is None and mode == "file":  # auto: the warmup's launches name the tactics
+                identity, tokens = self._identity(backend, hosts, tokens)
                 time_model, why = load_time_model(backend, path, expert_bytes, identity, tokens)
                 if time_model is not None:
                     digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
         except Exception as error:  # noqa: BLE001 - the vote carries any error to every rank
             why = f"{type(error).__name__}: {error}"
             logger.warning(f"adaptive EPLB start-up check failed on EP rank {self.ep_rank}: {why}")
-        identity_digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-        votes = transport.allgather((why, digest, len(self.layers), identity_digest))
+        votes = transport.allgather((why, digest, len(self.layers), calibrate.digest(identity)))
         stopped = [f"{gap} (EP rank {rank})" for rank, (gap, *_) in enumerate(votes) if gap]
         if not stopped and len({file for _, file, *_ in votes}) > 1:
             stopped = [f"the EP ranks read different files at {path}"]
@@ -555,7 +565,102 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
             f"adaptive EPLB balances {len(self.layers)} MoE layers; one layer's install copy "
             f"takes {copy_ms:.3f} ms per replica at start-up"
         )
+        if time_model is None:  # auto: cached or calibrated in the CUDA graph warmup
+            self._pending = (backend, hosts, expert_bytes, tokens, copy_ms)
+            self.off_reason = "its time model comes in the CUDA graph warmup, not run yet"
+            logger.info(f"adaptive EPLB stays off until {self.off_reason}")
+            return
         self.start_runtime(time_model, self.mapping.gpus_per_node, copy_ms)
+
+    def _identity(self, backend: object, hosts: int, tokens: list[int]) -> tuple[dict, list[int]]:
+        """The calibration identity of this run and its decode buckets that one launch takes."""
+        identity = calibration_identity(backend, self.ep_size, hosts, tokens, self.num_slots)
+        return identity, [t for t in tokens if str(t) in identity["tactics"]]
+
+    def before_capture(self) -> None:
+        """Under ``time_model`` ``auto``, take rank 0's cached calibration of this run, else calibrate
+        the decode time model (:func:`~.calibrate.calibrate`) and cache it, and start the runtime on
+        it; or log why adaptive EPLB stays off. Once, between the CUDA graph warmup's first pass,
+        which launched every decode bucket (autotuned or not, their tactics are known now), and its
+        capture. Collective over EP; nothing to do otherwise."""
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        backend, hosts, expert_bytes, tokens, copy_ms = pending
+        identity, path, cached, model, why = {}, None, None, None, None
+        try:
+            identity, tokens = self._identity(backend, hosts, tokens)
+            path = calibrate.cache_path(self.config, identity)
+            cached = calibrate.read_cache(path) if self.ep_rank == 0 else None
+        except Exception as error:  # noqa: BLE001 - voted below
+            why = f"{type(error).__name__}: {error}"
+        votes = self.transport.allgather((why, calibrate.digest(identity), cached))
+        why = next((f"{gap} (EP rank {rank})" for rank, (gap, *_) in enumerate(votes) if gap), None)
+        if why is None and len({digest for _, digest, _ in votes}) > 1:
+            why = "the EP ranks resolve different decode kernels"
+        if why is None and votes[0][2] is not None:  # one text, one identity: one outcome
+            try:
+                model, stale = load_time_model(
+                    backend, str(path), expert_bytes, identity, tokens, votes[0][2]
+                )
+            except Exception as error:  # noqa: BLE001 - a file that does not parse is stale
+                stale = f"{type(error).__name__}: {error}"
+            logger.info(
+                f"adaptive EPLB time model cached at {path}" + (f": {stale}" if stale else "")
+            )
+        if why is None and model is None:
+            model, why = self._calibrate(backend, identity, expert_bytes, tokens, path)
+        if why is not None:
+            self.off_reason = f"no decode time model: {why}"
+            logger.warning(f"adaptive EPLB is off: {self.off_reason}")
+            return
+        self.off_reason = None
+        self.start_runtime(model, self.mapping.gpus_per_node, copy_ms)
+
+    def _calibrate(self, backend, identity, expert_bytes, tokens, path) -> tuple:
+        """``(time model, None)`` calibrated and cached, or ``(None, why)``. Collective over EP."""
+        planes = [backend.get_parameter(name) for name, _ in backend.slot_weight_planes()]
+        state = [self._route_tables, *(self._statistics or {}).values(), self._recording_flag]
+        state = [t for t in state + planes if t is not None]
+        before, model = calibrate.snapshot(state), None
+        try:
+            text, why, times = calibrate.calibrate(
+                backend,
+                tokens,
+                identity=identity,
+                expert_bytes=expert_bytes,
+                num_experts=self.layers[0].expert_count,
+                num_slots=self.num_slots,
+                rank=self.ep_rank,
+                gather=self.transport.allgather,
+                settings=calibrate.Settings.of(self.config),
+            )
+            if times and path is not None and self.ep_rank == 0:  # the designs' times, to replay
+                calibrate.write_cache(path.with_suffix(".times.json"), json.dumps(times))
+            for b in json.loads(text)["buckets"] if text and self.ep_rank == 0 else ():
+                keys = ("scale", "se", "holdout_z", "rmse_us", "median_us", "designs", "held")
+                line = ", ".join(f"{k} {b[k]}" for k in keys + ("per_active_slot_us",))
+                (logger.info if b["held"] else logger.warning)(
+                    f"adaptive EPLB bucket {b['tokens']}: {line}"
+                )
+            if why is None:
+                model, why = load_time_model(
+                    backend, str(path), expert_bytes, identity, tokens, text
+                )
+        except Exception as error:  # noqa: BLE001 - voted below
+            why = f"{type(error).__name__}: {error}"
+        changed = not calibrate.unchanged(before, calibrate.snapshot(state))
+        votes = self.transport.allgather((changed, None if model is not None else why))
+        if any(c for c, _ in votes):  # every rank raises, none waits in a collective
+            changed = [rank for rank, (c, _) in enumerate(votes) if c]
+            raise RuntimeError(f"the calibration changed the weights or balancer state: {changed}")
+        why = next((f"{gap} (EP rank {rank})" for rank, (_, gap) in enumerate(votes) if gap), None)
+        if why is not None:
+            return None, f"the calibration failed: {why}"
+        failed = calibrate.write_cache(path, text) if self.ep_rank == 0 else None
+        if failed:
+            logger.warning(f"adaptive EPLB keeps its calibration in memory only: {failed}")
+        return model, None
 
     def platform_gap(self, backend: AdaptiveEplbBackend) -> str | None:
         """Why the installs cannot run on this rank, or ``None``: they copy experts from every EP
@@ -640,6 +745,9 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         """Record the statistics of generation steps outside warmup only, and pass the generation
         requests' progress to the runtime when it asks for it."""
         recording = num_generation_requests > 0 and generation_only and not is_warmup
+        if self._pending is not None and not is_warmup:  # serving began, no warmup calibrated it
+            self._pending, self.off_reason = None, "no CUDA graph warmup calibrated its time model"
+            logger.warning(f"adaptive EPLB is off: {self.off_reason}")
         if self.off_reason is not None or getattr(self.runtime, "failure", None) is not None:
             recording = False  # nothing reads the statistics of adaptive EPLB that is off
         self.recording = recording
