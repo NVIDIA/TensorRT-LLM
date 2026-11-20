@@ -347,9 +347,7 @@ def _run_create_py_executor(
     monkeypatch.setattr(py_executor_creator, "log_memory_usage", lambda *args, **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: is_mla_model)
     monkeypatch.setattr(
-        py_executor_creator,
-        "is_hybrid_linear",
-        lambda _: is_hybrid_linear_model,
+        py_executor_creator, "declares_recurrent_state", lambda _: is_hybrid_linear_model
     )
     monkeypatch.setattr(py_executor_creator, "get_sm_version", lambda: sm_version)
     monkeypatch.setattr(py_executor_creator, "KvCacheCreator", kv_cache_creator_cls)
@@ -572,7 +570,7 @@ def test_fp4_mla_block_reuse_blocker(
     enable_chunked_prefill: bool,
     supported: bool,
 ) -> None:
-    monkeypatch.setattr(py_executor_creator, "is_hybrid_linear", lambda _: is_hybrid)
+    monkeypatch.setattr(py_executor_creator, "declares_recurrent_state", lambda _: is_hybrid)
 
     blocker = _fp4_mla_block_reuse_blocker(
         SimpleNamespace(), enable_chunked_prefill=enable_chunked_prefill

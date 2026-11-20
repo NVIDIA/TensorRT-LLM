@@ -239,11 +239,6 @@ def get_kimi_linear_layer_masks(config):
     return full_mask, kda_mask
 
 
-def get_kimi_linear_num_attention_layers(config):
-    full_mask, _ = get_kimi_linear_layer_masks(config)
-    return sum(full_mask)
-
-
 def is_glm5_next(config: transformers.PretrainedConfig) -> bool:
     """True for GLM-5.3-Flash ("glm5_next") hybrid KDA + sparse-MLA text models.
 
@@ -297,12 +292,6 @@ def get_glm5_next_layer_masks(
         kda_mask.append(is_kda)
         full_mask.append(is_full)
     return full_mask, kda_mask
-
-
-def get_glm5_next_num_attention_layers(
-        config: transformers.PretrainedConfig) -> int:
-    full_mask, _ = get_glm5_next_layer_masks(config)
-    return sum(full_mask)
 
 
 def _coerce_torch_dtype(dtype):
@@ -557,11 +546,6 @@ def get_qwen3_hybrid_layer_masks(config):
     return layer_mask, mamba_layer_mask
 
 
-def get_qwen3_hybrid_num_attention_layers(config):
-    layer_mask, _ = get_qwen3_hybrid_layer_masks(config)
-    return sum(layer_mask)
-
-
 def mamba_effective_tp_size(mapping) -> int:
     """TP degree for sizing per-rank mamba/KDA state (budgeting AND allocation).
 
@@ -659,22 +643,27 @@ class MambaKVCacheParams:
 def extract_mamba_kv_cache_params(config,
                                   spec_config=None,
                                   quant_config=None) -> MambaKVCacheParams:
-    """Dispatch geometry extraction to the model's cache implementation."""
-    if is_nemotron_hybrid(config):
-        from ..modules.mamba.cache_manager import \
-            get_nemotron_cache_params as extract
-    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
-        from ..modules.fla.cache_manager import get_gdn_cache_params as extract
-    elif is_kimi_linear(config):
-        from ..modules.kimi_kda.cache_manager import \
-            get_kimi_cache_params as extract
-    elif is_glm5_next(config):
-        from ..attention.backends.sparse.glm_kpool.cache_manager import \
-            get_glm5_next_cache_params as extract
-    else:
+    """Return the cache geometry that the model class of ``config`` declares."""
+    # Imported lazily: both modules import this one.
+    from ..models.modeling_utils import (resolve_model_class,
+                                         resolve_recurrent_state_spec)
+    from ..recurrent_state_spec import mamba_params_from_recurrent_state_spec
+
+    if resolve_model_class(config) is None:
+        raise ValueError(
+            f"No model class is registered for {type(config).__name__} with "
+            f"architectures={getattr(config, 'architectures', None)!r}; the "
+            "model class declares the recurrent state")
+    spec = resolve_recurrent_state_spec(config, quant_config=quant_config)
+    if spec is None:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
-    return extract(config, spec_config=spec_config, quant_config=quant_config)
+    num_draft_layers = 0
+    if spec_config is not None:
+        from ..speculative.utils import get_num_spec_layers
+        num_draft_layers = get_num_spec_layers(spec_config) or 0
+    return mamba_params_from_recurrent_state_spec(
+        spec, num_draft_layers=num_draft_layers)
 
 
 def build_mamba_kv_cache_params(config,

@@ -2441,7 +2441,14 @@ def test_derive_v2_windows_skip_hybrid_linear_configs() -> None:
     manager indexes them by global layer id, so the two would disagree."""
     model_config = Mock()
     model_config.pretrained_config = _mixed_schedule_pretrained(
-        [_SLIDING, _FULL, _SLIDING, _FULL], hybrid_override_pattern="M*M*"
+        [_SLIDING, _FULL, _SLIDING, _FULL],
+        architectures=["NemotronHForCausalLM"],
+        hybrid_override_pattern="M*M*",
+        ssm_state_size=16,
+        conv_kernel=4,
+        mamba_num_heads=4,
+        n_groups=1,
+        mamba_head_dim=8,
     )
 
     assert (

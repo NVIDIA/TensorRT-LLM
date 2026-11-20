@@ -282,7 +282,7 @@ def _create(
         dwdp_global_rank=lambda: 0,
         get_calibrator=_DummyCalibrator,
         is_mla=lambda _: True,
-        is_hybrid_linear=lambda _: False,
+        declares_recurrent_state=lambda _: False,
         get_sm_version=lambda: 100,
     )
     for name, fake in fakes.items():
