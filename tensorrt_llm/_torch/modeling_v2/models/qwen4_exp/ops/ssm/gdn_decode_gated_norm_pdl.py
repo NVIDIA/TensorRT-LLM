@@ -437,7 +437,7 @@ class GdnDecodeGatedNormPdl(OpWrapper):
     Deterministic. Graph-capturable after the first call per geometry (compiled then).
 
     Source: the CuTe DSL kernel in this file, JIT-compiled (`cute_ext.compile`) for the
-    running device at the first call per geometry; the cells ran that path on sm_103.
+    running device at the first call per geometry; the cells ran that path on sm_103 and sm_107.
 
     The default target: this kernel takes an fp32 pool only -- a bf16 pool fails its
     compile loudly ("`copy` currently only supports equal source and destination element

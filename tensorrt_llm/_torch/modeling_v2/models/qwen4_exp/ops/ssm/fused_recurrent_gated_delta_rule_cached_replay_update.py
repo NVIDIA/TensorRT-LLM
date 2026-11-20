@@ -286,7 +286,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
       per-step window and the manager promotes it.
 
     The kernels are Triton, JIT-compiled on first call for the running device; the cells
-    ran that JIT path on sm_103. The launch is one V tile, `num_warps=4`, grid
+    ran that JIT path on sm_103 and sm_107. The launch is one V tile, `num_warps=4`, grid
     `(1, N * HV)`: the tuned mappings need HV = 2H or 4H and never engage at HV/H = 3
     (16 / 48 and 4 / 12 alike). The checkpoint's dtype is the kernel's `STATE_FP32`
     specialization and nothing else below N = 128: an fp32 checkpoint enters the history

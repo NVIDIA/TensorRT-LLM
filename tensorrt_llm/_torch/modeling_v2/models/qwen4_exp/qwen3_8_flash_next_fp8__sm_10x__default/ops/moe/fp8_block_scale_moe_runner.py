@@ -376,7 +376,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     `routed_scaling_factor`, `tune_max_num_tokens` and `use_dp` are inert on the pre-routed path.
     The registered fake returns `[T, 2H]` (upstream defect; eager is unaffected).
 
-    Certified on GB300 with near-uniform random routing at the checkpoint's E 512, H 2560, I 640,
+    Certified on sm_103 and sm_107 with near-uniform random routing at the checkpoint's E 512, H 2560, I 640,
     top-10, within the test's 16 / 0.75 bf16-ulp gate: the whole stack, 256-wide windows at
     offsets 0 / 256 and 128-wide at 0 / 128 / 256 / 384, at the cells' rows (1 to 16384, captured
     where the cells say). Not certified: other windows or geometries, rows past 16384 (the target

@@ -434,7 +434,7 @@ def test_the_grids_stay_on_the_host():
 PATCH = 16
 TEXT_TOKENS = 5
 
-_GEOMETRY = SimpleNamespace(merge=MERGE, patch=PATCH, pixel_width=PIXEL_WIDTH)
+_GEOMETRY = SimpleNamespace(merge=MERGE, patch=PATCH, pixel_width=PIXEL_WIDTH, dtype=torch.float32)
 
 
 def _request_media(modality, grids):
@@ -529,11 +529,14 @@ def test_a_malformed_grid_is_refused():
         _admit(request)
 
 
-def test_pixels_that_disagree_with_the_grid_are_refused():
+def test_pixels_that_disagree_with_the_grid_or_the_tower_are_refused():
     request = _request(video=VIDEOS)
     video = request.py_multimodal_data["video"]
     video["pixel_values_videos"] = torch.empty(5, PIXEL_WIDTH, device="meta")
     with pytest.raises(ValueError, match="pixel_values_videos is .*describe 48 patch rows"):
+        _admit(request)
+    video["pixel_values_videos"] = torch.empty(48, PIXEL_WIDTH, dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="torch.uint8; the vision tower runs at torch.float32"):
         _admit(request)
     del video["video_grid_thw"]
     with pytest.raises(ValueError, match="this target reads 'pixel_values_videos'"):

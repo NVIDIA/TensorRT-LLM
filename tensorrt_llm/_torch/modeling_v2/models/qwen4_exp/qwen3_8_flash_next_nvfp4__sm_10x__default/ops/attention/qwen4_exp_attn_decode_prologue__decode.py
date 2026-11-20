@@ -366,6 +366,10 @@ def _launch(num_tokens: int) -> Tuple[int, int]:
 #: projection row `[q 6 | k 1 | v 1 | gate 6 | index q 4, k 1 | v slot]` in heads of 256 and
 #: 128 (4352 wide, the index query at column 3584), the packed `[q | k | v]` 2048 wide.
 _TP4 = dict(geom="tp4")
+#: One tp2 / tep2 rank (attention TP 2): 12 q heads and one of the 2 KV heads, the fused row
+#: `[q 12 | k 1 | v 1 | gate 12 | index q 4, k 1 | v slot]` (7424 wide, the index query at
+#: 6656), the packed buffer 3584 wide.
+_TP2 = dict(geom="tp2")
 #: One dep4 rank (attention DP): every head, `[q 24 | k 2 | v 2 | gate 24 | index ...]`
 #: (14080 wide, the index query at 13312), the packed buffer 7168 wide.
 _DEP4 = dict(geom="dep4")
@@ -445,6 +449,18 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
             ),  # fmt: skip
         ),
         Cell(
+            why="tp2/tep2 rank, MTP-3 verify: 1 request x 4 rows at 84000..84003 (a group end "
+            "with its three earlier members in the launch), bf16 pool",
+            spec=dict(_TP2, pos=(84000,), rows_per_request=4),
+        ),
+        Cell(
+            why="tp2/tep2 rank, 32 requests x 4 MTP-3 verify rows (a generation server's 128-row "
+            "graph; eight-head programs, the second masks three), e4m3 pool",
+            spec=dict(
+                _TP2, pos=tuple(3000 + 6007 * r for r in range(32)), rows_per_request=4, fp8=True
+            ),
+        ),
+        Cell(
             why="dep4 rank, decode 16 requests at 20k..94k (ht's step), e4m3 pool",
             spec=dict(_DEP4, pos=_HT16, fp8=True),
         ),
@@ -484,7 +500,7 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
 
     Not certified: NVFP4 pools (the forward keeps the composition there); in-launch index
     scores; non-zero index-plane mRoPE sections; mRoPE on the compressed key; `T == 0` returns
-    at once; head geometries other than 6/1 and 24/2 x 256 with a 4 x 128 index plane.
+    at once; head geometries other than 6/1, 12/1 and 24/2 x 256 with a 4 x 128 index plane.
     """
 
     def __call__(

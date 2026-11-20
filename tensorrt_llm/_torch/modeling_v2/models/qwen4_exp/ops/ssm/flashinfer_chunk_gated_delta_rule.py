@@ -75,12 +75,13 @@ def _rank_slots(num_seqs: int, slots: int) -> tuple[int, ...]:
     return picked
 
 
-def _rank_cell(why: str, geometry, seqlens, slots: int, initial, fi_path: str) -> Cell:
+def _rank_cell(why: str, geometry, seqlens, slots: int, initial, fi_path) -> Cell:
     """The target's call (`PrefillTarget._gdn_core`) at one rank's pool: the stock
     manager's bf16 state page at the member's slot count, the layer's view of it, a
     prefix view of a wider output buffer, `has_initial_state`, `linear_gate`. `fi_path` is
-    the FlashInfer kernel the call reaches on sm_103: `cp` (the context-parallel pipeline)
-    or `chunked`."""
+    the FlashInfer kernel the call reaches -- `cp` (the context-parallel pipeline),
+    `chunked` or `inplace` -- on every served GPU, or a `{(major, minor): path}` map where
+    FlashInfer's SM-count heuristic picks differently."""
     return Cell(
         why=why,
         spec=dict(
@@ -361,7 +362,7 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
         ),
         _rank_cell(
             "dep4 16/48, carried 512-token prompt, 850-slot bf16 page",
-            QWEN38_GEOMETRY, (512,), DEP4_SLOTS, (True,), "chunked",
+            QWEN38_GEOMETRY, (512,), DEP4_SLOTS, (True,), {(10, 3): "chunked", (10, 7): "cp"},
         ),
         _rank_cell(
             "tep4 4/12 envelope, 8192 rows over 128 seqs of 63/65, chunked path",

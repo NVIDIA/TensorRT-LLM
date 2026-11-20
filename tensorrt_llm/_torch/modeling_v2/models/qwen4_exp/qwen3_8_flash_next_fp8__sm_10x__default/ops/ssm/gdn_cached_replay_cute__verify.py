@@ -2719,7 +2719,7 @@ class GdnCachedReplayCute(OpWrapper):
     fp32 G); the dot order differs, so outputs match it to a few bf16 ulps, not bitwise. Launch
     mappings are bitwise each other, and CUDA-graph replay is bitwise eager.
 
-    Certified on GB300 at the cells (rows at both ends of the page, consecutive steps from warm
+    Certified on sm_103 and sm_107 at the cells (rows at both ends of the page, consecutive steps from warm
     histories with random acceptance) within the Triton entry's test bands. Not supported: fp32
     state, T > 8, other geometries, K or V other than 128, history other than 16, pre-gated
     g / beta (`A_log=None` compiles but is not certified).

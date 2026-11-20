@@ -151,7 +151,7 @@ class LowMBf16Mm(OpWrapper):
     rows_per_block) on the first call, which must come before CUDA-graph capture, and cost tens
     of microseconds of host time a call: route only captured decode calls here.
 
-    Certified on GB300 within the test's 4 / 2 bf16-ulp band at the cells: M 1, 3, 4, 8, 12, 16
+    Certified on sm_103 and sm_107 within the test's 4 / 2 bf16-ulp band at the cells: M 1, 3, 4, 8, 12, 16
     on the FlashInfer kernels, 24 and 32 on cuBLAS. Not certified: M above 16 on FlashInfer.
     """
 

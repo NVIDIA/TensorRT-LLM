@@ -452,7 +452,7 @@ class PleNgramEmbed(OpWrapper):
     rows over 1874 slots.
 
     The kernels are Triton, JIT-compiled on first call for the running
-    device: every cell above ran that path on sm_103. The host-resident
+    device: every cell above ran that path on sm_103 and sm_107. The host-resident
     cells read a pinned host table through its mapped device address, the
     stock PLE host offload's placement. The checkpoint-height cells allocate
     the 47.7 GiB table on the device.

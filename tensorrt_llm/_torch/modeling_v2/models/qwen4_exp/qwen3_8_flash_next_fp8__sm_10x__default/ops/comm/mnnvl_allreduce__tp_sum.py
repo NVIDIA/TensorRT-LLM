@@ -22,6 +22,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.mnnvl_allreduce import (
     mnnvl_workspace_args,
     workspace_bytes,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm.functional import AllReduceFusionOp
 
 NONE = int(AllReduceFusionOp.NONE)
@@ -38,7 +39,7 @@ class MnnvlTpSum(OpWrapper):
     workspace is built once by `mnnvl_workspace_args` (a TP collective) for a row budget the
     kernel does not check; `is_valid` does."""
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = SERVED_ARCHS | {Arch.SM_100}
 
     CELLS: tuple[Cell, ...] = tuple(
         Cell(why=f"tp_sum, {why}, tp{world}", spec=dict(world=world, rows=rows, **_TP_SUM))

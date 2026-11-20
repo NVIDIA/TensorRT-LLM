@@ -4,8 +4,8 @@
 
 On the GPUs in `archs.SERVED`, Qwen3.8-Flash-Next-NVFP4 lands on
 `qwen3_8_flash_next_nvfp4__sm_10x__default` and Qwen3.8-Flash-Next-FP8 (FP8_BLOCK_SCALES) on
-`qwen3_8_flash_next_fp8__sm_10x__default`, at one of the layouts in `_LAYOUTS` or, over several
-nodes, at dep<world size>, each with one-model MTP-Eagle or no speculative
+`qwen3_8_flash_next_fp8__sm_10x__default`, at one of the layouts in `_LAYOUTS` or, across nodes,
+at dep8, each with one-model MTP-Eagle or no speculative
 decoding. The target's `check_deployment` then declines the checkpoints and engine choices it
 does not run, so `auto` falls back to the built-in implementation instead of failing in the build.
 """
@@ -44,7 +44,8 @@ def layout(mapping: Mapping) -> Optional[str]:
 
     Attention runs TP over the whole world, or DP with the LM head whole. Across nodes only
     attention DP with the routed experts split by expert over the whole world is served
-    (dep<world size>). Pipeline and context parallelism and MoE clusters are other forwards.
+    over eight ranks (dep8), the width that was run. Pipeline and context parallelism and MoE
+    clusters are other forwards.
     """
     if mapping.enable_attention_dp:
         attention_as_built = not mapping.enable_lm_head_tp_in_adp
@@ -58,7 +59,8 @@ def layout(mapping: Mapping) -> Optional[str]:
         return None
     if mapping.is_multi_node():
         expert_split = mapping.moe_tp_size == 1 and mapping.moe_ep_size == mapping.world_size
-        return f"dep{mapping.world_size}" if mapping.enable_attention_dp and expert_split else None
+        dep8 = mapping.world_size == 8 and mapping.enable_attention_dp and expert_split
+        return "dep8" if dep8 else None
     return _LAYOUTS.get(
         (mapping.world_size, mapping.enable_attention_dp, mapping.moe_tp_size, mapping.moe_ep_size)
     )
@@ -80,7 +82,7 @@ def route(
             f"(tp={mapping.tp_size}, pp={mapping.pp_size}, cp={mapping.cp_size}, "
             f"attention_dp={mapping.enable_attention_dp}, moe_tp={mapping.moe_tp_size}, "
             f"moe_ep={mapping.moe_ep_size}); the qwen4_exp targets serve {archs.served_names()} "
-            f"at {', '.join(_LAYOUTS.values())} in one node, or dep<world size> across nodes"
+            f"at {', '.join(_LAYOUTS.values())} in one node, or dep8 across nodes"
         )
     if spec is not None and not (
         isinstance(spec, MTPDecodingConfig) and spec.spec_dec_mode.is_mtp_eagle_one_model()
@@ -96,10 +98,6 @@ def route(
 
         ModelingV2Qwen38FlashNextFp8Sm10xDefault.check_deployment(model_config, llm_args, member)
         return ModelingV2Qwen38FlashNextFp8Sm10xDefault
-    if str(getattr(model_config, "moe_backend_requested", "")).upper() == "CUTEDSL" and (
-        not archs.fast_path("cute_dsl_moe", compute_capability)
-    ):
-        raise NoTarget(f"moe_config.backend=CUTEDSL does not run on {compute_capability}")
     from .qwen3_8_flash_next_nvfp4__sm_10x__default.modeling import (
         ModelingV2Qwen38FlashNextNvfp4Sm10xDefault,
     )

@@ -596,7 +596,7 @@ def validate_request(tower, request) -> None:
     (`merge`, `patch`, `pixel_width`).
 
     Refused: a frame past `VISION_CALL_MAX_PATCHES` patches (the one bound the tower keeps),
-    a malformed grid or pixel payload, media whose rows disagree with the prompt's
+    a malformed grid or pixel payload (or pixels not at the tower's dtype), media whose rows disagree with the prompt's
     placeholder count, missing or mis-sized `mrope_position_ids`, and a request with both
     images and videos whose item metadata is missing or does not list its items."""
     data = request.py_multimodal_data
@@ -672,6 +672,11 @@ def _media_grid(tower, modality, media, pixel_key, grid_key):
         raise ValueError(
             f"{pixel_key} is {tuple(pixel_values.shape)}; its grids describe {patches} patch "
             f"rows of {tower.pixel_width}"
+        )
+    if pixel_values.dtype != tower.dtype:
+        raise ValueError(
+            f"{pixel_key} is {pixel_values.dtype}; the vision tower runs at {tower.dtype} "
+            "(multimodal_config.vision_gpu_normalize ships uint8)"
         )
     return grid
 

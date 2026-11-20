@@ -891,7 +891,7 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     kernel. Batch-invariant: a row's output and state do not depend on the other rows.
 
     Source: the CuTe DSL kernel in this file, JIT-compiled (`cute.compile`) for the running
-    device at the first call per geometry; the cells ran that path on sm_103 (GB300).
+    device at the first call per geometry; the cells ran that path on sm_103 and sm_107.
 
     The default target (`DecodeTarget._gdn_block`, a decode step without verify rows): at
     tp4, tep4 and dep4 its routing admits a bf16 recurrent-state cache only, so the decode

@@ -128,7 +128,7 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     call, and a second step's logits replay bitwise their own eager call.
 
     Source: a Triton kernel JIT-compiled at first call for the running device;
-    the cells ran on sm_103. One program per row with an int64 row offset;
+    the cells ran on sm_103 and sm_107. One program per row with an int64 row offset;
     2^31 elements is 6.1e6 rows of 352, far past the envelope.
 
     Certified: bf16 outputs from fp32 logits 352 wide (the call site) at 1, 32,

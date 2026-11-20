@@ -183,7 +183,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
     output is freshly allocated and contiguous; no input is mutated.
 
     Both kernels are Triton, JIT-compiled at first call for the running GPU;
-    the cells ran that JIT path on sm_103 (GB300, 152 SMs).
+    the cells ran that JIT path on sm_103 and sm_107.
 
     Certified: bf16 `x` with the sigmoid gate over the in_proj column view of
     `z`, N = 128.

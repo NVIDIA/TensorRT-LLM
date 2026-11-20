@@ -35,7 +35,7 @@ DEV = "cuda"
 D, IH, ID, TPB, CR, ROT, WIDTH, SLOTS = 256, 4, 128, 32, 4, 64, 8196, 8
 #: Per-rank geometry: (q heads, KV heads); the fused row is
 #: `[q | k | v | gate | index q 4 x 128, k 128 | v slot 128]`.
-GEOMS = {"tp4": (6, 1), "dep4": (24, 2)}
+GEOMS = {"tp4": (6, 1), "tp2": (12, 1), "dep4": (24, 2)}
 #: One bf16 spacing of an element no larger than its row's largest, in 2^-8 units of the
 #: row scale; the relative RMS bound is measured, see the module docstring.
 ELEMENT_ULP, RMS_ULP = 2.0, 0.05

@@ -1461,7 +1461,7 @@ class QsaTopkExpandDecode(OpWrapper):
     from the launch, not pinned by a test).
 
     JIT-compiled: `cute.compile` (`--enable-tvm-ffi`) on a key's first call, for the device
-    that makes it. The cells ran that path on sm_103 (GB300) at widths 2560, 2304 and 4096.
+    that makes it. The cells ran that path on sm_103 and sm_107 at widths 2560, 2304 and 4096.
 
     Certified, every cell bitwise against `reference` (block list and token selection):
     - tp1's cells at 2560 columns: decode 1 row of near-equal scores, 4 rows, 16 rows of

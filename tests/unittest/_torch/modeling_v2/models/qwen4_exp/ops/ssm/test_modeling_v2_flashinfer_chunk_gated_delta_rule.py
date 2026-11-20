@@ -93,9 +93,9 @@ def _flashinfer_path(spec) -> str:
 
 
 def _certified_path(spec) -> str:
-    """`fi_path` was recorded on sm_103; FlashInfer picks the pipeline by SM count elsewhere."""
-    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
-    return spec["fi_path"] if on_sm103 else _flashinfer_path(spec)
+    """The pipeline the cell recorded for this GPU (FlashInfer picks it by SM count)."""
+    path = spec["fi_path"]
+    return path if isinstance(path, str) else path[torch.cuda.get_device_capability()]
 
 
 def _check(result):

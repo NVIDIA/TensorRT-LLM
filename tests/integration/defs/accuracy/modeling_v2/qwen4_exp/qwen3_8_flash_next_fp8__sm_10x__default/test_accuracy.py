@@ -106,13 +106,19 @@ _TEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attentio
 _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
 _DEP2 = dict(tensor_parallel_size=2, moe_expert_parallel_size=2, enable_attention_dp=True)
 # Only tep4 runs the breakable prefill graph: routing admits it under attention TP alone.
+_FOUR_GPUS, _TWO_GPUS = pytest.mark.skip_less_device(4), pytest.mark.skip_less_device(2)
 _MTP3_ENGINES = [
-    pytest.param(_TEP4, "fp8", True, {}, id="tep4_fp8_kv_breakable"),
-    pytest.param(_DEP4, "auto", False, {}, id="dep4"),
+    pytest.param(_TEP4, "fp8", True, {}, id="tep4_fp8_kv_breakable", marks=_FOUR_GPUS),
+    pytest.param(_DEP4, "auto", False, {}, id="dep4", marks=_FOUR_GPUS),
     pytest.param(
-        _DEP4, "auto", False, {"TRTLLM_FORCE_COMM_METHOD": "NVLINK_ONE_SIDED"}, id="dep4_alltoall"
+        _DEP4,
+        "auto",
+        False,
+        {"TRTLLM_FORCE_COMM_METHOD": "NVLINK_ONE_SIDED"},
+        id="dep4_alltoall",
+        marks=_FOUR_GPUS,
     ),
-    pytest.param(_DEP2, "nvfp4", False, {}, id="dep2_nvfp4_kv"),
+    pytest.param(_DEP2, "nvfp4", False, {}, id="dep2_nvfp4_kv", marks=_TWO_GPUS),
 ]
 
 
@@ -194,7 +200,6 @@ class TestModelingV2Qwen38FlashNextFp8Sm10xDefault(LlmapiAccuracyTestHarness):
         assert_acceptance_length(key, acceptance_length)
 
     @skip_unserved_gpu
-    @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(145000)
     @pytest.mark.parametrize("parallel, kv_dtype, breakable, env", _MTP3_ENGINES)
     def test_mtp3_gsm8k(self, mocker, request, parallel, kv_dtype, breakable, env):

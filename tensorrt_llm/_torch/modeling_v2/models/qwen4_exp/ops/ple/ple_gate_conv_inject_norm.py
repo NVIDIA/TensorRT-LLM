@@ -568,7 +568,7 @@ class PleGateConvInjectNorm(OpWrapper):
 
     Source: the four Triton kernels in this file (three launches a call, the
     packed-row conv a fourth on context-shaped steps), JIT-compiled for the
-    running device; every cell ran the JIT path on sm_103 (GB300).
+    running device; every cell ran the JIT path on sm_103 and sm_107.
 
     Numerics: every rounding point of the composition is kept, so the only
     differences are fp32 reduction order (the three norms' sums of squares

@@ -5,15 +5,15 @@
 The loader retains FP8 or BF16 PLE storage and supports FP8 block-scaled or native
 NVFP4 draft experts. Native NVFP4 experts use their checkpoint scalars and local window.
 
-One target for the layouts `routing.py` admits in one node: one rank (tp1, every head and
+One target for the layouts `routing.py` admits: one rank (tp1, every head and
 expert); at four ranks tp4 (attention TP4, routed experts split by intermediate), tep4
 (attention TP4, experts EP4) and dep4 (attention DP, experts EP4); at two ranks dep2 (attention
 DP, experts EP2), the layout of both disaggregated-serving engines, which is dep4 at half the
 group, tp2 (attention TP2, every expert split by intermediate) and tep2 (attention TP2, experts
-EP2); across nodes dep<world size>. The core holds the static
-structure (this rank's share of the weights, derived operands, per-manager pool views);
-`PrefillTarget` (any batch with context rows) and `DecodeTarget` (generation only) run a step
-over it, passing every argument to every op at the call site.
+EP2); across nodes dep8. The core holds the static structure (this rank's share of the
+weights, derived operands, per-manager pool views); `PrefillTarget` (any batch with context rows)
+and `DecodeTarget` (generation only) run a step over it, passing every argument to every op at
+the call site.
 
 The forward is cut per rank; what the layout settles is settled once, at construction:
 
@@ -432,7 +432,7 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.utils import ActivationType, is_gdn_replay_enabled
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.functional import AllReduceFusionOp
+from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -465,6 +465,12 @@ _CUTEDSL_MAX_DRAFT_LEN = 3
 # Rows per request of the widest verify step (`max_draft_len + 1`), and of the widest
 # one without the GDN cached replay (the per-step recurrent states).
 _MAX_VERIFY_WIDTH = _pool.MAX_VERIFY_WIDTH
+#: Strategies of the stock `AllReduce` module's own kernels, which the raw all-reduce op has no
+#: branch for: the module calls the op at AUTO where it cannot run them, and so does `_tp_sum_op`.
+_MODULE_ONLY_STRATEGIES = frozenset({int(AllReduceStrategy.MNNVL), int(AllReduceStrategy.SYMM_MEM)})
+#: Overrides the stock model's attention-DP MoE round trip; `check_deployment` declines any value
+#: but `ALLGATHER`, the round trip this target runs.
+MOE_COMM_METHOD_ENV = "TRTLLM_FORCE_COMM_METHOD"
 
 # Recurrent-state cache dtypes the target serves, checked at bind: at one rank the checkpoint's
 # fp32 too.
@@ -1198,10 +1204,11 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             "use moe_config.backend=TRTLLM"
         )
         # At one rank the CuteDSL-layout copy of the experts for prefill-sized launches
-        # (`_moe_prefill_copy`); `weights.py` declares it from this.
-        self.moe_prefill_copy = cute_dsl_moe and _moe_prefill_copy(
+        # (`_moe_prefill_copy`, whose switch is read on every GPU); `weights.py` declares it.
+        prefill_copy = _moe_prefill_copy(
             self.one_rank, self.trunk_moe_backend, model_config.max_num_tokens
         )
+        self.moe_prefill_copy = cute_dsl_moe and prefill_copy
         # Cached native NVFP4 operands or the one-rank FP8 conversion, built once because
         # the shell's post-load walk reaches `post_load_weights` again.
         self._mtp_moe_nvfp4 = None
@@ -1524,11 +1531,14 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
     def _tp_sum_op(self):
         """The sum that completes a block's per-rank partial output, settled once: under
         attention TP the plain all-reduce over the TP group (`comm/allreduce`, op `NONE`, at
-        the engine's `allreduce_strategy`), which every rank gets the same bits back from;
-        otherwise nothing to sum."""
+        the engine's `allreduce_strategy`, AUTO for `_MODULE_ONLY_STRATEGIES`), which every rank
+        gets the same bits back from; otherwise nothing to sum."""
         if self.attn_tp_size == 1:
             return lambda x: x
-        group = allreduce_group_args(self.mapping, self.allreduce_strategy)
+        strategy = self.allreduce_strategy
+        if strategy in _MODULE_ONLY_STRATEGIES:
+            strategy = int(AllReduceStrategy.AUTO)
+        group = allreduce_group_args(self.mapping, strategy)
 
         def tp_sum(x: torch.Tensor) -> torch.Tensor:
             return allreduce(
@@ -6823,8 +6833,7 @@ def _text_settings(text) -> dict:
 class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
     DecoderModelForCausalLM[Qwen4ExpDefaultModelingV2, PretrainedConfig]
 ):
-    """Qwen3.8-Flash-Next-NVFP4 at tp1, tp2, tep2, dep2, tp4, tep4, dep4, or dep<world size>
-    across nodes."""
+    """Qwen3.8-Flash-Next-NVFP4 at tp1, tp2, tep2, dep2, tp4, tep4, dep4, or dep8 across nodes."""
 
     # At tp1 one-engine speculative decoding takes the engine's fast paths (greedy and
     # temperature-only sampling CUDA graph variants, the overlap loop on the execution stream,
@@ -6939,10 +6948,11 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             raise NoTarget(
                 f"the engine runs the model in {model_config.torch_dtype}; the target is bf16"
             )
-        # The CuteDSL expert pipeline runs every expert at once: one rank only.
+        # The CuteDSL expert pipeline runs every expert at once (one rank only), where it is built.
         requested = str(model_config.moe_backend_requested).upper()
+        cute_dsl = one_rank and archs.fast_path("cute_dsl_moe", torch.cuda.get_device_capability())
         moe_backends = [
-            name for name, runs in _TRUNK_MOE_BACKENDS.items() if one_rank or runs != "CUTEDSL"
+            name for name, runs in _TRUNK_MOE_BACKENDS.items() if cute_dsl or runs != "CUTEDSL"
         ]
         if requested not in moe_backends:
             raise NoTarget(
@@ -6964,6 +6974,27 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 f"moe_config.load_balancer (EPLB) at {layout}: the target runs fixed contiguous "
                 "expert windows and registers no layer with the balancer, so the placement "
                 "would do nothing"
+            )
+        strategy = AllReduceStrategy(int(model_config.allreduce_strategy))
+        if _pool.attention_tp_size(mapping) > 1 and strategy in (
+            AllReduceStrategy.UB,
+            AllReduceStrategy.LOWPRECISION,
+        ):
+            raise NoTarget(
+                f"allreduce_strategy={strategy.name} at {layout}: the target calls the all-reduce "
+                "op directly, without the buffers the stock AllReduce module sets up for it"
+            )
+        # As the stock factory: only an attention-DP group has a MoE round trip to override.
+        comm_method = os.environ.get(MOE_COMM_METHOD_ENV, "ALLGATHER").upper()
+        if mapping.enable_attention_dp and mapping.dp_size > 1 and comm_method != "ALLGATHER":
+            raise NoTarget(
+                f"{MOE_COMM_METHOD_ENV}={comm_method} at {layout}: the target runs the "
+                "attention-DP MoE round trip as ALLGATHER (the default)"
+            )
+        if getattr(llm_args.multimodal_config, "vision_gpu_normalize", False):
+            raise NoTarget(
+                "multimodal_config.vision_gpu_normalize: the input processor then ships uint8 "
+                "pixels, and the vision tower runs at the bf16 activation dtype"
             )
         if prefill_graph == "piecewise":
             raise NoTarget(

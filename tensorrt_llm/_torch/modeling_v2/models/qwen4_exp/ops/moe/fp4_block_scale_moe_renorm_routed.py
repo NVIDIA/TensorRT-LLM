@@ -6,10 +6,10 @@ FC1 GEMM + SwiGLU + NVFP4 requantization + grouped FC2 GEMM + routing-weighted
 combine, in one trtllm-gen call.
 
 It runs over an expert window (`local_expert_offset`, `local_num_experts`; the whole routing
-space by default) at the intermediate width a rank holds: the window of a tep4 / dep4 / dep2
-rank, every expert at a tp4 rank's padded slice, every expert at tp1. A decode call over the
-whole 512-expert layer at I 640 runs its pinned tactic (`DECODE_TACTICS`), every other call the
-AutoTuner's."""
+space by default) at the intermediate width a rank holds: the window of a tep4 / dep4 / tep2 /
+dep2 / dep8 rank, every expert at a tp4 or tp2 rank's padded slice, every expert at tp1. A decode
+call over the whole 512-expert layer at I 640 runs its pinned tactic (`DECODE_TACTICS`), every
+other call the AutoTuner's."""
 
 from __future__ import annotations
 
@@ -281,11 +281,13 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
             why="16384 rows: max_num_tokens of the tuned config; past the 8192 tuning bucket",
             spec=_ckpt(16384),
         ),
-        # The windows: tep4 / dep4 a 128-expert window at I 640, dep2 a 256-expert window, tp4
-        # all 512 experts at its 160-wide slice padded to 256. Rows: 1 (decode), 4 (an MTP-3
-        # verify step), 5 (past the block routing kernel), 128 (dep4's 4 x 32 gathered rows),
-        # 1024 (MTP-7 verify of 128 requests) and 8192 (a prefill chunk); offsets cover every
-        # rank.
+        # The windows: tep4 / dep4 a 128-expert window at I 640, tep2 / dep2 a 256-expert window,
+        # dep8 a 64-expert window, tp4 all 512 experts at its 160-wide slice padded to 256, tp2 at
+        # its 320-wide slice padded to 384. Rows: 1 (decode), 4 (an MTP-3 verify step), 5 (past
+        # the block routing kernel), 128 (dep4's 4 x 32 gathered rows), 1024 (MTP-7 verify of 128
+        # requests) and 8192 (a prefill chunk); at dep8 8 (the group's 8 x 1 gathered decode rows)
+        # and 256 (8 x 32). Offsets cover every rank of the 128- and 256-expert splits and ranks
+        # 0, 3 and 7 of dep8's.
         Cell(why="tep4 decode: one token, rank 0's 128-expert window", spec=_layer(1, 0, 128)),
         Cell(why="tep4 MTP-3 verify at con1: 4 rows, rank 1's window", spec=_layer(4, 128, 128)),
         Cell(why="ep4 at 5 rows, rank 2's window: past the block kernel", spec=_layer(5, 256, 128)),
@@ -306,6 +308,23 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
         Cell(
             why="dep2 prefill chunk at 8192 rows, rank 0's 256-expert window",
             spec=_layer(8192, 0, 256),
+        ),
+        Cell(why="tp2 MTP-3 verify: 4 rows, 512 experts at I 384", spec=_layer(4, 0, 512, 384)),
+        Cell(why="tp2 at 128 rows, 512 experts at I 384", spec=_layer(128, 0, 512, 384)),
+        Cell(
+            why="tp2 prefill chunk 8192 rows, 512 experts at I 384", spec=_layer(8192, 0, 512, 384)
+        ),
+        Cell(
+            why="dep8 gathered decode 8 x 1 = 8 rows, rank 0's 64-expert window",
+            spec=_layer(8, 0, 64),
+        ),
+        Cell(
+            why="dep8 gathered decode 8 x 32 = 256 rows, rank 3's 64-expert window",
+            spec=_layer(256, 192, 64),
+        ),
+        Cell(
+            why="dep8 prefill chunk at 8192 rows, rank 7's 64-expert window",
+            spec=_layer(8192, 448, 64),
         ),
     )
 
@@ -342,13 +361,16 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
     Windows: a window's weight stacks are its own experts only (the op compares the scales'
     expert dimension with `local_num_experts`; the whole stack beside a window's scales would be
     read as its first experts, refused by `is_valid`; the windows test holds this refusal).
-    Not certified: windows of the padded I 256 stack (tp4 does not split experts); window rows
-    past 8192 (the caller chunks).
+    Not certified: windows of the padded I 256 and I 384 stacks (tp4 and tp2 do not split
+    experts); a 64-expert window at an offset no cell names (dep8 ranks 1, 2, 4, 5 and 6); window
+    rows past 8192 (the caller chunks).
 
     Hard limits
       window       the whole 512 at I 640 (tp1), 128 of 512 at I 640 (every offset), 256 of
-                   512 at I 640, 512 at I 256
-      T            certified at 1, 128 and 16384 (max_num_tokens of the tuned config).
+                   512 at I 640 (both offsets), 64 of 512 at I 640 (offsets 0, 192 and 448),
+                   512 at I 256 (tp4) and at I 384 (tp2)
+      T            the whole layer certified at 1, 128 and 16384 (max_num_tokens of the tuned
+                   config), the windows at their cells' rows, 1 to 8192.
                    Autotuner buckets stop at 8192, the op's
                    `tune_max_num_tokens` default, which this entry does not
                    pass: a call past 8192 rows runs the 8192 bucket's tactic
