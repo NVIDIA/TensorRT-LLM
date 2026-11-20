@@ -208,3 +208,95 @@ def test_moe_with_routing_tables_is_bitwise_to_its_own_routing(num_tokens, do_fi
             e2p = [out[2].flatten()[: num_tokens * TOP_K].long() for out in (expected, got)]
             rows = [out[0][e] for out, e in zip((expected, got), e2p)]
             torch.testing.assert_close(rows[1], rows[0], atol=0, rtol=0)
+
+
+def _assert_same_tables(got, want, ids, top_k, local_start, routing_tiles):
+    """Both are TRTLLM-Gen routing tables of ``ids``, up to the row order inside an expert's block."""
+    flat = ids.flatten().long()
+    n = flat.numel()
+    for t, tile in enumerate(routing_tiles):
+        num_ctas = int(want[t, 4, 0])
+        assert got[t, 4, :2].tolist() == want[t, 4, :2].tolist()
+        for row in (2, 3):
+            assert torch.equal(got[t, row, :num_ctas], want[t, row, :num_ctas])
+        assert torch.equal(got[t, 0, :n] >= 0, want[t, 0, :n] >= 0)
+        here = want[t, 0, :n] >= 0
+        tokens = torch.arange(n, device=ids.device)[here] // top_k
+        for tables in (got, want):
+            e2p = tables[t, 0, :n][here].long()
+            assert e2p.unique().numel() == e2p.numel()
+            assert torch.equal(tables[t, 2, e2p // tile].long(), flat[here] - local_start)
+            assert torch.equal(tables[t, 1, e2p].long(), tokens)
+
+
+@pytest.mark.parametrize("scope,num_tokens", [("ep_rank1", 6)])
+@torch.inference_mode()
+def test_one_cluster_route_matches_the_cute_kernel(scope, num_tokens, monkeypatch):
+    """The one-cluster kernel gives the CuTe DSL kernel's routing, NVFP4 input and routing tables (rows of an
+    expert in any order), eager and replayed in a CUDA graph."""
+    from tensorrt_llm._torch.moe.kernels.blackwell import dsv4_route_one
+    from tensorrt_llm._torch.moe.kernels.blackwell.dsv4_route_quant import (
+        ROUTING_TABLE_TILES,
+        dsv4_route,
+        dsv4_route_nvfp4_quant,
+    )
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("the one-cluster route kernel targets SM100/SM103")
+    kwargs, local_start = {}, 0
+    if scope.startswith("ep_rank"):
+        local_start = int(scope[-1]) * (NUM_EXPERTS // 2)
+        kwargs = {"local_experts": (local_start, NUM_EXPERTS // 2)}
+    logits, bias, x, global_scale = _clustered_inputs(num_tokens, seed=10 + num_tokens)
+    # Ties, NaN, infinite and very negative logits.
+    logits[0, 40:60] = 2.0
+    if num_tokens > 2:
+        logits[1, 7] = float("nan")
+        logits[2, 300:305] = float("inf")
+        logits[num_tokens - 1, ::3] = -100.0
+    launched = []
+    launch = dsv4_route_one.route_one
+    monkeypatch.setattr(
+        dsv4_route_one, "route_one", lambda *a, **k: launched.append(1) or launch(*a, **k)
+    )
+
+    def run(one_cluster, route_only, weights_dtype):
+        if route_only:
+            return dsv4_route(
+                logits,
+                bias,
+                TOP_K,
+                SCALING,
+                weights_dtype,
+                HIDDEN,
+                with_routing_tables=True,
+                one_cluster=one_cluster,
+                **kwargs,
+            )
+        return dsv4_route_nvfp4_quant(
+            logits, bias, x, global_scale, TOP_K, SCALING, weights_dtype, with_routing_tables=True,
+            one_cluster=one_cluster, **kwargs,
+        )  # fmt: skip
+
+    for route_only, weights_dtype in ((True, torch.float32), (False, torch.bfloat16)):
+        *want, want_tables = run(False, route_only, weights_dtype)
+        assert not launched
+        *got, got_tables = run(True, route_only, weights_dtype)
+        assert len(launched) == 1
+        launched.clear()
+        _assert_equal(got, want)
+        _assert_same_tables(
+            got_tables, want_tables, got[0], TOP_K, local_start, ROUTING_TABLE_TILES
+        )
+
+    # Captured once, replayed on new logits written into the captured input.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        *captured, captured_tables = run(True, True, torch.float32)
+    logits.copy_(torch.randn_like(logits) * 4)
+    graph.replay()
+    *want, want_tables = run(False, True, torch.float32)
+    _assert_equal(captured, want)
+    _assert_same_tables(
+        captured_tables, want_tables, captured[0], TOP_K, local_start, ROUTING_TABLE_TILES
+    )
