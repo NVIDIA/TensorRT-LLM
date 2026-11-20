@@ -16,14 +16,17 @@
 
 import math
 import time
+from collections.abc import Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from tensorrt_llm.logger import logger
 
 from .enums import MetricNames
-from .perf import (FINISH_REASON_LABEL, PerfMetricsCollector, PerfMetricsRecord,
-                   kv_cache_utilization)
+from .perf import (FINISH_REASON_LABEL, KV_MOVEMENT_WINDOW_FIELDS,
+                   PerfMetricsCollector, PerfMetricsRecord,
+                   kv_cache_utilization, kv_pool_rows, pool_counts,
+                   total_pool_count)
 
 if TYPE_CHECKING:
     from prometheus_client import CollectorRegistry, Counter
@@ -260,6 +263,17 @@ class PrometheusExposure:
             documentation=
             "Logical slot bytes by configured level, pool group and disjoint state",
             labelnames=[*storage_labels, "state"])
+        self.kv_cache_movement_window_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_movement_window_blocks",
+            documentation=
+            "Hot-pool block movements in the last observed KV statistics window",
+            labelnames=[*iteration_labelnames, "operation"])
+        self.kv_cache_movement_window_blocks_by_pool = Gauge(
+            name=self.metric_prefix + "kv_cache_movement_window_blocks_by_pool",
+            documentation=
+            "Block movements in the last observed KV statistics window by hot pool",
+            labelnames=[*iteration_labelnames, "pool_group", "operation"])
+        self._kv_movement_window_pools: dict[str, set[int]] = {}
         self.kv_cache_tier_moved_blocks = Counter(
             name=self.metric_prefix + "kv_cache_tier_moved_blocks_total",
             documentation=
@@ -1489,6 +1503,33 @@ class PrometheusExposure:
                             ifb_stats["numDeferredGenReceives"],
                             labels=rank_labels)
 
+    def _log_kv_movement_window(self, iteration_stats: Mapping,
+                                rank_labels: dict) -> None:
+        if not isinstance(
+                iteration_stats.get("kvCacheIterationStatsByPoolGroup"),
+                Mapping):
+            return
+        hot_pools, movements = kv_pool_rows(iteration_stats)
+        groups = set(hot_pools or ()) | set(movements or ())
+        rank = rank_labels[self.labelname_dp_rank]
+        seen = self._kv_movement_window_pools.setdefault(rank, set())
+        seen.update(groups)
+        for operation, _, field in KV_MOVEMENT_WINDOW_FIELDS:
+            counts = pool_counts(movements, groups, field)
+            labels = {**rank_labels, "operation": operation}
+            # NaN clears stale pool values for multiprocess scrapes.
+            for group in seen:
+                count = counts.get(group)
+                self._log_gauge(self.kv_cache_movement_window_blocks_by_pool,
+                                math.nan if count is None else count,
+                                labels={
+                                    **labels, "pool_group": str(group)
+                                })
+            total = total_pool_count(counts) if movements is not None else None
+            self._log_gauge(self.kv_cache_movement_window_blocks,
+                            math.nan if total is None else total,
+                            labels=labels)
+
     def _log_rank_iteration_stats(self, iteration_stats: dict,
                                   rank: str) -> None:
         """Log local KV and scheduling measurements for one rank.
@@ -1498,6 +1539,7 @@ class PrometheusExposure:
             rank: Normalized data-parallel rank label.
         """
         rank_labels = {self.labelname_dp_rank: rank}
+        self._log_kv_movement_window(iteration_stats, rank_labels)
         activity = iteration_stats.get("conversationActivity", {})
         for window in ("10m", "1h"):
             observation = activity.get(window)

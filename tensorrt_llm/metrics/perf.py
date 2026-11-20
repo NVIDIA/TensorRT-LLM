@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias
@@ -22,6 +22,12 @@ MetricKey: TypeAlias = str | MetricNames
 MetricScalar: TypeAlias = str | int | float | bool | None
 MetricValue: TypeAlias = (
     MetricScalar | Mapping[MetricKey, "MetricValue"] | tuple["MetricValue", ...]
+)
+PoolRows: TypeAlias = dict[int, Mapping[MetricKey, MetricValue]]
+KV_MOVEMENT_WINDOW_FIELDS = (
+    ("offload", "kv_offload_blocks", "iterOffloadBlocks"),
+    ("onboard", "kv_onboard_blocks", "iterOnboardBlocks"),
+    ("host_drop", "kv_host_dropped_blocks", "iterHostDroppedBlocks"),
 )
 
 # Unrecognized fields remain per-iteration so old/new producers can interoperate.
@@ -74,6 +80,65 @@ def _thaw(value: MetricValue) -> object:
     if isinstance(value, tuple):
         return [_thaw(item) for item in value]
     return value
+
+
+def block_count(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _pool_id(value: object) -> int | None:
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return block_count(value)
+
+
+def kv_pool_rows(
+    snapshot: Mapping[MetricKey, MetricValue],
+) -> tuple[PoolRows | None, PoolRows | None]:
+    storage = snapshot.get("kvCacheStorageStats")
+    hot_pools: PoolRows | None = None
+    if isinstance(storage, (tuple, list)):
+        hot_pools = {}
+        for row in storage:
+            if not isinstance(row, Mapping):
+                hot_pools = None
+                break
+            level = _pool_id(row.get("cacheLevel"))
+            if level is None:
+                hot_pools = None
+                break
+            if level != 0:
+                continue
+            group = _pool_id(row.get("poolGroupId"))
+            if group is None or group in hot_pools:
+                hot_pools = None
+                break
+            hot_pools[group] = row
+
+    report = snapshot.get("kvCacheIterationStatsByPoolGroup")
+    movements: PoolRows | None = None
+    if isinstance(report, Mapping):
+        movements = {}
+        for group_id, row in report.items():
+            group = _pool_id(group_id)
+            if group is None or group in movements or not isinstance(row, Mapping):
+                movements = None
+                break
+            movements[group] = row
+    return hot_pools, movements
+
+
+def pool_counts(rows: PoolRows | None, groups: Iterable[int], field: str) -> dict[int, int | None]:
+    return {
+        group: block_count(rows.get(group, {}).get(field)) if rows is not None else None
+        for group in groups
+    }
+
+
+def total_pool_count(counts: Mapping[int, int | None]) -> int | None:
+    if any(value is None for value in counts.values()):
+        return None
+    return sum(value for value in counts.values() if value is not None)
 
 
 def kv_cache_utilization(stats: Mapping) -> float | None:
