@@ -45,13 +45,15 @@ Each entry also records a checksum per `WEIGHT_MANIFEST_CHUNK_BYTES` chunk of
 the canonical bytes, computed on the device that holds the tensor. Comparison
 stays byte-exact on the digests; the checksums only explain a digest
 difference: the report names the byte ranges whose chunks differ, and when
-every chunk agrees, the device bytes were equal and only the host copy that was
-hashed differed.
+every chunk agrees, the device bytes most likely matched and the host copy that
+was hashed differed. Checksums are not collision-free, so agreement is strong
+evidence, not proof.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import functools
 import hashlib
 import json
 import os
@@ -86,9 +88,13 @@ SKIP_REASON_NON_STRIDED = "non_strided_layout"
 
 _ROLE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _METADATA_FIELDS = ("kind", "dtype", "shape", "stride", "storage_offset", "nbytes")
-# The weighted byte sums of a chunk stay below 2**63 up to this chunk size, so
-# they are exact and do not depend on the reduction order.
-_MAX_CHUNK_BYTES = 1 << 27
+# Chunk checksums weight each byte offset with a fixed pseudo-random integer in
+# [1, _CHECKSUM_WEIGHT_LIMIT). With weights below 2**31, a chunk's weighted byte
+# sum stays below 2**63 up to _MAX_CHUNK_BYTES, so it is exact and does not
+# depend on the reduction order.
+_CHECKSUM_WEIGHT_SEED = 7102503
+_CHECKSUM_WEIGHT_LIMIT = 1 << 31
+_MAX_CHUNK_BYTES = 1 << 24
 # Chunks reduced per kernel launch; bounds the int64 working set of a reduction.
 _CHUNKS_PER_REDUCTION = 16
 
@@ -98,7 +104,9 @@ class WeightManifestEntry:
     """One hashed tensor: identity, layout metadata, its byte digest, and chunk checksums.
 
     `chunk_checksums` holds one checksum per `chunk_bytes` chunk of the canonical
-    bytes (see `chunk_checksums`); both are empty or zero for an empty tensor.
+    bytes (see `chunk_checksums`); both are empty or zero for an empty tensor. An
+    entry without checksums serializes without the two fields, as format version
+    1 entries did, so a version 1 manifest still loads with a matching digest.
     """
 
     fqn: str
@@ -113,7 +121,7 @@ class WeightManifestEntry:
     chunk_checksums: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "fqn": self.fqn,
             "kind": self.kind,
             "dtype": self.dtype,
@@ -122,9 +130,11 @@ class WeightManifestEntry:
             "storage_offset": self.storage_offset,
             "nbytes": self.nbytes,
             "sha256": self.sha256,
-            "chunk_bytes": self.chunk_bytes,
-            "chunk_checksums": list(self.chunk_checksums),
         }
+        if self.chunk_checksums:
+            payload["chunk_bytes"] = self.chunk_bytes
+            payload["chunk_checksums"] = list(self.chunk_checksums)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "WeightManifestEntry":
@@ -404,17 +414,35 @@ def canonical_tensor_bytes(tensor: torch.Tensor) -> torch.Tensor:
     return flat.view(torch.uint8)
 
 
+@functools.lru_cache(maxsize=8)
+def _checksum_weights(chunk_bytes: int) -> torch.Tensor:
+    """The `chunk_bytes` chunk-checksum weights, drawn on the CPU from a fixed seed."""
+    generator = torch.Generator().manual_seed(_CHECKSUM_WEIGHT_SEED)
+    return torch.randint(
+        1, _CHECKSUM_WEIGHT_LIMIT, (chunk_bytes,), generator=generator, dtype=torch.int64
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def _device_checksum_weights(chunk_bytes: int, device: torch.device) -> torch.Tensor:
+    return _checksum_weights(chunk_bytes).to(device)
+
+
 def chunk_checksums(
     tensor: torch.Tensor, chunk_bytes: int = WEIGHT_MANIFEST_CHUNK_BYTES
 ) -> tuple[str, ...]:
     """Return one checksum per `chunk_bytes` chunk of a tensor's canonical bytes.
 
-    The checksum of a chunk is the sum of `byte * (offset + 1)` over its bytes,
-    with offsets counted from the chunk start, as 16 hexadecimal digits; the last
-    chunk may be shorter. It is computed on the device that holds the tensor, so
-    for a CUDA tensor it describes device memory, independently of the host copy
-    that the SHA-256 digest reads. The sums are exact, so equal bytes give equal
-    checksums on every device.
+    The checksum of a chunk is the sum of `byte * weight[offset]` over its bytes,
+    as 16 hexadecimal digits, where `offset` counts from the chunk start and the
+    weights are pseudo-random integers in [1, 2**31) drawn from a fixed seed, the
+    same in every process and on every device; the last chunk may be shorter.
+    Because every weight is nonzero, changing a single byte always changes its
+    chunk's checksum; several changed bytes cancel out only by rare coincidence.
+    The checksum is computed on the device that holds the tensor, so for a CUDA
+    tensor it describes device memory, independently of the host copy that the
+    SHA-256 digest reads. The sums are exact, so equal bytes give equal checksums
+    on every device.
     """
     if not 0 < chunk_bytes <= _MAX_CHUNK_BYTES:
         raise ValueError(f"chunk_bytes must be in (0, {_MAX_CHUNK_BYTES}], got {chunk_bytes}")
@@ -424,7 +452,7 @@ def chunk_checksums(
     raw = flat.view(torch.uint8)
     total = raw.numel()
     full_chunks = total // chunk_bytes
-    weights = torch.arange(1, min(chunk_bytes, total) + 1, dtype=torch.int64, device=raw.device)
+    weights = _device_checksum_weights(chunk_bytes, raw.device)
     sums: list[torch.Tensor] = []
     for first in range(0, full_chunks, _CHUNKS_PER_REDUCTION):
         count = min(_CHUNKS_PER_REDUCTION, full_chunks - first)
@@ -449,8 +477,8 @@ def describe_chunk_differences(
     """Say where two entries' bytes differ according to their chunk checksums.
 
     Returns the merged byte ranges of the differing chunks, a note that every
-    chunk agrees (so only the hashed host copies differ), or an empty string
-    when the entries carry no comparable checksums.
+    chunk agrees (so the device bytes most likely match and the hashed host copies
+    differ), or an empty string when the entries carry no comparable checksums.
     """
     if (
         not expected.chunk_checksums
@@ -464,7 +492,10 @@ def describe_chunk_differences(
         if left != right
     ]
     if not differing:
-        return "every device chunk checksum agrees, so only the hashed host copies differ"
+        return (
+            "every device chunk checksum agrees, so the device bytes most likely match "
+            "and the hashed host copies differ"
+        )
     ranges: list[list[int]] = []
     for index in differing:
         if ranges and index == ranges[-1][1] + 1:
