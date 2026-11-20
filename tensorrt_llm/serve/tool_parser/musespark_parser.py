@@ -133,9 +133,14 @@ class MuseSparkToolParser(BaseToolParser):
     EOS = "<|end_of_text|>"
     STRUCTURAL_TOKENS = (START, MESSAGE, EOM, EOT, EOS)
 
-    _HEADER_RE = re.compile(r"(?:<\|start\|>assistant)?(\s+to=(" + _NAME + r"))<\|message\|>")
+    # A header's whitespace begins where a whitespace run begins. A match that
+    # starts inside a run also matches from the start of the run, and trying
+    # every start in a long run takes time quadratic in its length.
+    _HEADER_RE = re.compile(
+        r"(?:<\|start\|>assistant)?(?<!\s)(\s+to=(" + _NAME + r"))<\|message\|>"
+    )
     # Header still growing at the end of the buffer (no <|message|> yet).
-    _HEADER_TAIL_RE = re.compile(r"(?:<\|start\|>assistant\s+|\s+)to=" + _NAME + r"\s*$")
+    _HEADER_TAIL_RE = re.compile(r"(?:<\|start\|>assistant\s+|(?<!\s)\s+)to=" + _NAME + r"\s*$")
     # Both paths anchor on the opening tag; the closer is found by search, so a
     # truncated invoke is still seen. See _iter_invokes.
     _INVOKE_START_RE = re.compile(r"<atem:invoke\s+name=(?:\"|')?(" + _NAME + r")(?:\"|')?[^>]*>")
@@ -507,9 +512,17 @@ class MuseSparkToolParser(BaseToolParser):
         """
         hold = max(cls._partial_suffix_len(safe, tok) for tok in cls.STRUCTURAL_TOKENS)
         for n in range(len(safe), hold, -1):
+            if n < len(safe) and safe[-n].isspace() and safe[-n - 1].isspace():
+                # A suffix that starts inside a whitespace run matches only if
+                # the longer one starting a character earlier did.
+                continue
             suffix = safe[-n:]
             core = suffix[: len(suffix) - cls._partial_suffix_len(suffix, cls.MESSAGE)]
-            if "<|start|>assistant".startswith(core) or cls._HEADER_PREFIX_RE.match(core):
+            if (
+                core.isspace()
+                or "<|start|>assistant".startswith(core)
+                or cls._HEADER_PREFIX_RE.match(core)
+            ):
                 return n
         return hold
 
